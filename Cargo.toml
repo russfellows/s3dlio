@@ -1,0 +1,45 @@
+[package]
+name = "dlio_s3_rust"
+version = "0.1.1"
+edition = "2024"
+
+[lib]
+name = "dlio_s3_rust"
+crate-type = ["cdylib", "rlib"]      # cdylib → Python wheel, rlib → normal Rust
+
+[[bin]]
+name = "s3Rust-cli"
+path = "src/bin/cli.rs"
+
+[dependencies]
+aws-config         = "^1"
+aws-sdk-s3         = "^1"
+
+# --- async / net stack ----------------------------------------------------
+tokio   = { version = "1", features = ["rt-multi-thread", "macros"] }
+hyper   = { version = "^0.14", features = ["client", "tcp"] }		# ← downgrade
+hyper-rustls = "^0.24"                                       		# ← matches hyper 0.14
+rustls  = { version = "^0.21", features = ["dangerous_configuration"] }	# ← matches hyper‑rustls 0.24
+webpki-roots = "^0.22"
+
+# --- util / CLI / etc. ----------------------------------------------------
+once_cell = "^1.19"
+dotenvy   = "^0.15"
+anyhow    = "^1"
+clap      = { version = "4", features = ["derive"] }
+regex     = "1.11"
+futures = "^0.3"
+rand = "0.9.0"
+
+# -------- Python bindings ----------
+pyo3        = { version = "^0.20", features = ["extension-module"] }
+numpy       = "^0.20"
+ndarray     = "^0.15"
+ndarray-npy = "^0.8"
+zip         = "^0.6"
+
+
+[features]
+default = []
+extension-module = []     # suppresses the cfg warning when building the wheel
+
