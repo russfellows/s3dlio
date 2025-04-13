@@ -11,9 +11,15 @@ For ease of testing, both the cli and library are built into a container image. 
 ### Plan for Publishing
 Currently, the plan is to publish the Python library on PyPi for distribution.  The compiled Rust executable may also be published on GitHub for general use.  The source code may also be published, although that is TBD for now.  
 
-# Building Executables and Libraries
+# How to Build
 In order to build this project, you can build the code and libraries and use them directly. 
 
+### Prerequisites 
+1. Rust, see [https://www.rust-lang.org/tools/install] How to Install Rust
+2. The `maturin` command, which may be installed with pip, uv or some other tools
+3. The `patchelf` executable, best installed with system packages, such as `sudo apt-get install patchelf` or similar 
+
+## Building Executables and Libraries
 To build the code, there is a two step process:
 1. First build the Rust code and library. Use `cargo build --release` , which of course presumes you have Rust installed
 2. Next, build the Python library, using maturin.  Command is: `maturin build --release --features extension-module`
@@ -70,16 +76,16 @@ root@loki-node3:/app# s3Rust-cli
 Usage: s3Rust-cli <COMMAND>
 
 Commands:
-  list      List keys that start with the given prefix
-  get       Download one or many objects
-  delete    Delete one object or every object that matches the prefix
-  put       Upload one object with random data
-  put-many  Upload many objects concurrently with random data
-  help      Print this message or the help of the given subcommand(s)
+  list    List keys that start with the given prefix
+  get     Download one or many objects
+  delete  Delete one object or every object that matches the prefix
+  put     Upload one object with random data. Upload one or more  concurrently with random data
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help
   -V, --version  Print version
+
 root@loki-node3:/app#
 ```
 
@@ -134,7 +140,7 @@ Total objects: 0
 ```
 #### Example put-many and then Delete to cleanup
 ```
-root@loki-node3:/app# s3Rust-cli put-many -c -n 1200 -t russ-test3-{}.obj s3://my-bucket4/
+root@loki-node3:/app# s3Rust-cli put -c -n 1200 -t russ-test3-{}.obj s3://my-bucket4/
 Uploaded 1200 objects (total 25165824000 bytes) in 7.607254643s (157.74 objects/s, 3154.88 MB/s)
 
 root@loki-node3:/app# 
