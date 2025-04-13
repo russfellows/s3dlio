@@ -46,6 +46,7 @@ Python 3.13.2
 Setting up the variables and information necessary to access S3 can be somewhat tricky.  This code supports the use of both, or either of environment variables, and values in a ```.env``` file.  Note that this container includes a sample .env file.  The values are from a private test environment.  Thus the ACCESS_KEY and SECRET_KEY values are not a concern.  
 
 These values are required, but may be set as environment variables if desired.  Probably easier to just set them in the .env file, which is read in by default.
+
 *Note: There is a sample file called "my-env" which may be edited, and saved as .env.  Since dot files are hidden, they are not incldued in Github repos by default.*
 
 Here are the contents, which include several commented out test buckets:
