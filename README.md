@@ -11,6 +11,18 @@ For ease of testing, both the cli and library are built into a container image. 
 ### Plan for Publishing
 Currently, the plan is to publish the Python library on PyPi for distribution.  The compiled Rust executable may also be published on GitHub for general use.  The source code may also be published, although that is TBD for now.  
 
+# Building Executables and Libraries
+In order to build this project, you can build the code and libraries and use them directly. 
+
+To build the code, there is a two step process:
+1. First build the Rust code and library. Use `cargo build --release` , which of course presumes you have Rust installed
+2. Next, build the Python library, using maturin.  Command is: `maturin build --release --features extension-module`
+
+## Installing Python Library
+To install the python library you would use a `pip install --force-reinstall ./path/to/my/manylinux.whl` using the path of the .whl file just created
+
+For testing purposes you can build and run the container.  The container will contain the executable, along with a python library.  This allows you to run either the Rust cli, or a python program that uses the Python library.
+
 ## Starting the Container
 Here is an example of starting the container and showing the contents of the containers /app directory.  Note: It is VERY important to use the "--net=host" or similar command when starting, since using S3 necessitates network connectivity to S3 storage:
 
