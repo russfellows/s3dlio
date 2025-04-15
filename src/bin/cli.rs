@@ -1,3 +1,6 @@
+//
+// Copyright, 2025.  Signal65 / Futurum Group.
+// 
 //! CLI supporting `list`, `get`, `delete`, `put`, and `putmany`.
 //!
 //! Examples:
