@@ -1,3 +1,6 @@
+//
+// Copyright, 2025.  Signal65 / Futurum Group.
+// 
 // src/python_api.rs
 //! PyO3 bindings – expose the same operations as the Rust CLI.
 
