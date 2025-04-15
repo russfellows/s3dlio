@@ -6,7 +6,7 @@ This guide shows how to use the Rust library, which supports both a compiled com
 ### Purpose
 The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The five primary operations for S3 are included: Get, Put, List, Delete, and Create-Bucket.  Note that bucket creation currently occurs only as part of a Put operation.  
 
-For ease of testing, both the cli and library are built into a container image.  The Rust source code has been striped from this container in order to reduce its size.  
+For ease of testing, both the cli and library may be built into a container as well.  The Rust source code is removed from this container in order to reduce its size.  
 
 ### Plan for Publishing
 Currently, the plan is to publish the Python library on PyPi for distribution.  The compiled Rust executable may also be published on GitHub for general use.  The source code may also be published, although that is TBD for now.  
