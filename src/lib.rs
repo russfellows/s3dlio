@@ -1,3 +1,6 @@
+//
+// Copyright, 2025.  Signal65 / Futurum Group.
+// 
 // src/lib.rs
 //! Public re‑exports **plus** the Python module glue.
 //! Crate root – re‑export helpers for the CLI and PyO3 bindings.
