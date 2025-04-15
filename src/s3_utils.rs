@@ -1,3 +1,6 @@
+//
+// Copyright, 2025.  Signal65 / Futurum Group.
+// 
 // src/s3_utils.rs
 //! Thread‑safe, blocking wrapper around the async AWS Rust SDK.
 //! Provides helpers used by both the CLI and the forthcoming PyO3 bindings.
