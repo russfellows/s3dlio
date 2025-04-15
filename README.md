@@ -9,7 +9,7 @@ The purpose of this library is to enable testing of S3 storage via both a cli an
 For ease of testing, both the cli and library may be built into a container as well.  The Rust source code is removed from this container in order to reduce its size.  
 
 ### Plan for Publishing
-Currently, the plan is to publish the Python library on PyPi for distribution.  The compiled Rust executable may also be published on GitHub for general use.  The source code may also be published, although that is TBD for now.  
+Currently, the plan is to publish the Python library on PyPi for distribution.  The compiled Rust executable may also be published on GitHub for general use.  The source code was just published, since the project was made public.  
 
 # How to Build
 In order to build this project, you can build the code and libraries and use them directly. 
