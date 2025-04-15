@@ -1,3 +1,6 @@
+//
+// Copyright, 2025.  Signal65 / Futurum Group.
+// 
 /// Generates a buffer of `size` bytes with controlled deduplication and compressibility.
 ///
 /// # Parameters
