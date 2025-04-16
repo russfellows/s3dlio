@@ -26,11 +26,24 @@ To build the code, there is a two step process:
 
 ## Installing Python Library
 To install the python library you would use a `pip install --force-reinstall ./path/to/my/manylinux.whl` using the path of the .whl file just created
+For testing purposes you can build and run the code on most Linux systems, including both the Rust cli and the python library.  For ease of use, a container may be used as well.  
 
-For testing purposes you can build and run the container.  The container will contain the executable, along with a python library.  This allows you to run either the Rust cli, or a python program that uses the Python library.
+## Container
+A container image may be built from the source code in this repository.  Also, examining the Dockerfile may help users better understand how to build the code outside of a container by examining the steps in the Dockerfile.  
+The container will contain the executable, along with a python library.  This allows you to run either the Rust cli, or a python program that uses the Python library.
+### Building / Pulling
+Either docker or podman may be used to create the image, typically with a `podman build -t xxx .` where xxx is the name you want to use for your container image. For those that want to simply pull and run a pre-built container, a relatively recent image may be found on quay.io.  However, the version on quay may be older than that available by building from the source code in this repository.  
 
-## Starting the Container
-Here is an example of starting the container and showing the contents of the containers /app directory.  Note: It is VERY important to use the "--net=host" or similar command when starting, since using S3 necessitates network connectivity to S3 storage:
+The location of the container is here:  https://quay.io/repository/russfellows-sig65/dealio_s3_rust
+
+In order to pull the container using docker, you may execute the following:
+```
+docker pull quay.io/russfellows-sig65/dealio_s3_rust
+```
+
+### Running Container
+Here is an example of starting the container using podman, and listing the contents of the containers /app directory.  
+***Note:** It is VERY important to use the "--net=host" or similar command when starting, since using S3 necessitates network connectivity to S3 storage.*
 
 ```
 eval@loki-node3:~/real-dealio2$ podman run --net=host --rm -it dealio_s3-rust 
