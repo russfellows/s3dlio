@@ -1,6 +1,6 @@
 # How to Guide
 
-## s3Rust Library and CLI
+## S3 Rust Library and CLI
 This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3Rust-cli``` and Python library, compiled into a wheel file.  
 
 ### Purpose
