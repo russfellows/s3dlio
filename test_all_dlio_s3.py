@@ -72,7 +72,7 @@ def main():
     num_put_many = 10
     put_many_size = 1 * 1024 * 1024  # 1 MB each
     start_put_many = time.perf_counter()
-    s3.put(multi_put_prefix, num=num_put_many, template="multi_test_{}.dat", max_in_flight=NumJobs, size=put_many_size, should_create_bucket=False)
+    s3.put(multi_put_prefix, num=num_put_many, template="multi_test_{}_of_{}.dat", max_in_flight=NumJobs, size=put_many_size, should_create_bucket=False)
     end_put_many = time.perf_counter()
     elapsed_put_many = end_put_many - start_put_many
     total_put_bytes = num_put_many * put_many_size
@@ -82,7 +82,7 @@ def main():
 
     # --- 7. Multiple object download (get_many) test for the multi-put objects ---
     # Reconstruct the list of expected URIs based on the same prefix/template logic.
-    multi_put_uris = [multi_put_prefix + f"multi_test_{i}.dat" for i in range(num_put_many)]
+    multi_put_uris = [multi_put_prefix + f"multi_test_{i}_of_{num_put_many}.dat" for i in range(num_put_many)]
     start_get_many_new = time.perf_counter()
     put_many_pairs = s3.get_many(multi_put_uris, NumJobs)
     end_get_many_new = time.perf_counter()

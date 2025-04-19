@@ -49,6 +49,7 @@ enum Command {
     Get {
         /// S3 URI – can be a full key or a prefix ending with `/`.
         uri: String,
+        
         /// Maximum concurrent GET requests.
         #[arg(short = 'j', long = "jobs", default_value_t = 64)]
         jobs: usize,
@@ -57,6 +58,7 @@ enum Command {
     Delete {
         /// S3 URI (single key or prefix ending with `/`).
         uri: String,
+
         /// Batch size (number of parallel delete calls).
         #[arg(short = 'j', long = "jobs", default_value_t = 1000)]
         jobs: usize,
@@ -65,28 +67,31 @@ enum Command {
     Put {
         /// S3 URI prefix (e.g. s3://bucket/prefix)
         uri_prefix: String,
+
         /// Optionally create the bucket if it does not exist.
         #[arg(short = 'c', long = "create-bucket", action)]
         create_bucket_flag: bool,
-        /// Number of objects to create and upload.
-        #[arg(short = 'n', long = "num", default_value_t = 1)]
-        num: usize,
-        /// Template for object names. Use '{}' as a placeholder.
-        #[arg(short = 't', long = "template", default_value = "object_{}.dat")]
-        template: String,
+       
         /// Maximum concurrent uploads (jobs), but is modified to be min(jobs, num).
         #[arg(short = 'j', long = "jobs", default_value_t = 32)]
         jobs: usize,
-        /// Object size in bytes (default 20 MB).
-        #[arg(short = 's', long = "size", default_value_t = DEFAULT_OBJECT_SIZE)]
-        size: usize,
+
+        /// Number of objects to create and upload.
+        #[arg(short = 'n', long = "num", default_value_t = 1)]
+        num: usize,
+
         /// What kind of object to generate: 
         #[arg( short = 'o', long = "object-type", value_enum, ignore_case = true, default_value_t = ObjectType::Raw)] // Without value_parser [] values are case insensitive
         object_type: ObjectType,
-        // Following are older definitions
-        //#[arg( short = 'o', long = "object-type", default_value = "Raw")] // Without value_parser [] values are case insensitive
-        //#[arg( short = 'o', long = "object-type", value_parser = ["NPZ","TFRecord","HDF5","Raw"], default_value = "Raw")]
-        //object_type: String,
+
+        /// Object size in bytes (default 20 MB).
+        #[arg(short = 's', long = "size", default_value_t = DEFAULT_OBJECT_SIZE)]
+        size: usize,
+
+        /// Template for object names. Use '{}' as a placeholder.
+        //#[arg(short = 't', long = "template", default_value = "object_{}.dat")]
+        #[arg(short = 't', long = "template", default_value = "object_{}_of_{}.dat")]
+        template: String,
     },
 }
 
@@ -288,8 +293,21 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
     }
     // Generate the full list of URIs.
     let mut uris = Vec::with_capacity(num);
+
+    /*
+     * Old single bracket template
     for i in 0..num {
         let object_name = template.replace("{}", &i.to_string());
+        let full_uri = format!("s3://{}/{}{}", bucket, prefix, object_name);
+        uris.push(full_uri);
+    }
+    */
+
+    for i in 0..num {
+        // replace first {} with the index, second {} with the total count
+        let object_name = template
+            .replacen("{}", &i.to_string(), 1)
+            .replacen("{}", &num.to_string(), 1);
         let full_uri = format!("s3://{}/{}{}", bucket, prefix, object_name);
         uris.push(full_uri);
     }
