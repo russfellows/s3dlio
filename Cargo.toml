@@ -1,6 +1,6 @@
 [package]
 name = "dlio_s3_rust"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 
 [lib]
@@ -37,6 +37,7 @@ numpy       = "^0.20"
 ndarray     = "^0.15"
 ndarray-npy = "^0.8"
 zip         = "^0.6"
+rayon = "1.10.0"
 
 
 [features]

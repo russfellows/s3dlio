@@ -1,6 +1,88 @@
+// src/data_gen.rs
 //
 // Copyright, 2025.  Signal65 / Futurum Group.
 // 
+
+use once_cell::sync::Lazy;
+use rand::Rng;
+use rayon::prelude::*;
+
+// -----------------------------------------------------------------------------
+// Generate a buffer of random bytes.
+// -----------------------------------------------------------------------------
+
+/// A base random block of 512 bytes, generated once.
+static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
+    let mut block = vec![0u8; 512];
+    rand::rngs::ThreadRng::default().fill(&mut block[..]);
+    block
+});
+
+// For now, each of our 4 object types just calls the same function
+pub fn generate_npz(size: usize) -> Vec<u8> {
+    generate_random_data(size)
+} 
+
+pub fn generate_tfrecord(size: usize) -> Vec<u8> {
+    generate_random_data(size)
+} 
+
+pub fn generate_hdf5(size: usize) -> Vec<u8> {
+    generate_random_data(size)
+} 
+
+pub fn generate_raw_data(size: usize) -> Vec<u8> {
+    generate_random_data(size)
+} 
+
+/// Generates a buffer of `size` random bytes by:
+/// 1. Enforcing a minimum size of 512 bytes.
+/// 2. Filling each 512-byte block with a static base block.
+/// 3. Modifying the first 32 bytes of each block,
+///    and modifying the last 32 bytes only if the block is larger than 128 bytes.
+///
+/// This ensures each 512-byte block is unique while avoiding the need to generate a whole new
+/// random buffer on every call.
+//pub fn generate_random_data(mut size: usize) -> Vec<u8> {
+fn generate_random_data(mut size: usize) -> Vec<u8> {
+    // Enforce a minimum size of 512 bytes.
+    if size < 512 {
+        size = 512;
+    }
+
+    // Allocate the buffer.
+    let mut data = vec![0u8; size];
+
+    // Fill each 512-byte block by copying from the static base block.
+    for chunk in data.chunks_mut(512) {
+        let len = chunk.len();
+        chunk.copy_from_slice(&BASE_BLOCK[..len]);
+    }
+
+    let mut rng = rand::rngs::ThreadRng::default();
+    let mut offset = 0;
+    while offset < size {
+        let block_end = std::cmp::min(offset + 512, size);
+        let block_size = block_end - offset;
+
+        // Modify the first 32 bytes (or the full block if it's smaller).
+        if block_size > 0 {
+            let first_len = if block_size >= 32 { 32 } else { block_size };
+            rng.fill(&mut data[offset .. offset + first_len]);
+        }
+
+        // Modify the last 32 bytes only if the block is larger than 128 bytes.
+        if block_size > 128 {
+            rng.fill(&mut data[block_end - 32 .. block_end]);
+        }
+
+        offset += 512;
+    }
+
+    data
+}
+
+
 /// Generates a buffer of `size` bytes with controlled deduplication and compressibility.
 ///
 /// # Parameters
@@ -23,12 +105,11 @@
 ///
 /// # Returns
 /// A `Vec<u8>` with the requested size, containing data with the specified deduplication and compressibility characteristics.
-use once_cell::sync::Lazy;
-use rand::Rng;
-use rayon::prelude::*;
 
+#[allow(dead_code)]
 /// Start of a data generation function that supports specifying deduplication and compression ratios of data created
-pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+//pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     // Enforce a minimum size of 512 bytes.
     if size < 512 {
         size = 512;
@@ -64,6 +145,7 @@ pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) 
     {
         let mut rng = rand::rngs::ThreadRng::default();
         for i in 0..unique_blocks {
+            let _ = i; // Because we never explicitly use i, its just an index
             // Start with a clone of the base block.
             let mut block = base_block.clone();
             // Uniquify by modifying the first 32 bytes (or less if the block is smaller).

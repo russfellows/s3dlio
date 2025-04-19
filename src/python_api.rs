@@ -13,46 +13,29 @@ use regex::Regex;
 
 use crate::s3_utils::{
     delete_objects, get_object_uri, get_objects_parallel, list_objects, parse_s3_uri,
-    put_objects_parallel, generate_random_data, DEFAULT_OBJECT_SIZE, create_bucket,
-    //put_object, put_objects_parallel, generate_random_data, DEFAULT_OBJECT_SIZE, create_bucket,
-    // Note: the put_object is never called now, we always call put_objects_parallel
+    put_objects_parallel, create_bucket, ObjectType, DEFAULT_OBJECT_SIZE,
 };
+
+use crate::data_gen::{
+    generate_npz, generate_tfrecord, generate_hdf5, generate_raw_data,
+};
+
 
 /// Convert an error into a Python RuntimeError.
 fn py_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+// Convert a Python String into a Rust ObjectType Enum
+// is handled in the file src/s3_utils.rsd
 
-/*
- * Old Put
- *
-/// `put(uris, max_in_flight=32, size=None, create_bucket=False) -> None`
-/// Uploads multiple objects concurrently with random data (default 20 MB).
-/// This new put, is the old put_many, but will handle a single object as well
-#[pyfunction]
-#[pyo3(signature = (uris, max_in_flight = 32, size = None, should_create_bucket = false))]
-pub fn put(uris: Vec<String>, max_in_flight: usize, size: Option<usize>, should_create_bucket: bool) -> PyResult<()> {
-    let size = size.unwrap_or(DEFAULT_OBJECT_SIZE);
-    if !uris.is_empty() {
-        let (bucket, _) = parse_s3_uri(&uris[0]).map_err(py_err)?;
-        if should_create_bucket {
-            if let Err(e) = create_bucket(&bucket) {
-                eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
-            }
-        }
-    }
-    let data = generate_random_data(size);
-    put_objects_parallel(&uris, &data, max_in_flight).map_err(py_err)
-}
-*/
 
 /// `put(prefix, num=1, template="object_{}.dat", max_in_flight=32, size=None, should_create_bucket=False) -> None`
 /// Uploads one or many objects with random data (default 20 MB). The `prefix` is an S3 URI
 /// that specifies the bucket and key prefix. The function generates object names using the provided `template`.
 #[pyfunction]
-#[pyo3(signature = (prefix, num=1, template="object_{}.dat", max_in_flight=32, size=None, should_create_bucket=false))]
-pub fn put(prefix: &str, num: usize, template: &str, max_in_flight: usize, size: Option<usize>, should_create_bucket: bool) -> PyResult<()> {
+#[pyo3(signature = (prefix, num=1, template="object_{}.dat", max_in_flight=32, size=None, should_create_bucket=false, object_type = ObjectType::Raw))]  
+pub fn put(prefix: &str, num: usize, template: &str, max_in_flight: usize, size: Option<usize>, should_create_bucket: bool, object_type: ObjectType) -> PyResult<()> {
     let size = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let (bucket, mut key_prefix) = parse_s3_uri(prefix).map_err(py_err)?;
     if should_create_bucket {
@@ -70,7 +53,18 @@ pub fn put(prefix: &str, num: usize, template: &str, max_in_flight: usize, size:
         let full_uri = format!("s3://{}/{}{}", bucket, key_prefix, object_name);
         uris.push(full_uri);
     }
-    let data = generate_random_data(size);
+    
+    // Old we just called generate_random_data()
+    //let data = generate_random_data(size);
+    // New, we call a specific function depending upon the datatype we are generating 
+    let data = match object_type {
+        ObjectType::Npz => generate_npz(size),
+        ObjectType::TfRecord => generate_tfrecord(size),
+        ObjectType::Hdf5 => generate_hdf5(size),
+        ObjectType::Raw => generate_raw_data(size),
+    };
+
+
     // Compute effective concurrency: use the smaller of max_in_flight and the number of URIs.
     let effective_jobs = std::cmp::min(max_in_flight, num);
     put_objects_parallel(&uris, &data, effective_jobs).map_err(py_err)

@@ -9,6 +9,7 @@
 use pyo3::prelude::*;
 
 pub mod s3_utils;
+pub mod data_gen;
 
 
 // keep the python module for the wheel build
@@ -29,8 +30,10 @@ pub use s3_utils::{
     delete_objects,
     put_object_with_random_data,
     put_objects_with_random_data,
+    put_objects_with_random_data_and_type,
     generate_random_data,
     DEFAULT_OBJECT_SIZE,
+    ObjectType,
 };
 
 
