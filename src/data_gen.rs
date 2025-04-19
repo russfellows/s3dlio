@@ -10,10 +10,13 @@ use rayon::prelude::*;
 // -----------------------------------------------------------------------------
 // Generate a buffer of random bytes.
 // -----------------------------------------------------------------------------
+//
+const BLK_SIZE: usize = 512;
+const HALF_BLK: usize = BLK_SIZE / 2;
 
-/// A base random block of 512 bytes, generated once.
+/// A base random block of BLK_SIZE bytes, generated once.
 static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
-    let mut block = vec![0u8; 512];
+    let mut block = vec![0u8; BLK_SIZE];
     rand::rngs::ThreadRng::default().fill(&mut block[..]);
     block
 });
@@ -36,25 +39,25 @@ pub fn generate_raw_data(size: usize) -> Vec<u8> {
 } 
 
 /// Generates a buffer of `size` random bytes by:
-/// 1. Enforcing a minimum size of 512 bytes.
-/// 2. Filling each 512-byte block with a static base block.
+/// 1. Enforcing a minimum size of BLK_SIZE bytes.
+/// 2. Filling each BLK_SIZE-byte block with a static base block.
 /// 3. Modifying the first 32 bytes of each block,
 ///    and modifying the last 32 bytes only if the block is larger than 128 bytes.
 ///
-/// This ensures each 512-byte block is unique while avoiding the need to generate a whole new
+/// This ensures each BLK_SIZE-byte block is unique while avoiding the need to generate a whole new
 /// random buffer on every call.
 //pub fn generate_random_data(mut size: usize) -> Vec<u8> {
 fn generate_random_data(mut size: usize) -> Vec<u8> {
-    // Enforce a minimum size of 512 bytes.
-    if size < 512 {
-        size = 512;
+    // Enforce a minimum size of BLK_SIZE bytes.
+    if size < BLK_SIZE {
+        size = BLK_SIZE;
     }
 
     // Allocate the buffer.
     let mut data = vec![0u8; size];
 
-    // Fill each 512-byte block by copying from the static base block.
-    for chunk in data.chunks_mut(512) {
+    // Fill each BLK_SIZE-byte block by copying from the static base block.
+    for chunk in data.chunks_mut(BLK_SIZE) {
         let len = chunk.len();
         chunk.copy_from_slice(&BASE_BLOCK[..len]);
     }
@@ -62,7 +65,7 @@ fn generate_random_data(mut size: usize) -> Vec<u8> {
     let mut rng = rand::rngs::ThreadRng::default();
     let mut offset = 0;
     while offset < size {
-        let block_end = std::cmp::min(offset + 512, size);
+        let block_end = std::cmp::min(offset + BLK_SIZE, size);
         let block_size = block_end - offset;
 
         // Modify the first 32 bytes (or the full block if it's smaller).
@@ -72,11 +75,11 @@ fn generate_random_data(mut size: usize) -> Vec<u8> {
         }
 
         // Modify the last 32 bytes only if the block is larger than 128 bytes.
-        if block_size > 128 {
+        if block_size > HALF_BLK {
             rng.fill(&mut data[block_end - 32 .. block_end]);
         }
 
-        offset += 512;
+        offset += BLK_SIZE;
     }
 
     data
@@ -86,16 +89,16 @@ fn generate_random_data(mut size: usize) -> Vec<u8> {
 /// Generates a buffer of `size` bytes with controlled deduplication and compressibility.
 ///
 /// # Parameters
-/// - `size`: The total size (in bytes) of the returned buffer; if less than 512, it is raised to 512.
+/// - `size`: The total size (in bytes) of the returned buffer; if less than BLK_SIZE, it is raised to BLK_SIZE.
 /// - `dedup`: The deduplication factor. For example, dedup = 3 means that roughly one out of every 3 blocks
 ///   is unique; a value of 1 produces fully unique blocks. (If dedup is 0, it is treated as 1.)
-/// - `compress`: The compressibility factor. For values greater than 1, each 512-byte block is generated so that
+/// - `compress`: The compressibility factor. For values greater than 1, each BLK_SIZE-byte block is generated so that
 ///   a fraction f = (compress - 1) / compress of the block is constant while the rest is random. For instance,
 ///   compress = 2 produces roughly 50% constant data per block (and 50% random), making the block roughly 2:1 compressible.
 ///   A value of 1 produces all-random data.
 ///
 /// # Implementation Details
-/// - The function works on fixed 512-byte blocks. A minimal size of 512 bytes is enforced.
+/// - The function works on fixed BLK_SIZE-byte blocks. A minimal size of BLK_SIZE bytes is enforced.
 /// - It builds a base block according to the compress parameter: the first `constant_length` bytes are constant
 ///   (set here to zero) and the remainder of the block is random.
 /// - Then it creates a set of "unique" blocks by cloning the base block and modifying only a small portion:
@@ -110,12 +113,12 @@ fn generate_random_data(mut size: usize) -> Vec<u8> {
 /// Start of a data generation function that supports specifying deduplication and compression ratios of data created
 //pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
 fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
-    // Enforce a minimum size of 512 bytes.
-    if size < 512 {
-        size = 512;
+    // Enforce a minimum size of BLK_SIZE bytes.
+    if size < BLK_SIZE {
+        size = BLK_SIZE;
     }
 
-    let block_size = 512;
+    let block_size = BLK_SIZE;
     let nblocks = (size + block_size - 1) / block_size;
 
     // Determine the number of unique blocks based on dedup factor.
@@ -128,7 +131,7 @@ fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> V
     let constant_length = (f * block_size as f64).round() as usize;
     // The rest (block_size - constant_length) is left to be random.
 
-    // Build a base 512-byte block that already has the desired compressible layout.
+    // Build a base BLK_SIZE-byte block that already has the desired compressible layout.
     let mut base_block = vec![0u8; block_size];
     // Fill the constant portion (first constant_length bytes) with a fixed pattern (here, zeros).
     for j in 0..constant_length {
