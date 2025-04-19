@@ -6,6 +6,7 @@
 //! Provides helpers used by both the CLI and the forthcoming PyO3 bindings.
 
 use anyhow::{bail, Context, Result};
+use clap::ValueEnum;
 
 use aws_config::meta::region::RegionProviderChain;
 //use aws_sdk_s3::{config::Region, types::{Delete, ObjectIdentifier}, Client};
@@ -18,7 +19,14 @@ use once_cell::sync::{Lazy, OnceCell};
 use std::{env, sync::Arc};
 use tokio::{runtime::Handle, sync::Semaphore, task};
 
+use pyo3::{PyAny, FromPyObject, PyResult};
+
 use rand::Rng;
+
+use crate::data_gen::{generate_npz, generate_tfrecord, generate_hdf5, generate_raw_data};
+
+// End imports
+
 
 // Default size: 20 MB.
 pub const DEFAULT_OBJECT_SIZE: usize = 20 * 1024 * 1024;
@@ -26,18 +34,43 @@ pub const DEFAULT_OBJECT_SIZE: usize = 20 * 1024 * 1024;
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 // -----------------------------------------------------------------------------
+// Enum of our data type, for now just 4 types 
+// -----------------------------------------------------------------------------
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[clap(rename_all = "UPPERCASE")]   // enum variants match exactly their uppercase names
+pub enum ObjectType {
+    Npz,
+    TfRecord,
+    Hdf5,
+    Raw,
+}
+
+// map &str → ObjectType
+impl From<&str> for ObjectType {
+    fn from(s: &str) -> Self {
+        match s.to_ascii_uppercase().as_str() {
+            "NPZ" => ObjectType::Npz,
+            "TFRECORD" => ObjectType::TfRecord,
+            "HDF5" => ObjectType::Hdf5,
+            _ => ObjectType::Raw,
+        }
+    }
+}
+
+// allow PyO3 to extract a Python string into our enum
+impl<'source> FromPyObject<'source> for ObjectType {
+    fn extract(ob: &'source PyAny) -> PyResult<Self> {
+        // Pull out a &str, the delegate fto our From<&str> impl 
+        let s: &str = ob.extract()?;
+        Ok(ObjectType::from(s))
+    }
+}
+
+
+
+// -----------------------------------------------------------------------------
 // Generate a buffer of random bytes.
 // -----------------------------------------------------------------------------
-
-/*
- * Old simple version
-pub fn generate_random_data(size: usize) -> Vec<u8> {
-    let mut data = vec![0u8; size];
-    //rand::thread_rng().fill(&mut data[..]); // Old definition
-    rand::rngs::ThreadRng::default().fill(&mut data[..]);
-    data
-}
-*/
 
 /// A base random block of 512 bytes, generated once.
 static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
@@ -193,6 +226,9 @@ pub fn create_bucket(bucket: &str) -> Result<()> {
 }
 
 
+// ---------------------
+// Put operations 
+// ---------------------
 
 /// Asynchronously uploads an object to S3.
 pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
@@ -246,6 +282,26 @@ pub fn put_object_with_random_data(uri: &str, size: usize) -> Result<()> {
 pub fn put_objects_with_random_data(uris: &[String], size: usize, max_in_flight: usize) -> Result<()> {
     let data = generate_random_data(size);
     put_objects_parallel(uris, &data, max_in_flight)
+}
+
+/// Upload each URI with a buffer chosen by `object_type`.
+pub fn put_objects_with_random_data_and_type(
+    uris: &[String],
+    size: usize,
+    max_in_flight: usize,
+    object_type: ObjectType,
+) -> Result<(), anyhow::Error> {
+    // pick the generator
+    let buffer: Vec<u8> = match object_type {
+        ObjectType::Npz      => generate_npz(size),
+        ObjectType::TfRecord => generate_tfrecord(size),
+        ObjectType::Hdf5     => generate_hdf5(size),
+        ObjectType::Raw      => generate_raw_data(size),
+    };
+    // flood‑fill in parallel
+    put_objects_parallel(uris, &buffer, max_in_flight)
+        .context("S3 PUT failure")?;
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -316,6 +372,10 @@ pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
         Ok(())
     })
 }
+
+// ----------------------------
+// Get operations
+// ----------------------------
 
 /// Download a single object into memory.
 pub fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {

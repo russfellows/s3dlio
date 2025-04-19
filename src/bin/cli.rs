@@ -14,19 +14,22 @@
 //! ```
 
 use anyhow::{bail, Context, Result};
+//use clap::{Parser, Subcommand, ValueEnum};
 use clap::{Parser, Subcommand};
-//use clap::{Subcommand};
 use std::io::{self, Write};
 use std::time::Instant;
 
 // Import shared functions from the crate.
 use dlio_s3_rust::{
     delete_objects, get_object_uri, get_objects_parallel, list_objects, parse_s3_uri,
-    DEFAULT_OBJECT_SIZE,
+    DEFAULT_OBJECT_SIZE, ObjectType,
 };
 
 // Import the bucket creation helper.
 //use dlio_s3_rust::s3_utils::create_bucket;
+
+// Import the data creation functions, only if called directly 
+//use dlio_s3_rust::data_gen::{generate_npz, generate_tfrecord, generate_hdf5, generate_raw_data};
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -58,26 +61,12 @@ enum Command {
         #[arg(short = 'j', long = "jobs", default_value_t = 1000)]
         jobs: usize,
     },
-    /// Upload one object with random data.
-    /*
-     * This is no longer used, we will use the old PutMany as the new Put
-    Put {
-        /// S3 URI (e.g. s3://bucket/key)
-        uri: String,
-        /// Optionally create the bucket if it does not exist.
-        #[arg(short = 'c', long = "create_bucket", action)]
-        create_bucket_flag: bool,
-        /// Object size in bytes (default 20 MB)
-        #[arg(short = 's', long = "size", default_value_t = DEFAULT_OBJECT_SIZE)]
-        size: usize,
-    },
-    */
     /// Upload one or more  concurrently with random data.
     Put {
         /// S3 URI prefix (e.g. s3://bucket/prefix)
         uri_prefix: String,
         /// Optionally create the bucket if it does not exist.
-        #[arg(short = 'c', long = "create_bucket", action)]
+        #[arg(short = 'c', long = "create-bucket", action)]
         create_bucket_flag: bool,
         /// Number of objects to create and upload.
         #[arg(short = 'n', long = "num", default_value_t = 1)]
@@ -91,6 +80,13 @@ enum Command {
         /// Object size in bytes (default 20 MB).
         #[arg(short = 's', long = "size", default_value_t = DEFAULT_OBJECT_SIZE)]
         size: usize,
+        /// What kind of object to generate: 
+        #[arg( short = 'o', long = "object-type", value_enum, ignore_case = true, default_value_t = ObjectType::Raw)] // Without value_parser [] values are case insensitive
+        object_type: ObjectType,
+        // Following are older definitions
+        //#[arg( short = 'o', long = "object-type", default_value = "Raw")] // Without value_parser [] values are case insensitive
+        //#[arg( short = 'o', long = "object-type", value_parser = ["NPZ","TFRecord","HDF5","Raw"], default_value = "Raw")]
+        //object_type: String,
     },
 }
 
@@ -112,27 +108,21 @@ fn main() -> Result<()> {
         Command::List { uri } => list_cmd(&uri),
         Command::Get { uri, jobs } => get_cmd(&uri, jobs),
         Command::Delete { uri, jobs } => delete_cmd(&uri, jobs),
-        /*
-         * This was the old Put that only handled a single object, new Put handles 1 or more
-        Command::Put { uri, create_bucket_flag, size } => {
-            let (bucket, _key) = parse_s3_uri(&uri)?;
-            if create_bucket_flag {
-                if let Err(e) = dlio_s3_rust::s3_utils::create_bucket(&bucket) {
-                    eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
-                }
-            }
-            put_cmd(&uri, size)
-        },
-        */
+        
         // Was previously called PutMany, now renamed to just Put
-        Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size } => {
+        //Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size } => {
+        Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type } => {
             let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
             if create_bucket_flag {
                 if let Err(e) = dlio_s3_rust::s3_utils::create_bucket(&bucket) {
                     eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
                 }
             }
-            put_many_cmd(&uri_prefix, num, &template, jobs, size)
+            // No longer need to parse obj_type into ObjecType enum
+            //let obj_type = dlio_s3_rust::ObjectType::from(object_type.as_str());
+            
+            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type)
+
         },
     }
 }
@@ -287,24 +277,10 @@ fn delete_cmd(uri: &str, _jobs: usize) -> Result<()> {
     Ok(())
 }
 
-/*
- * Old put command, handled only a single object
-fn put_cmd(uri: &str, size: usize) -> Result<()> {
-    let t0 = Instant::now();
-    dlio_s3_rust::put_object_with_random_data(uri, size)?;
-    let elapsed = t0.elapsed();
-    let mb = size as f64 / (1024.0 * 1024.0);
-    let throughput = mb / elapsed.as_secs_f64();
-    println!(
-        "Uploaded 1 object ({} bytes) in {:?} ({:.2} MB/s)",
-        size, elapsed, throughput
-    );
-    Ok(())
-}
-*/
-
 // New "Put" command always calls put_many_cmd, so we need to handle a single object here also
-fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize) -> Result<()> {
+//fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize) -> Result<()> {
+// New put_many_cmd now takes our ObjectType
+fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: dlio_s3_rust::ObjectType) -> Result<()> {
     // Parse the prefix into bucket and key prefix.
     let (bucket, mut prefix) = parse_s3_uri(uri_prefix)?;
     if !prefix.ends_with('/') {
@@ -321,7 +297,9 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
     let effective_jobs = std::cmp::min(jobs, num);
     let t0 = Instant::now();
 
-    dlio_s3_rust::put_objects_with_random_data(&uris, size, effective_jobs)?;
+    //dlio_s3_rust::put_objects_with_random_data(&uris, size, effective_jobs)?;
+    dlio_s3_rust::put_objects_with_random_data_and_type(&uris, size, effective_jobs, object_type)?;
+
     let elapsed = t0.elapsed();
     let total_bytes = num * size;
     let mb_total = total_bytes as f64 / (1024.0 * 1024.0);
