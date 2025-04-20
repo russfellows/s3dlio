@@ -104,9 +104,9 @@ Options:
 root@loki-node3:/app#
 ```
 
-### Example get --help command
+### Example --help for subcommand
 
-First is an example of getting help for the ```get``` subcommand:
+First is an example of getting help for the `get` subcommand:
 
 ```
 root@loki-node3:/app# s3Rust-cli get --help 
@@ -123,6 +123,29 @@ Options:
 
 
 ```
+Next is an example of help for the `put` subcommand:
+
+```
+root@loki-node3:/app# s3Rust-cli put --help
+Upload one or more objects concurrently, uses ObjectType format filled with random data
+
+Usage: s3Rust-cli put [OPTIONS] <URI_PREFIX>
+
+Arguments:
+  <URI_PREFIX>  S3 URI prefix (e.g. s3://bucket/prefix)
+
+Options:
+  -c, --create-bucket              Optionally create the bucket if it does not exist
+  -j, --jobs <JOBS>                Maximum concurrent uploads (jobs), but is modified to be min(jobs, num) [default: 32]
+  -n, --num <NUM>                  Number of objects to create and upload [default: 1]
+  -o, --object-type <OBJECT_TYPE>  What kind of object to generate: [default: RAW] [possible values: NPZ, TFRECORD, HDF5, RAW]
+  -s, --size <SIZE>                Object size in bytes (default 20 MB) [default: 20971520]
+  -t, --template <TEMPLATE>        Template for object names. Use '{}' as a placeholder [default: object_{}_of_{}.dat]
+  -h, --help                       Print help
+```
+
+
+
 ### Additional CLI Examples
 Here are several examples of running the ```s3Rust-cli``` command:
 
@@ -153,7 +176,8 @@ root@loki-node3:/app# s3Rust-cli list s3://my-bucket4/
 
 Total objects: 0
 ```
-#### Example put-many and then Delete to cleanup
+#### Example put and then delete to cleanup
+Note: This use of put only uses a single set of braces `{}` , and will thus each object will have only the object number, and not the total number in the name:
 ```
 root@loki-node3:/app# s3Rust-cli put -c -n 1200 -t russ-test3-{}.obj s3://my-bucket4/
 Uploaded 1200 objects (total 25165824000 bytes) in 7.607254643s (157.74 objects/s, 3154.88 MB/s)
