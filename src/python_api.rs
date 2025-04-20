@@ -13,6 +13,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyAny};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3_asyncio::tokio as aio;
+use tokio::task;
+
 
 use crate::s3_utils::{
     create_bucket, delete_objects, get_object_uri, get_objects_parallel, list_objects,
@@ -96,11 +98,27 @@ pub(crate) fn put_async_py<'p>(
     let (bucket, uris) = build_uri_list(prefix, template, num)?;
     let jobs = max_in_flight.min(num);
     let obj = str_to_obj(object_type);
+
+    // New Async IO, offloaded to spawn blocking rather than our "block_on" inside a tokio worker.
+    aio::future_into_py(py, async move {
+        let res: Result<(), PyErr> = task::spawn_blocking(move || {
+            if should_create_bucket { let _ = create_bucket(&bucket); }
+            put_objects_with_random_data_and_type(&uris, sz, jobs, obj)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .await
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        res
+    })
+
+    /*
+     * Old async IO
     aio::future_into_py(py, async move {
         if should_create_bucket { let _ = create_bucket(&bucket); }
         put_objects_with_random_data_and_type(&uris, sz, jobs, obj)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })
+    */
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +127,24 @@ pub(crate) fn put_async_py<'p>(
 pub fn list(uri: &str) -> PyResult<Vec<String>> {
     let (bucket, prefix) = parse_s3_uri(uri).map_err(py_err)?;
     list_objects(&bucket, &prefix).map_err(py_err)
+}
+
+// ---------------------------------------------------------------------------
+// GET‑many **stats** (sync)  — no payload copies
+// ---------------------------------------------------------------------------
+#[pyfunction(name = "get_many_stats")]
+#[pyo3(signature = (uris, max_in_flight = 64))]
+pub fn get_many_stats(
+    py: Python<'_>,
+    uris: Vec<String>,
+    max_in_flight: usize,
+) -> PyResult<(usize, usize)> {
+    py.allow_threads(|| {
+        let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
+        let n = res.len();
+        let total: usize = res.iter().map(|(_, b)| b.len()).sum();
+        Ok((n, total))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +176,44 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
 }
 
 // ---------------------------------------------------------------------------
+// GET‑many **stats** (async)
+// ---------------------------------------------------------------------------
+#[pyfunction(name = "get_many_stats_async")]
+#[pyo3(signature = (uris, max_in_flight = 64))]
+pub(crate) fn get_many_stats_async<'p>(
+    py: Python<'p>,
+    uris: Vec<String>,
+    max_in_flight: usize,
+) -> PyResult<&'p PyAny> {
+    // New async
+    aio::future_into_py(py, async move {
+        // spawn the blocking S3 work
+        let (n, total) = task::spawn_blocking(move || {
+            let res = get_objects_parallel(&uris, max_in_flight)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let total = res.iter().map(|(_, b)| b.len()).sum::<usize>();
+
+            //Ok((res.len(), total))
+            Ok::<(usize, usize), PyErr>((res.len(), total))
+
+        })
+        .await
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
+        Ok((n, total))
+    })
+    
+    /*
+     * Old async
+    aio::future_into_py(py, async move {
+        let res = get_objects_parallel(&uris, max_in_flight)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let total: usize = res.iter().map(|(_, b)| b.len()).sum();
+        Ok((res.len(), total))
+    })
+    */
+}
+
+// ---------------------------------------------------------------------------
 // GET many (async) ------------------------------------------------------------
 #[pyfunction(name = "get_many_async")]
 #[pyo3(signature = (uris, max_in_flight = 64))]
@@ -148,6 +222,26 @@ pub(crate) fn get_many_async_py<'p>(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<&'p PyAny> {
+    // New async 
+    aio::future_into_py(py, async move {
+        // off‑load the whole download into a blocking thread
+        let pairs: Vec<(String, Vec<u8>)> = task::spawn_blocking(move || {
+            get_objects_parallel(&uris, max_in_flight)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .await
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
+        // now safely convert bytes → PyBytes under the GIL
+        Python::with_gil(|py| {
+            let pyres: Vec<(String, Py<PyBytes>)> = pairs.into_iter()
+                .map(|(u, b)| (u, PyBytes::new(py, &b).into_py(py)))
+                .collect::<Vec<_>>();
+            Ok(pyres)
+        })
+    })
+
+    /*
+     * Old async
     aio::future_into_py(py, async move {
         let res = get_objects_parallel(&uris, max_in_flight)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -158,6 +252,7 @@ pub(crate) fn get_many_async_py<'p>(
             }).collect::<Vec<_>>())
         })
     })
+    */
 }
 
 // ---------------------------------------------------------------------------
@@ -197,8 +292,10 @@ pub fn _pymod(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(list, m)?)?;
+    m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
     m.add_function(wrap_pyfunction!(get_many, m)?)?;
+    m.add_function(wrap_pyfunction!(get_many_stats_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
     m.add_function(wrap_pyfunction!(read_npz, m)?)?;
