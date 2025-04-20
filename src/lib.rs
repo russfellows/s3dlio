@@ -1,8 +1,7 @@
-//
-// Copyright, 2025.  Signal65 / Futurum Group.
-// 
 // src/lib.rs
-//! Crate root — public re‑exports plus the Python module glue.
+// Copyright, 2025.  Signal65 / Futurum Group.
+//
+// Crate root — public re‑exports plus the Python module glue.
 
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
@@ -19,12 +18,20 @@ mod python_api;
 #[cfg(feature = "extension-module")]
 use python_api::{
     // synchronous
-    put, list, get_many, get, delete, read_npz,
+    put,
+    list,
+    get,
+    get_many,
+    get_many_stats,
+    delete,
+    read_npz,
     // asynchronous
-    put_async_py, get_many_async_py,
+    put_async_py,
+    get_many_async_py,
+    get_many_stats_async,
 };
 
-// Re‑export Rust helpers for the CLI and downstream Rust crates -------------
+// Re‑export Rust helpers for the CLI and downstream Rust crates ------------
 pub use s3_utils::{
     parse_s3_uri,
     list_objects,
@@ -41,13 +48,14 @@ pub use s3_utils::{
 // ---------------------------------------------------------------------------
 #[cfg(feature = "extension-module")]
 #[pymodule]
-fn dlio_s3_rust(_py: Python, m: &PyModule) -> PyResult<()> {
+pub fn dlio_s3_rust(_py: Python, m: &PyModule) -> PyResult<()> {
     pyo3::prepare_freethreaded_python();
 
     // sync wrappers
     m.add_function(wrap_pyfunction!(list, m)?)?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
     m.add_function(wrap_pyfunction!(get_many, m)?)?;
+    m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(read_npz, m)?)?;
@@ -55,6 +63,7 @@ fn dlio_s3_rust(_py: Python, m: &PyModule) -> PyResult<()> {
     // async wrappers
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;
+    m.add_function(wrap_pyfunction!(get_many_stats_async, m)?)?;
 
     Ok(())
 }
