@@ -95,7 +95,7 @@ Commands:
   list    List keys that start with the given prefix
   get     Download one or many objects
   delete  Delete one object or every object that matches the prefix
-  put     Upload one object with random data. Upload one or more  concurrently with random data
+  put     Upload one or more objects concurrently, uses ObjectType format filled with random data
   help    Print this message or the help of the given subcommand(s)
 
 Options:
