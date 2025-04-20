@@ -45,7 +45,7 @@ enum Command {
         /// S3 URI (e.g. s3://bucket/prefix/)
         uri: String,
     },
-    /// Download one or many objects.
+    /// Download one or many objects concurrently.
     Get {
         /// S3 URI – can be a full key or a prefix ending with `/`.
         uri: String,
@@ -63,7 +63,7 @@ enum Command {
         #[arg(short = 'j', long = "jobs", default_value_t = 1000)]
         jobs: usize,
     },
-    /// Upload one or more  concurrently with random data.
+    /// Upload one or more objects concurrently, uses ObjectType format filled with random data.
     Put {
         /// S3 URI prefix (e.g. s3://bucket/prefix)
         uri_prefix: String,
@@ -89,7 +89,6 @@ enum Command {
         size: usize,
 
         /// Template for object names. Use '{}' as a placeholder.
-        //#[arg(short = 't', long = "template", default_value = "object_{}.dat")]
         #[arg(short = 't', long = "template", default_value = "object_{}_of_{}.dat")]
         template: String,
     },
@@ -171,6 +170,7 @@ fn list_cmd(uri: &str) -> Result<()> {
     Ok(())
 }
 
+/// Get command: supports glob matching on keys (after the last '/').
 fn get_cmd(uri: &str, jobs: usize) -> Result<()> {
     let (bucket, key_or_prefix) = parse_s3_uri(uri)?;
 
@@ -243,6 +243,7 @@ fn get_cmd(uri: &str, jobs: usize) -> Result<()> {
     Ok(())
 }
 
+/// Delete command: supports glob matching on keys (after the last '/').
 fn delete_cmd(uri: &str, _jobs: usize) -> Result<()> {
     let (bucket, key_or_pattern) = parse_s3_uri(uri)?;
 
@@ -282,9 +283,7 @@ fn delete_cmd(uri: &str, _jobs: usize) -> Result<()> {
     Ok(())
 }
 
-// New "Put" command always calls put_many_cmd, so we need to handle a single object here also
-//fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize) -> Result<()> {
-// New put_many_cmd now takes our ObjectType
+// New "Put" command always calls put_many_cmd, so we need to handle a single object here also, also takes our ObjectType
 fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: dlio_s3_rust::ObjectType) -> Result<()> {
     // Parse the prefix into bucket and key prefix.
     let (bucket, mut prefix) = parse_s3_uri(uri_prefix)?;
@@ -312,10 +311,10 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
         uris.push(full_uri);
     }
 
+    // Find the lesser of the number of jobs or number of objects
     let effective_jobs = std::cmp::min(jobs, num);
     let t0 = Instant::now();
 
-    //dlio_s3_rust::put_objects_with_random_data(&uris, size, effective_jobs)?;
     dlio_s3_rust::put_objects_with_random_data_and_type(&uris, size, effective_jobs, object_type)?;
 
     let elapsed = t0.elapsed();
