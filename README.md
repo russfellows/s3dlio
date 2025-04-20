@@ -77,7 +77,8 @@ S3_BUCKET=my-bucket2
 ```
 
 ## Using the Rust CLI
-The Rust executable is in your path.  A  ```which s3Rust-cli``` shows its location:
+If you built this project locally, outside a container, you will have to install the executable, or provide the path to its location, which by default is in the "./target/release" directory.
+If running in the container, the Rust executable is in your path.  A  ```which s3Rust-cli``` shows its location:
 
 ```
 root@loki-node3:/app# which s3Rust-cli
@@ -94,7 +95,7 @@ Commands:
   list    List keys that start with the given prefix
   get     Download one or many objects
   delete  Delete one object or every object that matches the prefix
-  put     Upload one object with random data. Upload one or more  concurrently with random data
+  put     Upload one or more objects concurrently, uses ObjectType format filled with random data
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -104,9 +105,9 @@ Options:
 root@loki-node3:/app#
 ```
 
-### Example get --help command
+### Example --help for subcommand
 
-First is an example of getting help for the ```get``` subcommand:
+First is an example of getting help for the `get` subcommand:
 
 ```
 root@loki-node3:/app# s3Rust-cli get --help 
@@ -123,6 +124,29 @@ Options:
 
 
 ```
+Next is an example of help for the `put` subcommand:
+
+```
+root@loki-node3:/app# s3Rust-cli put --help
+Upload one or more objects concurrently, uses ObjectType format filled with random data
+
+Usage: s3Rust-cli put [OPTIONS] <URI_PREFIX>
+
+Arguments:
+  <URI_PREFIX>  S3 URI prefix (e.g. s3://bucket/prefix)
+
+Options:
+  -c, --create-bucket              Optionally create the bucket if it does not exist
+  -j, --jobs <JOBS>                Maximum concurrent uploads (jobs), but is modified to be min(jobs, num) [default: 32]
+  -n, --num <NUM>                  Number of objects to create and upload [default: 1]
+  -o, --object-type <OBJECT_TYPE>  What kind of object to generate: [default: RAW] [possible values: NPZ, TFRECORD, HDF5, RAW]
+  -s, --size <SIZE>                Object size in bytes (default 20 MB) [default: 20971520]
+  -t, --template <TEMPLATE>        Template for object names. Use '{}' as a placeholder [default: object_{}_of_{}.dat]
+  -h, --help                       Print help
+```
+
+
+
 ### Additional CLI Examples
 Here are several examples of running the ```s3Rust-cli``` command:
 
@@ -153,7 +177,8 @@ root@loki-node3:/app# s3Rust-cli list s3://my-bucket4/
 
 Total objects: 0
 ```
-#### Example put-many and then Delete to cleanup
+#### Example put and then delete to cleanup
+Note: This use of put only uses a single set of braces `{}` , and will thus each object will have only the object number, and not the total number in the name:
 ```
 root@loki-node3:/app# s3Rust-cli put -c -n 1200 -t russ-test3-{}.obj s3://my-bucket4/
 Uploaded 1200 objects (total 25165824000 bytes) in 7.607254643s (157.74 objects/s, 3154.88 MB/s)
@@ -168,34 +193,43 @@ Deleting 1200 objects…
 Done.
 root@loki-node3:/app#
 ```
+# Python
+The intention of this entire library is to provide a Python library for interacting with S3.  The Rust CLI provides a way to check the underlying functions without worrying about constructing a Python program, or syntax errors.  Because it is pure Rust, it also more accurately displays the potential performance that may be attained.  However, using the Python library is the intention.  In the "docs" subdirectory, there is a quick overview of the Python API, written by a chat agent.  For those who prefer examples, there is a sample Python script to test the APIs, shown below.
 
-### Running a Python Test
+## Running a Python Test
+Note: The following example shows running the `test_new_dlio_s3.py` Python script, after changing the number of objects to 500, by editing the file.  The default number of objects to use for testing is only 5 objects.  In order to display more accurate performance values, the following example shows running the test with `NUM_OBJECTS = 500` setting.
 
 ```
-root@loki-node3:/app# python ./test_all_dlio_s3.py 
-=== Listing objects from s3://my-bucket2/my-data2/ ===
-First 25 objects:
-['my-data2/file_1000_of_1000.npz', 'my-data2/file_100_of_1000.npz', 'my-data2/file_101_of_1000.npz', 'my-data2/file_102_of_1000.npz', 'my-data2/file_103_of_1000.npz', 'my-data2/file_104_of_1000.npz', 'my-data2/file_105_of_1000.npz', 'my-data2/file_106_of_1000.npz', 'my-data2/file_107_of_1000.npz', 'my-data2/file_108_of_1000.npz', 'my-data2/file_109_of_1000.npz', 'my-data2/file_10_of_1000.npz', 'my-data2/file_110_of_1000.npz', 'my-data2/file_111_of_1000.npz', 'my-data2/file_112_of_1000.npz', 'my-data2/file_113_of_1000.npz', 'my-data2/file_114_of_1000.npz', 'my-data2/file_115_of_1000.npz', 'my-data2/file_116_of_1000.npz', 'my-data2/file_117_of_1000.npz', 'my-data2/file_118_of_1000.npz', 'my-data2/file_119_of_1000.npz', 'my-data2/file_11_of_1000.npz', 'my-data2/file_120_of_1000.npz', 'my-data2/file_121_of_1000.npz']
-Total objects: 999
+root@loki-node3:/app# uv run test_new_dlio_s3.py 
+=== Sync LIST ===
+Found 999 objects under s3://my-bucket2/my-data2/ in 0.02s
 
-Single download from s3://my-bucket2/my-data2/file_101_of_1000.npz: 296.15 MB/s (27377002 bytes in 0.09 s)
+=== Sync PUT ===
+Uploaded 500 objects (10000.00 MiB) in 3.34s -> 149.66 ops/s, 2993.14 MiB/s
 
-Multi-get: Downloaded 490 objects in 10.43 s
-Throughput: 46.98 objects/s, 1226.50 MB/s
+=== Sync GET Many ===
+Fetched 500 objects (10000.00 MiB) in 7.50s -> 66.67 ops/s, 1333.49 MiB/s
 
-Single put: Uploaded 1 MB to s3://my-bucket2/test_rust_api/single_put_test.dat in 0.01 s (68.33 MB/s)
+=== Sync GET Many Stats ===
+Stats: 500 objects, 10485760000 bytes (10000.00 MiB) in 2.21s -> 226.25 ops/s, 4524.91 MiB/s
 
-Get newly uploaded object: 1048576 bytes in 0.01 s
+=== Sync DELETE ===
+Deleted test objects in 0.37s
 
-Put many: Uploaded 10 objects (total 10485760 bytes) in 0.04 s (232.88 MB/s)
+=== Async LIST ===
+Found 999 objects under s3://my-bucket2/my-data2/ in 0.02s
 
-Get many: Downloaded 10 objects (total 10485760 bytes) in 0.04 s (250.91 MB/s)
+=== Async PUT ===
+Uploaded 500 objects (10000.00 MiB) in 3.10s -> 161.18 ops/s, 3223.68 MiB/s
 
-Delete: Removed all objects under s3://my-bucket2/test_rust_api/ in 0.01 s
+=== Async GET Many ===
+Fetched 500 objects (10000.00 MiB) in 7.64s -> 65.41 ops/s, 1308.29 MiB/s
 
-After deletion, objects under s3://my-bucket2/test_rust_api/:
-[]
-Deletion verified: no objects remain.
+=== Async GET Many Stats ===
+Stats: 500 objects, 10485760000 bytes (10000.00 MiB) in 2.41s -> 207.79 ops/s, 4155.79 MiB/s
+
+=== Async DELETE ===
+Deleted test objects in 0.36s
 root@loki-node3:/app# 
 ```
 
