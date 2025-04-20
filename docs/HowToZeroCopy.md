@@ -1,5 +1,7 @@
 # HowTo ZeroCopy
 
+Note: This is from Chat, describing how to implement Zero Copy, from Rust to Python.  Will mark this as a future enhancement.  
+
 Below is a minimal and tested approach for PyO3 0.20.3 that demonstrates how to return a read-only memoryview referencing a Rust Vec<u8> without copying. You do not implement a PyBufferProtocol trait (it does not exist in user-facing form in pyo3 0.20.x); instead, you call the C API function PyMemoryView_FromMemory and return the resulting memoryview object to Python.
 
 Use this pattern in your S3 “get” code:
