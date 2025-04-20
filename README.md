@@ -77,7 +77,8 @@ S3_BUCKET=my-bucket2
 ```
 
 ## Using the Rust CLI
-The Rust executable is in your path.  A  ```which s3Rust-cli``` shows its location:
+If you built this project locally, outside a container, you will have to install the executable, or provide the path to its location, which by default is in the "./target/release" directory.
+If running in the container, the Rust executable is in your path.  A  ```which s3Rust-cli``` shows its location:
 
 ```
 root@loki-node3:/app# which s3Rust-cli
