@@ -1,27 +1,31 @@
 // src/s3_utils.rs
+//
+// Copyright, 2025.  Signal65 / Futurum Group.
+// 
 //! Thread‑safe, blocking wrapper around the async AWS Rust SDK.
 //! Provides high‑level S3 operations: list, get, delete, typed PUT.
 
+
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
-use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::{config::Region, Client};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use futures::{stream::FuturesUnordered, StreamExt};
-use once_cell::sync::OnceCell;
-use std::{env, sync::Arc};
-use tokio::{runtime::Handle, sync::Semaphore, task};    // import task for block_in_place
 use pyo3::{FromPyObject, PyAny, PyResult};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 // data generation helpers
 use crate::data_gen::{generate_npz, generate_tfrecord, generate_hdf5, generate_raw_data};
+
+// S3 client creation
+use crate::s3_client::{aws_s3_client, block_on};
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 pub const DEFAULT_OBJECT_SIZE: usize = 20 * 1024 * 1024;
-pub const DEFAULT_REGION: &str     = "us-east-1";
 
 // -----------------------------------------------------------------------------
 // ObjectType enum for typed data generation
@@ -53,54 +57,6 @@ impl<'source> FromPyObject<'source> for ObjectType {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Global S3 client (lazy, thread‑safe)
-// -----------------------------------------------------------------------------
-static CLIENT: OnceCell<Client> = OnceCell::new();
-static RUNTIME: OnceCell<tokio::runtime::Runtime> = OnceCell::new();   // for block_on fallback
-
-fn client() -> Result<Client> {
-    CLIENT.get_or_try_init(|| {
-        dotenvy::dotenv().ok();
-        if env::var("AWS_ACCESS_KEY_ID").is_err() || env::var("AWS_SECRET_ACCESS_KEY").is_err() {
-            bail!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
-        }
-        let region = RegionProviderChain::first_try(env::var("AWS_REGION").ok().map(Region::new))
-            .or_default_provider()
-            .or_else(Region::new(DEFAULT_REGION));
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
-        if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL") {
-            if !endpoint.is_empty() {
-                loader = loader.endpoint_url(endpoint);
-            }
-        }
-        let fut = loader.load();
-        let cfg = match Handle::try_current() {
-            Ok(handle) => task::block_in_place(|| handle.block_on(fut)),
-            Err(_) => {
-                let rt = RUNTIME.get_or_init(|| {
-                    tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime")
-                });
-                rt.block_on(fut)
-            }
-        };
-        Ok::<_, anyhow::Error>(Client::new(&cfg))
-    }).map(Clone::clone)
-}
-
-// -----------------------------------------------------------------------------
-// Helper: synchronously wait on a future
-// -----------------------------------------------------------------------------
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    if let Ok(handle) = Handle::try_current() {
-        handle.block_on(fut)
-    } else {
-        let rt = RUNTIME.get_or_init(|| {
-            tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime")
-        });
-        rt.block_on(fut)
-    }
-}
 
 // -----------------------------------------------------------------------------
 // S3 URI helpers
@@ -113,10 +69,13 @@ pub fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
     Ok((bucket.to_string(), key.to_string()))
 }
 
+// -----------------------------------------------------------------------------
+// S3 Create bucket
+// -----------------------------------------------------------------------------
 /// Create an S3 bucket if it does not exist.
 pub fn create_bucket(bucket: &str) -> Result<()> {
     block_on(async {
-        let client = client()?;
+        let client = aws_s3_client()?;
         match client.create_bucket().bucket(bucket).send().await {
             Ok(_) => Ok(()),
             Err(e) => {
@@ -135,12 +94,12 @@ pub fn create_bucket(bucket: &str) -> Result<()> {
 }
 
 // -----------------------------------------------------------------------------
-// List and Delete operations
+// List operation
 // -----------------------------------------------------------------------------
 /// List every key under `prefix` (handles pagination).
 pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
     block_on(async {
-        let client = client()?;
+        let client = aws_s3_client()?;
         let mut keys = Vec::new();
         let mut cont: Option<String> = None;
         loop {
@@ -149,13 +108,8 @@ pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
                 req = req.continuation_token(token);
             }
             let resp = req.send().await.context("list_objects_v2 failed")?;
-            //
-            // Four attempts at iterating over objects in the response
-            //for obj in resp.contents().as_ref().unwrap_or_default() {
-            //for obj in resp.contents().iter().flatten() {
-            //for obj in resp.contents().unwrap_or(&[]) {
-            //for obj in resp.contents().map(|v| v.as_slice()).unwrap_or(&[]) {
             
+            // iterating over objects in the response
             for obj in resp.contents() {
                 if let Some(k) = obj.key() {
                     keys.push(k.to_string());
@@ -171,11 +125,14 @@ pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
     })
 }
 
+
+// -----------------------------------------------------------------------------
+// Delete operation
+// -----------------------------------------------------------------------------
 /// Delete many keys (up to 1000 per call).
 pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
-    use aws_sdk_s3::types::{Delete, ObjectIdentifier};
     block_on(async {
-        let client = client()?;
+        let client = aws_s3_client()?;
         for chunk in keys.chunks(1000) {
             let objs: Vec<ObjectIdentifier> = chunk.iter()
                 .map(|k| ObjectIdentifier::builder().key(k).build().map_err(anyhow::Error::from))
@@ -192,7 +149,7 @@ pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
 // -----------------------------------------------------------------------------
 /// Download a single object from S3 (bucket/key).
 async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
-    let client = client()?;
+    let client = aws_s3_client()?;
     let resp = client.get_object().bucket(bucket).key(key)
         .send().await.context("get_object failed")?;
     let data = resp.body.collect().await.context("collect body failed")?.into_bytes();
@@ -261,15 +218,13 @@ pub fn put_objects_with_random_data_and_type(
 // Internal helpers (private)
 // -----------------------------------------------------------------------------
 async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
-    let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let client = Client::new(&cfg);
+    let client = aws_s3_client()?;
     let body = ByteStream::from(data.to_vec());
     client.put_object().bucket(bucket).key(key).body(body).send().await?;
     Ok(())
 }
 
 
-//fn put_objects_parallel(uris: &[String], data: &[u8], max_in_flight: usize) -> Result<()> {
 pub(crate) fn put_objects_parallel(uris: &[String], data: &[u8], max_in_flight: usize) -> Result<()> {
     block_on(async {
         let sem = Arc::new(Semaphore::new(max_in_flight));

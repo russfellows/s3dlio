@@ -1,7 +1,7 @@
+// src/python_api.rs
 //
 // Copyright, 2025.  Signal65 / Futurum Group.
 // 
-// src/python_api.rs
 //! PyO3 bindings — sync *and* async wrappers around the Rust S3 helpers.
 //!
 //! * **Sync** paths call `py.allow_threads` so the GIL is released while Rust blocks.
