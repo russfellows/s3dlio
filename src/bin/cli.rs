@@ -9,12 +9,10 @@
 //! s3Rust-cli get    s3://bucket/key.npz           # single
 //! s3Rust-cli get    s3://bucket/prefix/ -j 128    # many
 //! s3Rust-cli delete s3://bucket/prefix/           # delete all under prefix
-//! s3Rust-cli put    s3://bucket/key             # put one object
-//! s3Rust-cli putmany s3://bucket/prefix/          # put many objects 
+//! s3Rust-cli put    s3://bucket/key               # put one or more object
 //! ```
 
 use anyhow::{bail, Context, Result};
-//use clap::{Parser, Subcommand, ValueEnum};
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use std::time::Instant;
@@ -37,6 +35,7 @@ struct Cli {
     #[command(subcommand)]
     cmd: Command,
 }
+
 
 #[derive(Subcommand)]
 enum Command {
@@ -80,7 +79,7 @@ enum Command {
         #[arg(short = 'n', long = "num", default_value_t = 1)]
         num: usize,
 
-        /// What kind of object to generate: 
+        /// Specify Type of object to generate: 
         #[arg( short = 'o', long = "object-type", value_enum, ignore_case = true, default_value_t = ObjectType::Raw)] // Without value_parser [] values are case insensitive
         object_type: ObjectType,
 
@@ -88,11 +87,12 @@ enum Command {
         #[arg(short = 's', long = "size", default_value_t = DEFAULT_OBJECT_SIZE)]
         size: usize,
 
-        /// Template for object names. Use '{}' as a placeholder.
+        /// Template for names. Use '{}' for replacement, first '{}' is object number, 2nd is total count.
         #[arg(short = 't', long = "template", default_value = "object_{}_of_{}.dat")]
         template: String,
     },
 }
+
 
 /// Main CLI function
 fn main() -> Result<()> {
@@ -112,9 +112,7 @@ fn main() -> Result<()> {
         Command::List { uri } => list_cmd(&uri),
         Command::Get { uri, jobs } => get_cmd(&uri, jobs),
         Command::Delete { uri, jobs } => delete_cmd(&uri, jobs),
-        
-        // Was previously called PutMany, now renamed to just Put
-        //Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size } => {
+
         Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type } => {
             let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
             if create_bucket_flag {
@@ -130,6 +128,7 @@ fn main() -> Result<()> {
         },
     }
 }
+
 
 /// List command: supports glob matching on keys (after the last '/').
 fn list_cmd(uri: &str) -> Result<()> {
@@ -169,6 +168,7 @@ fn list_cmd(uri: &str) -> Result<()> {
     writeln!(out, "\nTotal objects: {}", keys.len())?;
     Ok(())
 }
+
 
 /// Get command: supports glob matching on keys (after the last '/').
 fn get_cmd(uri: &str, jobs: usize) -> Result<()> {
@@ -243,6 +243,7 @@ fn get_cmd(uri: &str, jobs: usize) -> Result<()> {
     Ok(())
 }
 
+
 /// Delete command: supports glob matching on keys (after the last '/').
 fn delete_cmd(uri: &str, _jobs: usize) -> Result<()> {
     let (bucket, key_or_pattern) = parse_s3_uri(uri)?;
@@ -283,7 +284,8 @@ fn delete_cmd(uri: &str, _jobs: usize) -> Result<()> {
     Ok(())
 }
 
-// New "Put" command always calls put_many_cmd, so we need to handle a single object here also, also takes our ObjectType
+
+/// Put command supports 1 or more objects, also takes our ObjectType
 fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: dlio_s3_rust::ObjectType) -> Result<()> {
     // Parse the prefix into bucket and key prefix.
     let (bucket, mut prefix) = parse_s3_uri(uri_prefix)?;
@@ -293,15 +295,7 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
     // Generate the full list of URIs.
     let mut uris = Vec::with_capacity(num);
 
-    /*
-     * Old single bracket template
-    for i in 0..num {
-        let object_name = template.replace("{}", &i.to_string());
-        let full_uri = format!("s3://{}/{}{}", bucket, prefix, object_name);
-        uris.push(full_uri);
-    }
-    */
-
+    // Now replace brackets with values
     for i in 0..num {
         // replace first {} with the index, second {} with the total count
         let object_name = template

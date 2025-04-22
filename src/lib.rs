@@ -1,4 +1,5 @@
 // src/lib.rs
+//
 // Copyright, 2025.  Signal65 / Futurum Group.
 //
 // Crate root — public re‑exports plus the Python module glue.
@@ -6,6 +7,8 @@
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
 
+// Local files to use
+pub mod s3_client;
 pub mod s3_utils;
 pub mod data_gen;
 

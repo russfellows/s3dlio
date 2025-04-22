@@ -1,11 +1,13 @@
-use crate::s3_utils::{get_object, parse_s3_uri};
 //
 // Copyright, 2025.  Signal65 / Futurum Group.
 // 
+
 use anyhow::{Context, Result};
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use tokio::{sync::{mpsc, Semaphore}, task::JoinHandle};
+
+use crate::s3_utils::{get_object, parse_s3_uri};
 
 /// Item type returned to the consumer.
 pub type ObjectData = (String, Vec<u8>);
