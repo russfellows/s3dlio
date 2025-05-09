@@ -149,15 +149,25 @@ fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> V
         let mut rng = rand::rngs::ThreadRng::default();
         for i in 0..unique_blocks {
             let _ = i; // Because we never explicitly use i, its just an index
-            // Start with a clone of the base block.
+            // Start with a clone of the base block
             let mut block = base_block.clone();
             // Uniquify by modifying the first 32 bytes (or less if the block is smaller).
             let modify_len = std::cmp::min(32, block_size);
             rng.fill(&mut block[..modify_len]);
-            // If the block is larger than 128 bytes, also modify the last 32 bytes.
+            //
+            // If the block is larger than HALF_BLK bytes, also modify the first 32 bytes of the
+            // second half of our block.
+            if block_size > HALF_BLK {
+                let offset = HALF_BLK;
+                let end = offset + 32;
+                rng.fill(&mut block[offset..end]);
+            }
+            /*
+             * Old, incorrect, remove soon
             if block_size > 128 {
                 rng.fill(&mut block[block_size - 32..block_size]);
             }
+            */
             unique.push(block);
         }
     }
