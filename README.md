@@ -34,7 +34,7 @@ The container will contain the executable, along with a python library.  This al
 ### Building / Pulling
 Either docker or podman may be used to create the image, typically with a `podman build -t xxx .` where xxx is the name you want to use for your container image. For those that want to simply pull and run a pre-built container, a relatively recent image may be found on quay.io.  However, the version on quay may be older than that available by building from the source code in this repository.  
 
-The location of the container is here:  https://quay.io/repository/russfellows-sig65/dealio_s3_rust
+***Note:** A possibly OLD container is here:  https://quay.io/repository/russfellows-sig65/dealio_s3_rust*
 
 In order to pull the container using docker, you may execute the following:
 ```
@@ -42,7 +42,7 @@ docker pull quay.io/russfellows-sig65/dealio_s3_rust
 ```
 
 ### Running Container
-Here is an example of starting the container using podman, and listing the contents of the containers /app directory.  
+Here is an example of starting a container using podman, and listing the contents of the containers /app directory.  
 ***Note:** It is VERY important to use the "--net=host" or similar command when starting, since using S3 necessitates network connectivity to S3 storage.*
 
 ```
@@ -55,15 +55,27 @@ root@loki-node3:/app# python --version
 Python 3.13.2
 ```
 
-## Important S3 Info
-Setting up the variables and information necessary to access S3 can be somewhat tricky.  This code supports the use of both, or either of environment variables, and values in a ```.env``` file.  Note that this container includes a sample .env file.  The values are from a private test environment.  Thus the ACCESS_KEY and SECRET_KEY values are not a concern.  
+# S3 Access
+This library and CLI currently support accessing S3 via http without TLS, and S3 with TLS via https for both official, and self signed certificates.  There is NO option to connect via TLS and ignore certificate errors.  There are several reasons for this, the two biggest ones being:
+1) It is VERY difficult to do this with the current Rust crates and AWS S3 SDK
+2) It is VERY dangerous, and strongly discouraged
 
-These values are required, but may be set as environment variables if desired.  Probably easier to just set them in the .env file, which is read in by default.
+## Important S3 Environment Info
+Setting up the environment variables and information necessary to access S3 can be somewhat tricky.  This code supports the use of variables read in from a ```.env``` file, OR environment variables.  Note that the examples here have sample .env files.  The values included from a private test environment, thus the ACCESS_KEY and SECRET_KEY values are not a concern.  Again, these may be set as environment variables if desired, but probably easier to set them in the .env file, which is read in by default.
 
-***Note:** There is a sample file called "my-env" which may be edited, and saved as .env.  Since dot files are hidden, they are not incldued in Github repos by default.*
+***Note:** The following values are required:*
+```
+AWS_ACCESS_KEY_ID=some-id
+AWS_SECRET_ACCESS_KEY=my-secret
+AWS_ENDPOINT_URL=https://dns-name-or-ipaddr:port-number
+AWS_REGION=region-if-needed
+```
+***Note:** The following value is OPTIONAL, but **REQUIRED** if using a self signed certificate with TLS access to S3:*
+```
+AWS_CA_BUNDLE_PATH=/a/path/to-myfile.pem
+```
 
-Here are the contents, which include several commented out test buckets:
-
+Here are the contents of the sample .env file:
 ```
 eval@loki-node3:~/real-dealio2$ cat .env
 AWS_ACCESS_KEY_ID=BG0XPVXISBP41DCXOQR8
@@ -71,12 +83,49 @@ AWS_SECRET_ACCESS_KEY=kGSmlMHBl0ohc/nYRtGbBx4KCfpdPN1/fLbtjUyX
 AWS_ENDPOINT_URL=http://10.9.0.21
 AWS_REGION=us-east-1
 S3_BUCKET=my-bucket2
-#S3_BUCKET=bucket1
-#S3_BUCKET=warp-benchmark-bucket
-
 ```
 
-## Using the Rust CLI
+# Python
+The intention of this entire library is to provide a Python library for interacting with S3.  The Rust CLI provides a way to check the underlying functions without worrying about constructing a Python program, or syntax errors.  Because it is pure Rust, it also more accurately displays the potential performance that may be attained.  However, using the Python library is the intention.  In the "docs" subdirectory, there is a quick overview of the Python API, written by a chat agent.  For those who prefer examples, there is a sample Python script to test the APIs, shown below.
+
+## Running a Python Test
+Note: The following example shows running the `test_new_dlio_s3.py` Python script, after changing the number of objects to 500, by editing the file.  The default number of objects to use for testing is only 5 objects.  In order to display more accurate performance values, the following example shows running the test with `NUM_OBJECTS = 500` setting.
+
+```
+root@loki-node3:/app# uv run test_new_dlio_s3.py 
+=== Sync LIST ===
+Found 999 objects under s3://my-bucket2/my-data2/ in 0.02s
+
+=== Sync PUT ===
+Uploaded 500 objects (10000.00 MiB) in 3.34s -> 149.66 ops/s, 2993.14 MiB/s
+
+=== Sync GET Many ===
+Fetched 500 objects (10000.00 MiB) in 7.50s -> 66.67 ops/s, 1333.49 MiB/s
+
+=== Sync GET Many Stats ===
+Stats: 500 objects, 10485760000 bytes (10000.00 MiB) in 2.21s -> 226.25 ops/s, 4524.91 MiB/s
+
+=== Sync DELETE ===
+Deleted test objects in 0.37s
+
+=== Async LIST ===
+Found 999 objects under s3://my-bucket2/my-data2/ in 0.02s
+
+=== Async PUT ===
+Uploaded 500 objects (10000.00 MiB) in 3.10s -> 161.18 ops/s, 3223.68 MiB/s
+
+=== Async GET Many ===
+Fetched 500 objects (10000.00 MiB) in 7.64s -> 65.41 ops/s, 1308.29 MiB/s
+
+=== Async GET Many Stats ===
+Stats: 500 objects, 10485760000 bytes (10000.00 MiB) in 2.41s -> 207.79 ops/s, 4155.79 MiB/s
+
+=== Async DELETE ===
+Deleted test objects in 0.36s
+root@loki-node3:/app# 
+```
+
+# Using the Rust CLI
 If you built this project locally, outside a container, you will have to install the executable, or provide the path to its location, which by default is in the "./target/release" directory.
 If running in the container, the Rust executable is in your path.  A  ```which s3Rust-cli``` shows its location:
 
@@ -193,43 +242,3 @@ Deleting 1200 objects…
 Done.
 root@loki-node3:/app#
 ```
-# Python
-The intention of this entire library is to provide a Python library for interacting with S3.  The Rust CLI provides a way to check the underlying functions without worrying about constructing a Python program, or syntax errors.  Because it is pure Rust, it also more accurately displays the potential performance that may be attained.  However, using the Python library is the intention.  In the "docs" subdirectory, there is a quick overview of the Python API, written by a chat agent.  For those who prefer examples, there is a sample Python script to test the APIs, shown below.
-
-## Running a Python Test
-Note: The following example shows running the `test_new_dlio_s3.py` Python script, after changing the number of objects to 500, by editing the file.  The default number of objects to use for testing is only 5 objects.  In order to display more accurate performance values, the following example shows running the test with `NUM_OBJECTS = 500` setting.
-
-```
-root@loki-node3:/app# uv run test_new_dlio_s3.py 
-=== Sync LIST ===
-Found 999 objects under s3://my-bucket2/my-data2/ in 0.02s
-
-=== Sync PUT ===
-Uploaded 500 objects (10000.00 MiB) in 3.34s -> 149.66 ops/s, 2993.14 MiB/s
-
-=== Sync GET Many ===
-Fetched 500 objects (10000.00 MiB) in 7.50s -> 66.67 ops/s, 1333.49 MiB/s
-
-=== Sync GET Many Stats ===
-Stats: 500 objects, 10485760000 bytes (10000.00 MiB) in 2.21s -> 226.25 ops/s, 4524.91 MiB/s
-
-=== Sync DELETE ===
-Deleted test objects in 0.37s
-
-=== Async LIST ===
-Found 999 objects under s3://my-bucket2/my-data2/ in 0.02s
-
-=== Async PUT ===
-Uploaded 500 objects (10000.00 MiB) in 3.10s -> 161.18 ops/s, 3223.68 MiB/s
-
-=== Async GET Many ===
-Fetched 500 objects (10000.00 MiB) in 7.64s -> 65.41 ops/s, 1308.29 MiB/s
-
-=== Async GET Many Stats ===
-Stats: 500 objects, 10485760000 bytes (10000.00 MiB) in 2.41s -> 207.79 ops/s, 4155.79 MiB/s
-
-=== Async DELETE ===
-Deleted test objects in 0.36s
-root@loki-node3:/app# 
-```
-
