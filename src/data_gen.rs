@@ -11,6 +11,7 @@ use rayon::prelude::*;
 // Generate a buffer of random bytes.
 // -----------------------------------------------------------------------------
 //
+const MOD_SIZE: usize = 32;
 const BLK_SIZE: usize = 512;
 const HALF_BLK: usize = BLK_SIZE / 2;
 
@@ -41,8 +42,8 @@ pub fn generate_raw_data(size: usize) -> Vec<u8> {
 /// Generates a buffer of `size` random bytes by:
 /// 1. Enforcing a minimum size of BLK_SIZE bytes.
 /// 2. Filling each BLK_SIZE-byte block with a static base block.
-/// 3. Modifying the first 32 bytes of each block,
-///    and modifying the last 32 bytes only if the block is larger than 128 bytes.
+/// 3. Modifying the first MOD_SIZE bytes of each block,
+///    and modifying the last MOD_SIZE bytes only if the block is larger than 128 bytes.
 ///
 /// This ensures each BLK_SIZE-byte block is unique while avoiding the need to generate a whole new
 /// random buffer on every call.
@@ -68,15 +69,15 @@ fn generate_random_data(mut size: usize) -> Vec<u8> {
         let block_end = std::cmp::min(offset + BLK_SIZE, size);
         let block_size = block_end - offset;
 
-        // Modify the first 32 bytes (or the full block if it's smaller).
+        // Modify the first MOD_SIZE bytes (or the full block if it's smaller).
         if block_size > 0 {
-            let first_len = if block_size >= 32 { 32 } else { block_size };
+            let first_len = if block_size >= MOD_SIZE { MOD_SIZE } else { block_size };
             rng.fill(&mut data[offset .. offset + first_len]);
         }
 
-        // Modify the last 32 bytes only if the block is larger than 128 bytes.
+        // Modify the last MOD_SIZE bytes only if the block is larger than 128 bytes.
         if block_size > HALF_BLK {
-            rng.fill(&mut data[block_end - 32 .. block_end]);
+            rng.fill(&mut data[block_end - MOD_SIZE .. block_end]);
         }
 
         offset += BLK_SIZE;
@@ -102,7 +103,7 @@ fn generate_random_data(mut size: usize) -> Vec<u8> {
 /// - It builds a base block according to the compress parameter: the first `constant_length` bytes are constant
 ///   (set here to zero) and the remainder of the block is random.
 /// - Then it creates a set of "unique" blocks by cloning the base block and modifying only a small portion:
-///   the first 32 bytes, and if the block is larger than 128 bytes, also the last 32 bytes.
+///   the first MOD_SIZE bytes, and if the block is larger than 128 bytes, also the last MOD_SIZE bytes.
 /// - Finally, the unique blocks are repeated in round-robin order to fill the requested output size.
 /// - The final assembly step is parallelized using Rayon for efficiency on large buffers.
 ///
@@ -151,21 +152,21 @@ fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> V
             let _ = i; // Because we never explicitly use i, its just an index
             // Start with a clone of the base block
             let mut block = base_block.clone();
-            // Uniquify by modifying the first 32 bytes (or less if the block is smaller).
-            let modify_len = std::cmp::min(32, block_size);
+            // Uniquify by modifying the first MOD_SIZE bytes (or less if the block is smaller).
+            let modify_len = std::cmp::min(MOD_SIZE, block_size);
             rng.fill(&mut block[..modify_len]);
             //
-            // If the block is larger than HALF_BLK bytes, also modify the first 32 bytes of the
+            // If the block is larger than HALF_BLK bytes, also modify the first MOD_SIZE bytes of the
             // second half of our block.
-            if block_size > HALF_BLK {
+            if block_size > (HALF_BLK + MOD_SIZE) {
                 let offset = HALF_BLK;
-                let end = offset + 32;
+                let end = offset + MOD_SIZE;
                 rng.fill(&mut block[offset..end]);
             }
             /*
              * Old, incorrect, remove soon
             if block_size > 128 {
-                rng.fill(&mut block[block_size - 32..block_size]);
+                rng.fill(&mut block[block_size - MOD_SIZE..block_size]);
             }
             */
             unique.push(block);
