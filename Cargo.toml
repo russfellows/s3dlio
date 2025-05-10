@@ -51,6 +51,8 @@ ndarray     = "^0.15"
 ndarray-npy = "^0.8"
 zip         = "^0.6"
 rayon = "1.10.0"
+chrono = "0.4.41"
+io = "0.0.2"
 
 
 [features]

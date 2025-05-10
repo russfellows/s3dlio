@@ -6,15 +6,25 @@
 use once_cell::sync::Lazy;
 use rand::Rng;
 use rayon::prelude::*;
+use std::sync::Arc;
 
 // -----------------------------------------------------------------------------
 // Generate a buffer of random bytes.
 // -----------------------------------------------------------------------------
 //
-const MOD_SIZE: usize = 32;
-const BLK_SIZE: usize = 512;
+pub const BLK_SIZE: usize = 512; // This is used elsewhere, hence pub
 const HALF_BLK: usize = BLK_SIZE / 2;
+const MOD_SIZE: usize = 32;
 
+/// New version
+/// A base random block of BLK_SIZE bytes, generated once and shared.
+static A_BASE_BLOCK: Lazy<Arc<Vec<u8>>> = Lazy::new(|| {
+    let mut block = vec![0u8; BLK_SIZE];
+    rand::rngs::ThreadRng::default().fill(&mut block[..]);
+    Arc::new(block)
+});
+
+/// Original version
 /// A base random block of BLK_SIZE bytes, generated once.
 static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
     let mut block = vec![0u8; BLK_SIZE];
@@ -110,10 +120,8 @@ fn generate_random_data(mut size: usize) -> Vec<u8> {
 /// # Returns
 /// A `Vec<u8>` with the requested size, containing data with the specified deduplication and compressibility characteristics.
 
-#[allow(dead_code)]
 /// Start of a data generation function that supports specifying deduplication and compression ratios of data created
-//pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
-fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+pub fn generate_controlled_data0(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     // Enforce a minimum size of BLK_SIZE bytes.
     if size < BLK_SIZE {
         size = BLK_SIZE;
@@ -122,69 +130,176 @@ fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> V
     let block_size = BLK_SIZE;
     let nblocks = (size + block_size - 1) / block_size;
 
-    // Determine the number of unique blocks based on dedup factor.
+    // Determine deduplication factor and number of unique blocks
     let dedup_factor = if dedup == 0 { 1 } else { dedup };
-    let unique_blocks = (nblocks + dedup_factor - 1) / dedup_factor;
+    let unique_blocks = if dedup_factor > 1 {
+        ((nblocks as f64) / (dedup_factor as f64)).round().max(1.0) as usize
+    } else {
+        nblocks
+    };
 
-    // Compute the compressibility fraction:
-    // For compress > 1: f = (compress - 1) / compress, meaning that f of the block is constant.
-    let f = if compress > 1 { (compress - 1) as f64 / compress as f64 } else { 0.0 };
-    let constant_length = (f * block_size as f64).round() as usize;
-    // The rest (block_size - constant_length) is left to be random.
+    // Prepare parameters for compression: fraction = (compress-1)/compress
+    let (f_num, f_den) = if compress > 1 {
+        (compress - 1, compress)
+    } else {
+        (0, 1)
+    };
+    let floor_len = (f_num * block_size) / f_den;
+    let rem = (f_num * block_size) % f_den;
 
-    // Build a base BLK_SIZE-byte block that already has the desired compressible layout.
-    let mut base_block = vec![0u8; block_size];
-    // Fill the constant portion (first constant_length bytes) with a fixed pattern (here, zeros).
-    for j in 0..constant_length {
-        base_block[j] = 0;
-    }
-    {
-        // Fill the remaining bytes with random data.
+    // Precompute zero-prefix lengths per unique block (Bresenham distribution)
+    let const_lens: Vec<usize> = {
+        let mut v = Vec::with_capacity(unique_blocks);
+        let mut err_acc = 0;
+        for _ in 0..unique_blocks {
+            err_acc += rem;
+            if err_acc >= f_den {
+                err_acc -= f_den;
+                v.push(floor_len + 1);
+            } else {
+                v.push(floor_len);
+            }
+        }
+        v
+    };
+
+    // Generate unique blocks in parallel
+    let unique: Vec<Arc<Vec<u8>>> = const_lens.into_par_iter().map(|const_len| {
         let mut rng = rand::rngs::ThreadRng::default();
-        rng.fill(&mut base_block[constant_length..]);
+        // Clone the shared base block cheaply
+        let mut block_arc = Arc::clone(&A_BASE_BLOCK);
+        // Obtain mutable access (clone-on-write if needed)
+        let block = Arc::make_mut(&mut block_arc);
+
+        // Zero out the constant prefix using slice fill
+        block[..const_len].fill(0);
+
+        // Compute modification region
+        let region_start = const_len;
+        let region_len = block_size - region_start;
+        let modify_len = region_len.min(MOD_SIZE);
+
+        // 1) Modify at the start of the random region
+        rng.fill(&mut block[region_start..region_start + modify_len]);
+
+        // 2) Optionally modify a second chunk if it fits
+        let second_offset = HALF_BLK.max(region_start);
+        if second_offset + modify_len <= block_size {
+            rng.fill(&mut block[second_offset..second_offset + modify_len]);
+        }
+
+        block_arc
+    }).collect();
+
+    // Build the final output buffer without an initial zero fill
+    let total_size = nblocks * block_size;
+    let mut data: Vec<u8> = Vec::with_capacity(total_size);
+    unsafe {
+        data.set_len(total_size);
     }
 
-    // Generate the unique blocks.
+    data.par_chunks_mut(block_size)
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let idx = i % unique.len();
+            let src = &unique[idx];
+            chunk.copy_from_slice(src);
+        });
+
+    // Trim to exact size
+    data.truncate(size);
+    data
+}
+
+
+/// Last version of code, should be accurate, but slightly inefficient
+pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+    // Enforce a minimum size of BLK_SIZE bytes.
+    if size < BLK_SIZE {
+        size = BLK_SIZE;
+    }
+
+    let block_size = BLK_SIZE;
+    let nblocks = (size + block_size - 1) / block_size;
+
+    // Determine deduplication: target ratio = 1/dedup_factor
+    let dedup_factor = if dedup == 0 { 1 } else { dedup };
+    // Round to nearest number of unique blocks for better approximation
+    let unique_blocks = if dedup_factor > 1 {
+        // Round(nblocks/dedup_factor)
+        let ub = ((nblocks as f64) / (dedup_factor as f64)).round() as usize;
+        ub.max(1)
+    } else {
+        nblocks
+    };
+
+    // Prepare parameters for compression spread across blocks
+    let (f_num, f_den) = if compress > 1 {
+        (compress - 1, compress)
+    } else {
+        (0, 1)
+    };
+    // Base zero prefix length (floor)
+    let floor_len = (f_num * block_size) / f_den;
+    // Remainder gives extra zeros to distribute
+    let rem = (f_num * block_size) % f_den;
+
+    // Generate unique blocks with per-block varying zero-prefix lengths
     let mut unique: Vec<Vec<u8>> = Vec::with_capacity(unique_blocks);
     {
         let mut rng = rand::rngs::ThreadRng::default();
-        for i in 0..unique_blocks {
-            let _ = i; // Because we never explicitly use i, its just an index
-            // Start with a clone of the base block
-            let mut block = base_block.clone();
-            // Uniquify by modifying the first MOD_SIZE bytes (or less if the block is smaller).
-            let modify_len = std::cmp::min(MOD_SIZE, block_size);
-            rng.fill(&mut block[..modify_len]);
-            //
-            // If the block is larger than HALF_BLK bytes, also modify the first MOD_SIZE bytes of the
-            // second half of our block.
-            if block_size > (HALF_BLK + MOD_SIZE) {
-                let offset = HALF_BLK;
-                let end = offset + MOD_SIZE;
-                rng.fill(&mut block[offset..end]);
+        let mut err_acc = 0;
+
+        for _ in 0..unique_blocks {
+            // Start from the base random block
+            let mut block = BASE_BLOCK.clone();
+
+            // Determine this block's constant prefix length via Bresenham error accumulation
+            err_acc += rem;
+            let const_len = if err_acc >= f_den {
+                err_acc -= f_den;
+                floor_len + 1
+            } else {
+                floor_len
+            };
+
+            // Zero out the constant prefix
+            for j in 0..const_len {
+                block[j] = 0;
             }
-            /*
-             * Old, incorrect, remove soon
-            if block_size > 128 {
-                rng.fill(&mut block[block_size - MOD_SIZE..block_size]);
+
+            // Compute region for unique modifications
+            let region_start = const_len;
+            let region_len = block_size - region_start;
+            let modify_len = std::cmp::min(MOD_SIZE, region_len);
+
+            // 1) Modify at the start of the random region
+            rng.fill(&mut block[region_start..region_start + modify_len]);
+
+            // 2) Optionally modify a second chunk (if it fits within the random region)
+            let second_offset = std::cmp::max(HALF_BLK, region_start);
+            if second_offset + modify_len <= block_size {
+                rng.fill(&mut block[second_offset..second_offset + modify_len]);
             }
-            */
+
             unique.push(block);
         }
     }
 
-    // Build the final output buffer.
+    // Build the final output buffer in parallel
     let total_size = nblocks * block_size;
     let mut data = vec![0u8; total_size];
-    // Use Rayon to fill each block in parallel.
     data.par_chunks_mut(block_size)
         .enumerate()
         .for_each(|(i, chunk)| {
-            let unique_index = i % unique.len();
-            chunk.copy_from_slice(&unique[unique_index]);
+            let idx = i % unique.len();
+            chunk.copy_from_slice(&unique[idx]);
         });
 
-    // Trim the buffer to the exact requested size.
+    // Trim to exact requested size (may leave a partial block)
     data.truncate(size);
     data
 }
+
+
+
