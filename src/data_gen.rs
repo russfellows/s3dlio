@@ -121,7 +121,7 @@ fn generate_random_data(mut size: usize) -> Vec<u8> {
 /// A `Vec<u8>` with the requested size, containing data with the specified deduplication and compressibility characteristics.
 
 /// Start of a data generation function that supports specifying deduplication and compression ratios of data created
-pub fn generate_controlled_data0(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     // Enforce a minimum size of BLK_SIZE bytes.
     if size < BLK_SIZE {
         size = BLK_SIZE;
@@ -213,7 +213,7 @@ pub fn generate_controlled_data0(mut size: usize, dedup: usize, compress: usize)
 
 
 /// Last version of code, should be accurate, but slightly inefficient
-pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+pub fn generate_controlled_data0(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     // Enforce a minimum size of BLK_SIZE bytes.
     if size < BLK_SIZE {
         size = BLK_SIZE;
