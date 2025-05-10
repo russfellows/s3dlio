@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use std::time::Instant;
+use log::LevelFilter;
 
 // Import shared functions from the crate.
 use dlio_s3_rust::{
@@ -23,15 +24,15 @@ use dlio_s3_rust::{
     DEFAULT_OBJECT_SIZE, ObjectType,
 };
 
-// Import the bucket creation helper.
-//use dlio_s3_rust::s3_utils::create_bucket;
 
-// Import the data creation functions, only if called directly 
-//use dlio_s3_rust::data_gen::{generate_npz, generate_tfrecord, generate_hdf5, generate_raw_data};
 
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Cli {
+    /// Turn on verbose (info‑level) logging
+    #[arg(short, long)]
+    verbose: bool,
+
     #[command(subcommand)]
     cmd: Command,
 }
@@ -107,6 +108,17 @@ fn main() -> Result<()> {
 
 
     let cli = Cli::parse();
+
+    // 1️⃣  Set up logging early – once per process.
+    if cli.verbose {
+        env_logger::Builder::from_default_env()
+            .filter_level(LevelFilter::Debug)   // Shows Error, Warn, Info and Debug levels 
+            .init();
+    } else {
+        env_logger::Builder::from_default_env()
+            .filter_level(LevelFilter::Warn)   // Shows Error and Warn levels 
+            .init();
+    }
 
     match cli.cmd {
         Command::List { uri } => list_cmd(&uri),

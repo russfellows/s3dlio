@@ -15,6 +15,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3_asyncio::tokio as aio;
 use tokio::task;
 
+use log::LevelFilter;
+use env_logger;
 
 use crate::s3_utils::{
     create_bucket, delete_objects, get_object_uri, get_objects_parallel, list_objects,
@@ -286,6 +288,36 @@ pub fn read_npz(py: Python<'_>, uri: &str, array_name: Option<&str>) -> PyResult
 }
 
 // ---------------------------------------------------------------------------
+// LOGGING INITIALISER  (sync) -------------------------------------------------
+
+/// Initialise Rust‑side logging *once*
+///
+/// Examples (Python):
+/// ```python
+/// import dlio_s3_rust
+/// dlio_s3_rust.init_logging("info")   # or "debug", "warn"
+/// ```
+///
+/// Subsequent calls are ignored, so it’s safe to invoke from multiple threads.
+#[pyfunction]
+#[pyo3(signature = (level = "info"))]   // default = "info"
+pub fn init_logging(level: &str) -> PyResult<()> {
+    let lvl = match level.to_ascii_lowercase().as_str() {
+        "error" => LevelFilter::Error,
+        "warn"  | "warning" => LevelFilter::Warn,
+        "info"  => LevelFilter::Info,
+        "debug" => LevelFilter::Debug,
+        "trace" => LevelFilter::Trace,
+        _ => LevelFilter::Info,
+    };
+
+    let _ = env_logger::builder()
+        .filter_level(lvl)
+        .try_init();         // ignores AlreadyInit
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Internal module exposed to lib.rs -----------------------------------------
 #[pymodule]
 pub fn _pymod(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -299,6 +331,7 @@ pub fn _pymod(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
     m.add_function(wrap_pyfunction!(read_npz, m)?)?;
+    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     Ok(())
 }
 
