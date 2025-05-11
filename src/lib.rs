@@ -30,6 +30,7 @@ use python_api::{
     get_many_stats,
     delete,
     read_npz,
+    init_logging,
     // asynchronous
     put_async_py,
     get_many_async_py,
@@ -64,6 +65,7 @@ pub fn dlio_s3_rust(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(delete, m)?)?;
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(read_npz, m)?)?;
+    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
 
     // async wrappers
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;

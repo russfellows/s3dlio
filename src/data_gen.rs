@@ -57,8 +57,7 @@ pub fn generate_raw_data(size: usize) -> Vec<u8> {
 ///
 /// This ensures each BLK_SIZE-byte block is unique while avoiding the need to generate a whole new
 /// random buffer on every call.
-//pub fn generate_random_data(mut size: usize) -> Vec<u8> {
-fn generate_random_data(mut size: usize) -> Vec<u8> {
+pub fn generate_random_data(mut size: usize) -> Vec<u8> {
     // Enforce a minimum size of BLK_SIZE bytes.
     if size < BLK_SIZE {
         size = BLK_SIZE;
