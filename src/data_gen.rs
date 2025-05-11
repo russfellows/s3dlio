@@ -34,19 +34,23 @@ static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
 
 // For now, each of our 4 object types just calls the same function
 pub fn generate_npz(size: usize) -> Vec<u8> {
-    generate_random_data(size)
+    //generate_random_data(size)
+    generate_controlled_data(size, 1, 1)
 } 
 
 pub fn generate_tfrecord(size: usize) -> Vec<u8> {
-    generate_random_data(size)
+    //generate_random_data(size)
+    generate_controlled_data(size, 1, 1)
 } 
 
 pub fn generate_hdf5(size: usize) -> Vec<u8> {
-    generate_random_data(size)
+    //generate_random_data(size)
+    generate_controlled_data(size, 1, 1)
 } 
 
 pub fn generate_raw_data(size: usize) -> Vec<u8> {
-    generate_random_data(size)
+    //generate_random_data(size)
+    generate_controlled_data(size, 1, 1)
 } 
 
 /// Generates a buffer of `size` random bytes by:

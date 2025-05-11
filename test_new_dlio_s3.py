@@ -1,3 +1,7 @@
+import importlib.util, sys
+spec = importlib.util.find_spec("dlio_s3_rust")
+print("→ loading from:", spec and spec.origin, file=sys.stderr)
+
 import time
 import asyncio
 import dlio_s3_rust as s3
@@ -12,6 +16,12 @@ SIZE = 20971520  # s3.DEFAULT_OBJECT_SIZE  from Rust default
 
 
 def sync_tests():
+    # turn on info‑level logs (shows the AWS S3 info messages, including AWS_CA_BUNDLE_PATH loading)
+    s3.init_logging("info")
+
+    # turn on debug‑level logs (shows AWS S3 SDK info + debug messages)
+    #s3.init_logging("debug")
+
     print("=== Sync LIST ===")
     start = time.time()
     objs = s3.list(READ_PREFIX)
@@ -50,6 +60,9 @@ def sync_tests():
 
 
 async def async_tests():
+    # turn on info‑level logs (shows the AWS_CA_BUNDLE_PATH message)
+    s3.init_logging("info")
+
     print("=== Async LIST ===")
     start = time.time()
     objs = s3.list(READ_PREFIX)
@@ -87,6 +100,7 @@ async def async_tests():
 
 
 def main():
+
     sync_tests()
     print()
     asyncio.run(async_tests())

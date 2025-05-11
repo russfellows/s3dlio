@@ -13,7 +13,7 @@
 //! ```
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::io::{self, Write};
 use std::time::Instant;
 use log::LevelFilter;
@@ -30,8 +30,18 @@ use dlio_s3_rust::{
 #[command(author, version, about)]
 struct Cli {
     /// Turn on verbose (info‑level) logging
+    /*
+     * Old single 
     #[arg(short, long)]
     verbose: bool,
+    */
+    // New, counts the number of v's
+    #[arg(short = 'v', 
+        long, 
+        action = ArgAction::Count,
+        help = "Increase log verbosity: -v = Info, -vv = Debug",
+    )]
+    verbose: u8,
 
     #[command(subcommand)]
     cmd: Command,
@@ -110,15 +120,28 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 1️⃣  Set up logging early – once per process.
+    /*
     if cli.verbose {
         env_logger::Builder::from_default_env()
-            .filter_level(LevelFilter::Debug)   // Shows Error, Warn, Info and Debug levels 
+            //.filter_level(LevelFilter::Debug)   // Shows Error, Warn, Info and Debug levels 
+            .filter_level(LevelFilter::Info)   // Shows Error, Warn and Info levels 
             .init();
     } else {
         env_logger::Builder::from_default_env()
             .filter_level(LevelFilter::Warn)   // Shows Error and Warn levels 
             .init();
     }
+    */
+    // Initialise logging once, based on how many `-v` flags were given:
+    let level = match cli.verbose {
+        0 => LevelFilter::Warn,   // no -v
+        1 => LevelFilter::Info,   // -v
+        _ => LevelFilter::Debug,  // -vv or more
+    };
+    env_logger::Builder::from_default_env()
+        .filter_level(level)
+        .init();
+
 
     match cli.cmd {
         Command::List { uri } => list_cmd(&uri),
