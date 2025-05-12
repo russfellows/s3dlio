@@ -1,10 +1,12 @@
-import importlib.util, sys
-spec = importlib.util.find_spec("dlio_s3_rust")
-print("→ loading from:", spec and spec.origin, file=sys.stderr)
+#import importlib.util, sys
+##spec = importlib.util.find_spec("dlio_s3_rust")
+#spec = importlib.util.find_spec("s3dlio")
+#print("→ loading from:", spec and spec.origin, file=sys.stderr)
 
 import time
 import asyncio
-import dlio_s3_rust as s3
+#import dlio_s3_rust as s3
+import s3dlio as s3
 
 # Adjust these to your S3 URIs:
 READ_PREFIX = "s3://my-bucket2/my-data2/"

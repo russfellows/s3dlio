@@ -19,9 +19,9 @@ use std::time::Instant;
 use log::LevelFilter;
 
 // Import shared functions from the crate.
-use dlio_s3_rust::{
+use s3dlio::{
     delete_objects, get_object_uri, get_objects_parallel, list_objects, parse_s3_uri,
-    DEFAULT_OBJECT_SIZE, ObjectType,
+    put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
 };
 
 
@@ -151,12 +151,12 @@ fn main() -> Result<()> {
         Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type } => {
             let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
             if create_bucket_flag {
-                if let Err(e) = dlio_s3_rust::s3_utils::create_bucket(&bucket) {
+                if let Err(e) = s3dlio::s3_utils::create_bucket(&bucket) {
                     eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
                 }
             }
             // No longer need to parse obj_type into ObjecType enum
-            //let obj_type = dlio_s3_rust::ObjectType::from(object_type.as_str());
+            //let obj_type = s3dlio::ObjectType::from(object_type.as_str());
             
             put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type)
 
@@ -321,7 +321,7 @@ fn delete_cmd(uri: &str, _jobs: usize) -> Result<()> {
 
 
 /// Put command supports 1 or more objects, also takes our ObjectType
-fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: dlio_s3_rust::ObjectType) -> Result<()> {
+fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType) -> Result<()> {
     // Parse the prefix into bucket and key prefix.
     let (bucket, mut prefix) = parse_s3_uri(uri_prefix)?;
     if !prefix.ends_with('/') {
@@ -344,7 +344,7 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
     let effective_jobs = std::cmp::min(jobs, num);
     let t0 = Instant::now();
 
-    dlio_s3_rust::put_objects_with_random_data_and_type(&uris, size, effective_jobs, object_type)?;
+    put_objects_with_random_data_and_type(&uris, size, effective_jobs, object_type)?;
 
     let elapsed = t0.elapsed();
     let total_bytes = num * size;

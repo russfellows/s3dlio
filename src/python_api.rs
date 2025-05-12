@@ -294,8 +294,8 @@ pub fn read_npz(py: Python<'_>, uri: &str, array_name: Option<&str>) -> PyResult
 ///
 /// Examples (Python):
 /// ```python
-/// import dlio_s3_rust
-/// dlio_s3_rust.init_logging("info")   # or "debug", "warn"
+/// import s3dlio
+/// s3dlio.init_logging("info")   # or "debug", "warn"
 /// ```
 ///
 /// Subsequent calls are ignored, so it’s safe to invoke from multiple threads.
