@@ -1,17 +1,17 @@
 [package]
-name = "dlio_s3_rust"
+name = "s3dlio"
 version = "0.3.1"
 edition = "2024"
 
 [lib]
-name = "dlio_s3_rust"
+name = "s3dlio"
 crate-type = ["cdylib", "rlib"]      # cdylib → Python wheel, rlib → normal Rust
 
 [package.metadata.maturin]
 features = ["extension-module"]
 
 [[bin]]
-name = "s3Rust-cli"
+name = "s3dlio-cli"
 path = "src/bin/cli.rs"
 
 [dependencies]

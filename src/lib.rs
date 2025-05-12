@@ -54,7 +54,7 @@ pub use s3_utils::{
 // ---------------------------------------------------------------------------
 #[cfg(feature = "extension-module")]
 #[pymodule]
-pub fn dlio_s3_rust(_py: Python, m: &PyModule) -> PyResult<()> {
+pub fn s3dlio(_py: Python, m: &PyModule) -> PyResult<()> {
     pyo3::prepare_freethreaded_python();
 
     // sync wrappers

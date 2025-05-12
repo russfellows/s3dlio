@@ -1102,38 +1102,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dlio_s3_rust"
-version = "0.3.1"
-dependencies = [
- "anyhow",
- "aws-config",
- "aws-sdk-s3",
- "aws-smithy-http-client",
- "chrono",
- "clap",
- "dotenvy",
- "env_logger",
- "futures",
- "hyper 1.6.0",
- "hyper-rustls 0.27.5",
- "io",
- "log",
- "ndarray",
- "ndarray-npy",
- "numpy",
- "once_cell",
- "pyo3",
- "pyo3-asyncio",
- "rand",
- "rayon",
- "regex",
- "rustls 0.23.25",
- "tokio",
- "webpki-roots 0.26.11",
- "zip 0.6.6",
-]
-
-[[package]]
 name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2998,6 +2966,38 @@ name = "ryu"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
+
+[[package]]
+name = "s3dlio"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-http-client",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "env_logger",
+ "futures",
+ "hyper 1.6.0",
+ "hyper-rustls 0.27.5",
+ "io",
+ "log",
+ "ndarray",
+ "ndarray-npy",
+ "numpy",
+ "once_cell",
+ "pyo3",
+ "pyo3-asyncio",
+ "rand",
+ "rayon",
+ "regex",
+ "rustls 0.23.25",
+ "tokio",
+ "webpki-roots 0.26.11",
+ "zip 0.6.6",
+]
 
 [[package]]
 name = "scale-info"
