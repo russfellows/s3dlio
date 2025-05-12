@@ -2,7 +2,7 @@ name: Sync from public upstream
 
 on:
   schedule:
-    - cron: '15 6 * * *'    # Runs daily at 6:15am UTC
+    - cron: '15 6 * * *'    # daily at 06:15 UTC
 
 jobs:
   sync:
@@ -11,14 +11,15 @@ jobs:
       - name: Checkout private mirror
         uses: actions/checkout@v3
         with:
-          repository: russfellows/dlio_s3_rust
+          repository: russfellows/s3dlio
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: main
+          fetch-depth: 0        # get full history so merges work
 
       - name: Pull upstream
         run: |
           git remote add upstream https://github.com/russfellows/dlio_s3_rust.git
-          git fetch upstream
+          git fetch upstream --tags
           git merge --no-edit upstream/main
 
       - name: Push changes
