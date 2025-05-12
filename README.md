@@ -1,7 +1,7 @@
 # How to Guide
 
 ## S3 Rust Library and CLI
-This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3Rust-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import dlio_s3_rust as s3` and used by Python programs.
+This guide shows how to use the Rust library, which supports both a compiled command line interface executable called `s3Rust-cli` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import s3dlio as s3` and used by Python programs.
 
 ### Purpose
 The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The five primary operations for S3 are included: Get, Put, List, Delete, and Create-Bucket.  Note that bucket creation currently occurs only as part of a Put operation.  
@@ -9,7 +9,7 @@ The purpose of this library is to enable testing of S3 storage via both a cli an
 For ease of testing, both the cli and library may be built into a container as well.  The Rust source code is removed from this container in order to reduce its size.  
 
 ### Plan for Publishing
-In the near future, the Python library `dlio_s3_rust` will be published on PyPi for distribution.  The compiled Rust executable and Python wheel files are already published on GitHub and are availble under the release section of this project.  
+In the near future, the Python library `s3dlio` will be published on PyPi for distribution.  The compiled Rust executable and Python wheel files are already published on GitHub and are availble under the release section of this project.  
 
 # How to Build
 In order to build this project, you can build the code and libraries and use them directly. 
@@ -38,7 +38,7 @@ Either docker or podman may be used to create the image, typically with a `podma
 
 In order to pull the container using docker, you may execute the following:
 ```
-docker pull quay.io/russfellows-sig65/dealio_s3_rust
+docker pull quay.io/russfellows-sig65/s3dlio
 ```
 
 ### Running Container
@@ -52,7 +52,7 @@ README.md  dlio_s3_test3.py  target  test_all_dlio_s3.py
 root@loki-node3:/app# which python
 /app/.venv/bin/python
 root@loki-node3:/app# python --version
-Python 3.13.2
+Python 3.12.8
 ```
 
 # S3 Access
@@ -127,17 +127,17 @@ root@loki-node3:/app#
 
 # Using the Rust CLI
 If you built this project locally, outside a container, you will have to install the executable, or provide the path to its location, which by default is in the "./target/release" directory.
-If running in the container, the Rust executable is in your path.  A  ```which s3Rust-cli``` shows its location:
+If running in the container, the Rust executable is in your path.  A  ```which s3dlio-cli``` shows its location:
 
 ```
-root@loki-node3:/app# which s3Rust-cli
+root@loki-node3:/app# which s3dlio-cli
 /usr/local/bin/s3Rust-cli
 ```
 
 Running the command without any arguments shows the usage:
 
 ```
-root@loki-node3:/app# s3Rust-cli                           
+root@loki-node3:/app# s3dlio-cli                          
 Usage: s3Rust-cli <COMMAND>
 
 Commands:
@@ -148,7 +148,7 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-root@loki-node3:/app# s3Rust-cli                           
+root@loki-node3:/app# s3dlio-cli                           
 Usage: s3Rust-cli <COMMAND>
 
 Commands:
@@ -187,10 +187,10 @@ Options:
 Next is an example of help for the `put` subcommand:
 
 ```
-root@loki-node3:/app# s3Rust-cli put --help
+root@loki-node3:/app# s3dlio-cli put --help
 Upload one or more objects concurrently, uses ObjectType format filled with random data
 
-Usage: s3Rust-cli put [OPTIONS] <URI_PREFIX>
+Usage: s3dlio-cli put [OPTIONS] <URI_PREFIX>
 
 Arguments:
   <URI_PREFIX>  S3 URI prefix (e.g. s3://bucket/prefix)
@@ -208,10 +208,10 @@ Options:
 
 
 ### Additional CLI Examples
-Here are several examples of running the ```s3Rust-cli``` command:
+Here are several examples of running the `s3dlio-cli` command:
 
 ```
-root@loki-node3:/app# s3Rust-cli list s3://my-bucket4/
+root@loki-node3:/app# s3dlio-cli list s3://my-bucket4/
 ...
 /russ-test3-989.obj
 /russ-test3-99.obj
@@ -230,25 +230,25 @@ Total objects: 1200
 ```
 #### Example Delete command and List
 ```
-root@loki-node3:/app# s3Rust-cli delete s3://my-bucket4/
+root@loki-node3:/app# s3dlio-cli delete s3://my-bucket4/
 Deleting 1200 objects…
 Done.
-root@loki-node3:/app# s3Rust-cli list s3://my-bucket4/
+root@loki-node3:/app# s3dlio-cli list s3://my-bucket4/
 
 Total objects: 0
 ```
 #### Example put and then delete to cleanup
 Note: This use of put only uses a single set of braces `{}` , and will thus each object will have only the object number, and not the total number in the name:
 ```
-root@loki-node3:/app# s3Rust-cli put -c -n 1200 -t russ-test3-{}.obj s3://my-bucket4/
+root@loki-node3:/app# s3dlio-cli put -c -n 1200 -t russ-test3-{}.obj s3://my-bucket4/
 Uploaded 1200 objects (total 25165824000 bytes) in 7.607254643s (157.74 objects/s, 3154.88 MB/s)
 
 root@loki-node3:/app# 
-root@loki-node3:/app# s3Rust-cli get -j 32 s3://my-bucket4/
+root@loki-node3:/app# s3dlio-cli get -j 32 s3://my-bucket4/
 Fetching 1200 objects with 32 jobs…
 downloaded 24000.00 MB in 4.345053775s (5523.52 MB/s)
 
-root@loki-node3:/app# s3Rust-cli delete s3://my-bucket4/
+root@loki-node3:/app# s3dlio-cli delete s3://my-bucket4/
 Deleting 1200 objects…
 Done.
 root@loki-node3:/app#
