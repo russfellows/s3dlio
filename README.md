@@ -148,9 +148,20 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
+root@loki-node3:/app# s3Rust-cli                           
+Usage: s3Rust-cli <COMMAND>
+
+Commands:
+  list    List keys that start with the given prefix
+  get     Download one or many objects
+  delete  Delete one object or every object that matches the prefix
+  put     Upload one or more objects concurrently, uses ObjectType format filled with random data
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -v, --verbose...  Increase log verbosity: -v = Info, -vv = Debug
   -h, --help     Print help
   -V, --version  Print version
-
 root@loki-node3:/app#
 ```
 
