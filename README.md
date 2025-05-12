@@ -1,7 +1,7 @@
 # How to Guide
 
 ## S3 Rust Library and CLI
-This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3Rust-cli``` and Python library, compiled into a wheel file.  
+This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3Rust-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import dlio_s3_rust as s3` and used by Python programs.
 
 ### Purpose
 The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The five primary operations for S3 are included: Get, Put, List, Delete, and Create-Bucket.  Note that bucket creation currently occurs only as part of a Put operation.  
@@ -9,7 +9,7 @@ The purpose of this library is to enable testing of S3 storage via both a cli an
 For ease of testing, both the cli and library may be built into a container as well.  The Rust source code is removed from this container in order to reduce its size.  
 
 ### Plan for Publishing
-Currently, the plan is to publish the Python library on PyPi for distribution.  The compiled Rust executable may also be published on GitHub for general use.  The source code was just published, since the project was made public.  
+In the near future, the Python library `dlio_s3_rust` will be published on PyPi for distribution.  The compiled Rust executable and Python wheel files are already published on GitHub and are availble under the release section of this project.  
 
 # How to Build
 In order to build this project, you can build the code and libraries and use them directly. 
