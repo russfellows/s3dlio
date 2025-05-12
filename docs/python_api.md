@@ -6,10 +6,10 @@ This document outlines the Python interface provided by the `dlio_s3_rust` packa
 
 ## Installation
 
-After building or installing the wheel:
+After building the wheel, you may install the dlio_s3_rust library from the wheel:
 
 ```bash
-pip install dlio_s3_rust-<version>-py3-none-any.whl
+pip install /path/to/my/dlio_s3_rust-<version>-*.whl
 ```
 
 Then, in Python:
@@ -19,6 +19,16 @@ import dlio_s3_rust as s3
 ```
 
 ---
+
+## Logging
+There is a logging api which supports the default level of "warn", along with "info" and "debug".  These are set by passing the appropriate string for the level to initialize logging.
+```python
+    # turn on info‑level logs (shows the AWS S3 info messages, including AWS_CA_BUNDLE_PATH loading)
+    s3.init_logging("info")
+
+    # turn on debug‑level logs (shows AWS S3 SDK info + debug messages)
+    #s3.init_logging("debug")
+```
 
 ## Constants
 
