@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]      # cdylib → Python wheel, rlib → normal 
 features = ["extension-module"]
 
 [[bin]]
-name = "s3dlio-cli"
+name = "s3-cli"
 path = "src/bin/cli.rs"
 
 [dependencies]

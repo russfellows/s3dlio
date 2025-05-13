@@ -1,7 +1,7 @@
 # How to Guide
 
 ## S3 Rust Library and CLI
-This guide shows how to use the Rust library, which supports both a compiled command line interface executable called `s3Rust-cli` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import s3dlio as s3` and used by Python programs.
+This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import dlio_s3_rust as s3` and used by Python programs.
 
 ### Purpose
 The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The five primary operations for S3 are included: Get, Put, List, Delete, and Create-Bucket.  Note that bucket creation currently occurs only as part of a Put operation.  
@@ -127,35 +127,26 @@ root@loki-node3:/app#
 
 # Using the Rust CLI
 If you built this project locally, outside a container, you will have to install the executable, or provide the path to its location, which by default is in the "./target/release" directory.
-If running in the container, the Rust executable is in your path.  A  ```which s3dlio-cli``` shows its location:
+If running in the container, the Rust executable is in your path.  A  ```which s3-cli``` shows its location:
 
 ```
-root@loki-node3:/app# which s3dlio-cli
-/usr/local/bin/s3Rust-cli
+root@loki-node3:/app# which s3-cli
+/usr/local/bin/s3-cli
 ```
 
 Running the command without any arguments shows the usage:
 
 ```
-root@loki-node3:/app# s3dlio-cli                          
-Usage: s3Rust-cli <COMMAND>
+root@loki-node3:/app# s3-cli                           
+Usage: s3-cli <COMMAND>
 
 Commands:
   list    List keys that start with the given prefix
   get     Download one or many objects
   delete  Delete one object or every object that matches the prefix
   put     Upload one or more objects concurrently, uses ObjectType format filled with random data
-  help    Print this message or the help of the given subcommand(s)
-
-Options:
-root@loki-node3:/app# s3dlio-cli                           
-Usage: s3Rust-cli <COMMAND>
-
-Commands:
-  list    List keys that start with the given prefix
-  get     Download one or many objects
-  delete  Delete one object or every object that matches the prefix
-  put     Upload one or more objects concurrently, uses ObjectType format filled with random data
+  upload    Upload local files (PUT, but from disk not RAM)
+  download  Download object(s) → directory
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -170,10 +161,10 @@ root@loki-node3:/app#
 First is an example of getting help for the `get` subcommand:
 
 ```
-root@loki-node3:/app# s3Rust-cli get --help 
+root@loki-node3:/app# s3-cli get --help 
 Download one or many objects
 
-Usage: s3Rust-cli get [OPTIONS] <URI>
+Usage: s3-cli get [OPTIONS] <URI>
 
 Arguments:
   <URI>  S3 URI – can be a full key or a prefix ending with `/`
@@ -187,10 +178,10 @@ Options:
 Next is an example of help for the `put` subcommand:
 
 ```
-root@loki-node3:/app# s3dlio-cli put --help
+root@loki-node3:/app# s3-cli put --help
 Upload one or more objects concurrently, uses ObjectType format filled with random data
 
-Usage: s3dlio-cli put [OPTIONS] <URI_PREFIX>
+Usage: s3-cli put [OPTIONS] <URI_PREFIX>
 
 Arguments:
   <URI_PREFIX>  S3 URI prefix (e.g. s3://bucket/prefix)
@@ -208,10 +199,10 @@ Options:
 
 
 ### Additional CLI Examples
-Here are several examples of running the `s3dlio-cli` command:
+Here are several examples of running the ```s3-cli``` command:
 
 ```
-root@loki-node3:/app# s3dlio-cli list s3://my-bucket4/
+root@loki-node3:/app# s3-cli list s3://my-bucket4/
 ...
 /russ-test3-989.obj
 /russ-test3-99.obj
@@ -230,25 +221,26 @@ Total objects: 1200
 ```
 #### Example Delete command and List
 ```
-root@loki-node3:/app# s3dlio-cli delete s3://my-bucket4/
+root@loki-node3:/app# s3-cli delete s3://my-bucket4/
 Deleting 1200 objects…
 Done.
-root@loki-node3:/app# s3dlio-cli list s3://my-bucket4/
+root@loki-node3:/app# s3-cli list s3://my-bucket4/
 
 Total objects: 0
 ```
 #### Example put and then delete to cleanup
 Note: This use of put only uses a single set of braces `{}` , and will thus each object will have only the object number, and not the total number in the name:
 ```
-root@loki-node3:/app# s3dlio-cli put -c -n 1200 -t russ-test3-{}.obj s3://my-bucket4/
+root@loki-node3:/app# s3-cli put -c -n 1200 -t russ-test3-{}.obj s3://my-bucket4/
 Uploaded 1200 objects (total 25165824000 bytes) in 7.607254643s (157.74 objects/s, 3154.88 MB/s)
 
 root@loki-node3:/app# 
-root@loki-node3:/app# s3dlio-cli get -j 32 s3://my-bucket4/
+root@loki-node3:/app# s3-cli get -j 32 s3://my-bucket4/
 Fetching 1200 objects with 32 jobs…
 downloaded 24000.00 MB in 4.345053775s (5523.52 MB/s)
 
-root@loki-node3:/app# s3dlio-cli delete s3://my-bucket4/
+root@loki-node3:/app# s3-cli delete s3://my-bucket4/
+
 Deleting 1200 objects…
 Done.
 root@loki-node3:/app#

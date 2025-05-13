@@ -148,7 +148,7 @@ pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
 // Download (GET) operations
 // -----------------------------------------------------------------------------
 /// Download a single object from S3 (bucket/key).
-async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
+pub async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
     let client = aws_s3_client()?;
     let resp = client.get_object().bucket(bucket).key(key)
         .send().await.context("get_object failed")?;
@@ -214,16 +214,17 @@ pub fn put_objects_with_random_data_and_type(
     put_objects_parallel(&uris, &buffer, max_in_flight)
 }
 
-// -----------------------------------------------------------------------------
-// Internal helpers (private)
-// -----------------------------------------------------------------------------
-async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
+/// Upload an object
+pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
     let client = aws_s3_client()?;
     let body = ByteStream::from(data.to_vec());
     client.put_object().bucket(bucket).key(key).body(body).send().await?;
     Ok(())
 }
 
+// -----------------------------------------------------------------------------
+// Internal helpers (private)
+// -----------------------------------------------------------------------------
 
 pub(crate) fn put_objects_parallel(uris: &[String], data: &[u8], max_in_flight: usize) -> Result<()> {
     block_on(async {
