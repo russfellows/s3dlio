@@ -23,6 +23,8 @@ use crate::s3_utils::{
     parse_s3_uri, put_objects_with_random_data_and_type, ObjectType, DEFAULT_OBJECT_SIZE,
 };
 
+use crate::s3_copy::{upload_files, download_objects};
+
 // ---------------------------------------------------------------------------
 // Error helper ----------------------------------------------------------------
 fn py_err<E: std::fmt::Display>(e: E) -> PyErr { PyRuntimeError::new_err(e.to_string()) }

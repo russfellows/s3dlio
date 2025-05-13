@@ -5,16 +5,20 @@
 //!
 //! Examples:
 //! ```bash
-//! s3Rust-cli list   s3://bucket/prefix/
-//! s3Rust-cli get    s3://bucket/key.npz           # single
-//! s3Rust-cli get    s3://bucket/prefix/ -j 128    # many
-//! s3Rust-cli delete s3://bucket/prefix/           # delete all under prefix
-//! s3Rust-cli put    s3://bucket/key               # put one or more object
+//! s3Rust-cli list        s3://bucket/prefix/
+//! s3Rust-cli get         s3://bucket/key.npz           # single
+//! s3Rust-cli get         s3://bucket/prefix/ -j 128    # many
+//! s3Rust-cli delete      s3://bucket/prefix/           # delete all under prefix
+//! s3Rust-cli put         s3://bucket/key               # put one or more object
+//! s3Rust-cli upload      local-file s3://bucket/key    # upload one or more objects
+//! s3Rust-cli download    s3://bucket/key local-file    # download  one or more object
+//! s3Rust-cli put         s3://bucket/key               # put one or more object
 //! ```
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Instant;
 use log::LevelFilter;
 
@@ -24,7 +28,7 @@ use s3dlio::{
     put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
 };
 
-
+use s3dlio::s3_copy::{upload_files, download_objects};
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -102,6 +106,27 @@ enum Command {
         #[arg(short = 't', long = "template", default_value = "object_{}_of_{}.dat")]
         template: String,
     },
+    /// Upload local files (PUT, but from disk not RAM)
+    Upload {
+        /// S3 prefix **ending with '/'**
+        dest: String,
+        /// One or more local files / globs
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        #[arg(short, long, default_value_t = 32)]
+        jobs: usize,
+        #[arg(short = 'c', long)]
+        create_bucket: bool,
+    },
+    /// Download object(s) → directory
+    Download {
+        /// S3 URI (full key or prefix)
+        src: String,
+        /// Local directory
+        dest_dir: PathBuf,
+        #[arg(short, long, default_value_t = 64)]
+        jobs: usize,
+    },
 }
 
 
@@ -145,8 +170,18 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Command::List { uri } => list_cmd(&uri),
+
         Command::Get { uri, jobs } => get_cmd(&uri, jobs),
+
         Command::Delete { uri, jobs } => delete_cmd(&uri, jobs),
+
+        Command::Upload{dest, files, jobs, create_bucket} => {
+            upload_files(&dest, &files, jobs, create_bucket)
+        }
+
+        Command::Download{src, dest_dir, jobs} => {
+            download_objects(&src, &dest_dir, jobs)
+        }
 
         Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type } => {
             let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
@@ -155,12 +190,10 @@ fn main() -> Result<()> {
                     eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
                 }
             }
-            // No longer need to parse obj_type into ObjecType enum
-            //let obj_type = s3dlio::ObjectType::from(object_type.as_str());
             
             put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type)
 
-        },
+        }
     }
 }
 

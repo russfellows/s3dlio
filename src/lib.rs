@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 
 // Local files to use
 pub mod s3_client;
+pub mod s3_copy;
 pub mod s3_utils;
 pub mod data_gen;
 
