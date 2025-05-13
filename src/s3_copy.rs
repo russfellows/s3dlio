@@ -4,7 +4,9 @@ use anyhow::{bail, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use std::{fs, path::Path, sync::Arc};
+use glob::glob;
+use regex::Regex;
+use std::{fs, path::{Path}, sync::Arc};
 use tokio::{fs as async_fs, runtime::Runtime, sync::Semaphore};
 
 use crate::s3_utils::{
@@ -16,12 +18,12 @@ use crate::s3_utils::{
 // Will upload local files → S3  &  download S3 → local files
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Upload a list of local files into `s3://bucket/prefix/…`,
+/// Upload local files (supports globs) into `s3://bucket/prefix/…`,
 /// streaming each file off disk with up to `max_in_flight` tasks.
 /// If `do_create_bucket` is true, we attempt to create the bucket first.
 pub fn upload_files<P: AsRef<Path>>(  
     dest_prefix: &str,
-    paths: &[P],
+    patterns: &[P],
     max_in_flight: usize,
     do_create_bucket: bool,
 ) -> Result<()> {
@@ -29,6 +31,25 @@ pub fn upload_files<P: AsRef<Path>>(
     // Allow empty prefix (bucket root) or a non-empty prefix that ends with '/'
     if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
         bail!("dest_prefix must end with '/' if specifying a non-root prefix");
+    }
+
+    // Expand globs and single paths
+    let mut paths = Vec::new();
+    for pat in patterns {
+        let s = pat.as_ref().to_string_lossy();
+        if s.contains('*') || s.contains('?') {
+            for entry in glob(&s)? {
+                match entry {
+                    Ok(pb) => paths.push(pb),
+                    Err(e) => log::warn!("Glob error for pattern {}: {}", s, e),
+                }
+            }
+        } else {
+            paths.push(pat.as_ref().to_path_buf());
+        }
+    }
+    if paths.is_empty() {
+        bail!("No files matched for upload");
     }
 
     if do_create_bucket {
@@ -48,26 +69,24 @@ pub fn upload_files<P: AsRef<Path>>(
         dest_prefix,
         effective_jobs
     );
-    // DEBUG: details of create_bucket and original limit
-    log::debug!("upload_files debug: create_bucket={}, requested_jobs={}",
-        do_create_bucket, max_in_flight);
+    // DEBUG: details of create_bucket and requested jobs
+    log::debug!(
+        "upload_files debug: create_bucket={}, requested_jobs={}",
+        do_create_bucket,
+        max_in_flight
+    );
 
     let sem = Arc::new(Semaphore::new(effective_jobs));
     let result = rt.block_on(async {
         let mut futs = FuturesUnordered::new();
-        for p in paths {
-            log::debug!("queueing upload for {:?}", p.as_ref());
+        for path in paths.clone() {
+            log::debug!("queueing upload for {:?}", path);
             let sem = sem.clone();
             let bucket = bucket.clone();
-            let key = {
-                let fname = p
-                    .as_ref()
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("Bad path {:?}", p.as_ref()))?
-                    .to_string_lossy();
-                format!("{}{}", key_prefix, fname)
-            };
-            let path = p.as_ref().to_path_buf();
+            let fname = path.file_name()
+                .ok_or_else(|| anyhow::anyhow!("Bad path {:?}", path))?
+                .to_string_lossy();
+            let key = format!("{}{}", key_prefix, fname);
 
             futs.push(tokio::spawn(async move {
                 log::debug!("starting upload of {:?} → s3://{}/{}", path, bucket, key);
@@ -97,19 +116,40 @@ pub fn upload_files<P: AsRef<Path>>(
     result
 }
 
-/// Download one key or every key under a prefix into `dest_dir/`,
+/// Download one key, every key under a prefix, or glob/regex-match objects into `dest_dir/`,
 /// creating files with their original basenames, up to `max_in_flight` at once.
 pub fn download_objects(
     src_uri: &str,
     dest_dir: &Path,
     max_in_flight: usize,
 ) -> Result<()> {
-    let (bucket, key) = parse_s3_uri(src_uri)?;
-    let keys = if key.ends_with('/') || key.is_empty() {
-        list_objects(&bucket, &key)?
+    let (bucket, key_pattern) = parse_s3_uri(src_uri)?;
+
+    // Determine keys to fetch: glob ('*' or '?'), prefix, or exact
+    let keys = if key_pattern.contains('*') || key_pattern.contains('?') {
+        let (prefix, pattern) = if let Some(pos) = key_pattern.rfind('/') {
+            (&key_pattern[..=pos], &key_pattern[pos+1..])
+        } else {
+            ("", key_pattern.as_str())
+        };
+        let all = list_objects(&bucket, prefix)?;
+        let mut regex_pat = regex::escape(pattern)
+            .replace("\\*", ".*")
+            .replace("\\?", ".");
+        regex_pat = format!("^{}$", regex_pat);
+        let re = Regex::new(&regex_pat)?;
+        all.into_iter()
+            .filter(|k| re.is_match(k.rsplit('/').next().unwrap_or(k)))
+            .collect::<Vec<_>>()
+    } else if key_pattern.ends_with('/') || key_pattern.is_empty() {
+        list_objects(&bucket, &key_pattern)?
     } else {
-        vec![key]
+        vec![key_pattern.clone()]
     };
+
+    if keys.is_empty() {
+        bail!("No objects matched for download");
+    }
 
     // sync—make sure the dir exists
     fs::create_dir_all(dest_dir)?;
