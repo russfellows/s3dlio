@@ -9,7 +9,7 @@ The purpose of this library is to enable testing of S3 storage via both a cli an
 For ease of testing, both the cli and library may be built into a container as well.  The Rust source code is removed from this container in order to reduce its size.  
 
 ### Plan for Publishing
-In the near future, the Python library `dlio_s3_rust` will be published on PyPi for distribution.  The compiled Rust executable and Python wheel files are already published on GitHub and are availble under the release section of this project.  
+In the near future, the Python library `s3dlio` will be published on PyPi for distribution.  The compiled Rust executable and Python wheel files are already published on GitHub and are availble under the release section of this project.  
 
 # How to Build
 In order to build this project, you can build the code and libraries and use them directly. 
@@ -38,7 +38,7 @@ Either docker or podman may be used to create the image, typically with a `podma
 
 In order to pull the container using docker, you may execute the following:
 ```
-docker pull quay.io/russfellows-sig65/dealio_s3_rust
+docker pull quay.io/russfellows-sig65/s3dlio
 ```
 
 ### Running Container
@@ -52,7 +52,7 @@ README.md  dlio_s3_test3.py  target  test_all_dlio_s3.py
 root@loki-node3:/app# which python
 /app/.venv/bin/python
 root@loki-node3:/app# python --version
-Python 3.13.2
+Python 3.12.8
 ```
 
 # S3 Access
@@ -137,19 +137,6 @@ root@loki-node3:/app# which s3-cli
 Running the command without any arguments shows the usage:
 
 ```
-root@loki-node3:/app# s3-cli                           
-Usage: s3-cli <COMMAND>
-
-Commands:
-  list    List keys that start with the given prefix
-  get     Download one or many objects
-  delete  Delete one object or every object that matches the prefix
-  put     Upload one or more objects concurrently, uses ObjectType format filled with random data
-  upload    Upload local files (PUT, but from disk not RAM)
-  download  Download object(s) → directory
-  help    Print this message or the help of the given subcommand(s)
-
-Options:
 root@loki-node3:/app# s3-cli                           
 Usage: s3-cli <COMMAND>
 
@@ -253,6 +240,7 @@ Fetching 1200 objects with 32 jobs…
 downloaded 24000.00 MB in 4.345053775s (5523.52 MB/s)
 
 root@loki-node3:/app# s3-cli delete s3://my-bucket4/
+
 Deleting 1200 objects…
 Done.
 root@loki-node3:/app#
