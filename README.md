@@ -1,7 +1,7 @@
 # How to Guide
 
 ## S3 Rust Library and CLI
-This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import dlio_s3_rust as s3` and used by Python programs.
+This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import s3dlio as s3` and used by Python programs.
 
 ### Purpose
 The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The five primary operations for S3 are included: Get, Put, List, Delete, and Create-Bucket.  Note that bucket creation currently occurs only as part of a Put operation.  
@@ -141,13 +141,13 @@ root@loki-node3:/app# s3-cli
 Usage: s3-cli <COMMAND>
 
 Commands:
-  list    List keys that start with the given prefix
-  get     Download one or many objects
-  delete  Delete one object or every object that matches the prefix
-  put     Upload one or more objects concurrently, uses ObjectType format filled with random data
+  list      List keys that start with the given prefix
+  get       Download one or many objects
+  delete    Delete one object or every object that matches the prefix
+  put       Upload one or more objects concurrently, uses ObjectType format filled with random data
   upload    Upload local files (PUT, but from disk not RAM)
   download  Download object(s) → directory
-  help    Print this message or the help of the given subcommand(s)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -v, --verbose...  Increase log verbosity: -v = Info, -vv = Debug
