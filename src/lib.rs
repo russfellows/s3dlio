@@ -35,6 +35,8 @@ use python_api::{
     delete,
     read_npz,
     init_logging,
+    upload,
+    download,
     // asynchronous
     put_async_py,
     get_many_async_py,
@@ -71,6 +73,8 @@ pub fn s3dlio(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(read_npz, m)?)?;
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(upload, m)?)?;
+    m.add_function(wrap_pyfunction!(download, m)?)?;
 
     // async wrappers
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;

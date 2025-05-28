@@ -3203,6 +3203,7 @@ dependencies = [
  "futures",
  "hdf5-metno",
  "hdf5-metno-sys",
+ "glob",
  "hyper 1.6.0",
  "hyper-rustls 0.27.5",
  "io",
