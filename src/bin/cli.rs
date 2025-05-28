@@ -53,15 +53,6 @@ enum Command {
         /// S3 URI (e.g. s3://bucket/prefix/)
         uri: String,
     },
-    /// Download one or many objects concurrently.
-    Get {
-        /// S3 URI – can be a full key or a prefix ending with `/`.
-        uri: String,
-        
-        /// Maximum concurrent GET requests.
-        #[arg(short = 'j', long = "jobs", default_value_t = 64)]
-        jobs: usize,
-    },
     /// Delete one object or every object that matches the prefix.
     Delete {
         /// S3 URI (single key or prefix ending with `/`).
@@ -69,6 +60,15 @@ enum Command {
 
         /// Batch size (number of parallel delete calls).
         #[arg(short = 'j', long = "jobs", default_value_t = 1000)]
+        jobs: usize,
+    },
+    /// Download one or many objects concurrently.
+    Get {
+        /// S3 URI – can be a full key or a prefix ending with `/`.
+        uri: String,
+        
+        /// Maximum concurrent GET requests.
+        #[arg(short = 'j', long = "jobs", default_value_t = 64)]
         jobs: usize,
     },
     /// Upload one or more objects concurrently, uses ObjectType format filled with random data.
@@ -108,25 +108,28 @@ enum Command {
         #[arg(short = 'x', long = "compress", default_value_t = 1)]
         compress_f: usize,
     },
-    /// Upload local files to S3 (uses globbing for pattern match)
+    /// Upload local files (supports glob patterns) to S3, concurrently to jobs
     Upload {
-        /// S3 prefix **ending with '/'**
-        dest: String,
-        /// One or more local files / globs
+        /// One or more local files or glob patterns ('*' and '?')
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        #[arg(short, long, default_value_t = 32)]
+        /// S3 prefix **ending with '/'**
+        dest: String,
+        /// Maximum parallel uploads
+        #[arg(short = 'j', long = "jobs", default_value_t = 32)]
         jobs: usize,
-        #[arg(short = 'c', long)]
+        /// Create the bucket if it doesn’t exist
+        #[arg(short = 'c', long = "create-bucket")]
         create_bucket: bool,
     },
     /// Download object(s) to named directory (uses globbing pattern match)
     Download {
-        /// S3 URI (full key or prefix)
+        /// S3 URI – can be a full key or prefix/glob with '*' or '?'.
         src: String,
-        /// Local directory
+        /// Local directory to write into
         dest_dir: PathBuf,
-        #[arg(short, long, default_value_t = 64)]
+        /// Maximum parallel downloads
+        #[arg(short = 'j', long = "jobs", default_value_t = 64)]
         jobs: usize,
     },
 }
@@ -177,11 +180,11 @@ fn main() -> Result<()> {
 
         Command::Delete { uri, jobs } => delete_cmd(&uri, jobs),
 
-        Command::Upload{dest, files, jobs, create_bucket} => {
+        Command::Upload { files, dest, jobs, create_bucket } => {
             upload_files(&dest, &files, jobs, create_bucket)
         }
 
-        Command::Download{src, dest_dir, jobs} => {
+        Command::Download { src, dest_dir, jobs } => {
             download_objects(&src, &dest_dir, jobs)
         }
 

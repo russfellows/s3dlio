@@ -15,6 +15,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3_asyncio::tokio as aio;
 use tokio::task;
 
+use std::path::PathBuf;
 use log::LevelFilter;
 use env_logger;
 
@@ -73,6 +74,32 @@ pub fn put(
     py.allow_threads(|| {
         if should_create_bucket { let _ = create_bucket(&bucket); }
         put_objects_with_random_data_and_type(&uris, sz, jobs, obj).map_err(py_err)
+    })
+}
+
+ // ---------------------------------------------------------------------------
+ // UPLOAD (sync) -------------------------------------------------------------
+ #[pyfunction]
+#[pyo3(signature = (
+    src_patterns,     // list of local paths or glob patterns
+    dest_prefix,      // S3 URI (must end with `/` or empty)
+    max_in_flight = 32,
+    create_bucket = false
+))]
+pub fn upload(
+    py: Python<'_>,
+    src_patterns: Vec<&str>,
+    dest_prefix: &str,
+    max_in_flight: usize,
+    create_bucket: bool,
+) -> PyResult<()> {
+    // expand to Vec<PathBuf>
+    let paths: Vec<PathBuf> = src_patterns.into_iter()
+        .map(PathBuf::from)
+        .collect();
+    py.allow_threads(|| {
+        upload_files(dest_prefix, &paths, max_in_flight, create_bucket)
+            .map_err(py_err)
     })
 }
 
@@ -178,6 +205,28 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
     let bytes = get_object_uri(uri).map_err(py_err)?;
     Ok(PyBytes::new(py, &bytes).into_py(py))
 }
+
+// ---------------------------------------------------------------------------
+// DOWNLOAD (sync) -----------------------------------------------------------
+#[pyfunction]
+#[pyo3(signature = (
+    src_uri,        // single key, prefix, or glob
+    dest_dir,       // local directory
+    max_in_flight = 64
+))]
+pub fn download(
+    py: Python<'_>,
+    src_uri: &str,
+    dest_dir: &str,
+    max_in_flight: usize,
+) -> PyResult<()> {
+    let dir = PathBuf::from(dest_dir);
+    py.allow_threads(|| {
+        download_objects(src_uri, &dir, max_in_flight)
+            .map_err(py_err)
+    })
+}
+
 
 // ---------------------------------------------------------------------------
 // GET‑many **stats** (async)
@@ -327,6 +376,8 @@ pub fn _pymod(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(list, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(upload, m)?)?;
+    m.add_function(wrap_pyfunction!(download, m)?)?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
     m.add_function(wrap_pyfunction!(get_many, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats_async, m)?)?;
