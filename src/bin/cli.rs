@@ -106,7 +106,7 @@ enum Command {
         #[arg(short = 't', long = "template", default_value = "object_{}_of_{}.dat")]
         template: String,
     },
-    /// Upload local files (PUT, but from disk not RAM)
+    /// Upload local files to S3 (uses globbing for pattern match)
     Upload {
         /// S3 prefix **ending with '/'**
         dest: String,
@@ -118,7 +118,7 @@ enum Command {
         #[arg(short = 'c', long)]
         create_bucket: bool,
     },
-    /// Download object(s) → directory
+    /// Download object(s) to named directory (uses globbing pattern match)
     Download {
         /// S3 URI (full key or prefix)
         src: String,

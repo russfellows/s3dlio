@@ -7,7 +7,7 @@
 
 
 use anyhow::{bail, Context, Result};
-use clap::ValueEnum;
+//use clap::ValueEnum;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
@@ -16,8 +16,12 @@ use pyo3::{FromPyObject, PyAny, PyResult};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+use log::{info, debug};
+
 // data generation helpers
-use crate::data_gen::{generate_npz, generate_tfrecord, generate_hdf5, generate_raw_data};
+//use crate::data_gen::{generate_npz, generate_tfrecord, generate_hdf5, generate_raw_data};
+use crate::data_gen::{generate_object};
+use crate::config::Config;
 
 // S3 client creation
 use crate::s3_client::{aws_s3_client, block_on};
@@ -30,6 +34,9 @@ pub const DEFAULT_OBJECT_SIZE: usize = 20 * 1024 * 1024;
 // -----------------------------------------------------------------------------
 // ObjectType enum for typed data generation
 // -----------------------------------------------------------------------------
+/*
+ * Note: ObjectType enum moved into src/config.rs
+ *
 #[derive(Clone, Copy, Debug, ValueEnum)]
 #[clap(rename_all = "UPPERCASE")] // CLI shows NPZ, TFRECORD, HDF5, RAW
 pub enum ObjectType {
@@ -38,6 +45,7 @@ pub enum ObjectType {
     Hdf5,
     Raw,
 }
+*/
 
 impl From<&str> for ObjectType {
     fn from(s: &str) -> Self {
@@ -57,6 +65,7 @@ impl<'source> FromPyObject<'source> for ObjectType {
     }
 }
 
+use crate::config::ObjectType;
 
 // -----------------------------------------------------------------------------
 // S3 URI helpers
@@ -153,6 +162,8 @@ pub async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
     let resp = client.get_object().bucket(bucket).key(key)
         .send().await.context("get_object failed")?;
     let data = resp.body.collect().await.context("collect body failed")?.into_bytes();
+
+    info!("S3 GET s3://{}/{} ", bucket, key);
     Ok(data.to_vec())
 }
 
@@ -200,6 +211,9 @@ async fn get_object_uri_async(uri: &str) -> Result<Vec<u8>> {
 // -----------------------------------------------------------------------------
 // Typed PUT operations
 // -----------------------------------------------------------------------------
+/*
+ * Old version
+ *
 /// Upload each URI with a buffer chosen by `object_type`.
 pub fn put_objects_with_random_data_and_type(
     uris: &[String], size: usize, max_in_flight: usize,
@@ -213,11 +227,46 @@ pub fn put_objects_with_random_data_and_type(
     };
     put_objects_parallel(&uris, &buffer, max_in_flight)
 }
+*/
+
+// Updated version, that uses our object_type
+/// Upload each URI with a buffer chosen by `object_type`.
+pub fn put_objects_with_random_data_and_type(
+    uris: &[String],
+    size: usize,
+    max_in_flight: usize,
+    object_type: ObjectType,
+) -> Result<()> {
+    /* build a tiny config just for data generation */
+
+    info!(
+        "put_objects: type={:?}, size={} bytes, uris={} parallelism={}",
+        object_type,
+        size,
+        uris.len(),
+        max_in_flight
+    );
+
+    let cfg = Config {
+        object_type,
+        elements: 1,                // 1 record
+        element_size: size,         // whole buffer is the record
+        use_controlled: false,
+        dedup_factor: 1,
+        compress_factor: 1,
+    };
+
+    let buffer = generate_object(&cfg)?;
+    debug!("Uploading buffer of {} bytes to {} URIs", buffer.len(), uris.len());
+    put_objects_parallel(&uris, &buffer, max_in_flight)
+}
 
 /// Upload an object
 pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
     let client = aws_s3_client()?;
     let body = ByteStream::from(data.to_vec());
+    info!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
+
     client.put_object().bucket(bucket).key(key).body(body).send().await?;
     Ok(())
 }

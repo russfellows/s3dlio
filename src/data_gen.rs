@@ -3,10 +3,17 @@
 // Copyright, 2025.  Signal65 / Futurum Group.
 // 
 
+//use anyhow::{Result, bail};
+
 use once_cell::sync::Lazy;
 use rand::Rng;
 use rayon::prelude::*;
 use std::sync::Arc;
+use log::{info, debug};
+
+use crate::data_formats::{build_npz, build_hdf5, build_tfrecord, build_raw};
+use crate::config::Config;
+use crate::config::ObjectType;
 
 // -----------------------------------------------------------------------------
 // Generate a buffer of random bytes.
@@ -32,6 +39,53 @@ static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
     block
 });
 
+// -------------------------------------------------------------
+// Public API to generate a specific object type, of a given size
+// -------------------------------------------------------------
+/// A function to build objects in the correct format
+pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
+    // create the payload once
+    //
+    let total_bytes = cfg.elements * cfg.element_size;
+    info!(
+        "Generating object: type={:?}, elements={}, element_size={} bytes, total_bytes={}",
+        cfg.object_type, cfg.elements, cfg.element_size, total_bytes
+    );
+    let data = if cfg.use_controlled {
+        debug!("Using controlled data: dedup={}, compress={}", 
+            cfg.dedup_factor, cfg.compress_factor
+        );
+        generate_controlled_data(total_bytes, cfg.dedup_factor, cfg.compress_factor)
+    } else {
+        debug!("Using generic random data");
+        generate_random_data(total_bytes)
+    };
+
+    // Old
+    /*
+     * let object: Bytes = match cfg.format.as_str() {
+        "NPZ"      => build_npz(cfg.elements, cfg.element_size, &data)?,
+        "HDF5"     => build_hdf5(cfg.elements, cfg.element_size, &data)?,
+        "TFRecord" => build_tfrecord(cfg.elements, cfg.element_size, &data)?,
+        "RAW"      => build_raw(&data)?,                                    // raw passthrough
+    };
+    */
+
+    // New, uses type
+    let object = match cfg.object_type {
+        ObjectType::Npz      => build_npz(cfg.elements, cfg.element_size, &data)?,
+        ObjectType::Hdf5     => build_hdf5(cfg.elements, cfg.element_size, &data)?,
+        ObjectType::TfRecord => build_tfrecord(cfg.elements, cfg.element_size, &data)?,
+        ObjectType::Raw      => build_raw(&data)?,
+    };
+
+    debug!("Generated paylod: {} bytes", object.len());
+    Ok(object)
+}
+
+/*
+ * Not used, instead we use the generate_object() function above
+ *
 // For now, each of our 4 object types just calls the same function
 pub fn generate_npz(size: usize) -> Vec<u8> {
     //generate_random_data(size)
@@ -52,6 +106,8 @@ pub fn generate_raw_data(size: usize) -> Vec<u8> {
     //generate_random_data(size)
     generate_controlled_data(size, 1, 1)
 } 
+*
+*/
 
 /// Generates a buffer of `size` random bytes by:
 /// 1. Enforcing a minimum size of BLK_SIZE bytes.
