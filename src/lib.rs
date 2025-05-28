@@ -4,6 +4,9 @@
 //
 // Crate root — public re‑exports plus the Python module glue.
 
+pub mod data_formats;
+pub mod config;
+
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
 
@@ -49,8 +52,9 @@ pub use s3_utils::{
     delete_objects,
     put_objects_with_random_data_and_type,
     DEFAULT_OBJECT_SIZE,
-    ObjectType,
 };
+
+pub use crate::config::ObjectType;
 
 // ---------------------------------------------------------------------------
 // PyO3 module init -----------------------------------------------------------

@@ -114,7 +114,7 @@ enum Command {
         #[arg(short = 'c', long = "create-bucket")]
         create_bucket: bool,
     },
-    /// Download object(s) → directory, with glob patterns, concurrently
+    /// Download object(s) to named directory (uses globbing pattern match)
     Download {
         /// S3 URI – can be a full key or prefix/glob with '*' or '?'.
         src: String,
