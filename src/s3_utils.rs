@@ -211,23 +211,6 @@ async fn get_object_uri_async(uri: &str) -> Result<Vec<u8>> {
 // -----------------------------------------------------------------------------
 // Typed PUT operations
 // -----------------------------------------------------------------------------
-/*
- * Old version
- *
-/// Upload each URI with a buffer chosen by `object_type`.
-pub fn put_objects_with_random_data_and_type(
-    uris: &[String], size: usize, max_in_flight: usize,
-    object_type: ObjectType,
-) -> Result<()> {
-    let buffer = match object_type {
-        ObjectType::Npz      => generate_npz(size),
-        ObjectType::TfRecord => generate_tfrecord(size),
-        ObjectType::Hdf5     => generate_hdf5(size),
-        ObjectType::Raw      => generate_raw_data(size),
-    };
-    put_objects_parallel(&uris, &buffer, max_in_flight)
-}
-*/
 
 // Updated version, that uses our object_type
 /// Upload each URI with a buffer chosen by `object_type`.
@@ -236,6 +219,8 @@ pub fn put_objects_with_random_data_and_type(
     size: usize,
     max_in_flight: usize,
     object_type: ObjectType,
+    dedup_factor: usize,
+    compress_factor: usize,
 ) -> Result<()> {
     /* build a tiny config just for data generation */
 
@@ -251,9 +236,10 @@ pub fn put_objects_with_random_data_and_type(
         object_type,
         elements: 1,                // 1 record
         element_size: size,         // whole buffer is the record
-        use_controlled: false,
-        dedup_factor: 1,
-        compress_factor: 1,
+        use_controlled: dedup_factor != 1 || compress_factor != 1,  // We use controlled data if
+                                                                    // dedup or compress are set 
+        dedup_factor,
+        compress_factor,
     };
 
     let buffer = generate_object(&cfg)?;
