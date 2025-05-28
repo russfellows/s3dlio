@@ -33,7 +33,7 @@ use s3dlio::s3_copy::{upload_files, download_objects};
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Cli {
-    // New, counts the number of v's
+    /// Turn on verbose (info‑level) logging New, counts the number of v's
     #[arg(short = 'v', 
         long, 
         action = ArgAction::Count,
@@ -79,6 +79,10 @@ enum Command {
         /// Optionally create the bucket if it does not exist.
         #[arg(short = 'c', long = "create-bucket", action)]
         create_bucket_flag: bool,
+
+        /// Deduplication factor (integer ≥1). 1 => fully unique.
+        #[arg(short = 'd', long = "dedup", default_value_t = 1)]
+        dedup_f: usize,
        
         /// Maximum concurrent uploads (jobs), but is modified to be min(jobs, num).
         #[arg(short = 'j', long = "jobs", default_value_t = 32)]
@@ -99,6 +103,10 @@ enum Command {
         /// Template for names. Use '{}' for replacement, first '{}' is object number, 2nd is total count.
         #[arg(short = 't', long = "template", default_value = "object_{}_of_{}.dat")]
         template: String,
+
+        /// Compression factor (integer ≥1). 1 => fully random.
+        #[arg(short = 'x', long = "compress", default_value_t = 1)]
+        compress_f: usize,
     },
     /// Upload local files (supports glob patterns) to S3, concurrently to jobs
     Upload {
@@ -180,7 +188,7 @@ fn main() -> Result<()> {
             download_objects(&src, &dest_dir, jobs)
         }
 
-        Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type } => {
+        Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f } => {
             let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
             if create_bucket_flag {
                 if let Err(e) = s3dlio::s3_utils::create_bucket(&bucket) {
@@ -188,7 +196,7 @@ fn main() -> Result<()> {
                 }
             }
             
-            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type)
+            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f)
 
         }
     }
@@ -351,7 +359,7 @@ fn delete_cmd(uri: &str, _jobs: usize) -> Result<()> {
 
 
 /// Put command supports 1 or more objects, also takes our ObjectType
-fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType) -> Result<()> {
+fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize) -> Result<()> {
     // Parse the prefix into bucket and key prefix.
     let (bucket, mut prefix) = parse_s3_uri(uri_prefix)?;
     if !prefix.ends_with('/') {
@@ -374,7 +382,7 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
     let effective_jobs = std::cmp::min(jobs, num);
     let t0 = Instant::now();
 
-    put_objects_with_random_data_and_type(&uris, size, effective_jobs, object_type)?;
+    put_objects_with_random_data_and_type(&uris, size, effective_jobs, object_type, dedup_f, compress_f)?;
 
     let elapsed = t0.elapsed();
     let total_bytes = num * size;
