@@ -55,7 +55,9 @@ fn str_to_obj(s: &str) -> ObjectType { ObjectType::from(s) }
     max_in_flight = 32,
     size = None,
     should_create_bucket = false,
-    object_type = "RAW"
+    object_type = "RAW",
+    dedup_factor = 1,
+    compress_factor = 1
 ))]
 pub fn put(
     py: Python<'_>,
@@ -66,6 +68,8 @@ pub fn put(
     size: Option<usize>,
     should_create_bucket: bool,
     object_type: &str,
+    dedup_factor: usize,
+    compress_factor: usize,
 ) -> PyResult<()> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let (bucket, uris) = build_uri_list(prefix, template, num)?;
@@ -73,7 +77,7 @@ pub fn put(
     let obj = str_to_obj(object_type);
     py.allow_threads(|| {
         if should_create_bucket { let _ = create_bucket(&bucket); }
-        put_objects_with_random_data_and_type(&uris, sz, jobs, obj).map_err(py_err)
+        put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor).map_err(py_err)
     })
 }
 
@@ -113,7 +117,9 @@ pub fn upload(
     max_in_flight = 32,
     size = None,
     should_create_bucket = false,
-    object_type = "RAW"
+    object_type = "RAW",
+    dedup_factor = 1,
+    compress_factor = 1
 ))]
 pub(crate) fn put_async_py<'p>(
     py: Python<'p>,
@@ -124,6 +130,8 @@ pub(crate) fn put_async_py<'p>(
     size: Option<usize>,
     should_create_bucket: bool,
     object_type: &'p str,
+    dedup_factor: usize,
+    compress_factor: usize,
 ) -> PyResult<&'p PyAny> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let (bucket, uris) = build_uri_list(prefix, template, num)?;
@@ -134,7 +142,7 @@ pub(crate) fn put_async_py<'p>(
     aio::future_into_py(py, async move {
         let res: Result<(), PyErr> = task::spawn_blocking(move || {
             if should_create_bucket { let _ = create_bucket(&bucket); }
-            put_objects_with_random_data_and_type(&uris, sz, jobs, obj)
+            put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
         .await
@@ -146,7 +154,7 @@ pub(crate) fn put_async_py<'p>(
      * Old async IO
     aio::future_into_py(py, async move {
         if should_create_bucket { let _ = create_bucket(&bucket); }
-        put_objects_with_random_data_and_type(&uris, sz, jobs, obj)
+        put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })
     */
