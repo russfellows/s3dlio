@@ -1,7 +1,7 @@
 AWS_REGION=us-west-2
-AWS_SECRET_ACCESS_KEY=YMdL+gFfZpyPhdpmNDLJlQrprACrt/VrOopVxGTf
-AWS_ACCESS_KEY_ID=AKIATIY32AUDUM4WWLTX
+AWS_SECRET_ACCESS_KEY=***Private***
+AWS_ACCESS_KEY_ID=***Private***
 AWS_ENDPOINT_URL=https://s3.amazonaws.com
-S3_BUCKET=signal65-public
+S3_BUCKET=***Private***
 #AWS_CA_BUNDLE_PATH=./aws-root-bad-ca.pem
 AWS_CA_BUNDLE_PATH=./aws-root-ca.pem
