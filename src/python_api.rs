@@ -19,9 +19,11 @@ use std::path::PathBuf;
 use log::LevelFilter;
 use env_logger;
 
+use crate::config::ObjectType;
+
 use crate::s3_utils::{
     create_bucket, delete_objects, get_object_uri, get_objects_parallel, list_objects,
-    parse_s3_uri, put_objects_with_random_data_and_type, ObjectType, DEFAULT_OBJECT_SIZE,
+    parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
 };
 
 use crate::s3_copy::{upload_files, download_objects};
