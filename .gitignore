@@ -2,3 +2,4 @@
 .venv
 src/*.save
 src/bin/*.save
+*.zst
