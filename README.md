@@ -4,8 +4,22 @@
 This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import s3dlio as s3` and used by Python programs.
 
 ### Purpose
-The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The five primary operations for S3 are included: Get, Put, List, Delete, and Create-Bucket.  Note that bucket creation currently occurs only as part of a Put operation.  
+The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The five primary operations for S3 are included: 
+ - get
+ - put
+ - list
+ - delete
+ - create-bucket.
 
+Additionally, the cli supports commands to upload and download data.  These are:
+ - upload
+ - download
+
+These operations will respectively upload/put a local file as an object, or download/get an object as a local file.  
+
+**Note** that bucket creation currently occurs only as part of a Put operation.  
+
+### Container
 For ease of testing, both the cli and library may be built into a container as well.  The Rust source code is removed from this container in order to reduce its size.  
 
 ### Plan for Publishing
