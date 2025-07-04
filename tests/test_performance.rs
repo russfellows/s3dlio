@@ -1,7 +1,8 @@
 // tests/test_performance.rs
 //
 use std::time::Instant;
-use s3dlio::data_gen::{generate_random_data, generate_controlled_data};
+//use s3dlio::data_gen::{generate_random_data, generate_controlled_data};
+use s3dlio::data_gen::generate_controlled_data;
 
 /// Measure generate_random_data() over 100 runs of 1 GiB each.
 /// Run with: `cargo test -- --ignored --nocapture perf_random`
