@@ -1,8 +1,8 @@
 use clap::ValueEnum;
 
 /// Valid object formats.
-#[clap(rename_all = "UPPERCASE")] // CLI shows NPZ, TFRECORD, HDF5, RAW
 #[derive(Clone, Copy, Debug, ValueEnum)]
+#[clap(rename_all = "UPPERCASE")] // CLI shows NPZ, TFRECORD, HDF5, RAW
 pub enum ObjectType {
     Npz,
     TfRecord,

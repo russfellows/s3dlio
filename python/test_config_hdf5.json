@@ -1,0 +1,24 @@
+{
+    "format": "HDF5",
+    "elements_per_file": 100,
+    "element_size": 262144,
+    "file": false,
+    "s3": true,
+    "file_config": {
+      "output_path": "/tmp/datasets",
+      "index_output_path": "/tmp/datasets/index"
+    },
+    "s3_config": {
+      "bucket_name": "my-bucket2",
+      "object_prefix": "",
+      "region": "us-east-1",
+      "aws_access_key_id": "BG0XPVXISBP41DCXOQR8",
+      "aws_secret_access_key": "kGSmlMHBl0ohc/nYRtGbBx4KCfpdPN1/fLbtjUyX",
+      "endpoint_url": "http://10.9.0.21",
+      "create_bucket_if_missing": true
+    },
+    "file_name_pattern": "file_x_of_y",
+    "num_files": 1000,
+    "num_threads": 32
+}
+  
