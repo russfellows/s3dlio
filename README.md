@@ -136,6 +136,20 @@ Found 999 objects under s3://my-bucket2/my-data2/ in 0.02s
 === Sync PUT ===
 Uploaded 500 objects (10000.00 MiB) in 3.34s -> 149.66 ops/s, 2993.14 MiB/s
 
+=== Sync STAT ===
+Stat for s3://my-bucket2/test_rust_api/object_0_of_5.dat:
+  size: 20971520
+  last_modified: 2025-07-16T22:53:33Z
+  etag: "05a7bc9e4bab6974ebbb712ad54c18de"
+  content_type: application/octet-stream
+  content_language: None
+  storage_class: None
+  metadata: {}
+  version_id: None
+  replication_status: None
+  server_side_encryption: None
+  ssekms_key_id: None
+
 === Sync GET Many ===
 Fetched 500 objects (10000.00 MiB) in 7.50s -> 66.67 ops/s, 1333.49 MiB/s
 
