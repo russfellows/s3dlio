@@ -6,6 +6,7 @@
 //! Examples:
 //! ```bash
 //! s3Rust-cli list        s3://bucket/prefix/
+//! s3Rust-cli stat        s3://bucket/prefix/
 //! s3Rust-cli get         s3://bucket/key.npz           # single
 //! s3Rust-cli get         s3://bucket/prefix/ -j 128    # many
 //! s3Rust-cli delete      s3://bucket/prefix/           # delete all under prefix
@@ -25,7 +26,7 @@ use log::LevelFilter;
 // Import shared functions from the crate.
 use s3dlio::{
     delete_objects, get_object_uri, get_objects_parallel, list_objects, parse_s3_uri,
-    put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
+    stat_object_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
 };
 
 use s3dlio::s3_copy::{upload_files, download_objects};
@@ -51,6 +52,11 @@ enum Command {
     /// List keys that start with the given prefix.
     List {
         /// S3 URI (e.g. s3://bucket/prefix/)
+        uri: String,
+    },
+    /// Stat object, show size & last modify date of a single object 
+    Stat {
+        /// Full S3 URI (e.g. s3://bucket/prefix/key)
         uri: String,
     },
     /// Delete one object or every object that matches the prefix.
@@ -176,6 +182,8 @@ fn main() -> Result<()> {
     match cli.cmd {
         Command::List { uri } => list_cmd(&uri),
 
+        Command::Stat { uri } => stat_cmd(&uri),
+
         Command::Get { uri, jobs } => get_cmd(&uri, jobs),
 
         Command::Delete { uri, jobs } => delete_cmd(&uri, jobs),
@@ -215,6 +223,9 @@ fn list_cmd(uri: &str) -> Result<()> {
 
     let mut keys = list_objects(&bucket, effective_prefix)?;
 
+/*
+ * OLD: could cause listing of children it shouldn't
+ *
     if glob_pattern.contains('*') {
          let regex_pattern = format!("^{}$", regex::escape(glob_pattern).replace("\\*", ".*"));
          let re = regex::Regex::new(&regex_pattern)
@@ -226,6 +237,22 @@ fn list_cmd(uri: &str) -> Result<()> {
              })
              .collect();
     }
+*/
+
+    // Always filter by the basename, whether exact or glob.
+    let regex_pattern = format!(
+        "^{}$",
+        regex::escape(glob_pattern).replace("\\*", ".*")
+    );
+    let re = regex::Regex::new(&regex_pattern)
+        .with_context(|| "Invalid regex pattern generated from glob")?;
+    keys = keys
+        .into_iter()
+        .filter(|k| {
+            let basename = k.rsplit('/').next().unwrap_or(k);
+            re.is_match(basename)
+        })
+        .collect();
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -239,6 +266,28 @@ fn list_cmd(uri: &str) -> Result<()> {
         }
     }
     writeln!(out, "\nTotal objects: {}", keys.len())?;
+    Ok(())
+}
+
+/// Stat command: provide info on a single object
+fn stat_cmd(uri: &str) -> Result<()> {
+    let os = stat_object_uri(uri)?;
+    println!("Size            : {}", os.size);
+    println!("LastModified    : {:?}", os.last_modified);
+    println!("ETag            : {:?}", os.e_tag);
+    println!("Content-Type    : {:?}", os.content_type);
+    println!("Content-Language: {:?}", os.content_language);
+    println!("StorageClass    : {:?}", os.storage_class);
+    println!("VersionId       : {:?}", os.version_id);
+    println!("ReplicationStat : {:?}", os.replication_status);
+    println!("SSE             : {:?}", os.server_side_encryption);
+    println!("SSE-KMS Key ID  : {:?}", os.ssekms_key_id);
+    if !os.metadata.is_empty() {
+        println!("User Metadata:");
+        for (k,v) in os.metadata {
+            println!("  {} = {}", k, v);
+        }
+    }
     Ok(())
 }
 

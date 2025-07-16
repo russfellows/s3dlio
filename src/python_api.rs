@@ -10,7 +10,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyAny};
+//use pyo3::types::{PyBytes, PyAny};
+use pyo3::types::{PyBytes, PyAny, PyDict};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3_asyncio::tokio as aio;
 use tokio::task;
@@ -23,7 +24,7 @@ use crate::config::ObjectType;
 
 use crate::s3_utils::{
     create_bucket, delete_objects, get_object_uri, get_objects_parallel, list_objects,
-    parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
+    stat_object_uri, parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
 };
 
 use crate::s3_copy::{upload_files, download_objects};
@@ -168,6 +169,26 @@ pub(crate) fn put_async_py<'p>(
 pub fn list(uri: &str) -> PyResult<Vec<String>> {
     let (bucket, prefix) = parse_s3_uri(uri).map_err(py_err)?;
     list_objects(&bucket, &prefix).map_err(py_err)
+}
+
+// ---------------------------------------------------------------------------
+// STAT (sync) ----------------------------------------------------------------
+#[pyfunction]
+pub fn stat(py: Python, uri: &str) -> PyResult<PyObject> {
+    let os = stat_object_uri(uri).map_err(py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("size", os.size)?;
+    dict.set_item("last_modified", os.last_modified)?;
+    dict.set_item("etag", os.e_tag)?;
+    dict.set_item("content_type", os.content_type)?;
+    dict.set_item("content_language", os.content_language)?;
+    dict.set_item("storage_class", os.storage_class)?;
+    dict.set_item("metadata", os.metadata)?;
+    dict.set_item("version_id", os.version_id)?;
+    dict.set_item("replication_status", os.replication_status)?;
+    dict.set_item("server_side_encryption", os.server_side_encryption)?;
+    dict.set_item("ssekms_key_id", os.ssekms_key_id)?;
+    Ok(dict.to_object(py))
 }
 
 // ---------------------------------------------------------------------------

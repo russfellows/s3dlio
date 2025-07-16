@@ -29,6 +29,7 @@ use python_api::{
     // synchronous
     put,
     list,
+    stat,
     get,
     get_many,
     get_many_stats,
@@ -48,6 +49,7 @@ pub use s3_utils::{
     parse_s3_uri,
     list_objects,
     get_object_uri,
+    stat_object_uri,
     get_objects_parallel,
     delete_objects,
     put_objects_with_random_data_and_type,
@@ -66,6 +68,7 @@ pub fn s3dlio(_py: Python, m: &PyModule) -> PyResult<()> {
 
     // sync wrappers
     m.add_function(wrap_pyfunction!(list, m)?)?;
+    m.add_function(wrap_pyfunction!(stat, m)?)?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
     m.add_function(wrap_pyfunction!(get_many, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;

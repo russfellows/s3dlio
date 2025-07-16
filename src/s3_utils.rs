@@ -7,19 +7,18 @@
 
 
 use anyhow::{bail, Context, Result};
-//use clap::ValueEnum;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use futures::{stream::FuturesUnordered, StreamExt};
 use pyo3::{FromPyObject, PyAny, PyResult};
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::sync::Semaphore;
 
 use log::{info, debug};
 
 // data generation helpers
-//use crate::data_gen::{generate_npz, generate_tfrecord, generate_hdf5, generate_raw_data};
 use crate::data_gen::{generate_object};
 use crate::config::Config;
 
@@ -32,21 +31,33 @@ use crate::s3_client::{aws_s3_client, block_on};
 pub const DEFAULT_OBJECT_SIZE: usize = 20 * 1024 * 1024;
 
 // -----------------------------------------------------------------------------
-// ObjectType enum for typed data generation
+// ObjectStat struct for stat operation 
 // -----------------------------------------------------------------------------
-/*
- * Note: ObjectType enum moved into src/config.rs
- *
-#[derive(Clone, Copy, Debug, ValueEnum)]
-#[clap(rename_all = "UPPERCASE")] // CLI shows NPZ, TFRECORD, HDF5, RAW
-pub enum ObjectType {
-    Npz,
-    TfRecord,
-    Hdf5,
-    Raw,
+/// Full set of common S3 metadata from a HEAD-object call.
+#[derive(Debug)]
+pub struct ObjectStat {
+    pub size:                     u64,
+    pub last_modified:            Option<String>,
+    pub e_tag:                    Option<String>,
+    pub content_type:             Option<String>,
+    pub content_language:         Option<String>,
+    pub content_encoding:         Option<String>,
+    pub cache_control:            Option<String>,
+    pub content_disposition:      Option<String>,
+    pub expires:                  Option<String>,
+    pub storage_class:            Option<String>,
+    pub server_side_encryption:   Option<String>,
+    pub ssekms_key_id:            Option<String>,
+    pub sse_customer_algorithm:   Option<String>,
+    pub version_id:               Option<String>,
+    pub replication_status:       Option<String>,
+    pub metadata:                 HashMap<String, String>,
 }
-*/
 
+// -----------------------------------------------------------------------------
+// ObjectType enum for typed data generation
+// Note: the defintion moved
+// -----------------------------------------------------------------------------
 impl From<&str> for ObjectType {
     fn from(s: &str) -> Self {
         match s.to_ascii_uppercase().as_str() {
@@ -111,29 +122,121 @@ pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
         let client = aws_s3_client()?;
         let mut keys = Vec::new();
         let mut cont: Option<String> = None;
+
+        // If debug show what we have
+        debug!("list_objects: bucket='{}' prefix='{}'", bucket, prefix);
+
         loop {
-            let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
+            let mut _req = client.list_objects_v2().bucket(bucket).prefix(prefix);
+
+            debug!("  loop: continuation_token={:?}", cont);
+            let req = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix);
+
+
             if let Some(token) = &cont {
-                req = req.continuation_token(token);
+                _req = req.continuation_token(token);
+                debug!("    attached continuation_token='{}'", token);
             }
-            let resp = req.send().await.context("list_objects_v2 failed")?;
+            let resp = _req.send().await.context("list_objects_v2 failed")?;
+            debug!("    page received: {} contents", resp.contents().len());
             
             // iterating over objects in the response
             for obj in resp.contents() {
                 if let Some(k) = obj.key() {
+                    debug!("      found key: '{}'", k);
                     keys.push(k.to_string());
                 }
             }
             if let Some(next) = resp.next_continuation_token() {
                 cont = Some(next.to_string());
+                debug!("    next_continuation_token='{}'", cont.as_ref().unwrap());
             } else {
+                debug!("    no more pages, breaking");
                 break;
             }
         }
+        debug!("list_objects result: {} total keys", keys.len());
         Ok(keys)
     })
 }
 
+// -----------------------------------------------------------------------------
+// Stat (HEAD) operation
+// -----------------------------------------------------------------------------
+/// Perform HEAD-object and return **all** common metadata. 
+pub fn stat_object(bucket: &str, prefix: &str, key: &str) -> Result<ObjectStat> {
+    /*
+    // build the full object key: always start with "/" (root),
+    // then "<prefix>/" if prefix non-empty, then the `key`
+    let prefix_trim = prefix.trim_matches('/');
+    let prefix_slash = if prefix_trim.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}/", prefix_trim)
+    };
+    let object_key = format!("{}{}", prefix_slash, key);
+    */
+
+    // Clean off any leading slash from the incoming key
+    let key_clean = key.trim_start_matches('/');
+    // Trim slashes off prefix, then join prefix and key with exactly one "/"
+    let prefix_clean = prefix.trim_matches('/');
+    let full_key = if prefix_clean.is_empty() {
+        key_clean.to_string()
+    } else {
+        format!("{}/{}", prefix_clean, key_clean)
+    };
+    debug!(
+        "stat_object → bucket='{}', prefix='{}', key='{}', full_key='{}'",
+        bucket, prefix, key, full_key
+    );
+
+    block_on(async {
+        let client = aws_s3_client()?;
+        let resp = client.head_object()
+            .bucket(bucket)
+            .key(&full_key)
+            .send()
+            .await
+            .context("head_object failed")?;
+
+
+        Ok(ObjectStat {
+            size:                   resp.content_length().unwrap_or_default() as u64,
+            last_modified:          resp.last_modified().map(|t| t.to_string()),
+            e_tag:                  resp.e_tag().map(|s| s.to_string()),
+            content_type:           resp.content_type().map(|s| s.to_string()),
+            content_language:       resp.content_language().map(|s| s.to_string()),
+            content_encoding:       resp.content_encoding().map(|s| s.to_string()),
+            cache_control:          resp.cache_control().map(|s| s.to_string()),
+            content_disposition:    resp.content_disposition().map(|s| s.to_string()),
+            expires:                resp.expires_string().map(|s| s.to_string()),
+            storage_class:          resp.storage_class().map(|s| s.as_str().to_string()),
+            server_side_encryption: resp.server_side_encryption().map(|s| s.as_str().to_string()),
+            ssekms_key_id:          resp.ssekms_key_id().map(|s| s.to_string()),
+            sse_customer_algorithm: resp.sse_customer_algorithm().map(|s| s.to_string()),
+            version_id:             resp.version_id().map(|s| s.to_string()),
+            replication_status:     resp.replication_status().map(|s| s.as_str().to_string()),
+            metadata:               resp.metadata().cloned().unwrap_or_default(),
+        })
+    })
+}
+
+
+
+/// Convenience wrapper that accepts a full `s3://bucket/key` URI.
+pub fn stat_object_uri(uri: &str) -> Result<ObjectStat> {
+    let (bucket, key) = parse_s3_uri(uri)?;
+    if key.is_empty() {
+        bail!("Cannot STAT: no key specified (use full key)");
+    }
+    //stat_object(&bucket, &key)
+    // If no prefix, pass empty string for now
+    stat_object(&bucket, "", &key)
+}
 
 // -----------------------------------------------------------------------------
 // Delete operation

@@ -4,10 +4,11 @@
 This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import s3dlio as s3` and used by Python programs.
 
 ### Purpose
-The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The five primary operations for S3 are included: 
+The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The six primary operations for S3 are included: 
  - get
  - put
  - list
+ - stat
  - delete
  - create-bucket.
 
@@ -34,9 +35,29 @@ In order to build this project, you can build the code and libraries and use the
 3. The `patchelf` executable, best installed with system packages, such as `sudo apt-get install patchelf` or similar 
 
 ## Building Executables and Libraries
+### Rust Environment Pre-Req
+Given this is a Rust project, you must install the Rust toolchain, including cargo, etc.
+
+### Python Environment Pre-Req
+The uv package manager and virtual environment works well.  
+The 'uv' tool may be installed via: 
+```
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Next, you will need a virtual environment, along with Python
+Here are the steps:
+1. ```uv venv```
+2. ```source .venv/bin/activate```
+3. ```uv python install 3.12```
+
+### Building
 To build the code, there is a two step process:
-1. First build the Rust code and library. Use `cargo build --release` , which of course presumes you have Rust installed
-2. Next, build the Python library, using maturin.  Command is: `maturin build --release --features extension-module`
+1. First build the Rust code and library. Use `cargo build --release` 
+2. Building the Python library requires the Python Environment pre-reqs listed above.
+3. Then: ```maturin build --release --features extension-module```
+
+***Note:** In order to build the python library, you will need a python environment.*
 
 ## Installing Python Library
 To install the python library you would use a `pip install --force-reinstall ./path/to/my/manylinux.whl` using the path of the .whl file just created
@@ -48,12 +69,14 @@ The container will contain the executable, along with a python library.  This al
 ### Building / Pulling
 Either docker or podman may be used to create the image, typically with a `podman build -t xxx .` where xxx is the name you want to use for your container image. For those that want to simply pull and run a pre-built container, a relatively recent image may be found on quay.io.  However, the version on quay may be older than that available by building from the source code in this repository.  
 
-***Note:** A possibly OLD container is here:  https://quay.io/repository/russfellows-sig65/dealio_s3_rust*
+***Note:** An OLD container is here:  https://quay.io/repository/russfellows-sig65/dealio_s3_rust*
 
 In order to pull the container using docker, you may execute the following:
+
 ```
 docker pull quay.io/russfellows-sig65/s3dlio
 ```
+***Note 2:** The above container does not exist currently*
 
 ### Running Container
 Here is an example of starting a container using podman, and listing the contents of the containers /app directory.  

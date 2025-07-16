@@ -1,11 +1,6 @@
-#import importlib.util, sys
-##spec = importlib.util.find_spec("dlio_s3_rust")
-#spec = importlib.util.find_spec("s3dlio")
-#print("→ loading from:", spec and spec.origin, file=sys.stderr)
-
+# Python test script to show python binding capabilities
 import time
 import asyncio
-#import dlio_s3_rust as s3
 import s3dlio as s3
 
 # Adjust these to your S3 URIs:
@@ -30,6 +25,7 @@ def sync_tests():
     dt = time.time() - start
     print(f"Found {len(objs)} objects under {READ_PREFIX} in {dt:.2f}s")
 
+
     print("\n=== Sync PUT ===")
     start = time.time()
     s3.put(TEST_PREFIX, NUM_OBJECTS, TEMPLATE, NUM_JOBS)
@@ -37,6 +33,15 @@ def sync_tests():
     total_bytes = NUM_OBJECTS * SIZE
     mib = total_bytes / (1024**2)
     print(f"Uploaded {NUM_OBJECTS} objects ({mib:.2f} MiB) in {dt:.2f}s -> {NUM_OBJECTS/dt:.2f} ops/s, {mib/dt:.2f} MiB/s")
+ 
+    print("\n=== Sync STAT ===")
+    # re-build the same list of URIs we want to stat
+    uris = [f"{TEST_PREFIX}" + TEMPLATE.format(i, NUM_OBJECTS) for i in range(NUM_OBJECTS)]
+    stat_uri = uris[0]
+    obj_meta = s3.stat(stat_uri)
+    print(f"Stat for {stat_uri}:")
+    for k, v in obj_meta.items():
+        print(f"  {k}: {v}")
 
     print("\n=== Sync GET Many ===")
     uris = [f"{TEST_PREFIX}" + TEMPLATE.format(i, NUM_OBJECTS) for i in range(NUM_OBJECTS)]
