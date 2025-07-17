@@ -37,9 +37,13 @@ In order to build this project, you can build the code and libraries and use the
 ## Building Executables and Libraries
 ### Rust Environment Pre-Req
 Given this is a Rust project, you must install the Rust toolchain, including cargo, etc.
+The following installs the Rust toolchain:
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
 
 ### Python Environment Pre-Req
-The uv package manager and virtual environment works well.  
+A Python environment is required.  The uv package manager and virtual environment works well.  
 The 'uv' tool may be installed via: 
 ```
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -51,17 +55,17 @@ Here are the steps:
 2. ```source .venv/bin/activate```
 3. ```uv python install 3.12```
 
-### Building
-To build the code, there is a two step process:
-1. First build the Rust code and library. Use `cargo build --release` 
-2. Building the Python library requires the Python Environment pre-reqs listed above.
-3. Then: ```maturin build --release --features extension-module```
+### Building the CLI
+To build the executable cli code:
+ * At the top of the project issue: `cargo build --release`
+ * Upon success the executable called `s3-cli` will exist in the ./target/release directory
 
-***Note:** In order to build the python library, you will need a python environment.*
-
-## Installing Python Library
-To install the python library you would use a `pip install --force-reinstall ./path/to/my/manylinux.whl` using the path of the .whl file just created
-For testing purposes you can build and run the code on most Linux systems, including both the Rust cli and the python library.  For ease of use, a container may be used as well.  
+### Building the Python Library
+This step requires the Python Environment pre-reqs listed above.
+ * First, make certain you have activated your virtual environment
+ * If using uv, the command `source .venv/bin/activate` will do so
+ * Next, to build the python library: `maturin build --release --features extension-module`
+ * Upon success a python wheel will exist in the ./target/wheels directory
 
 ## Container
 A container image may be built from the source code in this repository.  Also, examining the Dockerfile may help users better understand how to build the code outside of a container by examining the steps in the Dockerfile.  
