@@ -1,5 +1,5 @@
 # Overview
-The goal of this project is to provides a Python library and CLI for S3 interaction, using v1.85+ of AWS S3 Rust SDK.  This is designed to be a general purpose library, with AI/ML specific operations supported as well. Moreover, the intent is to provide low-level S3 operations (get, put, list, stat, delete), along with higher-level AI/ML compatible operations that perform data-loader and checkpoint-writer functionality, similar to PyTorch and TensorFlow data-loader and checkpoint-writer functions.  
+The goal of this project is to provide a Python library and CLI for S3 interaction, using v1.85+ of AWS S3 Rust SDK.  This is designed to be a general purpose library, with AI/ML specific operations supported as well. Moreover, the intent is to provide low-level S3 operations (get, put, list, stat, delete), along with higher-level AI/ML compatible operations that perform data-loader and checkpoint-writer functionality, similar to PyTorch and TensorFlow data-loader and checkpoint-writer functions.  
 
 As such, this project essentially has 3 components that can be utilized:
 1. A Rust library "s3dlio"
@@ -7,7 +7,7 @@ As such, this project essentially has 3 components that can be utilized:
 3. An executable CLI, built using Rust
 
 ## What's New
-Since the prior project "dlio_s3_rust" was archived and all future work moved to this project, there have been a number o enhancements.  These include the following:
+Since the prior project "dlio_s3_rust" was archived and all future work moved to this project, there have been a number of enhancements.  These include the following:
  * Enhanced data generation - now supports settable dedupe and compression ratios
  * Two new cli commands: upload and download, which help enhance the use as a testing tool
  * One new cli and Python library command, "stat"  
