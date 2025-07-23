@@ -18,6 +18,14 @@ pub mod data_gen;
 
 pub use data_gen::generate_controlled_data;
 
+pub mod data_loader;
+
+pub use data_loader::dataset;
+pub use data_loader::dataset::{Dataset, DatasetError};
+pub use data_loader::dataloader::DataLoader;
+pub use data_loader::options::LoaderOptions;
+
+
 // ---------------------------------------------------------------------------
 // Python bindings -----------------------------------------------------------
 // ---------------------------------------------------------------------------
