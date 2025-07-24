@@ -115,7 +115,10 @@ Python 3.12.8
 ```
 
 # S3 Access
-This library and CLI currently support accessing S3 via http without TLS, and S3 with TLS via https for both official, and self signed certificates.  There is NO option to connect via TLS and ignore certificate errors.  There are several reasons for this, the two biggest ones being:
+This library and CLI currently support accessing S3 via http without TLS, and S3 with TLS via https for both official, and self signed certificates.  There is a method to direct the library to use a PEM file bundle of self-signed certificates, which is detailed below.
+
+## Lack of Insecure TLS Option
+There is NO option to connect via TLS and ignore certificate errors.  There are several reasons for this, the two biggest ones being:
 1) It is VERY difficult to do this with the current Rust crates and AWS S3 SDK
 2) It is VERY dangerous, and strongly discouraged
 
