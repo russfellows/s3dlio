@@ -62,6 +62,8 @@ io = "0.0.2"
 crc32fast = "1.4.2"
 hdf5-metno-sys = "0.10.1"
 glob = "0.3.2"
+zstd = "0.13.3"
+humantime = "2.2.0"
 
 
 

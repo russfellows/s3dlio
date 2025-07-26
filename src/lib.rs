@@ -16,6 +16,9 @@ pub mod s3_copy;
 pub mod s3_utils;
 pub mod data_gen;
 
+pub mod s3_logger;
+pub mod s3_ops;
+
 pub use data_gen::generate_controlled_data;
 
 // ---------------------------------------------------------------------------
