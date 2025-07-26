@@ -8,14 +8,26 @@ As such, this project essentially has 3 components that can be utilized:
 
 ## What's New
 Since the prior project "dlio_s3_rust" was archived and all future work moved to this project, there have been a number of enhancements.  These include the following:
- * Enhanced data generation - now supports settable dedupe and compression ratios
- * Two new cli commands: upload and download, which help enhance the use as a testing tool
- * One new cli and Python library command, "stat"  
- * AI/ML object creation options:  This library now supports creation, and all S3 operations of 4 specific, AI/ML data / object types:
-   - TensorRecord
-   - HDF5
-   - NPZ
-   - Raw
+  * Enhanced data generation - now supports settable dedupe and compression ratios
+  * Two new cli commands: upload and download, which help enhance the use as a testing tool
+  * One new cli and Python library command, "stat"  
+  * AI/ML object creation options:  This library now supports creation, and all S3 operations of 4 specific, AI/ML data / object types:
+    - TensorRecord
+    - HDF5
+    - NPZ
+    - Raw
+
+## To Do and Enhancements
+What is left?  Several items are already identified as future enhancements.  These are noted both in discussions for this repo, and in the "Issues".  Note that currently all outstanding issues are tagged as enhancements, as there are no known bugs.  There are ALWAYS things that could work better, or differently, but currently, there are no outstanding issues.
+
+### Enhancements
+These are listed in no particular order:
+  * Add AI/ML data loader functionality (issue #14)
+  * Add AI/ML check point writer feature (issue #18)
+  * Implement S3 operation logging (issue #17)
+  * Improve Get performance (issue #11)
+  * Improve Put performance and add multi-part upload (issue #12)
+  * Improve python binding performance, w/ zero-copy views (issue #13)
 
 # How to Guide
 ## S3 Rust Library and CLI
