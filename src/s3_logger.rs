@@ -12,6 +12,7 @@ use std::io::{BufWriter, Write};
 use std::time::SystemTime;
 use std::thread;
 use std::sync::{Mutex, mpsc::{sync_channel, channel, SyncSender, Receiver}};
+use log::info;
 use once_cell::sync::OnceCell;
 use zstd::stream::write::Encoder;
 
@@ -30,6 +31,10 @@ pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
     }
     let logger = Logger::new(path.as_ref())?;
     let _ = GLOBAL_LOGGER.set(logger);
+
+    // Print out some info if info logging set
+    info!("Intialized S3 operation logging to file: {}", path.as_ref());
+
     Ok(())
 }
 
@@ -57,6 +62,9 @@ pub fn finalize_op_logger() {
             first_byte_time: None,
             end_time: SystemTime::now(),
         });
+
+        // Print info if info set
+        info!("Shutting down S3 operation logging");
 
         // Wait for the background thread to finish (encoder flushes on drop).
         if let Some(done_rx) = logger.done_rx.lock().unwrap().take() {

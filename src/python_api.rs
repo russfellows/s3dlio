@@ -26,12 +26,30 @@ use crate::s3_utils::{
     create_bucket, delete_objects, get_object_uri, get_objects_parallel, list_objects,
     stat_object_uri, parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
 };
-
 use crate::s3_copy::{upload_files, download_objects};
+use crate::s3_logger::{init_op_logger, finalize_op_logger};
 
 // ---------------------------------------------------------------------------
 // Error helper ----------------------------------------------------------------
 fn py_err<E: std::fmt::Display>(e: E) -> PyErr { PyRuntimeError::new_err(e.to_string()) }
+
+// ---------------------------------------------------------------------------
+// OP-LOG INITIALISER / FINALISER (sync)
+// ---------------------------------------------------------------------------
+/// Start operation logging to a warp-replay compatible `.tsv.zst` file.
+/// Must be called **before** the S3 calls you want logged.
+#[pyfunction]
+pub fn init_op_log(path: &str) -> PyResult<()> {
+    init_op_logger(path).map_err(py_err)
+}
+
+/// Flush and close the op-log. Safe to call multiple times.
+#[pyfunction]
+pub fn finalize_op_log() -> PyResult<()> {
+    finalize_op_logger();
+    Ok(())
+}
+
 
 // ---------------------------------------------------------------------------
 // Helper ----------------------------------------------------------------------
@@ -416,6 +434,8 @@ pub fn _pymod(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(delete, m)?)?;
     m.add_function(wrap_pyfunction!(read_npz, m)?)?;
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(init_op_log, m)?)?;
+    m.add_function(wrap_pyfunction!(finalize_op_log, m)?)?;
     Ok(())
 }
 

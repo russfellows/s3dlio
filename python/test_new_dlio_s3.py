@@ -13,9 +13,6 @@ SIZE = 20971520  # s3.DEFAULT_OBJECT_SIZE  from Rust default
 
 
 def sync_tests():
-    # turn on info‑level logs (shows the AWS S3 info messages, including AWS_CA_BUNDLE_PATH loading)
-    s3.init_logging("info")
-
     # turn on debug‑level logs (shows AWS S3 SDK info + debug messages)
     #s3.init_logging("debug")
 
@@ -68,7 +65,7 @@ def sync_tests():
 
 async def async_tests():
     # turn on info‑level logs (shows the AWS_CA_BUNDLE_PATH message)
-    s3.init_logging("info")
+    #s3.init_logging("info")
 
     print("=== Async LIST ===")
     start = time.time()
@@ -108,9 +105,19 @@ async def async_tests():
 
 def main():
 
+    # turn on info‑level logs (shows the AWS S3 info messages, including AWS_CA_BUNDLE_PATH loading)
+    s3.init_logging("info")
+
+    # Start op logging (warp-replay compatible TSV.ZST)
+    s3.init_op_log("/tmp/python_s3_ops_test.tsv.zst")
+
     sync_tests()
     print()
     asyncio.run(async_tests())
+
+    # Flush and close (safe to call multiple times)
+    s3.finalize_op_log()
+
 
 
 if __name__ == "__main__":

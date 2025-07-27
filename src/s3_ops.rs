@@ -49,7 +49,7 @@ impl S3Ops {
         }
     }
 
-    /// Centralized helper function to log an operation's results.
+    /// Centralized helper function to log s3 operation's results.
     fn log_op(
         &self,
         ctx: LogContext,
