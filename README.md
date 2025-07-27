@@ -17,6 +17,32 @@ Since the prior project "dlio_s3_rust" was archived and all future work moved to
     - NPZ
     - Raw
 
+### Logging
+This is a new feature, that logs all S3 operations.  The file format is designed to be compatible with the MinIO warp tool.  Thus, these s3 op-log files can be used with our warp-replay project.
+
+To enable via the cli, use the ```--op-log <FILE>``` syntax.
+
+#### Op logging Environment variables
+There are a number of tuning parameters that may be set, they are as follows:
+
+For normal situations, optimizes I/O throughput and works on best-effort with minimal I/O or CPU impact. 
+```
+bash
+export S3DLIO_OPLOG_BUF=2048        # entries
+export S3DLIO_OPLOG_WBUFCAP=262144  # 256 KiB
+export S3DLIO_OPLOG_LEVEL=1
+export S3DLIO_OPLOG_LOSSLESS=false
+```
+
+For high replay fidelity, i.e. lossless logging, and high burst tolerance, use the following:
+```
+bash
+export S3DLIO_OPLOG_BUF=8192        # entries
+export S3DLIO_OPLOG_WBUFCAP=1048576 # 1 MiB
+export S3DLIO_OPLOG_LEVEL=1
+export S3DLIO_OPLOG_LOSSLESS=true
+```
+
 ## To Do and Enhancements
 What is left?  Several items are already identified as future enhancements.  These are noted both in discussions for this repo, and in the "Issues".  Note that currently all outstanding issues are tagged as enhancements, as there are no known bugs.  There are ALWAYS things that could work better, or differently, but currently, there are no outstanding issues.
 
@@ -230,18 +256,21 @@ Usage: s3-cli <COMMAND>
 
 Commands:
   list      List keys that start with the given prefix
-  get       Download one or many objects
+  stat      Stat object, show size & last modify date of a single object
   delete    Delete one object or every object that matches the prefix
+  get       Download one or many objects concurrently
   put       Upload one or more objects concurrently, uses ObjectType format filled with random data
-  upload    Upload local files (PUT, but from disk not RAM)
-  download  Download object(s) → directory
+  upload    Upload local files (supports glob patterns) to S3, concurrently to jobs
+  download  Download object(s) to named directory (uses globbing pattern match)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-  -v, --verbose...  Increase log verbosity: -v = Info, -vv = Debug
-  -h, --help     Print help
-  -V, --version  Print version
-root@loki-node3:/app#
+  -v, --verbose...     Increase log verbosity: -v = Info, -vv = Debug
+      --op-log <FILE>  Write warp‑replay compatible op‑log (.tsv.zst). Disabled if not provided
+  -h, --help           Print help
+  -V, --version        Print version
+
+root@loki-node3:/app# 
 ```
 
 ### Example --help for subcommand

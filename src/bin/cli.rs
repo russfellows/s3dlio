@@ -13,7 +13,6 @@
 //! s3Rust-cli put         s3://bucket/key               # put one or more object
 //! s3Rust-cli upload      local-file s3://bucket/key    # upload one or more objects
 //! s3Rust-cli download    s3://bucket/key local-file    # download  one or more object
-//! s3Rust-cli put         s3://bucket/key               # put one or more object
 //! ```
 
 use anyhow::{bail, Context, Result};
@@ -30,6 +29,7 @@ use s3dlio::{
 };
 
 use s3dlio::s3_copy::{upload_files, download_objects};
+use s3dlio::{init_op_logger, finalize_op_logger};
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -41,6 +41,10 @@ struct Cli {
         help = "Increase log verbosity: -v = Info, -vv = Debug",
     )]
     verbose: u8,
+
+    /// Write warp‑replay compatible op‑log (.tsv.zst). Disabled if not provided.
+    #[arg(long = "op-log", value_name = "FILE")]
+    op_log: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Command,
@@ -155,19 +159,6 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // 1️⃣  Set up logging early – once per process.
-    /*
-    if cli.verbose {
-        env_logger::Builder::from_default_env()
-            //.filter_level(LevelFilter::Debug)   // Shows Error, Warn, Info and Debug levels 
-            .filter_level(LevelFilter::Info)   // Shows Error, Warn and Info levels 
-            .init();
-    } else {
-        env_logger::Builder::from_default_env()
-            .filter_level(LevelFilter::Warn)   // Shows Error and Warn levels 
-            .init();
-    }
-    */
     // Initialise logging once, based on how many `-v` flags were given:
     let level = match cli.verbose {
         0 => LevelFilter::Warn,   // no -v
@@ -179,21 +170,28 @@ fn main() -> Result<()> {
         .init();
 
 
+    // If set, start the op‑logger *before* the first S3 call
+    if let Some(ref path) = cli.op_log {
+        if let Err(e) = init_op_logger(path.to_string_lossy()) {
+            eprintln!("failed to start op‑logger `{}`: {e}", path.display());
+        }
+    }
+
     match cli.cmd {
-        Command::List { uri } => list_cmd(&uri),
+        Command::List { uri } => list_cmd(&uri)?,
 
-        Command::Stat { uri } => stat_cmd(&uri),
+        Command::Stat { uri } => stat_cmd(&uri)?,
 
-        Command::Get { uri, jobs } => get_cmd(&uri, jobs),
+        Command::Get { uri, jobs } => get_cmd(&uri, jobs)?,
 
-        Command::Delete { uri, jobs } => delete_cmd(&uri, jobs),
+        Command::Delete { uri, jobs } => delete_cmd(&uri, jobs)?,
 
         Command::Upload { files, dest, jobs, create_bucket } => {
-            upload_files(&dest, &files, jobs, create_bucket)
+            upload_files(&dest, &files, jobs, create_bucket)?
         }
 
         Command::Download { src, dest_dir, jobs } => {
-            download_objects(&src, &dest_dir, jobs)
+            download_objects(&src, &dest_dir, jobs)?
         }
 
         Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f } => {
@@ -204,10 +202,17 @@ fn main() -> Result<()> {
                 }
             }
             
-            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f)
+            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f)?
 
         }
     }
+
+    // If set, finalize the op‑logger 
+    if cli.op_log.is_some() {
+        finalize_op_logger();
+    }
+
+    Ok(())
 }
 
 

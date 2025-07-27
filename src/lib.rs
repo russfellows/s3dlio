@@ -20,6 +20,7 @@ pub mod s3_logger;
 pub mod s3_ops;
 
 pub use data_gen::generate_controlled_data;
+pub use crate::s3_logger::{init_op_logger, global_logger, finalize_op_logger, Logger};
 
 // ---------------------------------------------------------------------------
 // Python bindings -----------------------------------------------------------
