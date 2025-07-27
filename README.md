@@ -20,7 +20,22 @@ Since the prior project "dlio_s3_rust" was archived and all future work moved to
 ### Logging
 This is a new feature, that logs all S3 operations.  The file format is designed to be compatible with the MinIO warp tool.  Thus, these s3 op-log files can be used with our warp-replay project.
 
+#### Rust CLI Usage
 To enable via the cli, use the ```--op-log <FILE>``` syntax.
+
+#### Python Library Usage
+To enable s3 operation logging in Python, you must first start the logging:
+```
+# Start op logging (warp-replay compatible TSV.ZST)
+s3.init_op_log("/tmp/python_s3_ops_test.tsv.zst")
+```
+
+Then, prior to exiting, shut down the logger to finalize the file properly.
+```
+# Flush and close (safe to call multiple times)
+s3.finalize_op_log()
+```
+
 
 #### Op logging Environment variables
 There are a number of tuning parameters that may be set, they are as follows:
@@ -50,7 +65,7 @@ What is left?  Several items are already identified as future enhancements.  The
 These are listed in no particular order:
   * Add AI/ML data loader functionality (issue #14)
   * Add AI/ML check point writer feature (issue #18)
-  * Implement S3 operation logging (issue #17)
+  * (✅ Completed!) Implement S3 operation logging (issue #17 - closed 27, July 2025)
   * Improve Get performance (issue #11)
   * Improve Put performance and add multi-part upload (issue #12)
   * Improve python binding performance, w/ zero-copy views (issue #13)
