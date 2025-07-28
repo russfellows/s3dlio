@@ -16,7 +16,11 @@ pub mod s3_copy;
 pub mod s3_utils;
 pub mod data_gen;
 
+pub mod s3_logger;
+pub mod s3_ops;
+
 pub use data_gen::generate_controlled_data;
+pub use crate::s3_logger::{init_op_logger, global_logger, finalize_op_logger, Logger};
 
 pub mod data_loader;
 
@@ -44,6 +48,8 @@ use python_api::{
     delete,
     read_npz,
     init_logging,
+    init_op_log,
+    finalize_op_log,
     upload,
     download,
     // asynchronous
@@ -84,6 +90,8 @@ pub fn s3dlio(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(read_npz, m)?)?;
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(init_op_log, m)?)?;
+    m.add_function(wrap_pyfunction!(finalize_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(upload, m)?)?;
     m.add_function(wrap_pyfunction!(download, m)?)?;
 

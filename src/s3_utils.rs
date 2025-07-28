@@ -7,9 +7,7 @@
 
 
 use anyhow::{bail, Context, Result};
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use futures::{stream::FuturesUnordered, StreamExt};
 use pyo3::{FromPyObject, PyAny, PyResult};
 use std::sync::Arc;
@@ -25,10 +23,25 @@ use crate::config::Config;
 // S3 client creation
 use crate::s3_client::{aws_s3_client, block_on};
 
+// S3 operation logging
+use crate::s3_logger::global_logger;
+use crate::s3_ops::S3Ops;
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 pub const DEFAULT_OBJECT_SIZE: usize = 20 * 1024 * 1024;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// helper: create an S3Ops wired to the singleton logger (if any)
+fn build_ops() -> Result<S3Ops> {
+    let client = aws_s3_client()?;
+    let logger = global_logger();
+    let client_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
+    let endpoint  = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
+    Ok(S3Ops::new(client, logger, &client_id, &endpoint))
+}
 
 // -----------------------------------------------------------------------------
 // ObjectStat struct for stat operation 
@@ -119,7 +132,13 @@ pub fn create_bucket(bucket: &str) -> Result<()> {
 /// List every key under `prefix` (handles pagination).
 pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
     block_on(async {
-        let client = aws_s3_client()?;
+        // Old, pre logger
+//        let client = aws_s3_client()?;
+
+        // Fire one lightweight LIST to get the op into the log.
+        let _ = build_ops()?.list_objects(bucket, prefix).await;
+
+        let client = aws_s3_client()?;   // reuse raw client for pagination
         let mut keys = Vec::new();
         let mut cont: Option<String> = None;
 
@@ -168,17 +187,6 @@ pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
 // -----------------------------------------------------------------------------
 /// Perform HEAD-object and return **all** common metadata. 
 pub fn stat_object(bucket: &str, prefix: &str, key: &str) -> Result<ObjectStat> {
-    /*
-    // build the full object key: always start with "/" (root),
-    // then "<prefix>/" if prefix non-empty, then the `key`
-    let prefix_trim = prefix.trim_matches('/');
-    let prefix_slash = if prefix_trim.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}/", prefix_trim)
-    };
-    let object_key = format!("{}{}", prefix_slash, key);
-    */
 
     // Clean off any leading slash from the incoming key
     let key_clean = key.trim_start_matches('/');
@@ -195,6 +203,13 @@ pub fn stat_object(bucket: &str, prefix: &str, key: &str) -> Result<ObjectStat> 
     );
 
     block_on(async {
+        // Old pre logger
+        //let client = aws_s3_client()?;
+        //
+        // New, with logger
+        // Log the HEAD request
+        let _ = build_ops()?.stat_object(bucket, &full_key).await;
+
         let client = aws_s3_client()?;
         let resp = client.head_object()
             .bucket(bucket)
@@ -241,6 +256,9 @@ pub fn stat_object_uri(uri: &str) -> Result<ObjectStat> {
 // -----------------------------------------------------------------------------
 // Delete operation
 // -----------------------------------------------------------------------------
+/*
+ * Old - pre logger
+ *
 /// Delete many keys (up to 1000 per call).
 pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
     block_on(async {
@@ -255,10 +273,25 @@ pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
         Ok(())
     })
 }
+*/
+
+/// Delete many keys (up to 1000 per logged batch).
+pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
+    block_on(async {
+        let ops = build_ops()?;
+        for chunk in keys.chunks(1000) {
+            ops.delete_objects(bucket, chunk.to_vec()).await?;
+        }
+        Ok(())
+    })
+}
 
 // -----------------------------------------------------------------------------
 // Download (GET) operations
 // -----------------------------------------------------------------------------
+/*
+ * Old, pre logger
+ *
 /// Download a single object from S3 (bucket/key).
 pub async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
     let client = aws_s3_client()?;
@@ -268,6 +301,17 @@ pub async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
 
     info!("S3 GET s3://{}/{} ", bucket, key);
     Ok(data.to_vec())
+}
+*/
+
+/// Download a single object from S3 **with op‑logging**.
+pub async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
+    // delegate to S3Ops (which records the GET) and propagate errors
+    let data = build_ops()?.get_object(bucket, key).await?;
+    
+    // Emit an info‑level message
+    info!("S3 GET s3://{}/{}", bucket, key);
+    Ok(data)
 }
 
 /// Download a single object by URI.
@@ -350,6 +394,9 @@ pub fn put_objects_with_random_data_and_type(
     put_objects_parallel(&uris, &buffer, max_in_flight)
 }
 
+/*
+ * Old, pre logger
+ *
 /// Upload an object
 pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
     let client = aws_s3_client()?;
@@ -357,6 +404,17 @@ pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()
     info!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
 
     client.put_object().bucket(bucket).key(key).body(body).send().await?;
+    Ok(())
+}
+*/
+
+/// Upload a single object to S3 **with op‑logging**.
+pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
+    // delegate to S3Ops (which records the PUT) and propagate errors
+    build_ops()?.put_object(bucket, key, data.to_vec()).await?;
+    
+    // Emit an info‑level message if you like
+    info!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
     Ok(())
 }
 

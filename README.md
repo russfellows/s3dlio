@@ -1,5 +1,5 @@
 # Overview
-The goal of this project is to provide a Python library and CLI for S3 interaction, using v1.85+ of AWS S3 Rust SDK.  This is designed to be a general purpose library, with AI/ML specific operations supported as well. Moreover, the intent is to provide low-level S3 operations (get, put, list, stat, delete), along with higher-level AI/ML compatible operations that perform data-loader and checkpoint-writer functionality, similar to PyTorch and TensorFlow data-loader and checkpoint-writer functions.  
+The goal of this project is to provide a Python library and CLI for S3 interaction, using very recent versions of AWS S3 Rust SDK (current version is documented in the Project overview).  This is designed to be a general purpose library, with AI/ML specific operations supported as well. Moreover, the intent is to provide low-level S3 operations (get, put, list, stat, delete), along with higher-level AI/ML compatible operations that perform data-loader and checkpoint-writer functionality, similar to PyTorch and TensorFlow data-loader and checkpoint-writer functions.  
 
 As such, this project essentially has 3 components that can be utilized:
 1. A Rust library "s3dlio"
@@ -8,14 +8,67 @@ As such, this project essentially has 3 components that can be utilized:
 
 ## What's New
 Since the prior project "dlio_s3_rust" was archived and all future work moved to this project, there have been a number of enhancements.  These include the following:
- * Enhanced data generation - now supports settable dedupe and compression ratios
- * Two new cli commands: upload and download, which help enhance the use as a testing tool
- * One new cli and Python library command, "stat"  
- * AI/ML object creation options:  This library now supports creation, and all S3 operations of 4 specific, AI/ML data / object types:
-   - TensorRecord
-   - HDF5
-   - NPZ
-   - Raw
+  * Enhanced data generation - now supports settable dedupe and compression ratios
+  * Two new cli commands: upload and download, which help enhance the use as a testing tool
+  * One new cli and Python library command, "stat"  
+  * AI/ML object creation options:  This library now supports creation, and all S3 operations of 4 specific, AI/ML data / object types:
+    - TensorRecord
+    - HDF5
+    - NPZ
+    - Raw
+
+### Logging
+This is a new feature, that logs all S3 operations.  The file format is designed to be compatible with the MinIO warp tool.  Thus, these s3 op-log files can be used with our warp-replay project.
+
+#### Rust CLI Usage
+To enable via the cli, use the ```--op-log <FILE>``` syntax.
+
+#### Python Library Usage
+To enable s3 operation logging in Python, you must first start the logging:
+```
+# Start op logging (warp-replay compatible TSV.ZST)
+s3.init_op_log("/tmp/python_s3_ops_test.tsv.zst")
+```
+
+Then, prior to exiting, shut down the logger to finalize the file properly.
+```
+# Flush and close (safe to call multiple times)
+s3.finalize_op_log()
+```
+
+
+#### Op logging Environment variables
+There are a number of tuning parameters that may be set, they are as follows:
+
+For normal situations, optimizes I/O throughput and works on best-effort with minimal I/O or CPU impact. 
+```
+bash
+export S3DLIO_OPLOG_BUF=2048        # entries
+export S3DLIO_OPLOG_WBUFCAP=262144  # 256 KiB
+export S3DLIO_OPLOG_LEVEL=1
+export S3DLIO_OPLOG_LOSSLESS=false
+```
+
+For high replay fidelity, i.e. lossless logging, and high burst tolerance, use the following:
+```
+bash
+export S3DLIO_OPLOG_BUF=8192        # entries
+export S3DLIO_OPLOG_WBUFCAP=1048576 # 1 MiB
+export S3DLIO_OPLOG_LEVEL=1
+export S3DLIO_OPLOG_LOSSLESS=true
+```
+
+## To Do and Enhancements
+What is left?  Several items are already identified as future enhancements.  These are noted both in discussions for this repo, and in the "Issues".  Note that currently all outstanding issues are tagged as enhancements, as there are no known bugs.  There are ALWAYS things that could work better, or differently, but currently, there are no outstanding issues.
+
+### Enhancements
+These are listed in no particular order:
+  * Add AI/ML data loader functionality (issue #14)
+  * Add AI/ML check point writer feature (issue #18)
+  * (✅ Completed!) Implement S3 operation logging (issue #17 - closed 27, July 2025)
+  * Improve Get performance (issue #11)
+  * Improve Put performance and add multi-part upload (issue #12)
+  * Improve python binding performance, w/ zero-copy views (issue #13)
 
 # How to Guide
 ## S3 Rust Library and CLI
@@ -115,7 +168,10 @@ Python 3.12.8
 ```
 
 # S3 Access
-This library and CLI currently support accessing S3 via http without TLS, and S3 with TLS via https for both official, and self signed certificates.  There is NO option to connect via TLS and ignore certificate errors.  There are several reasons for this, the two biggest ones being:
+This library and CLI currently support accessing S3 via http without TLS, and S3 with TLS via https for both official, and self signed certificates.  There is a method to direct the library to use a PEM file bundle of self-signed certificates, which is detailed below.
+
+## Lack of Insecure TLS Option
+There is NO option to connect via TLS and ignore certificate errors.  There are several reasons for this, the two biggest ones being:
 1) It is VERY difficult to do this with the current Rust crates and AWS S3 SDK
 2) It is VERY dangerous, and strongly discouraged
 
@@ -215,18 +271,21 @@ Usage: s3-cli <COMMAND>
 
 Commands:
   list      List keys that start with the given prefix
-  get       Download one or many objects
+  stat      Stat object, show size & last modify date of a single object
   delete    Delete one object or every object that matches the prefix
+  get       Download one or many objects concurrently
   put       Upload one or more objects concurrently, uses ObjectType format filled with random data
-  upload    Upload local files (PUT, but from disk not RAM)
-  download  Download object(s) → directory
+  upload    Upload local files (supports glob patterns) to S3, concurrently to jobs
+  download  Download object(s) to named directory (uses globbing pattern match)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-  -v, --verbose...  Increase log verbosity: -v = Info, -vv = Debug
-  -h, --help     Print help
-  -V, --version  Print version
-root@loki-node3:/app#
+  -v, --verbose...     Increase log verbosity: -v = Info, -vv = Debug
+      --op-log <FILE>  Write warp‑replay compatible op‑log (.tsv.zst). Disabled if not provided
+  -h, --help           Print help
+  -V, --version        Print version
+
+root@loki-node3:/app# 
 ```
 
 ### Example --help for subcommand

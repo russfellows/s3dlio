@@ -50,24 +50,6 @@ fn tls_context_from_pem(filename: impl AsRef<Path>) -> Result<tls::TlsContext> {
 }
 
 
-/// Create a TLS context using a CA bundle file
-/*
- * Old
- *
-fn tls_context_from_pem(filename: impl AsRef<Path>) -> tls::TlsContext {
-    let pem_contents = fs::read(filename.as_ref())
-        .expect(&format!("Failed to read CA bundle file: {}", filename.as_ref().display()));
-
-    let trust_store = tls::TrustStore::empty()
-        .with_pem_certificate(pem_contents.as_slice());
-
-    tls::TlsContext::builder()
-        .with_trust_store(trust_store)
-        .build()
-        .expect("valid TLS config from PEM")
-}
-*/
-
 /// Instantiate the S3 client
 pub fn aws_s3_client() -> Result<Client> {
     CLIENT.get_or_try_init(|| {
