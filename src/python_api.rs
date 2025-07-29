@@ -2,10 +2,10 @@
 //
 // Copyright, 2025.  Signal65 / Futurum Group.
 // 
-//! PyO3 bindings — sync *and* async wrappers around the Rust S3 helpers.
+//! PyO3 bindings — sync *and* async wrappers around the Rust S3 helpers.
 //!
 //! * **Sync** paths call `py.allow_threads` so the GIL is released while Rust blocks.
-//! * **Async** paths return `asyncio` futures via **pyo3‑asyncio + Tokio**.
+//! * **Async** paths return `asyncio` futures via **pyo3-async-runtimes + Tokio**.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -13,7 +13,9 @@ use pyo3::prelude::*;
 //use pyo3::types::{PyBytes, PyAny};
 use pyo3::types::{PyBytes, PyAny, PyDict};
 use pyo3::exceptions::PyRuntimeError;
-use pyo3_asyncio::tokio as aio;
+use pyo3::conversion::IntoPyObjectExt;
+use numpy::ndarray as nd_np;
+use pyo3_async_runtimes::tokio as aio;
 use tokio::task;
 
 use std::path::PathBuf;
@@ -26,10 +28,34 @@ use crate::s3_utils::{
     create_bucket, delete_objects, get_object_uri, get_objects_parallel, list_objects,
     stat_object_uri, parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
 };
+
 use crate::s3_copy::{upload_files, download_objects};
 use crate::s3_logger::{init_op_logger, finalize_op_logger};
 
 // ---------------------------------------------------------------------------
+// Logging init (sync) --------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+/// Initialise Rust-side logging once.
+/// Safe to call multiple times; subsequent calls are ignored.
+#[pyfunction]
+pub fn init_logging(level: &str) -> PyResult<()> {
+    let filter = match level.to_lowercase().as_str() {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "warn"  => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        _       => LevelFilter::Info,
+    };
+
+    let _ = env_logger::builder()
+        .filter_level(filter)
+        .is_test(false)
+        .try_init();
+
+    Ok(())
+}
+
 // Error helper ----------------------------------------------------------------
 fn py_err<E: std::fmt::Display>(e: E) -> PyErr { PyRuntimeError::new_err(e.to_string()) }
 
@@ -67,18 +93,18 @@ fn build_uri_list(prefix: &str, template: &str, num: usize) -> PyResult<(String,
 fn str_to_obj(s: &str) -> ObjectType { ObjectType::from(s) }
 
 // ---------------------------------------------------------------------------
-// PUT (sync) ------------------------------------------------------------------
+// PUT (sync) -----------------------------------------------------------------
 #[pyfunction]
 #[pyo3(signature = (
-    prefix,
-    num = 1,
-    template = "object_{}_of_{}.dat", // two slots: {}→i, {}→num 
-    max_in_flight = 32,
+    prefix,         // destination prefix (s3://bucket/prefix/)
+    num,            // how many objects
+    template,       // file name template e.g. "object_{}_of_{}.dat"
+    max_in_flight = 64,
     size = None,
     should_create_bucket = false,
-    object_type = "RAW",
+    object_type = "zeros",
     dedup_factor = 1,
-    compress_factor = 1
+    compress_factor = 1,
 ))]
 pub fn put(
     py: Python<'_>,
@@ -98,49 +124,24 @@ pub fn put(
     let obj = str_to_obj(object_type);
     py.allow_threads(|| {
         if should_create_bucket { let _ = create_bucket(&bucket); }
-        put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor).map_err(py_err)
-    })
-}
-
- // ---------------------------------------------------------------------------
- // UPLOAD (sync) -------------------------------------------------------------
- #[pyfunction]
-#[pyo3(signature = (
-    src_patterns,     // list of local paths or glob patterns
-    dest_prefix,      // S3 URI (must end with `/` or empty)
-    max_in_flight = 32,
-    create_bucket = false
-))]
-pub fn upload(
-    py: Python<'_>,
-    src_patterns: Vec<&str>,
-    dest_prefix: &str,
-    max_in_flight: usize,
-    create_bucket: bool,
-) -> PyResult<()> {
-    // expand to Vec<PathBuf>
-    let paths: Vec<PathBuf> = src_patterns.into_iter()
-        .map(PathBuf::from)
-        .collect();
-    py.allow_threads(|| {
-        upload_files(dest_prefix, &paths, max_in_flight, create_bucket)
+        put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor)
             .map_err(py_err)
     })
 }
 
 // ---------------------------------------------------------------------------
-// PUT (async) -----------------------------------------------------------------
-#[pyfunction(name = "put_async")]
+// PUT (async) ----------------------------------------------------------------
+#[pyfunction(name = "put_async_py")]
 #[pyo3(signature = (
-    prefix,
-    num = 1,
-    template = "object_{}_of_{}.dat",
-    max_in_flight = 32,
+    prefix,         // destination prefix (s3://bucket/prefix/)
+    num,            // how many objects
+    template,       // file name template e.g. "object_{}_of_{}.dat"
+    max_in_flight = 64,
     size = None,
     should_create_bucket = false,
-    object_type = "RAW",
+    object_type = "zeros",
     dedup_factor = 1,
-    compress_factor = 1
+    compress_factor = 1,
 ))]
 pub(crate) fn put_async_py<'p>(
     py: Python<'p>,
@@ -153,32 +154,25 @@ pub(crate) fn put_async_py<'p>(
     object_type: &'p str,
     dedup_factor: usize,
     compress_factor: usize,
-) -> PyResult<&'p PyAny> {
+) -> PyResult<Bound<'p, PyAny>> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let (bucket, uris) = build_uri_list(prefix, template, num)?;
     let jobs = max_in_flight.min(num);
     let obj = str_to_obj(object_type);
 
-    // New Async IO, offloaded to spawn blocking rather than our "block_on" inside a tokio worker.
     aio::future_into_py(py, async move {
-        let res: Result<(), PyErr> = task::spawn_blocking(move || {
+        // Run the blocking S3 workload on a dedicated thread
+        tokio::task::spawn_blocking(move || {
             if should_create_bucket { let _ = create_bucket(&bucket); }
             put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
         .await
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        res
-    })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
 
-    /*
-     * Old async IO
-    aio::future_into_py(py, async move {
-        if should_create_bucket { let _ = create_bucket(&bucket); }
-        put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        // Resolve to Python None on success
+        Python::with_gil(|py| Ok(py.None()))
     })
-    */
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +200,7 @@ pub fn stat(py: Python, uri: &str) -> PyResult<PyObject> {
     dict.set_item("replication_status", os.replication_status)?;
     dict.set_item("server_side_encryption", os.server_side_encryption)?;
     dict.set_item("ssekms_key_id", os.ssekms_key_id)?;
-    Ok(dict.to_object(py))
+    dict.into_py_any(py)
 }
 
 // ---------------------------------------------------------------------------
@@ -228,21 +222,55 @@ pub fn get_many_stats(
 }
 
 // ---------------------------------------------------------------------------
-// GET many (sync) -------------------------------------------------------------
-#[pyfunction]
+// GET many (async) ------------------------------------------------------------
+#[pyfunction(name = "get_many_stats_async")]
 #[pyo3(signature = (uris, max_in_flight = 64))]
-pub fn get_many(
-    py: Python<'_>,
+pub(crate) fn get_many_stats_async<'p>(
+    py: Python<'p>,
     uris: Vec<String>,
     max_in_flight: usize,
-) -> PyResult<Vec<(String, Py<PyBytes>)>> {
-    py.allow_threads(|| {
-        let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
+) -> PyResult<Bound<'p, PyAny>> {
+    // New async
+    aio::future_into_py(py, async move {
+        // Run blocking listing work on a dedicated thread
+        let (n, total) = tokio::task::spawn_blocking(move || {
+            let res = get_objects_parallel(&uris, max_in_flight)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let total = res.iter().map(|(_, b)| b.len()).sum::<usize>();
+            Ok::<(usize, usize), PyErr>((res.len(), total))
+        })
+        .await
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
+
+        // Return a Python tuple
+        Python::with_gil(|py| (n, total).into_py_any(py))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GET many (async) — return (uri, bytes) -------------------------------------
+#[pyfunction(name = "get_many_async_py")]
+#[pyo3(signature = (uris, max_in_flight = 64))]
+pub(crate) fn get_many_async_py<'p>(
+    py: Python<'p>,
+    uris: Vec<String>,
+    max_in_flight: usize,
+) -> PyResult<Bound<'p, PyAny>> {
+    // New async 
+    aio::future_into_py(py, async move {
+        // off‑load the whole download into a blocking thread
+        let pairs: Vec<(String, Vec<u8>)> = task::spawn_blocking(move || {
+            get_objects_parallel(&uris, max_in_flight)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .await
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
+        // now safely convert bytes → PyBytes under the GIL
         Python::with_gil(|py| {
-            Ok(res.into_iter().map(|(u,b)| {
-                let by: Py<PyBytes> = PyBytes::new(py,&b).into_py(py);
-                (u, by)
-            }).collect())
+            let pyres: Vec<(String, Py<PyBytes>)> = pairs.into_iter()
+                .map(|(u, b)| (u, PyBytes::new(py, &b).unbind()))
+                .collect::<Vec<_>>();
+            Ok(pyres)
         })
     })
 }
@@ -252,7 +280,7 @@ pub fn get_many(
 #[pyfunction]
 pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
     let bytes = get_object_uri(uri).map_err(py_err)?;
-    Ok(PyBytes::new(py, &bytes).into_py(py))
+    Ok(PyBytes::new(py, &bytes).unbind())
 }
 
 // ---------------------------------------------------------------------------
@@ -276,100 +304,79 @@ pub fn download(
     })
 }
 
-
 // ---------------------------------------------------------------------------
-// GET‑many **stats** (async)
-// ---------------------------------------------------------------------------
-#[pyfunction(name = "get_many_stats_async")]
+// GET‑many (sync) ---------------------------------------------------------
+#[pyfunction]
 #[pyo3(signature = (uris, max_in_flight = 64))]
-pub(crate) fn get_many_stats_async<'p>(
-    py: Python<'p>,
+pub fn get_many(
+    py: Python<'_>,
     uris: Vec<String>,
     max_in_flight: usize,
-) -> PyResult<&'p PyAny> {
-    // New async
-    aio::future_into_py(py, async move {
-        // spawn the blocking S3 work
-        let (n, total) = task::spawn_blocking(move || {
-            let res = get_objects_parallel(&uris, max_in_flight)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let total = res.iter().map(|(_, b)| b.len()).sum::<usize>();
-
-            //Ok((res.len(), total))
-            Ok::<(usize, usize), PyErr>((res.len(), total))
-
-        })
-        .await
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
-        Ok((n, total))
-    })
-    
-    /*
-     * Old async
-    aio::future_into_py(py, async move {
-        let res = get_objects_parallel(&uris, max_in_flight)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let total: usize = res.iter().map(|(_, b)| b.len()).sum();
-        Ok((res.len(), total))
-    })
-    */
-}
-
-// ---------------------------------------------------------------------------
-// GET many (async) ------------------------------------------------------------
-#[pyfunction(name = "get_many_async")]
-#[pyo3(signature = (uris, max_in_flight = 64))]
-pub(crate) fn get_many_async_py<'p>(
-    py: Python<'p>,
-    uris: Vec<String>,
-    max_in_flight: usize,
-) -> PyResult<&'p PyAny> {
-    // New async 
-    aio::future_into_py(py, async move {
-        // off‑load the whole download into a blocking thread
-        let pairs: Vec<(String, Vec<u8>)> = task::spawn_blocking(move || {
-            get_objects_parallel(&uris, max_in_flight)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })
-        .await
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
-        // now safely convert bytes → PyBytes under the GIL
-        Python::with_gil(|py| {
-            let pyres: Vec<(String, Py<PyBytes>)> = pairs.into_iter()
-                .map(|(u, b)| (u, PyBytes::new(py, &b).into_py(py)))
-                .collect::<Vec<_>>();
-            Ok(pyres)
-        })
-    })
-
-    /*
-     * Old async
-    aio::future_into_py(py, async move {
-        let res = get_objects_parallel(&uris, max_in_flight)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+) -> PyResult<Vec<(String, Py<PyBytes>)>> {
+    py.allow_threads(|| {
+        let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
         Python::with_gil(|py| {
             Ok(res.into_iter().map(|(u,b)| {
-                let by: Py<PyBytes> = PyBytes::new(py,&b).into_py(py);
+                let by: Py<PyBytes> = PyBytes::new(py,&b).unbind();
                 (u, by)
-            }).collect::<Vec<_>>())
+            }).collect())
         })
     })
-    */
 }
 
 // ---------------------------------------------------------------------------
-// DELETE (sync) ---------------------------------------------------------------
+// DELETE (sync) --------------------------------------------------------------
 #[pyfunction]
 pub fn delete(uri: &str) -> PyResult<()> {
     let (bucket, key) = parse_s3_uri(uri).map_err(py_err)?;
     let list = if key.ends_with('/') || key.is_empty() {
+        // delete everything under a prefix
         list_objects(&bucket, &key).map_err(py_err)?
-    } else { vec![key] };
-    Python::with_gil(|py| py.allow_threads(|| delete_objects(&bucket, &list)).map_err(py_err))
+    } else {
+        // delete a single object
+        vec![key]
+    };
+    delete_objects(&bucket, &list).map_err(py_err)
+}
+
+/*
+ * Poorly modified - remove ?
+ *
+pub fn delete(uri: &str) -> PyResult<usize> {
+    let (bucket, prefix) = parse_s3_uri(uri).map_err(py_err)?;
+    delete_objects(&bucket, &prefix).map_err(py_err)
+}
+*/
+
+
+// ---------------------------------------------------------------------------
+// UPLOAD (sync) --------------------------------------------------------------
+#[pyfunction]
+#[pyo3(signature = (
+    src_patterns,     // list of local paths or glob patterns
+    dest_prefix,      // S3 URI (must end with `/` or empty)
+    max_in_flight = 32,
+    create_bucket = false
+))]
+pub fn upload(
+    py: Python<'_>,
+    src_patterns: Vec<String>,
+    dest_prefix: &str,
+    max_in_flight: usize,
+    create_bucket: bool,
+) -> PyResult<()> {
+    // expand to Vec<PathBuf>
+    let paths: Vec<PathBuf> = src_patterns.into_iter()
+        .map(PathBuf::from)
+        .collect();
+    py.allow_threads(|| {
+        upload_files(dest_prefix, &paths, max_in_flight, create_bucket)
+            .map_err(py_err)
+    })
 }
 
 // ---------------------------------------------------------------------------
-// read_npz helper -------------------------------------------------------------
+// READ NPZ (sync) -> numpy array --------------------------------------------
 use numpy::PyArrayDyn;
 use std::io::Cursor;
 
@@ -384,43 +391,18 @@ pub fn read_npz(py: Python<'_>, uri: &str, array_name: Option<&str>) -> PyResult
         .or_else(|| npz.names().ok().and_then(|mut v| v.pop()))
         .ok_or_else(|| PyRuntimeError::new_err("NPZ file is empty"))?;
     let arr: ndarray::ArrayD<f32> = npz.by_name(&name).map_err(py_err)?;
-    Ok(PyArrayDyn::<f32>::from_owned_array(py, arr).into_py(py))
+    let shape: Vec<usize> = arr.shape().to_vec();
+    let data = arr.into_raw_vec();
+    let arr_np = nd_np::ArrayD::from_shape_vec(nd_np::IxDyn(&shape), data).map_err(py_err)?;
+    let py_arr = PyArrayDyn::<f32>::from_owned_array(py, arr_np);
+    py_arr.into_py_any(py)
 }
 
 // ---------------------------------------------------------------------------
-// LOGGING INITIALISER  (sync) -------------------------------------------------
-
-/// Initialise Rust‑side logging *once*
-///
-/// Examples (Python):
-/// ```python
-/// import s3dlio
-/// s3dlio.init_logging("info")   # or "debug", "warn"
-/// ```
-///
-/// Subsequent calls are ignored, so it’s safe to invoke from multiple threads.
-#[pyfunction]
-#[pyo3(signature = (level = "info"))]   // default = "info"
-pub fn init_logging(level: &str) -> PyResult<()> {
-    let lvl = match level.to_ascii_lowercase().as_str() {
-        "error" => LevelFilter::Error,
-        "warn"  | "warning" => LevelFilter::Warn,
-        "info"  => LevelFilter::Info,
-        "debug" => LevelFilter::Debug,
-        "trace" => LevelFilter::Trace,
-        _ => LevelFilter::Info,
-    };
-
-    let _ = env_logger::builder()
-        .filter_level(lvl)
-        .try_init();         // ignores AlreadyInit
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Internal module exposed to lib.rs -----------------------------------------
+// (Sub)module exposed to lib.rs -----------------------------------------
+/// This allows re-exporting these functions from the crate-level `#[pymodule]`.
 #[pymodule]
-pub fn _pymod(_py: Python, m: &PyModule) -> PyResult<()> {
+pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(list, m)?)?;

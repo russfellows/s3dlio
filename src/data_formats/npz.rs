@@ -30,7 +30,11 @@ pub fn build_npz(elements: usize, _element_size: usize, data: &[u8]) -> Result<B
     let mut cursor = Cursor::new(Vec::<u8>::new());
     {
         let mut zip = ZipWriter::new(&mut cursor);
-        let opts = FileOptions::default()
+        //
+        // Old interface
+        //let opts = FileOptions::default()
+        // New 
+        let opts: FileOptions<()> = FileOptions::default()
             .compression_method(CompressionMethod::Stored);
 
         zip.start_file("data.npy", opts)?;

@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use futures::{stream::FuturesUnordered, StreamExt};
 use pyo3::{FromPyObject, PyAny, PyResult};
+use pyo3::types::PyAnyMethods;
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::Semaphore;
@@ -82,12 +83,25 @@ impl From<&str> for ObjectType {
     }
 }
 
+
+// New pyo3 version 0.25 API
+impl<'source> FromPyObject<'source> for ObjectType {
+    fn extract_bound(ob: &pyo3::Bound<'source, PyAny>) -> PyResult<Self> {
+        let s = ob.extract::<&str>()?;
+        Ok(ObjectType::from(s))
+    }
+}
+
+/*
+ * Old definition with pyo3 v0.20
+ *
 impl<'source> FromPyObject<'source> for ObjectType {
     fn extract(ob: &'source PyAny) -> PyResult<Self> {
         let s = ob.extract::<&str>()?;
         Ok(ObjectType::from(s))
     }
 }
+*/
 
 use crate::config::ObjectType;
 
