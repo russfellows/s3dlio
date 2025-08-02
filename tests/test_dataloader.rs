@@ -1,7 +1,7 @@
-//! Integration tests for the Stage‑1 DataLoader.
-//
-//  We use small, in‑memory mock datasets so the tests are deterministic
-//  and do not need S3 or any external services.
+//! Integration tests for the Stage-1 DataLoader.
+//!
+//! We use small, in-memory mock datasets so the tests are deterministic
+//! and do not need S3 or any external services.
 
 use s3dlio::{DataLoader, Dataset, DatasetError, LoaderOptions};
 
@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt; // for `next()`
 
 // ────────────────────────────────────────────────────────────────────────────
-// Helper 1: Map‑style dataset with a backing Vec<T>
+// Helper 1: Map-style dataset with a backing Vec<T>
 // ────────────────────────────────────────────────────────────────────────────
+#[derive(Clone)]
 struct VecDataset {
     data: Vec<i32>,
 }
@@ -32,7 +33,7 @@ impl Dataset for VecDataset {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Helper 2: Iterable‑only dataset implemented as an async stream
+// Helper 2: Iterable-only dataset implemented as an async stream
 // ────────────────────────────────────────────────────────────────────────────
 struct StreamDataset {
     n: usize,
@@ -59,7 +60,7 @@ impl Dataset for StreamDataset {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Helper 3: Unknown‑length map dataset (no `len`, but supports `get`)
+// Helper 3: Unknown-length map dataset (no `len`, but supports `get`)
 // ────────────────────────────────────────────────────────────────────────────
 struct UnknownLenDataset {
     n: usize,
@@ -83,7 +84,7 @@ impl Dataset for UnknownLenDataset {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Tests
+// Baseline Stage 1 Tests
 // ────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -151,6 +152,11 @@ async fn unknown_len_dataset() {
         LoaderOptions {
             batch_size: 3,
             drop_last: false,
+            shuffle: false,
+            seed: 0,
+            num_workers: 0,
+            prefetch: 0,
+            auto_tune: false,
         },
     );
 
@@ -174,3 +180,83 @@ async fn empty_dataset() {
     assert!(stream.next().await.is_none(), "stream should be empty");
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Stage 2 Tests
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Two runs with the same shuffle seed must produce identical sequences,
+/// and that sequence must differ from the unshuffled order.
+#[tokio::test]
+async fn shuffle_determinism() {
+    let base: VecDataset = VecDataset { data: (0..50).collect() };
+
+    // Unshuffled (seed ignored)
+    let uns_opt = LoaderOptions::default()
+        .with_batch_size(1)
+        .shuffle(false, 123);
+    let uns: Vec<i32> = DataLoader::new(base.clone(), uns_opt)
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        //.map(Result::unwrap)
+        .flat_map(Result::unwrap)
+        .collect();
+
+    // Two shuffled runs with the same seed
+    let shuf_opt = LoaderOptions::default()
+        .with_batch_size(1)
+        .shuffle(true, 42);
+    let shuf1: Vec<i32> = DataLoader::new(base.clone(), shuf_opt.clone())
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        //.map(Result::unwrap)
+        .flat_map(Result::unwrap)
+        .collect();
+    let shuf2: Vec<i32> = DataLoader::new(base, shuf_opt)
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        //.map(Result::unwrap)
+        .flat_map(Result::unwrap)
+        .collect();
+
+    assert_eq!(shuf1, shuf2, "shuffled outputs with same seed must match");
+    assert_ne!(uns, shuf1, "shuffled sequence must differ from unshuffled");
+}
+
+/// Parallel workers + prefetch must not change the output compared to
+/// the default (single-threaded, no prefetch) loader.
+#[tokio::test]
+async fn parallel_prefetch_equivalence() {
+    let ds = VecDataset { data: (0..100).collect() };
+
+    // Default loader
+    let default_out: Vec<i32> = DataLoader::new(ds.clone(), LoaderOptions::default().with_batch_size(10))
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        //.map(Result::unwrap)
+        .flat_map(Result::unwrap)
+        .collect();
+
+    // Parallel loader
+    let parallel_opts = LoaderOptions::default()
+        .with_batch_size(10)
+        .num_workers(4)
+        .prefetch(16);
+    let parallel_out: Vec<i32> = DataLoader::new(ds, parallel_opts)
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        //.map(Result::unwrap)
+        .flat_map(Result::unwrap)
+        .collect();
+
+    assert_eq!(default_out, parallel_out, "parallel loader output must match default");
+}
