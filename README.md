@@ -7,6 +7,14 @@ As such, this project essentially has 3 components that can be utilized:
 3. An executable CLI, built using Rust
 
 ## What's New
+This is in reverse order, newest first.
+### Version 0.4.0
+This version added a high-level, "data-loader" interface, to enable use within AI/ML workflows.  The data loader work is on-going, but should have basic functionality, primarily through the Python library interface, where it is expected to receive most use.  This release will require testing to ensure its interface and usage align with traditional AI/ML data-loaders.  Testers are requested.  
+
+### Version 0.3.x
+These versions added features including new I/O tracing capabilities.  The file format is the same as the MinIO warp tool, thus enabling capture in a semi standard way.  With an I/O trace file, this enables the recording and playback of S3 I/O operations, with s3dlio providing the "recording" part of the equation.  Additional changes in these releases included improving and updating the Rust - Python binding, async I/O library utilized.  The async library changes should be invisible, but will ultimately enable higher multi-threading with lower overhead, and increased compatability with other libraries going forward.  
+
+### Version 0.3.0
 Since the prior project "dlio_s3_rust" was archived and all future work moved to this project, there have been a number of enhancements.  These include the following:
   * Enhanced data generation - now supports settable dedupe and compression ratios
   * Two new cli commands: upload and download, which help enhance the use as a testing tool
