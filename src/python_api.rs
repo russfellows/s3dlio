@@ -18,7 +18,7 @@ use pyo3::conversion::IntoPyObjectExt;
 
 use pyo3_async_runtimes::tokio::future_into_py; // only for bridge → Python
 use tokio::{
-    spawn,
+//    spawn,
     task,
     sync::{mpsc, Mutex},
 };
@@ -121,14 +121,19 @@ pub fn put(
     })
 }
 
-#[pyfunction(name = "put_async_py")]
+// Old, the python visible name has an _py at the end
+//#[pyfunction(name = "put_async_py")]
+// New, now it does not.
+#[pyfunction(name = "put_async")]
 #[pyo3(signature = (
     prefix, num, template,
     max_in_flight = 64, size = None,
     should_create_bucket = false, object_type = "zeros",
     dedup_factor = 1, compress_factor = 1
 ))]
-pub fn put_async_py<'p>(
+// Old, we knew this was a crate, and now we don't ??? 
+//pub fn put_async_py<'p>(
+pub (crate) fn put_async_py<'p>(
     py: Python<'p>,
     prefix: &'p str, num: usize, template: &'p str,
     max_in_flight: usize, size: Option<usize>,
@@ -210,9 +215,12 @@ pub fn get_many_stats_async<'p>(
     })
 }
 
-#[pyfunction(name = "get_many_async_py")]
+// Old, had a _py
+//#[pyfunction(name = "get_many_async_py")]
+#[pyfunction(name = "get_many_async")]
 #[pyo3(signature = (uris, max_in_flight = 64))]
-pub fn get_many_async_py<'p>(
+//pub fn get_many_async_py<'p>(
+pub (crate) fn get_many_async_py<'p>(
     py: Python<'p>,
     uris: Vec<String>,
     max_in_flight: usize,
@@ -340,29 +348,6 @@ impl Dataset for PyVecDataset {
     }
 }
 
-/*
- * Old
- *
-fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
-    if let Some(d) = d {
-        let g_usize = |k: &str, def| d.get_item(k).and_then(|v| v.extract::<usize>().ok()).unwrap_or(def);
-        let g_bool  = |k: &str, def| d.get_item(k).and_then(|v| v.extract::<bool>().ok()).unwrap_or(def);
-        let g_u64   = |k: &str, def| d.get_item(k).and_then(|v| v.extract::<u64>().ok()).unwrap_or(def);
-
-        LoaderOptions {
-            batch_size:  g_usize("batch_size", 32),
-            drop_last:   g_bool("drop_last", false),
-            shuffle:     g_bool("shuffle", false),
-            seed:        g_u64("seed", 0),
-            num_workers: g_usize("num_workers", 0),
-            prefetch:    g_usize("prefetch", 0),
-            auto_tune:   g_bool("auto_tune", false),
-        }
-    } else {
-        LoaderOptions::default()
-    }
-}
-*/
 
 /// Convert an optional Python dict of options into LoaderOptions.
 fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
