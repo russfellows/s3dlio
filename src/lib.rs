@@ -105,6 +105,11 @@ pub fn s3dlio(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats_async, m)?)?;
 
+    // -- Add async DataLoader classes for Python API --
+    m.add_class::<python_api::PyVecDataset>()?;
+    m.add_class::<python_api::PyAsyncDataLoader>()?;
+    m.add_class::<python_api::PyAsyncDataLoaderIter>()?;
+
     Ok(())
 }
 
