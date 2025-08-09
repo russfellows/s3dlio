@@ -1,5 +1,22 @@
+# Rust #
+###########
 /target
-.venv
 src/*.save
 src/bin/*.save
+
+# Misc #
+###########
 *.zst
+
+# Python #
+###########
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+.venv
+venv/
+*.env
+.ipynb_checkpoints

@@ -8,11 +8,12 @@ pub mod options;
 pub mod sampler;
 pub mod prefetch;
 pub mod transform;
+pub mod s3_bytes;
 
 
 // Re‐export the key types at this level:
 pub use dataloader::DataLoader;
-//pub use dataset::{Dataset, DatasetError, DynStream};
 pub use dataset::{Dataset, DatasetError};
 pub use options::LoaderOptions;
+pub use s3_bytes::S3BytesDataset;
 

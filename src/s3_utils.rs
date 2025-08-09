@@ -14,15 +14,17 @@ use pyo3::types::PyAnyMethods;
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::Semaphore;
+use bytes::Bytes;
 
 use log::{info, debug};
 
 // data generation helpers
 use crate::data_gen::{generate_object};
 use crate::config::Config;
+use crate::config::ObjectType;
 
 // S3 client creation
-use crate::s3_client::{aws_s3_client, block_on};
+use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
 
 // S3 operation logging
 use crate::s3_logger::global_logger;
@@ -36,8 +38,8 @@ pub const DEFAULT_OBJECT_SIZE: usize = 20 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // helper: create an S3Ops wired to the singleton logger (if any)
-fn build_ops() -> Result<S3Ops> {
-    let client = aws_s3_client()?;
+async fn build_ops_async() -> Result<S3Ops> {
+    let client = aws_s3_client_async().await?;
     let logger = global_logger();
     let client_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
     let endpoint  = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
@@ -92,18 +94,6 @@ impl<'source> FromPyObject<'source> for ObjectType {
     }
 }
 
-/*
- * Old definition with pyo3 v0.20
- *
-impl<'source> FromPyObject<'source> for ObjectType {
-    fn extract(ob: &'source PyAny) -> PyResult<Self> {
-        let s = ob.extract::<&str>()?;
-        Ok(ObjectType::from(s))
-    }
-}
-*/
-
-use crate::config::ObjectType;
 
 // -----------------------------------------------------------------------------
 // S3 URI helpers
@@ -121,9 +111,10 @@ pub fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
 // -----------------------------------------------------------------------------
 /// Create an S3 bucket if it does not exist.
 pub fn create_bucket(bucket: &str) -> Result<()> {
-    block_on(async {
-        let client = aws_s3_client()?;
-        match client.create_bucket().bucket(bucket).send().await {
+    let bucket = bucket.to_string(); // own it
+    run_on_global_rt(async move {
+        let client = aws_s3_client_async().await?;
+        match client.create_bucket().bucket(&bucket).send().await {
             Ok(_) => Ok(()),
             Err(e) => {
                 if let Some(code) = e.code() {
@@ -145,38 +136,28 @@ pub fn create_bucket(bucket: &str) -> Result<()> {
 // -----------------------------------------------------------------------------
 /// List every key under `prefix` (handles pagination).
 pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
-    block_on(async {
-        // Old, pre logger
-//        let client = aws_s3_client()?;
+    let bucket = bucket.to_string();
+    let prefix = prefix.to_string();
+    run_on_global_rt(async move {
+        // log one LIST
+        let _ = build_ops_async().await?.list_objects(&bucket, &prefix).await;
+        let client = aws_s3_client_async().await?;   // reuse raw client for pagination
 
-        // Fire one lightweight LIST to get the op into the log.
-        let _ = build_ops()?.list_objects(bucket, prefix).await;
-
-        let client = aws_s3_client()?;   // reuse raw client for pagination
         let mut keys = Vec::new();
         let mut cont: Option<String> = None;
 
-        // If debug show what we have
         debug!("list_objects: bucket='{}' prefix='{}'", bucket, prefix);
 
         loop {
-            let mut _req = client.list_objects_v2().bucket(bucket).prefix(prefix);
-
             debug!("  loop: continuation_token={:?}", cont);
-            let req = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix);
-
-
+            let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
             if let Some(token) = &cont {
-                _req = req.continuation_token(token);
+                req = req.continuation_token(token);
                 debug!("    attached continuation_token='{}'", token);
             }
-            let resp = _req.send().await.context("list_objects_v2 failed")?;
+            let resp = req.send().await.context("list_objects_v2 failed")?;
             debug!("    page received: {} contents", resp.contents().len());
-            
-            // iterating over objects in the response
+
             for obj in resp.contents() {
                 if let Some(k) = obj.key() {
                     debug!("      found key: '{}'", k);
@@ -196,156 +177,167 @@ pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
     })
 }
 
+
+/// Read `length` bytes starting at `offset` from `s3://bucket/key`.
+/// A negative or oversize request is truncated to the object size.
+/// Uses the existing `get_object_uri()` helper internally so we don’t
+/// duplicate S3-client code right now.
+pub fn get_range(
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Vec<u8>> {
+    let uri = format!("s3://{bucket}/{key}");
+    let bytes = get_object_uri(&uri)?;
+    let start = offset as usize;
+    let end = match length {
+        Some(len) => start.saturating_add(len as usize).min(bytes.len()),
+        None => bytes.len(),
+    };
+    if start >= bytes.len() {
+        Ok(Vec::new())
+    } else {
+        Ok(bytes[start..end].to_vec())
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Stat (HEAD) operation
 // -----------------------------------------------------------------------------
-/// Perform HEAD-object and return **all** common metadata. 
-pub fn stat_object(bucket: &str, prefix: &str, key: &str) -> Result<ObjectStat> {
 
-    // Clean off any leading slash from the incoming key
+/// Perform HEAD-object and return all common metadata (async).
+pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
+
+    // optional: log the HEAD via S3Ops (does not return the metadata)
     let key_clean = key.trim_start_matches('/');
-    // Trim slashes off prefix, then join prefix and key with exactly one "/"
-    let prefix_clean = prefix.trim_matches('/');
-    let full_key = if prefix_clean.is_empty() {
-        key_clean.to_string()
-    } else {
-        format!("{}/{}", prefix_clean, key_clean)
-    };
+    let _ = build_ops_async().await?.stat_object(bucket, key_clean).await;
+
     debug!(
-        "stat_object → bucket='{}', prefix='{}', key='{}', full_key='{}'",
-        bucket, prefix, key, full_key
+        "stat_object → bucket='{}', key='{}', key_clean='{}'",
+        bucket, key, key_clean
     );
 
-    block_on(async {
-        // Old pre logger
-        //let client = aws_s3_client()?;
-        //
-        // New, with logger
-        // Log the HEAD request
-        let _ = build_ops()?.stat_object(bucket, &full_key).await;
+    let client = aws_s3_client_async().await?;
+    let resp = client.head_object()
+        .bucket(bucket)
+        .key(key.trim_start_matches('/'))
+        .send()
+        .await
+        .context("head_object failed")?;
 
-        let client = aws_s3_client()?;
-        let resp = client.head_object()
-            .bucket(bucket)
-            .key(&full_key)
-            .send()
-            .await
-            .context("head_object failed")?;
-
-
-        Ok(ObjectStat {
-            size:                   resp.content_length().unwrap_or_default() as u64,
-            last_modified:          resp.last_modified().map(|t| t.to_string()),
-            e_tag:                  resp.e_tag().map(|s| s.to_string()),
-            content_type:           resp.content_type().map(|s| s.to_string()),
-            content_language:       resp.content_language().map(|s| s.to_string()),
-            content_encoding:       resp.content_encoding().map(|s| s.to_string()),
-            cache_control:          resp.cache_control().map(|s| s.to_string()),
-            content_disposition:    resp.content_disposition().map(|s| s.to_string()),
-            expires:                resp.expires_string().map(|s| s.to_string()),
-            storage_class:          resp.storage_class().map(|s| s.as_str().to_string()),
-            server_side_encryption: resp.server_side_encryption().map(|s| s.as_str().to_string()),
-            ssekms_key_id:          resp.ssekms_key_id().map(|s| s.to_string()),
-            sse_customer_algorithm: resp.sse_customer_algorithm().map(|s| s.to_string()),
-            version_id:             resp.version_id().map(|s| s.to_string()),
-            replication_status:     resp.replication_status().map(|s| s.as_str().to_string()),
-            metadata:               resp.metadata().cloned().unwrap_or_default(),
-        })
+    Ok(ObjectStat {
+        size:                   resp.content_length().unwrap_or_default() as u64,
+        last_modified:          resp.last_modified().map(|t| t.to_string()),
+        e_tag:                  resp.e_tag().map(|s| s.to_string()),
+        content_type:           resp.content_type().map(|s| s.to_string()),
+        content_language:       resp.content_language().map(|s| s.to_string()),
+        content_encoding:       resp.content_encoding().map(|s| s.to_string()),
+        cache_control:          resp.cache_control().map(|s| s.to_string()),
+        content_disposition:    resp.content_disposition().map(|s| s.to_string()),
+        // if your SDK has `expires()` instead of `expires_string()`, swap accordingly
+        expires:                resp.expires_string().map(|s| s.to_string()),
+        storage_class:          resp.storage_class().map(|s| s.as_str().to_string()),
+        server_side_encryption: resp.server_side_encryption().map(|s| s.as_str().to_string()),
+        ssekms_key_id:          resp.ssekms_key_id().map(|s| s.to_string()),
+        sse_customer_algorithm: resp.sse_customer_algorithm().map(|s| s.to_string()),
+        version_id:             resp.version_id().map(|s| s.to_string()),
+        replication_status:     resp.replication_status().map(|s| s.as_str().to_string()),
+        metadata:               resp.metadata().cloned().unwrap_or_default(),
     })
 }
 
-
-
 /// Convenience wrapper that accepts a full `s3://bucket/key` URI.
-pub fn stat_object_uri(uri: &str) -> Result<ObjectStat> {
+///
+/// Async HEAD by full URI (non-blocking; safe inside Tokio)
+pub async fn stat_object_uri_async(uri: &str) -> Result<ObjectStat> {
     let (bucket, key) = parse_s3_uri(uri)?;
-    if key.is_empty() {
-        bail!("Cannot STAT: no key specified (use full key)");
-    }
-    //stat_object(&bucket, &key)
-    // If no prefix, pass empty string for now
-    stat_object(&bucket, "", &key)
+    if key.is_empty() { bail!("Cannot HEAD: no key specified"); }
+    stat_object(&bucket, &key).await
 }
+
+/*
+ * Old ?
+ *
+/// Sync wrapper that is safe even if a Tokio runtime is already running.
+pub fn stat_object_uri(uri: &str) -> Result<ObjectStat> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(stat_object_uri_async(uri)))
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()?
+            .block_on(stat_object_uri_async(uri))
+    }
+}
+*/
+
+/// Sync wrapper that is safe uses helper, we don't use the one above now? 
+pub fn stat_object_uri(uri: &str) -> anyhow::Result<ObjectStat> {
+    let uri = uri.to_string();
+    run_on_global_rt(async move { stat_object_uri_async(&uri).await })
+}
+
+/// Async stat for many URIs (concurrent).
+pub async fn stat_object_many_async(uris: Vec<String>) -> Result<Vec<ObjectStat>> {
+    use futures_util::future::try_join_all;
+    let futs = uris.into_iter().map(|u| async move { stat_object_uri_async(&u).await });
+    try_join_all(futs).await
+}
+
 
 // -----------------------------------------------------------------------------
 // Delete operation
 // -----------------------------------------------------------------------------
-/*
- * Old - pre logger
- *
-/// Delete many keys (up to 1000 per call).
-pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
-    block_on(async {
-        let client = aws_s3_client()?;
-        for chunk in keys.chunks(1000) {
-            let objs: Vec<ObjectIdentifier> = chunk.iter()
-                .map(|k| ObjectIdentifier::builder().key(k).build().map_err(anyhow::Error::from))
-                .collect::<Result<_>>()?;
-            let delete = Delete::builder().set_objects(Some(objs)).build().map_err(anyhow::Error::from)?;
-            client.delete_objects().bucket(bucket).delete(delete).send().await?;
-        }
-        Ok(())
-    })
-}
-*/
 
 /// Delete many keys (up to 1000 per logged batch).
 pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
-    block_on(async {
-        let ops = build_ops()?;
-        for chunk in keys.chunks(1000) {
-            ops.delete_objects(bucket, chunk.to_vec()).await?;
+    let bucket = bucket.to_string();
+    let to_delete: Vec<String> = keys.to_vec();
+    run_on_global_rt(async move {
+        let ops = build_ops_async().await?;
+        for chunk in to_delete.chunks(1000) {
+            ops.delete_objects(&bucket, chunk.to_vec()).await?;
         }
         Ok(())
     })
 }
+
+
 
 // -----------------------------------------------------------------------------
 // Download (GET) operations
 // -----------------------------------------------------------------------------
-/*
- * Old, pre logger
- *
-/// Download a single object from S3 (bucket/key).
-pub async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
-    let client = aws_s3_client()?;
-    let resp = client.get_object().bucket(bucket).key(key)
-        .send().await.context("get_object failed")?;
-    let data = resp.body.collect().await.context("collect body failed")?.into_bytes();
-
-    info!("S3 GET s3://{}/{} ", bucket, key);
-    Ok(data.to_vec())
-}
-*/
 
 /// Download a single object from S3 **with op‑logging**.
 pub async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
     // delegate to S3Ops (which records the GET) and propagate errors
-    let data = build_ops()?.get_object(bucket, key).await?;
+    let data = build_ops_async().await?.get_object(bucket, key).await?;
     
     // Emit an info‑level message
     info!("S3 GET s3://{}/{}", bucket, key);
     Ok(data)
 }
 
-/// Download a single object by URI.
-pub fn get_object_uri(uri: &str) -> Result<Vec<u8>> {
-    let (bucket, key) = parse_s3_uri(uri)?;
-    if key.is_empty() {
-        bail!("Cannot GET: no key specified (use full key)");
-    }
-    block_on(get_object(&bucket, &key))
+/// Download a single object by URI, uses helper
+pub fn get_object_uri(uri: &str) -> anyhow::Result<Vec<u8>> {
+    let uri = uri.to_string();
+    run_on_global_rt(async move { get_object_uri_async(&uri).await })
 }
 
 /// Download many objects concurrently (ordered by input).
 pub fn get_objects_parallel(
-    uris: &[String], max_in_flight: usize,
+    uris: &[String],
+    max_in_flight: usize,
 ) -> Result<Vec<(String, Vec<u8>)>> {
-    block_on(async {
+    let uris = uris.to_vec(); // own for 'static
+    run_on_global_rt(async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));
         let mut futs = FuturesUnordered::new();
+
         for uri in uris.iter().cloned() {
-            let sem = sem.clone();
+            let sem = Arc::clone(&sem);
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 let data = get_object_uri_async(&uri).await?;
@@ -356,12 +348,15 @@ pub fn get_objects_parallel(
         while let Some(res) = futs.next().await {
             out.push(res??);
         }
+        // keep input order
         out.sort_by_key(|(u, _)| uris.iter().position(|x| x == u).unwrap());
         Ok(out)
     })
 }
 
-async fn get_object_uri_async(uri: &str) -> Result<Vec<u8>> {
+
+/// Public async get object call
+pub async fn get_object_uri_async(uri: &str) -> Result<Vec<u8>> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
@@ -383,51 +378,34 @@ pub fn put_objects_with_random_data_and_type(
     dedup_factor: usize,
     compress_factor: usize,
 ) -> Result<()> {
-    /* build a tiny config just for data generation */
-
     info!(
         "put_objects: type={:?}, size={} bytes, uris={} parallelism={}",
-        object_type,
-        size,
-        uris.len(),
-        max_in_flight
+        object_type, size, uris.len(), max_in_flight
     );
 
     let cfg = Config {
         object_type,
-        elements: 1,                // 1 record
-        element_size: size,         // whole buffer is the record
-        use_controlled: dedup_factor != 1 || compress_factor != 1,  // We use controlled data if
-                                                                    // dedup or compress are set 
+        elements: 1,
+        element_size: size,
+        use_controlled: dedup_factor != 1 || compress_factor != 1,
         dedup_factor,
         compress_factor,
     };
 
-    let buffer = generate_object(&cfg)?;
-    debug!("Uploading buffer of {} bytes to {} URIs", buffer.len(), uris.len());
-    put_objects_parallel(&uris, &buffer, max_in_flight)
+    let buffer: Bytes = generate_object(&cfg)?.into();  // or: Bytes::from(generate_object(&cfg)?)
+    let uris_vec = uris.to_vec();                     // own for 'static
+    debug!("Uploading buffer of {} bytes to {} URIs", buffer.len(), uris_vec.len());
+    put_objects_parallel(uris_vec, buffer, max_in_flight)
 }
 
-/*
- * Old, pre logger
- *
-/// Upload an object
-pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
-    let client = aws_s3_client()?;
-    let body = ByteStream::from(data.to_vec());
-    info!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
 
-    client.put_object().bucket(bucket).key(key).body(body).send().await?;
-    Ok(())
-}
-*/
 
 /// Upload a single object to S3 **with op‑logging**.
 pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
     // delegate to S3Ops (which records the PUT) and propagate errors
-    build_ops()?.put_object(bucket, key, data.to_vec()).await?;
+    build_ops_async().await?.put_object(bucket, key, data.to_vec()).await?;
     
-    // Emit an info‑level message if you like
+    // Emit an info‑level message 
     info!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
     Ok(())
 }
@@ -435,20 +413,29 @@ pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()
 // -----------------------------------------------------------------------------
 // Internal helpers (private)
 // -----------------------------------------------------------------------------
+//
 
-pub(crate) fn put_objects_parallel(uris: &[String], data: &[u8], max_in_flight: usize) -> Result<()> {
-    block_on(async {
+pub(crate) fn put_objects_parallel(
+    uris: Vec<String>,
+    data: Bytes,                    // ref-counted, cheap to clone
+    max_in_flight: usize,
+) -> anyhow::Result<()> {
+    run_on_global_rt(async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));
         let mut futs = FuturesUnordered::new();
-        for uri in uris.iter().cloned() {
-            let sem = sem.clone();
-            let data = data.to_vec();
+
+        for uri in uris.into_iter() {
+            let sem = Arc::clone(&sem);
+            let payload = data.clone();           // zero-copy clone
+
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 let (b, k) = parse_s3_uri(&uri)?;
-                put_object_async(&b, &k, &data).await
+                // &[u8] view over Bytes — no copy here
+                put_object_async(&b, &k, payload.as_ref()).await
             }));
         }
+
         while let Some(res) = futs.next().await {
             res??;
         }
