@@ -9,21 +9,38 @@ use async_trait::async_trait;
 use futures_core::stream::Stream;
 use std::pin::Pin;
 use thiserror::Error;
-use anyhow;
+use anyhow::{self, Error as AnyError}; // <-- bring Error type in
 
 /// A boxed, pinned, sendable async stream of fallible items.
 pub type DynStream<T> =
     Pin<Box<dyn Stream<Item = Result<T, DatasetError>> + Send + 'static>>;
 
 /// Item‑level error type for dataset & loader operations.
-#[derive(Error, Debug)]
+#[derive(Error, Debug)] 
 pub enum DatasetError {
-    #[error("index {0} out of range")]
+    #[error("index out of range: {0}")]  // if using thiserror
     IndexOutOfRange(usize),
+
     #[error("operation not supported for this dataset type")]
     Unsupported,
+
+    // NEW generic backend error
     #[error(transparent)]
-    Backend(#[from] anyhow::Error),
+    Backend(#[from] AnyError),
+}
+
+
+// Mapping from string to error
+impl From<String> for DatasetError {
+    fn from(s: String) -> Self {
+        DatasetError::Backend(AnyError::msg(s))
+    }
+}
+
+impl From<&str> for DatasetError {
+    fn from(s: &str) -> Self {
+        DatasetError::Backend(AnyError::msg(s.to_string()))
+    }
 }
 
 /// A logical collection of **samples** (e.g. S3 objects, TFRecord

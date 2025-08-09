@@ -6,15 +6,13 @@ import s3dlio as s3
 # Adjust these to your S3 URIs:
 READ_PREFIX = "s3://my-bucket2/my-data2/"
 TEST_PREFIX = "s3://my-bucket2/test_rust_api/"
-NUM_OBJECTS = 5
+NUM_OBJECTS = 500
 TEMPLATE = "object_{}_of_{}.dat"
 NUM_JOBS = 32
 SIZE = 20971520  # s3.DEFAULT_OBJECT_SIZE  from Rust default
 
 
 def sync_tests():
-    # turn on debug‑level logs (shows AWS S3 SDK info + debug messages)
-    #s3.init_logging("debug")
 
     print("=== Sync LIST ===")
     start = time.time()
@@ -106,17 +104,19 @@ async def async_tests():
 def main():
 
     # turn on info‑level logs (shows the AWS S3 info messages, including AWS_CA_BUNDLE_PATH loading)
-    s3.init_logging("info")
+    #s3.init_logging("info")
+    # turn on debug‑level logs (shows AWS S3 SDK info + debug messages)
+    #s3.init_logging("debug")
 
     # Start op logging (warp-replay compatible TSV.ZST)
-    s3.init_op_log("/tmp/python_s3_ops_test.tsv.zst")
+    #s3.init_op_log("/tmp/python_s3_ops_test.tsv.zst")
 
     sync_tests()
     print()
     asyncio.run(async_tests())
 
     # Flush and close (safe to call multiple times)
-    s3.finalize_op_log()
+    #s3.finalize_op_log()
 
 
 

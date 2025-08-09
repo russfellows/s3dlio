@@ -12,16 +12,18 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyAnyMethods, PyBytes, PyDict, PyDictMethods};
+use pyo3::types::{PyAny, PyAnyMethods, PyBytes, PyDict, PyDictMethods, PyList};
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::conversion::IntoPyObjectExt;
 
 use pyo3_async_runtimes::tokio::future_into_py; // only for bridge → Python
 use tokio::{
-//    spawn,
     task,
     sync::{mpsc, Mutex},
 };
+
+// Only needed if we run async, which we're not doing yet
+//use tokio::runtime::Runtime;
 
 use numpy::ndarray as nd_np;
 
@@ -39,8 +41,12 @@ use env_logger;
 // ---------------------------------------------------------------------------
 use crate::config::ObjectType;
 use crate::s3_utils::{
-    create_bucket, delete_objects, get_object_uri, get_objects_parallel, list_objects,
-    parse_s3_uri, put_objects_with_random_data_and_type, stat_object_uri, DEFAULT_OBJECT_SIZE,
+    create_bucket, delete_objects, get_object_uri, get_objects_parallel,
+    list_objects as list_objects_rs, get_range,
+    parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
+    stat_object_uri,                    // ← sync
+    stat_object_uri_async,              // ← async
+    stat_object_many_async,             // ← async-many
 };
 use crate::s3_copy::{download_objects, upload_files};
 use crate::s3_logger::{finalize_op_logger, init_op_logger};
@@ -49,6 +55,7 @@ use crate::data_loader::{
     DataLoader,
     dataset::{Dataset, DatasetError},
     options::LoaderOptions,
+    s3_bytes::S3BytesDataset, //Only if required
 };
 
 use futures_util::StreamExt;
@@ -93,6 +100,101 @@ fn build_uri_list(prefix: &str, template: &str, num: usize) -> PyResult<(String,
 }
 fn str_to_obj(s: &str) -> ObjectType { ObjectType::from(s) }
 
+// New Code
+
+// ------------------------------------------------------------------------
+// NEW: Python-visible list_objects()  (sync wrapper)
+// ------------------------------------------------------------------------
+#[pyfunction]
+fn list_objects(bucket: &str, prefix: &str) -> PyResult<Vec<String>> {
+    list_objects_rs(bucket, prefix).map_err(py_err)
+}
+
+// ------------------------------------------------------------------------
+// NEW: Python-visible get_object()  (sync wrapper)
+// ------------------------------------------------------------------------
+#[pyfunction]
+fn get_object(
+    py: Python<'_>,
+    bucket: &str,
+    key: &str,
+    offset: Option<u64>,
+    length: Option<u64>,
+) -> PyResult<Py<PyBytes>> {
+    let bytes = get_range(bucket, key, offset.unwrap_or(0), length)
+        .map_err(py_err)?;
+    // Owned PyBytes until zero-copy lands
+    Ok(PyBytes::new(py, &bytes[..]).unbind())
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyS3Dataset { inner: S3BytesDataset }
+
+#[pymethods]
+impl PyS3Dataset {
+    #[new]
+    fn new(uri: &str) -> PyResult<Self> {
+        let ds = S3BytesDataset::from_prefix(uri)
+            //.map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: ds })
+    }
+    /// Optional: expose keys for debugging
+    fn keys(&self) -> Vec<String> { self.inner.keys().clone() }
+}
+
+// async loader over S3BytesDataset
+#[pyclass]
+pub struct PyS3AsyncDataLoader {
+    rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Vec<u8>>, DatasetError>>>>,
+}
+
+#[pymethods]
+impl PyS3AsyncDataLoader {
+    #[new]
+    fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+        let ds = S3BytesDataset::from_prefix(uri)
+            //.map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let opts = opts_from_dict(opts); // you already have this helper
+
+        let (tx, rx) = mpsc::channel::<Result<Vec<Vec<u8>>, DatasetError>>(opts.prefetch.max(1));
+
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            let loader = DataLoader::new(ds, opts);
+            let mut stream = loader.stream();
+            while let Some(batch) = stream.next().await {
+                // batch: Result<Vec<Vec<u8>>, DatasetError>
+                if tx.send(batch).await.is_err() { break; }
+            }
+        });
+
+        Ok(Self { rx: Arc::new(Mutex::new(rx)) })
+    }
+
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.rx.clone();
+        future_into_py(py, async move {
+            let mut guard = rx.lock().await;
+            match guard.recv().await {
+                Some(Ok(batch)) => Python::with_gil(|py| {
+                    // turn Vec<Vec<u8>> into list[bytes]
+                    let out: Vec<Py<PyBytes>> = batch.into_iter()
+                        .map(|b| PyBytes::new(py, &b).unbind())
+                        .collect();
+                    Ok(out.into_py_any(py)?)
+                }),
+                Some(Err(e)) => Err(PyRuntimeError::new_err(format!("{:?}", e))),
+                None => Err(PyStopAsyncIteration::new_err("end of stream")),
+            }
+        })
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // S3 helpers (sync + async)
 // ---------------------------------------------------------------------------
@@ -121,9 +223,6 @@ pub fn put(
     })
 }
 
-// Old, the python visible name has an _py at the end
-//#[pyfunction(name = "put_async_py")]
-// New, now it does not.
 #[pyfunction(name = "put_async")]
 #[pyo3(signature = (
     prefix, num, template,
@@ -131,8 +230,6 @@ pub fn put(
     should_create_bucket = false, object_type = "zeros",
     dedup_factor = 1, compress_factor = 1
 ))]
-// Old, we knew this was a crate, and now we don't ??? 
-//pub fn put_async_py<'p>(
 pub (crate) fn put_async_py<'p>(
     py: Python<'p>,
     prefix: &'p str, num: usize, template: &'p str,
@@ -160,9 +257,17 @@ pub (crate) fn put_async_py<'p>(
 #[pyfunction]
 pub fn list(uri: &str) -> PyResult<Vec<String>> {
     let (bucket, prefix) = parse_s3_uri(uri).map_err(py_err)?;
-    list_objects(&bucket, &prefix).map_err(py_err)
+    list_objects_rs(&bucket, &prefix).map_err(py_err)
 }
 
+//
+// Stat calls
+//
+
+
+/*
+ * Old
+ *
 #[pyfunction]
 pub fn stat(py: Python, uri: &str) -> PyResult<PyObject> {
     let os = stat_object_uri(uri).map_err(py_err)?;
@@ -180,6 +285,103 @@ pub fn stat(py: Python, uri: &str) -> PyResult<PyObject> {
     dict.set_item("ssekms_key_id", os.ssekms_key_id)?;
     dict.into_py_any(py)
 }
+*/
+
+/*
+ * Old stat calls that returned PyObject
+ *
+#[pyfunction]
+pub fn stat(py: Python, uri: &str) -> PyResult<PyObject> {
+    let os = stat_object_uri(uri).map_err(py_err)?;
+    Ok(stat_to_pydict(py, os)?.into())
+}
+
+#[pyfunction]
+fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<&'py PyAny> {
+    let uri = uri.to_owned();
+    future_into_py(py, async move {
+        let os = stat_object_uri_async(&uri).await.map_err(py_err)?;
+        Python::with_gil(|py| Ok::<PyObject, PyErr>(stat_to_pydict(py, os)?.into()))
+    })
+}
+
+#[pyfunction]
+fn stat_many_async<'py>(py: Python<'py>, uris: Vec<&str>) -> PyResult<&'py PyAny> {
+    let uris = uris.into_iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    future_into_py(py, async move {
+        let metas = stat_object_many_async(uris).await.map_err(py_err)?;
+        Python::with_gil(|py| {
+            let out = pyo3::types::PyList::empty(py);
+            for os in metas {
+                out.append(stat_to_pydict(py, os)?)?;
+            }
+            Ok::<PyObject, PyErr>(out.into())
+        })
+    })
+}
+*/
+
+// New stat calls, almost the same ???? 
+//
+#[pyfunction]
+pub fn stat(py: Python<'_>, uri: &str) -> PyResult<PyObject> {
+    let os = stat_object_uri(uri).map_err(py_err)?;
+    let d = stat_to_pydict(py, os)?;         // Bound<'py, PyDict>
+    Ok(d.unbind().into())                    // -> PyObject (owned)
+}
+
+#[pyfunction]
+fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    let uri = uri.to_owned();
+    future_into_py(py, async move {
+        let os = stat_object_uri_async(&uri).await.map_err(py_err)?;
+        Python::with_gil(|py| {
+            let obj: PyObject = stat_to_pydict(py, os)?.unbind().into();
+            Ok::<PyObject, PyErr>(obj)
+        })
+    })
+}
+
+#[pyfunction]
+fn stat_many_async<'py>(py: Python<'py>, uris: Vec<String>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    future_into_py(py, async move {
+        let metas = stat_object_many_async(uris).await.map_err(py_err)?;
+        Python::with_gil(|py| {
+            let list = PyList::empty(py);
+            for os in metas {
+                // append accepts any IntoPyObject<'py>; Bound<'py, PyDict> works directly
+                list.append(stat_to_pydict(py, os)?)?;
+            }
+            Ok::<PyObject, PyErr>(list.unbind().into())
+        })
+    })
+}
+
+
+/// Helper function to map Rust to Python for stat call
+fn stat_to_pydict<'py>(py: Python<'py>, os: crate::s3_utils::ObjectStat)
+    -> PyResult<pyo3::Bound<'py, PyDict>>
+{
+    let d = PyDict::new(py);
+    d.set_item("size", os.size)?;
+    d.set_item("last_modified", os.last_modified)?;
+    d.set_item("etag", os.e_tag)?;
+    d.set_item("content_type", os.content_type)?;
+    d.set_item("content_language", os.content_language)?;
+    d.set_item("content_encoding", os.content_encoding)?;
+    d.set_item("cache_control", os.cache_control)?;
+    d.set_item("content_disposition", os.content_disposition)?;
+    d.set_item("expires", os.expires)?;
+    d.set_item("storage_class", os.storage_class)?;
+    d.set_item("server_side_encryption", os.server_side_encryption)?;
+    d.set_item("ssekms_key_id", os.ssekms_key_id)?;
+    d.set_item("sse_customer_algorithm", os.sse_customer_algorithm)?;
+    d.set_item("version_id", os.version_id)?;
+    d.set_item("replication_status", os.replication_status)?;
+    d.set_item("metadata", os.metadata)?;
+    Ok(d)
+}
+
 
 #[pyfunction(name = "get_many_stats")]
 #[pyo3(signature = (uris, max_in_flight = 64))]
@@ -215,11 +417,8 @@ pub fn get_many_stats_async<'p>(
     })
 }
 
-// Old, had a _py
-//#[pyfunction(name = "get_many_async_py")]
 #[pyfunction(name = "get_many_async")]
 #[pyo3(signature = (uris, max_in_flight = 64))]
-//pub fn get_many_async_py<'p>(
 pub (crate) fn get_many_async_py<'p>(
     py: Python<'p>,
     uris: Vec<String>,
@@ -281,7 +480,7 @@ pub fn get_many(
 pub fn delete(uri: &str) -> PyResult<()> {
     let (bucket, key) = parse_s3_uri(uri).map_err(py_err)?;
     let targets = if key.ends_with('/') || key.is_empty() {
-        list_objects(&bucket, &key).map_err(py_err)?
+        list_objects_rs(&bucket, &key).map_err(py_err)?
     } else {
         vec![key]
     };
@@ -457,8 +656,12 @@ pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(list, m)?)?;
+    m.add_function(wrap_pyfunction!(list_objects, m)?)?;
     m.add_function(wrap_pyfunction!(stat, m)?)?;
+    m.add_function(wrap_pyfunction!(stat_async, m)?)?;
+    m.add_function(wrap_pyfunction!(stat_many_async, m)?)?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
+    m.add_function(wrap_pyfunction!(get_object, m)?)?;
     m.add_function(wrap_pyfunction!(get_many, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;
@@ -477,6 +680,8 @@ pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyVecDataset>()?;
     m.add_class::<PyAsyncDataLoader>()?;
     m.add_class::<PyAsyncDataLoaderIter>()?;
+    m.add_class::<PyS3Dataset>()?;
+    m.add_class::<PyS3AsyncDataLoader>()?;
     Ok(())
 }
 

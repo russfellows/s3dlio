@@ -1,6 +1,6 @@
 [project]
 name = "s3dlio"
-version = "0.4.0"
+version = "0.4.1"
 description = "A Python S3 library providing deep-learning I/O built in Rust"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -11,7 +11,9 @@ requires = ["maturin>=0.12"]
 build-backend = "maturin"
 
 [tool.maturin]
-module-name = "s3dlio"
+module-name   = "s3dlio._pymod"   # put the .so inside the s3dlio package
+python-source = "python"
+python-packages = ["s3dlio"]      # <-- NOTE the key name
 
 [tool.uv.workspace]
 members = ["python3.12"]
