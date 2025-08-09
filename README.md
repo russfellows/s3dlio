@@ -8,8 +8,11 @@ As such, this project essentially has 3 components that can be utilized:
 
 ## What's New
 This is in reverse order, newest first.
+### Version 0.4.1
+This version added a several python bindings to the "data-loader" interface, for use within PyTorch, TensorFlow and Jax AI/ML workflows.  At this stage this feature is deemed fully functional via the Python library interfaces. HOWEVER, additional testing is requested to ensure its interface and usage align with traditional AI/ML data-loaders.  Basic data-loader tests via python are available in the python/tests subdirectory, specifically using the files tf_smoke.py, jax_smoke.py and pytorch_smoke.py.    
+
 ### Version 0.4.0
-This version added a high-level, "data-loader" interface, to enable use within AI/ML workflows.  The data loader work is on-going, but should have basic functionality, primarily through the Python library interface, where it is expected to receive most use.  This release will require testing to ensure its interface and usage align with traditional AI/ML data-loaders.  Testers are requested.  
+This version added a high-level, "data-loader" interface, to enable use within AI/ML workflows.  The data loader work is on-going, but should have basic functionality, primarily through the Python library interface, where it is expected to receive most use.  This release will require testing to ensure its interface and usage align with traditional AI/ML data-loaders.   
 
 ### Version 0.3.x
 These versions added features including new I/O tracing capabilities.  The file format is the same as the MinIO warp tool, thus enabling capture in a semi standard way.  With an I/O trace file, this enables the recording and playback of S3 I/O operations, with s3dlio providing the "recording" part of the equation.  Additional changes in these releases included improving and updating the Rust - Python binding, async I/O library utilized.  The async library changes should be invisible, but will ultimately enable higher multi-threading with lower overhead, and increased compatability with other libraries going forward.  
@@ -71,7 +74,7 @@ What is left?  Several items are already identified as future enhancements.  The
 
 ### Enhancements
 These are listed in no particular order:
-  * Add AI/ML data loader functionality (issue #14)
+  * (✅ Completed!) Add AI/ML data loader functionality (issue #14 - close 9, Aug. 2025)
   * Add AI/ML check point writer feature (issue #18)
   * (✅ Completed!) Implement S3 operation logging (issue #17 - closed 27, July 2025)
   * Improve Get performance (issue #11)
