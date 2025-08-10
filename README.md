@@ -286,14 +286,16 @@ root@loki-node3:/app# s3-cli
 Usage: s3-cli <COMMAND>
 
 Commands:
-  list      List keys that start with the given prefix
-  stat      Stat object, show size & last modify date of a single object
-  delete    Delete one object or every object that matches the prefix
-  get       Download one or many objects concurrently
-  put       Upload one or more objects concurrently, uses ObjectType format filled with random data
-  upload    Upload local files (supports glob patterns) to S3, concurrently to jobs
-  download  Download object(s) to named directory (uses globbing pattern match)
-  help      Print this message or the help of the given subcommand(s)
+  create-bucket  Create a new S3 bucket
+  delete-bucket  Delete an S3 bucket. The bucket must be empty
+  list           List objects in an S3 path, the final part of path is treated as a regex. Example: s3-cli list s3://my-bucket/data/.*\\.csv
+  stat           Stat object, show size & last modify date of a single object
+  delete         Delete one object or every object that matches the prefix
+  get            Download one or many objects concurrently
+  put            Upload one or more objects concurrently, uses ObjectType format filled with random data
+  upload         Upload local files (supports glob patterns) to S3, concurrently to jobs
+  download       Download object(s) to named directory (uses globbing pattern match)
+  help           Print this message or the help of the given subcommand(s)
 
 Options:
   -v, --verbose...     Increase log verbosity: -v = Info, -vv = Debug
