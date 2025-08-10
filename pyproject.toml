@@ -1,6 +1,6 @@
 [project]
 name = "s3dlio"
-version = "0.4.1"
+version = "0.4.2"
 description = "A Python S3 library providing deep-learning I/O built in Rust"
 readme = "README.md"
 requires-python = ">=3.12"

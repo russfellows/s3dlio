@@ -41,9 +41,10 @@ use env_logger;
 // ---------------------------------------------------------------------------
 use crate::config::ObjectType;
 use crate::s3_utils::{
-    create_bucket, delete_objects, get_object_uri, get_objects_parallel,
+    delete_objects, get_object_uri, get_objects_parallel,
     list_objects as list_objects_rs, get_range,
     parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
+    create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs,
     stat_object_uri,                    // ← sync
     stat_object_uri_async,              // ← async
     stat_object_many_async,             // ← async-many
@@ -103,11 +104,12 @@ fn str_to_obj(s: &str) -> ObjectType { ObjectType::from(s) }
 // New Code
 
 // ------------------------------------------------------------------------
-// NEW: Python-visible list_objects()  (sync wrapper)
+// NEW: Python-visible list_objects()  (sync wrapper), with recursion
 // ------------------------------------------------------------------------
 #[pyfunction]
-fn list_objects(bucket: &str, prefix: &str) -> PyResult<Vec<String>> {
-    list_objects_rs(bucket, prefix).map_err(py_err)
+#[pyo3(signature = (bucket, prefix, recursive = false))]
+fn list_objects(bucket: &str, prefix: &str, recursive: bool) -> PyResult<Vec<String>> {
+    list_objects_rs(bucket, prefix, recursive).map_err(py_err)
 }
 
 // ------------------------------------------------------------------------
@@ -194,6 +196,37 @@ impl PyS3AsyncDataLoader {
     }
 }
 
+// - create-bucket command
+#[pyfunction]
+pub fn create_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
+    // --- Add consistent prefix handling, just like in the CLI ---
+    let final_bucket_name = bucket_name
+        .strip_prefix("s3://")
+        .unwrap_or(bucket_name)
+        .trim_end_matches('/')
+        .to_string(); // Own the string to move it across the thread boundary
+
+    // Release the GIL to allow other Python threads to run
+    py.allow_threads(move || {
+        create_bucket_rs(&final_bucket_name).map_err(py_err)
+    })
+}
+
+// - delete-bucket command
+#[pyfunction]
+pub fn delete_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
+    // Clean the input string to get a valid bucket name
+    let final_bucket_name = bucket_name
+        .strip_prefix("s3://")
+        .unwrap_or(bucket_name)
+        .trim_end_matches('/')
+        .to_string(); // Own the string to move across the thread boundary
+
+    // Release the GIL for the blocking S3 call
+    py.allow_threads(move || {
+        delete_bucket_rs(&final_bucket_name).map_err(py_err)
+    })
+}
 
 // ---------------------------------------------------------------------------
 // S3 helpers (sync + async)
@@ -217,7 +250,7 @@ pub fn put(
     let jobs = max_in_flight.min(num);
     let obj = str_to_obj(object_type);
     py.allow_threads(|| {
-        if should_create_bucket { let _ = create_bucket(&bucket); }
+        if should_create_bucket { let _ = create_bucket_rs(&bucket); }
         put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor)
             .map_err(py_err)
     })
@@ -244,7 +277,7 @@ pub (crate) fn put_async_py<'p>(
 
     future_into_py(py, async move {
         task::spawn_blocking(move || {
-            if should_create_bucket { let _ = create_bucket(&bucket); }
+            if should_create_bucket { let _ = create_bucket_rs(&bucket); }
             put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor)
                 .map_err(py_err)
         })
@@ -254,72 +287,21 @@ pub (crate) fn put_async_py<'p>(
     })
 }
 
+
+// --- `list` function
 #[pyfunction]
-pub fn list(uri: &str) -> PyResult<Vec<String>> {
-    let (bucket, prefix) = parse_s3_uri(uri).map_err(py_err)?;
-    list_objects_rs(&bucket, &prefix).map_err(py_err)
+#[pyo3(signature = (uri, recursive = false))]
+pub fn list(uri: &str, recursive: bool) -> PyResult<Vec<String>> {
+    let (bucket, mut path) = parse_s3_uri(uri).map_err(py_err)?;
+
+    // If the path ends with a slash, automatically append a wildcard to search inside it.
+    if path.ends_with('/') {
+        path.push_str(".*");
+    }
+
+    crate::s3_utils::list_objects(&bucket, &path, recursive).map_err(py_err)
 }
 
-//
-// Stat calls
-//
-
-
-/*
- * Old
- *
-#[pyfunction]
-pub fn stat(py: Python, uri: &str) -> PyResult<PyObject> {
-    let os = stat_object_uri(uri).map_err(py_err)?;
-    let dict = PyDict::new(py);
-    dict.set_item("size", os.size)?;
-    dict.set_item("last_modified", os.last_modified)?;
-    dict.set_item("etag", os.e_tag)?;
-    dict.set_item("content_type", os.content_type)?;
-    dict.set_item("content_language", os.content_language)?;
-    dict.set_item("storage_class", os.storage_class)?;
-    dict.set_item("metadata", os.metadata)?;
-    dict.set_item("version_id", os.version_id)?;
-    dict.set_item("replication_status", os.replication_status)?;
-    dict.set_item("server_side_encryption", os.server_side_encryption)?;
-    dict.set_item("ssekms_key_id", os.ssekms_key_id)?;
-    dict.into_py_any(py)
-}
-*/
-
-/*
- * Old stat calls that returned PyObject
- *
-#[pyfunction]
-pub fn stat(py: Python, uri: &str) -> PyResult<PyObject> {
-    let os = stat_object_uri(uri).map_err(py_err)?;
-    Ok(stat_to_pydict(py, os)?.into())
-}
-
-#[pyfunction]
-fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<&'py PyAny> {
-    let uri = uri.to_owned();
-    future_into_py(py, async move {
-        let os = stat_object_uri_async(&uri).await.map_err(py_err)?;
-        Python::with_gil(|py| Ok::<PyObject, PyErr>(stat_to_pydict(py, os)?.into()))
-    })
-}
-
-#[pyfunction]
-fn stat_many_async<'py>(py: Python<'py>, uris: Vec<&str>) -> PyResult<&'py PyAny> {
-    let uris = uris.into_iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    future_into_py(py, async move {
-        let metas = stat_object_many_async(uris).await.map_err(py_err)?;
-        Python::with_gil(|py| {
-            let out = pyo3::types::PyList::empty(py);
-            for os in metas {
-                out.append(stat_to_pydict(py, os)?)?;
-            }
-            Ok::<PyObject, PyErr>(out.into())
-        })
-    })
-}
-*/
 
 // New stat calls, almost the same ???? 
 //
@@ -446,18 +428,29 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
     Ok(PyBytes::new(py, &bytes[..]).unbind())
 }
 
+// --- `download` function
 #[pyfunction]
-#[pyo3(signature = (src_uri, dest_dir, max_in_flight = 64))]
+#[pyo3(signature = (src_uri, dest_dir, max_in_flight = 64, recursive = true))]
 pub fn download(
     py: Python<'_>,
     src_uri: &str,
     dest_dir: &str,
     max_in_flight: usize,
+    recursive: bool,
 ) -> PyResult<()> {
     let dir = PathBuf::from(dest_dir);
-    py.allow_threads(|| download_objects(src_uri, &dir, max_in_flight).map_err(py_err))
+    // The `download_objects` function in `s3_copy.rs` needs a `recursive` flag.
+    // We'll assume for now it has been added.
+    py.allow_threads(move || {
+        // NOTE: This assumes `download_objects` will be updated to accept a `recursive` flag.
+        // Let's pretend the signature is: `download_objects(src_uri, &dir, max_in_flight, recursive)`
+        // For now, we call the existing function which is implicitly recursive.
+        download_objects(src_uri, &dir, max_in_flight, recursive).map_err(py_err)
+    })
 }
 
+
+// --- `get_many` function
 #[pyfunction]
 #[pyo3(signature = (uris, max_in_flight = 64))]
 pub fn get_many(
@@ -476,16 +469,40 @@ pub fn get_many(
     })
 }
 
+// --- `delete` function
 #[pyfunction]
-pub fn delete(uri: &str) -> PyResult<()> {
-    let (bucket, key) = parse_s3_uri(uri).map_err(py_err)?;
-    let targets = if key.ends_with('/') || key.is_empty() {
-        list_objects_rs(&bucket, &key).map_err(py_err)?
+#[pyo3(signature = (uri, recursive = false))]
+pub fn delete(uri: &str, recursive: bool) -> PyResult<()> {
+    let (bucket, mut key_pattern) = parse_s3_uri(uri).map_err(py_err)?;
+
+    /*
+     * Old
+     *
+    // If the pattern isn't a glob/regex and not a prefix, it's a single key.
+    // Otherwise, use list_objects to find all matching keys.
+    let keys_to_delete = if !key_pattern.contains('*') && !key_pattern.contains('?') && !key_pattern.ends_with('/') {
+        vec![key_pattern]
     } else {
-        vec![key]
+        crate::s3_utils::list_objects(&bucket, &key_pattern, recursive).map_err(py_err)?
     };
-    delete_objects(&bucket, &targets).map_err(py_err)
+    */
+
+    // If the path ends with a slash, automatically append a wildcard to search inside it.
+    if key_pattern.ends_with('/') {
+        key_pattern.push_str(".*");
+    }
+
+    let keys_to_delete =
+        crate::s3_utils::list_objects(&bucket, &key_pattern, recursive).map_err(py_err)?;
+
+    if keys_to_delete.is_empty() {
+        // Return Ok instead of an error if nothing matched, this is common practice
+        return Ok(());
+    }
+
+    delete_objects(&bucket, &keys_to_delete).map_err(py_err)
 }
+
 
 #[pyfunction]
 #[pyo3(signature = (src_patterns, dest_prefix,
@@ -653,6 +670,8 @@ impl PyAsyncDataLoaderIter {
 #[pymodule]
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     // S3 helpers
+    m.add_function(wrap_pyfunction!(create_bucket, m)?)?;
+    m.add_function(wrap_pyfunction!(delete_bucket, m)?)?;
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(list, m)?)?;

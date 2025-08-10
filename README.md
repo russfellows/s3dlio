@@ -9,6 +9,9 @@ As such, this project essentially has 3 components that can be utilized:
 ## What's New
 This is in reverse order, newest first.
 ### Version 0.4.1
+Version 0.4.2 added regular expression parsing to most commainds, including list, delete, get and download.  These all seem to work consistently between the CLI and the python library.  Also, there is a new recursive options "-r" or --recursive" that makes these operate recursively.  Essentially, this just eliminates the commands seeing a "/" as a path separator. Additionally if the target command ends with a trailing slash "/" character, internally we just append a regex wildcard of dot start ".*" meaning any pattern to the end.  Also, we added a "create-bucket" operator as a standalone command, via both cli and python library.
+
+### Version 0.4.1
 This version added a several python bindings to the "data-loader" interface, for use within PyTorch, TensorFlow and Jax AI/ML workflows.  At this stage this feature is deemed fully functional via the Python library interfaces. HOWEVER, additional testing is requested to ensure its interface and usage align with traditional AI/ML data-loaders.  Basic data-loader tests via python are available in the python/tests subdirectory, specifically using the files tf_smoke.py, jax_smoke.py and pytorch_smoke.py.    
 
 ### Version 0.4.0
@@ -74,25 +77,27 @@ What is left?  Several items are already identified as future enhancements.  The
 
 ### Enhancements
 These are listed in no particular order:
-  * (✅ Completed!) Add AI/ML data loader functionality (issue #14 - close 9, Aug. 2025)
+  * (✅ Completed!) Add AI/ML data loader functionality (issue #14 - closed 9, Aug. 2025)
   * Add AI/ML check point writer feature (issue #18)
   * (✅ Completed!) Implement S3 operation logging (issue #17 - closed 27, July 2025)
   * Improve Get performance (issue #11)
   * Improve Put performance and add multi-part upload (issue #12)
   * Improve python binding performance, w/ zero-copy views (issue #13)
+  * (✅ Completed!) Implement regex for operations (issue #23 - closed 10, Aug. 2025)
 
 # How to Guide
 ## S3 Rust Library and CLI
 This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import s3dlio as s3` and used by Python programs.
 
 ### Purpose
-The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The six primary operations for S3 are included: 
+The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The following primary operations for S3 are included: 
  - get
  - put
  - list
  - stat
  - delete
- - create-bucket.
+ - create-bucket
+ - delete-bucket
 
 Additionally, the cli supports commands to upload and download data.  These are:
  - upload
@@ -100,7 +105,7 @@ Additionally, the cli supports commands to upload and download data.  These are:
 
 These operations will respectively upload/put a local file as an object, or download/get an object as a local file.  
 
-**Note** that bucket creation currently occurs only as part of a Put operation.  
+**Note** that bucket creation can occur explicitly, or as part of a Put operation if the create-bucket flag is passed.  
 
 ### Container
 For ease of testing, both the cli and library may be built into a container as well.  The Rust source code is removed from this container in order to reduce its size.  

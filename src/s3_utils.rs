@@ -13,6 +13,7 @@ use pyo3::{FromPyObject, PyAny, PyResult};
 use pyo3::types::PyAnyMethods;
 use std::sync::Arc;
 use std::collections::HashMap;
+use regex::Regex;
 use tokio::sync::Semaphore;
 use bytes::Bytes;
 
@@ -131,6 +132,138 @@ pub fn create_bucket(bucket: &str) -> Result<()> {
     })
 }
 
+
+// -----------------------------------------------------------------------------
+// S3 Delete bucket
+// -----------------------------------------------------------------------------
+/// Delete an S3 bucket. The bucket must be empty.
+pub fn delete_bucket(bucket: &str) -> Result<()> {
+    let bucket = bucket.to_string(); // own it for the async move
+    run_on_global_rt(async move {
+        let client = aws_s3_client_async().await?;
+        client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to delete bucket '{}'. Note: Buckets must be empty before deletion.",
+                    bucket
+                )
+            })?;
+        Ok(())
+    })
+}
+
+/// List keys under a path, with regex matching on the final path component.
+/// Handles S3 pagination automatically.
+pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<String>> {
+    // Clone inputs to move them into the async block
+    let bucket = bucket.to_string();
+    let path = path.to_string();
+
+    // Use the new tokio runtime framework
+    run_on_global_rt(async move {
+        // 1. Determine the S3 prefix and the regex pattern from the input path.
+        let (prefix, pattern) = match path.rfind('/') {
+            Some(index) => {
+                let (p, pat) = path.split_at(index + 1);
+                (p, pat)
+            }
+            None => ("", path.as_str()),
+        };
+
+        // If the pattern is empty (e.g., path ends in "/"), default to matching everything.
+        let final_pattern = if pattern.is_empty() { ".*" } else { pattern };
+
+        // 2. Compile the regex.
+        let re = Regex::new(final_pattern)
+            .with_context(|| format!("Invalid regex pattern: '{}'", final_pattern))?;
+
+        // This logging operation can be adapted or removed, but here's how to keep it:
+        let _ = build_ops_async().await?.list_objects(&bucket, prefix).await;
+
+        let client = aws_s3_client_async().await?;
+        let mut keys = Vec::new();
+        let mut cont: Option<String> = None;
+
+        // 3. Set the delimiter for the S3 API call based on the recursive flag.
+        let delimiter = if recursive { None } else { Some("/") };
+
+        debug!(
+            "list_objects: bucket='{}', prefix='{}', pattern='{}', recursive={}",
+            bucket, prefix, final_pattern, recursive
+        );
+
+        loop {
+            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix);
+
+            if let Some(d) = delimiter {
+                req_builder = req_builder.delimiter(d);
+            }
+
+            if let Some(token) = &cont {
+                req_builder = req_builder.continuation_token(token);
+                debug!("  loop: continuation_token={:?}", cont);
+            }
+
+            let resp = req_builder
+                .send()
+                .await
+                .context("list_objects_v2 failed")?;
+            debug!(
+                "  page received: {} contents, {} common prefixes",
+                resp.contents().len(),
+                resp.common_prefixes().len()
+            );
+
+            // 4. Filter and collect results based on the regex.
+
+            // Handle objects (files)
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    if let Some(basename) = key.strip_prefix(prefix) {
+                        if re.is_match(basename) {
+                            debug!("    matched key: '{}'", key);
+                            keys.push(key.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Handle common prefixes (directories), only present in non-recursive mode
+            for common_prefix in resp.common_prefixes() {
+                if let Some(prefix_key) = common_prefix.prefix() {
+                    if let Some(basename) = prefix_key.strip_prefix(prefix) {
+                        if re.is_match(basename) {
+                            debug!("    matched common prefix: '{}'", prefix_key);
+                            keys.push(prefix_key.to_string());
+                        }
+                    }
+                }
+            }
+
+            if let Some(next) = resp.next_continuation_token() {
+                cont = Some(next.to_string());
+                debug!("  next_continuation_token='{}'", cont.as_ref().unwrap());
+            } else {
+                debug!("  no more pages, breaking");
+                break;
+            }
+        }
+
+        info!("list_objects result: {} total keys", keys.len());
+        keys.sort(); // Sort for consistent output
+        Ok(keys)
+    })
+}
+
+
+
+/*
+ * Old, pre regex
+ *
 // -----------------------------------------------------------------------------
 // List operation
 // -----------------------------------------------------------------------------
@@ -176,6 +309,7 @@ pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
         Ok(keys)
     })
 }
+*/
 
 
 /// Read `length` bytes starting at `offset` from `s3://bucket/key`.

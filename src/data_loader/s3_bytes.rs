@@ -15,7 +15,9 @@ impl S3BytesDataset {
         let (bucket, prefix) = parse_s3_uri(uri)
             .map_err(|e| DatasetError::from(e.to_string()))?;
 
-        let keys = list_objects_rs(&bucket, &prefix)
+        //let keys = list_objects_rs(&bucket, &prefix)
+        // New list_objects which has a 3rd parameter of recursive, passing true seems right ?
+        let keys = list_objects_rs(&bucket, &prefix, true)
             .map_err(|e| DatasetError::from(e.to_string()))?;
 
         Ok(Self { bucket, keys })

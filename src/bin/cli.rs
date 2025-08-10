@@ -15,21 +15,61 @@
 //! s3Rust-cli download    s3://bucket/key local-file    # download  one or more object
 //! ```
 
-use anyhow::{bail, Context, Result};
+//use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::str::FromStr; // For the custom S3Path type
 use std::time::Instant;
 use log::LevelFilter;
+use log::info;
+
+
 
 // Import shared functions from the crate.
 use s3dlio::{
-    delete_objects, get_object_uri, get_objects_parallel, list_objects, parse_s3_uri,
-    stat_object_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
+    delete_objects, get_objects_parallel, parse_s3_uri, stat_object_uri, 
+    put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
 };
 
 use s3dlio::s3_copy::{upload_files, download_objects};
 use s3dlio::{init_op_logger, finalize_op_logger};
+
+
+// --- Define the S3Path struct for clap to use as a custom parser.
+// This struct neatly encapsulates the bucket and key.
+#[derive(Clone, Debug)]
+struct S3Path {
+    bucket: String,
+    key: String,
+}
+
+impl S3Path {
+    fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Implement `FromStr` so that `clap` can parse a string like "s3://bucket/key"
+/// directly into our `S3Path` struct.
+impl FromStr for S3Path {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (bucket, key) = parse_s3_uri(s)?;
+        Ok(S3Path {
+            bucket,
+            key,
+        })
+    }
+}
+
+// -- Commands
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -53,11 +93,38 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+
+    /// Create a new S3 bucket.
+    CreateBucket {
+        /// The name of the bucket to create (e.g., my-new-bucket)
+        bucket_name: String,
+    },
+
+    /// Delete an S3 bucket. The bucket must be empty.
+    DeleteBucket {
+        /// The name of the bucket to delete (e.g., my-old-bucket)
+        bucket_name: String,
+    },
+
+    /// List objects in an S3 path, the final part of path is treated as a regex.
+    /// Example: s3-cli list s3://my-bucket/data/.*\\.csv
+    List {
+        #[clap(value_parser)]
+        s3_path: S3Path,
+
+        /// List objects recursively
+        #[clap(short, long)]
+        recursive: bool,
+    },
+    /*
+     * Old
+     *
     /// List keys that start with the given prefix.
     List {
         /// S3 URI (e.g. s3://bucket/prefix/)
         uri: String,
     },
+    */
     /// Stat object, show size & last modify date of a single object 
     Stat {
         /// Full S3 URI (e.g. s3://bucket/prefix/key)
@@ -71,6 +138,10 @@ enum Command {
         /// Batch size (number of parallel delete calls).
         #[arg(short = 'j', long = "jobs", default_value_t = 1000)]
         jobs: usize,
+        
+        /// Perform the operation recursively.
+        #[clap(short, long)]
+        recursive: bool,
     },
     /// Download one or many objects concurrently.
     Get {
@@ -80,6 +151,10 @@ enum Command {
         /// Maximum concurrent GET requests.
         #[arg(short = 'j', long = "jobs", default_value_t = 64)]
         jobs: usize,
+        
+        /// Perform the operation recursively.
+        #[clap(short, long)]
+        recursive: bool,
     },
     /// Upload one or more objects concurrently, uses ObjectType format filled with random data.
     Put {
@@ -141,6 +216,9 @@ enum Command {
         /// Maximum parallel downloads
         #[arg(short = 'j', long = "jobs", default_value_t = 64)]
         jobs: usize,
+        /// Download recursively
+        #[clap(short, long)] 
+        recursive: bool,     
     },
 }
 
@@ -178,22 +256,67 @@ fn main() -> Result<()> {
     }
 
     match cli.cmd {
-        Command::List { uri } => list_cmd(&uri)?,
+        // New, create-bucket command
+        Command::CreateBucket { bucket_name } => {
+            // Reliably clean the input to get a valid bucket name by
+            // stripping the protocol prefix and any trailing slashes.
+            let final_bucket_name = bucket_name
+                .strip_prefix("s3://")
+                .unwrap_or(&bucket_name)
+                .trim_end_matches('/');
 
+            info!("Attempting to create bucket: {}...", final_bucket_name);
+            s3dlio::s3_utils::create_bucket(final_bucket_name)?;
+            println!("Successfully created or verified bucket '{}'.", final_bucket_name);
+        },
+
+        Command::DeleteBucket { bucket_name } => {
+            // Reliably clean the input to get a valid bucket name
+            let final_bucket_name = bucket_name
+                .strip_prefix("s3://")
+                .unwrap_or(&bucket_name)
+                .trim_end_matches('/');
+
+            info!("Attempting to delete bucket: {}...", final_bucket_name);
+            s3dlio::s3_utils::delete_bucket(final_bucket_name)?;
+            println!("Successfully deleted bucket '{}'.", final_bucket_name);
+        }
+
+        // --- Update the `List` command handler.
+        // It now unpacks `s3_path` and `recursive` and calls our new backend function.
+        Command::List { s3_path, recursive } => {
+            let keys = s3dlio::s3_utils::list_objects(s3_path.bucket(), s3_path.key(), recursive)?;
+    
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            for key in &keys {
+                if let Err(e) = writeln!(out, "{}", key) {
+                    if e.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(()); // Handle cases like piping to `head`
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
+            writeln!(out, "\nTotal objects: {}", keys.len())?;
+        }
+    
         Command::Stat { uri } => stat_cmd(&uri)?,
-
-        Command::Get { uri, jobs } => get_cmd(&uri, jobs)?,
-
-        Command::Delete { uri, jobs } => delete_cmd(&uri, jobs)?,
-
+    
+        // New, with regex and recursion
+        Command::Get { uri, jobs, recursive } => get_cmd(&uri, jobs, recursive)?,
+    
+        Command::Delete { uri, jobs, recursive } => delete_cmd(&uri, jobs, recursive)?,
+    
+    
         Command::Upload { files, dest, jobs, create_bucket } => {
             upload_files(&dest, &files, jobs, create_bucket)?
         }
-
-        Command::Download { src, dest_dir, jobs } => {
-            download_objects(&src, &dest_dir, jobs)?
+    
+        Command::Download { src, dest_dir, jobs, recursive } => {
+            download_objects(&src, &dest_dir, jobs, recursive)?
         }
-
+    
         Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f } => {
             let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
             if create_bucket_flag {
@@ -201,11 +324,12 @@ fn main() -> Result<()> {
                     eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
                 }
             }
-            
+    
             put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f)?
-
+    
         }
-    }
+
+    } // End of match cli.cmd
 
     // If set, finalize the op‑logger 
     if cli.op_log.is_some() {
@@ -215,64 +339,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-
-/// List command: supports glob matching on keys (after the last '/').
-fn list_cmd(uri: &str) -> Result<()> {
-    let (bucket, key_pattern) = parse_s3_uri(uri)?;
-
-    let (effective_prefix, glob_pattern) = if let Some(pos) = key_pattern.rfind('/') {
-        (&key_pattern[..=pos], &key_pattern[pos+1..])
-    } else {
-        ("", key_pattern.as_str())
-    };
-
-    let mut keys = list_objects(&bucket, effective_prefix)?;
-
-/*
- * OLD: could cause listing of children it shouldn't
- *
-    if glob_pattern.contains('*') {
-         let regex_pattern = format!("^{}$", regex::escape(glob_pattern).replace("\\*", ".*"));
-         let re = regex::Regex::new(&regex_pattern)
-             .with_context(|| "Invalid regex pattern generated from glob")?;
-         keys = keys.into_iter()
-             .filter(|k| {
-                 let basename = k.rsplit('/').next().unwrap_or(k);
-                 re.is_match(basename)
-             })
-             .collect();
-    }
-*/
-
-    // Always filter by the basename, whether exact or glob.
-    let regex_pattern = format!(
-        "^{}$",
-        regex::escape(glob_pattern).replace("\\*", ".*")
-    );
-    let re = regex::Regex::new(&regex_pattern)
-        .with_context(|| "Invalid regex pattern generated from glob")?;
-    keys = keys
-        .into_iter()
-        .filter(|k| {
-            let basename = k.rsplit('/').next().unwrap_or(k);
-            re.is_match(basename)
-        })
-        .collect();
-
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    for key in &keys {
-        if let Err(e) = writeln!(out, "{}", key) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(());
-            } else {
-                return Err(e.into());
-            }
-        }
-    }
-    writeln!(out, "\nTotal objects: {}", keys.len())?;
-    Ok(())
-}
 
 /// Stat command: provide info on a single object
 fn stat_cmd(uri: &str) -> Result<()> {
@@ -296,110 +362,80 @@ fn stat_cmd(uri: &str) -> Result<()> {
     Ok(())
 }
 
+/// Get command: downloads objects matching a key, prefix, or pattern.
+fn get_cmd(uri: &str, jobs: usize, recursive: bool) -> Result<()> {
+    let (bucket, mut key_pattern) = s3dlio::parse_s3_uri(uri)?;
 
-/// Get command: supports glob matching on keys (after the last '/').
-fn get_cmd(uri: &str, jobs: usize) -> Result<()> {
-    let (bucket, key_or_prefix) = parse_s3_uri(uri)?;
-
-    if key_or_prefix.contains('*') {
-        let (effective_prefix, glob_pattern) = if let Some(pos) = key_or_prefix.rfind('/') {
-            (&key_or_prefix[..=pos], &key_or_prefix[pos+1..])
-        } else {
-            ("", key_or_prefix.as_str())
-        };
-        let mut keys = list_objects(&bucket, effective_prefix)?;
-        if glob_pattern.contains('*') {
-            let regex_pattern = format!("^{}$", regex::escape(glob_pattern).replace("\\*", ".*"));
-            let re = regex::Regex::new(&regex_pattern)
-                .with_context(|| "Invalid regex pattern generated from glob")?;
-            keys = keys.into_iter()
-                .filter(|k| {
-                    let basename = k.rsplit('/').next().unwrap_or(k);
-                    re.is_match(basename)
-                })
-                .collect();
-        }
-        if keys.is_empty() {
-            bail!("No objects match pattern '{}' in bucket '{}'", key_or_prefix, bucket);
-        }
-        let uris: Vec<String> = keys.into_iter().map(|k| format!("s3://{}/{}", bucket, k)).collect();
-        eprintln!("Fetching {} objects with {} jobs…", uris.len(), jobs);
-        let t0 = Instant::now();
-        let total_bytes: usize = get_objects_parallel(&uris, jobs)?
-            .into_iter()
-            .map(|(_, bytes)| bytes.len())
-            .sum();
-        let dt = t0.elapsed();
-        eprintln!(
-            "downloaded {:.2} MB in {:?} ({:.2} MB/s)",
-            total_bytes as f64 / 1_048_576.0,
-            dt,
-            total_bytes as f64 / 1_048_576.0 / dt.as_secs_f64()
-        );
-    } else if key_or_prefix.ends_with('/') || key_or_prefix.is_empty() {
-        let prefix = key_or_prefix;
-        let keys = list_objects(&bucket, &prefix)?;
-        if keys.is_empty() {
-            bail!("No objects match prefix '{}' in bucket '{}'", prefix, bucket);
-        }
-        let uris: Vec<String> = keys.into_iter().map(|k| format!("s3://{}/{}", bucket, k)).collect();
-        eprintln!("Fetching {} objects with {} jobs…", uris.len(), jobs);
-        let t0 = Instant::now();
-        let total_bytes: usize = get_objects_parallel(&uris, jobs)?
-            .into_iter()
-            .map(|(_, bytes)| bytes.len())
-            .sum();
-        let dt = t0.elapsed();
-        eprintln!(
-            "downloaded {:.2} MB in {:?} ({:.2} MB/s)",
-            total_bytes as f64 / 1_048_576.0,
-            dt,
-            total_bytes as f64 / 1_048_576.0 / dt.as_secs_f64()
-        );
+    /*
+     * Old
+     *
+    // If the pattern is not a glob/regex and not a prefix, it's a single key.
+    // Otherwise, use list_objects to find all matching keys.
+    let keys_to_get = if !key_pattern.contains('*') && !key_pattern.contains('?') && !key_pattern.ends_with('/') {
+        vec![key_pattern]
     } else {
-        let full_uri = format!("s3://{}/{}", bucket, key_or_prefix);
-        let t0 = Instant::now();
-        let bytes = get_object_uri(&full_uri)?;
-        println!(
-            "downloaded {} bytes in {:?} ({:.2} MB/s)",
-            bytes.len(),
-            t0.elapsed(),
-            bytes.len() as f64 / 1_048_576.0 / t0.elapsed().as_secs_f64()
-        );
+        s3dlio::s3_utils::list_objects(&bucket, &key_pattern, recursive)?
+    };
+    */
+    
+    // New, simpler
+    // If the path ends with a slash, automatically append a wildcard to search inside it.
+    if key_pattern.ends_with('/') {
+        key_pattern.push_str(".*");
     }
+
+    // List the objects using the potentially modified pattern.
+    let keys_to_get = s3dlio::s3_utils::list_objects(&bucket, &key_pattern, recursive)?;
+
+    if keys_to_get.is_empty() {
+        bail!("No objects match pattern '{}' in bucket '{}'", uri, bucket);
+    }
+
+    let uris: Vec<String> = keys_to_get.into_iter().map(|k| format!("s3://{}/{}", bucket, k)).collect();
+    eprintln!("Fetching {} objects with {} jobs…", uris.len(), jobs);
+
+    let t0 = Instant::now();
+    let total_bytes: usize = get_objects_parallel(&uris, jobs)?
+        .into_iter()
+        .map(|(_, bytes)| bytes.len())
+        .sum();
+    let dt = t0.elapsed();
+
+    eprintln!(
+        "downloaded {:.2} MB in {:?} ({:.2} MB/s)",
+        total_bytes as f64 / 1_048_576.0,
+        dt,
+        total_bytes as f64 / 1_048_576.0 / dt.as_secs_f64()
+    );
+
     Ok(())
 }
 
+/// Delete command: deletes objects matching a key, prefix, or pattern.
+fn delete_cmd(uri: &str, _jobs: usize, recursive: bool) -> Result<()> {
+    let (bucket, mut key_pattern) = s3dlio::parse_s3_uri(uri)?;
 
-/// Delete command: supports glob matching on keys (after the last '/').
-fn delete_cmd(uri: &str, _jobs: usize) -> Result<()> {
-    let (bucket, key_or_pattern) = parse_s3_uri(uri)?;
-
-    let keys_to_delete = if key_or_pattern.contains('*') {
-        let (effective_prefix, glob_pattern) = if let Some(pos) = key_or_pattern.rfind('/') {
-            (&key_or_pattern[..=pos], &key_or_pattern[pos+1..])
-        } else {
-            ("", key_or_pattern.as_str())
-        };
-
-        let mut keys = list_objects(&bucket, effective_prefix)?;
-        if glob_pattern.contains('*') {
-            let regex_pattern = format!("^{}$", regex::escape(glob_pattern).replace("\\*", ".*"));
-            let re = regex::Regex::new(&regex_pattern)
-                .with_context(|| "Invalid regex pattern generated from glob")?;
-            keys = keys.into_iter()
-                .filter(|k| {
-                    let basename = k.rsplit('/').next().unwrap_or(k);
-                    re.is_match(basename)
-                })
-                .collect();
-        }
-        keys
-    } else if key_or_pattern.ends_with('/') || key_or_pattern.is_empty() {
-        list_objects(&bucket, &key_or_pattern)?
+    /*
+     * Old
+     *
+    // If the pattern is not a glob/regex and not a prefix, it's a single key.
+    // Otherwise, use list_objects to find all matching keys.
+    let keys_to_delete = if !key_pattern.contains('*') && !key_pattern.contains('?') && !key_pattern.ends_with('/') {
+        vec![key_pattern]
     } else {
-        vec![key_or_pattern]
+        s3dlio::s3_utils::list_objects(&bucket, &key_pattern, recursive)?
     };
+    */
+
+    // New, simpler
+    // If the path ends with a slash, automatically append a wildcard to search inside it.
+    if key_pattern.ends_with('/') {
+        key_pattern.push_str(".*");
+    }
+
+    // List the objects using the potentially modified pattern.
+    let keys_to_delete = s3dlio::s3_utils::list_objects(&bucket, &key_pattern, recursive)?;
+
 
     if keys_to_delete.is_empty() {
         bail!("No objects to delete under the specified URI");
@@ -410,6 +446,7 @@ fn delete_cmd(uri: &str, _jobs: usize) -> Result<()> {
     eprintln!("Done.");
     Ok(())
 }
+
 
 
 /// Put command supports 1 or more objects, also takes our ObjectType

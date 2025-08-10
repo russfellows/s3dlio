@@ -5,7 +5,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use glob::glob;
-use regex::Regex;
+//use regex::Regex;
 use std::{fs, path::{Path}, sync::Arc};
 use tokio::{fs as async_fs, runtime::Runtime, sync::Semaphore};
 
@@ -116,36 +116,38 @@ pub fn upload_files<P: AsRef<Path>>(
     result
 }
 
+
 /// Download one key, every key under a prefix, or glob/regex-match objects into `dest_dir/`,
 /// creating files with their original basenames, up to `max_in_flight` at once.
 pub fn download_objects(
     src_uri: &str,
     dest_dir: &Path,
     max_in_flight: usize,
+    recursive: bool,
 ) -> Result<()> {
-    let (bucket, key_pattern) = parse_s3_uri(src_uri)?;
+    let (bucket, mut key_pattern) = parse_s3_uri(src_uri)?;
 
-    // Determine keys to fetch: glob ('*' or '?'), prefix, or exact
-    let keys = if key_pattern.contains('*') || key_pattern.contains('?') {
-        let (prefix, pattern) = if let Some(pos) = key_pattern.rfind('/') {
-            (&key_pattern[..=pos], &key_pattern[pos+1..])
-        } else {
-            ("", key_pattern.as_str())
-        };
-        let all = list_objects(&bucket, prefix)?;
-        let mut regex_pat = regex::escape(pattern)
-            .replace("\\*", ".*")
-            .replace("\\?", ".");
-        regex_pat = format!("^{}$", regex_pat);
-        let re = Regex::new(&regex_pat)?;
-        all.into_iter()
-            .filter(|k| re.is_match(k.rsplit('/').next().unwrap_or(k)))
-            .collect::<Vec<_>>()
-    } else if key_pattern.ends_with('/') || key_pattern.is_empty() {
-        list_objects(&bucket, &key_pattern)?
-    } else {
+    /*
+     * Old
+     *
+    // If the pattern is not a glob/regex and not a prefix, it's a single key.
+    // Otherwise, use our powerful list_objects function to find all matching keys.
+    let keys = if !key_pattern.ends_with('/') && !key_pattern.contains('*') && !key_pattern.contains('?') {
         vec![key_pattern.clone()]
+    } else {
+        // Use the `recursive` parameter passed in from the caller
+        list_objects(&bucket, &key_pattern, recursive)?
     };
+    */
+
+    // New, simpler
+    // If the path ends with a slash, automatically append a wildcard to search inside it.
+    if key_pattern.ends_with('/') {
+        key_pattern.push_str(".*");
+    }
+
+    // List the objects using the potentially modified pattern.
+    let keys = list_objects(&bucket, &key_pattern, recursive)?;
 
     if keys.is_empty() {
         bail!("No objects matched for download");
@@ -182,6 +184,10 @@ pub fn download_objects(
             futs.push(tokio::spawn(async move {
                 log::debug!("starting download of s3://{}/{} → {:?}", bucket, k, out_dir);
                 let _permit = sem.acquire_owned().await.unwrap();
+                // Skip "directories" which are objects that end with a slash
+                if k.ends_with('/') {
+                    return Ok::<(), anyhow::Error>(());
+                }
                 let bytes = get_object(&bucket, &k).await?;
                 let fname = Path::new(&k)
                     .file_name()
@@ -210,4 +216,5 @@ pub fn download_objects(
     }
     result
 }
+
 
