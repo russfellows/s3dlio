@@ -8,7 +8,7 @@ As such, this project essentially has 3 components that can be utilized:
 
 ## What's New
 This is in reverse order, newest first.
-### Version 0.4.1
+### Version 0.4.2
 Version 0.4.2 added regular expression parsing to most commainds, including list, delete, get and download.  These all seem to work consistently between the CLI and the python library.  Also, there is a new recursive options "-r" or --recursive" that makes these operate recursively.  Essentially, this just eliminates the commands seeing a "/" as a path separator. Additionally if the target command ends with a trailing slash "/" character, internally we just append a regex wildcard of dot start ".*" meaning any pattern to the end.  Also, we added a "create-bucket" operator as a standalone command, via both cli and python library.
 
 ### Version 0.4.1
