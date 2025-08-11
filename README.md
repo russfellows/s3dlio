@@ -174,16 +174,36 @@ Here is an example of starting a container using podman, and listing the content
 ***Note:** It is VERY important to use the "--net=host" or similar command when starting, since using S3 necessitates network connectivity to S3 storage.*
 
 ```
-eval@loki-node3:~/real-dealio2$ podman run --net=host --rm -it dealio_s3-rust 
-root@loki-node3:/app# ls
-README.md  dlio_s3_test3.py  target  test_all_dlio_s3.py
-root@loki-node3:/app# which python
+eval@loki-node:~ $ podman run --net=host --rm -it s3dlio:0.4.2
+root@loki-node:/app# ls
+LICENSE  README.md  aws-env  configs  docs  local-env  python  target  tests  uv.lock  wheels
+root@loki-node:/app# which python
 /app/.venv/bin/python
-root@loki-node3:/app# python --version
-Python 3.12.8
+root@loki-node:/app# python --version
+Python 3.12.11
+
+root@loki-node:/app# python ./python/tests/test_regex.py 
+--- Creating S3 bucket russ-test5... ---
+--- Setting up test files in S3... ---
+Setup complete.
+
+--- Testing s3dlio.list() ---
+Non-recursive list found 2 items: ['test-recursive-py/data/', 'test-recursive-py/dummy1.txt']
+Recursive list found 3 items: ['test-recursive-py/data/dummy2.txt', 'test-recursive-py/data/logs/dummy3.txt', 'test-recursive-py/dummy1.txt']
+✅ List tests passed!
+
+--- Testing s3dlio.download() ---
+Non-recursive download got: ['dummy1.txt']
+Recursive download got: ['dummy3.txt', 'dummy1.txt', 'dummy2.txt']
+✅ Download tests passed!
+
+--- Cleaning up test files... ---
+--- Deleting Empty S3 bucket russ-test5... ---
+✅ Cleanup successful!
+root@loki-node:/app# exit 
 ```
 
-# S3 Access
+# S3 Access via CLI or Python Library
 This library and CLI currently support accessing S3 via http without TLS, and S3 with TLS via https for both official, and self signed certificates.  There is a method to direct the library to use a PEM file bundle of self-signed certificates, which is detailed below.
 
 ## Lack of Insecure TLS Option
