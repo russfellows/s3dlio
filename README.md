@@ -154,20 +154,20 @@ This step requires the Python Environment pre-reqs listed above.
  * Next, to build the python library: `maturin build --release --features extension-module`
  * Upon success a python wheel will exist in the ./target/wheels directory
 
-## Container
+# Container
 A container image may be built from the source code in this repository.  Also, examining the Dockerfile may help users better understand how to build the code outside of a container by examining the steps in the Dockerfile.  
 The container will contain the executable, along with a python library.  This allows you to run either the Rust cli, or a python program that uses the Python library.
 ### Building / Pulling
 Either docker or podman may be used to create the image, typically with a `podman build -t xxx .` where xxx is the name you want to use for your container image. For those that want to simply pull and run a pre-built container, a relatively recent image may be found on quay.io.  However, the version on quay may be older than that available by building from the source code in this repository.  
 
-***Note:** An OLD container is here:  https://quay.io/repository/russfellows-sig65/dealio_s3_rust*
+***Note:** A NEW container is here:  https://quay.io/repository/russfellows-sig65/s3dlio*
 
-In order to pull the container using docker, you may execute the following:
+In order to pull the container using podman (or docker), you may execute the following:
 
 ```
-docker pull quay.io/russfellows-sig65/s3dlio
+podman pull quay.io/russfellows-sig65/s3dlio:0.4.2
 ```
-***Note 2:** The above container does not exist currently*
+***Note 2:** The above container must be pulled with the tag name as indicated*
 
 ### Running Container
 Here is an example of starting a container using podman, and listing the contents of the containers /app directory.  
