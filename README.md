@@ -8,6 +8,7 @@ As such, this project essentially has 3 components that can be utilized:
 
 ## What's New
 This is in reverse order, newest first.
+
 ### Version 0.4.3
 After many promises of a fully functional and compatible PyTorch data loader, I believe that version 0.4.3 provides it.  Or, at least something very similar and quite functional, as all functional compatability tests and comparisons to the aws s3torchconnector library seem to show parity.  
 Also we updated the Dockerfile to enable building containers again.  Likely more work is needed to slim down the image as its about 19 GB. 
@@ -167,36 +168,56 @@ This step requires the Python Environment pre-reqs listed above.
  * Next, to build the python library: `maturin build --release --features extension-module`
  * Upon success a python wheel will exist in the ./target/wheels directory
 
-## Container
+# Container
 A container image may be built from the source code in this repository.  Also, examining the Dockerfile may help users better understand how to build the code outside of a container by examining the steps in the Dockerfile.  
 The container will contain the executable, along with a python library.  This allows you to run either the Rust cli, or a python program that uses the Python library.
 ### Building / Pulling
 Either docker or podman may be used to create the image, typically with a `podman build -t xxx .` where xxx is the name you want to use for your container image. For those that want to simply pull and run a pre-built container, a relatively recent image may be found on quay.io.  However, the version on quay may be older than that available by building from the source code in this repository.  
 
-***Note:** An OLD container is here:  https://quay.io/repository/russfellows-sig65/dealio_s3_rust*
+***Note:** A NEW container is here:  https://quay.io/repository/russfellows-sig65/s3dlio*
 
-In order to pull the container using docker, you may execute the following:
+In order to pull the container using podman (or docker), you may execute the following:
 
 ```
-docker pull quay.io/russfellows-sig65/s3dlio
+podman pull quay.io/russfellows-sig65/s3dlio:0.4.2
 ```
-***Note 2:** The above container does not exist currently*
+***Note 2:** The above container must be pulled with the tag name as indicated*
 
 ### Running Container
 Here is an example of starting a container using podman, and listing the contents of the containers /app directory.  
 ***Note:** It is VERY important to use the "--net=host" or similar command when starting, since using S3 necessitates network connectivity to S3 storage.*
 
 ```
-eval@loki-node3:~/real-dealio2$ podman run --net=host --rm -it dealio_s3-rust 
-root@loki-node3:/app# ls
-README.md  dlio_s3_test3.py  target  test_all_dlio_s3.py
-root@loki-node3:/app# which python
+eval@loki-node:~ $ podman run --net=host --rm -it s3dlio:0.4.2
+root@loki-node:/app# ls
+LICENSE  README.md  aws-env  configs  docs  local-env  python  target  tests  uv.lock  wheels
+root@loki-node:/app# which python
 /app/.venv/bin/python
-root@loki-node3:/app# python --version
-Python 3.12.8
+root@loki-node:/app# python --version
+Python 3.12.11
+
+root@loki-node:/app# python ./python/tests/test_regex.py 
+--- Creating S3 bucket russ-test5... ---
+--- Setting up test files in S3... ---
+Setup complete.
+
+--- Testing s3dlio.list() ---
+Non-recursive list found 2 items: ['test-recursive-py/data/', 'test-recursive-py/dummy1.txt']
+Recursive list found 3 items: ['test-recursive-py/data/dummy2.txt', 'test-recursive-py/data/logs/dummy3.txt', 'test-recursive-py/dummy1.txt']
+✅ List tests passed!
+
+--- Testing s3dlio.download() ---
+Non-recursive download got: ['dummy1.txt']
+Recursive download got: ['dummy3.txt', 'dummy1.txt', 'dummy2.txt']
+✅ Download tests passed!
+
+--- Cleaning up test files... ---
+--- Deleting Empty S3 bucket russ-test5... ---
+✅ Cleanup successful!
+root@loki-node:/app# exit 
 ```
 
-# S3 Access
+# S3 Access via CLI or Python Library
 This library and CLI currently support accessing S3 via http without TLS, and S3 with TLS via https for both official, and self signed certificates.  There is a method to direct the library to use a PEM file bundle of self-signed certificates, which is detailed below.
 
 ## Lack of Insecure TLS Option
@@ -299,14 +320,16 @@ root@loki-node3:/app# s3-cli
 Usage: s3-cli <COMMAND>
 
 Commands:
-  list      List keys that start with the given prefix
-  stat      Stat object, show size & last modify date of a single object
-  delete    Delete one object or every object that matches the prefix
-  get       Download one or many objects concurrently
-  put       Upload one or more objects concurrently, uses ObjectType format filled with random data
-  upload    Upload local files (supports glob patterns) to S3, concurrently to jobs
-  download  Download object(s) to named directory (uses globbing pattern match)
-  help      Print this message or the help of the given subcommand(s)
+  create-bucket  Create a new S3 bucket
+  delete-bucket  Delete an S3 bucket. The bucket must be empty
+  list           List objects in an S3 path, the final part of path is treated as a regex. Example: s3-cli list s3://my-bucket/data/.*\\.csv
+  stat           Stat object, show size & last modify date of a single object
+  delete         Delete one object or every object that matches the prefix
+  get            Download one or many objects concurrently
+  put            Upload one or more objects concurrently, uses ObjectType format filled with random data
+  upload         Upload local files (supports glob patterns) to S3, concurrently to jobs
+  download       Download object(s) to named directory (uses globbing pattern match)
+  help           Print this message or the help of the given subcommand(s)
 
 Options:
   -v, --verbose...     Increase log verbosity: -v = Info, -vv = Debug
