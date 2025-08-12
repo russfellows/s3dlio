@@ -71,12 +71,29 @@ impl<D: Dataset> DataLoader<D> {
             });
         } else if let Some(mut stream) = ds.as_stream() {
             // -------- Iterable-style: drain underlying stream, form batches --------
+            // NEW (Stage 0): optional sharding across distributed ranks + DataLoader workers
+            let shard_world = self.opts.shard_world_size.max(1);
+            let worker_n    = self.opts.num_workers_pytorch.max(1);
+            let shard_mod   = shard_world * worker_n;
+
+            // Clamp shard indices to valid ranges to be defensive
+            let rank       = if shard_world > 0 { self.opts.shard_rank.min(shard_world - 1) } else { 0 };
+            let worker_id  = if worker_n > 0 { self.opts.worker_id.min(worker_n - 1) } else { 0 };
+            let shard_id   = rank * worker_n + worker_id;
+
             let tx_it = tx.clone();
             tokio::spawn(async move {
                 let mut buf: Vec<D::Item> = Vec::with_capacity(batch);
+                let mut i: usize = 0; // item counter for round-robin sharding
                 while let Some(next) = stream.next().await {
                     match next {
                         Ok(item) => {
+                            // Keep item if this shard "owns" position i in round-robin
+                            let take = if shard_mod <= 1 { true } else { (i % shard_mod) == shard_id };
+                            i = i.wrapping_add(1);
+
+                            if !take { continue; }
+
                             buf.push(item);
                             if buf.len() == batch {
                                 if tx_it.send(Ok(std::mem::take(&mut buf))).await.is_err() {

@@ -10,6 +10,8 @@ from importlib import import_module
 import sys as _sys
 from typing import List  # avoid confusion with Rust-exported `list` symbol
 
+from .torch import S3MapDataset, S3IterableDataset
+
 # ------------------------------------------------------------------
 # 1) Import the native module and re-export *public* names
 #     Import the native extension from inside this package

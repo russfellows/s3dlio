@@ -8,6 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
+//use aws_sdk_s3::primitives::ByteStream;
 use futures::{stream::FuturesUnordered, StreamExt};
 use pyo3::{FromPyObject, PyAny, PyResult};
 use pyo3::types::PyAnyMethods;
@@ -261,56 +262,29 @@ pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<Str
 
 
 
-/*
- * Old, pre regex
- *
-// -----------------------------------------------------------------------------
-// List operation
-// -----------------------------------------------------------------------------
-/// List every key under `prefix` (handles pagination).
-pub fn list_objects(bucket: &str, prefix: &str) -> Result<Vec<String>> {
-    let bucket = bucket.to_string();
-    let prefix = prefix.to_string();
-    run_on_global_rt(async move {
-        // log one LIST
-        let _ = build_ops_async().await?.list_objects(&bucket, &prefix).await;
-        let client = aws_s3_client_async().await?;   // reuse raw client for pagination
-
-        let mut keys = Vec::new();
-        let mut cont: Option<String> = None;
-
-        debug!("list_objects: bucket='{}' prefix='{}'", bucket, prefix);
-
-        loop {
-            debug!("  loop: continuation_token={:?}", cont);
-            let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
-            if let Some(token) = &cont {
-                req = req.continuation_token(token);
-                debug!("    attached continuation_token='{}'", token);
-            }
-            let resp = req.send().await.context("list_objects_v2 failed")?;
-            debug!("    page received: {} contents", resp.contents().len());
-
-            for obj in resp.contents() {
-                if let Some(k) = obj.key() {
-                    debug!("      found key: '{}'", k);
-                    keys.push(k.to_string());
-                }
-            }
-            if let Some(next) = resp.next_continuation_token() {
-                cont = Some(next.to_string());
-                debug!("    next_continuation_token='{}'", cont.as_ref().unwrap());
-            } else {
-                debug!("    no more pages, breaking");
-                break;
-            }
+/// NEW: Async GET by byte-range on full s3:// URI.
+/// If `length` is None, reads from `offset` to end.
+pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+    let (bucket, key) = parse_s3_uri(uri)?;
+    if key.is_empty() { bail!("Cannot GET range: no key specified"); }
+    let client = aws_s3_client_async().await?;
+    let mut range = format!("bytes={}-", offset);
+    if let Some(len) = length {
+        if len > 0 {
+            let end = offset.saturating_add(len).saturating_sub(1);
+            range = format!("bytes={}-{}", offset, end);
         }
-        debug!("list_objects result: {} total keys", keys.len());
-        Ok(keys)
-    })
+    }
+    let resp = client.get_object()
+        .bucket(&bucket)
+        .key(key.trim_start_matches('/'))
+        .range(range)
+        .send()
+        .await
+        .context("get_object(range) failed")?;
+    let body = resp.body.collect().await.context("collect range body")?;
+    Ok(body.into_bytes().to_vec())
 }
-*/
-
 
 /// Read `length` bytes starting at `offset` from `s3://bucket/key`.
 /// A negative or oversize request is truncated to the object size.
