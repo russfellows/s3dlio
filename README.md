@@ -8,7 +8,20 @@ As such, this project essentially has 3 components that can be utilized:
 
 ## What's New
 This is in reverse order, newest first.
-### Version 0.4.1
+### Version 0.4.3
+After many promises of a fully functional and compatible PyTorch data loader, I believe that version 0.4.3 provides it.  Or, at least something very similar and quite functional, as all functional compatability tests and comparisons to the aws s3torchconnector library seem to show parity.  
+Also we updated the Dockerfile to enable building containers again.  Likely more work is needed to slim down the image as its about 19 GB. 
+#### New Tests
+There are several new tests added, in the python/tests subdirectory, including:
+  - python/tests/aws-s3dlio_compare_suite.py
+  - python/tests/compare_aws_s3dlio_loaders.py
+  - python/tests/jax_tf_vers_4-3_demo.py
+  - python/tests/torch_vers_4-3_demo.py
+
+#### New Docs
+There is also a new DataLoader_README.md file that explains all the options and how to use the data loader features in each library framework. 
+
+### Version 0.4.2
 Version 0.4.2 added regular expression parsing to most commainds, including list, delete, get and download.  These all seem to work consistently between the CLI and the python library.  Also, there is a new recursive options "-r" or --recursive" that makes these operate recursively.  Essentially, this just eliminates the commands seeing a "/" as a path separator. Additionally if the target command ends with a trailing slash "/" character, internally we just append a regex wildcard of dot start ".*" meaning any pattern to the end.  Also, we added a "create-bucket" operator as a standalone command, via both cli and python library.
 
 ### Version 0.4.1

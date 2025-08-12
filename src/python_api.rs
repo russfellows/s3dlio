@@ -22,9 +22,6 @@ use tokio::{
     sync::{mpsc, Mutex},
 };
 
-// Only needed if we run async, which we're not doing yet
-//use tokio::runtime::Runtime;
-
 use numpy::ndarray as nd_np;
 
 use std::{
@@ -55,7 +52,7 @@ use crate::s3_logger::{finalize_op_logger, init_op_logger};
 use crate::data_loader::{
     DataLoader,
     dataset::{Dataset, DatasetError},
-    options::LoaderOptions,
+    options::{LoaderOptions, ReaderMode},
     s3_bytes::S3BytesDataset, //Only if required
 };
 
@@ -135,9 +132,11 @@ pub struct PyS3Dataset { inner: S3BytesDataset }
 
 #[pymethods]
 impl PyS3Dataset {
+    /// NEW: optional opts (reader mode)
     #[new]
-    fn new(uri: &str) -> PyResult<Self> {
-        let ds = S3BytesDataset::from_prefix(uri)
+    fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+        let o = opts_from_dict(opts);
+        let ds = S3BytesDataset::from_prefix_with_opts(uri, &o)
             //.map_err(|e| PyRuntimeError::new_err(e))?;
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner: ds })
@@ -152,22 +151,29 @@ pub struct PyS3AsyncDataLoader {
     rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Vec<u8>>, DatasetError>>>>,
 }
 
+
+// AsyncDataLoader function
 #[pymethods]
 impl PyS3AsyncDataLoader {
     #[new]
     fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
-        let ds = S3BytesDataset::from_prefix(uri)
-            //.map_err(|e| PyRuntimeError::new_err(e))?;
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let opts = opts_from_dict(opts); // you already have this helper
+        // Parse options once, and apply safe defaults for range mode tuning.
+        let o = opts_from_dict(opts)
+            .part_size(8 * 1024 * 1024)
+            .max_inflight_parts(4);
 
-        let (tx, rx) = mpsc::channel::<Result<Vec<Vec<u8>>, DatasetError>>(opts.prefetch.max(1));
+        // Build the dataset with the SAME options (reader_mode, part_size, etc.)
+        let ds = S3BytesDataset::from_prefix_with_opts(uri, &o)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Use the SAME options for DataLoader and for channel capacity.
+        let (tx, rx) =
+            mpsc::channel::<Result<Vec<Vec<u8>>, DatasetError>>(o.prefetch.max(1));
 
         pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-            let loader = DataLoader::new(ds, opts);
+            let loader = DataLoader::new(ds, o);
             let mut stream = loader.stream();
             while let Some(batch) = stream.next().await {
-                // batch: Result<Vec<Vec<u8>>, DatasetError>
                 if tx.send(batch).await.is_err() { break; }
             }
         });
@@ -183,7 +189,6 @@ impl PyS3AsyncDataLoader {
             let mut guard = rx.lock().await;
             match guard.recv().await {
                 Some(Ok(batch)) => Python::with_gil(|py| {
-                    // turn Vec<Vec<u8>> into list[bytes]
                     let out: Vec<Py<PyBytes>> = batch.into_iter()
                         .map(|b| PyBytes::new(py, &b).unbind())
                         .collect();
@@ -195,6 +200,7 @@ impl PyS3AsyncDataLoader {
         })
     }
 }
+
 
 // - create-bucket command
 #[pyfunction]
@@ -567,34 +573,64 @@ impl Dataset for PyVecDataset {
 
 /// Convert an optional Python dict of options into LoaderOptions.
 fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
+    let def = LoaderOptions::default();
+
     if let Some(d) = d {
-        // Helper closures that cope with the new Result‑of‑Option signature.
-        let g_usize = |k: &str, def: usize| match d.get_item(k) {
-            Ok(Some(val)) => val.extract::<usize>().unwrap_or(def),
-            _             => def,
+        // Helper closures that cope with the Result-of-Option signature.
+        let g_usize = |k: &str, dv: usize| match d.get_item(k) {
+            Ok(Some(val)) => val.extract::<usize>().unwrap_or(dv),
+            _             => dv,
         };
-        let g_bool = |k: &str, def: bool| match d.get_item(k) {
-            Ok(Some(val)) => val.extract::<bool>().unwrap_or(def),
-            _             => def,
+        let g_bool = |k: &str, dv: bool| match d.get_item(k) {
+            Ok(Some(val)) => val.extract::<bool>().unwrap_or(dv),
+            _             => dv,
         };
-        let g_u64 = |k: &str, def: u64| match d.get_item(k) {
-            Ok(Some(val)) => val.extract::<u64>().unwrap_or(def),
-            _             => def,
+        let g_u64 = |k: &str, dv: u64| match d.get_item(k) {
+            Ok(Some(val)) => val.extract::<u64>().unwrap_or(dv),
+            _             => dv,
+        };
+
+        // Reader mode: accept "sequential" or "range" (case-insensitive).
+        let reader_mode = match d.get_item("reader_mode") {
+            Ok(Some(val)) => {
+                if let Ok(s) = val.extract::<&str>() {
+                    match s.to_ascii_lowercase().as_str() {
+                        "range"      => ReaderMode::Range,
+                        "sequential" => ReaderMode::Sequential,
+                        _            => def.reader_mode,
+                    }
+                } else {
+                    def.reader_mode
+                }
+            }
+            _ => def.reader_mode,
         };
 
         LoaderOptions {
-            batch_size:  g_usize("batch_size", 32),
-            drop_last:   g_bool ("drop_last",  false),
-            shuffle:     g_bool ("shuffle",    false),
-            seed:        g_u64  ("seed",       0),
-            num_workers: g_usize("num_workers", 0),
-            prefetch:    g_usize("prefetch",   0),
-            auto_tune:   g_bool ("auto_tune",  false),
+            // existing fields
+            batch_size:           g_usize("batch_size",  def.batch_size),
+            drop_last:            g_bool ("drop_last",   def.drop_last),
+            shuffle:              g_bool ("shuffle",     def.shuffle),
+            seed:                 g_u64  ("seed",        def.seed),
+            num_workers:          g_usize("num_workers", def.num_workers),
+            prefetch:             g_usize("prefetch",    def.prefetch),
+            auto_tune:            g_bool ("auto_tune",   def.auto_tune),
+
+            // new fields
+            reader_mode,
+            part_size:            g_usize("part_size",           def.part_size),
+            max_inflight_parts:   g_usize("max_inflight_parts",  def.max_inflight_parts),
+
+            shard_rank:           g_usize("shard_rank",          def.shard_rank),
+            shard_world_size:     g_usize("shard_world_size",    def.shard_world_size),
+            worker_id:            g_usize("worker_id",           def.worker_id),
+            num_workers_pytorch:  g_usize("num_workers_pytorch", def.num_workers_pytorch),
         }
     } else {
-        LoaderOptions::default()
+        def
     }
 }
+
 
 
 #[pyclass]
