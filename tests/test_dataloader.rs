@@ -144,21 +144,20 @@ async fn iterable_dataset() {
     assert_eq!(collected, (0..55).collect::<Vec<_>>());
 }
 
+
 #[tokio::test]
 async fn unknown_len_dataset() {
     let ds = UnknownLenDataset { n: 10 };
-    let loader = DataLoader::new(
-        ds,
-        LoaderOptions {
-            batch_size: 3,
-            drop_last: false,
-            shuffle: false,
-            seed: 0,
-            num_workers: 0,
-            prefetch: 0,
-            auto_tune: false,
-        },
-    );
+
+    // Use builder-style options to avoid breakage when LoaderOptions grows fields.
+    let opts = LoaderOptions::default()
+        .with_batch_size(3)
+        .drop_last(false)
+        .shuffle(false, 0)
+        .num_workers(0)
+        .prefetch(0);
+
+    let loader = DataLoader::new(ds, opts);
 
     let collected: Vec<_> = loader
         .stream()
