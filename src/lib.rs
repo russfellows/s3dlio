@@ -43,6 +43,15 @@ pub use crate::s3_utils::{
     DEFAULT_OBJECT_SIZE,
 };
 
+mod multipart;
+
+// Re-export the multipart public types
+pub use crate::multipart::{
+    MultipartUploadConfig,
+    MultipartUploadSink,
+    MultipartCompleteInfo,
+};
+
 // types:
 pub use crate::config::ObjectType;
 

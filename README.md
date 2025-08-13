@@ -9,6 +9,17 @@ As such, this project essentially has 3 components that can be utilized:
 ## What's New
 This is in reverse order, newest first.
 
+### Version 0.4.4
+Added a multi-part uploader.  This includes the ability to do so with zero buffer copies between Python and Rust.  This works by providing a function, that Rust executes and allocates the space for.  Python can then fill the memory region, and give it back to Rust.  This all occurs zero-copy with Rust managing lifetimes.  At this point, the memory region can be streamed to the S3 back-end, including using multi-part upload.  
+#### New Tests
+There are several new tests added, in the python/tests subdirectory, including:
+  - python/tests/multi-part_smoke.py
+  - python/tests/test_multipart_writer.py
+  - tests/test_multipart.rs
+
+#### New Docs
+There is also a new MultiPart_README.md file that explains all the options and how to use the multi part features in each library framework. 
+
 ### Version 0.4.3
 After many promises of a fully functional and compatible PyTorch data loader, I believe that version 0.4.3 provides it.  Or, at least something very similar and quite functional, as all functional compatability tests and comparisons to the aws s3torchconnector library seem to show parity.  
 Also we updated the Dockerfile to enable building containers again.  Likely more work is needed to slim down the image as its about 19 GB. 
