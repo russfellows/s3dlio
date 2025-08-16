@@ -9,6 +9,15 @@ As such, this project essentially has 3 components that can be utilized:
 ## What's New
 This is in reverse order, newest first.
 
+### Version 0.4.5 - Rust only - Phase1
+Added new bindings and backend to support Azure blob storage.  As of this initial phase1 release, there are only minimal interfaces to Azure blob.  Until this becomes fully flushed out, will remain as Rust only changes.  
+
+#### New Tests
+There are several new tests added, in the tests subdirectory, including:
+  - azure_blob_multi.rs
+  - azure_blob_sequence.rs
+  - azure_blob_smoke.rs
+
 ### Version 0.4.4
 Added a multi-part uploader.  This includes the ability to do so with zero buffer copies between Python and Rust.  This works by providing a function, that Rust executes and allocates the space for.  Python can then fill the memory region, and give it back to Rust.  This all occurs zero-copy with Rust managing lifetimes.  At this point, the memory region can be streamed to the S3 back-end, including using multi-part upload.  
 #### New Tests
