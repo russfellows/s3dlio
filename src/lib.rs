@@ -16,6 +16,7 @@ pub mod s3_copy;
 pub mod s3_utils;
 pub mod s3_logger;
 pub mod s3_ops;
+pub mod object_store;
 
 // (other modules/elided)
 pub mod data_gen;
@@ -29,6 +30,20 @@ pub use crate::data_loader::dataset::{Dataset, DatasetError};
 pub use crate::data_loader::options::LoaderOptions;
 // Module alias so tests can use `s3dlio::dataset::DynStream`:
 pub use crate::data_loader::dataset;  // re-export the whole module as `s3dlio::dataset`
+                                      //
+
+// Re-export the new trait + helpers for easy access elsewhere
+#[cfg(feature = "azure")]
+pub mod azure_client;
+
+pub use object_store::{
+    ObjectStore,
+    S3ObjectStore,
+    ObjectMetadata,
+    infer_scheme,
+    store_for_uri,
+    Scheme,
+};
 
 // ===== Re-exports expected by src/bin/cli.rs at the crate root =====
 // s3_utils items:

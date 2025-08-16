@@ -1,6 +1,6 @@
 [package]
 name = "s3dlio"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 
 [lib]
@@ -18,13 +18,18 @@ path = "src/bin/cli.rs"
 aws-config         = "^1"
 aws-sdk-s3         = "^1"
 
+# Azure SDK crates (keep minor versions flexible; they evolve together)
+azure_core = { version = "0.27.0", optional = true }          # Response/Body, paging, errors
+azure_identity = { version = "0.27.0", optional = true }      # DefaultAzureCredential
+azure_storage_blob = { version = "0.4.0", optional = true }   # Blob/Container/BlockBlob clients
+
 # Optional: Add env_logger and log for debugging output from SDK/client
-env_logger = "0.11"
-log = "0.4"
+env_logger = "^0.11"
+log = "^0.4"
 
 # --- async / net stack ----------------------------------------------------
-tokio   = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio   = { version = "^1", features = ["full"] }
+tokio-stream = { version = "^0.1", features = ["sync"] }
 hyper   = { version = "^1", features = ["client"] }		# ← Upgraded
 hyper-rustls = "^0.27"                                		# ← matches hyper ^1
 aws-smithy-http-client = { version = "1.0.1", features = ["rustls-aws-lc"] }
@@ -76,6 +81,7 @@ futures-util = "^0.3"
 zstd         = "^0.13"
 humantime    = "^2.2"
 tokio-sync   = "^0.1.8"
+base64 = "0.22.1"
 
 
 [dev-dependencies]
@@ -85,6 +91,13 @@ futures-util  = "^0.3"
 async-trait   = "^0.1"   # needed by the mock datasets
 
 [features]
-default = []
+#default = []
+default = ["s3"]
+s3 = []
 extension-module = []     # suppresses the cfg warning when building the wheel
+azure = [
+    "dep:azure_storage_blob", 
+    "dep:azure_identity", 
+    "dep:azure_core",
+]
 
