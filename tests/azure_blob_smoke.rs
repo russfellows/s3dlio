@@ -1,4 +1,3 @@
-// tests/azure_blob_smoke.rs
 #![cfg(feature = "azure")]
 
 use anyhow::{Context, Result};
@@ -8,7 +7,8 @@ use futures::stream;
 use rand::{Rng, rng};
 use rand::distr::Alphanumeric;
 use std::env;
-use s3dlio::azure_client::AzureBlob; // the adapter you just added
+use s3dlio::azure_client::AzureBlob; // direct client tests
+use s3dlio::object_store::store_for_uri; // NEW: factory-based smoke
 
 fn req_env(key: &str) -> Result<String> {
     env::var(key).with_context(|| format!("Missing required env var {}", key))
@@ -28,9 +28,17 @@ fn random_key(prefix: &str) -> String {
     format!("{prefix}-{suffix}")
 }
 
+
 async fn mk_client() -> Result<AzureBlob> {
     let container = req_env("AZURE_BLOB_CONTAINER")?;
     if let Some(url) = opt_env("AZURE_BLOB_ACCOUNT_URL") {
+        if let Some(acct) = opt_env("AZURE_BLOB_ACCOUNT") {
+            // crude parse: https://{account}.blob.core.windows.net
+            let host = url.strip_prefix("https://").unwrap_or(&url);
+            let acc_from_url = host.split('.').next().unwrap_or("");
+            anyhow::ensure!(acc_from_url == acct,
+                "AZURE_BLOB_ACCOUNT_URL points to '{acc_from_url}', but AZURE_BLOB_ACCOUNT is '{acct}'");
+        }
         Ok(AzureBlob::with_default_credential_from_url(&url, &container)?)
     } else {
         let acct = req_env("AZURE_BLOB_ACCOUNT")?;
@@ -47,7 +55,9 @@ fn crc32(bytes: &[u8]) -> u32 {
 #[tokio::test]
 async fn put_get_list_stat_delete_smoke() -> Result<()> {
     // Skip with a friendly note if not configured
-    if env::var("AZURE_BLOB_CONTAINER").is_err() || (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err()) {
+    if env::var("AZURE_BLOB_CONTAINER").is_err()
+        || (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
+    {
         eprintln!("SKIP: set AZURE_BLOB_CONTAINER and (AZURE_BLOB_ACCOUNT or AZURE_BLOB_ACCOUNT_URL) to run azure blob tests");
         return Ok(());
     }
@@ -89,7 +99,9 @@ async fn put_get_list_stat_delete_smoke() -> Result<()> {
 #[tokio::test]
 async fn multipart_stream_upload_roundtrip() -> Result<()> {
     // Skip if not configured
-    if env::var("AZURE_BLOB_CONTAINER").is_err() || (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err()) {
+    if env::var("AZURE_BLOB_CONTAINER").is_err()
+        || (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
+    {
         eprintln!("SKIP: set AZURE_BLOB_CONTAINER and (AZURE_BLOB_ACCOUNT or AZURE_BLOB_ACCOUNT_URL) to run azure blob tests");
         return Ok(());
     }
@@ -142,6 +154,45 @@ async fn multipart_stream_upload_roundtrip() -> Result<()> {
 
     // cleanup
     client.delete_objects(&vec![key.clone()]).await?;
+    Ok(())
+}
+
+/// NEW: validate the ObjectStore factory with both `az://...` and full HTTPS forms.
+#[tokio::test]
+async fn factory_roundtrip_smoke() -> Result<()> {
+    // Skip if not configured
+    if env::var("AZURE_BLOB_CONTAINER").is_err()
+        || (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
+    {
+        eprintln!("SKIP: set AZURE_BLOB_CONTAINER and (AZURE_BLOB_ACCOUNT or AZURE_BLOB_ACCOUNT_URL) to run azure blob tests");
+        return Ok(());
+    }
+
+    let account = req_env("AZURE_BLOB_ACCOUNT")?;
+    let container = req_env("AZURE_BLOB_CONTAINER")?;
+    let base_https = opt_env("AZURE_BLOB_ACCOUNT_URL")
+        .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", account));
+
+    let payload = b"hello via ObjectStore";
+
+    // 1) az:// form
+    let key1 = random_key("s3dlio-factory-az");
+    let uri1 = format!("az://{}/{}/{}", account, container, key1);
+    let store1 = store_for_uri(&uri1)?;
+    store1.put(&uri1, payload).await?;
+    let got1 = store1.get(&uri1).await?;
+    assert_eq!(&got1[..], payload);
+    store1.delete(&uri1).await?;
+
+    // 2) full https form
+    let key2 = random_key("s3dlio-factory-https");
+    let uri2 = format!("{}/{}/{}", base_https.trim_end_matches('/'), container, key2);
+    let store2 = store_for_uri(&uri2)?;
+    store2.put(&uri2, payload).await?;
+    let got2 = store2.get(&uri2).await?;
+    assert_eq!(&got2[..], payload);
+    store2.delete(&uri2).await?;
+
     Ok(())
 }
 
