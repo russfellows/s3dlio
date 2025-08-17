@@ -17,6 +17,7 @@ pub mod s3_utils;
 pub mod s3_logger;
 pub mod s3_ops;
 pub mod object_store;
+pub mod file_store;
 
 // (other modules/elided)
 pub mod data_gen;
@@ -44,6 +45,8 @@ pub use object_store::{
     store_for_uri,
     Scheme,
 };
+
+pub use file_store::FileSystemObjectStore;
 
 // ===== Re-exports expected by src/bin/cli.rs at the crate root =====
 // s3_utils items:
