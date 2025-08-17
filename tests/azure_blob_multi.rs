@@ -28,12 +28,20 @@ fn random_key(prefix: &str) -> String {
 async fn mk_client() -> Result<AzureBlob> {
     let container = req_env("AZURE_BLOB_CONTAINER")?;
     if let Some(url) = opt_env("AZURE_BLOB_ACCOUNT_URL") {
+        if let Some(acct) = opt_env("AZURE_BLOB_ACCOUNT") {
+            // crude parse: https://{account}.blob.core.windows.net
+            let host = url.strip_prefix("https://").unwrap_or(&url);
+            let acc_from_url = host.split('.').next().unwrap_or("");
+            anyhow::ensure!(acc_from_url == acct,
+                "AZURE_BLOB_ACCOUNT_URL points to '{acc_from_url}', but AZURE_BLOB_ACCOUNT is '{acct}'");
+        }
         Ok(AzureBlob::with_default_credential_from_url(&url, &container)?)
     } else {
         let acct = req_env("AZURE_BLOB_ACCOUNT")?;
         Ok(AzureBlob::with_default_credential(&acct, &container)?)
     }
 }
+
 
 #[tokio::test]
 async fn multi_blob_roundtrip_and_cleanup() -> Result<()> {
