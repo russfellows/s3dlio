@@ -6,8 +6,11 @@ As such, this project essentially has 3 components that can be utilized:
 2. A Python library built on top of the Rust library, also called "s3dlio"
 3. An executable CLI, built using Rust
 
-## What's New
+# What's New
 This is in reverse order, newest first.
+
+## Version 0.5.0 - Rust only - File and Azure Blob
+Enhanced the support of the two new storage backends, Posix file and Azure blob.  These remain "Rust Library" only enhancements, however, exposing the minimal changes to the python library should be straigthforward.  This represents a significant enhancement of this projects capabilities.  There is a full readme with all the details on these enhances in a file in the docs subdirectory, specifically docs/Vers_5-0_Backend-Parity.md file.
 
 ### Version 0.4.6 - Rust only - File Phase1
 Added new bindings and backend to support Posix File storage.  As of this initial phase1 release, there are only minimal interfaces.  Until this becomes fully flushed out, will remain as Rust only changes.  

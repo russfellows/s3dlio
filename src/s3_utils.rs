@@ -518,6 +518,29 @@ pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()
     Ok(())
 }
 
+/// Upload a single object to S3 by URI **with op‑logging**.
+pub async fn put_object_uri_async(uri: &str, data: &[u8]) -> Result<()> {
+    let (bucket, key) = parse_s3_uri(uri)?;
+    put_object_async(&bucket, &key, data).await
+}
+
+/// Upload object via multipart using existing MultipartUploadSink infrastructure.
+pub async fn put_object_multipart_uri_async(
+    uri: &str,
+    data: &[u8],
+    part_size: Option<usize>,
+) -> Result<()> {
+    use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
+    let cfg = MultipartUploadConfig {
+        part_size: part_size.unwrap_or(16 * 1024 * 1024), // 16 MiB default
+        ..Default::default()
+    };
+    let mut sink = MultipartUploadSink::from_uri(uri, cfg)?;
+    sink.write_blocking(data)?;
+    sink.finish_blocking()?;
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Internal helpers (private)
 // -----------------------------------------------------------------------------

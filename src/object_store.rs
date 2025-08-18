@@ -21,6 +21,9 @@ use crate::s3_utils::{
     delete_objects as s3_delete_objects,
     create_bucket as s3_create_bucket,
     delete_bucket as s3_delete_bucket,
+    // NEW: PUT operations via ObjectStore
+    put_object_uri_async as s3_put_object_uri_async,
+    put_object_multipart_uri_async as s3_put_object_multipart_uri_async,
 };
 
 // Expose FS adapter (already implemented in src/file_store.rs)
@@ -134,12 +137,14 @@ impl ObjectStore for S3ObjectStore {
         s3_get_object_range_uri_async(uri, offset, length).await
     }
 
-    async fn put(&self, _uri: &str, _data: &[u8]) -> Result<()> {
-        bail!("S3ObjectStore::put not routed via ObjectStore yet (existing S3 PUT paths use s3_utils directly)");
+    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        s3_put_object_uri_async(uri, data).await
     }
 
-    async fn put_multipart(&self, _uri: &str, _data: &[u8], _part_size: Option<usize>) -> Result<()> {
-        bail!("S3ObjectStore::put_multipart not routed via ObjectStore yet");
+    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
+        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        s3_put_object_multipart_uri_async(uri, data, part_size).await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
