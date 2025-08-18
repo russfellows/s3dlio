@@ -1,0 +1,724 @@
+// src/file_store_direct.rs
+//
+// Enhanced FileSystemObjectStore with O_DIRECT support for AI/ML workloads
+// This module provides direct I/O capabilities that bypass the page cache
+
+use anyhow::{bail, Result};
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+use crate::object_store::{ObjectStore, ObjectMetadata};
+
+/// Configuration options for FileSystem operations
+#[derive(Debug, Clone)]
+pub struct FileSystemConfig {
+    /// Enable O_DIRECT I/O to bypass page cache (Linux/Unix only)
+    pub direct_io: bool,
+    /// Buffer alignment for O_DIRECT (typically 4096 bytes)
+    pub alignment: usize,
+    /// Minimum I/O size for O_DIRECT operations
+    pub min_io_size: usize,
+    /// Enable O_SYNC for synchronous writes
+    pub sync_writes: bool,
+}
+
+impl Default for FileSystemConfig {
+    fn default() -> Self {
+        // Get system page size for proper alignment
+        let page_size = get_system_page_size();
+        
+        Self {
+            direct_io: false,
+            alignment: page_size,
+            min_io_size: page_size,
+            sync_writes: false,
+        }
+    }
+}
+
+impl FileSystemConfig {
+    /// Create a new configuration with O_DIRECT enabled for AI/ML workloads
+    pub fn direct_io() -> Self {
+        let page_size = get_system_page_size();
+        
+        Self {
+            direct_io: true,
+            alignment: page_size,
+            min_io_size: page_size,
+            sync_writes: false,
+        }
+    }
+
+    /// Create a configuration optimized for high-performance AI/ML workloads
+    pub fn high_performance() -> Self {
+        let page_size = get_system_page_size();
+        
+        Self {
+            direct_io: true,
+            alignment: page_size,
+            min_io_size: 64 * 1024,     // 64KB minimum I/O for better performance
+            sync_writes: true,          // Ensure data hits storage
+        }
+    }
+}
+
+/// Get the system page size for proper O_DIRECT alignment
+fn get_system_page_size() -> usize {
+    #[cfg(unix)]
+    {
+        unsafe {
+            let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+            if page_size > 0 {
+                page_size as usize
+            } else {
+                4096 // Fallback to 4KB if sysconf fails
+            }
+        }
+    }
+    
+    #[cfg(not(unix))]
+    {
+        4096 // Default fallback for non-Unix systems
+    }
+}
+
+/// Enhanced FileSystem adapter with O_DIRECT support
+pub struct ConfigurableFileSystemObjectStore {
+    config: FileSystemConfig,
+}
+
+impl ConfigurableFileSystemObjectStore {
+    pub fn new(config: FileSystemConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn with_direct_io() -> Self {
+        Self::new(FileSystemConfig::direct_io())
+    }
+
+    pub fn high_performance() -> Self {
+        Self::new(FileSystemConfig::high_performance())
+    }
+
+    /// Test if the filesystem at the given path supports O_DIRECT
+    pub async fn test_direct_io_support(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            // Create a test file to check O_DIRECT support
+            let test_path = path.join(".test_direct_io");
+            let result = tokio::task::spawn_blocking(move || -> bool {
+                use std::fs::OpenOptions;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                
+                // Try to create a small file with O_DIRECT
+                match OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&test_path)
+                {
+                    Ok(mut file) => {
+                        // Try to write aligned data
+                        let page_size = get_system_page_size();
+                        let test_data = vec![0u8; page_size];
+                        let write_result = file.write_all(&test_data);
+                        
+                        // Clean up test file
+                        let _ = std::fs::remove_file(&test_path);
+                        
+                        write_result.is_ok()
+                    }
+                    Err(_) => false
+                }
+            }).await;
+            
+            result.unwrap_or(false)
+        }
+        
+        #[cfg(not(unix))]
+        {
+            false // O_DIRECT not supported on non-Unix systems
+        }
+    }
+
+    /// Convert a URI to a filesystem path
+    fn uri_to_path(uri: &str) -> Result<PathBuf> {
+        if !uri.starts_with("file://") {
+            bail!("FileSystemObjectStore expects file:// URI, got: {}", uri);
+        }
+        
+        // Strip file:// prefix
+        let path = &uri[7..];
+        Ok(PathBuf::from(path))
+    }
+
+    /// Convert a filesystem path back to a URI for list operations
+    fn path_to_uri(path: &Path) -> String {
+        if path.is_absolute() {
+            format!("file://{}", path.display())
+        } else {
+            path.display().to_string()
+        }
+    }
+
+    /// Create ObjectMetadata from filesystem metadata
+    async fn metadata_from_path(path: &Path) -> Result<ObjectMetadata> {
+        let metadata = fs::metadata(path).await?;
+        
+        // Create ObjectMetadata compatible with S3ObjectStat
+        let last_modified = metadata.modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|duration| {
+                // Convert to RFC 3339 format like S3 uses
+                let secs = duration.as_secs();
+                let datetime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+                format!("{:?}", datetime) // Simple formatting for now
+            });
+            
+        let file_hash = format!("file-{}-{}", 
+            metadata.len(),
+            metadata.modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        );
+        
+        Ok(ObjectMetadata {
+            size: metadata.len(),
+            last_modified,
+            e_tag: Some(file_hash),
+            content_type: None,
+            content_language: None,
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            expires: None,
+            storage_class: Some("DIRECT_IO".to_string()),
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            version_id: None,
+            replication_status: None,
+            metadata: HashMap::new(),
+        })
+    }
+
+    /// Align buffer for O_DIRECT operations
+    fn align_buffer(&self, data: &[u8]) -> Vec<u8> {
+        if !self.config.direct_io {
+            return data.to_vec();
+        }
+
+        let alignment = self.config.alignment;
+        let aligned_size = ((data.len() + alignment - 1) / alignment) * alignment;
+        let mut aligned_buffer = vec![0u8; aligned_size];
+        aligned_buffer[..data.len()].copy_from_slice(data);
+        aligned_buffer
+    }
+
+    /// Create OpenOptions with appropriate flags for the configuration
+    fn create_open_options(&self, read: bool, write: bool) -> fs::OpenOptions {
+        let mut options = fs::OpenOptions::new();
+        options.read(read).write(write);
+
+        if write {
+            options.create(true).truncate(true);
+        }
+
+        #[cfg(unix)]
+        {
+            if self.config.direct_io {
+                // O_DIRECT flag (Linux/Unix)
+                options.custom_flags(libc::O_DIRECT);
+            }
+            if self.config.sync_writes && write {
+                // O_SYNC flag for synchronous writes
+                options.custom_flags(libc::O_SYNC);
+            }
+        }
+
+        options
+    }
+
+    /// Read file with O_DIRECT if configured
+    async fn read_file_direct(&self, path: &Path) -> Result<Vec<u8>> {
+        if !self.config.direct_io {
+            // Fallback to normal tokio read
+            return Ok(fs::read(path).await?);
+        }
+
+        // For O_DIRECT, we need to be careful about alignment and may need to fall back
+        match self.try_read_file_direct(path).await {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                // If O_DIRECT fails, fall back to regular I/O
+                log::warn!("O_DIRECT read failed for {}, falling back to regular I/O: {}", path.display(), e);
+                Ok(fs::read(path).await?)
+            }
+        }
+    }
+
+    /// Try to read file with O_DIRECT, may fail due to alignment or filesystem support
+    async fn try_read_file_direct(&self, path: &Path) -> Result<Vec<u8>> {
+        let metadata = fs::metadata(path).await?;
+        let file_size = metadata.len() as usize;
+        
+        if file_size == 0 {
+            return Ok(Vec::new());
+        }
+        
+        // For small files or when O_DIRECT would be inefficient, use regular I/O
+        if file_size < self.config.min_io_size {
+            return Ok(fs::read(path).await?);
+        }
+        
+        #[cfg(unix)]
+        {
+            let path = path.to_owned();
+            let alignment = self.config.alignment;
+            
+            // Use spawn_blocking to run sync I/O in thread pool
+            tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                use std::fs::OpenOptions;
+                use std::io::Read;
+                use std::os::unix::fs::OpenOptionsExt;
+                
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)?;
+                
+                // Read in aligned chunks
+                let mut result = Vec::new();
+                let mut temp_buffer = vec![0u8; alignment];
+                let mut total_read = 0;
+                
+                while total_read < file_size {
+                    let bytes_read = file.read(&mut temp_buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    
+                    let copy_size = std::cmp::min(bytes_read, file_size - total_read);
+                    result.extend_from_slice(&temp_buffer[..copy_size]);
+                    total_read += copy_size;
+                }
+                
+                result.truncate(file_size);
+                Ok(result)
+            }).await?
+        }
+        
+        #[cfg(not(unix))]
+        {
+            // Fallback for non-Unix systems
+            Ok(fs::read(path).await?)
+        }
+    }
+
+    /// Write file with O_DIRECT if configured
+    async fn write_file_direct(&self, path: &Path, data: &[u8]) -> Result<()> {
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        if !self.config.direct_io {
+            // Fallback to normal tokio write
+            return Ok(fs::write(path, data).await?);
+        }
+
+        // Try O_DIRECT write, fall back to regular write if it fails
+        match self.try_write_file_direct(path, data).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                log::warn!("O_DIRECT write failed for {}, falling back to regular I/O: {}", path.display(), e);
+                Ok(fs::write(path, data).await?)
+            }
+        }
+    }
+
+    /// Try to write file with O_DIRECT, may fail due to alignment or filesystem support
+    async fn try_write_file_direct(&self, path: &Path, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(fs::write(path, data).await?);
+        }
+
+        // For small files, use regular I/O
+        if data.len() < self.config.min_io_size {
+            return Ok(fs::write(path, data).await?);
+        }
+
+        #[cfg(unix)]
+        {
+            let path = path.to_owned();
+            let data = data.to_vec();
+            let alignment = self.config.alignment;
+            let sync_writes = self.config.sync_writes;
+            
+            // Use spawn_blocking for sync I/O
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                use std::fs::OpenOptions;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                
+                let mut flags = libc::O_DIRECT;
+                if sync_writes {
+                    flags |= libc::O_SYNC;
+                }
+                
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .custom_flags(flags)
+                    .open(&path)?;
+                
+                // Write data in aligned chunks
+                let mut written = 0;
+                
+                while written < data.len() {
+                    let remaining = data.len() - written;
+                    let chunk_size = std::cmp::min(remaining, alignment);
+                    
+                    // Create aligned buffer for this chunk
+                    let mut aligned_chunk = vec![0u8; alignment];
+                    aligned_chunk[..chunk_size].copy_from_slice(&data[written..written + chunk_size]);
+                    
+                    // Write full aligned chunk
+                    file.write_all(&aligned_chunk)?;
+                    written += chunk_size;
+                }
+                
+                file.flush()?;
+                
+                // Truncate to original size
+                file.set_len(data.len() as u64)?;
+                
+                Ok(())
+            }).await?
+        }
+        
+        #[cfg(not(unix))]
+        {
+            // Fallback for non-Unix systems
+            Ok(fs::write(path, data).await?)
+        }
+    }
+
+    /// Read range with O_DIRECT support
+    async fn read_range_direct(&self, path: &Path, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+        if !self.config.direct_io {
+            // Fallback to normal implementation
+            let mut file = fs::File::open(path).await?;
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            
+            let read_length = length.unwrap_or(u64::MAX);
+            let mut buffer = Vec::new();
+            
+            if read_length == u64::MAX {
+                file.read_to_end(&mut buffer).await?;
+            } else {
+                buffer.resize(read_length as usize, 0);
+                let bytes_read = file.read(&mut buffer).await?;
+                buffer.truncate(bytes_read);
+            }
+            
+            return Ok(buffer);
+        }
+
+        // Try O_DIRECT first, fall back to regular I/O if it fails
+        match self.try_read_range_direct(path, offset, length).await {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                log::warn!("O_DIRECT range read failed for {}, falling back to regular I/O: {}", path.display(), e);
+                // Fall back to regular I/O
+                let mut file = fs::File::open(path).await?;
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+                
+                let read_length = length.unwrap_or(u64::MAX);
+                let mut buffer = Vec::new();
+                
+                if read_length == u64::MAX {
+                    file.read_to_end(&mut buffer).await?;
+                } else {
+                    buffer.resize(read_length as usize, 0);
+                    let bytes_read = file.read(&mut buffer).await?;
+                    buffer.truncate(bytes_read);
+                }
+                
+                Ok(buffer)
+            }
+        }
+    }
+
+    /// Try to read file range with O_DIRECT, may fail due to alignment or filesystem support
+    async fn try_read_range_direct(&self, path: &Path, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+        // O_DIRECT range read requires careful alignment
+        let alignment = self.config.alignment as u64;
+        let aligned_offset = (offset / alignment) * alignment;
+        let offset_adjustment = (offset - aligned_offset) as usize;
+        
+        let read_length = length.unwrap_or_else(|| {
+            // Read to end of file
+            let metadata = std::fs::metadata(path).unwrap();
+            metadata.len() - offset
+        });
+        
+        let total_length = offset_adjustment + read_length as usize;
+        let aligned_length = ((total_length + self.config.alignment - 1) / self.config.alignment) * self.config.alignment;
+        
+        let mut buffer = vec![0u8; aligned_length];
+        
+        let options = self.create_open_options(true, false);
+        let mut file = options.open(path).await?;
+        
+        file.seek(std::io::SeekFrom::Start(aligned_offset)).await?;
+        let bytes_read = file.read(&mut buffer).await?;
+        
+        // Extract the requested range
+        let start = offset_adjustment;
+        let end = std::cmp::min(start + read_length as usize, bytes_read);
+        
+        Ok(buffer[start..end].to_vec())
+    }
+
+    /// Recursively collect files in a directory
+    async fn collect_files_recursive(dir: &Path, prefix: &str, results: &mut Vec<String>) -> Result<()> {
+        let mut entries = fs::read_dir(dir).await?;
+        
+        while let Some(entry) = entries.next_entry().await? {
+            let entry_path = entry.path();
+            let file_name = entry_path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+                
+            if entry_path.is_dir() {
+                let new_prefix = if prefix.is_empty() {
+                    file_name.to_string()
+                } else {
+                    format!("{}/{}", prefix, file_name)
+                };
+                Box::pin(Self::collect_files_recursive(&entry_path, &new_prefix, results)).await?;
+            } else {
+                let file_uri = Self::path_to_uri(&entry_path);
+                results.push(file_uri);
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ObjectStore for ConfigurableFileSystemObjectStore {
+    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        let path = Self::uri_to_path(uri)?;
+        
+        if !path.exists() {
+            bail!("File not found: {}", path.display());
+        }
+        
+        if !path.is_file() {
+            bail!("Path is not a file: {}", path.display());
+        }
+        
+        self.read_file_direct(&path).await
+    }
+
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        let path = Self::uri_to_path(uri)?;
+        
+        if !path.exists() {
+            bail!("File not found: {}", path.display());
+        }
+        
+        if !path.is_file() {
+            bail!("Path is not a file: {}", path.display());
+        }
+        
+        self.read_range_direct(&path, offset, length).await
+    }
+
+    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        let path = Self::uri_to_path(uri)?;
+        
+        self.write_file_direct(&path, data).await
+    }
+
+    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
+        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        
+        if !self.config.direct_io {
+            // Fallback to regular put for non-direct I/O
+            return self.put(uri, data).await;
+        }
+        
+        // For O_DIRECT multipart, write in aligned chunks
+        let chunk_size = part_size.unwrap_or(self.config.min_io_size);
+        
+        let path = Self::uri_to_path(uri)?;
+        
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        
+        let options = self.create_open_options(false, true);
+        let mut file = options.open(&path).await?;
+        
+        for chunk in data.chunks(chunk_size) {
+            let aligned_chunk = self.align_buffer(chunk);
+            file.write_all(&aligned_chunk).await?;
+        }
+        
+        file.flush().await?;
+        
+        // Truncate to exact size
+        file.set_len(data.len() as u64).await?;
+        
+        Ok(())
+    }
+
+    async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
+        if !uri_prefix.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        let base_path = Self::uri_to_path(uri_prefix)?;
+        let mut results = Vec::new();
+        
+        if !base_path.exists() {
+            return Ok(results); // Empty list for non-existent paths
+        }
+        
+        if base_path.is_file() {
+            // If the prefix points to a file, return just that file
+            results.push(Self::path_to_uri(&base_path));
+            return Ok(results);
+        }
+        
+        if base_path.is_dir() {
+            if recursive {
+                Self::collect_files_recursive(&base_path, "", &mut results).await?;
+            } else {
+                // Non-recursive: only direct children
+                let mut entries = fs::read_dir(&base_path).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let entry_path = entry.path();
+                    if entry_path.is_file() {
+                        results.push(Self::path_to_uri(&entry_path));
+                    }
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+
+    async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
+        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        let path = Self::uri_to_path(uri)?;
+        
+        if !path.exists() {
+            bail!("File not found: {}", path.display());
+        }
+        
+        if !path.is_file() {
+            bail!("Path is not a file: {}", path.display());
+        }
+        
+        Self::metadata_from_path(&path).await
+    }
+
+    async fn delete(&self, uri: &str) -> Result<()> {
+        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        let path = Self::uri_to_path(uri)?;
+        
+        if !path.exists() {
+            // Already deleted, consider it success
+            return Ok(());
+        }
+        
+        if path.is_file() {
+            fs::remove_file(&path).await?;
+        } else if path.is_dir() {
+            fs::remove_dir_all(&path).await?;
+        }
+        
+        Ok(())
+    }
+
+    async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+        if !uri_prefix.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        let base_path = Self::uri_to_path(uri_prefix)?;
+        
+        if !base_path.exists() {
+            return Ok(()); // Nothing to delete
+        }
+        
+        if base_path.is_file() {
+            fs::remove_file(&base_path).await?;
+        } else if base_path.is_dir() {
+            // Collect all files under the prefix and delete them
+            let files = self.list(uri_prefix, true).await?;
+            for file_uri in files {
+                self.delete(&file_uri).await?;
+            }
+            
+            // Try to remove the directory if it's empty
+            if let Err(_) = fs::remove_dir(&base_path).await {
+                // Directory might not be empty due to subdirectories
+                // For now, we'll leave non-empty directories
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn create_container(&self, name: &str) -> Result<()> {
+        let path = PathBuf::from(name);
+        fs::create_dir_all(&path).await?;
+        Ok(())
+    }
+
+    async fn delete_container(&self, name: &str) -> Result<()> {
+        let path = PathBuf::from(name);
+        
+        if !path.exists() {
+            return Ok(()); // Already deleted
+        }
+        
+        if path.is_dir() {
+            fs::remove_dir(&path).await?; // Only removes empty directories
+        } else {
+            bail!("Path is not a directory: {}", path.display());
+        }
+        
+        Ok(())
+    }
+}
+
+impl ConfigurableFileSystemObjectStore {
+    #[inline]
+    pub fn boxed(config: FileSystemConfig) -> Box<dyn ObjectStore> {
+        Box::new(Self::new(config))
+    }
+
+    #[inline]
+    pub fn boxed_direct_io() -> Box<dyn ObjectStore> {
+        Box::new(Self::with_direct_io())
+    }
+
+    #[inline]
+    pub fn boxed_high_performance() -> Box<dyn ObjectStore> {
+        Box::new(Self::high_performance())
+    }
+}
