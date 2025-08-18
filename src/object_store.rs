@@ -29,6 +29,9 @@ use crate::s3_utils::{
 // Expose FS adapter (already implemented in src/file_store.rs)
 use crate::file_store::FileSystemObjectStore;
 
+// Expose enhanced FS adapter with O_DIRECT support
+use crate::file_store_direct::{ConfigurableFileSystemObjectStore, FileSystemConfig};
+
 // --- Azure (feature-gated) ---------------------------------------------------
 #[cfg(feature = "azure")]
 use bytes::Bytes;
@@ -380,6 +383,69 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     match infer_scheme(uri) {
         Scheme::File  => Ok(FileSystemObjectStore::boxed()),
         Scheme::S3    => Ok(S3ObjectStore::boxed()),
+        Scheme::Azure => {
+            #[cfg(feature = "azure")]
+            {
+                return Ok(AzureObjectStore::boxed());
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                bail!("Azure backend not enabled. Rebuild with `--features azure`.");
+            }
+        }
+        Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
+    }
+}
+
+/// Enhanced factory that supports configuration options for file I/O
+pub fn store_for_uri_with_config(uri: &str, file_config: Option<FileSystemConfig>) -> Result<Box<dyn ObjectStore>> {
+    match infer_scheme(uri) {
+        Scheme::File => {
+            if let Some(config) = file_config {
+                Ok(ConfigurableFileSystemObjectStore::boxed(config))
+            } else {
+                Ok(FileSystemObjectStore::boxed())
+            }
+        }
+        Scheme::S3 => Ok(S3ObjectStore::boxed()),
+        Scheme::Azure => {
+            #[cfg(feature = "azure")]
+            {
+                return Ok(AzureObjectStore::boxed());
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                bail!("Azure backend not enabled. Rebuild with `--features azure`.");
+            }
+        }
+        Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
+    }
+}
+
+/// Factory for creating file stores with O_DIRECT enabled for AI/ML workloads
+pub fn direct_io_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
+    match infer_scheme(uri) {
+        Scheme::File => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
+        Scheme::S3 => Ok(S3ObjectStore::boxed()),
+        Scheme::Azure => {
+            #[cfg(feature = "azure")]
+            {
+                return Ok(AzureObjectStore::boxed());
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                bail!("Azure backend not enabled. Rebuild with `--features azure`.");
+            }
+        }
+        Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
+    }
+}
+
+/// Factory for creating high-performance stores optimized for AI/ML workloads
+pub fn high_performance_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
+    match infer_scheme(uri) {
+        Scheme::File => Ok(ConfigurableFileSystemObjectStore::boxed_high_performance()),
+        Scheme::S3 => Ok(S3ObjectStore::boxed()),
         Scheme::Azure => {
             #[cfg(feature = "azure")]
             {

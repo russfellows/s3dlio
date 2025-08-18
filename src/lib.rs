@@ -18,6 +18,7 @@ pub mod s3_logger;
 pub mod s3_ops;
 pub mod object_store;
 pub mod file_store;
+pub mod file_store_direct;
 
 // (other modules/elided)
 pub mod data_gen;

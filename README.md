@@ -9,6 +9,22 @@ As such, this project essentially has 3 components that can be utilized:
 # What's New
 This is in reverse order, newest first.
 
+## Version 0.5.1 - O_DIRECT File I/O Support
+Added comprehensive O_DIRECT file I/O support for high-performance AI/ML workloads that need to bypass the OS page cache. This implementation provides graceful fallback to regular I/O when O_DIRECT is not supported, automatic system page size detection, and configurable alignment options. Key features include filesystem compatibility detection, factory functions for easy setup, and robust error handling. This enhancement is particularly beneficial for large-scale AI/ML training where cache pollution and memory pressure can impact performance.
+
+#### New Features
+- `ConfigurableFileSystemObjectStore` with O_DIRECT support
+- Automatic system page size detection via `libc::sysconf`
+- Graceful fallback to regular I/O when O_DIRECT is unavailable
+- Factory functions: `direct_io_store_for_uri()` and `high_performance_store_for_uri()`
+- Comprehensive configuration options for alignment, sync writes, and minimum I/O sizes
+
+#### New Tests
+- tests/test_direct_io.rs - 10 comprehensive tests covering O_DIRECT functionality, fallback mechanisms, and cross-platform compatibility
+
+#### New Documentation
+- docs/O_DIRECT_Implementation.md - Complete implementation guide and usage examples
+
 ## Version 0.5.0 - Rust only - File and Azure Blob
 Enhanced the support of the two new storage backends, Posix file and Azure blob.  These remain "Rust Library" only enhancements, however, exposing the minimal changes to the python library should be straigthforward.  This represents a significant enhancement of this projects capabilities.  There is a full readme with all the details on these enhances in a file in the docs subdirectory, specifically docs/Vers_5-0_Backend-Parity.md file.
 
