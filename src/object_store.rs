@@ -49,6 +49,7 @@ pub type ObjectMetadata = S3ObjectStat;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
     File,
+    Direct,
     S3,
     Azure,
     Unknown,
@@ -57,6 +58,7 @@ pub enum Scheme {
 /// Best-effort scheme inference from a URI.
 pub fn infer_scheme(uri: &str) -> Scheme {
     if uri.starts_with("file://") { Scheme::File }
+    else if uri.starts_with("direct://") { Scheme::Direct }
     else if uri.starts_with("s3://") { Scheme::S3 }
     else if uri.starts_with("az://") || uri.contains(".blob.core.windows.net/") { Scheme::Azure }
     else { Scheme::Unknown }
@@ -294,11 +296,11 @@ impl ObjectStore for AzureObjectStore {
 
     async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
-        let part = part_size.unwrap_or(16 * 1024 * 1024);
+        let part = part_size.unwrap_or(crate::constants::DEFAULT_AZURE_MULTIPART_PART_SIZE);
         let max_in_flight = std::env::var("AZURE_MAX_INFLIGHT")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(32);
+            .unwrap_or(crate::constants::DEFAULT_CONCURRENT_UPLOADS);
 
         // Stream the provided buffer as Bytes chunks of size `part`
         let chunks = data
@@ -382,6 +384,7 @@ impl ObjectStore for AzureObjectStore {
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     match infer_scheme(uri) {
         Scheme::File  => Ok(FileSystemObjectStore::boxed()),
+        Scheme::Direct => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
         Scheme::S3    => Ok(S3ObjectStore::boxed()),
         Scheme::Azure => {
             #[cfg(feature = "azure")]
@@ -407,6 +410,13 @@ pub fn store_for_uri_with_config(uri: &str, file_config: Option<FileSystemConfig
                 Ok(FileSystemObjectStore::boxed())
             }
         }
+        Scheme::Direct => {
+            if let Some(config) = file_config {
+                Ok(ConfigurableFileSystemObjectStore::boxed(config))
+            } else {
+                Ok(ConfigurableFileSystemObjectStore::boxed_direct_io())
+            }
+        }
         Scheme::S3 => Ok(S3ObjectStore::boxed()),
         Scheme::Azure => {
             #[cfg(feature = "azure")]
@@ -426,6 +436,7 @@ pub fn store_for_uri_with_config(uri: &str, file_config: Option<FileSystemConfig
 pub fn direct_io_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     match infer_scheme(uri) {
         Scheme::File => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
+        Scheme::Direct => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
         Scheme::S3 => Ok(S3ObjectStore::boxed()),
         Scheme::Azure => {
             #[cfg(feature = "azure")]
@@ -445,6 +456,7 @@ pub fn direct_io_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
 pub fn high_performance_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     match infer_scheme(uri) {
         Scheme::File => Ok(ConfigurableFileSystemObjectStore::boxed_high_performance()),
+        Scheme::Direct => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
         Scheme::S3 => Ok(S3ObjectStore::boxed()),
         Scheme::Azure => {
             #[cfg(feature = "azure")]

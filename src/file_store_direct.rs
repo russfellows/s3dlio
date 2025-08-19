@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::constants::{DEFAULT_PAGE_SIZE, DEFAULT_MIN_IO_SIZE};
 use crate::object_store::{ObjectStore, ObjectMetadata};
 
 /// Configuration options for FileSystem operations
@@ -17,7 +18,7 @@ use crate::object_store::{ObjectStore, ObjectMetadata};
 pub struct FileSystemConfig {
     /// Enable O_DIRECT I/O to bypass page cache (Linux/Unix only)
     pub direct_io: bool,
-    /// Buffer alignment for O_DIRECT (typically 4096 bytes)
+    /// Buffer alignment for O_DIRECT (typically system page size)
     pub alignment: usize,
     /// Minimum I/O size for O_DIRECT operations
     pub min_io_size: usize,
@@ -59,7 +60,7 @@ impl FileSystemConfig {
         Self {
             direct_io: true,
             alignment: page_size,
-            min_io_size: 64 * 1024,     // 64KB minimum I/O for better performance
+            min_io_size: DEFAULT_MIN_IO_SIZE,
             sync_writes: true,          // Ensure data hits storage
         }
     }
@@ -74,14 +75,14 @@ fn get_system_page_size() -> usize {
             if page_size > 0 {
                 page_size as usize
             } else {
-                4096 // Fallback to 4KB if sysconf fails
+                DEFAULT_PAGE_SIZE // Fallback if sysconf fails
             }
         }
     }
     
     #[cfg(not(unix))]
     {
-        4096 // Default fallback for non-Unix systems
+        DEFAULT_PAGE_SIZE // Default fallback for non-Unix systems
     }
 }
 
@@ -146,15 +147,22 @@ impl ConfigurableFileSystemObjectStore {
         }
     }
 
-    /// Convert a URI to a filesystem path
+    /// Convert a URI to a filesystem path (accepts both file:// and direct:// schemes)
     fn uri_to_path(uri: &str) -> Result<PathBuf> {
-        if !uri.starts_with("file://") {
-            bail!("FileSystemObjectStore expects file:// URI, got: {}", uri);
-        }
+        let path = if uri.starts_with("file://") {
+            &uri[7..] // Strip "file://" prefix
+        } else if uri.starts_with("direct://") {
+            &uri[9..] // Strip "direct://" prefix  
+        } else {
+            bail!("FileSystemObjectStore expects file:// or direct:// URI, got: {}", uri);
+        };
         
-        // Strip file:// prefix
-        let path = &uri[7..];
         Ok(PathBuf::from(path))
+    }
+
+    /// Check if URI uses a valid file scheme (file:// or direct://)
+    fn is_valid_file_uri(uri: &str) -> bool {
+        uri.starts_with("file://") || uri.starts_with("direct://")
     }
 
     /// Convert a filesystem path back to a URI for list operations
@@ -520,7 +528,7 @@ impl ConfigurableFileSystemObjectStore {
 #[async_trait]
 impl ObjectStore for ConfigurableFileSystemObjectStore {
     async fn get(&self, uri: &str) -> Result<Vec<u8>> {
-        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
         if !path.exists() {
@@ -535,7 +543,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
-        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
         if !path.exists() {
@@ -550,14 +558,14 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     }
 
     async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
-        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
         self.write_file_direct(&path, data).await
     }
 
     async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
-        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         
         if !self.config.direct_io {
             // Fallback to regular put for non-direct I/O
@@ -591,7 +599,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
-        if !uri_prefix.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        if !Self::is_valid_file_uri(uri_prefix) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let base_path = Self::uri_to_path(uri_prefix)?;
         let mut results = Vec::new();
         
@@ -624,7 +632,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     }
 
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
-        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
         if !path.exists() {
@@ -639,7 +647,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
-        if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
         if !path.exists() {
@@ -657,7 +665,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
-        if !uri_prefix.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        if !Self::is_valid_file_uri(uri_prefix) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let base_path = Self::uri_to_path(uri_prefix)?;
         
         if !base_path.exists() {

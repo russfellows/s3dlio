@@ -25,6 +25,8 @@ use aws_sdk_s3::primitives::ByteStream;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+
+use crate::constants::{DEFAULT_S3_MULTIPART_PART_SIZE, MIN_S3_MULTIPART_PART_SIZE, DEFAULT_MULTIPART_BUFFER_CAPACITY};
 /*
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use tokio::task::JoinSet;
@@ -51,7 +53,7 @@ pub struct MultipartUploadConfig {
 impl Default for MultipartUploadConfig {
     fn default() -> Self {
         Self {
-            part_size: 16 * 1024 * 1024,   // 16 MiB
+            part_size: DEFAULT_S3_MULTIPART_PART_SIZE,
             max_in_flight: 16,
             abort_on_drop: true,
             content_type: None,
@@ -130,7 +132,7 @@ impl MultipartUploadSink {
 
     /// Async constructor: issues CreateMultipartUpload.
     pub async fn new_async(bucket: &str, key: &str, cfg: MultipartUploadConfig) -> Result<Self> {
-        if cfg.part_size < 5 * 1024 * 1024 {
+        if cfg.part_size < MIN_S3_MULTIPART_PART_SIZE {
             bail!("part_size must be at least 5 MiB for S3 Multipart Upload");
         }
         if cfg.max_in_flight == 0 {
@@ -159,7 +161,7 @@ impl MultipartUploadSink {
             key: key.to_string(),
             upload_id,
             cfg, // moved exactly once here
-            buf: Vec::with_capacity(2 * 1024 * 1024),
+            buf: Vec::with_capacity(DEFAULT_MULTIPART_BUFFER_CAPACITY),
             next_part_number: 1,
             total_bytes: 0,
             started_at: SystemTime::now(),

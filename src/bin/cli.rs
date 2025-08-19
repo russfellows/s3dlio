@@ -31,6 +31,7 @@ use log::info;
 use s3dlio::{
     delete_objects, get_objects_parallel, parse_s3_uri, stat_object_uri, 
     put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
+    object_store::store_for_uri,
 };
 
 use s3dlio::s3_copy::{upload_files, download_objects};
@@ -220,11 +221,24 @@ enum Command {
         #[clap(short, long)] 
         recursive: bool,     
     },
+
+    /// List objects using generic storage URI (supports s3://, az://, file://, direct://)
+    /// Example: s3dlio ls s3://bucket/prefix/ -r
+    #[clap(name = "ls")]
+    GenericList {
+        /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, file:///path/)
+        uri: String,
+
+        /// List objects recursively
+        #[clap(short, long)]
+        recursive: bool,
+    },
 }
 
 
 /// Main CLI function
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Loads any variables from .env file that are not already set
     dotenvy::dotenv().ok();
 
@@ -326,7 +340,11 @@ fn main() -> Result<()> {
             }
     
             put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f)?
-    
+
+        }
+
+        Command::GenericList { uri, recursive } => {
+            generic_list_cmd(&uri, recursive).await?
         }
 
     } // End of match cli.cmd
@@ -339,6 +357,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Generic list command that works with any storage backend
+async fn generic_list_cmd(uri: &str, recursive: bool) -> Result<()> {
+    let store = store_for_uri(uri)?;
+    let keys = store.list(uri, recursive).await?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for key in &keys {
+        if let Err(e) = writeln!(out, "{}", key) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(()); // Handle cases like piping to `head`
+            } else {
+                return Err(e.into());
+            }
+        }
+    }
+    writeln!(out, "
+Total objects: {}", keys.len())?;
+    Ok(())
+}
 
 /// Stat command: provide info on a single object
 fn stat_cmd(uri: &str) -> Result<()> {
