@@ -4,6 +4,7 @@
 //
 // Crate root — public re-exports plus the Python module glue.
 
+pub mod constants;
 pub mod data_formats;
 pub mod config;
 

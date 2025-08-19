@@ -3612,7 +3612,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3dlio"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3654,6 +3654,8 @@ dependencies = [
  "rayon",
  "regex",
  "rustls 0.23.31",
+ "serde",
+ "serde_json",
  "tempfile",
  "tfrecord",
  "thiserror 1.0.69",
