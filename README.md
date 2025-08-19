@@ -9,6 +9,19 @@ As such, this project essentially has 3 components that can be utilized:
 # What's New
 This is in reverse order, newest first.
 
+## Version 0.5.2 - Multi-Backend CLI Support
+Added comprehensive multi-backend CLI support with a unified interface that works seamlessly across all storage backends. The new generic `ls` command automatically detects and routes to the appropriate backend based on URI schemes (`file://`, `direct://`, `s3://`, `az://`), while maintaining full backward compatibility with existing S3-specific commands. This release includes enhanced URI scheme validation, a centralized constants module for improved maintainability, and comprehensive documentation. The implementation provides a clean migration path where users can adopt the new unified CLI interface at their own pace while existing workflows continue unchanged.
+
+#### Key Features
+- **Unified CLI Interface**: New generic `ls` command supporting all storage backends via URI schemes
+- **Automatic Backend Detection**: CLI automatically routes to appropriate backend based on URI
+- **Enhanced URI Support**: Full validation and support for `file://`, `direct://`, `s3://`, `az://` schemes
+- **Backward Compatibility**: All existing S3-specific commands continue to work unchanged
+- **Code Quality**: Added centralized constants module and improved error handling
+
+#### New Documentation
+- **docs/BACKEND_IMPROVEMENT_PLAN.md**: Comprehensive backend improvement planning and roadmap
+
 ## Version 0.5.1 - O_DIRECT File I/O Support
 Added comprehensive O_DIRECT file I/O support for high-performance AI/ML workloads that need to bypass the OS page cache. This implementation provides graceful fallback to regular I/O when O_DIRECT is not supported, automatic system page size detection, and configurable alignment options. Key features include filesystem compatibility detection, factory functions for easy setup, and robust error handling. This enhancement is particularly beneficial for large-scale AI/ML training where cache pollution and memory pressure can impact performance.
 
