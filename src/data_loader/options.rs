@@ -36,6 +36,19 @@ impl Default for ReaderMode {
     fn default() -> Self { ReaderMode::Sequential }
 }
 
+/// How the dataloader processes batches.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadingMode {
+    /// Traditional sequential loading - maintains order, waits for full batches
+    Sequential,
+    /// Async pooling with out-of-order completion and dynamic batch formation
+    AsyncPool(crate::data_loader::async_pool_dataloader::PoolConfig),
+}
+
+impl Default for LoadingMode {
+    fn default() -> Self { LoadingMode::Sequential }
+}
+
 #[derive(Debug, Clone)]
 pub struct LoaderOptions {
     /// Number of samples per batch.
@@ -54,6 +67,10 @@ pub struct LoaderOptions {
     pub prefetch: usize,
     /// If true, adapt `num_workers`/`prefetch` during runtime (simple heuristic).
     pub auto_tune: bool,
+
+    // ── New in Stage 3 (loading strategy) ───────────────────────────────────
+    /// Loading strategy: Sequential (traditional) or AsyncPool (dynamic batching)
+    pub loading_mode: LoadingMode,
 
     // ── New in Stage 0 (reader strategy) ────────────────────────────────────
     /// Reader strategy used to fetch object bytes.
@@ -85,6 +102,9 @@ impl Default for LoaderOptions {
             num_workers: 0,
             prefetch: 0,
             auto_tune: false,
+
+            // new defaults (Stage 3)
+            loading_mode: LoadingMode::Sequential,
 
             // new defaults (Stage 0)
             reader_mode: ReaderMode::Sequential,
@@ -176,6 +196,26 @@ impl LoaderOptions {
     pub fn worker(mut self, worker_id: usize, num_workers: usize) -> Self {
         self.worker_id = worker_id;
         self.num_workers_pytorch = num_workers.max(1);
+        self
+    }
+
+    /// Use traditional sequential loading (maintains order, waits for full batches)
+    pub fn sequential_loading(mut self) -> Self {
+        self.loading_mode = LoadingMode::Sequential;
+        self
+    }
+
+    /// Use async pool loading with default configuration
+    pub fn async_pool_loading(mut self) -> Self {
+        self.loading_mode = LoadingMode::AsyncPool(
+            crate::data_loader::async_pool_dataloader::PoolConfig::default()
+        );
+        self
+    }
+
+    /// Use async pool loading with custom configuration
+    pub fn async_pool_loading_with_config(mut self, config: crate::data_loader::async_pool_dataloader::PoolConfig) -> Self {
+        self.loading_mode = LoadingMode::AsyncPool(config);
         self
     }
 }
