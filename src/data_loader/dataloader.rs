@@ -5,7 +5,7 @@
 // without pinning/boxing issues.
 
 use crate::data_loader::dataset::{Dataset, DatasetError};
-use crate::data_loader::options::LoaderOptions;
+use crate::data_loader::options::{LoaderOptions, LoadingMode};
 use crate::data_loader::sampler::{Sampler, SequentialSampler, ShuffleSampler};
 
 use futures_util::StreamExt;
@@ -27,6 +27,12 @@ impl<D: Dataset> DataLoader<D> {
     /// Produce an async stream of `Result<Vec<Item>>` batches.
     /// Returned type is a concrete `ReceiverStream`, which is `Unpin` and `Sized`.
     pub fn stream(self) -> ReceiverStream<Result<Vec<D::Item>, DatasetError>> {
+        // Check if async pooling was requested
+        if let LoadingMode::AsyncPool(_) = self.opts.loading_mode {
+            eprintln!("Warning: AsyncPool loading mode requested but only supported for MultiBackendDataset");
+            eprintln!("Falling back to Sequential loading mode. Use AsyncPoolDataLoader directly for async pooling.");
+        }
+
         let batch = self.opts.batch_size.max(1);
         let drop_last = self.opts.drop_last;
         let shuffle = self.opts.shuffle;
