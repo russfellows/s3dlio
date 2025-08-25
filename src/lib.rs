@@ -26,6 +26,8 @@ pub mod data_gen;
 pub use data_gen::generate_controlled_data;
 
 pub mod data_loader;
+pub mod checkpoint;
+
 // ===== Re-exports expected by tests/test_dataloader.rs at the crate root =====
 // Types:
 pub use crate::data_loader::dataloader::DataLoader;

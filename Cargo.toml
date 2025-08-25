@@ -1,6 +1,6 @@
 [package]
 name = "s3dlio"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2024"
 
 [lib]
@@ -63,8 +63,8 @@ hdf5-metno = "^0.10"
 hdf5-metno-sys = "^0.10"
 
 # -------- Python bindings ----------
-pyo3         = { version = "^0.25", features = ["extension-module"] }
-pyo3-async-runtimes = { version = "^0.25", features = ["tokio-runtime"] }
+pyo3           = { version = "^0.25", features = ["extension-module"], optional = true }
+pyo3-async-runtimes = { version = "^0.25", features = ["tokio-runtime"], optional = true }
 numpy        = "^0.25"
 ndarray      = "^0.15"
 ndarray-npy = "^0.8"
@@ -99,7 +99,7 @@ async-trait   = "^0.1"   # needed by the mock datasets
 #default = []
 default = ["s3"]
 s3 = []
-extension-module = []     # suppresses the cfg warning when building the wheel
+extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 azure = [
     "dep:azure_storage_blob", 
     "dep:azure_identity", 
