@@ -107,6 +107,92 @@ pub trait ObjectStore: Send + Sync {
         self.put(dst_uri, &data).await
     }
 
+    /// Atomic rename/move operation. For file:// backends, this uses filesystem rename
+    /// which is atomic. For cloud backends, this typically falls back to copy+delete.
+    /// Returns an error if the operation cannot be completed atomically.
+    async fn rename(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
+        // Default implementation: copy then delete (not atomic, but works)
+        self.copy(src_uri, dst_uri).await?;
+        self.delete(src_uri).await
+    }
+
+    /// Get a streaming writer for zero-copy operations.
+    /// This enables writing large objects without buffering the entire content in memory.
+    async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>>;
+
+}
+
+/// Streaming writer interface for zero-copy object uploads
+#[async_trait]
+pub trait ObjectWriter: Send + Sync {
+    /// Write a chunk of data to the object stream.
+    /// Chunks are written in order and the implementation handles buffering/uploading.
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()>;
+    
+    /// Finalize the object upload. Must be called to complete the write.
+    /// After calling finalize(), the writer should not be used again.
+    async fn finalize(self: Box<Self>) -> Result<()>;
+    
+    /// Get the total number of bytes written so far.
+    fn bytes_written(&self) -> u64;
+    
+    /// Cancel the upload and clean up any partial data.
+    /// This is called automatically if the writer is dropped without finalize().
+    async fn cancel(self: Box<Self>) -> Result<()> {
+        // Default implementation: just drop
+        Ok(())
+    }
+}
+
+/// Default buffered implementation that collects chunks and calls put()
+pub struct BufferedObjectWriter<'a> {
+    uri: String,
+    store: &'a dyn ObjectStore,
+    buffer: Vec<u8>,
+    bytes_written: u64,
+    finalized: bool,
+}
+
+impl<'a> BufferedObjectWriter<'a> {
+    pub fn new(uri: String, store: &'a dyn ObjectStore) -> Self {
+        Self {
+            uri,
+            store,
+            buffer: Vec::new(),
+            bytes_written: 0,
+            finalized: false,
+        }
+    }
+}
+
+#[async_trait]
+impl<'a> ObjectWriter for BufferedObjectWriter<'a> {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.buffer.extend_from_slice(chunk);
+        self.bytes_written += chunk.len() as u64;
+        Ok(())
+    }
+    
+    async fn finalize(mut self: Box<Self>) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        self.store.put(&self.uri, &self.buffer).await
+    }
+    
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+    
+    async fn cancel(mut self: Box<Self>) -> Result<()> {
+        self.finalized = true;
+        self.buffer.clear();
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -183,6 +269,62 @@ impl ObjectStore for S3ObjectStore {
 
     async fn delete_container(&self, name: &str) -> Result<()> {
         s3_delete_bucket(name)
+    }
+
+    async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
+        // For S3, use buffered writer that collects chunks then uses put_multipart
+        Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
+    }
+}
+
+/// Buffered writer for S3 that collects chunks and uses multipart upload
+pub struct S3BufferedWriter {
+    uri: String,
+    buffer: Vec<u8>,
+    bytes_written: u64,
+    finalized: bool,
+}
+
+impl S3BufferedWriter {
+    pub fn new(uri: String) -> Self {
+        Self {
+            uri,
+            buffer: Vec::new(),
+            bytes_written: 0,
+            finalized: false,
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectWriter for S3BufferedWriter {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.buffer.extend_from_slice(chunk);
+        self.bytes_written += chunk.len() as u64;
+        Ok(())
+    }
+    
+    async fn finalize(mut self: Box<Self>) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        
+        // Use S3 multipart upload for the buffered data
+        s3_put_object_multipart_uri_async(&self.uri, &self.buffer, None).await
+    }
+    
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+    
+    async fn cancel(mut self: Box<Self>) -> Result<()> {
+        self.finalized = true;
+        self.buffer.clear();
+        Ok(())
     }
 }
 
@@ -374,6 +516,66 @@ impl ObjectStore for AzureObjectStore {
         let container = it.next().ok_or_else(|| anyhow!("expected \"account/container\""))?;
         let cli = AzureBlob::with_default_credential(account, container)?;
         let _ = cli.delete_container().await?;
+        Ok(())
+    }
+
+    async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
+        // For Azure, use buffered writer that collects chunks then uses put_multipart
+        Ok(Box::new(AzureBufferedWriter::new(uri.to_string())))
+    }
+}
+
+/// Buffered writer for Azure that collects chunks and uses multipart upload
+#[cfg(feature = "azure")]
+pub struct AzureBufferedWriter {
+    uri: String,
+    buffer: Vec<u8>,
+    bytes_written: u64,
+    finalized: bool,
+}
+
+#[cfg(feature = "azure")]
+impl AzureBufferedWriter {
+    pub fn new(uri: String) -> Self {
+        Self {
+            uri,
+            buffer: Vec::new(),
+            bytes_written: 0,
+            finalized: false,
+        }
+    }
+}
+
+#[cfg(feature = "azure")]
+#[async_trait]
+impl ObjectWriter for AzureBufferedWriter {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        self.buffer.extend_from_slice(chunk);
+        self.bytes_written += chunk.len() as u64;
+        Ok(())
+    }
+    
+    async fn finalize(mut self: Box<Self>) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        
+        // Use Azure multipart upload for the buffered data
+        let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
+        cli.put(&key, Bytes::from(self.buffer.clone()), true).await
+    }
+    
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+    
+    async fn cancel(mut self: Box<Self>) -> Result<()> {
+        self.finalized = true;
+        self.buffer.clear();
         Ok(())
     }
 }

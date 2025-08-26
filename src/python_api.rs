@@ -1133,6 +1133,140 @@ impl PyCheckpointStore {
     }
 }
 
+/// Streaming checkpoint writer for zero-copy operations
+#[pyclass]
+pub struct PyCheckpointStream {
+    store: Arc<Mutex<CheckpointStore>>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    step: u64,
+    epoch: u64,
+    framework: String,
+    world_size: u32,
+    rank: u32,
+    writer: Option<Box<dyn crate::object_store::ObjectWriter + Send>>,
+    key: Option<String>,
+    finalized: bool,
+}
+
+#[pymethods]
+impl PyCheckpointStream {
+    /// Write a chunk of data to the stream (zero-copy)
+    #[pyo3(text_signature = "(self, data)")]
+    fn write_chunk(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<usize> {
+        if self.finalized {
+            return Err(PyRuntimeError::new_err("Stream has been finalized"));
+        }
+        
+        // Lazy initialization of the writer
+        if self.writer.is_none() {
+            let store = self.store.clone();
+            let world_size = self.world_size;
+            let rank = self.rank;
+            let step = self.step;
+            let _epoch = self.epoch; // May be used in future for enhanced metadata
+            let _framework = self.framework.clone(); // May be used in future for enhanced metadata
+            
+            let (writer, key) = py.allow_threads(|| {
+                self.runtime.block_on(async {
+                    let store_guard = store.lock().await;
+                    let ckpt_writer = store_guard.writer(world_size, rank);
+                    let layout = crate::checkpoint::paths::KeyLayout::new(
+                        "checkpoints".to_string(), 
+                        step,
+                    );
+                    ckpt_writer.get_shard_writer(&layout).await
+                })
+            }).map_err(|e| PyRuntimeError::new_err(format!("Failed to create writer: {}", e)))?;
+            
+            self.writer = Some(writer);
+            self.key = Some(key);
+        }
+        
+        // Write the chunk
+        if let Some(ref mut writer) = self.writer {
+            py.allow_threads(|| {
+                self.runtime.block_on(async {
+                    writer.write_chunk(data).await
+                })
+            }).map_err(|e| PyRuntimeError::new_err(format!("Write failed: {}", e)))?;
+            
+            Ok(data.len())
+        } else {
+            Err(PyRuntimeError::new_err("Writer initialization failed"))
+        }
+    }
+    
+    /// Get the number of bytes written so far
+    #[pyo3(text_signature = "(self)")]
+    fn bytes_written(&self) -> u64 {
+        self.writer.as_ref().map_or(0, |w| w.bytes_written())
+    }
+    
+    /// Finalize the stream and return shard metadata
+    #[pyo3(text_signature = "(self)")]
+    fn finalize(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        if self.finalized {
+            return Err(PyRuntimeError::new_err("Stream already finalized"));
+        }
+        
+        if let (Some(writer), Some(key)) = (self.writer.take(), self.key.take()) {
+            let store = self.store.clone();
+            let world_size = self.world_size;
+            let rank = self.rank;
+            let step = self.step;
+            let epoch = self.epoch;
+            
+            let shard_meta = py.allow_threads(|| {
+                self.runtime.block_on(async {
+                    // Finalize the writer
+                    writer.finalize().await?;
+                    
+                    // Create shard metadata
+                    let store_guard = store.lock().await;
+                    let ckpt_writer = store_guard.writer(world_size, rank);
+                    let layout = crate::checkpoint::paths::KeyLayout::new(
+                        "checkpoints".to_string(), 
+                        step,
+                    );
+                    ckpt_writer.finalize_shard_meta(&layout, key).await
+                })
+            }).map_err(|e| PyRuntimeError::new_err(format!("Finalize failed: {}", e)))?;
+            
+            self.finalized = true;
+            
+            // Return metadata as Python dict
+            let dict = PyDict::new(py);
+            dict.set_item("step", step).ok();
+            dict.set_item("epoch", epoch).ok();
+            dict.set_item("rank", shard_meta.rank).ok();
+            dict.set_item("key", &shard_meta.key).ok();
+            dict.set_item("size", shard_meta.size).ok();
+            if let Some(etag) = &shard_meta.etag {
+                dict.set_item("etag", etag).ok();
+            }
+            Ok(dict.into())
+        } else {
+            Err(PyRuntimeError::new_err("No data written to stream"))
+        }
+    }
+    
+    /// Cancel the stream and clean up
+    #[pyo3(text_signature = "(self)")]
+    fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
+        if let Some(writer) = self.writer.take() {
+            py.allow_threads(|| {
+                self.runtime.block_on(async {
+                    writer.cancel().await
+                })
+            }).map_err(|e| PyRuntimeError::new_err(format!("Cancel failed: {}", e)))?;
+        }
+        
+        self.finalized = true;
+        self.key = None;
+        Ok(())
+    }
+}
+
 #[pyclass]
 pub struct PyCheckpointWriter {
     store: Arc<Mutex<CheckpointStore>>,
@@ -1176,6 +1310,36 @@ impl PyCheckpointWriter {
                 dict.set_item("etag", etag).ok();
             }
             dict.into()
+        })
+    }
+
+    /// Get a streaming writer for a distributed shard (zero-copy version)
+    /// Returns a PyCheckpointStream that can be written to incrementally
+    #[pyo3(text_signature = "(self, step, epoch, framework)")]
+    fn get_distributed_shard_stream(
+        &self,
+        _py: Python<'_>, // Python context, may be used for future enhancements
+        step: u64,
+        epoch: u64,
+        framework: String,
+    ) -> PyResult<PyCheckpointStream> {
+        let store = self.store.clone();
+        let world_size = self.world_size;
+        let rank = self.rank;
+        
+        // Note: We'll need to handle the async creation in a different way
+        // For now, return a PyCheckpointStream that handles lazy initialization
+        Ok(PyCheckpointStream {
+            store,
+            runtime: self.runtime.clone(),
+            step,
+            epoch,
+            framework,
+            world_size,
+            rank,
+            writer: None,
+            key: None,
+            finalized: false,
         })
     }
 
@@ -1482,6 +1646,7 @@ pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     // Checkpoint system
     m.add_class::<PyCheckpointStore>()?;
     m.add_class::<PyCheckpointWriter>()?;
+    m.add_class::<PyCheckpointStream>()?;
     m.add_class::<PyCheckpointReader>()?;
     m.add_class::<PyCheckpointInfo>()?;
     m.add_function(wrap_pyfunction!(save_checkpoint, m)?)?;

@@ -11,7 +11,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::constants::{DEFAULT_PAGE_SIZE, DEFAULT_MIN_IO_SIZE};
-use crate::object_store::{ObjectStore, ObjectMetadata};
+use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter};
 
 /// Configuration options for FileSystem operations
 #[derive(Debug, Clone)]
@@ -83,6 +83,150 @@ fn get_system_page_size() -> usize {
     #[cfg(not(unix))]
     {
         DEFAULT_PAGE_SIZE // Default fallback for non-Unix systems
+    }
+}
+
+/// Streaming writer for direct I/O filesystem operations
+pub struct DirectIOWriter {
+    file: Option<fs::File>,
+    path: PathBuf,
+    config: FileSystemConfig,
+    bytes_written: u64,
+    finalized: bool,
+    buffer: Vec<u8>, // Buffer for alignment and minimum I/O size requirements
+}
+
+impl DirectIOWriter {
+    async fn new(path: PathBuf, config: FileSystemConfig) -> Result<Self> {
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        
+        // Create and open the file for writing with appropriate flags
+        let file = if config.direct_io {
+            #[cfg(unix)]
+            {
+                use tokio::fs::OpenOptions;
+                
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .await?
+            }
+            #[cfg(not(unix))]
+            {
+                // Fallback to regular I/O on non-Unix systems
+                fs::File::create(&path).await?
+            }
+        } else {
+            fs::File::create(&path).await?
+        };
+        
+        Ok(Self {
+            file: Some(file),
+            path,
+            config,
+            bytes_written: 0,
+            finalized: false,
+            buffer: Vec::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl ObjectWriter for DirectIOWriter {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        
+        let file = match self.file.as_mut() {
+            Some(f) => f,
+            None => bail!("Writer has been finalized or cancelled"),
+        };
+
+        if !self.config.direct_io {
+            // Regular I/O - write directly
+            file.write_all(chunk).await?;
+            self.bytes_written += chunk.len() as u64;
+            
+            if self.config.sync_writes {
+                file.sync_all().await?;
+            }
+        } else {
+            // DirectIO - need to handle alignment and buffering
+            self.buffer.extend_from_slice(chunk);
+            
+            // Write aligned chunks when we have enough data
+            let alignment = self.config.alignment;
+            let min_io_size = self.config.min_io_size;
+            
+            while self.buffer.len() >= min_io_size {
+                let write_size = (self.buffer.len() / alignment) * alignment;
+                if write_size > 0 {
+                    let write_data = self.buffer.drain(..write_size).collect::<Vec<u8>>();
+                    file.write_all(&write_data).await?;
+                    self.bytes_written += write_data.len() as u64;
+                    
+                    if self.config.sync_writes {
+                        file.sync_all().await?;
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    async fn finalize(mut self: Box<Self>) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        
+        if let Some(mut file) = self.file.take() {
+            // Write any remaining buffered data for DirectIO
+            if self.config.direct_io && !self.buffer.is_empty() {
+                let alignment = self.config.alignment;
+                let buffer_len = self.buffer.len();
+                
+                // Pad buffer to alignment boundary
+                let aligned_length = ((buffer_len + alignment - 1) / alignment) * alignment;
+                self.buffer.resize(aligned_length, 0);
+                
+                file.write_all(&self.buffer).await?;
+                self.bytes_written += buffer_len as u64; // Only count real data, not padding
+            }
+            
+            file.flush().await?;
+            file.sync_all().await?;
+        }
+        
+        self.finalized = true;
+        Ok(())
+    }
+    
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+    
+    async fn cancel(mut self: Box<Self>) -> Result<()> {
+        self.finalized = true;
+        self.buffer.clear(); // Clear any buffered data
+        
+        if let Some(_file) = self.file.take() {
+            // File will be closed when dropped
+        }
+        
+        // Remove the partial file
+        if self.path.exists() {
+            let _ = fs::remove_file(&self.path).await; // Ignore errors
+        }
+        
+        Ok(())
     }
 }
 
@@ -711,6 +855,43 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         }
         
         Ok(())
+    }
+
+    async fn rename(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
+        if !Self::is_valid_file_uri(src_uri) { 
+            bail!("FileSystemObjectStore expected file:// or direct:// URI for source"); 
+        }
+        if !Self::is_valid_file_uri(dst_uri) { 
+            bail!("FileSystemObjectStore expected file:// or direct:// URI for destination"); 
+        }
+        
+        let src_path = Self::uri_to_path(src_uri)?;
+        let dst_path = Self::uri_to_path(dst_uri)?;
+        
+        if !src_path.exists() {
+            bail!("Source file not found: {}", src_path.display());
+        }
+        
+        // Create parent directories for destination if they don't exist
+        if let Some(parent) = dst_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        
+        // Use tokio::fs::rename for atomic filesystem rename operation
+        fs::rename(&src_path, &dst_path).await?;
+        Ok(())
+    }
+
+    async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
+        if !Self::is_valid_file_uri(uri) { 
+            bail!("FileSystemObjectStore expected file:// or direct:// URI"); 
+        }
+        
+        let path = Self::uri_to_path(uri)?;
+        
+        // For direct I/O, we might want a specialized writer, but for now use the same
+        // as regular filesystem with potential for future direct I/O optimization
+        Ok(Box::new(DirectIOWriter::new(path, self.config.clone()).await?))
     }
 }
 

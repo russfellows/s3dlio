@@ -20,3 +20,7 @@ env/
 venv/
 *.env
 .ipynb_checkpoints
+
+# Python extension modules (compiled from Rust via maturin)
+*.so
+*/_pymod.cpython-*.so

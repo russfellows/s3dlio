@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::object_store::{ObjectStore, ObjectMetadata};
+use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter};
 
 /// FileSystem adapter that implements ObjectStore for local POSIX file operations.
 /// 
@@ -23,6 +23,82 @@ use crate::object_store::{ObjectStore, ObjectMetadata};
 /// - create_container: creates directories
 /// - delete_container: removes empty directories
 pub struct FileSystemObjectStore;
+
+/// Streaming writer for filesystem operations
+pub struct FileSystemWriter {
+    file: Option<fs::File>,
+    path: PathBuf,
+    bytes_written: u64,
+    finalized: bool,
+}
+
+impl FileSystemWriter {
+    async fn new(path: PathBuf) -> Result<Self> {
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        
+        // Create and open the file for writing
+        let file = fs::File::create(&path).await?;
+        
+        Ok(Self {
+            file: Some(file),
+            path,
+            bytes_written: 0,
+            finalized: false,
+        })
+    }
+}
+
+#[async_trait]
+impl ObjectWriter for FileSystemWriter {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        
+        if let Some(ref mut file) = self.file {
+            file.write_all(chunk).await?;
+            self.bytes_written += chunk.len() as u64;
+            Ok(())
+        } else {
+            bail!("Writer has been finalized or cancelled");
+        }
+    }
+    
+    async fn finalize(mut self: Box<Self>) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        
+        if let Some(mut file) = self.file.take() {
+            file.flush().await?;
+            file.sync_all().await?;
+        }
+        
+        self.finalized = true;
+        Ok(())
+    }
+    
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+    
+    async fn cancel(mut self: Box<Self>) -> Result<()> {
+        self.finalized = true;
+        if let Some(_file) = self.file.take() {
+            // File will be closed when dropped
+        }
+        
+        // Remove the partial file
+        if self.path.exists() {
+            let _ = fs::remove_file(&self.path).await; // Ignore errors
+        }
+        
+        Ok(())
+    }
+}
 
 impl FileSystemObjectStore {
     pub fn new() -> Self { Self }
@@ -304,5 +380,40 @@ impl ObjectStore for FileSystemObjectStore {
         }
         
         Ok(())
+    }
+
+    async fn rename(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
+        if !src_uri.starts_with("file://") { 
+            bail!("FileSystemObjectStore expected file:// URI for source"); 
+        }
+        if !dst_uri.starts_with("file://") { 
+            bail!("FileSystemObjectStore expected file:// URI for destination"); 
+        }
+        
+        let src_path = Self::uri_to_path(src_uri)?;
+        let dst_path = Self::uri_to_path(dst_uri)?;
+        
+        if !src_path.exists() {
+            bail!("Source file not found: {}", src_path.display());
+        }
+        
+        // Create parent directories for destination if they don't exist
+        if let Some(parent) = dst_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        
+        // Use tokio::fs::rename for atomic filesystem rename operation
+        fs::rename(&src_path, &dst_path).await?;
+        Ok(())
+    }
+
+    async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
+        if !uri.starts_with("file://") { 
+            bail!("FileSystemObjectStore expected file:// URI"); 
+        }
+        
+        let path = Self::uri_to_path(uri)?;
+        let writer = FileSystemWriter::new(path).await?;
+        Ok(Box::new(writer))
     }
 }
