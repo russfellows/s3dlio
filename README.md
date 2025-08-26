@@ -1,201 +1,36 @@
-# Overview
-The goal of this project is to provide a Python library and CLI for S3 interaction, using very recent versions of AWS S3 Rust SDK (current version is documented in the Project overview).  This is designed to be a general purpose library, with AI/ML specific operations supported as well. Moreover, the intent is to provide low-level S3 operations (get, put, list, stat, delete), along with higher-level AI/ML compatible operations that perform data-loader and checkpoint-writer functionality, similar to PyTorch and TensorFlow data-loader and checkpoint-writer functions.  
+# s3dlio - Multi-Protocol AI/ML Storage Library
 
-As such, this project essentially has 3 components that can be utilized:
-1. A Rust library "s3dlio"
-2. A Python library built on top of the Rust library, also called "s3dlio"
-3. An executable CLI, built using Rust
+## Overview
+s3dlio is a high-performance, multi-protocol storage library designed specifically for AI/ML workloads. Built in Rust with Python bindings, it provides zero-copy streaming, comprehensive checkpointing, and advanced data loading capabilities across multiple storage backends including S3, Azure Blob Storage, local filesystems, and high-performance DirectIO.
 
-# What's New
-This is in reverse order, newest first.
+This project supports both low-level storage operations (get, put, list, stat, delete) and high-level AI/ML operations including PyTorch/TensorFlow/JAX-compatible data loaders and distributed checkpointing systems. The library is designed to handle arbitrarily large models and datasets while maintaining memory efficiency through zero-copy streaming architecture.
 
-## Version 0.6.1 - Zero-Copy Streaming Infrastructure
-Enhanced the checkpointing system with comprehensive zero-copy streaming capabilities, enabling memory-efficient processing of arbitrarily large checkpoints. This major advancement eliminates memory bottlenecks and enables checkpointing of models larger than available RAM.
+## Key Components
+1. **Rust Core Library**: High-performance storage operations with zero-copy streaming
+2. **Python Library**: ML framework integration with seamless PyTorch/TensorFlow/JAX compatibility  
+3. **CLI Tool**: Unified command-line interface supporting all storage backends
 
-#### 🚀 Phase 2 Streaming Features
-- **Zero-Copy Streaming**: Direct memory transfer from Python to Rust without copying
-- **ObjectWriter Trait**: Unified streaming interface across all storage backends
-- **Memory Optimization**: Peak memory usage = single chunk size (not total checkpoint size)
-- **Incremental Writing**: Process large checkpoints without full buffering
-- **Python Streaming API**: `PyCheckpointStream` for memory-efficient data transfer
+## Multi-Backend Support
+- **AWS S3**: Full S3 API compatibility with multipart upload support
+- **Azure Blob Storage**: Complete Azure integration with hot/cool tier support
+- **Local Filesystem**: High-performance file operations with optional O_DIRECT support
+- **DirectIO**: Bypass OS page cache for maximum I/O performance
 
-#### Memory Efficiency Examples
-```python
-# Traditional approach: Memory usage = full model size
-shard_meta = writer.save_distributed_shard(step, epoch, framework, data)
+## Recent Highlights
 
-# New streaming approach: Memory usage = single chunk size
-stream = writer.get_distributed_shard_stream(step, epoch, framework)
-for chunk in data_chunks:
-    stream.write_chunk(chunk)  # Zero-copy transfer
-shard_meta = stream.finalize()
+### Version 0.6.2 - Enhanced Data Integrity (Latest)
+Complete checksum integration across all storage backends providing CRC32C-based data integrity validation. All checkpoint operations now include computed checksums with zero-copy streaming preserved.
 
-# Result: 99%+ reduction in peak memory usage for large models
-```
+### Version 0.6.1 - Zero-Copy Streaming Infrastructure  
+Revolutionary memory efficiency enabling processing of models larger than available RAM. Peak memory usage reduced from full model size to single chunk size (99%+ memory reduction for large models).
 
-#### Performance Benefits
-- **50GB Model**: Traditional = 50GB peak memory, Streaming = 64MB peak memory
-- **Scalability**: Handle checkpoints larger than available RAM  
-- **Zero Bottlenecks**: Eliminates memory-based performance limitations
-- **Backend Consistency**: Streaming works identically across S3, Azure, file://, and DirectIO
+### Version 0.6.0 - Comprehensive Checkpointing System
+Production-ready distributed checkpointing modeled after AWS S3 PyTorch Connector, with multi-backend support and framework integration for PyTorch, JAX, and TensorFlow.
 
-📖 **[Enhanced Checkpoint Documentation](docs/Checkpoint_Features.md)** - Complete streaming API guide with memory efficiency comparisons
+### Version 0.5.3 - Advanced Async DataLoader
+Dynamic batch formation with out-of-order completion, eliminating head-of-line blocking while maintaining complete backward compatibility.
 
-## Version 0.6.0 - Comprehensive Checkpointing System
-Added a complete distributed checkpointing system modeled after the AWS S3 PyTorch Connector, providing high-performance checkpoint operations across all storage backends. The checkpoint system is implemented primarily in Rust for optimal performance and safety, with Python bindings for seamless integration with ML frameworks including PyTorch, JAX, and TensorFlow.
-
-#### Key Features
-- **Multi-Backend Checkpointing**: Full support across S3, Azure Blob, file://, and O_DIRECT backends
-- **Distributed Coordination**: Multi-rank checkpoint coordination with manifest-based discovery
-- **Framework Integration**: Native support for PyTorch, JAX, and TensorFlow workflows
-- **Storage Optimization**: Hot-spot avoidance strategies (Flat, RoundRobin, Binary) for cloud storage
-- **Production Ready**: Comprehensive test coverage with 28 tests across Rust and Python
-
-#### API Examples
-```rust
-// Rust API
-let store = CheckpointStore::open("s3://bucket/checkpoints")?;
-let writer = store.writer(world_size, rank)?;
-let manifest_key = writer.write_manifest(epoch, "pytorch", shard_metas, None).await?;
-```
-
-```python
-# Python API
-import s3dlio
-store = s3dlio.PyCheckpointStore("s3://bucket/checkpoints", "round_robin", None)
-writer = store.writer(world_size=4, rank=0)
-manifest_key = writer.finalize_distributed_checkpoint(
-    step=100, epoch=10, framework="pytorch", shard_metas=shard_keys
-)
-```
-
-#### Test Coverage
-- **Rust Tests**: Integration and advanced checkpoint operations (7 tests)
-- **Python Tests**: Basic operations and framework integration (7 tests)  
-- **Framework Support**: PyTorch, JAX, TensorFlow serialization validation
-- **Multi-Backend**: All storage strategies tested across backends
-
-📖 **[Checkpoint Documentation](docs/Checkpoint_Features.md)** - Complete API reference, examples, and best practices
-
-## Version 0.5.3 - Enhanced Async Pool DataLoader with Backward Compatibility
-Added a revolutionary async pooling DataLoader that provides dynamic batch formation with out-of-order completion, eliminating head-of-line blocking for high-throughput ML workloads. The key innovation is **complete backward compatibility** - existing code continues to work unchanged with traditional sequential loading, while new code can opt into async pooling for significant performance improvements.
-
-#### Key Features
-- **Dynamic Batch Formation**: Batches form from completed requests rather than waiting for specific items in order
-- **Out-of-Order Completion**: Eliminates head-of-line blocking where slow requests delay entire batches  
-- **Complete Backward Compatibility**: Existing DataLoader code continues working unchanged
-- **Multi-Backend Support**: Works seamlessly across all 4 storage backends (file://, direct://, s3://, az://)
-- **Configurable Performance**: Conservative, Balanced, and Aggressive presets for different workload requirements
-
-#### Quick Start
-```rust
-// Traditional approach (unchanged)
-let loader = DataLoader::new(dataset, LoaderOptions::default());
-
-// New unified approach with async pooling
-let loader = UnifiedDataLoader::new(dataset, 
-    LoaderOptions::default().async_pool_loading()
-);
-```
-
-📖 **[Technical Documentation](docs/Enhanced_Async_Pool_DataLoader.md)** - Complete API reference, architecture details, and performance tuning guide
-
-🚀 **[Demo Application](examples/async_pool_dataloader_demo.rs)** - Comprehensive demonstration with 4 different scenarios
-
-## Version 0.5.2 - Multi-Backend CLI Support
-Added comprehensive multi-backend CLI support with a unified interface that works seamlessly across all storage backends. The new generic `ls` command automatically detects and routes to the appropriate backend based on URI schemes (`file://`, `direct://`, `s3://`, `az://`), while maintaining full backward compatibility with existing S3-specific commands. This release includes enhanced URI scheme validation, a centralized constants module for improved maintainability, and comprehensive documentation. The implementation provides a clean migration path where users can adopt the new unified CLI interface at their own pace while existing workflows continue unchanged.
-
-#### Key Features
-- **Unified CLI Interface**: New generic `ls` command supporting all storage backends via URI schemes
-- **Automatic Backend Detection**: CLI automatically routes to appropriate backend based on URI
-- **Enhanced URI Support**: Full validation and support for `file://`, `direct://`, `s3://`, `az://` schemes
-- **Backward Compatibility**: All existing S3-specific commands continue to work unchanged
-- **Code Quality**: Added centralized constants module and improved error handling
-
-#### New Documentation
-- **docs/BACKEND_IMPROVEMENT_PLAN.md**: Comprehensive backend improvement planning and roadmap
-
-## Version 0.5.1 - O_DIRECT File I/O Support
-Added comprehensive O_DIRECT file I/O support for high-performance AI/ML workloads that need to bypass the OS page cache. This implementation provides graceful fallback to regular I/O when O_DIRECT is not supported, automatic system page size detection, and configurable alignment options. Key features include filesystem compatibility detection, factory functions for easy setup, and robust error handling. This enhancement is particularly beneficial for large-scale AI/ML training where cache pollution and memory pressure can impact performance.
-
-#### New Features
-- `ConfigurableFileSystemObjectStore` with O_DIRECT support
-- Automatic system page size detection via `libc::sysconf`
-- Graceful fallback to regular I/O when O_DIRECT is unavailable
-- Factory functions: `direct_io_store_for_uri()` and `high_performance_store_for_uri()`
-- Comprehensive configuration options for alignment, sync writes, and minimum I/O sizes
-
-#### New Tests
-- tests/test_direct_io.rs - 10 comprehensive tests covering O_DIRECT functionality, fallback mechanisms, and cross-platform compatibility
-
-#### New Documentation
-- docs/O_DIRECT_Implementation.md - Complete implementation guide and usage examples
-
-## Version 0.5.0 - Rust only - File and Azure Blob
-Enhanced the support of the two new storage backends, Posix file and Azure blob.  These remain "Rust Library" only enhancements, however, exposing the minimal changes to the python library should be straigthforward.  This represents a significant enhancement of this projects capabilities.  There is a full readme with all the details on these enhances in a file in the docs subdirectory, specifically docs/Vers_5-0_Backend-Parity.md file.
-
-### Version 0.4.6 - Rust only - File Phase1
-Added new bindings and backend to support Posix File storage.  As of this initial phase1 release, there are only minimal interfaces.  Until this becomes fully flushed out, will remain as Rust only changes.  
-
-#### New Tests
-New tests added, in the tests subdirectory, including:
-  - test_file_store.rs - 9 file I/O tests
-
-### Version 0.4.5 - Rust only - Azure Phase1
-Added new bindings and backend to support Azure blob storage.  As of this initial phase1 release, there are only minimal interfaces to Azure blob.  Until this becomes fully flushed out, will remain as Rust only changes.  
-
-#### New Tests
-There are several new tests added, in the tests subdirectory, including:
-  - azure_blob_multi.rs
-  - azure_blob_sequence.rs
-  - azure_blob_smoke.rs
-
-### Version 0.4.4
-Added a multi-part uploader.  This includes the ability to do so with zero buffer copies between Python and Rust.  This works by providing a function, that Rust executes and allocates the space for.  Python can then fill the memory region, and give it back to Rust.  This all occurs zero-copy with Rust managing lifetimes.  At this point, the memory region can be streamed to the S3 back-end, including using multi-part upload.  
-#### New Tests
-There are several new tests added, in the python/tests subdirectory, including:
-  - python/tests/multi-part_smoke.py
-  - python/tests/test_multipart_writer.py
-  - tests/test_multipart.rs
-
-#### New Docs
-There is also a new MultiPart_README.md file that explains all the options and how to use the multi part features in each library framework. 
-
-### Version 0.4.3
-After many promises of a fully functional and compatible PyTorch data loader, I believe that version 0.4.3 provides it.  Or, at least something very similar and quite functional, as all functional compatability tests and comparisons to the aws s3torchconnector library seem to show parity.  
-Also we updated the Dockerfile to enable building containers again.  Likely more work is needed to slim down the image as its about 19 GB. 
-#### New Tests
-There are several new tests added, in the python/tests subdirectory, including:
-  - python/tests/aws-s3dlio_compare_suite.py
-  - python/tests/compare_aws_s3dlio_loaders.py
-  - python/tests/jax_tf_vers_4-3_demo.py
-  - python/tests/torch_vers_4-3_demo.py
-
-#### New Docs
-There is also a new DataLoader_README.md file that explains all the options and how to use the data loader features in each library framework. 
-
-### Version 0.4.2
-Version 0.4.2 added regular expression parsing to most commainds, including list, delete, get and download.  These all seem to work consistently between the CLI and the python library.  Also, there is a new recursive options "-r" or --recursive" that makes these operate recursively.  Essentially, this just eliminates the commands seeing a "/" as a path separator. Additionally if the target command ends with a trailing slash "/" character, internally we just append a regex wildcard of dot asterisk ".*" meaning any pattern to the end.  Also, we added both "create-bucket" and "delete-bucket" operators as standalone commands, via both cli and python library.
-
-### Version 0.4.1
-This version added a several python bindings to the "data-loader" interface, for use within PyTorch, TensorFlow and Jax AI/ML workflows.  At this stage this feature is deemed fully functional via the Python library interfaces. HOWEVER, additional testing is requested to ensure its interface and usage align with traditional AI/ML data-loaders.  Basic data-loader tests via python are available in the python/tests subdirectory, specifically using the files tf_smoke.py, jax_smoke.py and pytorch_smoke.py.    
-
-### Version 0.4.0
-This version added a high-level, "data-loader" interface, to enable use within AI/ML workflows.  The data loader work is on-going, but should have basic functionality, primarily through the Python library interface, where it is expected to receive most use.  This release will require testing to ensure its interface and usage align with traditional AI/ML data-loaders.   
-
-### Version 0.3.x
-These versions added features including new I/O tracing capabilities.  The file format is the same as the MinIO warp tool, thus enabling capture in a semi standard way.  With an I/O trace file, this enables the recording and playback of S3 I/O operations, with s3dlio providing the "recording" part of the equation.  Additional changes in these releases included improving and updating the Rust - Python binding, async I/O library utilized.  The async library changes should be invisible, but will ultimately enable higher multi-threading with lower overhead, and increased compatability with other libraries going forward.  
-
-### Version 0.3.0
-Since the prior project "dlio_s3_rust" was archived and all future work moved to this project, there have been a number of enhancements.  These include the following:
-  * Enhanced data generation - now supports settable dedupe and compression ratios
-  * Two new cli commands: upload and download, which help enhance the use as a testing tool
-  * One new cli and Python library command, "stat"  
-  * AI/ML object creation options:  This library now supports creation, and all S3 operations of 4 specific, AI/ML data / object types:
-    - TensorRecord
-    - HDF5
-    - NPZ
-    - Raw
+📖 **[Complete Version History](docs/Changelog.md)** - Detailed changelog with all enhancements and technical details
 
 ### Logging
 This is a new feature, that logs all S3 operations.  The file format is designed to be compatible with the MinIO warp tool.  Thus, these s3 op-log files can be used with our warp-replay project.
@@ -244,7 +79,7 @@ What is left?  Several items are already identified as future enhancements.  The
 ### Enhancements
 These are listed in no particular order:
   * (✅ Completed!) Add AI/ML data loader functionality (issue #14 - closed 9, Aug. 2025)
-  * Add AI/ML check point writer feature (issue #18)
+  * (✅ Completed!) Add AI/ML check point writer feature (issue #18 - closed 26, Aug. 2025)
   * (✅ Completed!) Implement S3 operation logging (issue #17 - closed 27, July 2025)
   * Improve Get performance (issue #11)
   * Improve Put performance and add multi-part upload (issue #12)
@@ -252,32 +87,43 @@ These are listed in no particular order:
   * (✅ Completed!) Implement regex for operations (issue #23 - closed 10, Aug. 2025)
 
 # How to Guide
-## S3 Rust Library and CLI
-This guide shows how to use the Rust library, which supports both a compiled command line interface executable called ```s3-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import s3dlio as s3` and used by Python programs.
+## Multi-Protocol Storage Library and CLI
+This guide shows how to use the s3dlio library, which supports both a compiled command line interface executable called ```s3-cli``` and Python library, compiled into a wheel file. Using this wheel, the Python library may be installed, imported via  `import s3dlio as s3` and used by Python programs.
 
 ### Purpose
-The purpose of this library is to enable testing of S3 storage via both a cli and a Python library.  The intention is to create hooks to DLIO, so that it may access S3 storage during its testing.  The following primary operations for S3 are included: 
+The purpose of this library is to provide a unified interface for AI/ML storage operations across multiple backends including AWS S3, Azure Blob Storage, local filesystems, and high-performance DirectIO. The library is designed to enable testing and production use of storage systems via both CLI and Python interfaces. The intention is to provide low-level storage operations (get, put, list, stat, delete) along with higher-level AI/ML compatible operations including data-loader and checkpoint-writer functionality, similar to PyTorch and TensorFlow equivalents.
+
+### Multi-Backend Support
+The library automatically detects and routes to the appropriate backend based on URI schemes:
+- **s3://**: AWS S3 storage operations
+- **az://**: Azure Blob Storage operations  
+- **file://**: Local filesystem operations
+- **direct://**: High-performance DirectIO operations
+
+### Core Operations
+The following primary operations are supported across all backends:
  - get
  - put
  - list
  - stat
  - delete
- - create-bucket
- - delete-bucket
+ - create-bucket (where applicable)
+ - delete-bucket (where applicable)
 
-Additionally, the cli supports commands to upload and download data.  These are:
+### Enhanced Operations
+Additionally, the CLI supports commands to upload and download data:
  - upload
  - download
 
-These operations will respectively upload/put a local file as an object, or download/get an object as a local file.  
+These operations will respectively upload/put a local file as an object, or download/get an object as a local file.
 
 **Note** that bucket creation can occur explicitly, or as part of a Put operation if the create-bucket flag is passed.  
 
 ### Container
-For ease of testing, both the cli and library may be built into a container as well.  The Rust source code is removed from this container in order to reduce its size.  
+For ease of testing and deployment, both the CLI and library may be built into a container. The Rust source code is removed from this container to reduce its size.
 
 ### Plan for Publishing
-In the near future, the Python library `s3dlio` will be published on PyPi for distribution.  The compiled Rust executable and Python wheel files are already published on GitHub and are availble under the release section of this project.  
+The Python library `s3dlio` will be published on PyPi for distribution. The compiled Rust executable and Python wheel files are already published on GitHub and are available under the release section of this project.  
 
 # How to Build
 In order to build this project, you can build the code and libraries and use them directly. 

@@ -118,6 +118,36 @@ impl<'a> Writer<'a> {
         })
     }
 
+    /// Helper to create ShardMeta with checksum from writer before finalizing
+    pub async fn finalize_shard_meta_with_checksum(
+        &self, 
+        layout: &KeyLayout, 
+        key: String, 
+        checksum: Option<String>
+    ) -> Result<ShardMeta> {
+        let uri = layout.to_uri(&self.base_uri, &key);
+        let meta = self.store.stat(&uri).await?;
+        Ok(ShardMeta {
+            rank: self.rank,
+            key,
+            size: meta.size,
+            etag: meta.e_tag,
+            checksum,
+        })
+    }
+
+    /// Complete helper: finalize writer and create ShardMeta with checksum
+    pub async fn finalize_writer_to_shard_meta(
+        &self,
+        layout: &KeyLayout,
+        key: String,
+        writer: Box<dyn crate::object_store::ObjectWriter>
+    ) -> Result<ShardMeta> {
+        let checksum = writer.checksum();
+        writer.finalize().await?;
+        self.finalize_shard_meta_with_checksum(layout, key, checksum).await
+    }
+
     /// Write a manifest (typically called by rank 0)
     pub async fn write_manifest(&self, layout: &KeyLayout, manifest: &Manifest) -> Result<String> {
         let manifest_key = layout.manifest_key();

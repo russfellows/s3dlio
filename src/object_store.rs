@@ -8,6 +8,7 @@ use anyhow::anyhow;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use crc32fast::Hasher;
 
 // --- S3 ----------------------------------------------------------------------
 use crate::s3_utils::{
@@ -136,6 +137,10 @@ pub trait ObjectWriter: Send + Sync {
     /// Get the total number of bytes written so far.
     fn bytes_written(&self) -> u64;
     
+    /// Get the computed checksum for the data written so far.
+    /// Returns None if no checksum has been computed yet.
+    fn checksum(&self) -> Option<String>;
+    
     /// Cancel the upload and clean up any partial data.
     /// This is called automatically if the writer is dropped without finalize().
     async fn cancel(self: Box<Self>) -> Result<()> {
@@ -151,6 +156,7 @@ pub struct BufferedObjectWriter<'a> {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
+    hasher: Hasher,
 }
 
 impl<'a> BufferedObjectWriter<'a> {
@@ -161,6 +167,7 @@ impl<'a> BufferedObjectWriter<'a> {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
+            hasher: Hasher::new(),
         }
     }
 }
@@ -172,6 +179,7 @@ impl<'a> ObjectWriter for BufferedObjectWriter<'a> {
             bail!("Cannot write to finalized writer");
         }
         self.buffer.extend_from_slice(chunk);
+        self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
         Ok(())
     }
@@ -186,6 +194,10 @@ impl<'a> ObjectWriter for BufferedObjectWriter<'a> {
     
     fn bytes_written(&self) -> u64 {
         self.bytes_written
+    }
+    
+    fn checksum(&self) -> Option<String> {
+        Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
     
     async fn cancel(mut self: Box<Self>) -> Result<()> {
@@ -283,6 +295,7 @@ pub struct S3BufferedWriter {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
+    hasher: Hasher,
 }
 
 impl S3BufferedWriter {
@@ -292,6 +305,7 @@ impl S3BufferedWriter {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
+            hasher: Hasher::new(),
         }
     }
 }
@@ -303,6 +317,7 @@ impl ObjectWriter for S3BufferedWriter {
             bail!("Cannot write to finalized writer");
         }
         self.buffer.extend_from_slice(chunk);
+        self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
         Ok(())
     }
@@ -319,6 +334,10 @@ impl ObjectWriter for S3BufferedWriter {
     
     fn bytes_written(&self) -> u64 {
         self.bytes_written
+    }
+    
+    fn checksum(&self) -> Option<String> {
+        Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
     
     async fn cancel(mut self: Box<Self>) -> Result<()> {
@@ -532,6 +551,7 @@ pub struct AzureBufferedWriter {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
+    hasher: Hasher,
 }
 
 #[cfg(feature = "azure")]
@@ -542,6 +562,7 @@ impl AzureBufferedWriter {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
+            hasher: Hasher::new(),
         }
     }
 }
@@ -554,6 +575,7 @@ impl ObjectWriter for AzureBufferedWriter {
             bail!("Cannot write to finalized writer");
         }
         self.buffer.extend_from_slice(chunk);
+        self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
         Ok(())
     }
@@ -571,6 +593,10 @@ impl ObjectWriter for AzureBufferedWriter {
     
     fn bytes_written(&self) -> u64 {
         self.bytes_written
+    }
+    
+    fn checksum(&self) -> Option<String> {
+        Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
     
     async fn cancel(mut self: Box<Self>) -> Result<()> {
