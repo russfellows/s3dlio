@@ -105,12 +105,9 @@ impl ObjectWriter for FileSystemWriter {
                 use std::io::Write;
                 compressor.write_all(chunk)?;
                 
-                // For streaming, we need to periodically get data
-                // For now, let's store the data in the compressor and flush at the end
-                self.compressed_bytes += chunk.len() as u64; // Temporary - will be updated in finalize
+                // Don't update compressed_bytes here - we don't know the compressed size until finalize()
             } else {
-                // No compression
-                self.compressed_bytes += chunk.len() as u64;
+                // No compression - write directly to file
                 file.write_all(chunk).await?;
             }
             Ok(())
@@ -157,7 +154,10 @@ impl ObjectWriter for FileSystemWriter {
     }
     
     fn compression_ratio(&self) -> f64 {
-        if self.bytes_written == 0 {
+        if self.bytes_written == 0 || !self.compression.is_enabled() {
+            1.0
+        } else if self.compressed_bytes == 0 {
+            // Not yet finalized - can't determine ratio
             1.0
         } else {
             self.compressed_bytes as f64 / self.bytes_written as f64

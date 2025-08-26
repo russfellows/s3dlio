@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crc32fast::Hasher;
+use std::io::Write;
 
 use crate::constants::{DEFAULT_PAGE_SIZE, DEFAULT_MIN_IO_SIZE};
-use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter};
+use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, CompressionConfig};
 
 /// Configuration options for FileSystem operations
 #[derive(Debug, Clone)]
@@ -96,14 +97,51 @@ pub struct DirectIOWriter {
     finalized: bool,
     buffer: Vec<u8>, // Buffer for alignment and minimum I/O size requirements
     hasher: Hasher,
+    compression: CompressionConfig,
+    compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
+    compressed_bytes: u64,
 }
 
 impl DirectIOWriter {
-    async fn new(path: PathBuf, config: FileSystemConfig) -> Result<Self> {
+    pub async fn new(path: PathBuf, config: FileSystemConfig) -> Result<Self> {
+        Self::new_with_compression(path, config, CompressionConfig::None).await
+    }
+    
+    pub async fn new_with_compression(path: PathBuf, config: FileSystemConfig, compression: CompressionConfig) -> Result<Self> {
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
+        
+        // Append compression extension to path if needed
+        let final_path = if compression.is_enabled() {
+            let mut path_with_ext = path.clone();
+            let ext = match &compression {
+                CompressionConfig::None => "",
+                CompressionConfig::Zstd { .. } => ".zst",
+            };
+            if let Some(existing_ext) = path_with_ext.extension() {
+                let new_ext = format!("{}{}", existing_ext.to_str().unwrap_or(""), ext);
+                path_with_ext.set_extension(new_ext);
+            } else {
+                let new_name = format!("{}{}", path_with_ext.file_name().unwrap_or_default().to_str().unwrap_or(""), ext);
+                path_with_ext.set_file_name(new_name);
+            }
+            path_with_ext
+        } else {
+            path.clone()
+        };
+        
+        // Create compressor if needed
+        let compressor = match &compression {
+            CompressionConfig::None => None,
+            CompressionConfig::Zstd { level } => {
+                match zstd::Encoder::new(Vec::new(), *level) {
+                    Ok(encoder) => Some(encoder),
+                    Err(_) => None, // Fall back to no compression on error
+                }
+            }
+        };
         
         // Create and open the file for writing with appropriate flags
         let file = if config.direct_io {
@@ -116,26 +154,29 @@ impl DirectIOWriter {
                     .create(true)
                     .truncate(true)
                     .custom_flags(libc::O_DIRECT)
-                    .open(&path)
+                    .open(&final_path)
                     .await?
             }
             #[cfg(not(unix))]
             {
                 // Fallback to regular I/O on non-Unix systems
-                fs::File::create(&path).await?
+                fs::File::create(&final_path).await?
             }
         } else {
-            fs::File::create(&path).await?
+            fs::File::create(&final_path).await?
         };
         
         Ok(Self {
             file: Some(file),
-            path,
+            path: final_path,
             config,
             bytes_written: 0,
             finalized: false,
             buffer: Vec::new(),
             hasher: Hasher::new(),
+            compression,
+            compressor,
+            compressed_bytes: 0,
         })
     }
 }
@@ -149,6 +190,20 @@ impl ObjectWriter for DirectIOWriter {
         
         // Update checksum for all written data
         self.hasher.update(chunk);
+        self.bytes_written += chunk.len() as u64;
+        
+        // Handle compression
+        let data_to_write = if let Some(ref mut compressor) = self.compressor {
+            // Compress the chunk and collect compressed data
+            compressor.write_all(chunk)?;
+            let compressed = compressor.get_mut();
+            let result = compressed.clone();
+            compressed.clear();
+            result
+        } else {
+            // No compression - use original chunk
+            chunk.to_vec()
+        };
         
         let file = match self.file.as_mut() {
             Some(f) => f,
@@ -157,15 +212,14 @@ impl ObjectWriter for DirectIOWriter {
 
         if !self.config.direct_io {
             // Regular I/O - write directly
-            file.write_all(chunk).await?;
-            self.bytes_written += chunk.len() as u64;
+            file.write_all(&data_to_write).await?;
             
             if self.config.sync_writes {
                 file.sync_all().await?;
             }
         } else {
             // DirectIO - need to handle alignment and buffering
-            self.buffer.extend_from_slice(chunk);
+            self.buffer.extend_from_slice(&data_to_write);
             
             // Write aligned chunks when we have enough data
             let alignment = self.config.alignment;
@@ -176,7 +230,6 @@ impl ObjectWriter for DirectIOWriter {
                 if write_size > 0 {
                     let write_data = self.buffer.drain(..write_size).collect::<Vec<u8>>();
                     file.write_all(&write_data).await?;
-                    self.bytes_written += write_data.len() as u64;
                     
                     if self.config.sync_writes {
                         file.sync_all().await?;
@@ -194,6 +247,24 @@ impl ObjectWriter for DirectIOWriter {
         }
         
         if let Some(mut file) = self.file.take() {
+            // Finalize compression if enabled
+            if let Some(compressor) = self.compressor.take() {
+                let compressed_data = compressor.finish()?;
+                self.compressed_bytes = compressed_data.len() as u64;
+                
+                if !compressed_data.is_empty() {
+                    if !self.config.direct_io {
+                        // Regular I/O - write directly
+                        file.write_all(&compressed_data).await?;
+                    } else {
+                        // DirectIO - add to buffer for alignment
+                        self.buffer.extend_from_slice(&compressed_data);
+                    }
+                }
+            } else {
+                self.compressed_bytes = self.bytes_written;
+            }
+            
             // Write any remaining buffered data for DirectIO
             if self.config.direct_io && !self.buffer.is_empty() {
                 let alignment = self.config.alignment;
@@ -204,7 +275,6 @@ impl ObjectWriter for DirectIOWriter {
                 self.buffer.resize(aligned_length, 0);
                 
                 file.write_all(&self.buffer).await?;
-                self.bytes_written += buffer_len as u64; // Only count real data, not padding
             }
             
             file.flush().await?;
@@ -223,9 +293,31 @@ impl ObjectWriter for DirectIOWriter {
         Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
     
+    fn compression(&self) -> CompressionConfig {
+        self.compression.clone()
+    }
+    
+    fn compression_ratio(&self) -> f64 {
+        if self.bytes_written == 0 || !self.compression.is_enabled() {
+            1.0
+        } else {
+            // Use current buffer size if not finalized yet, otherwise use compressed_bytes
+            let current_compressed_size = if self.finalized {
+                self.compressed_bytes
+            } else {
+                self.buffer.len() as u64
+            };
+            current_compressed_size as f64 / self.bytes_written as f64
+        }
+    }
+    
     async fn cancel(mut self: Box<Self>) -> Result<()> {
         self.finalized = true;
         self.buffer.clear(); // Clear any buffered data
+        
+        if let Some(compressor) = self.compressor {
+            drop(compressor); // Clean up compressor
+        }
         
         if let Some(_file) = self.file.take() {
             // File will be closed when dropped
