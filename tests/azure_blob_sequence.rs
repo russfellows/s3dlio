@@ -1,4 +1,4 @@
-#![cfg(feature = "azure")]
+// Azure backend tests - now always enabled
 
 use anyhow::{Context, Result};
 use bytes::Bytes;

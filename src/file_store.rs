@@ -11,7 +11,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crc32fast::Hasher;
 
-use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter};
+use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, CompressionConfig};
 
 /// FileSystem adapter that implements ObjectStore for local POSIX file operations.
 /// 
@@ -30,26 +30,60 @@ pub struct FileSystemWriter {
     file: Option<fs::File>,
     path: PathBuf,
     bytes_written: u64,
+    compressed_bytes: u64,
     finalized: bool,
     hasher: Hasher,
+    compression: CompressionConfig,
+    compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
 }
 
 impl FileSystemWriter {
     async fn new(path: PathBuf) -> Result<Self> {
+        Self::new_with_compression(path, CompressionConfig::None).await
+    }
+    
+    pub async fn new_with_compression(path: PathBuf, compression: CompressionConfig) -> Result<Self> {
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
         
+        // Determine final path with compression extension if needed
+        let final_path = if compression.is_enabled() {
+            let extension = path.extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let new_extension = if extension.is_empty() {
+                compression.extension().trim_start_matches('.')
+            } else {
+                &format!("{}{}", extension, compression.extension())
+            };
+            path.with_extension(new_extension)
+        } else {
+            path.clone()
+        };
+        
         // Create and open the file for writing
-        let file = fs::File::create(&path).await?;
+        let file = fs::File::create(&final_path).await?;
+        
+        let compressor = match compression {
+            CompressionConfig::None => None,
+            CompressionConfig::Zstd { level } => {
+                let mut encoder = zstd::Encoder::new(Vec::new(), level)?;
+                encoder.include_checksum(false)?; // We handle checksums ourselves
+                Some(encoder)
+            }
+        };
         
         Ok(Self {
             file: Some(file),
-            path,
+            path: final_path,
             bytes_written: 0,
+            compressed_bytes: 0,
             finalized: false,
             hasher: Hasher::new(),
+            compression,
+            compressor,
         })
     }
 }
@@ -61,10 +95,24 @@ impl ObjectWriter for FileSystemWriter {
             bail!("Cannot write to finalized writer");
         }
         
+        // Update checksum with original data (before compression)
+        self.hasher.update(chunk);
+        self.bytes_written += chunk.len() as u64;
+        
         if let Some(ref mut file) = self.file {
-            file.write_all(chunk).await?;
-            self.hasher.update(chunk);
-            self.bytes_written += chunk.len() as u64;
+            if let Some(ref mut compressor) = self.compressor {
+                // Compress the chunk using std::io::Write trait
+                use std::io::Write;
+                compressor.write_all(chunk)?;
+                
+                // For streaming, we need to periodically get data
+                // For now, let's store the data in the compressor and flush at the end
+                self.compressed_bytes += chunk.len() as u64; // Temporary - will be updated in finalize
+            } else {
+                // No compression
+                self.compressed_bytes += chunk.len() as u64;
+                file.write_all(chunk).await?;
+            }
             Ok(())
         } else {
             bail!("Writer has been finalized or cancelled");
@@ -77,6 +125,13 @@ impl ObjectWriter for FileSystemWriter {
         }
         
         if let Some(mut file) = self.file.take() {
+            // Finalize compression if enabled
+            if let Some(compressor) = self.compressor.take() {
+                let final_compressed = compressor.finish()?;
+                self.compressed_bytes = final_compressed.len() as u64; // Update with actual compressed size
+                file.write_all(&final_compressed).await?;
+            }
+            
             file.flush().await?;
             file.sync_all().await?;
         }
@@ -91,6 +146,22 @@ impl ObjectWriter for FileSystemWriter {
     
     fn checksum(&self) -> Option<String> {
         Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
+    }
+    
+    fn compressed_bytes(&self) -> u64 {
+        self.compressed_bytes
+    }
+    
+    fn compression(&self) -> CompressionConfig {
+        self.compression
+    }
+    
+    fn compression_ratio(&self) -> f64 {
+        if self.bytes_written == 0 {
+            1.0
+        } else {
+            self.compressed_bytes as f64 / self.bytes_written as f64
+        }
     }
     
     async fn cancel(mut self: Box<Self>) -> Result<()> {

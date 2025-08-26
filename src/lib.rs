@@ -37,8 +37,7 @@ pub use crate::data_loader::options::LoaderOptions;
 pub use crate::data_loader::dataset;  // re-export the whole module as `s3dlio::dataset`
                                       //
 
-// Re-export the new trait + helpers for easy access elsewhere
-#[cfg(feature = "azure")]
+// Re-export the Azure client module (always available now)
 pub mod azure_client;
 
 pub use object_store::{
