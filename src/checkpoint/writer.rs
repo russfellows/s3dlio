@@ -12,6 +12,7 @@ pub struct Writer<'a> {
     pub strategy: Strategy,
     pub multipart_threshold: usize, // bytes; above this use put_multipart
     pub part_size: Option<usize>,   // forwarded to put_multipart
+    pub compression: Option<crate::object_store::CompressionConfig>,
 }
 
 impl<'a> Writer<'a> {
@@ -29,6 +30,7 @@ impl<'a> Writer<'a> {
             strategy: Strategy::Flat,
             multipart_threshold: 100 * 1024 * 1024, // 100MB default
             part_size: None,
+            compression: None,
         }
     }
 
@@ -47,47 +49,113 @@ impl<'a> Writer<'a> {
         self
     }
 
+    pub fn with_compression(mut self, compression: crate::object_store::CompressionConfig) -> Self {
+        self.compression = Some(compression);
+        self
+    }
+
     /// Upload a shard for this rank and return metadata
     pub async fn put_shard(&self, layout: &KeyLayout, data: &[u8]) -> Result<ShardMeta> {
         let key = layout.shard_key(self.rank, self.strategy);
         let uri = layout.to_uri(&self.base_uri, &key);
         
-        // Choose upload method based on size
-        if data.len() >= self.multipart_threshold {
-            self.store.put_multipart(&uri, data, self.part_size).await?;
+        // If compression is enabled, use streaming writer for compression support
+        if let Some(compression) = &self.compression {
+            let (mut writer, _) = self.get_shard_writer(layout).await?;
+            writer.write_chunk(data).await?;
+            let _ = writer.finalize().await?;
+            
+            // When compression is enabled, the file gets the compression extension
+            let compressed_uri = if compression.is_enabled() {
+                format!("{}{}", uri, compression.extension())
+            } else {
+                uri
+            };
+            
+            // Update the key to include compression extension for the manifest
+            let compressed_key = if compression.is_enabled() {
+                format!("{}{}", key, compression.extension())
+            } else {
+                key
+            };
+            
+            let meta = self.store.stat(&compressed_uri).await?;
+            Ok(ShardMeta {
+                rank: self.rank,
+                key: compressed_key,
+                size: meta.size,
+                etag: meta.e_tag,
+                checksum: None, // TODO: Add checksum support if needed
+            })
         } else {
-            self.store.put(&uri, data).await?;
+            // Choose upload method based on size for uncompressed data
+            if data.len() >= self.multipart_threshold {
+                self.store.put_multipart(&uri, data, self.part_size).await?;
+            } else {
+                self.store.put(&uri, data).await?;
+            }
+            
+            // Collect metadata
+            let meta = self.store.stat(&uri).await?;
+            Ok(ShardMeta {
+                rank: self.rank,
+                key: key,
+                size: meta.size,
+                etag: meta.e_tag,
+                checksum: None, // TODO: Add checksum support if needed
+            })
         }
-        
-        // Collect metadata
-        let meta = self.store.stat(&uri).await?;
-        Ok(ShardMeta {
-            rank: self.rank,
-            key: key,
-            size: meta.size,
-            etag: meta.e_tag,
-            checksum: None, // TODO: Add checksum support if needed
-        })
     }
 
     /// Upload a shard with custom key (for flexibility)
     pub async fn put_shard_with_key(&self, key: &str, data: &[u8]) -> Result<ShardMeta> {
         let uri = format!("{}/{}", self.base_uri.trim_end_matches('/'), key);
         
-        if data.len() >= self.multipart_threshold {
-            self.store.put_multipart(&uri, data, self.part_size).await?;
+        // If compression is enabled, use streaming writer for compression support
+        if let Some(compression) = &self.compression {
+            let mut writer = self.get_shard_writer_with_key(key).await?;
+            writer.write_chunk(data).await?;
+            let _ = writer.finalize().await?;
+            
+            // When compression is enabled, the file gets the compression extension
+            let compressed_uri = if compression.is_enabled() {
+                format!("{}{}", uri, compression.extension())
+            } else {
+                uri
+            };
+            
+            // Update the key to include compression extension for the manifest
+            let compressed_key = if compression.is_enabled() {
+                format!("{}{}", key, compression.extension())
+            } else {
+                key.to_string()
+            };
+            
+            let meta = self.store.stat(&compressed_uri).await?;
+            Ok(ShardMeta {
+                rank: self.rank,
+                key: compressed_key,
+                size: meta.size,
+                etag: meta.e_tag,
+                checksum: None,
+            })
         } else {
-            self.store.put(&uri, data).await?;
+            // Choose upload method based on size for uncompressed data
+            if data.len() >= self.multipart_threshold {
+                self.store.put_multipart(&uri, data, self.part_size).await?;
+            } else {
+                self.store.put(&uri, data).await?;
+            }
+            
+            let meta = self.store.stat(&uri).await?;
+            Ok(ShardMeta {
+                rank: self.rank,
+                key: key.to_string(),
+                size: meta.size,
+                etag: meta.e_tag,
+                checksum: None,
+            })
         }
-        
-        let meta = self.store.stat(&uri).await?;
-        Ok(ShardMeta {
-            rank: self.rank,
-            key: key.to_string(),
-            size: meta.size,
-            etag: meta.e_tag,
-            checksum: None,
-        })
     }
 
     /// Get a streaming writer for a shard (zero-copy version of put_shard)
@@ -95,14 +163,25 @@ impl<'a> Writer<'a> {
     pub async fn get_shard_writer(&self, layout: &KeyLayout) -> Result<(Box<dyn crate::object_store::ObjectWriter>, String)> {
         let key = layout.shard_key(self.rank, self.strategy);
         let uri = layout.to_uri(&self.base_uri, &key);
-        let writer = self.store.get_writer(&uri).await?;
+        
+        let writer = if let Some(compression) = &self.compression {
+            self.store.get_writer_with_compression(&uri, *compression).await?
+        } else {
+            self.store.get_writer(&uri).await?
+        };
+        
         Ok((writer, key))
     }
 
     /// Get a streaming writer with custom key (for flexibility)
     pub async fn get_shard_writer_with_key(&self, key: &str) -> Result<Box<dyn crate::object_store::ObjectWriter>> {
         let uri = format!("{}/{}", self.base_uri.trim_end_matches('/'), key);
-        self.store.get_writer(&uri).await
+        
+        if let Some(compression) = &self.compression {
+            self.store.get_writer_with_compression(&uri, *compression).await
+        } else {
+            self.store.get_writer(&uri).await
+        }
     }
 
     /// Helper to create ShardMeta after streaming write is complete

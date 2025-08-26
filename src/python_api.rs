@@ -1032,8 +1032,7 @@ impl PyCheckpointStore {
         if let Some(level) = compression_level {
             use crate::object_store::CompressionConfig;
             let compression_config = CompressionConfig::zstd_level(level);
-            // Note: CheckpointConfig may not have compression support yet
-            // This will be added in a future update
+            config = config.with_compression(compression_config);
         }
         
         let store = CheckpointStore::open_with_config(&uri, config)

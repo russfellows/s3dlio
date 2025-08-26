@@ -995,6 +995,17 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         // as regular filesystem with potential for future direct I/O optimization
         Ok(Box::new(DirectIOWriter::new(path, self.config.clone()).await?))
     }
+
+    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+        if !Self::is_valid_file_uri(uri) { 
+            bail!("FileSystemObjectStore expected file:// or direct:// URI"); 
+        }
+        
+        let path = Self::uri_to_path(uri)?;
+        
+        // For direct I/O with compression
+        Ok(Box::new(DirectIOWriter::new_with_compression(path, self.config.clone(), compression).await?))
+    }
 }
 
 impl ConfigurableFileSystemObjectStore {

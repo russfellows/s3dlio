@@ -20,6 +20,7 @@ pub struct CheckpointConfig {
     pub part_size: Option<usize>,
     pub enable_validation: bool,
     pub concurrent_uploads: bool,
+    pub compression: Option<crate::object_store::CompressionConfig>,
 }
 
 impl Default for CheckpointConfig {
@@ -30,6 +31,7 @@ impl Default for CheckpointConfig {
             part_size: None,
             enable_validation: true,
             concurrent_uploads: true,
+            compression: None,
         }
     }
 }
@@ -64,6 +66,11 @@ impl CheckpointConfig {
         self
     }
 
+    pub fn with_compression(mut self, compression: crate::object_store::CompressionConfig) -> Self {
+        self.compression = Some(compression);
+        self
+    }
+
     /// Optimized for S3/Azure with hot-spot avoidance
     pub fn cloud_optimized() -> Self {
         Self {
@@ -72,6 +79,7 @@ impl CheckpointConfig {
             part_size: Some(8 * 1024 * 1024), // 8MB parts
             enable_validation: true,
             concurrent_uploads: true,
+            compression: None,
         }
     }
 
@@ -83,6 +91,7 @@ impl CheckpointConfig {
             part_size: None,
             enable_validation: false, // Skip validation for local FS
             concurrent_uploads: true,
+            compression: None,
         }
     }
 
@@ -94,6 +103,7 @@ impl CheckpointConfig {
             part_size: Some(16 * 1024 * 1024), // 16MB parts
             enable_validation: false,
             concurrent_uploads: true,
+            compression: None,
         }
     }
 }
@@ -128,10 +138,16 @@ impl CheckpointStore {
 
     /// Create a writer for this store
     pub fn writer(&self, world_size: u32, rank: u32) -> Writer {
-        Writer::new(&*self.store, self.uri.clone(), world_size, rank)
+        let mut writer = Writer::new(&*self.store, self.uri.clone(), world_size, rank)
             .with_strategy(self.config.strategy)
             .with_multipart_threshold(self.config.multipart_threshold)
-            .with_part_size(self.config.part_size.unwrap_or(8 * 1024 * 1024))
+            .with_part_size(self.config.part_size.unwrap_or(8 * 1024 * 1024));
+        
+        if let Some(compression) = &self.config.compression {
+            writer = writer.with_compression(compression.clone());
+        }
+        
+        writer
     }
 
     /// Create a reader for this store

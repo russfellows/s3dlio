@@ -93,13 +93,35 @@ impl<'a> Reader<'a> {
     /// Read a complete shard by its relative key
     pub async fn read_shard(&self, shard_rel_key: &str) -> Result<Vec<u8>> {
         let uri = format!("{}/{}", self.base_uri, shard_rel_key);
-        self.store.get(&uri).await
+        let data = self.store.get(&uri).await?;
+        
+        // Check if this is a compressed file and decompress if needed
+        if shard_rel_key.ends_with(".zst") {
+            use std::io::Read;
+            let mut decoder = zstd::Decoder::new(&data[..])?;
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            Ok(decompressed)
+        } else {
+            Ok(data)
+        }
     }
 
     /// Read a complete shard by its relative key with integrity validation
     pub async fn read_shard_with_validation(&self, shard_rel_key: &str, expected_checksum: Option<&str>) -> Result<Vec<u8>> {
         let uri = format!("{}/{}", self.base_uri, shard_rel_key);
-        self.store.get_with_validation(&uri, expected_checksum).await
+        let data = self.store.get_with_validation(&uri, expected_checksum).await?;
+        
+        // Check if this is a compressed file and decompress if needed
+        if shard_rel_key.ends_with(".zst") {
+            use std::io::Read;
+            let mut decoder = zstd::Decoder::new(&data[..])?;
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            Ok(decompressed)
+        } else {
+            Ok(data)
+        }
     }
 
     /// Read a shard by rank from a manifest
