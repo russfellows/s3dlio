@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use crc32fast::Hasher;
 
 use crate::constants::{DEFAULT_PAGE_SIZE, DEFAULT_MIN_IO_SIZE};
 use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter};
@@ -94,6 +95,7 @@ pub struct DirectIOWriter {
     bytes_written: u64,
     finalized: bool,
     buffer: Vec<u8>, // Buffer for alignment and minimum I/O size requirements
+    hasher: Hasher,
 }
 
 impl DirectIOWriter {
@@ -133,6 +135,7 @@ impl DirectIOWriter {
             bytes_written: 0,
             finalized: false,
             buffer: Vec::new(),
+            hasher: Hasher::new(),
         })
     }
 }
@@ -143,6 +146,9 @@ impl ObjectWriter for DirectIOWriter {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
+        
+        // Update checksum for all written data
+        self.hasher.update(chunk);
         
         let file = match self.file.as_mut() {
             Some(f) => f,
@@ -211,6 +217,10 @@ impl ObjectWriter for DirectIOWriter {
     
     fn bytes_written(&self) -> u64 {
         self.bytes_written
+    }
+    
+    fn checksum(&self) -> Option<String> {
+        Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
     
     async fn cancel(mut self: Box<Self>) -> Result<()> {

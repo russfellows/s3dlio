@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use crc32fast::Hasher;
 
 use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter};
 
@@ -30,6 +31,7 @@ pub struct FileSystemWriter {
     path: PathBuf,
     bytes_written: u64,
     finalized: bool,
+    hasher: Hasher,
 }
 
 impl FileSystemWriter {
@@ -47,6 +49,7 @@ impl FileSystemWriter {
             path,
             bytes_written: 0,
             finalized: false,
+            hasher: Hasher::new(),
         })
     }
 }
@@ -60,6 +63,7 @@ impl ObjectWriter for FileSystemWriter {
         
         if let Some(ref mut file) = self.file {
             file.write_all(chunk).await?;
+            self.hasher.update(chunk);
             self.bytes_written += chunk.len() as u64;
             Ok(())
         } else {
@@ -83,6 +87,10 @@ impl ObjectWriter for FileSystemWriter {
     
     fn bytes_written(&self) -> u64 {
         self.bytes_written
+    }
+    
+    fn checksum(&self) -> Option<String> {
+        Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
     
     async fn cancel(mut self: Box<Self>) -> Result<()> {

@@ -1,7 +1,7 @@
 [project]
 name = "s3dlio"
-version = "0.6.1"
-description = "A Python S3 library providing deep-learning I/O built in Rust"
+version = "0.6.2"
+description = "Multi-protocol AI/ML storage library with zero-copy streaming, checkpointing, and data loading capabilities"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
