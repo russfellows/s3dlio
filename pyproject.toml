@@ -1,12 +1,6 @@
 [project]
 name = "s3dlio"
 version = "0.7.1"
-description = "Multi-protocol AI/ML storage library with zero-copy streaming, checkpointing, and data loading capabilities"ject]
-name = "s3dlio"
-version = "0.7.1"
-description = "Multi-protocol AI/ML storage library with zero-copy streaming, checkpointing, and data loading capabilities"ject]
-name = "s3dlio"
-version = "0.7.0"
 description = "Multi-protocol AI/ML storage library with zero-copy streaming, checkpointing, and data loading capabilities"
 readme = "README.md"
 requires-python = ">=3.12"
