@@ -1009,12 +1009,11 @@ pub struct PyCheckpointStore {
 #[pymethods]
 impl PyCheckpointStore {
     #[new]
-    #[pyo3(signature = (uri, strategy=None, multipart_threshold=None, compression_level=None))]
+    #[pyo3(text_signature = "(uri, strategy=None, multipart_threshold=None)")]
     fn new(
         uri: String,
         strategy: Option<String>,
         multipart_threshold: Option<usize>,
-        compression_level: Option<i32>,
     ) -> PyResult<Self> {
         let mut config = CheckpointConfig::new();
         
@@ -1026,14 +1025,6 @@ impl PyCheckpointStore {
         
         if let Some(threshold) = multipart_threshold {
             config = config.with_multipart_threshold(threshold);
-        }
-        
-        // Add compression configuration
-        if let Some(level) = compression_level {
-            use crate::object_store::CompressionConfig;
-            let compression_config = CompressionConfig::zstd_level(level);
-            // Note: CheckpointConfig may not have compression support yet
-            // This will be added in a future update
         }
         
         let store = CheckpointStore::open_with_config(&uri, config)
@@ -1566,14 +1557,14 @@ fn save_checkpoint(
     data: &[u8],
     user_meta: Option<PyObject>,
 ) -> PyResult<String> {
-    let store = PyCheckpointStore::new(uri, None, None, None)?;
+    let store = PyCheckpointStore::new(uri, None, None)?;
     store.save(py, step, epoch, framework, data, user_meta)
 }
 
 #[pyfunction]
 #[pyo3(text_signature = "(uri)")]
 fn load_checkpoint(py: Python<'_>, uri: String) -> PyResult<Option<PyObject>> {
-    let store = PyCheckpointStore::new(uri, None, None, None)?;
+    let store = PyCheckpointStore::new(uri, None, None)?;
     store.load_latest(py)
 }
 
@@ -1589,7 +1580,7 @@ fn save_distributed_shard(
     world_size: u32,
     rank: u32,
 ) -> PyResult<PyObject> {
-    let store = PyCheckpointStore::new(uri, None, None, None)?;
+    let store = PyCheckpointStore::new(uri, None, None)?;
     let writer = store.writer(world_size, rank)?;
     writer.save_distributed_shard(py, step, epoch, framework, data)
 }
@@ -1607,7 +1598,7 @@ fn finalize_distributed_checkpoint(
     rank: u32,
     user_meta: Option<PyObject>,
 ) -> PyResult<String> {
-    let store = PyCheckpointStore::new(uri, None, None, None)?;
+    let store = PyCheckpointStore::new(uri, None, None)?;
     let writer = store.writer(world_size, rank)?;
     writer.finalize_distributed_checkpoint(py, step, epoch, framework, shard_metas, user_meta)
 }

@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use crc32fast::Hasher;
+use std::io::Write;
 
 // Helper function for integrity validation
 fn compute_checksum(data: &[u8]) -> String {
@@ -416,16 +417,36 @@ pub struct S3BufferedWriter {
     bytes_written: u64,
     finalized: bool,
     hasher: Hasher,
+    compression: CompressionConfig,
+    compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
+    compressed_bytes: u64,
 }
 
 impl S3BufferedWriter {
     pub fn new(uri: String) -> Self {
+        Self::new_with_compression(uri, CompressionConfig::None)
+    }
+    
+    pub fn new_with_compression(uri: String, compression: CompressionConfig) -> Self {
+        let compressor = match &compression {
+            CompressionConfig::None => None,
+            CompressionConfig::Zstd { level } => {
+                match zstd::Encoder::new(Vec::new(), *level) {
+                    Ok(encoder) => Some(encoder),
+                    Err(_) => None, // Fall back to no compression on error
+                }
+            }
+        };
+        
         Self {
             uri,
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
             hasher: Hasher::new(),
+            compression,
+            compressor,
+            compressed_bytes: 0,
         }
     }
 }
@@ -436,9 +457,21 @@ impl ObjectWriter for S3BufferedWriter {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
-        self.buffer.extend_from_slice(chunk);
+        
         self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
+        
+        // Handle compression
+        if let Some(ref mut compressor) = self.compressor {
+            // Compress the chunk and add to buffer
+            compressor.write_all(chunk)?;
+            let compressed = compressor.get_mut();
+            self.buffer.append(compressed);
+        } else {
+            // No compression - direct to buffer
+            self.buffer.extend_from_slice(chunk);
+        }
+        
         Ok(())
     }
     
@@ -448,8 +481,24 @@ impl ObjectWriter for S3BufferedWriter {
         }
         self.finalized = true;
         
+        // Finalize compression if enabled
+        if let Some(compressor) = self.compressor.take() {
+            let compressed_data = compressor.finish()?;
+            self.buffer = compressed_data;
+        }
+        
+        self.compressed_bytes = self.buffer.len() as u64;
+        
+        // Append compression extension if needed
+        let mut final_uri = self.uri.clone();
+        if self.compression.is_enabled() {
+            if !final_uri.ends_with(self.compression.extension()) {
+                final_uri.push_str(self.compression.extension());
+            }
+        }
+        
         // Use S3 multipart upload for the buffered data
-        s3_put_object_multipart_uri_async(&self.uri, &self.buffer, None).await
+        s3_put_object_multipart_uri_async(&final_uri, &self.buffer, None).await
     }
     
     fn bytes_written(&self) -> u64 {
@@ -460,9 +509,30 @@ impl ObjectWriter for S3BufferedWriter {
         Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
     
+    fn compression(&self) -> CompressionConfig {
+        self.compression.clone()
+    }
+    
+    fn compression_ratio(&self) -> f64 {
+        if self.bytes_written == 0 || !self.compression.is_enabled() {
+            1.0
+        } else {
+            // Use current buffer size if not finalized yet, otherwise use compressed_bytes
+            let current_compressed_size = if self.finalized {
+                self.compressed_bytes
+            } else {
+                self.buffer.len() as u64
+            };
+            current_compressed_size as f64 / self.bytes_written as f64
+        }
+    }
+    
     async fn cancel(mut self: Box<Self>) -> Result<()> {
         self.finalized = true;
         self.buffer.clear();
+        if let Some(compressor) = self.compressor {
+            drop(compressor); // Clean up compressor
+        }
         Ok(())
     }
 }
@@ -669,17 +739,37 @@ pub struct AzureBufferedWriter {
     bytes_written: u64,
     finalized: bool,
     hasher: Hasher,
+    compression: CompressionConfig,
+    compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
+    compressed_bytes: u64,
 }
 
 
 impl AzureBufferedWriter {
     pub fn new(uri: String) -> Self {
+        Self::new_with_compression(uri, CompressionConfig::None)
+    }
+    
+    pub fn new_with_compression(uri: String, compression: CompressionConfig) -> Self {
+        let compressor = match &compression {
+            CompressionConfig::None => None,
+            CompressionConfig::Zstd { level } => {
+                match zstd::Encoder::new(Vec::new(), *level) {
+                    Ok(encoder) => Some(encoder),
+                    Err(_) => None, // Fall back to no compression on error
+                }
+            }
+        };
+        
         Self {
             uri,
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
             hasher: Hasher::new(),
+            compression,
+            compressor,
+            compressed_bytes: 0,
         }
     }
 }
@@ -691,9 +781,21 @@ impl ObjectWriter for AzureBufferedWriter {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
-        self.buffer.extend_from_slice(chunk);
+        
         self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
+        
+        // Handle compression
+        if let Some(ref mut compressor) = self.compressor {
+            // Compress the chunk and add to buffer
+            compressor.write_all(chunk)?;
+            let compressed = compressor.get_mut();
+            self.buffer.append(compressed);
+        } else {
+            // No compression - direct to buffer
+            self.buffer.extend_from_slice(chunk);
+        }
+        
         Ok(())
     }
     
@@ -703,9 +805,24 @@ impl ObjectWriter for AzureBufferedWriter {
         }
         self.finalized = true;
         
-        // Use Azure multipart upload for the buffered data
+        // Finalize compression if enabled
+        if let Some(compressor) = self.compressor.take() {
+            let compressed_data = compressor.finish()?;
+            self.buffer = compressed_data;
+        }
+        
+        self.compressed_bytes = self.buffer.len() as u64;
+        
+        // Append compression extension if needed
         let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
-        cli.put(&key, Bytes::from(self.buffer.clone()), true).await
+        let final_key = if self.compression.is_enabled() && !key.ends_with(self.compression.extension()) {
+            format!("{}{}", key, self.compression.extension())
+        } else {
+            key
+        };
+        
+        // Use Azure multipart upload for the buffered data
+        cli.put(&final_key, Bytes::from(self.buffer.clone()), true).await
     }
     
     fn bytes_written(&self) -> u64 {
@@ -716,9 +833,30 @@ impl ObjectWriter for AzureBufferedWriter {
         Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
     
+    fn compression(&self) -> CompressionConfig {
+        self.compression.clone()
+    }
+    
+    fn compression_ratio(&self) -> f64 {
+        if self.bytes_written == 0 || !self.compression.is_enabled() {
+            1.0
+        } else {
+            // Use current buffer size if not finalized yet, otherwise use compressed_bytes
+            let current_compressed_size = if self.finalized {
+                self.compressed_bytes
+            } else {
+                self.buffer.len() as u64
+            };
+            current_compressed_size as f64 / self.bytes_written as f64
+        }
+    }
+    
     async fn cancel(mut self: Box<Self>) -> Result<()> {
         self.finalized = true;
         self.buffer.clear();
+        if let Some(compressor) = self.compressor {
+            drop(compressor); // Clean up compressor
+        }
         Ok(())
     }
 }
