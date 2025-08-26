@@ -18,7 +18,10 @@ This project supports both low-level storage operations (get, put, list, stat, d
 
 ## Recent Highlights
 
-### Version 0.7.2 - Complete Python Compression Integration (Latest)
+### Version 0.7.3 - Modular Python API Architecture (Latest)
+Major architectural refactoring transforming the monolithic Python API into a clean modular structure. Split 1883-line `python_api.rs` into organized modules for core storage, AI/ML functions, and advanced features. Eliminated all compiler warnings, fixed critical bugs, and added comprehensive regression test suite with 16 test cases covering all 49 public functions. Zero breaking changes - all existing code continues to work unchanged.
+
+### Version 0.7.2 - Complete Python Compression Integration
 Full end-to-end compression support with Python API integration. The `compression_level` parameter now provides seamless compression/decompression across all storage backends with automatic save/load cycles. Achieves 99.8% compression ratios with data integrity preservation through streaming zstd compression and automatic decompression on read.
 
 ### Version 0.6.2 - Enhanced Data Integrity

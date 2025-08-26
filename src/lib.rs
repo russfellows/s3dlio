@@ -84,62 +84,17 @@ pub use crate::s3_logger::{init_op_logger, finalize_op_logger};
 #[cfg(feature = "extension-module")]
 mod python_api;
 
-#[cfg(feature = "extension-module")]
-use python_api::{
-    // synchronous
-    put,
-    list,
-    stat,
-    get,
-    get_many,
-    get_many_stats,
-    delete,
-    read_npz,
-    init_logging,
-    init_op_log,
-    finalize_op_log,
-    upload,
-    download,
-
-    // async
-    put_async_py,
-    get_many_async_py,
-    get_many_stats_async,
-};
-
 
 // ---------------------------------------------------------------------------
 // PyO3 module init -----------------------------------------------------------
 // ---------------------------------------------------------------------------
 #[cfg(feature = "extension-module")]
 #[pymodule]
-pub fn s3dlio(m: &Bound<PyModule>) -> PyResult<()> {
+pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     pyo3::prepare_freethreaded_python();
 
-    // sync wrappers
-    m.add_function(wrap_pyfunction!(list, m)?)?;
-    m.add_function(wrap_pyfunction!(stat, m)?)?;
-    m.add_function(wrap_pyfunction!(get, m)?)?;
-    m.add_function(wrap_pyfunction!(get_many, m)?)?;
-    m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(delete, m)?)?;
-    m.add_function(wrap_pyfunction!(put, m)?)?;
-    m.add_function(wrap_pyfunction!(read_npz, m)?)?;
-    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
-    m.add_function(wrap_pyfunction!(init_op_log, m)?)?;
-    m.add_function(wrap_pyfunction!(finalize_op_log, m)?)?;
-    m.add_function(wrap_pyfunction!(upload, m)?)?;
-    m.add_function(wrap_pyfunction!(download, m)?)?;
-
-    // async wrappers
-    m.add_function(wrap_pyfunction!(put_async_py, m)?)?;
-    m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;
-    m.add_function(wrap_pyfunction!(get_many_stats_async, m)?)?;
-
-    // -- Add async DataLoader classes for Python API --
-    m.add_class::<python_api::PyVecDataset>()?;
-    m.add_class::<python_api::PyAsyncDataLoader>()?;
-    m.add_class::<python_api::PyAsyncDataLoaderIter>()?;
+    // Register all functions from modular API
+    python_api::register_all_functions(m)?;
 
     Ok(())
 }
