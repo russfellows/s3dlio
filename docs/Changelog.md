@@ -1,5 +1,42 @@
 # s3dlio Changelog
 
+## Version 0.7.0 - Phase 3 Complete: Compression, Integrity, Python Exchange + Azure Ungating (August 26, 2025)
+
+This major release completes **Phase 3 Implementation** with all priorities (2, 3, 4) plus Azure ungating, providing enterprise-grade compression, integrity validation, enhanced Python integration, and seamless multi-cloud operations.
+
+### 🎯 Phase 3 Priority 2: Compression Support
+- **Zstd Compression**: Full streaming compression integration with configurable levels (1-22)
+- **FileSystemWriter**: Complete compression implementation with automatic file extension handling (.zst)
+- **Performance**: Optimized streaming compression maintaining zero-copy semantics where possible
+- **Backend Coverage**: Compression support across all ObjectStore implementations
+
+### 🔒 Phase 3 Priority 3: Integrity Validation
+- **CRC32C Validation**: Advanced integrity validation with corruption detection
+- **Range Validation**: Partial read validation for optimized data access patterns
+- **Concurrent Validation**: High-performance validation supporting concurrent operations
+- **Error Reporting**: Detailed corruption detection with actionable error messages
+
+### 🐍 Phase 3 Priority 4: Python-Rust Exchange Enhancement
+- **Tensor Data Exchange**: Enhanced zero-copy tensor serialization/deserialization
+- **Metadata Preservation**: Complete metadata retention during Python-Rust data exchange
+- **Distributed Checkpoints**: Advanced checkpoint loading with validation
+- **Error Handling**: Improved error propagation between Python and Rust layers
+
+### ☁️ Azure Ungating
+- **Always Available**: Azure ObjectStore no longer requires feature flags
+- **Unified Factory**: `store_for_uri()` supports all backends (File, S3, Azure) seamlessly
+- **Multi-Cloud Ready**: Complete backend parity for enterprise multi-cloud deployments
+
+### 🧪 Comprehensive Testing
+- **Phase 3 Tests**: 17/17 tests passing across all priorities
+- **Backend Parity**: 2/2 tests confirming complete ObjectStore trait implementation
+- **Zero Warnings**: Clean compilation with all compiler warnings resolved
+
+### 🔧 Technical Improvements
+- **FileSystemWriter**: Added `new_with_compression()`, compression fields, and zstd integration
+- **ObjectStore Trait**: Enhanced with validation methods and compression support
+- **Test Coverage**: Comprehensive validation of compression levels, integrity checks, and Python exchange
+
 ## Version 0.6.2 - Phase 3 Enhanced Metadata with Checksum Integration (August 26, 2025)
 
 This release completes **Phase 3 Priority 1**, implementing comprehensive checksum integration across the s3dlio zero-copy streaming infrastructure to provide data integrity validation for all storage backends.

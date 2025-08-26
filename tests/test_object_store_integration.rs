@@ -79,7 +79,7 @@ async fn test_multipart_operations() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "azure")]
+
 #[tokio::test]
 async fn test_azure_store_factory() -> Result<()> {
     // Test az:// URI (just factory, no actual operations without credentials)

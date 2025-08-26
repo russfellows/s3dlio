@@ -17,14 +17,11 @@ async fn test_complete_object_store_parity() -> Result<()> {
     // Test all backends can be instantiated
     let file_store = store_for_uri("file:///tmp/test")?;
     let s3_store = store_for_uri("s3://test-bucket/test")?;
-    
-    #[cfg(feature = "azure")]
     let azure_store = store_for_uri("az://account/container/test")?;
     
-    #[cfg(not(feature = "azure"))]
+    // Test Azure backend is always available (ungated in v0.6.3)
     let azure_result = store_for_uri("az://account/container/test");
-    #[cfg(not(feature = "azure"))]
-    assert!(azure_result.is_err()); // Should fail when feature not enabled
+    assert!(azure_result.is_ok()); // Should succeed - Azure is now always available
     
     println!("✅ All backends instantiate through unified factory");
     
@@ -32,15 +29,9 @@ async fn test_complete_object_store_parity() -> Result<()> {
     // This compiles only if all backends have identical ObjectStore implementations
     let _: &dyn s3dlio::object_store::ObjectStore = &*file_store;
     let _: &dyn s3dlio::object_store::ObjectStore = &*s3_store;
+    let _: &dyn s3dlio::object_store::ObjectStore = &*azure_store;
     
-    #[cfg(feature = "azure")]
-    {
-        let _: &dyn s3dlio::object_store::ObjectStore = &*azure_store;
-        println!("✅ All three backends (File, S3, Azure) implement identical ObjectStore trait");
-    }
-    
-    #[cfg(not(feature = "azure"))]
-    println!("✅ Two backends (File, S3) implement identical ObjectStore trait (Azure feature disabled)");
+    println!("✅ All three backends (File, S3, Azure) implement identical ObjectStore trait");
     
     println!("🎉 COMPLETE PARITY ACHIEVED:");
     println!("   - Unified ObjectStore trait with identical API surface");
@@ -62,12 +53,8 @@ fn test_backend_feature_parity() {
     // S3 backend: Now complete with PUT operations  
     println!("✅ S3ObjectStore: Complete implementation (including new PUT operations)");
     
-    // Azure backend: Complete (feature-gated)
-    #[cfg(feature = "azure")]
-    println!("✅ AzureObjectStore: Complete implementation (feature enabled)");
-    
-    #[cfg(not(feature = "azure"))]
-    println!("✅ AzureObjectStore: Complete implementation (feature disabled in this build)");
+    // Azure backend: Complete (ungated in v0.6.3)
+    println!("✅ AzureObjectStore: Complete implementation (always available)");
     
     println!("🎯 All backends now provide identical capabilities for AI/ML workloads");
 }

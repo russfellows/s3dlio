@@ -96,6 +96,12 @@ impl<'a> Reader<'a> {
         self.store.get(&uri).await
     }
 
+    /// Read a complete shard by its relative key with integrity validation
+    pub async fn read_shard_with_validation(&self, shard_rel_key: &str, expected_checksum: Option<&str>) -> Result<Vec<u8>> {
+        let uri = format!("{}/{}", self.base_uri, shard_rel_key);
+        self.store.get_with_validation(&uri, expected_checksum).await
+    }
+
     /// Read a shard by rank from a manifest
     pub async fn read_shard_by_rank(&self, manifest: &Manifest, rank: u32) -> Result<Vec<u8>> {
         let shard = manifest.shards.iter()
@@ -105,12 +111,35 @@ impl<'a> Reader<'a> {
         self.read_shard(&shard.key).await
     }
 
+    /// Read a shard by rank from a manifest with integrity validation
+    pub async fn read_shard_by_rank_with_validation(&self, manifest: &Manifest, rank: u32) -> Result<Vec<u8>> {
+        let shard = manifest.shards.iter()
+            .find(|s| s.rank == rank)
+            .ok_or_else(|| anyhow::anyhow!("Shard for rank {} not found in manifest", rank))?;
+        
+        self.read_shard_with_validation(&shard.key, shard.checksum.as_deref()).await
+    }
+
     /// Read all shards from a manifest
     pub async fn read_all_shards(&self, manifest: &Manifest) -> Result<Vec<(u32, Vec<u8>)>> {
         let mut results = Vec::new();
         
         for shard in &manifest.shards {
             let data = self.read_shard(&shard.key).await?;
+            results.push((shard.rank, data));
+        }
+        
+        // Sort by rank for consistent ordering
+        results.sort_by_key(|(rank, _)| *rank);
+        Ok(results)
+    }
+
+    /// Read all shards from a manifest with integrity validation
+    pub async fn read_all_shards_with_validation(&self, manifest: &Manifest) -> Result<Vec<(u32, Vec<u8>)>> {
+        let mut results = Vec::new();
+        
+        for shard in &manifest.shards {
+            let data = self.read_shard_with_validation(&shard.key, shard.checksum.as_deref()).await?;
             results.push((shard.rank, data));
         }
         
@@ -135,6 +164,41 @@ impl<'a> Reader<'a> {
         let mut results = try_join_all(futures).await?;
         results.sort_by_key(|(rank, _)| *rank);
         Ok(results)
+    }
+
+    /// Read all shards concurrently with integrity validation
+    pub async fn read_all_shards_concurrent_with_validation(&self, manifest: &Manifest) -> Result<Vec<(u32, Vec<u8>)>> {
+        use futures::future::try_join_all;
+        
+        let futures = manifest.shards.iter().map(|shard| {
+            let rank = shard.rank;
+            let key = shard.key.clone();
+            let checksum = shard.checksum.clone();
+            async move {
+                let data = self.read_shard_with_validation(&key, checksum.as_deref()).await?;
+                Ok::<(u32, Vec<u8>), anyhow::Error>((rank, data))
+            }
+        });
+        
+        let mut results = try_join_all(futures).await?;
+        results.sort_by_key(|(rank, _)| *rank);
+        Ok(results)
+    }
+
+    /// Validate an entire checkpoint including all shards with integrity checking
+    pub async fn validate_checkpoint_integrity(&self, manifest: &Manifest) -> Result<bool> {
+        // Check if all shards have checksums
+        for shard in &manifest.shards {
+            if shard.checksum.is_none() {
+                return Ok(false); // Cannot validate without checksums
+            }
+        }
+        
+        // Attempt to read all shards with validation
+        match self.read_all_shards_with_validation(manifest).await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Get checkpoint metadata without downloading data

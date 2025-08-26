@@ -3612,7 +3612,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3dlio"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3624,6 +3624,7 @@ dependencies = [
  "azure_identity",
  "azure_storage_blob",
  "base64 0.22.1",
+ "bytemuck",
  "bytes",
  "chrono",
  "clap",

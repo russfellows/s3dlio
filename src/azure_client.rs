@@ -1,5 +1,4 @@
 // src/azure_client.rs
-#![cfg(feature = "azure")]
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;

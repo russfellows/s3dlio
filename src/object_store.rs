@@ -1,14 +1,20 @@
 // src/object_store.rs
 //
 // Pluggable object-store abstraction.
-// Backends: FileSystem, S3, and (feature="azure") Azure Blob.
+// Backends: FileSystem, S3, and Azure Blob.
+// Features: Checksums, Compression, and Integrity Validation
 
-#[cfg(feature = "azure")]
 use anyhow::anyhow;
-
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use crc32fast::Hasher;
+
+// Helper function for integrity validation
+fn compute_checksum(data: &[u8]) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(data);
+    format!("{:08x}", hasher.finalize())
+}
 
 // --- S3 ----------------------------------------------------------------------
 use crate::s3_utils::{
@@ -33,18 +39,51 @@ use crate::file_store::FileSystemObjectStore;
 // Expose enhanced FS adapter with O_DIRECT support
 use crate::file_store_direct::{ConfigurableFileSystemObjectStore, FileSystemConfig};
 
-// --- Azure (feature-gated) ---------------------------------------------------
-#[cfg(feature = "azure")]
+// --- Azure ---------------------------------------------------
 use bytes::Bytes;
-
-#[cfg(feature = "azure")]
 use futures::stream;
-
-#[cfg(feature = "azure")]
 use crate::azure_client::{AzureBlob, AzureBlobProperties};
 
 /// Provider-neutral object metadata. For now this aliases S3's metadata.
 pub type ObjectMetadata = S3ObjectStat;
+
+/// Compression configuration for ObjectWriter implementations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionConfig {
+    None,
+    Zstd { level: i32 },
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        CompressionConfig::None
+    }
+}
+
+impl CompressionConfig {
+    /// Create Zstd compression with default level (3)
+    pub fn zstd_default() -> Self {
+        CompressionConfig::Zstd { level: 3 }
+    }
+    
+    /// Create Zstd compression with custom level (1-22)
+    pub fn zstd_level(level: i32) -> Self {
+        CompressionConfig::Zstd { level: level.clamp(1, 22) }
+    }
+    
+    /// Get the file extension for this compression format
+    pub fn extension(&self) -> &'static str {
+        match self {
+            CompressionConfig::None => "",
+            CompressionConfig::Zstd { .. } => ".zst",
+        }
+    }
+    
+    /// Check if compression is enabled
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, CompressionConfig::None)
+    }
+}
 
 /// Supported schemes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +140,65 @@ pub trait ObjectStore: Send + Sync {
     async fn exists(&self, uri: &str) -> Result<bool> {
         Ok(self.stat(uri).await.is_ok())
     }
+    
+    /// Get object with integrity validation.
+    /// Returns the data and validates it against the expected checksum if provided.
+    async fn get_with_validation(&self, uri: &str, expected_checksum: Option<&str>) -> Result<Vec<u8>> {
+        let data = self.get(uri).await?;
+        
+        if let Some(expected) = expected_checksum {
+            let actual = compute_checksum(&data);
+            if actual != expected {
+                bail!("Integrity validation failed for {}: expected {}, got {}", uri, expected, actual);
+            }
+        }
+        
+        Ok(data)
+    }
+    
+    /// Get byte range with integrity validation.
+    /// For partial reads, validates against the partial data checksum if provided.
+    async fn get_range_with_validation(
+        &self, 
+        uri: &str, 
+        offset: u64, 
+        length: Option<u64>,
+        expected_checksum: Option<&str>
+    ) -> Result<Vec<u8>> {
+        let data = self.get_range(uri, offset, length).await?;
+        
+        if let Some(expected) = expected_checksum {
+            let actual = compute_checksum(&data);
+            if actual != expected {
+                bail!("Integrity validation failed for range {}[{}:{}]: expected {}, got {}", 
+                      uri, offset, offset + data.len() as u64, expected, actual);
+            }
+        }
+        
+        Ok(data)
+    }
+    
+    /// Load and validate checkpoint data with integrity checking.
+    /// This method is specifically designed for checkpoint loading scenarios.
+    async fn load_checkpoint_with_validation(
+        &self, 
+        checkpoint_uri: &str, 
+        expected_checksum: Option<&str>
+    ) -> Result<Vec<u8>> {
+        // Get checkpoint data
+        let data = self.get(checkpoint_uri).await?;
+        
+        // Validate integrity if checksum provided
+        if let Some(expected) = expected_checksum {
+            let actual = compute_checksum(&data);
+            if actual != expected {
+                bail!("Checkpoint integrity validation failed for {}: expected checksum {}, got {}", 
+                      checkpoint_uri, expected, actual);
+            }
+        }
+        
+        Ok(data)
+    }
 
     /// Default copy reads then writes. Backends can override with server-side copy.
     async fn copy(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
@@ -128,18 +226,40 @@ pub trait ObjectStore: Send + Sync {
 pub trait ObjectWriter: Send + Sync {
     /// Write a chunk of data to the object stream.
     /// Chunks are written in order and the implementation handles buffering/uploading.
+    /// If compression is enabled, data is compressed before storage.
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()>;
     
     /// Finalize the object upload. Must be called to complete the write.
     /// After calling finalize(), the writer should not be used again.
     async fn finalize(self: Box<Self>) -> Result<()>;
     
-    /// Get the total number of bytes written so far.
+    /// Get the total number of uncompressed bytes written so far.
     fn bytes_written(&self) -> u64;
     
-    /// Get the computed checksum for the data written so far.
+    /// Get the total number of compressed bytes (if compression is enabled).
+    /// Returns the same as bytes_written() if compression is disabled.
+    fn compressed_bytes(&self) -> u64 {
+        self.bytes_written() // Default: no compression
+    }
+    
+    /// Get the computed checksum for the uncompressed data written so far.
     /// Returns None if no checksum has been computed yet.
     fn checksum(&self) -> Option<String>;
+    
+    /// Get compression configuration for this writer.
+    fn compression(&self) -> CompressionConfig {
+        CompressionConfig::None // Default: no compression
+    }
+    
+    /// Get compression ratio (compressed_size / uncompressed_size).
+    /// Returns 1.0 if compression is disabled.
+    fn compression_ratio(&self) -> f64 {
+        if self.bytes_written() == 0 {
+            1.0
+        } else {
+            self.compressed_bytes() as f64 / self.bytes_written() as f64
+        }
+    }
     
     /// Cancel the upload and clean up any partial data.
     /// This is called automatically if the writer is dropped without finalize().
@@ -348,9 +468,8 @@ impl ObjectWriter for S3BufferedWriter {
 }
 
 // ============================================================================
-// Azure adapter (feature = "azure")
+// Azure adapter
 // ============================================================================
-#[cfg(feature = "azure")]
 fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     // Supports:
     // - az://{account}/{container}/{key...}
@@ -381,7 +500,6 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     bail!("not a recognized Azure URI: {}", uri)
 }
 
-#[cfg(feature = "azure")]
 fn az_uri(account: &str, container: &str, key: &str) -> String {
     if key.is_empty() {
         format!("az://{}/{}", account, container)
@@ -390,7 +508,6 @@ fn az_uri(account: &str, container: &str, key: &str) -> String {
     }
 }
 
-#[cfg(feature = "azure")]
 fn az_props_to_meta(p: &AzureBlobProperties) -> ObjectMetadata {
     ObjectMetadata {
         size: p.content_length,
@@ -412,10 +529,10 @@ fn az_props_to_meta(p: &AzureBlobProperties) -> ObjectMetadata {
     }
 }
 
-#[cfg(feature = "azure")]
+
 pub struct AzureObjectStore;
 
-#[cfg(feature = "azure")]
+
 impl AzureObjectStore {
     pub fn new() -> Self { Self }
     #[inline]
@@ -434,7 +551,7 @@ impl AzureObjectStore {
     }
 }
 
-#[cfg(feature = "azure")]
+
 #[async_trait]
 impl ObjectStore for AzureObjectStore {
     async fn get(&self, uri: &str) -> Result<Vec<u8>> {
@@ -545,7 +662,7 @@ impl ObjectStore for AzureObjectStore {
 }
 
 /// Buffered writer for Azure that collects chunks and uses multipart upload
-#[cfg(feature = "azure")]
+
 pub struct AzureBufferedWriter {
     uri: String,
     buffer: Vec<u8>,
@@ -554,7 +671,7 @@ pub struct AzureBufferedWriter {
     hasher: Hasher,
 }
 
-#[cfg(feature = "azure")]
+
 impl AzureBufferedWriter {
     pub fn new(uri: String) -> Self {
         Self {
@@ -567,7 +684,7 @@ impl AzureBufferedWriter {
     }
 }
 
-#[cfg(feature = "azure")]
+
 #[async_trait]
 impl ObjectWriter for AzureBufferedWriter {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
@@ -614,16 +731,7 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
         Scheme::File  => Ok(FileSystemObjectStore::boxed()),
         Scheme::Direct => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
         Scheme::S3    => Ok(S3ObjectStore::boxed()),
-        Scheme::Azure => {
-            #[cfg(feature = "azure")]
-            {
-                return Ok(AzureObjectStore::boxed());
-            }
-            #[cfg(not(feature = "azure"))]
-            {
-                bail!("Azure backend not enabled. Rebuild with `--features azure`.");
-            }
-        }
+        Scheme::Azure => Ok(AzureObjectStore::boxed()),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     }
 }
@@ -646,16 +754,7 @@ pub fn store_for_uri_with_config(uri: &str, file_config: Option<FileSystemConfig
             }
         }
         Scheme::S3 => Ok(S3ObjectStore::boxed()),
-        Scheme::Azure => {
-            #[cfg(feature = "azure")]
-            {
-                return Ok(AzureObjectStore::boxed());
-            }
-            #[cfg(not(feature = "azure"))]
-            {
-                bail!("Azure backend not enabled. Rebuild with `--features azure`.");
-            }
-        }
+        Scheme::Azure => Ok(AzureObjectStore::boxed()),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     }
 }
@@ -666,16 +765,7 @@ pub fn direct_io_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
         Scheme::File => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
         Scheme::Direct => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
         Scheme::S3 => Ok(S3ObjectStore::boxed()),
-        Scheme::Azure => {
-            #[cfg(feature = "azure")]
-            {
-                return Ok(AzureObjectStore::boxed());
-            }
-            #[cfg(not(feature = "azure"))]
-            {
-                bail!("Azure backend not enabled. Rebuild with `--features azure`.");
-            }
-        }
+        Scheme::Azure => Ok(AzureObjectStore::boxed()),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     }
 }
@@ -686,16 +776,7 @@ pub fn high_performance_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>>
         Scheme::File => Ok(ConfigurableFileSystemObjectStore::boxed_high_performance()),
         Scheme::Direct => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
         Scheme::S3 => Ok(S3ObjectStore::boxed()),
-        Scheme::Azure => {
-            #[cfg(feature = "azure")]
-            {
-                return Ok(AzureObjectStore::boxed());
-            }
-            #[cfg(not(feature = "azure"))]
-            {
-                bail!("Azure backend not enabled. Rebuild with `--features azure`.");
-            }
-        }
+        Scheme::Azure => Ok(AzureObjectStore::boxed()),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     }
 }
