@@ -495,4 +495,14 @@ impl ObjectStore for FileSystemObjectStore {
         let writer = FileSystemWriter::new(path).await?;
         Ok(Box::new(writer))
     }
+
+    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+        if !uri.starts_with("file://") { 
+            bail!("FileSystemObjectStore expected file:// URI"); 
+        }
+        
+        let path = Self::uri_to_path(uri)?;
+        let writer = FileSystemWriter::new_with_compression(path, compression).await?;
+        Ok(Box::new(writer))
+    }
 }

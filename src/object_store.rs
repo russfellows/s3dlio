@@ -220,6 +220,16 @@ pub trait ObjectStore: Send + Sync {
     /// This enables writing large objects without buffering the entire content in memory.
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>>;
 
+    /// Get a streaming writer with compression support for zero-copy operations.
+    /// This enables writing large objects with compression without buffering the entire content in memory.
+    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+        // Default implementation: use get_writer (no compression)
+        if compression.is_enabled() {
+            bail!("Compression not supported by this ObjectStore implementation");
+        }
+        self.get_writer(uri).await
+    }
+
 }
 
 /// Streaming writer interface for zero-copy object uploads
@@ -407,6 +417,11 @@ impl ObjectStore for S3ObjectStore {
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
         // For S3, use buffered writer that collects chunks then uses put_multipart
         Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
+    }
+
+    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+        // For S3, use buffered writer with compression support
+        Ok(Box::new(S3BufferedWriter::new_with_compression(uri.to_string(), compression)))
     }
 }
 
@@ -728,6 +743,11 @@ impl ObjectStore for AzureObjectStore {
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
         // For Azure, use buffered writer that collects chunks then uses put_multipart
         Ok(Box::new(AzureBufferedWriter::new(uri.to_string())))
+    }
+
+    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+        // For Azure, use buffered writer with compression support
+        Ok(Box::new(AzureBufferedWriter::new_with_compression(uri.to_string(), compression)))
     }
 }
 
