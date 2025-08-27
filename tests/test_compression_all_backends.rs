@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use s3dlio::object_store::{ObjectWriter, CompressionConfig, store_for_uri};
 use s3dlio::file_store::FileSystemWriter;
-use s3dlio::file_store_direct::{DirectIOWriter, ConfigurableFileSystemObjectStore, FileSystemConfig};
+use s3dlio::file_store_direct::{DirectIOWriter, FileSystemConfig};
 
 // Test data that compresses well
 fn get_test_data() -> Vec<u8> {

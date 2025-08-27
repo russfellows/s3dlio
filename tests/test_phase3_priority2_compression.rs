@@ -114,8 +114,12 @@ async fn test_compression_disabled() -> Result<()> {
     // Verify compression is disabled
     assert!(!writer.compression().is_enabled());
     assert_eq!(writer.compression(), CompressionConfig::None);
-    assert_eq!(writer.bytes_written(), writer.compressed_bytes());
+    // When compression is disabled, compressed_bytes remains 0 (no compression tracking)
+    assert_eq!(writer.compressed_bytes(), 0);
     assert_eq!(writer.compression_ratio(), 1.0);
+    
+    // Check that we actually wrote the data
+    assert_eq!(writer.bytes_written(), test_data.len() as u64);
     
     // Finalize
     let writer_boxed = Box::new(writer);
