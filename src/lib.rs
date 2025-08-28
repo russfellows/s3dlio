@@ -4,6 +4,19 @@
 //
 // Crate root — public re-exports plus the Python module glue.
 
+// ===== Core Public API =====
+// This is the main stable API that external users should use
+pub mod api;
+
+// Re-export the main API at the crate root for convenience
+pub use api::*;
+
+// ===== Internal Modules (Implementation) =====
+// These are public for internal use but may change without notice
+
+// ===== Internal Modules (Implementation) =====
+// These are public for internal use but may change without notice
+
 pub mod constants;
 pub mod data_formats;
 pub mod config;
@@ -14,7 +27,7 @@ pub mod profiling;
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
 
-// Local files to use
+// Internal modules - these may change in future versions
 pub mod s3_client;
 pub mod s3_copy;
 pub mod s3_utils;
@@ -23,13 +36,15 @@ pub mod s3_ops;
 pub mod object_store;
 pub mod file_store;
 pub mod file_store_direct;
-
-// (other modules/elided)
 pub mod data_gen;
-pub use data_gen::generate_controlled_data;
-
 pub mod data_loader;
 pub mod checkpoint;
+pub mod azure_client;
+mod multipart;
+
+// ===== Legacy Re-exports for Backward Compatibility =====
+// These maintain compatibility with existing code but may be deprecated
+pub use data_gen::generate_controlled_data;
 
 // ===== Re-exports expected by tests/test_dataloader.rs at the crate root =====
 // Types:
@@ -38,10 +53,6 @@ pub use crate::data_loader::dataset::{Dataset, DatasetError};
 pub use crate::data_loader::options::LoaderOptions;
 // Module alias so tests can use `s3dlio::dataset::DynStream`:
 pub use crate::data_loader::dataset;  // re-export the whole module as `s3dlio::dataset`
-                                      //
-
-// Re-export the Azure client module (always available now)
-pub mod azure_client;
 
 pub use object_store::{
     ObjectStore,
@@ -68,8 +79,6 @@ pub use crate::s3_utils::{
     put_objects_with_random_data_and_type,
     DEFAULT_OBJECT_SIZE,
 };
-
-mod multipart;
 
 // Re-export the multipart public types
 pub use crate::multipart::{

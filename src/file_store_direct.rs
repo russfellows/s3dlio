@@ -229,12 +229,14 @@ impl ObjectWriter for DirectIOWriter {
             while self.buffer.len() >= min_io_size {
                 let write_size = (self.buffer.len() / alignment) * alignment;
                 if write_size > 0 {
+                    // Extract the data to write
                     let write_data = self.buffer.drain(..write_size).collect::<Vec<u8>>();
+                    
+                    // Write the data
                     file.write_all(&write_data).await?;
                     
-                    if self.config.sync_writes {
-                        file.sync_all().await?;
-                    }
+                    // For O_DIRECT, we must sync immediately to ensure data persistence  
+                    file.sync_all().await?;
                 }
             }
         }
@@ -268,18 +270,72 @@ impl ObjectWriter for DirectIOWriter {
             
             // Write any remaining buffered data for DirectIO
             if self.config.direct_io && !self.buffer.is_empty() {
+                // For O_DIRECT, we use the hybrid I/O approach:
+                // 1. Write aligned chunks with O_DIRECT for performance
+                // 2. Write the final unaligned data with standard buffered I/O
+                
                 let alignment = self.config.alignment;
                 let buffer_len = self.buffer.len();
                 
-                // Pad buffer to alignment boundary
-                let aligned_length = ((buffer_len + alignment - 1) / alignment) * alignment;
-                self.buffer.resize(aligned_length, 0);
+                if buffer_len >= alignment {
+                    // Write the aligned portion using the existing O_DIRECT file
+                    let aligned_len = (buffer_len / alignment) * alignment;
+                    
+                    let result = file.write_all(&self.buffer[..aligned_len]).await;
+                    match result {
+                        Ok(()) => {},
+                        Err(e) => {
+                            return Err(e.into());
+                        }
+                    }
+                    
+                    // Keep only the unaligned remainder
+                    self.buffer.drain(..aligned_len);
+                }
                 
-                file.write_all(&self.buffer).await?;
+                // If there's still unaligned data, write it using buffered I/O
+                if !self.buffer.is_empty() {
+                    // First, ensure all O_DIRECT data is synced before switching to buffered I/O
+                    file.sync_all().await?;
+                    
+                    // Close the O_DIRECT file and reopen without O_DIRECT for the final write
+                    drop(file);
+                    
+                    // Reopen the file in append mode without O_DIRECT
+                    let mut buffered_file = tokio::fs::OpenOptions::new()
+                        .append(true)  // Only append - this preserves existing content
+                        .open(&self.path)
+                        .await?;
+                    
+                    // Write the remaining unaligned data using standard buffered I/O
+                    buffered_file.write_all(&self.buffer).await?;
+                    buffered_file.flush().await?;
+                    buffered_file.sync_all().await?;
+                } else {
+                    // No unaligned data, just sync the O_DIRECT file
+                    // Note: O_DIRECT bypasses page cache, so flush() is not needed
+                    let sync_result = file.sync_all().await;
+                    match sync_result {
+                        Ok(()) => {},
+                        Err(e) => {
+                            return Err(e.into());
+                        }
+                    }
+                }
+            } else {
+                // Standard file I/O or no remaining buffer
+                if !self.config.direct_io {
+                    // Only flush if not using O_DIRECT (O_DIRECT bypasses page cache)
+                    let flush_result = file.flush().await;
+                    match flush_result {
+                        Ok(()) => {},
+                        Err(e) => {
+                            return Err(e.into());
+                        }
+                    }
+                }
+                file.sync_all().await?;
             }
-            
-            file.flush().await?;
-            file.sync_all().await?;
         }
         
         self.finalized = true;
