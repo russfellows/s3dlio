@@ -18,7 +18,10 @@ This project supports both low-level storage operations (get, put, list, stat, d
 
 ## Recent Highlights
 
-### Version 0.7.7 - Phase 2 Streaming API & Complete Python Bindings (Latest)
+### Version 0.7.8 - Rust API Cleanup & O_DIRECT Implementation (Latest)
+Complete Rust API redesign with clean, stable interfaces for external developers and working O_DIRECT implementation. Introduces new `s3dlio::api` module with factory functions `store_for_uri()` and `direct_io_store_for_uri()`, unified `ObjectStore` trait, and backward compatibility. Features functional O_DIRECT streaming writer with `DirectIOWriter`, hybrid I/O support (automatic switching between O_DIRECT for aligned data and buffered I/O for unaligned chunks), and proper error handling. Includes comprehensive documentation in `docs/api/` directory, usage examples, and documented path forward for completing O_DIRECT data persistence optimization. Provides enterprise-ready stable API for external Rust developers while maintaining all existing functionality.
+
+### Version 0.7.7 - Phase 2 Streaming API & Complete Python Bindings
 Complete Phase 2 streaming infrastructure with production-ready Python bindings and comprehensive test coverage. Introduces universal `ObjectWriter` streaming APIs with `write_chunk()`, `write_owned_bytes()`, and `finalize()` methods across all storage backends (S3, Azure, Filesystem, Direct I/O). Features zero-copy optimization through `write_owned_bytes()`, optional zstd compression, and robust Python integration with `PyWriterOptions` and `PyObjectWriter` classes. Includes comprehensive test suites (7 Rust + 8 Python tests), proper error handling, and post-finalization statistics access. Enables memory-efficient streaming of arbitrarily large files with minimal memory footprint.  Also fixed the docker container build to not copy all of the local .venv environment, making for a substantially smaller container image.
 
 ### Version 0.7.5 - HTTP Client Optimization & Performance Enhancement

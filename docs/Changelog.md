@@ -1,5 +1,39 @@
 # s3dlio Changelog
 
+## Version 0.7.8 - Rust API Cleanup & O_DIRECT Implementation (August 28, 2025)
+
+This release delivers a **complete Rust API redesign** with clean, stable interfaces for external developers and a **working O_DIRECT implementation** with streaming support. The new API provides better ergonomics, backward compatibility, and enterprise-ready documentation.
+
+### 🎯 **Clean Stable Rust API (NEW)**
+- **Public API Module**: New `s3dlio::api` module with stable, documented interfaces for external developers
+- **Factory Functions**: `store_for_uri()` and `direct_io_store_for_uri()` for easy object store creation
+- **ObjectStore Trait**: Unified interface with `put()`, `get()`, and streaming operations across all backends
+- **Backward Compatibility**: Existing code continues to work unchanged with new APIs available alongside
+
+### ⚡ **O_DIRECT Implementation**
+- **Direct I/O Support**: Linux O_DIRECT implementation with 4KB alignment for maximum performance
+- **Streaming Writer**: `DirectIOWriter` with `write_chunk()` and `finalize()` methods for large uploads
+- **Hybrid I/O**: Automatic switching between O_DIRECT (aligned data) and buffered I/O (unaligned final chunks)
+- **Error Handling**: Fixed finalization crashes and implemented proper resource cleanup
+
+### 📚 **Comprehensive Documentation**
+- **API Design Guide**: Complete documentation of design principles and usage patterns
+- **User Guide**: Step-by-step examples for common use cases and advanced scenarios
+- **Future Work**: Documented remaining O_DIRECT data persistence optimization tasks
+- **Examples**: Added `rust_api_basic_usage.rs` and comprehensive O_DIRECT test examples
+
+### 🔧 **Developer Experience**
+- **Stable Interface**: Clear separation between stable `api` and internal `api::advanced` modules
+- **Configuration Types**: `WriterOptions` and other configuration structs in public API
+- **Error Propagation**: Consistent error handling across all API methods
+- **Test Coverage**: Extensive examples validating O_DIRECT functionality and hybrid I/O
+
+### 🏗️ **Code Organization**
+- **API Module**: New `src/api.rs` and `src/api/` directory with clean public interfaces
+- **Documentation**: Organized in `docs/api/` and `docs/development/` directories
+- **Examples**: Clear demonstration code showing best practices and usage patterns
+- **Future Tasks**: Documented path forward for completing O_DIRECT data persistence optimization
+
 ## Version 0.7.7 - Phase 2 Streaming API & Complete Python Bindings (August 28, 2025)
 
 This release delivers the **complete Phase 2 streaming infrastructure** with production-ready Python bindings, comprehensive test coverage, and full multi-backend support. Introduces powerful streaming writer APIs enabling memory-efficient uploads across all storage backends with zero-copy optimizations and optional compression.
