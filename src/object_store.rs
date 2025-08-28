@@ -100,6 +100,42 @@ impl CompressionConfig {
     }
 }
 
+
+/// Configuration options for creating object writers
+#[derive(Debug, Clone, Default)]
+pub struct WriterOptions {
+    /// Optional compression configuration
+    pub compression: Option<CompressionConfig>,
+    /// Buffer size hint for streaming operations
+    pub buffer_size: Option<usize>,
+    /// Maximum part size for multipart uploads
+    pub part_size: Option<usize>,
+}
+
+impl WriterOptions {
+    /// Create new WriterOptions with default values
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Set compression configuration
+    pub fn with_compression(mut self, compression: CompressionConfig) -> Self {
+        self.compression = Some(compression);
+        self
+    }
+    
+    /// Set buffer size hint
+    pub fn with_buffer_size(mut self, size: usize) -> Self {
+        self.buffer_size = Some(size);
+        self
+    }
+    
+    /// Set maximum part size for multipart uploads
+    pub fn with_part_size(mut self, size: usize) -> Self {
+        self.part_size = Some(size);
+        self
+    }
+}
 /// Supported schemes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -244,6 +280,17 @@ pub trait ObjectStore: Send + Sync {
         self.get_writer(uri).await
     }
 
+    /// Create a new streaming writer with specified options.
+    /// This is the unified interface for creating writers with configurable options.
+    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+        // Default implementation: use get_writer_with_compression if compression is specified
+        if let Some(compression) = options.compression {
+            self.get_writer_with_compression(uri, compression).await
+        } else {
+            self.get_writer(uri).await
+        }
+    }
+
     /// High-performance optimized GET operation for large objects.
     /// Automatically chooses between single GET and concurrent range requests
     /// based on object size and configured thresholds. This method provides
@@ -278,6 +325,13 @@ pub trait ObjectWriter: Send + Sync {
     /// Chunks are written in order and the implementation handles buffering/uploading.
     /// If compression is enabled, data is compressed before storage.
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()>;
+
+    /// Write owned bytes for zero-copy optimization.
+    /// Takes ownership of the data to avoid copying.
+    async fn write_owned_bytes(&mut self, data: Vec<u8>) -> Result<()> {
+        // Default implementation: convert to slice and call write_chunk
+        self.write_chunk(&data).await
+    }
     
     /// Finalize the object upload. Must be called to complete the write.
     /// After calling finalize(), the writer should not be used again.
@@ -461,6 +515,15 @@ impl ObjectStore for S3ObjectStore {
     async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
         // For S3, use buffered writer with compression support
         Ok(Box::new(S3BufferedWriter::new_with_compression(uri.to_string(), compression)))
+    }
+
+    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+        // For S3, use buffered writer that collects chunks then uses put_multipart
+        if let Some(compression) = options.compression {
+            Ok(Box::new(S3BufferedWriter::new_with_compression(uri.to_string(), compression)))
+        } else {
+            Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
+        }
     }
 
     async fn get_optimized(&self, uri: &str) -> Result<Vec<u8>> {
@@ -841,6 +904,15 @@ impl ObjectStore for AzureObjectStore {
     async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
         // For Azure, use buffered writer with compression support
         Ok(Box::new(AzureBufferedWriter::new_with_compression(uri.to_string(), compression)))
+    }
+
+    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+        // For Azure, use buffered writer that collects chunks then uses put_multipart
+        if let Some(compression) = options.compression {
+            Ok(Box::new(AzureBufferedWriter::new_with_compression(uri.to_string(), compression)))
+        } else {
+            Ok(Box::new(AzureBufferedWriter::new(uri.to_string())))
+        }
     }
 }
 

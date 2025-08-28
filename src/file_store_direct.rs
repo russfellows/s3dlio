@@ -4,6 +4,7 @@
 // This module provides direct I/O capabilities that bypass the page cache
 
 use anyhow::{bail, Result};
+use crate::object_store::WriterOptions;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -1005,6 +1006,21 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         
         // For direct I/O with compression
         Ok(Box::new(DirectIOWriter::new_with_compression(path, self.config.clone(), compression).await?))
+    }
+
+    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+        if !Self::is_valid_file_uri(uri) {
+            bail!("FileSystemObjectStore expected file:// or direct:// URI");
+        }
+        
+        let path = Self::uri_to_path(uri)?;
+        
+        // Create DirectIOWriter with optional compression
+        if let Some(compression) = options.compression {
+            Ok(Box::new(DirectIOWriter::new_with_compression(path, self.config.clone(), compression).await?))
+        } else {
+            Ok(Box::new(DirectIOWriter::new(path, self.config.clone()).await?))
+        }
     }
 }
 

@@ -1,5 +1,45 @@
 # s3dlio Changelog
 
+## Version 0.7.7 - Phase 2 Streaming API & Complete Python Bindings (August 28, 2025)
+
+This release delivers the **complete Phase 2 streaming infrastructure** with production-ready Python bindings, comprehensive test coverage, and full multi-backend support. Introduces powerful streaming writer APIs enabling memory-efficient uploads across all storage backends with zero-copy optimizations and optional compression.
+
+### 🚀 **Phase 2 Streaming API (NEW)**
+- **Universal Streaming Writers**: `ObjectWriter` trait with `write_chunk()`, `write_owned_bytes()`, and `finalize()` methods
+- **Multi-Backend Support**: S3, Azure Blob Storage, Filesystem, and Direct I/O filesystem streaming
+- **Zero-Copy Optimization**: `write_owned_bytes()` method eliminates memory copies for maximum performance
+- **Compression Integration**: Optional zstd compression with automatic `.zst` extension handling
+
+### 🐍 **Complete Python Bindings**
+- **PyWriterOptions**: Full configuration control with compression, buffer sizes, and upload parameters
+- **PyObjectWriter**: Python wrapper with synchronous API for seamless integration
+- **Creator Functions**: `create_s3_writer()`, `create_azure_writer()`, `create_filesystem_writer()`, `create_direct_filesystem_writer()`
+- **Post-Finalization Stats**: Access to `bytes_written()` and `compressed_bytes()` even after writer finalization
+
+### ✅ **Comprehensive Test Coverage**
+- **Rust Test Suite**: 7 streaming backend tests covering all writer functionality and compression
+- **Python Test Suite**: 8 complete test scenarios validating all streaming operations
+- **Error Handling**: Robust validation of edge cases, finalization states, and invalid operations
+- **Compression Validation**: File extension handling (`.zst`) and compression ratio verification
+
+### 🏗️ **Code Organization & Cleanup**
+- **Modular Structure**: All Python APIs properly organized in `src/python_api/` subdirectory
+- **Test Organization**: All Python tests moved to `python/tests/` directory following best practices
+- **Duplicate Removal**: Eliminated old duplicate files and consolidated streaming functionality
+- **Example Code**: Added `examples/phase2_streaming_demo.rs` demonstrating streaming API usage
+
+### 🔧 **Infrastructure Improvements**
+- **Build System**: Updated maturin integration with proper feature flags
+- **Project Structure**: Reorganized scripts to `scripts/` directory for better organization
+- **Benchmark Suite**: Added `benches/s3_microbenchmarks.rs` for performance validation
+- **Docker Support**: Enhanced Docker configuration for streaming functionality
+
+### 📊 **Performance Features**
+- **Streaming Memory Efficiency**: Write arbitrarily large files with minimal memory footprint
+- **Async Writer Creation**: Non-blocking writer instantiation across all backends
+- **Synchronous Write Operations**: Optimized for Python integration with `block_on` pattern
+- **Statistics Preservation**: Maintain access to upload metrics after stream completion
+
 ## Version 0.7.6 - Advanced Performance Profiling Infrastructure (August 27, 2025)
 
 This release introduces **comprehensive performance profiling capabilities** with CPU sampling, flamegraph generation, and advanced benchmarking infrastructure. Validated with large-scale testing achieving **1.88 GB/s upload** and **5.34 GB/s download** throughput.
@@ -611,4 +651,4 @@ In this first incremental release of our high-level data-loading API, we’ve ad
 | Python `pyo3` wrappers (`dataset.py` / `dataloader.py`)          | **Pending** (next release)                            |
 | Smoke tests against a live MinIO bucket                          | Replaced by in-memory unit tests for fast iteration   |
 
-Everything else in our Stage 1 blueprint is here and passing CI—so you now have a minimal, idiomatic Rust API for batching S3-backed data, ready to build on in Stage 2 (shuffling, parallel fetch, auto-tuning).  
+Everything else in our Stage 1 blueprint is here and passing CI—so you now have a minimal, idiomatic Rust API for batching S3-backed data, ready to build on in Stage 2 (shuffling, parallel fetch, auto-tuning).

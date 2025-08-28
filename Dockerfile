@@ -80,6 +80,9 @@ WORKDIR /app
 # Make sure uv (and the venv) is on the PATH.
 ENV PATH="/root/.local/bin:/app/.venv/bin:${PATH}"
 
+# Install our needed libraries
+RUN uv pip install tensorflow jax torch numpy 
+
 # Install the wheel
 COPY --from=builder /app/wheels ./target/wheels/
 RUN uv pip install ./target/wheels/*.whl
