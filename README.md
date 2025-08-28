@@ -41,6 +41,19 @@ Dynamic batch formation with out-of-order completion, eliminating head-of-line b
 
 📖 **[Complete Version History](docs/Changelog.md)** - Detailed changelog with all enhancements and technical details
 
+## Configuration & Tuning
+
+### Environment Variables
+s3dlio supports comprehensive configuration through environment variables for performance tuning and optimization:
+
+- **HTTP Client Optimization**: `S3DLIO_USE_OPTIMIZED_HTTP=true` enables enhanced connection pooling
+- **Runtime Scaling**: `S3DLIO_RT_THREADS=32` controls Tokio worker threads  
+- **Connection Pool**: `S3DLIO_MAX_HTTP_CONNECTIONS=400` sets max connections per host
+- **Range GET**: `S3DLIO_RANGE_CONCURRENCY=64` for large object optimization
+- **Operation Logging**: `S3DLIO_OPLOG_LEVEL=2` for detailed S3 operation tracking
+
+📖 **[Complete Environment Variables Reference](docs/Environment_Variables.md)** - Comprehensive configuration guide with performance tuning examples
+
 ### Logging
 This is a new feature, that logs all S3 operations.  The file format is designed to be compatible with the MinIO warp tool.  Thus, these s3 op-log files can be used with our warp-replay project.
 
