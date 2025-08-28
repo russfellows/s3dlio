@@ -18,7 +18,10 @@ This project supports both low-level storage operations (get, put, list, stat, d
 
 ## Recent Highlights
 
-### Version 0.7.5 - HTTP Client Optimization & Performance Enhancement (Latest)
+### Version 0.7.7 - Phase 2 Streaming API & Complete Python Bindings (Latest)
+Complete Phase 2 streaming infrastructure with production-ready Python bindings and comprehensive test coverage. Introduces universal `ObjectWriter` streaming APIs with `write_chunk()`, `write_owned_bytes()`, and `finalize()` methods across all storage backends (S3, Azure, Filesystem, Direct I/O). Features zero-copy optimization through `write_owned_bytes()`, optional zstd compression, and robust Python integration with `PyWriterOptions` and `PyObjectWriter` classes. Includes comprehensive test suites (7 Rust + 8 Python tests), proper error handling, and post-finalization statistics access. Enables memory-efficient streaming of arbitrarily large files with minimal memory footprint.  Also fixed the docker container build to not copy all of the local .venv environment, making for a substantially smaller container image.
+
+### Version 0.7.5 - HTTP Client Optimization & Performance Enhancement
 Advanced HTTP client optimization through strategic AWS SDK fork integration. Successfully forked `aws-smithy-http-client` to expose connection pool configuration, achieving +2-3% performance improvement with full backward compatibility. Features environment variable control (`S3DLIO_USE_OPTIMIZED_HTTP=true`) for easy A/B testing between AWS SDK defaults and optimized configuration. Includes enhanced connection pooling (200 max connections), optimized timeouts (800ms idle), and HTTP/2 improvements. All 84 tests pass with comprehensive performance validation.
 
 ### Version 0.7.3 - Modular Python API Architecture

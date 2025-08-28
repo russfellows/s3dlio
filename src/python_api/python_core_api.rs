@@ -9,12 +9,13 @@
 // Basic S3 operations: put, get, list, delete, stat, create/delete buckets
 
 use pyo3::prelude::*;
+use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::{PyAny, 
-    PyBytes, 
+    PyBytes, PyBytesMethods, 
     PyDict, PyDictMethods, 
     PyList, PyListMethods};
 use pyo3::{PyObject, Bound};
-use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3_async_runtimes::tokio::future_into_py;
                                                 
@@ -49,10 +50,25 @@ use crate::s3_copy::{download_objects, upload_files};
 use crate::s3_logger::{finalize_op_logger, init_op_logger};
 
 use crate::data_loader::{
+
     dataset::DatasetError,
+
     options::LoaderOptions,
+
     s3_bytes::S3BytesDataset,
+
+
+
 };
+// Phase 2 streaming functionality imports
+use crate::object_store::{
+    ObjectStore, ObjectWriter, WriterOptions, CompressionConfig,
+    S3ObjectStore, AzureObjectStore
+};
+use crate::file_store::FileSystemObjectStore;
+use crate::file_store_direct::ConfigurableFileSystemObjectStore;
+use anyhow::{Result};
+
 
 // ---------------------------------------------------------------------------
 // Core API functions
@@ -104,8 +120,7 @@ fn str_to_obj(s: &str) -> ObjectType { ObjectType::from(s) }
 
 // Helper function for options
 fn opts_from_dict(_opts: Option<Bound<'_, PyDict>>) -> LoaderOptions {
-    // TODO: Implement proper options parsing from Python dict
-    // For now, return default options
+    // Basic implementation - return default options for now
     LoaderOptions::default()
 }
 
@@ -216,8 +231,8 @@ pub fn put_async_py<'p>(
 
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false))]
-pub fn list(uri: &str, recursive: bool) -> PyResult<Vec<String>> {
-    let (bucket, mut path) = parse_s3_uri(uri).map_err(py_err)?;
+pub fn list(uri: String, recursive: bool) -> PyResult<Vec<String>> {
+    let (bucket, mut path) = parse_s3_uri(&uri).map_err(py_err)?;
 
     if path.ends_with('/') {
         path.push_str(".*");
@@ -227,14 +242,14 @@ pub fn list(uri: &str, recursive: bool) -> PyResult<Vec<String>> {
 }
 
 #[pyfunction]
-pub fn stat(py: Python<'_>, uri: &str) -> PyResult<PyObject> {
-    let os = stat_object_uri(uri).map_err(py_err)?;
+pub fn stat(py: Python<'_>, uri: String) -> PyResult<PyObject> {
+    let os = stat_object_uri(&uri).map_err(py_err)?;
     let d = stat_to_pydict(py, os)?;
     Ok(d.unbind().into())
 }
 
 #[pyfunction]
-pub fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
+pub fn stat_async<'py>(py: Python<'py>, uri: String) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
     future_into_py(py, async move {
         let os = stat_object_uri_async(&uri).await.map_err(py_err)?;
@@ -341,8 +356,8 @@ pub fn get_many_async_py<'p>(
 }
 
 #[pyfunction]
-pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
-    let bytes = get_object_uri(uri).map_err(py_err)?;
+pub fn get(py: Python<'_>, uri: String) -> PyResult<Py<PyBytes>> {
+    let bytes = get_object_uri(&uri).map_err(py_err)?;
     Ok(PyBytes::new(py, &bytes[..]).unbind())
 }
 
@@ -350,14 +365,14 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
 #[pyo3(signature = (src_uri, dest_dir, max_in_flight = 64, recursive = true))]
 pub fn download(
     py: Python<'_>,
-    src_uri: &str,
+    src_uri: String,
     dest_dir: &str,
     max_in_flight: usize,
     recursive: bool,
 ) -> PyResult<()> {
     let dir = PathBuf::from(dest_dir);
     py.allow_threads(move || {
-        download_objects(src_uri, &dir, max_in_flight, recursive).map_err(py_err)
+        download_objects(&src_uri, &dir, max_in_flight, recursive).map_err(py_err)
     })
 }
 
@@ -381,8 +396,8 @@ pub fn get_many(
 
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false))]
-pub fn delete(uri: &str, recursive: bool) -> PyResult<()> {
-    let (bucket, mut key_pattern) = parse_s3_uri(uri).map_err(py_err)?;
+pub fn delete(uri: String, recursive: bool) -> PyResult<()> {
+    let (bucket, mut key_pattern) = parse_s3_uri(&uri).map_err(py_err)?;
 
     if key_pattern.ends_with('/') {
         key_pattern.push_str(".*");
@@ -425,9 +440,9 @@ pub struct PyS3Dataset {
 #[pymethods]
 impl PyS3Dataset {
     #[new]
-    fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+    fn new(uri: String, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         let o = opts_from_dict(opts);
-        let ds = S3BytesDataset::from_prefix_with_opts(uri, &o)
+        let ds = S3BytesDataset::from_prefix_with_opts(&uri, &o)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner: ds })
     }
@@ -443,10 +458,10 @@ pub struct PyS3AsyncDataLoader {
 #[pymethods]
 impl PyS3AsyncDataLoader {
     #[new]
-    fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+    fn new(uri: String, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         let o = opts_from_dict(opts);
         
-        let ds = S3BytesDataset::from_prefix_with_opts(uri, &o)
+        let ds = S3BytesDataset::from_prefix_with_opts(&uri, &o)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let (tx, rx) =
@@ -485,6 +500,181 @@ impl PyS3AsyncDataLoader {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2 Streaming API Classes
+// ---------------------------------------------------------------------------
+
+/// Python wrapper for WriterOptions
+#[pyclass]
+pub struct PyWriterOptions {
+    inner: WriterOptions,
+}
+
+#[pymethods]
+impl PyWriterOptions {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: WriterOptions::new(),
+        }
+    }
+    
+    /// Set compression for the writer
+    fn with_compression(&mut self, compression_type: &str, level: Option<i32>) -> PyResult<()> {
+        let compression = match compression_type.to_lowercase().as_str() {
+            "zstd" => {
+                let level = level.unwrap_or(3); // Default zstd compression level
+                CompressionConfig::Zstd { level }
+            },
+            "none" => CompressionConfig::None,
+            _ => return Err(PyRuntimeError::new_err(format!("Unsupported compression type: {}", compression_type))),
+        };
+        
+        self.inner = self.inner.clone().with_compression(compression);
+        Ok(())
+    }
+    
+    /// Set buffer size for the writer
+    fn with_buffer_size(&mut self, size: usize) {
+        self.inner = self.inner.clone().with_buffer_size(size);
+    }
+}
+
+/// Python wrapper for ObjectWriter
+#[pyclass]
+pub struct PyObjectWriter {
+    finalized_stats: Option<(u64, u64)>, // (bytes_written, compressed_bytes)
+    inner: Option<Box<dyn ObjectWriter>>,
+}
+
+#[pymethods]
+impl PyObjectWriter {
+    /// Write a chunk of bytes to the stream
+    fn write_chunk(&mut self, data: &Bound<'_, PyBytes>) -> PyResult<()> {
+        let writer = self.inner.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
+        
+        let bytes = data.as_bytes().to_vec();
+
+        pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+            writer.write_chunk(&bytes).await
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to write chunk: {}", e)))
+        })
+    }
+    fn write_owned_bytes(&mut self, data: &Bound<'_, PyBytes>) -> PyResult<()> {
+        let writer = self.inner.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
+        
+        let bytes = data.as_bytes().to_vec();
+        
+        pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+            writer.write_owned_bytes(bytes).await
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e)))
+        })
+    }
+    
+    /// Finalize the writer and complete the upload
+    fn finalize<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        // Capture stats before taking the writer
+        let stats = if let Some(ref writer) = self.inner {
+            (writer.bytes_written(), writer.compressed_bytes())
+        } else {
+            return Err(PyRuntimeError::new_err("Writer has already been finalized"));
+        };
+        
+        let writer = self.inner.take().unwrap();
+        self.finalized_stats = Some(stats);
+        
+        future_into_py(py, async move {
+            writer.finalize().await
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to finalize writer: {}", e)))
+        })
+    }
+    
+    /// Get the number of bytes written so far
+    fn bytes_written(&self) -> PyResult<u64> {
+        if let Some((bytes_written, _)) = self.finalized_stats {
+            Ok(bytes_written)
+        } else if let Some(writer) = self.inner.as_ref() {
+            Ok(writer.bytes_written())
+        } else {
+            Err(PyRuntimeError::new_err("Writer has been finalized"))
+        }
+    }
+    
+    /// Get the checksum of the data written (if available)
+    fn checksum(&self) -> Option<String> {
+        self.inner.as_ref()
+            .and_then(|writer| writer.checksum())
+    }
+    
+    /// Get the number of compressed bytes (if compression is enabled)
+    fn compressed_bytes(&self) -> PyResult<u64> {
+        if let Some((_, compressed_bytes)) = self.finalized_stats {
+            Ok(compressed_bytes)
+        } else if let Some(writer) = self.inner.as_ref() {
+            Ok(writer.compressed_bytes())
+        } else {
+            Err(PyRuntimeError::new_err("Writer has been finalized"))
+        }
+    }
+}
+
+/// Create a streaming writer for S3
+#[pyfunction]
+pub fn create_s3_writer<'py>(py: Python<'py>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<Bound<'py, PyAny>> {
+    let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
+    
+    future_into_py(py, async move {
+        let store = S3ObjectStore::new();
+        let writer = store.create_writer(&uri, opts).await
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create S3 writer: {}", e)))?;
+        
+        Ok(PyObjectWriter { inner: Some(writer), finalized_stats: None })
+    })
+}
+
+/// Create a streaming writer for Azure Blob Storage
+#[pyfunction]
+pub fn create_azure_writer<'py>(py: Python<'py>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<Bound<'py, PyAny>> {
+    let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
+    
+    future_into_py(py, async move {
+        let store = AzureObjectStore::new();
+        let writer = store.create_writer(&uri, opts).await
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create Azure writer: {}", e)))?;
+        
+        Ok(PyObjectWriter { inner: Some(writer), finalized_stats: None })
+    })
+}
+
+/// Create a streaming writer for filesystem
+#[pyfunction]
+pub fn create_filesystem_writer<'py>(py: Python<'py>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<Bound<'py, PyAny>> {
+    let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
+    
+    future_into_py(py, async move {
+        let store = FileSystemObjectStore::new();
+        let writer = store.create_writer(&uri, opts).await
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create filesystem writer: {}", e)))?;
+        
+        Ok(PyObjectWriter { inner: Some(writer), finalized_stats: None })
+    })
+}
+
+/// Create a streaming writer for direct I/O filesystem
+#[pyfunction]
+pub fn create_direct_filesystem_writer<'py>(py: Python<'py>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<Bound<'py, PyAny>> {
+    let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
+    
+    future_into_py(py, async move {
+        let store = ConfigurableFileSystemObjectStore::new(Default::default());
+        let writer = store.create_writer(&uri, opts).await
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create direct filesystem writer: {}", e)))?;
+        
+        Ok(PyObjectWriter { inner: Some(writer), finalized_stats: None })
+    })
+}
+// ---------------------------------------------------------------------------
 // Module registration function for core API
 // ---------------------------------------------------------------------------
 pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -517,5 +707,19 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyS3Dataset>()?;
     m.add_class::<PyS3AsyncDataLoader>()?;
     
+    // Phase 2 Streaming API classes and functions
+    m.add_class::<PyWriterOptions>()?;
+    m.add_class::<PyObjectWriter>()?;
+    m.add_function(wrap_pyfunction!(create_s3_writer, m)?)?;
+    m.add_function(wrap_pyfunction!(create_azure_writer, m)?)?;
+    m.add_function(wrap_pyfunction!(create_filesystem_writer, m)?)?;
+    m.add_function(wrap_pyfunction!(create_direct_filesystem_writer, m)?)?;
+    m.add_function(wrap_pyfunction!(debug_test_function, m)?)?;
+
     Ok(())
+}
+
+#[pyfunction]
+pub fn debug_test_function() -> String {
+    "This is from src/python_api/python_core_api.rs".to_string()
 }

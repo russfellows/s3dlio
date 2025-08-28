@@ -9,11 +9,8 @@
 // Checkpoint system, multipart uploads, async operations
 
 use pyo3::prelude::*;
-use pyo3::types::{
-    PyBytes,
-    PyDict, PyDictMethods};
-use pyo3::{PyObject, Bound};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError};
+use pyo3::types::{PyBytes, PyDict};
 use pyo3::conversion::IntoPyObjectExt;
 
 use tokio::{
@@ -27,7 +24,7 @@ use std::{
 // ---------------------------------------------------------------------------
 // Project crates
 // ---------------------------------------------------------------------------
-use crate::python_api::python_core_api::py_err;
+use super::python_core_api::py_err;
 use crate::object_store::store_for_uri;
 
 #[cfg(feature = "extension-module")]

@@ -1,9 +1,11 @@
+use log::debug;
 // src/file_store.rs
 //
 // FileSystemObjectStore implementation for POSIX file I/O
 // This provides the same ObjectStore interface for local filesystem operations
 
 use anyhow::{bail, Result};
+use crate::object_store::WriterOptions;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -91,6 +93,7 @@ impl FileSystemWriter {
 #[async_trait]
 impl ObjectWriter for FileSystemWriter {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        debug!("FileSystemWriter::write_chunk: writing {} bytes", chunk.len());
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
@@ -117,6 +120,7 @@ impl ObjectWriter for FileSystemWriter {
     }
     
     async fn finalize(mut self: Box<Self>) -> Result<()> {
+        debug!("FileSystemWriter::finalize: starting finalization");
         if self.finalized {
             return Ok(());
         }
@@ -124,6 +128,7 @@ impl ObjectWriter for FileSystemWriter {
         if let Some(mut file) = self.file.take() {
             // Finalize compression if enabled
             if let Some(compressor) = self.compressor.take() {
+                debug!("FileSystemWriter::finalize: finalizing compression, path: {}", self.path.display());
                 let final_compressed = compressor.finish()?;
                 self.compressed_bytes = final_compressed.len() as u64; // Update with actual compressed size
                 file.write_all(&final_compressed).await?;
@@ -504,5 +509,20 @@ impl ObjectStore for FileSystemObjectStore {
         let path = Self::uri_to_path(uri)?;
         let writer = FileSystemWriter::new_with_compression(path, compression).await?;
         Ok(Box::new(writer))
+    }
+
+    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+        if !uri.starts_with("file://") {
+            bail!("FileSystemObjectStore expected file:// URI");
+        }
+        
+        let path = Self::uri_to_path(uri)?;
+        if let Some(compression) = options.compression {
+            let writer = FileSystemWriter::new_with_compression(path, compression).await?;
+            Ok(Box::new(writer))
+        } else {
+            let writer = FileSystemWriter::new(path).await?;
+            Ok(Box::new(writer))
+        }
     }
 }
