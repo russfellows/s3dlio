@@ -31,6 +31,7 @@ use log::info;
 use s3dlio::{
     delete_objects, get_objects_parallel, parse_s3_uri, stat_object_uri, 
     put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
+    list_buckets,
     object_store::store_for_uri,
 };
 
@@ -94,6 +95,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+
+    /// List all S3 buckets in the account.
+    ListBuckets,
 
     /// Create a new S3 bucket.
     CreateBucket {
@@ -235,6 +239,32 @@ enum Command {
     },
 }
 
+// -----------------------------------------------------------------------------
+// Command implementations
+// -----------------------------------------------------------------------------
+
+/// List all S3 buckets in the account.
+async fn list_buckets_cmd() -> Result<()> {
+    println!("Listing all S3 buckets...");
+    
+    let buckets = list_buckets()?;
+    
+    if buckets.is_empty() {
+        println!("No buckets found in this S3 account.");
+        return Ok(());
+    }
+    
+    println!("\nFound {} bucket(s):", buckets.len());
+    println!("{:<30} {}", "Bucket Name", "Creation Date");
+    println!("{}", "-".repeat(60));
+    
+    for bucket in buckets {
+        println!("{:<30} {}", bucket.name, bucket.creation_date);
+    }
+    
+    Ok(())
+}
+
 
 /// Main CLI function
 #[tokio::main]
@@ -270,6 +300,11 @@ async fn main() -> Result<()> {
     }
 
     match cli.cmd {
+        // List all buckets command
+        Command::ListBuckets => {
+            list_buckets_cmd().await?;
+        },
+
         // New, create-bucket command
         Command::CreateBucket { bucket_name } => {
             // Reliably clean the input to get a valid bucket name by

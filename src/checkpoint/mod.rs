@@ -137,7 +137,7 @@ impl CheckpointStore {
     }
 
     /// Create a writer for this store
-    pub fn writer(&self, world_size: u32, rank: u32) -> Writer {
+    pub fn writer(&self, world_size: u32, rank: u32) -> Writer<'_> {
         let mut writer = Writer::new(&*self.store, self.uri.clone(), world_size, rank)
             .with_strategy(self.config.strategy)
             .with_multipart_threshold(self.config.multipart_threshold)
@@ -151,7 +151,7 @@ impl CheckpointStore {
     }
 
     /// Create a reader for this store
-    pub fn reader(&self) -> Reader {
+    pub fn reader(&self) -> Reader<'_> {
         Reader::new(&*self.store, self.uri.clone())
     }
 
