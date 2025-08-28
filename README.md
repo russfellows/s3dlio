@@ -234,9 +234,9 @@ Either docker or podman may be used to create the image, typically with a `podma
 In order to pull the container using podman (or docker), you may execute the following:
 
 ```
-podman pull quay.io/russfellows-sig65/s3dlio:0.4.2
+podman pull quay.io/russfellows-sig65/s3dlio
 ```
-***Note 2:** The above container must be pulled with the tag name as indicated*
+***Note 2:** The above container may be pulled with the a specific tag name if it exists*
 
 ### Running Container
 Here is an example of starting a container using podman, and listing the contents of the containers /app directory.  
