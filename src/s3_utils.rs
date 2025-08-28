@@ -18,6 +18,9 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use regex::Regex;
 use tokio::sync::Semaphore;
+
+#[cfg(feature = "profiling")]
+use tracing::instrument;
 use bytes::Bytes;
 
 use log::{info, debug};
@@ -306,6 +309,15 @@ pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<Str
 
 /// NEW: Async GET by byte-range on full s3:// URI.
 /// If `length` is None, reads from `offset` to end.
+#[cfg_attr(feature = "profiling", instrument(
+    name = "s3.get_range",
+    skip(uri),
+    fields(
+        uri = %uri,
+        offset = %offset,
+        length = ?length
+    )
+))]
 pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() { bail!("Cannot GET range: no key specified"); }
@@ -359,6 +371,17 @@ pub fn get_range(
 /// High-performance concurrent range GET for large objects.
 /// Automatically determines optimal chunk size and concurrency based on object size.
 /// Uses pre-allocated buffers and concurrent range requests for maximum throughput.
+#[cfg_attr(feature = "profiling", instrument(
+    name = "s3.get_concurrent_range",
+    skip(uri),
+    fields(
+        uri = %uri,
+        offset = %offset,
+        length = ?length,
+        chunk_size = ?chunk_size,
+        max_concurrency = ?max_concurrency
+    )
+))]
 pub async fn get_object_concurrent_range_async(
     uri: &str,
     offset: u64,
@@ -417,6 +440,19 @@ pub async fn get_object_concurrent_range_async(
 }
 
 /// Internal implementation of concurrent range GET with pre-allocated buffers
+#[cfg_attr(feature = "profiling", instrument(
+    name = "s3.concurrent_range_impl",
+    skip(client, bucket, key),
+    fields(
+        bucket = %bucket,
+        key = %key,
+        start_offset = %start_offset,
+        end_offset = %end_offset,
+        total_bytes = %(end_offset - start_offset),
+        chunk_size = %chunk_size,
+        max_concurrency = %max_concurrency
+    )
+))]
 async fn concurrent_range_get_impl(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -706,6 +742,11 @@ pub fn get_objects_parallel(
 
 
 /// Optimized async get object call that uses concurrent range downloads for larger objects
+#[cfg_attr(feature = "profiling", instrument(
+    name = "s3.get_optimized",
+    skip(uri),
+    fields(uri = %uri)
+))]
 pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Vec<u8>> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {

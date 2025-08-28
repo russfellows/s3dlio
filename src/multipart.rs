@@ -38,6 +38,9 @@ use std::time::SystemTime;
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
 use crate::s3_utils::parse_s3_uri;
 
+#[cfg(feature = "profiling")]
+use tracing::instrument;
+
 #[derive(Clone, Debug)]
 pub struct MultipartUploadConfig {
     /// Target size of each part in bytes (AWS minimum is 5 MiB, typical 8–64 MiB).
@@ -203,6 +206,16 @@ impl MultipartUploadSink {
 
 
     /// Async write: buffers and schedules part uploads as needed.
+    #[cfg_attr(feature = "profiling", instrument(
+        name = "mpu.write",
+        skip(self, data),
+        fields(
+            data_len = data.len(),
+            buf_len = self.buf.len(),
+            part_size = self.cfg.part_size,
+            total_bytes = self.total_bytes
+        )
+    ))]
     pub async fn write(&mut self, data: Vec<u8>) -> Result<()> {
         self.total_bytes += data.len() as u64;
 

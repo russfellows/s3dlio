@@ -52,7 +52,42 @@ s3dlio supports comprehensive configuration through environment variables for pe
 - **Range GET**: `S3DLIO_RANGE_CONCURRENCY=64` for large object optimization
 - **Operation Logging**: `S3DLIO_OPLOG_LEVEL=2` for detailed S3 operation tracking
 
-📖 **[Complete Environment Variables Reference](docs/Environment_Variables.md)** - Comprehensive configuration guide with performance tuning examples
+📖 **[Complete Environment Variables Reference](docs/api/Environment_Variables.md)** - Comprehensive configuration guide with performance tuning examples
+
+## Performance Profiling & Analysis
+
+### Advanced Profiling Infrastructure (NEW in v0.7.6)
+s3dlio includes comprehensive performance profiling capabilities for analyzing and optimizing AI/ML workloads:
+
+- **🔥 CPU Profiling**: High-frequency sampling (100Hz) with flamegraph generation
+- **📊 Benchmarking Suite**: Criterion microbenchmarks validating 25+ GB/s buffer operations  
+- **⚡ Large-Scale Testing**: 5GB+ multi-object workloads achieving **1.88 GB/s upload** and **5.34 GB/s download**
+- **🎯 Zero-Overhead Design**: Feature-gated profiling with no performance impact when disabled
+
+### Running Performance Tests
+```bash
+# Set up environment for real S3 testing
+cp .env.example .env
+# Edit .env with your AWS credentials
+
+# Large-scale profiling test (5GB dataset)
+S3DLIO_TEST_SIZE_GB=5 S3DLIO_MIN_OBJECT_MB=2 S3DLIO_MAX_OBJECT_MB=8 \
+cargo run --example large_scale_s3_test --features profiling --release
+
+# Microbenchmark suite
+cargo bench --features profiling
+
+# Simple flamegraph validation
+cargo run --example simple_flamegraph_test --features profiling --release
+```
+
+### Profiling Output
+All profiling results are saved to the `profiles/` directory:
+- **Upload Analysis**: `large_scale_upload_profile.svg` - CPU distribution across concurrent uploads
+- **Download Analysis**: `large_scale_download_profile.svg` - Memory management optimization  
+- **Validation**: `simple_test_profile.svg` - Basic profiling verification
+
+📊 **[Complete Profiling Results](docs/performance/Profiling_Results_Summary.md)** - Detailed performance analysis with flamegraph insights
 
 ### Logging
 This is a new feature, that logs all S3 operations.  The file format is designed to be compatible with the MinIO warp tool.  Thus, these s3 op-log files can be used with our warp-replay project.
