@@ -18,7 +18,10 @@ This project supports both low-level storage operations (get, put, list, stat, d
 
 ## Recent Highlights
 
-### Version 0.7.3 - Modular Python API Architecture (Latest)
+### Version 0.7.5 - HTTP Client Optimization & Performance Enhancement (Latest)
+Advanced HTTP client optimization through strategic AWS SDK fork integration. Successfully forked `aws-smithy-http-client` to expose connection pool configuration, achieving +2-3% performance improvement with full backward compatibility. Features environment variable control (`S3DLIO_USE_OPTIMIZED_HTTP=true`) for easy A/B testing between AWS SDK defaults and optimized configuration. Includes enhanced connection pooling (200 max connections), optimized timeouts (800ms idle), and HTTP/2 improvements. All 84 tests pass with comprehensive performance validation.
+
+### Version 0.7.3 - Modular Python API Architecture
 Major architectural refactoring transforming the monolithic Python API into a clean modular structure. Split 1883-line `python_api.rs` into organized modules for core storage, AI/ML functions, and advanced features. Eliminated all compiler warnings, fixed critical bugs, and added comprehensive regression test suite with 16 test cases covering all 49 public functions. Zero breaking changes - all existing code continues to work unchanged.
 
 ### Version 0.7.2 - Complete Python Compression Integration

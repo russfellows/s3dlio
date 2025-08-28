@@ -8,15 +8,13 @@
 
 use anyhow::{bail, Context, Result};
 use aws_config::meta::region::RegionProviderChain;
+use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::{config::Region, Client};
-use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
-
-//use once_cell::sync::OnceCell;
-
-use tokio::runtime::{Builder, Handle};
+use aws_smithy_http_client::{tls::{self, rustls_provider::CryptoMode}, Builder as HttpClientBuilder, Connector};
+use std::{env, fs, thread, time::Duration};
+use tokio::runtime::{Builder as TokioBuilder, Handle};
 use tokio::sync::{oneshot, OnceCell};
-
-use std::{env, fs, thread};
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use log::{info, debug}; // For logging
@@ -42,10 +40,14 @@ fn global_rt_handle() -> &'static Handle {
         thread::Builder::new()
             .name("s3dlio-rt".to_string())
             .spawn(move || {
-                let rt = Builder::new_multi_thread()
+                // Intelligent thread count with environment override
+                let threads = get_runtime_threads();
+                debug!("Creating Tokio runtime with {} worker threads", threads);
+                
+                let rt = TokioBuilder::new_multi_thread()
                     .enable_io()
                     .enable_time()
-                    .worker_threads(2)
+                    .worker_threads(threads)
                     .thread_name("s3dlio-rt-worker")
                     .build()
                     .expect("failed to build global tokio runtime");
@@ -61,24 +63,58 @@ fn global_rt_handle() -> &'static Handle {
     })
 }
 
+/// Get optimal number of runtime threads with environment override
+fn get_runtime_threads() -> usize {
+    std::env::var("S3DLIO_RT_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            let cores = num_cpus::get();
+            let default_threads = std::cmp::max(8, cores * 2);
+            // Cap at reasonable maximum to avoid thread explosion
+            std::cmp::min(default_threads, 32)
+        })
+}
 
-/// Run an async `fut` on the global runtime and block the **current** (non-Tokio) thread
-/// until it completes. This never blocks a Tokio worker thread.
+
+/// Run an async `fut` on the global runtime and block the **current** thread
+/// until it completes. Handles both runtime and non-runtime contexts.
 pub fn run_on_global_rt<F, T>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let handle = global_rt_handle().clone();
-    let (tx, rx) = oneshot::channel();
+    // Check if we're already in a runtime context
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            // We're already in a runtime context, but we still need to execute on our global runtime
+            // Use spawn and block with a different approach
+            let handle = global_rt_handle().clone();
+            let (tx, rx) = std::sync::mpsc::channel();
 
-    handle.spawn(async move {
-        let _ = tx.send(fut.await);
-    });
+            handle.spawn(async move {
+                let result = fut.await;
+                let _ = tx.send(result);
+            });
 
-    // Block this plain OS thread until the async result arrives.
-    rx.blocking_recv()
-        .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
+            // Use blocking receive which works even from within runtime context
+            rx.recv()
+                .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
+        }
+        Err(_) => {
+            // Not in a runtime, use our original approach with oneshot
+            let handle = global_rt_handle().clone();
+            let (tx, rx) = oneshot::channel();
+
+            handle.spawn(async move {
+                let _ = tx.send(fut.await);
+            });
+
+            // Block this plain OS thread until the async result arrives.
+            rx.blocking_recv()
+                .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
+        }
+    }
 }
 
 
@@ -102,6 +138,104 @@ fn tls_context_from_pem(filename: impl AsRef<Path>) -> Result<tls::TlsContext> {
         .with_trust_store(trust_store)
         .build()
         .with_context(|| format!("Failed to build TLS context from PEM {}", filename.as_ref().display()))
+}
+
+
+// -----------------------------------------------------------------------------
+// HTTP Client Configuration
+// -----------------------------------------------------------------------------
+
+/// Get HTTP configuration values from environment with performance-oriented defaults
+fn get_max_http_connections() -> usize {
+    std::env::var("S3DLIO_MAX_HTTP_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            // Conservative optimization: Don't over-allocate connections
+            // Too many can cause contention, too few limit throughput
+            200  // Reduced from 600 - more conservative approach
+        })
+}
+
+/// Get HTTP idle timeout optimized for storage speed
+/// User suggested: ~100ms per MB for fast local storage
+fn get_http_idle_timeout() -> Duration {
+    std::env::var("S3DLIO_HTTP_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| {
+            // Back to user's original recommendation: ~100ms per MB
+            // For 8MB objects: 800ms timeout  
+            // More conservative than our previous 2s timeout
+            Duration::from_millis(800)  // Original user recommendation
+        })
+}
+
+/// Get operation timeout for large file transfers
+fn get_operation_timeout() -> Duration {
+    std::env::var("S3DLIO_OPERATION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| {
+            // For fast storage: ~1 second per 8MB object should be plenty
+            // 5000 objects * 1 second = 83 minutes max (very conservative)
+            // Use more aggressive timeout for better resource management
+            Duration::from_secs(120)  // 2 minutes per operation - much faster
+        })
+}
+
+/// Create an optimized HTTP client with connection pool configuration
+/// This function uses our patched aws-smithy-http-client to access hyper_builder
+fn create_optimized_http_client() -> Result<SharedHttpClient> {
+    // Get performance configuration
+    let max_connections = get_max_http_connections();
+    let idle_timeout = get_http_idle_timeout();
+    
+    debug!("Configuring optimized HTTP client: max_connections={}, idle_timeout={:?}", 
+           max_connections, idle_timeout);
+    
+    // Create hyper client with optimized connection pool settings  
+    let executor = hyper_util::rt::TokioExecutor::new();
+    let mut hyper_builder = hyper_util::client::legacy::Builder::new(executor);
+    hyper_builder
+        .pool_max_idle_per_host(max_connections)  // Maximum connections per host
+        .pool_idle_timeout(idle_timeout)          // Keep-alive timeout
+        .timer(hyper_util::rt::TokioTimer::new()) // Use Tokio timer
+        .http2_only(false)                        // Allow HTTP/1.1 and HTTP/2
+        .http2_adaptive_window(true)              // Enable HTTP/2 adaptive windows
+        .http2_keep_alive_interval(Duration::from_secs(30))  // Conservative keep-alive
+        .http2_keep_alive_timeout(Duration::from_secs(10));  // Conservative timeout
+        
+    // Then create a SharedHttpClient from the optimized Connector
+    // Since Connector doesn't implement Clone, we need to create it inside the closure
+    let http_client = HttpClientBuilder::new()
+        .build_with_connector_fn({
+            let max_connections = max_connections;
+            let idle_timeout = idle_timeout;
+            move |_settings, _components| {
+                // Recreate the hyper builder inside the closure
+                let executor = hyper_util::rt::TokioExecutor::new();
+                let mut hyper_builder = hyper_util::client::legacy::Builder::new(executor);
+                hyper_builder
+                    .pool_max_idle_per_host(max_connections)
+                    .pool_idle_timeout(idle_timeout)
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .http2_only(false)
+                    .http2_adaptive_window(true)
+                    .http2_keep_alive_interval(Duration::from_secs(30))
+                    .http2_keep_alive_timeout(Duration::from_secs(10));
+                    
+                Connector::builder()
+                    .hyper_builder(hyper_builder)
+                    .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
+                    .build()
+            }
+        });
+        
+    info!("Optimized HTTP client created with {} max connections per host", max_connections);
+    Ok(http_client)
 }
 
 
@@ -130,19 +264,44 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                 bail!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
             }
 
-            // Optional custom CA
-            let mut http_client_builder =
-                aws_smithy_http_client::Builder::new().tls_provider(tls::Provider::Rustls(
-                    CryptoMode::AwsLc,
-                ));
+            // Create HTTP client with optimized settings
+            debug!("Building HTTP client with optimization settings: max_connections={}, idle_timeout={}ms", 
+                   get_max_http_connections(), get_http_idle_timeout().as_millis());
 
-            if let Ok(ca_bundle_path) = env::var("AWS_CA_BUNDLE_PATH") {
-                debug!("Loading CA bundle from environment: {}", ca_bundle_path);
-                info!("Loading CA bundle from environment: {}", ca_bundle_path);
-                let ca_bundle_path_env = PathBuf::from(ca_bundle_path);
-                let tls_context = tls_context_from_pem(ca_bundle_path_env)?;
-                http_client_builder = http_client_builder.tls_context(tls_context);
-            }
+            let http_client = match env::var("AWS_CA_BUNDLE_PATH") {
+                Ok(ca_bundle_path) if !ca_bundle_path.is_empty() => {
+                    debug!("Loading CA bundle from environment: {}", ca_bundle_path);
+                    info!("Loading CA bundle from environment: {}", ca_bundle_path);
+                    let ca_bundle_path_env = PathBuf::from(ca_bundle_path);
+                    let tls_context = tls_context_from_pem(ca_bundle_path_env)?;
+                    
+                    // Create builder with custom CA
+                    Some(aws_smithy_http_client::Builder::new()
+                        .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
+                        .tls_context(tls_context)
+                        .build_https())
+                },
+                _ => {
+                    // Check if optimized HTTP client is enabled via environment variable
+                    // AWS SDK defaults seem to perform well, so require explicit opt-in
+                    match env::var("S3DLIO_USE_OPTIMIZED_HTTP").unwrap_or_default().to_lowercase().as_str() {
+                        "true" | "1" | "yes" | "on" | "enable" => {
+                            // Use our optimized HTTP client with connection pooling (opt-in)
+                            debug!("Using optimized HTTP client with enhanced connection pooling (enabled)");
+                            info!("HTTP optimization enabled: Enhanced connection pooling for specialized workloads");
+                            
+                            Some(create_optimized_http_client()?)
+                        },
+                        _ => {
+                            // Use default AWS SDK configuration - don't create custom HTTP client at all (DEFAULT)
+                            debug!("Using default AWS SDK HTTP client configuration (default)");
+                            info!("HTTP client: Using default AWS SDK configuration (set S3DLIO_USE_OPTIMIZED_HTTP=true to enable optimizations)");
+                            
+                            None
+                        }
+                    }
+                }
+            };
 
             // Region & optional endpoint
             let region =
@@ -151,18 +310,30 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                     .or_else(Region::new(DEFAULT_REGION));
 
             let mut loader =
-                aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
+                aws_config::defaults(aws_config::BehaviorVersion::v2025_08_07()).region(region);
             if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL") {
                 if !endpoint.is_empty() {
                     loader = loader.endpoint_url(endpoint);
                 }
             }
 
-            // Load config fully async (no blocking calls)
-            let cfg = loader
-                .http_client(http_client_builder.build_https())
-                .load()
-                .await;
+            // Load config fully async with optimized timeout configuration
+            let timeout_config = TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(5))  // Quick connection timeout
+                .operation_timeout(get_operation_timeout()) // Configurable for large transfers
+                .build();
+
+            debug!("S3 client timeout config: connect=5s, operation={}s", 
+                   get_operation_timeout().as_secs());
+
+            let mut config_builder = loader.timeout_config(timeout_config);
+            
+            // Conditionally set HTTP client only if we have one
+            if let Some(client) = http_client {
+                config_builder = config_builder.http_client(client);
+            }
+            
+            let cfg = config_builder.load().await;
 
             Ok::<_, anyhow::Error>(Client::new(&cfg))
         })

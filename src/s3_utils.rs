@@ -160,6 +160,45 @@ pub fn delete_bucket(bucket: &str) -> Result<()> {
     })
 }
 
+// -----------------------------------------------------------------------------
+// S3 List buckets
+// -----------------------------------------------------------------------------
+/// List all S3 buckets in the account.
+/// Returns a vector of bucket names with their creation dates.
+pub fn list_buckets() -> Result<Vec<BucketInfo>> {
+    run_on_global_rt(async move {
+        let client = aws_s3_client_async().await?;
+        let response = client
+            .list_buckets()
+            .send()
+            .await
+            .context("Failed to list S3 buckets")?;
+
+        let mut buckets = Vec::new();
+        let bucket_list = response.buckets();
+        for bucket in bucket_list {
+            let name = bucket.name().unwrap_or("Unknown").to_string();
+            let creation_date = bucket.creation_date()
+                .map(|dt| dt.to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            
+            buckets.push(BucketInfo {
+                name,
+                creation_date,
+            });
+        }
+        
+        Ok(buckets)
+    })
+}
+
+/// Information about an S3 bucket
+#[derive(Debug, Clone)]
+pub struct BucketInfo {
+    pub name: String,
+    pub creation_date: String,
+}
+
 /// List keys under a path, with regex matching on the final path component.
 /// Handles S3 pagination automatically.
 pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<String>> {
@@ -291,7 +330,7 @@ pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u
 
 /// Read `length` bytes starting at `offset` from `s3://bucket/key`.
 /// A negative or oversize request is truncated to the object size.
-/// Uses the existing `get_object_uri()` helper internally so we don’t
+/// Uses the existing `get_object_uri()` helper internally so we don't
 /// duplicate S3-client code right now.
 pub fn get_range(
     bucket: &str,
@@ -311,6 +350,206 @@ pub fn get_range(
     } else {
         Ok(bytes[start..end].to_vec())
     }
+}
+
+// -----------------------------------------------------------------------------
+// Concurrent Range GET Operations (Phase 1 Optimization)
+// -----------------------------------------------------------------------------
+
+/// High-performance concurrent range GET for large objects.
+/// Automatically determines optimal chunk size and concurrency based on object size.
+/// Uses pre-allocated buffers and concurrent range requests for maximum throughput.
+pub async fn get_object_concurrent_range_async(
+    uri: &str,
+    offset: u64,
+    length: Option<u64>,
+    chunk_size: Option<usize>,
+    max_concurrency: Option<usize>,
+) -> Result<Vec<u8>> {
+    let (bucket, key) = parse_s3_uri(uri)?;
+    if key.is_empty() {
+        bail!("Cannot GET concurrent range: no key specified");
+    }
+
+    // Get object size first
+    let client = aws_s3_client_async().await?;
+    let head_resp = client
+        .head_object()
+        .bucket(&bucket)
+        .key(key.trim_start_matches('/'))
+        .send()
+        .await
+        .context("head_object failed for concurrent range GET")?;
+
+    let object_size = head_resp.content_length().unwrap_or(0) as u64;
+    
+    // Calculate actual range
+    let start_offset = offset;
+    let end_offset = match length {
+        Some(len) => std::cmp::min(start_offset + len, object_size),
+        None => object_size,
+    };
+    
+    if start_offset >= object_size {
+        return Ok(Vec::new());
+    }
+    
+    let total_bytes = end_offset - start_offset;
+    
+    // Determine optimal strategy based on size
+    let effective_chunk_size = chunk_size.unwrap_or_else(|| get_optimal_chunk_size(total_bytes));
+    
+    // Use single request for small objects
+    if total_bytes <= effective_chunk_size as u64 {
+        debug!("Using single range request for {} bytes", total_bytes);
+        return get_object_range_uri_async(uri, start_offset, Some(total_bytes)).await;
+    }
+
+    // Use concurrent ranges for large objects
+    let effective_concurrency = max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
+    
+    debug!(
+        "Using concurrent range GET: {} bytes, chunk_size={}, concurrency={}",
+        total_bytes, effective_chunk_size, effective_concurrency
+    );
+
+    concurrent_range_get_impl(&client, &bucket, &key, start_offset, end_offset, effective_chunk_size, effective_concurrency).await
+}
+
+/// Internal implementation of concurrent range GET with pre-allocated buffers
+async fn concurrent_range_get_impl(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    start_offset: u64,
+    end_offset: u64,
+    chunk_size: usize,
+    max_concurrency: usize,
+) -> Result<Vec<u8>> {
+    let total_bytes = end_offset - start_offset;
+    
+    // Calculate chunk ranges
+    let mut ranges = Vec::new();
+    let mut current_offset = start_offset;
+    
+    while current_offset < end_offset {
+        let chunk_end = std::cmp::min(current_offset + chunk_size as u64, end_offset);
+        let buffer_start = (current_offset - start_offset) as usize;
+        ranges.push((current_offset, chunk_end, buffer_start));
+        current_offset = chunk_end;
+    }
+    
+    // Create semaphore for concurrency control
+    let semaphore = Arc::new(Semaphore::new(max_concurrency));
+    
+    // Use Arc<Mutex<Vec<u8>>> to store results
+    let result = Arc::new(std::sync::Mutex::new(vec![0u8; total_bytes as usize]));
+    
+    // Execute concurrent range requests
+    let mut futures = FuturesUnordered::new();
+    
+    for (range_start, range_end, buffer_offset) in ranges {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        let semaphore = semaphore.clone();
+        let result = result.clone();
+        
+        let future = async move {
+            let _permit = semaphore.acquire().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+            
+            let range_header = format!("bytes={}-{}", range_start, range_end - 1);
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key.trim_start_matches('/'))
+                .range(range_header)
+                .send()
+                .await
+                .context("concurrent range request failed")?;
+            
+            let body = resp.body.collect().await.context("collect concurrent range body")?;
+            let chunk_data = body.into_bytes();
+            
+            // Write to shared buffer
+            {
+                let mut result_guard = result.lock().map_err(|e| anyhow::anyhow!("Mutex lock error: {}", e))?;
+                let end_pos = buffer_offset + chunk_data.len();
+                result_guard[buffer_offset..end_pos].copy_from_slice(&chunk_data);
+            }
+            
+            Ok::<_, anyhow::Error>(())
+        };
+        
+        futures.push(future);
+    }
+    
+    // Wait for all requests to complete
+    while let Some(result_future) = futures.next().await {
+        result_future.context("concurrent range request failed")?;
+    }
+    
+    // Extract final result
+    let final_result = Arc::try_unwrap(result)
+        .map_err(|_| anyhow::anyhow!("Failed to unwrap result Arc"))?
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("Mutex poison error: {}", e))?;
+    
+    Ok(final_result)
+}
+
+/// Get optimal chunk size based on total transfer size
+fn get_optimal_chunk_size(total_bytes: u64) -> usize {
+    std::env::var("S3DLIO_CHUNK_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            // Intelligent defaults based on object size
+            if total_bytes < 16 * 1024 * 1024 {
+                // < 16MB: Use 1MB chunks
+                1024 * 1024
+            } else if total_bytes < 256 * 1024 * 1024 {
+                // 16MB - 256MB: Use 4MB chunks
+                4 * 1024 * 1024
+            } else {
+                // > 256MB: Use 8MB chunks for optimal throughput
+                8 * 1024 * 1024
+            }
+        })
+}
+
+/// Get optimal concurrency based on total transfer size
+fn get_optimal_concurrency(total_bytes: u64) -> usize {
+    std::env::var("S3DLIO_RANGE_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            let cores = num_cpus::get();
+            if total_bytes < 32 * 1024 * 1024 {
+                // < 32MB: Limited concurrency
+                std::cmp::max(2, cores / 2)
+            } else if total_bytes < 512 * 1024 * 1024 {
+                // 32MB - 512MB: Moderate concurrency
+                std::cmp::max(4, cores)
+            } else {
+                // > 512MB: High concurrency for large transfers
+                std::cmp::max(8, cores * 2)
+            }
+        })
+}
+
+/// Synchronous wrapper for concurrent range GET
+pub fn get_object_concurrent_range(
+    uri: &str,
+    offset: u64,
+    length: Option<u64>,
+    chunk_size: Option<usize>,
+    max_concurrency: Option<usize>,
+) -> Result<Vec<u8>> {
+    let uri_owned = uri.to_string(); // Clone the URI to avoid lifetime issues
+    run_on_global_rt(async move {
+        get_object_concurrent_range_async(&uri_owned, offset, length, chunk_size, max_concurrency).await
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -451,7 +690,7 @@ pub fn get_objects_parallel(
             let sem = Arc::clone(&sem);
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                let data = get_object_uri_async(&uri).await?;
+                let data = get_object_uri_optimized_async(&uri).await?;
                 Ok::<_, anyhow::Error>((uri, data))
             }));
         }
@@ -463,6 +702,50 @@ pub fn get_objects_parallel(
         out.sort_by_key(|(u, _)| uris.iter().position(|x| x == u).unwrap());
         Ok(out)
     })
+}
+
+
+/// Optimized async get object call that uses concurrent range downloads for larger objects
+pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Vec<u8>> {
+    let (bucket, key) = parse_s3_uri(uri)?;
+    if key.is_empty() {
+        bail!("Cannot GET: no key specified");
+    }
+    
+    // Use environment variable to control range optimization threshold
+    let range_threshold = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(4) * 1024 * 1024; // Default 4MB threshold
+    
+    // Get object size first to decide strategy
+    let client = aws_s3_client_async().await?;
+    let head_resp = client
+        .head_object()
+        .bucket(&bucket)
+        .key(key.trim_start_matches('/'))
+        .send()
+        .await;
+        
+    match head_resp {
+        Ok(resp) => {
+            let object_size = resp.content_length().unwrap_or(0) as u64;
+            
+            // For objects larger than threshold, use concurrent range downloads
+            if object_size >= range_threshold {
+                debug!("Using concurrent range download for {}MB object: {}", 
+                       object_size / (1024 * 1024), uri);
+                get_object_concurrent_range_async(uri, 0, None, None, None).await
+            } else {
+                // For smaller objects, use regular download
+                get_object(&bucket, &key).await
+            }
+        },
+        Err(_) => {
+            // If HEAD fails, fall back to regular download
+            get_object(&bucket, &key).await
+        }
+    }
 }
 
 

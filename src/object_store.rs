@@ -9,6 +9,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use crc32fast::Hasher;
 use std::io::Write;
+use log::debug;
 
 // Helper function for integrity validation
 fn compute_checksum(data: &[u8]) -> String {
@@ -47,6 +48,19 @@ use crate::azure_client::{AzureBlob, AzureBlobProperties};
 
 /// Provider-neutral object metadata. For now this aliases S3's metadata.
 pub type ObjectMetadata = S3ObjectStat;
+
+// -----------------------------------------------------------------------------
+// Performance Configuration Helpers
+// -----------------------------------------------------------------------------
+
+/// Get the threshold size for using concurrent range requests.
+/// Objects/transfers above this size will use concurrent range GET for optimal performance.
+fn get_concurrent_threshold() -> u64 {
+    std::env::var("S3DLIO_CONCURRENT_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32 * 1024 * 1024) // Default: 32MB threshold
+}
 
 /// Compression configuration for ObjectWriter implementations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +242,31 @@ pub trait ObjectStore: Send + Sync {
             bail!("Compression not supported by this ObjectStore implementation");
         }
         self.get_writer(uri).await
+    }
+
+    /// High-performance optimized GET operation for large objects.
+    /// Automatically chooses between single GET and concurrent range requests
+    /// based on object size and configured thresholds. This method provides
+    /// the best performance for large object retrieval.
+    async fn get_optimized(&self, uri: &str) -> Result<Vec<u8>> {
+        // Default implementation: delegate to regular get()
+        // S3ObjectStore will override this with concurrent range logic
+        self.get(uri).await
+    }
+
+    /// High-performance optimized range GET operation.
+    /// Uses concurrent range requests for large transfers to maximize throughput.
+    async fn get_range_optimized(
+        &self, 
+        uri: &str, 
+        offset: u64, 
+        length: Option<u64>,
+        _chunk_size: Option<usize>,
+        _max_concurrency: Option<usize>
+    ) -> Result<Vec<u8>> {
+        // Default implementation: delegate to regular get_range()
+        // S3ObjectStore will override this with concurrent range logic
+        self.get_range(uri, offset, length).await
     }
 
 }
@@ -422,6 +461,60 @@ impl ObjectStore for S3ObjectStore {
     async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
         // For S3, use buffered writer with compression support
         Ok(Box::new(S3BufferedWriter::new_with_compression(uri.to_string(), compression)))
+    }
+
+    async fn get_optimized(&self, uri: &str) -> Result<Vec<u8>> {
+        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        
+        // Get object size to determine strategy
+        let metadata = self.stat(uri).await?;
+        let object_size = metadata.size;
+        
+        // Use threshold-based decision for optimization
+        let threshold = get_concurrent_threshold();
+        
+        if object_size >= threshold {
+            debug!("Using concurrent range GET for large object: {} bytes", object_size);
+            // Use concurrent range GET for large objects
+            crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await
+        } else {
+            debug!("Using standard GET for small object: {} bytes", object_size);
+            // Use standard GET for small objects
+            self.get(uri).await
+        }
+    }
+
+    async fn get_range_optimized(
+        &self, 
+        uri: &str, 
+        offset: u64, 
+        length: Option<u64>,
+        chunk_size: Option<usize>,
+        max_concurrency: Option<usize>
+    ) -> Result<Vec<u8>> {
+        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        
+        let transfer_size = match length {
+            Some(len) => len,
+            None => {
+                // Get object size to calculate transfer size
+                let metadata = self.stat(uri).await?;
+                metadata.size.saturating_sub(offset)
+            }
+        };
+        
+        // Use threshold-based decision for optimization
+        let threshold = get_concurrent_threshold();
+        
+        if transfer_size >= threshold {
+            debug!("Using concurrent range GET for large transfer: {} bytes", transfer_size);
+            // Use concurrent range GET for large transfers
+            crate::s3_utils::get_object_concurrent_range_async(uri, offset, length, chunk_size, max_concurrency).await
+        } else {
+            debug!("Using standard range GET for small transfer: {} bytes", transfer_size);
+            // Use standard range GET for small transfers
+            self.get_range(uri, offset, length).await
+        }
     }
 }
 

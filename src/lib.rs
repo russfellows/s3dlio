@@ -58,6 +58,8 @@ pub use crate::s3_utils::{
     get_object_uri,
     get_objects_parallel,
     list_objects,
+    list_buckets,
+    BucketInfo,
     parse_s3_uri,
     stat_object_uri,
     put_objects_with_random_data_and_type,
