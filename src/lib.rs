@@ -8,6 +8,9 @@ pub mod constants;
 pub mod data_formats;
 pub mod config;
 
+// Profiling infrastructure (feature-gated)
+pub mod profiling;
+
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
 

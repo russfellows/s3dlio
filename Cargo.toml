@@ -1,6 +1,6 @@
 [package]
 name = "s3dlio"
-version = "0.7.5"
+version = "0.7.6"
 edition = "2024"
 
 [lib]
@@ -91,20 +91,36 @@ humantime    = "^2.2"
 tokio-sync   = "^0.1.8"
 base64 = "0.22.1"
 
+# --- Profiling (optional, enabled via "profiling" feature) ---------------
+tracing           = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "registry", "env-filter"], optional = true }
+console-subscriber = { version = "0.4", optional = true }
+pprof             = { version = "0.13", features = ["flamegraph"], optional = true }
+
 
 [dev-dependencies]
 tokio         = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-sync   = "^0.1.8"
 futures-util  = "^0.3"
 async-trait   = "^0.1"   # needed by the mock datasets
+criterion     = { version = "0.5", features = ["html_reports"] }
 
 [features]
 #default = []
 default = ["s3"]
 s3 = []
+profiling = ["dep:tracing", "dep:tracing-subscriber", "dep:console-subscriber", "dep:pprof"]
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 
 [patch.crates-io]
 # Use our patched version to expose hyper_builder methods for HTTP connection pool configuration
 aws-smithy-http-client = { path = "fork-patches/aws-smithy-http-client" }
+
+[[bench]]
+name = "performance_microbenchmarks"
+harness = false
+
+[[bench]]
+name = "simple_test"
+harness = false
 

@@ -1,5 +1,47 @@
 # s3dlio Changelog
 
+## Version 0.7.6 - Advanced Performance Profiling Infrastructure (August 27, 2025)
+
+This release introduces **comprehensive performance profiling capabilities** with CPU sampling, flamegraph generation, and advanced benchmarking infrastructure. Validated with large-scale testing achieving **1.88 GB/s upload** and **5.34 GB/s download** throughput.
+
+### 🔥 **Performance Profiling Infrastructure (NEW)**
+- **CPU Profiling**: High-frequency sampling (100Hz) with `pprof` integration for detailed performance analysis
+- **Flamegraph Generation**: Visual CPU hotspot analysis with SVG output to `profiles/` directory
+- **Zero-Overhead Design**: Feature-gated profiling (`--features profiling`) with no performance impact when disabled
+- **Real S3 Integration**: Profiling with actual AWS S3 operations using `.env` configuration
+
+### 📊 **Comprehensive Benchmarking Suite**
+- **Criterion Microbenchmarks**: Buffer operations (25 GB/s), data generation (2.6 GB/s), vector ops, URI parsing
+- **Large-Scale Testing**: 5GB+ multi-object workloads with realistic 2-8MB object sizes
+- **Complete S3 Lifecycle**: Bucket creation → upload → listing → download → cleanup → deletion
+- **Performance Validation**: Demonstrated **1,879 MB/s upload** and **5,335 MB/s download** speeds
+
+### 🎯 **Advanced Profiling Features**
+- **Async Task Monitoring**: Tokio console integration (`tokio-console`) for runtime analysis
+- **Structured Tracing**: Context-aware logging with span hierarchy and performance metrics
+- **Multiple Profiling Modes**: Section profiling, full-application profiling, and targeted micro-profiling
+- **Visual Analysis**: Detailed flamegraphs showing CPU distribution across concurrent operations
+
+### 🗂️ **Project Structure Optimization**
+- **Documentation Organization**: Restructured `docs/` into `performance/`, `development/`, and `api/` subdirectories
+- **Clean Example Structure**: Consolidated profiling examples with shell script integration
+- **Output Organization**: Dedicated `profiles/` directory for generated flamegraphs and analysis
+- **Professional Structure**: Following Rust best practices for scalable project organization
+
+### 🔧 **New Profiling Examples & Tools**
+- **`large_scale_s3_test.rs`**: Comprehensive 5GB+ stress testing with concurrent operations
+- **`simple_flamegraph_test.rs`**: Basic profiling validation and flamegraph generation
+- **`profile_s3_operations.rs`**: Real S3 operation profiling with environment integration
+- **`profile_performance.sh`**: Automated profiling script for continuous performance monitoring
+
+### 📈 **Performance Results & Insights**
+- **Upload Performance**: 1.88 GB/s sustained throughput with 16 concurrent operations
+- **Download Performance**: 5.34 GB/s with optimized 32 concurrent range requests
+- **Memory Efficiency**: Constant memory usage regardless of dataset size
+- **CPU Efficiency**: Minimal overhead allowing resources for ML workloads
+
+For detailed performance analysis and flamegraph results, see: [Performance Profiling Results](performance/Profiling_Results_Summary.md)
+
 ## Version 0.7.5 - HTTP Client Optimization & Performance Enhancement (August 27, 2025)
 
 This release delivers **advanced HTTP client optimization** through strategic AWS SDK integration, providing measurable performance improvements with full backward compatibility and environment variable control.
