@@ -1,6 +1,6 @@
 [project]
 name = "s3dlio"
-version = "0.7.7"
+version = "0.7.9"
 description = "Multi-protocol AI/ML storage library with zero-copy streaming, checkpointing, and data loading capabilities"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,6 +14,7 @@ build-backend = "maturin"
 module-name   = "s3dlio._pymod"   # put the .so inside the s3dlio package
 python-source = "python"
 python-packages = ["s3dlio"]      # <-- NOTE the key name
+features = ["extension-module"]    # ensure extension-module feature is enabled
 
 [tool.uv.workspace]
 members = ["python3.12"]

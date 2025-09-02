@@ -16,6 +16,9 @@ use pyo3::prelude::*;
 mod python_core_api;
 mod python_aiml_api;
 mod python_advanced_api;
+// NOTE: zero_copy_api.rs contains valuable zero-copy implementations but is disabled
+// due to numpy dependency. See zero_copy_api.rs header for enabling instructions.
+// mod zero_copy_api;
 
 // Main module registration function
 pub fn register_all_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
