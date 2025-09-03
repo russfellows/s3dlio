@@ -20,7 +20,7 @@ This project supports both low-level storage operations (get, put, list, stat, d
 
 ### ✅ Version 0.7.9 - PRODUCTION READY Python API (September 2, 2025)
 
-**BREAKTHROUGH RELEASE**: Successfully resolved all Python async/sync integration issues. The Python API is now **fully functional and production-ready** for AI/ML workloads.
+**UPDATED RELEASE**: Successfully resolved all Python async/sync integration issues. The Python API appears **fully functional and ready** for AI/ML workloads.
 
 **What's Fixed:**
 - ✅ **Async Integration**: No more "no running event loop" errors - all functions work from regular Python code
@@ -45,9 +45,9 @@ store.save('model_state', your_model_data)
 loaded_data = store.load('model_state')
 ```
 
-**Ready for Production**: All core functionality validated, comprehensive test suite, and honest documentation matching actual capabilities.
+**Ready for Beta**: All core functionality validated, comprehensive test suite, and updated documentation matching capabilities.
 
-### Version 0.7.8 - Rust API Cleanup & O_DIRECT Implementation (Latest)
+### Version 0.7.8 - Rust API Cleanup & O_DIRECT Implementation
 Complete Rust API redesign with clean, stable interfaces for external developers and working O_DIRECT implementation. Introduces new `s3dlio::api` module with factory functions `store_for_uri()` and `direct_io_store_for_uri()`, unified `ObjectStore` trait, and backward compatibility. Features functional O_DIRECT streaming writer with `DirectIOWriter`, hybrid I/O support (automatic switching between O_DIRECT for aligned data and buffered I/O for unaligned chunks), and proper error handling. Includes comprehensive documentation in `docs/api/` directory, usage examples, and documented path forward for completing O_DIRECT data persistence optimization. Provides enterprise-ready stable API for external Rust developers while maintaining all existing functionality.
 
 ### Version 0.7.7 - Phase 2 Streaming API & Complete Python Bindings
