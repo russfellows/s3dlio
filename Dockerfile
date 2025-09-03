@@ -88,8 +88,13 @@ COPY --from=builder /app/wheels ./target/wheels/
 RUN uv pip install ./target/wheels/*.whl
 
 # Cleanup build artifacts
-RUN rm -rf  /app/target/release/build /app/target/release/deps /app/src
-RUN rm -rf  /app/Cargo.* /app/*.sh /app/Dockerfile* /app/*.toml
+RUN rm -rf  /app/target/release/build /app/target/release/deps /app/src && \
+	rm -rf  /app/Cargo.* /app/*.sh /app/Dockerfile* /app/*.toml && \
+	rm -f   /app/tests/*.rs && \
+	rm -rf  /app/examples && \
+	rm -rf  /app/benches && \
+	rm -rf  /app/fork-patches && \
+	rm -rf  /app/profiles
 
 
 # Default to bash for interactive testing.
