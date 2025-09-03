@@ -264,7 +264,7 @@ The container will contain the executable, along with a python library.  This al
 ### Building / Pulling
 Either docker or podman may be used to create the image, typically with a `podman build -t xxx .` where xxx is the name you want to use for your container image. For those that want to simply pull and run a pre-built container, a relatively recent image may be found on quay.io.  However, the version on quay may be older than that available by building from the source code in this repository.  
 
-***Note:** A NEW container is here:  https://quay.io/repository/russfellows-sig65/s3dlio*
+***Note:** A NEW container is here:  [https://quay.io/repository/russfellows-sig65/s3dlio](https://quay.io/repository/russfellows-sig65/s3dlio/tag/latest)*
 
 In order to pull the container using podman (or docker), you may execute the following:
 
