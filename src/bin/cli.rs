@@ -37,6 +37,7 @@ use s3dlio::{
 
 use s3dlio::s3_copy::{upload_files, download_objects};
 use s3dlio::{init_op_logger, finalize_op_logger};
+use s3dlio::progress::S3ProgressTracker;
 
 
 // --- Define the S3Path struct for clap to use as a custom parser.
@@ -359,11 +360,19 @@ async fn main() -> Result<()> {
     
     
         Command::Upload { files, dest, jobs, create_bucket } => {
-            upload_files(&dest, &files, jobs, create_bucket)?
+            let spinner = S3ProgressTracker::spinner("UPLOAD");
+            spinner.set_message(format!("Uploading files to {}...", dest));
+            let result = upload_files(&dest, &files, jobs, create_bucket);
+            spinner.finish_with_message("Upload complete!");
+            result?
         }
     
         Command::Download { src, dest_dir, jobs, recursive } => {
-            download_objects(&src, &dest_dir, jobs, recursive)?
+            let spinner = S3ProgressTracker::spinner("DOWNLOAD");
+            spinner.set_message(format!("Downloading from {} to {:?}...", src, dest_dir));
+            let result = download_objects(&src, &dest_dir, jobs, recursive);
+            spinner.finish_with_message("Download complete!");
+            result?
         }
     
         Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f } => {
@@ -465,21 +474,19 @@ fn get_cmd(uri: &str, jobs: usize, recursive: bool) -> Result<()> {
     }
 
     let uris: Vec<String> = keys_to_get.into_iter().map(|k| format!("s3://{}/{}", bucket, k)).collect();
-    eprintln!("Fetching {} objects with {} jobs…", uris.len(), jobs);
+    
+    // Create progress bar for download operation
+    let progress = S3ProgressTracker::new("GET", uris.len() as u64, 0); // We don't know total bytes yet
+    progress.progress_bar.set_message(format!("Preparing to download {} objects...", uris.len()));
 
     let t0 = Instant::now();
-    let total_bytes: usize = get_objects_parallel(&uris, jobs)?
-        .into_iter()
-        .map(|(_, bytes)| bytes.len())
-        .sum();
+    let results = get_objects_parallel(&uris, jobs)?;
+    
+    let total_bytes: usize = results.iter().map(|(_, bytes)| bytes.len()).sum();
     let dt = t0.elapsed();
 
-    eprintln!(
-        "downloaded {:.2} MB in {:?} ({:.2} MB/s)",
-        total_bytes as f64 / 1_048_576.0,
-        dt,
-        total_bytes as f64 / 1_048_576.0 / dt.as_secs_f64()
-    );
+    // Finish the progress bar with completion stats
+    progress.finish("Download", total_bytes as u64, dt);
 
     Ok(())
 }
@@ -544,19 +551,18 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
 
     // Find the lesser of the number of jobs or number of objects
     let effective_jobs = std::cmp::min(jobs, num);
-    let t0 = Instant::now();
-
-    put_objects_with_random_data_and_type(&uris, size, effective_jobs, object_type, dedup_f, compress_f)?;
-
-    let elapsed = t0.elapsed();
     let total_bytes = num * size;
-    let mb_total = total_bytes as f64 / (1024.0 * 1024.0);
-    let throughput = mb_total / elapsed.as_secs_f64();
-    let objects_per_sec = num as f64 / elapsed.as_secs_f64();
-    println!(
-        "Uploaded {} objects (total {} bytes) in {:?} ({:.2} objects/s, {:.2} MB/s)",
-        num, total_bytes, elapsed, objects_per_sec, throughput
-    );
+    
+    // Create progress bar for upload operation
+    let progress = S3ProgressTracker::new("PUT", num as u64, total_bytes as u64);
+    progress.progress_bar.set_message(format!("Preparing to upload {} objects...", num));
+
+    let t0 = Instant::now();
+    put_objects_with_random_data_and_type(&uris, size, effective_jobs, object_type, dedup_f, compress_f)?;
+    let elapsed = t0.elapsed();
+
+    // Finish the progress bar with completion stats
+    progress.finish("Upload", total_bytes as u64, elapsed);
     Ok(())
 }
 
