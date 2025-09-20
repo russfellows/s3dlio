@@ -4,6 +4,13 @@
 //
 // Crate root — public re-exports plus the Python module glue.
 
+// Compile-time feature compatibility check
+#[cfg(all(feature = "native-backends", feature = "arrow-backend"))]
+compile_error!("Enable only one of: native-backends or arrow-backend");
+
+#[cfg(not(any(feature = "native-backends", feature = "arrow-backend")))]
+compile_error!("Must enable either 'native-backends' or 'arrow-backend' feature");
+
 // ===== Core Public API =====
 // This is the main stable API that external users should use
 pub mod api;
@@ -34,6 +41,11 @@ pub mod s3_utils;
 pub mod s3_logger;
 pub mod s3_ops;
 pub mod object_store;
+
+// Arrow backend (optional, feature-gated)
+#[cfg(feature = "arrow-backend")]
+pub mod object_store_arrow;
+
 pub mod file_store;
 pub mod file_store_direct;
 pub mod data_gen;
@@ -54,14 +66,27 @@ pub use crate::data_loader::options::LoaderOptions;
 // Module alias so tests can use `s3dlio::dataset::DynStream`:
 pub use crate::data_loader::dataset;  // re-export the whole module as `s3dlio::dataset`
 
+// Common object store types (available for both backends)
 pub use object_store::{
     ObjectStore,
-    S3ObjectStore,
     ObjectMetadata,
     infer_scheme,
-    store_for_uri,
     Scheme,
 };
+
+// Native backend specific exports
+#[cfg(feature = "native-backends")]
+pub use object_store::{
+    S3ObjectStore,
+    store_for_uri,
+    store_for_uri_with_config,
+    direct_io_store_for_uri,
+    high_performance_store_for_uri,
+};
+
+// Arrow backend specific exports
+#[cfg(feature = "arrow-backend")]
+pub use object_store_arrow::store_for_uri;
 
 pub use file_store::FileSystemObjectStore;
 

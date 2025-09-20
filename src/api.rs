@@ -55,15 +55,23 @@ pub use crate::object_store::ObjectMetadata;
 /// URI scheme detection
 pub use crate::object_store::{Scheme, infer_scheme};
 
-// Factory functions for creating stores
-/// Create an object store for the given URI
+// Factory functions for creating stores (backend-dependent)
+#[cfg(feature = "native-backends")]
+#[cfg(feature = "native-backends")]
+/// Create an object store for the given URI (native AWS/Azure backend)
 pub use crate::object_store::store_for_uri;
 
-/// Create a direct I/O optimized object store
+#[cfg(feature = "native-backends")]
+/// Create a direct I/O optimized object store (native backend only)
 pub use crate::object_store::direct_io_store_for_uri;
 
-/// Create a high-performance object store (with optimizations)
+#[cfg(feature = "native-backends")]
+/// Create a high-performance object store (native backend only)
 pub use crate::object_store::high_performance_store_for_uri;
+
+#[cfg(feature = "arrow-backend")]
+/// Create an object store for the given URI (Apache Arrow backend)
+pub use crate::object_store_arrow::store_for_uri;
 
 // Data loading interface
 /// Main data loader for ML/AI workloads

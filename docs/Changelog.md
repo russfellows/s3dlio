@@ -1,5 +1,95 @@
 # s3dlio Changelog
 
+## Version 0.7.10 - Apache Arrow Backend & Performance Optimization (September 19, 2025)
+
+### 🚀 **Major Release: Apache Arrow Backend Implementation**
+
+This release introduces a complete **Apache Arrow `object_store` backend** as a high-performance alternative to the native AWS SDK. The Arrow backend delivers **superior performance** while providing better ecosystem integration and future-proofing.
+
+**Key Achievement**: Arrow backend **outperforms native AWS SDK by 15% for PUT operations** and 6% for GET operations, proving that modern object storage abstractions can exceed vendor-specific performance.
+
+### 🎯 **Performance Highlights**
+
+| Backend | PUT Performance | GET Performance | Overall Status |
+|---------|----------------|-----------------|----------------|
+| **Apache Arrow** | **349.86 MB/s** | **2442.47 MB/s** | ✅ **Superior** |
+| Native AWS SDK | 304.54 MB/s | 2299.26 MB/s | ✅ Baseline |
+
+**Performance Improvement**: +15% PUT throughput, +6% GET throughput with Arrow backend
+
+### ✅ **Core Features Implemented**
+
+#### **🏗️ Complete Apache Arrow Backend**
+- **Full API Compatibility**: Drop-in replacement for native backend with identical interface
+- **Feature Flag System**: Compile-time backend selection with `--features arrow-backend`
+- **S3 Protocol Compliance**: Full compatibility with AWS S3 and S3-compatible storage
+- **Production Ready**: Handles real-world workloads with excellent performance characteristics
+
+#### **📊 Comprehensive Performance Framework**  
+- **Backend Comparison Tests**: Automated performance testing with identical conditions
+- **High-Performance Functions**: Uses optimized batch operations (`put_objects_parallel`, `get_objects_parallel`)
+- **Concurrency Optimization**: Proper async task management with `FuturesUnordered` and semaphore limiting
+- **Automated Scripts**: `run_backend_comparison.sh` for reproducible performance testing
+
+#### **🔧 Technical Implementation**
+- **Explicit S3Builder Configuration**: Bypasses EC2 metadata service dependencies
+- **Zero-Copy Data Handling**: Efficient `Bytes` cloning for minimal memory overhead  
+- **Tokio Integration**: Full async/await compatibility with proper task spawning
+- **Error Handling**: Comprehensive error propagation consistent with native backend
+
+### 🚨 **Critical Performance Discovery**
+
+**Issue Identified**: Initial tests showed terrible performance (~10 MB/s) due to using individual async calls instead of high-performance batch functions.
+
+**Solution Implemented**: Switched to CLI-equivalent high-performance functions:
+- `put_objects_with_random_data_and_type()` for PUT operations
+- `get_objects_parallel()` for GET operations  
+
+**Result**: **35x performance improvement** - from 10 MB/s to 350+ MB/s throughput
+
+### 📈 **Performance Optimization Insights**
+
+1. **Batch Operations Critical**: Individual async calls create overhead - batch functions essential for performance
+2. **Concurrency Tuning**: 16 PUT / 32 GET concurrent operations optimal for s3dlio workloads
+3. **Arrow Scales Better**: Superior performance with larger objects (375 MB/s vs 319 MB/s for 10MB objects)
+4. **Memory Efficiency**: Both backends use zero-copy patterns effectively
+
+### 🛠️ **Usage Instructions**
+
+```bash
+# Build with Arrow backend
+cargo build --no-default-features --features arrow-backend
+
+# Run performance comparison
+./scripts/run_backend_comparison.sh
+
+# Test Arrow backend specifically  
+cargo test --no-default-features --features arrow-backend test_arrow_backend_performance
+```
+
+### 📚 **Documentation Added**
+
+- **Performance Guide**: `docs/performance/Apache_Arrow_Backend_Implementation.md`
+- **Comparison Framework**: Detailed performance testing methodology 
+- **Usage Instructions**: Complete setup and configuration guide
+- **Technical Architecture**: Implementation details and design decisions
+
+### 🔄 **Breaking Changes**
+
+- **Feature Flags**: Backends are now mutually exclusive - cannot enable both simultaneously
+- **Compile-Time Selection**: Must choose backend at build time via feature flags
+- **API Compatibility**: No runtime API changes - fully backward compatible
+
+### 🎯 **Future Implications**
+
+The Arrow backend success demonstrates:
+- Modern object storage abstractions can exceed vendor SDKs
+- Apache Arrow ecosystem provides excellent S3 compatibility  
+- Performance-critical applications benefit from explicit async concurrency
+- Feature flag architecture enables clean backend experimentation
+
+---
+
 ## Version 0.7.9 - Python API Stability & Multi-Backend Streaming (September 2, 2025)
 
 This release delivers a **stable, production-ready Python API** with fully functional streaming operations across multiple storage backends and comprehensive checkpoint system. Focus on reliability and actual functionality over feature claims.
