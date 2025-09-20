@@ -1,6 +1,6 @@
 [package]
 name = "s3dlio"
-version = "0.7.9"
+version = "0.7.10"
 edition = "2024"
 
 [lib]
@@ -91,6 +91,10 @@ humantime    = "^2.2"
 tokio-sync   = "^0.1.8"
 base64 = "0.22.1"
 
+# --- Arrow backend (optional, enabled via "arrow-backend" feature) -------
+object_store = { version = "0.12", default-features = false, features = ["aws", "azure", "http", "gcp"], optional = true }
+url = { version = "2.5", optional = true }
+
 # --- Profiling (optional, enabled via "profiling" feature) ---------------
 tracing           = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["fmt", "registry", "env-filter"], optional = true }
@@ -107,14 +111,20 @@ criterion     = { version = "0.5", features = ["html_reports"] }
 
 [features]
 #default = []
-default = ["s3"]
+default = ["s3", "native-backends"]
 s3 = []
+native-backends = []                    # Current AWS/Azure implementations  
+arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
 profiling = ["dep:tracing", "dep:tracing-subscriber", "dep:console-subscriber", "dep:pprof"]
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 
 [patch.crates-io]
 # Use our patched version to expose hyper_builder methods for HTTP connection pool configuration
 aws-smithy-http-client = { path = "fork-patches/aws-smithy-http-client" }
+
+[[example]]
+name = "s3_backend_comparison"
+path = "examples/s3_backend_comparison.rs"
 
 [[bench]]
 name = "performance_microbenchmarks"
