@@ -27,6 +27,7 @@ pub use api::*;
 pub mod constants;
 pub mod data_formats;
 pub mod config;
+pub mod progress;
 
 // Profiling infrastructure (feature-gated)
 pub mod profiling;
@@ -52,6 +53,11 @@ pub mod data_gen;
 pub mod data_loader;
 pub mod checkpoint;
 pub mod azure_client;
+pub mod concurrency;
+#[cfg(feature = "enhanced-http")]
+pub mod http;
+pub mod io_uring;
+pub mod performance;
 mod multipart;
 
 // ===== Legacy Re-exports for Backward Compatibility =====

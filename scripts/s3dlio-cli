@@ -1,0 +1,32 @@
+#!/bin/bash
+# scripts/s3dlio-cli
+#
+# Wrapper script for easy backend selection
+
+BACKEND="${S3DLIO_BACKEND:-native}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(dirname "$SCRIPT_DIR")"
+
+case "$BACKEND" in
+    "native"|"aws")
+        CLI_BINARY="$BASE_DIR/target/performance_variants/s3-cli-native"
+        ;;
+    "arrow")
+        CLI_BINARY="$BASE_DIR/target/performance_variants/s3-cli-arrow"
+        ;;
+    *)
+        echo "❌ Invalid backend: $BACKEND"
+        echo "   Set S3DLIO_BACKEND to 'native' or 'arrow'"
+        echo "   Example: S3DLIO_BACKEND=arrow $0 put s3://bucket/key"
+        exit 1
+        ;;
+esac
+
+if [[ ! -f "$CLI_BINARY" ]]; then
+    echo "❌ CLI binary not found: $CLI_BINARY"
+    echo "   Run: $BASE_DIR/scripts/build_performance_variants.sh"
+    exit 1
+fi
+
+echo "🎯 Using $BACKEND backend: $(basename "$CLI_BINARY")"
+exec "$CLI_BINARY" "$@"
