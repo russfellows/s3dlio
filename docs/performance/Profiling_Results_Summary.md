@@ -116,9 +116,10 @@ All profiling outputs are saved to the `profiles/` directory:
 
 Based on profiling results, potential areas for improvement:
 1. **SIMD Optimization**: Vectorized data operations for buffer management
-2. **io_uring Integration**: Linux-specific async I/O for even higher throughput
-3. **Memory Pool Optimization**: Further reduce allocation overhead
-4. **Compression Pipeline**: Hardware-accelerated compression for network optimization
+2. **Memory Pool Optimization**: Further reduce allocation overhead  
+3. **Compression Pipeline**: Hardware-accelerated compression for network optimization
+
+**Note**: io_uring integration was evaluated in v0.7.11 but removed in v0.8.0 as it provided no performance benefits for network I/O operations.
 
 ---
 

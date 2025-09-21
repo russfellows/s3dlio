@@ -108,6 +108,39 @@ impl S3Ops {
         }
     }
 
+    /// GET (Download) a range of bytes from an object.
+    pub async fn get_object_range(&self, bucket: &str, key: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+        let ctx = LogContext {
+            operation: "GET_RANGE",
+            key: format!("{}[{}-{}]", key, start, end),
+            num_objects: 1,
+            start_time: SystemTime::now(),
+        };
+
+        let range = format!("bytes={}-{}", start, end);
+        let result = self.client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range(range)
+            .send()
+            .await;
+        let first_byte_time = SystemTime::now();
+
+        match result {
+            Ok(output) => {
+                let body = output.body.collect().await?.into_bytes();
+                let bytes = body.len() as u64;
+                self.log_op(ctx, &Ok::<(), &str>(()), bytes, Some(first_byte_time));
+                Ok(body.to_vec())
+            }
+            Err(e) => {
+                self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None); 
+                Err(e.into())
+            }
+        }
+    }
+
     /// PUT (Upload) an object.
     pub async fn put_object(&self, bucket: &str, key: &str, data: Vec<u8>) -> Result<()> {
         let ctx = LogContext {

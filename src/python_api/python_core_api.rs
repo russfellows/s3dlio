@@ -50,6 +50,134 @@ pub fn py_err<E: std::fmt::Display>(error: E) -> PyErr {
     PyRuntimeError::new_err(format!("{}", error))
 }
 
+/// Multi-process GET for maximum throughput (Python API)
+/// 
+/// Args:
+///     uri (str): S3 URI prefix (e.g., "s3://bucket/prefix/")
+///     procs (int): Number of worker processes to spawn (default: 4)
+///     jobs (int): Concurrent operations per worker process (default: 64)  
+///     num (int): Number of objects to download (for benchmarking, default: 1000)
+///     template (str): Object name template with {} placeholder (default: "object_{}.dat")
+/// 
+/// Returns:
+///     dict: Performance statistics with keys:
+///         - total_objects (int): Total objects processed
+///         - total_bytes (int): Total bytes transferred  
+///         - duration_seconds (float): Time taken
+///         - throughput_mb_s (float): Overall throughput in MB/s
+///         - ops_per_sec (float): Operations per second
+///         - workers (list): Per-worker performance stats
+
+/// Find the s3-cli binary for use as worker processes
+fn find_s3_cli_binary() -> Result<String, anyhow::Error> {
+    use std::path::Path;
+    
+    // Try common development locations
+    let candidates = vec![
+        "./target/release/s3-cli",
+        "./target/debug/s3-cli",
+        "../target/release/s3-cli", 
+        "../target/debug/s3-cli",
+    ];
+    
+    for candidate in candidates {
+        if Path::new(candidate).exists() {
+            return Ok(candidate.to_string());
+        }
+    }
+    
+    // Try finding s3-cli in PATH
+    if let Ok(output) = std::process::Command::new("which").arg("s3-cli").output() {
+        if output.status.success() {
+            let path = String::from_utf8(output.stdout)?;
+            let path = path.trim();
+            if !path.is_empty() {
+                return Ok(path.to_string());
+            }
+        }
+    }
+    
+    anyhow::bail!("Could not find s3-cli binary. Please build it with 'cargo build --bin s3-cli' or ensure it's in PATH")
+}
+
+#[pyfunction]
+#[pyo3(signature = (uri, procs = 4, jobs = 64, num = 1000, template = "object_{}.dat"))]
+pub fn mp_get(
+    uri: &str,
+    procs: usize,
+    jobs: usize,
+    num: usize,
+    template: &str,
+) -> PyResult<PyObject> {
+    use crate::mp::{MpGetConfigBuilder, run_get_shards};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    
+    Python::with_gil(|py| {
+        // Parse S3 URI
+        let (bucket, key_prefix) = parse_s3_uri(uri).map_err(py_err)?;
+        
+        // Generate object keys based on template and number
+        let mut keys = Vec::new();
+        for i in 0..num {
+            let key = if template.contains("{}") {
+                template.replace("{}", &i.to_string())
+            } else {
+                format!("{}{}", template, i)
+            };
+            keys.push(format!("s3://{}/{}{}", bucket, key_prefix, key));
+        }
+        
+        // Create temporary keylist file
+        let mut keylist_file = NamedTempFile::new().map_err(py_err)?;
+        for key in &keys {
+            writeln!(keylist_file, "{}", key).map_err(py_err)?;
+        }
+        let keylist_path = keylist_file.path().to_path_buf();
+        
+        // Find the s3-cli binary for worker processes
+        let s3_cli_path = find_s3_cli_binary().map_err(py_err)?;
+        
+        // Configure multi-process GET
+        let config = MpGetConfigBuilder::new()
+            .procs(procs)
+            .concurrent_per_proc(jobs)
+            .keylist(keylist_path)
+            .worker_cmd(s3_cli_path)
+            .build();
+        
+        // Run the multi-process operation
+        let result = run_get_shards(&config).map_err(py_err)?;
+        
+        // Build Python dictionary result
+        let dict = PyDict::new(py);
+        dict.set_item("total_objects", result.total_objects)?;
+        dict.set_item("total_bytes", result.total_bytes)?;
+        dict.set_item("duration_seconds", result.elapsed_seconds)?;
+        dict.set_item("throughput_mb_s", result.throughput_mbps())?;
+        dict.set_item("ops_per_sec", result.ops_per_second())?;
+        
+        // Add per-worker stats
+        let workers = PyList::empty(py);
+        for worker in &result.per_worker {
+            let worker_dict = PyDict::new(py);
+            worker_dict.set_item("worker_id", worker.worker_id)?;
+            worker_dict.set_item("objects", worker.objects)?;
+            worker_dict.set_item("bytes", worker.bytes)?;
+            let worker_throughput = if result.elapsed_seconds > 0.0 {
+                (worker.bytes as f64 / (1024.0 * 1024.0)) / result.elapsed_seconds
+            } else {
+                0.0
+            };
+            worker_dict.set_item("throughput_mb_s", worker_throughput)?;
+            workers.append(worker_dict)?;
+        }
+        dict.set_item("workers", workers)?;
+        
+        Ok(dict.into_py_any(py)?.into())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Logging helpers
 // ---------------------------------------------------------------------------
@@ -648,6 +776,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_many, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
     m.add_function(wrap_pyfunction!(upload, m)?)?;
+    m.add_function(wrap_pyfunction!(mp_get, m)?)?;
     
     // Phase 2 Streaming API classes and functions
     m.add_class::<PyWriterOptions>()?;

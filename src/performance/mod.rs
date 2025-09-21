@@ -17,9 +17,6 @@ use crate::concurrency::AdaptiveScheduler;
 #[cfg(feature = "enhanced-http")]
 use crate::http::EnhancedHttpClient;
 
-#[cfg(feature = "io-uring")]
-use crate::io_uring::IoUringFileStore;
-
 /// Performance-optimized S3 client factory
 pub struct PerformanceOptimizedClient {
     config: PerformanceConfig,
@@ -27,9 +24,6 @@ pub struct PerformanceOptimizedClient {
     
     #[cfg(feature = "enhanced-http")]
     http_client: Option<EnhancedHttpClient>,
-    
-    #[cfg(feature = "io-uring")]
-    io_uring_store: Option<IoUringFileStore>,
 }
 
 impl PerformanceOptimizedClient {
@@ -53,22 +47,12 @@ impl PerformanceOptimizedClient {
             None
         };
         
-        #[cfg(feature = "io-uring")]
-        let io_uring_store = if config.enable_optimizations && cfg!(target_os = "linux") {
-            Some(IoUringFileStore::new(config.io_uring.clone())?)
-        } else {
-            None
-        };
-        
         Ok(Self {
             config,
             scheduler,
             
             #[cfg(feature = "enhanced-http")]
             http_client,
-            
-            #[cfg(feature = "io-uring")]
-            io_uring_store,
         })
     }
     
@@ -111,12 +95,6 @@ impl PerformanceOptimizedClient {
     #[cfg(feature = "enhanced-http")]
     pub fn http_client(&self) -> Option<&EnhancedHttpClient> {
         self.http_client.as_ref()
-    }
-    
-    /// Get the io_uring store (if enabled and feature available)
-    #[cfg(feature = "io-uring")]
-    pub fn io_uring_store(&self) -> Option<&IoUringFileStore> {
-        self.io_uring_store.as_ref()
     }
     
     /// Update configuration dynamically
@@ -173,17 +151,6 @@ impl PerformanceOptimizedClient {
         !endpoint.contains("amazonaws.com")
     }
     
-    /// Check if io_uring should be used
-    pub fn should_use_io_uring(&self) -> bool {
-        #[cfg(feature = "io-uring")]
-        {
-            return self.io_uring_store.is_some() && cfg!(target_os = "linux");
-        }
-        
-        #[cfg(not(feature = "io-uring"))]
-        false
-    }
-    
     /// Get performance statistics
     pub fn performance_stats(&self) -> PerformanceStats {
         let mut stats = PerformanceStats::default();
@@ -203,14 +170,6 @@ impl PerformanceOptimizedClient {
             }
         }
         
-        #[cfg(feature = "io-uring")]
-        {
-            if let Some(store) = &self.io_uring_store {
-                stats.io_uring_operations = store.operation_count();
-                stats.io_uring_queue_depth = store.current_queue_depth();
-            }
-        }
-        
         stats
     }
 }
@@ -223,8 +182,6 @@ pub struct PerformanceStats {
     pub operations_completed: u64,
     pub http2_connections: usize,
     pub http1_connections: usize,
-    pub io_uring_operations: u64,
-    pub io_uring_queue_depth: u32,
 }
 
 impl std::fmt::Display for PerformanceStats {
@@ -237,11 +194,6 @@ impl std::fmt::Display for PerformanceStats {
         if self.http2_connections > 0 || self.http1_connections > 0 {
             writeln!(f, "  HTTP/2 Connections: {}", self.http2_connections)?;
             writeln!(f, "  HTTP/1.1 Connections: {}", self.http1_connections)?;
-        }
-        
-        if self.io_uring_operations > 0 {
-            writeln!(f, "  io_uring Operations: {}", self.io_uring_operations)?;
-            writeln!(f, "  io_uring Queue Depth: {}", self.io_uring_queue_depth)?;
         }
         
         Ok(())
