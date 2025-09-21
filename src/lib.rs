@@ -28,6 +28,11 @@ pub mod constants;
 pub mod data_formats;
 pub mod config;
 pub mod progress;
+pub mod memory;
+pub mod download;
+pub mod sharded_client;
+pub mod range_engine;
+pub mod mp;
 
 // Profiling infrastructure (feature-gated)
 pub mod profiling;
@@ -56,7 +61,6 @@ pub mod azure_client;
 pub mod concurrency;
 #[cfg(feature = "enhanced-http")]
 pub mod http;
-pub mod io_uring;
 pub mod performance;
 mod multipart;
 

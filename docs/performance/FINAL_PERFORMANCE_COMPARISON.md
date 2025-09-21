@@ -2,8 +2,10 @@
 
 **Test Date**: September 20, 2025  
 **Test Configuration**: 5,000 objects × 10 MiB = 48.8 GB total data  
-**Test Environment**: Enhanced features (HTTP/2, io_uring), 48 concurrent jobs, 3.0 GB/s target  
+**Test Environment**: Enhanced features (HTTP/2), 48 concurrent jobs, 3.0 GB/s target  
 **Baseline Tool**: Warp S3 benchmarking tool with fixed 10 MiB objects, 2-minute duration
+
+> **Update v0.8.0**: io_uring references preserved for historical accuracy but removed from current codebase. New multi-process architecture in v0.8.0 delivers 2x performance improvement via different approach.
 
 ## 🎯 Performance Baseline: Warp Results
 

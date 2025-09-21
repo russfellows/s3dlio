@@ -76,7 +76,16 @@ fn get_system_page_size() -> usize {
         unsafe {
             let page_size = libc::sysconf(libc::_SC_PAGESIZE);
             if page_size > 0 {
-                page_size as usize
+                let detected_size = page_size as usize;
+                
+                // Validate the detected page size is within reasonable bounds
+                // Most systems use 4KB pages, some use 8KB, 16KB, or 64KB
+                if detected_size >= 512 && detected_size <= 65536 && detected_size.is_power_of_two() {
+                    detected_size
+                } else {
+                    // Invalid page size detected, use safe default
+                    DEFAULT_PAGE_SIZE
+                }
             } else {
                 DEFAULT_PAGE_SIZE // Fallback if sysconf fails
             }
@@ -87,6 +96,64 @@ fn get_system_page_size() -> usize {
     {
         DEFAULT_PAGE_SIZE // Default fallback for non-Unix systems
     }
+}
+
+/// Create a page-aligned buffer for O_DIRECT operations
+fn create_aligned_buffer(size: usize, alignment: usize) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        // Use posix_memalign to create properly aligned buffer
+        use std::alloc::{alloc, Layout};
+        
+        if size == 0 {
+            return Vec::new();
+        }
+        
+        // Ensure size is aligned to alignment boundary
+        let aligned_size = ((size + alignment - 1) / alignment) * alignment;
+        
+        unsafe {
+            let layout = Layout::from_size_align(aligned_size, alignment)
+                .expect("Invalid layout for aligned buffer");
+            let ptr = alloc(layout);
+            
+            if ptr.is_null() {
+                panic!("Failed to allocate aligned buffer");
+            }
+            
+            // Initialize with zeros
+            std::ptr::write_bytes(ptr, 0, aligned_size);
+            
+            // Create Vec from raw parts
+            Vec::from_raw_parts(ptr, 0, aligned_size)
+        }
+    }
+    
+    #[cfg(not(unix))]
+    {
+        // Fallback for non-Unix systems - regular Vec
+        vec![0u8; size]
+    }
+}
+
+/// Resize an aligned buffer, preserving alignment
+fn resize_aligned_buffer(buffer: &mut Vec<u8>, new_size: usize, alignment: usize) {
+    if new_size <= buffer.capacity() {
+        // Simple case - just adjust length
+        unsafe {
+            buffer.set_len(new_size);
+        }
+        return;
+    }
+    
+    // Need to reallocate with larger capacity
+    let mut new_buffer = create_aligned_buffer(new_size, alignment);
+    let copy_size = std::cmp::min(buffer.len(), new_size);
+    new_buffer[..copy_size].copy_from_slice(&buffer[..copy_size]);
+    unsafe {
+        new_buffer.set_len(buffer.len());
+    }
+    *buffer = new_buffer;
 }
 
 /// Streaming writer for direct I/O filesystem operations
@@ -167,13 +234,20 @@ impl DirectIOWriter {
             fs::File::create(&final_path).await?
         };
         
+        // Create aligned buffer for O_DIRECT operations
+        let buffer = if config.direct_io {
+            create_aligned_buffer(config.min_io_size * 2, config.alignment)
+        } else {
+            Vec::new()
+        };
+        
         Ok(Self {
             file: Some(file),
             path: final_path,
             config,
             bytes_written: 0,
             finalized: false,
-            buffer: Vec::new(),
+            buffer,
             hasher: Hasher::new(),
             compression,
             compressor,
@@ -219,24 +293,50 @@ impl ObjectWriter for DirectIOWriter {
                 file.sync_all().await?;
             }
         } else {
-            // DirectIO - need to handle alignment and buffering
-            self.buffer.extend_from_slice(&data_to_write);
-            
-            // Write aligned chunks when we have enough data
+            // DirectIO - need to handle alignment and buffering with proper page alignment
             let alignment = self.config.alignment;
             let min_io_size = self.config.min_io_size;
             
+            // Ensure buffer has enough capacity for the new data
+            let new_len = self.buffer.len() + data_to_write.len();
+            if new_len > self.buffer.capacity() {
+                let new_capacity = ((new_len + min_io_size - 1) / min_io_size) * min_io_size;
+                resize_aligned_buffer(&mut self.buffer, new_capacity, alignment);
+            }
+            
+            // Copy data to aligned buffer
+            let old_len = self.buffer.len();
+            unsafe {
+                let dst = self.buffer.as_mut_ptr().add(old_len);
+                std::ptr::copy_nonoverlapping(data_to_write.as_ptr(), dst, data_to_write.len());
+                self.buffer.set_len(old_len + data_to_write.len());
+            }
+            
+            // Write aligned chunks when we have enough data
             while self.buffer.len() >= min_io_size {
                 let write_size = (self.buffer.len() / alignment) * alignment;
                 if write_size > 0 {
-                    // Extract the data to write
-                    let write_data = self.buffer.drain(..write_size).collect::<Vec<u8>>();
+                    // Create aligned write buffer by copying from our aligned buffer
+                    let write_slice = &self.buffer[..write_size];
                     
-                    // Write the data
-                    file.write_all(&write_data).await?;
+                    // Write the aligned data directly from our aligned buffer
+                    file.write_all(write_slice).await?;
                     
                     // For O_DIRECT, we must sync immediately to ensure data persistence  
                     file.sync_all().await?;
+                    
+                    // Move remaining data to front of buffer
+                    let remaining = self.buffer.len() - write_size;
+                    if remaining > 0 {
+                        unsafe {
+                            let src = self.buffer.as_ptr().add(write_size);
+                            let dst = self.buffer.as_mut_ptr();
+                            std::ptr::copy(src, dst, remaining);
+                        }
+                    }
+                    unsafe {
+                        self.buffer.set_len(remaining);
+                    }
                 }
             }
         }
@@ -260,8 +360,24 @@ impl ObjectWriter for DirectIOWriter {
                         // Regular I/O - write directly
                         file.write_all(&compressed_data).await?;
                     } else {
-                        // DirectIO - add to buffer for alignment
-                        self.buffer.extend_from_slice(&compressed_data);
+                        // DirectIO - add to aligned buffer properly
+                        let alignment = self.config.alignment;
+                        let min_io_size = self.config.min_io_size;
+                        
+                        // Ensure buffer has enough capacity for the compressed data
+                        let new_len = self.buffer.len() + compressed_data.len();
+                        if new_len > self.buffer.capacity() {
+                            let new_capacity = ((new_len + min_io_size - 1) / min_io_size) * min_io_size;
+                            resize_aligned_buffer(&mut self.buffer, new_capacity, alignment);
+                        }
+                        
+                        // Copy compressed data to aligned buffer
+                        let old_len = self.buffer.len();
+                        unsafe {
+                            let dst = self.buffer.as_mut_ptr().add(old_len);
+                            std::ptr::copy_nonoverlapping(compressed_data.as_ptr(), dst, compressed_data.len());
+                            self.buffer.set_len(old_len + compressed_data.len());
+                        }
                     }
                 }
             } else {
@@ -289,8 +405,18 @@ impl ObjectWriter for DirectIOWriter {
                         }
                     }
                     
-                    // Keep only the unaligned remainder
-                    self.buffer.drain(..aligned_len);
+                    // Keep only the unaligned remainder - move data to preserve alignment
+                    let remaining = buffer_len - aligned_len;
+                    if remaining > 0 {
+                        unsafe {
+                            let src = self.buffer.as_ptr().add(aligned_len);
+                            let dst = self.buffer.as_mut_ptr();
+                            std::ptr::copy(src, dst, remaining);
+                        }
+                    }
+                    unsafe {
+                        self.buffer.set_len(remaining);
+                    }
                 }
                 
                 // If there's still unaligned data, write it using buffered I/O
@@ -529,8 +655,15 @@ impl ConfigurableFileSystemObjectStore {
 
         let alignment = self.config.alignment;
         let aligned_size = ((data.len() + alignment - 1) / alignment) * alignment;
-        let mut aligned_buffer = vec![0u8; aligned_size];
-        aligned_buffer[..data.len()].copy_from_slice(data);
+        let mut aligned_buffer = create_aligned_buffer(aligned_size, alignment);
+        unsafe { 
+            aligned_buffer.set_len(aligned_size);
+            aligned_buffer[..data.len()].copy_from_slice(data);
+            // Zero out the padding
+            if data.len() < aligned_size {
+                aligned_buffer[data.len()..].fill(0);
+            }
+        }
         aligned_buffer
     }
 
@@ -606,9 +739,10 @@ impl ConfigurableFileSystemObjectStore {
                     .custom_flags(libc::O_DIRECT)
                     .open(&path)?;
                 
-                // Read in aligned chunks
+                // Read in aligned chunks using aligned buffer
                 let mut result = Vec::new();
-                let mut temp_buffer = vec![0u8; alignment];
+                let mut temp_buffer = create_aligned_buffer(alignment, alignment);
+                unsafe { temp_buffer.set_len(alignment); }
                 let mut total_read = 0;
                 
                 while total_read < file_size {
@@ -695,13 +829,20 @@ impl ConfigurableFileSystemObjectStore {
                 // Write data in aligned chunks
                 let mut written = 0;
                 
+                // Create single aligned buffer for all writes
+                let mut aligned_chunk = create_aligned_buffer(alignment, alignment);
+                unsafe { aligned_chunk.set_len(alignment); }
+                
                 while written < data.len() {
                     let remaining = data.len() - written;
                     let chunk_size = std::cmp::min(remaining, alignment);
                     
-                    // Create aligned buffer for this chunk
-                    let mut aligned_chunk = vec![0u8; alignment];
+                    // Clear and copy data to aligned buffer
+                    unsafe { aligned_chunk.set_len(0); aligned_chunk.set_len(alignment); }
                     aligned_chunk[..chunk_size].copy_from_slice(&data[written..written + chunk_size]);
+                    if chunk_size < alignment {
+                        aligned_chunk[chunk_size..].fill(0);
+                    }
                     
                     // Write full aligned chunk
                     file.write_all(&aligned_chunk)?;
@@ -786,7 +927,8 @@ impl ConfigurableFileSystemObjectStore {
         let total_length = offset_adjustment + read_length as usize;
         let aligned_length = ((total_length + self.config.alignment - 1) / self.config.alignment) * self.config.alignment;
         
-        let mut buffer = vec![0u8; aligned_length];
+        let mut buffer = create_aligned_buffer(aligned_length, self.config.alignment);
+        unsafe { buffer.set_len(aligned_length); }
         
         let options = self.create_open_options(true, false);
         let mut file = options.open(path).await?;

@@ -1,6 +1,6 @@
 [package]
 name = "s3dlio"
-version = "0.7.11"
+version = "0.8.0"
 edition = "2024"
 
 [lib]
@@ -99,8 +99,8 @@ url = { version = "2.5", optional = true }
 # --- Enhanced HTTP client with HTTP/2 support --------------------------------
 reqwest = { version = "0.12", features = ["rustls-tls", "http2", "hickory-dns"], optional = true }
 
-# --- io_uring backend (Linux only) --------------------------------------------
-tokio-uring = { version = "0.5", optional = true }
+# --- High-performance memory and file I/O ------------------------------------
+nix = { version = "0.29", features = ["fs"], optional = true }  # For O_DIRECT and positioned I/O
 
 # --- Profiling (optional, enabled via "profiling" feature) ---------------
 tracing           = { version = "0.1", optional = true }
@@ -123,7 +123,7 @@ s3 = []
 native-backends = []                    # Current AWS/Azure implementations  
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
 enhanced-http = ["dep:reqwest"]      # Enhanced HTTP client with HTTP/2 support
-io-uring = ["dep:tokio-uring"]       # io_uring backend for Linux
+direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
 profiling = ["dep:tracing", "dep:tracing-subscriber", "dep:console-subscriber", "dep:pprof"]
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 

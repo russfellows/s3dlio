@@ -8,9 +8,6 @@ use crate::concurrency::{ConcurrencyMode, S3PerformanceProfile, Throughput};
 #[cfg(feature = "enhanced-http")]
 use crate::http::HttpClientConfig;
 
-#[cfg(feature = "io-uring")]
-use crate::io_uring::IoUringConfig;
-
 /// Comprehensive performance configuration
 #[derive(Debug, Clone)]
 pub struct PerformanceConfig {
@@ -20,10 +17,6 @@ pub struct PerformanceConfig {
     /// HTTP client configuration
     #[cfg(feature = "enhanced-http")]
     pub http_client: HttpClientConfig,
-    
-    /// io_uring configuration (Linux only)
-    #[cfg(feature = "io-uring")]
-    pub io_uring: IoUringConfig,
     
     /// S3 performance profile
     pub s3_profile: S3PerformanceProfile,
@@ -65,9 +58,6 @@ impl Default for PerformanceConfig {
             
             #[cfg(feature = "enhanced-http")]
             http_client: HttpClientConfig::default(),
-            
-            #[cfg(feature = "io-uring")]
-            io_uring: IoUringConfig::default(),
             
             s3_profile: S3PerformanceProfile::default(),
             part_size: PartSizeConfig::default(),
@@ -112,9 +102,6 @@ impl PerformanceConfig {
             #[cfg(feature = "enhanced-http")]
             http_client: HttpClientConfig::high_performance(),
             
-            #[cfg(feature = "io-uring")]
-            io_uring: IoUringConfig::high_performance(),
-            
             s3_profile: S3PerformanceProfile::high_performance(),
             part_size: PartSizeConfig {
                 target_part_size: 10 * 1024 * 1024, // 10 MiB objects
@@ -140,9 +127,6 @@ impl PerformanceConfig {
             
             #[cfg(feature = "enhanced-http")]
             http_client: HttpClientConfig::high_performance(),
-            
-            #[cfg(feature = "io-uring")]
-            io_uring: IoUringConfig::high_performance(),
             
             s3_profile: S3PerformanceProfile::high_performance(),
             part_size: PartSizeConfig::default(),
@@ -170,13 +154,6 @@ impl PerformanceConfig {
             
             #[cfg(feature = "enhanced-http")]
             http_client: HttpClientConfig::auto_detect(endpoint),
-            
-            #[cfg(feature = "io-uring")]
-            io_uring: if is_aws { 
-                IoUringConfig::default() 
-            } else { 
-                IoUringConfig::high_performance() 
-            },
             
             s3_profile,
             part_size: PartSizeConfig::default(),
@@ -222,16 +199,6 @@ impl PerformanceConfig {
             }
         }
         
-        // io_uring settings
-        #[cfg(feature = "io-uring")]
-        {
-            if let Ok(queue_depth) = std::env::var("S3DLIO_URING_QUEUE_DEPTH") {
-                if let Ok(depth) = queue_depth.parse::<u32>() {
-                    config.io_uring.queue_depth = depth;
-                }
-            }
-        }
-        
         Ok(config)
     }
     
@@ -262,7 +229,6 @@ pub mod env_keys {
     pub const PART_SIZE_MB: &str = "S3DLIO_PART_SIZE_MB";
     pub const ENABLE_OPTIMIZATIONS: &str = "S3DLIO_ENABLE_OPTIMIZATIONS";
     pub const ENABLE_HTTP2: &str = "S3DLIO_ENABLE_HTTP2";
-    pub const URING_QUEUE_DEPTH: &str = "S3DLIO_URING_QUEUE_DEPTH";
     pub const PERFORMANCE_PROFILE: &str = "S3DLIO_PERFORMANCE_PROFILE";
 }
 

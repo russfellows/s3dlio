@@ -15,8 +15,7 @@
 //! s3Rust-cli download    s3://bucket/key local-file    # download  one or more object
 //! ```
 
-//use anyhow::{bail, Context, Result};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -24,6 +23,7 @@ use std::str::FromStr; // For the custom S3Path type
 use std::time::Instant;
 use log::LevelFilter;
 use log::info;
+use tempfile::NamedTempFile;
 
 
 
@@ -33,6 +33,7 @@ use s3dlio::{
     put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
     list_buckets,
     object_store::store_for_uri,
+    mp,
 };
 
 use s3dlio::s3_copy::{upload_files, download_objects};
@@ -152,15 +153,52 @@ enum Command {
     /// Download one or many objects concurrently.
     Get {
         /// S3 URI – can be a full key or a prefix ending with `/`.
-        uri: String,
+        uri: Option<String>,
         
         /// Maximum concurrent GET requests.
         #[arg(short = 'j', long = "jobs", default_value_t = 64)]
         jobs: usize,
         
+        /// Alternative: maximum concurrent GET requests (for mp compatibility).
+        #[arg(long = "concurrent")]
+        concurrent: Option<usize>,
+        
+        /// File containing list of S3 URIs to download (one per line).
+        #[arg(long = "keylist")]
+        keylist: Option<PathBuf>,
+        
         /// Perform the operation recursively.
         #[clap(short, long)]
         recursive: bool,
+    },
+    /// Multi-process GET for maximum throughput (warp-level performance).
+    MpGet {
+        /// S3 URI prefix for objects to download (e.g. s3://bucket/prefix/)
+        uri: String,
+        
+        /// Number of worker processes to spawn
+        #[arg(short = 'p', long = "procs", default_value_t = 4)]
+        procs: usize,
+        
+        /// Concurrent operations per worker process
+        #[arg(short = 'j', long = "jobs", default_value_t = 64)]
+        jobs: usize,
+        
+        /// Number of objects to download (for testing/benchmarking)
+        #[arg(short = 'n', long = "num", default_value_t = 1000)]
+        num: usize,
+        
+        /// Object size in bytes (for generated object names)
+        #[arg(short = 's', long = "size", default_value_t = 1048576)]
+        size: usize,
+        
+        /// Template for object names (use {} for number placeholder)
+        #[arg(short = 't', long = "template", default_value = "object_{}.dat")]
+        template: String,
+        
+        /// Progress reporting interval in seconds
+        #[arg(short = 'i', long = "interval", default_value_t = 1.0)]
+        interval: f64,
     },
     /// Upload one or more objects concurrently, uses ObjectType format filled with random data.
     Put {
@@ -354,7 +392,14 @@ async fn main() -> Result<()> {
         Command::Stat { uri } => stat_cmd(&uri)?,
     
         // New, with regex and recursion
-        Command::Get { uri, jobs, recursive } => get_cmd(&uri, jobs, recursive)?,
+        Command::Get { uri, jobs, concurrent, keylist, recursive } => {
+            get_cmd(uri.as_deref(), jobs, concurrent, keylist.as_deref(), recursive)?
+        }
+        
+        // Multi-process GET for maximum throughput
+        Command::MpGet { uri, procs, jobs, num, size, template, interval } => {
+            mp_get_cmd(&uri, procs, jobs, num, size, &template, interval)?
+        }
     
         Command::Delete { uri, jobs, recursive } => delete_cmd(&uri, jobs, recursive)?,
     
@@ -445,8 +490,46 @@ fn stat_cmd(uri: &str) -> Result<()> {
 }
 
 /// Get command: downloads objects matching a key, prefix, or pattern.
-fn get_cmd(uri: &str, jobs: usize, recursive: bool) -> Result<()> {
-    let (bucket, mut key_pattern) = s3dlio::parse_s3_uri(uri)?;
+fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool) -> Result<()> {
+    // Determine concurrency level (prefer concurrent over jobs for mp compatibility)
+    let concurrency = concurrent.unwrap_or(jobs);
+    
+    // Handle keylist mode vs URI mode
+    if let Some(keylist_path) = keylist {
+        // Read URIs from keylist file
+        let keylist_content = std::fs::read_to_string(keylist_path)
+            .with_context(|| format!("Failed to read keylist file: {:?}", keylist_path))?;
+        
+        let uris: Vec<String> = keylist_content
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.to_string())
+            .collect();
+            
+        if uris.is_empty() {
+            bail!("No URIs found in keylist file: {:?}", keylist_path);
+        }
+        
+        println!("Processing {} URIs from keylist with concurrency {}", uris.len(), concurrency);
+        
+        let t0 = Instant::now();
+        let results = get_objects_parallel(&uris, concurrency)?;
+        let dt = t0.elapsed();
+        
+        let total_bytes: usize = results.iter().map(|(_, bytes)| bytes.len()).sum();
+        
+        // Report benchmark results (data is immediately discarded for benchmarking)
+        let throughput_mb_s = (total_bytes as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64();
+        println!("Benchmarked {} objects: {} bytes in {:.3}s ({:.2} MB/s)", 
+                 results.len(), total_bytes, dt.as_secs_f64(), throughput_mb_s);
+        
+        return Ok(());
+    }
+    
+    // Original URI-based mode
+    let uri_str = uri.ok_or_else(|| anyhow::anyhow!("Either --uri or --keylist must be provided"))?;
+    let (bucket, mut key_pattern) = s3dlio::parse_s3_uri(uri_str)?;
 
     /*
      * Old
@@ -470,7 +553,7 @@ fn get_cmd(uri: &str, jobs: usize, recursive: bool) -> Result<()> {
     let keys_to_get = s3dlio::s3_utils::list_objects(&bucket, &key_pattern, recursive)?;
 
     if keys_to_get.is_empty() {
-        bail!("No objects match pattern '{}' in bucket '{}'", uri, bucket);
+        bail!("No objects match pattern '{}' in bucket '{}'", uri_str, bucket);
     }
 
     let uris: Vec<String> = keys_to_get.into_iter().map(|k| format!("s3://{}/{}", bucket, k)).collect();
@@ -488,6 +571,73 @@ fn get_cmd(uri: &str, jobs: usize, recursive: bool) -> Result<()> {
     // Finish the progress bar with completion stats
     progress.finish("Download", total_bytes as u64, dt);
 
+    Ok(())
+}
+
+/// Multi-process GET command for maximum throughput
+fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, template: &str, _interval: f64) -> Result<()> {
+    let (bucket, key_prefix) = parse_s3_uri(uri)?;
+    
+    println!("Multi-process GET starting with {} processes, {} jobs per process", procs, jobs);
+    println!("Target: {} objects from s3://{}/{}", num, bucket, key_prefix);
+    
+    // Generate object keys based on template and number
+    let mut keys = Vec::new();
+    for i in 0..num {
+        let key = if template.contains("{}") {
+            template.replace("{}", &i.to_string())
+        } else {
+            format!("{}{}", template, i)
+        };
+        keys.push(format!("s3://{}/{}{}", bucket, key_prefix, key));
+    }
+    
+    // Create temporary keylist file
+    let keylist_file = NamedTempFile::new()?;
+    let keylist_path = keylist_file.path().to_path_buf();
+    
+    // Write keys to file
+    {
+        let mut file = std::fs::File::create(&keylist_path)?;
+        for key in &keys {
+            writeln!(file, "{}", key)?;
+        }
+    }
+    
+    // Get the current executable path for worker processes
+    let current_exe = std::env::current_exe()?;
+    
+    // Configure multi-process GET (without oplog for now - will add proper zstd support later) 
+    let config = mp::MpGetConfigBuilder::new()
+        .procs(procs)
+        .concurrent_per_proc(jobs)
+        .keylist(keylist_path)
+        .worker_cmd(current_exe.to_string_lossy().to_string())
+        .passthrough_io(false)  // Disable debug output for clean results
+        .build();
+    
+    // Run the multi-process operation
+    let result = mp::run_get_shards(&config)?;
+    
+    // Print summary
+    println!("\n=== Multi-Process GET Summary ===");
+    println!("Total operations: {}", result.total_objects);
+    println!("Total bytes: {}", result.total_bytes);
+    println!("Duration: {:.2}s", result.elapsed_seconds);
+    println!("Throughput: {:.2} MB/s", result.throughput_mbps());
+    println!("Operations/sec: {:.2}", result.ops_per_second());
+    
+    println!("\nPer-worker performance:");
+    for worker in &result.per_worker {
+        let worker_throughput = if result.elapsed_seconds > 0.0 {
+            (worker.bytes as f64 / (1024.0 * 1024.0)) / result.elapsed_seconds
+        } else {
+            0.0
+        };
+        println!("  Worker {}: {} ops, {} bytes, {:.2} MB/s", 
+                 worker.worker_id, worker.objects, worker.bytes, worker_throughput);
+    }
+    
     Ok(())
 }
 
