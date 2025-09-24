@@ -338,14 +338,32 @@ pub (crate) fn put_async_py<'p>(
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false))]
 pub fn list(uri: &str, recursive: bool) -> PyResult<Vec<String>> {
-    let (bucket, mut path) = parse_s3_uri(uri).map_err(py_err)?;
-
-    // If the path ends with a slash, automatically append a wildcard to search inside it.
-    if path.ends_with('/') {
-        path.push_str(".*");
+    use crate::object_store::{infer_scheme, Scheme};
+    
+    match infer_scheme(uri) {
+        Scheme::S3 => {
+            let (bucket, mut path) = parse_s3_uri(uri).map_err(py_err)?;
+            
+            // If the path ends with a slash, automatically append a wildcard to search inside it.
+            if path.ends_with('/') {
+                path.push_str(".*");
+            }
+            
+            crate::s3_utils::list_objects(&bucket, &path, recursive).map_err(py_err)
+        }
+        Scheme::File | Scheme::Direct => {
+            // For file systems, we'll need to implement file listing
+            // TODO: Implement file system listing
+            Err(PyRuntimeError::new_err("File system listing not yet implemented"))
+        }
+        Scheme::Azure => {
+            // TODO: Implement Azure listing
+            Err(PyRuntimeError::new_err("Azure listing not yet implemented"))
+        }
+        Scheme::Unknown => {
+            Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
+        }
     }
-
-    crate::s3_utils::list_objects(&bucket, &path, recursive).map_err(py_err)
 }
 
 
@@ -353,9 +371,39 @@ pub fn list(uri: &str, recursive: bool) -> PyResult<Vec<String>> {
 //
 #[pyfunction]
 pub fn stat(py: Python<'_>, uri: &str) -> PyResult<PyObject> {
-    let os = stat_object_uri(uri).map_err(py_err)?;
-    let d = stat_to_pydict(py, os)?;         // Bound<'py, PyDict>
-    Ok(d.unbind().into())                    // -> PyObject (owned)
+    use crate::object_store::{infer_scheme, Scheme};
+    
+    match infer_scheme(uri) {
+        Scheme::S3 => {
+            let os = stat_object_uri(uri).map_err(py_err)?;
+            let d = stat_to_pydict(py, os)?;
+            Ok(d.unbind().into())
+        }
+        Scheme::File | Scheme::Direct => {
+            // For file systems, get file metadata
+            use std::fs;
+            let path = uri.strip_prefix("file://").unwrap_or(uri);
+            let metadata = fs::metadata(path).map_err(py_err)?;
+            
+            // Create a simple stat dict for files
+            let dict = PyDict::new(py);
+            dict.set_item("size", metadata.len())?;
+            dict.set_item("key", path)?;
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    dict.set_item("last_modified", since_epoch.as_secs())?;
+                }
+            }
+            Ok(dict.unbind().into())
+        }
+        Scheme::Azure => {
+            // TODO: Implement Azure stat
+            Err(PyRuntimeError::new_err("Azure stat not yet implemented"))
+        }
+        Scheme::Unknown => {
+            Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
+        }
+    }
 }
 
 #[pyfunction]
@@ -470,8 +518,28 @@ pub (crate) fn get_many_async_py<'p>(
 
 #[pyfunction]
 pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
-    let bytes = get_object_uri(uri).map_err(py_err)?;
-    Ok(PyBytes::new(py, &bytes[..]).unbind())
+    use crate::object_store::{infer_scheme, Scheme};
+    
+    match infer_scheme(uri) {
+        Scheme::S3 => {
+            let bytes = get_object_uri(uri).map_err(py_err)?;
+            Ok(PyBytes::new(py, &bytes[..]).unbind())
+        }
+        Scheme::File | Scheme::Direct => {
+            // For file systems, read the file directly
+            use std::fs;
+            let path = uri.strip_prefix("file://").unwrap_or(uri);
+            let bytes = fs::read(path).map_err(py_err)?;
+            Ok(PyBytes::new(py, &bytes[..]).unbind())
+        }
+        Scheme::Azure => {
+            // TODO: Implement Azure get
+            Err(PyRuntimeError::new_err("Azure get not yet implemented"))
+        }
+        Scheme::Unknown => {
+            Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
+        }
+    }
 }
 
 // --- `download` function

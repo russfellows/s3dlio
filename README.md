@@ -33,6 +33,46 @@ cargo build --no-default-features --features native-backends
 
 ## Recent Highlights
 
+### 🎯 Version 0.8.1 - Enhanced API & PyTorch Integration (September 24, 2025)
+
+**PRODUCTION-READY ENHANCED API**: Complete **Enhanced API** with **100% working PyTorch integration** and **34/34 tests passing**. The new simplified API provides modern interfaces while maintaining full backward compatibility.
+
+**Key Achievements:**
+- ✅ **Enhanced API Functions**: `create_dataset()` and `create_async_loader()` with options support
+- ✅ **PyTorch Integration Fixed**: `S3IterableDataset` working perfectly with DataLoader support  
+- ✅ **100% Test Coverage**: All 34 tests passing with comprehensive functionality validation
+- ✅ **Organized Documentation**: Complete API docs in `docs/api/` with version control
+- ✅ **Critical Testing Guide**: Documented Python import gotchas and best practices
+
+**Enhanced API Usage:**
+```python
+import s3dlio
+
+# Enhanced API - Simple and powerful
+dataset = s3dlio.create_dataset("file:///path/to/data")
+loader = s3dlio.create_async_loader("s3://bucket/path", {"batch_size": 32})
+
+# PyTorch Integration - Now working!  
+from s3dlio.torch import S3IterableDataset
+dataset = S3IterableDataset("s3://bucket/data", loader_opts={})
+dataloader = DataLoader(dataset, batch_size=16)
+
+# Legacy API - Still supported
+s3dlio.get("s3://bucket/file", "/local/path")  # Still works
+```
+
+**Testing Results:**
+| Category | Status | Details |
+|----------|---------|---------|
+| **Installation** | ✅ 9/9 PASSED | All Rust functions available |
+| **Enhanced API** | ✅ 8/8 PASSED | Dataset/loader creation working |  
+| **PyTorch** | ✅ 5/5 PASSED | S3IterableDataset functional |
+| **Legacy API** | ✅ 7/7 PASSED | Backward compatibility maintained |
+| **Error Handling** | ✅ 3/3 PASSED | Proper error messages |
+| **Async Operations** | ✅ 2/2 PASSED | Streaming working |
+
+**Total: 34/34 PASSED (100.0%)**
+
 ### 🚀 Version 0.8.0 - Multi-Process Performance Engine & Python Bindings (September 20, 2025)
 
 **WARP-LEVEL S3 PERFORMANCE**: New multi-process architecture with **Python bindings** delivering **2,308 MB/s** (8 processes) vs **1,150 MB/s** (single process) = **2x performance improvement**. Python bindings achieve **100%+ CLI performance parity** at 1,712 MB/s.

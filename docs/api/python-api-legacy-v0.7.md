@@ -1,6 +1,14 @@
-# s3dlio Python Library Reference
+# s3dlio Python Library Reference - LEGACY v0.7.x
 
-This document outlines the Python interface provided by the `s3dlio` package, providing high-performance storage operations across multiple backends with streaming and compression capabilities.
+**⚠️ LEGACY DOCUMENTATION WARNING**
+- **This document**: For s3dlio v0.7.x and earlier (2024-early 2025)
+- **Status**: OUTDATED - Use only for older releases  
+- **Current API**: See `python-api-v0.8.0-current.md` for latest version
+- **Known Issues**: PyTorch integration was broken in these versions
+
+---
+
+This document outlines the Python interface provided by the `s3dlio` package v0.7.x, providing high-performance storage operations across multiple backends with streaming and compression capabilities.
 
 ---
 
