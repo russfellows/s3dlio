@@ -9,6 +9,7 @@ pub mod sampler;
 pub mod prefetch;
 pub mod transform;
 pub mod s3_bytes;
+pub mod fs_bytes;
 pub mod async_pool_dataloader;
 
 
@@ -17,5 +18,6 @@ pub use dataloader::DataLoader;
 pub use dataset::{Dataset, DatasetError};
 pub use options::LoaderOptions;
 pub use s3_bytes::S3BytesDataset;
+pub use fs_bytes::FileSystemBytesDataset;
 pub use async_pool_dataloader::{AsyncPoolDataLoader, MultiBackendDataset, PoolConfig, UnifiedDataLoader};
 

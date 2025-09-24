@@ -32,6 +32,7 @@ use crate::data_loader::{
     options::{LoaderOptions, ReaderMode},
     s3_bytes::S3BytesDataset,
 };
+use crate::api::dataset_for_uri_with_options;
 #[cfg(feature = "extension-module")]
 use crate::checkpoint::{CheckpointStore, CheckpointConfig, Strategy, CheckpointInfo};
 
@@ -55,6 +56,152 @@ impl PyS3Dataset {
     }
     /// Optional: expose keys for debugging
     fn keys(&self) -> Vec<String> { self.inner.keys().clone() }
+}
+
+// Generic dataset that works with all URI schemes
+#[pyclass]
+pub struct PyDataset {
+    inner: Arc<dyn Dataset<Item = Vec<u8>>>,
+}
+
+#[pymethods]
+impl PyDataset {
+    #[new]
+    fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+        let o = opts_from_dict(opts);
+        let dataset = dataset_for_uri_with_options(uri, &o)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::from(dataset) })
+    }
+
+    /// Get the number of items in the dataset
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self.inner.len().unwrap_or(0))
+    }
+
+    /// Get an item by index (for map-style datasets) 
+    fn get_item<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Py<PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        let bound_result = future_into_py(py, async move {
+            let data = inner.get(index).await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Python::with_gil(|py| {
+                // Bound<'py, PyBytes> -> Bound<'py, PyAny> -> Py<PyAny>
+                let obj: Py<PyAny> = PyBytes::new(py, &data).into_any().unbind();
+                Ok(obj)
+            })
+        })?;
+        Ok(bound_result.unbind())
+    }
+
+    /// Return list of keys if supported (for debugging S3 datasets)
+    fn keys(&self) -> PyResult<Vec<String>> {
+        // This is a bit of a hack - we try to downcast to S3BytesDataset
+        // TODO: Make this more elegant with a proper trait
+        Err(PyRuntimeError::new_err("keys() not supported for generic datasets yet"))
+    }
+}
+
+impl Clone for PyDataset {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+// Generic async loader that works with PyDataset
+#[pyclass]
+#[derive(Clone)]
+pub struct PyBytesAsyncDataLoader {
+    dataset: PyDataset,
+    opts: LoaderOptions,
+}
+
+#[pymethods]
+impl PyBytesAsyncDataLoader {
+    #[new]
+    #[pyo3(signature = (dataset, opts=None))]
+    fn new(dataset: PyDataset, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+        Ok(Self { dataset, opts: opts_from_dict(opts) })
+    }
+
+    fn __aiter__<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Py<PyBytesAsyncDataLoaderIter>> {
+        PyBytesAsyncDataLoaderIter::spawn_stream(py, slf.dataset.clone(), slf.opts.clone())
+    }
+}
+
+#[pyclass]
+pub struct PyBytesAsyncDataLoaderIter {
+    rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Vec<u8>>, DatasetError>>>>,
+}
+
+impl PyBytesAsyncDataLoaderIter {
+    fn spawn_stream(
+        py: Python<'_>,
+        dataset: PyDataset,
+        opts: LoaderOptions,
+    ) -> PyResult<Py<Self>> {
+        let (tx, rx) = mpsc::channel::<Result<Vec<Vec<u8>>, DatasetError>>(opts.prefetch.max(1));
+
+        // Spawn the producer task
+        pyo3_async_runtimes::tokio::get_runtime()
+            .spawn(async move {
+                // Create a simple batch iterator from the dataset
+                let batch_size = opts.batch_size.max(1);
+                if let Some(len) = dataset.inner.len() {
+                    let mut i = 0;
+                    while i < len {
+                        let mut batch = Vec::new();
+                        for j in 0..batch_size {
+                            if i + j >= len { break; }
+                            match dataset.inner.get(i + j).await {
+                                Ok(data) => batch.push(data),
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    return;
+                                }
+                            }
+                        }
+                        if !batch.is_empty() {
+                            if tx.send(Ok(batch)).await.is_err() { break; }
+                        }
+                        i += batch_size;
+                    }
+                }
+            });
+
+        Py::new(py, Self { rx: Arc::new(Mutex::new(rx)) })
+    }
+}
+
+#[pymethods]
+impl PyBytesAsyncDataLoaderIter {
+    fn __anext__<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Py<PyAny>> {
+        let rx = Arc::clone(&slf.rx);
+        let bound_result = future_into_py(py, async move {
+            let mut guard = rx.lock().await;
+            match guard.recv().await {
+                Some(Ok(batch)) => {
+                    Python::with_gil(|py| {
+                        let py_list = PyList::empty(py);
+                        for item in batch {
+                            py_list.append(PyBytes::new(py, &item))?;
+                        }
+                        // Bound<'py, PyList> -> Py<PyAny>
+                        Ok(py_list.into_any().unbind())
+                    })
+                }
+                Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+                None => Err(PyStopAsyncIteration::new_err("StopAsyncIteration")),
+            }
+        })?;
+        Ok(bound_result.unbind())
+    }
 }
 
 // async loader over S3BytesDataset
@@ -95,21 +242,23 @@ impl PyS3AsyncDataLoader {
 
     fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
 
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let rx = self.rx.clone();
-        future_into_py(py, async move {
+        let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
             match guard.recv().await {
                 Some(Ok(batch)) => Python::with_gil(|py| {
                     let out: Vec<Py<PyBytes>> = batch.into_iter()
                         .map(|b| PyBytes::new(py, &b).unbind())
                         .collect();
+                    // Vec<Py<PyBytes>> -> Py<PyAny> via IntoPyObjectExt
                     Ok(out.into_py_any(py)?)
                 }),
                 Some(Err(e)) => Err(PyRuntimeError::new_err(format!("{:?}", e))),
                 None => Err(PyStopAsyncIteration::new_err("end of stream")),
             }
-        })
+        })?;
+        Ok(bound_result.unbind())
     }
 }
 
@@ -173,18 +322,33 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
     let def = LoaderOptions::default();
 
     if let Some(d) = d {
-        // Helper closures that cope with the Result-of-Option signature.
+        // Helper closures with better error handling
         let g_usize = |k: &str, dv: usize| match d.get_item(k) {
-            Ok(Some(val)) => val.extract::<usize>().unwrap_or(dv),
-            _             => dv,
+            Ok(Some(val)) => {
+                val.extract::<usize>().unwrap_or_else(|_| {
+                    eprintln!("Warning: Invalid value for '{}', expected usize, using default {}", k, dv);
+                    dv
+                })
+            }
+            _ => dv,
         };
         let g_bool = |k: &str, dv: bool| match d.get_item(k) {
-            Ok(Some(val)) => val.extract::<bool>().unwrap_or(dv),
-            _             => dv,
+            Ok(Some(val)) => {
+                val.extract::<bool>().unwrap_or_else(|_| {
+                    eprintln!("Warning: Invalid value for '{}', expected bool, using default {}", k, dv);
+                    dv
+                })
+            }
+            _ => dv,
         };
         let g_u64 = |k: &str, dv: u64| match d.get_item(k) {
-            Ok(Some(val)) => val.extract::<u64>().unwrap_or(dv),
-            _             => dv,
+            Ok(Some(val)) => {
+                val.extract::<u64>().unwrap_or_else(|_| {
+                    eprintln!("Warning: Invalid value for '{}', expected u64, using default {}", k, dv);
+                    dv
+                })
+            }
+            _ => dv,
         };
 
         // Reader mode: accept "sequential" or "range" (case-insensitive).
@@ -202,6 +366,20 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             }
             _ => def.reader_mode,
         };
+
+        // Check for unknown keys and warn about them
+        let known_keys = [
+            "batch_size", "drop_last", "shuffle", "seed", "num_workers", "prefetch", "auto_tune",
+            "reader_mode", "part_size", "max_inflight_parts", "shard_rank", "shard_world_size",
+            "worker_id", "num_workers_pytorch"
+        ];
+        for key in d.keys() {
+            if let Ok(key_str) = key.extract::<&str>() {
+                if !known_keys.contains(&key_str) {
+                    eprintln!("Warning: Unknown option '{}' ignored. Valid options: {:?}", key_str, known_keys);
+                }
+            }
+        }
 
         LoaderOptions {
             // existing fields
@@ -286,16 +464,17 @@ impl PyAsyncDataLoaderIter {
     fn __anext__<'py>(
         slf: PyRef<'py, Self>,
         py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Py<PyAny>> {
         let rx = slf.rx.clone();
-        future_into_py(py, async move {
+        let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
             match guard.recv().await {
                 Some(Ok(batch)) => Python::with_gil(|py| batch.into_py_any(py)),
                 Some(Err(e))    => Err(PyRuntimeError::new_err(format!("{:?}", e))),
                 None            => Err(PyStopAsyncIteration::new_err("end of loader")),
             }
-        })
+        })?;
+        Ok(bound_result.unbind())
     }
 }
 
@@ -958,6 +1137,7 @@ pub fn load_checkpoint_with_validation(
 /// Currently disabled due to threading issues - TODO: Fix in future version
 // #[pyfunction]
 // #[pyo3(signature = (uri, array, compress=true, validate=true))]
+#[allow(dead_code)]
 pub fn save_numpy_array(
     _py: Python<'_>,
     _uri: &str,
@@ -972,6 +1152,7 @@ pub fn save_numpy_array(
 /// Currently disabled due to threading issues - TODO: Fix in future version
 // #[pyfunction]
 // #[pyo3(signature = (uri, shape, dtype="f32", validate_checksum=None))]
+#[allow(dead_code)]
 pub fn load_numpy_array(
     _py: Python<'_>,
     _uri: &str,
@@ -980,6 +1161,94 @@ pub fn load_numpy_array(
     _validate_checksum: Option<&str>,
 ) -> PyResult<PyObject> {
     Err(PyRuntimeError::new_err("load_numpy_array is temporarily disabled"))
+}
+
+/// Create a dataset from any supported URI scheme
+#[pyfunction]
+#[pyo3(signature = (uri, opts=None))]
+pub fn create_dataset(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<PyDataset> {
+    PyDataset::new(uri, opts)
+}
+
+/// Create an async data loader from any supported URI scheme (convenience function)
+#[pyfunction]
+#[pyo3(signature = (uri, opts=None))]
+pub fn create_async_loader(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<PyBytesAsyncDataLoader> {
+    let dataset = create_dataset(uri, opts.as_ref().map(|d| d.clone()))?;
+    PyBytesAsyncDataLoader::new(dataset, opts)
+}
+
+// ---------------------------------------------------------------------------
+// Compatibility shims for existing code
+// ---------------------------------------------------------------------------
+
+/// Compatibility wrapper - creates a PyDataset but only for S3 URIs
+/// DEPRECATED: Use PyDataset or create_dataset() instead
+#[pyclass]
+#[derive(Clone)]
+pub struct PyS3DatasetCompat {
+    inner: PyDataset,
+}
+
+#[pymethods]
+impl PyS3DatasetCompat {
+    #[new]
+    fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+        use crate::object_store::infer_scheme;
+        
+        if !matches!(infer_scheme(uri), crate::object_store::Scheme::S3) {
+            return Err(PyRuntimeError::new_err(
+                "PyS3Dataset only supports S3 URIs. Use PyDataset for other schemes."
+            ));
+        }
+        
+        eprintln!("Warning: PyS3Dataset is deprecated. Use PyDataset or create_dataset() instead.");
+        let dataset = PyDataset::new(uri, opts)?;
+        Ok(Self { inner: dataset })
+    }
+
+    fn keys(&self) -> PyResult<Vec<String>> {
+        self.inner.keys()
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        self.inner.__len__()
+    }
+
+    fn get_item<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Py<PyAny>> {
+        self.inner.get_item(py, index)
+    }
+}
+
+/// Compatibility wrapper for PyS3AsyncDataLoader
+/// DEPRECATED: Use PyBytesAsyncDataLoader with create_dataset() instead
+#[pyclass]
+pub struct PyS3AsyncDataLoaderCompat {
+    inner: PyBytesAsyncDataLoader,
+}
+
+#[pymethods]
+impl PyS3AsyncDataLoaderCompat {
+    #[new]
+    fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+        use crate::object_store::infer_scheme;
+        
+        if !matches!(infer_scheme(uri), crate::object_store::Scheme::S3) {
+            return Err(PyRuntimeError::new_err(
+                "PyS3AsyncDataLoader only supports S3 URIs. Use create_async_loader() for other schemes."
+            ));
+        }
+        
+        eprintln!("Warning: PyS3AsyncDataLoader is deprecated. Use create_async_loader() instead.");
+        let loader = create_async_loader(uri, opts)?;
+        Ok(Self { inner: loader })
+    }
+
+    fn __aiter__(&self) -> PyResult<PyBytesAsyncDataLoader> {
+        // Show deprecation warning but still work for compatibility
+        eprintln!("Warning: PyS3AsyncDataLoader is deprecated. Use create_async_loader() instead: loader = s3dlio.create_async_loader(uri, opts)");
+        Ok(self.inner.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -994,9 +1263,24 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     
     // Data loader classes
     m.add_class::<PyS3Dataset>()?;
+    m.add_class::<PyDataset>()?;
     m.add_class::<PyVecDataset>()?;
     m.add_class::<PyAsyncDataLoader>()?;
     m.add_class::<PyAsyncDataLoaderIter>()?;
+    m.add_class::<PyBytesAsyncDataLoader>()?;
+    m.add_class::<PyBytesAsyncDataLoaderIter>()?;
+
+    // Compatibility classes (deprecated)
+    m.add_class::<PyS3DatasetCompat>()?;
+    m.add_class::<PyS3AsyncDataLoaderCompat>()?;
+
+    // Dataset factory functions
+    m.add_function(wrap_pyfunction!(create_dataset, m)?)?;
+    m.add_function(wrap_pyfunction!(create_async_loader, m)?)?;
+
+    // Add compatibility aliases (these create the deprecated names that existing code expects)
+    // The user should migrate to PyDataset and create_async_loader() instead
+    m.add("PyS3AsyncDataLoader", m.getattr("PyS3AsyncDataLoaderCompat")?)?;
     
     // Checkpoint system (if enabled)
     #[cfg(feature = "extension-module")]

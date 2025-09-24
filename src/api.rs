@@ -113,8 +113,48 @@ pub use anyhow::Error;
 /// Dataset-specific errors
 pub use crate::data_loader::dataset::DatasetError;
 
+/// S3 bytes dataset
+pub use crate::data_loader::s3_bytes::S3BytesDataset;
+
+/// File system bytes dataset
+pub use crate::data_loader::fs_bytes::FileSystemBytesDataset;
+
 /// Convenience type alias for Results
 pub type S3dlioResult<T> = Result<T>;
+
+/// Create a dataset from a URI with default options
+pub fn dataset_for_uri(uri: &str) -> Result<Box<dyn Dataset<Item = Vec<u8>>>> {
+    dataset_for_uri_with_options(uri, &LoaderOptions::default())
+}
+
+/// Create a dataset from a URI with custom options
+pub fn dataset_for_uri_with_options(uri: &str, opts: &LoaderOptions) -> Result<Box<dyn Dataset<Item = Vec<u8>>>> {
+    use crate::object_store::infer_scheme;
+    
+    match infer_scheme(uri) {
+        crate::object_store::Scheme::S3 => {
+            let dataset = S3BytesDataset::from_prefix_with_opts(uri, opts)
+                .map_err(|e| anyhow::anyhow!("Failed to create S3 dataset: {}", e))?;
+            Ok(Box::new(dataset))
+        }
+        crate::object_store::Scheme::File => {
+            let dataset = FileSystemBytesDataset::from_uri_with_opts(uri, opts)
+                .map_err(|e| anyhow::anyhow!("Failed to create file system dataset: {}", e))?;
+            Ok(Box::new(dataset))
+        }
+        crate::object_store::Scheme::Azure => {
+            // TODO: Implement Azure dataset
+            anyhow::bail!("Azure datasets not yet implemented")
+        }
+        crate::object_store::Scheme::Direct => {
+            // TODO: Implement direct I/O dataset
+            anyhow::bail!("Direct I/O datasets not yet implemented")
+        }
+        crate::object_store::Scheme::Unknown => {
+            anyhow::bail!("Unable to infer dataset type from URI: {}", uri)
+        }
+    }
+}
 
 /// Advanced API for power users
 pub mod advanced;

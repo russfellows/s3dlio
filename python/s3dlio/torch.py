@@ -153,7 +153,8 @@ class _AsyncBytesSource:
     def start(self) -> "_AsyncBytesSource":
         def runner():
             async def run():
-                loader = _core.PyS3AsyncDataLoader(self._uri, self._opts)
+                # Use the new generic create_async_loader function
+                loader = _core.create_async_loader(self._uri, self._opts)
                 try:
                     async for batch in loader:  # batch: List[bytes]
                         for b in batch:
