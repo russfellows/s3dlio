@@ -42,6 +42,11 @@ impl S3ProgressTracker {
         self.progress_bar.set_message(format!("{}/{} objects", objects_completed, total_objects));
     }
 
+    /// Update the total size of the progress bar (useful when total size is discovered during operation)
+    pub fn set_total_bytes(&self, total_bytes: u64) {
+        self.progress_bar.set_length(total_bytes);
+    }
+
     /// Finish the progress bar with a completion message
     pub fn finish(&self, operation: &str, total_bytes: u64, duration: Duration) {
         let throughput_mbps = (total_bytes as f64 / 1_048_576.0) / duration.as_secs_f64();
@@ -95,5 +100,10 @@ impl ProgressCallback {
         let total_bytes = self.bytes_transferred.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed) + bytes;
         
         self.tracker.update(total_bytes, completed, self.total_objects);
+    }
+
+    /// Update the progress bar's total size as we discover the actual total
+    pub fn update_total_bytes(&self, total_bytes: u64) {
+        self.tracker.set_total_bytes(total_bytes);
     }
 }

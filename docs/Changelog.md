@@ -1,5 +1,111 @@
 # s3dlio Changelog
 
+## Version 0.8.3 - Multi-Backend Progress Tracking & Enhanced Copy Operations (September 25, 2025)
+
+### 🚀 **Universal Copy Operations with Progress Tracking**
+
+This release transforms `upload` and `download` commands into universal copy operations that work seamlessly across **all storage backends** (S3, Azure Blob, local file system, O_DIRECT) with **consistent progress tracking** and **enhanced pattern matching**.
+
+**Key Achievement**: **Unified copy interface** - upload and download now function as enhanced versions of the Unix `cp` command, supporting **regex patterns**, **glob patterns**, and **multi-backend operations** with real-time progress bars.
+
+### 🎯 **Multi-Backend Support**
+
+#### **🔄 Universal Storage Backends**
+- **S3**: `s3://bucket/prefix/` - Amazon S3 compatible storage
+- **Azure Blob**: `az://container/prefix/` or `azure://container/prefix/` - Microsoft Azure Blob Storage  
+- **File System**: `file:///path/to/directory/` - Local file system operations
+- **Direct I/O**: `direct:///path/to/directory/` - High-performance O_DIRECT file operations
+- **Automatic detection**: Backend automatically selected based on URI scheme
+- **Consistent behavior**: Same progress tracking and performance across all backends
+
+#### **📊 Enhanced Progress Tracking**
+- **Real-time progress bars**: Consistent across all storage backends with transfer rates, ETA, and completion percentage
+- **Multi-file tracking**: Accurate progress for concurrent upload/download operations
+- **Dynamic totals**: Progress bars update correctly even when total size is unknown initially
+- **Performance metrics**: Display transfer rates (MB/s, KiB/s) and estimated time remaining
+- **Fixed Tokio runtime issues**: Eliminated runtime nesting panics in CLI and Python API
+
+#### **🎯 Advanced Pattern Matching**
+- **Individual Files**: `file.txt` - Upload/download specific files
+- **Directories**: `directory/` - Process all files in directory (upload) or prefix (download)
+- **Glob Patterns**: `*.log`, `file_*.txt`, `data?.csv` - Shell-style wildcards
+- **Regex Patterns**: `.*\.log$`, `file_[0-9]+\.txt` - Powerful regular expression matching
+- **Cross-backend patterns**: All pattern types work with any storage backend
+
+### 🔧 **Enhanced CLI Commands**
+
+#### **📤 Universal Upload Command**
+```bash
+# Upload to different backends with progress
+s3-cli upload /local/files/*.log s3://bucket/logs/
+s3-cli upload /local/data/* az://container/data/  
+s3-cli upload /local/files/* file:///backup/files/
+s3-cli upload /local/data/* direct:///fast-storage/data/
+
+# Regex patterns for advanced file selection
+s3-cli upload "/path/to/logs/.*\.log$" s3://bucket/logs/
+s3-cli upload "/data/file_[0-9]+\.txt" az://container/data/
+```
+
+#### **📥 Universal Download Command**  
+```bash
+# Download from any backend with progress
+s3-cli download s3://bucket/data/ ./local-data/
+s3-cli download az://container/logs/ ./logs/
+s3-cli download file:///remote-mount/data/ ./data/
+s3-cli download direct:///nvme/cache/ ./cache/
+
+# Cross-backend copying workflow
+s3-cli download s3://source-bucket/data/ ./temp/
+s3-cli upload ./temp/* az://dest-container/data/
+```
+
+### 🐍 **Python API Improvements**
+
+#### **🔄 Multi-Backend Python Functions**
+- **`s3dlio.upload()`**: Works with all storage backends, maintains same signature
+- **`s3dlio.download()`**: Universal download supporting all URI schemes  
+- **Runtime safety**: Fixed Tokio runtime nesting issues for stable operation
+- **Pattern support**: Inherits glob and regex pattern matching from generic functions
+- **No breaking changes**: Existing Python code works unchanged with enhanced capabilities
+
+#### **🛡️ Robust Error Handling**
+- **Bucket creation control**: Only creates buckets/containers when explicitly requested with `create_bucket=True`
+- **Backend validation**: Clear error messages for unsupported operations or invalid URIs
+- **Graceful degradation**: Operations continue even if individual files fail (with warnings)
+- **Progress callback support**: Internal progress tracking ready for future Python progress bar integration
+
+### 🏗️ **Architecture Improvements**
+
+#### **🎯 Generic Backend Functions**
+- **`generic_upload_files()`**: Backend-agnostic upload with progress tracking
+- **`generic_download_objects()`**: Universal download supporting all storage types
+- **ObjectStore trait**: Clean abstraction enabling easy addition of new storage backends
+- **Async architecture**: Proper async/await implementation preventing runtime conflicts
+- **Performance preservation**: All existing performance optimizations maintained across backends
+
+#### **🔧 Technical Fixes**
+- **Tokio runtime resolution**: Eliminated nested runtime creation causing panics in CLI commands
+- **Progress bar accuracy**: Fixed "0 B/0 B" display by implementing dynamic total updates
+- **Pattern matching robustness**: Enhanced regex detection and glob handling for better file discovery
+- **Memory efficiency**: Maintained streaming performance while adding multi-backend support
+
+### 📈 **Performance & Compatibility**
+
+#### **⚡ Performance Characteristics**
+- **Unchanged performance**: All existing benchmark results maintained
+- **Concurrent operations**: Multi-file uploads/downloads preserve parallel execution
+- **Memory footprint**: Minimal overhead added for backend abstraction
+- **Progress tracking overhead**: Negligible performance impact for progress bar functionality
+
+#### **🔄 Backward Compatibility**
+- **CLI compatibility**: All existing CLI commands work unchanged with enhanced capabilities
+- **Python API compatibility**: Existing Python scripts run without modification
+- **Configuration preservation**: All existing settings and options preserved
+- **Migration path**: Seamless upgrade with immediate access to new multi-backend features
+
+---
+
 ## Version 0.8.2 - Configurable Data Generation Modes (September 25, 2025)
 
 ### 🚀 **Configurable Data Generation Modes for Optimal Performance**

@@ -7,11 +7,12 @@ use futures::StreamExt;
 use glob::glob;
 //use regex::Regex;
 use std::{fs, path::{Path}, sync::Arc};
-use tokio::{fs as async_fs, runtime::Runtime, sync::Semaphore};
+use tokio::{fs as async_fs, sync::Semaphore};
 
 use crate::s3_utils::{
     parse_s3_uri, create_bucket, list_objects, get_object, put_object_async,
 };
+use crate::progress::ProgressCallback;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Functions that leverage existing s3_utils code
@@ -21,11 +22,12 @@ use crate::s3_utils::{
 /// Upload local files (supports globs) into `s3://bucket/prefix/…`,
 /// streaming each file off disk with up to `max_in_flight` tasks.
 /// If `do_create_bucket` is true, we attempt to create the bucket first.
-pub fn upload_files<P: AsRef<Path>>(  
+pub async fn upload_files<P: AsRef<Path>>(  
     dest_prefix: &str,
     patterns: &[P],
     max_in_flight: usize,
     do_create_bucket: bool,
+    progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
     let (bucket, key_prefix) = parse_s3_uri(dest_prefix)?;
     // Allow empty prefix (bucket root) or a non-empty prefix that ends with '/'
@@ -59,9 +61,6 @@ pub fn upload_files<P: AsRef<Path>>(
     // Cap the number of concurrent tasks to the number of items
     let effective_jobs = std::cmp::min(max_in_flight, paths.len());
 
-    // build a Tokio runtime for our async work
-    let rt = Runtime::new()?;
-
     // INFO: start of bulk upload
     log::info!(
         "Starting upload of {} file(s) to {} (jobs={})",
@@ -77,16 +76,20 @@ pub fn upload_files<P: AsRef<Path>>(
     );
 
     let sem = Arc::new(Semaphore::new(effective_jobs));
-    let result = rt.block_on(async {
+    let result = {
         let mut futs = FuturesUnordered::new();
         for path in paths.clone() {
             log::debug!("queueing upload for {:?}", path);
             let sem = sem.clone();
             let bucket = bucket.clone();
+            let progress = progress_callback.clone();
             let fname = path.file_name()
                 .ok_or_else(|| anyhow::anyhow!("Bad path {:?}", path))?
                 .to_string_lossy();
             let key = format!("{}{}", key_prefix, fname);
+
+            // Get file size for progress tracking
+            let file_size = fs::metadata(&path)?.len();
 
             futs.push(tokio::spawn(async move {
                 log::debug!("starting upload of {:?} → s3://{}/{}", path, bucket, key);
@@ -94,6 +97,12 @@ pub fn upload_files<P: AsRef<Path>>(
                 let body = ByteStream::from_path(&path).await?;
                 put_object_async(&bucket, &key, &body.collect().await?.into_bytes()).await?;
                 log::debug!("finished upload of {:?} → s3://{}/{}", path, bucket, key);
+                
+                // Update progress if callback provided
+                if let Some(ref progress) = progress {
+                    progress.object_completed(file_size);
+                }
+                
                 Ok::<(), anyhow::Error>(())
             }));
         }
@@ -102,7 +111,7 @@ pub fn upload_files<P: AsRef<Path>>(
             join_res??;
         }
         Ok(())
-    });
+    };
 
     // INFO: result of bulk upload
     match &result {
@@ -119,11 +128,12 @@ pub fn upload_files<P: AsRef<Path>>(
 
 /// Download one key, every key under a prefix, or glob/regex-match objects into `dest_dir/`,
 /// creating files with their original basenames, up to `max_in_flight` at once.
-pub fn download_objects(
+pub async fn download_objects(
     src_uri: &str,
     dest_dir: &Path,
     max_in_flight: usize,
     recursive: bool,
+    progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
     let (bucket, mut key_pattern) = parse_s3_uri(src_uri)?;
 
@@ -159,9 +169,6 @@ pub fn download_objects(
     // Cap the number of concurrent tasks to the number of items
     let effective_jobs = std::cmp::min(max_in_flight, keys.len());
 
-    // build a Tokio runtime for our async work
-    let rt = Runtime::new()?;
-
     // INFO: start of bulk download
     log::info!(
         "Starting download of {} object(s) from {} to {:?} (jobs={})",
@@ -174,12 +181,13 @@ pub fn download_objects(
     log::debug!("download_objects debug: requested_jobs={}", max_in_flight);
 
     let sem = Arc::new(Semaphore::new(effective_jobs));
-    let result = rt.block_on(async {
+    let result = {
         let mut futs = FuturesUnordered::new();
         for k in keys.clone() {
             let sem = sem.clone();
             let bucket = bucket.clone();
             let out_dir = dest_dir.to_path_buf();
+            let progress = progress_callback.clone();
 
             futs.push(tokio::spawn(async move {
                 log::debug!("starting download of s3://{}/{} → {:?}", bucket, k, out_dir);
@@ -189,12 +197,19 @@ pub fn download_objects(
                     return Ok::<(), anyhow::Error>(());
                 }
                 let bytes = get_object(&bucket, &k).await?;
+                let byte_count = bytes.len() as u64;
                 let fname = Path::new(&k)
                     .file_name()
                     .ok_or_else(|| anyhow::anyhow!("Bad key: {}", k))?;
                 let out_path = out_dir.join(fname);
-                async_fs::write(&out_path, bytes).await?;
+                async_fs::write(&out_path, &bytes).await?;
                 log::debug!("finished download of s3://{}/{} → {:?}", bucket, k, out_path);
+                
+                // Update progress if callback provided
+                if let Some(ref progress) = progress {
+                    progress.object_completed(byte_count);
+                }
+                
                 Ok::<(), anyhow::Error>(())
             }));
         }
@@ -203,7 +218,7 @@ pub fn download_objects(
             join_res??;
         }
         Ok(())
-    });
+    };
 
     // INFO: result of bulk download
     match &result {

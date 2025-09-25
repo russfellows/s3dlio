@@ -21,9 +21,11 @@ use std::io::{self, Write, ErrorKind};
 use std::path::PathBuf;
 use std::str::FromStr; // For the custom S3Path type
 use std::time::Instant;
+use std::sync::Arc;
 use log::LevelFilter;
 use log::info;
 use tempfile::NamedTempFile;
+use glob;
 
 
 
@@ -37,9 +39,9 @@ use s3dlio::{
     config::{DataGenMode, Config},
 };
 
-use s3dlio::s3_copy::{upload_files, download_objects};
+use s3dlio::{generic_upload_files, generic_download_objects};
 use s3dlio::{init_op_logger, finalize_op_logger};
-use s3dlio::progress::S3ProgressTracker;
+use s3dlio::progress::{S3ProgressTracker, ProgressCallback};
 
 /// Macro to safely print with broken pipe handling
 macro_rules! safe_println {
@@ -261,12 +263,12 @@ enum Command {
         #[arg(long = "chunk-size", default_value_t = 256 * 1024)]
         chunk_size: usize,
     },
-    /// Upload local files (supports glob patterns) to S3, concurrently to jobs
+    /// Upload local files to any storage backend (S3, Azure, file://, direct://), supports glob and regex patterns
     Upload {
-        /// One or more local files or glob patterns ('*' and '?')
+        /// One or more local files, directories, glob patterns ('*','?'), or regex patterns
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        /// S3 prefix **ending with '/'**
+        /// Destination URI (s3://bucket/, az://container/, file:///path/, direct:///path/) **ending with '/'**
         dest: String,
         /// Maximum parallel uploads
         #[arg(short = 'j', long = "jobs", default_value_t = 32)]
@@ -275,9 +277,9 @@ enum Command {
         #[arg(short = 'c', long = "create-bucket")]
         create_bucket: bool,
     },
-    /// Download object(s) to named directory (uses globbing pattern match)
+    /// Download objects from any storage backend (S3, Azure, file://, direct://), supports glob and regex patterns
     Download {
-        /// S3 URI – can be a full key or prefix/glob with '*' or '?'.
+        /// Source URI with optional patterns – supports full URIs, prefixes, globs ('*','?'), and regex patterns
         src: String,
         /// Local directory to write into
         dest_dir: PathBuf,
@@ -429,18 +431,100 @@ async fn main() -> Result<()> {
     
     
         Command::Upload { files, dest, jobs, create_bucket } => {
-            let spinner = S3ProgressTracker::spinner("UPLOAD");
-            spinner.set_message(format!("Uploading files to {}...", dest));
-            let result = upload_files(&dest, &files, jobs, create_bucket);
-            spinner.finish_with_message("Upload complete!");
+            // Calculate total size of files to upload for progress tracking
+            let mut total_bytes = 0u64;
+            let mut file_count = 0;
+            
+            for pattern in &files {
+                let s = pattern.to_string_lossy();
+                if s.contains('*') || s.contains('?') {
+                    for entry in glob::glob(&s)? {
+                        match entry {
+                            Ok(path) => {
+                                if let Ok(metadata) = std::fs::metadata(&path) {
+                                    if metadata.is_file() {
+                                        total_bytes += metadata.len();
+                                        file_count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => log::warn!("Glob error: {}", e),
+                        }
+                    }
+                } else {
+                    let path = std::path::Path::new(s.as_ref());
+                    if let Ok(metadata) = std::fs::metadata(path) {
+                        if metadata.is_file() {
+                            total_bytes += metadata.len();
+                            file_count += 1;
+                        }
+                    }
+                }
+            }
+
+            if file_count == 0 {
+                bail!("No files found to upload");
+            }
+
+            // Create progress tracker
+            let progress_tracker = Arc::new(S3ProgressTracker::new("UPLOAD", file_count, total_bytes));
+            let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), file_count));
+
+            // Handle bucket creation for backends that support it
+            if create_bucket {
+                if let Ok(store) = s3dlio::store_for_uri(&dest) {
+                    // Extract bucket/container name from URI
+                    if dest.starts_with("s3://") {
+                        if let Ok((bucket, _)) = parse_s3_uri(&dest) {
+                            if let Err(e) = store.create_container(&bucket).await {
+                                log::warn!("Failed to create bucket {}: {}", bucket, e);
+                            }
+                        }
+                    } else if dest.starts_with("az://") || dest.starts_with("azure://") {
+                        // For Azure, extract container name
+                        let parts: Vec<&str> = dest.trim_start_matches("az://").trim_start_matches("azure://").split('/').collect();
+                        if let Some(container) = parts.get(0) {
+                            if let Err(e) = store.create_container(container).await {
+                                log::warn!("Failed to create container {}: {}", container, e);
+                            }
+                        }
+                    }
+                    // File backends don't need bucket creation, directories are created automatically
+                }
+            }
+
+            let t0 = Instant::now();
+            let result = generic_upload_files(&dest, &files, jobs, Some(progress_callback)).await;
+            let elapsed = t0.elapsed();
+
+            // Finish progress bar
+            progress_tracker.finish("Upload", total_bytes, elapsed);
+            
             result?
         }
     
         Command::Download { src, dest_dir, jobs, recursive } => {
-            let spinner = S3ProgressTracker::spinner("DOWNLOAD");
-            spinner.set_message(format!("Downloading from {} to {:?}...", src, dest_dir));
-            let result = download_objects(&src, &dest_dir, jobs, recursive);
-            spinner.finish_with_message("Download complete!");
+            // Use generic object store to list objects (works with all backends)
+            let store = s3dlio::store_for_uri(&src)?;
+            let keys = store.list(&src, recursive).await?;
+            
+            if keys.is_empty() {
+                bail!("No objects matched for download");
+            }
+
+            // Create progress tracker with unknown total bytes initially
+            let progress_tracker = Arc::new(S3ProgressTracker::new("DOWNLOAD", keys.len() as u64, 0));
+            let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), keys.len() as u64));
+
+            let t0 = Instant::now();
+            let result = generic_download_objects(&src, &dest_dir, jobs, recursive, Some(progress_callback.clone())).await;
+            let elapsed = t0.elapsed();
+
+            // Get final byte count from progress callback and update the progress bar total
+            let total_bytes = progress_callback.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
+            progress_callback.update_total_bytes(total_bytes);
+            progress_tracker.finish("Download", total_bytes, elapsed);
+            
             result?
         }
     
@@ -591,6 +675,10 @@ fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: O
     
     let total_bytes: usize = results.iter().map(|(_, bytes)| bytes.len()).sum();
     let dt = t0.elapsed();
+
+    // Update the progress bar total and position to show completed state
+    progress.set_total_bytes(total_bytes as u64);
+    progress.update(total_bytes as u64, uris.len() as u64, uris.len() as u64);
 
     // Finish the progress bar with completion stats
     progress.finish("Download", total_bytes as u64, dt);
