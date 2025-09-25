@@ -55,6 +55,7 @@ pub mod object_store_arrow;
 pub mod file_store;
 pub mod file_store_direct;
 pub mod data_gen;
+pub mod streaming_writer;
 pub mod data_loader;
 pub mod checkpoint;
 pub mod azure_client;

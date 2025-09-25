@@ -809,25 +809,14 @@ pub fn put_objects_with_random_data_and_type(
     uris: &[String],
     size: usize,
     max_in_flight: usize,
-    object_type: ObjectType,
-    dedup_factor: usize,
-    compress_factor: usize,
+    config: Config,
 ) -> Result<()> {
     info!(
         "put_objects: type={:?}, size={} bytes, uris={} parallelism={}",
-        object_type, size, uris.len(), max_in_flight
+        config.object_type, size, uris.len(), max_in_flight
     );
 
-    let cfg = Config {
-        object_type,
-        elements: 1,
-        element_size: size,
-        use_controlled: dedup_factor != 1 || compress_factor != 1,
-        dedup_factor,
-        compress_factor,
-    };
-
-    let buffer: Bytes = generate_object(&cfg)?.into();  // or: Bytes::from(generate_object(&cfg)?)
+    let buffer: Bytes = generate_object(&config)?.into();  // or: Bytes::from(generate_object(&config)?)
     let uris_vec = uris.to_vec();                     // own for 'static
     debug!("Uploading buffer of {} bytes to {} URIs", buffer.len(), uris_vec.len());
     put_objects_parallel(uris_vec, buffer, max_in_flight)

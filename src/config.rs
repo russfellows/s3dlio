@@ -11,6 +11,24 @@ pub enum ObjectType {
     Raw,
 }
 
+/// Data generation modes for performance optimization.
+#[derive(Clone, Copy, Debug, ValueEnum, Deserialize, Serialize)]
+#[clap(rename_all = "kebab-case")] // CLI shows streaming, single-pass
+#[serde(rename_all = "snake_case")] // JSON shows streaming, single_pass
+pub enum DataGenMode {
+    /// Streaming generation with configurable chunk size (default, faster for most workloads)
+    Streaming,
+    /// Single-pass generation (legacy, faster for 16-32MB objects)
+    SinglePass,
+}
+
+impl Default for DataGenMode {
+    fn default() -> Self {
+        // Default to streaming based on performance benchmarks showing 64% win rate
+        Self::Streaming
+    }
+}
+
 /// S3-specific configuration
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct S3Config {
@@ -73,5 +91,43 @@ pub struct Config {
     // ---- knobs for data pattern generation ----
     pub use_controlled: bool,    // true => call generate_controlled_data()
     pub dedup_factor:   usize,       // e.g. 1 (all unique), 3 (1/3 unique)
-    pub compress_factor: usize,    // e.g. 1 (random), 2 (≈50 % zeros)
+    pub compress_factor: usize,    // e.g. 1 (random), 2 (≈50 % zeros)
+    
+    // ---- performance optimization ----
+    pub data_gen_mode: DataGenMode,  // streaming vs single-pass generation  
+    pub chunk_size: usize,           // chunk size for streaming mode (default 256KB)
+}
+
+impl Config {
+    /// Create a new Config with optimal defaults based on performance benchmarks
+    pub fn new_with_defaults(
+        object_type: ObjectType,
+        elements: usize, 
+        element_size: usize,
+        dedup_factor: usize,
+        compress_factor: usize
+    ) -> Self {
+        Self {
+            object_type,
+            elements,
+            element_size,
+            use_controlled: dedup_factor != 1 || compress_factor != 1,
+            dedup_factor,
+            compress_factor,
+            data_gen_mode: DataGenMode::default(), // Streaming by default
+            chunk_size: 256 * 1024, // 256KB optimal from benchmarks
+        }
+    }
+    
+    /// Override data generation mode for specific performance requirements
+    pub fn with_data_gen_mode(mut self, mode: DataGenMode) -> Self {
+        self.data_gen_mode = mode;
+        self
+    }
+    
+    /// Override chunk size for streaming mode
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size;
+        self
+    }
 }

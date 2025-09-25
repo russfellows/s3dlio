@@ -1,6 +1,6 @@
 [package]
 name = "s3dlio"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 
 [lib]
@@ -51,6 +51,7 @@ regex       = "1.11"
 futures     = "^0.3"
 rand        = { version = "^0.9", features = ["std", "alloc"] }
 rand_chacha = { version = "^0.3" }
+rand_pcg    = { version = "^0.3" }
 bytemuck    = "^1.14"
 tempfile    = "^3.20"
 tfrecord    = "^0.15"

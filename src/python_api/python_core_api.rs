@@ -20,7 +20,7 @@ use log::LevelFilter;
 use env_logger;
 
 // Project crates
-use crate::config::ObjectType;
+use crate::config::{ObjectType, DataGenMode, Config};
 use crate::s3_utils::{
     delete_objects, get_object_uri, get_objects_parallel,
     list_objects as list_objects_rs, get_range,
@@ -216,6 +216,14 @@ fn build_uri_list(prefix: &str, template: &str, num: usize) -> PyResult<(String,
 }
 fn str_to_obj(s: &str) -> ObjectType { ObjectType::from(s) }
 
+fn str_to_data_gen_mode(s: &str) -> DataGenMode {
+    match s.to_lowercase().as_str() {
+        "streaming" => DataGenMode::Streaming,
+        "single-pass" | "single_pass" | "singlepass" => DataGenMode::SinglePass,
+        _ => DataGenMode::Streaming, // Default to streaming
+    }
+}
+
 // ------------------------------------------------------------------------
 // NEW: Python-visible list_objects()  (sync wrapper), with recursion
 // ------------------------------------------------------------------------
@@ -282,7 +290,8 @@ pub fn delete_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
     prefix, num, template,
     max_in_flight = 64, size = None,
     should_create_bucket = false, object_type = "zeros",
-    dedup_factor = 1, compress_factor = 1
+    dedup_factor = 1, compress_factor = 1,
+    data_gen_mode = "streaming", chunk_size = 262144
 ))]
 pub fn put(
     py: Python<'_>,
@@ -290,14 +299,19 @@ pub fn put(
     max_in_flight: usize, size: Option<usize>,
     should_create_bucket: bool, object_type: &str,
     dedup_factor: usize, compress_factor: usize,
+    data_gen_mode: &str, chunk_size: usize,
 ) -> PyResult<()> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let (bucket, uris) = build_uri_list(prefix, template, num)?;
     let jobs = max_in_flight.min(num);
     let obj = str_to_obj(object_type);
+    let mode = str_to_data_gen_mode(data_gen_mode);
+    let config = Config::new_with_defaults(obj, 1, sz, dedup_factor, compress_factor)
+        .with_data_gen_mode(mode)
+        .with_chunk_size(chunk_size);
     py.allow_threads(|| {
         if should_create_bucket { let _ = create_bucket_rs(&bucket); }
-        put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor)
+        put_objects_with_random_data_and_type(&uris, sz, jobs, config)
             .map_err(py_err)
     })
 }
@@ -307,7 +321,8 @@ pub fn put(
     prefix, num, template,
     max_in_flight = 64, size = None,
     should_create_bucket = false, object_type = "zeros",
-    dedup_factor = 1, compress_factor = 1
+    dedup_factor = 1, compress_factor = 1,
+    data_gen_mode = "streaming", chunk_size = 262144
 ))]
 pub (crate) fn put_async_py<'p>(
     py: Python<'p>,
@@ -315,16 +330,21 @@ pub (crate) fn put_async_py<'p>(
     max_in_flight: usize, size: Option<usize>,
     should_create_bucket: bool, object_type: &'p str,
     dedup_factor: usize, compress_factor: usize,
+    data_gen_mode: &'p str, chunk_size: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let (bucket, uris) = build_uri_list(prefix, template, num)?;
     let jobs = max_in_flight.min(num);
     let obj = str_to_obj(object_type);
+    let mode = str_to_data_gen_mode(data_gen_mode);
+    let config = Config::new_with_defaults(obj, 1, sz, dedup_factor, compress_factor)
+        .with_data_gen_mode(mode)
+        .with_chunk_size(chunk_size);
 
     future_into_py(py, async move {
         task::spawn_blocking(move || {
             if should_create_bucket { let _ = create_bucket_rs(&bucket); }
-            put_objects_with_random_data_and_type(&uris, sz, jobs, obj, dedup_factor, compress_factor)
+            put_objects_with_random_data_and_type(&uris, sz, jobs, config)
                 .map_err(py_err)
         })
         .await
