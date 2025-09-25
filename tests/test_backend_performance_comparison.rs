@@ -88,6 +88,7 @@ async fn benchmark_put_operations(
     concurrency: usize
 ) -> Result<(PerformanceMetrics, Vec<String>)> {
     use s3dlio::{put_objects_with_random_data_and_type, ObjectType};
+    use s3dlio::config::Config;
     
     let start_time = Instant::now();
     
@@ -103,13 +104,18 @@ async fn benchmark_put_operations(
     
     // Use the same high-performance function that CLI uses
     // This uses FuturesUnordered and proper async concurrency
+    let config = Config::new_with_defaults(
+        ObjectType::Raw, // Raw data for pure performance test
+        1, // elements
+        object_size, // element_size
+        1, // No deduplication 
+        1, // No compression
+    );
     put_objects_with_random_data_and_type(
         &object_keys,
         object_size,
         concurrency,
-        ObjectType::Raw, // Raw data for pure performance test
-        1, // No deduplication 
-        1, // No compression
+        config,
     )?;
     
     let total_duration = start_time.elapsed();

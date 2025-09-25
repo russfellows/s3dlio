@@ -17,7 +17,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
-use std::io::{self, Write};
+use std::io::{self, Write, ErrorKind};
 use std::path::PathBuf;
 use std::str::FromStr; // For the custom S3Path type
 use std::time::Instant;
@@ -34,11 +34,27 @@ use s3dlio::{
     list_buckets,
     object_store::store_for_uri,
     mp,
+    config::{DataGenMode, Config},
 };
 
 use s3dlio::s3_copy::{upload_files, download_objects};
 use s3dlio::{init_op_logger, finalize_op_logger};
 use s3dlio::progress::S3ProgressTracker;
+
+/// Macro to safely print with broken pipe handling
+macro_rules! safe_println {
+    ($($arg:tt)*) => {
+        match writeln!(io::stdout(), $($arg)*) {
+            Ok(_) => {},
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                // Gracefully exit on broken pipe (e.g., when piped to head/tail)
+                std::process::exit(0);
+            }
+            Err(e) => return Err(e.into())
+        }
+    };
+}
+
 
 
 // --- Define the S3Path struct for clap to use as a custom parser.
@@ -236,6 +252,14 @@ enum Command {
         /// Compression factor (integer ≥1). 1 => fully random.
         #[arg(short = 'x', long = "compress", default_value_t = 1)]
         compress_f: usize,
+
+        /// Data generation mode for performance optimization
+        #[arg(long = "data-gen-mode", value_enum, ignore_case = true, default_value_t = s3dlio::config::DataGenMode::Streaming)]
+        data_gen_mode: s3dlio::config::DataGenMode,
+
+        /// Chunk size for streaming generation mode (bytes)
+        #[arg(long = "chunk-size", default_value_t = 256 * 1024)]
+        chunk_size: usize,
     },
     /// Upload local files (supports glob patterns) to S3, concurrently to jobs
     Upload {
@@ -284,21 +308,21 @@ enum Command {
 
 /// List all S3 buckets in the account.
 async fn list_buckets_cmd() -> Result<()> {
-    println!("Listing all S3 buckets...");
+    safe_println!("Listing all S3 buckets...");
     
     let buckets = list_buckets()?;
     
     if buckets.is_empty() {
-        println!("No buckets found in this S3 account.");
+        safe_println!("No buckets found in this S3 account.");
         return Ok(());
     }
     
-    println!("\nFound {} bucket(s):", buckets.len());
-    println!("{:<30} {}", "Bucket Name", "Creation Date");
-    println!("{}", "-".repeat(60));
+    safe_println!("\nFound {} bucket(s):", buckets.len());
+    safe_println!("{:<30} {}", "Bucket Name", "Creation Date");
+    safe_println!("{}", "-".repeat(60));
     
     for bucket in buckets {
-        println!("{:<30} {}", bucket.name, bucket.creation_date);
+        safe_println!("{:<30} {}", bucket.name, bucket.creation_date);
     }
     
     Ok(())
@@ -355,7 +379,7 @@ async fn main() -> Result<()> {
 
             info!("Attempting to create bucket: {}...", final_bucket_name);
             s3dlio::s3_utils::create_bucket(final_bucket_name)?;
-            println!("Successfully created or verified bucket '{}'.", final_bucket_name);
+            safe_println!("Successfully created or verified bucket '{}'.", final_bucket_name);
         },
 
         Command::DeleteBucket { bucket_name } => {
@@ -367,7 +391,7 @@ async fn main() -> Result<()> {
 
             info!("Attempting to delete bucket: {}...", final_bucket_name);
             s3dlio::s3_utils::delete_bucket(final_bucket_name)?;
-            println!("Successfully deleted bucket '{}'.", final_bucket_name);
+            safe_println!("Successfully deleted bucket '{}'.", final_bucket_name);
         }
 
         // --- Update the `List` command handler.
@@ -420,7 +444,7 @@ async fn main() -> Result<()> {
             result?
         }
     
-        Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f } => {
+        Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size } => {
             let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
             if create_bucket_flag {
                 if let Err(e) = s3dlio::s3_utils::create_bucket(&bucket) {
@@ -428,7 +452,7 @@ async fn main() -> Result<()> {
                 }
             }
     
-            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f)?
+            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size)?
 
         }
 
@@ -470,20 +494,20 @@ Total objects: {}", keys.len())?;
 /// Stat command: provide info on a single object
 fn stat_cmd(uri: &str) -> Result<()> {
     let os = stat_object_uri(uri)?;
-    println!("Size            : {}", os.size);
-    println!("LastModified    : {:?}", os.last_modified);
-    println!("ETag            : {:?}", os.e_tag);
-    println!("Content-Type    : {:?}", os.content_type);
-    println!("Content-Language: {:?}", os.content_language);
-    println!("StorageClass    : {:?}", os.storage_class);
-    println!("VersionId       : {:?}", os.version_id);
-    println!("ReplicationStat : {:?}", os.replication_status);
-    println!("SSE             : {:?}", os.server_side_encryption);
-    println!("SSE-KMS Key ID  : {:?}", os.ssekms_key_id);
+    safe_println!("Size            : {}", os.size);
+    safe_println!("LastModified    : {:?}", os.last_modified);
+    safe_println!("ETag            : {:?}", os.e_tag);
+    safe_println!("Content-Type    : {:?}", os.content_type);
+    safe_println!("Content-Language: {:?}", os.content_language);
+    safe_println!("StorageClass    : {:?}", os.storage_class);
+    safe_println!("VersionId       : {:?}", os.version_id);
+    safe_println!("ReplicationStat : {:?}", os.replication_status);
+    safe_println!("SSE             : {:?}", os.server_side_encryption);
+    safe_println!("SSE-KMS Key ID  : {:?}", os.ssekms_key_id);
     if !os.metadata.is_empty() {
-        println!("User Metadata:");
+        safe_println!("User Metadata:");
         for (k,v) in os.metadata {
-            println!("  {} = {}", k, v);
+            safe_println!("  {} = {}", k, v);
         }
     }
     Ok(())
@@ -680,7 +704,7 @@ fn delete_cmd(uri: &str, _jobs: usize, recursive: bool) -> Result<()> {
 
 
 /// Put command supports 1 or more objects, also takes our ObjectType
-fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize) -> Result<()> {
+fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize, data_gen_mode: DataGenMode, chunk_size: usize) -> Result<()> {
     // Parse the prefix into bucket and key prefix.
     let (bucket, mut prefix) = parse_s3_uri(uri_prefix)?;
     if !prefix.ends_with('/') {
@@ -708,7 +732,11 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
     progress.progress_bar.set_message(format!("Preparing to upload {} objects...", num));
 
     let t0 = Instant::now();
-    put_objects_with_random_data_and_type(&uris, size, effective_jobs, object_type, dedup_f, compress_f)?;
+    // Create config with specified data generation mode and chunk size
+    let config = Config::new_with_defaults(object_type, 1, size, dedup_f, compress_f)
+        .with_data_gen_mode(data_gen_mode)
+        .with_chunk_size(chunk_size);
+    put_objects_with_random_data_and_type(&uris, size, effective_jobs, config)?;
     let elapsed = t0.elapsed();
 
     // Finish the progress bar with completion stats

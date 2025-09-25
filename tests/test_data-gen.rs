@@ -9,7 +9,7 @@ use s3dlio::data_gen::generate_controlled_data;
 #[cfg(test)]
 mod tests {
     use super::generate_controlled_data;
-    use s3dlio::data_gen::BLK_SIZE;
+    use s3dlio::constants::BLK_SIZE;
     use std::io::{self, Write};
 
     // How close our dedupe and compression ratios must be, set to 0.10 = 10%

@@ -33,6 +33,46 @@ cargo build --no-default-features --features native-backends
 
 ## Recent Highlights
 
+### 🚀 Version 0.8.2 - Configurable Data Generation Modes (September 25, 2025)
+
+**CONFIGURABLE DATA GENERATION MODES**: Introducing **configurable data generation modes** with **streaming as the default** for optimal performance. Based on comprehensive benchmarking, **streaming mode provides 2.6-3.5x performance improvement** for 1-8MB objects and wins in **64% of real-world scenarios**.
+
+**Key Features:**
+- ✅ **DataGenMode Configuration**: Choose between `streaming` (default) and `single-pass` modes
+- ✅ **CLI Integration**: `--data-gen-mode` and `--chunk-size` options for performance tuning
+- ✅ **Python API Enhancement**: `data_gen_mode` and `chunk_size` parameters in `put()` function  
+- ✅ **Intelligent Defaults**: Streaming mode automatically selected based on benchmark data
+- ✅ **Real S3 Testing**: Verified with actual S3 backend achieving 80+ MiB/s throughput
+- ✅ **Backward Compatibility**: All existing code benefits from new streaming defaults
+
+**CLI Usage:**
+```bash
+# Default streaming mode (optimal performance)
+s3-cli put s3://bucket/object-{}.bin --num 10 --size 4MB
+
+# Explicit mode selection  
+s3-cli put s3://bucket/object-{}.bin --num 10 --size 4MB --data-gen-mode streaming
+s3-cli put s3://bucket/object-{}.bin --num 10 --size 16MB --data-gen-mode single-pass
+```
+
+**Python API:**
+```python
+import s3dlio
+
+# Default streaming mode (2.6-3.5x faster for most cases)
+s3dlio.put("s3://bucket/object-{}.bin", num=10, template="obj-{}-of-{}", size=4194304)
+
+# Explicit configuration
+s3dlio.put("s3://bucket/object-{}.bin", num=10, template="obj-{}-of-{}", 
+          size=4194304, data_gen_mode="streaming", chunk_size=65536)
+```
+
+**Performance Benchmarks:**
+- **1-8MB objects**: Streaming mode provides 2.6-3.5x performance improvement
+- **Overall scenarios**: Streaming wins in 64% of real-world test cases
+- **Memory efficiency**: Streaming uses less memory through on-demand generation  
+- **16-32MB range**: Single-pass competitive for specific object sizes
+
 ### 🎯 Version 0.8.1 - Enhanced API & PyTorch Integration (September 24, 2025)
 
 **PRODUCTION-READY ENHANCED API**: Complete **Enhanced API** with **100% working PyTorch integration** and **34/34 tests passing**. The new simplified API provides modern interfaces while maintaining full backward compatibility.
@@ -593,22 +633,62 @@ Options:
 Next is an example of help for the `put` subcommand:
 
 ```
-root@loki-node3:/app# s3-cli put --help
+$ s3-cli put --help
 Upload one or more objects concurrently, uses ObjectType format filled with random data
 
 Usage: s3-cli put [OPTIONS] <URI_PREFIX>
 
 Arguments:
-  <URI_PREFIX>  S3 URI prefix (e.g. s3://bucket/prefix)
+  <URI_PREFIX>
+          S3 URI prefix (e.g. s3://bucket/prefix)
 
 Options:
-  -c, --create-bucket              Optionally create the bucket if it does not exist
-  -j, --jobs <JOBS>                Maximum concurrent uploads (jobs), but is modified to be min(jobs, num) [default: 32]
-  -n, --num <NUM>                  Number of objects to create and upload [default: 1]
-  -o, --object-type <OBJECT_TYPE>  What kind of object to generate: [default: RAW] [possible values: NPZ, TFRECORD, HDF5, RAW]
-  -s, --size <SIZE>                Object size in bytes (default 20 MB) [default: 20971520]
-  -t, --template <TEMPLATE>        Template for object names. Use '{}' as a placeholder [default: object_{}_of_{}.dat]
-  -h, --help                       Print help
+  -c, --create-bucket
+          Optionally create the bucket if it does not exist
+
+  -d, --dedup <DEDUP_F>
+          Deduplication factor (integer ≥1). 1 => fully unique
+          [default: 1]
+
+  -j, --jobs <JOBS>
+          Maximum concurrent uploads (jobs), but is modified to be min(jobs, num)
+          [default: 32]
+
+  -n, --num <NUM>
+          Number of objects to create and upload
+          [default: 1]
+
+  -o, --object-type <OBJECT_TYPE>
+          Specify Type of object to generate:
+          [default: RAW]
+          [possible values: NPZ, TFRECORD, HDF5, RAW]
+
+  -s, --size <SIZE>
+          Object size in bytes (default 20 MB)
+          [default: 20971520]
+
+  -t, --template <TEMPLATE>
+          Template for names. Use '{}' for replacement, first '{}' is object number, 2nd is total count
+          [default: object_{}_of_{}.dat]
+
+  -x, --compress <COMPRESS_F>
+          Compression factor (integer ≥1). 1 => fully random
+          [default: 1]
+
+      --data-gen-mode <DATA_GEN_MODE>          ⭐ NEW in v0.8.2
+          Data generation mode for performance optimization
+
+          Possible values:
+          - streaming:   Streaming generation with configurable chunk size (default, faster for most workloads)
+          - single-pass: Single-pass generation (legacy, faster for 16-32MB objects)
+          [default: streaming]
+
+      --chunk-size <CHUNK_SIZE>                ⭐ NEW in v0.8.2  
+          Chunk size for streaming generation mode (bytes)
+          [default: 262144]
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 

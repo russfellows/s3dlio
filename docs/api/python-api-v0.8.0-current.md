@@ -125,6 +125,57 @@ data = s3dlio.get("s3://bucket/object.txt")
 s3dlio.put("s3://bucket/object.txt", b"data")
 ```
 
+#### `put(prefix, num, template, ...)` - ✅ **WORKING** (v0.8.2+)
+**NEW in v0.8.2**: Configurable data generation modes for optimal performance
+
+```python
+# ✅ WORKING: Bulk object creation with default streaming mode
+s3dlio.put(
+    prefix="s3://bucket/object-{}.bin",
+    num=10,
+    template="obj-{}-of-{}",
+    size=4194304,  # 4MB objects
+    max_in_flight=64
+)
+
+# ✅ WORKING: Explicit data generation mode selection (v0.8.2+)
+s3dlio.put(
+    prefix="s3://bucket/object-{}.bin", 
+    num=10,
+    template="obj-{}-of-{}",
+    size=4194304,
+    data_gen_mode="streaming",  # Default: optimal for most cases
+    chunk_size=262144          # Default chunk size
+)
+
+# ✅ WORKING: Single-pass mode for specific use cases
+s3dlio.put(
+    prefix="s3://bucket/object-{}.bin",
+    num=10, 
+    template="obj-{}-of-{}",
+    size=16777216,             # 16MB objects
+    data_gen_mode="single-pass", # Alternative mode
+    chunk_size=65536
+)
+```
+
+**Parameters (v0.8.2+)**:
+- `prefix`: S3 URI template with `{}` placeholder for object names
+- `num`: Number of objects to create
+- `template`: Template for object naming (use `{}` for index and total)
+- `size`: Size of each object in bytes
+- `max_in_flight`: Maximum concurrent uploads (default: 64)
+- `data_gen_mode`: **NEW** - `"streaming"` (default) or `"single-pass"`  
+- `chunk_size`: **NEW** - Chunk size for data generation (default: 262144)
+- `object_type`: Object content type (default: `"zeros"`)
+- `dedup_factor`: Deduplication factor (default: 1)
+- `compress_factor`: Compression factor (default: 1)
+
+**Performance Notes (v0.8.2+)**:
+- **Streaming mode** (default): 2.6-3.5x faster for 1-8MB objects, wins in 64% of scenarios
+- **Single-pass mode**: May be competitive for 16-32MB objects in specific cases
+- **Automatic optimization**: Streaming is set as default based on comprehensive benchmarking
+
 #### `list(uri: str) -> List[str]` - ✅ **WORKING**
 ```python  
 # ✅ WORKING: List objects

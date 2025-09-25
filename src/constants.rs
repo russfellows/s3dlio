@@ -2,6 +2,10 @@
 //
 // Centralized constants for s3dlio to avoid hardcoded values throughout the codebase
 
+use std::sync::Arc;
+use once_cell::sync::Lazy;
+use rand::RngCore;
+
 /// Default page size fallback when system detection fails (4096 bytes)
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
 
@@ -83,6 +87,39 @@ pub enum StorageBackend {
     /// Azure Blob Storage
     Azure,
 }
+
+// =============================================================================
+// Data Generation Constants
+// =============================================================================
+
+/// Block size for data generation (512 bytes)
+/// This is the fundamental unit for deduplication and compression calculations
+pub const BLK_SIZE: usize = 512;
+
+/// Half block size for internal calculations
+pub const HALF_BLK: usize = BLK_SIZE / 2;
+
+/// Modification region size for randomization (32 bytes)
+/// This determines the size of regions that get randomized within blocks
+pub const MOD_SIZE: usize = 32;
+
+/// A base random block of BLK_SIZE bytes, generated once and shared.
+/// Used by the single-pass data generation algorithm.
+pub static A_BASE_BLOCK: Lazy<Arc<Vec<u8>>> = Lazy::new(|| {
+    let mut rng = rand::rngs::ThreadRng::default();
+    let mut block = vec![0u8; BLK_SIZE];
+    rng.fill_bytes(&mut block[..]);
+    Arc::new(block)
+});
+
+/// Original base random block of BLK_SIZE bytes, generated once.
+/// Used by the two-pass reference implementation for comparison.
+pub static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
+    let mut rng = rand::rngs::ThreadRng::default();
+    let mut block = vec![0u8; BLK_SIZE];
+    rng.fill_bytes(&mut block[..]);
+    block
+});
 
 impl StorageBackend {
     /// Returns the URI scheme for this backend

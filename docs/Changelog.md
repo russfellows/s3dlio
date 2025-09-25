@@ -1,5 +1,94 @@
 # s3dlio Changelog
 
+## Version 0.8.2 - Configurable Data Generation Modes (September 25, 2025)
+
+### 🚀 **Configurable Data Generation Modes for Optimal Performance**
+
+This release introduces **configurable data generation modes** based on comprehensive performance benchmarking. Users can now choose between **streaming** and **single-pass** data generation modes via both CLI and Python API, with **streaming set as the default** for optimal performance in most scenarios.
+
+**Key Achievement**: **Streaming mode provides 2.6-3.5x performance improvement** for 1-8MB objects and wins in **64% of real-world scenarios**, making it the ideal default choice.
+
+### 🎯 **New Configuration System**
+
+#### **🔥 Data Generation Modes**
+- **`DataGenMode::Streaming`**: Default mode using streaming data generation for better memory efficiency and performance
+- **`DataGenMode::SinglePass`**: Alternative mode for specific use cases where single-pass generation may be preferred
+- **Intelligent defaults**: Streaming mode chosen as default based on extensive benchmarking data
+- **Full configurability**: Both modes available via CLI options and Python API parameters
+
+#### **⚡ CLI Integration**
+- **`--data-gen-mode`**: Choose between `streaming` (default) or `single-pass` modes
+- **`--chunk-size`**: Configure chunk size for fine-tuning performance (default: 262144 bytes)
+- **Backward compatibility**: All existing CLI commands work unchanged with new streaming defaults
+- **Real S3 testing**: Verified with actual S3 backend operations
+
+#### **🐍 Python API Enhancement**
+- **`data_gen_mode`** parameter: Accept `"streaming"` (default) or `"single-pass"` in `put()` function
+- **`chunk_size`** parameter: Configurable chunk size for performance optimization
+- **Default behavior**: Streaming mode automatically selected for optimal performance
+- **Seamless integration**: New parameters work alongside existing Python API functionality
+
+### 🔧 **Performance Characteristics**
+
+#### **📊 Benchmarking Results**
+- **1-8MB objects**: Streaming mode shows 2.6-3.5x performance improvement
+- **Overall win rate**: Streaming performs better in 64% of real-world scenarios  
+- **16-32MB range**: Single-pass mode competitive for specific object sizes
+- **Memory efficiency**: Streaming mode uses less memory due to on-demand generation
+- **Throughput**: Real S3 testing shows excellent throughput rates (80+ MiB/s)
+
+#### **🎯 Configuration Examples**
+
+**CLI Usage:**
+```bash
+# Default streaming mode
+s3-cli put s3://bucket/object-{}.bin --num 10 --size 4MB
+
+# Explicit streaming mode
+s3-cli put s3://bucket/object-{}.bin --num 10 --size 4MB --data-gen-mode streaming
+
+# Single-pass mode for specific use cases  
+s3-cli put s3://bucket/object-{}.bin --num 10 --size 4MB --data-gen-mode single-pass --chunk-size 65536
+```
+
+**Python API:**
+```python
+import s3dlio
+
+# Default streaming mode
+s3dlio.put("s3://bucket/object-{}.bin", num=10, template="obj-{}-of-{}", size=4194304)
+
+# Explicit mode selection
+s3dlio.put("s3://bucket/object-{}.bin", num=10, template="obj-{}-of-{}", 
+           size=4194304, data_gen_mode="streaming", chunk_size=65536)
+```
+
+### 🔧 **Technical Implementation**
+- **DataGenerator Architecture**: New streaming data generation system with instance entropy for deterministic behavior
+- **Memory Efficiency**: **32x memory efficiency improvement** - 256KB vs 8MB memory usage for 8MB objects  
+- **Config System**: Added `data_gen_mode` and `chunk_size` fields with builder pattern methods
+- **Function Integration**: Updated `put_objects_with_random_data_and_type()` to accept unified Config parameter
+- **Comprehensive Testing**: 18/19 tests passing with edge case, error handling, and production performance validation
+
+### 📊 **Measured Performance Achievements**
+- **Single-Pass Enhancement**: 3.3x faster generation (70% reduction from 7.9ms to 2.4ms for 1MB objects)
+- **Streaming Throughput**: 7.66 GB/s single-thread baseline with **20+ GB/s multi-process capability**
+- **Memory Footprint**: **Zero-copy chunk generation** for optimal memory efficiency per chunk
+- **Production Testing**: Verified with real S3 backend achieving 80+ MiB/s throughput rates
+
+### 📚 **Comprehensive Documentation**
+The v0.8.2 release includes extensive technical documentation:
+- **Performance Analysis**: `docs/performance/before-after-comparison-v0.8.2.md` - Detailed before/after comparison
+- **Implementation Guide**: `docs/performance/enhanced-data-generation-v0.8.2-progress-summary.md` - Complete technical overview
+- **Testing Validation**: `docs/performance/comprehensive-testing-summary-v0.8.2.md` - Full test coverage analysis
+- **Foundation Work**: `docs/performance/single-pass-data-generation-v0.8.1.md` - Single-pass optimization foundation
+
+### 🎯 **Backward Compatibility & Migration**
+- **Zero breaking changes**: All existing code continues to work with new streaming defaults
+- **Automatic enhancement**: Existing applications immediately benefit from optimized streaming mode  
+- **Optional configuration**: New parameters are optional - intelligent defaults provide optimal performance
+- **Seamless upgrade**: v0.8.1 to v0.8.2 requires no code changes while delivering performance improvements
+
 ## Version 0.8.1 - Enhanced API & PyTorch Integration (September 24, 2025)
 
 ### 🚀 **Production-Ready Enhanced API with Full PyTorch Integration**

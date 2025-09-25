@@ -327,17 +327,33 @@ mod tests {
 
     #[test]
     fn part_index_distribution() {
-        let shards = ShardedS3Clients {
-            shards: Vec::new(),
+        // Create test shards
+        let mut shards = Vec::new();
+        for i in 0..4 {
+            shards.push(ClientShard {
+                #[cfg(feature = "native-backends")]
+                aws_client: None,
+                #[cfg(feature = "arrow-backend")]
+                arrow_store: None,
+                shard_id: i,
+            });
+        }
+        
+        let sharded_clients = ShardedS3Clients {
+            shards,
             shard_count: 4,
         };
 
         // Test round-robin distribution for part indices
         for i in 0..16 {
             let expected_shard = i % 4;
-            let actual_shard = shards.get_shard(i).shard_id;
-            // Note: This will fail until we properly initialize shards
-            // It's here to show the expected behavior
+            let actual_shard = sharded_clients.get_shard(i).shard_id;
+            assert_eq!(
+                actual_shard, 
+                expected_shard,
+                "Part index {} should map to shard {}, got {}",
+                i, expected_shard, actual_shard
+            );
         }
     }
 
