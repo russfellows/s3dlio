@@ -30,7 +30,7 @@ use crate::s3_utils::{
     stat_object_uri_async,
     stat_object_many_async,
 };
-use crate::s3_copy::{download_objects, upload_files};
+use crate::{generic_upload_files, generic_download_objects, store_for_uri};
 use crate::s3_logger::{finalize_op_logger, init_op_logger};
 
 // Phase 2 streaming functionality imports
@@ -576,10 +576,9 @@ pub fn download(
     // The `download_objects` function in `s3_copy.rs` needs a `recursive` flag.
     // We'll assume for now it has been added.
     py.allow_threads(move || {
-        // NOTE: This assumes `download_objects` will be updated to accept a `recursive` flag.
-        // Let's pretend the signature is: `download_objects(src_uri, &dir, max_in_flight, recursive)`
-        // For now, we call the existing function which is implicitly recursive.
-        download_objects(src_uri, &dir, max_in_flight, recursive).map_err(py_err)
+        // Use the new generic download function that works with all backends
+        let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+        rt.block_on(generic_download_objects(src_uri, &dir, max_in_flight, recursive, None)).map_err(py_err)
     })
 }
 
@@ -649,7 +648,37 @@ pub fn upload(
     create_bucket: bool,
 ) -> PyResult<()> {
     let paths: Vec<PathBuf> = src_patterns.into_iter().map(PathBuf::from).collect();
-    py.allow_threads(|| upload_files(dest_prefix, &paths, max_in_flight, create_bucket).map_err(py_err))
+    py.allow_threads(|| {
+        // Use the new generic upload function that works with all backends
+        let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+        rt.block_on(async {
+            // Handle bucket creation ONLY if explicitly requested
+            if create_bucket {
+                if let Ok(store) = store_for_uri(dest_prefix) {
+                    // Extract bucket/container name from URI
+                    if dest_prefix.starts_with("s3://") {
+                        if let Ok((bucket, _)) = parse_s3_uri(dest_prefix) {
+                            if let Err(e) = store.create_container(&bucket).await {
+                                log::warn!("Failed to create bucket {}: {}", bucket, e);
+                            }
+                        }
+                    } else if dest_prefix.starts_with("az://") || dest_prefix.starts_with("azure://") {
+                        // For Azure, extract container name
+                        let parts: Vec<&str> = dest_prefix.trim_start_matches("az://").trim_start_matches("azure://").split('/').collect();
+                        if let Some(container) = parts.get(0) {
+                            if let Err(e) = store.create_container(container).await {
+                                log::warn!("Failed to create container {}: {}", container, e);
+                            }
+                        }
+                    }
+                    // File backends don't need bucket creation, directories are created automatically
+                }
+            }
+            
+            // Use generic upload that works with all backends
+            generic_upload_files(dest_prefix, &paths, max_in_flight, None).await
+        }).map_err(py_err)
+    })
 }
 
 // ---------------------------------------------------------------------------

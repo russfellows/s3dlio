@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use crc32fast::Hasher;
 use std::io::Write;
 use log::debug;
+use regex::Regex;
 
 // Helper function for integrity validation
 fn compute_checksum(data: &[u8]) -> String {
@@ -1102,5 +1103,257 @@ pub fn high_performance_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>>
         Scheme::Azure => Ok(AzureObjectStore::boxed()),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     }
+}
+
+// ============================================================================
+// Generic Upload/Download Functions with Progress Tracking
+// ============================================================================
+
+use std::path::Path;
+use std::sync::Arc;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use tokio::sync::Semaphore;
+use glob;
+use crate::progress::ProgressCallback;
+
+/// Generic upload function that works with any ObjectStore backend
+/// and supports progress tracking. Supports glob patterns (*,?) and regex patterns.
+pub async fn generic_upload_files<P: AsRef<Path>>(
+    dest_prefix: &str,
+    patterns: &[P],
+    max_in_flight: usize,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<()> {
+    // Expand patterns (globs, regex, and single paths)
+    let mut paths = Vec::new();
+    for pat in patterns {
+        let s = pat.as_ref().to_string_lossy();
+        
+        // Handle different pattern types
+        if s.contains('*') || s.contains('?') {
+            // Glob pattern - use glob crate
+            for entry in glob::glob(&s).map_err(|e| anyhow!("Glob pattern error: {}", e))? {
+                match entry {
+                    Ok(pb) => {
+                        if pb.is_file() {
+                            paths.push(pb);
+                        }
+                    },
+                    Err(e) => log::warn!("Glob error for pattern {}: {}", s, e),
+                }
+            }
+        } else if s.contains('^') || s.contains('$') || s.contains('[') || s.contains('(') || s.contains('\\') || s.contains('.') {
+            // Regex pattern - scan directory and apply regex
+            let (dir_part, pattern_part) = match s.rfind('/') {
+                Some(index) => {
+                    let (dir, pattern) = s.split_at(index + 1);
+                    (dir, pattern)
+                }
+                None => ("./", s.as_ref()),
+            };
+            
+            let pattern_part = if pattern_part.is_empty() { ".*" } else { pattern_part };
+            log::debug!("Trying regex pattern '{}' in directory '{}'", pattern_part, dir_part);
+            
+            match Regex::new(pattern_part) {
+                Ok(re) => {
+                    let dir_path = std::path::Path::new(dir_part);
+                    if dir_path.is_dir() {
+                        for entry in std::fs::read_dir(dir_path)
+                            .map_err(|e| anyhow!("Cannot read directory '{}': {}", dir_part, e))? {
+                            if let Ok(entry) = entry {
+                                let path = entry.path();
+                                if path.is_file() {
+                                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                                        if re.is_match(filename) {
+                                            log::debug!("Regex matched file: {:?}", path);
+                                            paths.push(path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                Err(_) => {
+                    // Not a valid regex, treat as literal file path
+                    log::debug!("Invalid regex pattern '{}', treating as literal path", pattern_part);
+                    let path = pat.as_ref();
+                    if path.is_file() {
+                        paths.push(path.to_path_buf());
+                    }
+                }
+            }
+        } else {
+            // Regular file path
+            let path = pat.as_ref();
+            if path.is_file() {
+                paths.push(path.to_path_buf());
+            } else if path.is_dir() {
+                // If it's a directory, add all files in it
+                for entry in std::fs::read_dir(path)
+                    .map_err(|e| anyhow!("Cannot read directory '{:?}': {}", path, e))? {
+                    if let Ok(entry) = entry {
+                        let entry_path = entry.path();
+                        if entry_path.is_file() {
+                            paths.push(entry_path);
+                        }
+                    }
+                }
+            } else {
+                log::warn!("Path does not exist or is not accessible: {:?}", path);
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        bail!("No files matched for upload");
+    }
+
+    // Cap the number of concurrent tasks
+    let effective_jobs = std::cmp::min(max_in_flight, paths.len());
+
+    log::info!(
+        "Starting upload of {} file(s) to {} (jobs={})",
+        paths.len(),
+        dest_prefix,
+        effective_jobs
+    );
+
+    let sem = Arc::new(Semaphore::new(effective_jobs));
+    let mut futs = FuturesUnordered::new();
+
+    for path in paths.clone() {
+        log::debug!("queueing upload for {:?}", path);
+        let sem = sem.clone();
+        let store = store_for_uri(dest_prefix)?; // Each task gets its own store instance
+        let progress = progress_callback.clone();
+        let dest_base = dest_prefix.to_string();
+
+        let fname = path.file_name()
+            .ok_or_else(|| anyhow!("Bad path {:?}", path))?
+            .to_string_lossy();
+
+        // Construct destination URI
+        let dest_uri = if dest_base.ends_with('/') {
+            format!("{}{}", dest_base, fname)
+        } else {
+            format!("{}/{}", dest_base, fname)
+        };
+
+        // Get file size for progress tracking
+        let file_size = std::fs::metadata(&path)?.len();
+
+        futs.push(tokio::spawn(async move {
+            log::debug!("starting upload of {:?} → {}", path, dest_uri);
+            let _permit = sem.acquire_owned().await.unwrap();
+
+            // Read file data
+            let data = tokio::fs::read(&path).await?;
+
+            // Upload via ObjectStore trait
+            store.put(&dest_uri, &data).await?;
+
+            log::debug!("finished upload of {:?} → {}", path, dest_uri);
+
+            // Update progress if callback provided
+            if let Some(ref progress) = progress {
+                progress.object_completed(file_size);
+            }
+
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+
+    // Wait for all uploads to complete
+    while let Some(join_res) = futs.next().await {
+        join_res??;
+    }
+
+    log::info!("Finished upload of {} file(s) to {}", paths.len(), dest_prefix);
+    Ok(())
+}
+
+/// Generic download function that works with any ObjectStore backend
+/// and supports progress tracking.
+pub async fn generic_download_objects(
+    src_uri: &str,
+    dest_dir: &Path,
+    max_in_flight: usize,
+    recursive: bool,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<()> {
+    let store = store_for_uri(src_uri)?;
+
+    // List objects to download
+    let keys = store.list(src_uri, recursive).await?;
+
+    if keys.is_empty() {
+        bail!("No objects matched for download");
+    }
+
+    // Ensure destination directory exists
+    std::fs::create_dir_all(dest_dir)?;
+
+    // Cap the number of concurrent tasks
+    let effective_jobs = std::cmp::min(max_in_flight, keys.len());
+
+    log::info!(
+        "Starting download of {} object(s) from {} to {:?} (jobs={})",
+        keys.len(),
+        src_uri,
+        dest_dir,
+        effective_jobs
+    );
+
+    let sem = Arc::new(Semaphore::new(effective_jobs));
+    let mut futs = FuturesUnordered::new();
+
+    for uri in keys.clone() {
+        let sem = sem.clone();
+        let store = store_for_uri(&uri)?; // Each task gets its own store instance
+        let progress = progress_callback.clone();
+        let out_dir = dest_dir.to_path_buf();
+
+        futs.push(tokio::spawn(async move {
+            log::debug!("starting download of {} → {:?}", uri, out_dir);
+            let _permit = sem.acquire_owned().await.unwrap();
+
+            // Skip "directories" (URIs that end with slash)
+            if uri.ends_with('/') {
+                return Ok::<(), anyhow::Error>(());
+            }
+
+            // Download the object
+            let bytes = store.get(&uri).await?;
+            let byte_count = bytes.len() as u64;
+
+            // Extract filename from URI
+            let fname = uri.split('/').last()
+                .ok_or_else(|| anyhow!("Cannot extract filename from URI: {}", uri))?;
+            let out_path = out_dir.join(fname);
+
+            // Write to disk
+            tokio::fs::write(&out_path, bytes).await?;
+
+            log::debug!("finished download of {} → {:?}", uri, out_path);
+
+            // Update progress if callback provided
+            if let Some(ref progress) = progress {
+                progress.object_completed(byte_count);
+            }
+
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+
+    // Wait for all downloads to complete
+    while let Some(join_res) = futs.next().await {
+        join_res??;
+    }
+
+    log::info!("Finished download of {} object(s) to {:?}", keys.len(), dest_dir);
+    Ok(())
 }
 

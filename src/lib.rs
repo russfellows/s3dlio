@@ -93,6 +93,8 @@ pub use object_store::{
     store_for_uri_with_config,
     direct_io_store_for_uri,
     high_performance_store_for_uri,
+    generic_upload_files,
+    generic_download_objects,
 };
 
 // Arrow backend specific exports
