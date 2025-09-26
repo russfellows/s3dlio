@@ -639,19 +639,6 @@ fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: O
     let uri_str = uri.ok_or_else(|| anyhow::anyhow!("Either --uri or --keylist must be provided"))?;
     let (bucket, mut key_pattern) = s3dlio::parse_s3_uri(uri_str)?;
 
-    /*
-     * Old
-     *
-    // If the pattern is not a glob/regex and not a prefix, it's a single key.
-    // Otherwise, use list_objects to find all matching keys.
-    let keys_to_get = if !key_pattern.contains('*') && !key_pattern.contains('?') && !key_pattern.ends_with('/') {
-        vec![key_pattern]
-    } else {
-        s3dlio::s3_utils::list_objects(&bucket, &key_pattern, recursive)?
-    };
-    */
-    
-    // New, simpler
     // If the path ends with a slash, automatically append a wildcard to search inside it.
     if key_pattern.ends_with('/') {
         key_pattern.push_str(".*");
@@ -757,19 +744,6 @@ fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, te
 fn delete_cmd(uri: &str, _jobs: usize, recursive: bool) -> Result<()> {
     let (bucket, mut key_pattern) = s3dlio::parse_s3_uri(uri)?;
 
-    /*
-     * Old
-     *
-    // If the pattern is not a glob/regex and not a prefix, it's a single key.
-    // Otherwise, use list_objects to find all matching keys.
-    let keys_to_delete = if !key_pattern.contains('*') && !key_pattern.contains('?') && !key_pattern.ends_with('/') {
-        vec![key_pattern]
-    } else {
-        s3dlio::s3_utils::list_objects(&bucket, &key_pattern, recursive)?
-    };
-    */
-
-    // New, simpler
     // If the path ends with a slash, automatically append a wildcard to search inside it.
     if key_pattern.ends_with('/') {
         key_pattern.push_str(".*");
