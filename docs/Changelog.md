@@ -1,5 +1,36 @@
 # s3dlio Changelog
 
+## Version 0.8.4 - Critical Regex Pattern Matching Fix (September 25, 2025)
+
+### 🐛 **Critical Bug Fixes**
+
+#### **🎯 Fixed Regex Pattern Matching for All Commands**
+- **Issue**: `list`, `get`, `delete`, and `download` commands with regex patterns like `s3://mybucket/` were incorrectly returning CommonPrefixes ("/") instead of actual matching objects
+- **Root Cause**: S3 API with delimiter="/" was treating objects with leading slashes (e.g., `/object_0.dat`) as being in subdirectories, returning them as CommonPrefixes rather than Contents
+- **Solution**: Enhanced CommonPrefixes handling to intelligently distinguish between:
+  - **Single-character prefixes** (like "/") that contain objects with leading slashes → Process recursively to find actual objects
+  - **Multi-character prefixes** (like "dir1/", "subdir/") that represent true subdirectories → Skip in non-recursive mode
+- **Impact**: All pattern-based operations now work correctly while preserving proper directory hierarchy behavior
+
+#### **🔧 Improved Directory Boundary Respect**
+- **Non-recursive listings** (default): Only show objects at the current level, properly exclude subdirectory contents
+- **Recursive listings** (`--recursive`): Show all objects including subdirectory contents as expected  
+- **Smart CommonPrefix processing**: Objects with leading slashes (e.g., `//object_0.dat`) are treated as root-level objects, not subdirectories
+- **Preserved existing behavior**: All directory navigation and listing semantics remain unchanged for standard use cases
+
+#### **✅ Verified Across All Commands**
+- **`list s3://bucket/.*pattern.*`**: Now correctly finds matching objects instead of showing "/"
+- **`get s3://bucket/.*pattern.*`**: Successfully retrieves all objects matching regex patterns
+- **`delete s3://bucket/.*pattern.*`**: Safely deletes only objects matching the specified pattern  
+- **`download s3://bucket/.*pattern.*`**: Downloads all matching objects while respecting directory structure
+
+### 🛠 **Technical Improvements**
+- **Enhanced debug logging**: Better visibility into prefix vs pattern matching logic
+- **Code cleanup**: Removed obsolete commented-out code sections from CLI handlers
+- **Consistent error handling**: Improved pattern matching error messages across all commands
+
+---
+
 ## Version 0.8.3 - Multi-Backend Progress Tracking & Enhanced Copy Operations (September 25, 2025)
 
 ### 🚀 **Universal Copy Operations with Progress Tracking**

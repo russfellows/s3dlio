@@ -223,6 +223,9 @@ pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<Str
         // If the pattern is empty (e.g., path ends in "/"), default to matching everything.
         let final_pattern = if pattern.is_empty() { ".*" } else { pattern };
 
+        // Use the recursive flag as-is - don't auto-enable recursion
+        let effective_recursive = recursive;
+
         // 2. Compile the regex.
         let re = Regex::new(final_pattern)
             .with_context(|| format!("Invalid regex pattern: '{}'", final_pattern))?;
@@ -234,12 +237,12 @@ pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<Str
         let mut keys = Vec::new();
         let mut cont: Option<String> = None;
 
-        // 3. Set the delimiter for the S3 API call based on the recursive flag.
-        let delimiter = if recursive { None } else { Some("/") };
+        // 3. Set the delimiter for the S3 API call based on the effective recursive flag.
+        let delimiter = if effective_recursive { None } else { Some("/") };
 
         debug!(
-            "list_objects: bucket='{}', prefix='{}', pattern='{}', recursive={}",
-            bucket, prefix, final_pattern, recursive
+            "list_objects: bucket='{}', prefix='{}', pattern='{}', recursive={}, effective_recursive={}",
+            bucket, prefix, final_pattern, recursive, effective_recursive
         );
 
         loop {
@@ -278,13 +281,43 @@ pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<Str
                 }
             }
 
-            // Handle common prefixes (directories), only present in non-recursive mode
-            for common_prefix in resp.common_prefixes() {
-                if let Some(prefix_key) = common_prefix.prefix() {
-                    if let Some(basename) = prefix_key.strip_prefix(prefix) {
-                        if re.is_match(basename) {
-                            debug!("    matched common prefix: '{}'", prefix_key);
-                            keys.push(prefix_key.to_string());
+            // Handle common prefixes (directories) selectively in non-recursive mode  
+            // Only process CommonPrefixes that represent single-character separators (like "/")
+            // This handles the case where objects with leading slashes are treated as directories by S3
+            if !effective_recursive {
+                for common_prefix in resp.common_prefixes() {
+                    if let Some(prefix_key) = common_prefix.prefix() {
+                        if let Some(basename) = prefix_key.strip_prefix(prefix) {
+                            // Only process single-character prefixes like "/" that might contain root-level objects
+                            // Skip multi-character directory prefixes like "dir1/", "subdir/"
+                            // Note: Don't check if pattern matches the prefix - check if objects under the prefix match
+                            if basename.len() == 1 && basename == "/" {
+                                debug!("    found single-slash common prefix, querying recursively: '{}'", prefix_key);
+                                // Make one recursive call to get objects under the "/" prefix
+                                // This should be safe since we're only going one level deep
+                                if let Ok(client_async) = aws_s3_client_async().await {
+                                    let recursive_req = client_async
+                                        .list_objects_v2()
+                                        .bucket(&bucket)
+                                        .prefix(prefix_key);
+                                    // No delimiter for recursive call
+                                    
+                                    if let Ok(recursive_resp) = recursive_req.send().await {
+                                        for obj in recursive_resp.contents() {
+                                            if let Some(key) = obj.key() {
+                                                if let Some(obj_basename) = key.strip_prefix(prefix) {
+                                                    if re.is_match(obj_basename) {
+                                                        debug!("    matched object under slash prefix: '{}'", key);
+                                                        keys.push(key.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                debug!("    skipping multi-char common prefix: '{}'", prefix_key);
+                            }
                         }
                     }
                 }
