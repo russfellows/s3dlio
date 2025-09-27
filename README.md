@@ -5,12 +5,12 @@
 **s3dlio** is a high-performance, multi-protocol storage library designed for AI/ML workloads and data-intensive applications. Built in Rust with Python bindings, it provides zero-copy streaming, comprehensive checkpointing, and universal copy operations across multiple storage backends.
 
 **Key Features:**
-- 🚀 **Universal Copy Operations**: Upload/download work like enhanced Unix `cp` across all storage backends
-- ⚡ **World-Class Performance**: Up to 4.8 GB/s throughput with intelligent optimization
-- 📊 **Real-Time Progress Tracking**: Beautiful progress bars with transfer rates and ETA
+- 🚀 **Universal Copy Operations**: Upload/download work like enhanced Unix `cp` across tested storage backends
+- ⚡ **High Performance**: Close to 4.8 line-speed throughput with intelligent optimization
+- 📊 **Real-Time Progress Tracking**: CLI has progress bars with transfer rates and ETA
 - 🔍 **Advanced Pattern Matching**: Support for glob patterns (`*.log`) and regex (`.*\.log$`)
 - 🐍 **Python Integration**: Full PyTorch/TensorFlow/JAX compatibility with async support
-- 🏗️ **Multi-Backend Architecture**: Seamless operation across S3, Azure, file systems, and DirectIO
+- 🏗️ **Multi-Backend Architecture**: Support I/O across S3, Azure, file systems, and DirectIO
 
 ## Storage Backend Support
 
@@ -23,7 +23,7 @@ s3dlio provides a unified interface for all storage operations, treating upload/
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance
 
 ### S3 Backend Options
-Choose your optimal S3 backend:
+Choose an optimal S3 backend:
 ```bash
 # Apache Arrow backend (recommended for modern deployments)
 cargo build --no-default-features --features arrow-backend
@@ -54,7 +54,7 @@ pip install s3dlio
 
 ### 🚀 Universal Copy Operations
 
-s3dlio treats upload and download as enhanced versions of the Unix `cp` command, working seamlessly across all storage backends:
+s3dlio treats upload and download as enhanced versions of the Unix `cp` command, working across all storage backends:
 
 **CLI Usage:**
 ```bash
@@ -131,13 +131,13 @@ s3dlio delivers world-class performance across all operations:
 
 | Operation | Performance | Notes |
 |-----------|-------------|-------|
-| **S3 PUT** | Up to 3.089 GB/s | Exceeds hardware baseline by 17.8% |
-| **S3 GET** | Up to 4.826 GB/s | World-class download performance |
-| **Multi-Process** | 2.3+ GB/s | 2x improvement over single process |
+| **S3 PUT** | Up to 3.089 GB/s | Exceeds steady-state baseline by 17.8% |
+| **S3 GET** | Up to 4.826 GB/s | Near line-speed performance |
+| **Multi-Process** | 2-3x faster | Improvement over single process |
 | **Streaming Mode** | 2.6-3.5x faster | For 1-8MB objects vs single-pass |
 
 ### Optimization Features
-- **HTTP/2 Support**: Modern multiplexing for enhanced throughput
+- **HTTP/2 Support**: Modern multiplexing for enhanced throughput (with Apache Arrow backend only)
 - **Intelligent Defaults**: Streaming mode automatically selected based on benchmarks
 - **Multi-Process Architecture**: Massive parallelism for maximum performance
 - **Zero-Copy Streaming**: Memory-efficient operations for large datasets
