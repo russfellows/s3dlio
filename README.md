@@ -5,7 +5,7 @@
 **s3dlio** is a high-performance, multi-protocol storage library designed for AI/ML workloads and data-intensive applications. Built in Rust with Python bindings, it provides zero-copy streaming, comprehensive checkpointing, and universal copy operations across multiple storage backends.
 
 **Key Features:**
-- 🚀 **Universal Copy Operations**: Upload/download work like enhanced Unix `cp` across tested storage backends
+- 🚀 **Universal Copy Operations**: Upload/download work like Unix `cp` across tested storage backends
 - ⚡ **High Performance**: Close to 4.8 line-speed throughput with intelligent optimization
 - 📊 **Real-Time Progress Tracking**: CLI has progress bars with transfer rates and ETA
 - 🔍 **Advanced Pattern Matching**: Support for glob patterns (`*.log`) and regex (`.*\.log$`)
