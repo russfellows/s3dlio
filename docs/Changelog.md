@@ -1,5 +1,48 @@
 # s3dlio Changelog
 
+## Version 0.8.5 - Direct I/O Support & Async Loader Fixes (September 29, 2025)
+
+### 🚀 **Major New Features**
+
+#### **💾 Direct I/O Dataset Support**
+- **New Feature**: Added full Direct I/O dataset support for `direct://` URIs
+- **Implementation**: Created `DirectIOBytesDataset` using object store pattern with O_DIRECT support
+- **Performance**: Leverages existing `ConfigurableFileSystemObjectStore::boxed_direct_io()` for maximum throughput
+- **API Integration**: `create_dataset("direct:///path/to/files")` now works seamlessly alongside `file://`, `s3://`, and `az://` schemes
+- **Testing**: Comprehensive test suite with single file and directory operations
+
+#### **🔄 Async Loader Improvements**
+- **Fixed**: Async loaders now return individual items (bytes objects) by default instead of batches (lists)
+- **Smart Batching**: When `batch_size=1` (default for async loaders), yields individual items for intuitive iteration
+- **Backward Compatible**: Explicit `batch_size > 1` still returns lists for ML workload efficiency
+- **Improved UX**: `async for item in loader:` now works as expected without type confusion
+
+### 🐛 **Bug Fixes**
+
+#### **🔧 Python API Baseline Fixes**
+- **Fixed**: `test_realism_baseline.py` string/bytes type error in async test creation
+- **Fixed**: Multi-backend factory parity - all URI schemes now work consistently
+- **Validation**: 11/11 baseline tests now pass (9 multi-backend + 2 async functionality)
+
+#### **📁 API Module Organization**
+- **Enhanced**: Added `DirectIOBytesDataset` to public API exports
+- **Updated**: Dataset factory function now handles `direct://` schemes correctly
+- **Improved**: Better error messages for unsupported URI schemes
+
+### 🛠 **Technical Improvements**
+- **Code Quality**: Removed duplicate closing braces and syntax errors
+- **Module Structure**: Added `directio_bytes.rs` to data_loader module exports
+- **API Consistency**: All dataset types now follow the same creation patterns
+- **Test Coverage**: DirectIO tests pass reliably with proper error handling
+
+### 📖 **Documentation & Infrastructure**
+- **Added**: Comprehensive AI coding instructions in `.github/copilot-instructions.md`
+- **Updated**: README.md with HDF5 dependency requirements for all major platforms
+- **Enhanced**: `install_pyo3_wheel.sh` handles different Python versions with wildcard matching
+- **Organized**: Python test suite structure maintained in `python/tests/` directory
+
+---
+
 ## Version 0.8.4 - Critical Regex Pattern Matching Fix (September 25, 2025)
 
 ### 🐛 **Critical Bug Fixes**

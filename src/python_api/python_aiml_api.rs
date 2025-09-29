@@ -188,12 +188,19 @@ impl PyBytesAsyncDataLoaderIter {
             match guard.recv().await {
                 Some(Ok(batch)) => {
                     Python::with_gil(|py| {
-                        let py_list = PyList::empty(py);
-                        for item in batch {
-                            py_list.append(PyBytes::new(py, &item))?;
+                        if batch.len() == 1 {
+                            // Return individual item for batch_size = 1
+                            let item = &batch[0];
+                            let obj: Py<PyAny> = PyBytes::new(py, item).into_any().unbind();
+                            Ok(obj)
+                        } else {
+                            // Return list for batch_size > 1
+                            let py_list = PyList::empty(py);
+                            for item in batch {
+                                py_list.append(PyBytes::new(py, &item))?;
+                            }
+                            Ok(py_list.into_any().unbind())
                         }
-                        // Bound<'py, PyList> -> Py<PyAny>
-                        Ok(py_list.into_any().unbind())
                     })
                 }
                 Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
@@ -1175,7 +1182,15 @@ pub fn create_dataset(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Py
 #[pyo3(signature = (uri, opts=None))]
 pub fn create_async_loader(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<PyBytesAsyncDataLoader> {
     let dataset = create_dataset(uri, opts.as_ref().map(|d| d.clone()))?;
-    PyBytesAsyncDataLoader::new(dataset, opts)
+    
+    // For async loaders, default to batch_size = 1 for intuitive individual item iteration
+    let mut loader_opts = opts_from_dict(opts);
+    if loader_opts.batch_size == LoaderOptions::default().batch_size {
+        // User didn't specify batch_size, default to 1 for async loaders
+        loader_opts.batch_size = 1;
+    }
+    
+    Ok(PyBytesAsyncDataLoader { dataset, opts: loader_opts })
 }
 
 // ---------------------------------------------------------------------------
