@@ -12,6 +12,10 @@
 - 🐍 **Python Integration**: Full PyTorch/TensorFlow/JAX compatibility with async support
 - 🏗️ **Multi-Backend Architecture**: Support I/O across S3, Azure, file systems, and DirectIO
 
+## 📊 Performance Monitoring (v0.8.7)
+
+Advanced HDR histogram-based performance monitoring for AI/ML workloads, providing precise tail latency analysis (P99, P99.9, P99.99+) and comprehensive throughput tracking. Built-in presets for training, inference, and distributed scenarios with thread-safe global metrics collection.
+
 ## 🧠 AI/ML Training Enhancement (v0.8.6)
 
 Added comprehensive LoaderOptions Realism Knobs for production AI/ML workloads, providing fine-grained control over data loading behavior, performance optimization, and training pipeline configuration with PyTorch/TensorFlow best practices.

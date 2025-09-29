@@ -34,6 +34,9 @@ pub mod sharded_client;
 pub mod range_engine;
 pub mod mp;
 
+// Performance monitoring
+pub mod metrics;
+
 // Profiling infrastructure (feature-gated)
 pub mod profiling;
 

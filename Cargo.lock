@@ -2198,6 +2198,7 @@ checksum = "765c9198f173dd59ce26ff9f95ef0aafd0a0fe01fb9d72841bc5066a4c06511d"
 dependencies = [
  "base64 0.21.7",
  "byteorder",
+ "crossbeam-channel",
  "flate2",
  "nom",
  "num-traits",
@@ -3049,6 +3050,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "metrics"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3045b4193fbdc5b5681f32f11070da9be3609f189a79f3390706d42587f46bb5"
+dependencies = [
+ "ahash",
+ "portable-atomic",
 ]
 
 [[package]]
@@ -4494,7 +4505,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3dlio"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4522,6 +4533,7 @@ dependencies = [
  "glob",
  "hdf5-metno",
  "hdf5-metno-sys",
+ "hdrhistogram",
  "humantime",
  "hyper 1.7.0",
  "hyper-rustls 0.27.7",
@@ -4530,6 +4542,7 @@ dependencies = [
  "io",
  "libc",
  "log",
+ "metrics",
  "ndarray 0.15.6",
  "ndarray-npy",
  "nix 0.29.0",
@@ -4537,6 +4550,7 @@ dependencies = [
  "numpy",
  "object_store",
  "once_cell",
+ "parking_lot",
  "pprof",
  "pyo3",
  "pyo3-async-runtimes",

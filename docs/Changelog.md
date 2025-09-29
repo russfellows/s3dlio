@@ -1,5 +1,44 @@
 # s3dlio Changelog
 
+## Version 0.8.7 - HDR Performance Monitoring for AI/ML Workloads (September 29, 2025)
+
+### 🚀 **Major New Features**
+
+#### **📊 HDR Histogram Performance Monitoring**
+- **New Module**: Added comprehensive `src/metrics/` module with HDR histogram-based performance tracking
+- **Precise Tail Latency**: P99, P99.9, P99.99+ percentile measurement for AI/ML performance analysis
+- **High Throughput Support**: Configurable precision and limits up to 1TB/s for large-scale workloads
+- **Thread-Safe Collection**: Global metrics with `parking_lot` synchronization for high-frequency recording
+- **AI/ML Presets**: Pre-configured settings for training, inference, and distributed scenarios
+
+#### **🎯 Global Metrics API**
+- **Simple Integration**: `record_operation()` and `print_global_report()` convenience functions
+- **Configurable Precision**: 1-5 significant digits for different accuracy requirements
+- **Operation Tracking**: Per-operation latency and throughput analysis
+- **Error Recording**: Built-in error rate tracking and reporting
+
+#### **🔧 Enhanced Dependencies**
+- **hdrhistogram ^7.5**: High Dynamic Range histograms for detailed performance analysis
+- **metrics ^0.23**: Professional metrics collection framework
+- **parking_lot ^0.12**: High-performance RwLock for concurrent access
+
+#### **📈 Performance Analysis Demo**
+- **New Demo**: `examples/performance_monitoring_demo.rs` with realistic AI/ML workload simulation
+- **Comprehensive Reporting**: Detailed latency and throughput analysis across operation types
+- **Training Patterns**: Simulates data loading, preprocessing, forward/backward passes, checkpointing
+
+### 🛠️ **Implementation Details**
+- **Version Bump**: 0.8.6 → 0.8.7 in both Rust and Python packages
+- **Clean Architecture**: Focused on measurement rather than premature optimization
+- **Future-Ready**: Foundation for planned OS page cache control features (v0.8.8)
+
+### 📚 **Documentation**
+- **New Guide**: `docs/PERFORMANCE-MONITORING-v0.8.7.md` with comprehensive usage examples
+- **Integration Examples**: PyTorch DataLoader and DLIO framework integration patterns
+- **Performance Strategies**: Guidelines for training, inference, and distributed workloads
+
+---
+
 ## Version 0.8.6 - LoaderOptions Realism Knobs for AI/ML Training (September 29, 2025)
 
 ### 🚀 **Major New Features**
