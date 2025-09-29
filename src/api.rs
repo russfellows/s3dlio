@@ -119,6 +119,9 @@ pub use crate::data_loader::s3_bytes::S3BytesDataset;
 /// File system bytes dataset
 pub use crate::data_loader::fs_bytes::FileSystemBytesDataset;
 
+/// Direct I/O bytes dataset for maximum performance
+pub use crate::data_loader::directio_bytes::DirectIOBytesDataset;
+
 /// Convenience type alias for Results
 pub type S3dlioResult<T> = Result<T>;
 
@@ -147,8 +150,9 @@ pub fn dataset_for_uri_with_options(uri: &str, opts: &LoaderOptions) -> Result<B
             anyhow::bail!("Azure datasets not yet implemented")
         }
         crate::object_store::Scheme::Direct => {
-            // TODO: Implement direct I/O dataset
-            anyhow::bail!("Direct I/O datasets not yet implemented")
+            let dataset = DirectIOBytesDataset::from_uri_with_opts(uri, opts)
+                .map_err(|e| anyhow::anyhow!("Failed to create Direct I/O dataset: {}", e))?;
+            Ok(Box::new(dataset))
         }
         crate::object_store::Scheme::Unknown => {
             anyhow::bail!("Unable to infer dataset type from URI: {}", uri)
@@ -161,7 +165,7 @@ pub mod advanced;
 
 // Version information
 /// Current API version
-pub const API_VERSION: &str = "0.8.0";
+pub const API_VERSION: &str = "0.8.5";
 
 /// Check if this API version is compatible with the given version
 pub fn is_compatible_version(required: &str) -> bool {

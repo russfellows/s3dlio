@@ -12,6 +12,10 @@
 - 🐍 **Python Integration**: Full PyTorch/TensorFlow/JAX compatibility with async support
 - 🏗️ **Multi-Backend Architecture**: Support I/O across S3, Azure, file systems, and DirectIO
 
+## 🔧 Recent Compatibility Fixes (v0.8.5)
+
+Fixed several compatibility issues to ensure reliable operation across all supported backends and Python API functionality.
+
 ## Storage Backend Support
 
 ### Universal Backend Architecture
@@ -204,6 +208,17 @@ s3dlio includes comprehensive performance profiling capabilities for analyzing a
 - **Rust**: [Install Rust toolchain](https://www.rust-lang.org/tools/install)
 - **Python 3.12+**: For Python library development
 - **UV** (recommended): [Install UV](https://docs.astral.sh/uv/getting-started/installation/) for Python environment management
+- **HDF5**: Required for HDF5 format support
+  ```bash
+  # Ubuntu/Debian
+  sudo apt update && sudo apt install -y libhdf5-dev
+  
+  # macOS
+  brew install hdf5
+  
+  # RHEL/CentOS/Fedora
+  sudo dnf install hdf5-devel  # or yum install hdf5-devel
+  ```
 
 ### Build Steps
 
