@@ -1,10 +1,8 @@
 /// Multi-process performance testing for s3dlio v0.8.2+
 /// Tests the multi-process capability to achieve 20+ GB/s aggregate throughput
 
-use std::process::{Command, Stdio};
 use std::time::Instant;
 use std::fs;
-use std::path::Path;
 
 fn throughput_gb_per_sec(bytes: usize, duration_ms: f64) -> f64 {
     (bytes as f64) / (1024.0 * 1024.0 * 1024.0) / (duration_ms / 1000.0)

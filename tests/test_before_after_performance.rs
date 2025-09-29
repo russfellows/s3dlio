@@ -54,9 +54,9 @@ fn test_before_after_performance_comparison() {
         let generator = DataGenerator::new();
         for _ in 0..3 {
             let mut obj_gen = generator.begin_object(size, dedup, compress);
-            let mut total_size = 0;
+            let mut _total_size = 0;
             while let Some(chunk) = obj_gen.fill_chunk(chunk_size) {
-                total_size += chunk.len();
+                _total_size += chunk.len();
             }
         }
         

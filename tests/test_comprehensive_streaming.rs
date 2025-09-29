@@ -2,11 +2,8 @@
 /// Tests edge cases, error conditions, and multi-process scenarios for production readiness
 
 use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-use std::collections::HashMap;
 
 fn throughput_gb_per_sec(bytes: usize, duration_ms: f64) -> f64 {
     (bytes as f64) / (1024.0 * 1024.0 * 1024.0) / (duration_ms / 1000.0)
