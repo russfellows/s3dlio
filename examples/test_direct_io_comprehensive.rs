@@ -1,6 +1,5 @@
 use anyhow::Result;
-use s3dlio::api::{direct_io_store_for_uri, WriterOptions};
-use std::path::Path;
+use s3dlio::api::direct_io_store_for_uri;
 
 #[tokio::main]
 async fn main() -> Result<()> {

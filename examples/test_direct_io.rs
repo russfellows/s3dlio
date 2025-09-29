@@ -3,7 +3,6 @@
 
 use anyhow::Result;
 use s3dlio::api::{direct_io_store_for_uri, store_for_uri};
-use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<()> {

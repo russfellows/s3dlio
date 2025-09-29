@@ -12,9 +12,9 @@
 - 🐍 **Python Integration**: Full PyTorch/TensorFlow/JAX compatibility with async support
 - 🏗️ **Multi-Backend Architecture**: Support I/O across S3, Azure, file systems, and DirectIO
 
-## 🔧 Recent Compatibility Fixes (v0.8.5)
+## 🧠 AI/ML Training Enhancement (v0.8.6)
 
-Fixed several compatibility issues to ensure reliable operation across all supported backends and Python API functionality.
+Added comprehensive LoaderOptions Realism Knobs for production AI/ML workloads, providing fine-grained control over data loading behavior, performance optimization, and training pipeline configuration with PyTorch/TensorFlow best practices.
 
 ## Storage Backend Support
 
@@ -155,7 +155,13 @@ loaded_data = store.load('model_state')
 
 **Ready for Production**: All core functionality validated, comprehensive test suite, and honest documentation matching actual capabilities.
 
-### Version 0.7.8 - Rust API Cleanup & O_DIRECT Implementation (Latest)
+### Version 0.8.6 - LoaderOptions Realism Knobs for AI/ML Training (Latest)
+Comprehensive AI/ML training enhancement with 10 new LoaderOptions configuration knobs for production workloads. Features pin_memory GPU optimization, persistent_workers for epoch efficiency, configurable timeouts, multiprocessing context control, sampling strategies, memory format optimization, and async GPU transfers. Includes convenience presets (gpu_optimized, distributed_optimized, debug_mode) and full Python integration with PyLoaderOptions fluent builder pattern. Production-ready defaults aligned with PyTorch/TensorFlow best practices.
+
+### Version 0.8.5 - Direct I/O Support & Async Loader Fixes
+Complete Direct I/O dataset support for `direct://` URIs with async loader improvements. Added DirectIOBytesDataset using O_DIRECT for maximum throughput, fixed async loaders to return individual items by default, and resolved Python API baseline compatibility issues. Enhanced dataset factory function and comprehensive test coverage.
+
+### Version 0.7.8 - Rust API Cleanup & O_DIRECT Implementation
 Complete Rust API redesign with clean, stable interfaces for external developers and working O_DIRECT implementation. Introduces new `s3dlio::api` module with factory functions `store_for_uri()` and `direct_io_store_for_uri()`, unified `ObjectStore` trait, and backward compatibility. Features functional O_DIRECT streaming writer with `DirectIOWriter`, hybrid I/O support (automatic switching between O_DIRECT for aligned data and buffered I/O for unaligned chunks), and proper error handling. Includes comprehensive documentation in `docs/api/` directory, usage examples, and documented path forward for completing O_DIRECT data persistence optimization. Provides enterprise-ready stable API for external Rust developers while maintaining all existing functionality.
 
 ### Version 0.7.7 - Phase 2 Streaming API & Complete Python Bindings

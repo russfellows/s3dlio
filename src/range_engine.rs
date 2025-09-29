@@ -407,8 +407,8 @@ impl Default for RangeEngineBuilder {
 mod tests {
     use super::*;
 
-    #[test]
-    fn range_calculation() {
+    #[tokio::test]
+    async fn range_calculation() {
         let config = RangeEngineConfig {
             range_size: 64 * 1024 * 1024, // 64MB
             min_split_size: 128 * 1024 * 1024, // 128MB
@@ -428,8 +428,8 @@ mod tests {
         assert_eq!(engine.estimate_range_count(500 * 1024 * 1024), expected_ranges);
     }
 
-    #[test]
-    fn adaptive_range_sizing() {
+    #[tokio::test]
+    async fn adaptive_range_sizing() {
         let config = RangeEngineConfig {
             range_size: 64 * 1024 * 1024, // 64MB
             adaptive_sizing: true,
@@ -453,8 +453,8 @@ mod tests {
         assert_eq!(engine.calculate_adaptive_range_size(near_end), expected as usize);
     }
 
-    #[test]
-    fn range_engine_builder() {
+    #[tokio::test]
+    async fn range_engine_builder() {
         let engine = RangeEngineBuilder::new()
             .range_size(32 * 1024 * 1024)
             .max_concurrent_ranges(16)

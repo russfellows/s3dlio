@@ -291,6 +291,155 @@ pub fn read_npz(py: Python<'_>, uri: &str, array_name: Option<&str>) -> PyResult
 }
 
 // ---------------------------------------------------------------------------
+// LoaderOptions Python wrapper with AI/ML realism knobs
+// ---------------------------------------------------------------------------
+#[pyclass]
+#[derive(Clone)]
+pub struct PyLoaderOptions {
+    inner: LoaderOptions,
+}
+
+#[pymethods]
+impl PyLoaderOptions {
+    #[new]
+    fn new() -> Self {
+        Self { inner: LoaderOptions::default() }
+    }
+
+    // Basic options
+    fn with_batch_size(&mut self, size: usize) -> Self {
+        Self { inner: self.inner.clone().with_batch_size(size) }
+    }
+
+    fn drop_last(&mut self, yes: bool) -> Self {
+        Self { inner: self.inner.clone().drop_last(yes) }
+    }
+
+    fn shuffle(&mut self, on: bool, seed: u64) -> Self {
+        Self { inner: self.inner.clone().shuffle(on, seed) }
+    }
+
+    fn num_workers(&mut self, n: usize) -> Self {
+        Self { inner: self.inner.clone().num_workers(n) }
+    }
+
+    fn prefetch(&mut self, n: usize) -> Self {
+        Self { inner: self.inner.clone().prefetch(n) }
+    }
+
+    fn auto_tune(&mut self, on: bool) -> Self {
+        Self { inner: self.inner.clone().auto_tune(on) }
+    }
+
+    // AI/ML realism knobs
+    fn pin_memory(&mut self, pin: bool) -> Self {
+        Self { inner: self.inner.clone().pin_memory(pin) }
+    }
+
+    fn persistent_workers(&mut self, persistent: bool) -> Self {
+        Self { inner: self.inner.clone().persistent_workers(persistent) }
+    }
+
+    fn with_timeout(&mut self, seconds: f64) -> Self {
+        Self { inner: self.inner.clone().with_timeout(seconds) }
+    }
+
+    fn use_spawn(&mut self) -> Self {
+        Self { inner: self.inner.clone().use_spawn() }
+    }
+
+    fn use_fork(&mut self) -> Self {
+        Self { inner: self.inner.clone().use_fork() }
+    }
+
+    fn use_forkserver(&mut self) -> Self {
+        Self { inner: self.inner.clone().use_forkserver() }
+    }
+
+    fn random_sampling(&mut self, replacement: bool) -> Self {
+        Self { inner: self.inner.clone().random_sampling(replacement) }
+    }
+
+    fn distributed_sampling(&mut self, rank: usize, world_size: usize) -> Self {
+        Self { inner: self.inner.clone().distributed_sampling(rank, world_size) }
+    }
+
+    fn channels_last(&mut self) -> Self {
+        Self { inner: self.inner.clone().channels_last() }
+    }
+
+    fn channels_first(&mut self) -> Self {
+        Self { inner: self.inner.clone().channels_first() }
+    }
+
+    fn non_blocking(&mut self, non_blocking: bool) -> Self {
+        Self { inner: self.inner.clone().non_blocking(non_blocking) }
+    }
+
+    fn with_generator_seed(&mut self, seed: u64) -> Self {
+        Self { inner: self.inner.clone().with_generator_seed(seed) }
+    }
+
+    fn enable_transforms(&mut self, enable: bool) -> Self {
+        Self { inner: self.inner.clone().enable_transforms(enable) }
+    }
+
+    fn collate_buffer_size(&mut self, size: usize) -> Self {
+        Self { inner: self.inner.clone().collate_buffer_size(size) }
+    }
+
+    // Convenience presets
+    fn gpu_optimized(&mut self) -> Self {
+        Self { inner: self.inner.clone().gpu_optimized() }
+    }
+
+    fn distributed_optimized(&mut self, rank: usize, world_size: usize) -> Self {
+        Self { inner: self.inner.clone().distributed_optimized(rank, world_size) }
+    }
+
+    fn debug_mode(&mut self) -> Self {
+        Self { inner: self.inner.clone().debug_mode() }
+    }
+
+    // Property accessors (renamed to avoid conflicts)
+    #[getter]
+    fn get_batch_size(&self) -> usize { self.inner.batch_size }
+
+    #[getter]
+    fn get_drop_last(&self) -> bool { self.inner.drop_last }
+
+    #[getter]
+    fn get_shuffle(&self) -> bool { self.inner.shuffle }
+
+    #[getter]
+    fn get_seed(&self) -> u64 { self.inner.seed }
+
+    #[getter]
+    fn get_num_workers(&self) -> usize { self.inner.num_workers }
+
+    #[getter]
+    fn get_prefetch(&self) -> usize { self.inner.prefetch }
+
+    #[getter]
+    fn get_pin_memory(&self) -> bool { self.inner.pin_memory }
+
+    #[getter]
+    fn get_persistent_workers(&self) -> bool { self.inner.persistent_workers }
+
+    #[getter]
+    fn get_timeout_seconds(&self) -> Option<f64> { self.inner.timeout_seconds }
+
+    #[getter]
+    fn get_non_blocking(&self) -> bool { self.inner.non_blocking }
+
+    #[getter]
+    fn get_shard_rank(&self) -> usize { self.inner.shard_rank }
+
+    #[getter]
+    fn get_shard_world_size(&self) -> usize { self.inner.shard_world_size }
+}
+
+// ---------------------------------------------------------------------------
 // DataLoader bindings
 // ---------------------------------------------------------------------------
 #[pyclass]
@@ -408,6 +557,18 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             shard_world_size:     g_usize("shard_world_size",    def.shard_world_size),
             worker_id:            g_usize("worker_id",           def.worker_id),
             num_workers_pytorch:  g_usize("num_workers_pytorch", def.num_workers_pytorch),
+
+            // AI/ML realism knobs (use defaults for now)
+            pin_memory:           def.pin_memory,
+            persistent_workers:   def.persistent_workers,
+            timeout_seconds:      def.timeout_seconds,
+            multiprocessing_context: def.multiprocessing_context,
+            sampler_type:         def.sampler_type,
+            memory_format:        def.memory_format,
+            non_blocking:         def.non_blocking,
+            generator_seed:       def.generator_seed,
+            enable_transforms:    def.enable_transforms,
+            collate_buffer_size:  def.collate_buffer_size,
         }
     } else {
         def
@@ -1277,6 +1438,7 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // m.add_function(wrap_pyfunction!(load_numpy_array, m)?)?;
     
     // Data loader classes
+    m.add_class::<PyLoaderOptions>()?;
     m.add_class::<PyS3Dataset>()?;
     m.add_class::<PyDataset>()?;
     m.add_class::<PyVecDataset>()?;

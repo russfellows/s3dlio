@@ -522,7 +522,8 @@ mod tests {
 
         // Test average object size
         let avg_size = summary.avg_object_size();
-        assert_eq!(avg_size, 100.0 * 1024.0);
+        // 100 MiB / 1000 objects = 104857.6 bytes per object
+        assert_eq!(avg_size, 104857.6);
     }
 
     #[test]

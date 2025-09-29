@@ -1,5 +1,47 @@
 # s3dlio Changelog
 
+## Version 0.8.6 - LoaderOptions Realism Knobs for AI/ML Training (September 29, 2025)
+
+### 🚀 **Major New Features**
+
+#### **🧠 LoaderOptions Realism Knobs**
+- **New Feature**: Added 10 comprehensive AI/ML training configuration options for realistic production workloads
+- **Core Knobs**: 
+  - `pin_memory`: GPU memory pinning for faster CPU-to-GPU transfers
+  - `persistent_workers`: Worker process persistence across training epochs
+  - `timeout_seconds`: Configurable data loading timeout handling
+  - `multiprocessing_context`: Choice of spawn/fork/forkserver process contexts
+  - `sampler_type`: Sequential/random/weighted sampling strategies
+  - `memory_format`: Channels-first/channels-last memory layout control
+  - `non_blocking`: Asynchronous GPU transfer operations
+  - `generator_seed`: Reproducible random number generation
+  - `enable_transforms`: Runtime data transformation toggle
+  - `collate_buffer_size`: Batch collation buffer size optimization
+
+#### **🎯 Convenience Presets**
+- **gpu_optimized()**: Pre-configured settings for optimal GPU training performance
+- **distributed_optimized()**: Best practices for multi-node distributed training
+- **debug_mode()**: Enhanced debugging and validation for development workflows
+
+#### **🐍 Python Integration Enhancement**
+- **PyLoaderOptions Class**: Full PyO3 bindings with fluent builder pattern
+- **Method Chaining**: Intuitive configuration with `.pin_memory(True).persistent_workers(True)` syntax
+- **Property Access**: Direct access to all configuration options
+- **Seamless Integration**: Works with existing s3dlio Python API
+
+### 📚 **Documentation**
+- **Implementation Guide**: Comprehensive documentation in `docs/LOADER-OPTIONS-REALISM-KNOBS.md`
+- **Before/After Examples**: Clear migration path and usage patterns
+- **Performance Implications**: Detailed analysis of each configuration option
+- **Architecture Decisions**: Design rationale and implementation details
+
+### 🔧 **Technical Implementation**
+- **Enhanced Core**: Extended `src/data_loader/options.rs` with new enums and configuration fields
+- **Python Bindings**: Added `PyLoaderOptions` in `src/python_api/python_aiml_api.rs`
+- **Comprehensive Testing**: Full test coverage in `python/tests/test_loader_options_*.py`
+- **Backward Compatibility**: All existing APIs remain unchanged
+- **Production Defaults**: Aligned with PyTorch and TensorFlow best practices
+
 ## Version 0.8.5 - Direct I/O Support & Async Loader Fixes (September 29, 2025)
 
 ### 🚀 **Major New Features**
