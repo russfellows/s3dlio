@@ -261,8 +261,8 @@ mod tests {
         assert_eq!(config.client_pools, 8);
     }
 
-    #[test]
-    fn target_memory() {
+    #[tokio::test]
+    async fn target_memory() {
         let pool = BufferPoolConfig::default().build();
         let target = Target::Memory { pool: pool.clone() };
         

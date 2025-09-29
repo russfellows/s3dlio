@@ -2,6 +2,7 @@
 //!
 //! Stage 1 exposed only `batch_size` and `drop_last`.
 //! Stage 2 adds shuffle, num_workers, prefetch, and auto_tune.
+//! Stage 3 adds AI/ML realism knobs: pin_memory, persistent_workers, timeout, etc.
 //!
 //! Builder helpers are provided so callers can write a fluent style:
 //!
@@ -11,6 +12,9 @@
 //!     .shuffle(true, 42)
 //!     .num_workers(8)
 //!     .prefetch(16)
+//!     .pin_memory(true)
+//!     .persistent_workers(true)
+//!     .timeout_seconds(30.0)
 //!     .auto_tune(false);
 //!
 
@@ -47,6 +51,53 @@ pub enum LoadingMode {
 
 impl Default for LoadingMode {
     fn default() -> Self { LoadingMode::Sequential }
+}
+
+/// Multiprocessing context for worker processes (mirrors PyTorch DataLoader options)
+#[derive(Debug, Clone, PartialEq)]
+pub enum MultiprocessingContext {
+    /// Use spawn method (safest, slower startup)
+    Spawn,
+    /// Use fork method (faster startup, potential issues with CUDA)
+    Fork,
+    /// Use forkserver method (balance of safety and performance)
+    ForkServer,
+}
+
+impl Default for MultiprocessingContext {
+    fn default() -> Self { MultiprocessingContext::Spawn }
+}
+
+/// Sampling strategy for dataset iteration
+#[derive(Debug, Clone, PartialEq)]
+pub enum SamplerType {
+    /// Sequential iteration through dataset
+    Sequential,
+    /// Random sampling (with replacement if specified)
+    Random { replacement: bool },
+    /// Weighted random sampling for imbalanced datasets
+    WeightedRandom { weights: Vec<f64> },
+    /// Distributed sampling for multi-GPU training
+    DistributedRandom { rank: usize, world_size: usize },
+}
+
+impl Default for SamplerType {
+    fn default() -> Self { SamplerType::Sequential }
+}
+
+/// Memory format optimization for tensor layouts
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryFormat {
+    /// Channels-last format (NHWC) - better for some GPUs
+    ChannelsLast,
+    /// Channels-first format (NCHW) - traditional PyTorch default
+    ChannelsFirst,
+    /// Let the framework decide optimal format
+    Auto,
+}
+
+impl Default for MemoryFormat {
+    fn default() -> Self { MemoryFormat::Auto }
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +140,28 @@ pub struct LoaderOptions {
     pub worker_id: usize,
     /// Total PyTorch DataLoader workers for this dataset instance.
     pub num_workers_pytorch: usize,
+
+    // ── New in Stage 3 (AI/ML realism knobs) ────────────────────────────────
+    /// Pin memory for faster CPU→GPU transfers (critical for GPU training)
+    pub pin_memory: bool,
+    /// Keep workers alive between epochs (massive performance improvement)
+    pub persistent_workers: bool,
+    /// Worker timeout in seconds (handles stuck/slow workers)
+    pub timeout_seconds: Option<f64>,
+    /// Multiprocessing context (spawn/fork/forkserver)
+    pub multiprocessing_context: MultiprocessingContext,
+    /// Sampling strategy for dataset iteration
+    pub sampler_type: SamplerType,
+    /// Memory format optimization for tensor layouts
+    pub memory_format: MemoryFormat,
+    /// Non-blocking transfers for performance (when supported)
+    pub non_blocking: bool,
+    /// Custom generator seed for enhanced reproducibility
+    pub generator_seed: Option<u64>,
+    /// Enable dataset-level transforms/augmentations
+    pub enable_transforms: bool,
+    /// Batch collation buffer size for optimization
+    pub collate_buffer_size: usize,
 }
 
 impl Default for LoaderOptions {
@@ -115,6 +188,18 @@ impl Default for LoaderOptions {
             shard_world_size: 1,
             worker_id: 0,
             num_workers_pytorch: 1,
+
+            // new defaults (Stage 3 - AI/ML realism)
+            pin_memory: false,
+            persistent_workers: false,
+            timeout_seconds: None,
+            multiprocessing_context: MultiprocessingContext::default(),
+            sampler_type: SamplerType::default(),
+            memory_format: MemoryFormat::default(),
+            non_blocking: false,
+            generator_seed: None,
+            enable_transforms: false,
+            collate_buffer_size: 1024, // 1KB default buffer
         }
     }
 }
@@ -216,6 +301,154 @@ impl LoaderOptions {
     /// Use async pool loading with custom configuration
     pub fn async_pool_loading_with_config(mut self, config: crate::data_loader::async_pool_dataloader::PoolConfig) -> Self {
         self.loading_mode = LoadingMode::AsyncPool(config);
+        self
+    }
+
+    // ── New in Stage 3: AI/ML realism builder helpers ───────────────────────
+
+    /// Enable/disable memory pinning for faster CPU→GPU transfers
+    pub fn pin_memory(mut self, pin: bool) -> Self {
+        self.pin_memory = pin;
+        self
+    }
+
+    /// Enable/disable persistent workers (keep workers alive between epochs)
+    pub fn persistent_workers(mut self, persistent: bool) -> Self {
+        self.persistent_workers = persistent;
+        self
+    }
+
+    /// Set worker timeout in seconds (None = no timeout)
+    pub fn timeout_seconds(mut self, timeout: Option<f64>) -> Self {
+        self.timeout_seconds = timeout;
+        self
+    }
+
+    /// Set timeout in seconds (convenience method)
+    pub fn with_timeout(mut self, seconds: f64) -> Self {
+        self.timeout_seconds = Some(seconds);
+        self
+    }
+
+    /// Set multiprocessing context
+    pub fn multiprocessing_context(mut self, context: MultiprocessingContext) -> Self {
+        self.multiprocessing_context = context;
+        self
+    }
+
+    /// Use spawn multiprocessing (safest)
+    pub fn use_spawn(mut self) -> Self {
+        self.multiprocessing_context = MultiprocessingContext::Spawn;
+        self
+    }
+
+    /// Use fork multiprocessing (faster startup)
+    pub fn use_fork(mut self) -> Self {
+        self.multiprocessing_context = MultiprocessingContext::Fork;
+        self
+    }
+
+    /// Use forkserver multiprocessing (balanced)
+    pub fn use_forkserver(mut self) -> Self {
+        self.multiprocessing_context = MultiprocessingContext::ForkServer;
+        self
+    }
+
+    /// Set sampling strategy
+    pub fn sampler_type(mut self, sampler: SamplerType) -> Self {
+        self.sampler_type = sampler;
+        self
+    }
+
+    /// Use random sampling
+    pub fn random_sampling(mut self, replacement: bool) -> Self {
+        self.sampler_type = SamplerType::Random { replacement };
+        self
+    }
+
+    /// Use weighted random sampling for imbalanced datasets
+    pub fn weighted_sampling(mut self, weights: Vec<f64>) -> Self {
+        self.sampler_type = SamplerType::WeightedRandom { weights };
+        self
+    }
+
+    /// Use distributed sampling for multi-GPU training
+    pub fn distributed_sampling(mut self, rank: usize, world_size: usize) -> Self {
+        self.sampler_type = SamplerType::DistributedRandom { rank, world_size };
+        self
+    }
+
+    /// Set memory format for tensor layout optimization
+    pub fn memory_format(mut self, format: MemoryFormat) -> Self {
+        self.memory_format = format;
+        self
+    }
+
+    /// Use channels-last memory format (NHWC)
+    pub fn channels_last(mut self) -> Self {
+        self.memory_format = MemoryFormat::ChannelsLast;
+        self
+    }
+
+    /// Use channels-first memory format (NCHW)
+    pub fn channels_first(mut self) -> Self {
+        self.memory_format = MemoryFormat::ChannelsFirst;
+        self
+    }
+
+    /// Enable/disable non-blocking transfers
+    pub fn non_blocking(mut self, non_blocking: bool) -> Self {
+        self.non_blocking = non_blocking;
+        self
+    }
+
+    /// Set custom generator seed for enhanced reproducibility
+    pub fn generator_seed(mut self, seed: Option<u64>) -> Self {
+        self.generator_seed = seed;
+        self
+    }
+
+    /// Set generator seed (convenience method)
+    pub fn with_generator_seed(mut self, seed: u64) -> Self {
+        self.generator_seed = Some(seed);
+        self
+    }
+
+    /// Enable/disable dataset transforms/augmentations
+    pub fn enable_transforms(mut self, enable: bool) -> Self {
+        self.enable_transforms = enable;
+        self
+    }
+
+    /// Set collate buffer size for batch optimization
+    pub fn collate_buffer_size(mut self, size: usize) -> Self {
+        self.collate_buffer_size = size.max(64); // Minimum 64 bytes
+        self
+    }
+
+    /// Configure for high-performance GPU training (common preset)
+    pub fn gpu_optimized(mut self) -> Self {
+        self.pin_memory = true;
+        self.persistent_workers = true;
+        self.non_blocking = true;
+        self.memory_format = MemoryFormat::ChannelsFirst;
+        self.multiprocessing_context = MultiprocessingContext::Spawn;
+        self
+    }
+
+    /// Configure for distributed training (common preset)
+    pub fn distributed_optimized(self, rank: usize, world_size: usize) -> Self {
+        self.gpu_optimized()
+            .distributed_sampling(rank, world_size)
+            .shard(rank, world_size)
+    }
+
+    /// Configure for development/debugging (safe settings)
+    pub fn debug_mode(mut self) -> Self {
+        self.num_workers = 0; // Single-threaded
+        self.persistent_workers = false;
+        self.timeout_seconds = Some(10.0); // Short timeout
+        self.auto_tune = false;
         self
     }
 }

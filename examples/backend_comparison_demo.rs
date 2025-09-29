@@ -7,10 +7,10 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 #[cfg(feature = "native-backends")]
-use s3dlio::api::{store_for_uri, ObjectStore, WriterOptions, CompressionConfig};
+use s3dlio::api::{store_for_uri, WriterOptions, CompressionConfig};
 
 #[cfg(feature = "arrow-backend")]
-use s3dlio::api::{store_for_uri, ObjectStore, WriterOptions, CompressionConfig};
+use s3dlio::api::{store_for_uri, WriterOptions, CompressionConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {

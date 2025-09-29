@@ -145,42 +145,39 @@ impl Dataset for FileSystemBytesDataset {
 mod tests {
     use super::*;
     use std::fs;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_single_file() {
-        // Use /mnt/vast1 for test storage
-        let test_dir = "/mnt/vast1/s3dlio_test";
-        let file_path = format!("{}/test.txt", test_dir);
+        // Use temporary directory for test
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
         
-        // Create test directory and file
-        fs::create_dir_all(test_dir).unwrap();
+        // Create test file
         fs::write(&file_path, b"Hello, World!").unwrap();
 
-        let uri = format!("file://{}", file_path);
+        let uri = format!("file://{}", file_path.display());
         let dataset = FileSystemBytesDataset::from_uri(&uri).unwrap();
 
         assert_eq!(dataset.len(), Some(1));
         let data = dataset.get(0).await.unwrap();
         assert_eq!(data, b"Hello, World!");
         
-        // Cleanup
-        fs::remove_file(&file_path).unwrap();
-        fs::remove_dir(test_dir).unwrap();
+        // TempDir automatically cleans up when dropped
     }
 
     #[tokio::test]
     async fn test_directory() {
-        // Use /mnt/vast1 for test storage
-        let test_dir = "/mnt/vast1/s3dlio_test_dir";
-        let file1 = format!("{}/file1.txt", test_dir);
-        let file2 = format!("{}/file2.txt", test_dir);
+        // Use temporary directory for test
+        let temp_dir = TempDir::new().unwrap();
+        let file1 = temp_dir.path().join("file1.txt");
+        let file2 = temp_dir.path().join("file2.txt");
         
-        // Create test directory and files
-        fs::create_dir_all(test_dir).unwrap();
+        // Create test files
         fs::write(&file1, b"File 1 content").unwrap();
         fs::write(&file2, b"File 2 content").unwrap();
 
-        let uri = format!("file://{}", test_dir);
+        let uri = format!("file://{}", temp_dir.path().display());
         let dataset = FileSystemBytesDataset::from_uri(&uri).unwrap();
 
         assert_eq!(dataset.len(), Some(2));
@@ -194,9 +191,6 @@ mod tests {
         assert!(data2 == b"File 1 content" || data2 == b"File 2 content");
         assert_ne!(data1, data2);
         
-        // Cleanup
-        fs::remove_file(&file1).unwrap();
-        fs::remove_file(&file2).unwrap(); 
-        fs::remove_dir(test_dir).unwrap();
+        // TempDir automatically cleans up when dropped
     }
 }
