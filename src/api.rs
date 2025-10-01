@@ -55,19 +55,41 @@ pub use crate::object_store::ObjectMetadata;
 /// URI scheme detection
 pub use crate::object_store::{Scheme, infer_scheme};
 
+// Op-log (trace logging) support
+/// Initialize operation logging to a file
+pub use crate::s3_logger::{init_op_logger, finalize_op_logger, global_logger, Logger};
+
+/// Wrapper that adds logging to any ObjectStore
+pub use crate::object_store_logger::LoggedObjectStore;
+
 // Factory functions for creating stores (backend-dependent)
-#[cfg(feature = "native-backends")]
 #[cfg(feature = "native-backends")]
 /// Create an object store for the given URI (native AWS/Azure backend)
 pub use crate::object_store::store_for_uri;
+
+#[cfg(feature = "native-backends")]
+/// Create an object store with optional operation logging
+pub use crate::object_store::store_for_uri_with_logger;
+
+#[cfg(feature = "native-backends")]
+/// Create an object store with configuration and optional logging
+pub use crate::object_store::store_for_uri_with_config_and_logger;
 
 #[cfg(feature = "native-backends")]
 /// Create a direct I/O optimized object store (native backend only)
 pub use crate::object_store::direct_io_store_for_uri;
 
 #[cfg(feature = "native-backends")]
+/// Create a direct I/O store with optional logging
+pub use crate::object_store::direct_io_store_for_uri_with_logger;
+
+#[cfg(feature = "native-backends")]
 /// Create a high-performance object store (native backend only)
 pub use crate::object_store::high_performance_store_for_uri;
+
+#[cfg(feature = "native-backends")]
+/// Create a high-performance store with optional logging
+pub use crate::object_store::high_performance_store_for_uri_with_logger;
 
 #[cfg(feature = "arrow-backend")]
 /// Create an object store for the given URI (Apache Arrow backend)

@@ -1,5 +1,105 @@
 # s3dlio Changelog
 
+## Version 0.8.12 - Universal Op-Log Support (October 1, 2025)
+
+### 🎯 **Release Focus: Operation Logging for All Storage Backends**
+
+This release extends operation trace logging (op-log) support from S3-only to all storage backends (file://, s3://, az://, direct://). Enables performance profiling, debugging, and warp-replay compatibility for any storage system using the same TSV format.
+
+### ✨ **New Features**
+
+#### **Universal ObjectStore Logging** (`src/object_store_logger.rs`)
+- **LoggedObjectStore Wrapper**: Non-invasive decorator pattern wraps any `ObjectStore` implementation
+- **All Operations Logged**: GET, PUT, LIST, DELETE, STAT operations with timing and error tracking
+- **Thread-Safe**: Uses existing logger infrastructure (`src/s3_logger.rs`) with channel-based logging
+- **TSV Format**: Zstd-compressed format compatible with warp-replay tool
+  - Format: `idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns`
+- **All Backends Supported**: file://, s3://, az://, direct:// URIs
+
+#### **Rust API Integration** (PRIMARY Interface)
+Added logger-enabled factory functions in `src/object_store.rs`:
+```rust
+use s3dlio::{init_op_logger, store_for_uri_with_logger, global_logger, finalize_op_logger};
+
+// Initialize logger
+init_op_logger("operations.tsv.zst")?;
+
+// Create store with logging enabled
+let logger = global_logger();
+let store = store_for_uri_with_logger("file:///data/", logger)?;
+
+// All operations automatically logged
+store.list("file:///data/", true).await?;
+store.get("file:///data/file.dat").await?;
+
+// Finalize and flush logs
+finalize_op_logger()?;
+```
+
+Available factory functions:
+- `store_for_uri_with_logger(uri, logger)`
+- `store_for_uri_with_config_and_logger(uri, config, logger)`
+- `direct_io_store_for_uri_with_logger(uri, logger)`
+- `high_performance_store_for_uri_with_logger(uri, logger)`
+
+#### **Python API Integration** (SECONDARY Interface)
+Added logger control functions in `src/python_api/python_core_api.rs`:
+```python
+import s3dlio
+
+# Initialize op-log
+s3dlio.init_op_log("operations.tsv.zst")
+
+# Check if logging is active
+if s3dlio.is_op_log_active():
+    print("Logging enabled")
+
+# All ObjectStore operations automatically logged
+s3dlio.list_objects("file:///data/", recursive=True)
+s3dlio.get_object("file:///data/file.dat")
+
+# Finalize and flush logs
+s3dlio.finalize_op_log()
+```
+
+#### **CLI Integration** (Testing Interface)
+- Global `--op-log FILE` flag for all commands
+- Works with: `ls`, `upload`, `download`, and other ObjectStore-based commands
+```bash
+# List with op-log
+s3-cli --op-log list_ops.tsv.zst ls file:///data/ -r
+
+# Upload with op-log
+s3-cli --op-log upload_ops.tsv.zst upload /local/files/ s3://bucket/prefix/
+
+# Download with op-log
+s3-cli --op-log download_ops.tsv.zst download s3://bucket/prefix/ /local/dir/ -r
+```
+
+### 🔧 **Technical Details**
+
+- **Decorator Pattern**: `LoggedObjectStore` wraps any `ObjectStore` without modifying implementations
+- **Backward Compatible**: All existing code works unchanged (logger parameter optional)
+- **Zero Overhead When Disabled**: No performance impact when logger not initialized
+- **17 Methods Wrapped**: All ObjectStore trait methods instrumented with timing and error capture
+
+### 📊 **Testing**
+
+- Test script: `tests/test_op_log_all_backends.sh`
+- Validates op-log creation for file:// and direct:// backends
+- Confirms TSV format and zstd compression
+- Verifies timing data and error handling
+
+### 🎓 **Use Cases**
+
+1. **Performance Profiling**: Track operation timing across all backends
+2. **Debugging**: Identify slow operations or errors in storage access
+3. **Warp-Replay**: Generate traces for replay/simulation testing
+4. **Multi-Backend Analysis**: Compare performance across file://, s3://, az://, direct://
+5. **Production Monitoring**: Log production I/O patterns for analysis
+
+---
+
 ## Version 0.8.10 - TFRecord Index Generation (October 1, 2025)
 
 ### 🎯 **Release Focus: NVIDIA DALI-Compatible TFRecord Indexing**

@@ -1,7 +1,7 @@
 [project]
 name = "s3dlio"
-version = "0.8.10"
-description = "Multi-protocol AI/ML storage library with zero-copy streaming, checkpointing, and data loading capabilities"
+version = "0.8.12"
+description = "High-performance S3, Azure, and file system operations for AI/ML"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []

@@ -34,13 +34,13 @@ use s3dlio::{
     delete_objects, get_objects_parallel, parse_s3_uri, stat_object_uri, 
     put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
     list_buckets,
-    object_store::store_for_uri,
+    object_store::store_for_uri_with_logger,
     mp,
     config::{DataGenMode, Config},
 };
 
 use s3dlio::{generic_upload_files, generic_download_objects};
-use s3dlio::{init_op_logger, finalize_op_logger};
+use s3dlio::{init_op_logger, finalize_op_logger, global_logger};
 use s3dlio::progress::{S3ProgressTracker, ProgressCallback};
 
 /// Macro to safely print with broken pipe handling
@@ -493,7 +493,8 @@ async fn main() -> Result<()> {
 
             // Handle bucket creation for backends that support it
             if create_bucket {
-                if let Ok(store) = s3dlio::store_for_uri(&dest) {
+                let logger = global_logger();
+                if let Ok(store) = store_for_uri_with_logger(&dest, logger) {
                     // Extract bucket/container name from URI
                     if dest.starts_with("s3://") {
                         if let Ok((bucket, _)) = parse_s3_uri(&dest) {
@@ -526,7 +527,8 @@ async fn main() -> Result<()> {
     
         Command::Download { src, dest_dir, jobs, recursive } => {
             // Use generic object store to list objects (works with all backends)
-            let store = s3dlio::store_for_uri(&src)?;
+            let logger = global_logger();
+            let store = store_for_uri_with_logger(&src, logger)?;
             let keys = store.list(&src, recursive).await?;
             
             if keys.is_empty() {
@@ -581,7 +583,8 @@ async fn main() -> Result<()> {
 
 /// Generic list command that works with any storage backend
 async fn generic_list_cmd(uri: &str, recursive: bool) -> Result<()> {
-    let store = store_for_uri(uri)?;
+    let logger = global_logger();
+    let store = store_for_uri_with_logger(uri, logger)?;
     let keys = store.list(uri, recursive).await?;
 
     let stdout = io::stdout();

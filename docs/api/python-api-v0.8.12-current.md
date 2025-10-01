@@ -1,7 +1,7 @@
-# S3DLIO Python API Reference - Version 0.8.0 (Current)
+# S3DLIO Python API Reference - Version 0.8.12 (Current)
 
 **⚠️ IMPORTANT VERSION INFORMATION**
-- **This document**: For s3dlio v0.8.0+ (September 2025)
+- **This document**: For s3dlio v0.8.12+ (October 2025)
 - **Previous API**: See `python_api_legacy_v0.7.md` for older versions
 - **Status**: This is the CURRENT and RECOMMENDED API
 
@@ -328,7 +328,162 @@ except RuntimeError as e:
 
 ---
 
-## 📚 **Additional Documentation**
+## � **Operation Logging (Op-Log)** - **🆕 v0.8.11**
+
+The op-log feature enables performance analysis and debugging by tracing all storage operations to a compressed TSV file. Supports all backends: `file://`, `s3://`, `az://`, and `direct://`.
+
+### Quick Start
+
+```python
+import s3dlio
+
+# 1. Initialize op-log at the start
+s3dlio.init_op_log("/tmp/my_operations.tsv.zst")
+
+# 2. Check if active (optional)
+if s3dlio.is_op_log_active():
+    print("Op-log is recording")
+
+# 3. Perform your operations - ALL are automatically logged
+s3dlio.upload(
+    src_patterns=["./data/*.dat"],
+    dest_prefix="file:///tmp/output/",
+    max_in_flight=4,
+    create_bucket=False
+)
+
+s3dlio.download(
+    src_uri="file:///tmp/output/",
+    dest_dir="./downloads/",
+    max_in_flight=4,
+    recursive=True
+)
+
+# 4. Finalize op-log at the end
+s3dlio.finalize_op_log()
+```
+
+### Op-Log Functions
+
+#### `init_op_log(path: str)`
+Initialize operation logging to a compressed TSV file.
+
+**Parameters:**
+- `path`: Output file path (will be created with `.zst` extension)
+
+**Example:**
+```python
+s3dlio.init_op_log("/tmp/performance_trace.tsv.zst")
+```
+
+#### `is_op_log_active() -> bool`
+Check if operation logging is currently active.
+
+**Returns:** `True` if op-log is recording, `False` otherwise
+
+**Example:**
+```python
+if s3dlio.is_op_log_active():
+    print("Operations are being traced")
+```
+
+#### `finalize_op_log()`
+Finalize and flush the operation log file.
+
+**Example:**
+```python
+s3dlio.finalize_op_log()
+print("Op-log saved successfully")
+```
+
+### Op-Log Format
+
+The op-log file is a zstd-compressed TSV with the following columns:
+
+```
+idx  thread  op  client_id  n_objects  bytes  endpoint  file  error  start  first_byte  end  duration_ns
+```
+
+**Columns:**
+- `idx`: Sequential operation index
+- `thread`: Thread identifier (hash)
+- `op`: Operation type (`PUT`, `GET`, `LIST`, etc.)
+- `client_id`: Client/session identifier
+- `n_objects`: Number of objects involved
+- `bytes`: Bytes transferred
+- `endpoint`: Storage endpoint (e.g., `file://`, `s3://bucket`)
+- `file`: File path (without URI scheme prefix)
+- `error`: Error message if operation failed
+- `start`: Operation start timestamp (ISO 8601)
+- `first_byte`: Time of first byte (ISO 8601)
+- `end`: Operation end timestamp (ISO 8601)
+- `duration_ns`: Duration in nanoseconds
+
+### Complete Example
+
+```python
+import s3dlio
+import os
+
+def process_data_with_logging():
+    """Process data with full operation tracing."""
+    
+    # Initialize op-log
+    log_file = "/tmp/data_processing.tsv.zst"
+    s3dlio.init_op_log(log_file)
+    print(f"Op-log initialized: {log_file}")
+    
+    try:
+        # Upload files to file:// backend
+        s3dlio.upload(
+            src_patterns=["./input/*.dat"],
+            dest_prefix="file:///tmp/staging/",
+            max_in_flight=8,
+            create_bucket=False
+        )
+        
+        # Download from file:// backend
+        s3dlio.download(
+            src_uri="file:///tmp/staging/",
+            dest_dir="/tmp/processed/",
+            max_in_flight=8,
+            recursive=True
+        )
+        
+        # Upload to DirectIO storage
+        s3dlio.upload(
+            src_patterns=["/tmp/processed/*.dat"],
+            dest_prefix="direct:///fast/storage/",
+            max_in_flight=16,
+            create_bucket=False
+        )
+        
+        print("All operations completed successfully")
+        
+    finally:
+        # Always finalize the log
+        s3dlio.finalize_op_log()
+        
+        # Verify log file
+        if os.path.exists(log_file):
+            size = os.path.getsize(log_file)
+            print(f"Op-log saved: {log_file} ({size} bytes)")
+
+if __name__ == "__main__":
+    process_data_with_logging()
+```
+
+### Notes
+
+- **Zero overhead**: When op-log is not initialized, there's no performance impact
+- **Thread-safe**: Safe to use with concurrent operations
+- **All backends**: Works with file://, s3://, az://, and direct:// URIs
+- **Automatic**: Once initialized, all operations are logged transparently
+- **Compatible**: Log format is compatible with warp-replay tool
+
+---
+
+## �📚 **Additional Documentation**
 
 - **Enhanced API Reference**: `enhanced-api-v0.8.0.md` - Complete technical details
 - **Migration Guide**: `migration-guide-v0.8.0.md` - Detailed migration instructions  

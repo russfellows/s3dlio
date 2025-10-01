@@ -1,19 +1,45 @@
-# Issue: Op-Log (Trace) Facility Only Works for S3 Backend
+# ISSUE: Op-Log Support for All Storage Backends
 
-## Status
-**Open** - Discovered during v0.8.8 testing (October 2025)
+**Status**: ✅ **RESOLVED - Fixed in v0.8.12**  
+**Created**: October 1, 2025  
+**Resolved**: October 1, 2025  
+**Priority**: High  
+**Component**: Operation Logging
+
+## Resolution Summary
+Implemented `LoggedObjectStore` wrapper using decorator pattern to add logging to all ObjectStore implementations. All storage backends (file://, s3://, az://, direct://) now support operation logging through unified API.
+
+### Implementation Details
+- **Module**: `src/object_store_logger.rs` (321 lines)
+- **Pattern**: Decorator/wrapper around any `ObjectStore` implementation
+- **Factory Functions**: Added `*_with_logger()` variants of all store creation functions
+- **API Integration**: Rust API (primary), Python API (secondary), CLI (testing)
+- **Test Coverage**: `tests/test_op_log_all_backends.sh` validates all backends
+
+### Changes Made
+1. Created `LoggedObjectStore` wrapper that intercepts all ObjectStore trait methods
+2. Added logger-enabled factory functions in `src/object_store.rs`
+3. Updated Python API with `init_op_log()`, `finalize_op_log()`, `is_op_log_active()`
+4. Updated CLI to use `store_for_uri_with_logger()` when `--op-log` flag is provided
+5. Maintained full backward compatibility - all existing code works unchanged
+
+See **Changelog.md** for complete v0.8.11 release notes.
+
+---
+
+## Original Issue Report
 
 ## Severity
 **Medium** - Functionality limitation, not a regression
 
 ## Summary
-The `--op-log` facility (operation trace logging) only records operations for S3-backed commands (`s3://` URIs). Generic storage commands using other backends (`file://`, `az://`, `direct://`) via the unified object_store trait do not generate trace records.
+The `--op-log` facility (operation trace logging) only recorded operations for S3-backed commands (`s3://` URIs). Generic storage commands using other backends (`file://`, `az://`, `direct://`) via the unified object_store trait did not generate trace records.
 
-## Current Behavior
+## Original Behavior
 
-### ✅ Works (S3-specific commands)
+### ✅ Worked (S3-specific commands)
 ```bash
-# These commands write operation records to trace log:
+# These commands wrote operation records to trace log:
 s3-cli --op-log trace.tsv.zst get s3://bucket/key
 s3-cli --op-log trace.tsv.zst put s3://bucket/key
 s3-cli --op-log trace.tsv.zst delete s3://bucket/key
@@ -21,9 +47,9 @@ s3-cli --op-log trace.tsv.zst list s3://bucket/prefix
 s3-cli --op-log trace.tsv.zst mp-get s3://bucket/prefix
 ```
 
-### ❌ Doesn't Work (Generic storage commands)
+### ❌ Didn't Work (Generic storage commands)
 ```bash
-# These commands only create header, no operation records:
+# These commands only created header, no operation records:
 s3-cli --op-log trace.tsv.zst download file:///path/to/file file:///dest/
 s3-cli --op-log trace.tsv.zst upload file:///src/ s3://bucket/prefix/
 s3-cli --op-log trace.tsv.zst ls file:///path/
@@ -34,7 +60,7 @@ s3-cli --op-log trace.tsv.zst download direct:///mnt/storage/ /local/dest/
 ## Root Cause
 
 ### Architecture
-The trace logging is implemented in `src/s3_ops.rs` as part of the S3-specific `S3Ops` struct:
+The trace logging was implemented in `src/s3_ops.rs` as part of the S3-specific `S3Ops` struct:
 
 ```rust
 // src/s3_ops.rs line 54-82

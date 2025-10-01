@@ -1,4 +1,14 @@
-# s3dlio - Universal 
+# s3dlio - Universal Storage I/O Library
+
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
+[![Tests](https://img.shields.io/badge/tests-74%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
+[![Version](https://img.shields.io/badge/version-0.8.12-blue)](https://github.com/russfellows/s3dlio/releases)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
+
+High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, local file systems, and DirectIO.
+
 ## 📊 Performance Monitoring (v0.8.7)
 
 Advanced HDR histogram-based performance monitoring for AI/ML workloads, providing precise tail latency analysis (P99, P99.9, P99.99+) and comprehensive throughput tracking. Built-in presets for training, inference, and distributed scenarios with thread-safe global metrics collection.
@@ -263,6 +273,68 @@ s3dlio supports comprehensive configuration through environment variables for pe
 
 ### Advanced Profiling Infrastructure (NEW in v0.7.6)
 s3dlio includes comprehensive performance profiling capabilities for analyzing and optimizing AI/ML workloads:
+
+### Operation Logging (Op-Log) - All Backends (NEW in v0.8.11)
+s3dlio provides universal operation trace logging across **all storage backends** (file://, s3://, az://, direct://), enabling performance profiling, debugging, and warp-replay compatibility.
+
+**Rust API (PRIMARY Interface):**
+```rust
+use s3dlio::{init_op_logger, store_for_uri_with_logger, global_logger, finalize_op_logger};
+
+// Initialize logger
+init_op_logger("operations.tsv.zst")?;
+
+// Create store with logging enabled
+let logger = global_logger();
+let store = store_for_uri_with_logger("file:///data/", logger)?;
+
+// All operations automatically logged with timing
+store.list("file:///data/", true).await?;
+store.get("file:///data/file.dat").await?;
+store.put("file:///data/output.dat", data).await?;
+
+// Finalize and flush logs
+finalize_op_logger()?;
+```
+
+**Python API (SECONDARY Interface):**
+```python
+import s3dlio
+
+# Initialize op-log
+s3dlio.init_op_log("operations.tsv.zst")
+
+# All ObjectStore operations automatically logged
+s3dlio.list_objects("s3://bucket/data/", recursive=True)
+data = s3dlio.get_object("az://container/model.pt")
+
+# Check logging status
+if s3dlio.is_op_log_active():
+    print("Logging enabled")
+
+# Finalize and flush logs
+s3dlio.finalize_op_log()
+```
+
+**CLI Usage (Testing Interface):**
+```bash
+# List with op-log
+s3-cli --op-log list_ops.tsv.zst ls file:///data/ -r
+
+# Upload with op-log (all backends)
+s3-cli --op-log upload_ops.tsv.zst upload /local/files/ s3://bucket/prefix/
+s3-cli --op-log upload_ops.tsv.zst upload /local/files/ az://container/data/
+s3-cli --op-log upload_ops.tsv.zst upload /local/files/ file:///remote/storage/
+
+# Download with op-log
+s3-cli --op-log download_ops.tsv.zst download s3://bucket/data/ /local/dir/ -r
+```
+
+**Op-Log Format:**
+- **TSV with zstd compression**: Space-efficient, warp-replay compatible
+- **Columns**: `idx`, `thread`, `op`, `client_id`, `n_objects`, `bytes`, `endpoint`, `file`, `error`, `start`, `first_byte`, `end`, `duration_ns`
+- **Operations tracked**: GET, PUT, LIST, DELETE, STAT, and all ObjectStore methods
+- **Use cases**: Performance analysis, debugging slow operations, production monitoring, multi-backend comparison
 
 ## Building from Source
 
