@@ -61,6 +61,7 @@ pub mod page_cache;
 pub mod data_gen;
 pub mod streaming_writer;
 pub mod tfrecord_index;
+pub mod object_store_logger;  // Op-log support for all backends
 pub mod data_loader;
 pub mod checkpoint;
 pub mod azure_client;

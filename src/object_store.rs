@@ -36,6 +36,8 @@ use crate::s3_utils::{
     put_object_multipart_uri_async as s3_put_object_multipart_uri_async,
 };
 
+use crate::s3_logger::global_logger;
+
 // Expose FS adapter (already implemented in src/file_store.rs)
 use crate::file_store::FileSystemObjectStore;
 
@@ -1051,57 +1053,146 @@ impl ObjectWriter for AzureBufferedWriter {
 // Convenience factory that picks a backend from a URI
 // ============================================================================
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
-    match infer_scheme(uri) {
-        Scheme::File  => Ok(FileSystemObjectStore::boxed()),
-        Scheme::Direct => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
-        Scheme::S3    => Ok(S3ObjectStore::boxed()),
-        Scheme::Azure => Ok(AzureObjectStore::boxed()),
+    store_for_uri_with_logger(uri, None)
+}
+
+/// Create a store for the given URI with optional operation logging.
+/// 
+/// When a logger is provided, all ObjectStore operations will be traced to the op-log.
+/// This enables performance analysis and debugging for all backends (file://, s3://, az://, direct://).
+///
+/// # Arguments
+/// * `uri` - Storage URI (e.g., "s3://bucket/", "file:///path/", "az://container/")
+/// * `logger` - Optional Logger instance for operation tracing
+///
+/// # Example
+/// ```rust,no_run
+/// use s3dlio::{store_for_uri_with_logger, init_op_logger, global_logger};
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// // Initialize op-log
+/// init_op_logger("trace.tsv.zst")?;
+/// let logger = global_logger();
+///
+/// // Create store with logging
+/// let store = store_for_uri_with_logger("file:///tmp/data", logger)?;
+///
+/// // Operations are now traced
+/// let data = store.get("file:///tmp/data/test.txt").await?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Logger>) -> Result<Box<dyn ObjectStore>> {
+    use crate::object_store_logger::LoggedObjectStore;
+    use std::sync::Arc;
+    
+    let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
+        Scheme::File  => FileSystemObjectStore::boxed(),
+        Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
+        Scheme::S3    => S3ObjectStore::boxed(),
+        Scheme::Azure => AzureObjectStore::boxed(),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
+    };
+    
+    // Wrap with logger if provided
+    if let Some(logger) = logger {
+        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+    } else {
+        Ok(store)
     }
 }
 
 /// Enhanced factory that supports configuration options for file I/O
 pub fn store_for_uri_with_config(uri: &str, file_config: Option<FileSystemConfig>) -> Result<Box<dyn ObjectStore>> {
-    match infer_scheme(uri) {
+    store_for_uri_with_config_and_logger(uri, file_config, None)
+}
+
+/// Enhanced factory with configuration and optional logger support
+pub fn store_for_uri_with_config_and_logger(
+    uri: &str, 
+    file_config: Option<FileSystemConfig>,
+    logger: Option<crate::s3_logger::Logger>
+) -> Result<Box<dyn ObjectStore>> {
+    use crate::object_store_logger::LoggedObjectStore;
+    use std::sync::Arc;
+    
+    let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => {
             if let Some(config) = file_config {
-                Ok(ConfigurableFileSystemObjectStore::boxed(config))
+                ConfigurableFileSystemObjectStore::boxed(config)
             } else {
-                Ok(FileSystemObjectStore::boxed())
+                FileSystemObjectStore::boxed()
             }
         }
         Scheme::Direct => {
             if let Some(config) = file_config {
-                Ok(ConfigurableFileSystemObjectStore::boxed(config))
+                ConfigurableFileSystemObjectStore::boxed(config)
             } else {
-                Ok(ConfigurableFileSystemObjectStore::boxed_direct_io())
+                ConfigurableFileSystemObjectStore::boxed_direct_io()
             }
         }
-        Scheme::S3 => Ok(S3ObjectStore::boxed()),
-        Scheme::Azure => Ok(AzureObjectStore::boxed()),
+        Scheme::S3 => S3ObjectStore::boxed(),
+        Scheme::Azure => AzureObjectStore::boxed(),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
+    };
+    
+    // Wrap with logger if provided
+    if let Some(logger) = logger {
+        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+    } else {
+        Ok(store)
     }
 }
 
 /// Factory for creating file stores with O_DIRECT enabled for AI/ML workloads
 pub fn direct_io_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
-    match infer_scheme(uri) {
-        Scheme::File => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
-        Scheme::Direct => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
-        Scheme::S3 => Ok(S3ObjectStore::boxed()),
-        Scheme::Azure => Ok(AzureObjectStore::boxed()),
+    direct_io_store_for_uri_with_logger(uri, None)
+}
+
+/// Factory for creating file stores with O_DIRECT and optional logger
+pub fn direct_io_store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Logger>) -> Result<Box<dyn ObjectStore>> {
+    use crate::object_store_logger::LoggedObjectStore;
+    use std::sync::Arc;
+    
+    let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
+        Scheme::File => ConfigurableFileSystemObjectStore::boxed_direct_io(),
+        Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
+        Scheme::S3 => S3ObjectStore::boxed(),
+        Scheme::Azure => AzureObjectStore::boxed(),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
+    };
+    
+    // Wrap with logger if provided
+    if let Some(logger) = logger {
+        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+    } else {
+        Ok(store)
     }
 }
 
 /// Factory for creating high-performance stores optimized for AI/ML workloads
 pub fn high_performance_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
-    match infer_scheme(uri) {
-        Scheme::File => Ok(ConfigurableFileSystemObjectStore::boxed_high_performance()),
-        Scheme::Direct => Ok(ConfigurableFileSystemObjectStore::boxed_direct_io()),
-        Scheme::S3 => Ok(S3ObjectStore::boxed()),
-        Scheme::Azure => Ok(AzureObjectStore::boxed()),
+    high_performance_store_for_uri_with_logger(uri, None)
+}
+
+/// Factory for creating high-performance stores with optional logger
+pub fn high_performance_store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Logger>) -> Result<Box<dyn ObjectStore>> {
+    use crate::object_store_logger::LoggedObjectStore;
+    use std::sync::Arc;
+    
+    let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
+        Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
+        Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
+        Scheme::S3 => S3ObjectStore::boxed(),
+        Scheme::Azure => AzureObjectStore::boxed(),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
+    };
+    
+    // Wrap with logger if provided
+    if let Some(logger) = logger {
+        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+    } else {
+        Ok(store)
     }
 }
 
@@ -1227,7 +1318,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
     for path in paths.clone() {
         debug!("queueing upload for {:?}", path);
         let sem = sem.clone();
-        let store = store_for_uri(dest_prefix)?; // Each task gets its own store instance
+        let store = store_for_uri_with_logger(dest_prefix, global_logger())?; // Each task gets its own store instance
         let progress = progress_callback.clone();
         let dest_base = dest_prefix.to_string();
 
@@ -1284,7 +1375,7 @@ pub async fn generic_download_objects(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
-    let store = store_for_uri(src_uri)?;
+    let store = store_for_uri_with_logger(src_uri, global_logger())?;
 
     // List objects to download
     let keys = store.list(src_uri, recursive).await?;
@@ -1312,7 +1403,7 @@ pub async fn generic_download_objects(
 
     for uri in keys.clone() {
         let sem = sem.clone();
-        let store = store_for_uri(&uri)?; // Each task gets its own store instance
+        let store = store_for_uri_with_logger(&uri, global_logger())?; // Each task gets its own store instance
         let progress = progress_callback.clone();
         let out_dir = dest_dir.to_path_buf();
 

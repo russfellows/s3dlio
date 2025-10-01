@@ -30,8 +30,9 @@ use crate::s3_utils::{
     stat_object_uri_async,
     stat_object_many_async,
 };
-use crate::{generic_upload_files, generic_download_objects, store_for_uri};
-use crate::s3_logger::{finalize_op_logger, init_op_logger};
+use crate::{generic_upload_files, generic_download_objects};
+use crate::s3_logger::{finalize_op_logger, init_op_logger, global_logger};
+use crate::object_store::store_for_uri_with_logger;
 
 // Phase 2 streaming functionality imports
 use crate::object_store::{
@@ -208,6 +209,11 @@ pub fn init_op_log(path: &str) -> PyResult<()> { init_op_logger(path).map_err(py
 
 #[pyfunction]
 pub fn finalize_op_log() -> PyResult<()> { finalize_op_logger(); Ok(()) }
+
+#[pyfunction]
+pub fn is_op_log_active() -> PyResult<bool> {
+    Ok(global_logger().is_some())
+}
 
 // ---------------------------------------------------------------------------
 // Utility helpers
@@ -661,9 +667,12 @@ pub fn upload(
         // Use the new generic upload function that works with all backends
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(async {
+            // Get logger if op-log is active
+            let logger = global_logger();
+            
             // Handle bucket creation ONLY if explicitly requested
             if create_bucket {
-                if let Ok(store) = store_for_uri(dest_prefix) {
+                if let Ok(store) = store_for_uri_with_logger(dest_prefix, logger.clone()) {
                     // Extract bucket/container name from URI
                     if dest_prefix.starts_with("s3://") {
                         if let Ok((bucket, _)) = parse_s3_uri(dest_prefix) {
@@ -882,6 +891,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(init_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(finalize_op_log, m)?)?;
+    m.add_function(wrap_pyfunction!(is_op_log_active, m)?)?;
     
     // Core storage operations
     m.add_function(wrap_pyfunction!(list_objects, m)?)?;
