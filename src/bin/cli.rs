@@ -18,7 +18,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use std::io::{self, Write, ErrorKind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr; // For the custom S3Path type
 use std::time::Instant;
 use std::sync::Arc;
@@ -302,6 +302,19 @@ enum Command {
         #[clap(short, long)]
         recursive: bool,
     },
+
+    /// Generate NVIDIA DALI-compatible index file for TFRecord files
+    /// Format: "{offset} {size}\n" (space-separated ASCII text)
+    /// Example: s3dlio tfrecord-index train.tfrecord train.tfrecord.idx
+    #[clap(name = "tfrecord-index")]
+    TfrecordIndex {
+        /// Path to TFRecord file (input)
+        tfrecord_path: PathBuf,
+
+        /// Path to index file (output, typically .idx extension)
+        #[arg(default_value = None)]
+        index_path: Option<PathBuf>,
+    },
 }
 
 // -----------------------------------------------------------------------------
@@ -552,6 +565,10 @@ async fn main() -> Result<()> {
             generic_list_cmd(&uri, recursive).await?
         }
 
+        Command::TfrecordIndex { tfrecord_path, index_path } => {
+            tfrecord_index_cmd(&tfrecord_path, index_path.as_deref())?
+        }
+
     } // End of match cli.cmd
 
     // If set, finalize the op‑logger 
@@ -580,6 +597,40 @@ async fn generic_list_cmd(uri: &str, recursive: bool) -> Result<()> {
     }
     writeln!(out, "
 Total objects: {}", keys.len())?;
+    Ok(())
+}
+
+/// TFRecord index generation command
+/// Creates NVIDIA DALI-compatible index files for TFRecord files
+fn tfrecord_index_cmd(tfrecord_path: &PathBuf, index_path: Option<&Path>) -> Result<()> {
+    use s3dlio::tfrecord_index::write_index_for_tfrecord_file;
+    
+    // Determine output path: use provided or default to input + ".idx"
+    let output_path = match index_path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let mut p = tfrecord_path.clone();
+            let current_name = p.file_name()
+                .context("Invalid TFRecord path")?
+                .to_string_lossy()
+                .to_string();
+            p.set_file_name(format!("{}.idx", current_name));
+            p
+        }
+    };
+    
+    info!("Indexing TFRecord file: {}", tfrecord_path.display());
+    info!("Output index file: {}", output_path.display());
+    
+    let start = Instant::now();
+    let num_records = write_index_for_tfrecord_file(tfrecord_path, &output_path)
+        .map_err(|e| anyhow::anyhow!("Failed to create index: {}", e))?;
+    let elapsed = start.elapsed();
+    
+    safe_println!("Successfully indexed {} records in {:.2?}", num_records, elapsed);
+    safe_println!("Index file: {}", output_path.display());
+    safe_println!("Format: NVIDIA DALI compatible (text, space-separated)");
+    
     Ok(())
 }
 

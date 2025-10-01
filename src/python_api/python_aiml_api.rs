@@ -1429,6 +1429,143 @@ impl PyS3AsyncDataLoaderCompat {
 }
 
 // ---------------------------------------------------------------------------
+// TFRecord Index Generation (NVIDIA DALI Compatible)
+// ---------------------------------------------------------------------------
+
+/// Generate NVIDIA DALI-compatible index file for a TFRecord file
+///
+/// Creates a text-format index file with "{offset} {size}\n" format that can be used
+/// by NVIDIA DALI's fn.readers.tfrecord(index_path=...) and TensorFlow tooling.
+///
+/// Args:
+///     tfrecord_path: Path to the TFRecord file (input)
+///     index_path: Path to the index file (output, typically .idx extension).
+///                 If None, defaults to tfrecord_path + ".idx"
+///
+/// Returns:
+///     Number of records indexed
+///
+/// Example:
+///     >>> import s3dlio
+///     >>> num_records = s3dlio.create_tfrecord_index("train.tfrecord", "train.tfrecord.idx")
+///     >>> print(f"Indexed {num_records} records")
+#[pyfunction]
+#[pyo3(signature = (tfrecord_path, index_path=None))]
+pub fn create_tfrecord_index(
+    tfrecord_path: &str,
+    index_path: Option<&str>,
+) -> PyResult<usize> {
+    use crate::tfrecord_index::write_index_for_tfrecord_file;
+    use std::path::Path;
+    
+    // Determine output path
+    let output_path = match index_path {
+        Some(p) => p.to_string(),
+        None => format!("{}.idx", tfrecord_path),
+    };
+    
+    // Create index
+    let num_records = write_index_for_tfrecord_file(
+        Path::new(tfrecord_path),
+        Path::new(&output_path),
+    ).map_err(py_err)?;
+    
+    Ok(num_records)
+}
+
+/// Generate DALI-compatible index text from TFRecord bytes (in-memory)
+///
+/// Parses TFRecord data from bytes and returns index text in NVIDIA DALI format.
+/// Useful for processing TFRecord data already loaded into memory.
+///
+/// Args:
+///     tfrecord_bytes: Raw TFRecord file data as bytes
+///
+/// Returns:
+///     Index text string in "{offset} {size}\n" format
+///
+/// Example:
+///     >>> import s3dlio
+///     >>> with open("train.tfrecord", "rb") as f:
+///     ...     data = f.read()
+///     >>> index_text = s3dlio.index_tfrecord_bytes(data)
+///     >>> with open("train.tfrecord.idx", "w") as f:
+///     ...     f.write(index_text)
+#[pyfunction]
+pub fn index_tfrecord_bytes(tfrecord_bytes: &[u8]) -> PyResult<String> {
+    use crate::tfrecord_index::index_text_from_bytes;
+    
+    let index_text = index_text_from_bytes(tfrecord_bytes).map_err(py_err)?;
+    Ok(index_text)
+}
+
+/// Get index entries from TFRecord bytes (returns list of (offset, size) tuples)
+///
+/// Parses TFRecord data and returns structured index information as Python tuples.
+/// Each tuple contains (offset: int, size: int) for one TFRecord entry.
+///
+/// Args:
+///     tfrecord_bytes: Raw TFRecord file data as bytes
+///
+/// Returns:
+///     List of (offset, size) tuples
+///
+/// Example:
+///     >>> import s3dlio
+///     >>> with open("train.tfrecord", "rb") as f:
+///     ...     data = f.read()
+///     >>> entries = s3dlio.get_tfrecord_index_entries(data)
+///     >>> for offset, size in entries:
+///     ...     print(f"Record at offset {offset}, size {size}")
+#[pyfunction]
+pub fn get_tfrecord_index_entries(tfrecord_bytes: &[u8]) -> PyResult<Vec<(u64, u64)>> {
+    use crate::tfrecord_index::index_entries_from_bytes;
+    
+    let entries = index_entries_from_bytes(tfrecord_bytes).map_err(py_err)?;
+    let tuples: Vec<(u64, u64)> = entries
+        .into_iter()
+        .map(|e| (e.offset, e.size))
+        .collect();
+    
+    Ok(tuples)
+}
+
+/// Read and parse a DALI-compatible TFRecord index file
+///
+/// Reads an index file in NVIDIA DALI format and parses it into
+/// structured index entries as Python tuples.
+///
+/// Args:
+///     index_path: Path to the index file (.idx)
+///
+/// Returns:
+///     List of (offset, size) tuples
+///
+/// Example:
+///     >>> import s3dlio
+///     >>> entries = s3dlio.read_tfrecord_index("train.tfrecord.idx")
+///     >>> print(f"Found {len(entries)} records")
+///     >>> # Use entries for random access
+///     >>> with open("train.tfrecord", "rb") as f:
+///     ...     for offset, size in entries:
+///     ...         f.seek(offset)
+///     ...         record_bytes = f.read(size)
+///     ...         # Process record...
+#[pyfunction]
+pub fn read_tfrecord_index(index_path: &str) -> PyResult<Vec<(u64, u64)>> {
+    use crate::tfrecord_index::read_index_file;
+    use std::path::Path;
+    
+    let entries = read_index_file(Path::new(index_path)).map_err(py_err)?;
+    let tuples: Vec<(u64, u64)> = entries
+        .into_iter()
+        .map(|e| (e.offset, e.size))
+        .collect();
+    
+    Ok(tuples)
+}
+
+// ---------------------------------------------------------------------------
 // Module registration function for AI/ML API
 // ---------------------------------------------------------------------------
 pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1455,6 +1592,12 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Dataset factory functions
     m.add_function(wrap_pyfunction!(create_dataset, m)?)?;
     m.add_function(wrap_pyfunction!(create_async_loader, m)?)?;
+
+    // TFRecord index generation (NVIDIA DALI compatible)
+    m.add_function(wrap_pyfunction!(create_tfrecord_index, m)?)?;
+    m.add_function(wrap_pyfunction!(index_tfrecord_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(get_tfrecord_index_entries, m)?)?;
+    m.add_function(wrap_pyfunction!(read_tfrecord_index, m)?)?;
 
     // Add compatibility aliases (these create the deprecated names that existing code expects)
     // The user should migrate to PyDataset and create_async_loader() instead

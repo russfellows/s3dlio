@@ -85,7 +85,6 @@ pub fn drop_cache_region<F: AsRawFd>(fd: &F, offset: i64, length: i64) -> std::i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

@@ -1,4 +1,34 @@
-# s3dlio - Universal High-Performance Storage Library
+# s3dlio - Universal 
+## 📊 Performance Monitoring (v0.8.7)
+
+Advanced HDR histogram-based performance monitoring for AI/ML workloads, providing precise tail latency analysis (P99, P99.9, P99.99+) and comprehensive throughput tracking. Built-in presets for training, inference, and distributed scenarios with thread-safe global metrics collection.
+
+## 📇 TFRecord Index Generation (v0.8.10)
+
+**NEW**: Generate NVIDIA DALI-compatible index files for efficient random access to TFRecord datasets. Enables shuffled data loading, distributed training, and O(1) record seeking with minimal overhead (0.4% file size). Pure Rust implementation with comprehensive Python API.
+
+```python
+import s3dlio
+
+# Generate index for efficient random access
+s3dlio.create_tfrecord_index("train.tfrecord")
+
+# Read index and access any record directly
+index = s3dlio.read_tfrecord_index("train.tfrecord.idx")
+offset, size = index[42]  # O(1) access, ~1200x faster than sequential scan
+```
+
+**Use Cases**: Random shuffling, distributed training sharding, batch loading, DALI pipeline integration. Compatible with NVIDIA DALI and TensorFlow tooling. See [Quick Reference](docs/TFRECORD-INDEX-QUICKREF.md) for details.
+
+## 🧠 AI/ML Training Enhancement (v0.8.6)
+
+Added comprehensive LoaderOptions Realism Knobs for production AI/ML workloads, providing fine-grained control over data loading behavior, performance optimization, and training pipeline configuration with PyTorch/TensorFlow best practices.
+
+## Storage Backend Support
+
+### Universal Backend Architecture
+s3dlio provides a unified interface for all storage operations, treating upload/download as enhanced copy commands that work across any backend:
+nce Storage Library
 
 ## Overview
 
