@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::str::FromStr; // For the custom S3Path type
 use std::time::Instant;
 use std::sync::Arc;
-use log::LevelFilter;
-use log::info;
+use tracing::{info, warn};
+use tracing_subscriber::{fmt, EnvFilter};
 use tempfile::NamedTempFile;
 use glob;
 
@@ -347,14 +347,22 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialise logging once, based on how many `-v` flags were given:
-    let level = match cli.verbose {
-        0 => LevelFilter::Warn,   // no -v
-        1 => LevelFilter::Info,   // -v
-        _ => LevelFilter::Debug,  // -vv or more
+    // Initialize tracing subscriber based on verbosity
+    let filter = match cli.verbose {
+        0 => "warn",        // no -v: WARN level
+        1 => "info",        // -v: INFO level
+        _ => "debug",       // -vv or more: DEBUG level
     };
-    env_logger::Builder::from_default_env()
-        .filter_level(level)
+    
+    // Initialize tracing with env filter (compatible with dl-driver/s3-bench)
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(filter)))
+        .with_target(false)
         .init();
+    
+    // Initialize tracing-log bridge to capture log crate messages from dependencies
+    tracing_log::LogTracer::init().ok();
 
 
     // If set, start the op‑logger *before* the first S3 call
@@ -448,7 +456,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            Err(e) => log::warn!("Glob error: {}", e),
+                            Err(e) => warn!("Glob error: {}", e),
                         }
                     }
                 } else {
@@ -477,7 +485,7 @@ async fn main() -> Result<()> {
                     if dest.starts_with("s3://") {
                         if let Ok((bucket, _)) = parse_s3_uri(&dest) {
                             if let Err(e) = store.create_container(&bucket).await {
-                                log::warn!("Failed to create bucket {}: {}", bucket, e);
+                                warn!("Failed to create bucket {}: {}", bucket, e);
                             }
                         }
                     } else if dest.starts_with("az://") || dest.starts_with("azure://") {
@@ -485,7 +493,7 @@ async fn main() -> Result<()> {
                         let parts: Vec<&str> = dest.trim_start_matches("az://").trim_start_matches("azure://").split('/').collect();
                         if let Some(container) = parts.get(0) {
                             if let Err(e) = store.create_container(container).await {
-                                log::warn!("Failed to create container {}: {}", container, e);
+                                warn!("Failed to create container {}: {}", container, e);
                             }
                         }
                     }

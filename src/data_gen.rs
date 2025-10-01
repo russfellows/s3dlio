@@ -7,7 +7,7 @@
 
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use log::{info, debug};
+use tracing::{info, debug};
 
 use crate::constants::{BLK_SIZE, HALF_BLK, MOD_SIZE, A_BASE_BLOCK, BASE_BLOCK};
 use crate::data_formats::{build_npz, build_hdf5, build_tfrecord, build_raw};

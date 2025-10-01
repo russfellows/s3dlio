@@ -3,6 +3,8 @@
 ## Project Overview
 s3dlio is a high-performance, multi-protocol storage library built in Rust with Python bindings, designed for AI/ML workloads. It provides universal copy operations across S3, Azure, local file systems, and DirectIO with near line-speed performance.
 
+**Current Version**: v0.8.8 (October 2025)
+
 ### Performance Targets
 - **Read (GET)**: Minimum 5 GB/s (50 Gb/s) sustained, target higher
 - **Write (PUT)**: Minimum 2.5 GB/s (25 Gb/s) sustained, target higher
@@ -107,11 +109,29 @@ Key variables for development/testing:
 ## Project-Specific Conventions
 
 ### Versioning & Releases
-- **Current version**: v0.8.4 (check `Cargo.toml` and `pyproject.toml`)
-- **Patch releases**: Increment build number (v0.8.4 → v0.8.5)
+- **Current version**: v0.8.8 (check `Cargo.toml` and `pyproject.toml`)
+- **Patch releases**: Increment build number (v0.8.8 → v0.8.9)
 - **Minor releases**: For major features (v0.8.x → v0.9.0)
 - **Major version 0.x**: Until production-ready quality achieved
 - **Documentation**: Update `docs/Changelog.md` and `README.md` for every release
+
+### Logging Framework (v0.8.8+)
+- **Framework**: Uses `tracing` crate (not `log`) for observability
+- **Dependencies**: `tracing ^0.1`, `tracing-subscriber ^0.3`, `tracing-log ^0.2`
+- **Verbosity levels**: 
+  - Default: WARN level (quiet)
+  - `-v`: INFO level
+  - `-vv`: DEBUG level
+- **Trace logging**: Operation trace (--op-log) uses separate zstd-compressed TSV format
+- **Compatibility**: dl-driver and s3-bench (io-bench) also use tracing
+- **Usage**: `tracing::info!()`, `tracing::debug!()`, `tracing::warn!()`, `tracing::error!()`
+
+### Page Cache Optimization (v0.8.8+)
+- **Module**: `src/page_cache.rs` - Linux/Unix posix_fadvise() wrapper
+- **PageCacheMode**: Sequential, Random, DontNeed, Normal, Auto
+- **Auto mode**: Sequential for files ≥64MB, Random for smaller files
+- **Integration**: file_store.rs get() and get_range() operations
+- **Platform**: Linux/Unix only (no-op on Windows)
 
 ### Error Handling
 - Use `anyhow::Result` for all public APIs

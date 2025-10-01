@@ -16,8 +16,8 @@ use tokio::task;
 
 use std::path::PathBuf;
 
-use log::LevelFilter;
-use env_logger;
+use tracing::Level;
+use tracing_subscriber;
 
 // Project crates
 use crate::config::{ObjectType, DataGenMode, Config};
@@ -184,13 +184,22 @@ pub fn mp_get(
 #[pyfunction]
 pub fn init_logging(level: &str) -> PyResult<()> {
     let filter = match level.to_lowercase().as_str() {
-        "trace" => LevelFilter::Trace,
-        "debug" => LevelFilter::Debug,
-        "warn"  => LevelFilter::Warn,
-        "error" => LevelFilter::Error,
-        _       => LevelFilter::Info,
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "warn"  => Level::WARN,
+        "error" => Level::ERROR,
+        _       => Level::INFO,
     };
-    let _ = env_logger::builder().filter_level(filter).is_test(false).try_init();
+    
+    // Initialize tracing subscriber with the specified level
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(filter)
+        .with_target(false)
+        .try_init();
+    
+    // Initialize tracing-log bridge to capture log crate messages
+    tracing_log::LogTracer::init().ok();
+    
     Ok(())
 }
 
@@ -659,7 +668,7 @@ pub fn upload(
                     if dest_prefix.starts_with("s3://") {
                         if let Ok((bucket, _)) = parse_s3_uri(dest_prefix) {
                             if let Err(e) = store.create_container(&bucket).await {
-                                log::warn!("Failed to create bucket {}: {}", bucket, e);
+                                warn!("Failed to create bucket {}: {}", bucket, e);
                             }
                         }
                     } else if dest_prefix.starts_with("az://") || dest_prefix.starts_with("azure://") {
@@ -667,7 +676,7 @@ pub fn upload(
                         let parts: Vec<&str> = dest_prefix.trim_start_matches("az://").trim_start_matches("azure://").split('/').collect();
                         if let Some(container) = parts.get(0) {
                             if let Err(e) = store.create_container(container).await {
-                                log::warn!("Failed to create container {}: {}", container, e);
+                                warn!("Failed to create container {}: {}", container, e);
                             }
                         }
                     }

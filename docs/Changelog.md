@@ -1,5 +1,58 @@
 # s3dlio Changelog
 
+## Version 0.8.8 - Page Cache Hints & Tracing Framework (October 1, 2025)
+
+### 🚀 **Major New Features**
+
+#### **🗂️ posix_fadvise() Page Cache Optimization**
+- **New Module**: Added `src/page_cache.rs` with Linux/Unix page cache hint support
+- **PageCacheMode Enum**: Sequential, Random, DontNeed, Normal, and Auto modes
+- **Auto Mode Intelligence**: Automatically applies Sequential hints for files ≥64MB, Random for smaller files
+- **File Store Integration**: Integrated into `file_store.rs` get() and get_range() operations
+- **Platform Support**: Linux/Unix only (no-op on Windows)
+- **Performance Impact**: Optimizes kernel read-ahead and caching strategies for different access patterns
+
+#### **📝 Logging Framework Migration: log → tracing**
+- **Complete Migration**: Replaced `log` and `env_logger` with `tracing` ecosystem
+- **Enhanced Compatibility**: Now compatible with dl-driver and s3-bench (io-bench) projects
+- **Dependencies Updated**: 
+  - `tracing ^0.1` (with log feature for compatibility)
+  - `tracing-subscriber ^0.3` (with fmt, env-filter, registry features)
+  - `tracing-log ^0.2` (for backward compatibility bridge)
+- **Verbosity Mapping**: 
+  - Default (no flags): WARN level
+  - `-v`: INFO level
+  - `-vv`: DEBUG level
+- **Scope**: Updated 12 source files with ~99 log macro conversions
+- **Trace Logging Preserved**: Operation trace logging (--op-log) functionality remains unchanged
+
+### 🐛 **Known Issues Documented**
+- **Progress Bars**: Documented real-time update issue in `KNOWN-ISSUES.md`
+- **Op-Log Backend Support**: Created comprehensive issue documentation for extending trace logging to all storage backends (file://, az://, direct://)
+- **Issue Tracking**: Added `KNOWN-ISSUES.md` for project-wide issue management
+
+### 🛠️ **Implementation Details**
+- **Version Bump**: 0.8.7 → 0.8.8 in both Rust and Python packages
+- **Clean Compilation**: All changes compile successfully with no errors
+- **Testing**: Verified logging levels, trace independence, and page cache hint application
+- **Documentation**: Three new issue docs with root cause analysis and proposed solutions
+
+### 📚 **Files Modified**
+- **Core Modules**: cli.rs, s3_logger.rs, data_gen.rs, s3_utils.rs, s3_client.rs, object_store.rs, python_core_api.rs
+- **Additional Updates**: checkpoint/latest.rs, http/client.rs, s3_copy.rs, file_store_direct.rs, profiling.rs
+- **New Files**: 
+  - `src/page_cache.rs` - Page cache hint implementation
+  - `KNOWN-ISSUES.md` - Project-wide issue tracker
+  - `docs/ISSUE-op-log-backend-support.md` - Detailed issue analysis
+  - `docs/GITHUB-ISSUE-op-log-backend-support.md` - GitHub issue format
+
+### 🔄 **Backward Compatibility**
+- **LogTracer Bridge**: Added for compatibility with crates still using `log` macros
+- **Trace Format**: Operation trace logging format unchanged (warp-replay compatible)
+- **API Stability**: No breaking changes to public APIs
+
+---
+
 ## Version 0.8.7 - HDR Performance Monitoring for AI/ML Workloads (September 29, 2025)
 
 ### 🚀 **Major New Features**

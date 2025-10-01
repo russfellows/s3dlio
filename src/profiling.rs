@@ -24,6 +24,11 @@ static PROFILING_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic:
 
 #[cfg(feature = "profiling")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+#[cfg(feature = "profiling")]
+use tracing::{warn, debug};
+
+#[cfg(not(feature = "profiling"))]
+use tracing::{warn, debug};
 
 /// Initialize comprehensive profiling infrastructure
 /// 
@@ -37,11 +42,11 @@ pub fn init_profiling() -> anyhow::Result<()> {
     {
         // Check if already initialized
         if PROFILING_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
-            log::warn!("Profiling already initialized, skipping");
+            warn!("Profiling already initialized, skipping");
             return Ok(());
         }
 
-        log::info!("Initializing profiling infrastructure");
+        info!("Initializing profiling infrastructure");
 
         // Set up tracing subscriber with layers
         let env_filter = EnvFilter::try_from_default_env()
@@ -50,7 +55,7 @@ pub fn init_profiling() -> anyhow::Result<()> {
         // Add tokio-console layer if available
         if std::env::var("S3DLIO_TOKIO_CONSOLE").is_ok() {
             console_subscriber::init();
-            log::info!("Tokio console subscriber initialized - connect with 'tokio-console'");
+            info!("Tokio console subscriber initialized - connect with 'tokio-console'");
         } else {
             let subscriber = tracing_subscriber::registry()
                 .with(env_filter)
@@ -64,13 +69,13 @@ pub fn init_profiling() -> anyhow::Result<()> {
         }
 
         PROFILING_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
-        log::info!("Profiling initialized successfully");
+        info!("Profiling initialized successfully");
         Ok(())
     }
 
     #[cfg(not(feature = "profiling"))]
     {
-        log::debug!("Profiling not available (feature disabled)");
+        debug!("Profiling not available (feature disabled)");
         Ok(())
     }
 }
@@ -82,15 +87,15 @@ pub fn init_profiling() -> anyhow::Result<()> {
 pub fn save_flamegraph(path: &str) -> anyhow::Result<()> {
     #[cfg(feature = "profiling")]
     {
-        log::info!("Flamegraph save requested to: {}", path);
-        log::warn!("Use standalone pprof ProfilerGuard for flamegraph generation");
+        info!("Flamegraph save requested to: {}", path);
+        warn!("Use standalone pprof ProfilerGuard for flamegraph generation");
         Ok(())
     }
 
     #[cfg(not(feature = "profiling"))]
     {
         let _ = path; // Suppress unused warning
-        log::warn!("Cannot save flamegraph - profiling feature not enabled");
+        warn!("Cannot save flamegraph - profiling feature not enabled");
         anyhow::bail!("Profiling feature not enabled");
     }
 }
@@ -116,7 +121,7 @@ impl SectionProfiler {
     fn new(name: &str) -> anyhow::Result<Self> {
         #[cfg(feature = "profiling")]
         {
-            log::debug!("Started section profiler: {}", name);
+            debug!("Started section profiler: {}", name);
         }
 
         Ok(Self {
@@ -128,12 +133,12 @@ impl SectionProfiler {
     pub fn save_flamegraph(&self, _path: &str) -> anyhow::Result<()> {
         #[cfg(feature = "profiling")]
         {
-            log::info!("Section profiler '{}' save requested - use standalone pprof::ProfilerGuard instead", self.name);
+            info!("Section profiler '{}' save requested - use standalone pprof::ProfilerGuard instead", self.name);
         }
 
         #[cfg(not(feature = "profiling"))]
         {
-            log::warn!("Cannot save section flamegraph - profiling feature not enabled");
+            warn!("Cannot save section flamegraph - profiling feature not enabled");
         }
         
         Ok(())
@@ -144,7 +149,7 @@ impl Drop for SectionProfiler {
     fn drop(&mut self) {
         #[cfg(feature = "profiling")]
         {
-            log::debug!("Stopped section profiler: {}", self.name);
+            debug!("Stopped section profiler: {}", self.name);
         }
     }
 }

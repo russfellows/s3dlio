@@ -12,6 +12,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crc32fast::Hasher;
 use std::io::Write;
+use tracing::warn;
 
 use crate::constants::{DEFAULT_PAGE_SIZE, DEFAULT_MIN_IO_SIZE};
 use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, CompressionConfig};
@@ -703,7 +704,7 @@ impl ConfigurableFileSystemObjectStore {
             Ok(data) => Ok(data),
             Err(e) => {
                 // If O_DIRECT fails, fall back to regular I/O
-                log::warn!("O_DIRECT read failed for {}, falling back to regular I/O: {}", path.display(), e);
+                warn!("O_DIRECT read failed for {}, falling back to regular I/O: {}", path.display(), e);
                 Ok(fs::read(path).await?)
             }
         }
@@ -784,7 +785,7 @@ impl ConfigurableFileSystemObjectStore {
         match self.try_write_file_direct(path, data).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                log::warn!("O_DIRECT write failed for {}, falling back to regular I/O: {}", path.display(), e);
+                warn!("O_DIRECT write failed for {}, falling back to regular I/O: {}", path.display(), e);
                 Ok(fs::write(path, data).await?)
             }
         }
@@ -890,7 +891,7 @@ impl ConfigurableFileSystemObjectStore {
         match self.try_read_range_direct(path, offset, length).await {
             Ok(data) => Ok(data),
             Err(e) => {
-                log::warn!("O_DIRECT range read failed for {}, falling back to regular I/O: {}", path.display(), e);
+                warn!("O_DIRECT range read failed for {}, falling back to regular I/O: {}", path.display(), e);
                 // Fall back to regular I/O
                 let mut file = fs::File::open(path).await?;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;

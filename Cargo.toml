@@ -1,6 +1,6 @@
 [package]
 name = "s3dlio"
-version = "0.8.7"
+version = "0.8.8"
 edition = "2024"
 
 [lib]
@@ -23,9 +23,10 @@ azure_core = { version = "0.27.0" }          # Response/Body, paging, errors
 azure_identity = { version = "0.27.0" }      # DefaultAzureCredential
 azure_storage_blob = { version = "0.4.0" }   # Blob/Container/BlockBlob clients
 
-# Optional: Add env_logger and log for debugging output from SDK/client
-env_logger = "^0.11"
-log = "^0.4"
+# Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
+tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat
+tracing-subscriber = { version = "^0.3", features = ["env-filter", "fmt"] }  # Subscriber for formatting
+tracing-log = "^0.2"  # Bridge to capture log crate messages from dependencies
 
 # --- async / net stack ----------------------------------------------------
 tokio   = { version = "^1", features = ["full"] }
@@ -109,8 +110,7 @@ reqwest = { version = "0.12", features = ["rustls-tls", "http2", "hickory-dns"],
 nix = { version = "0.29", features = ["fs"], optional = true }  # For O_DIRECT and positioned I/O
 
 # --- Profiling (optional, enabled via "profiling" feature) ---------------
-tracing           = { version = "0.1", optional = true }
-tracing-subscriber = { version = "0.3", features = ["fmt", "registry", "env-filter"], optional = true }
+# tracing and tracing-subscriber are now main dependencies above
 console-subscriber = { version = "0.4", optional = true }
 pprof             = { version = "0.13", features = ["flamegraph"], optional = true }
 
@@ -130,7 +130,7 @@ native-backends = []                    # Current AWS/Azure implementations
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
 enhanced-http = ["dep:reqwest"]      # Enhanced HTTP client with HTTP/2 support
 direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
-profiling = ["dep:tracing", "dep:tracing-subscriber", "dep:console-subscriber", "dep:pprof"]
+profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always available
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 
 [patch.crates-io]

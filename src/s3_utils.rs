@@ -23,7 +23,7 @@ use tokio::sync::Semaphore;
 use tracing::instrument;
 use bytes::Bytes;
 
-use log::{info, debug};
+use tracing::{info, debug};
 
 // data generation helpers
 use crate::data_gen::{generate_object};

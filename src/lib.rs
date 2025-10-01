@@ -57,6 +57,7 @@ pub mod object_store_arrow;
 
 pub mod file_store;
 pub mod file_store_direct;
+pub mod page_cache;
 pub mod data_gen;
 pub mod streaming_writer;
 pub mod data_loader;

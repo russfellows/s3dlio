@@ -17,7 +17,7 @@ use tokio::sync::{oneshot, OnceCell};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use log::{info, debug}; // For logging
+use tracing::{info, debug}; // For logging
 
 
 // -----------------------------------------------------------------------------
