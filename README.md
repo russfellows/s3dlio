@@ -12,7 +12,15 @@
 - 🐍 **Python Integration**: Full PyTorch/TensorFlow/JAX compatibility with async support
 - 🏗️ **Multi-Backend Architecture**: Support I/O across S3, Azure, file systems, and DirectIO
 
-## 📊 Performance Monitoring (v0.8.7)
+## �️ Page Cache Optimization (v0.8.8)
+
+Added intelligent Linux/Unix page cache hints via `posix_fadvise()` with automatic mode selection based on file size. Optimizes kernel read-ahead behavior for both sequential large files (≥64MB) and random small file access patterns. Integrated with file:// and direct:// backends.
+
+## 📝 Tracing Framework (v0.8.8)
+
+Migrated from `log` crate to `tracing` ecosystem for enhanced observability and compatibility with dl-driver and s3-bench projects. Supports standard verbosity levels (`-v` for INFO, `-vv` for DEBUG) with preserved operation trace logging functionality.
+
+## �📊 Performance Monitoring (v0.8.7)
 
 Advanced HDR histogram-based performance monitoring for AI/ML workloads, providing precise tail latency analysis (P99, P99.9, P99.99+) and comprehensive throughput tracking. Built-in presets for training, inference, and distributed scenarios with thread-safe global metrics collection.
 

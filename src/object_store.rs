@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use crc32fast::Hasher;
 use std::io::Write;
-use log::debug;
+use tracing::{debug, warn, info};
 use regex::Regex;
 
 // Helper function for integrity validation
@@ -1140,7 +1140,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                             paths.push(pb);
                         }
                     },
-                    Err(e) => log::warn!("Glob error for pattern {}: {}", s, e),
+                    Err(e) => warn!("Glob error for pattern {}: {}", s, e),
                 }
             }
         } else if s.contains('^') || s.contains('$') || s.contains('[') || s.contains('(') || s.contains('\\') || s.contains('.') {
@@ -1154,7 +1154,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
             };
             
             let pattern_part = if pattern_part.is_empty() { ".*" } else { pattern_part };
-            log::debug!("Trying regex pattern '{}' in directory '{}'", pattern_part, dir_part);
+            debug!("Trying regex pattern '{}' in directory '{}'", pattern_part, dir_part);
             
             match Regex::new(pattern_part) {
                 Ok(re) => {
@@ -1167,7 +1167,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                                 if path.is_file() {
                                     if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                                         if re.is_match(filename) {
-                                            log::debug!("Regex matched file: {:?}", path);
+                                            debug!("Regex matched file: {:?}", path);
                                             paths.push(path);
                                         }
                                     }
@@ -1178,7 +1178,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                 },
                 Err(_) => {
                     // Not a valid regex, treat as literal file path
-                    log::debug!("Invalid regex pattern '{}', treating as literal path", pattern_part);
+                    debug!("Invalid regex pattern '{}', treating as literal path", pattern_part);
                     let path = pat.as_ref();
                     if path.is_file() {
                         paths.push(path.to_path_buf());
@@ -1202,7 +1202,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                     }
                 }
             } else {
-                log::warn!("Path does not exist or is not accessible: {:?}", path);
+                warn!("Path does not exist or is not accessible: {:?}", path);
             }
         }
     }
@@ -1214,7 +1214,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
     // Cap the number of concurrent tasks
     let effective_jobs = std::cmp::min(max_in_flight, paths.len());
 
-    log::info!(
+    info!(
         "Starting upload of {} file(s) to {} (jobs={})",
         paths.len(),
         dest_prefix,
@@ -1225,7 +1225,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
     let mut futs = FuturesUnordered::new();
 
     for path in paths.clone() {
-        log::debug!("queueing upload for {:?}", path);
+        debug!("queueing upload for {:?}", path);
         let sem = sem.clone();
         let store = store_for_uri(dest_prefix)?; // Each task gets its own store instance
         let progress = progress_callback.clone();
@@ -1246,7 +1246,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
         let file_size = std::fs::metadata(&path)?.len();
 
         futs.push(tokio::spawn(async move {
-            log::debug!("starting upload of {:?} → {}", path, dest_uri);
+            debug!("starting upload of {:?} → {}", path, dest_uri);
             let _permit = sem.acquire_owned().await.unwrap();
 
             // Read file data
@@ -1255,7 +1255,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
             // Upload via ObjectStore trait
             store.put(&dest_uri, &data).await?;
 
-            log::debug!("finished upload of {:?} → {}", path, dest_uri);
+            debug!("finished upload of {:?} → {}", path, dest_uri);
 
             // Update progress if callback provided
             if let Some(ref progress) = progress {
@@ -1271,7 +1271,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
         join_res??;
     }
 
-    log::info!("Finished upload of {} file(s) to {}", paths.len(), dest_prefix);
+    info!("Finished upload of {} file(s) to {}", paths.len(), dest_prefix);
     Ok(())
 }
 
@@ -1299,7 +1299,7 @@ pub async fn generic_download_objects(
     // Cap the number of concurrent tasks
     let effective_jobs = std::cmp::min(max_in_flight, keys.len());
 
-    log::info!(
+    info!(
         "Starting download of {} object(s) from {} to {:?} (jobs={})",
         keys.len(),
         src_uri,
@@ -1317,7 +1317,7 @@ pub async fn generic_download_objects(
         let out_dir = dest_dir.to_path_buf();
 
         futs.push(tokio::spawn(async move {
-            log::debug!("starting download of {} → {:?}", uri, out_dir);
+            debug!("starting download of {} → {:?}", uri, out_dir);
             let _permit = sem.acquire_owned().await.unwrap();
 
             // Skip "directories" (URIs that end with slash)
@@ -1337,7 +1337,7 @@ pub async fn generic_download_objects(
             // Write to disk
             tokio::fs::write(&out_path, bytes).await?;
 
-            log::debug!("finished download of {} → {:?}", uri, out_path);
+            debug!("finished download of {} → {:?}", uri, out_path);
 
             // Update progress if callback provided
             if let Some(ref progress) = progress {
@@ -1353,7 +1353,7 @@ pub async fn generic_download_objects(
         join_res??;
     }
 
-    log::info!("Finished download of {} object(s) to {:?}", keys.len(), dest_dir);
+    info!("Finished download of {} object(s) to {:?}", keys.len(), dest_dir);
     Ok(())
 }
 

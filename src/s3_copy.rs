@@ -5,6 +5,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use glob::glob;
+use tracing::{info, debug, warn, error};
 //use regex::Regex;
 use std::{fs, path::{Path}, sync::Arc};
 use tokio::{fs as async_fs, sync::Semaphore};
@@ -43,7 +44,7 @@ pub async fn upload_files<P: AsRef<Path>>(
             for entry in glob(&s)? {
                 match entry {
                     Ok(pb) => paths.push(pb),
-                    Err(e) => log::warn!("Glob error for pattern {}: {}", s, e),
+                    Err(e) => warn!("Glob error for pattern {}: {}", s, e),
                 }
             }
         } else {
@@ -62,14 +63,14 @@ pub async fn upload_files<P: AsRef<Path>>(
     let effective_jobs = std::cmp::min(max_in_flight, paths.len());
 
     // INFO: start of bulk upload
-    log::info!(
+    info!(
         "Starting upload of {} file(s) to {} (jobs={})",
         paths.len(),
         dest_prefix,
         effective_jobs
     );
     // DEBUG: details of create_bucket and requested jobs
-    log::debug!(
+    debug!(
         "upload_files debug: create_bucket={}, requested_jobs={}",
         do_create_bucket,
         max_in_flight
@@ -79,7 +80,7 @@ pub async fn upload_files<P: AsRef<Path>>(
     let result = {
         let mut futs = FuturesUnordered::new();
         for path in paths.clone() {
-            log::debug!("queueing upload for {:?}", path);
+            debug!("queueing upload for {:?}", path);
             let sem = sem.clone();
             let bucket = bucket.clone();
             let progress = progress_callback.clone();
@@ -92,11 +93,11 @@ pub async fn upload_files<P: AsRef<Path>>(
             let file_size = fs::metadata(&path)?.len();
 
             futs.push(tokio::spawn(async move {
-                log::debug!("starting upload of {:?} → s3://{}/{}", path, bucket, key);
+                debug!("starting upload of {:?} → s3://{}/{}", path, bucket, key);
                 let _permit = sem.acquire_owned().await.unwrap();
                 let body = ByteStream::from_path(&path).await?;
                 put_object_async(&bucket, &key, &body.collect().await?.into_bytes()).await?;
-                log::debug!("finished upload of {:?} → s3://{}/{}", path, bucket, key);
+                debug!("finished upload of {:?} → s3://{}/{}", path, bucket, key);
                 
                 // Update progress if callback provided
                 if let Some(ref progress) = progress {
@@ -115,12 +116,12 @@ pub async fn upload_files<P: AsRef<Path>>(
 
     // INFO: result of bulk upload
     match &result {
-        Ok(()) => log::info!(
+        Ok(()) => info!(
             "Finished upload of {} file(s) to {}",
             paths.len(),
             dest_prefix
         ),
-        Err(e) => log::error!("Upload failed: {}", e),
+        Err(e) => error!("Upload failed: {}", e),
     }
     result
 }
@@ -170,7 +171,7 @@ pub async fn download_objects(
     let effective_jobs = std::cmp::min(max_in_flight, keys.len());
 
     // INFO: start of bulk download
-    log::info!(
+    info!(
         "Starting download of {} object(s) from {} to {:?} (jobs={})",
         keys.len(),
         src_uri,
@@ -178,7 +179,7 @@ pub async fn download_objects(
         effective_jobs
     );
     // DEBUG: details of requested jobs
-    log::debug!("download_objects debug: requested_jobs={}", max_in_flight);
+    debug!("download_objects debug: requested_jobs={}", max_in_flight);
 
     let sem = Arc::new(Semaphore::new(effective_jobs));
     let result = {
@@ -190,7 +191,7 @@ pub async fn download_objects(
             let progress = progress_callback.clone();
 
             futs.push(tokio::spawn(async move {
-                log::debug!("starting download of s3://{}/{} → {:?}", bucket, k, out_dir);
+                debug!("starting download of s3://{}/{} → {:?}", bucket, k, out_dir);
                 let _permit = sem.acquire_owned().await.unwrap();
                 // Skip "directories" which are objects that end with a slash
                 if k.ends_with('/') {
@@ -203,7 +204,7 @@ pub async fn download_objects(
                     .ok_or_else(|| anyhow::anyhow!("Bad key: {}", k))?;
                 let out_path = out_dir.join(fname);
                 async_fs::write(&out_path, &bytes).await?;
-                log::debug!("finished download of s3://{}/{} → {:?}", bucket, k, out_path);
+                debug!("finished download of s3://{}/{} → {:?}", bucket, k, out_path);
                 
                 // Update progress if callback provided
                 if let Some(ref progress) = progress {
@@ -222,12 +223,12 @@ pub async fn download_objects(
 
     // INFO: result of bulk download
     match &result {
-        Ok(()) => log::info!(
+        Ok(()) => info!(
             "Finished download of {} object(s) to {:?}",
             keys.len(),
             dest_dir
         ),
-        Err(e) => log::error!("Download failed: {}", e),
+        Err(e) => error!("Download failed: {}", e),
     }
     result
 }

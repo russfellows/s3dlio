@@ -100,6 +100,25 @@ impl Default for MemoryFormat {
     fn default() -> Self { MemoryFormat::Auto }
 }
 
+/// Page cache behavior hint for file I/O (maps to posix_fadvise on Linux/Unix)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageCacheMode {
+    /// Sequential access pattern - prefetch data ahead (POSIX_FADV_SEQUENTIAL)
+    Sequential,
+    /// Random access pattern - don't prefetch (POSIX_FADV_RANDOM)
+    Random,
+    /// Don't pollute page cache - data won't be reused (POSIX_FADV_DONTNEED)
+    DontNeed,
+    /// Let OS decide based on default heuristics (POSIX_FADV_NORMAL)
+    Normal,
+    /// Automatically choose based on file size (Sequential for large, Random for small)
+    Auto,
+}
+
+impl Default for PageCacheMode {
+    fn default() -> Self { PageCacheMode::Auto }
+}
+
 #[derive(Debug, Clone)]
 pub struct LoaderOptions {
     /// Number of samples per batch.
@@ -162,6 +181,8 @@ pub struct LoaderOptions {
     pub enable_transforms: bool,
     /// Batch collation buffer size for optimization
     pub collate_buffer_size: usize,
+    /// Page cache behavior hint for file I/O operations
+    pub page_cache_mode: PageCacheMode,
 }
 
 impl Default for LoaderOptions {
@@ -200,6 +221,7 @@ impl Default for LoaderOptions {
             generator_seed: None,
             enable_transforms: false,
             collate_buffer_size: 1024, // 1KB default buffer
+            page_cache_mode: PageCacheMode::default(),
         }
     }
 }
@@ -449,6 +471,12 @@ impl LoaderOptions {
         self.persistent_workers = false;
         self.timeout_seconds = Some(10.0); // Short timeout
         self.auto_tune = false;
+        self
+    }
+
+    /// Set page cache behavior hint for file I/O
+    pub fn with_page_cache_mode(mut self, mode: PageCacheMode) -> Self {
+        self.page_cache_mode = mode;
         self
     }
 }

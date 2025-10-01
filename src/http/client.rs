@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use std::time::Duration;
 use reqwest::ClientBuilder;
+use tracing::{info, warn};
 
 /// HTTP client configuration for optimal S3 performance
 #[derive(Debug, Clone)]
@@ -179,21 +180,21 @@ impl HttpClientFactory {
             // Test if endpoint supports HTTP/2
             match client.test_http2_support(endpoint).await {
                 Ok(true) => {
-                    log::info!("Detected HTTP/2 support for endpoint: {}", endpoint);
+                    info!("Detected HTTP/2 support for endpoint: {}", endpoint);
                     // Recreate client with prior knowledge enabled for better performance
                     let mut config = client.config.clone();
                     config.http2_prior_knowledge = true;
                     client = EnhancedHttpClient::new(config)?;
                 },
                 Ok(false) => {
-                    log::info!("Endpoint does not support HTTP/2, using HTTP/1.1: {}", endpoint);
+                    info!("Endpoint does not support HTTP/2, using HTTP/1.1: {}", endpoint);
                     // Recreate client with HTTP/1.1 only
                     let mut config = client.config.clone();
                     config.enable_http2 = false;
                     client = EnhancedHttpClient::new(config)?;
                 },
                 Err(e) => {
-                    log::warn!("Failed to test HTTP/2 support for {}: {}. Using HTTP/1.1", endpoint, e);
+                    warn!("Failed to test HTTP/2 support for {}: {}. Using HTTP/1.1", endpoint, e);
                     // Fallback to HTTP/1.1
                     let mut config = client.config.clone();
                     config.enable_http2 = false;

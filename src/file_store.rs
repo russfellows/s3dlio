@@ -1,4 +1,4 @@
-use log::debug;
+use tracing::debug;
 // src/file_store.rs
 //
 // FileSystemObjectStore implementation for POSIX file I/O
@@ -6,6 +6,8 @@ use log::debug;
 
 use anyhow::{bail, Result};
 use crate::object_store::WriterOptions;
+use crate::page_cache::{apply_page_cache_hint};
+use crate::data_loader::options::PageCacheMode;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -296,7 +298,22 @@ impl ObjectStore for FileSystemObjectStore {
             bail!("Path is not a file: {}", path.display());
         }
         
-        let data = fs::read(&path).await?;
+        // Get file size first for page cache hint
+        let metadata = fs::metadata(&path).await?;
+        let file_size = metadata.len();
+        
+        // Open file and apply page cache hint based on size
+        let file = fs::File::open(&path).await?;
+        let std_file = file.try_into_std().map_err(|_| anyhow::anyhow!("Failed to convert to std file"))?;
+        
+        // Apply auto page cache hint (Sequential for large files, Random for small)
+        let _ = apply_page_cache_hint(&std_file, PageCacheMode::Auto, file_size);
+        
+        // Convert back to tokio file and read
+        let mut file = fs::File::from_std(std_file);
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).await?;
+        
         Ok(data)
     }
 
@@ -312,7 +329,17 @@ impl ObjectStore for FileSystemObjectStore {
             bail!("Path is not a file: {}", path.display());
         }
         
-        let mut file = fs::File::open(&path).await?;
+        // Get file size and apply page cache hint
+        let metadata = fs::metadata(&path).await?;
+        let file_size = metadata.len();
+        
+        let file = fs::File::open(&path).await?;
+        let std_file = file.try_into_std().map_err(|_| anyhow::anyhow!("Failed to convert to std file"))?;
+        
+        // For range reads, use Random hint (typical for random access patterns)
+        let _ = apply_page_cache_hint(&std_file, PageCacheMode::Random, file_size);
+        
+        let mut file = fs::File::from_std(std_file);
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         
         let read_length = length.unwrap_or(u64::MAX);

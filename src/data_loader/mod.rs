@@ -17,7 +17,7 @@ pub mod async_pool_dataloader;
 // Re‐export the key types at this level:
 pub use dataloader::DataLoader;
 pub use dataset::{Dataset, DatasetError};
-pub use options::LoaderOptions;
+pub use options::{LoaderOptions, PageCacheMode, ReaderMode, LoadingMode, MultiprocessingContext, SamplerType, MemoryFormat};
 pub use s3_bytes::S3BytesDataset;
 pub use fs_bytes::FileSystemBytesDataset;
 pub use directio_bytes::DirectIOBytesDataset;

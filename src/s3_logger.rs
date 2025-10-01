@@ -12,7 +12,7 @@ use std::io::{BufWriter, Write};
 use std::time::SystemTime;
 use std::thread;
 use std::sync::{Mutex, mpsc::{sync_channel, channel, SyncSender, Receiver}};
-use log::info;
+use tracing::info;
 use once_cell::sync::OnceCell;
 use zstd::stream::write::Encoder;
 

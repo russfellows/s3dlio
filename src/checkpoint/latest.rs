@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use tracing::warn;
 use crate::object_store::ObjectStore;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -81,7 +82,7 @@ async fn write_latest_with_atomic_rename(
         // If rename fails, fall back to regular write and clean up temp
         let _ = store.delete(&temp_uri).await; // ignore errors
         store.put(latest_uri, &bytes).await?;
-        log::warn!("Atomic rename failed, used fallback write: {}", e);
+        warn!("Atomic rename failed, used fallback write: {}", e);
     }
     
     Ok(())
