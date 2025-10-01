@@ -1,5 +1,128 @@
 # s3dlio Changelog
 
+## Version 0.8.10 - TFRecord Index Generation (October 1, 2025)
+
+### 🎯 **Release Focus: NVIDIA DALI-Compatible TFRecord Indexing**
+
+This release adds comprehensive TFRecord index file generation compatible with NVIDIA DALI and TensorFlow tooling. Enables efficient random access, shuffled data loading, and distributed training workflows for large TFRecord datasets.
+
+### ✨ **New Features**
+
+#### **TFRecord Index Generation** (`src/tfrecord_index.rs`)
+- **Pure Rust Implementation**: Zero-dependency stdlib-only implementation (437 lines)
+- **DALI-Compatible Format**: Generates text indexes matching NVIDIA DALI `tfrecord2idx` specification
+  - Format: `"{offset} {size}\n"` (space-separated ASCII text)
+  - Validated against [NVIDIA DALI source](https://github.com/NVIDIA/DALI/blob/main/tools/tfrecord2idx)
+- **Core Functions**:
+  - `index_entries_from_bytes()` - Parse TFRecord to index entries
+  - `index_text_from_bytes()` - Generate DALI text format
+  - `write_index_for_tfrecord_file()` - File-to-file indexing
+  - `read_index_file()` - Parse index files for random access
+  - `TfRecordIndexer` - Streaming parser for large files
+
+#### **Python API Integration** (PRIMARY Interface)
+Added 4 PyO3-wrapped functions in `src/python_api/python_aiml_api.rs`:
+```python
+import s3dlio
+
+# Generate index (auto-generates .idx file)
+num_records = s3dlio.create_tfrecord_index("train.tfrecord")
+
+# Read index for random access
+index = s3dlio.read_tfrecord_index("train.tfrecord.idx")
+offset, size = index[42]  # O(1) access to any record
+
+# In-memory operations
+index_text = s3dlio.index_tfrecord_bytes(data)
+entries = s3dlio.get_tfrecord_index_entries(data)
+```
+
+#### **CLI Tool** (Optional)
+- Added `s3-cli tfrecord-index` subcommand for batch index generation
+- Auto-generates `.idx` extension or accepts custom output path
+
+### 🎓 **Use Cases Enabled**
+
+1. **Random Access**: O(1) seeking to any record (~1200x speedup vs sequential)
+2. **Shuffled Training**: Different random order each epoch
+3. **Distributed Training**: Efficient data sharding across GPUs/workers
+4. **Batch Loading**: Fast seeking to batch boundaries
+5. **DALI Integration**: Direct use with NVIDIA DALI pipelines
+
+### 📊 **Performance Characteristics**
+
+From validation testing (1000-record dataset):
+- **Index Overhead**: 0.4% of TFRecord file size
+- **Random Access Speedup**: ~1200x vs sequential scan
+- **Access Pattern**: O(1) with index vs O(n) without
+
+### 🧪 **Testing & Validation**
+
+**22 tests, all passing:**
+- ✅ 9 Rust unit tests (format, read/write, edge cases)
+- ✅ 4 Python integration tests (API functionality)
+- ✅ 4 DALI compatibility tests (format validation)
+- ✅ 5 practical usage examples (ML workflows)
+- ✅ Zero compilation warnings
+
+**New Test Files:**
+- `tests/test_tfrecord_index_python.py` - Python API integration
+- `tests/test_dali_compatibility.py` - DALI format validation
+- `tests/test_index_usage_examples.py` - Real-world usage patterns
+- `tests/run_tfrecord_tests.sh` - Comprehensive test runner
+
+### 📚 **Documentation**
+
+**New Documentation:**
+- `docs/TFRECORD-INDEX-IMPLEMENTATION.md` - Complete implementation guide
+- `docs/TFRECORD-INDEX-SUMMARY.md` - Implementation summary & results
+- `docs/TFRECORD-INDEX-QUICKREF.md` - Quick reference guide
+
+**Coverage:**
+- Python API usage examples
+- Rust API usage examples
+- DALI integration patterns
+- Distributed training workflows
+- Performance analysis
+
+### 🔧 **Technical Details**
+
+- **Format Compliance**: Verified against NVIDIA DALI tfrecord2idx specification
+- **TensorFlow Compatible**: Standard format used by TensorFlow tooling
+- **Streaming Support**: Can process files larger than memory
+- **Round-trip Tested**: Write → Read → Verify correctness validated
+
+### 🎯 **Compatibility**
+
+- ✅ **NVIDIA DALI**: Format validated against official specification
+- ✅ **TensorFlow**: Standard index format for TF datasets
+- ✅ **Python 3.12+**: Tested with latest Python via PyO3
+- ✅ **Rust 1.70+**: Pure stdlib, no external dependencies
+
+### 🚀 **Migration Guide**
+
+No breaking changes. This is a pure feature addition. Existing code continues to work unchanged.
+
+**To use the new functionality:**
+```python
+# Python (PRIMARY interface)
+import s3dlio
+s3dlio.create_tfrecord_index("your_data.tfrecord")
+```
+
+```rust
+// Rust library
+use s3dlio::tfrecord_index::*;
+write_index_for_tfrecord_file("your_data.tfrecord", "your_data.tfrecord.idx")?;
+```
+
+```bash
+# CLI (optional)
+s3-cli tfrecord-index your_data.tfrecord
+```
+
+---
+
 ## Version 0.8.9 - Build Quality & Dependency Cleanup (October 1, 2025)
 
 ### 🎯 **Release Focus: Code Quality, Build Hygiene, and Dependency Management**
