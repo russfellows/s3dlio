@@ -23,7 +23,7 @@ use std::str::FromStr; // For the custom S3Path type
 use std::time::Instant;
 use std::sync::Arc;
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::EnvFilter;
 use tempfile::NamedTempFile;
 use glob;
 

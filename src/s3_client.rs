@@ -10,12 +10,15 @@ use anyhow::{bail, Context, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::{config::Region, Client};
-use aws_smithy_http_client::{tls::{self, rustls_provider::CryptoMode}, Builder as HttpClientBuilder, Connector};
+use aws_smithy_http_client::{tls, Builder as HttpClientBuilder};
+use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
+#[cfg(feature = "experimental-http-client")]
+use aws_smithy_http_client::Connector;
 use std::{env, fs, thread, time::Duration};
 use tokio::runtime::{Builder as TokioBuilder, Handle};
 use tokio::sync::{oneshot, OnceCell};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 use tracing::{info, debug}; // For logging
 
@@ -187,13 +190,17 @@ fn get_operation_timeout() -> Duration {
 }
 
 /// Create an optimized HTTP client with connection pool configuration
-/// This function uses our patched aws-smithy-http-client to access hyper_builder
+/// 
+/// NOTE: This function requires the "experimental-http-client" feature and a patched
+/// aws-smithy-http-client to access hyper_builder. Without the patch, this code won't
+/// compile. Enable via: cargo build --features experimental-http-client
+#[cfg(feature = "experimental-http-client")]
 fn create_optimized_http_client() -> Result<SharedHttpClient> {
     // Get performance configuration
     let max_connections = get_max_http_connections();
     let idle_timeout = get_http_idle_timeout();
     
-    debug!("Configuring optimized HTTP client: max_connections={}, idle_timeout={:?}", 
+    debug!("Configuring experimental optimized HTTP client: max_connections={}, idle_timeout={:?}", 
            max_connections, idle_timeout);
     
     // Create hyper client with optimized connection pool settings  
@@ -234,8 +241,20 @@ fn create_optimized_http_client() -> Result<SharedHttpClient> {
             }
         });
         
-    info!("Optimized HTTP client created with {} max connections per host", max_connections);
+    info!("Experimental optimized HTTP client created with {} max connections per host", max_connections);
     Ok(http_client)
+}
+
+/// Create default HTTP client without custom optimizations
+/// This is the standard path that doesn't require patched dependencies
+#[cfg(not(feature = "experimental-http-client"))]
+fn create_optimized_http_client() -> Result<SharedHttpClient> {
+    debug!("Using default AWS SDK HTTP client (experimental-http-client feature not enabled)");
+    
+    // Return standard AWS SDK HTTP client with Rustls TLS
+    // build_http() creates an HTTPS client with Rustls by default
+    Ok(HttpClientBuilder::new()
+        .build_http())
 }
 
 
@@ -270,12 +289,14 @@ pub async fn aws_s3_client_async() -> Result<Client> {
 
             let http_client = match env::var("AWS_CA_BUNDLE_PATH") {
                 Ok(ca_bundle_path) if !ca_bundle_path.is_empty() => {
+                    // User has specified custom CA bundle via environment
+                    // This is a standard AWS SDK feature that must work in all builds
                     debug!("Loading CA bundle from environment: {}", ca_bundle_path);
                     info!("Loading CA bundle from environment: {}", ca_bundle_path);
-                    let ca_bundle_path_env = PathBuf::from(ca_bundle_path);
-                    let tls_context = tls_context_from_pem(ca_bundle_path_env)?;
+                    let tls_context = tls_context_from_pem(&ca_bundle_path)?;
                     
-                    // Create builder with custom CA
+                    // Build HTTPS client with custom CA using standard AWS SDK API
+                    // Once TLS provider and context are set, use build_https()
                     Some(aws_smithy_http_client::Builder::new()
                         .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
                         .tls_context(tls_context)

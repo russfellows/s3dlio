@@ -15,16 +15,76 @@ s3dlio is a high-performance, multi-protocol storage library built in Rust with 
 
 ### Dual-Backend System
 The project uses **mutually exclusive backend selection** at compile-time:
-- `native-backends` feature: AWS SDK + Azure SDK (default)
-- `arrow-backend` feature: Apache Arrow object_store implementation
+- `native-backends` feature: AWS SDK + Azure SDK (**DEFAULT** - recommended for production)
+- `arrow-backend` feature: Apache Arrow object_store implementation (experimental, optional)
 
 ```bash
-# Build commands
+# Default build (uses native-backends)
+cargo build --release
+
+# Explicit native-backends (RECOMMENDED)
 cargo build --no-default-features --features native-backends
+
+# Experimental arrow backend (NOT RECOMMENDED for production)
 cargo build --no-default-features --features arrow-backend
 ```
 
 **Critical**: These features are mutually exclusive by design (`compile_error!` in `src/lib.rs`).
+
+**Backend Status**:
+- **native-backends**: Default, proven performance (5+ GB/s reads, 2.5+ GB/s writes), production-ready
+- **arrow-backend**: Experimental only, no proven performance benefit, kept for comparison testing
+
+### Build Quality Standards
+
+**CRITICAL: Zero Warnings Policy**
+- ALL builds MUST be warning-free before commits
+- Never use quick fixes like `_` prefix to silence unused variable warnings
+- Unused variables often indicate logic errors that must be investigated
+- Unused imports must be removed, not ignored
+
+**Pre-Commit Checklist**:
+1. Run `cargo build --release` and verify ZERO warnings
+2. Run `cargo clippy` and fix all issues
+3. Investigate root cause of any warning - do not suppress without understanding
+4. If unsure about a warning, ask for clarification before committing
+
+**Shell Command Best Practices**:
+- Never use exclamation marks (`!`) in Python print statements or shell commands
+- Exclamation marks cause shell escaping issues in bash
+- Use simple declarative messages instead: "Import successful" not "Import successful!"
+
+**Warning Investigation Process**:
+```bash
+# Check for warnings
+cargo build --release 2>&1 | grep -i warning
+
+# Get full details
+cargo build --release 2>&1 | grep -A 10 warning
+
+# For clippy suggestions
+cargo clippy --all-targets --all-features
+```
+
+**Common Warning Anti-Patterns** (DO NOT DO):
+- ❌ Adding `_` prefix to silence unused variable warnings
+- ❌ Using `#[allow(unused)]` without understanding why
+- ❌ Importing modules "just in case" they might be needed
+- ❌ Leaving debug code that uses variables only in certain configs
+
+**Correct Approach**:
+- ✅ Remove unused imports completely
+- ✅ Investigate why variables aren't used (logic bug?)
+- ✅ Use feature gates if code is conditionally compiled
+- ✅ Refactor to eliminate the warning's root cause
+
+### Dependency Management
+
+**aws-smithy-http-client Patches: REMOVED**
+- Custom patches in `fork-patches/aws-smithy-http-client/` are NOT used by default
+- Patches showed no measurable performance benefit
+- Removed from `[patch.crates-io]` to avoid forcing downstream users to patch
+- Fork preserved for reference/experimentation but not required for builds
 
 ### Public API Structure
 - **Stable API**: `src/api.rs` - External developers use this via `s3dlio::api`
@@ -76,16 +136,27 @@ python tests/test_functionality.py  # Tests installed package
 ### UV Package Manager
 Project uses UV (not pip) for Python package management:
 ```bash
-# Activate UV environment
-source .venv/bin/activate  # Check for (s3dlio) prefix in prompt
+# CRITICAL: Always check if you're in the virtual environment
+# Virtual environment status: prompt shows (s3dlio) prefix when active
+
+# Activate UV environment (if not already active)
+source .venv/bin/activate
 
 # Install packages  
 uv pip install package_name  # NOT pip install
 
-# Virtual environment status
-# In environment: prompt shows (s3dlio) prefix
-# Outside environment: no prefix shown
+# Run Python commands
+python -c "import s3dlio; print('Import successful')"  # Works when venv active
+
+# Deactivate when done
+deactivate
 ```
+
+**Important Notes:**
+- Terminal interrupts (Ctrl-C) may exit the virtual environment
+- Always verify `(s3dlio)` prefix appears in prompt before running Python commands
+- If no prefix shown, run `source .venv/bin/activate` to re-enter environment
+- Never use exclamation marks in Python print statements (shell escaping issues)
 
 ### Backend Development
 ```bash

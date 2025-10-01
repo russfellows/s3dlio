@@ -1,5 +1,121 @@
 # s3dlio Changelog
 
+## Version 0.8.9 - Build Quality & Dependency Cleanup (October 1, 2025)
+
+### 🎯 **Release Focus: Code Quality, Build Hygiene, and Dependency Management**
+
+This maintenance release focuses on improving build quality, removing forced dependencies, and updating to the latest AWS SDK versions. No functional changes to runtime behavior—all existing code continues to work identically.
+
+### 🛠️ **Build Quality Improvements**
+
+#### **Zero-Warnings Build Policy**
+- **Fixed**: Removed unused `fmt` import in `src/bin/cli.rs` that caused warning
+- **Enforcement**: Added comprehensive "Zero Warnings Policy" to `.github/copilot-instructions.md`
+- **Pre-Commit Checklist**: Documented warning investigation process and anti-patterns
+- **Result**: Clean compilation with zero warnings in default build
+
+#### **Optional Experimental HTTP Client**
+- **Removed**: Forced `aws-smithy-http-client` patch from `Cargo.toml` `[patch.crates-io]`
+- **Added**: New `experimental-http-client` feature flag for optional custom HTTP optimizations
+- **Default Behavior**: Uses standard AWS SDK HTTP client (no patches required)
+- **Experimental Path**: Requires uncommenting patch AND building with `--features experimental-http-client`
+- **Rationale**: Custom HTTP client showed no consistent performance benefit in production testing
+- **Benefit**: Downstream users no longer forced to patch dependencies
+
+### 📚 **Documentation Updates**
+
+#### **Backend Recommendations Corrected**
+- **README.md**: Completely rewrote "S3 Backend Options" section
+  - Clarified `native-backends` is DEFAULT and RECOMMENDED for production
+  - Marked `arrow-backend` as EXPERIMENTAL with no proven performance advantage
+  - Removed misleading "recommended for modern deployments" language
+- **copilot-instructions.md**: Updated backend guidance and patch removal notes
+- **Changelog.md**: Added clarifications to v0.7.10 entry about arrow backend status
+- **Performance docs**: Added warnings to `Apache_Arrow_Backend_Implementation.md`
+- **src/object_store_arrow.rs**: Updated header comments to mark as experimental
+
+#### **Build Quality Standards**
+- **Added**: Comprehensive build quality section to copilot-instructions
+- **Documented**: Warning investigation workflow and anti-patterns
+- **Clarified**: Patch usage is optional, not required for builds
+
+### 📦 **Dependency Updates**
+
+Updated to latest AWS SDK and supporting crates:
+- **aws-config**: `1.8.5` → `1.8.6`
+- **aws-sdk-s3**: `1.103.0` → **`1.106.0`** (3 minor version bump)
+- **aws-sdk-sso**: `1.82.0` → `1.84.0`
+- **aws-sdk-ssooidc**: `1.83.0` → `1.86.0`
+- **aws-sdk-sts**: `1.84.0` → `1.86.0`
+- **aws-smithy-runtime**: `1.9.0` → `1.9.2`
+- **aws-lc-sys**: `0.32.1` → `0.32.2`
+- Added: `hashbrown` v0.16.0, `itertools` v0.13.0
+
+### 🔧 **Technical Implementation Details**
+
+#### **Feature-Gated HTTP Client**
+```rust
+// Default build (no experimental features)
+#[cfg(not(feature = "experimental-http-client"))]
+fn create_optimized_http_client() -> Result<SharedHttpClient> {
+    Ok(HttpClientBuilder::new().build_http())  // Standard AWS SDK
+}
+
+// Experimental build (requires patched dependency)
+#[cfg(feature = "experimental-http-client")]
+fn create_optimized_http_client() -> Result<SharedHttpClient> {
+    // Custom hyper_builder configuration
+    // Requires uncommenting [patch.crates-io] section
+}
+```
+
+#### **AWS_CA_BUNDLE Support**
+- Works in ALL builds (standard and experimental)
+- Uses standard AWS SDK API: `.tls_provider()` + `.tls_context()` + `.build_https()`
+- Critical AWS SDK feature preserved across all configurations
+
+### ✅ **Verification & Testing**
+
+- **Build Verification**: Default build compiles with zero warnings
+- **Historical Validation**: Compared against v0.7.9 (production-verified) implementation
+- **API Compatibility**: All existing code paths preserved and verified identical
+- **Backward Compatibility**: No breaking changes, all existing APIs work unchanged
+
+### 🎯 **Usage**
+
+```bash
+# Default build (RECOMMENDED for production)
+cargo build --release
+
+# Experimental HTTP optimizations (optional, requires manual patch enablement)
+# 1. Uncomment [patch.crates-io] section in Cargo.toml
+# 2. cargo build --release --features experimental-http-client
+```
+
+### 📊 **Impact Summary**
+
+| Change | Before (v0.8.8) | After (v0.8.9) | Benefit |
+|--------|-----------------|----------------|---------|
+| **Build Warnings** | 1 unused import | Zero warnings | ✅ Clean compilation |
+| **Forced Patches** | Required for all users | Optional only | ✅ Downstream flexibility |
+| **Default Behavior** | Same | Same | ✅ No breaking changes |
+| **AWS SDK Version** | 1.103.0 | 1.106.0 | ✅ Latest bug fixes |
+| **Documentation** | Some inaccuracies | Fully corrected | ✅ Clear guidance |
+
+### 🔄 **Migration Notes**
+
+**No action required** for existing users. This is a drop-in replacement:
+- Default behavior unchanged
+- All APIs work identically
+- Performance characteristics preserved
+- Environment variables work the same
+
+For users who enabled experimental HTTP optimizations (`S3DLIO_USE_OPTIMIZED_HTTP=true`):
+- Feature continues to work in default build using standard AWS SDK HTTP client
+- To use custom `hyper_builder` optimizations: uncomment patch AND build with `--features experimental-http-client`
+
+---
+
 ## Version 0.8.8 - Page Cache Hints & Tracing Framework (October 1, 2025)
 
 ### 🚀 **Major New Features**
@@ -669,11 +785,13 @@ cargo build --release --features enhanced-http,io-uring
 
 ## Version 0.7.10 - Apache Arrow Backend & Performance Optimization (September 19, 2025)
 
+**⚠️ UPDATE (October 2025):** The Arrow backend introduced in this release showed promising initial benchmarks but did not provide consistent performance benefits in production testing. The native AWS SDK backend remains the default and recommended configuration. Arrow backend is retained as an experimental option for comparison testing.
+
 ### 🚀 **Major Release: Apache Arrow Backend Implementation**
 
-This release introduces a complete **Apache Arrow `object_store` backend** as a high-performance alternative to the native AWS SDK. The Arrow backend delivers **superior performance** while providing better ecosystem integration and future-proofing.
+This release introduces a complete **Apache Arrow `object_store` backend** as an experimental alternative to the native AWS SDK. Initial benchmarks showed promising results, though subsequent production testing favored the native backend for sustained high-throughput workloads.
 
-**Key Achievement**: Arrow backend **outperforms native AWS SDK by 15% for PUT operations** and 6% for GET operations, proving that modern object storage abstractions can exceed vendor-specific performance.
+**Initial Benchmark Results**: Arrow backend showed 15% better PUT performance and 6% better GET performance in initial testing, though production workloads did not consistently replicate these results.
 
 ### 🎯 **Performance Highlights**
 

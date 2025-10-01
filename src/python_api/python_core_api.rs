@@ -16,7 +16,7 @@ use tokio::task;
 
 use std::path::PathBuf;
 
-use tracing::Level;
+use tracing::{Level, warn};
 use tracing_subscriber;
 
 // Project crates

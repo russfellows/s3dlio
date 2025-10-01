@@ -569,6 +569,7 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             generator_seed:       def.generator_seed,
             enable_transforms:    def.enable_transforms,
             collate_buffer_size:  def.collate_buffer_size,
+            page_cache_mode:      def.page_cache_mode,  // Use default (Auto)
         }
     } else {
         def

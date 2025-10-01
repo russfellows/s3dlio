@@ -39,14 +39,28 @@ s3dlio provides a unified interface for all storage operations, treating upload/
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance
 
 ### S3 Backend Options
-Choose an optimal S3 backend:
-```bash
-# Apache Arrow backend (recommended for modern deployments)
-cargo build --no-default-features --features arrow-backend
+s3dlio supports two S3 backend implementations. **Native AWS SDK is the default and recommended** for production use:
 
-# Native AWS SDK backend (proven performance)
+```bash
+# Default: Native AWS SDK backend (RECOMMENDED for production)
+cargo build --release
+# or explicitly:
 cargo build --no-default-features --features native-backends
+
+# Experimental: Apache Arrow object_store backend (optional, for testing)
+cargo build --no-default-features --features arrow-backend
 ```
+
+**Why native-backends is default:**
+- Proven performance in production workloads
+- Optimized for high-throughput S3 operations (5+ GB/s reads, 2.5+ GB/s writes)
+- Well-tested with MinIO, Vast, and AWS S3
+
+**About arrow-backend:**
+- Experimental alternative implementation
+- No proven performance advantage over native backend
+- Useful for comparison testing and development
+- Not recommended for production use
 
 ## Quick Start
 
