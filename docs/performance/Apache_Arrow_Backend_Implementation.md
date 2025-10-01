@@ -2,11 +2,14 @@
 
 **Version**: 0.7.10  
 **Date**: September 19, 2025  
-**Status**: Completed ✅
+**Status**: Experimental - Not Production Ready
+
+**⚠️ IMPORTANT UPDATE (October 2025):**  
+Subsequent production testing has shown that the Arrow backend does NOT provide consistent performance benefits over the native AWS SDK backend. Initial benchmarks were promising but did not reflect real-world production workload performance. The arrow-backend feature is retained for comparison testing and development purposes only. **native-backends remains the default and recommended configuration for production use.**
 
 ## Overview
 
-This document describes the implementation of an Apache Arrow `object_store` backend as an alternative to the native AWS SDK for s3dlio. The Arrow backend provides comparable performance while offering better ecosystem compatibility and potential future benefits.
+This document describes the implementation of an Apache Arrow `object_store` backend as an alternative to the native AWS SDK for s3dlio. Initial testing suggested comparable performance, but production validation showed the native backend performs better for sustained high-throughput workloads.
 
 ## Implementation Summary
 

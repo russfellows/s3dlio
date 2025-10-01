@@ -1,6 +1,6 @@
 [package]
 name = "s3dlio"
-version = "0.8.8"
+version = "0.8.9"
 edition = "2024"
 
 [lib]
@@ -132,10 +132,20 @@ enhanced-http = ["dep:reqwest"]      # Enhanced HTTP client with HTTP/2 support
 direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
 profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always available
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
+experimental-http-client = []        # Enable custom hyper_builder optimizations (requires patched aws-smithy-http-client)
 
-[patch.crates-io]
-# Use our patched version to expose hyper_builder methods for HTTP connection pool configuration
-aws-smithy-http-client = { path = "fork-patches/aws-smithy-http-client" }
+# NOTE: Custom aws-smithy-http-client patches are DISABLED by default
+# The fork-patches/aws-smithy-http-client/ directory contains experimental HTTP connection
+# pool configuration changes that were tested but showed no measurable performance benefit.
+# Keeping fork available for reference/experimentation but not forcing downstream users
+# to patch their dependencies.
+#
+# To enable experimental HTTP client optimizations (NOT RECOMMENDED):
+# 1. Uncomment the [patch.crates-io] section below
+# 2. Build with: cargo build --features experimental-http-client
+#
+# [patch.crates-io]
+# aws-smithy-http-client = { path = "fork-patches/aws-smithy-http-client" }
 
 [[example]]
 name = "s3_backend_comparison"

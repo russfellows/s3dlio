@@ -3,7 +3,10 @@
 // Arrow-backed adapter for s3dlio's ObjectStore trait.
 // Routes I/O through the Apache Arrow `object_store` crate.
 //
-// Build: gated behind feature "arrow-backend" (recommended).
+// Build: gated behind feature "arrow-backend" (EXPERIMENTAL - NOT production ready).
+//
+// NOTE: This backend is experimental and has NOT shown performance benefits over
+// native-backends in production testing. Kept for comparison testing only.
 //
 // This module is intentionally "stateless": each call parses the full URI and
 // constructs (or reuses) the appropriate backend via object_store::parse_url.
