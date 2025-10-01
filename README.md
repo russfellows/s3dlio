@@ -4,18 +4,34 @@
 [![Tests](https://img.shields.io/badge/tests-74%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Version](https://img.shields.io/badge/version-0.8.12-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, local file systems, and DirectIO.
 
-## 📊 Performance Monitoring (v0.8.7)
+## 📊 Operation Logging (Op-Log) - All Backends (v0.8.12)
 
-Advanced HDR histogram-based performance monitoring for AI/ML workloads, providing precise tail latency analysis (P99, P99.9, P99.99+) and comprehensive throughput tracking. Built-in presets for training, inference, and distributed scenarios with thread-safe global metrics collection.
+**NEW**: Universal operation trace logging now supports ALL storage backends (file://, s3://, az://, direct://). Performance profiling and debugging for any storage system with the same TSV format used for S3.
+
+```python
+import s3dlio
+
+# Initialize op-log (once at start)
+s3dlio.init_op_log("/tmp/operations.tsv.zst")
+
+# All operations automatically logged
+s3dlio.upload(["./data/*.dat"], "file:///backup/", max_in_flight=8, create_bucket=False)
+s3dlio.download("direct:///fast-storage/", "./local/", max_in_flight=16, recursive=True)
+
+# Finalize (once at end)
+s3dlio.finalize_op_log()
+```
+
+**Features**: Zstd-compressed TSV logs, warp-replay compatible, clean file paths, zero overhead when not initialized. Works with Rust API, Python API, and CLI (`--op-log` flag).
 
 ## 📇 TFRecord Index Generation (v0.8.10)
 
-**NEW**: Generate NVIDIA DALI-compatible index files for efficient random access to TFRecord datasets. Enables shuffled data loading, distributed training, and O(1) record seeking with minimal overhead (0.4% file size). Pure Rust implementation with comprehensive Python API.
+Generate NVIDIA DALI-compatible index files for efficient random access to TFRecord datasets. Enables shuffled data loading, distributed training, and O(1) record seeking with minimal overhead (0.4% file size). Pure Rust implementation with comprehensive Python API.
 
 ```python
 import s3dlio
@@ -30,37 +46,13 @@ offset, size = index[42]  # O(1) access, ~1200x faster than sequential scan
 
 **Use Cases**: Random shuffling, distributed training sharding, batch loading, DALI pipeline integration. Compatible with NVIDIA DALI and TensorFlow tooling. See [Quick Reference](docs/TFRECORD-INDEX-QUICKREF.md) for details.
 
-## 🧠 AI/ML Training Enhancement (v0.8.6)
+## 🗂️ Page Cache & Tracing (v0.8.8)
 
-Added comprehensive LoaderOptions Realism Knobs for production AI/ML workloads, providing fine-grained control over data loading behavior, performance optimization, and training pipeline configuration with PyTorch/TensorFlow best practices.
+**Page Cache Optimization**: Intelligent Linux/Unix page cache hints via `posix_fadvise()` with automatic mode selection based on file size. Optimizes kernel read-ahead behavior for both sequential large files (≥64MB) and random small file access patterns.
 
-## Storage Backend Support
+**Tracing Framework**: Migrated from `log` crate to `tracing` ecosystem for enhanced observability. Compatible with dl-driver and s3-bench projects. Supports standard verbosity levels (`-v` for INFO, `-vv` for DEBUG) with preserved operation trace logging.
 
-### Universal Backend Architecture
-s3dlio provides a unified interface for all storage operations, treating upload/download as enhanced copy commands that work across any backend:
-nce Storage Library
-
-## Overview
-
-**s3dlio** is a high-performance, multi-protocol storage library designed for AI/ML workloads and data-intensive applications. Built in Rust with Python bindings, it provides zero-copy streaming, comprehensive checkpointing, and universal copy operations across multiple storage backends.
-
-**Key Features:**
-- 🚀 **Universal Copy Operations**: Upload/download work like Unix `cp` across tested storage backends
-- ⚡ **High Performance**: Close to 4.8 line-speed throughput with intelligent optimization
-- 📊 **Real-Time Progress Tracking**: CLI has progress bars with transfer rates and ETA
-- 🔍 **Advanced Pattern Matching**: Support for glob patterns (`*.log`) and regex (`.*\.log$`)
-- 🐍 **Python Integration**: Full PyTorch/TensorFlow/JAX compatibility with async support
-- 🏗️ **Multi-Backend Architecture**: Support I/O across S3, Azure, file systems, and DirectIO
-
-## �️ Page Cache Optimization (v0.8.8)
-
-Added intelligent Linux/Unix page cache hints via `posix_fadvise()` with automatic mode selection based on file size. Optimizes kernel read-ahead behavior for both sequential large files (≥64MB) and random small file access patterns. Integrated with file:// and direct:// backends.
-
-## 📝 Tracing Framework (v0.8.8)
-
-Migrated from `log` crate to `tracing` ecosystem for enhanced observability and compatibility with dl-driver and s3-bench projects. Supports standard verbosity levels (`-v` for INFO, `-vv` for DEBUG) with preserved operation trace logging functionality.
-
-## �📊 Performance Monitoring (v0.8.7)
+## 📊 Performance Monitoring (v0.8.7)
 
 Advanced HDR histogram-based performance monitoring for AI/ML workloads, providing precise tail latency analysis (P99, P99.9, P99.99+) and comprehensive throughput tracking. Built-in presets for training, inference, and distributed scenarios with thread-safe global metrics collection.
 
