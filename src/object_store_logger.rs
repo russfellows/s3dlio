@@ -78,7 +78,8 @@ fn get_thread_id() -> usize {
 /// # Example
 ///
 /// ```rust,no_run
-/// use s3dlio::{store_for_uri, LoggedObjectStore, init_op_logger, global_logger};
+/// use s3dlio::{store_for_uri, LoggedObjectStore, init_op_logger, global_logger, ObjectStore};
+/// use std::sync::Arc;
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// // Initialize logger
@@ -87,7 +88,7 @@ fn get_thread_id() -> usize {
 ///
 /// // Create store and wrap with logging
 /// let store = store_for_uri("file:///tmp/data")?;
-/// let logged_store = LoggedObjectStore::new(store, logger);
+/// let logged_store = LoggedObjectStore::new(Arc::from(store), logger);
 ///
 /// // All operations now logged
 /// let data = logged_store.get("file:///tmp/data/test.txt").await?;
