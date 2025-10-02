@@ -3,15 +3,15 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-121%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Version](https://img.shields.io/badge/version-0.8.15-blue)](https://github.com/russfellows/s3dlio/releases)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, local file systems, and DirectIO.
 
-## 📊 Operation Logging (Op-Log) - All Backends (v0.8.14)
+## 📊 Operation Logging (Op-Log) - All Backends (v0.8.15)
 
-**NEW**: Universal operation trace logging now supports ALL storage backends (file://, s3://, az://, direct://). Performance profiling and debugging for any storage system with the same TSV format used for S3.
+**NEW**: Universal operation trace logging now supports ALL storage backends (file://, s3://, az://, direct://). Performance profiling and debugging for any storage system with the same TSV format used for S3.  This includes the ability to create trace logs, and read them.  
 
 ```python
 import s3dlio
