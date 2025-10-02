@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-121%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Version](https://img.shields.io/badge/version-0.8.15-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.8.16-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -97,7 +97,8 @@ Added comprehensive LoaderOptions Realism Knobs for production AI/ML workloads, 
 s3dlio provides a unified interface for all storage operations, treating upload/download as enhanced copy commands that work across any backend:
 
 - **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations with multiple backend choices
-- **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with hot/cool tier support  
+- **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with hot/cool tier support
+- **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - GCS infrastructure in place (ObjectStore integration pending v0.8.20)
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance
 

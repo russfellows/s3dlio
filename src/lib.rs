@@ -65,6 +65,7 @@ pub mod object_store_logger;  // Op-log support for all backends
 pub mod data_loader;
 pub mod checkpoint;
 pub mod azure_client;
+pub mod gcs_client;  // Google Cloud Storage client
 pub mod concurrency;
 #[cfg(feature = "enhanced-http")]
 pub mod http;

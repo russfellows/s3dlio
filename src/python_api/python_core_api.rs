@@ -395,6 +395,10 @@ pub fn list(uri: &str, recursive: bool) -> PyResult<Vec<String>> {
             // TODO: Implement Azure listing
             Err(PyRuntimeError::new_err("Azure listing not yet implemented"))
         }
+        Scheme::Gcs => {
+            // TODO: Implement GCS listing
+            Err(PyRuntimeError::new_err("GCS listing not yet implemented"))
+        }
         Scheme::Unknown => {
             Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
         }
@@ -434,6 +438,10 @@ pub fn stat(py: Python<'_>, uri: &str) -> PyResult<PyObject> {
         Scheme::Azure => {
             // TODO: Implement Azure stat
             Err(PyRuntimeError::new_err("Azure stat not yet implemented"))
+        }
+        Scheme::Gcs => {
+            // TODO: Implement GCS stat
+            Err(PyRuntimeError::new_err("GCS stat not yet implemented"))
         }
         Scheme::Unknown => {
             Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
@@ -570,6 +578,10 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
         Scheme::Azure => {
             // TODO: Implement Azure get
             Err(PyRuntimeError::new_err("Azure get not yet implemented"))
+        }
+        Scheme::Gcs => {
+            // TODO: Implement GCS get
+            Err(PyRuntimeError::new_err("GCS get not yet implemented"))
         }
         Scheme::Unknown => {
             Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))

@@ -146,6 +146,7 @@ pub enum Scheme {
     Direct,
     S3,
     Azure,
+    Gcs,
     Unknown,
 }
 
@@ -155,6 +156,7 @@ pub fn infer_scheme(uri: &str) -> Scheme {
     else if uri.starts_with("direct://") { Scheme::Direct }
     else if uri.starts_with("s3://") { Scheme::S3 }
     else if uri.starts_with("az://") || uri.contains(".blob.core.windows.net/") { Scheme::Azure }
+    else if uri.starts_with("gs://") || uri.starts_with("gcs://") { Scheme::Gcs }
     else { Scheme::Unknown }
 }
 
@@ -1091,6 +1093,7 @@ pub fn store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Log
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3    => S3ObjectStore::boxed(),
         Scheme::Azure => AzureObjectStore::boxed(),
+        Scheme::Gcs   => bail!("GCS backend not yet fully implemented"),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     
@@ -1133,6 +1136,7 @@ pub fn store_for_uri_with_config_and_logger(
         }
         Scheme::S3 => S3ObjectStore::boxed(),
         Scheme::Azure => AzureObjectStore::boxed(),
+        Scheme::Gcs => bail!("GCS backend not yet fully implemented"),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     
@@ -1159,6 +1163,7 @@ pub fn direct_io_store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_l
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => S3ObjectStore::boxed(),
         Scheme::Azure => AzureObjectStore::boxed(),
+        Scheme::Gcs => bail!("GCS backend not yet fully implemented"),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     
@@ -1185,6 +1190,7 @@ pub fn high_performance_store_for_uri_with_logger(uri: &str, logger: Option<crat
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => S3ObjectStore::boxed(),
         Scheme::Azure => AzureObjectStore::boxed(),
+        Scheme::Gcs => bail!("GCS backend not yet fully implemented"),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     
