@@ -1,26 +1,65 @@
 # s3dlio Changelog
 
-## Version 0.8.13 - Shared Op-Log Replay Library (December 2025)
+## Version 0.8.14 - Shared Op-Log Replay Library with Compatibility Testing (October 2025)
 
-### 🎯 **Release Focus: Eliminate Code Duplication Across Ecosystem**
+### 🎯 **Release Focus: Production-Ready Shared Library with Comprehensive Testing**
 
-This release introduces the `s3dlio-oplog` shared library crate, consolidating operation log replay functionality previously duplicated across s3dlio, s3-bench, and dl-driver. Provides format-tolerant parsing, microsecond-precision timeline replay, and pluggable execution backends.
+This release introduces the `s3dlio-oplog` shared library crate with extensive compatibility testing, consolidating operation log replay functionality previously duplicated across s3dlio, s3-bench, and dl-driver. Includes 33 tests (100% passing) validating compatibility with both s3-bench and dl-driver usage patterns.
 
 ### ✨ **New Features**
 
-#### **s3dlio-oplog Shared Crate** (`crates/s3dlio-oplog/`)
+#### **s3dlio-oplog Shared Crate v0.8.14** (`crates/s3dlio-oplog/`)
 - **Format-Tolerant Reader**: Auto-detects JSONL and TSV formats with zstd decompression
   - Header-driven column mapping handles variations ("operation" vs "op", etc.)
+  - Supports minimal 6-field and extended 13-field TSV formats
   - Ported from dl-driver's `oplog_ingest.rs` with enhancements
 - **Timeline-Based Replayer**: Microsecond-precision absolute scheduling
   - Preserves original operation timing relationships
+  - Speed multiplier support (0.1x to 1000x)
   - Ported from s3-bench's `replay.rs` with trait abstraction
 - **Pluggable Execution**: `OpExecutor` trait for custom backends
   - Default `S3dlioExecutor` uses s3dlio ObjectStore
   - Easy integration with custom storage systems
 - **URI Translation**: 1:1 backend retargeting (s3→az, file→direct)
 - **Operation Filtering**: Replay subsets (GET-only, PUT/DELETE, etc.)
-- **Speed Control**: 0.1x to 1000x replay speed multipliers
+
+### 🧪 **Comprehensive Compatibility Testing**
+
+#### **Test Coverage: 33 Tests (100% Passing)**
+- **11 Unit Tests**: Core functionality (types, reader, uri, replayer)
+- **17 Integration Tests**: Real-world compatibility scenarios
+  - 4 s3-bench compatibility tests
+  - 3 dl-driver compatibility tests  
+  - 3 format flexibility tests
+  - 7 core functionality tests
+- **5 Doc Tests**: Example code validation
+- **Zero Warnings**: Production-ready build quality
+
+#### **s3-bench Compatibility Validated ✅**
+- ✅ 13-column TSV format parsing
+- ✅ HEAD → STAT operation aliasing
+- ✅ Speed multiplier timeline scheduling
+- ✅ Endpoint prefix stripping + URI retargeting
+- ✅ Zstd compression auto-detection
+
+#### **dl-driver Compatibility Validated ✅**
+- ✅ JSONL format with flexible field mapping
+- ✅ Base URI path construction
+- ✅ Path remapping for cross-environment replay
+- ✅ Field aliases ("operation" vs "op", "t_start_ns" vs "start")
+- ✅ Fast mode support (skip timing delays)
+
+### 📚 **Documentation**
+
+#### **User Documentation**
+- `crates/s3dlio-oplog/README.md` - Quick start guide and API reference
+- `docs/S3DLIO_OPLOG_INTEGRATION.md` - Detailed integration guide
+- `examples/oplog_replay_basic.rs` - Working example with mock executor
+
+#### **Testing Documentation**
+- `crates/s3dlio-oplog/docs/COMPATIBILITY_TESTING.md` - Detailed test descriptions
+- `crates/s3dlio-oplog/docs/COMPATIBILITY_TESTING_SUMMARY.md` - Executive summary
+- Migration guides for both s3-bench and dl-driver
 
 #### **Core Components**
 ```rust

@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 [package]
 name = "s3dlio"
-version = "0.8.12"
+version = "0.8.14"
 edition = "2021"
 
 [lib]

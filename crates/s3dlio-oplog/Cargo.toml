@@ -1,6 +1,6 @@
 [package]
 name = "s3dlio-oplog"
-version = "0.1.0"
+version = "0.8.14"
 edition = "2021"
 description = "Shared operation log parsing and replay functionality for s3dlio ecosystem"
 license = "MIT OR Apache-2.0"
