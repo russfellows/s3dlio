@@ -29,6 +29,37 @@ s3dlio.finalize_op_log()
 
 **Features**: Zstd-compressed TSV logs, warp-replay compatible, clean file paths, zero overhead when not initialized. Works with Rust API, Python API, and CLI (`--op-log` flag).
 
+## 🔄 Operation Log Replay - Shared Library (v0.8.13)
+
+**NEW**: `s3dlio-oplog` shared crate for workload replay across the s3dlio ecosystem (s3-bench, dl-driver). Eliminates code duplication with format-tolerant parsing, microsecond-precision timeline replay, and pluggable execution backends.
+
+```rust
+use s3dlio_oplog::{ReplayConfig, replay_with_s3dlio};
+use std::path::PathBuf;
+
+// Replay captured workload with timing preservation
+let config = ReplayConfig {
+    op_log_path: PathBuf::from("workload.tsv.zst"),
+    target_uri: Some("s3://test-bucket/".to_string()),  // Retarget to new backend
+    speed: 1.0,  // Real-time (use 10.0 for stress test)
+    continue_on_error: false,
+    filter_ops: None,  // Or Some(vec![OpType::GET]) to filter
+};
+
+replay_with_s3dlio(config).await?;
+```
+
+**Key Features**:
+- **Format-Tolerant**: Auto-detects JSONL/TSV with zstd compression
+- **Timeline Accuracy**: Microsecond-precision absolute scheduling  
+- **Backend Retargeting**: 1:1 URI translation (s3→az, file→direct, etc.)
+- **Pluggable Execution**: `OpExecutor` trait for custom backends
+- **Operation Filtering**: Replay subsets (GET-only, PUT/DELETE, etc.)
+- **Speed Control**: 0.1x to 1000x replay speed multipliers
+
+**Location**: `crates/s3dlio-oplog/`  
+**Documentation**: [Integration Guide](docs/S3DLIO_OPLOG_INTEGRATION.md)
+
 ## 📇 TFRecord Index Generation (v0.8.10)
 
 Generate NVIDIA DALI-compatible index files for efficient random access to TFRecord datasets. Enables shuffled data loading, distributed training, and O(1) record seeking with minimal overhead (0.4% file size). Pure Rust implementation with comprehensive Python API.

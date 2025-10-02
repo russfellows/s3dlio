@@ -1,5 +1,139 @@
 # s3dlio Changelog
 
+## Version 0.8.13 - Shared Op-Log Replay Library (December 2025)
+
+### 🎯 **Release Focus: Eliminate Code Duplication Across Ecosystem**
+
+This release introduces the `s3dlio-oplog` shared library crate, consolidating operation log replay functionality previously duplicated across s3dlio, s3-bench, and dl-driver. Provides format-tolerant parsing, microsecond-precision timeline replay, and pluggable execution backends.
+
+### ✨ **New Features**
+
+#### **s3dlio-oplog Shared Crate** (`crates/s3dlio-oplog/`)
+- **Format-Tolerant Reader**: Auto-detects JSONL and TSV formats with zstd decompression
+  - Header-driven column mapping handles variations ("operation" vs "op", etc.)
+  - Ported from dl-driver's `oplog_ingest.rs` with enhancements
+- **Timeline-Based Replayer**: Microsecond-precision absolute scheduling
+  - Preserves original operation timing relationships
+  - Ported from s3-bench's `replay.rs` with trait abstraction
+- **Pluggable Execution**: `OpExecutor` trait for custom backends
+  - Default `S3dlioExecutor` uses s3dlio ObjectStore
+  - Easy integration with custom storage systems
+- **URI Translation**: 1:1 backend retargeting (s3→az, file→direct)
+- **Operation Filtering**: Replay subsets (GET-only, PUT/DELETE, etc.)
+- **Speed Control**: 0.1x to 1000x replay speed multipliers
+
+#### **Core Components**
+```rust
+// crates/s3dlio-oplog/src/types.rs
+pub enum OpType { GET, PUT, DELETE, LIST, STAT }
+pub struct OpLogEntry {
+    pub idx: Option<u64>,
+    pub op: OpType,
+    pub bytes: Option<usize>,
+    pub endpoint: Option<String>,
+    pub file: String,
+    pub start: DateTime<Utc>,
+    pub duration_ns: Option<i64>,
+    pub error: Option<String>,
+}
+
+// crates/s3dlio-oplog/src/reader.rs  
+pub struct OpLogReader {
+    pub fn from_file(path: PathBuf) -> Result<Self>
+    pub fn entries(&self) -> Vec<OpLogEntry>
+    pub fn filter_operations(&self, filter: Vec<OpType>) -> Vec<OpLogEntry>
+}
+
+// crates/s3dlio-oplog/src/replayer.rs
+pub struct ReplayConfig {
+    pub op_log_path: PathBuf,
+    pub target_uri: Option<String>,
+    pub speed: f64,
+    pub continue_on_error: bool,
+    pub filter_ops: Option<Vec<OpType>>,
+}
+
+#[async_trait]
+pub trait OpExecutor {
+    async fn get(&self, uri: &str) -> Result<()>;
+    async fn put(&self, uri: &str, bytes: usize) -> Result<()>;
+    async fn delete(&self, uri: &str) -> Result<()>;
+    async fn list(&self, uri: &str) -> Result<()>;
+    async fn stat(&self, uri: &str) -> Result<()>;
+}
+
+pub async fn replay_workload<E: OpExecutor + 'static>(
+    config: ReplayConfig,
+    executor: Arc<E>
+) -> Result<()>
+
+pub async fn replay_with_s3dlio(config: ReplayConfig) -> Result<()>
+
+// crates/s3dlio-oplog/src/uri.rs
+pub fn translate_uri(file: &str, endpoint: &str, target: &str) -> String
+```
+
+### 📚 **Documentation**
+
+- **Integration Guide**: `docs/S3DLIO_OPLOG_INTEGRATION.md`
+  - Complete API reference and usage examples
+  - s3-bench migration guide (remove `src/replay.rs`, use shared crate)
+  - dl-driver migration guide (leverage shared reader or custom executor)
+  - Supported formats (JSONL/TSV with zstd), configuration options
+- **Example Code**: `examples/oplog_replay_basic.rs`
+  - Basic replay with default executor
+  - Speed multiplier and filtering demonstrations
+  - Backend retargeting examples
+
+### 🏗️ **Architecture**
+
+- **Workspace Structure**: Converted to Cargo workspace
+  ```toml
+  [workspace]
+  members = [".", "crates/s3dlio-oplog"]
+  ```
+- **Dependencies**:
+  - chrono (with serde for DateTime serialization)
+  - csv 1.3 (TSV parsing)
+  - zstd 0.13 (compression)
+  - tokio, async-trait, futures (async execution)
+  - s3dlio (with native-backends feature)
+
+### ✅ **Testing**
+
+- **Unit Tests**: 11 tests covering all modules
+  - `types.rs`: OpType parsing and display
+  - `reader.rs`: JSONL/TSV parsing, format detection
+  - `uri.rs`: Cross-backend translation
+  - `replayer.rs`: Mock executor replay
+- **Doc Tests**: 5 tests validating documentation examples
+- **Quality**: Zero warnings build (adheres to project standards)
+
+### 🔧 **Implementation Details**
+
+- **Arc-based Executor Lifetime**: Solves async task lifetime issues
+  ```rust
+  pub async fn replay_workload<E: OpExecutor + 'static>(
+      config: ReplayConfig,
+      executor: Arc<E>  // Arc wrapper for async task safety
+  ) -> Result<()>
+  ```
+- **Data Generation**: Uses s3dlio's `generate_controlled_data()` for PUT operations
+- **Error Handling**: `anyhow::Result` throughout, configurable continue-on-error
+- **Logging**: Uses tracing framework for observability
+
+### 🚀 **Migration Benefits**
+
+- **s3-bench**: Remove ~300 lines of duplicate code (`src/replay.rs`)
+- **dl-driver**: Remove ~400 lines of duplicate code (`src/oplog_ingest.rs`)
+- **Shared Maintenance**: Bug fixes and features benefit all projects
+- **Consistent Behavior**: Single implementation ensures identical replay semantics
+
+### 📦 **Version**
+
+- **s3dlio-oplog**: v0.1.0 (initial release)
+- **s3dlio**: v0.8.13 (workspace conversion, README update)
+
 ## Version 0.8.12 - Universal Op-Log Support (October 1, 2025)
 
 ### 🎯 **Release Focus: Operation Logging for All Storage Backends**
