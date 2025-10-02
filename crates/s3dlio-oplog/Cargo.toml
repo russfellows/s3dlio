@@ -1,0 +1,41 @@
+[package]
+name = "s3dlio-oplog"
+version = "0.1.0"
+edition = "2021"
+description = "Shared operation log parsing and replay functionality for s3dlio ecosystem"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Core dependencies
+anyhow = "^1"
+thiserror = "^1"
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = "^1.0"
+chrono = { version = "^0.4", features = ["serde"] }  # Enable serde support
+
+# Async runtime
+tokio = { version = "^1", features = ["full"] }
+async-trait = "^0.1"
+futures = "^0.3"
+
+# CSV/TSV parsing
+csv = "^1.3"
+
+# Compression
+zstd = "^0.13"
+
+# Bytes handling
+bytes = "^1.10"
+
+# s3dlio core (for ObjectStore and data generation)
+s3dlio = { path = "../..", default-features = false, features = ["native-backends"] }
+
+# Logging
+tracing = "^0.1"
+
+[dev-dependencies]
+tempfile = "^3"
+tokio-test = "^0.4"
+
+[features]
+default = []
