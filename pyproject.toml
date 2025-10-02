@@ -1,10 +1,11 @@
 [project]
 name = "s3dlio"
-version = "0.8.15"
+version = "0.8.16"
 description = "High-performance S3, Azure, and file system operations for AI/ML"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
+license = { text = "AGPL-3.0" }
 
 [build-system]
 requires = ["maturin>=0.12"]

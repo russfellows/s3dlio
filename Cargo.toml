@@ -3,10 +3,10 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.8.15"
+version = "0.8.16"
 edition = "2021"
 authors = ["Russ Fellows"]
-license = "MIT"
+license = "AGPL-3.0"
 
 [package]
 name = "s3dlio"
@@ -32,6 +32,9 @@ aws-sdk-s3         = "^1"
 azure_core = { version = "0.27.0" }          # Response/Body, paging, errors
 azure_identity = { version = "0.27.0" }      # DefaultAzureCredential
 azure_storage_blob = { version = "0.4.0" }   # Blob/Container/BlockBlob clients
+
+# Google Cloud Storage SDK (using gcloud-storage - part of google-cloud-rust)
+gcloud-storage = "^1.1"                      # GCS client with ADC support
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat

@@ -176,6 +176,10 @@ pub fn dataset_for_uri_with_options(uri: &str, opts: &LoaderOptions) -> Result<B
                 .map_err(|e| anyhow::anyhow!("Failed to create Direct I/O dataset: {}", e))?;
             Ok(Box::new(dataset))
         }
+        crate::object_store::Scheme::Gcs => {
+            // TODO: Implement GCS dataset
+            anyhow::bail!("GCS datasets not yet implemented")
+        }
         crate::object_store::Scheme::Unknown => {
             anyhow::bail!("Unable to infer dataset type from URI: {}", uri)
         }
