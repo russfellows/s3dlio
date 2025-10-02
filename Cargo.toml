@@ -1,10 +1,17 @@
 [workspace]
 members = [".", "crates/s3dlio-oplog"]
 
+# Workspace-level package metadata that can be inherited by all members
+[workspace.package]
+version = "0.8.15"
+edition = "2021"
+authors = ["Russ Fellows"]
+license = "MIT"
+
 [package]
 name = "s3dlio"
-version = "0.8.14"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 name = "s3dlio"

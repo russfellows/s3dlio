@@ -103,6 +103,24 @@ pub const HALF_BLK: usize = BLK_SIZE / 2;
 /// This determines the size of regions that get randomized within blocks
 pub const MOD_SIZE: usize = 32;
 
+// =============================================================================
+// Op-Log Streaming Constants
+// =============================================================================
+
+/// Default chunk size for streaming op-log reads (1 MB)
+/// Used for BufReader capacity when parsing op-log files
+pub const DEFAULT_OPLOG_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Default op-log entry buffer capacity (1024 entries)
+/// Channel buffer size for background parsing thread
+pub const DEFAULT_OPLOG_ENTRY_BUFFER: usize = 1024;
+
+/// Environment variable for op-log read buffer size
+pub const ENV_OPLOG_READ_BUF: &str = "S3DLIO_OPLOG_READ_BUF";
+
+/// Environment variable for op-log chunk size
+pub const ENV_OPLOG_CHUNK_SIZE: &str = "S3DLIO_OPLOG_CHUNK_SIZE";
+
 /// A base random block of BLK_SIZE bytes, generated once and shared.
 /// Used by the single-pass data generation algorithm.
 pub static A_BASE_BLOCK: Lazy<Arc<Vec<u8>>> = Lazy::new(|| {

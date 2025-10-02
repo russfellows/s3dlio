@@ -112,7 +112,8 @@ pub mod types;
 pub mod uri;
 
 // Re-export main types and functions for convenience
-pub use reader::{OpLogFormat, OpLogReader};
+pub use reader::{OpLogFormat, OpLogReader, OpLogStreamReader};
 pub use replayer::{OpExecutor, ReplayConfig, S3dlioExecutor, replay_with_s3dlio, replay_workload};
 pub use types::{OpLogEntry, OpType};
 pub use uri::translate_uri;
+
