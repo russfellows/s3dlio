@@ -2,24 +2,23 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-121%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Version](https://img.shields.io/badge/version-0.8.18-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.8.19-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-## 🌟 What's New in v0.8.18
+## 🌟 What's New in v0.8.19
 
-**GCS Backend Phase 2 - Production Ready!** 🚀
+**Universal Commands Across All Backends** 🔧
 
-The 5th storage backend is now fully functional with complete ObjectStore integration:
-- ✅ **Upload/Download**: Full support for `gs://` URIs
-- ✅ **List/Delete**: Works with Application Default Credentials (ADC)
-- ✅ **Multi-Backend CLI**: Delete command now works across all backends
-- ✅ **Zero Warnings**: Clean build with comprehensive testing
+- ✅ **Universal `ls`**: Now works with all 5 backends (S3, GCS, Azure, File, DirectIO) with regex pattern filtering
+- ✅ **Universal `stat`**: Metadata operations across all backends with improved output formatting
+- ✅ **Python API Updates**: `list()` and `stat()` now universal with pattern support
+- ✅ **S3 Region Fix**: `list-buckets` correctly uses `us-east-1`
 
-See [GCS Phase 2 Documentation](docs/GCS_Phase2_0-8-18.md) for complete details.
+See [v0.8.19 Release Notes](docs/v0.8.19-RELEASE-NOTES.md) for complete details.
 
 ## 📊 Operation Logging (Op-Log) - All Backends (v0.8.15)
 

@@ -38,7 +38,7 @@ use glob;
 
 // Import shared functions from the crate.
 use s3dlio::{
-    get_objects_parallel, parse_s3_uri, stat_object_uri, 
+    get_objects_parallel, parse_s3_uri,
     put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
     list_buckets,
     object_store::store_for_uri_with_logger,
@@ -309,6 +309,11 @@ enum Command {
         /// List objects recursively
         #[clap(short, long)]
         recursive: bool,
+
+        /// Optional regex pattern to filter results (applied client-side, works with all backends)
+        /// Example: '.*\.txt$' to match only .txt files
+        #[clap(short, long)]
+        pattern: Option<String>,
     },
 
     /// Generate NVIDIA DALI-compatible index file for TFRecord files
@@ -428,6 +433,14 @@ async fn main() -> Result<()> {
         // --- Update the `List` command handler.
         // It now unpacks `s3_path` and `recursive` and calls our new backend function.
         Command::List { s3_path, recursive } => {
+            // Deprecation warning
+            eprintln!("WARNING: The 'list' command is deprecated and S3-only.");
+            eprintln!("Please use 'ls' for universal multi-backend support:");
+            eprintln!("  s3-cli ls s3://bucket/prefix/ -r");
+            eprintln!("  s3-cli ls s3://bucket/prefix/ -p '.*\\.txt$'  # with regex pattern");
+            eprintln!("This command will be removed in v0.9.0.");
+            eprintln!();
+            
             let keys = s3dlio::s3_utils::list_objects(s3_path.bucket(), s3_path.key(), recursive)?;
     
             let stdout = io::stdout();
@@ -444,7 +457,7 @@ async fn main() -> Result<()> {
             writeln!(out, "\nTotal objects: {}", keys.len())?;
         }
     
-        Command::Stat { uri } => stat_cmd(&uri)?,
+        Command::Stat { uri } => stat_cmd(&uri).await?,
     
         // New, with regex and recursion
         Command::Get { uri, jobs, concurrent, keylist, recursive } => {
@@ -579,8 +592,8 @@ async fn main() -> Result<()> {
 
         }
 
-        Command::GenericList { uri, recursive } => {
-            generic_list_cmd(&uri, recursive).await?
+        Command::GenericList { uri, recursive, pattern } => {
+            generic_list_cmd(&uri, recursive, pattern.as_deref()).await?
         }
 
         Command::TfrecordIndex { tfrecord_path, index_path } => {
@@ -598,10 +611,20 @@ async fn main() -> Result<()> {
 }
 
 /// Generic list command that works with any storage backend
-async fn generic_list_cmd(uri: &str, recursive: bool) -> Result<()> {
+/// Supports optional client-side regex filtering
+async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>) -> Result<()> {
+    use regex::Regex;
+    
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger)?;
-    let keys = store.list(uri, recursive).await?;
+    let mut keys = store.list(uri, recursive).await?;
+
+    // Apply client-side regex filtering if pattern provided
+    if let Some(pat) = pattern {
+        let re = Regex::new(pat)
+            .with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
+        keys.retain(|k| re.is_match(k));
+    }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -653,19 +676,49 @@ fn tfrecord_index_cmd(tfrecord_path: &PathBuf, index_path: Option<&Path>) -> Res
     Ok(())
 }
 
-/// Stat command: provide info on a single object
-fn stat_cmd(uri: &str) -> Result<()> {
-    let os = stat_object_uri(uri)?;
+/// Stat command: provide info on a single object (universal, works with all backends)
+async fn stat_cmd(uri: &str) -> Result<()> {
+    let logger = global_logger();
+    let store = store_for_uri_with_logger(uri, logger)?;
+    let os = store.stat(uri).await?;
+    
+    // Always show core fields
+    safe_println!("URI             : {}", uri);
     safe_println!("Size            : {}", os.size);
-    safe_println!("LastModified    : {:?}", os.last_modified);
-    safe_println!("ETag            : {:?}", os.e_tag);
-    safe_println!("Content-Type    : {:?}", os.content_type);
-    safe_println!("Content-Language: {:?}", os.content_language);
-    safe_println!("StorageClass    : {:?}", os.storage_class);
-    safe_println!("VersionId       : {:?}", os.version_id);
-    safe_println!("ReplicationStat : {:?}", os.replication_status);
-    safe_println!("SSE             : {:?}", os.server_side_encryption);
-    safe_println!("SSE-KMS Key ID  : {:?}", os.ssekms_key_id);
+    
+    // Only show optional fields if they have values
+    if let Some(ref lm) = os.last_modified {
+        safe_println!("LastModified    : {}", lm);
+    }
+    if let Some(ref et) = os.e_tag {
+        safe_println!("ETag            : {}", et);
+    }
+    if let Some(ref ct) = os.content_type {
+        safe_println!("Content-Type    : {}", ct);
+    }
+    if let Some(ref cl) = os.content_language {
+        safe_println!("Content-Language: {}", cl);
+    }
+    if let Some(ref ce) = os.content_encoding {
+        safe_println!("Content-Encoding: {}", ce);
+    }
+    if let Some(ref sc) = os.storage_class {
+        safe_println!("StorageClass    : {}", sc);
+    }
+    if let Some(ref vid) = os.version_id {
+        safe_println!("VersionId       : {}", vid);
+    }
+    if let Some(ref rs) = os.replication_status {
+        safe_println!("ReplicationStat : {}", rs);
+    }
+    if let Some(ref sse) = os.server_side_encryption {
+        safe_println!("SSE             : {}", sse);
+    }
+    if let Some(ref kmsid) = os.ssekms_key_id {
+        safe_println!("SSE-KMS Key ID  : {}", kmsid);
+    }
+    
+    // Show user metadata if present
     if !os.metadata.is_empty() {
         safe_println!("User Metadata:");
         for (k,v) in os.metadata {

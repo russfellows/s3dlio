@@ -26,7 +26,6 @@ use crate::s3_utils::{
     list_objects as list_objects_rs, get_range,
     parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
     create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs,
-    stat_object_uri,
     stat_object_uri_async,
     stat_object_many_async,
 };
@@ -371,38 +370,26 @@ pub (crate) fn put_async_py<'p>(
 
 // --- `list` function
 #[pyfunction]
-#[pyo3(signature = (uri, recursive = false))]
-pub fn list(uri: &str, recursive: bool) -> PyResult<Vec<String>> {
-    use crate::object_store::{infer_scheme, Scheme};
+#[pyo3(signature = (uri, recursive = false, pattern = None))]
+pub fn list(uri: &str, recursive: bool, pattern: Option<&str>) -> PyResult<Vec<String>> {
+    // Universal list using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
+    let logger = global_logger();
+    let store = store_for_uri_with_logger(uri, logger).map_err(py_err)?;
     
-    match infer_scheme(uri) {
-        Scheme::S3 => {
-            let (bucket, mut path) = parse_s3_uri(uri).map_err(py_err)?;
-            
-            // If the path ends with a slash, automatically append a wildcard to search inside it.
-            if path.ends_with('/') {
-                path.push_str(".*");
-            }
-            
-            crate::s3_utils::list_objects(&bucket, &path, recursive).map_err(py_err)
-        }
-        Scheme::File | Scheme::Direct => {
-            // For file systems, we'll need to implement file listing
-            // TODO: Implement file system listing
-            Err(PyRuntimeError::new_err("File system listing not yet implemented"))
-        }
-        Scheme::Azure => {
-            // TODO: Implement Azure listing
-            Err(PyRuntimeError::new_err("Azure listing not yet implemented"))
-        }
-        Scheme::Gcs => {
-            // TODO: Implement GCS listing
-            Err(PyRuntimeError::new_err("GCS listing not yet implemented"))
-        }
-        Scheme::Unknown => {
-            Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
-        }
+    // Use tokio runtime to call async list
+    let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+    let mut keys = rt.block_on(async {
+        store.list(uri, recursive).await
+    }).map_err(py_err)?;
+    
+    // Apply client-side regex filtering if pattern provided
+    if let Some(pat) = pattern {
+        use regex::Regex;
+        let re = Regex::new(pat).map_err(py_err)?;
+        keys.retain(|k| re.is_match(k));
     }
+    
+    Ok(keys)
 }
 
 
@@ -410,43 +397,18 @@ pub fn list(uri: &str, recursive: bool) -> PyResult<Vec<String>> {
 //
 #[pyfunction]
 pub fn stat(py: Python<'_>, uri: &str) -> PyResult<PyObject> {
-    use crate::object_store::{infer_scheme, Scheme};
+    // Universal stat using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
+    let logger = global_logger();
+    let store = store_for_uri_with_logger(uri, logger).map_err(py_err)?;
     
-    match infer_scheme(uri) {
-        Scheme::S3 => {
-            let os = stat_object_uri(uri).map_err(py_err)?;
-            let d = stat_to_pydict(py, os)?;
-            Ok(d.unbind().into())
-        }
-        Scheme::File | Scheme::Direct => {
-            // For file systems, get file metadata
-            use std::fs;
-            let path = uri.strip_prefix("file://").unwrap_or(uri);
-            let metadata = fs::metadata(path).map_err(py_err)?;
-            
-            // Create a simple stat dict for files
-            let dict = PyDict::new(py);
-            dict.set_item("size", metadata.len())?;
-            dict.set_item("key", path)?;
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    dict.set_item("last_modified", since_epoch.as_secs())?;
-                }
-            }
-            Ok(dict.unbind().into())
-        }
-        Scheme::Azure => {
-            // TODO: Implement Azure stat
-            Err(PyRuntimeError::new_err("Azure stat not yet implemented"))
-        }
-        Scheme::Gcs => {
-            // TODO: Implement GCS stat
-            Err(PyRuntimeError::new_err("GCS stat not yet implemented"))
-        }
-        Scheme::Unknown => {
-            Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
-        }
-    }
+    // Use tokio runtime to call async stat
+    let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+    let os = rt.block_on(async {
+        store.stat(uri).await
+    }).map_err(py_err)?;
+    
+    let d = stat_to_pydict(py, os)?;
+    Ok(d.unbind().into())
 }
 
 #[pyfunction]

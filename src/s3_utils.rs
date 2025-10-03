@@ -168,9 +168,46 @@ pub fn delete_bucket(bucket: &str) -> Result<()> {
 // -----------------------------------------------------------------------------
 /// List all S3 buckets in the account.
 /// Returns a vector of bucket names with their creation dates.
+/// 
+/// NOTE: ListBuckets is a global S3 operation that MUST use us-east-1 region,
+/// regardless of the configured default region. This function creates a special
+/// client with us-east-1 to avoid "AuthorizationHeaderMalformed" errors.
 pub fn list_buckets() -> Result<Vec<BucketInfo>> {
     run_on_global_rt(async move {
-        let client = aws_s3_client_async().await?;
+        // ListBuckets is a GLOBAL operation and MUST use us-east-1
+        // Create a special client with forced us-east-1 region
+        use aws_sdk_s3::config::Region;
+        use aws_config::meta::region::RegionProviderChain;
+        use aws_config::timeout::TimeoutConfig;
+        use std::time::Duration;
+        use tracing::debug;
+        
+        dotenvy::dotenv().ok();
+        
+        // Force us-east-1 for global ListBuckets operation
+        let region = RegionProviderChain::first_try(Some(Region::new("us-east-1")));
+        
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::v2025_08_07())
+            .region(region);
+            
+        // Respect endpoint URL if set (for MinIO, etc.)
+        if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
+            if !endpoint.is_empty() {
+                loader = loader.endpoint_url(endpoint);
+            }
+        }
+        
+        // Use same timeout config as main client
+        let timeout_config = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .operation_timeout(Duration::from_secs(120))
+            .build();
+            
+        let cfg = loader.timeout_config(timeout_config).load().await;
+        let client = aws_sdk_s3::Client::new(&cfg);
+        
+        debug!("ListBuckets using forced us-east-1 region (global operation requirement)");
+        
         let response = client
             .list_buckets()
             .send()
