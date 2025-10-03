@@ -2,16 +2,28 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-121%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Version](https://img.shields.io/badge/version-0.8.16-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.8.18-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
-High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, local file systems, and DirectIO.
+High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
+
+## 🌟 What's New in v0.8.18
+
+**GCS Backend Phase 2 - Production Ready!** 🚀
+
+The 5th storage backend is now fully functional with complete ObjectStore integration:
+- ✅ **Upload/Download**: Full support for `gs://` URIs
+- ✅ **List/Delete**: Works with Application Default Credentials (ADC)
+- ✅ **Multi-Backend CLI**: Delete command now works across all backends
+- ✅ **Zero Warnings**: Clean build with comprehensive testing
+
+See [GCS Phase 2 Documentation](docs/GCS_Phase2_0-8-18.md) for complete details.
 
 ## 📊 Operation Logging (Op-Log) - All Backends (v0.8.15)
 
-**NEW**: Universal operation trace logging now supports ALL storage backends (file://, s3://, az://, direct://). Performance profiling and debugging for any storage system with the same TSV format used for S3.  This includes the ability to create trace logs, and read them.  
+**Universal operation trace logging now supports ALL storage backends** (file://, s3://, az://, gs://, direct://). Performance profiling and debugging for any storage system with the same TSV format.
 
 ```python
 import s3dlio
@@ -19,9 +31,9 @@ import s3dlio
 # Initialize op-log (once at start)
 s3dlio.init_op_log("/tmp/operations.tsv.zst")
 
-# All operations automatically logged
-s3dlio.upload(["./data/*.dat"], "file:///backup/", max_in_flight=8, create_bucket=False)
-s3dlio.download("direct:///fast-storage/", "./local/", max_in_flight=16, recursive=True)
+# All operations automatically logged - works with all backends
+s3dlio.upload(["./data/*.dat"], "gs://ml-bucket/", max_in_flight=8)
+s3dlio.download("s3://data-lake/", "./local/", max_in_flight=16, recursive=True)
 
 # Finalize (once at end)
 s3dlio.finalize_op_log()
@@ -98,7 +110,7 @@ s3dlio provides a unified interface for all storage operations, treating upload/
 
 - **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations with multiple backend choices
 - **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with hot/cool tier support
-- **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - GCS infrastructure in place (ObjectStore integration pending v0.8.20)
+- **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - **Production ready (v0.8.18)** with full ObjectStore integration
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance
 
@@ -155,17 +167,19 @@ s3dlio treats upload and download as enhanced versions of the Unix `cp` command,
 # Upload to any backend with real-time progress
 s3-cli upload /local/data/*.log s3://mybucket/logs/
 s3-cli upload /local/files/* az://container/data/  
+s3-cli upload /local/models/* gs://ml-bucket/models/
 s3-cli upload /local/backup/* file:///remote-mount/backup/
 s3-cli upload /local/cache/* direct:///nvme-storage/cache/
 
 # Download from any backend  
 s3-cli download s3://bucket/data/ ./local-data/
 s3-cli download az://container/logs/ ./logs/
+s3-cli download gs://ml-bucket/datasets/ ./datasets/
 s3-cli download file:///network-storage/data/ ./data/
 
 # Cross-backend copying workflow
 s3-cli download s3://source-bucket/data/ ./temp/
-s3-cli upload ./temp/* az://dest-container/data/
+s3-cli upload ./temp/* gs://dest-bucket/data/
 ```
 
 **Advanced Pattern Matching:**
@@ -188,17 +202,19 @@ import s3dlio
 # Universal upload/download across all backends
 s3dlio.upload(['/local/data.csv'], 's3://bucket/data/')
 s3dlio.upload(['/local/logs/*.log'], 'az://container/logs/')  
+s3dlio.upload(['/local/models/*.pt'], 'gs://ml-bucket/models/')
 s3dlio.download('s3://bucket/data/', './local-data/')
+s3dlio.download('gs://ml-bucket/datasets/', './datasets/')
 
 # High-level AI/ML operations
 dataset = s3dlio.create_dataset("s3://bucket/training-data/")
-loader = s3dlio.create_async_loader("file:///data/", {"batch_size": 32})
+loader = s3dlio.create_async_loader("gs://ml-bucket/data/", {"batch_size": 32})
 
 # PyTorch integration
 from s3dlio.torch import S3IterableDataset
 from torch.utils.data import DataLoader
 
-dataset = S3IterableDataset("s3://bucket/data/", loader_opts={})
+dataset = S3IterableDataset("gs://bucket/data/", loader_opts={})
 dataloader = DataLoader(dataset, batch_size=16)
 ```
 

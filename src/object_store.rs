@@ -49,6 +49,9 @@ use bytes::Bytes;
 use futures::stream;
 use crate::azure_client::{AzureBlob, AzureBlobProperties};
 
+// --- GCS -----------------------------------------------------
+use crate::gcs_client::{GcsClient, GcsObjectMetadata, parse_gcs_uri};
+
 /// Provider-neutral object metadata. For now this aliases S3's metadata.
 pub type ObjectMetadata = S3ObjectStat;
 
@@ -1052,6 +1055,306 @@ impl ObjectWriter for AzureBufferedWriter {
 }
 
 // ============================================================================
+// Google Cloud Storage (GCS) adapter
+// ============================================================================
+
+/// Helper function to create GCS URI from bucket and key
+fn gcs_uri(bucket: &str, key: &str) -> String {
+    if key.is_empty() {
+        format!("gs://{}", bucket)
+    } else {
+        format!("gs://{}/{}", bucket, key)
+    }
+}
+
+/// Convert GCS object metadata to provider-neutral ObjectMetadata
+fn gcs_meta_to_object_meta(meta: &GcsObjectMetadata) -> ObjectMetadata {
+    ObjectMetadata {
+        size: meta.size,
+        last_modified: meta.updated.clone(),
+        e_tag: meta.etag.clone(),
+        content_type: None,
+        content_language: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        expires: None,
+        storage_class: None,
+        server_side_encryption: None,
+        ssekms_key_id: None,
+        sse_customer_algorithm: None,
+        version_id: None,
+        replication_status: None,
+        metadata: Default::default(),
+    }
+}
+
+pub struct GcsObjectStore;
+
+impl GcsObjectStore {
+    pub fn new() -> Self { Self }
+    
+    #[inline]
+    pub fn boxed() -> Box<dyn ObjectStore> { Box::new(Self) }
+
+    async fn get_client() -> Result<GcsClient> {
+        GcsClient::new().await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for GcsObjectStore {
+    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        let client = Self::get_client().await?;
+        client.get_object(&bucket, &object).await
+    }
+
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        let client = Self::get_client().await?;
+        client.get_object_range(&bucket, &object, offset, length).await
+    }
+
+    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        let client = Self::get_client().await?;
+        client.put_object(&bucket, &object, data).await
+    }
+
+    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        let chunk_size = part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE);
+        let client = Self::get_client().await?;
+        client.put_object_multipart(&bucket, &object, data, chunk_size).await
+    }
+
+    async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
+        let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)
+            .or_else(|_| {
+                // Handle bucket-only URIs like "gs://bucket" or "gs://bucket/"
+                if let Some(rest) = uri_prefix.strip_prefix("gs://").or_else(|| uri_prefix.strip_prefix("gcs://")) {
+                    let bucket = rest.trim_end_matches('/').to_string();
+                    if !bucket.is_empty() {
+                        return Ok((bucket, String::new()));
+                    }
+                }
+                bail!("Invalid GCS URI for list operation: {}", uri_prefix)
+            })?;
+
+        let client = Self::get_client().await?;
+        let keys = client.list_objects(&bucket, Some(&key_prefix), recursive).await?;
+
+        // Convert keys to full URIs
+        Ok(keys.into_iter().map(|k| gcs_uri(&bucket, &k)).collect())
+    }
+
+    async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        let client = Self::get_client().await?;
+        let meta = client.stat_object(&bucket, &object).await?;
+        Ok(gcs_meta_to_object_meta(&meta))
+    }
+
+    async fn delete(&self, uri: &str) -> Result<()> {
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        let client = Self::get_client().await?;
+        client.delete_object(&bucket, &object).await
+    }
+
+    async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+        let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)
+            .or_else(|_| {
+                // Handle bucket-only URIs
+                if let Some(rest) = uri_prefix.strip_prefix("gs://").or_else(|| uri_prefix.strip_prefix("gcs://")) {
+                    let bucket = rest.trim_end_matches('/').to_string();
+                    if !bucket.is_empty() {
+                        return Ok((bucket, String::new()));
+                    }
+                }
+                bail!("Invalid GCS URI for delete_prefix operation: {}", uri_prefix)
+            })?;
+
+        let client = Self::get_client().await?;
+        // List all objects with the prefix
+        let keys = client.list_objects(&bucket, Some(&key_prefix), true).await?;
+        
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        // Delete all objects
+        client.delete_objects(&bucket, keys).await
+    }
+
+    async fn create_container(&self, name: &str) -> Result<()> {
+        // For GCS, the "container" is a bucket
+        let client = Self::get_client().await?;
+        client.create_bucket(name, None).await
+    }
+
+    async fn delete_container(&self, name: &str) -> Result<()> {
+        // For GCS, the "container" is a bucket
+        let client = Self::get_client().await?;
+        client.delete_bucket(name).await
+    }
+
+    async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
+        // For GCS, use buffered writer
+        Ok(Box::new(GcsBufferedWriter::new(uri.to_string())))
+    }
+
+    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+        // For GCS, use buffered writer with compression support
+        Ok(Box::new(GcsBufferedWriter::new_with_compression(uri.to_string(), compression)))
+    }
+
+    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+        // For GCS, use buffered writer
+        if let Some(compression) = options.compression {
+            Ok(Box::new(GcsBufferedWriter::new_with_compression(uri.to_string(), compression)))
+        } else {
+            Ok(Box::new(GcsBufferedWriter::new(uri.to_string())))
+        }
+    }
+}
+
+/// Buffered writer for GCS that collects chunks and uses multipart upload
+pub struct GcsBufferedWriter {
+    uri: String,
+    buffer: Vec<u8>,
+    bytes_written: u64,
+    finalized: bool,
+    hasher: Hasher,
+    compression: CompressionConfig,
+    compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
+    compressed_bytes: u64,
+}
+
+impl GcsBufferedWriter {
+    pub fn new(uri: String) -> Self {
+        Self::new_with_compression(uri, CompressionConfig::None)
+    }
+    
+    pub fn new_with_compression(uri: String, compression: CompressionConfig) -> Self {
+        let compressor = match &compression {
+            CompressionConfig::None => None,
+            CompressionConfig::Zstd { level } => {
+                match zstd::Encoder::new(Vec::new(), *level) {
+                    Ok(encoder) => Some(encoder),
+                    Err(_) => None, // Fall back to no compression on error
+                }
+            }
+        };
+        
+        Self {
+            uri,
+            buffer: Vec::new(),
+            bytes_written: 0,
+            finalized: false,
+            hasher: Hasher::new(),
+            compression,
+            compressor,
+            compressed_bytes: 0,
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectWriter for GcsBufferedWriter {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if self.finalized {
+            bail!("Cannot write to finalized writer");
+        }
+        
+        self.hasher.update(chunk);
+        self.bytes_written += chunk.len() as u64;
+        
+        // Handle compression
+        if let Some(ref mut compressor) = self.compressor {
+            // Compress the chunk and add to buffer
+            compressor.write_all(chunk)?;
+            let compressed = compressor.get_mut();
+            self.buffer.append(compressed);
+        } else {
+            // No compression - direct to buffer
+            self.buffer.extend_from_slice(chunk);
+        }
+        
+        Ok(())
+    }
+    
+    async fn finalize(mut self: Box<Self>) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        
+        // Finalize compression if enabled
+        if let Some(compressor) = self.compressor.take() {
+            let compressed_data = compressor.finish()?;
+            self.buffer = compressed_data;
+        }
+        
+        self.compressed_bytes = self.buffer.len() as u64;
+        
+        // Append compression extension if needed
+        let mut final_uri = self.uri.clone();
+        if self.compression.is_enabled() {
+            if !final_uri.ends_with(self.compression.extension()) {
+                final_uri.push_str(self.compression.extension());
+            }
+        }
+        
+        // Parse URI and upload via GCS client
+        let (bucket, object) = parse_gcs_uri(&final_uri)?;
+        let client = GcsClient::new().await?;
+        
+        // Use multipart for large objects, simple put for small ones
+        if self.buffer.len() > crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE {
+            client.put_object_multipart(&bucket, &object, &self.buffer, crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE).await
+        } else {
+            client.put_object(&bucket, &object, &self.buffer).await
+        }
+    }
+    
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+    
+    fn checksum(&self) -> Option<String> {
+        Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
+    }
+    
+    fn compression(&self) -> CompressionConfig {
+        self.compression.clone()
+    }
+    
+    fn compression_ratio(&self) -> f64 {
+        if self.bytes_written == 0 || !self.compression.is_enabled() {
+            1.0
+        } else {
+            // Use current buffer size if not finalized yet, otherwise use compressed_bytes
+            let current_compressed_size = if self.finalized {
+                self.compressed_bytes
+            } else {
+                self.buffer.len() as u64
+            };
+            current_compressed_size as f64 / self.bytes_written as f64
+        }
+    }
+    
+    async fn cancel(mut self: Box<Self>) -> Result<()> {
+        self.finalized = true;
+        self.buffer.clear();
+        if let Some(compressor) = self.compressor {
+            drop(compressor); // Clean up compressor
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Convenience factory that picks a backend from a URI
 // ============================================================================
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
@@ -1093,7 +1396,7 @@ pub fn store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Log
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3    => S3ObjectStore::boxed(),
         Scheme::Azure => AzureObjectStore::boxed(),
-        Scheme::Gcs   => bail!("GCS backend not yet fully implemented"),
+        Scheme::Gcs   => GcsObjectStore::boxed(),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     

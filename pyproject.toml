@@ -1,7 +1,7 @@
 [project]
 name = "s3dlio"
-version = "0.8.16"
-description = "High-performance S3, Azure, and file system operations for AI/ML"
+version = "0.8.18"
+description = "High-performance S3, Azure, GCS, and file system operations for AI/ML"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []

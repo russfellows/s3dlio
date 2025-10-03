@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.8.16"
+version = "0.8.18"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "AGPL-3.0"
