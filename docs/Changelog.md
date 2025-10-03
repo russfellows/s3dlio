@@ -1,5 +1,18 @@
 # s3dlio Changelog
 
+## Version 0.8.19 - Universal Commands Across All Backends (October 2025)
+
+**See full details in [docs/v0.8.19-RELEASE-NOTES.md](./v0.8.19-RELEASE-NOTES.md)**
+
+### Key Features
+- **Universal `ls` command** with regex pattern filtering across all 5 backends (S3, GCS, Azure, File, DirectIO)
+- **Universal `stat` command** with improved output formatting (only shows fields with values)
+- **Python API updates**: `list()` and `stat()` now work universally across all backends
+- **S3 region fix**: `list-buckets` now correctly uses `us-east-1` region
+- **Deprecation**: `list` command deprecated in favor of `ls` (backward compatible with warning)
+
+---
+
 ## Version 0.8.18 - GCS Backend Phase 2 Complete (October 2025)
 
 ### 🎯 **Release Focus: GCS ObjectStore Integration & Multi-Backend CLI**
