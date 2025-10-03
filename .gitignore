@@ -24,3 +24,7 @@ venv/
 # Python extension modules (compiled from Rust via maturin)
 *.so
 */_pymod.cpython-*.so
+
+# Local environment files with secrets (do not commit)
+*.local
+*-env.local

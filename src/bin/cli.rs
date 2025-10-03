@@ -13,6 +13,13 @@
 //! s3Rust-cli put         s3://bucket/key               # put one or more object
 //! s3Rust-cli upload      local-file s3://bucket/key    # upload one or more objects
 //! s3Rust-cli download    s3://bucket/key local-file    # download  one or more object
+//!
+//! # Multi-backend support (S3, Azure, GCS, file://, direct://)
+//! s3dlio upload files/*.txt s3://bucket/data/           # S3
+//! s3dlio upload files/*.txt az://account/container/     # Azure
+//! s3dlio upload files/*.txt gs://bucket/data/           # Google Cloud Storage
+//! s3dlio upload files/*.txt file:///local/path/         # Local filesystem
+//! s3dlio upload files/*.txt direct:///fast/storage/     # DirectIO
 //! ```
 
 use anyhow::{bail, Context, Result};
@@ -31,7 +38,7 @@ use glob;
 
 // Import shared functions from the crate.
 use s3dlio::{
-    delete_objects, get_objects_parallel, parse_s3_uri, stat_object_uri, 
+    get_objects_parallel, parse_s3_uri, stat_object_uri, 
     put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
     list_buckets,
     object_store::store_for_uri_with_logger,
@@ -263,12 +270,12 @@ enum Command {
         #[arg(long = "chunk-size", default_value_t = 256 * 1024)]
         chunk_size: usize,
     },
-    /// Upload local files to any storage backend (S3, Azure, file://, direct://), supports glob and regex patterns
+    /// Upload local files to any storage backend (S3, Azure, GCS, file://, direct://), supports glob and regex patterns
     Upload {
         /// One or more local files, directories, glob patterns ('*','?'), or regex patterns
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        /// Destination URI (s3://bucket/, az://container/, file:///path/, direct:///path/) **ending with '/'**
+        /// Destination URI (s3://bucket/, az://container/, gs://bucket/, file:///path/, direct:///path/) **ending with '/'**
         dest: String,
         /// Maximum parallel uploads
         #[arg(short = 'j', long = "jobs", default_value_t = 32)]
@@ -277,7 +284,7 @@ enum Command {
         #[arg(short = 'c', long = "create-bucket")]
         create_bucket: bool,
     },
-    /// Download objects from any storage backend (S3, Azure, file://, direct://), supports glob and regex patterns
+    /// Download objects from any storage backend (S3, Azure, GCS, file://, direct://), supports glob and regex patterns
     Download {
         /// Source URI with optional patterns – supports full URIs, prefixes, globs ('*','?'), and regex patterns
         src: String,
@@ -291,11 +298,12 @@ enum Command {
         recursive: bool,     
     },
 
-    /// List objects using generic storage URI (supports s3://, az://, file://, direct://)
+    /// List objects using generic storage URI (supports s3://, az://, gs://, file://, direct://)
     /// Example: s3dlio ls s3://bucket/prefix/ -r
+    /// Example: s3dlio ls gs://bucket/prefix/ -r
     #[clap(name = "ls")]
     GenericList {
-        /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, file:///path/)
+        /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, gs://bucket/prefix/, file:///path/)
         uri: String,
 
         /// List objects recursively
@@ -448,7 +456,7 @@ async fn main() -> Result<()> {
             mp_get_cmd(&uri, procs, jobs, num, size, &template, interval)?
         }
     
-        Command::Delete { uri, jobs, recursive } => delete_cmd(&uri, jobs, recursive)?,
+        Command::Delete { uri, jobs, recursive } => delete_cmd(&uri, jobs, recursive).await?,
     
     
         Command::Upload { files, dest, jobs, create_bucket } => {
@@ -508,6 +516,14 @@ async fn main() -> Result<()> {
                         if let Some(container) = parts.get(0) {
                             if let Err(e) = store.create_container(container).await {
                                 warn!("Failed to create container {}: {}", container, e);
+                            }
+                        }
+                    } else if dest.starts_with("gs://") || dest.starts_with("gcs://") {
+                        // For GCS, extract bucket name
+                        let parts: Vec<&str> = dest.trim_start_matches("gs://").trim_start_matches("gcs://").split('/').collect();
+                        if let Some(bucket) = parts.get(0) {
+                            if let Err(e) = store.create_container(bucket).await {
+                                warn!("Failed to create GCS bucket {}: {}", bucket, e);
                             }
                         }
                     }
@@ -803,25 +819,26 @@ fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, te
 }
 
 /// Delete command: deletes objects matching a key, prefix, or pattern.
-fn delete_cmd(uri: &str, _jobs: usize, recursive: bool) -> Result<()> {
-    let (bucket, mut key_pattern) = s3dlio::parse_s3_uri(uri)?;
-
-    // If the path ends with a slash, automatically append a wildcard to search inside it.
-    if key_pattern.ends_with('/') {
-        key_pattern.push_str(".*");
+async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool) -> Result<()> {
+    use s3dlio::object_store::store_for_uri_with_logger;
+    
+    // Use generic object store to delete objects (works with all backends)
+    let logger = global_logger();
+    let store = store_for_uri_with_logger(uri, logger)?;
+    
+    // If recursive or URI ends with '/', delete prefix; otherwise delete single object
+    if recursive || uri.ends_with('/') {
+        // Delete prefix
+        info!("Deleting prefix: {}", uri);
+        store.delete_prefix(uri).await?;
+        eprintln!("Deleted all objects under prefix: {}", uri);
+    } else {
+        // Delete single object
+        info!("Deleting object: {}", uri);
+        store.delete(uri).await?;
+        eprintln!("Deleted: {}", uri);
     }
-
-    // List the objects using the potentially modified pattern.
-    let keys_to_delete = s3dlio::s3_utils::list_objects(&bucket, &key_pattern, recursive)?;
-
-
-    if keys_to_delete.is_empty() {
-        bail!("No objects to delete under the specified URI");
-    }
-
-    eprintln!("Deleting {} objects…", keys_to_delete.len());
-    delete_objects(&bucket, &keys_to_delete)?;
-    eprintln!("Done.");
+    
     Ok(())
 }
 

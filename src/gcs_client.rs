@@ -268,7 +268,7 @@ impl GcsClient {
             .items
             .unwrap_or_default()
             .into_iter()
-            .map(|obj| format!("gs://{}/{}", bucket, obj.name))
+            .map(|obj| obj.name)  // Return just the object name, not full URI
             .collect();
 
         debug!("GCS LIST success: {} objects", result.len());

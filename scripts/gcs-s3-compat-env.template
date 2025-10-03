@@ -1,0 +1,17 @@
+#!/bin/bash
+# GCS S3-Compatible Mode Environment Template
+# Copy this file to gcs-s3-compat-env.local and fill in your HMAC credentials
+# DO NOT commit .local files - they are in .gitignore
+
+# For Google Cloud Storage with S3-compatible HMAC keys
+# Get HMAC keys from: https://console.cloud.google.com/storage/settings
+# Create interoperability keys (HMAC) for your service account
+
+export AWS_ENDPOINT_URL="https://storage.googleapis.com"
+export AWS_ACCESS_KEY_ID="YOUR_GCS_ACCESS_KEY_HERE"
+export AWS_SECRET_ACCESS_KEY="YOUR_GCS_SECRET_KEY_HERE"
+
+echo "GCS S3-Compatible Mode configured"
+echo "Endpoint: $AWS_ENDPOINT_URL"
+echo "Access Key: ${AWS_ACCESS_KEY_ID:0:10}..."
+echo "Test with: s3-cli ls s3://your-bucket/"

@@ -1,0 +1,21 @@
+#!/bin/bash
+# GCS Native Authentication Environment Template
+# Copy this file to gcs-native-env.local and fill in your credentials
+# DO NOT commit .local files - they are in .gitignore
+
+# For Google Cloud Storage with Application Default Credentials (ADC)
+# Run this command first:
+#   gcloud auth application-default login
+#
+# This will create credentials at:
+#   ~/.config/gcloud/application_default_credentials.json
+#
+# Then source this file:
+#   source gcs-native-env.local
+
+# No additional environment variables needed for ADC
+# The gcloud-storage SDK will automatically discover credentials
+
+echo "GCS Native Authentication (ADC) configured"
+echo "Credentials location: ~/.config/gcloud/application_default_credentials.json"
+echo "Test with: s3-cli ls gs://your-bucket/"
