@@ -810,6 +810,43 @@ pub fn get_objects_parallel(
     })
 }
 
+/// Download many objects concurrently with progress tracking (ordered by input).
+pub fn get_objects_parallel_with_progress(
+    uris: &[String],
+    max_in_flight: usize,
+    progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let uris = uris.to_vec(); // own for 'static
+    run_on_global_rt(async move {
+        let sem = Arc::new(Semaphore::new(max_in_flight));
+        let mut futs = FuturesUnordered::new();
+
+        for uri in uris.iter().cloned() {
+            let sem = Arc::clone(&sem);
+            let progress = progress_callback.clone();
+            futs.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
+                let data = get_object_uri_optimized_async(&uri).await?;
+                let byte_count = data.len() as u64;
+                
+                // Update progress if callback provided
+                if let Some(ref progress) = progress {
+                    progress.object_completed(byte_count);
+                }
+                
+                Ok::<_, anyhow::Error>((uri, data))
+            }));
+        }
+        let mut out = Vec::with_capacity(uris.len());
+        while let Some(res) = futs.next().await {
+            out.push(res??);
+        }
+        // keep input order
+        out.sort_by_key(|(u, _)| uris.iter().position(|x| x == u).unwrap());
+        Ok(out)
+    })
+}
+
 
 /// Optimized async get object call that uses concurrent range downloads for larger objects
 #[cfg_attr(feature = "profiling", instrument(
@@ -881,6 +918,16 @@ pub fn put_objects_with_random_data_and_type(
     max_in_flight: usize,
     config: Config,
 ) -> Result<()> {
+    put_objects_with_random_data_and_type_with_progress(uris, size, max_in_flight, config, None)
+}
+
+pub fn put_objects_with_random_data_and_type_with_progress(
+    uris: &[String],
+    size: usize,
+    max_in_flight: usize,
+    config: Config,
+    progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
+) -> Result<()> {
     info!(
         "put_objects: type={:?}, size={} bytes, uris={} parallelism={}",
         config.object_type, size, uris.len(), max_in_flight
@@ -889,7 +936,7 @@ pub fn put_objects_with_random_data_and_type(
     let buffer: Bytes = generate_object(&config)?.into();  // or: Bytes::from(generate_object(&config)?)
     let uris_vec = uris.to_vec();                     // own for 'static
     debug!("Uploading buffer of {} bytes to {} URIs", buffer.len(), uris_vec.len());
-    put_objects_parallel(uris_vec, buffer, max_in_flight)
+    put_objects_parallel_with_progress(uris_vec, buffer, max_in_flight, progress_callback)
 }
 
 
@@ -932,10 +979,22 @@ pub async fn put_object_multipart_uri_async(
 // -----------------------------------------------------------------------------
 //
 
+// TODO: Consider removing this function in a future version once all callers
+// have migrated to put_objects_parallel_with_progress. Kept for backward compatibility.
+#[allow(dead_code)]
 pub(crate) fn put_objects_parallel(
     uris: Vec<String>,
     data: Bytes,                    // ref-counted, cheap to clone
     max_in_flight: usize,
+) -> anyhow::Result<()> {
+    put_objects_parallel_with_progress(uris, data, max_in_flight, None)
+}
+
+pub(crate) fn put_objects_parallel_with_progress(
+    uris: Vec<String>,
+    data: Bytes,                    // ref-counted, cheap to clone
+    max_in_flight: usize,
+    progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> anyhow::Result<()> {
     run_on_global_rt(async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));
@@ -944,12 +1003,20 @@ pub(crate) fn put_objects_parallel(
         for uri in uris.into_iter() {
             let sem = Arc::clone(&sem);
             let payload = data.clone();           // zero-copy clone
+            let progress = progress_callback.clone();
 
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 let (b, k) = parse_s3_uri(&uri)?;
                 // &[u8] view over Bytes — no copy here
-                put_object_async(&b, &k, payload.as_ref()).await
+                put_object_async(&b, &k, payload.as_ref()).await?;
+                
+                // Update progress after successful upload
+                if let Some(progress) = progress {
+                    progress.object_completed(payload.len() as u64);
+                }
+                
+                Ok::<_, anyhow::Error>(())
             }));
         }
 

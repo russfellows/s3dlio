@@ -116,12 +116,14 @@ pub use crate::s3_utils::{
     delete_objects,
     get_object_uri,
     get_objects_parallel,
+    get_objects_parallel_with_progress,
     list_objects,
     list_buckets,
     BucketInfo,
     parse_s3_uri,
     stat_object_uri,
     put_objects_with_random_data_and_type,
+    put_objects_with_random_data_and_type_with_progress,
     DEFAULT_OBJECT_SIZE,
 };
 
