@@ -1,5 +1,47 @@
 # s3dlio Changelog
 
+## Version 0.8.20 - Progress Bar Fixes & Universal Backend Support for GET/PUT (October 2025)
+
+### 🎯 **Release Focus: CLI Progress Tracking & Backend Consistency**
+
+This release fixes a critical issue where progress bars in the CLI would jump to 100% at completion instead of updating incrementally during operations. Additionally, `get` and `put` commands have been converted from S3-specific implementations to use the universal ObjectStore interface, ensuring consistent behavior across all 5 storage backends.
+
+### ✨ **Bug Fixes**
+
+#### **Progress Bar Functionality** 🔧
+- **Fixed incremental progress updates**: Progress bars now update continuously during async operations instead of jumping to 100% at completion
+- **GET command progress tracking**: Added proper `ProgressCallback` integration with parallel downloads
+- **PUT command progress tracking**: Added proper `ProgressCallback` integration with parallel uploads
+- **Real-time throughput display**: Progress bars show accurate transfer speeds during operations
+
+#### **Universal Backend Architecture** 🌐
+- **GET command universality**: Converted from S3-specific `get_objects_parallel()` to universal ObjectStore interface
+- **PUT command universality**: Converted from S3-specific implementation to universal ObjectStore interface
+- **Multi-backend credential checking**: Commands now only require credentials for their respective backends (S3, GCS, Azure)
+- **Consistent behavior**: GET/PUT commands now work identically across all backends: `s3://`, `gs://`, `az://`, `file://`, `direct://`
+
+### 🔧 **Technical Improvements**
+
+#### **API Enhancements**
+- **Backward compatibility maintained**: All existing Rust library APIs unchanged - other projects using s3dlio continue to work without modifications
+- **New progress-aware functions**: Added `get_objects_parallel_with_progress()` and `put_objects_with_random_data_and_type_with_progress()` with optional progress callbacks
+- **Wrapper pattern**: Original functions now call progress-aware versions with `None` for progress callback
+
+#### **Architecture Consistency**
+- **Universal ObjectStore usage**: All CLI commands now consistently use the ObjectStore trait
+- **Performance preservation**: Maintained semaphore-based concurrency and FuturesUnordered async patterns
+- **Clean builds**: Resolved all compiler warnings with proper dead code annotations
+
+### 🧪 **Testing**
+
+#### **Verified Functionality**
+- **File backend testing**: Successfully tested GET/PUT progress tracking with `file://` URIs
+- **Progress tracking validation**: Confirmed incremental updates during parallel operations
+- **Round-trip operations**: Verified PUT followed by GET operations work correctly
+- **Multi-backend support**: Commands properly detect and handle different URI schemes
+
+---
+
 ## Version 0.8.19 - Universal Commands Across All Backends (October 2025)
 
 **See full details in [docs/v0.8.19-RELEASE-NOTES.md](./v0.8.19-RELEASE-NOTES.md)**

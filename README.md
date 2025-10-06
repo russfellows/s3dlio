@@ -2,14 +2,25 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-121%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Version](https://img.shields.io/badge/version-0.8.19-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.8.20-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-## 🌟 What's New in v0.8.19
+## 🌟 What's New in v0.8.20
+
+**Progress Bar Fixes & Universal GET/PUT Commands** 🔧
+
+- ✅ **Fixed CLI Progress Bars**: Progress now updates incrementally during operations instead of jumping to 100% at completion
+- ✅ **Universal GET/PUT**: Commands now work across all 5 backends (S3, GCS, Azure, File, DirectIO) using ObjectStore interface
+- ✅ **Backward Compatible**: All existing Rust library APIs unchanged - other projects continue to work without modifications
+- ✅ **Real-time Metrics**: Progress bars show accurate transfer speeds and incremental completion
+
+---
+
+## 📝 Previous Release - v0.8.19
 
 **Universal Commands Across All Backends** 🔧
 

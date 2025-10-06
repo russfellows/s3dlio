@@ -33,17 +33,19 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tempfile::NamedTempFile;
 use glob;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 
 
 // Import shared functions from the crate.
 use s3dlio::{
-    get_objects_parallel, parse_s3_uri,
-    put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE, ObjectType,
+    parse_s3_uri,
+    DEFAULT_OBJECT_SIZE, ObjectType,
     list_buckets,
     object_store::store_for_uri_with_logger,
     mp,
     config::{DataGenMode, Config},
+    data_gen::generate_object,
 };
 
 use s3dlio::{generic_upload_files, generic_download_objects};
@@ -357,18 +359,26 @@ async fn list_buckets_cmd() -> Result<()> {
 }
 
 
+/// Check if AWS credentials are available for S3 operations
+fn check_aws_credentials() -> Result<()> {
+    if std::env::var("AWS_ACCESS_KEY_ID").is_err() || std::env::var("AWS_SECRET_ACCESS_KEY").is_err() {
+        bail!("Missing required AWS environment variables. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and optionally AWS_REGION) either in your environment or in a .env file.");
+    }
+    Ok(())
+}
+
+/// Check if credentials are needed based on URI scheme
+fn requires_aws_credentials(uri: &str) -> bool {
+    // Only S3 URIs require AWS credentials
+    // Other schemes (gs://, az://, file://, direct://) use their own auth methods
+    uri.starts_with("s3://")
+}
+
 /// Main CLI function
 #[tokio::main]
 async fn main() -> Result<()> {
     // Loads any variables from .env file that are not already set
     dotenvy::dotenv().ok();
-
-    // Optionally, pre-check required AWS variables.
-    if std::env::var("AWS_ACCESS_KEY_ID").is_err() || std::env::var("AWS_SECRET_ACCESS_KEY").is_err() {
-        eprintln!("Error: Missing required environment variables. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and optionally AWS_REGION) either in your environment or in a .env file.");
-        std::process::exit(1);
-    }
-
 
     let cli = Cli::parse();
 
@@ -399,13 +409,15 @@ async fn main() -> Result<()> {
     }
 
     match cli.cmd {
-        // List all buckets command
+        // List all buckets command (S3-specific)
         Command::ListBuckets => {
+            check_aws_credentials()?;
             list_buckets_cmd().await?;
         },
 
-        // New, create-bucket command
+        // New, create-bucket command (S3-specific)
         Command::CreateBucket { bucket_name } => {
+            check_aws_credentials()?;
             // Reliably clean the input to get a valid bucket name by
             // stripping the protocol prefix and any trailing slashes.
             let final_bucket_name = bucket_name
@@ -419,6 +431,7 @@ async fn main() -> Result<()> {
         },
 
         Command::DeleteBucket { bucket_name } => {
+            check_aws_credentials()?;
             // Reliably clean the input to get a valid bucket name
             let final_bucket_name = bucket_name
                 .strip_prefix("s3://")
@@ -433,6 +446,7 @@ async fn main() -> Result<()> {
         // --- Update the `List` command handler.
         // It now unpacks `s3_path` and `recursive` and calls our new backend function.
         Command::List { s3_path, recursive } => {
+            check_aws_credentials()?;  // S3-only command
             // Deprecation warning
             eprintln!("WARNING: The 'list' command is deprecated and S3-only.");
             eprintln!("Please use 'ls' for universal multi-backend support:");
@@ -457,22 +471,48 @@ async fn main() -> Result<()> {
             writeln!(out, "\nTotal objects: {}", keys.len())?;
         }
     
-        Command::Stat { uri } => stat_cmd(&uri).await?,
+        Command::Stat { uri } => {
+            // Only check AWS credentials if using S3
+            if requires_aws_credentials(&uri) {
+                check_aws_credentials()?;
+            }
+            stat_cmd(&uri).await?
+        },
     
         // New, with regex and recursion
         Command::Get { uri, jobs, concurrent, keylist, recursive } => {
-            get_cmd(uri.as_deref(), jobs, concurrent, keylist.as_deref(), recursive)?
+            // Only check AWS credentials if URI is S3
+            if let Some(uri_str) = &uri {
+                if requires_aws_credentials(uri_str) {
+                    check_aws_credentials()?;
+                }
+            }
+            get_cmd(uri.as_deref(), jobs, concurrent, keylist.as_deref(), recursive).await?
         }
         
         // Multi-process GET for maximum throughput
         Command::MpGet { uri, procs, jobs, num, size, template, interval } => {
+            // Check AWS credentials for S3 URIs
+            if requires_aws_credentials(&uri) {
+                check_aws_credentials()?;
+            }
             mp_get_cmd(&uri, procs, jobs, num, size, &template, interval)?
         }
     
-        Command::Delete { uri, jobs, recursive } => delete_cmd(&uri, jobs, recursive).await?,
+        Command::Delete { uri, jobs, recursive } => {
+            // Check AWS credentials for S3 URIs
+            if requires_aws_credentials(&uri) {
+                check_aws_credentials()?;
+            }
+            delete_cmd(&uri, jobs, recursive).await?
+        },
     
     
         Command::Upload { files, dest, jobs, create_bucket } => {
+            // Check AWS credentials only for S3 destinations
+            if requires_aws_credentials(&dest) {
+                check_aws_credentials()?;
+            }
             // Calculate total size of files to upload for progress tracking
             let mut total_bytes = 0u64;
             let mut file_count = 0;
@@ -555,6 +595,10 @@ async fn main() -> Result<()> {
         }
     
         Command::Download { src, dest_dir, jobs, recursive } => {
+            // Check AWS credentials only for S3 sources
+            if requires_aws_credentials(&src) {
+                check_aws_credentials()?;
+            }
             // Use generic object store to list objects (works with all backends)
             let logger = global_logger();
             let store = store_for_uri_with_logger(&src, logger)?;
@@ -581,22 +625,37 @@ async fn main() -> Result<()> {
         }
     
         Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size } => {
-            let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
-            if create_bucket_flag {
-                if let Err(e) = s3dlio::s3_utils::create_bucket(&bucket) {
-                    eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
+            // Check AWS credentials only for S3 operations
+            if requires_aws_credentials(&uri_prefix) {
+                check_aws_credentials()?;
+                
+                // Handle S3-specific bucket creation
+                if create_bucket_flag {
+                    let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
+                    if let Err(e) = s3dlio::s3_utils::create_bucket(&bucket) {
+                        eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
+                    }
                 }
             }
     
-            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size)?
+            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size).await?
 
         }
 
         Command::GenericList { uri, recursive, pattern } => {
+            // Check AWS credentials only for S3 URIs
+            if requires_aws_credentials(&uri) {
+                check_aws_credentials()?;
+            }
             generic_list_cmd(&uri, recursive, pattern.as_deref()).await?
         }
 
         Command::TfrecordIndex { tfrecord_path, index_path } => {
+            // Check AWS credentials only for S3 paths
+            let tfrecord_str = tfrecord_path.to_string_lossy();
+            if requires_aws_credentials(&tfrecord_str) {
+                check_aws_credentials()?;
+            }
             tfrecord_index_cmd(&tfrecord_path, index_path.as_deref())?
         }
 
@@ -729,7 +788,7 @@ async fn stat_cmd(uri: &str) -> Result<()> {
 }
 
 /// Get command: downloads objects matching a key, prefix, or pattern.
-fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool) -> Result<()> {
+async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool) -> Result<()> {
     // Determine concurrency level (prefer concurrent over jobs for mp compatibility)
     let concurrency = concurrent.unwrap_or(jobs);
     
@@ -752,54 +811,114 @@ fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: O
         
         println!("Processing {} URIs from keylist with concurrency {}", uris.len(), concurrency);
         
+        // Create progress tracker for keylist mode
+        let progress_tracker = Arc::new(S3ProgressTracker::new("GET", uris.len() as u64, 0));
+        let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), uris.len() as u64));
+        
         let t0 = Instant::now();
-        let results = get_objects_parallel(&uris, concurrency)?;
+        
+        // Use universal ObjectStore interface for parallel downloads
+        let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut futs = futures_util::stream::FuturesUnordered::new();
+        let mut total_bytes = 0u64;
+        
+        for uri in &uris {
+            let sem = sem.clone();
+            let progress = progress_callback.clone();
+            let uri = uri.clone();
+            let logger = global_logger();
+            
+            futs.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
+                let store = store_for_uri_with_logger(&uri, logger)?;
+                let data = store.get(&uri).await?;
+                let byte_count = data.len() as u64;
+                
+                // Update progress
+                progress.object_completed(byte_count);
+                
+                Ok::<(String, u64), anyhow::Error>((uri, byte_count))
+            }));
+        }
+        
+        while let Some(result) = futs.next().await {
+            let (uri, byte_count) = result??;
+            total_bytes += byte_count;
+            info!("Downloaded {} bytes from {}", byte_count, uri);
+        }
+        
         let dt = t0.elapsed();
         
-        let total_bytes: usize = results.iter().map(|(_, bytes)| bytes.len()).sum();
+        // Update final progress
+        progress_callback.update_total_bytes(total_bytes);
+        progress_tracker.finish("Download", total_bytes, dt);
         
         // Report benchmark results (data is immediately discarded for benchmarking)
         let throughput_mb_s = (total_bytes as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64();
         println!("Benchmarked {} objects: {} bytes in {:.3}s ({:.2} MB/s)", 
-                 results.len(), total_bytes, dt.as_secs_f64(), throughput_mb_s);
+                 uris.len(), total_bytes, dt.as_secs_f64(), throughput_mb_s);
         
         return Ok(());
     }
     
-    // Original URI-based mode
+    // Original URI-based mode - use universal ObjectStore interface
     let uri_str = uri.ok_or_else(|| anyhow::anyhow!("Either --uri or --keylist must be provided"))?;
-    let (bucket, mut key_pattern) = s3dlio::parse_s3_uri(uri_str)?;
-
-    // If the path ends with a slash, automatically append a wildcard to search inside it.
-    if key_pattern.ends_with('/') {
-        key_pattern.push_str(".*");
-    }
-
-    // List the objects using the potentially modified pattern.
-    let keys_to_get = s3dlio::s3_utils::list_objects(&bucket, &key_pattern, recursive)?;
-
-    if keys_to_get.is_empty() {
-        bail!("No objects match pattern '{}' in bucket '{}'", uri_str, bucket);
-    }
-
-    let uris: Vec<String> = keys_to_get.into_iter().map(|k| format!("s3://{}/{}", bucket, k)).collect();
     
-    // Create progress bar for download operation
-    let progress = S3ProgressTracker::new("GET", uris.len() as u64, 0); // We don't know total bytes yet
-    progress.progress_bar.set_message(format!("Preparing to download {} objects...", uris.len()));
+    // Only check AWS credentials if using S3 backend
+    if requires_aws_credentials(uri_str) {
+        check_aws_credentials()?;
+    }
+
+    // Use universal ObjectStore to list objects (works with all backends)
+    let logger = global_logger();
+    let store = store_for_uri_with_logger(uri_str, logger)?;
+    let keys = store.list(uri_str, recursive).await?;
+
+    if keys.is_empty() {
+        bail!("No objects match pattern '{}'", uri_str);
+    }
+
+    // Create progress tracker
+    let progress_tracker = Arc::new(S3ProgressTracker::new("GET", keys.len() as u64, 0));
+    let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), keys.len() as u64));
 
     let t0 = Instant::now();
-    let results = get_objects_parallel(&uris, jobs)?;
     
-    let total_bytes: usize = results.iter().map(|(_, bytes)| bytes.len()).sum();
+    // Use universal ObjectStore interface for parallel downloads
+    let sem = Arc::new(tokio::sync::Semaphore::new(jobs));
+    let mut futs = futures_util::stream::FuturesUnordered::new();
+    let mut total_bytes = 0u64;
+    
+    for uri in &keys {
+        let sem = sem.clone();
+        let progress = progress_callback.clone();
+        let uri = uri.clone();
+        let logger = global_logger();
+        
+        futs.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            let store = store_for_uri_with_logger(&uri, logger)?;
+            let data = store.get(&uri).await?;
+            let byte_count = data.len() as u64;
+            
+            // Update progress
+            progress.object_completed(byte_count);
+            
+            Ok::<(String, u64), anyhow::Error>((uri, byte_count))
+        }));
+    }
+    
+    while let Some(result) = futs.next().await {
+        let (uri, byte_count) = result??;
+        total_bytes += byte_count;
+        info!("Downloaded {} bytes from {}", byte_count, uri);
+    }
+    
     let dt = t0.elapsed();
 
-    // Update the progress bar total and position to show completed state
-    progress.set_total_bytes(total_bytes as u64);
-    progress.update(total_bytes as u64, uris.len() as u64, uris.len() as u64);
-
-    // Finish the progress bar with completion stats
-    progress.finish("Download", total_bytes as u64, dt);
+    // Update final progress and finish
+    progress_callback.update_total_bytes(total_bytes);
+    progress_tracker.finish("Download", total_bytes, dt);
 
     Ok(())
 }
@@ -898,12 +1017,13 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool) -> Result<()> {
 
 
 /// Put command supports 1 or more objects, also takes our ObjectType
-fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize, data_gen_mode: DataGenMode, chunk_size: usize) -> Result<()> {
-    // Parse the prefix into bucket and key prefix.
-    let (bucket, mut prefix) = parse_s3_uri(uri_prefix)?;
+async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize, data_gen_mode: DataGenMode, chunk_size: usize) -> Result<()> {
+    // Ensure prefix ends with '/' for consistent URI generation
+    let mut prefix = uri_prefix.to_string();
     if !prefix.ends_with('/') {
         prefix.push('/');
     }
+    
     // Generate the full list of URIs.
     let mut uris = Vec::with_capacity(num);
 
@@ -913,7 +1033,7 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
         let object_name = template
             .replacen("{}", &i.to_string(), 1)
             .replacen("{}", &num.to_string(), 1);
-        let full_uri = format!("s3://{}/{}{}", bucket, prefix, object_name);
+        let full_uri = format!("{}{}", prefix, object_name);
         uris.push(full_uri);
     }
 
@@ -922,19 +1042,56 @@ fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size:
     let total_bytes = num * size;
     
     // Create progress bar for upload operation
-    let progress = S3ProgressTracker::new("PUT", num as u64, total_bytes as u64);
-    progress.progress_bar.set_message(format!("Preparing to upload {} objects...", num));
+    let progress_tracker = Arc::new(S3ProgressTracker::new("PUT", num as u64, total_bytes as u64));
+    let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), num as u64));
+    progress_tracker.progress_bar.set_message(format!("Preparing to upload {} objects...", num));
 
     let t0 = Instant::now();
-    // Create config with specified data generation mode and chunk size
+    
+    // Generate test data
     let config = Config::new_with_defaults(object_type, 1, size, dedup_f, compress_f)
         .with_data_gen_mode(data_gen_mode)
         .with_chunk_size(chunk_size);
-    put_objects_with_random_data_and_type(&uris, size, effective_jobs, config)?;
+    let data = generate_object(&config)?;
+    
+    // Use universal ObjectStore interface for parallel uploads
+    let sem = Arc::new(tokio::sync::Semaphore::new(effective_jobs));
+    let mut futs = FuturesUnordered::new();
+    let logger = global_logger();
+    
+    for uri in &uris {
+        let sem = sem.clone();
+        let progress = progress_callback.clone();
+        let uri = uri.clone();
+        let data = data.clone();
+        let logger = logger.clone();
+        
+        futs.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            let store = store_for_uri_with_logger(&uri, logger)?;
+            store.put(&uri, &data).await?;
+            let byte_count = data.len() as u64;
+            
+            // Update progress
+            progress.object_completed(byte_count);
+            
+            Ok::<(String, u64), anyhow::Error>((uri, byte_count))
+        }));
+    }
+    
+    let mut total_uploaded_bytes = 0u64;
+    while let Some(result) = futs.next().await {
+        let (uri, byte_count) = result??;
+        total_uploaded_bytes += byte_count;
+        info!("Uploaded {} bytes to {}", byte_count, uri);
+    }
+    
     let elapsed = t0.elapsed();
 
-    // Finish the progress bar with completion stats
-    progress.finish("Upload", total_bytes as u64, elapsed);
+    // Update final progress and finish
+    progress_callback.update_total_bytes(total_uploaded_bytes);
+    progress_tracker.finish("Upload", total_uploaded_bytes, elapsed);
+    
     Ok(())
 }
 
