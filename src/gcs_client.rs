@@ -13,7 +13,11 @@ use gcloud_storage::http::objects::list::ListObjectsRequest;
 use gcloud_storage::http::buckets::insert::InsertBucketRequest;
 use gcloud_storage::http::buckets::delete::DeleteBucketRequest;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 use tracing::{debug, info};
+
+// Global cached GCS client - initialized once and reused across all operations
+static GCS_CLIENT: OnceCell<Arc<Client>> = OnceCell::const_new();
 
 /// Minimal object metadata for GCS objects.
 /// Maps to the provider-neutral ObjectMetadata type in object_store.rs.
@@ -37,25 +41,32 @@ pub struct GcsClient {
 
 impl GcsClient {
     /// Create a new GCS client using Application Default Credentials.
+    /// This now uses a cached global client for efficiency - authentication only happens once.
     /// 
     /// The credentials are automatically discovered from:
     /// - GOOGLE_APPLICATION_CREDENTIALS env var (loaded by dotenvy)
     /// - Metadata server (if running on GCP)
     /// - gcloud CLI credentials
     pub async fn new() -> Result<Self> {
-        debug!("Initializing GCS client with Application Default Credentials");
+        let client = GCS_CLIENT
+            .get_or_try_init(|| async {
+                debug!("Initializing GCS client with Application Default Credentials (first time only)");
+                
+                // Use with_auth() to automatically discover credentials
+                let config = ClientConfig::default()
+                    .with_auth()
+                    .await
+                    .map_err(|e| anyhow!("Failed to initialize GCS authentication: {}", e))?;
+                
+                let client = Client::new(config);
+                
+                info!("GCS client initialized successfully with Application Default Credentials (cached for reuse)");
+                Ok::<Arc<Client>, anyhow::Error>(Arc::new(client))
+            })
+            .await?;
         
-        // Use with_auth() to automatically discover credentials
-        let config = ClientConfig::default()
-            .with_auth()
-            .await
-            .map_err(|e| anyhow!("Failed to initialize GCS authentication: {}", e))?;
-        
-        let client = Client::new(config);
-        
-        info!("GCS client initialized successfully with Application Default Credentials");
         Ok(Self {
-            client: Arc::new(client),
+            client: Arc::clone(client),
         })
     }
 

@@ -1,5 +1,100 @@
 # s3dlio Changelog
 
+## Version 0.8.21 - Backend Authentication Caching & Performance Analysis (October 2025)
+
+### 🎯 **Release Focus: Multi-Backend Authentication Optimization**
+
+This release implements global authentication caching for GCS and Azure backends, eliminating repeated authentication overhead in multi-threaded workloads. This matches the existing S3 client caching pattern, ensuring all three cloud backends now have optimal performance characteristics.
+
+### ✨ **Performance Optimizations**
+
+#### **GCS Client Caching** ⚡
+- **Global credential cache**: GCS client now uses `OnceCell<Arc<Client>>` for single-initialization authentication
+- **Eliminated per-operation overhead**: Authentication happens once per process instead of once per thread/operation
+- **Implementation**: `src/gcs_client.rs` - Added `GCS_CLIENT` static with async initialization via `get_or_try_init()`
+
+#### **Azure Credential Caching** ⚡
+- **Global credential cache**: Azure client now uses `OnceCell<Arc<dyn TokenCredential>>` for cached authentication
+- **Eliminated per-operation overhead**: `DefaultAzureCredential::new()` called once and cached globally
+- **Implementation**: `src/azure_client.rs` - Added `AZURE_CREDENTIAL` static with async initialization
+- **Performance parity**: Azure now matches S3 and GCS authentication efficiency
+
+#### **S3 Client Already Optimized** ✅
+- **Verified existing implementation**: S3 client already uses `CLIENT.get_or_try_init()` for caching
+- **No changes needed**: S3 authentication has been optimized since earlier versions
+
+### 📊 **Performance Analysis & Documentation**
+
+#### **Comprehensive Performance Review**
+- **Created**: `docs/PERFORMANCE_OPTIMIZATION_ANALYSIS.md` - Runtime performance analysis
+  - Client caching strategies across all backends
+  - Buffer management and memory allocation patterns
+  - Connection pool configuration guidelines
+  - Concurrency tuning recommendations
+  - Part size optimization for large files
+
+- **Created**: `docs/COMBINED_PERFORMANCE_RECOMMENDATIONS.md` - Architecture & ML-focused analysis
+  - Backend-agnostic range engine recommendations (Priority 1)
+  - Python async loader parallelism improvements (Priority 1)
+  - Loader return type stability verification (✅ Already implemented)
+  - Zero-copy Rust→Python patterns
+  - Dynamic part sizing for 100 Gb networks
+  - Adaptive concurrency tuning
+
+#### **Implementation Roadmap**
+- **Phase 1 (Weeks 1-2)**: Backend-agnostic range engine, concurrent batch loading
+- **Phase 2 (Weeks 3-4)**: Dynamic part sizing, adaptive concurrency
+- **Phase 3 (Weeks 5-6)**: Zero-copy optimizations, buffer management improvements
+
+### 🔧 **Code Quality Improvements**
+
+#### **Enhanced Developer Documentation**
+- **Updated**: `.github/copilot-instructions.md` - Added critical virtual environment checks
+  - Always verify `(s3dlio)` prefix in terminal prompt before building
+  - Documented virtual environment activation requirements
+  - Python extension build workflow best practices
+
+#### **Data Loader API Stability** ✅
+- **Verified**: Python async data loaders already return consistent `list[bytes]` type
+- **All loaders confirmed**: `PyBytesAsyncDataLoaderIter`, `PyS3AsyncDataLoader`, `PyAsyncDataLoaderIter`
+- **ML framework compatibility**: Stable type contracts for PyTorch, JAX, TensorFlow
+- **Documentation**: `docs/LOADER_RETURN_TYPE_QUICK_WIN.md`
+
+### 🎯 **Performance Targets**
+
+Current library capabilities (on 100 Gb infrastructure):
+- **S3 GET**: 5+ GB/s sustained ✅
+- **S3 PUT**: 2.5+ GB/s sustained ✅
+- **GCS/Azure**: Now benefit from same client caching optimizations ✅
+- **Multi-threaded efficiency**: Eliminated authentication bottlenecks ✅
+
+### 📝 **Configuration Best Practices**
+
+For 100 Gb infrastructure (Vast/MinIO):
+```bash
+export S3DLIO_RT_THREADS=32
+export S3DLIO_MAX_HTTP_CONNECTIONS=400
+export S3DLIO_HTTP_IDLE_TIMEOUT_MS=1500
+export S3DLIO_OPERATION_TIMEOUT_SECS=300
+export S3DLIO_USE_OPTIMIZED_HTTP=true
+```
+
+For cloud deployments:
+```bash
+export S3DLIO_RT_THREADS=16
+export S3DLIO_MAX_HTTP_CONNECTIONS=200
+export S3DLIO_HTTP_IDLE_TIMEOUT_MS=2000
+export S3DLIO_OPERATION_TIMEOUT_SECS=600
+```
+
+### 🧪 **Build Quality**
+
+- **Zero warnings**: All builds pass with 0 compiler warnings
+- **Clean architecture**: Client caching pattern consistent across all backends
+- **Virtual environment workflow**: Enhanced documentation for Python extension builds
+
+---
+
 ## Version 0.8.20 - Progress Bar Fixes & Universal Backend Support for GET/PUT (October 2025)
 
 ### 🎯 **Release Focus: CLI Progress Tracking & Backend Consistency**

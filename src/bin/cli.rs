@@ -176,6 +176,10 @@ enum Command {
         /// Perform the operation recursively.
         #[clap(short, long)]
         recursive: bool,
+        
+        /// Optional regex pattern to filter objects to delete (applied client-side, works with all backends).
+        #[clap(short, long)]
+        pattern: Option<String>,
     },
     /// Download one or many objects concurrently.
     Get {
@@ -499,12 +503,12 @@ async fn main() -> Result<()> {
             mp_get_cmd(&uri, procs, jobs, num, size, &template, interval)?
         }
     
-        Command::Delete { uri, jobs, recursive } => {
+        Command::Delete { uri, jobs, recursive, pattern } => {
             // Check AWS credentials for S3 URIs
             if requires_aws_credentials(&uri) {
                 check_aws_credentials()?;
             }
-            delete_cmd(&uri, jobs, recursive).await?
+            delete_cmd(&uri, jobs, recursive, pattern.as_deref()).await?
         },
     
     
@@ -991,24 +995,80 @@ fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, te
 }
 
 /// Delete command: deletes objects matching a key, prefix, or pattern.
-async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool) -> Result<()> {
+async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&str>) -> Result<()> {
     use s3dlio::object_store::store_for_uri_with_logger;
+    use regex::Regex;
     
     // Use generic object store to delete objects (works with all backends)
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger)?;
     
-    // If recursive or URI ends with '/', delete prefix; otherwise delete single object
+    // If recursive or URI ends with '/', delete prefix; otherwise check if it's a pattern
     if recursive || uri.ends_with('/') {
-        // Delete prefix
-        info!("Deleting prefix: {}", uri);
-        store.delete_prefix(uri).await?;
-        eprintln!("Deleted all objects under prefix: {}", uri);
+        if let Some(pat) = pattern {
+            // Delete with regex filter
+            let mut keys = store.list(uri, recursive).await?;
+            let re = Regex::new(pat)
+                .with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
+            keys.retain(|k| re.is_match(k));
+            
+            if keys.is_empty() {
+                eprintln!("No objects match pattern '{}' under prefix '{}'", pat, uri);
+                return Ok(());
+            }
+            
+            info!("Deleting {} objects matching pattern '{}' under prefix '{}'", keys.len(), pat, uri);
+            eprintln!("Found {} objects matching pattern '{}'", keys.len(), pat);
+            
+            for key in &keys {
+                store.delete(key).await?;
+                info!("Deleted: {}", key);
+            }
+            
+            eprintln!("Deleted {} objects", keys.len());
+        } else {
+            // Delete entire prefix without filter
+            info!("Deleting prefix: {}", uri);
+            store.delete_prefix(uri).await?;
+            eprintln!("Deleted all objects under prefix: {}", uri);
+        }
     } else {
-        // Delete single object
-        info!("Deleting object: {}", uri);
-        store.delete(uri).await?;
-        eprintln!("Deleted: {}", uri);
+        // First, try to list objects with this URI as a prefix to see if it matches multiple objects
+        let mut keys = store.list(uri, false).await?;
+        
+        // Apply regex filter if provided
+        if let Some(pat) = pattern {
+            let re = Regex::new(pat)
+                .with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
+            keys.retain(|k| re.is_match(k));
+        }
+        
+        if keys.is_empty() {
+            // No objects found with this prefix, try as exact object name
+            info!("Deleting single object: {}", uri);
+            store.delete(uri).await?;
+            eprintln!("Deleted: {}", uri);
+        } else if keys.len() == 1 && keys[0] == uri && pattern.is_none() {
+            // Exactly one object and it matches the URI exactly (no pattern filter)
+            info!("Deleting single object: {}", uri);
+            store.delete(uri).await?;
+            eprintln!("Deleted: {}", uri);
+        } else {
+            // Multiple objects match the prefix (or pattern filter was applied)
+            info!("Deleting {} objects matching prefix: {}", keys.len(), uri);
+            if let Some(pat) = pattern {
+                eprintln!("Found {} objects matching prefix '{}' and pattern '{}'", keys.len(), uri, pat);
+            } else {
+                eprintln!("Found {} objects matching prefix '{}'", keys.len(), uri);
+            }
+            
+            for key in &keys {
+                store.delete(key).await?;
+                info!("Deleted: {}", key);
+            }
+            
+            eprintln!("Deleted {} objects", keys.len());
+        }
     }
     
     Ok(())

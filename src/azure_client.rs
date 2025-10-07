@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 use azure_core::credentials::TokenCredential;
 use azure_core::http::{Body, NoFormat, RequestContent, XmlFormat};
@@ -19,6 +20,9 @@ use azure_storage_blob::models::{
     BlockBlobClientStageBlockOptions, BlockBlobClientUploadOptions, BlockList, BlockListType,
     BlockLookupList, ListBlobsFlatSegmentResponse,
 };
+
+// Global credential cache to avoid repeated authentication
+static AZURE_CREDENTIAL: OnceCell<Arc<dyn TokenCredential>> = OnceCell::const_new();
 
 /// Minimal properties surfaced by `stat`.
 #[derive(Debug, Clone)]
@@ -50,16 +54,43 @@ impl AzureBlob {
     /// Build with Entra ID (AAD) default chain (env, managed identity, etc).
     pub fn with_default_credential(account: &str, container: &str) -> Result<Self> {
         let account_url = Self::account_url_from_account(account);
-        let credential_arc = DefaultAzureCredential::new()?;
-        let credential: Arc<dyn TokenCredential> = credential_arc;
-        Ok(Self { account_url, container: container.to_string(), credential })
+        
+        // Get or initialize the global credential (only authenticates once per process)
+        let credential = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                AZURE_CREDENTIAL.get_or_try_init(|| async {
+                    let credential_arc = DefaultAzureCredential::new()?;
+                    let credential: Arc<dyn TokenCredential> = credential_arc;
+                    Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
+                }).await
+            })
+        })?;
+        
+        Ok(Self { 
+            account_url, 
+            container: container.to_string(), 
+            credential: Arc::clone(credential) 
+        })
     }
 
     /// Same, when a full endpoint URL (possibly emulator) is provided.
     pub fn with_default_credential_from_url(account_url: &str, container: &str) -> Result<Self> {
-        let credential_arc = DefaultAzureCredential::new()?;
-        let credential: Arc<dyn TokenCredential> = credential_arc;
-        Ok(Self { account_url: account_url.to_string(), container: container.to_string(), credential })
+        // Get or initialize the global credential (only authenticates once per process)
+        let credential = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                AZURE_CREDENTIAL.get_or_try_init(|| async {
+                    let credential_arc = DefaultAzureCredential::new()?;
+                    let credential: Arc<dyn TokenCredential> = credential_arc;
+                    Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
+                }).await
+            })
+        })?;
+        
+        Ok(Self { 
+            account_url: account_url.to_string(), 
+            container: container.to_string(), 
+            credential: Arc::clone(credential) 
+        })
     }
 
     /// Blob service (rarely needed directly).

@@ -188,19 +188,13 @@ impl PyBytesAsyncDataLoaderIter {
             match guard.recv().await {
                 Some(Ok(batch)) => {
                     Python::with_gil(|py| {
-                        if batch.len() == 1 {
-                            // Return individual item for batch_size = 1
-                            let item = &batch[0];
-                            let obj: Py<PyAny> = PyBytes::new(py, item).into_any().unbind();
-                            Ok(obj)
-                        } else {
-                            // Return list for batch_size > 1
-                            let py_list = PyList::empty(py);
-                            for item in batch {
-                                py_list.append(PyBytes::new(py, &item))?;
-                            }
-                            Ok(py_list.into_any().unbind())
+                        // Always return list[bytes] for consistent type contract
+                        // This ensures PyTorch/JAX/TF pipelines get stable types
+                        let py_list = PyList::empty(py);
+                        for item in batch {
+                            py_list.append(PyBytes::new(py, &item))?;
                         }
+                        Ok(py_list.into_any().unbind())
                     })
                 }
                 Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
