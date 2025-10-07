@@ -249,6 +249,20 @@ impl GcsClient {
     }
 
     /// List objects with optional prefix filtering.
+    /// List objects in a GCS bucket with optional prefix filtering.
+    /// 
+    /// **Pagination**: This method automatically handles GCS pagination to retrieve
+    /// all matching objects, not just the first 1000. GCS returns a maximum of 1000
+    /// objects per API call by default. This implementation uses the `next_page_token`
+    /// from each response to fetch subsequent pages until all objects are retrieved.
+    /// 
+    /// # Arguments
+    /// * `bucket` - The GCS bucket name
+    /// * `prefix` - Optional prefix filter for object names
+    /// * `recursive` - If false, uses delimiter "/" for directory-like listing
+    /// 
+    /// # Returns
+    /// Complete list of all matching object names (not URIs)
     pub async fn list_objects(
         &self,
         bucket: &str,
@@ -260,30 +274,55 @@ impl GcsClient {
             bucket, prefix, recursive
         );
 
-        let mut request = ListObjectsRequest {
-            bucket: bucket.to_string(),
-            prefix: prefix.map(|s| s.to_string()),
-            ..Default::default()
-        };
+        let mut all_objects = Vec::new();
+        let mut page_token: Option<String> = None;
 
-        // For non-recursive, use delimiter to only list "folders"
-        if !recursive {
-            request.delimiter = Some("/".to_string());
+        // Pagination loop - GCS returns max 1000 objects per page by default
+        loop {
+            let mut request = ListObjectsRequest {
+                bucket: bucket.to_string(),
+                prefix: prefix.map(|s| s.to_string()),
+                page_token: page_token.clone(),
+                ..Default::default()
+            };
+
+            // For non-recursive, use delimiter to only list "folders"
+            if !recursive {
+                request.delimiter = Some("/".to_string());
+            }
+
+            debug!(
+                "GCS LIST page request: page_token={:?}",
+                page_token.as_ref().map(|t| format!("{}...", &t[..t.len().min(20)]))
+            );
+
+            let response = self.client.list_objects(&request)
+                .await
+                .map_err(|e| anyhow!("GCS LIST failed for bucket {}: {}", bucket, e))?;
+
+            // Collect objects from this page
+            let page_objects: Vec<String> = response
+                .items
+                .unwrap_or_default()
+                .into_iter()
+                .map(|obj| obj.name)  // Return just the object name, not full URI
+                .collect();
+
+            debug!("GCS LIST page received: {} objects", page_objects.len());
+            all_objects.extend(page_objects);
+
+            // Check for next page token
+            if let Some(next_token) = response.next_page_token {
+                page_token = Some(next_token);
+                debug!("GCS LIST continuing to next page");
+            } else {
+                debug!("GCS LIST no more pages, breaking");
+                break;
+            }
         }
 
-        let response = self.client.list_objects(&request)
-            .await
-            .map_err(|e| anyhow!("GCS LIST failed for bucket {}: {}", bucket, e))?;
-
-        let result: Vec<String> = response
-            .items
-            .unwrap_or_default()
-            .into_iter()
-            .map(|obj| obj.name)  // Return just the object name, not full URI
-            .collect();
-
-        debug!("GCS LIST success: {} objects", result.len());
-        Ok(result)
+        debug!("GCS LIST success: {} total objects", all_objects.len());
+        Ok(all_objects)
     }
 
     /// Create a new GCS bucket.
