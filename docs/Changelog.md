@@ -1,5 +1,76 @@
 # s3dlio Changelog
 
+## Version 0.8.22 - GCS Pagination Fix (October 2025)
+
+### 🐛 **Critical Bug Fix: GCS List/Delete Limited to 1000 Objects**
+
+This release fixes a critical pagination bug in Google Cloud Storage operations that limited list and delete operations to only the first 1000 objects, even when more objects existed.
+
+#### **Issue**
+- **GCS list operations**: Only returned first 1000 objects from bucket/prefix
+- **GCS delete operations**: Only deleted first 1000 objects when deleting by prefix
+- **Root cause**: Missing pagination loop in `GcsClient::list_objects()`
+- **S3 comparison**: S3 operations were already correct (had pagination since earlier versions)
+
+#### **Fix Details**
+- **File**: `src/gcs_client.rs`
+- **Method**: `GcsClient::list_objects()`
+- **Implementation**: Added pagination loop using GCS `page_token` / `next_page_token` pattern
+- **Pattern**: Matches existing S3 pagination implementation (S3 uses `continuation_token` / `next_continuation_token`)
+
+```rust
+// Before: Single page only (limited to 1000 objects)
+let response = self.client.list_objects(&request).await?;
+let result: Vec<String> = response.items.unwrap_or_default()...
+
+// After: Full pagination support
+let mut all_objects = Vec::new();
+let mut page_token: Option<String> = None;
+
+loop {
+    let mut request = ListObjectsRequest {
+        page_token: page_token.clone(),
+        ...
+    };
+    
+    let response = self.client.list_objects(&request).await?;
+    all_objects.extend(response.items...);
+    
+    if let Some(next_token) = response.next_page_token {
+        page_token = Some(next_token);
+    } else {
+        break;
+    }
+}
+```
+
+#### **Impact**
+✅ **Fixed**: GCS list operations now return ALL matching objects  
+✅ **Fixed**: GCS delete_prefix now deletes ALL matching objects  
+✅ **No regression**: Single-page results (<1000 objects) work as before  
+✅ **S3/Azure**: No changes needed (S3 already correct, Azure uses different API)
+
+#### **Testing**
+- **Test guide**: `docs/GCS-PAGINATION-TEST-GUIDE.md`
+- **Verification**: Code review against GCS API documentation
+- **Comparison**: Matches proven S3 pagination pattern
+- **Build**: Zero compiler warnings
+
+### 📚 **Documentation**
+
+- **Added**: `docs/GCS-PAGINATION-TEST-GUIDE.md` - Comprehensive testing guide
+  - Root cause analysis and code comparison
+  - Test strategy for >1000 object scenarios
+  - Debug logging examples
+  - Manual verification checklist
+
+### 🔍 **API References**
+- [GCS Objects.list API](https://cloud.google.com/storage/docs/json_api/v1/objects/list)
+- GCS default: 1000 objects per page
+- Pagination field: `page_token` → `next_page_token`
+
+---
+
 ## Version 0.8.21 - Backend Authentication Caching & Performance Analysis (October 2025)
 
 ### 🎯 **Release Focus: Multi-Backend Authentication Optimization**
