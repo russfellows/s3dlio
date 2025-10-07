@@ -96,6 +96,13 @@ cargo clippy --all-targets --all-features
 - **Build process**: `./build_pyo3.sh` → `./install_pyo3_wheel.sh`
 - **Critical testing rule**: Always test installed package, never development `python/` directory
 
+**CRITICAL: Virtual Environment Check**
+- **ALWAYS verify virtual environment is active** before any build/install commands
+- Check for `(s3dlio)` prefix in terminal prompt
+- If not active, run: `source .venv/bin/activate`
+- Terminal interrupts (Ctrl-C) may exit the virtual environment
+- Re-activate before continuing work
+
 ## Key Development Patterns
 
 ### URI-based Universal Interface
@@ -124,9 +131,26 @@ When modifying backends, always use feature gates:
 
 ## Critical Development Workflows
 
+**CRITICAL: Always Check Virtual Environment Before Building**
+```bash
+# STEP 1: ALWAYS verify virtual environment is active
+# Look for (s3dlio) prefix in prompt
+# If missing, activate:
+source .venv/bin/activate
+
+# STEP 2: Then proceed with builds
+cargo build --release
+# or
+./build_pyo3.sh
+```
+
 ### Python Extension Development
 ```bash
 # REQUIRED workflow after any Rust changes
+# FIRST: Ensure virtual environment is active
+source .venv/bin/activate  # If not already active
+
+# Then build and install
 ./build_pyo3.sh && ./install_pyo3_wheel.sh
 python tests/test_functionality.py  # Tests installed package
 ```
