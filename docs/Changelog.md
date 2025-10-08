@@ -1,5 +1,111 @@
 # s3dlio Changelog
 
+## Version 0.9.0 - API-Stable Beta with Breaking Changes (October 2025)
+
+### 🚨 **BREAKING CHANGES**
+
+#### **ObjectStore Trait Returns Bytes (Not Vec<u8>)**
+- **Breaking**: `ObjectStore::get()` now returns `Result<Bytes>` instead of `Result<Vec<u8>>`
+- **Breaking**: `ObjectStore::get_range()` now returns `Result<Bytes>` instead of `Result<Vec<u8>>`
+- **Impact**: Code using ObjectStore directly must handle `Bytes` or call `.to_vec()`
+- **Python API**: Unchanged - conversion happens internally
+- **Helper methods**: Unchanged - still return `Vec<u8>` for backward compatibility
+
+**Migration**:
+```rust
+// Old (v0.8.x)
+let data: Vec<u8> = store.get(uri).await?;
+
+// New (v0.9.0) - Option 1: Use Bytes
+let data: Bytes = store.get(uri).await?;
+
+// New (v0.9.0) - Option 2: Convert to Vec
+let data: Vec<u8> = store.get(uri).await?.to_vec();
+```
+
+### ✨ **New Features**
+
+#### **1. Zero-Copy Performance (Stage 2)**
+- **10-15% memory reduction**: Eliminated unnecessary Vec allocations
+- **S3/Azure zero-copy**: SDKs return Bytes, we now return directly (no `.to_vec()`)
+- **Efficient concatenation**: Use `BytesMut` for concurrent range downloads
+- **Cheap cloning**: Bytes are Arc-like, cloning doesn't duplicate data
+
+#### **2. Concurrent Batch Loading (Stage 1)**
+- **3-8x faster Python batch loading**: Concurrent fetching in `spawn_stream()`
+- **JoinSet + Semaphore pattern**: Efficient async task management
+- **Configurable concurrency**: Control parallelism via `LoaderOptions`
+- **Python API enhancement**: Transparent performance improvement
+
+#### **3. Optional Adaptive Tuning (Stage 4)**
+- **Opt-in auto-tuning**: Disabled by default, users explicitly enable
+- **Smart part sizing**: 8 MB (small files) → 16 MB (medium) → 32 MB (large)
+- **Smart concurrency**: 2x-8x CPU count based on workload type
+- **Explicit override**: User settings ALWAYS take precedence
+- **API**: `WriterOptions::with_adaptive()`, `LoaderOptions::with_adaptive()`
+
+**Usage**:
+```rust
+// Enable adaptive tuning
+let opts = WriterOptions::new().with_adaptive();
+
+// Explicit settings override adaptive
+let opts = WriterOptions::new()
+    .with_adaptive()
+    .with_part_size(20 * 1024 * 1024); // 20 MB used, adaptive ignored
+```
+
+### 📚 **Documentation**
+
+- **New**: `docs/ADAPTIVE-TUNING.md` - Complete adaptive tuning guide
+- **New**: `docs/STAGE3-DEFERRAL.md` - Stage 3 deferral explanation
+- **New**: `examples/adaptive_tuning_demo.rs` - Comprehensive demo
+
+### 🧪 **Testing**
+
+- **91 unit tests pass** (10 new adaptive config tests)
+- **30 Python tests pass** (100% pass rate)
+- **Zero compilation warnings**
+- **All backends tested**: S3, Azure, GCS, File, DirectIO
+
+### 🔧 **API Changes**
+
+**New Public Types**:
+- `AdaptiveConfig` - Optional auto-tuning configuration
+- `AdaptiveMode` - Enabled/Disabled enum
+- `WorkloadType` - Small/Medium/Large file classifications
+- `AdaptiveParams` - Parameter computation
+
+**New Methods**:
+- `WriterOptions::with_adaptive()` - Enable adaptive tuning
+- `WriterOptions::with_adaptive_config()` - Custom adaptive config
+- `WriterOptions::effective_part_size()` - Compute effective part size
+- `WriterOptions::effective_buffer_size()` - Compute effective buffer size
+- `LoaderOptions::with_adaptive()` - Enable adaptive tuning
+- `LoaderOptions::with_adaptive_config()` - Custom adaptive config
+- `LoaderOptions::effective_part_size()` - Compute effective part size
+- `LoaderOptions::effective_concurrency()` - Compute effective concurrency
+
+### ⚡ **Performance Summary**
+
+- **Memory**: 10-15% reduction (zero-copy Bytes)
+- **Batch loading**: 3-8x faster (concurrent fetching)
+- **Adaptive tuning**: Minimal overhead (microseconds at config time)
+
+### 🗺️ **Roadmap**
+
+- **v0.9.1**: Stage 3 (Backend-agnostic range engine) - NON-BREAKING performance enhancement
+  - 30-50% throughput improvement for File/Azure/GCS large files
+  - All backends get S3-level range performance
+
+### 🔗 **Commits**
+
+- Stage 1: Python loader concurrent batching (0994a1a)
+- Stage 2: Zero-copy Bytes migration (d214dfc)
+- Stage 4: Optional adaptive tuning (b4fd8b3)
+
+---
+
 ## Version 0.8.23 - Delete Operation Progress Tracking (October 2025)
 
 ### ✨ **Enhancement: Real-time Progress for Delete Operations**
