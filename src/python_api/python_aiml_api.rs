@@ -15,7 +15,8 @@ use pyo3::conversion::IntoPyObjectExt;
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use futures_util::StreamExt;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::task::JoinSet;
 
 use numpy::ndarray as nd_np;
 use numpy::PyArrayDyn;
@@ -145,25 +146,66 @@ impl PyBytesAsyncDataLoaderIter {
     ) -> PyResult<Py<Self>> {
         let (tx, rx) = mpsc::channel::<Result<Vec<Vec<u8>>, DatasetError>>(opts.prefetch.max(1));
 
-        // Spawn the producer task
+        // Extract concurrency setting for concurrent batch fetching
+        // Default to 8 workers if num_workers is 0
+        let num_workers = if opts.num_workers > 0 { opts.num_workers } else { 8 };
+
+        // Spawn the producer task with concurrent batch fetching
         pyo3_async_runtimes::tokio::get_runtime()
             .spawn(async move {
-                // Create a simple batch iterator from the dataset
                 let batch_size = opts.batch_size.max(1);
+                let semaphore = Arc::new(Semaphore::new(num_workers));
+                
                 if let Some(len) = dataset.inner.len() {
                     let mut i = 0;
                     while i < len {
-                        let mut batch = Vec::new();
-                        for j in 0..batch_size {
-                            if i + j >= len { break; }
-                            match dataset.inner.get(i + j).await {
-                                Ok(data) => batch.push(data),
-                                Err(e) => {
+                        // Collect indices for this batch
+                        let batch_indices: Vec<usize> = (0..batch_size)
+                            .filter_map(|j| {
+                                let idx = i + j;
+                                if idx < len { Some(idx) } else { None }
+                            })
+                            .collect();
+                        
+                        if batch_indices.is_empty() { break; }
+                        
+                        // Fetch batch items CONCURRENTLY using JoinSet
+                        let mut join_set = JoinSet::new();
+                        for (order, idx) in batch_indices.iter().enumerate() {
+                            let dataset_clone = dataset.clone();
+                            let sem = Arc::clone(&semaphore);
+                            let idx = *idx;
+                            
+                            join_set.spawn(async move {
+                                let _permit = sem.acquire().await.unwrap();
+                                let data = dataset_clone.inner.get(idx).await?;
+                                Ok::<(usize, Vec<u8>), DatasetError>((order, data))
+                            });
+                        }
+                        
+                        // Collect results preserving order
+                        let mut batch_results: Vec<Option<Vec<u8>>> = vec![None; batch_indices.len()];
+                        while let Some(result) = join_set.join_next().await {
+                            match result {
+                                Ok(Ok((order, data))) => {
+                                    batch_results[order] = Some(data);
+                                }
+                                Ok(Err(e)) => {
                                     let _ = tx.send(Err(e)).await;
+                                    return;
+                                }
+                                Err(join_err) => {
+                                    let _ = tx.send(Err(DatasetError::from(join_err.to_string()))).await;
                                     return;
                                 }
                             }
                         }
+                        
+                        // Convert to batch (filter_map skips None, but all should be Some)
+                        let batch: Vec<Vec<u8>> = batch_results.into_iter()
+                            .filter_map(|x| x)
+                            .collect();
+                        
                         if !batch.is_empty() {
                             if tx.send(Ok(batch)).await.is_err() { break; }
                         }

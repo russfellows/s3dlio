@@ -1,5 +1,54 @@
 # s3dlio Changelog
 
+## Version 0.8.23 - Delete Operation Progress Tracking (October 2025)
+
+### ✨ **Enhancement: Real-time Progress for Delete Operations**
+
+This release adds comprehensive progress tracking to delete operations, providing visual feedback during long-running deletions (e.g., 93,000+ objects).
+
+#### **Delete Progress Tracking**
+- **Progress bar**: Real-time visual progress for all multi-object deletions
+- **Rate display**: Shows objects/second deletion rate
+- **ETA calculation**: Estimated time to completion
+- **Two-phase feedback**:
+  1. "Listing objects to delete..." - During list/pagination phase
+  2. Progress bar with live updates during deletion phase
+
+#### **Implementation Details**
+- **File**: `src/bin/cli.rs` - Enhanced `delete_cmd()` function
+- **All delete scenarios covered**:
+  - Recursive prefix deletion (`--recursive` or trailing `/`)
+  - Pattern-filtered deletion (`--pattern`)
+  - Multi-object prefix matches
+- **Uses indicatif progress bars** matching GET/PUT operation style
+- **Progress template**: `Deleting: {spinner} [{elapsed}] [{bar}] {pos}/{len} objects ({per_sec}, ETA: {eta})`
+
+#### **User Experience Improvements**
+- **Before**: Silent operation for minutes with no feedback on 93,000+ object deletions
+- **After**: 
+  - Immediate feedback: "Listing objects to delete..."
+  - Count shown: "Found 93,000 objects to delete"
+  - Live progress: Visual bar updating as each object is deleted
+  - Completion message: "Deleted 93,000 objects"
+
+#### **Example Output**
+```bash
+$ s3-cli delete gs://bucket/prefix/ --recursive
+Listing objects to delete...
+Found 93,000 objects to delete
+Deleting: ⠋ [00:02:15] [████████████████░░░░░░░░] 65,432/93,000 objects (485.2/s, ETA: 00:00:57)
+```
+
+### 🔧 **Technical Notes**
+
+- **No performance impact**: Progress updates are lightweight
+- **Pagination handled**: Works correctly with GCS (1000/page), Azure (5000/page), S3 (1000/page)
+- **All backends supported**: S3, GCS, Azure, File, DirectIO
+- **Single object deletions**: No progress bar (immediate)
+- **Consistent with existing operations**: Matches GET/PUT progress style
+
+---
+
 ## Version 0.8.22 - GCS Pagination Fix (October 2025)
 
 ### 🐛 **Critical Bug Fix: GCS List/Delete Limited to 1000 Objects**
