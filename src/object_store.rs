@@ -166,10 +166,16 @@ pub fn infer_scheme(uri: &str) -> Scheme {
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Get entire object into memory.
-    async fn get(&self, uri: &str) -> Result<Vec<u8>>;
+    /// 
+    /// Returns `Bytes` for zero-copy efficiency. The S3/Azure SDKs return data as `Bytes`,
+    /// allowing us to avoid unnecessary allocations. Use `.as_ref()` to get &[u8] or
+    /// `.to_vec()` only when ownership is required.
+    async fn get(&self, uri: &str) -> Result<Bytes>;
 
     /// Get a byte-range. If `length` is None, read from `offset` to end.
-    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>>;
+    /// 
+    /// Returns `Bytes` for zero-copy efficiency.
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes>;
 
     /// Put full object (single-shot).
     async fn put(&self, uri: &str, data: &[u8]) -> Result<()>;
@@ -212,7 +218,8 @@ pub trait ObjectStore: Send + Sync {
             }
         }
         
-        Ok(data)
+        // Convert Bytes to Vec<u8> for backward compatibility
+        Ok(data.to_vec())
     }
     
     /// Get byte range with integrity validation.
@@ -234,7 +241,8 @@ pub trait ObjectStore: Send + Sync {
             }
         }
         
-        Ok(data)
+        // Convert Bytes to Vec<u8> for backward compatibility
+        Ok(data.to_vec())
     }
     
     /// Load and validate checkpoint data with integrity checking.
@@ -256,7 +264,8 @@ pub trait ObjectStore: Send + Sync {
             }
         }
         
-        Ok(data)
+        // Convert Bytes to Vec<u8> for backward compatibility
+        Ok(data.to_vec())
     }
 
     /// Default copy reads then writes. Backends can override with server-side copy.
@@ -306,7 +315,8 @@ pub trait ObjectStore: Send + Sync {
     async fn get_optimized(&self, uri: &str) -> Result<Vec<u8>> {
         // Default implementation: delegate to regular get()
         // S3ObjectStore will override this with concurrent range logic
-        self.get(uri).await
+        // Convert Bytes to Vec<u8> for backward compatibility
+        self.get(uri).await.map(|b| b.to_vec())
     }
 
     /// High-performance optimized range GET operation.
@@ -321,7 +331,8 @@ pub trait ObjectStore: Send + Sync {
     ) -> Result<Vec<u8>> {
         // Default implementation: delegate to regular get_range()
         // S3ObjectStore will override this with concurrent range logic
-        self.get_range(uri, offset, length).await
+        // Convert Bytes to Vec<u8> for backward compatibility
+        self.get_range(uri, offset, length).await.map(|b| b.to_vec())
     }
 
 }
@@ -462,12 +473,12 @@ impl S3ObjectStore {
 
 #[async_trait]
 impl ObjectStore for S3ObjectStore {
-    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get(&self, uri: &str) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         s3_get_object_uri_async(uri).await
     }
 
-    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         s3_get_object_range_uri_async(uri, offset, length).await
     }
@@ -546,12 +557,12 @@ impl ObjectStore for S3ObjectStore {
         
         if object_size >= threshold {
             debug!("Using concurrent range GET for large object: {} bytes", object_size);
-            // Use concurrent range GET for large objects
-            crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await
+            // Use concurrent range GET for large objects - convert Bytes to Vec<u8>
+            crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await.map(|b| b.to_vec())
         } else {
             debug!("Using standard GET for small object: {} bytes", object_size);
-            // Use standard GET for small objects
-            self.get(uri).await
+            // Use standard GET for small objects - convert Bytes to Vec<u8>
+            self.get(uri).await.map(|b| b.to_vec())
         }
     }
 
@@ -579,12 +590,12 @@ impl ObjectStore for S3ObjectStore {
         
         if transfer_size >= threshold {
             debug!("Using concurrent range GET for large transfer: {} bytes", transfer_size);
-            // Use concurrent range GET for large transfers
-            crate::s3_utils::get_object_concurrent_range_async(uri, offset, length, chunk_size, max_concurrency).await
+            // Use concurrent range GET for large transfers - convert Bytes to Vec<u8>
+            crate::s3_utils::get_object_concurrent_range_async(uri, offset, length, chunk_size, max_concurrency).await.map(|b| b.to_vec())
         } else {
             debug!("Using standard range GET for small transfer: {} bytes", transfer_size);
-            // Use standard range GET for small transfers
-            self.get_range(uri, offset, length).await
+            // Use standard range GET for small transfers - convert Bytes to Vec<u8>
+            self.get_range(uri, offset, length).await.map(|b| b.to_vec())
         }
     }
 }
@@ -803,17 +814,17 @@ impl AzureObjectStore {
 
 #[async_trait]
 impl ObjectStore for AzureObjectStore {
-    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get(&self, uri: &str) -> Result<Bytes> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
-        let b = cli.get(&key).await?; // Bytes
-        Ok(b.to_vec())
+        let b = cli.get(&key).await?; // Bytes - return directly for zero-copy
+        Ok(b)
     }
 
-    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         let end = length.map(|len| offset + len - 1);
-        let b = cli.get_range(&key, offset, end).await?;
-        Ok(b.to_vec())
+        let b = cli.get_range(&key, offset, end).await?; // Bytes - return directly for zero-copy
+        Ok(b)
     }
 
     async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
@@ -1104,13 +1115,13 @@ impl GcsObjectStore {
 
 #[async_trait]
 impl ObjectStore for GcsObjectStore {
-    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get(&self, uri: &str) -> Result<Bytes> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let client = Self::get_client().await?;
         client.get_object(&bucket, &object).await
     }
 
-    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let client = Self::get_client().await?;
         client.get_object_range(&bucket, &object, offset, length).await

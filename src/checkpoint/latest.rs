@@ -303,7 +303,7 @@ mod tests {
         
         // Verify content preserved
         let content = store.get(&dst_uri).await?;
-        assert_eq!(content, b"test atomic rename content");
+        assert_eq!(content.as_ref(), b"test atomic rename content");
         
         println!("✓ Filesystem rename atomicity test passed");
         
@@ -363,7 +363,7 @@ mod tests {
         
         // Verify content
         let content = store.get(&dst_uri).await?;
-        assert_eq!(content, b"cross-directory rename test");
+        assert_eq!(content.as_ref(), b"cross-directory rename test");
         
         println!("✓ Cross-directory atomic rename test passed");
         

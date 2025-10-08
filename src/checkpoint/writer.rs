@@ -478,7 +478,7 @@ mod tests {
             // Verify the file was written correctly
             let uri = format!("{}/{}", writer.base_uri.trim_end_matches('/'), custom_key);
             let read_data = store.get(&uri).await?;
-            assert_eq!(read_data, data);
+            assert_eq!(read_data.as_ref(), data);
             assert_eq!(bytes_written, data.len() as u64);
             
             println!("✓ Custom key streaming writer test passed");

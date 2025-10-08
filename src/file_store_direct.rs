@@ -4,6 +4,7 @@
 // This module provides direct I/O capabilities that bypass the page cache
 
 use anyhow::{bail, Result};
+use bytes::Bytes;
 use crate::object_store::WriterOptions;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -693,19 +694,21 @@ impl ConfigurableFileSystemObjectStore {
     }
 
     /// Read file with O_DIRECT if configured
-    async fn read_file_direct(&self, path: &Path) -> Result<Vec<u8>> {
+    async fn read_file_direct(&self, path: &Path) -> Result<Bytes> {
         if !self.config.direct_io {
             // Fallback to normal tokio read
-            return Ok(fs::read(path).await?);
+            let data = fs::read(path).await?;
+            return Ok(Bytes::from(data));
         }
 
         // For O_DIRECT, we need to be careful about alignment and may need to fall back
         match self.try_read_file_direct(path).await {
-            Ok(data) => Ok(data),
+            Ok(data) => Ok(Bytes::from(data)),
             Err(e) => {
                 // If O_DIRECT fails, fall back to regular I/O
                 warn!("O_DIRECT read failed for {}, falling back to regular I/O: {}", path.display(), e);
-                Ok(fs::read(path).await?)
+                let data = fs::read(path).await?;
+                Ok(Bytes::from(data))
             }
         }
     }
@@ -867,7 +870,7 @@ impl ConfigurableFileSystemObjectStore {
     }
 
     /// Read range with O_DIRECT support
-    async fn read_range_direct(&self, path: &Path, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+    async fn read_range_direct(&self, path: &Path, offset: u64, length: Option<u64>) -> Result<Bytes> {
         if !self.config.direct_io {
             // Fallback to normal implementation
             let mut file = fs::File::open(path).await?;
@@ -884,12 +887,12 @@ impl ConfigurableFileSystemObjectStore {
                 buffer.truncate(bytes_read);
             }
             
-            return Ok(buffer);
+            return Ok(Bytes::from(buffer));
         }
 
         // Try O_DIRECT first, fall back to regular I/O if it fails
         match self.try_read_range_direct(path, offset, length).await {
-            Ok(data) => Ok(data),
+            Ok(data) => Ok(Bytes::from(data)),
             Err(e) => {
                 warn!("O_DIRECT range read failed for {}, falling back to regular I/O: {}", path.display(), e);
                 // Fall back to regular I/O
@@ -907,7 +910,7 @@ impl ConfigurableFileSystemObjectStore {
                     buffer.truncate(bytes_read);
                 }
                 
-                Ok(buffer)
+                Ok(Bytes::from(buffer))
             }
         }
     }
@@ -973,7 +976,7 @@ impl ConfigurableFileSystemObjectStore {
 
 #[async_trait]
 impl ObjectStore for ConfigurableFileSystemObjectStore {
-    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get(&self, uri: &str) -> Result<Bytes> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
@@ -988,7 +991,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         self.read_file_direct(&path).await
     }
 
-    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
         

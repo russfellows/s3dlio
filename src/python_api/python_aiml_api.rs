@@ -1329,9 +1329,11 @@ pub fn load_checkpoint_with_validation(
     py.allow_threads(|| {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             if validate_integrity {
+                // load_checkpoint_with_validation returns Vec<u8> for backward compatibility
                 store.load_checkpoint_with_validation(uri, None).await
             } else {
-                store.get(uri).await
+                // get returns Bytes, convert to Vec<u8>
+                store.get(uri).await.map(|b| b.to_vec())
             }
         })
     }).map_err(py_err)

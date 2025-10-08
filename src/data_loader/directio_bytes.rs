@@ -104,7 +104,9 @@ impl DirectIOBytesDataset {
         let store = store_for_uri(uri)
             .map_err(|e| DatasetError::from(format!("Failed to create Direct I/O store: {}", e)))?;
         
+        // Convert Bytes to Vec<u8> for Dataset API compatibility
         store.get(uri).await
+            .map(|bytes| bytes.to_vec())
             .map_err(|e| DatasetError::from(format!("Failed to read file with Direct I/O {}: {}", uri, e)))
     }
 }

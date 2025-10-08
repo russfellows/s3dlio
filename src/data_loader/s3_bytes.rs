@@ -69,7 +69,8 @@ impl Dataset for S3BytesDataset {
                 let bytes = get_object_uri_async(&uri)
                     .await
                     .map_err(DatasetError::from)?;
-                Ok(bytes)
+                // Convert Bytes to Vec<u8> for Dataset API compatibility
+                Ok(bytes.to_vec())
             }
             ReaderMode::Range => {
                 // HEAD to learn size
@@ -94,8 +95,9 @@ impl Dataset for S3BytesDataset {
                     .buffered(max_inflight);
 
                 while let Some(res) = chunks.next().await {
-                    let mut v = res.map_err(DatasetError::from)?;
-                    out.append(&mut v);
+                    let bytes = res.map_err(DatasetError::from)?;
+                    // Extend Vec with bytes from Bytes
+                    out.extend_from_slice(&bytes);
                 }
                 Ok(out)
             }

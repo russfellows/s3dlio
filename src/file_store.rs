@@ -5,6 +5,7 @@ use tracing::debug;
 // This provides the same ObjectStore interface for local filesystem operations
 
 use anyhow::{bail, Result};
+use bytes::Bytes;
 use crate::object_store::WriterOptions;
 use crate::page_cache::{apply_page_cache_hint};
 use crate::data_loader::options::PageCacheMode;
@@ -286,7 +287,7 @@ impl FileSystemObjectStore {
 
 #[async_trait]
 impl ObjectStore for FileSystemObjectStore {
-    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get(&self, uri: &str) -> Result<Bytes> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
@@ -314,10 +315,11 @@ impl ObjectStore for FileSystemObjectStore {
         let mut data = Vec::new();
         file.read_to_end(&mut data).await?;
         
-        Ok(data)
+        // Convert to Bytes (cheap, just wraps in Arc)
+        Ok(Bytes::from(data))
     }
 
-    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
@@ -355,7 +357,8 @@ impl ObjectStore for FileSystemObjectStore {
             buffer.truncate(bytes_read);
         }
         
-        Ok(buffer)
+        // Convert to Bytes (cheap, just wraps in Arc)
+        Ok(Bytes::from(buffer))
     }
 
     async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
