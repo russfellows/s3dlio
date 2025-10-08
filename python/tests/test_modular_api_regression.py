@@ -52,7 +52,9 @@ class TestModularAPI(unittest.TestCase):
     def test_aiml_functions_available(self):
         """Test that AI/ML functions are available."""
         aiml_functions = [
-            'read_npz', 'save_numpy_array', 'load_numpy_array'
+            'read_npz'
+            # Note: save_numpy_array and load_numpy_array are permanently removed
+            # They were disabled in v0.7.x and removed from v0.9.0 API
         ]
         
         for func_name in aiml_functions:
@@ -145,7 +147,8 @@ class TestModularAPI(unittest.TestCase):
         # but we can verify they're callable functions
         
         functions_to_test = [
-            'read_npz', 'save_numpy_array', 'load_numpy_array'
+            'read_npz'
+            # Note: save_numpy_array and load_numpy_array removed in v0.9.0
         ]
         
         for func_name in functions_to_test:
@@ -191,7 +194,8 @@ class TestModularAPI(unittest.TestCase):
             'get_many_async', 'put_async',
             
             # NumPy integration
-            'read_npz', 'save_numpy_array', 'load_numpy_array',
+            'read_npz',
+            # Note: save_numpy_array and load_numpy_array removed in v0.9.0
             
             # Data loaders
             'PyVecDataset', 'PyAsyncDataLoader',

@@ -103,7 +103,8 @@ impl<'a> Reader<'a> {
             decoder.read_to_end(&mut decompressed)?;
             Ok(decompressed)
         } else {
-            Ok(data)
+            // Convert Bytes to Vec<u8>
+            Ok(data.to_vec())
         }
     }
 

@@ -4,6 +4,7 @@
 // Provides high-level operations for GCS buckets and objects with Application Default Credentials (ADC).
 
 use anyhow::{anyhow, bail, Result};
+use bytes::Bytes;
 use gcloud_storage::client::{Client, ClientConfig};
 use gcloud_storage::http::objects::download::Range;
 use gcloud_storage::http::objects::get::GetObjectRequest;
@@ -71,7 +72,7 @@ impl GcsClient {
     }
 
     /// Get entire object as bytes.
-    pub async fn get_object(&self, bucket: &str, object: &str) -> Result<Vec<u8>> {
+    pub async fn get_object(&self, bucket: &str, object: &str) -> Result<Bytes> {
         debug!("GCS GET: bucket={}, object={}", bucket, object);
         
         let data = self.client.download_object(
@@ -85,7 +86,8 @@ impl GcsClient {
         .map_err(|e| anyhow!("GCS GET failed for gs://{}/{}: {}", bucket, object, e))?;
         
         debug!("GCS GET success: {} bytes", data.len());
-        Ok(data)
+        // Convert Vec<u8> to Bytes (cheap, just wraps in Arc)
+        Ok(Bytes::from(data))
     }
 
     /// Get a byte range from an object.
@@ -95,7 +97,7 @@ impl GcsClient {
         object: &str,
         offset: u64,
         length: Option<u64>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         debug!(
             "GCS GET RANGE: bucket={}, object={}, offset={}, length={:?}",
             bucket, object, offset, length
@@ -117,7 +119,8 @@ impl GcsClient {
         .map_err(|e| anyhow!("GCS GET RANGE failed for gs://{}/{}: {}", bucket, object, e))?;
 
         debug!("GCS GET RANGE success: {} bytes", data.len());
-        Ok(data)
+        // Convert Vec<u8> to Bytes (cheap, just wraps in Arc)
+        Ok(Bytes::from(data))
     }
 
     /// Upload object with simple upload (for small objects).

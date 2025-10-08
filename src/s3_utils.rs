@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 
 #[cfg(feature = "profiling")]
 use tracing::instrument;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use tracing::{info, debug};
 
@@ -388,7 +388,7 @@ pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<Str
         length = ?length
     )
 ))]
-pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() { bail!("Cannot GET range: no key specified"); }
     let client = aws_s3_client_async().await?;
@@ -407,7 +407,8 @@ pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u
         .await
         .context("get_object(range) failed")?;
     let body = resp.body.collect().await.context("collect range body")?;
-    Ok(body.into_bytes().to_vec())
+    // Zero-copy: return Bytes directly
+    Ok(body.into_bytes())
 }
 
 /// Read `length` bytes starting at `offset` from `s3://bucket/key`.
@@ -458,7 +459,7 @@ pub async fn get_object_concurrent_range_async(
     length: Option<u64>,
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {
         bail!("Cannot GET concurrent range: no key specified");
@@ -484,7 +485,7 @@ pub async fn get_object_concurrent_range_async(
     };
     
     if start_offset >= object_size {
-        return Ok(Vec::new());
+        return Ok(Bytes::new());
     }
     
     let total_bytes = end_offset - start_offset;
@@ -531,7 +532,7 @@ async fn concurrent_range_get_impl(
     end_offset: u64,
     chunk_size: usize,
     max_concurrency: usize,
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     let total_bytes = end_offset - start_offset;
     
     // Calculate chunk ranges
@@ -548,8 +549,8 @@ async fn concurrent_range_get_impl(
     // Create semaphore for concurrency control
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
     
-    // Use Arc<Mutex<Vec<u8>>> to store results
-    let result = Arc::new(std::sync::Mutex::new(vec![0u8; total_bytes as usize]));
+    // Use Arc<Mutex<BytesMut>> to store results
+    let result = Arc::new(std::sync::Mutex::new(BytesMut::zeroed(total_bytes as usize)));
     
     // Execute concurrent range requests
     let mut futures = FuturesUnordered::new();
@@ -595,13 +596,13 @@ async fn concurrent_range_get_impl(
         result_future.context("concurrent range request failed")?;
     }
     
-    // Extract final result
+    // Extract final result and convert to Bytes
     let final_result = Arc::try_unwrap(result)
         .map_err(|_| anyhow::anyhow!("Failed to unwrap result Arc"))?
         .into_inner()
         .map_err(|e| anyhow::anyhow!("Mutex poison error: {}", e))?;
     
-    Ok(final_result)
+    Ok(final_result.freeze())
 }
 
 /// Get optimal chunk size based on total transfer size
@@ -651,7 +652,7 @@ pub fn get_object_concurrent_range(
     length: Option<u64>,
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     let uri_owned = uri.to_string(); // Clone the URI to avoid lifetime issues
     run_on_global_rt(async move {
         get_object_concurrent_range_async(&uri_owned, offset, length, chunk_size, max_concurrency).await
@@ -767,7 +768,7 @@ pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
 // -----------------------------------------------------------------------------
 
 /// Download a single object from S3 **with op‑logging**.
-pub async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
+pub async fn get_object(bucket: &str, key: &str) -> Result<Bytes> {
     // delegate to S3Ops (which records the GET) and propagate errors
     let data = build_ops_async().await?.get_object(bucket, key).await?;
     
@@ -777,7 +778,7 @@ pub async fn get_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
 }
 
 /// Download a single object by URI, uses helper
-pub fn get_object_uri(uri: &str) -> anyhow::Result<Vec<u8>> {
+pub fn get_object_uri(uri: &str) -> anyhow::Result<Bytes> {
     let uri = uri.to_string();
     run_on_global_rt(async move { get_object_uri_async(&uri).await })
 }
@@ -786,7 +787,7 @@ pub fn get_object_uri(uri: &str) -> anyhow::Result<Vec<u8>> {
 pub fn get_objects_parallel(
     uris: &[String],
     max_in_flight: usize,
-) -> Result<Vec<(String, Vec<u8>)>> {
+) -> Result<Vec<(String, Bytes)>> {
     let uris = uris.to_vec(); // own for 'static
     run_on_global_rt(async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));
@@ -815,7 +816,7 @@ pub fn get_objects_parallel_with_progress(
     uris: &[String],
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
-) -> Result<Vec<(String, Vec<u8>)>> {
+) -> Result<Vec<(String, Bytes)>> {
     let uris = uris.to_vec(); // own for 'static
     run_on_global_rt(async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));
@@ -854,7 +855,7 @@ pub fn get_objects_parallel_with_progress(
     skip(uri),
     fields(uri = %uri)
 ))]
-pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Vec<u8>> {
+pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
@@ -898,7 +899,7 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Vec<u8>> {
 
 
 /// Public async get object call
-pub async fn get_object_uri_async(uri: &str) -> Result<Vec<u8>> {
+pub async fn get_object_uri_async(uri: &str) -> Result<Bytes> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");

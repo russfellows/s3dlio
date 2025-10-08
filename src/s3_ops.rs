@@ -10,6 +10,7 @@
 use crate::s3_logger::{LogEntry, Logger};
 use anyhow::Result;
 use aws_sdk_s3::{types::Delete, Client};
+use bytes::Bytes;
 //use std::sync::Arc;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -83,7 +84,7 @@ impl S3Ops {
     }
 
     /// GET (Download) an object.
-    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes> {
         let ctx = LogContext {
             operation: "GET",
             key: key.to_string(),
@@ -99,7 +100,8 @@ impl S3Ops {
                 let body = output.body.collect().await?.into_bytes();
                 let bytes = body.len() as u64;
                 self.log_op(ctx, &Ok::<(), &str>(()), bytes, Some(first_byte_time));
-                Ok(body.to_vec())
+                // Zero-copy: return Bytes directly instead of converting to Vec
+                Ok(body)
             }
             Err(e) => {
                 self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None); 
@@ -109,7 +111,7 @@ impl S3Ops {
     }
 
     /// GET (Download) a range of bytes from an object.
-    pub async fn get_object_range(&self, bucket: &str, key: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+    pub async fn get_object_range(&self, bucket: &str, key: &str, start: u64, end: u64) -> Result<Bytes> {
         let ctx = LogContext {
             operation: "GET_RANGE",
             key: format!("{}[{}-{}]", key, start, end),
@@ -132,7 +134,8 @@ impl S3Ops {
                 let body = output.body.collect().await?.into_bytes();
                 let bytes = body.len() as u64;
                 self.log_op(ctx, &Ok::<(), &str>(()), bytes, Some(first_byte_time));
-                Ok(body.to_vec())
+                // Zero-copy: return Bytes directly
+                Ok(body)
             }
             Err(e) => {
                 self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None); 

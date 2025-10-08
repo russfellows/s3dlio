@@ -998,6 +998,7 @@ fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, te
 async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&str>) -> Result<()> {
     use s3dlio::object_store::store_for_uri_with_logger;
     use regex::Regex;
+    use indicatif::{ProgressBar, ProgressStyle};
     
     // Use generic object store to delete objects (works with all backends)
     let logger = global_logger();
@@ -1020,17 +1021,55 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             info!("Deleting {} objects matching pattern '{}' under prefix '{}'", keys.len(), pat, uri);
             eprintln!("Found {} objects matching pattern '{}'", keys.len(), pat);
             
+            // Create progress bar for deletion
+            let pb = ProgressBar::new(keys.len() as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("Deleting: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({per_sec}, ETA: {eta})")
+                    .unwrap()
+                    .progress_chars("█▉▊▋▌▍▎▏  ")
+            );
+            
             for key in &keys {
                 store.delete(key).await?;
                 info!("Deleted: {}", key);
+                pb.inc(1);
             }
             
-            eprintln!("Deleted {} objects", keys.len());
+            pb.finish_with_message(format!("Deleted {} objects matching pattern", keys.len()));
+            eprintln!("\nSuccessfully deleted {} objects matching pattern '{}'", keys.len(), pat);
         } else {
-            // Delete entire prefix without filter
-            info!("Deleting prefix: {}", uri);
-            store.delete_prefix(uri).await?;
-            eprintln!("Deleted all objects under prefix: {}", uri);
+            // Delete entire prefix without filter - need to list first for progress
+            info!("Listing objects under prefix: {}", uri);
+            eprintln!("Listing objects to delete...");
+            let keys = store.list(uri, recursive).await?;
+            
+            if keys.is_empty() {
+                eprintln!("No objects found under prefix: {}", uri);
+                return Ok(());
+            }
+            
+            let total_count = keys.len();
+            info!("Deleting {} objects under prefix '{}'", total_count, uri);
+            eprintln!("Found {} objects to delete", total_count);
+            
+            // Create progress bar for deletion
+            let pb = ProgressBar::new(total_count as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("Deleting: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({per_sec}, ETA: {eta})")
+                    .unwrap()
+                    .progress_chars("█▉▊▋▌▍▎▏  ")
+            );
+            
+            for key in &keys {
+                store.delete(key).await?;
+                info!("Deleted: {}", key);
+                pb.inc(1);
+            }
+            
+            pb.finish_with_message(format!("Completed deletion of {} objects", total_count));
+            eprintln!("\nSuccessfully deleted {} objects under prefix: {}", total_count, uri);
         }
     } else {
         // First, try to list objects with this URI as a prefix to see if it matches multiple objects
@@ -1047,27 +1086,43 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             // No objects found with this prefix, try as exact object name
             info!("Deleting single object: {}", uri);
             store.delete(uri).await?;
-            eprintln!("Deleted: {}", uri);
+            eprintln!("Successfully deleted 1 object: {}", uri);
         } else if keys.len() == 1 && keys[0] == uri && pattern.is_none() {
             // Exactly one object and it matches the URI exactly (no pattern filter)
             info!("Deleting single object: {}", uri);
             store.delete(uri).await?;
-            eprintln!("Deleted: {}", uri);
+            eprintln!("Successfully deleted 1 object: {}", uri);
         } else {
             // Multiple objects match the prefix (or pattern filter was applied)
-            info!("Deleting {} objects matching prefix: {}", keys.len(), uri);
+            let total_count = keys.len();
+            info!("Deleting {} objects matching prefix: {}", total_count, uri);
             if let Some(pat) = pattern {
-                eprintln!("Found {} objects matching prefix '{}' and pattern '{}'", keys.len(), uri, pat);
+                eprintln!("Found {} objects matching prefix '{}' and pattern '{}'", total_count, uri, pat);
             } else {
-                eprintln!("Found {} objects matching prefix '{}'", keys.len(), uri);
+                eprintln!("Found {} objects matching prefix '{}'", total_count, uri);
             }
+            
+            // Create progress bar for deletion
+            let pb = ProgressBar::new(total_count as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("Deleting: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({per_sec}, ETA: {eta})")
+                    .unwrap()
+                    .progress_chars("█▉▊▋▌▍▎▏  ")
+            );
             
             for key in &keys {
                 store.delete(key).await?;
                 info!("Deleted: {}", key);
+                pb.inc(1);
             }
             
-            eprintln!("Deleted {} objects", keys.len());
+            pb.finish_with_message(format!("Completed deletion of {} objects", total_count));
+            if let Some(pat) = pattern {
+                eprintln!("\nSuccessfully deleted {} objects matching pattern '{}'", total_count, pat);
+            } else {
+                eprintln!("\nSuccessfully deleted {} objects", total_count);
+            }
         }
     }
     

@@ -89,7 +89,9 @@ impl Dataset for MultiBackendDataset {
         let uri = self.uris.get(idx)
             .ok_or(DatasetError::IndexOutOfRange(idx))?;
         
+        // Convert Bytes to Vec<u8> for Dataset API compatibility
         self.store.get(uri).await
+            .map(|bytes| bytes.to_vec())
             .map_err(|e| DatasetError::from(e.to_string()))
     }
 }
@@ -192,7 +194,7 @@ impl AsyncPoolDataLoader {
                     
                     let fut: RequestFuture = Box::pin(async move {
                         let result = match tokio::time::timeout(timeout, store.get(&uri)).await {
-                            Ok(Ok(data)) => Ok(data),
+                            Ok(Ok(data)) => Ok(data.to_vec()), // Convert Bytes to Vec<u8>
                             Ok(Err(e)) => Err(anyhow::anyhow!("Store error: {}", e)),
                             Err(_) => Err(anyhow::anyhow!("Request timeout after {:?}", timeout)),
                         };
@@ -220,7 +222,7 @@ impl AsyncPoolDataLoader {
                                 
                                 let fut: RequestFuture = Box::pin(async move {
                                     let result = match tokio::time::timeout(timeout, store.get(&uri)).await {
-                                        Ok(Ok(data)) => Ok(data),
+                                        Ok(Ok(data)) => Ok(data.to_vec()), // Convert Bytes to Vec<u8>
                                         Ok(Err(e)) => Err(anyhow::anyhow!("Store error: {}", e)),
                                         Err(_) => Err(anyhow::anyhow!("Request timeout after {:?}", timeout)),
                                     };

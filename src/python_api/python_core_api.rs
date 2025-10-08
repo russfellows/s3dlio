@@ -506,8 +506,11 @@ pub (crate) fn get_many_async_py<'p>(
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     future_into_py(py, async move {
+        // get_objects_parallel returns Vec<(String, Bytes)>, convert to Vec<u8>
         let pairs: Vec<(String, Vec<u8>)> = task::spawn_blocking(move || {
-            get_objects_parallel(&uris, max_in_flight).map_err(py_err)
+            get_objects_parallel(&uris, max_in_flight)
+                .map(|pairs| pairs.into_iter().map(|(u, b)| (u, b.to_vec())).collect())
+                .map_err(py_err)
         })
         .await
         .map_err(py_err)??;

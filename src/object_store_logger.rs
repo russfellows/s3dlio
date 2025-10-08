@@ -14,6 +14,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use async_trait::async_trait;
 use anyhow::Result;
+use bytes::Bytes;
 
 use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, WriterOptions};
 use crate::s3_logger::{Logger, LogEntry};
@@ -142,7 +143,7 @@ impl LoggedObjectStore {
 
 #[async_trait]
 impl ObjectStore for LoggedObjectStore {
-    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get(&self, uri: &str) -> Result<Bytes> {
         let start = SystemTime::now();
         let result = self.inner.get(uri).await;
         let end = SystemTime::now();
@@ -155,7 +156,7 @@ impl ObjectStore for LoggedObjectStore {
         result
     }
 
-    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let start = SystemTime::now();
         let result = self.inner.get_range(uri, offset, length).await;
         let end = SystemTime::now();
