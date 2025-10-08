@@ -183,6 +183,10 @@ pub struct LoaderOptions {
     pub collate_buffer_size: usize,
     /// Page cache behavior hint for file I/O operations
     pub page_cache_mode: PageCacheMode,
+    
+    // ── New in v0.9.0 (adaptive tuning) ─────────────────────────────────────
+    /// Optional adaptive configuration for auto-tuning (default: None/disabled)
+    pub adaptive: Option<crate::adaptive_config::AdaptiveConfig>,
 }
 
 impl Default for LoaderOptions {
@@ -222,6 +226,9 @@ impl Default for LoaderOptions {
             enable_transforms: false,
             collate_buffer_size: 1024, // 1KB default buffer
             page_cache_mode: PageCacheMode::default(),
+            
+            // new defaults (v0.9.0 - adaptive tuning)
+            adaptive: None, // Disabled by default - users opt-in
         }
     }
 }
@@ -478,6 +485,62 @@ impl LoaderOptions {
     pub fn with_page_cache_mode(mut self, mode: PageCacheMode) -> Self {
         self.page_cache_mode = mode;
         self
+    }
+    
+    // ── New in v0.9.0: adaptive tuning builder helpers ──────────────────────
+    
+    /// Enable adaptive tuning with default configuration
+    /// 
+    /// When enabled, part_size and num_workers will be auto-tuned based on
+    /// workload characteristics. Explicit settings always override adaptive.
+    pub fn with_adaptive(mut self) -> Self {
+        self.adaptive = Some(crate::adaptive_config::AdaptiveConfig::enabled());
+        self
+    }
+    
+    /// Set custom adaptive configuration
+    pub fn with_adaptive_config(mut self, config: crate::adaptive_config::AdaptiveConfig) -> Self {
+        self.adaptive = Some(config);
+        self
+    }
+    
+    /// Compute effective part size considering adaptive tuning
+    /// 
+    /// CRITICAL: Explicit part_size always overrides adaptive behavior
+    pub fn effective_part_size(&self, file_size: Option<usize>) -> usize {
+        use crate::adaptive_config::AdaptiveParams;
+        
+        if let Some(ref adaptive_cfg) = self.adaptive {
+            let params = AdaptiveParams::new(adaptive_cfg.clone());
+            // If part_size was explicitly set, it's used; otherwise adaptive computes it
+            params.compute_part_size(file_size, Some(self.part_size))
+        } else {
+            // No adaptive: use explicit part_size
+            self.part_size
+        }
+    }
+    
+    /// Compute effective concurrency considering adaptive tuning
+    /// 
+    /// CRITICAL: Explicit num_workers always overrides adaptive behavior
+    pub fn effective_concurrency(&self, workload: Option<crate::adaptive_config::WorkloadType>) -> usize {
+        use crate::adaptive_config::AdaptiveParams;
+        
+        if let Some(ref adaptive_cfg) = self.adaptive {
+            let params = AdaptiveParams::new(adaptive_cfg.clone());
+            // If num_workers was explicitly set (non-zero), use it; otherwise adaptive computes
+            let explicit = if self.num_workers > 0 { Some(self.num_workers) } else { None };
+            params.compute_concurrency(workload, explicit)
+        } else {
+            // No adaptive: use explicit num_workers (0 means auto = CPU count)
+            if self.num_workers > 0 {
+                self.num_workers
+            } else {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+            }
+        }
     }
 }
 

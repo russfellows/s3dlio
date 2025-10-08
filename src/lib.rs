@@ -70,6 +70,7 @@ pub mod concurrency;
 #[cfg(feature = "enhanced-http")]
 pub mod http;
 pub mod performance;
+pub mod adaptive_config;  // Optional adaptive tuning for performance
 mod multipart;
 
 // ===== Legacy Re-exports for Backward Compatibility =====

@@ -118,6 +118,19 @@ pub use crate::checkpoint::CheckpointConfig;
 /// Information about saved checkpoints
 pub use crate::checkpoint::CheckpointInfo;
 
+// Adaptive performance tuning (optional, opt-in)
+/// Adaptive configuration for optional auto-tuning
+pub use crate::adaptive_config::AdaptiveConfig;
+
+/// Adaptive tuning mode (Enabled/Disabled)
+pub use crate::adaptive_config::AdaptiveMode;
+
+/// Workload type hints for adaptive optimization
+pub use crate::adaptive_config::WorkloadType;
+
+/// Compute adaptive parameters based on workload
+pub use crate::adaptive_config::AdaptiveParams;
+
 // Essential utilities
 /// Parse S3 URI into bucket and key components
 pub use crate::s3_utils::parse_s3_uri;

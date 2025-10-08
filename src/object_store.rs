@@ -116,6 +116,8 @@ pub struct WriterOptions {
     pub buffer_size: Option<usize>,
     /// Maximum part size for multipart uploads
     pub part_size: Option<usize>,
+    /// Optional adaptive configuration for auto-tuning (default: disabled)
+    pub adaptive: Option<crate::adaptive_config::AdaptiveConfig>,
 }
 
 impl WriterOptions {
@@ -140,6 +142,50 @@ impl WriterOptions {
     pub fn with_part_size(mut self, size: usize) -> Self {
         self.part_size = Some(size);
         self
+    }
+    
+    /// Enable adaptive tuning with default configuration
+    pub fn with_adaptive(mut self) -> Self {
+        self.adaptive = Some(crate::adaptive_config::AdaptiveConfig::enabled());
+        self
+    }
+    
+    /// Set custom adaptive configuration
+    pub fn with_adaptive_config(mut self, config: crate::adaptive_config::AdaptiveConfig) -> Self {
+        self.adaptive = Some(config);
+        self
+    }
+    
+    /// Compute effective part size considering adaptive tuning
+    /// 
+    /// If part_size is explicitly set, it is always used.
+    /// Otherwise, if adaptive is enabled, it computes the optimal part size.
+    /// Falls back to default if neither is set.
+    pub fn effective_part_size(&self, file_size: Option<usize>) -> usize {
+        use crate::adaptive_config::AdaptiveParams;
+        
+        // If adaptive config is provided, use it to compute effective part size
+        if let Some(ref adaptive_cfg) = self.adaptive {
+            let params = AdaptiveParams::new(adaptive_cfg.clone());
+            params.compute_part_size(file_size, self.part_size)
+        } else {
+            // No adaptive config: use explicit part_size or default
+            self.part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE)
+        }
+    }
+    
+    /// Compute effective buffer size considering adaptive tuning
+    pub fn effective_buffer_size(&self, operation_type: &str) -> usize {
+        use crate::adaptive_config::AdaptiveParams;
+        
+        // If adaptive config is provided, use it to compute effective buffer size
+        if let Some(ref adaptive_cfg) = self.adaptive {
+            let params = AdaptiveParams::new(adaptive_cfg.clone());
+            params.compute_buffer_size(operation_type, self.buffer_size)
+        } else {
+            // No adaptive config: use explicit buffer_size or default
+            self.buffer_size.unwrap_or(1024 * 1024) // 1 MB default
+        }
     }
 }
 /// Supported schemes
