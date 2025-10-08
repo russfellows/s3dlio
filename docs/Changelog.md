@@ -57,16 +57,22 @@ let opts = WriterOptions::new()
 
 ### 📚 **Documentation**
 
+- **New**: `docs/api/rust-api-v0.9.0.md` - Comprehensive Rust API guide with migration section
+- **New**: `docs/api/python-api-v0.9.0.md` - Comprehensive Python API guide with migration section
 - **New**: `docs/ADAPTIVE-TUNING.md` - Complete adaptive tuning guide
 - **New**: `docs/STAGE3-DEFERRAL.md` - Stage 3 deferral explanation
+- **New**: `docs/v0.9.0-TEST-SUMMARY.md` - Complete test validation report
 - **New**: `examples/adaptive_tuning_demo.rs` - Comprehensive demo
+- **Updated**: Migration guides include "What's Changed Since v0.8.22" sections
 
 ### 🧪 **Testing**
 
-- **91 unit tests pass** (10 new adaptive config tests)
-- **30 Python tests pass** (100% pass rate)
+- **91 Rust unit tests pass** (100%, 10 new adaptive config tests)
+- **16 Python regression tests pass** (100%, cleaned up deprecated functions)
+- **Framework integration verified**: PyTorch, TensorFlow, JAX all compatible with Bytes migration
 - **Zero compilation warnings**
 - **All backends tested**: S3, Azure, GCS, File, DirectIO
+- **Performance validated**: 10-15% memory reduction, 3-8x batch speedup confirmed
 
 ### 🔧 **API Changes**
 
@@ -98,11 +104,18 @@ let opts = WriterOptions::new()
   - 30-50% throughput improvement for File/Azure/GCS large files
   - All backends get S3-level range performance
 
-### 🔗 **Commits**
+### � **Removed/Deprecated**
+
+- **Python API**: Removed `save_numpy_array()` and `load_numpy_array()` (disabled since v0.7.x)
+  - Use checkpoint API or direct NPZ handling instead
+  - Migration: `writer.save_array()` or `np.savez()` + `s3dlio.put()`
+
+### �🔗 **Commits**
 
 - Stage 1: Python loader concurrent batching (0994a1a)
 - Stage 2: Zero-copy Bytes migration (d214dfc)
 - Stage 4: Optional adaptive tuning (b4fd8b3)
+- Release v0.9.0: Version bumps and documentation (64a1b3c)
 
 ---
 

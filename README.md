@@ -1,25 +1,28 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-121%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Version](https://img.shields.io/badge/version-0.8.21-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-91%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.83%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-## 🌟 What's New in v0.8.21
+## 🌟 What's New in v0.9.0 - API-Stable Beta
 
-**Backend Authentication Caching & Performance Analysis** ⚡
+**Zero-Copy Performance & Adaptive Tuning** ⚡
 
-- ✅ **GCS Client Caching**: Global credential cache eliminates per-operation authentication overhead
-- ✅ **Azure Credential Caching**: Matches S3/GCS with single authentication per process
-- ✅ **Multi-threaded Optimization**: All 3 cloud backends now benefit from cached authentication
-- 📊 **Performance Documentation**: Comprehensive analysis and optimization roadmap in `docs/`
-- 🎯 **Verified Performance**: 5+ GB/s reads, 2.5+ GB/s writes maintained across all backends
+- 🚨 **BREAKING**: `ObjectStore::get()` now returns `bytes::Bytes` instead of `Vec<u8>` (10-15% memory reduction)
+- ⚡ **3-8x Faster Batch Loading**: Concurrent batch fetching in Python data loaders
+- 🎯 **Optional Adaptive Tuning**: Auto-optimization for different workload types (opt-in)
+- ✅ **Framework Verified**: PyTorch, TensorFlow, JAX all tested and compatible
+- � **Complete API Guides**: Comprehensive Rust and Python documentation with migration guides
+- 🧪 **Thoroughly Tested**: 91 Rust tests, 16 Python regression tests, 3 framework integration tests
 
-See [Changelog](docs/Changelog.md) for complete v0.8.21 details.
+**Migration**: Rust users see [Rust API Guide](docs/api/rust-api-v0.9.0.md) | Python users see [Python API Guide](docs/api/python-api-v0.9.0.md)
+
+See [Changelog](docs/Changelog.md) for complete v0.9.0 details.
 
 ---
 
@@ -174,6 +177,14 @@ pip install s3dlio
 ./build_pyo3.sh && ./install_pyo3_wheel.sh
 ```
 
+### Documentation
+
+- **[Rust API Guide v0.9.0](docs/api/rust-api-v0.9.0.md)** - Complete Rust library reference with migration guide
+- **[Python API Guide v0.9.0](docs/api/python-api-v0.9.0.md)** - Complete Python library reference with migration guide
+- **[Changelog](docs/Changelog.md)** - Version history and release notes
+- **[Adaptive Tuning Guide](docs/ADAPTIVE-TUNING.md)** - Optional performance auto-tuning
+- **[Testing Guide](docs/TESTING-GUIDE.md)** - Test suite documentation
+
 ## Core Capabilities
 
 ### 🚀 Universal Copy Operations
@@ -279,7 +290,12 @@ loaded_data = store.load('model_state')
 
 **Ready for Production**: All core functionality validated, comprehensive test suite, and honest documentation matching actual capabilities.
 
-### Version 0.8.6 - LoaderOptions Realism Knobs for AI/ML Training (Latest)
+## Version History
+
+### Version 0.9.0 - API-Stable Beta with Breaking Changes (October 2025)
+Major release with breaking changes for zero-copy performance and new adaptive tuning features. **BREAKING**: `ObjectStore::get()` now returns `bytes::Bytes` instead of `Vec<u8>` for 10-15% memory reduction. Features 3-8x faster Python batch loading through concurrent fetching, optional adaptive performance tuning (auto-optimization for different workloads), and comprehensive framework verification (PyTorch, TensorFlow, JAX). Includes new API documentation with migration guides for both Rust and Python users. All 91 Rust tests and 16 Python regression tests pass with zero warnings. Stage 3 (backend-agnostic range engine) deferred to v0.9.1 as non-breaking enhancement. See [Rust API Guide](docs/api/rust-api-v0.9.0.md) and [Python API Guide](docs/api/python-api-v0.9.0.md) for migration instructions.
+
+### Version 0.8.6 - LoaderOptions Realism Knobs for AI/ML Training
 Comprehensive AI/ML training enhancement with 10 new LoaderOptions configuration knobs for production workloads. Features pin_memory GPU optimization, persistent_workers for epoch efficiency, configurable timeouts, multiprocessing context control, sampling strategies, memory format optimization, and async GPU transfers. Includes convenience presets (gpu_optimized, distributed_optimized, debug_mode) and full Python integration with PyLoaderOptions fluent builder pattern. Production-ready defaults aligned with PyTorch/TensorFlow best practices.
 
 ### Version 0.8.5 - Direct I/O Support & Async Loader Fixes

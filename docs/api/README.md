@@ -2,8 +2,33 @@
 
 ## Current Documentation (Recommended)
 
-### Python API v0.8.0+ (September 2025)
-- **[Python API Reference v0.8.0](python-api-v0.8.0-current.md)** - **✅ CURRENT** 
+### API v0.9.0 (October 2025) - **✅ LATEST**
+
+- **[Rust API Guide v0.9.0](rust-api-v0.9.0.md)** - **✅ CURRENT**
+  - Complete Rust library reference
+  - **"What's Changed Since v0.8.22"** migration section
+  - Breaking change: `ObjectStore::get()` returns `Bytes` instead of `Vec<u8>`
+  - Adaptive tuning documentation
+  - Storage backends, data loaders, checkpoints
+  - Performance tips and complete examples
+
+- **[Python API Guide v0.9.0](python-api-v0.9.0.md)** - **✅ CURRENT**
+  - Complete Python library reference
+  - **"What's Changed Since v0.8.22"** migration section
+  - Minimal breaking changes (removed deprecated functions)
+  - Framework integration (PyTorch, TensorFlow, JAX)
+  - Quick start, common patterns, troubleshooting
+  - Migration checklist
+
+- **[Adaptive Tuning Guide](../ADAPTIVE-TUNING.md)** - Optional performance optimization
+  - Auto-tuning for different workload types
+  - Usage examples and customization
+  - When to use adaptive tuning
+
+### Previous Versions
+
+#### Python API v0.8.0+ (September 2025)
+- **[Python API Reference v0.8.0](python-api-v0.8.0-current.md)** - **⚠️ SUPERSEDED by v0.9.0**
   - Complete API reference with working status for each function
   - Enhanced multi-backend support (file://, s3://, az://, direct://)
   - Fixed PyTorch integration bug
@@ -36,35 +61,64 @@
 
 ## Quick Start (Current Version)
 
-For **s3dlio v0.8.0+**, use the enhanced API:
+For **s3dlio v0.9.0**, use the latest API:
 
+**Rust**:
+```rust
+use s3dlio::api::*;
+use bytes::Bytes;
+
+// Create storage backend (auto-detects from URI)
+let store = store_for_uri("s3://bucket/prefix/")?;
+
+// Read file (returns Bytes, not Vec<u8>)
+let data: Bytes = store.get("s3://bucket/file.bin")?;
+
+// Adaptive tuning (optional)
+let opts = LoaderOptions::default()
+    .with_batch_size(32)
+    .with_adaptive();  // Auto-optimize
+
+// Create async loader
+let loader = store.create_async_loader("s3://bucket/data/", opts)?;
+```
+
+**Python**:
 ```python
 import s3dlio
 
-# ✅ NEW: Multi-backend dataset creation
-dataset = s3dlio.create_dataset("file:///path/to/data")
-dataset = s3dlio.create_dataset("s3://bucket/prefix/")
+# Read file
+data = s3dlio.get("s3://bucket/file.bin")  # Returns bytes
 
-# ✅ NEW: Async data loading  
-loader = s3dlio.create_async_loader("file:///path/to/data")
+# Create async loader with adaptive tuning
+loader = s3dlio.create_async_loader(
+    uri="s3://bucket/data/",
+    opts={
+        'batch_size': 32,
+        'adaptive': {'mode': 'enabled'}  # Auto-optimize
+    }
+)
 
-# ✅ FIXED: PyTorch integration now works
-from s3dlio.torch import S3IterableDataset
-dataset = S3IterableDataset("file:///training/data/")
+# PyTorch integration
+import torch
+import numpy as np
+import io
 
-# ✅ LEGACY: Still works unchanged
-data = s3dlio.get("s3://bucket/object")
-s3dlio.put("s3://bucket/object", data)
+async for batch in loader:
+    for item_bytes in batch:
+        npz = np.load(io.BytesIO(item_bytes))
+        tensor = torch.from_numpy(npz['data'])
 ```
 
 ## Version Support
 
-| Version | Status | Python API Doc | Notes |
-|---------|--------|----------------|-------|  
-| v0.8.0+ | ✅ Current | `python-api-v0.8.0-current.md` | Enhanced API, PyTorch fixed |
-| v0.7.x  | ⚠️ Legacy | `python-api-legacy-v0.7.md` | PyTorch broken |
-| v0.6.x- | 🚫 Unsupported | Contact maintainers | Very old |
+| Version | Status | Rust API Doc | Python API Doc | Notes |
+|---------|--------|--------------|----------------|-------|
+| v0.9.0  | ✅ Current | `rust-api-v0.9.0.md` | `python-api-v0.9.0.md` | Bytes migration, adaptive tuning |
+| v0.8.0+ | ⚠️ Superseded | N/A | `python-api-v0.8.0-current.md` | Enhanced API, PyTorch fixed |
+| v0.7.x  | ⚠️ Legacy | N/A | `python-api-legacy-v0.7.md` | PyTorch broken |
+| v0.6.x- | 🚫 Unsupported | N/A | Contact maintainers | Very old |
 
 ---
 
-**💡 Recommendation**: Always use the current v0.8.0+ API documentation for new development. Legacy docs are provided only for understanding older releases.
+**💡 Recommendation**: Always use the current v0.9.0 API documentation for new development. See migration guides for upgrade instructions from v0.8.x.
