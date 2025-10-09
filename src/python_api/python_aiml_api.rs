@@ -779,7 +779,7 @@ impl PyCheckpointStore {
                 store.load_latest().await
             })
         }).map_err(|e| PyRuntimeError::new_err(format!("Load failed: {}", e)))
-        .map(|opt_data| opt_data.map(|data| PyBytes::new(py, &data).into()))
+        .map(|opt_data| opt_data.map(|data| Python::with_gil(|py| PyBytesView::new(data).into_py_any(py).unwrap())))
     }
 
     /// List available checkpoints
@@ -1205,8 +1205,8 @@ impl PyCheckpointReader {
             })
         }).map_err(|e| PyRuntimeError::new_err(format!("Read shard failed: {}", e)))?;
 
-        // Return zero-copy BytesView
-        Ok(PyBytesView::new(data))
+        // Return zero-copy BytesView as PyObject
+        Ok(PyBytesView::new(data).into_py_any(py)?)
     }
 }
 

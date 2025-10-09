@@ -311,7 +311,7 @@ mod tests {
 
         // Load it back
         let loaded = store.load_latest().await?.unwrap();
-        assert_eq!(loaded, data);
+        assert_eq!(&loaded[..], data);
 
         // List checkpoints
         let infos = store.list_checkpoints().await?;

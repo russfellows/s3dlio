@@ -402,7 +402,7 @@ mod tests {
         assert_eq!(manifest.world_size, 1);
 
         let shard_data = reader.read_shard_by_rank(&manifest, 0).await?;
-        assert_eq!(shard_data, data);
+        assert_eq!(&shard_data[..], data);
 
         Ok(())
     }
@@ -438,8 +438,8 @@ mod tests {
         assert_eq!(all_shards.len(), 2);
         assert_eq!(all_shards[0].0, 0); // rank 0
         assert_eq!(all_shards[1].0, 1); // rank 1
-        assert_eq!(all_shards[0].1, b"rank 0 data");
-        assert_eq!(all_shards[1].1, b"rank 1 data");
+        assert_eq!(&all_shards[0].1[..], b"rank 0 data");
+        assert_eq!(&all_shards[1].1[..], b"rank 1 data");
 
         Ok(())
     }

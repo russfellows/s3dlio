@@ -32,7 +32,7 @@ use crate::s3_utils::{
 };
 use crate::{generic_upload_files, generic_download_objects};
 use crate::s3_logger::{finalize_op_logger, init_op_logger, global_logger};
-use crate::object_store::store_for_uri_with_logger;
+use crate::object_store::{store_for_uri_with_logger, store_for_uri};
 
 // Phase 2 streaming functionality imports
 use crate::object_store::{
@@ -553,18 +553,17 @@ pub (crate) fn get_many_async_py<'p>(
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     future_into_py(py, async move {
-        // get_objects_parallel returns Vec<(String, Bytes)>, convert to Vec<u8>
-        let pairs: Vec<(String, Vec<u8>)> = task::spawn_blocking(move || {
+        // get_objects_parallel returns Vec<(String, Bytes)> - keep as Bytes for zero-copy
+        let pairs: Vec<(String, Bytes)> = task::spawn_blocking(move || {
             get_objects_parallel(&uris, max_in_flight)
-                .map(|pairs| pairs.into_iter().map(|(u, b)| (u, b.to_vec())).collect())
                 .map_err(py_err)
         })
         .await
         .map_err(py_err)??;
 
-        Python::with_gil(|py| {
+        Python::with_gil(|_py| {
             let out = pairs.into_iter()
-                .map(|(u, b)| (u, PyBytes::new(py, &b[..]).unbind()))
+                .map(|(u, b)| (u, PyBytesView::new(b)))
                 .collect::<Vec<_>>();
             Ok(out)
         })
@@ -622,22 +621,135 @@ pub fn download(
 }
 
 
-// --- `get_many` function
+// --- `get_many` function (universal backend support)
 #[pyfunction]
 #[pyo3(signature = (uris, max_in_flight = 64))]
 pub fn get_many(
     py: Python<'_>,
     uris: Vec<String>,
     max_in_flight: usize,
-) -> PyResult<Vec<(String, Py<PyBytes>)>> {
+) -> PyResult<Vec<(String, PyBytesView)>> {
+    use crate::object_store::{infer_scheme, Scheme};
+    use tokio::sync::Semaphore;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::sync::Arc;
+    
     py.allow_threads(|| {
-        let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
-        Python::with_gil(|py| {
-            Ok(res
-                .into_iter()
-                .map(|(u, b)| (u, PyBytes::new(py, &b[..]).unbind()))
-                .collect())
-        })
+        // Check all URIs are the same scheme
+        let schemes: Vec<_> = uris.iter().map(|u| infer_scheme(u)).collect();
+        let first_scheme = schemes.first().ok_or_else(|| {
+            PyRuntimeError::new_err("get_many requires at least one URI")
+        })?;
+        
+        // Verify all URIs use the same scheme
+        if !schemes.iter().all(|s| s == first_scheme) {
+            return Err(PyRuntimeError::new_err(
+                "get_many requires all URIs to use the same backend scheme"
+            ));
+        }
+        
+        // Route to appropriate backend
+        match first_scheme {
+            Scheme::S3 => {
+                // Use existing optimized S3 implementation
+                let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
+                Ok(res.into_iter()
+                    .map(|(u, b)| (u, PyBytesView::new(b)))
+                    .collect())
+            }
+            Scheme::File | Scheme::Direct => {
+                // Parallel file reads
+                let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+                let res = rt.block_on(async {
+                    let sem = Arc::new(Semaphore::new(max_in_flight));
+                    let mut futs = FuturesUnordered::new();
+                    
+                    for uri in uris.clone() {
+                        let sem = Arc::clone(&sem);
+                        futs.push(tokio::spawn(async move {
+                            let _permit = sem.acquire_owned().await.unwrap();
+                            let path = uri.strip_prefix("file://")
+                                .or_else(|| uri.strip_prefix("direct://"))
+                                .unwrap_or(&uri);
+                            let file_bytes = tokio::fs::read(path).await?;
+                            Ok::<_, std::io::Error>((uri, Bytes::from(file_bytes)))
+                        }));
+                    }
+                    
+                    let mut out = Vec::new();
+                    while let Some(res) = futs.next().await {
+                        let (uri, bytes) = res.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+                            .map_err(|e| anyhow::anyhow!("File read error: {}", e))?;
+                        out.push((uri, bytes));
+                    }
+                    
+                    // Maintain input order
+                    out.sort_by_key(|(u, _)| uris.iter().position(|x| x == u).unwrap());
+                    Ok::<_, anyhow::Error>(out)
+                }).map_err(py_err)?;
+                
+                Ok(res.into_iter()
+                    .map(|(u, b)| (u, PyBytesView::new(b)))
+                    .collect())
+            }
+            Scheme::Azure | Scheme::Gcs => {
+                // Use store_for_uri for Azure and GCS
+                let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+                let res = rt.block_on(async {
+                    let sem = Arc::new(Semaphore::new(max_in_flight));
+                    let mut futs = FuturesUnordered::new();
+                    
+                    for uri in uris.clone() {
+                        let sem = Arc::clone(&sem);
+                        futs.push(tokio::spawn(async move {
+                            let _permit = sem.acquire_owned().await.unwrap();
+                            
+                            // Use store_for_uri to get appropriate backend
+                            let store = store_for_uri(&uri)?;
+                            
+                            // Extract the key from the URI
+                            let key = if let Some(idx) = uri.find("://") {
+                                if let Some(slash_idx) = uri[idx+3..].find('/') {
+                                    &uri[idx+3+slash_idx+1..]
+                                } else {
+                                    ""
+                                }
+                            } else {
+                                &uri
+                            };
+                            
+                            if key.is_empty() {
+                                anyhow::bail!("Cannot GET: no key specified in URI: {}", uri);
+                            }
+                            
+                            let bytes = store.get(key).await?;
+                            Ok::<_, anyhow::Error>((uri, bytes))
+                        }));
+                    }
+                    
+                    let mut out = Vec::new();
+                    while let Some(res) = futs.next().await {
+                        let (uri, bytes) = res.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+                            .map_err(|e| anyhow::anyhow!("Get error: {}", e))?;
+                        out.push((uri, bytes));
+                    }
+                    
+                    // Maintain input order
+                    out.sort_by_key(|(u, _)| uris.iter().position(|x| x == u).unwrap());
+                    Ok::<_, anyhow::Error>(out)
+                }).map_err(py_err)?;
+                
+                Ok(res.into_iter()
+                    .map(|(u, b)| (u, PyBytesView::new(b)))
+                    .collect())
+            }
+            Scheme::Unknown => {
+                Err(PyRuntimeError::new_err(format!(
+                    "Unsupported URI scheme for get_many: {}", 
+                    uris.first().unwrap_or(&String::new())
+                )))
+            }
+        }
     })
 }
 
