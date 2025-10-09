@@ -32,6 +32,7 @@ pub mod memory;
 pub mod download;
 pub mod sharded_client;
 pub mod range_engine;
+pub mod range_engine_generic;  // Universal stream-based range engine (v0.9.2+)
 pub mod mp;
 
 // Performance monitoring
