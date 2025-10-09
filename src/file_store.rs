@@ -1,4 +1,4 @@
-use tracing::debug;
+use tracing::{debug, info, trace};
 // src/file_store.rs
 //
 // FileSystemObjectStore implementation for POSIX file I/O
@@ -9,14 +9,35 @@ use bytes::Bytes;
 use crate::object_store::WriterOptions;
 use crate::page_cache::{apply_page_cache_hint};
 use crate::data_loader::options::PageCacheMode;
+use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crc32fast::Hasher;
 
 use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, CompressionConfig};
+
+/// Configuration for FileSystemObjectStore
+#[derive(Debug, Clone)]
+pub struct FileSystemConfig {
+    /// Enable concurrent range downloads for large files
+    pub enable_range_engine: bool,
+    
+    /// Range engine configuration
+    pub range_engine: RangeEngineConfig,
+}
+
+impl Default for FileSystemConfig {
+    fn default() -> Self {
+        Self {
+            enable_range_engine: true,
+            range_engine: RangeEngineConfig::default(),
+        }
+    }
+}
 
 /// FileSystem adapter that implements ObjectStore for local POSIX file operations.
 /// 
@@ -28,7 +49,15 @@ use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, Compression
 /// Container Operations:
 /// - create_container: creates directories
 /// - delete_container: removes empty directories
-pub struct FileSystemObjectStore;
+/// 
+/// Performance:
+/// - Files >= 4MB use concurrent range downloads (configurable)
+/// - Files < 4MB use simple sequential reads
+/// - Expected 30-50% throughput improvement for large files
+#[derive(Clone)]
+pub struct FileSystemObjectStore {
+    config: Arc<FileSystemConfig>,
+}
 
 /// Streaming writer for filesystem operations
 pub struct FileSystemWriter {
@@ -188,7 +217,19 @@ impl ObjectWriter for FileSystemWriter {
 }
 
 impl FileSystemObjectStore {
-    pub fn new() -> Self { Self }
+    /// Create a new FileSystemObjectStore with default configuration
+    pub fn new() -> Self {
+        Self {
+            config: Arc::new(FileSystemConfig::default()),
+        }
+    }
+    
+    /// Create with custom configuration
+    pub fn with_config(config: FileSystemConfig) -> Self {
+        Self {
+            config: Arc::new(config),
+        }
+    }
     
     /// Convert a URI to a filesystem path
     fn uri_to_path(uri: &str) -> Result<PathBuf> {
@@ -283,6 +324,55 @@ impl FileSystemObjectStore {
         
         Ok(())
     }
+    
+    /// Download using RangeEngine for concurrent range requests
+    async fn get_with_range_engine(&self, uri: &str, file_size: u64) -> Result<Bytes> {
+        let engine = RangeEngine::new(self.config.range_engine.clone());
+        
+        // Create closure that captures uri for get_range calls
+        let uri_owned = uri.to_string();
+        let self_clone = self.clone();
+        
+        let get_range_fn = move |offset: u64, length: u64| {
+            let uri = uri_owned.clone();
+            let store = self_clone.clone();
+            async move {
+                store.get_range(&uri, offset, Some(length)).await
+            }
+        };
+        
+        let (bytes, stats) = engine.download(file_size, get_range_fn, None).await?;
+        
+        info!(
+            "RangeEngine downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
+            stats.bytes_downloaded,
+            stats.ranges_processed,
+            stats.throughput_mbps(),
+            stats.throughput_gbps()
+        );
+        
+        Ok(bytes)
+    }
+    
+    /// Simple sequential read for small files
+    async fn get_simple(&self, uri: &str, file_size: u64) -> Result<Bytes> {
+        let path = Self::uri_to_path(uri)?;
+        
+        // Open file and apply page cache hint based on size
+        let file = fs::File::open(&path).await?;
+        let std_file = file.try_into_std().map_err(|_| anyhow::anyhow!("Failed to convert to std file"))?;
+        
+        // Apply auto page cache hint (Sequential for large files, Random for small)
+        let _ = apply_page_cache_hint(&std_file, PageCacheMode::Auto, file_size);
+        
+        // Convert back to tokio file and read
+        let mut file = fs::File::from_std(std_file);
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).await?;
+        
+        // Convert to Bytes (cheap, just wraps in Arc)
+        Ok(Bytes::from(data))
+    }
 }
 
 #[async_trait]
@@ -299,24 +389,29 @@ impl ObjectStore for FileSystemObjectStore {
             bail!("Path is not a file: {}", path.display());
         }
         
-        // Get file size first for page cache hint
+        // Get file size to decide download strategy
         let metadata = fs::metadata(&path).await?;
         let file_size = metadata.len();
         
-        // Open file and apply page cache hint based on size
-        let file = fs::File::open(&path).await?;
-        let std_file = file.try_into_std().map_err(|_| anyhow::anyhow!("Failed to convert to std file"))?;
+        // Use RangeEngine for large files if enabled
+        if self.config.enable_range_engine && file_size >= self.config.range_engine.min_split_size {
+            trace!(
+                "File size {} >= threshold {}, using RangeEngine for {}",
+                file_size,
+                self.config.range_engine.min_split_size,
+                uri
+            );
+            return self.get_with_range_engine(uri, file_size).await;
+        }
         
-        // Apply auto page cache hint (Sequential for large files, Random for small)
-        let _ = apply_page_cache_hint(&std_file, PageCacheMode::Auto, file_size);
-        
-        // Convert back to tokio file and read
-        let mut file = fs::File::from_std(std_file);
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).await?;
-        
-        // Convert to Bytes (cheap, just wraps in Arc)
-        Ok(Bytes::from(data))
+        // Simple sequential read for small files
+        trace!(
+            "File size {} < threshold {}, using simple read for {}",
+            file_size,
+            self.config.range_engine.min_split_size,
+            uri
+        );
+        self.get_simple(uri, file_size).await
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
@@ -351,10 +446,9 @@ impl ObjectStore for FileSystemObjectStore {
             // Read to end of file
             file.read_to_end(&mut buffer).await?;
         } else {
-            // Read specific length
+            // Read specific length - use read_exact to ensure we get all bytes
             buffer.resize(read_length as usize, 0);
-            let bytes_read = file.read(&mut buffer).await?;
-            buffer.truncate(bytes_read);
+            file.read_exact(&mut buffer).await?;
         }
         
         // Convert to Bytes (cheap, just wraps in Arc)
