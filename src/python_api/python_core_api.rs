@@ -24,7 +24,7 @@ use tracing_subscriber;
 use crate::config::{ObjectType, DataGenMode, Config};
 use crate::s3_utils::{
     delete_objects, get_object_uri, get_objects_parallel,
-    list_objects as list_objects_rs, get_range,
+    list_objects as list_objects_rs, get_range as s3_get_range,
     parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
     create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs,
     stat_object_uri_async,
@@ -305,7 +305,7 @@ fn get_object(
     offset: Option<u64>,
     length: Option<u64>,
 ) -> PyResult<PyBytesView> {
-    let bytes = get_range(bucket, key, offset.unwrap_or(0), length)
+    let bytes = s3_get_range(bucket, key, offset.unwrap_or(0), length)
         .map_err(py_err)?;
     // Return zero-copy BytesView wrapper
     Ok(PyBytesView::new(bytes))
@@ -598,6 +598,22 @@ pub fn get(_py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
             Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
         }
     }
+}
+
+// --- `get_range` function (universal backend support)
+#[pyfunction(name = "get_range")]
+#[pyo3(signature = (uri, offset, length = None))]
+pub fn get_range_py(py: Python<'_>, uri: &str, offset: u64, length: Option<u64>) -> PyResult<PyBytesView> {
+    // Use universal ObjectStore interface for range requests
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+        rt.block_on(async {
+            let logger = global_logger();
+            let store = store_for_uri_with_logger(uri, logger).map_err(py_err)?;
+            let bytes = store.get_range(uri, offset, length).await.map_err(py_err)?;
+            Ok(PyBytesView::new(bytes))
+        })
+    })
 }
 
 // --- `download` function
@@ -1044,6 +1060,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_many_stats_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
+    m.add_function(wrap_pyfunction!(get_range_py, m)?)?;
     m.add_function(wrap_pyfunction!(download, m)?)?;
     m.add_function(wrap_pyfunction!(get_many, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
