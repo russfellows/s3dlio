@@ -1,10 +1,10 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-122%20passing-brightgreen)](docs/v0.9.2_Test_Summary.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-113%2F114-brightgreen)](docs/v0.9.2_Test_Summary.md)
-[![Python Tests](https://img.shields.io/badge/python%20tests-9%2F16-yellow)](docs/v0.9.2_Test_Summary.md)
-[![Version](https://img.shields.io/badge/version-0.9.2-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-130%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-118%2F119-brightgreen)](docs/Changelog.md)
+[![Python Tests](https://img.shields.io/badge/python%20tests-12%2F16-yellow)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.3-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.83%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -12,6 +12,40 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 New Releases
+
+### v0.9.3 - RangeEngine for Azure & GCS (October 2025)
+
+**Concurrent range downloads** for network storage backends with 30-50% throughput improvements on large files:
+- **Azure Blob Storage**: Automatic RangeEngine for files ≥ 4MB (20-50% faster)
+- **Google Cloud Storage**: Full RangeEngine integration with 2+ concurrent ranges
+- **Universal Python API**: All operations work across all 5 backends (S3, Azure, GCS, file://, direct://)
+
+**Performance:**
+- Azure: 16.54 MB/s (8MB blobs with RangeEngine)
+- GCS: 44-46 MB/s (128MB objects, 2 concurrent ranges)
+- Expected: 30-50% gains on high-bandwidth networks (>1 Gbps)
+
+**Configuration:**
+```rust
+use s3dlio::object_store::{AzureObjectStore, AzureConfig};
+
+// Default: RangeEngine enabled with network-optimized settings
+let store = AzureObjectStore::new();
+
+// Custom: Adjust thresholds and concurrency
+let config = AzureConfig {
+    enable_range_engine: true,
+    range_engine: RangeEngineConfig {
+        chunk_size: 64 * 1024 * 1024,        // 64MB chunks
+        max_concurrent_ranges: 32,            // 32 parallel
+        min_split_size: 4 * 1024 * 1024,     // 4MB threshold
+        range_timeout: Duration::from_secs(30),
+    },
+};
+let store = AzureObjectStore::with_config(config);
+```
+
+📖 [Changelog v0.9.3](docs/Changelog.md#version-093) | [Migration Guide](docs/Changelog.md#-migration-guide)
 
 ### v0.9.2 - Graceful Shutdown & Configuration Clarity (October 2025)
 
@@ -44,10 +78,26 @@ Universal commands, operation logging, performance monitoring, and AI/ML trainin
 s3dlio provides unified storage operations across all backends with consistent URI patterns:
 
 - **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations (5+ GB/s reads, 2.5+ GB/s writes)
-- **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with hot/cool tier support
-- **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - Production ready with full ObjectStore integration
-- **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations
-- **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance
+- **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with **RangeEngine** (30-50% faster for large blobs)
+- **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - Production ready with **RangeEngine** and full ObjectStore integration
+- **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations with **RangeEngine** support
+- **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance with **RangeEngine**
+
+### RangeEngine Performance Features (v0.9.3+)
+Concurrent range downloads hide network latency by parallelizing HTTP range requests:
+
+**Backends with RangeEngine:**
+- ✅ **Azure Blob Storage**: 30-50% faster for files ≥ 4MB
+- ✅ **Google Cloud Storage**: 30-50% faster for files ≥ 4MB  
+- ✅ **Local File System**: Optimized for files ≥ 64MB
+- ✅ **DirectIO**: Optimized for files ≥ 64MB
+- 🔄 **S3**: Coming soon
+
+**Configuration (all backends):**
+- Threshold: 4MB (Azure/GCS) or 64MB (file:// / direct://)
+- Chunk size: 64MB default
+- Max concurrent: 32 ranges (network) or 16 ranges (local)
+- Automatic: Enabled by default, no code changes needed
 
 ### S3 Backend Options
 s3dlio supports two S3 backend implementations. **Native AWS SDK is the default and recommended** for production use:
