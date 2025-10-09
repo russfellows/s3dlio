@@ -127,6 +127,36 @@ impl Default for PoolConfig {
     }
 }
 
+impl PoolConfig {
+    /// Create PoolConfig with sensible scaling from LoaderOptions
+    /// 
+    /// Maps LoaderOptions fields to pool configuration:
+    /// - `pool_size` = `num_workers * 16` (scale parallelism)
+    /// - `readahead_batches` = `prefetch.max(2)` (minimum prefetch depth)
+    /// 
+    /// This provides a reasonable starting point for users who want to derive
+    /// pool configuration from their training parameters.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let options = LoaderOptions { num_workers: 4, prefetch: 3, ..Default::default() };
+    /// let pool_config = PoolConfig::from_loader_options(&options);
+    /// // pool_size = 64, readahead_batches = 3
+    /// ```
+    pub fn from_loader_options(opts: &LoaderOptions) -> Self {
+        Self {
+            pool_size: if opts.num_workers > 0 {
+                opts.num_workers * 16
+            } else {
+                64  // Default when num_workers is 0 (auto)
+            },
+            readahead_batches: opts.prefetch.max(2),
+            ..Default::default()
+        }
+    }
+}
+
+
 impl AsyncPoolDataLoader {
     pub fn new(dataset: MultiBackendDataset, options: LoaderOptions) -> Self {
         Self {
