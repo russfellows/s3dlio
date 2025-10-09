@@ -1,8 +1,63 @@
 # s3dlio Changelog
 
-## Version 0.9.3 - RangeEngine for Azure & GCS Backends (October 2025)
+## Version 0.9.4 - S3-Specific API Deprecation (October 2025)
 
-### 🎯 **New Features**
+### ⚠️ **DEPRECATION NOTICES**
+
+#### **Python & Rust API: S3-Specific Data Functions Deprecated (Removal in v1.0.0)**
+
+Two S3-specific data operation functions have been deprecated in favor of universal URI-based alternatives. **These functions will be removed in v1.0.0.**
+
+**IMPORTANT**: 
+- This deprecation affects **BOTH Python AND Rust APIs**
+- `create_bucket()` and `delete_bucket()` are **NOT deprecated** - they will be made universal in future releases
+
+**Deprecated Functions:**
+
+1. **`list_objects(bucket, prefix, recursive)`** → Use `list(uri, recursive, pattern)`
+   
+   **Python:**
+   ```python
+   # OLD (deprecated)
+   objects = s3dlio.list_objects("bucket", "prefix/", recursive=True)
+   
+   # NEW (universal)
+   objects = s3dlio.list("s3://bucket/prefix/", recursive=True)
+   ```
+   
+   **Rust:**
+   ```rust
+   // OLD (deprecated)
+   use s3dlio::s3_utils::list_objects;
+   let objects = list_objects("bucket", "prefix/", true)?;
+   
+   // NEW (universal)
+   use s3dlio::api::{store_for_uri, ObjectStore};
+   let store = store_for_uri("s3://bucket/prefix/")?;
+   let objects = store.list("", true, None).await?;
+   ```
+
+2. **`get_object(bucket, key, offset, length)`** → Use `get(uri)` or `get_range(uri, offset, length)`
+   
+   **Python:**
+   ```python
+   # OLD (deprecated)
+   data = s3dlio.get_object("bucket", "key", offset=1024, length=4096)
+   
+   # NEW (universal)
+   data = s3dlio.get_range("s3://bucket/key", offset=1024, length=4096)
+   ```
+
+**Timeline:**
+- **v0.9.4**: Functions work with deprecation warnings (stderr + compile-time)
+- **v0.9.x → v1.0.0-rc**: Functions continue working with warnings
+- **v1.0.0**: Functions removed
+
+**See**: [DEPRECATION-NOTICE-v0.9.4.md](./DEPRECATION-NOTICE-v0.9.4.md) for complete migration guide.
+
+---
+
+## Version 0.9.3 - RangeEngine for Azure & GCS Backends (October 2025)
 
 #### **1. RangeEngine Integration for Azure Blob Storage**
 Concurrent range downloads significantly improve throughput for large Azure blobs by hiding network latency with parallel range requests.

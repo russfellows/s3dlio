@@ -303,18 +303,26 @@ fn str_to_data_gen_mode(s: &str) -> DataGenMode {
 }
 
 // ------------------------------------------------------------------------
-// NEW: Python-visible list_objects()  (sync wrapper), with recursion
+// ------------------------------------------------------------------------
+// DEPRECATED: Python-visible list_objects()  (sync wrapper), with recursion
+// This function is S3-specific and will be removed in v1.0.0.
+// Use the universal `list(uri, recursive, pattern)` function instead.
 // ------------------------------------------------------------------------
 #[pyfunction]
 #[pyo3(signature = (bucket, prefix, recursive = false))]
+#[deprecated(since = "0.9.4", note = "Use universal `list(uri, recursive, pattern)` instead. This S3-specific function will be removed in v1.0.0.")]
 fn list_objects(bucket: &str, prefix: &str, recursive: bool) -> PyResult<Vec<String>> {
+    eprintln!("WARNING: list_objects() is deprecated and will be removed in v1.0.0. Use list(uri, recursive, pattern) instead.");
     list_objects_rs(bucket, prefix, recursive).map_err(py_err)
 }
 
 // ------------------------------------------------------------------------
-// NEW: Python-visible get_object()  (sync wrapper)
+// DEPRECATED: Python-visible get_object()  (sync wrapper)
+// This function is S3-specific and will be removed in v1.0.0.
+// Use the universal `get(uri)` or `get_range(uri, offset, length)` function instead.
 // ------------------------------------------------------------------------
 #[pyfunction]
+#[deprecated(since = "0.9.4", note = "Use universal `get(uri)` or `get_range(uri, offset, length)` instead. This S3-specific function will be removed in v1.0.0.")]
 fn get_object(
     _py: Python<'_>,
     bucket: &str,
@@ -322,6 +330,7 @@ fn get_object(
     offset: Option<u64>,
     length: Option<u64>,
 ) -> PyResult<PyBytesView> {
+    eprintln!("WARNING: get_object() is deprecated and will be removed in v1.0.0. Use get(uri) or get_range(uri, offset, length) instead.");
     let bytes = s3_get_range(bucket, key, offset.unwrap_or(0), length)
         .map_err(py_err)?;
     // Return zero-copy BytesView wrapper
@@ -1049,10 +1058,15 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_op_log_active, m)?)?;
     
     // Core storage operations
-    m.add_function(wrap_pyfunction!(list_objects, m)?)?;
-    m.add_function(wrap_pyfunction!(get_object, m)?)?;
+    // DEPRECATED: S3-specific data operations (will be removed in v1.0.0)
+    m.add_function(wrap_pyfunction!(list_objects, m)?)?;      // Use list() instead
+    m.add_function(wrap_pyfunction!(get_object, m)?)?;        // Use get() or get_range() instead
+    
+    // Bucket management (S3-specific but kept for convenience)
     m.add_function(wrap_pyfunction!(create_bucket, m)?)?;
     m.add_function(wrap_pyfunction!(delete_bucket, m)?)?;
+    
+    // Universal storage operations (preferred)
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(list, m)?)?;
