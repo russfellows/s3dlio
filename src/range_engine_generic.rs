@@ -11,7 +11,30 @@ use anyhow::{Result, bail};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::constants::{
+    DEFAULT_RANGE_ENGINE_CHUNK_SIZE,
+    DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,
+    DEFAULT_FILE_RANGE_ENGINE_THRESHOLD,
+    DEFAULT_RANGE_TIMEOUT_SECS,
+};
+
 /// Configuration for range-based concurrent downloads
+/// 
+/// **Performance Considerations**:
+/// - **Local File Systems**: Range parallelism may be **slower** due to:
+///   - Seek overhead (random access vs sequential)
+///   - Disk I/O contention
+///   - Page cache already optimizes sequential reads
+///   - Consider disabling or using higher thresholds (16-64MB) for file:// URIs
+/// 
+/// - **Network Storage (S3/Azure/GCS)**: Benefits significantly from range parallelism:
+///   - Hides network latency with concurrent requests
+///   - 30-50% throughput improvement for large files
+///   - Lower thresholds (4MB) work well
+/// 
+/// - **DirectIO**: Limited benefit since O_DIRECT already bypasses page cache
+///   - Higher threshold (16MB) recommended due to alignment overhead
+///   - Lower concurrency (16) to avoid excessive parallel seeks
 #[derive(Debug, Clone)]
 pub struct RangeEngineConfig {
     /// Size of each range chunk in bytes (default: 64MB)
@@ -22,6 +45,7 @@ pub struct RangeEngineConfig {
     
     /// Minimum object size to trigger range splitting (default: 4MB)
     /// Objects smaller than this use simple single-request downloads
+    /// **WARNING**: For local filesystems, consider higher thresholds or disable entirely
     pub min_split_size: u64,
     
     /// Timeout per range request (default: 30s)
@@ -31,10 +55,10 @@ pub struct RangeEngineConfig {
 impl Default for RangeEngineConfig {
     fn default() -> Self {
         Self {
-            chunk_size: 64 * 1024 * 1024,      // 64MB chunks
-            max_concurrent_ranges: 32,          // Up to 32 parallel ranges
-            min_split_size: 4 * 1024 * 1024,   // Split files >= 4MB
-            range_timeout: Duration::from_secs(30),
+            chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,
+            max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,
+            min_split_size: DEFAULT_FILE_RANGE_ENGINE_THRESHOLD,
+            range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),
         }
     }
 }

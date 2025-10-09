@@ -6,19 +6,28 @@
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use crate::object_store::WriterOptions;
+use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crc32fast::Hasher;
 use std::io::Write;
-use tracing::warn;
+use tracing::{debug, info, trace, warn};
 
-use crate::constants::{DEFAULT_PAGE_SIZE, DEFAULT_MIN_IO_SIZE};
+use crate::constants::{DEFAULT_PAGE_SIZE, DEFAULT_MIN_IO_SIZE, DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD};
 use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, CompressionConfig};
 
 /// Configuration options for FileSystem operations
+/// 
+/// **DirectIO Performance Characteristics**:
+/// - O_DIRECT bypasses page cache - already very fast for sequential reads
+/// - Range parallelism provides **limited benefit** compared to network storage
+/// - Alignment overhead (page-size rounding) adds complexity
+/// - Expected improvement: 20-40% vs 30-50% for network storage
+/// - **Recommendation**: Higher thresholds (16-32MB) and lower concurrency (8-16)
 #[derive(Debug, Clone)]
 pub struct FileSystemConfig {
     /// Enable O_DIRECT I/O to bypass page cache (Linux/Unix only)
@@ -29,6 +38,11 @@ pub struct FileSystemConfig {
     pub min_io_size: usize,
     /// Enable O_SYNC for synchronous writes
     pub sync_writes: bool,
+    /// Enable concurrent range downloads for large files (default: true)
+    /// **Note**: DirectIO already fast, range parallelism has limited benefit
+    pub enable_range_engine: bool,
+    /// Range engine configuration
+    pub range_engine: RangeEngineConfig,
 }
 
 impl Default for FileSystemConfig {
@@ -41,6 +55,11 @@ impl Default for FileSystemConfig {
             alignment: page_size,
             min_io_size: page_size,
             sync_writes: false,
+            enable_range_engine: true,
+            range_engine: RangeEngineConfig {
+                min_split_size: DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD,
+                ..Default::default()
+            },
         }
     }
 }
@@ -55,6 +74,14 @@ impl FileSystemConfig {
             alignment: page_size,
             min_io_size: page_size,
             sync_writes: false,
+            enable_range_engine: true,
+            // DirectIO: higher threshold (16MB), lower concurrency (16)
+            range_engine: RangeEngineConfig {
+                chunk_size: 64 * 1024 * 1024,     // 64MB chunks
+                max_concurrent_ranges: 16,         // Lower concurrency for O_DIRECT
+                min_split_size: DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD,
+                ..Default::default()
+            },
         }
     }
 
@@ -67,6 +94,14 @@ impl FileSystemConfig {
             alignment: page_size,
             min_io_size: DEFAULT_MIN_IO_SIZE,
             sync_writes: true,          // Ensure data hits storage
+            enable_range_engine: true,
+            // High performance: same as direct_io
+            range_engine: RangeEngineConfig {
+                chunk_size: 64 * 1024 * 1024,
+                max_concurrent_ranges: 16,
+                min_split_size: DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD,
+                ..Default::default()
+            },
         }
     }
 }
@@ -519,12 +554,24 @@ impl ObjectWriter for DirectIOWriter {
 
 /// Enhanced FileSystem adapter with O_DIRECT support
 pub struct ConfigurableFileSystemObjectStore {
-    config: FileSystemConfig,
+    config: Arc<FileSystemConfig>,
+}
+
+impl Clone for ConfigurableFileSystemObjectStore {
+    fn clone(&self) -> Self {
+        Self {
+            config: Arc::clone(&self.config),
+        }
+    }
 }
 
 impl ConfigurableFileSystemObjectStore {
     pub fn new(config: FileSystemConfig) -> Self {
-        Self { config }
+        Self { config: Arc::new(config) }
+    }
+
+    pub fn with_config(config: FileSystemConfig) -> Self {
+        Self::new(config)
     }
 
     pub fn with_direct_io() -> Self {
@@ -883,8 +930,7 @@ impl ConfigurableFileSystemObjectStore {
                 file.read_to_end(&mut buffer).await?;
             } else {
                 buffer.resize(read_length as usize, 0);
-                let bytes_read = file.read(&mut buffer).await?;
-                buffer.truncate(bytes_read);
+                file.read_exact(&mut buffer).await?;
             }
             
             return Ok(Bytes::from(buffer));
@@ -906,8 +952,7 @@ impl ConfigurableFileSystemObjectStore {
                     file.read_to_end(&mut buffer).await?;
                 } else {
                     buffer.resize(read_length as usize, 0);
-                    let bytes_read = file.read(&mut buffer).await?;
-                    buffer.truncate(bytes_read);
+                    file.read_exact(&mut buffer).await?;
                 }
                 
                 Ok(Bytes::from(buffer))
@@ -945,6 +990,45 @@ impl ConfigurableFileSystemObjectStore {
         let end = std::cmp::min(start + read_length as usize, bytes_read);
         
         Ok(buffer[start..end].to_vec())
+    }
+
+    /// Get file using RangeEngine for concurrent downloads
+    async fn get_with_range_engine(&self, uri: &str, object_size: u64) -> Result<Bytes> {
+        debug!(
+            "DirectIO using RangeEngine: uri={}, size={} MB, threshold={} MB",
+            uri,
+            object_size / (1024 * 1024),
+            self.config.range_engine.min_split_size / (1024 * 1024)
+        );
+
+        let engine = RangeEngine::new(self.config.range_engine.clone());
+        let store = self.clone();
+        let uri_owned = uri.to_string();
+
+        let get_range_fn = move |offset: u64, length: u64| {
+            let store = store.clone();
+            let uri = uri_owned.clone();
+            async move { store.get_range(&uri, offset, Some(length)).await }
+        };
+
+        let (bytes, stats) = engine.download(object_size, get_range_fn, None).await?;
+
+        info!(
+            "DirectIO RangeEngine complete: {} MB in {:.2}s ({:.2} MB/s, {} ranges)",
+            bytes.len() / (1024 * 1024),
+            stats.elapsed_time.as_secs_f64(),
+            stats.throughput_mbps(),
+            stats.ranges_processed
+        );
+
+        Ok(bytes)
+    }
+
+    /// Simple file read without RangeEngine (for small files)
+    async fn get_simple(&self, uri: &str, _size: u64) -> Result<Bytes> {
+        let path = Self::uri_to_path(uri)?;
+        trace!("DirectIO using simple read for file: {}", path.display());
+        self.read_file_direct(&path).await
     }
 
     /// Recursively collect files in a directory
@@ -987,8 +1071,18 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         if !path.is_file() {
             bail!("Path is not a file: {}", path.display());
         }
-        
-        self.read_file_direct(&path).await
+
+        // Get file size to determine if we should use RangeEngine
+        let metadata = fs::metadata(&path).await?;
+        let size = metadata.len();
+
+        // Use RangeEngine for large files if enabled
+        if self.config.enable_range_engine && size >= self.config.range_engine.min_split_size {
+            return self.get_with_range_engine(uri, size).await;
+        }
+
+        // Use simple read for small files or when RangeEngine disabled
+        self.get_simple(uri, size).await
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
@@ -1196,7 +1290,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         
         // For direct I/O, we might want a specialized writer, but for now use the same
         // as regular filesystem with potential for future direct I/O optimization
-        Ok(Box::new(DirectIOWriter::new(path, self.config.clone()).await?))
+        Ok(Box::new(DirectIOWriter::new(path, (*self.config).clone()).await?))
     }
 
     async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
@@ -1207,7 +1301,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         let path = Self::uri_to_path(uri)?;
         
         // For direct I/O with compression
-        Ok(Box::new(DirectIOWriter::new_with_compression(path, self.config.clone(), compression).await?))
+        Ok(Box::new(DirectIOWriter::new_with_compression(path, (*self.config).clone(), compression).await?))
     }
 
     async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
@@ -1219,9 +1313,9 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         
         // Create DirectIOWriter with optional compression
         if let Some(compression) = options.compression {
-            Ok(Box::new(DirectIOWriter::new_with_compression(path, self.config.clone(), compression).await?))
+            Ok(Box::new(DirectIOWriter::new_with_compression(path, (*self.config).clone(), compression).await?))
         } else {
-            Ok(Box::new(DirectIOWriter::new(path, self.config.clone()).await?))
+            Ok(Box::new(DirectIOWriter::new(path, (*self.config).clone()).await?))
         }
     }
 }

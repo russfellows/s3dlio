@@ -19,11 +19,19 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crc32fast::Hasher;
 
 use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, CompressionConfig};
+use crate::constants::DEFAULT_FILE_RANGE_ENGINE_THRESHOLD;
 
 /// Configuration for FileSystemObjectStore
+/// 
+/// **Performance Note**: Range parallelism may be **counterproductive** for local files
+/// - Sequential reads are typically faster due to OS page cache optimization
+/// - Concurrent ranges introduce seek overhead and disk contention
+/// - Consider disabling range_engine or setting very high thresholds (>64MB)
+/// - Benefits are primarily for network storage (S3/Azure/GCS)
 #[derive(Debug, Clone)]
 pub struct FileSystemConfig {
-    /// Enable concurrent range downloads for large files
+    /// Enable concurrent range downloads for large files (default: true)
+    /// **Recommendation**: Set to false for local file systems
     pub enable_range_engine: bool,
     
     /// Range engine configuration
@@ -34,7 +42,10 @@ impl Default for FileSystemConfig {
     fn default() -> Self {
         Self {
             enable_range_engine: true,
-            range_engine: RangeEngineConfig::default(),
+            range_engine: RangeEngineConfig {
+                min_split_size: DEFAULT_FILE_RANGE_ENGINE_THRESHOLD,
+                ..Default::default()
+            },
         }
     }
 }
