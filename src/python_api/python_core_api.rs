@@ -23,7 +23,7 @@ use tracing_subscriber;
 // Project crates
 use crate::config::{ObjectType, DataGenMode, Config};
 use crate::s3_utils::{
-    delete_objects, get_object_uri, get_objects_parallel,
+    get_objects_parallel,
     list_objects as list_objects_rs, get_range as s3_get_range,
     parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
     create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs,
@@ -265,13 +265,30 @@ pub fn is_op_log_active() -> PyResult<bool> {
 // Utility helpers
 // ---------------------------------------------------------------------------
 fn build_uri_list(prefix: &str, template: &str, num: usize) -> PyResult<(String, Vec<String>)> {
-    let (bucket, mut key_prefix) = parse_s3_uri(prefix).map_err(py_err)?;
-    if !key_prefix.ends_with('/') { key_prefix.push('/'); }
+    // Extract scheme and parse URI generically (works for s3://, az://, file://, etc.)
+    let scheme_end = prefix.find("://").ok_or_else(|| {
+        anyhow::anyhow!("URI must contain scheme (e.g., s3://, az://, file://)")
+    }).map_err(py_err)?;
+    
+    let scheme = &prefix[..scheme_end + 3]; // Include "://"
+    let remainder = &prefix[scheme_end + 3..];
+    
+    // Split into bucket/container and key prefix
+    let (bucket, mut key_prefix) = if let Some(slash_pos) = remainder.find('/') {
+        (remainder[..slash_pos].to_string(), remainder[slash_pos + 1..].to_string())
+    } else {
+        (remainder.to_string(), String::new())
+    };
+    
+    if !key_prefix.is_empty() && !key_prefix.ends_with('/') { 
+        key_prefix.push('/'); 
+    }
+    
     let uris = (0..num).map(|i| {
         let name = template
             .replacen("{}", &i.to_string(), 1)
             .replacen("{}", &num.to_string(), 1);
-        format!("s3://{}/{}{}", bucket, key_prefix, name)
+        format!("{}{}/{}{}", scheme, bucket, key_prefix, name)
     }).collect();
     Ok((bucket, uris))
 }
@@ -348,7 +365,7 @@ pub fn delete_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
 // ---------------------------------------------------------------------------
 #[pyfunction]
 #[pyo3(signature = (
-    prefix, num, template,
+    prefix, num, template = None,
     max_in_flight = 64, size = None,
     should_create_bucket = false, object_type = "zeros",
     dedup_factor = 1, compress_factor = 1,
@@ -356,13 +373,14 @@ pub fn delete_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
 ))]
 pub fn put(
     py: Python<'_>,
-    prefix: &str, num: usize, template: &str,
+    prefix: &str, num: usize, template: Option<&str>,
     max_in_flight: usize, size: Option<usize>,
     should_create_bucket: bool, object_type: &str,
     dedup_factor: usize, compress_factor: usize,
     data_gen_mode: &str, chunk_size: usize,
 ) -> PyResult<()> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
+    let template = template.unwrap_or("object-{}");
     let (bucket, uris) = build_uri_list(prefix, template, num)?;
     let jobs = max_in_flight.min(num);
     let obj = str_to_obj(object_type);
@@ -379,7 +397,7 @@ pub fn put(
 
 #[pyfunction(name = "put_async")]
 #[pyo3(signature = (
-    prefix, num, template,
+    prefix, num, template = None,
     max_in_flight = 64, size = None,
     should_create_bucket = false, object_type = "zeros",
     dedup_factor = 1, compress_factor = 1,
@@ -387,13 +405,14 @@ pub fn put(
 ))]
 pub (crate) fn put_async_py<'p>(
     py: Python<'p>,
-    prefix: &'p str, num: usize, template: &'p str,
+    prefix: &'p str, num: usize, template: Option<&'p str>,
     max_in_flight: usize, size: Option<usize>,
     should_create_bucket: bool, object_type: &'p str,
     dedup_factor: usize, compress_factor: usize,
     data_gen_mode: &'p str, chunk_size: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
+    let template = template.unwrap_or("object-{}");
     let (bucket, uris) = build_uri_list(prefix, template, num)?;
     let jobs = max_in_flight.min(num);
     let obj = str_to_obj(object_type);
@@ -571,33 +590,16 @@ pub (crate) fn get_many_async_py<'p>(
 }
 
 #[pyfunction]
-pub fn get(_py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
-    use crate::object_store::{infer_scheme, Scheme};
-    
-    match infer_scheme(uri) {
-        Scheme::S3 => {
-            let bytes = get_object_uri(uri).map_err(py_err)?;
+pub fn get(py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
+    // Use universal ObjectStore API for all backends
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+        rt.block_on(async {
+            let store = store_for_uri(uri).map_err(py_err)?;
+            let bytes = store.get(uri).await.map_err(py_err)?;
             Ok(PyBytesView::new(bytes))
-        }
-        Scheme::File | Scheme::Direct => {
-            // For file systems, read the file directly
-            use std::fs;
-            let path = uri.strip_prefix("file://").unwrap_or(uri);
-            let file_bytes = fs::read(path).map_err(py_err)?;
-            Ok(PyBytesView::new(Bytes::from(file_bytes)))
-        }
-        Scheme::Azure => {
-            // TODO: Implement Azure get
-            Err(PyRuntimeError::new_err("Azure get not yet implemented"))
-        }
-        Scheme::Gcs => {
-            // TODO: Implement GCS get
-            Err(PyRuntimeError::new_err("GCS get not yet implemented"))
-        }
-        Scheme::Unknown => {
-            Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
-        }
-    }
+        })
+    })
 }
 
 // --- `get_range` function (universal backend support)
@@ -772,35 +774,36 @@ pub fn get_many(
 // --- `delete` function
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false))]
-pub fn delete(uri: &str, recursive: bool) -> PyResult<()> {
-    let (bucket, mut key_pattern) = parse_s3_uri(uri).map_err(py_err)?;
-
-    /*
-     * Old
-     *
-    // If the pattern isn't a glob/regex and not a prefix, it's a single key.
-    // Otherwise, use list_objects to find all matching keys.
-    let keys_to_delete = if !key_pattern.contains('*') && !key_pattern.contains('?') && !key_pattern.ends_with('/') {
-        vec![key_pattern]
-    } else {
-        crate::s3_utils::list_objects(&bucket, &key_pattern, recursive).map_err(py_err)?
-    };
-    */
-
-    // If the path ends with a slash, automatically append a wildcard to search inside it.
-    if key_pattern.ends_with('/') {
-        key_pattern.push_str(".*");
-    }
-
-    let keys_to_delete =
-        crate::s3_utils::list_objects(&bucket, &key_pattern, recursive).map_err(py_err)?;
-
-    if keys_to_delete.is_empty() {
-        // Return Ok instead of an error if nothing matched, this is common practice
-        return Ok(());
-    }
-
-    delete_objects(&bucket, &keys_to_delete).map_err(py_err)
+pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
+    // Use universal ObjectStore API for deletion
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+        rt.block_on(async {
+            let store = store_for_uri(uri).map_err(py_err)?;
+            
+            // Check if URI contains wildcards or ends with / (pattern/directory)
+            let has_pattern = uri.contains('*') || uri.contains('?') || uri.ends_with('/');
+            
+            if has_pattern || recursive {
+                // Need to list objects first, then delete them
+                let list_results = store.list(uri, recursive).await.map_err(py_err)?;
+                
+                if list_results.is_empty() {
+                    // No objects matched - this is OK
+                    return Ok(());
+                }
+                
+                // Delete each object (list returns full URIs)
+                for obj_uri in list_results {
+                    store.delete(&obj_uri).await.map_err(py_err)?;
+                }
+                Ok(())
+            } else {
+                // Simple single object deletion
+                store.delete(uri).await.map_err(py_err)
+            }
+        })
+    })
 }
 
 
@@ -994,7 +997,7 @@ pub fn create_azure_writer(py: Python<'_>, uri: String, options: Option<&PyWrite
     
     py.allow_threads(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
-            let store = AzureObjectStore;
+            let store = AzureObjectStore::new();
             let writer = store.create_writer(&uri, opts).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create Azure writer: {}", e)))?;
             

@@ -6,6 +6,9 @@ Top-level s3dlio package:
 • Adds small helpers and the high-level loaders for Torch / JAX / TF.
 """
 
+# Version - keep in sync with pyproject.toml
+__version__ = "0.9.2"
+
 from importlib import import_module
 import sys as _sys
 from typing import List  # avoid confusion with Rust-exported `list` symbol
