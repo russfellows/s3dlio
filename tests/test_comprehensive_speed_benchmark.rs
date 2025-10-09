@@ -104,7 +104,7 @@ async fn test_end_to_end_upload_speed_comparison() -> Result<()> {
     println!("Testing complete upload workflows: single-pass vs streaming");
     
     let size = 8 * 1024 * 1024; // 8MB
-    let store = FileSystemObjectStore;
+    let store = FileSystemObjectStore::new();
     let options = WriterOptions::default();
     
     // Test single-pass upload approach (current CLI/Python method)

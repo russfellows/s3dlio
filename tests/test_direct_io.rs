@@ -42,11 +42,11 @@ async fn test_direct_io_basic_operations() -> Result<()> {
     
     // Test get operation
     let retrieved_data = store.get(&test_uri).await?;
-    assert_eq!(retrieved_data, test_data);
+    assert_eq!(retrieved_data.as_ref(), test_data);
     
     // Test get_range operation
     let range_data = store.get_range(&test_uri, 7, Some(8)).await?;
-    assert_eq!(range_data, b"O_DIRECT");
+    assert_eq!(range_data.as_ref(), b"O_DIRECT");
     
     // Test stat operation - this might be causing the issue
     let metadata = store.stat(&test_uri).await?;
@@ -105,7 +105,7 @@ async fn test_fallback_to_normal_io() -> Result<()> {
     // Test basic operations
     store.put(&test_uri, test_data).await?;
     let retrieved_data = store.get(&test_uri).await?;
-    assert_eq!(retrieved_data, test_data);
+    assert_eq!(retrieved_data.as_ref(), test_data);
     
     // Clean up
     store.delete(&test_uri).await?;
@@ -171,7 +171,7 @@ async fn test_alignment_handling() -> Result<()> {
     let retrieved_data = store.get(&test_uri).await?;
     
     // Should retrieve exactly the original data, not the padded version
-    assert_eq!(retrieved_data, test_data);
+    assert_eq!(retrieved_data.as_ref(), test_data);
     assert_eq!(retrieved_data.len(), 68);
 
     // Clean up
@@ -230,11 +230,11 @@ async fn test_regular_filesystem_baseline() -> Result<()> {
     // Test basic operations work with regular I/O
     store.put(&test_uri, test_data).await?;
     let retrieved_data = store.get(&test_uri).await?;
-    assert_eq!(retrieved_data, test_data);
+    assert_eq!(retrieved_data.as_ref(), test_data);
     
     // Test range operations
     let range_data = store.get_range(&test_uri, 7, Some(7)).await?;
-    assert_eq!(range_data, b"regular");
+    assert_eq!(range_data.as_ref(), b"regular");
     
     // Clean up
     store.delete(&test_uri).await?;
@@ -260,11 +260,11 @@ async fn test_direct_io_graceful_fallback() -> Result<()> {
     // All operations should work via fallback when O_DIRECT isn't supported
     store.put(&test_uri, test_data).await?;
     let retrieved_data = store.get(&test_uri).await?;
-    assert_eq!(retrieved_data, test_data);
+    assert_eq!(retrieved_data.as_ref(), test_data);
     
     // Range operations should also work via fallback
     let range_data = store.get_range(&test_uri, 7, Some(8)).await?;
-    assert_eq!(range_data, b"graceful");
+    assert_eq!(range_data.as_ref(), b"graceful");
     
     // Clean up
     store.delete(&test_uri).await?;
@@ -289,7 +289,7 @@ async fn test_factory_functions() -> Result<()> {
     
     direct_store.put(&test_uri, test_data).await?;
     let retrieved = direct_store.get(&test_uri).await?;
-    assert_eq!(retrieved, test_data);
+    assert_eq!(retrieved.as_ref(), test_data);
     direct_store.delete(&test_uri).await?;
     
     // Test high_performance_store_for_uri factory

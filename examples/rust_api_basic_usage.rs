@@ -16,7 +16,7 @@ use s3dlio::api::{
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     // Example 1: Basic read/write operations
     basic_operations().await?;

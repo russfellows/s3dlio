@@ -12,7 +12,7 @@ use s3dlio::metrics::enhanced::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     
     // Initialize global metrics with high throughput support for all demos
     let global_config = MetricsConfig {

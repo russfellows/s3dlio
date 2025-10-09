@@ -1,7 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-91%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
+[![Tests](https://img.shields.io/badge/tests-122%20passing-brightgreen)](docs/v0.9.2_Test_Summary.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-113%2F114-brightgreen)](docs/v0.9.2_Test_Summary.md)
+[![Python Tests](https://img.shields.io/badge/python%20tests-9%2F16-yellow)](docs/v0.9.2_Test_Summary.md)
 [![Version](https://img.shields.io/badge/version-0.9.2-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.83%2B-orange)](https://www.rust-lang.org)
@@ -96,6 +98,7 @@ pip install s3dlio
 - **[Changelog](docs/Changelog.md)** - Version history and release notes
 - **[Adaptive Tuning Guide](docs/ADAPTIVE-TUNING.md)** - Optional performance auto-tuning
 - **[Testing Guide](docs/TESTING-GUIDE.md)** - Test suite documentation
+- **[v0.9.2 Test Summary](docs/v0.9.2_Test_Summary.md)** - ✅ 122/130 tests passing (93.8%)
 
 ## Core Capabilities
 

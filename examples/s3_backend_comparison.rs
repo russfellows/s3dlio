@@ -12,7 +12,7 @@ use tokio::time::sleep;
 async fn main() -> Result<()> {
     // Load environment variables
     dotenvy::dotenv().ok();
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     // Get S3 configuration from environment
     let bucket = env::var("S3_BUCKET").unwrap_or_else(|_| "my-bucket2".to_string());
