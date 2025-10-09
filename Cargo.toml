@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "AGPL-3.0"
@@ -44,6 +44,7 @@ tracing-log = "^0.2"  # Bridge to capture log crate messages from dependencies
 # --- async / net stack ----------------------------------------------------
 tokio   = { version = "^1", features = ["full"] }
 tokio-stream = { version = "^0.1", features = ["sync"] }
+tokio-util = "^0.7"  # For CancellationToken and other utilities
 hyper   = { version = "^1", features = ["client"] }		# ← Upgraded
 hyper-util = { version = "^0.1", features = ["client-legacy", "tokio"] }  # ← Added for HTTP client config
 hyper-rustls = "^0.27"                                		# ← matches hyper ^1

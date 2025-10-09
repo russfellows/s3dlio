@@ -1,6 +1,6 @@
-# s3dlio Rust Library API Guide - v0.9.0
+# s3dlio Rust Library API Guide - v0.9.2
 
-**Version**: 0.9.0 (API-stable beta)  
+**Version**: 0.9.2 (API-stable beta)  
 **Date**: October 2025  
 **Status**: Breaking changes from v0.8.x - see migration section
 
@@ -9,7 +9,8 @@
 ## Table of Contents
 
 - [Overview](#overview)
-- [What's New in v0.9.0](#whats-new-in-v090)
+- [What's New in v0.9.2](#whats-new-in-v092)
+- [Configuration Hierarchy](#configuration-hierarchy-understanding-the-three-levels)
 - [Breaking Changes from v0.8.22](#breaking-changes-from-v0822)
 - [Core API](#core-api)
 - [Adaptive Configuration (NEW)](#adaptive-configuration-new)
@@ -32,9 +33,26 @@ s3dlio is a high-performance, multi-protocol storage library for AI/ML workloads
 
 ---
 
-## What's New in v0.9.0
+## What's New in v0.9.2
 
-### Major Features
+### New Features
+
+1. **CancellationToken Support** 🛑 (v0.9.2)
+   - Graceful shutdown for all DataLoader components
+   - Clean Ctrl-C handling in training loops
+   - Cooperative cancellation across async workers
+   - See [Graceful Shutdown](#graceful-shutdown-v092) section
+
+2. **Configuration Hierarchy Documentation** 📚 (v0.9.2)
+   - Clear three-level design (LoaderOptions → PoolConfig → RangeEngineConfig)
+   - PyTorch-aligned concepts for ML practitioners
+   - See [Configuration Hierarchy](#configuration-hierarchy-understanding-the-three-levels) section
+
+3. **PoolConfig Convenience Constructor** 🛠️ (v0.9.2)
+   - `PoolConfig::from_loader_options()` to derive from training parameters
+   - Simplifies advanced tuning workflows
+
+### From v0.9.0
 
 1. **Zero-Copy Performance** ⚡
    - `ObjectStore::get()` now returns `bytes::Bytes` instead of `Vec<u8>`
@@ -57,12 +75,193 @@ s3dlio is a high-performance, multi-protocol storage library for AI/ML workloads
 - **Memory**: 10-15% reduction via Bytes migration
 - **Throughput**: Maintained 5+ GB/s reads, 2.5+ GB/s writes
 - **Batch loading**: 3-8x faster with concurrent fetching
+- **Cancellation**: Zero overhead when not used, clean shutdown when needed
 
-### Deferred Features
+---
 
-- **Stage 3** (Backend-agnostic range engine): Moved to v0.9.1
-  - Non-breaking internal optimization
-  - Will improve range request efficiency across all backends
+## Configuration Hierarchy: Understanding the Three Levels
+
+s3dlio provides three conceptual levels of configuration, aligned with standard AI/ML training frameworks like PyTorch. Understanding this hierarchy helps you configure data loading efficiently without confusion.
+
+### Level 1: LoaderOptions (User-Facing, Training-Centric)
+
+**Analogy**: PyTorch's `DataLoader(batch_size, num_workers, ...)`
+
+**Purpose**: Controls **WHAT** batches to create and **HOW** to iterate the dataset
+
+**Who uses it**: ML practitioners, data scientists, model trainers
+
+**Mental model**: "I'm training a model, I need batches of data"
+
+```rust
+use s3dlio::data_loader::LoaderOptions;
+
+let options = LoaderOptions {
+    batch_size: 32,              // Items per batch
+    drop_last: false,            // Keep incomplete final batch
+    shuffle: true,               // Randomize iteration order
+    num_workers: 4,              // Parallelism (like PyTorch)
+    prefetch: 2,                 // Prefetch depth (like PyTorch's prefetch_factor)
+    pin_memory: true,            // GPU optimization
+    persistent_workers: true,    // Keep workers alive between epochs
+    ..Default::default()
+};
+
+let loader = DataLoader::new(dataset, options);
+```
+
+**Key principle**: These options control training behavior, not storage implementation details.
+
+---
+
+### Level 2: PoolConfig (Performance Tuning, Optional)
+
+**Analogy**: Internal worker pool management in PyTorch (hidden behind `num_workers`)
+
+**Purpose**: Controls **HOW** data is fetched efficiently to fill batches
+
+**Who uses it**: Performance engineers, infrastructure teams tuning download performance
+
+**Mental model**: "I want to optimize download speed without changing training behavior"
+
+```rust
+use s3dlio::data_loader::{AsyncPoolDataLoader, PoolConfig};
+
+// Simple case: Use defaults (recommended for most users)
+let loader = AsyncPoolDataLoader::new(dataset, options);
+let stream = loader.stream();  // Uses PoolConfig::default()
+
+// Advanced case: Tune download performance
+let pool_config = PoolConfig {
+    pool_size: 128,              // Concurrent download workers
+    readahead_batches: 8,        // Batch prefetch depth
+    batch_timeout: Duration::from_secs(60),
+    ..Default::default()
+};
+
+let stream = loader.stream_with_pool(pool_config);
+```
+
+**Convenience constructor**: Derive from LoaderOptions:
+```rust
+// Scale pool configuration from training parameters
+let pool_config = PoolConfig::from_loader_options(&options);
+// pool_size = num_workers * 16, readahead_batches = prefetch.max(2)
+
+let stream = loader.stream_with_pool(pool_config);
+```
+
+**When to tune**:
+- ✅ You have high-bandwidth infrastructure (>10 Gb/s)
+- ✅ You're optimizing for specific workload patterns
+- ✅ Default performance doesn't meet requirements
+- ❌ You're prototyping or just getting started (use defaults)
+
+---
+
+### Level 3: RangeEngineConfig (Internal Optimization, Hidden)
+
+**Analogy**: File I/O internals in PyTorch Dataset implementations (buffering, caching)
+
+**Purpose**: Controls storage-layer optimizations for large object downloads
+
+**Who uses it**: Storage engineers, infrastructure experts debugging edge cases
+
+**Mental model**: "How does s3dlio split large files into parallel range requests?"
+
+```rust
+use s3dlio::range_engine_generic::RangeEngineConfig;
+
+// Configuration (typically not exposed in high-level APIs)
+let config = RangeEngineConfig {
+    chunk_size: 64 * 1024 * 1024,        // 64MB chunks
+    max_concurrent_ranges: 32,           // Parallel ranges per object
+    min_split_size: 4 * 1024 * 1024,    // 4MB threshold to trigger splitting
+    ..Default::default()
+};
+```
+
+**Backend-specific defaults**:
+- **S3**: `min_split_size = 4MB` (efficient for network objects)
+- **Local file**: `min_split_size = 4MB` (⚠️ may add overhead, use simple reads for small files)
+- **DirectIO**: `min_split_size = 16MB` (alignment-aware, optimized for large files)
+
+**Key principle**: This is **mostly hidden** from user-facing APIs. The RangeEngine is used internally by ObjectStore implementations and automatically configured based on backend type.
+
+**When exposed**: Only in specialized debugging/profiling scenarios, not in DataLoader APIs.
+
+---
+
+### Comparison with PyTorch DataLoader
+
+| s3dlio | PyTorch Equivalent | Visibility | Typical Users |
+|--------|-------------------|------------|---------------|
+| **LoaderOptions** | `DataLoader(...)` | ✅ Always visible | ML practitioners |
+| **PoolConfig** | Worker pool internals | 🟡 Optional (good defaults) | Performance engineers |
+| **RangeEngineConfig** | Dataset I/O internals | ❌ Hidden | Storage engineers |
+
+### PyTorch vs s3dlio Side-by-Side
+
+**PyTorch**:
+```python
+# User configures high-level training options only
+dataloader = torch.utils.data.DataLoader(
+    dataset,
+    batch_size=32,        # Level 1: Batch construction
+    num_workers=4,        # Level 1: Parallelism
+    prefetch_factor=2,    # Level 1: Prefetching
+    pin_memory=True,      # Level 1: GPU optimization
+)
+# Level 2 (worker pool) is automatically managed
+# Level 3 (file I/O) is hidden in Dataset implementation
+```
+
+**s3dlio (Simple - Like PyTorch)**:
+```rust
+// Level 1 only: Training-focused configuration
+let options = LoaderOptions {
+    batch_size: 32,
+    num_workers: 4,
+    prefetch: 2,
+    pin_memory: true,
+    ..Default::default()
+};
+
+let loader = DataLoader::new(dataset, options);
+let stream = loader.stream();  // Uses internal defaults for Levels 2 & 3
+```
+
+**s3dlio (Advanced - Tune Download Performance)**:
+```rust
+// Level 1: Training configuration
+let options = LoaderOptions { /* ... */ };
+
+// Level 2: Explicit download pool tuning (NOT available in PyTorch)
+let pool_config = PoolConfig {
+    pool_size: 128,           // More aggressive than default
+    readahead_batches: 8,
+    ..Default::default()
+};
+
+let loader = AsyncPoolDataLoader::new(dataset, options);
+let stream = loader.stream_with_pool(pool_config);
+
+// Level 3 (RangeEngine) still hidden, auto-configured by backend
+```
+
+---
+
+### Design Philosophy
+
+s3dlio's configuration hierarchy follows these principles:
+
+1. **Progressive complexity**: Simple by default, powerful when needed
+2. **PyTorch alignment**: Familiar concepts for ML practitioners
+3. **Separation of concerns**: Training logic vs storage optimization
+4. **Good defaults**: Most users never touch Level 2 or 3
+5. **Expert escape hatches**: Advanced users can tune performance
+
+**Golden rule**: Start with LoaderOptions only. Add PoolConfig tuning only when profiling shows it's beneficial.
 
 ---
 
@@ -372,6 +571,72 @@ let store = store_for_uri("gs://bucket/")?;
 
 ## Data Loaders
 
+> **📚 See also**: [Configuration Hierarchy](#configuration-hierarchy-understanding-the-three-levels) for understanding LoaderOptions, PoolConfig, and RangeEngineConfig.
+
+### Basic Usage (Level 1: LoaderOptions Only)
+
+```rust
+use s3dlio::data_loader::{DataLoader, LoaderOptions, MultiBackendDataset};
+use futures::stream::StreamExt;
+
+// Create dataset from URIs
+let uris = vec![
+    "s3://bucket/data/sample_000001.bin".to_string(),
+    "s3://bucket/data/sample_000002.bin".to_string(),
+    // ... more URIs
+];
+let dataset = MultiBackendDataset::from_uris(uris)?;
+
+// Configure training options (Level 1)
+let options = LoaderOptions::default()
+    .with_batch_size(32)
+    .with_cancellation_token(cancel_token);  // v0.9.2: Graceful shutdown
+
+// Create loader and stream batches
+let loader = DataLoader::new(dataset, options);
+let mut stream = loader.stream();
+
+while let Some(batch_result) = stream.next().await {
+    let batch = batch_result?;  // Vec<Vec<u8>>
+    // Process batch for training
+    train_step(batch).await?;
+}
+```
+
+### Advanced Usage (Level 2: PoolConfig Tuning)
+
+For high-performance scenarios, use `AsyncPoolDataLoader` with optional `PoolConfig`:
+
+```rust
+use s3dlio::data_loader::{AsyncPoolDataLoader, PoolConfig};
+
+let options = LoaderOptions::default()
+    .with_batch_size(32);
+
+let loader = AsyncPoolDataLoader::new(dataset, options);
+
+// Option A: Use defaults (recommended)
+let stream = loader.stream();
+
+// Option B: Derive from LoaderOptions
+let pool_config = PoolConfig::from_loader_options(&options);
+let stream = loader.stream_with_pool(pool_config);
+
+// Option C: Custom tuning for high-bandwidth infrastructure
+let pool_config = PoolConfig {
+    pool_size: 128,          // More concurrent downloads
+    readahead_batches: 8,    // Deeper prefetch queue
+    ..Default::default()
+};
+let stream = loader.stream_with_pool(pool_config);
+
+// Process batches
+while let Some(batch_result) = stream.next().await {
+    let batch = batch_result?;
+    train_step(batch).await?;
+}
+```
+
 ### Dataset Creation
 
 ```rust
@@ -423,6 +688,86 @@ let opts = LoaderOptions::default()
     .with_shuffle(true)
     .with_seed(42)
     .with_adaptive();  // Enable adaptive tuning
+```
+
+### Graceful Shutdown (v0.9.2)
+
+**CancellationToken support** enables clean shutdown of data loading operations:
+
+```rust
+use tokio_util::sync::CancellationToken;
+use futures::stream::StreamExt;
+
+// Create cancellation token
+let cancel_token = CancellationToken::new();
+
+// Configure loader with cancellation support
+let options = LoaderOptions::default()
+    .with_batch_size(32)
+    .with_cancellation_token(cancel_token.clone());
+
+let loader = DataLoader::new(dataset, options);
+let mut stream = loader.stream();
+
+// Spawn Ctrl-C handler
+let cancel_token_handler = cancel_token.clone();
+tokio::spawn(async move {
+    tokio::signal::ctrl_c().await.unwrap();
+    println!("Received Ctrl-C, shutting down gracefully...");
+    cancel_token_handler.cancel();
+});
+
+// Training loop with graceful shutdown
+while let Some(batch_result) = stream.next().await {
+    let batch = batch_result?;
+    train_step(batch).await?;
+}
+
+println!("Training stopped cleanly");
+```
+
+**AsyncPoolDataLoader also supports cancellation**:
+
+```rust
+let cancel_token = CancellationToken::new();
+
+let options = LoaderOptions::default()
+    .with_batch_size(32)
+    .with_cancellation_token(cancel_token.clone());
+
+let loader = AsyncPoolDataLoader::new(dataset, options);
+let mut stream = loader.stream();  // Cancellation handled automatically
+
+// Set up Ctrl-C handler as above
+// ...
+
+while let Some(batch_result) = stream.next().await {
+    // Processes batches, stops cleanly on cancellation
+}
+```
+
+**Behavior on cancellation**:
+- ✅ Workers exit cleanly without submitting new requests
+- ✅ In-flight requests are allowed to complete (drain pattern)
+- ✅ MPSC channels properly closed
+- ✅ No orphaned background tasks
+- ✅ Zero overhead when token not cancelled
+
+**Multiple loaders, shared token**:
+```rust
+let cancel_token = CancellationToken::new();
+
+// Both loaders share the same token
+let options1 = LoaderOptions::default()
+    .with_cancellation_token(cancel_token.clone());
+let options2 = LoaderOptions::default()
+    .with_cancellation_token(cancel_token.clone());
+
+// Single Ctrl-C cancels both loaders
+tokio::spawn(async move {
+    tokio::signal::ctrl_c().await.unwrap();
+    cancel_token.cancel();  // Stops all loaders
+});
 ```
 
 ---

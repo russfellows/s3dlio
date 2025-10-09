@@ -48,6 +48,43 @@ pub const MIN_S3_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 /// Default buffer capacity for multipart operations (2 MB)
 pub const DEFAULT_MULTIPART_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
 
+// ============================================================================
+// RangeEngine Configuration Constants
+// ============================================================================
+
+/// Default chunk size for RangeEngine concurrent downloads (64 MB)
+/// Used for splitting large objects into parallel range requests
+pub const DEFAULT_RANGE_ENGINE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Default maximum concurrent ranges for RangeEngine (32)
+/// Controls parallelism for concurrent range downloads
+pub const DEFAULT_RANGE_ENGINE_MAX_CONCURRENT: usize = 32;
+
+/// Default minimum object size to trigger RangeEngine for File backend (4 MB)
+/// Below this threshold, use simple sequential reads (more efficient for local files)
+/// NOTE: Local file systems benefit less from range parallelism due to seek overhead
+pub const DEFAULT_FILE_RANGE_ENGINE_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// Default minimum object size to trigger RangeEngine for DirectIO backend (16 MB)
+/// Higher threshold due to O_DIRECT alignment overhead and startup cost
+/// DirectIO already bypasses page cache, so range parallelism has limited benefit
+pub const DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD: u64 = 16 * 1024 * 1024;
+
+/// Default minimum object size to trigger RangeEngine for S3 backend (4 MB)
+/// S3 benefits significantly from range parallelism due to network latency
+pub const DEFAULT_S3_RANGE_ENGINE_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// Default minimum object size to trigger RangeEngine for Azure backend (4 MB)
+/// Azure benefits from range parallelism similar to S3
+pub const DEFAULT_AZURE_RANGE_ENGINE_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// Default minimum object size to trigger RangeEngine for GCS backend (4 MB)
+/// GCS benefits from range parallelism similar to S3
+pub const DEFAULT_GCS_RANGE_ENGINE_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// Default range request timeout (30 seconds)
+pub const DEFAULT_RANGE_TIMEOUT_SECS: u64 = 30;
+
 /// Page size bounds for validation
 pub const MIN_PAGE_SIZE: usize = 512;
 pub const MAX_PAGE_SIZE: usize = 64 * 1024;

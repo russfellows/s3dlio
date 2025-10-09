@@ -5,15 +5,20 @@
 
 use std::future::Future;
 use tokio::sync::mpsc::{channel, Receiver};
+use tokio_util::sync::CancellationToken;
 use crate::DatasetError;
 
-/// Spawn an async prefetcher.
+/// Spawn an async prefetcher with optional cancellation support.
 ///
 /// `producer` is called repeatedly (it returns a Future yielding `T`).
 /// The returned `Receiver` yields `Result<T, DatasetError>` up to `cap` in flight.
+/// 
+/// `cancel_token` enables graceful shutdown - when cancelled, the prefetch loop
+/// will exit cleanly without producing new items.
 pub fn spawn_prefetch<F, Fut, T>(
     cap: usize,
     mut producer: F,
+    cancel_token: Option<CancellationToken>,
 ) -> Receiver<Result<T, DatasetError>>
 where
     F: FnMut() -> Fut + Send + 'static,
@@ -22,8 +27,15 @@ where
 {
     let (tx, rx) = channel(cap.max(1));
     tokio::spawn(async move {
-        // keep producing until `producer` errors or the channel closes
+        // keep producing until `producer` errors, the channel closes, or cancellation
         loop {
+            // Check cancellation before producing
+            if let Some(ref token) = cancel_token {
+                if token.is_cancelled() {
+                    break;  // Clean exit
+                }
+            }
+            
             match producer().await {
                 Ok(item) => {
                     if tx.send(Ok(item)).await.is_err() {

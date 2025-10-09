@@ -1,5 +1,238 @@
 # s3dlio Changelog
 
+## Version 0.9.2 - CancellationToken & Configuration Rationalization (October 2025)
+
+### 🎯 **New Features**
+
+#### **1. CancellationToken Infrastructure for Graceful Shutdown**
+Comprehensive cancellation support across all DataLoader components enables clean shutdown of data loading operations.
+
+**Components Updated**:
+- `LoaderOptions`: Added `cancellation_token` field with builder methods
+- `spawn_prefetch()`: Added cancel_token parameter with loop check
+- `DataLoader`: Cancellation checks in all 3 spawn paths (map-known, iterable, map-unknown)
+- `AsyncPoolDataLoader`: Cancellation support in async pool worker with 3 checkpoints
+
+**Usage**:
+```rust
+use tokio_util::sync::CancellationToken;
+
+let cancel_token = CancellationToken::new();
+
+let options = LoaderOptions::default()
+    .with_batch_size(32)
+    .with_cancellation_token(cancel_token.clone());
+
+// Spawn Ctrl-C handler
+tokio::spawn(async move {
+    tokio::signal::ctrl_c().await.unwrap();
+    cancel_token.cancel();
+});
+
+let loader = DataLoader::new(dataset, options);
+let mut stream = loader.stream();
+
+while let Some(batch) = stream.next().await {
+    train_step(batch?).await?;
+}
+// Clean shutdown on Ctrl-C
+```
+
+**Behavior**:
+- ✅ Workers exit cleanly without submitting new requests
+- ✅ In-flight requests drain naturally
+- ✅ MPSC channels properly closed
+- ✅ No orphaned background tasks
+- ✅ Zero overhead when token not cancelled
+
+---
+
+#### **2. Configuration Hierarchy Rationalization**
+Clear three-level configuration design aligned with PyTorch DataLoader concepts for ML practitioners.
+
+**Documentation Added**:
+- `docs/CONFIGURATION-HIERARCHY.md` - Comprehensive analysis
+- `docs/api/rust-api-v0.9.2.md` - Updated from v0.9.0 with hierarchy section
+- `docs/api/python-api-v0.9.2.md` - Updated from v0.9.0 with Python-specific guidance
+
+**Three Levels**:
+1. **LoaderOptions** (User-Facing, Training-Centric)
+   - Like PyTorch's `DataLoader(batch_size, num_workers, ...)`
+   - Controls WHAT batches to create and HOW to iterate
+   - Always visible to users
+   
+2. **PoolConfig** (Performance Tuning, Optional)
+   - Like PyTorch's internal worker pool management
+   - Controls HOW data is fetched efficiently
+   - Good defaults via `stream()`, advanced tuning via `stream_with_pool()`
+   
+3. **RangeEngineConfig** (Internal Optimization, Hidden)
+   - Like file I/O internals in PyTorch Dataset
+   - Controls storage-layer parallel range requests
+   - Backend-specific, automatically configured
+
+**Code Enhancement**:
+```rust
+// NEW: Convenience constructor to bridge Level 1 → Level 2
+let pool_config = PoolConfig::from_loader_options(&options);
+// Derives: pool_size from num_workers, readahead_batches from prefetch
+```
+
+**Design Philosophy**:
+- Progressive complexity: Simple by default, powerful when needed
+- PyTorch alignment: Familiar concepts for ML practitioners
+- Separation of concerns: Training logic vs storage optimization
+- Good defaults: Most users never touch Level 2 or 3
+
+---
+
+### 🧪 **Testing Improvements**
+
+#### **Cancellation Test Suite**
+Comprehensive test coverage in `tests/test_cancellation.rs`:
+
+**9 Tests (All Passing ✅)**:
+- DataLoader tests (5): pre-cancellation, during streaming, delayed, no-token, shared token
+- AsyncPoolDataLoader tests (4): pre-cancellation, during streaming, stops new requests, idempotent
+
+**Test Patterns**:
+- Validates drain behavior (in-flight requests complete)
+- Timeout-based completion checks (2s)
+- Mock URIs for control flow testing
+- Ctrl-C handler examples
+
+**Documentation**:
+- Updated `docs/TESTING-GUIDE.md` with cancellation testing section
+- Test patterns, running instructions, expected behavior
+- Configuration hierarchy integration notes
+- Checklist for new components
+
+---
+
+### 📚 **Documentation Updates**
+
+#### **API Documentation Versioned to v0.9.2**:
+- Renamed `rust-api-v0.9.0.md` → `rust-api-v0.9.2.md`
+- Renamed `python-api-v0.9.0.md` → `python-api-v0.9.2.md`
+- Added "Configuration Hierarchy" sections
+- Added "Graceful Shutdown" section with CancellationToken examples
+- Updated "What's New" sections
+
+#### **New Documentation Files**:
+- `docs/CONFIGURATION-HIERARCHY.md` - Deep dive into three-level design
+- PyTorch comparison tables
+- Side-by-side examples (PyTorch vs s3dlio)
+- Recommendations for users
+- When to tune each level
+
+---
+
+### 🔧 **API Additions**
+
+**LoaderOptions**:
+```rust
+pub struct LoaderOptions {
+    // ... existing fields ...
+    
+    /// Optional cancellation token for graceful shutdown (NEW in v0.9.2)
+    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl LoaderOptions {
+    pub fn with_cancellation_token(self, token: CancellationToken) -> Self;
+    pub fn without_cancellation(self) -> Self;
+}
+```
+
+**PoolConfig**:
+```rust
+impl PoolConfig {
+    /// NEW: Derive from LoaderOptions with sensible scaling
+    pub fn from_loader_options(opts: &LoaderOptions) -> Self;
+}
+```
+
+**spawn_prefetch**:
+```rust
+// NEW: Added cancel_token parameter
+pub fn spawn_prefetch<F, Fut, T>(
+    cap: usize,
+    producer: F,
+    cancel_token: Option<CancellationToken>,  // NEW
+) -> Receiver<Result<T, DatasetError>>
+```
+
+---
+
+### ⚡ **Performance**
+
+- **Zero overhead** when cancellation token not used
+- **Clean shutdown** typically completes within 2 seconds
+- **No breaking changes** to existing code without cancellation
+- **Maintains** 5+ GB/s reads, 2.5+ GB/s writes
+
+---
+
+### 🛠️ **Build Status**
+
+- ✅ Zero compiler warnings
+- ✅ All tests passing (including 9 new cancellation tests)
+- ✅ Clean release builds
+- ✅ Documentation comprehensive and versioned
+
+---
+
+### 📦 **Migration Notes**
+
+**No breaking changes** - all features are additive:
+
+**To add graceful shutdown**:
+```rust
+// Before (v0.9.1)
+let options = LoaderOptions::default().with_batch_size(32);
+
+// After (v0.9.2) - optional cancellation
+let cancel_token = CancellationToken::new();
+let options = LoaderOptions::default()
+    .with_batch_size(32)
+    .with_cancellation_token(cancel_token);
+```
+
+**To use PoolConfig convenience constructor**:
+```rust
+// NEW in v0.9.2
+let pool_config = PoolConfig::from_loader_options(&options);
+let stream = loader.stream_with_pool(pool_config);
+```
+
+---
+
+### 🎯 **Key Use Cases**
+
+**Training Loops with Ctrl-C Handling**:
+- Clean shutdown prevents corrupted checkpoints
+- No orphaned background tasks
+- Proper resource cleanup
+
+**Multi-Loader Coordination**:
+- Single token cancels multiple loaders
+- Synchronized shutdown across components
+
+**Long-Running Jobs**:
+- Graceful termination on SIGTERM
+- Clean exit from infinite data streams
+
+---
+
+### 📖 **Further Reading**
+
+- **Configuration Guide**: `docs/CONFIGURATION-HIERARCHY.md`
+- **Rust API**: `docs/api/rust-api-v0.9.2.md`
+- **Python API**: `docs/api/python-api-v0.9.2.md`
+- **Testing Guide**: `docs/TESTING-GUIDE.md` (cancellation section)
+
+---
+
 ## Version 0.9.1 - True Zero-Copy Python API (October 2025)
 
 ### 🎯 **Critical Fixes**

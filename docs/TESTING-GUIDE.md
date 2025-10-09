@@ -214,6 +214,174 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
 ---
 
+## 🧪 **Cancellation Testing (v0.9.2)**
+
+### **Overview**
+
+s3dlio v0.9.2 introduces `CancellationToken` support for graceful shutdown of async data loading operations. The test suite in `tests/test_cancellation.rs` validates this behavior across all DataLoader components.
+
+### **Test Coverage**
+
+**File**: `tests/test_cancellation.rs` (9 comprehensive tests)
+
+#### **DataLoader Tests** (5 tests):
+1. **Cancellation before start** - Token cancelled before streaming begins
+2. **Cancellation during streaming** - Token cancelled mid-stream with in-flight requests
+3. **Cancellation with delay** - Simulates Ctrl-C after some batches processed
+4. **Without cancellation token** - Validates normal operation when no token provided
+5. **Multiple loaders, shared token** - Single token cancels multiple loaders simultaneously
+
+#### **AsyncPoolDataLoader Tests** (4 tests):
+1. **Cancellation before start** - Pre-cancelled token prevents pool startup
+2. **Cancellation during streaming** - Pool drains in-flight requests cleanly
+3. **Cancellation stops new requests** - Verifies no new requests after cancellation
+4. **Idempotent cancellation** - Multiple cancel() calls don't cause issues
+
+### **Running Cancellation Tests**
+
+```bash
+# Run all cancellation tests
+cargo test --test test_cancellation
+
+# Run specific test
+cargo test --test test_cancellation test_dataloader_cancellation_during_streaming
+
+# Run with output
+cargo test --test test_cancellation -- --nocapture
+```
+
+### **Expected Behavior**
+
+#### **On Cancellation**:
+- ✅ Workers exit cleanly without submitting new requests
+- ✅ In-flight requests are allowed to complete (drain pattern)
+- ✅ MPSC channels properly closed
+- ✅ No orphaned background tasks
+- ✅ Stream ends with `None` within timeout (2 seconds)
+
+#### **Without Cancellation**:
+- ✅ Normal operation continues indefinitely
+- ✅ All batches processed until dataset exhausted
+- ✅ Clean completion without hanging
+
+### **Test Patterns**
+
+#### **Basic Cancellation Test**:
+```rust
+#[tokio::test]
+async fn test_cancellation_example() {
+    let token = CancellationToken::new();
+    
+    let opts = LoaderOptions::default()
+        .with_batch_size(32)
+        .with_cancellation_token(token.clone());
+    
+    let loader = DataLoader::new(dataset, opts);
+    let mut stream = loader.stream();
+    
+    // Get some batches
+    let _ = stream.next().await;
+    
+    // Cancel
+    token.cancel();
+    
+    // Should complete quickly
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        async {
+            while let Some(_) = stream.next().await {}
+        }
+    ).await;
+    
+    assert!(result.is_ok(), "Stream should end after cancellation");
+}
+```
+
+#### **Ctrl-C Handler Pattern** (for applications):
+```rust
+let cancel_token = CancellationToken::new();
+
+let opts = LoaderOptions::default()
+    .with_cancellation_token(cancel_token.clone());
+
+// Spawn Ctrl-C handler
+tokio::spawn(async move {
+    tokio::signal::ctrl_c().await.unwrap();
+    println!("Received Ctrl-C, shutting down...");
+    cancel_token.cancel();
+});
+
+// Training loop
+let mut stream = loader.stream();
+while let Some(batch_result) = stream.next().await {
+    train_step(batch_result?).await?;
+}
+```
+
+### **Mock Dataset Pattern**
+
+The tests use non-existent `file://` URIs for testing cancellation logic:
+
+```rust
+fn create_test_dataset(size: usize) -> MultiBackendDataset {
+    let uris: Vec<String> = (0..size)
+        .map(|i| format!("file:///tmp/test_data_{}.bin", i))
+        .collect();
+    
+    MultiBackendDataset::from_uris(uris).expect("Failed to create test dataset")
+}
+```
+
+**Why mock URIs work**:
+- Cancellation logic doesn't depend on successful data fetches
+- Tests verify control flow, not data correctness
+- Timeouts prevent hanging on missing files
+- Focuses testing on cancellation behavior, not I/O
+
+### **Configuration Hierarchy and Cancellation**
+
+Cancellation is part of **Level 1: LoaderOptions** (user-facing configuration):
+
+```rust
+// Level 1: Training-focused configuration
+let options = LoaderOptions {
+    batch_size: 32,
+    cancellation_token: Some(token),  // NEW in v0.9.2
+    ..Default::default()
+};
+
+// Level 2: PoolConfig (performance tuning) inherits cancellation
+let loader = AsyncPoolDataLoader::new(dataset, options);
+let stream = loader.stream_with_pool(pool_config);
+// Cancellation applies regardless of pool configuration
+
+// Level 3: RangeEngine (internal) respects cancellation automatically
+```
+
+See [Configuration Hierarchy](CONFIGURATION-HIERARCHY.md) for full details.
+
+### **Testing Checklist for Cancellation**
+
+When adding new DataLoader components:
+
+- [ ] Add cancellation_token parameter to constructor/options
+- [ ] Check `token.is_cancelled()` before async operations
+- [ ] Use clean exit (break/return) when cancelled
+- [ ] Allow in-flight requests to drain naturally
+- [ ] Add test case to `tests/test_cancellation.rs`
+- [ ] Verify timeout behavior (should complete within 2s)
+- [ ] Test both with and without token
+
+### **Known Limitations**
+
+1. **Mock URIs**: Tests use non-existent files, so actual I/O isn't tested
+2. **Timeout-based**: Tests rely on timeouts rather than explicit completion signals
+3. **Single-threaded runtime**: Tests run in tokio single-threaded mode
+
+**For production testing**: Use real S3/Azure URIs with `.env` configuration.
+
+---
+
 ## 🐛 **Common Testing Problems and Solutions**
 
 ### **Problem**: "Functions exist manually but not in tests"

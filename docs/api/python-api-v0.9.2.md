@@ -1,6 +1,6 @@
-# s3dlio Python Library API Guide - v0.9.0
+# s3dlio Python Library API Guide - v0.9.2
 
-**Version**: 0.9.0 (API-stable beta)  
+**Version**: 0.9.2 (API-stable beta)  
 **Date**: October 2025  
 **Status**: Compatible with v0.8.22 - minimal breaking changes
 
@@ -9,7 +9,8 @@
 ## Table of Contents
 
 - [Overview](#overview)
-- [What's New in v0.9.0](#whats-new-in-v090)
+- [What's New in v0.9.2](#whats-new-in-v092)
+- [Configuration Hierarchy](#configuration-hierarchy-understanding-s3dlios-design)
 - [Breaking Changes from v0.8.22](#breaking-changes-from-v0822)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -40,9 +41,22 @@ s3dlio is a high-performance Python library for AI/ML data loading from cloud st
 
 ---
 
-## What's New in v0.9.0
+## What's New in v0.9.2
 
-### User-Facing Improvements
+### New Features in v0.9.2
+
+1. **Configuration Hierarchy Documentation** 📚
+   - Clear explanation of three-level design
+   - PyTorch DataLoader alignment
+   - Python users: Focus on Level 1 (training options) only
+   - See [Configuration Hierarchy](#configuration-hierarchy-understanding-s3dlios-design)
+
+2. **CancellationToken Support** 🛑 (Rust API)
+   - Graceful shutdown for Rust library users
+   - Python users: Use standard asyncio cancellation patterns
+   - Enables clean Ctrl-C handling in training loops
+
+### From v0.9.0
 
 1. **Concurrent Batch Loading** 🚀
    - 3-8x faster batch fetching
@@ -69,6 +83,161 @@ s3dlio is a high-performance Python library for AI/ML data loading from cloud st
 - **Bytes migration**: Underlying Rust API now uses `bytes::Bytes` (transparent to Python)
 - **Better memory management**: Reference-counted bytes reduce copies
 - **Improved async runtime**: More efficient task scheduling
+- **Configuration rationalization**: Clear conceptual hierarchy
+
+---
+
+## Configuration Hierarchy: Understanding s3dlio's Design
+
+s3dlio follows PyTorch DataLoader's conceptual design with three levels of configuration. Understanding this hierarchy helps you use s3dlio effectively without confusion.
+
+### Level 1: Loader Options (User-Facing, Training-Centric)
+
+**What it controls**: Batch construction and dataset iteration - training-focused parameters
+
+**Who uses it**: ML practitioners, data scientists, model trainers
+
+**Mental model**: "I'm training a model, I need batches of data"
+
+```python
+import s3dlio
+
+# Training-focused configuration (like PyTorch DataLoader)
+loader = s3dlio.create_async_loader(
+    uri="s3://bucket/training/",
+    opts={
+        'batch_size': 32,          # Items per batch
+        'shuffle': True,           # Randomize order
+        'seed': 42,                # Reproducibility
+        'prefetch': 2,             # Like PyTorch's prefetch_factor
+        'num_workers': 4,          # Like PyTorch's num_workers
+        'pin_memory': True,        # GPU optimization
+    }
+)
+
+async for batch in loader:
+    train_step(batch)  # Your training logic
+```
+
+**Key principle**: These options control **training behavior**, not storage implementation.
+
+---
+
+### Level 2: Pool Configuration (Performance Tuning, Hidden in Python)
+
+**What it controls**: Download worker pool management - how data is fetched efficiently
+
+**Who tunes it**: Performance engineers (usually via Rust API, not Python)
+
+**Mental model**: "I want faster downloads without changing training behavior"
+
+**In Python**: This level is **automatically managed** based on your Level 1 options. Python users don't directly configure pool settings - they're derived from `prefetch` and `num_workers`.
+
+```python
+# Python: No explicit PoolConfig needed
+loader = s3dlio.create_async_loader(
+    uri="s3://bucket/data/",
+    opts={
+        'prefetch': 4,        # Implicitly sets readahead depth
+        'num_workers': 8,     # Implicitly scales download pool
+    }
+)
+# Behind the scenes: pool_size ≈ num_workers * 16
+#                    readahead_batches ≈ prefetch
+```
+
+**In Rust API**: Advanced users can tune explicitly:
+```rust
+// Rust: Explicit pool tuning available
+let pool_config = PoolConfig {
+    pool_size: 128,              // Fine-grained control
+    readahead_batches: 8,
+    ..Default::default()
+};
+let stream = loader.stream_with_pool(pool_config);
+```
+
+**When to care**: Only if you're using the Rust API directly or need to understand performance characteristics.
+
+---
+
+### Level 3: RangeEngine Configuration (Internal, Completely Hidden)
+
+**What it controls**: How large files are split into parallel range requests
+
+**Who tunes it**: Storage engineers debugging edge cases (internal only)
+
+**Mental model**: "How does s3dlio parallelize large object downloads?"
+
+**In Python**: **Completely invisible** - handled automatically by the Rust backend.
+
+**In Rust API**: **Mostly hidden** - automatically configured based on backend type (S3, file, DirectIO).
+
+```rust
+// Rust: Internal configuration (not exposed in high-level APIs)
+// S3: 4MB threshold, 64MB chunks, 32 concurrent ranges
+// File: 4MB threshold (may add overhead)
+// DirectIO: 16MB threshold (alignment-optimized)
+```
+
+**Key principle**: Users should never need to think about this level - it's an internal optimization.
+
+---
+
+### Comparison with PyTorch DataLoader
+
+| Concept | PyTorch | s3dlio Python | s3dlio Rust | Visibility |
+|---------|---------|---------------|-------------|------------|
+| **Training config** | `DataLoader(...)` | `create_async_loader(opts={...})` | `LoaderOptions` | ✅ Always visible |
+| **Worker pool** | Hidden (automatic) | Hidden (automatic) | `PoolConfig` (optional) | 🟡 Python: hidden, Rust: optional |
+| **Storage I/O** | Hidden in Dataset | Hidden (automatic) | `RangeEngineConfig` | ❌ Always hidden |
+
+### Side-by-Side Example
+
+**PyTorch**:
+```python
+from torch.utils.data import DataLoader
+
+dataloader = DataLoader(
+    dataset,
+    batch_size=32,        # Level 1: Batch construction
+    num_workers=4,        # Level 1: Parallelism
+    prefetch_factor=2,    # Level 1: Prefetching
+    pin_memory=True,      # Level 1: GPU optimization
+)
+# Levels 2 & 3 are automatic
+```
+
+**s3dlio Python (Same Conceptual Level)**:
+```python
+import s3dlio
+
+loader = s3dlio.create_async_loader(
+    uri="s3://bucket/data/",
+    opts={
+        'batch_size': 32,     # Level 1: Batch construction
+        'num_workers': 4,     # Level 1: Parallelism
+        'prefetch': 2,        # Level 1: Prefetching
+        'pin_memory': True,   # Level 1: GPU optimization
+    }
+)
+# Levels 2 & 3 are automatic (just like PyTorch)
+```
+
+---
+
+### Design Philosophy
+
+s3dlio's Python API follows these principles:
+
+1. **PyTorch alignment**: Familiar concepts, minimal learning curve
+2. **Hide complexity**: Most users never think about Levels 2 or 3
+3. **Good defaults**: Automatic tuning based on your Level 1 options
+4. **Expert escape hatch**: Rust API exposes Level 2 for specialized tuning
+
+**Golden rule for Python users**: Configure training options (Level 1) only. Everything else is automatic.
+
+**For Rust library users**: You have access to all three levels for fine-grained control when needed.
 
 ---
 

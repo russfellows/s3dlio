@@ -608,6 +608,7 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             collate_buffer_size:  def.collate_buffer_size,
             page_cache_mode:      def.page_cache_mode,  // Use default (Auto)
             adaptive:             def.adaptive,  // Use default (None/disabled)
+            cancellation_token:   def.cancellation_token,  // Use default (None)
         }
     } else {
         def

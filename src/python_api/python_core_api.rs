@@ -1010,7 +1010,7 @@ pub fn create_filesystem_writer(py: Python<'_>, uri: String, options: Option<&Py
     
     py.allow_threads(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
-            let store = FileSystemObjectStore;
+            let store = FileSystemObjectStore::new();
             let writer = store.create_writer(&uri, opts).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create filesystem writer: {}", e)))?;
             
