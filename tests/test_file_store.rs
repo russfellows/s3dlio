@@ -72,7 +72,7 @@ async fn test_file_store_basic_operations() -> Result<()> {
     
     // Test get operation
     let retrieved_data = store.get(&file_uri).await?;
-    assert_eq!(retrieved_data, test_data);
+    assert_eq!(retrieved_data.as_ref(), test_data);
     
     // Test stat operation
     let metadata = store.stat(&file_uri).await?;
@@ -83,7 +83,7 @@ async fn test_file_store_basic_operations() -> Result<()> {
     // Test put with updated data
     store.put(&file_uri, updated_data).await?;
     let retrieved_updated = store.get(&file_uri).await?;
-    assert_eq!(retrieved_updated, updated_data);
+    assert_eq!(retrieved_updated.as_ref(), updated_data);
     
     // Test delete operation
     store.delete(&file_uri).await?;
@@ -106,19 +106,19 @@ async fn test_file_store_range_operations() -> Result<()> {
     
     // Test range read from beginning
     let range1 = store.get_range(&file_uri, 0, Some(10)).await?;
-    assert_eq!(range1, b"0123456789");
+    assert_eq!(range1.as_ref(), b"0123456789");
     
     // Test range read from middle
     let range2 = store.get_range(&file_uri, 10, Some(6)).await?;
-    assert_eq!(range2, b"ABCDEF");
+    assert_eq!(range2.as_ref(), b"ABCDEF");
     
     // Test range read to end (no length specified)
     let range3 = store.get_range(&file_uri, 30, None).await?;
-    assert_eq!(range3, b"UVWXYZ");
+    assert_eq!(range3.as_ref(), b"UVWXYZ");
     
     // Test range read beyond file size
     let range4 = store.get_range(&file_uri, 35, Some(10)).await?;
-    assert_eq!(range4, b"Z"); // Should only return what's available
+    assert_eq!(range4.as_ref(), b"Z"); // Should only return what's available
     
     Ok(())
 }
@@ -211,7 +211,7 @@ async fn test_file_store_copy_operations() -> Result<()> {
     let src_data = store.get(&src_uri).await?;
     let dst_data = store.get(&dst_uri).await?;
     assert_eq!(src_data, dst_data);
-    assert_eq!(src_data, test_data);
+    assert_eq!(src_data.as_ref(), test_data);
     
     Ok(())
 }
@@ -247,7 +247,7 @@ async fn test_file_store_relative_paths() -> Result<()> {
     store.put("file://./test.txt", test_data).await?;
     
     let retrieved_data = store.get("file://./test.txt").await?;
-    assert_eq!(retrieved_data, test_data);
+    assert_eq!(retrieved_data.as_ref(), test_data);
     
     // Restore original directory
     std::env::set_current_dir(current_dir)?;

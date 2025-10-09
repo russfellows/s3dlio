@@ -1,137 +1,51 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-91%20passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Version](https://img.shields.io/badge/version-0.9.0-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-122%20passing-brightgreen)](docs/v0.9.2_Test_Summary.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-113%2F114-brightgreen)](docs/v0.9.2_Test_Summary.md)
+[![Python Tests](https://img.shields.io/badge/python%20tests-9%2F16-yellow)](docs/v0.9.2_Test_Summary.md)
+[![Version](https://img.shields.io/badge/version-0.9.2-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.83%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-## 🌟 What's New in v0.9.0 - API-Stable Beta
+## 🌟 New Releases
 
-**Zero-Copy Performance & Adaptive Tuning** ⚡
+### v0.9.2 - Graceful Shutdown & Configuration Clarity (October 2025)
 
-- 🚨 **BREAKING**: `ObjectStore::get()` now returns `bytes::Bytes` instead of `Vec<u8>` (10-15% memory reduction)
-- ⚡ **3-8x Faster Batch Loading**: Concurrent batch fetching in Python data loaders
-- 🎯 **Optional Adaptive Tuning**: Auto-optimization for different workload types (opt-in)
-- ✅ **Framework Verified**: PyTorch, TensorFlow, JAX all tested and compatible
-- � **Complete API Guides**: Comprehensive Rust and Python documentation with migration guides
-- 🧪 **Thoroughly Tested**: 91 Rust tests, 16 Python regression tests, 3 framework integration tests
+Production-ready enhancements with zero breaking changes:
+- **CancellationToken Infrastructure**: Graceful shutdown for all DataLoader components
+- **Configuration Hierarchy**: PyTorch-aligned three-level design with comprehensive documentation
 
-**Migration**: Rust users see [Rust API Guide](docs/api/rust-api-v0.9.0.md) | Python users see [Python API Guide](docs/api/python-api-v0.9.0.md)
+📖 [Changelog](docs/Changelog.md) | [Rust API v0.9.2](docs/api/rust-api-v0.9.2.md) | [Python API v0.9.2](docs/api/python-api-v0.9.2.md)
 
-See [Changelog](docs/Changelog.md) for complete v0.9.0 details.
+### v0.9.x - Zero-Copy & Performance
 
----
+- **v0.9.1**: True zero-copy Python API with `BytesView`, universal `get_many()`
+- **v0.9.0** (BREAKING): `bytes::Bytes` migration (10-15% memory reduction), adaptive tuning, 3-8x faster batch loading
 
-## 📝 Previous Release - v0.8.20
+📖 Migration: [Rust v0.9.0](docs/api/rust-api-v0.9.0.md) | [Python v0.9.0](docs/api/python-api-v0.9.0.md)
 
-**Progress Bar Fixes & Universal GET/PUT Commands** 🔧
+### v0.8.x - Production Features (2024-2025)
 
-- ✅ **Fixed CLI Progress Bars**: Progress now updates incrementally during operations instead of jumping to 100% at completion
-- ✅ **Universal GET/PUT**: Commands now work across all 5 backends (S3, GCS, Azure, File, DirectIO) using ObjectStore interface
-- ✅ **Backward Compatible**: All existing Rust library APIs unchanged - other projects continue to work without modifications
-- ✅ **Real-time Metrics**: Progress bars show accurate transfer speeds and incremental completion
+Universal commands, operation logging, performance monitoring, and AI/ML training enhancements:
+- Universal GET/PUT/ls/stat/rm with progress bars
+- Op-Log system with warp-replay compatibility
+- TFRecord indexing (~1200x faster random access)
+- Page cache optimization and tracing framework
 
-- ✅ **Universal `ls`**: Now works with all 5 backends (S3, GCS, Azure, File, DirectIO) with regex pattern filtering
-- ✅ **Universal `stat`**: Metadata operations across all backends with improved output formatting
-- ✅ **Python API Updates**: `list()` and `stat()` now universal with pattern support
-- ✅ **S3 Region Fix**: `list-buckets` correctly uses `us-east-1`
-
-See [v0.8.19 Release Notes](docs/v0.8.19-RELEASE-NOTES.md) for complete details.
-
-## 📊 Operation Logging (Op-Log) - All Backends (v0.8.15)
-
-**Universal operation trace logging now supports ALL storage backends** (file://, s3://, az://, gs://, direct://). Performance profiling and debugging for any storage system with the same TSV format.
-
-```python
-import s3dlio
-
-# Initialize op-log (once at start)
-s3dlio.init_op_log("/tmp/operations.tsv.zst")
-
-# All operations automatically logged - works with all backends
-s3dlio.upload(["./data/*.dat"], "gs://ml-bucket/", max_in_flight=8)
-s3dlio.download("s3://data-lake/", "./local/", max_in_flight=16, recursive=True)
-
-# Finalize (once at end)
-s3dlio.finalize_op_log()
-```
-
-**Features**: Zstd-compressed TSV logs, warp-replay compatible, clean file paths, zero overhead when not initialized. Works with Rust API, Python API, and CLI (`--op-log` flag).
-
-## 🔄 Operation Log Replay - Shared Library (v0.8.13)
-
-**NEW**: `s3dlio-oplog` shared crate for workload replay across the s3dlio ecosystem (s3-bench, dl-driver). Eliminates code duplication with format-tolerant parsing, microsecond-precision timeline replay, and pluggable execution backends.
-
-```rust
-use s3dlio_oplog::{ReplayConfig, replay_with_s3dlio};
-use std::path::PathBuf;
-
-// Replay captured workload with timing preservation
-let config = ReplayConfig {
-    op_log_path: PathBuf::from("workload.tsv.zst"),
-    target_uri: Some("s3://test-bucket/".to_string()),  // Retarget to new backend
-    speed: 1.0,  // Real-time (use 10.0 for stress test)
-    continue_on_error: false,
-    filter_ops: None,  // Or Some(vec![OpType::GET]) to filter
-};
-
-replay_with_s3dlio(config).await?;
-```
-
-**Key Features**:
-- **Format-Tolerant**: Auto-detects JSONL/TSV with zstd compression
-- **Timeline Accuracy**: Microsecond-precision absolute scheduling  
-- **Backend Retargeting**: 1:1 URI translation (s3→az, file→direct, etc.)
-- **Pluggable Execution**: `OpExecutor` trait for custom backends
-- **Operation Filtering**: Replay subsets (GET-only, PUT/DELETE, etc.)
-- **Speed Control**: 0.1x to 1000x replay speed multipliers
-
-**Location**: `crates/s3dlio-oplog/`  
-**Documentation**: [Integration Guide](docs/S3DLIO_OPLOG_INTEGRATION.md)
-
-## 📇 TFRecord Index Generation (v0.8.10)
-
-Generate NVIDIA DALI-compatible index files for efficient random access to TFRecord datasets. Enables shuffled data loading, distributed training, and O(1) record seeking with minimal overhead (0.4% file size). Pure Rust implementation with comprehensive Python API.
-
-```python
-import s3dlio
-
-# Generate index for efficient random access
-s3dlio.create_tfrecord_index("train.tfrecord")
-
-# Read index and access any record directly
-index = s3dlio.read_tfrecord_index("train.tfrecord.idx")
-offset, size = index[42]  # O(1) access, ~1200x faster than sequential scan
-```
-
-**Use Cases**: Random shuffling, distributed training sharding, batch loading, DALI pipeline integration. Compatible with NVIDIA DALI and TensorFlow tooling. See [Quick Reference](docs/TFRECORD-INDEX-QUICKREF.md) for details.
-
-## 🗂️ Page Cache & Tracing (v0.8.8)
-
-**Page Cache Optimization**: Intelligent Linux/Unix page cache hints via `posix_fadvise()` with automatic mode selection based on file size. Optimizes kernel read-ahead behavior for both sequential large files (≥64MB) and random small file access patterns.
-
-**Tracing Framework**: Migrated from `log` crate to `tracing` ecosystem for enhanced observability. Compatible with dl-driver and s3-bench projects. Supports standard verbosity levels (`-v` for INFO, `-vv` for DEBUG) with preserved operation trace logging.
-
-## 📊 Performance Monitoring (v0.8.7)
-
-Advanced HDR histogram-based performance monitoring for AI/ML workloads, providing precise tail latency analysis (P99, P99.9, P99.99+) and comprehensive throughput tracking. Built-in presets for training, inference, and distributed scenarios with thread-safe global metrics collection.
-
-## 🧠 AI/ML Training Enhancement (v0.8.6)
-
-Added comprehensive LoaderOptions Realism Knobs for production AI/ML workloads, providing fine-grained control over data loading behavior, performance optimization, and training pipeline configuration with PyTorch/TensorFlow best practices.
+📖 [Complete Changelog](docs/Changelog.md)
 
 ## Storage Backend Support
 
 ### Universal Backend Architecture
-s3dlio provides a unified interface for all storage operations, treating upload/download as enhanced copy commands that work across any backend:
+s3dlio provides unified storage operations across all backends with consistent URI patterns:
 
-- **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations with multiple backend choices
+- **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations (5+ GB/s reads, 2.5+ GB/s writes)
 - **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with hot/cool tier support
-- **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - **Production ready (v0.8.18)** with full ObjectStore integration
+- **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - Production ready with full ObjectStore integration
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance
 
@@ -184,6 +98,7 @@ pip install s3dlio
 - **[Changelog](docs/Changelog.md)** - Version history and release notes
 - **[Adaptive Tuning Guide](docs/ADAPTIVE-TUNING.md)** - Optional performance auto-tuning
 - **[Testing Guide](docs/TESTING-GUIDE.md)** - Test suite documentation
+- **[v0.9.2 Test Summary](docs/v0.9.2_Test_Summary.md)** - ✅ 122/130 tests passing (93.8%)
 
 ## Core Capabilities
 
@@ -290,261 +205,105 @@ loaded_data = store.load('model_state')
 
 **Ready for Production**: All core functionality validated, comprehensive test suite, and honest documentation matching actual capabilities.
 
-## Version History
-
-### Version 0.9.0 - API-Stable Beta with Breaking Changes (October 2025)
-Major release with breaking changes for zero-copy performance and new adaptive tuning features. **BREAKING**: `ObjectStore::get()` now returns `bytes::Bytes` instead of `Vec<u8>` for 10-15% memory reduction. Features 3-8x faster Python batch loading through concurrent fetching, optional adaptive performance tuning (auto-optimization for different workloads), and comprehensive framework verification (PyTorch, TensorFlow, JAX). Includes new API documentation with migration guides for both Rust and Python users. All 91 Rust tests and 16 Python regression tests pass with zero warnings. Stage 3 (backend-agnostic range engine) deferred to v0.9.1 as non-breaking enhancement. See [Rust API Guide](docs/api/rust-api-v0.9.0.md) and [Python API Guide](docs/api/python-api-v0.9.0.md) for migration instructions.
-
-### Version 0.8.6 - LoaderOptions Realism Knobs for AI/ML Training
-Comprehensive AI/ML training enhancement with 10 new LoaderOptions configuration knobs for production workloads. Features pin_memory GPU optimization, persistent_workers for epoch efficiency, configurable timeouts, multiprocessing context control, sampling strategies, memory format optimization, and async GPU transfers. Includes convenience presets (gpu_optimized, distributed_optimized, debug_mode) and full Python integration with PyLoaderOptions fluent builder pattern. Production-ready defaults aligned with PyTorch/TensorFlow best practices.
-
-### Version 0.8.5 - Direct I/O Support & Async Loader Fixes
-Complete Direct I/O dataset support for `direct://` URIs with async loader improvements. Added DirectIOBytesDataset using O_DIRECT for maximum throughput, fixed async loaders to return individual items by default, and resolved Python API baseline compatibility issues. Enhanced dataset factory function and comprehensive test coverage.
-
-### Version 0.7.8 - Rust API Cleanup & O_DIRECT Implementation
-Complete Rust API redesign with clean, stable interfaces for external developers and working O_DIRECT implementation. Introduces new `s3dlio::api` module with factory functions `store_for_uri()` and `direct_io_store_for_uri()`, unified `ObjectStore` trait, and backward compatibility. Features functional O_DIRECT streaming writer with `DirectIOWriter`, hybrid I/O support (automatic switching between O_DIRECT for aligned data and buffered I/O for unaligned chunks), and proper error handling. Includes comprehensive documentation in `docs/api/` directory, usage examples, and documented path forward for completing O_DIRECT data persistence optimization. Provides enterprise-ready stable API for external Rust developers while maintaining all existing functionality.
-
-### Version 0.7.7 - Phase 2 Streaming API & Complete Python Bindings
-Complete Phase 2 streaming infrastructure with production-ready Python bindings and comprehensive test coverage. Introduces universal `ObjectWriter` streaming APIs with `write_chunk()`, `write_owned_bytes()`, and `finalize()` methods across all storage backends (S3, Azure, Filesystem, Direct I/O). Features zero-copy optimization through `write_owned_bytes()`, optional zstd compression, and robust Python integration with `PyWriterOptions` and `PyObjectWriter` classes. Includes comprehensive test suites (7 Rust + 8 Python tests), proper error handling, and post-finalization statistics access. Enables memory-efficient streaming of arbitrarily large files with minimal memory footprint.  Also fixed the docker container build to not copy all of the local .venv environment, making for a substantially smaller container image.
-
-### Version 0.7.5 - HTTP Client Optimization & Performance Enhancement
-Advanced HTTP client optimization through strategic AWS SDK fork integration. Successfully forked `aws-smithy-http-client` to expose connection pool configuration, achieving +2-3% performance improvement with full backward compatibility. Features environment variable control (`S3DLIO_USE_OPTIMIZED_HTTP=true`) for easy A/B testing between AWS SDK defaults and optimized configuration. Includes enhanced connection pooling (200 max connections), optimized timeouts (800ms idle), and HTTP/2 improvements. All 84 tests pass with comprehensive performance validation.
-
-### Version 0.7.3 - Modular Python API Architecture
-Major architectural refactoring transforming the monolithic Python API into a clean modular structure. Split 1883-line `python_api.rs` into organized modules for core storage, AI/ML functions, and advanced features. Eliminated all compiler warnings, fixed critical bugs, and added comprehensive regression test suite with 16 test cases covering all 49 public functions. Zero breaking changes - all existing code continues to work unchanged.
-
-### Version 0.7.2 - Complete Python Compression Integration
-Full end-to-end compression support with Python API integration. The `compression_level` parameter now provides seamless compression/decompression across all storage backends with automatic save/load cycles. Achieves 99.8% compression ratios with data integrity preservation through streaming zstd compression and automatic decompression on read.
-
-### Version 0.6.2 - Enhanced Data Integrity
-Complete checksum integration across all storage backends providing CRC32C-based data integrity validation. All checkpoint operations now include computed checksums with zero-copy streaming preserved.
-
-### Version 0.6.1 - Zero-Copy Streaming Infrastructure  
-Revolutionary memory efficiency enabling processing of models larger than available RAM. Peak memory usage reduced from full model size to single chunk size (99%+ memory reduction for large models).
-
-### Version 0.6.0 - Comprehensive Checkpointing System
-Production-ready distributed checkpointing modeled after AWS S3 PyTorch Connector, with multi-backend support and framework integration for PyTorch, JAX, and TensorFlow.
-
-### Version 0.5.3 - Advanced Async DataLoader
-Dynamic batch formation with out-of-order completion, eliminating head-of-line blocking while maintaining complete backward compatibility.
-
-📖 **[Complete Version History](docs/Changelog.md)** - Detailed changelog with all enhancements and technical details
-
 ## Configuration & Tuning
 
 ### Environment Variables
-s3dlio supports comprehensive configuration through environment variables for performance tuning and optimization:
+s3dlio supports comprehensive configuration through environment variables:
 
-- **HTTP Client Optimization**: `S3DLIO_USE_OPTIMIZED_HTTP=true` enables enhanced connection pooling
-- **Runtime Scaling**: `S3DLIO_RT_THREADS=32` controls Tokio worker threads  
-- **Connection Pool**: `S3DLIO_MAX_HTTP_CONNECTIONS=400` sets max connections per host
-- **Range GET**: `S3DLIO_RANGE_CONCURRENCY=64` for large object optimization
-- **Operation Logging**: `S3DLIO_OPLOG_LEVEL=2` for detailed S3 operation tracking
+- **HTTP Client Optimization**: `S3DLIO_USE_OPTIMIZED_HTTP=true` - Enhanced connection pooling
+- **Runtime Scaling**: `S3DLIO_RT_THREADS=32` - Tokio worker threads  
+- **Connection Pool**: `S3DLIO_MAX_HTTP_CONNECTIONS=400` - Max connections per host
+- **Range GET**: `S3DLIO_RANGE_CONCURRENCY=64` - Large object optimization
+- **Operation Logging**: `S3DLIO_OPLOG_LEVEL=2` - S3 operation tracking
 
-📖 **[Complete Environment Variables Reference](docs/api/Environment_Variables.md)** - Comprehensive configuration guide with performance tuning examples
+📖 [Environment Variables Reference](docs/api/Environment_Variables.md)
 
-## Performance Profiling & Analysis
+### Operation Logging (Op-Log)
+Universal operation trace logging across all backends with zstd-compressed TSV format, warp-replay compatible.
 
-### Advanced Profiling Infrastructure (NEW in v0.7.6)
-s3dlio includes comprehensive performance profiling capabilities for analyzing and optimizing AI/ML workloads:
-
-### Operation Logging (Op-Log) - All Backends (NEW in v0.8.11)
-s3dlio provides universal operation trace logging across **all storage backends** (file://, s3://, az://, direct://), enabling performance profiling, debugging, and warp-replay compatibility.
-
-**Rust API (PRIMARY Interface):**
-```rust
-use s3dlio::{init_op_logger, store_for_uri_with_logger, global_logger, finalize_op_logger};
-
-// Initialize logger
-init_op_logger("operations.tsv.zst")?;
-
-// Create store with logging enabled
-let logger = global_logger();
-let store = store_for_uri_with_logger("file:///data/", logger)?;
-
-// All operations automatically logged with timing
-store.list("file:///data/", true).await?;
-store.get("file:///data/file.dat").await?;
-store.put("file:///data/output.dat", data).await?;
-
-// Finalize and flush logs
-finalize_op_logger()?;
-```
-
-**Python API (SECONDARY Interface):**
 ```python
 import s3dlio
-
-# Initialize op-log
 s3dlio.init_op_log("operations.tsv.zst")
-
-# All ObjectStore operations automatically logged
-s3dlio.list_objects("s3://bucket/data/", recursive=True)
-data = s3dlio.get_object("az://container/model.pt")
-
-# Check logging status
-if s3dlio.is_op_log_active():
-    print("Logging enabled")
-
-# Finalize and flush logs
+# All operations automatically logged
 s3dlio.finalize_op_log()
 ```
 
-**CLI Usage (Testing Interface):**
-```bash
-# List with op-log
-s3-cli --op-log list_ops.tsv.zst ls file:///data/ -r
-
-# Upload with op-log (all backends)
-s3-cli --op-log upload_ops.tsv.zst upload /local/files/ s3://bucket/prefix/
-s3-cli --op-log upload_ops.tsv.zst upload /local/files/ az://container/data/
-s3-cli --op-log upload_ops.tsv.zst upload /local/files/ file:///remote/storage/
-
-# Download with op-log
-s3-cli --op-log download_ops.tsv.zst download s3://bucket/data/ /local/dir/ -r
-```
-
-**Op-Log Format:**
-- **TSV with zstd compression**: Space-efficient, warp-replay compatible
-- **Columns**: `idx`, `thread`, `op`, `client_id`, `n_objects`, `bytes`, `endpoint`, `file`, `error`, `start`, `first_byte`, `end`, `duration_ns`
-- **Operations tracked**: GET, PUT, LIST, DELETE, STAT, and all ObjectStore methods
-- **Use cases**: Performance analysis, debugging slow operations, production monitoring, multi-backend comparison
+See [S3DLIO OpLog Implementation](docs/S3DLIO_OPLOG_IMPLEMENTATION_SUMMARY.md) for detailed usage.
 
 ## Building from Source
 
 ### Prerequisites
 - **Rust**: [Install Rust toolchain](https://www.rust-lang.org/tools/install)
 - **Python 3.12+**: For Python library development
-- **UV** (recommended): [Install UV](https://docs.astral.sh/uv/getting-started/installation/) for Python environment management
-- **HDF5**: Required for HDF5 format support
-  ```bash
-  # Ubuntu/Debian
-  sudo apt update && sudo apt install -y libhdf5-dev
-  
-  # macOS
-  brew install hdf5
-  
-  # RHEL/CentOS/Fedora
-  sudo dnf install hdf5-devel  # or yum install hdf5-devel
-  ```
+- **UV** (recommended): [Install UV](https://docs.astral.sh/uv/getting-started/installation/)
+- **HDF5**: Required for HDF5 support (`libhdf5-dev` on Ubuntu, `brew install hdf5` on macOS)
 
 ### Build Steps
-
-**1. Set up Python Environment:**
 ```bash
+# Python environment
 uv venv && source .venv/bin/activate
-uv python install 3.12
-```
 
-**2. Build CLI:**
-```bash
+# Rust CLI
 cargo build --release
-# Binary available at ./target/release/s3-cli
-```
 
-**3. Build Python Library:**
-```bash
+# Python library
 ./build_pyo3.sh && ./install_pyo3_wheel.sh
 ```
 
 ## Configuration
 
 ### Environment Setup
-Create a `.env` file or set environment variables:
-
 ```bash
 # Required for S3 operations
 AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
 AWS_ENDPOINT_URL=https://your-s3-endpoint
 AWS_REGION=us-east-1
-
-# Optional: Custom CA bundle for self-signed certificates
-AWS_CA_BUNDLE_PATH=/path/to/ca-bundle.pem
 ```
-
-### Operation Logging
 Enable comprehensive S3 operation logging compatible with MinIO warp format:
 
-**CLI:**
-```bash
-s3-cli put s3://bucket/data --op-log /tmp/operations.tsv.zst
-```
-
-**Python:**
-```python
-import s3dlio
-s3dlio.init_op_log("/tmp/python_ops.tsv.zst")
-# ... perform operations ...
-s3dlio.finalize_op_log()
-```
 
 ## Advanced Features
 
-### 🔥 CPU Profiling & Analysis
-Enable detailed performance profiling for optimization:
+### CPU Profiling & Analysis
 ```bash
-# Build with profiling support
 cargo build --release --features profiling
-
-# Run large-scale performance analysis
-S3DLIO_TEST_SIZE_GB=5 cargo run --example large_scale_s3_test --features profiling
-
-# Generate flamegraph analysis
 cargo run --example simple_flamegraph_test --features profiling
 ```
 
-### 📊 Compression & Streaming
-High-performance compression with multiple algorithms:
+### Compression & Streaming
 ```python
 import s3dlio
-
-# Configure compression options
 options = s3dlio.PyWriterOptions()
-options.compression = "zstd"  # or "lz4", "gzip"
-options.compression_level = 3
-
-# Create compressed streaming writer
+options.compression = "zstd"
 writer = s3dlio.create_s3_writer('s3://bucket/data.zst', options)
 writer.write_chunk(large_data)
-stats = writer.finalize()  # Returns compression ratios
-```
-
-### 🎯 Data Generation Modes
-Optimize data generation for your workload:
-```bash
-# Streaming mode (default, 2.6-3.5x faster for most cases)
-s3-cli put s3://bucket/data-{}.bin --num 1000 --size 4MB --data-gen-mode streaming
-
-# Single-pass mode for specific use cases
-s3-cli put s3://bucket/data-{}.bin --num 100 --size 32MB --data-gen-mode single-pass
+stats = writer.finalize()
 ```
 
 ## Container Deployment
 
-### Pre-built Container
 ```bash
+# Use pre-built container
 podman pull quay.io/russfellows-sig65/s3dlio
 podman run --net=host --rm -it quay.io/russfellows-sig65/s3dlio
-```
 
-### Build Container
-```bash
+# Or build locally
 podman build -t s3dlio .
 ```
 
-**⚠️ Note**: Always use `--net=host` for network connectivity to storage backends.
+**Note**: Always use `--net=host` for storage backend connectivity.
 
 ## Documentation & Support
 
-- **📚 Complete API Documentation**: [docs/api/](docs/api/)
-- **🚀 Performance Analysis**: [docs/performance/](docs/performance/) 
+- **📚 API Documentation**: [docs/api/](docs/api/)
 - **📝 Changelog**: [docs/Changelog.md](docs/Changelog.md)
 - **🧪 Testing Guide**: [docs/TESTING-GUIDE.md](docs/TESTING-GUIDE.md)
+- **🚀 Performance**: [docs/performance/](docs/performance/)
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+Licensed under the Apache License 2.0 - see [LICENSE](LICENSE) file.
 
 ---
 

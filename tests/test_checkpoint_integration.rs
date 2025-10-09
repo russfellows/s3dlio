@@ -44,7 +44,7 @@ async fn test_basic_checkpoint_operations() {
     
     // Read the shard data  
     let loaded_data = reader.read_shard_by_rank(&latest_manifest, 0).await.unwrap();
-    assert_eq!(loaded_data, test_data);
+    assert_eq!(loaded_data.as_ref(), test_data);
     
     println!("✓ Successfully read back checkpoint data");
 }
@@ -109,7 +109,7 @@ async fn test_checkpoint_versioning() {
     assert_eq!(latest.epoch, 5);
     
     let data = reader.read_shard_by_rank(&latest, 0).await.unwrap();
-    assert_eq!(data, b"data for epoch 5");
+    assert_eq!(data.as_ref(), b"data for epoch 5");
     
     println!("✓ Latest checkpoint correctly identified as epoch {}", latest.epoch);
 }

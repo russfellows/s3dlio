@@ -62,6 +62,8 @@ async fn test_directio_compression() -> Result<()> {
         sync_writes: false,
         alignment: 4096,
         min_io_size: 4096,
+        enable_range_engine: false,
+        range_engine: Default::default(),
     };
     
     // Test with compression

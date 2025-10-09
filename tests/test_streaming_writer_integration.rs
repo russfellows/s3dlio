@@ -14,7 +14,7 @@ async fn test_streaming_data_writer_basic() -> Result<()> {
     let test_path = temp_dir.path().join("streaming_test.bin");
     let uri = format!("file://{}", test_path.display());
     
-    let store = FileSystemObjectStore;
+    let store = FileSystemObjectStore::new();
     let options = WriterOptions::new();
     
     let size = BLK_SIZE * 2; // 128KB
@@ -50,7 +50,7 @@ async fn test_streaming_data_writer_compression() -> Result<()> {
     let test_path = temp_dir.path().join("streaming_compressed.bin");
     let uri = format!("file://{}", test_path.display());
     
-    let store = FileSystemObjectStore;
+    let store = FileSystemObjectStore::new();
     let mut options = WriterOptions::new();
     options.compression = Some(CompressionConfig::Zstd { level: 3 });
     
@@ -90,7 +90,7 @@ async fn test_streaming_data_writer_checksum() -> Result<()> {
     let test_path = temp_dir.path().join("streaming_checksum.bin");
     let uri = format!("file://{}", test_path.display());
     
-    let store = FileSystemObjectStore;
+    let store = FileSystemObjectStore::new();
     let options = WriterOptions::new();
     
     let size = 1024; // Small size for easy verification
@@ -126,7 +126,7 @@ async fn test_streaming_data_writer_consistency() -> Result<()> {
     let test_path = temp_dir.path().join("streaming_consistency.bin");
     let uri = format!("file://{}", test_path.display());
     
-    let store = FileSystemObjectStore;
+    let store = FileSystemObjectStore::new();
     let options = WriterOptions::new();
     
     let mut streaming_writer = StreamingDataWriter::new(&uri, size, dedup, compress, &store, options.clone()).await?;
@@ -168,7 +168,7 @@ async fn test_streaming_data_writer_mixed_mode() -> Result<()> {
     let test_path = temp_dir.path().join("streaming_mixed.bin");
     let uri = format!("file://{}", test_path.display());
     
-    let store = FileSystemObjectStore;
+    let store = FileSystemObjectStore::new();
     let options = WriterOptions::new();
     
     let size = 1024;

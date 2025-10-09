@@ -31,7 +31,7 @@ async fn test_object_store_integrity_validation() -> Result<()> {
     
     // Test successful validation
     let validated_data = store.get_with_validation(&test_uri, Some(&expected_checksum)).await?;
-    assert_eq!(validated_data, test_data);
+    assert_eq!(validated_data.as_ref(), test_data);
     
     // Test validation failure
     let wrong_checksum = "00000000";
@@ -40,7 +40,7 @@ async fn test_object_store_integrity_validation() -> Result<()> {
     
     // Test validation with None checksum (should succeed)
     let data_no_validation = store.get_with_validation(&test_uri, None).await?;
-    assert_eq!(data_no_validation, test_data);
+    assert_eq!(data_no_validation.as_ref(), test_data);
     
     Ok(())
 }

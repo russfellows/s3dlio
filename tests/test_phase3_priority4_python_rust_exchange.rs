@@ -34,7 +34,7 @@ async fn test_enhanced_checkpoint_loading_with_validation() -> Result<()> {
     
     // Test loading with validation disabled (should still work)
     let loaded_no_validation = store.get(&checkpoint_uri).await?;
-    assert_eq!(loaded_no_validation, checkpoint_data);
+    assert_eq!(loaded_no_validation.as_ref(), checkpoint_data);
     
     // Test validation failure
     let wrong_checksum = "deadbeef";
@@ -181,7 +181,7 @@ async fn test_zero_copy_capabilities() -> Result<()> {
     
     // Test efficient loading
     let loaded_data = store.get_with_validation(&zero_copy_uri, Some(&checksum)).await?;
-    assert_eq!(loaded_data, original_data);
+    assert_eq!(loaded_data.as_ref(), original_data);
     
     // Test that the data is properly validated without extra copies
     assert_eq!(compute_checksum(&loaded_data), checksum);
@@ -207,7 +207,7 @@ async fn test_enhanced_error_handling() -> Result<()> {
     
     // Should succeed without validation
     let data = store.get(&test_uri).await?;
-    assert_eq!(data, test_data);
+    assert_eq!(data.as_ref(), test_data);
     
     // Should fail with wrong checksum
     let wrong_checksum = "00000000";
@@ -247,7 +247,7 @@ async fn test_metadata_preservation() -> Result<()> {
     // Test that metadata is preserved through the validation process
     let reader = Reader::new(store.as_ref(), base_uri);
     let loaded_data = reader.read_shard_by_rank_with_validation(&manifest, 0).await?;
-    assert_eq!(loaded_data, checkpoint_data);
+    assert_eq!(loaded_data.as_ref(), checkpoint_data);
     
     // Verify metadata integrity
     let shard = &manifest.shards[0];

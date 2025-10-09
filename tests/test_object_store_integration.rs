@@ -29,7 +29,7 @@ async fn test_file_store_operations() -> Result<()> {
     
     // Get operation
     let retrieved = store.get(&file_uri).await?;
-    assert_eq!(retrieved, test_data);
+    assert_eq!(retrieved.as_ref(), test_data);
     
     // List operation - list the directory containing our file
     let dir_uri = format!("file://{}", test_dir.path().join("test").display());
@@ -42,7 +42,7 @@ async fn test_file_store_operations() -> Result<()> {
     
     // Range operation
     let partial = store.get_range(&file_uri, 0, Some(5)).await?;
-    assert_eq!(partial, b"Hello");
+    assert_eq!(partial.as_ref(), b"Hello");
     
     // Delete operation
     store.delete(&file_uri).await?;
@@ -103,7 +103,7 @@ async fn test_cross_backend_consistency() -> Result<()> {
     // File store operations
     file_store.put(&file_uri, test_data).await?;
     let file_result = file_store.get(&file_uri).await?;
-    assert_eq!(file_result, test_data);
+    assert_eq!(file_result.as_ref(), test_data);
     
     // The interface is consistent even if S3 operations would fail
     // without proper credentials - the type system ensures compatibility

@@ -174,7 +174,7 @@ async fn test_error_recovery() {
     assert_eq!(latest.epoch, 2);
     
     let data = reader.read_shard_by_rank(&latest, 0).await.unwrap();
-    assert_eq!(data, b"complete checkpoint data");
+    assert_eq!(data.as_ref(), b"complete checkpoint data");
     
     println!("✓ Error recovery test: system correctly handles partial writes");
 }
