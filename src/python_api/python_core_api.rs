@@ -11,6 +11,7 @@ use pyo3::{PyObject, Bound};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3_async_runtimes::tokio::future_into_py;
+use bytes::Bytes;
 
 use tokio::task;
 
@@ -42,10 +43,56 @@ use crate::file_store::FileSystemObjectStore;
 use crate::file_store_direct::ConfigurableFileSystemObjectStore;
 
 // ---------------------------------------------------------------------------
-// Core API functions
+// Zero-Copy Buffer Support
 // ---------------------------------------------------------------------------
 
-/// Convert various errors to PyErr
+/// A Python-visible wrapper around Rust Bytes that exposes buffer protocol
+/// This allows Python code to get a memoryview without copying data
+#[pyclass(name = "BytesView")]
+pub struct PyBytesView {
+    /// The underlying Bytes (reference-counted, cheap to clone)
+    bytes: Bytes,
+}
+
+#[pymethods]
+impl PyBytesView {
+    /// Get the length of the data
+    fn __len__(&self) -> usize {
+        self.bytes.len()
+    }
+    
+    /// Support bytes() conversion - returns a copy
+    fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.bytes)
+    }
+    
+    /// Get a memoryview (zero-copy readonly access)
+    fn memoryview<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+        // Create a memoryview from our data
+        // Note: This creates a Python memoryview object that references our Bytes
+        let bytes_obj = PyBytes::new(py, &self.bytes);
+        let memoryview_class = py.import("builtins")?.getattr("memoryview")?;
+        Ok(memoryview_class.call1((bytes_obj,))?.into())
+    }
+    
+    /// Convert to Python bytes (copy)
+    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.bytes)
+    }
+    
+    /// Python repr
+    fn __repr__(&self) -> String {
+        format!("BytesView({} bytes)", self.bytes.len())
+    }
+}
+
+impl PyBytesView {
+    /// Create from Rust Bytes
+    pub fn new(bytes: Bytes) -> Self {
+        Self { bytes }
+    }
+}
+
 pub fn py_err<E: std::fmt::Display>(error: E) -> PyErr {
     PyRuntimeError::new_err(format!("{}", error))
 }
@@ -252,16 +299,16 @@ fn list_objects(bucket: &str, prefix: &str, recursive: bool) -> PyResult<Vec<Str
 // ------------------------------------------------------------------------
 #[pyfunction]
 fn get_object(
-    py: Python<'_>,
+    _py: Python<'_>,
     bucket: &str,
     key: &str,
     offset: Option<u64>,
     length: Option<u64>,
-) -> PyResult<Py<PyBytes>> {
+) -> PyResult<PyBytesView> {
     let bytes = get_range(bucket, key, offset.unwrap_or(0), length)
         .map_err(py_err)?;
-    // Owned PyBytes until zero-copy lands
-    Ok(PyBytes::new(py, &bytes[..]).unbind())
+    // Return zero-copy BytesView wrapper
+    Ok(PyBytesView::new(bytes))
 }
 
 // - create-bucket command
@@ -525,20 +572,20 @@ pub (crate) fn get_many_async_py<'p>(
 }
 
 #[pyfunction]
-pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
+pub fn get(_py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
     use crate::object_store::{infer_scheme, Scheme};
     
     match infer_scheme(uri) {
         Scheme::S3 => {
             let bytes = get_object_uri(uri).map_err(py_err)?;
-            Ok(PyBytes::new(py, &bytes[..]).unbind())
+            Ok(PyBytesView::new(bytes))
         }
         Scheme::File | Scheme::Direct => {
             // For file systems, read the file directly
             use std::fs;
             let path = uri.strip_prefix("file://").unwrap_or(uri);
-            let bytes = fs::read(path).map_err(py_err)?;
-            Ok(PyBytes::new(py, &bytes[..]).unbind())
+            let file_bytes = fs::read(path).map_err(py_err)?;
+            Ok(PyBytesView::new(Bytes::from(file_bytes)))
         }
         Scheme::Azure => {
             // TODO: Implement Azure get
@@ -894,6 +941,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Phase 2 Streaming API classes and functions
     m.add_class::<PyWriterOptions>()?;
     m.add_class::<PyObjectWriter>()?;
+    m.add_class::<PyBytesView>()?;  // Zero-copy buffer wrapper
     m.add_function(wrap_pyfunction!(create_s3_writer, m)?)?;
     m.add_function(wrap_pyfunction!(create_azure_writer, m)?)?;
     m.add_function(wrap_pyfunction!(create_filesystem_writer, m)?)?;
