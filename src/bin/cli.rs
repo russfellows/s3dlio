@@ -140,25 +140,6 @@ enum Command {
         bucket_name: String,
     },
 
-    /// List objects in an S3 path, the final part of path is treated as a regex.
-    /// Example: s3-cli list s3://my-bucket/data/.*\\.csv
-    List {
-        #[clap(value_parser)]
-        s3_path: S3Path,
-
-        /// List objects recursively
-        #[clap(short, long)]
-        recursive: bool,
-    },
-    /*
-     * Old
-     *
-    /// List keys that start with the given prefix.
-    List {
-        /// S3 URI (e.g. s3://bucket/prefix/)
-        uri: String,
-    },
-    */
     /// Stat object, show size & last modify date of a single object 
     Stat {
         /// Full S3 URI (e.g. s3://bucket/prefix/key)
@@ -310,6 +291,17 @@ enum Command {
         /// Download recursively
         #[clap(short, long)] 
         recursive: bool,     
+    },
+
+    /// [DEPRECATED - Use 'ls' instead] List objects in an S3 path (S3-only).
+    /// This S3-only command will be removed soon, use 'ls' for universal support.
+    List {
+        #[clap(value_parser)]
+        s3_path: S3Path,
+
+        /// List objects recursively
+        #[clap(short, long)]
+        recursive: bool,
     },
 
     /// List objects using generic storage URI (supports s3://, az://, gs://, file://, direct://)
@@ -464,9 +456,10 @@ async fn main() -> Result<()> {
             eprintln!("Please use 'ls' for universal multi-backend support:");
             eprintln!("  s3-cli ls s3://bucket/prefix/ -r");
             eprintln!("  s3-cli ls s3://bucket/prefix/ -p '.*\\.txt$'  # with regex pattern");
-            eprintln!("This command will be removed in v0.9.0.");
+            eprintln!("This command will be removed in v1.0.0.");
             eprintln!();
             
+            #[allow(deprecated)]
             let keys = s3dlio::s3_utils::list_objects(s3_path.bucket(), s3_path.key(), recursive)?;
     
             let stdout = io::stdout();
