@@ -11,6 +11,7 @@ use pyo3::{PyObject, Bound};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3_async_runtimes::tokio::future_into_py;
+use bytes::Bytes;
 
 use tokio::task;
 
@@ -23,7 +24,7 @@ use tracing_subscriber;
 use crate::config::{ObjectType, DataGenMode, Config};
 use crate::s3_utils::{
     delete_objects, get_object_uri, get_objects_parallel,
-    list_objects as list_objects_rs, get_range,
+    list_objects as list_objects_rs, get_range as s3_get_range,
     parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
     create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs,
     stat_object_uri_async,
@@ -31,7 +32,7 @@ use crate::s3_utils::{
 };
 use crate::{generic_upload_files, generic_download_objects};
 use crate::s3_logger::{finalize_op_logger, init_op_logger, global_logger};
-use crate::object_store::store_for_uri_with_logger;
+use crate::object_store::{store_for_uri_with_logger, store_for_uri};
 
 // Phase 2 streaming functionality imports
 use crate::object_store::{
@@ -42,10 +43,56 @@ use crate::file_store::FileSystemObjectStore;
 use crate::file_store_direct::ConfigurableFileSystemObjectStore;
 
 // ---------------------------------------------------------------------------
-// Core API functions
+// Zero-Copy Buffer Support
 // ---------------------------------------------------------------------------
 
-/// Convert various errors to PyErr
+/// A Python-visible wrapper around Rust Bytes that exposes buffer protocol
+/// This allows Python code to get a memoryview without copying data
+#[pyclass(name = "BytesView")]
+pub struct PyBytesView {
+    /// The underlying Bytes (reference-counted, cheap to clone)
+    bytes: Bytes,
+}
+
+#[pymethods]
+impl PyBytesView {
+    /// Get the length of the data
+    fn __len__(&self) -> usize {
+        self.bytes.len()
+    }
+    
+    /// Support bytes() conversion - returns a copy
+    fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.bytes)
+    }
+    
+    /// Get a memoryview (zero-copy readonly access)
+    fn memoryview<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+        // Create a memoryview from our data
+        // Note: This creates a Python memoryview object that references our Bytes
+        let bytes_obj = PyBytes::new(py, &self.bytes);
+        let memoryview_class = py.import("builtins")?.getattr("memoryview")?;
+        Ok(memoryview_class.call1((bytes_obj,))?.into())
+    }
+    
+    /// Convert to Python bytes (copy)
+    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.bytes)
+    }
+    
+    /// Python repr
+    fn __repr__(&self) -> String {
+        format!("BytesView({} bytes)", self.bytes.len())
+    }
+}
+
+impl PyBytesView {
+    /// Create from Rust Bytes
+    pub fn new(bytes: Bytes) -> Self {
+        Self { bytes }
+    }
+}
+
 pub fn py_err<E: std::fmt::Display>(error: E) -> PyErr {
     PyRuntimeError::new_err(format!("{}", error))
 }
@@ -252,16 +299,16 @@ fn list_objects(bucket: &str, prefix: &str, recursive: bool) -> PyResult<Vec<Str
 // ------------------------------------------------------------------------
 #[pyfunction]
 fn get_object(
-    py: Python<'_>,
+    _py: Python<'_>,
     bucket: &str,
     key: &str,
     offset: Option<u64>,
     length: Option<u64>,
-) -> PyResult<Py<PyBytes>> {
-    let bytes = get_range(bucket, key, offset.unwrap_or(0), length)
+) -> PyResult<PyBytesView> {
+    let bytes = s3_get_range(bucket, key, offset.unwrap_or(0), length)
         .map_err(py_err)?;
-    // Owned PyBytes until zero-copy lands
-    Ok(PyBytes::new(py, &bytes[..]).unbind())
+    // Return zero-copy BytesView wrapper
+    Ok(PyBytesView::new(bytes))
 }
 
 // - create-bucket command
@@ -506,18 +553,17 @@ pub (crate) fn get_many_async_py<'p>(
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     future_into_py(py, async move {
-        // get_objects_parallel returns Vec<(String, Bytes)>, convert to Vec<u8>
-        let pairs: Vec<(String, Vec<u8>)> = task::spawn_blocking(move || {
+        // get_objects_parallel returns Vec<(String, Bytes)> - keep as Bytes for zero-copy
+        let pairs: Vec<(String, Bytes)> = task::spawn_blocking(move || {
             get_objects_parallel(&uris, max_in_flight)
-                .map(|pairs| pairs.into_iter().map(|(u, b)| (u, b.to_vec())).collect())
                 .map_err(py_err)
         })
         .await
         .map_err(py_err)??;
 
-        Python::with_gil(|py| {
+        Python::with_gil(|_py| {
             let out = pairs.into_iter()
-                .map(|(u, b)| (u, PyBytes::new(py, &b[..]).unbind()))
+                .map(|(u, b)| (u, PyBytesView::new(b)))
                 .collect::<Vec<_>>();
             Ok(out)
         })
@@ -525,20 +571,20 @@ pub (crate) fn get_many_async_py<'p>(
 }
 
 #[pyfunction]
-pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
+pub fn get(_py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
     use crate::object_store::{infer_scheme, Scheme};
     
     match infer_scheme(uri) {
         Scheme::S3 => {
             let bytes = get_object_uri(uri).map_err(py_err)?;
-            Ok(PyBytes::new(py, &bytes[..]).unbind())
+            Ok(PyBytesView::new(bytes))
         }
         Scheme::File | Scheme::Direct => {
             // For file systems, read the file directly
             use std::fs;
             let path = uri.strip_prefix("file://").unwrap_or(uri);
-            let bytes = fs::read(path).map_err(py_err)?;
-            Ok(PyBytes::new(py, &bytes[..]).unbind())
+            let file_bytes = fs::read(path).map_err(py_err)?;
+            Ok(PyBytesView::new(Bytes::from(file_bytes)))
         }
         Scheme::Azure => {
             // TODO: Implement Azure get
@@ -552,6 +598,22 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<Py<PyBytes>> {
             Err(PyRuntimeError::new_err(format!("Unsupported URI scheme: {}", uri)))
         }
     }
+}
+
+// --- `get_range` function (universal backend support)
+#[pyfunction(name = "get_range")]
+#[pyo3(signature = (uri, offset, length = None))]
+pub fn get_range_py(py: Python<'_>, uri: &str, offset: u64, length: Option<u64>) -> PyResult<PyBytesView> {
+    // Use universal ObjectStore interface for range requests
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+        rt.block_on(async {
+            let logger = global_logger();
+            let store = store_for_uri_with_logger(uri, logger).map_err(py_err)?;
+            let bytes = store.get_range(uri, offset, length).await.map_err(py_err)?;
+            Ok(PyBytesView::new(bytes))
+        })
+    })
 }
 
 // --- `download` function
@@ -575,22 +637,135 @@ pub fn download(
 }
 
 
-// --- `get_many` function
+// --- `get_many` function (universal backend support)
 #[pyfunction]
 #[pyo3(signature = (uris, max_in_flight = 64))]
 pub fn get_many(
     py: Python<'_>,
     uris: Vec<String>,
     max_in_flight: usize,
-) -> PyResult<Vec<(String, Py<PyBytes>)>> {
+) -> PyResult<Vec<(String, PyBytesView)>> {
+    use crate::object_store::{infer_scheme, Scheme};
+    use tokio::sync::Semaphore;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::sync::Arc;
+    
     py.allow_threads(|| {
-        let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
-        Python::with_gil(|py| {
-            Ok(res
-                .into_iter()
-                .map(|(u, b)| (u, PyBytes::new(py, &b[..]).unbind()))
-                .collect())
-        })
+        // Check all URIs are the same scheme
+        let schemes: Vec<_> = uris.iter().map(|u| infer_scheme(u)).collect();
+        let first_scheme = schemes.first().ok_or_else(|| {
+            PyRuntimeError::new_err("get_many requires at least one URI")
+        })?;
+        
+        // Verify all URIs use the same scheme
+        if !schemes.iter().all(|s| s == first_scheme) {
+            return Err(PyRuntimeError::new_err(
+                "get_many requires all URIs to use the same backend scheme"
+            ));
+        }
+        
+        // Route to appropriate backend
+        match first_scheme {
+            Scheme::S3 => {
+                // Use existing optimized S3 implementation
+                let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
+                Ok(res.into_iter()
+                    .map(|(u, b)| (u, PyBytesView::new(b)))
+                    .collect())
+            }
+            Scheme::File | Scheme::Direct => {
+                // Parallel file reads
+                let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+                let res = rt.block_on(async {
+                    let sem = Arc::new(Semaphore::new(max_in_flight));
+                    let mut futs = FuturesUnordered::new();
+                    
+                    for uri in uris.clone() {
+                        let sem = Arc::clone(&sem);
+                        futs.push(tokio::spawn(async move {
+                            let _permit = sem.acquire_owned().await.unwrap();
+                            let path = uri.strip_prefix("file://")
+                                .or_else(|| uri.strip_prefix("direct://"))
+                                .unwrap_or(&uri);
+                            let file_bytes = tokio::fs::read(path).await?;
+                            Ok::<_, std::io::Error>((uri, Bytes::from(file_bytes)))
+                        }));
+                    }
+                    
+                    let mut out = Vec::new();
+                    while let Some(res) = futs.next().await {
+                        let (uri, bytes) = res.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+                            .map_err(|e| anyhow::anyhow!("File read error: {}", e))?;
+                        out.push((uri, bytes));
+                    }
+                    
+                    // Maintain input order
+                    out.sort_by_key(|(u, _)| uris.iter().position(|x| x == u).unwrap());
+                    Ok::<_, anyhow::Error>(out)
+                }).map_err(py_err)?;
+                
+                Ok(res.into_iter()
+                    .map(|(u, b)| (u, PyBytesView::new(b)))
+                    .collect())
+            }
+            Scheme::Azure | Scheme::Gcs => {
+                // Use store_for_uri for Azure and GCS
+                let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+                let res = rt.block_on(async {
+                    let sem = Arc::new(Semaphore::new(max_in_flight));
+                    let mut futs = FuturesUnordered::new();
+                    
+                    for uri in uris.clone() {
+                        let sem = Arc::clone(&sem);
+                        futs.push(tokio::spawn(async move {
+                            let _permit = sem.acquire_owned().await.unwrap();
+                            
+                            // Use store_for_uri to get appropriate backend
+                            let store = store_for_uri(&uri)?;
+                            
+                            // Extract the key from the URI
+                            let key = if let Some(idx) = uri.find("://") {
+                                if let Some(slash_idx) = uri[idx+3..].find('/') {
+                                    &uri[idx+3+slash_idx+1..]
+                                } else {
+                                    ""
+                                }
+                            } else {
+                                &uri
+                            };
+                            
+                            if key.is_empty() {
+                                anyhow::bail!("Cannot GET: no key specified in URI: {}", uri);
+                            }
+                            
+                            let bytes = store.get(key).await?;
+                            Ok::<_, anyhow::Error>((uri, bytes))
+                        }));
+                    }
+                    
+                    let mut out = Vec::new();
+                    while let Some(res) = futs.next().await {
+                        let (uri, bytes) = res.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+                            .map_err(|e| anyhow::anyhow!("Get error: {}", e))?;
+                        out.push((uri, bytes));
+                    }
+                    
+                    // Maintain input order
+                    out.sort_by_key(|(u, _)| uris.iter().position(|x| x == u).unwrap());
+                    Ok::<_, anyhow::Error>(out)
+                }).map_err(py_err)?;
+                
+                Ok(res.into_iter()
+                    .map(|(u, b)| (u, PyBytesView::new(b)))
+                    .collect())
+            }
+            Scheme::Unknown => {
+                Err(PyRuntimeError::new_err(format!(
+                    "Unsupported URI scheme for get_many: {}", 
+                    uris.first().unwrap_or(&String::new())
+                )))
+            }
+        }
     })
 }
 
@@ -885,6 +1060,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_many_stats_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
+    m.add_function(wrap_pyfunction!(get_range_py, m)?)?;
     m.add_function(wrap_pyfunction!(download, m)?)?;
     m.add_function(wrap_pyfunction!(get_many, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
@@ -894,6 +1070,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Phase 2 Streaming API classes and functions
     m.add_class::<PyWriterOptions>()?;
     m.add_class::<PyObjectWriter>()?;
+    m.add_class::<PyBytesView>()?;  // Zero-copy buffer wrapper
     m.add_function(wrap_pyfunction!(create_s3_writer, m)?)?;
     m.add_function(wrap_pyfunction!(create_azure_writer, m)?)?;
     m.add_function(wrap_pyfunction!(create_filesystem_writer, m)?)?;

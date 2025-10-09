@@ -201,6 +201,14 @@ enum Command {
         /// Perform the operation recursively.
         #[clap(short, long)]
         recursive: bool,
+        
+        /// Byte offset for range request (optional, for single-object GET only)
+        #[arg(long = "offset")]
+        offset: Option<u64>,
+        
+        /// Number of bytes to read for range request (optional, if not specified reads to end)
+        #[arg(long = "length")]
+        length: Option<u64>,
     },
     /// Multi-process GET for maximum throughput (warp-level performance).
     MpGet {
@@ -484,14 +492,14 @@ async fn main() -> Result<()> {
         },
     
         // New, with regex and recursion
-        Command::Get { uri, jobs, concurrent, keylist, recursive } => {
+        Command::Get { uri, jobs, concurrent, keylist, recursive, offset, length } => {
             // Only check AWS credentials if URI is S3
             if let Some(uri_str) = &uri {
                 if requires_aws_credentials(uri_str) {
                     check_aws_credentials()?;
                 }
             }
-            get_cmd(uri.as_deref(), jobs, concurrent, keylist.as_deref(), recursive).await?
+            get_cmd(uri.as_deref(), jobs, concurrent, keylist.as_deref(), recursive, offset, length).await?
         }
         
         // Multi-process GET for maximum throughput
@@ -792,9 +800,14 @@ async fn stat_cmd(uri: &str) -> Result<()> {
 }
 
 /// Get command: downloads objects matching a key, prefix, or pattern.
-async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool) -> Result<()> {
+async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool, offset: Option<u64>, length: Option<u64>) -> Result<()> {
     // Determine concurrency level (prefer concurrent over jobs for mp compatibility)
     let concurrency = concurrent.unwrap_or(jobs);
+    
+    // Validate range request parameters
+    if (offset.is_some() || length.is_some()) && (keylist.is_some() || recursive) {
+        bail!("Range requests (--offset/--length) are only supported for single-object GET, not with --keylist or --recursive");
+    }
     
     // Handle keylist mode vs URI mode
     if let Some(keylist_path) = keylist {
@@ -871,6 +884,35 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
     // Only check AWS credentials if using S3 backend
     if requires_aws_credentials(uri_str) {
         check_aws_credentials()?;
+    }
+
+    // Handle single-object range request
+    if let Some(offset_val) = offset {
+        // Range request mode - single object only
+        if recursive {
+            bail!("Range requests (--offset/--length) cannot be combined with --recursive");
+        }
+        
+        let logger = global_logger();
+        let store = store_for_uri_with_logger(uri_str, logger)?;
+        
+        let t0 = Instant::now();
+        let data = store.get_range(uri_str, offset_val, length).await?;
+        let dt = t0.elapsed();
+        
+        let byte_count = data.len() as u64;
+        let throughput_mb_s = (byte_count as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64();
+        
+        let range_desc = if let Some(len) = length {
+            format!("bytes {}-{}", offset_val, offset_val + len - 1)
+        } else {
+            format!("bytes {}-EOF", offset_val)
+        };
+        
+        println!("Range GET {}: {} bytes in {:.3}s ({:.2} MB/s)", 
+                 range_desc, byte_count, dt.as_secs_f64(), throughput_mb_s);
+        
+        return Ok(());
     }
 
     // Use universal ObjectStore to list objects (works with all backends)

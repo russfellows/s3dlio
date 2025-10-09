@@ -254,7 +254,7 @@ pub trait ObjectStore: Send + Sync {
     
     /// Get object with integrity validation.
     /// Returns the data and validates it against the expected checksum if provided.
-    async fn get_with_validation(&self, uri: &str, expected_checksum: Option<&str>) -> Result<Vec<u8>> {
+    async fn get_with_validation(&self, uri: &str, expected_checksum: Option<&str>) -> Result<Bytes> {
         let data = self.get(uri).await?;
         
         if let Some(expected) = expected_checksum {
@@ -264,8 +264,7 @@ pub trait ObjectStore: Send + Sync {
             }
         }
         
-        // Convert Bytes to Vec<u8> for backward compatibility
-        Ok(data.to_vec())
+        Ok(data)
     }
     
     /// Get byte range with integrity validation.
@@ -276,7 +275,7 @@ pub trait ObjectStore: Send + Sync {
         offset: u64, 
         length: Option<u64>,
         expected_checksum: Option<&str>
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let data = self.get_range(uri, offset, length).await?;
         
         if let Some(expected) = expected_checksum {
@@ -287,8 +286,7 @@ pub trait ObjectStore: Send + Sync {
             }
         }
         
-        // Convert Bytes to Vec<u8> for backward compatibility
-        Ok(data.to_vec())
+        Ok(data)
     }
     
     /// Load and validate checkpoint data with integrity checking.
@@ -358,11 +356,10 @@ pub trait ObjectStore: Send + Sync {
     /// Automatically chooses between single GET and concurrent range requests
     /// based on object size and configured thresholds. This method provides
     /// the best performance for large object retrieval.
-    async fn get_optimized(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
         // Default implementation: delegate to regular get()
         // S3ObjectStore will override this with concurrent range logic
-        // Convert Bytes to Vec<u8> for backward compatibility
-        self.get(uri).await.map(|b| b.to_vec())
+        self.get(uri).await
     }
 
     /// High-performance optimized range GET operation.
@@ -374,11 +371,10 @@ pub trait ObjectStore: Send + Sync {
         length: Option<u64>,
         _chunk_size: Option<usize>,
         _max_concurrency: Option<usize>
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         // Default implementation: delegate to regular get_range()
         // S3ObjectStore will override this with concurrent range logic
-        // Convert Bytes to Vec<u8> for backward compatibility
-        self.get_range(uri, offset, length).await.map(|b| b.to_vec())
+        self.get_range(uri, offset, length).await
     }
 
 }
@@ -591,7 +587,7 @@ impl ObjectStore for S3ObjectStore {
         }
     }
 
-    async fn get_optimized(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         
         // Get object size to determine strategy
@@ -603,12 +599,12 @@ impl ObjectStore for S3ObjectStore {
         
         if object_size >= threshold {
             debug!("Using concurrent range GET for large object: {} bytes", object_size);
-            // Use concurrent range GET for large objects - convert Bytes to Vec<u8>
-            crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await.map(|b| b.to_vec())
+            // Use concurrent range GET for large objects
+            crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await
         } else {
             debug!("Using standard GET for small object: {} bytes", object_size);
-            // Use standard GET for small objects - convert Bytes to Vec<u8>
-            self.get(uri).await.map(|b| b.to_vec())
+            // Use standard GET for small objects
+            self.get(uri).await
         }
     }
 
@@ -619,7 +615,7 @@ impl ObjectStore for S3ObjectStore {
         length: Option<u64>,
         chunk_size: Option<usize>,
         max_concurrency: Option<usize>
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         
         let transfer_size = match length {
@@ -636,12 +632,12 @@ impl ObjectStore for S3ObjectStore {
         
         if transfer_size >= threshold {
             debug!("Using concurrent range GET for large transfer: {} bytes", transfer_size);
-            // Use concurrent range GET for large transfers - convert Bytes to Vec<u8>
-            crate::s3_utils::get_object_concurrent_range_async(uri, offset, length, chunk_size, max_concurrency).await.map(|b| b.to_vec())
+            // Use concurrent range GET for large transfers
+            crate::s3_utils::get_object_concurrent_range_async(uri, offset, length, chunk_size, max_concurrency).await
         } else {
             debug!("Using standard range GET for small transfer: {} bytes", transfer_size);
-            // Use standard range GET for small transfers - convert Bytes to Vec<u8>
-            self.get_range(uri, offset, length).await.map(|b| b.to_vec())
+            // Use standard range GET for small transfers
+            self.get_range(uri, offset, length).await
         }
     }
 }

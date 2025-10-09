@@ -420,7 +420,7 @@ pub fn get_range(
     key: &str,
     offset: u64,
     length: Option<u64>,
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     let uri = format!("s3://{bucket}/{key}");
     let bytes = get_object_uri(&uri)?;
     let start = offset as usize;
@@ -429,9 +429,9 @@ pub fn get_range(
         None => bytes.len(),
     };
     if start >= bytes.len() {
-        Ok(Vec::new())
+        Ok(Bytes::new())
     } else {
-        Ok(bytes[start..end].to_vec())
+        Ok(bytes.slice(start..end))
     }
 }
 

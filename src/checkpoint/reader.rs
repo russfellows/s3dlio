@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bytes::Bytes;
 use crate::object_store::ObjectStore;
 use super::manifest::Manifest;
 use super::paths::KeyLayout;
@@ -91,7 +92,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a complete shard by its relative key
-    pub async fn read_shard(&self, shard_rel_key: &str) -> Result<Vec<u8>> {
+    pub async fn read_shard(&self, shard_rel_key: &str) -> Result<Bytes> {
         let uri = format!("{}/{}", self.base_uri, shard_rel_key);
         let data = self.store.get(&uri).await?;
         
@@ -101,15 +102,16 @@ impl<'a> Reader<'a> {
             let mut decoder = zstd::Decoder::new(&data[..])?;
             let mut decompressed = Vec::new();
             decoder.read_to_end(&mut decompressed)?;
-            Ok(decompressed)
+            // Convert Vec<u8> to Bytes for consistency
+            Ok(Bytes::from(decompressed))
         } else {
-            // Convert Bytes to Vec<u8>
-            Ok(data.to_vec())
+            // Return Bytes directly - zero copy!
+            Ok(data)
         }
     }
 
     /// Read a complete shard by its relative key with integrity validation
-    pub async fn read_shard_with_validation(&self, shard_rel_key: &str, expected_checksum: Option<&str>) -> Result<Vec<u8>> {
+    pub async fn read_shard_with_validation(&self, shard_rel_key: &str, expected_checksum: Option<&str>) -> Result<Bytes> {
         let uri = format!("{}/{}", self.base_uri, shard_rel_key);
         let data = self.store.get_with_validation(&uri, expected_checksum).await?;
         
@@ -119,14 +121,16 @@ impl<'a> Reader<'a> {
             let mut decoder = zstd::Decoder::new(&data[..])?;
             let mut decompressed = Vec::new();
             decoder.read_to_end(&mut decompressed)?;
-            Ok(decompressed)
+            // Convert Vec<u8> to Bytes for consistency
+            Ok(Bytes::from(decompressed))
         } else {
+            // Return Bytes directly - zero copy!
             Ok(data)
         }
     }
 
     /// Read a shard by rank from a manifest
-    pub async fn read_shard_by_rank(&self, manifest: &Manifest, rank: u32) -> Result<Vec<u8>> {
+    pub async fn read_shard_by_rank(&self, manifest: &Manifest, rank: u32) -> Result<Bytes> {
         let shard = manifest.shards.iter()
             .find(|s| s.rank == rank)
             .ok_or_else(|| anyhow::anyhow!("Shard for rank {} not found in manifest", rank))?;
@@ -135,7 +139,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a shard by rank from a manifest with integrity validation
-    pub async fn read_shard_by_rank_with_validation(&self, manifest: &Manifest, rank: u32) -> Result<Vec<u8>> {
+    pub async fn read_shard_by_rank_with_validation(&self, manifest: &Manifest, rank: u32) -> Result<Bytes> {
         let shard = manifest.shards.iter()
             .find(|s| s.rank == rank)
             .ok_or_else(|| anyhow::anyhow!("Shard for rank {} not found in manifest", rank))?;
@@ -144,7 +148,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read all shards from a manifest
-    pub async fn read_all_shards(&self, manifest: &Manifest) -> Result<Vec<(u32, Vec<u8>)>> {
+    pub async fn read_all_shards(&self, manifest: &Manifest) -> Result<Vec<(u32, Bytes)>> {
         let mut results = Vec::new();
         
         for shard in &manifest.shards {
@@ -158,7 +162,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read all shards from a manifest with integrity validation
-    pub async fn read_all_shards_with_validation(&self, manifest: &Manifest) -> Result<Vec<(u32, Vec<u8>)>> {
+    pub async fn read_all_shards_with_validation(&self, manifest: &Manifest) -> Result<Vec<(u32, Bytes)>> {
         let mut results = Vec::new();
         
         for shard in &manifest.shards {
@@ -172,7 +176,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read all shards concurrently for better performance
-    pub async fn read_all_shards_concurrent(&self, manifest: &Manifest) -> Result<Vec<(u32, Vec<u8>)>> {
+    pub async fn read_all_shards_concurrent(&self, manifest: &Manifest) -> Result<Vec<(u32, Bytes)>> {
         use futures::future::try_join_all;
         
         let futures = manifest.shards.iter().map(|shard| {
@@ -180,7 +184,7 @@ impl<'a> Reader<'a> {
             let key = shard.key.clone();
             async move {
                 let data = self.read_shard(&key).await?;
-                Ok::<(u32, Vec<u8>), anyhow::Error>((rank, data))
+                Ok::<(u32, Bytes), anyhow::Error>((rank, data))
             }
         });
         
@@ -190,7 +194,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read all shards concurrently with integrity validation
-    pub async fn read_all_shards_concurrent_with_validation(&self, manifest: &Manifest) -> Result<Vec<(u32, Vec<u8>)>> {
+    pub async fn read_all_shards_concurrent_with_validation(&self, manifest: &Manifest) -> Result<Vec<(u32, Bytes)>> {
         use futures::future::try_join_all;
         
         let futures = manifest.shards.iter().map(|shard| {
@@ -199,7 +203,7 @@ impl<'a> Reader<'a> {
             let checksum = shard.checksum.clone();
             async move {
                 let data = self.read_shard_with_validation(&key, checksum.as_deref()).await?;
-                Ok::<(u32, Vec<u8>), anyhow::Error>((rank, data))
+                Ok::<(u32, Bytes), anyhow::Error>((rank, data))
             }
         });
         
@@ -398,7 +402,7 @@ mod tests {
         assert_eq!(manifest.world_size, 1);
 
         let shard_data = reader.read_shard_by_rank(&manifest, 0).await?;
-        assert_eq!(shard_data, data);
+        assert_eq!(&shard_data[..], data);
 
         Ok(())
     }
@@ -434,8 +438,8 @@ mod tests {
         assert_eq!(all_shards.len(), 2);
         assert_eq!(all_shards[0].0, 0); // rank 0
         assert_eq!(all_shards[1].0, 1); // rank 1
-        assert_eq!(all_shards[0].1, b"rank 0 data");
-        assert_eq!(all_shards[1].1, b"rank 1 data");
+        assert_eq!(&all_shards[0].1[..], b"rank 0 data");
+        assert_eq!(&all_shards[1].1[..], b"rank 1 data");
 
         Ok(())
     }

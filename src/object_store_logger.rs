@@ -284,7 +284,7 @@ impl ObjectStore for LoggedObjectStore {
         result
     }
 
-    async fn get_with_validation(&self, uri: &str, expected_checksum: Option<&str>) -> Result<Vec<u8>> {
+    async fn get_with_validation(&self, uri: &str, expected_checksum: Option<&str>) -> Result<Bytes> {
         let start = SystemTime::now();
         let result = self.inner.get_with_validation(uri, expected_checksum).await;
         let end = SystemTime::now();
@@ -304,7 +304,7 @@ impl ObjectStore for LoggedObjectStore {
         offset: u64,
         length: Option<u64>,
         expected_checksum: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let start = SystemTime::now();
         let result = self.inner.get_range_with_validation(uri, offset, length, expected_checksum).await;
         let end = SystemTime::now();
