@@ -5,6 +5,7 @@ pub mod reader;
 pub mod latest;
 
 use anyhow::Result;
+use bytes::Bytes;
 use crate::object_store::{store_for_uri, ObjectStore};
 pub use manifest::{Manifest, ShardMeta};
 pub use paths::{KeyLayout, Strategy};
@@ -169,7 +170,7 @@ impl CheckpointStore {
     }
 
     /// Convenience method to load the latest checkpoint
-    pub async fn load_latest(&self) -> Result<Option<Vec<u8>>> {
+    pub async fn load_latest(&self) -> Result<Option<Bytes>> {
         let reader = self.reader();
         match reader.load_latest_manifest().await? {
             Some(manifest) => {

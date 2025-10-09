@@ -27,6 +27,7 @@ use std::sync::Arc;
 // Project crates
 use crate::object_store::store_for_uri;
 use crate::s3_utils::get_object_uri;
+use crate::python_api::python_core_api::PyBytesView;
 use crate::data_loader::{
     DataLoader,
     dataset::{Dataset, DatasetError},
@@ -1204,7 +1205,8 @@ impl PyCheckpointReader {
             })
         }).map_err(|e| PyRuntimeError::new_err(format!("Read shard failed: {}", e)))?;
 
-        Ok(PyBytes::new(py, &data).into())
+        // Return zero-copy BytesView
+        Ok(PyBytesView::new(data))
     }
 }
 
