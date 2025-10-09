@@ -1008,9 +1008,11 @@ pub(crate) fn put_objects_parallel_with_progress(
 
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                let (b, k) = parse_s3_uri(&uri)?;
+                
+                // Use universal ObjectStore API instead of S3-specific code
+                let store = crate::object_store::store_for_uri(&uri)?;
                 // &[u8] view over Bytes — no copy here
-                put_object_async(&b, &k, payload.as_ref()).await?;
+                store.put(&uri, payload.as_ref()).await?;
                 
                 // Update progress after successful upload
                 if let Some(progress) = progress {

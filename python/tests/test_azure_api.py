@@ -47,19 +47,29 @@ def test_azure_python_api():
         print("   Run: ./build_pyo3.sh && ./install_pyo3_wheel.sh")
         return False
     
-    # Test 1: Basic put/get
-    print("\n=== TEST 1: Basic put() and get() ===")
-    test_uri = f"az://{account}/{container}/test-python-basic.bin"
-    test_data = bytes([42] * (2 * 1024 * 1024))  # 2MB
+    # Test 1: Bulk put with random data generation
+    print("\n=== TEST 1: Bulk put() with random data ===")
+    prefix = f"az://{account}/{container}/test-python"
+    num_objects = 3
+    object_size = 2 * 1024 * 1024  # 2MB each
+    
+    # Variables used by multiple tests
+    test_uri = f"{prefix}/object-0"
+    data_bytes = None
     
     try:
-        print(f"📤 Uploading 2MB to {test_uri}...")
+        print(f"📤 Generating and uploading {num_objects} objects of {object_size // (1024*1024)}MB each...")
         start = time.time()
-        s3dlio.put(test_uri, test_data)
+        # put(prefix, num, template=None, ...) - template is now optional
+        # Use random data (default) which is non-compressible and non-deduplicatable
+        s3dlio.put(prefix, num_objects, size=object_size, object_type="random", 
+                   dedup_factor=1, compress_factor=1)
         upload_time = time.time() - start
-        print(f"   Upload time: {upload_time:.3f}s")
+        total_mb = (num_objects * object_size) / (1024 * 1024)
+        print(f"   Upload time: {upload_time:.3f}s ({total_mb / upload_time:.2f} MB/s)")
         
-        print(f"📥 Downloading with get()...")
+        # Download first object to verify
+        print(f"📥 Downloading first object: {test_uri}...")
         start = time.time()
         downloaded = s3dlio.get(test_uri)
         download_time = time.time() - start
@@ -68,15 +78,24 @@ def test_azure_python_api():
         print(f"   Download time: {download_time:.3f}s")
         print(f"   Throughput: {throughput:.2f} MB/s")
         
-        # Verify
-        assert len(downloaded) == len(test_data), "Size mismatch"
-        assert downloaded == test_data, "Data mismatch"
+        # Verify size and type
+        assert len(downloaded) == object_size, f"Size mismatch: got {len(downloaded)}, expected {object_size}"
         
-        # Check type - should be bytes
-        assert isinstance(downloaded, bytes), f"Expected bytes, got {type(downloaded)}"
+        # BytesView is the zero-copy wrapper (preferred), but bytes also works
+        # Check that it's a buffer-like object
+        assert hasattr(downloaded, '__len__'), f"Downloaded object should have length"
         
-        print("   ✅ Data verified correctly")
-        print("   ✅ Returns bytes (zero-copy from Rust)")
+        # Convert to bytes for content verification (if it's BytesView, this is efficient)
+        data_bytes = bytes(downloaded) if not isinstance(downloaded, bytes) else downloaded
+        first_byte = data_bytes[0]
+        # Random data should have variety (not all same byte)
+        has_variety = not all(b == first_byte for b in data_bytes[:1000])
+        assert has_variety, "Expected random data with variety, got uniform data"
+        
+        print("   ✅ Bulk put() generated objects correctly")
+        print(f"   ✅ get() returns {type(downloaded).__name__} (zero-copy wrapper)")
+        print("   ✅ Data verified as random (non-uniform)")
+
         
     except Exception as e:
         print(f"   ❌ Test failed: {e}")
@@ -84,17 +103,23 @@ def test_azure_python_api():
     
     # Test 2: get_range()
     print("\n=== TEST 2: get_range() ===")
+    
+    if data_bytes is None:
+        print("   ⚠️  Skipping get_range() tests - no reference data from Test 1")
+        return False
+    
     try:
-        print(f"📥 Testing get_range(0, 1024)...")
+        print(f"📥 Testing get_range(0, 1024) on {test_uri}...")
         range_data = s3dlio.get_range(test_uri, 0, 1024)
         assert len(range_data) == 1024, f"Expected 1024 bytes, got {len(range_data)}"
-        assert range_data == test_data[:1024], "Range data mismatch"
+        # Verify it's the same as the full download (check consistency)
+        assert bytes(range_data) == data_bytes[:1024], "Range data should match full download"
         print("   ✅ get_range() works correctly")
         
         print(f"📥 Testing get_range(1024, 2048)...")
         range_data2 = s3dlio.get_range(test_uri, 1024, 2048)
         assert len(range_data2) == 2048, f"Expected 2048 bytes, got {len(range_data2)}"
-        assert range_data2 == test_data[1024:1024+2048], "Range data mismatch"
+        assert bytes(range_data2) == data_bytes[1024:1024+2048], "Range data should match full download"
         print("   ✅ Second range works correctly")
         
     except Exception as e:
@@ -103,19 +128,25 @@ def test_azure_python_api():
     
     # Test 3: Large file (trigger RangeEngine)
     print("\n=== TEST 3: Large file (RangeEngine) ===")
-    large_uri = f"az://{account}/{container}/test-python-large.bin"
-    large_data = bytes([99] * (8 * 1024 * 1024))  # 8MB (> 4MB threshold)
+    large_size = 8 * 1024 * 1024  # 8MB (> 4MB threshold for RangeEngine)
+    large_prefix = f"az://{account}/{container}/test-python-large"
+    actual_large_uri = f"{large_prefix}/object-0.bin"
     
     try:
-        print(f"📤 Uploading 8MB to {large_uri}...")
+        print(f"📤 Generating and uploading 8MB file...")
         start = time.time()
-        s3dlio.put(large_uri, large_data)
+        # Use put() with bulk generation API - generate 1 object of 8MB
+        s3dlio.put(large_prefix, num=1, template="object-{}.bin", 
+                   size=large_size, object_type="random", 
+                   dedup_factor=1, compress_factor=1)
         upload_time = time.time() - start
-        print(f"   Upload time: {upload_time:.3f}s")
+        print(f"   Upload time: {upload_time:.3f}s ({(large_size / 1024 / 1024) / upload_time:.2f} MB/s)")
+        
+        # The file will be at test-python-large/object-0.bin
         
         print(f"📥 Downloading 8MB (should use RangeEngine)...")
         start = time.time()
-        downloaded_large = s3dlio.get(large_uri)
+        downloaded_large = s3dlio.get(actual_large_uri)
         download_time = time.time() - start
         
         throughput = (len(downloaded_large) / 1024 / 1024) / download_time
@@ -123,13 +154,15 @@ def test_azure_python_api():
         print(f"   Throughput: {throughput:.2f} MB/s")
         
         # Verify size
-        assert len(downloaded_large) == len(large_data), "Large file size mismatch"
+        assert len(downloaded_large) == large_size, f"Large file size mismatch: got {len(downloaded_large)}, expected {large_size}"
         
-        # Verify first and last 1KB (avoid full comparison for speed)
-        assert downloaded_large[:1024] == large_data[:1024], "Start mismatch"
-        assert downloaded_large[-1024:] == large_data[-1024:], "End mismatch"
+        # For random data, just verify it has variety
+        large_bytes = bytes(downloaded_large) if not isinstance(downloaded_large, bytes) else downloaded_large
+        first_byte = large_bytes[0]
+        has_variety = not all(b == first_byte for b in large_bytes[:10000])
+        assert has_variety, "Expected random data in large file"
         
-        print("   ✅ Large file downloaded correctly via RangeEngine")
+        print("   ✅ Large file downloaded correctly (RangeEngine triggered for >4MB)")
         
     except Exception as e:
         print(f"   ❌ Large file test failed: {e}")
@@ -157,10 +190,11 @@ def test_azure_python_api():
     try:
         print(f"🗑️  Deleting test files...")
         s3dlio.delete(test_uri)
-        s3dlio.delete(large_uri)
+        s3dlio.delete(actual_large_uri)
         print("   ✅ Cleanup complete")
     except Exception as e:
         print(f"   ⚠️  Cleanup warning: {e}")
+    
     
     print("\n" + "=" * 60)
     print("✅ All Azure Python API tests PASSED!")
