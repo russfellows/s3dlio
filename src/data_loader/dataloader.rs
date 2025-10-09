@@ -26,6 +26,9 @@ impl<D: Dataset> DataLoader<D> {
 
     /// Produce an async stream of `Result<Vec<Item>>` batches.
     /// Returned type is a concrete `ReceiverStream`, which is `Unpin` and `Sized`.
+    /// 
+    /// Supports graceful cancellation via `LoaderOptions::cancellation_token`.
+    /// When cancelled, prefetch loops exit cleanly without producing new batches.
     pub fn stream(self) -> ReceiverStream<Result<Vec<D::Item>, DatasetError>> {
         // Check if async pooling was requested
         if let LoadingMode::AsyncPool(_) = self.opts.loading_mode {
@@ -38,6 +41,7 @@ impl<D: Dataset> DataLoader<D> {
         let shuffle = self.opts.shuffle;
         let seed = self.opts.seed;
         let prefetch = self.opts.prefetch.max(1);
+        let cancel_token = self.opts.cancellation_token.clone();
 
         let (tx, rx) = mpsc::channel::<Result<Vec<D::Item>, DatasetError>>(prefetch);
 
@@ -53,9 +57,17 @@ impl<D: Dataset> DataLoader<D> {
             };
             let tx_idx = tx.clone();
             let ds_idx = ds.clone();
+            let cancel_token_idx = cancel_token.clone();
             tokio::spawn(async move {
                 let mut buf: Vec<D::Item> = Vec::with_capacity(batch);
                 while let Some(idx) = sampler.next_index() {
+                    // Check cancellation before fetching
+                    if let Some(ref token) = cancel_token_idx {
+                        if token.is_cancelled() {
+                            break;  // Clean exit
+                        }
+                    }
+                    
                     match ds_idx.get(idx).await {
                         Ok(item) => {
                             buf.push(item);
@@ -88,10 +100,18 @@ impl<D: Dataset> DataLoader<D> {
             let shard_id   = rank * worker_n + worker_id;
 
             let tx_it = tx.clone();
+            let cancel_token_it = cancel_token.clone();
             tokio::spawn(async move {
                 let mut buf: Vec<D::Item> = Vec::with_capacity(batch);
                 let mut i: usize = 0; // item counter for round-robin sharding
                 while let Some(next) = stream.next().await {
+                    // Check cancellation before processing
+                    if let Some(ref token) = cancel_token_it {
+                        if token.is_cancelled() {
+                            break;  // Clean exit
+                        }
+                    }
+                    
                     match next {
                         Ok(item) => {
                             // Keep item if this shard "owns" position i in round-robin
@@ -121,10 +141,18 @@ impl<D: Dataset> DataLoader<D> {
             // -------- Map-style with unknown length: probe indices until IndexOutOfRange --------
             let tx_un = tx.clone();
             let ds_un = ds.clone();
+            let cancel_token_un = cancel_token;
             tokio::spawn(async move {
                 let mut buf: Vec<D::Item> = Vec::with_capacity(batch);
                 let mut idx = 0usize;
                 loop {
+                    // Check cancellation before probing
+                    if let Some(ref token) = cancel_token_un {
+                        if token.is_cancelled() {
+                            break;  // Clean exit
+                        }
+                    }
+                    
                     match ds_un.get(idx).await {
                         Ok(item) => {
                             buf.push(item);

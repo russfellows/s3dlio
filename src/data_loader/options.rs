@@ -187,6 +187,12 @@ pub struct LoaderOptions {
     // ── New in v0.9.0 (adaptive tuning) ─────────────────────────────────────
     /// Optional adaptive configuration for auto-tuning (default: None/disabled)
     pub adaptive: Option<crate::adaptive_config::AdaptiveConfig>,
+    
+    // ── New in v0.9.2 (cancellation support) ────────────────────────────────
+    /// Optional cancellation token for graceful shutdown of async operations
+    /// When set, all prefetch loops and async workers will cooperatively cancel
+    /// Enables clean Ctrl-C handling and prevents orphaned background tasks
+    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl Default for LoaderOptions {
@@ -229,6 +235,9 @@ impl Default for LoaderOptions {
             
             // new defaults (v0.9.0 - adaptive tuning)
             adaptive: None, // Disabled by default - users opt-in
+            
+            // new defaults (v0.9.2 - cancellation support)
+            cancellation_token: None, // No cancellation by default
         }
     }
 }
@@ -501,6 +510,46 @@ impl LoaderOptions {
     /// Set custom adaptive configuration
     pub fn with_adaptive_config(mut self, config: crate::adaptive_config::AdaptiveConfig) -> Self {
         self.adaptive = Some(config);
+        self
+    }
+    
+    // ── New in v0.9.2: cancellation support builder helpers ─────────────────
+    
+    /// Set cancellation token for graceful shutdown
+    /// 
+    /// When set, all async operations (prefetch loops, pool workers) will
+    /// cooperatively check for cancellation and exit cleanly.
+    /// 
+    /// # Example
+    /// 
+    /// ```no_run
+    /// use s3dlio::data_loader::*;
+    /// use tokio_util::sync::CancellationToken;
+    /// 
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let cancel_token = CancellationToken::new();
+    /// 
+    /// // Setup Ctrl-C handler
+    /// let token_clone = cancel_token.clone();
+    /// tokio::spawn(async move {
+    ///     tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl-C");
+    ///     token_clone.cancel();
+    /// });
+    /// 
+    /// let opts = LoaderOptions::default()
+    ///     .with_batch_size(32)
+    ///     .with_cancellation_token(cancel_token);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_cancellation_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+    
+    /// Remove cancellation token (disable cancellation)
+    pub fn without_cancellation(mut self) -> Self {
+        self.cancellation_token = None;
         self
     }
     
