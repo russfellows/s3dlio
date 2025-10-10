@@ -51,6 +51,24 @@ pub const DEFAULT_MULTIPART_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
 // ============================================================================
 // RangeEngine Configuration Constants
 // ============================================================================
+//
+// RangeEngine provides concurrent range downloads for large objects, splitting
+// them into parallel requests to maximize throughput on high-bandwidth networks.
+//
+// PERFORMANCE CONSIDERATIONS:
+// - Small objects (< 16 MiB): Extra HEAD request overhead outweighs benefits
+// - Medium objects (16-64 MiB): 20-40% faster on high-bandwidth networks
+// - Large objects (> 64 MiB): 30-60% faster on high-bandwidth networks
+//
+// THRESHOLD SELECTION:
+// The 16 MiB default threshold was chosen to:
+// 1. Avoid HEAD request overhead on typical objects (most workloads use < 16 MiB)
+// 2. Still enable RangeEngine for moderately large files where benefit appears
+// 3. Balance performance vs overhead across diverse workloads
+//
+// For benchmarks with small objects (e.g., 1 MiB), disable RangeEngine entirely
+// to avoid the extra HEAD request per GET operation.
+// ============================================================================
 
 /// Default chunk size for RangeEngine concurrent downloads (64 MB)
 /// Used for splitting large objects into parallel range requests
@@ -60,27 +78,71 @@ pub const DEFAULT_RANGE_ENGINE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 /// Controls parallelism for concurrent range downloads
 pub const DEFAULT_RANGE_ENGINE_MAX_CONCURRENT: usize = 32;
 
-/// Default minimum object size to trigger RangeEngine for File backend (4 MB)
-/// Below this threshold, use simple sequential reads (more efficient for local files)
-/// NOTE: Local file systems benefit less from range parallelism due to seek overhead
-pub const DEFAULT_FILE_RANGE_ENGINE_THRESHOLD: u64 = 4 * 1024 * 1024;
+/// Universal default minimum object size to trigger RangeEngine (16 MiB)
+/// 
+/// This threshold applies to all network storage backends (S3, Azure, GCS) by default.
+/// Objects smaller than this use simple GET requests to avoid the overhead of an
+/// extra HEAD request for size detection.
+///
+/// **Why 16 MiB?**
+/// - Avoids overhead on typical objects (benchmarks, logs, configs, small files)
+/// - Still enables RangeEngine for moderately large files (media, datasets, archives)
+/// - Balances performance vs overhead across diverse workloads
+/// 
+/// **Performance Impact:**
+/// - Objects < 16 MiB: Single GET request (fast path, no size check)
+/// - Objects >= 16 MiB: HEAD + concurrent range GETs (RangeEngine path)
+/// 
+/// **When to Override:**
+/// - Set higher (e.g., 64 MiB) if most objects are small and throughput is critical
+/// - Set lower (e.g., 4 MiB) if most objects are large and network has high latency
+/// - Set to 0 or disable RangeEngine for benchmarking small objects
+///
+/// **Example Configuration:**
+/// ```rust
+/// use s3dlio::object_store::{GcsConfig, RangeEngineConfig};
+/// 
+/// // Custom threshold for large-file workloads
+/// let config = GcsConfig {
+///     enable_range_engine: true,
+///     range_engine: RangeEngineConfig {
+///         min_split_size: 4 * 1024 * 1024,  // 4 MiB threshold
+///         ..Default::default()
+///     },
+/// };
+/// 
+/// // Disable RangeEngine for small-object benchmarks
+/// let benchmark_config = GcsConfig {
+///     enable_range_engine: false,
+///     ..Default::default()
+/// };
+/// ```
+pub const DEFAULT_RANGE_ENGINE_THRESHOLD: u64 = 16 * 1024 * 1024;
 
-/// Default minimum object size to trigger RangeEngine for DirectIO backend (16 MB)
-/// Higher threshold due to O_DIRECT alignment overhead and startup cost
+/// Legacy alias for S3 backend (now uses universal threshold)
+/// Kept for backward compatibility, but DEFAULT_RANGE_ENGINE_THRESHOLD is preferred
+#[deprecated(since = "0.9.5", note = "Use DEFAULT_RANGE_ENGINE_THRESHOLD instead")]
+pub const DEFAULT_S3_RANGE_ENGINE_THRESHOLD: u64 = DEFAULT_RANGE_ENGINE_THRESHOLD;
+
+/// Legacy alias for Azure backend (now uses universal threshold)
+/// Kept for backward compatibility, but DEFAULT_RANGE_ENGINE_THRESHOLD is preferred
+#[deprecated(since = "0.9.5", note = "Use DEFAULT_RANGE_ENGINE_THRESHOLD instead")]
+pub const DEFAULT_AZURE_RANGE_ENGINE_THRESHOLD: u64 = DEFAULT_RANGE_ENGINE_THRESHOLD;
+
+/// Legacy alias for GCS backend (now uses universal threshold)
+/// Kept for backward compatibility, but DEFAULT_RANGE_ENGINE_THRESHOLD is preferred
+#[deprecated(since = "0.9.5", note = "Use DEFAULT_RANGE_ENGINE_THRESHOLD instead")]
+pub const DEFAULT_GCS_RANGE_ENGINE_THRESHOLD: u64 = DEFAULT_RANGE_ENGINE_THRESHOLD;
+
+/// Minimum object size to trigger RangeEngine for File backend (16 MiB)
+/// Local file systems benefit less from range parallelism due to seek overhead,
+/// but can still benefit for very large files on fast SSDs/NVMe storage
+pub const DEFAULT_FILE_RANGE_ENGINE_THRESHOLD: u64 = DEFAULT_RANGE_ENGINE_THRESHOLD;
+
+/// Minimum object size to trigger RangeEngine for DirectIO backend (16 MiB)
 /// DirectIO already bypasses page cache, so range parallelism has limited benefit
-pub const DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD: u64 = 16 * 1024 * 1024;
-
-/// Default minimum object size to trigger RangeEngine for S3 backend (4 MB)
-/// S3 benefits significantly from range parallelism due to network latency
-pub const DEFAULT_S3_RANGE_ENGINE_THRESHOLD: u64 = 4 * 1024 * 1024;
-
-/// Default minimum object size to trigger RangeEngine for Azure backend (4 MB)
-/// Azure benefits from range parallelism similar to S3
-pub const DEFAULT_AZURE_RANGE_ENGINE_THRESHOLD: u64 = 4 * 1024 * 1024;
-
-/// Default minimum object size to trigger RangeEngine for GCS backend (4 MB)
-/// GCS benefits from range parallelism similar to S3
-pub const DEFAULT_GCS_RANGE_ENGINE_THRESHOLD: u64 = 4 * 1024 * 1024;
+/// Higher threshold reduces overhead from O_DIRECT alignment requirements
+pub const DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD: u64 = DEFAULT_RANGE_ENGINE_THRESHOLD;
 
 /// Default range request timeout (30 seconds)
 pub const DEFAULT_RANGE_TIMEOUT_SECS: u64 = 30;

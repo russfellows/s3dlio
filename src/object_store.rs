@@ -52,7 +52,7 @@ use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
 use crate::constants::{
     DEFAULT_RANGE_ENGINE_CHUNK_SIZE,
     DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,
-    DEFAULT_AZURE_RANGE_ENGINE_THRESHOLD,
+    DEFAULT_RANGE_ENGINE_THRESHOLD,
     DEFAULT_RANGE_TIMEOUT_SECS,
 };
 use std::time::Duration;
@@ -959,7 +959,7 @@ fn az_props_to_meta(p: &AzureBlobProperties) -> ObjectMetadata {
 /// Configuration for Azure Blob Storage backend with RangeEngine support
 /// 
 /// Azure benefits significantly from concurrent range downloads due to network latency.
-/// Default configuration uses a lower threshold (4MB) compared to local file systems,
+/// Default configuration uses 16 MiB threshold to avoid overhead on typical objects,
 /// and higher concurrency (32 parallel ranges) since there's no disk contention.
 #[derive(Debug, Clone)]
 pub struct AzureConfig {
@@ -968,7 +968,7 @@ pub struct AzureConfig {
     pub enable_range_engine: bool,
     
     /// RangeEngine configuration
-    /// Network-optimized defaults: 4MB threshold, 32 concurrent ranges, 64MB chunks
+    /// Network-optimized defaults: 16 MiB threshold, 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
 }
 
@@ -977,9 +977,9 @@ impl Default for AzureConfig {
         Self {
             enable_range_engine: true,
             range_engine: RangeEngineConfig {
-                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64MB chunks
+                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
                 max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
-                min_split_size: DEFAULT_AZURE_RANGE_ENGINE_THRESHOLD,  // 4MB threshold
+                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 16 MiB threshold
                 range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
             },
         }
@@ -1390,7 +1390,7 @@ pub struct GcsConfig {
     pub enable_range_engine: bool,
     
     /// RangeEngine configuration
-    /// Network-optimized defaults: 4MB threshold, 32 concurrent ranges, 64MB chunks
+    /// Network-optimized defaults: 16 MiB threshold, 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
 }
 
@@ -1399,9 +1399,9 @@ impl Default for GcsConfig {
         Self {
             enable_range_engine: true,
             range_engine: RangeEngineConfig {
-                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64MB chunks
+                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
                 max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
-                min_split_size: DEFAULT_AZURE_RANGE_ENGINE_THRESHOLD,  // 4MB threshold (same as Azure)
+                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 16 MiB threshold
                 range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
             },
         }
