@@ -3,7 +3,7 @@
 ## Project Overview
 s3dlio is a high-performance, multi-protocol storage library built in Rust with Python bindings, designed for AI/ML workloads. It provides universal copy operations across S3, Azure, local file systems, and DirectIO with near line-speed performance.
 
-**Current Version**: v0.8.8 (October 2025)
+**Current Version**: v0.9.5 (October 2025)
 
 ### Performance Targets
 - **Read (GET)**: Minimum 5 GB/s (50 Gb/s) sustained, target higher
@@ -204,9 +204,10 @@ Key variables for development/testing:
 ## Project-Specific Conventions
 
 ### Versioning & Releases
-- **Current version**: v0.8.8 (check `Cargo.toml` and `pyproject.toml`)
-- **Patch releases**: Increment build number (v0.8.8 → v0.8.9)
-- **Minor releases**: For major features (v0.8.x → v0.9.0)
+- **Current version**: v0.9.5 (check `Cargo.toml` and `pyproject.toml`)
+- **Next version**: v0.9.6 (in development on v0.9.6-dev branch)
+- **Patch releases**: Increment build number (v0.9.5 → v0.9.6)
+- **Minor releases**: For major features (v0.9.x → v0.10.0)
 - **Major version 0.x**: Until production-ready quality achieved
 - **Documentation**: Update `docs/Changelog.md` and `README.md` for every release
 
@@ -227,6 +228,19 @@ Key variables for development/testing:
 - **Auto mode**: Sequential for files ≥64MB, Random for smaller files
 - **Integration**: file_store.rs get() and get_range() operations
 - **Platform**: Linux/Unix only (no-op on Windows)
+
+### RangeEngine Performance (v0.9.3+)
+- **Multi-backend support**: S3, Azure Blob Storage, Google Cloud Storage
+- **Default threshold**: 16 MiB (increased in v0.9.5 to fix 10% regression)
+- **Configuration**: `DEFAULT_RANGE_ENGINE_THRESHOLD` in `src/constants.rs`
+- **Performance gains**: 30-50% throughput improvement on large files (>64MB)
+- **Adaptive concurrency**: Automatically scales based on file size and network conditions
+
+### Delete Performance (v0.9.5+)
+- **Adaptive concurrency**: 10-70x faster delete operations
+- **Algorithm**: Scales with workload (10% of total objects, capped at 1,000)
+- **Progress tracking**: Batched updates every 50 operations (98% reduction in overhead)
+- **Universal support**: Works across all backends (S3, Azure, GCS, file://, direct://)
 
 ### Error Handling
 - Use `anyhow::Result` for all public APIs
