@@ -387,6 +387,123 @@ pub trait ObjectStore: Send + Sync {
 
 }
 
+/// Concurrent deletion helper for efficient batch deletions across all backends.
+/// 
+/// This function deletes multiple objects concurrently through the ObjectStore trait,
+/// providing significant performance improvements over sequential deletion while
+/// maintaining universal backend compatibility.
+/// 
+/// # Adaptive Concurrency
+/// - For small batches (< 10 objects): Sequential deletion (concurrency = 1)
+/// - For medium batches: 10% of total objects (with min 10, max 1000)
+/// - For large batches (10,000+ objects): Caps at 1000 concurrent operations
+/// 
+/// # Progress Updates
+/// - Batched updates (every 50 operations) to minimize overhead
+/// - Allows 98% reduction in progress bar overhead vs per-object updates
+/// - Final update ensures accurate completion count
+/// 
+/// # Arguments
+/// * `store` - Any ObjectStore implementation (S3, Azure, GCS, file, direct)
+/// * `keys` - Slice of object URIs to delete
+/// * `progress_callback` - Optional callback for progress updates (called every 50 deletions)
+/// 
+/// # Returns
+/// * `Ok(())` - All objects deleted successfully
+/// * `Err(_)` - First error encountered (other deletions may still be in progress)
+/// 
+/// # Example
+/// ```ignore
+/// let keys = vec!["s3://bucket/obj1", "s3://bucket/obj2"];
+/// delete_objects_concurrent(&store, &keys, Some(|count| {
+///     println!("Deleted {} objects", count);
+/// })).await?;
+/// ```
+pub async fn delete_objects_concurrent<F>(
+    store: &dyn ObjectStore,
+    keys: &[String],
+    progress_callback: Option<F>,
+) -> Result<()>
+where
+    F: Fn(usize) + Send + Sync + 'static,
+{
+    use futures::stream::{self, StreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let total = keys.len();
+    
+    if total == 0 {
+        return Ok(());
+    }
+
+    // Adaptive concurrency: 10% of total objects with reasonable min/max bounds
+    let max_concurrency = if total < 10 {
+        1  // Very small batches: sequential
+    } else if total < 100 {
+        10  // Small batches: minimum 10 concurrent
+    } else if total < 10_000 {
+        (total / 10).max(10).min(100)  // Medium batches: 10% with max 100
+    } else {
+        (total / 10).min(1000)  // Large batches: 10% capped at 1000
+    };
+
+    let completed = Arc::new(AtomicUsize::new(0));
+    let last_reported = Arc::new(AtomicUsize::new(0));
+    
+    // Wrap callback in Arc for sharing across async tasks
+    let callback_arc = progress_callback.map(Arc::new);
+    
+    // Progress reporting frequency: every 50 deletions or at completion
+    let report_interval = 50;
+
+    // Create concurrent deletion stream
+    let deletions = stream::iter(keys.iter().enumerate())
+        .map(|(idx, key)| {
+            let key = key.clone();
+            let completed = Arc::clone(&completed);
+            let last_reported = Arc::clone(&last_reported);
+            let callback = callback_arc.clone();
+            
+            async move {
+                // Delete the object
+                store.delete(&key).await?;
+                
+                // Update counter
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                
+                // Report progress in batches or on completion
+                if let Some(ref cb) = callback {
+                    let last = last_reported.load(Ordering::Relaxed);
+                    if count - last >= report_interval || count == total || idx == keys.len() - 1 {
+                        if last_reported.compare_exchange(last, count, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                            cb(count);
+                        }
+                    }
+                }
+                
+                Ok::<_, anyhow::Error>(())
+            }
+        })
+        .buffer_unordered(max_concurrency);
+
+    // Execute all deletions and collect results
+    let results: Vec<Result<()>> = deletions.collect().await;
+    
+    // Check for errors
+    for result in results {
+        result?;
+    }
+
+    // Final progress update to ensure accurate count
+    if let Some(callback) = callback_arc {
+        let final_count = completed.load(Ordering::Relaxed);
+        callback(final_count);
+    }
+
+    Ok(())
+}
+
 /// Streaming writer interface for zero-copy object uploads
 #[async_trait]
 pub trait ObjectWriter: Send + Sync {

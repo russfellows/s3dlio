@@ -1031,7 +1031,7 @@ fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, te
 
 /// Delete command: deletes objects matching a key, prefix, or pattern.
 async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&str>) -> Result<()> {
-    use s3dlio::object_store::store_for_uri_with_logger;
+    use s3dlio::object_store::{store_for_uri_with_logger, delete_objects_concurrent};
     use regex::Regex;
     use indicatif::{ProgressBar, ProgressStyle};
     
@@ -1053,11 +1053,14 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                 return Ok(());
             }
             
-            info!("Deleting {} objects matching pattern '{}' under prefix '{}'", keys.len(), pat, uri);
-            eprintln!("Found {} objects matching pattern '{}'", keys.len(), pat);
+            let total = keys.len();
+            info!("Deleting {} objects matching pattern '{}' under prefix '{}'", total, pat, uri);
+            eprintln!("Found {} objects matching pattern '{}' (using adaptive concurrency: ~{})", 
+                     total, pat, 
+                     if total < 10 { 1 } else if total < 100 { 10 } else if total < 10_000 { total / 10 } else { total / 10 }.min(1000));
             
             // Create progress bar for deletion
-            let pb = ProgressBar::new(keys.len() as u64);
+            let pb = ProgressBar::new(total as u64);
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template("Deleting: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({per_sec}, ETA: {eta})")
@@ -1065,14 +1068,20 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                     .progress_chars("█▉▊▋▌▍▎▏  ")
             );
             
-            for key in &keys {
-                store.delete(key).await?;
-                info!("Deleted: {}", key);
-                pb.inc(1);
-            }
+            // Clone progress bar for the callback
+            let pb_clone = pb.clone();
             
-            pb.finish_with_message(format!("Deleted {} objects matching pattern", keys.len()));
-            eprintln!("\nSuccessfully deleted {} objects matching pattern '{}'", keys.len(), pat);
+            // Use concurrent deletion with progress callback
+            delete_objects_concurrent(
+                store.as_ref(),
+                &keys,
+                Some(move |count: usize| {
+                    pb_clone.set_position(count as u64);
+                })
+            ).await?;
+            
+            pb.finish_with_message(format!("Deleted {} objects matching pattern", total));
+            eprintln!("\nSuccessfully deleted {} objects matching pattern '{}'", total, pat);
         } else {
             // Delete entire prefix without filter - need to list first for progress
             info!("Listing objects under prefix: {}", uri);
@@ -1084,12 +1093,14 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                 return Ok(());
             }
             
-            let total_count = keys.len();
-            info!("Deleting {} objects under prefix '{}'", total_count, uri);
-            eprintln!("Found {} objects to delete", total_count);
+            let total = keys.len();
+            info!("Deleting {} objects under prefix '{}'", total, uri);
+            eprintln!("Found {} objects to delete (using adaptive concurrency: ~{})", 
+                     total,
+                     if total < 10 { 1 } else if total < 100 { 10 } else if total < 10_000 { total / 10 } else { total / 10 }.min(1000));
             
             // Create progress bar for deletion
-            let pb = ProgressBar::new(total_count as u64);
+            let pb = ProgressBar::new(total as u64);
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template("Deleting: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({per_sec}, ETA: {eta})")
@@ -1097,14 +1108,20 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                     .progress_chars("█▉▊▋▌▍▎▏  ")
             );
             
-            for key in &keys {
-                store.delete(key).await?;
-                info!("Deleted: {}", key);
-                pb.inc(1);
-            }
+            // Clone progress bar for the callback
+            let pb_clone = pb.clone();
             
-            pb.finish_with_message(format!("Completed deletion of {} objects", total_count));
-            eprintln!("\nSuccessfully deleted {} objects under prefix: {}", total_count, uri);
+            // Use concurrent deletion with progress callback
+            delete_objects_concurrent(
+                store.as_ref(),
+                &keys,
+                Some(move |count: usize| {
+                    pb_clone.set_position(count as u64);
+                })
+            ).await?;
+            
+            pb.finish_with_message(format!("Completed deletion of {} objects", total));
+            eprintln!("\nSuccessfully deleted {} objects under prefix: {}", total, uri);
         }
     } else {
         // First, try to list objects with this URI as a prefix to see if it matches multiple objects
