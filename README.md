@@ -4,7 +4,7 @@
 [![Tests](https://img.shields.io/badge/tests-130%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-118%2F119-brightgreen)](docs/Changelog.md)
 [![Python Tests](https://img.shields.io/badge/python%20tests-12%2F16-yellow)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.5-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.6-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -12,6 +12,35 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.6 - RangeEngine Disabled by Default (October 2025)
+
+**⚠️ BREAKING CHANGE**: RangeEngine now disabled by default across all backends due to performance testing revealing up to 50% slowdown on typical workloads.
+
+**🔧 Key Changes:**
+- **RangeEngine Opt-In**: Must explicitly enable for large-file workloads (>= 64 MiB average)
+- **Performance Fix**: Eliminates extra HEAD/STAT request overhead (2x requests → 1x request)
+- **Default Threshold**: 16 MiB minimum split size when explicitly enabled
+- **Universal Impact**: All backends (S3, Azure, GCS, file://, direct://) now disabled by default
+
+**Migration Guide:**
+```rust
+// Enable for large-file workloads only
+let config = AzureConfig {
+    enable_range_engine: true,  // Opt-in
+    ..Default::default()
+};
+```
+
+**When to Enable:**
+- ✅ Large files (>= 64 MiB average)
+- ✅ High-bandwidth, high-latency networks
+- ❌ Mixed workloads (keep disabled)
+- ❌ Small objects (< 16 MiB)
+
+📖 [Full Details](docs/v0.9.6_RangeEngine_Disabled_By_Default.md) | [Changelog v0.9.6](docs/Changelog.md#version-096)
+
+## 📚 Recent Releases
 
 ### v0.9.5 - Performance Fixes & RangeEngine Tuning (October 2025)
 
