@@ -4,50 +4,74 @@
 [![Tests](https://img.shields.io/badge/tests-130%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-118%2F119-brightgreen)](docs/Changelog.md)
 [![Python Tests](https://img.shields.io/badge/python%20tests-12%2F16-yellow)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.5-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.6-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-## 🌟 New Releases
+## 🌟 Latest Release
+
+### v0.9.6 - RangeEngine Disabled by Default (October 2025)
+
+**⚠️ BREAKING CHANGE**: RangeEngine now disabled by default across all backends due to performance testing revealing up to 50% slowdown on typical workloads.
+
+**🔧 Key Changes:**
+- **RangeEngine Opt-In**: Must explicitly enable for large-file workloads (>= 64 MiB average)
+- **Performance Fix**: Eliminates extra HEAD/STAT request overhead (2x requests → 1x request)
+- **Default Threshold**: 16 MiB minimum split size when explicitly enabled
+- **Universal Impact**: All backends (S3, Azure, GCS, file://, direct://) now disabled by default
+
+**Migration Guide:**
+```rust
+// Enable for large-file workloads only
+let config = AzureConfig {
+    enable_range_engine: true,  // Opt-in
+    ..Default::default()
+};
+```
+
+**When to Enable:**
+- ✅ Large files (>= 64 MiB average)
+- ✅ High-bandwidth, high-latency networks
+- ❌ Mixed workloads (keep disabled)
+- ❌ Small objects (< 16 MiB)
+
+📖 [Full Details](docs/v0.9.6_RangeEngine_Disabled_By_Default.md) | [Changelog v0.9.6](docs/Changelog.md#version-096)
+
+## 📚 Recent Releases
+
+### v0.9.5 - Performance Fixes & RangeEngine Tuning (October 2025)
+
+**Critical performance improvements** fixing regressions and delivering 10-70x faster delete operations:
+
+**🚀 Major Improvements:**
+- **Adaptive Concurrency for Deletes**: 10-70x faster (500 objects: 70x, 7K objects: 12-25x, 93K objects: 10x+)
+- **RangeEngine Threshold Fix**: Increased to 16 MiB to eliminate 10% regression on small files
+- **Universal Backend Support**: Optimizations work across all 5 backends (S3, Azure, GCS, file://, direct://)
+
+**Delete Performance Examples:**
+- 500 objects: ~0.7s (was ~50s) - **70x faster**
+- 7,000 objects: ~5.5s (was ~70-140s) - **12-25x faster**
+- 93,000 objects: ~90s (was 15+ minutes) - **10x+ faster**
+
+**Technical Details:**
+- Adaptive concurrency: Scales from 10 to 1,000 concurrent deletions based on workload
+- Progress tracking: Batched updates (every 50 operations) reduce overhead by 98%
+- RangeEngine: 16 MiB threshold balances small-file efficiency with large-file performance
+
+📖 [Full Changelog v0.9.5](docs/Changelog.md#version-095) | [Performance Analysis](docs/v0.9.5-PERFORMANCE-REGRESSION-ANALYSIS.md)
+
+## 📚 Recent Releases
 
 ### v0.9.3 - RangeEngine for Azure & GCS (October 2025)
 
-**Concurrent range downloads** for network storage backends with 30-50% throughput improvements on large files:
-- **Azure Blob Storage**: Automatic RangeEngine for files ≥ 4MB (20-50% faster)
-- **Google Cloud Storage**: Full RangeEngine integration with 2+ concurrent ranges
-- **Universal Python API**: All operations work across all 5 backends (S3, Azure, GCS, file://, direct://)
+**Concurrent range downloads** for Azure and GCS with 30-50% throughput improvements on large files.
 
-**Performance:**
-- Azure: 16.54 MB/s (8MB blobs with RangeEngine)
-- GCS: 44-46 MB/s (128MB objects, 2 concurrent ranges)
-- Expected: 30-50% gains on high-bandwidth networks (>1 Gbps)
+📖 [Changelog v0.9.3](docs/Changelog.md#version-093)
 
-**Configuration:**
-```rust
-use s3dlio::object_store::{AzureObjectStore, AzureConfig};
-
-// Default: RangeEngine enabled with network-optimized settings
-let store = AzureObjectStore::new();
-
-// Custom: Adjust thresholds and concurrency
-let config = AzureConfig {
-    enable_range_engine: true,
-    range_engine: RangeEngineConfig {
-        chunk_size: 64 * 1024 * 1024,        // 64MB chunks
-        max_concurrent_ranges: 32,            // 32 parallel
-        min_split_size: 4 * 1024 * 1024,     // 4MB threshold
-        range_timeout: Duration::from_secs(30),
-    },
-};
-let store = AzureObjectStore::with_config(config);
-```
-
-📖 [Changelog v0.9.3](docs/Changelog.md#version-093) | [Migration Guide](docs/Changelog.md#-migration-guide)
-
-### v0.9.2 - Graceful Shutdown & Configuration Clarity (October 2025)
+### v0.9.2 - Graceful Shutdown & Configuration (October 2025)
 
 Production-ready enhancements with zero breaking changes:
 - **CancellationToken Infrastructure**: Graceful shutdown for all DataLoader components
@@ -83,21 +107,41 @@ s3dlio provides unified storage operations across all backends with consistent U
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations with **RangeEngine** support
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance with **RangeEngine**
 
-### RangeEngine Performance Features (v0.9.3+)
-Concurrent range downloads hide network latency by parallelizing HTTP range requests:
+### RangeEngine Performance Features (v0.9.3+, Updated v0.9.6)
+Concurrent range downloads hide network latency by parallelizing HTTP range requests.
 
-**Backends with RangeEngine:**
-- ✅ **Azure Blob Storage**: 30-50% faster for files ≥ 4MB
-- ✅ **Google Cloud Storage**: 30-50% faster for files ≥ 4MB  
-- ✅ **Local File System**: Optimized for files ≥ 64MB
-- ✅ **DirectIO**: Optimized for files ≥ 64MB
+**⚠️ IMPORTANT (v0.9.6+):** RangeEngine is **disabled by default** across all backends due to stat overhead causing up to 50% slowdown on typical workloads. Must be explicitly enabled for large-file operations.
+
+**Backends with RangeEngine Support:**
+- ✅ **Azure Blob Storage**: 30-50% faster for large files (must enable explicitly)
+- ✅ **Google Cloud Storage**: 30-50% faster for large files (must enable explicitly)
+- ✅ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
+- ✅ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
 - 🔄 **S3**: Coming soon
 
-**Configuration (all backends):**
-- Threshold: 4MB (Azure/GCS) or 64MB (file:// / direct://)
-- Chunk size: 64MB default
-- Max concurrent: 32 ranges (network) or 16 ranges (local)
-- Automatic: Enabled by default, no code changes needed
+**Default Configuration (v0.9.6+):**
+- **Status**: Disabled by default (was: enabled in v0.9.5)
+- **Reason**: Extra HEAD request on every GET causes 50% slowdown for typical workloads
+- **Threshold**: 16MB when enabled
+- **Chunk size**: 64MB default
+- **Max concurrent**: 32 ranges (network) or 16 ranges (local)
+
+**How to Enable for Large-File Workloads:**
+```rust
+use s3dlio::object_store::{AzureObjectStore, AzureConfig};
+
+let config = AzureConfig {
+    enable_range_engine: true,  // Explicitly enable for large files
+    ..Default::default()
+};
+let store = AzureObjectStore::with_config(config);
+```
+
+**When to Enable:**
+- ✅ Large-file workloads (average size >= 64 MiB)
+- ✅ High-bandwidth, high-latency networks
+- ❌ Mixed or small-object workloads
+- ❌ Local file systems
 
 ### S3 Backend Options
 s3dlio supports two S3 backend implementations. **Native AWS SDK is the default and recommended** for production use:
