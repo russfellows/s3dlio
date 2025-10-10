@@ -26,12 +26,12 @@ use crate::constants::DEFAULT_FILE_RANGE_ENGINE_THRESHOLD;
 /// **Performance Note**: Range parallelism may be **counterproductive** for local files
 /// - Sequential reads are typically faster due to OS page cache optimization
 /// - Concurrent ranges introduce seek overhead and disk contention
-/// - Consider disabling range_engine or setting very high thresholds (>64MB)
+/// - RangeEngine is **disabled by default** (v0.9.6+) due to performance testing
 /// - Benefits are primarily for network storage (S3/Azure/GCS)
 #[derive(Debug, Clone)]
 pub struct FileSystemConfig {
-    /// Enable concurrent range downloads for large files (default: true)
-    /// **Recommendation**: Set to false for local file systems
+    /// Enable concurrent range downloads for large files
+    /// Default: false (v0.9.6+) - local files rarely benefit from range parallelism
     pub enable_range_engine: bool,
     
     /// Range engine configuration
@@ -41,7 +41,7 @@ pub struct FileSystemConfig {
 impl Default for FileSystemConfig {
     fn default() -> Self {
         Self {
-            enable_range_engine: true,
+            enable_range_engine: false,  // Disabled by default due to local FS seek overhead (v0.9.6+)
             range_engine: RangeEngineConfig {
                 min_split_size: DEFAULT_FILE_RANGE_ENGINE_THRESHOLD,
                 ..Default::default()

@@ -1,5 +1,153 @@
 # s3dlio Changelog
 
+## Version 0.9.6 - RangeEngine Disabled by Default (October 2025)
+
+### ⚠️ **BREAKING CHANGES**
+
+#### **RangeEngine Disabled by Default (ALL Backends)**
+
+**Problem:** Performance testing revealed that RangeEngine causes **up to 50% slowdown** for typical workloads due to the extra HEAD/STAT request required on every GET operation to determine object size. While RangeEngine provides 30-50% throughput improvement for large files (>= 16 MiB), the mandatory stat overhead makes it counterproductive for most real-world workloads.
+
+**Solution:** RangeEngine is now **disabled by default** across all storage backends. Users must explicitly opt-in for large-file workloads where benefits outweigh the stat overhead.
+
+**Affected Backends:**
+- ✅ **Azure Blob Storage** (`az://`) - `enable_range_engine: false`
+- ✅ **Google Cloud Storage** (`gs://`, `gcs://`) - `enable_range_engine: false`
+- ✅ **Local File System** (`file://`) - `enable_range_engine: false`
+- ✅ **DirectIO** (`direct://`) - `enable_range_engine: false`
+- ✅ **S3** (`s3://`) - RangeEngine not yet implemented
+
+**Performance Impact:**
+- **Before (v0.9.5)**: Every GET operation performed HEAD + GET (2 requests)
+- **After (v0.9.6)**: GET operations use single request (no stat overhead)
+- **Typical workloads**: 50% faster due to elimination of HEAD requests
+- **Large-file workloads**: Must enable RangeEngine explicitly to get 30-50% benefit
+
+**Migration Guide:**
+
+**No changes required for most users** - default behavior now faster for typical workloads.
+
+**For large-file workloads (>= 16 MiB objects), explicitly enable RangeEngine:**
+
+```rust
+use s3dlio::object_store::{AzureObjectStore, AzureConfig, RangeEngineConfig};
+
+// Enable RangeEngine for large-file Azure workload
+let config = AzureConfig {
+    enable_range_engine: true,  // Explicitly enable (was: default true, now: default false)
+    range_engine: RangeEngineConfig {
+        min_split_size: 16 * 1024 * 1024,  // 16 MiB threshold (default)
+        max_concurrent_ranges: 32,          // 32 parallel ranges
+        chunk_size: 64 * 1024 * 1024,      // 64 MiB chunks
+        ..Default::default()
+    },
+};
+let store = AzureObjectStore::with_config(config);
+```
+
+**Same pattern for all backends:**
+
+```rust
+// Google Cloud Storage
+use s3dlio::object_store::{GcsObjectStore, GcsConfig};
+let config = GcsConfig {
+    enable_range_engine: true,  // Opt-in for large files
+    ..Default::default()
+};
+let store = GcsObjectStore::with_config(config);
+
+// Local File System
+use s3dlio::file_store::{FileSystemObjectStore, FileSystemConfig};
+let config = FileSystemConfig {
+    enable_range_engine: true,  // Rarely beneficial for local FS
+    ..Default::default()
+};
+let store = FileSystemObjectStore::with_config(config);
+
+// DirectIO
+use s3dlio::file_store_direct::{FileSystemConfig};
+let config = FileSystemConfig::direct_io();  // Still disabled by default
+// Explicitly enable if needed:
+let mut config = FileSystemConfig::direct_io();
+config.enable_range_engine = true;
+```
+
+**When to Enable RangeEngine:**
+- ✅ Large-file workloads (average object size >= 64 MiB)
+- ✅ High-bandwidth networks (>= 1 Gbps) with high latency
+- ✅ Dedicated large-object operations (media processing, ML training)
+- ❌ Mixed workloads with small and large objects
+- ❌ Benchmarks with small objects (< 16 MiB)
+- ❌ Local file systems (seek overhead usually outweighs benefit)
+
+---
+
+### 🔧 **Configuration Changes**
+
+#### **All Backend Configs Updated**
+
+1. **`AzureConfig`** (`src/object_store.rs`)
+   - `enable_range_engine`: `true` → `false`
+   - Documentation updated to reflect opt-in behavior
+
+2. **`GcsConfig`** (`src/object_store.rs`)
+   - `enable_range_engine`: `true` → `false`
+   - Documentation updated to reflect opt-in behavior
+
+3. **`FileSystemConfig`** (`src/file_store.rs`)
+   - `enable_range_engine`: `true` → `false`
+   - Documentation emphasizes local FS rarely benefits
+
+4. **`FileSystemConfig` (DirectIO)** (`src/file_store_direct.rs`)
+   - `enable_range_engine`: `true` → `false` in:
+     - `Default::default()`
+     - `direct_io()`
+     - `high_performance()`
+   - All presets now disable RangeEngine by default
+
+#### **Constants Documentation Updated**
+
+- `DEFAULT_RANGE_ENGINE_THRESHOLD` documentation clarifies:
+  - RangeEngine is **disabled by default**
+  - 16 MiB threshold applies only when explicitly enabled
+  - Explains performance trade-offs
+  - Provides example configurations for enabling
+
+---
+
+### 📊 **Performance Summary**
+
+| Workload Type | v0.9.5 Performance | v0.9.6 Performance (Default) | v0.9.6 with RangeEngine Enabled |
+|---------------|-------------------|------------------------------|----------------------------------|
+| Small objects (< 16 MiB) | **Slow** (2x requests: HEAD + GET) | **Fast** (1x request: GET only) | **Slow** (2x requests: HEAD + GET) |
+| Large files (>= 64 MiB) | **Medium** (HEAD + single GET) | **Medium** (single GET) | **Fast** (HEAD + parallel range GETs) |
+| Mixed workloads | **Slow overall** (all GETs statted) | **Fast** (no stat overhead) | **Slow overall** (all GETs statted) |
+
+**Key Insight:** RangeEngine provides benefit **only for large-file workloads**. For typical workloads with mixed object sizes, the stat overhead on small objects outweighs gains on large objects.
+
+---
+
+### 📚 **Documentation Updates**
+
+- **Constants (`src/constants.rs`)**: Comprehensive RangeEngine configuration guide
+- **Config Structs**: All backend configs document opt-in behavior
+- **README.md**: Updated to reflect disabled-by-default status
+- **Copilot Instructions**: Updated RangeEngine guidance
+
+---
+
+### 🔄 **Backward Compatibility**
+
+**Breaking Change:** Existing code that relies on RangeEngine being enabled by default will see different behavior. However, this change **improves performance for most workloads**.
+
+**Migration Path:**
+1. **If your workload uses small/mixed objects**: No changes needed - enjoy faster performance
+2. **If your workload uses large files (>= 64 MiB)**: Add explicit `enable_range_engine: true` to config
+
+**Deprecations:** None. All APIs remain stable.
+
+---
+
 ## Version 0.9.5 - Performance Fixes & RangeEngine Tuning (October 2025)
 
 ### 🚀 **PERFORMANCE IMPROVEMENTS**

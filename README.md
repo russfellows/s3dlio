@@ -78,23 +78,41 @@ s3dlio provides unified storage operations across all backends with consistent U
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations with **RangeEngine** support
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance with **RangeEngine**
 
-### RangeEngine Performance Features (v0.9.3+)
-Concurrent range downloads hide network latency by parallelizing HTTP range requests:
+### RangeEngine Performance Features (v0.9.3+, Updated v0.9.6)
+Concurrent range downloads hide network latency by parallelizing HTTP range requests.
 
-**Backends with RangeEngine:**
-- ✅ **Azure Blob Storage**: 30-50% faster for files ≥ 16MB (threshold raised in v0.9.5)
-- ✅ **Google Cloud Storage**: 30-50% faster for files ≥ 16MB (threshold raised in v0.9.5)
-- ✅ **Local File System**: Optimized for files ≥ 64MB
-- ✅ **DirectIO**: Optimized for files ≥ 64MB
+**⚠️ IMPORTANT (v0.9.6+):** RangeEngine is **disabled by default** across all backends due to stat overhead causing up to 50% slowdown on typical workloads. Must be explicitly enabled for large-file operations.
+
+**Backends with RangeEngine Support:**
+- ✅ **Azure Blob Storage**: 30-50% faster for large files (must enable explicitly)
+- ✅ **Google Cloud Storage**: 30-50% faster for large files (must enable explicitly)
+- ✅ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
+- ✅ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
 - 🔄 **S3**: Coming soon
 
-**Configuration (all backends):**
-- Threshold: 16MB (Azure/GCS - v0.9.5+) or 64MB (file:// / direct://)
-- Chunk size: 64MB default
-- Max concurrent: 32 ranges (network) or 16 ranges (local)
-- Automatic: Enabled by default, no code changes needed
+**Default Configuration (v0.9.6+):**
+- **Status**: Disabled by default (was: enabled in v0.9.5)
+- **Reason**: Extra HEAD request on every GET causes 50% slowdown for typical workloads
+- **Threshold**: 16MB when enabled
+- **Chunk size**: 64MB default
+- **Max concurrent**: 32 ranges (network) or 16 ranges (local)
 
-**Why 16MB threshold (v0.9.5)?** Previous 4MB threshold caused a 10% regression for small-object workloads due to extra HEAD requests. The 16MB threshold balances small-file efficiency with large-file performance gains.
+**How to Enable for Large-File Workloads:**
+```rust
+use s3dlio::object_store::{AzureObjectStore, AzureConfig};
+
+let config = AzureConfig {
+    enable_range_engine: true,  // Explicitly enable for large files
+    ..Default::default()
+};
+let store = AzureObjectStore::with_config(config);
+```
+
+**When to Enable:**
+- ✅ Large-file workloads (average size >= 64 MiB)
+- ✅ High-bandwidth, high-latency networks
+- ❌ Mixed or small-object workloads
+- ❌ Local file systems
 
 ### S3 Backend Options
 s3dlio supports two S3 backend implementations. **Native AWS SDK is the default and recommended** for production use:

@@ -229,12 +229,16 @@ Key variables for development/testing:
 - **Integration**: file_store.rs get() and get_range() operations
 - **Platform**: Linux/Unix only (no-op on Windows)
 
-### RangeEngine Performance (v0.9.3+)
-- **Multi-backend support**: S3, Azure Blob Storage, Google Cloud Storage
-- **Default threshold**: 16 MiB (increased in v0.9.5 to fix 10% regression)
+### RangeEngine Performance (v0.9.3+, Updated v0.9.6)
+- **Multi-backend support**: S3, Azure Blob Storage, Google Cloud Storage, file://, direct://
+- **Default status**: **DISABLED** by default as of v0.9.6 (was: enabled in v0.9.3-v0.9.5)
+- **Reason for change**: Stat overhead causes up to 50% slowdown on typical workloads
+- **Default threshold**: 16 MiB (when explicitly enabled)
 - **Configuration**: `DEFAULT_RANGE_ENGINE_THRESHOLD` in `src/constants.rs`
-- **Performance gains**: 30-50% throughput improvement on large files (>64MB)
-- **Adaptive concurrency**: Automatically scales based on file size and network conditions
+- **Performance gains**: 30-50% throughput improvement on large files (>= 64MB) **when enabled**
+- **Must opt-in**: Set `enable_range_engine: true` in backend config for large-file workloads
+- **When to enable**: Large-file workloads (>= 64 MiB average), high-bandwidth/high-latency networks
+- **When to keep disabled**: Mixed workloads, small objects, local file systems, benchmarks
 
 ### Delete Performance (v0.9.5+)
 - **Adaptive concurrency**: 10-70x faster delete operations

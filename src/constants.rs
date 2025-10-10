@@ -55,19 +55,37 @@ pub const DEFAULT_MULTIPART_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
 // RangeEngine provides concurrent range downloads for large objects, splitting
 // them into parallel requests to maximize throughput on high-bandwidth networks.
 //
+// **IMPORTANT: RangeEngine is DISABLED BY DEFAULT as of v0.9.6**
+// Performance testing revealed that the extra HEAD/STAT request on every GET
+// operation causes up to 50% slowdown for typical workloads. RangeEngine must
+// be explicitly enabled for large-file workloads where benefits outweigh overhead.
+//
 // PERFORMANCE CONSIDERATIONS:
-// - Small objects (< 16 MiB): Extra HEAD request overhead outweighs benefits
-// - Medium objects (16-64 MiB): 20-40% faster on high-bandwidth networks
-// - Large objects (> 64 MiB): 30-60% faster on high-bandwidth networks
+// - Small objects (< 16 MiB): HEAD overhead outweighs any parallel benefit
+// - Medium objects (16-64 MiB): 20-40% faster ONLY if RangeEngine enabled
+// - Large objects (> 64 MiB): 30-60% faster ONLY if RangeEngine enabled
+// - Typical workloads: Slower due to 2x requests (HEAD + GET) per object
 //
 // THRESHOLD SELECTION:
-// The 16 MiB default threshold was chosen to:
-// 1. Avoid HEAD request overhead on typical objects (most workloads use < 16 MiB)
-// 2. Still enable RangeEngine for moderately large files where benefit appears
-// 3. Balance performance vs overhead across diverse workloads
+// The 16 MiB default threshold (when RangeEngine is enabled) was chosen to:
+// 1. Skip range splitting for typical objects that don't benefit
+// 2. Only engage RangeEngine for moderately large files (>= 16 MiB)
+// 3. Balance performance vs overhead for large-file workloads
 //
-// For benchmarks with small objects (e.g., 1 MiB), disable RangeEngine entirely
-// to avoid the extra HEAD request per GET operation.
+// HOW TO ENABLE:
+// ```rust
+// // Enable for Azure large-file workloads
+// let config = AzureConfig {
+//     enable_range_engine: true,  // Must explicitly enable
+//     range_engine: RangeEngineConfig {
+//         min_split_size: 16 * 1024 * 1024,  // 16 MiB default
+//         ..Default::default()
+//     },
+// };
+// let store = AzureObjectStore::with_config(config);
+// ```
+//
+// For small-object benchmarks, leave RangeEngine disabled (default behavior).
 // ============================================================================
 
 /// Default chunk size for RangeEngine concurrent downloads (64 MB)
@@ -80,41 +98,34 @@ pub const DEFAULT_RANGE_ENGINE_MAX_CONCURRENT: usize = 32;
 
 /// Universal default minimum object size to trigger RangeEngine (16 MiB)
 /// 
-/// This threshold applies to all network storage backends (S3, Azure, GCS) by default.
-/// Objects smaller than this use simple GET requests to avoid the overhead of an
-/// extra HEAD request for size detection.
+/// This threshold applies to all storage backends (S3, Azure, GCS, file://, direct://)
+/// when RangeEngine is explicitly enabled. **RangeEngine is disabled by default as of v0.9.6.**
 ///
 /// **Why 16 MiB?**
-/// - Avoids overhead on typical objects (benchmarks, logs, configs, small files)
-/// - Still enables RangeEngine for moderately large files (media, datasets, archives)
-/// - Balances performance vs overhead across diverse workloads
+/// - Avoids range splitting for typical objects (configs, logs, small files)
+/// - Only engages RangeEngine for moderately large files (media, datasets, archives)
+/// - When enabled, balances performance vs overhead for large-file workloads
 /// 
-/// **Performance Impact:**
-/// - Objects < 16 MiB: Single GET request (fast path, no size check)
+/// **Performance Impact (when RangeEngine is enabled):**
+/// - Objects < 16 MiB: Single GET request (fast path, no range splitting)
 /// - Objects >= 16 MiB: HEAD + concurrent range GETs (RangeEngine path)
 /// 
 /// **When to Override:**
-/// - Set higher (e.g., 64 MiB) if most objects are small and throughput is critical
-/// - Set lower (e.g., 4 MiB) if most objects are large and network has high latency
-/// - Set to 0 or disable RangeEngine for benchmarking small objects
+/// - Set higher (e.g., 64 MiB) if most objects are large but still want to avoid HEAD overhead
+/// - Set lower (e.g., 4 MiB) for dedicated large-file workloads on high-latency networks
+/// - Leave RangeEngine disabled (default) for mixed or small-object workloads
 ///
 /// **Example Configuration:**
 /// ```rust
 /// use s3dlio::object_store::{GcsConfig, RangeEngineConfig};
 /// 
-/// // Custom threshold for large-file workloads
+/// // Enable RangeEngine for large-file workload
 /// let config = GcsConfig {
-///     enable_range_engine: true,
+///     enable_range_engine: true,  // Must explicitly enable (disabled by default)
 ///     range_engine: RangeEngineConfig {
-///         min_split_size: 4 * 1024 * 1024,  // 4 MiB threshold
+///         min_split_size: 16 * 1024 * 1024,  // 16 MiB threshold (default)
 ///         ..Default::default()
 ///     },
-/// };
-/// 
-/// // Disable RangeEngine for small-object benchmarks
-/// let benchmark_config = GcsConfig {
-///     enable_range_engine: false,
-///     ..Default::default()
 /// };
 /// ```
 pub const DEFAULT_RANGE_ENGINE_THRESHOLD: u64 = 16 * 1024 * 1024;

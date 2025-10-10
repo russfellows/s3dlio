@@ -38,8 +38,8 @@ pub struct FileSystemConfig {
     pub min_io_size: usize,
     /// Enable O_SYNC for synchronous writes
     pub sync_writes: bool,
-    /// Enable concurrent range downloads for large files (default: true)
-    /// **Note**: DirectIO already fast, range parallelism has limited benefit
+    /// Enable concurrent range downloads for large files
+    /// Default: false (v0.9.6+) - DirectIO rarely benefits from range parallelism
     pub enable_range_engine: bool,
     /// Range engine configuration
     pub range_engine: RangeEngineConfig,
@@ -55,7 +55,7 @@ impl Default for FileSystemConfig {
             alignment: page_size,
             min_io_size: page_size,
             sync_writes: false,
-            enable_range_engine: true,
+            enable_range_engine: false,  // Disabled by default due to O_DIRECT seek overhead (v0.9.6+)
             range_engine: RangeEngineConfig {
                 min_split_size: DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD,
                 ..Default::default()
@@ -74,7 +74,7 @@ impl FileSystemConfig {
             alignment: page_size,
             min_io_size: page_size,
             sync_writes: false,
-            enable_range_engine: true,
+            enable_range_engine: false,  // Disabled by default due to O_DIRECT seek overhead (v0.9.6+)
             // DirectIO: higher threshold (16MB), lower concurrency (16)
             range_engine: RangeEngineConfig {
                 chunk_size: 64 * 1024 * 1024,     // 64MB chunks
@@ -94,7 +94,7 @@ impl FileSystemConfig {
             alignment: page_size,
             min_io_size: DEFAULT_MIN_IO_SIZE,
             sync_writes: true,          // Ensure data hits storage
-            enable_range_engine: true,
+            enable_range_engine: false,  // Disabled by default due to O_DIRECT seek overhead (v0.9.6+)
             // High performance: same as direct_io
             range_engine: RangeEngineConfig {
                 chunk_size: 64 * 1024 * 1024,

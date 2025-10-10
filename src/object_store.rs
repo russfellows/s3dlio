@@ -959,12 +959,12 @@ fn az_props_to_meta(p: &AzureBlobProperties) -> ObjectMetadata {
 /// Configuration for Azure Blob Storage backend with RangeEngine support
 /// 
 /// Azure benefits significantly from concurrent range downloads due to network latency.
-/// Default configuration uses 16 MiB threshold to avoid overhead on typical objects,
-/// and higher concurrency (32 parallel ranges) since there's no disk contention.
+/// However, RangeEngine is **disabled by default** (v0.9.6+) to avoid stat overhead.
+/// Enable explicitly for large-file workloads where the benefit outweighs HEAD request cost.
 #[derive(Debug, Clone)]
 pub struct AzureConfig {
     /// Enable RangeEngine for concurrent range downloads
-    /// Default: true (network storage benefits from parallel ranges)
+    /// Default: false (v0.9.6+) - must opt-in to avoid stat overhead on every GET
     pub enable_range_engine: bool,
     
     /// RangeEngine configuration
@@ -975,7 +975,7 @@ pub struct AzureConfig {
 impl Default for AzureConfig {
     fn default() -> Self {
         Self {
-            enable_range_engine: true,
+            enable_range_engine: false,  // Disabled by default due to stat overhead (v0.9.6+)
             range_engine: RangeEngineConfig {
                 chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
                 max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
@@ -1382,11 +1382,12 @@ fn gcs_meta_to_object_meta(meta: &GcsObjectMetadata) -> ObjectMetadata {
 /// Configuration for Google Cloud Storage backend
 /// 
 /// Supports RangeEngine for concurrent range downloads on network storage.
-/// GCS benefits significantly from parallel range requests due to network latency.
+/// However, RangeEngine is **disabled by default** (v0.9.6+) to avoid stat overhead.
+/// Enable explicitly for large-file workloads where the benefit outweighs HEAD request cost.
 #[derive(Clone, Debug)]
 pub struct GcsConfig {
     /// Enable RangeEngine for concurrent range downloads
-    /// Default: true (network storage benefits from parallel ranges)
+    /// Default: false (v0.9.6+) - must opt-in to avoid stat overhead on every GET
     pub enable_range_engine: bool,
     
     /// RangeEngine configuration
@@ -1397,7 +1398,7 @@ pub struct GcsConfig {
 impl Default for GcsConfig {
     fn default() -> Self {
         Self {
-            enable_range_engine: true,
+            enable_range_engine: false,  // Disabled by default due to stat overhead (v0.9.6+)
             range_engine: RangeEngineConfig {
                 chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
                 max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
