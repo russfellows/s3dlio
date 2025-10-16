@@ -1,7 +1,7 @@
 # s3dlio Documentation
 
-**Last Updated:** October 9, 2025  
-**Current Version:** v0.9.4  
+**Last Updated:** October 15, 2025  
+**Current Version:** v0.9.7  
 **Documentation Status:** Organized and streamlined (15 essential documents)
 
 ---
