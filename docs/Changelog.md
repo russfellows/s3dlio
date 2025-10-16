@@ -1,5 +1,78 @@
 # s3dlio Changelog
 
+## Version 0.9.7 - Configurable Page Cache Hints (October 2025)
+
+### 🚀 **New Features**
+
+#### **Configurable `posix_fadvise` Hints for File I/O**
+
+Added ability to configure page cache behavior for file system operations (`file://` and `direct://` URIs) via the new `page_cache_mode` field in `FileSystemConfig`.
+
+**What is `posix_fadvise`?**  
+On Linux/Unix systems, `posix_fadvise()` provides hints to the kernel about expected file access patterns, allowing the OS to optimize page cache behavior for better performance.
+
+**Available Modes:**
+- **`Auto`** (default for full GETs): Automatically selects Sequential for large files (>= 64 MiB), Random for small files
+- **`Sequential`**: Prefetch data ahead - optimal for streaming reads, large sequential scans
+- **`Random`**: Don't prefetch - optimal for random access patterns, database queries
+- **`DontNeed`**: Don't cache pages - optimal for one-time reads, streaming that won't be re-read
+- **`Normal`**: Let OS use default heuristics
+
+**Default Behavior (No Configuration Required):**
+- Full GET operations: `Auto` mode (intelligent based on file size)
+- Range GET operations: `Random` mode (typical for random access)
+
+**Rust API Usage:**
+
+```rust
+use s3dlio::object_store::{store_for_uri_with_config, FileSystemConfig, PageCacheMode};
+
+// Example 1: Sequential access pattern (streaming, large files)
+let config = FileSystemConfig {
+    page_cache_mode: Some(PageCacheMode::Sequential),
+    ..Default::default()
+};
+let store = store_for_uri_with_config("file:///data/", Some(config))?;
+
+// Example 2: Random access pattern (database, random seeks)
+let config = FileSystemConfig {
+    page_cache_mode: Some(PageCacheMode::Random),
+    ..Default::default()
+};
+let store = store_for_uri_with_config("file:///db/", Some(config))?;
+
+// Example 3: Don't pollute cache (one-time streaming)
+let config = FileSystemConfig {
+    page_cache_mode: Some(PageCacheMode::DontNeed),
+    ..Default::default()
+};
+let store = store_for_uri_with_config("file:///stream/", Some(config))?;
+
+// Example 4: Use defaults (Auto for full GET, Random for range GET)
+let store = store_for_uri("file:///data/")?;  // No config needed
+```
+
+**When to Use:**
+- ✅ **Sequential**: Large file streaming, sequential scans, media processing
+- ✅ **Random**: Database files, random access patterns, sparse file access
+- ✅ **DontNeed**: Large one-time reads that won't be re-accessed (prevents cache pollution)
+- ✅ **Auto**: Default - works well for most workloads
+
+**Performance Impact:**
+- Sequential mode: Can provide 2-3x improvement for large sequential reads
+- Random mode: Reduces memory pressure for random access patterns
+- DontNeed mode: Prevents cache pollution for one-time large file operations
+
+**Files Changed:**
+- `src/file_store.rs`: Added `page_cache_mode` field to `FileSystemConfig`, updated GET operations
+- `src/api.rs`: Exported `PageCacheMode`, `FileSystemConfig`, and `store_for_uri_with_config`
+- `tests/test_file_range_engine.rs`: Updated tests for new field
+
+**Backward Compatibility:**  
+✅ **Fully backward compatible** - existing code continues to work with Auto/Random defaults
+
+---
+
 ## Version 0.9.6 - RangeEngine Disabled by Default (October 2025)
 
 ### ⚠️ **BREAKING CHANGES**

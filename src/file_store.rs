@@ -36,6 +36,12 @@ pub struct FileSystemConfig {
     
     /// Range engine configuration
     pub range_engine: RangeEngineConfig,
+    
+    /// Page cache behavior hint (maps to posix_fadvise on Linux/Unix)
+    /// - None: Use Auto mode (Sequential for large files >=64MB, Random for small)
+    /// - Some(mode): Explicitly set Sequential, Random, DontNeed, or Normal
+    /// Default: None (Auto mode)
+    pub page_cache_mode: Option<PageCacheMode>,
 }
 
 impl Default for FileSystemConfig {
@@ -46,6 +52,7 @@ impl Default for FileSystemConfig {
                 min_split_size: DEFAULT_FILE_RANGE_ENGINE_THRESHOLD,
                 ..Default::default()
             },
+            page_cache_mode: None,  // Use Auto mode by default
         }
     }
 }
@@ -373,8 +380,9 @@ impl FileSystemObjectStore {
         let file = fs::File::open(&path).await?;
         let std_file = file.try_into_std().map_err(|_| anyhow::anyhow!("Failed to convert to std file"))?;
         
-        // Apply auto page cache hint (Sequential for large files, Random for small)
-        let _ = apply_page_cache_hint(&std_file, PageCacheMode::Auto, file_size);
+        // Apply page cache hint (use configured mode or Auto by default)
+        let cache_mode = self.config.page_cache_mode.unwrap_or(PageCacheMode::Auto);
+        let _ = apply_page_cache_hint(&std_file, cache_mode, file_size);
         
         // Convert back to tokio file and read
         let mut file = fs::File::from_std(std_file);
@@ -444,8 +452,9 @@ impl ObjectStore for FileSystemObjectStore {
         let file = fs::File::open(&path).await?;
         let std_file = file.try_into_std().map_err(|_| anyhow::anyhow!("Failed to convert to std file"))?;
         
-        // For range reads, use Random hint (typical for random access patterns)
-        let _ = apply_page_cache_hint(&std_file, PageCacheMode::Random, file_size);
+        // Apply page cache hint (use configured mode, or Random for range reads by default)
+        let cache_mode = self.config.page_cache_mode.unwrap_or(PageCacheMode::Random);
+        let _ = apply_page_cache_hint(&std_file, cache_mode, file_size);
         
         let mut file = fs::File::from_std(std_file);
         file.seek(std::io::SeekFrom::Start(offset)).await?;

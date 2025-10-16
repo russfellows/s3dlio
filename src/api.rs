@@ -52,6 +52,12 @@ pub use crate::object_store::CompressionConfig;
 /// Object metadata information
 pub use crate::object_store::ObjectMetadata;
 
+/// FileSystem-specific configuration (page cache, range engine, etc.)
+pub use crate::file_store::FileSystemConfig;
+
+/// Page cache behavior hint for file I/O (maps to posix_fadvise on Linux/Unix)
+pub use crate::data_loader::options::PageCacheMode;
+
 /// URI scheme detection
 pub use crate::object_store::{Scheme, infer_scheme};
 
@@ -70,6 +76,10 @@ pub use crate::object_store::store_for_uri;
 #[cfg(feature = "native-backends")]
 /// Create an object store with optional operation logging
 pub use crate::object_store::store_for_uri_with_logger;
+
+#[cfg(feature = "native-backends")]
+/// Create an object store with FileSystemConfig (for page cache control, range engine, etc.)
+pub use crate::object_store::store_for_uri_with_config;
 
 #[cfg(feature = "native-backends")]
 /// Create an object store with configuration and optional logging

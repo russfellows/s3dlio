@@ -92,6 +92,7 @@ async fn test_file_range_engine_custom_config() -> Result<()> {
             min_split_size: 2 * 1024 * 1024, // 2MB threshold
             ..Default::default()
         },
+        page_cache_mode: None,  // Use default Auto mode
     };
     
     let store = FileSystemObjectStore::with_config(config);
