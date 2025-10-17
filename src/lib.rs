@@ -11,6 +11,13 @@ compile_error!("Enable only one of: native-backends or arrow-backend");
 #[cfg(not(any(feature = "native-backends", feature = "arrow-backend")))]
 compile_error!("Must enable either 'native-backends' or 'arrow-backend' feature");
 
+// GCS backend selection - choose one implementation
+#[cfg(all(feature = "gcs-community", feature = "gcs-official"))]
+compile_error!("Enable only one of: gcs-community or gcs-official");
+
+#[cfg(not(any(feature = "gcs-community", feature = "gcs-official")))]
+compile_error!("Must enable either 'gcs-community' or 'gcs-official' feature for GCS support");
+
 // ===== Core Public API =====
 // This is the main stable API that external users should use
 pub mod api;
@@ -66,7 +73,14 @@ pub mod object_store_logger;  // Op-log support for all backends
 pub mod data_loader;
 pub mod checkpoint;
 pub mod azure_client;
-pub mod gcs_client;  // Google Cloud Storage client
+
+// Google Cloud Storage client - feature-gated backend selection
+#[cfg(feature = "gcs-community")]
+pub mod gcs_client;  // Community-maintained gcloud-storage implementation
+
+#[cfg(feature = "gcs-official")]
+pub mod google_gcs_client;  // Official Google google-cloud-storage implementation
+
 pub mod concurrency;
 #[cfg(feature = "enhanced-http")]
 pub mod http;
