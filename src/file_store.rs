@@ -386,7 +386,9 @@ impl FileSystemObjectStore {
         
         // Convert back to tokio file and read
         let mut file = fs::File::from_std(std_file);
-        let mut data = Vec::new();
+        
+        // Pre-allocate to avoid reallocation churn (v0.9.9+)
+        let mut data = Vec::with_capacity(file_size as usize);
         file.read_to_end(&mut data).await?;
         
         // Convert to Bytes (cheap, just wraps in Arc)
