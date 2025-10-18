@@ -189,6 +189,21 @@ deactivate
 ./scripts/run_backend_comparison.sh
 ```
 
+### Search Tools
+- **ripgrep (rg)**: Fast code search available in terminal
+  ```bash
+  # Search for pattern across all files
+  rg "pattern" 
+  
+  # Search in specific file types
+  rg "pattern" --type rust
+  
+  # Case-insensitive search
+  rg -i "pattern"
+  ```
+- **grep_search tool**: Use for exact string or regex searches within files
+- **semantic_search tool**: Use for semantic/natural language code searches
+
 ### Environment Configuration
 Key variables for development/testing:
 - `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`

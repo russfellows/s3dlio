@@ -277,25 +277,36 @@ impl GcsClient {
             bucket, prefix, recursive
         );
 
-        let mut all_objects = Vec::new();
+        let mut results = Vec::new();
         let mut page_token: Option<String> = None;
+
+        // Normalize folder-like prefix for non-recursive listings
+        // GCS API works best with trailing "/" when using delimiter
+        let normalized_prefix = prefix.map(|p| {
+            if !recursive && !p.is_empty() && !p.ends_with('/') {
+                format!("{}/", p)
+            } else {
+                p.to_string()
+            }
+        });
 
         // Pagination loop - GCS returns max 1000 objects per page by default
         loop {
             let mut request = ListObjectsRequest {
                 bucket: bucket.to_string(),
-                prefix: prefix.map(|s| s.to_string()),
+                prefix: normalized_prefix.clone(),
                 page_token: page_token.clone(),
                 ..Default::default()
             };
 
-            // For non-recursive, use delimiter to only list "folders"
+            // For non-recursive, use delimiter to split results into files (items) and subdirs (prefixes)
             if !recursive {
                 request.delimiter = Some("/".to_string());
             }
 
             debug!(
-                "GCS LIST page request: page_token={:?}",
+                "GCS LIST page request: normalized_prefix={:?}, page_token={:?}",
+                normalized_prefix,
                 page_token.as_ref().map(|t| format!("{}...", &t[..t.len().min(20)]))
             );
 
@@ -303,16 +314,24 @@ impl GcsClient {
                 .await
                 .map_err(|e| anyhow!("GCS LIST failed for bucket {}: {}", bucket, e))?;
 
-            // Collect objects from this page
-            let page_objects: Vec<String> = response
-                .items
-                .unwrap_or_default()
-                .into_iter()
-                .map(|obj| obj.name)  // Return just the object name, not full URI
-                .collect();
+            // Collect files at this level (from items[])
+            if let Some(items) = response.items {
+                let item_names: Vec<String> = items
+                    .into_iter()
+                    .map(|obj| obj.name)
+                    .collect();
+                debug!("GCS LIST page received: {} objects", item_names.len());
+                results.extend(item_names);
+            }
 
-            debug!("GCS LIST page received: {} objects", page_objects.len());
-            all_objects.extend(page_objects);
+            // For non-recursive, also collect subdirectory prefixes
+            // These represent "folders" and always end with "/"
+            if !recursive {
+                if let Some(prefixes) = response.prefixes {
+                    debug!("GCS LIST page received: {} prefixes (subdirectories)", prefixes.len());
+                    results.extend(prefixes);
+                }
+            }
 
             // Check for next page token
             if let Some(next_token) = response.next_page_token {
@@ -324,8 +343,8 @@ impl GcsClient {
             }
         }
 
-        debug!("GCS LIST success: {} total objects", all_objects.len());
-        Ok(all_objects)
+        debug!("GCS LIST success: {} total results (files + prefixes)", results.len());
+        Ok(results)
     }
 
     /// Create a new GCS bucket.

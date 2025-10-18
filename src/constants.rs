@@ -167,6 +167,7 @@ pub const SCHEME_FILE: &str = "file://";
 pub const SCHEME_DIRECT: &str = "direct://";
 pub const SCHEME_S3: &str = "s3://";
 pub const SCHEME_AZURE: &str = "az://";
+pub const SCHEME_GCS: &str = "gs://";
 
 /// File I/O operation modes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,17 +186,6 @@ impl IoMode {
             IoMode::Direct => SCHEME_DIRECT,
         }
     }
-}
-
-/// Storage backend types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageBackend {
-    /// Local filesystem (buffered or direct)
-    File(IoMode),
-    /// Amazon S3
-    S3,
-    /// Azure Blob Storage
-    Azure,
 }
 
 // =============================================================================
@@ -248,14 +238,3 @@ pub static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
     rng.fill_bytes(&mut block[..]);
     block
 });
-
-impl StorageBackend {
-    /// Returns the URI scheme for this backend
-    pub fn uri_scheme(&self) -> &'static str {
-        match self {
-            StorageBackend::File(mode) => mode.uri_scheme(),
-            StorageBackend::S3 => SCHEME_S3,
-            StorageBackend::Azure => SCHEME_AZURE,
-        }
-    }
-}

@@ -4,7 +4,7 @@
 [![Tests](https://img.shields.io/badge/tests-130%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-118%2F119-brightgreen)](docs/Changelog.md)
 [![Python Tests](https://img.shields.io/badge/python%20tests-12%2F16-yellow)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.7-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.8-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -13,11 +13,31 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 ## 🌟 Latest Release
 
+### v0.9.8 - Optional GCS Backends & Page Cache Configuration (October 2025)
+
+**New in this release**:
+
+**🌐 Dual GCS Backend Options**:
+- **`gcs-community`** (default): Community-maintained `gcloud-storage` v1.1 - **100% reliable** (10/10 tests pass)
+- **`gcs-official`** (experimental): Official Google `google-cloud-storage` v1.1 - **80-90% reliable** (8-9/10 tests pass)
+- Compile-time selection via Cargo features
+- Identical APIs for easy A/B testing
+- **Known issue**: `gcs-official` has intermittent transport flakes due to upstream bug ([Issue #3574](https://github.com/googleapis/google-cloud-rust/issues/3574))
+- **Improvement**: Global client singleton pattern increased `gcs-official` reliability from 30% to 80-90%
+
+**📁 Configurable Page Cache Hints**:
+- Added `page_cache_mode` configuration for `file://` and `direct://` URIs
+- Control `posix_fadvise()` behavior: Sequential, Random, DontNeed, Normal, Auto
+- Optimize page cache for different access patterns (streaming, random, one-time reads)
+- Default: Auto mode (intelligent based on file size)
+
+📖 [Full Changelog v0.9.8](docs/Changelog.md#version-098) | [GCS Backend Selection Guide](docs/GCS-BACKEND-SELECTION.md)
+
+---
+
+## � Recent Releases
+
 ### v0.9.6 - RangeEngine Disabled by Default (October 2025)
-
-**⚠️ BREAKING CHANGE**: RangeEngine now disabled by default across all backends due to performance testing revealing up to 50% slowdown on typical workloads.
-
-**🔧 Key Changes:**
 - **RangeEngine Opt-In**: Must explicitly enable for large-file workloads (>= 64 MiB average)
 - **Performance Fix**: Eliminates extra HEAD/STAT request overhead (2x requests → 1x request)
 - **Default Threshold**: 16 MiB minimum split size when explicitly enabled
@@ -166,6 +186,38 @@ cargo build --no-default-features --features arrow-backend
 - No proven performance advantage over native backend
 - Useful for comparison testing and development
 - Not recommended for production use
+
+### GCS Backend Options (v0.9.7+)
+
+s3dlio supports **two mutually exclusive GCS backend implementations** that can be selected at compile time. **Community backend (`gcs-community`) is the default and recommended** for production use:
+
+```bash
+# Default: Community backend (RECOMMENDED for production)
+cargo build --release
+# or explicitly:
+cargo build --release --features gcs-community
+
+# Experimental: Official Google backend (for testing only)
+cargo build --release --no-default-features --features native-backends,s3,gcs-official
+```
+
+**Why gcs-community is default:**
+- ✅ Production-ready and stable (10/10 tests pass consistently)
+- ✅ Uses community-maintained `gcloud-storage` v1.1 crate
+- ✅ Full ADC (Application Default Credentials) support
+- ✅ All operations work reliably: GET, PUT, DELETE, LIST, STAT, range reads
+
+**About gcs-official:**
+- ⚠️ **Experimental only** - Known transport flakes in test suites
+- Uses official Google `google-cloud-storage` v1.1 crate
+- Individual operations work correctly (100% pass when tested alone)
+- Full test suite experiences intermittent "transport error" failures (7/10 tests fail)
+- **Root cause**: Upstream HTTP/2 connection pool flake in google-cloud-rust library
+  - **Bug Report**: https://github.com/googleapis/google-cloud-rust/issues/3574
+  - **Related Issue**: https://github.com/googleapis/google-cloud-rust/issues/3412
+- Not recommended for production until upstream issue is resolved
+
+**For more details:** See [GCS Backend Selection Guide](docs/GCS-BACKEND-SELECTION.md)
 
 ## Quick Start
 

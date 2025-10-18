@@ -57,8 +57,12 @@ use crate::constants::{
 };
 use std::time::Duration;
 
-// --- GCS -----------------------------------------------------
+// --- GCS - Feature-gated backend selection -------------------
+#[cfg(feature = "gcs-community")]
 use crate::gcs_client::{GcsClient, GcsObjectMetadata, parse_gcs_uri};
+
+#[cfg(feature = "gcs-official")]
+use crate::google_gcs_client::{GcsClient, GcsObjectMetadata, parse_gcs_uri};
 
 /// Provider-neutral object metadata. For now this aliases S3's metadata.
 pub type ObjectMetadata = S3ObjectStat;
