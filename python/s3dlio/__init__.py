@@ -7,7 +7,7 @@ Top-level s3dlio package:
 """
 
 # Version - keep in sync with pyproject.toml
-__version__ = "0.9.8"
+__version__ = "0.9.9"
 
 from importlib import import_module
 import sys as _sys
