@@ -104,10 +104,9 @@ cargo build --release --no-default-features --features native-backends,s3,gcs-of
 echo ""
 echo -e "${YELLOW}Running functional tests with gcs-official...${NC}"
 echo -e "${YELLOW}(Running single-threaded to avoid race conditions)${NC}"
-echo -e "${YELLOW}NOTE: This will likely fail as google_gcs_client is currently stub-only${NC}"
 echo ""
 
-set +e  # Don't exit on error for official backend (expected to fail)
+set +e  # Don't exit on error for official backend (may still have issues)
 cargo test --test test_gcs_functional --release --no-default-features --features native-backends,s3,gcs-official -- --test-threads=1 --nocapture
 OFFICIAL_EXIT_CODE=$?
 set -e
@@ -117,7 +116,7 @@ if [ $OFFICIAL_EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}✓ gcs-official tests PASSED${NC}"
 else
     echo ""
-    echo -e "${YELLOW}✗ gcs-official tests FAILED (expected - stub implementation only)${NC}"
+    echo -e "${RED}✗ gcs-official tests FAILED${NC}"
 fi
 
 echo ""
@@ -135,17 +134,22 @@ fi
 if [ $OFFICIAL_EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}✓ gcs-official (google-cloud-storage): PASSED${NC}"
 else
-    echo -e "${YELLOW}⚠ gcs-official (google-cloud-storage): FAILED (stub only)${NC}"
+    echo -e "${RED}✗ gcs-official (google-cloud-storage): FAILED${NC}"
 fi
 
 echo ""
 
 # Overall result
-if [ $COMMUNITY_EXIT_CODE -eq 0 ]; then
+if [ $COMMUNITY_EXIT_CODE -eq 0 ] && [ $OFFICIAL_EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║  Working Backend Available: gcs-community                    ║${NC}"
+    echo -e "${GREEN}║  ✓ BOTH BACKENDS PASSED                                      ║${NC}"
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
     exit 0
+elif [ $COMMUNITY_EXIT_CODE -eq 0 ]; then
+    echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║  Working Backend: gcs-community (gcs-official has issues)    ║${NC}"
+    echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+    exit 1
 else
     echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${RED}║  TESTS FAILED                                                ║${NC}"

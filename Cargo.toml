@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.7"
+version = "0.9.8"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "AGPL-3.0"
@@ -38,6 +38,7 @@ azure_storage_blob = { version = "0.4.0" }   # Blob/Container/BlockBlob clients
 # - gcs-official: Official Google google-cloud-storage (experimental)
 gcloud-storage = { version = "^1.1", optional = true }       # Community GCS client with ADC support
 google-cloud-storage = { version = "^1.1", optional = true } # Official Google GCS client
+google-cloud-gax = { version = "^1.1", optional = true }     # Google Cloud GAX library (needed for ItemPaginator trait)
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat
@@ -145,7 +146,7 @@ default = ["s3", "native-backends", "gcs-community"]
 s3 = []
 native-backends = []                    # Current AWS/Azure implementations
 gcs-community = ["dep:gcloud-storage"]  # Community-maintained GCS client (default)
-gcs-official = ["dep:google-cloud-storage"]  # Official Google GCS client (experimental)
+gcs-official = ["dep:google-cloud-storage", "dep:google-cloud-gax"]  # Official Google GCS client (experimental)
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
 enhanced-http = ["dep:reqwest"]      # Enhanced HTTP client with HTTP/2 support
 direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
