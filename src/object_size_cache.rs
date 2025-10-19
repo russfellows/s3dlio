@@ -384,4 +384,125 @@ mod tests {
         let stats = cache.stats().await;
         assert_eq!(stats.total_entries, 100);
     }
+    
+    #[tokio::test]
+    async fn test_zero_ttl_disables_cache() {
+        let cache = ObjectSizeCache::new(Duration::from_secs(0));
+        
+        cache.put("s3://bucket/object1".to_string(), 1000).await;
+        
+        // With 0 TTL, entry should be immediately expired
+        sleep(Duration::from_millis(10)).await;
+        let result = cache.get("s3://bucket/object1").await;
+        assert!(result.is_none(), "0 TTL should immediately expire entries");
+    }
+    
+    #[tokio::test]
+    async fn test_cache_hit_rate() {
+        let cache = ObjectSizeCache::new(Duration::from_secs(60));
+        
+        // Populate cache with 10 entries
+        for i in 0..10 {
+            cache.put(format!("s3://bucket/object-{}", i), i * 1000).await;
+        }
+        
+        // Test cache hit rate: 10 hits, 5 misses
+        let mut hits = 0;
+        let mut misses = 0;
+        
+        for i in 0..15 {
+            let uri = format!("s3://bucket/object-{}", i);
+            if cache.get(&uri).await.is_some() {
+                hits += 1;
+            } else {
+                misses += 1;
+            }
+        }
+        
+        assert_eq!(hits, 10, "Should have 10 cache hits");
+        assert_eq!(misses, 5, "Should have 5 cache misses");
+    }
+    
+    #[tokio::test]
+    async fn test_expiration_boundary() {
+        let cache = ObjectSizeCache::new(Duration::from_millis(50));
+        
+        cache.put("s3://bucket/fast-expire".to_string(), 1000).await;
+        
+        // Just before expiration
+        sleep(Duration::from_millis(25)).await;
+        assert!(cache.get("s3://bucket/fast-expire").await.is_some(), "Should still be valid");
+        
+        // Just after expiration
+        sleep(Duration::from_millis(30)).await;
+        assert!(cache.get("s3://bucket/fast-expire").await.is_none(), "Should be expired");
+    }
+    
+    #[tokio::test]
+    async fn test_large_number_of_entries() {
+        let cache = ObjectSizeCache::new(Duration::from_secs(60));
+        
+        // Add 1000 entries
+        for i in 0..1000 {
+            cache.put(format!("s3://bucket/object-{:04}", i), i * 1000).await;
+        }
+        
+        let stats = cache.stats().await;
+        assert_eq!(stats.total_entries, 1000);
+        assert_eq!(stats.valid_entries(), 1000);
+        
+        // Verify random access works
+        assert_eq!(cache.get("s3://bucket/object-0500").await, Some(500 * 1000));
+        assert_eq!(cache.get("s3://bucket/object-0999").await, Some(999 * 1000));
+    }
+    
+    #[tokio::test]
+    async fn test_concurrent_read_heavy_workload() {
+        let cache = Arc::new(ObjectSizeCache::new(Duration::from_secs(60)));
+        
+        // Populate cache with 100 entries
+        for i in 0..100 {
+            cache.put(format!("s3://bucket/object-{:03}", i), i * 1000).await;
+        }
+        
+        // Spawn 1000 concurrent readers
+        let mut handles = vec![];
+        for i in 0..1000 {
+            let cache_clone = Arc::clone(&cache);
+            let handle = tokio::spawn(async move {
+                let uri = format!("s3://bucket/object-{:03}", i % 100);
+                cache_clone.get(&uri).await
+            });
+            handles.push(handle);
+        }
+        
+        // All reads should succeed
+        let mut successful_reads = 0;
+        for handle in handles {
+            if handle.await.unwrap().is_some() {
+                successful_reads += 1;
+            }
+        }
+        
+        assert_eq!(successful_reads, 1000, "All reads should find cached entries");
+    }
+    
+    #[tokio::test]
+    async fn test_memory_efficiency_large_cache() {
+        let cache = ObjectSizeCache::new(Duration::from_secs(60));
+        
+        // Add 10,000 entries to test memory efficiency
+        for i in 0..10_000 {
+            cache.put(format!("s3://bucket/dataset/object-{:06}", i), i * 1000).await;
+        }
+        
+        let stats = cache.stats().await;
+        assert_eq!(stats.total_entries, 10_000);
+        assert_eq!(stats.valid_entries(), 10_000);
+        
+        // Verify clear works on large cache
+        cache.clear().await;
+        let stats_after = cache.stats().await;
+        assert_eq!(stats_after.total_entries, 0);
+    }
 }
