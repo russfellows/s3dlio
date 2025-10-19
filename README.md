@@ -13,7 +13,7 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 ## 🌟 Latest Release
 
-### v0.9.10 - Pre-Stat Size Cache for Benchmarking (December 2024)
+### v0.9.10 - Pre-Stat Size Cache for Benchmarking (19, October 2024)
 
 **🚀 2.5x Faster Multi-Object Downloads:**
 
@@ -37,7 +37,7 @@ for uri in &object_uris {
 
 ---
 
-### v0.9.9 - Buffer Pool Optimization for DirectIO (October 2025)
+### v0.9.9 - Buffer Pool Optimization for DirectIO (18, October 2025)
 
 **🚀 15-20% Faster DirectIO:**
 
@@ -90,15 +90,15 @@ let config = FileSystemConfig::default();  // ✅ No pool (backward compatible)
 For detailed release notes and migration guides, see the [Complete Changelog](docs/Changelog.md).
 
 **Recent versions:**
-- **v0.9.10** (December 2024) - Pre-stat size cache for benchmarking (2.5x faster multi-object downloads)
-- **v0.9.9** (October 2025) - Buffer pool optimization for DirectIO (15-20% throughput improvement)
-- **v0.9.8** (October 2025) - Dual GCS backend options, configurable page cache hints
-- **v0.9.6** (October 2025) - RangeEngine disabled by default (performance fix)
-- **v0.9.5** (October 2025) - Adaptive concurrency for deletes (10-70x faster)
-- **v0.9.3** (October 2025) - RangeEngine for Azure & GCS
-- **v0.9.2** (October 2025) - Graceful shutdown & configuration hierarchy
-- **v0.9.1** (October 2025) - Zero-copy Python API with BytesView
-- **v0.9.0** (October 2025) - bytes::Bytes migration (BREAKING)
+- **v0.9.10** (19, October 2024) - Pre-stat size cache for benchmarking (2.5x faster multi-object downloads)
+- **v0.9.9** (18, October 2025) - Buffer pool optimization for DirectIO (15-20% throughput improvement)
+- **v0.9.8** (17, October 2025) - Dual GCS backend options, configurable page cache hints
+- **v0.9.6** (10, October 2025) - RangeEngine disabled by default (performance fix)
+- **v0.9.5** (9, October 2025) - Adaptive concurrency for deletes (10-70x faster)
+- **v0.9.3** (8, October 2025) - RangeEngine for Azure & GCS
+- **v0.9.2** (8, October 2025) - Graceful shutdown & configuration hierarchy
+- **v0.9.1** (8, October 2025) - Zero-copy Python API with BytesView
+- **v0.9.0** (7, October 2025) - bytes::Bytes migration (BREAKING)
 - **v0.8.x** (2024-2025) - Production features (universal commands, OpLog, TFRecord indexing)
 
 ---
