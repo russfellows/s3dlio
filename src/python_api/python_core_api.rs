@@ -990,7 +990,7 @@ pub fn create_s3_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOp
     
     py.allow_threads(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
-            let store = S3ObjectStore;
+            let store = S3ObjectStore::new();
             let writer = store.create_writer(&uri, opts).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create S3 writer: {}", e)))?;
             
