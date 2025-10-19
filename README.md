@@ -1,10 +1,10 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-130%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-118%2F119-brightgreen)](docs/Changelog.md)
+[![Tests](https://img.shields.io/badge/tests-143%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-131%2F132-brightgreen)](docs/Changelog.md)
 [![Python Tests](https://img.shields.io/badge/python%20tests-12%2F16-yellow)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.9-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.10-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -13,9 +13,33 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 ## 🌟 Latest Release
 
+### v0.9.10 - Pre-Stat Size Cache for Benchmarking (December 2024)
+
+**🚀 2.5x Faster Multi-Object Downloads:**
+
+New `pre_stat_and_cache()` API eliminates stat overhead in benchmarking workloads:
+
+```rust
+// Pre-stat all objects once (200ms for 1000 objects)
+store.pre_stat_and_cache(&object_uris, 100).await?;
+
+// Downloads now skip stat operations - 2.5x faster!
+for uri in &object_uris {
+    let data = store.get(uri).await?;  // Uses cached size
+}
+```
+
+**Performance:** 32.8s → 13.0s for 1000-object benchmark (60% reduction in total time)  
+**Use Cases:** Benchmarking tools, dataset pre-loading, batch processing  
+**Backends:** S3, GCS, Azure (file:// uses TTL=0 for immediate freshness)
+
+📖 [Full Details v0.9.10](docs/Changelog.md#version-0910) | [Usage Examples](docs/Changelog.md#api-usage---after-v0910---pre-stat-optimization)
+
+---
+
 ### v0.9.9 - Buffer Pool Optimization for DirectIO (October 2025)
 
-**🚀 Major Performance Improvement - 15-20% Faster DirectIO:**
+**🚀 15-20% Faster DirectIO:**
 
 Eliminated allocation churn in DirectIO range reads through intelligent buffer pool integration:
 
@@ -66,6 +90,7 @@ let config = FileSystemConfig::default();  // ✅ No pool (backward compatible)
 For detailed release notes and migration guides, see the [Complete Changelog](docs/Changelog.md).
 
 **Recent versions:**
+- **v0.9.10** (December 2024) - Pre-stat size cache for benchmarking (2.5x faster multi-object downloads)
 - **v0.9.9** (October 2025) - Buffer pool optimization for DirectIO (15-20% throughput improvement)
 - **v0.9.8** (October 2025) - Dual GCS backend options, configurable page cache hints
 - **v0.9.6** (October 2025) - RangeEngine disabled by default (performance fix)
