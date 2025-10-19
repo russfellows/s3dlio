@@ -823,7 +823,9 @@ impl Default for S3Config {
 
 #[derive(Clone)]
 pub struct S3ObjectStore {
-    config: S3Config,
+    // Note: S3ObjectStore doesn't store config because it doesn't support RangeEngine yet
+    // (unlike GCS/Azure which do). The config is only used during construction to set
+    // the cache TTL. If RangeEngine support is added later, we can add the config field.
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
 }
 
@@ -832,7 +834,6 @@ impl S3ObjectStore {
         let config = S3Config::default();
         let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
-            config,
             size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
         }
     }
@@ -840,7 +841,6 @@ impl S3ObjectStore {
     pub fn with_config(config: S3Config) -> Self {
         let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
-            config,
             size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
         }
     }

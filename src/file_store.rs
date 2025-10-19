@@ -75,6 +75,7 @@ impl Default for FileSystemConfig {
 #[derive(Clone)]
 pub struct FileSystemObjectStore {
     config: Arc<FileSystemConfig>,
+    size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
 }
 
 /// Streaming writer for filesystem operations
@@ -236,16 +237,27 @@ impl ObjectWriter for FileSystemWriter {
 
 impl FileSystemObjectStore {
     /// Create a new FileSystemObjectStore with default configuration
+    /// 
+    /// v0.9.10: Uses TTL=0 for size cache (effectively disabled) because:
+    /// - File metadata can change rapidly on disk
+    /// - Local stat operations are fast (<1ms vs 10-50ms for network storage)
+    /// - Cache provides no meaningful performance benefit
     pub fn new() -> Self {
+        use std::time::Duration;
         Self {
             config: Arc::new(FileSystemConfig::default()),
+            size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(Duration::from_secs(0))),
         }
     }
     
     /// Create with custom configuration
+    /// 
+    /// v0.9.10: TTL=0 for file:// backend (no caching needed for local filesystem)
     pub fn with_config(config: FileSystemConfig) -> Self {
+        use std::time::Duration;
         Self {
             config: Arc::new(config),
+            size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(Duration::from_secs(0))),
         }
     }
     
@@ -670,5 +682,29 @@ impl ObjectStore for FileSystemObjectStore {
             let writer = FileSystemWriter::new(path).await?;
             Ok(Box::new(writer))
         }
+    }
+    
+    /// Pre-stat objects and populate the size cache
+    /// 
+    /// v0.9.10: For file:// backend, size_cache has TTL=0 (effectively disabled)
+    /// because local filesystem metadata operations are fast (~1ms vs 10-50ms for
+    /// network storage) and files can change rapidly on disk.
+    /// 
+    /// This method still works to maintain API compatibility, but provides minimal
+    /// performance benefit for local files.
+    async fn pre_stat_and_cache(
+        &self,
+        uris: &[String],
+        max_concurrent: usize,
+    ) -> Result<usize> {
+        // Use default concurrent pre_stat_objects implementation
+        let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
+        
+        // Populate size cache with results (TTL=0 means immediate expiration)
+        for (uri, size) in size_map.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
+        
+        Ok(size_map.len())
     }
 }
