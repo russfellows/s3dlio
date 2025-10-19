@@ -1245,6 +1245,13 @@ pub struct AzureConfig {
     /// RangeEngine configuration
     /// Network-optimized defaults: 16 MiB threshold, 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
+    
+    /// Time-to-live for cached object sizes
+    /// Default: 60 seconds
+    /// Set to 0 to disable caching
+    /// 
+    /// v0.9.10: Added for pre-stat optimization
+    pub size_cache_ttl_secs: u64,
 }
 
 impl Default for AzureConfig {
@@ -1257,6 +1264,7 @@ impl Default for AzureConfig {
                 min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 16 MiB threshold
                 range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
             },
+            size_cache_ttl_secs: 60,  // 60 second TTL for size cache
         }
     }
 }
@@ -1265,23 +1273,47 @@ impl Default for AzureConfig {
 #[derive(Clone)]
 pub struct AzureObjectStore {
     config: AzureConfig,
+    size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
 }
 
 
 impl AzureObjectStore {
     pub fn new() -> Self {
+        let config = AzureConfig::default();
+        let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
-            config: AzureConfig::default(),
+            config,
+            size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
         }
     }
     
     pub fn with_config(config: AzureConfig) -> Self {
-        Self { config }
+        let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
+        Self {
+            config,
+            size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+        }
     }
     
     #[inline]
     pub fn boxed() -> Box<dyn ObjectStore> {
         Box::new(Self::new())
+    }
+    
+    /// Get object size, checking cache first
+    /// 
+    /// v0.9.10: Added to optimize get() and get_with_range_engine()
+    /// by eliminating redundant stat() calls.
+    async fn get_object_size(&self, uri: &str) -> Result<u64> {
+        // Check cache first
+        if let Some(cached_size) = self.size_cache.get(uri).await {
+            return Ok(cached_size);
+        }
+        
+        // Cache miss - perform stat and cache result
+        let metadata = self.stat(uri).await?;
+        self.size_cache.put(uri.to_string(), metadata.size).await;
+        Ok(metadata.size)
     }
 
     fn client_for_uri(uri: &str) -> Result<(AzureBlob, String, String, String)> {
@@ -1343,9 +1375,8 @@ impl ObjectStore for AzureObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         
-        // Get blob size to decide download strategy
-        let props = cli.stat(&key).await?;
-        let object_size = props.content_length;
+        // Get blob size from cache or stat (v0.9.10: cache optimization)
+        let object_size = self.get_object_size(uri).await?;
         
         // Use RangeEngine for large blobs if enabled
         if self.config.enable_range_engine && object_size >= self.config.range_engine.min_split_size {
@@ -1482,6 +1513,26 @@ impl ObjectStore for AzureObjectStore {
         } else {
             Ok(Box::new(AzureBufferedWriter::new(uri.to_string())))
         }
+    }
+    
+    /// Pre-stat objects and populate the size cache
+    /// 
+    /// v0.9.10: Override default implementation to populate internal size cache.
+    /// This enables subsequent get() calls to skip redundant stat operations.
+    async fn pre_stat_and_cache(
+        &self,
+        uris: &[String],
+        max_concurrent: usize,
+    ) -> Result<usize> {
+        // Use default concurrent pre_stat_objects implementation
+        let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
+        
+        // Populate size cache with results
+        for (uri, size) in size_map.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
+        
+        Ok(size_map.len())
     }
 }
 
@@ -1659,6 +1710,8 @@ fn gcs_meta_to_object_meta(meta: &GcsObjectMetadata) -> ObjectMetadata {
 /// Supports RangeEngine for concurrent range downloads on network storage.
 /// However, RangeEngine is **disabled by default** (v0.9.6+) to avoid stat overhead.
 /// Enable explicitly for large-file workloads where the benefit outweighs HEAD request cost.
+/// 
+/// v0.9.10: Added size_cache_ttl_secs for pre-stat optimization
 #[derive(Clone, Debug)]
 pub struct GcsConfig {
     /// Enable RangeEngine for concurrent range downloads
@@ -1668,6 +1721,11 @@ pub struct GcsConfig {
     /// RangeEngine configuration
     /// Network-optimized defaults: 16 MiB threshold, 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
+    
+    /// Time-to-live for cached object sizes
+    /// Default: 60 seconds
+    /// Set to 0 to disable caching
+    pub size_cache_ttl_secs: u64,
 }
 
 impl Default for GcsConfig {
@@ -1680,6 +1738,7 @@ impl Default for GcsConfig {
                 min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 16 MiB threshold
                 range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
             },
+            size_cache_ttl_secs: 60,  // 60 second TTL for size cache
         }
     }
 }
@@ -1691,22 +1750,46 @@ impl Default for GcsConfig {
 #[derive(Clone)]
 pub struct GcsObjectStore {
     config: GcsConfig,
+    size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
 }
 
 impl GcsObjectStore {
     pub fn new() -> Self {
+        let config = GcsConfig::default();
+        let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
-            config: GcsConfig::default(),
+            config,
+            size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
         }
     }
     
     pub fn with_config(config: GcsConfig) -> Self {
-        Self { config }
+        let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
+        Self {
+            config,
+            size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+        }
     }
     
     #[inline]
     pub fn boxed() -> Box<dyn ObjectStore> {
         Box::new(Self::new())
+    }
+    
+    /// Get object size, checking cache first
+    /// 
+    /// v0.9.10: Added to optimize get() and get_with_range_engine()
+    /// by eliminating redundant stat() calls.
+    async fn get_object_size(&self, uri: &str) -> Result<u64> {
+        // Check cache first
+        if let Some(cached_size) = self.size_cache.get(uri).await {
+            return Ok(cached_size);
+        }
+        
+        // Cache miss - perform stat and cache result
+        let metadata = self.stat(uri).await?;
+        self.size_cache.put(uri.to_string(), metadata.size).await;
+        Ok(metadata.size)
     }
 
     async fn get_client() -> Result<GcsClient> {
@@ -1766,9 +1849,8 @@ impl ObjectStore for GcsObjectStore {
             return client.get_object(&bucket, &object).await;
         }
         
-        // Get object size via stat to determine strategy
-        let metadata = client.stat_object(&bucket, &object).await?;
-        let object_size = metadata.size;
+        // Get object size from cache or stat (v0.9.10: cache optimization)
+        let object_size = self.get_object_size(uri).await?;
         
         // Use RangeEngine for large objects (default 4MB+)
         if object_size >= self.config.range_engine.min_split_size {
@@ -1898,6 +1980,29 @@ impl ObjectStore for GcsObjectStore {
         } else {
             Ok(Box::new(GcsBufferedWriter::new(uri.to_string())))
         }
+    }
+    
+    /// Pre-stat objects and populate the size cache
+    /// 
+    /// v0.9.10: Override default implementation to populate internal size cache.
+    /// This enables subsequent get() calls to skip redundant stat operations.
+    /// 
+    /// Critical for benchmarking workloads that download many GCS objects,
+    /// eliminating per-object HEAD request latency (typically 10-50ms each).
+    async fn pre_stat_and_cache(
+        &self,
+        uris: &[String],
+        max_concurrent: usize,
+    ) -> Result<usize> {
+        // Use default concurrent pre_stat_objects implementation
+        let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
+        
+        // Populate size cache with results
+        for (uri, size) in size_map.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
+        
+        Ok(size_map.len())
     }
 }
 
