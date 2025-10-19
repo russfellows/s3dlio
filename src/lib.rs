@@ -36,6 +36,7 @@ pub mod data_formats;
 pub mod config;
 pub mod progress;
 pub mod memory;
+pub mod object_size_cache;  // v0.9.10: Pre-stat size caching for benchmarking
 pub mod download;
 pub mod sharded_client;
 pub mod range_engine;
