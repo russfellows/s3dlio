@@ -724,17 +724,27 @@ impl ObjectStore for FileSystemObjectStore {
     async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
         let path = Self::uri_to_path(uri)?;
         
-        if recursive {
-            tokio::fs::remove_dir_all(&path)
-                .await
-                .with_context(|| format!("Failed to remove directory recursively: {}", path.display()))?;
+        let result = if recursive {
+            tokio::fs::remove_dir_all(&path).await
         } else {
-            tokio::fs::remove_dir(&path)
-                .await
-                .with_context(|| format!("Failed to remove directory (not empty?): {}", path.display()))?;
-        }
+            tokio::fs::remove_dir(&path).await
+        };
         
-        Ok(())
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Directory doesn't exist - treat as success (idempotent operation)
+                tracing::debug!("Directory already removed or never existed: {}", path.display());
+                Ok(())
+            }
+            Err(e) => {
+                if recursive {
+                    Err(e).with_context(|| format!("Failed to remove directory recursively: {}", path.display()))
+                } else {
+                    Err(e).with_context(|| format!("Failed to remove directory (not empty?): {}", path.display()))
+                }
+            }
+        }
     }
 
     async fn update_metadata(&self, _uri: &str, _metadata: &HashMap<String, String>) -> Result<()> {
