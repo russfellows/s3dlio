@@ -9,6 +9,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use crc32fast::Hasher;
 use std::io::Write;
+use std::collections::HashMap;
 use tracing::{debug, warn, info};
 use regex::Regex;
 
@@ -210,6 +211,38 @@ pub enum Scheme {
     Gcs,
     Unknown,
 }
+/// Object properties for metadata update operations (v0.10.0+)
+/// 
+/// Used with `update_properties()` to modify object metadata without re-uploading data.
+/// Only non-None fields will be updated. For cloud backends, this typically requires
+/// copying the object with new metadata.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectProperties {
+    /// MIME content type (e.g., "application/json", "text/plain")
+    pub content_type: Option<String>,
+    
+    /// HTTP Cache-Control header (e.g., "max-age=3600, public")
+    pub cache_control: Option<String>,
+    
+    /// Content encoding (e.g., "gzip", "br")
+    pub content_encoding: Option<String>,
+    
+    /// Content language (e.g., "en-US", "fr-FR")
+    pub content_language: Option<String>,
+    
+    /// Content disposition (e.g., "attachment; filename=data.json")
+    pub content_disposition: Option<String>,
+    
+    /// HTTP Expires header (RFC 2822 date format)
+    pub expires: Option<String>,
+    
+    /// Storage class/tier for cost optimization
+    /// - S3: "STANDARD", "INTELLIGENT_TIERING", "GLACIER", "DEEP_ARCHIVE"
+    /// - GCS: "STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"
+    /// - Azure: "Hot", "Cool", "Archive"
+    pub storage_class: Option<String>,
+}
+
 
 /// Best-effort scheme inference from a URI.
 pub fn infer_scheme(uri: &str) -> Scheme {
@@ -540,6 +573,56 @@ pub trait ObjectStore: Send + Sync {
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
         Ok(size_map.len())
     }
+    
+    // =========================================================================
+    // Metadata Operations (v0.10.0+)
+    // =========================================================================
+    
+    /// Create a directory (POSIX) or prefix marker (cloud).
+    /// 
+    /// **Backend behavior**:
+    /// - `file://`, `direct://`: Creates actual directory with `create_dir_all()`
+    /// - `s3://`, `gs://`, `az://`: Creates empty marker object (e.g., `.keep`)
+    /// 
+    /// # Arguments
+    /// * `uri` - Full URI including scheme (e.g., "file:///tmp/dir", "s3://bucket/prefix/")
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        let _ = uri;
+        bail!("mkdir not implemented for this backend")
+    }
+
+    /// Remove a directory (POSIX) or delete all objects under prefix (cloud).
+    /// 
+    /// **Backend behavior**:
+    /// - `file://`, `direct://`: Removes directory (must be empty unless `recursive=true`)
+    /// - `s3://`, `gs://`, `az://`: Deletes all objects under prefix
+    /// 
+    /// # Arguments
+    /// * `uri` - Full URI including scheme
+    /// * `recursive` - If true, delete recursively; if false, fail if not empty
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        let _ = (uri, recursive);
+        bail!("rmdir not implemented for this backend")
+    }
+
+    /// Update custom object metadata (cloud-specific, x-amz-meta-*, x-goog-meta-*, x-ms-meta-*).
+    /// 
+    /// **Note**: For cloud backends, this typically requires copying the object with new metadata.
+    /// For file backends, this is not applicable.
+    async fn update_metadata(&self, uri: &str, metadata: &HashMap<String, String>) -> Result<()> {
+        let _ = (uri, metadata);
+        bail!("update_metadata not supported for this backend")
+    }
+
+    /// Update object properties (content-type, cache-control, storage class, etc).
+    /// 
+    /// **Note**: For cloud backends, changing properties requires copying the object.
+    /// For file backends, limited support.
+    async fn update_properties(&self, uri: &str, properties: &ObjectProperties) -> Result<()> {
+        let _ = (uri, properties);
+        bail!("update_properties not supported for this backend")
+    }
+
 
 }
 

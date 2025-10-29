@@ -167,6 +167,7 @@ async fn test_directio_compression_varied_patterns() -> Result<()> {
         min_io_size: 4096,
         enable_range_engine: false,
         range_engine: Default::default(),
+        buffer_pool: None,
     };
     
     for pattern in patterns {

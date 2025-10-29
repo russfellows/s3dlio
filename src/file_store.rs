@@ -4,7 +4,7 @@ use tracing::{debug, info, trace};
 // FileSystemObjectStore implementation for POSIX file I/O
 // This provides the same ObjectStore interface for local filesystem operations
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use crate::object_store::WriterOptions;
 use crate::page_cache::{apply_page_cache_hint};
@@ -18,7 +18,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crc32fast::Hasher;
 
-use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, CompressionConfig};
+use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, CompressionConfig, ObjectProperties};
 use crate::constants::DEFAULT_FILE_RANGE_ENGINE_THRESHOLD;
 
 /// Configuration for FileSystemObjectStore
@@ -707,4 +707,60 @@ impl ObjectStore for FileSystemObjectStore {
         
         Ok(size_map.len())
     }
+    // =========================================================================
+    // Metadata Operations (v0.10.0+) - ported from sai3-bench fs_metadata.rs
+    // =========================================================================
+    
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        let path = Self::uri_to_path(uri)?;
+        
+        tokio::fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("Failed to create directory: {}", path.display()))?;
+        
+        Ok(())
+    }
+
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        let path = Self::uri_to_path(uri)?;
+        
+        if recursive {
+            tokio::fs::remove_dir_all(&path)
+                .await
+                .with_context(|| format!("Failed to remove directory recursively: {}", path.display()))?;
+        } else {
+            tokio::fs::remove_dir(&path)
+                .await
+                .with_context(|| format!("Failed to remove directory (not empty?): {}", path.display()))?;
+        }
+        
+        Ok(())
+    }
+
+    async fn update_metadata(&self, _uri: &str, _metadata: &HashMap<String, String>) -> Result<()> {
+        // File systems don't support custom metadata keys like cloud storage
+        bail!("Custom metadata not supported for file:// backend")
+    }
+
+    async fn update_properties(&self, uri: &str, properties: &ObjectProperties) -> Result<()> {
+        let path = Self::uri_to_path(uri)?;
+        
+        // File systems have limited property support
+        // We can only really handle storage_class as a hint (ignored for now)
+        if properties.content_type.is_some() 
+            || properties.cache_control.is_some() 
+            || properties.content_encoding.is_some() {
+            bail!("HTTP properties (content-type, cache-control, etc.) not supported for file:// backend")
+        }
+        
+        // storage_class could map to filesystem features (btrfs compression, ZFS tiers)
+        // but for now we just accept it as a no-op
+        if let Some(ref storage_class) = properties.storage_class {
+            tracing::debug!("Ignoring storage_class '{}' for file:// backend at {}", storage_class, path.display());
+        }
+        
+        Ok(())
+    }
+
+
 }
