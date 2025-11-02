@@ -1,5 +1,38 @@
 # s3dlio Changelog
 
+## Version 0.9.11 - Directory Operations (November 2024)
+
+### 🎯 **Unified Directory Management Across All Backends**
+
+Added `mkdir` and `rmdir` operations to the `ObjectStore` trait for consistent directory handling across file systems and cloud storage.
+
+**New API Methods:**
+```rust
+async fn mkdir(&self, uri: &str) -> Result<()>
+async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()>
+```
+
+**Backend Implementations:**
+- **File/DirectIO** (`file://`, `direct://`): Creates/removes actual POSIX directories
+  - `mkdir`: Uses `tokio::fs::create_dir_all()` for recursive creation
+  - `rmdir`: Supports both empty (`remove_dir`) and recursive (`remove_dir_all`) deletion
+  
+- **Cloud Storage** (`s3://`, `az://`, `gs://`): Manages prefix markers
+  - `mkdir`: Creates empty marker objects (e.g., `.keep`) to represent directories
+  - `rmdir`: Deletes all objects under prefix (always recursive for cloud)
+
+**Integration:**
+- Required for sai3-bench v0.7.0+ directory tree workloads
+- Enables consistent directory operations across hybrid storage environments
+- Maintains backend-specific optimizations (e.g., cloud prefix semantics)
+
+**Backward Compatibility:**
+- ✅ Default trait implementations error gracefully for backends without support
+- ✅ No breaking changes to existing APIs
+- ✅ Optional functionality - existing workloads unaffected
+
+---
+
 ## Version 0.9.10 - Pre-Stat Size Cache for Benchmarking (December 2024)
 
 ### 🚀 **Major Performance Improvement for Multi-Object Workloads**
