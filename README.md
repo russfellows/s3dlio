@@ -4,7 +4,7 @@
 [![Tests](https://img.shields.io/badge/tests-143%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-131%2F132-brightgreen)](docs/Changelog.md)
 [![Python Tests](https://img.shields.io/badge/python%20tests-12%2F16-yellow)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.10-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.11-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -13,7 +13,34 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 ## 🌟 Latest Release
 
-### v0.9.10 - Pre-Stat Size Cache for Benchmarking (19, October 2024)
+### v0.9.11 - Directory Operations (November 2, 2025)
+
+**🎯 Unified Directory Management:**
+
+New `mkdir` and `rmdir` operations enable consistent directory handling across all backends:
+
+```rust
+// Create directory (POSIX) or prefix marker (cloud)
+store.mkdir("file:///data/test/").await?;
+store.mkdir("s3://bucket/prefix/").await?;
+
+// Remove directory - recursive or empty-only
+store.rmdir("file:///data/test/", false).await?;  // Must be empty
+store.rmdir("s3://bucket/prefix/", true).await?;  // Delete all objects
+```
+
+**Backend Support:**
+- **file://, direct://** - Creates/removes actual POSIX directories
+- **s3://, az://, gs://** - Manages prefix markers and object deletion
+
+**Integration:** Required for sai3-bench v0.7.0+ directory tree workloads  
+**Compatibility:** Zero breaking changes - default implementations for unsupported backends
+
+📖 [Full Details v0.9.11](docs/Changelog.md#version-0911) | [Previous Release v0.9.10](docs/Changelog.md#version-0910)
+
+---
+
+### v0.9.10 - Pre-Stat Size Cache for Benchmarking (October 19, 2024)
 
 **🚀 2.5x Faster Multi-Object Downloads:**
 
