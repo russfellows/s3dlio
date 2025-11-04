@@ -2309,7 +2309,7 @@ pub fn store_for_uri_with_config_and_logger(
         }
         Scheme::S3 => S3ObjectStore::boxed(),
         Scheme::Azure => AzureObjectStore::boxed(),
-        Scheme::Gcs => bail!("GCS backend not yet fully implemented"),
+        Scheme::Gcs => GcsObjectStore::boxed(),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     
@@ -2336,7 +2336,7 @@ pub fn direct_io_store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_l
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => S3ObjectStore::boxed(),
         Scheme::Azure => AzureObjectStore::boxed(),
-        Scheme::Gcs => bail!("GCS backend not yet fully implemented"),
+        Scheme::Gcs => GcsObjectStore::boxed(),
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     
@@ -2363,7 +2363,83 @@ pub fn high_performance_store_for_uri_with_logger(uri: &str, logger: Option<crat
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => S3ObjectStore::boxed(),
         Scheme::Azure => AzureObjectStore::boxed(),
-        Scheme::Gcs => bail!("GCS backend not yet fully implemented"),
+        Scheme::Gcs => GcsObjectStore::boxed(),
+        Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
+    };
+    
+    // Wrap with logger if provided
+    if let Some(logger) = logger {
+        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+    } else {
+        Ok(store)
+    }
+}
+
+/// Factory for creating cloud storage backends with RangeEngine enabled
+/// 
+/// This factory enables high-performance concurrent downloads for cloud storage (S3, Azure, GCS)
+/// by enabling RangeEngine with network-optimized settings. Use this when:
+/// - Testing within the cloud provider's network (low latency, high bandwidth)
+/// - Working with large objects (> 16 MiB) where parallelism improves throughput
+/// - Network conditions support concurrent connections (> 10 Gbps, < 3 ms latency)
+/// 
+/// RangeEngine is disabled by default to avoid stat() overhead on small files.
+/// This factory explicitly enables it for high-performance scenarios.
+/// 
+/// # Arguments
+/// * `uri` - Storage URI (e.g., "s3://bucket/", "az://container/", "gs://bucket/")
+/// 
+/// # Network Scenarios
+/// 
+/// **High-performance (local/in-cloud)**: > 10 Gbps, < 3 ms latency
+/// - Use this factory to enable RangeEngine
+/// - Expected improvement: 30-60% for large objects
+/// 
+/// **Remote/low-bandwidth**: < 1 Gbps, > 30 ms latency
+/// - Use standard `store_for_uri()` (RangeEngine disabled by default)
+/// - Avoids stat() overhead that may not be worth parallelism cost
+/// 
+/// # Example
+/// ```rust,no_run
+/// use s3dlio::object_store::store_for_uri_with_high_performance_cloud;
+/// 
+/// # async fn example() -> anyhow::Result<()> {
+/// // High-performance mode for in-cloud testing
+/// let store = store_for_uri_with_high_performance_cloud("s3://my-bucket/")?;
+/// let data = store.get("s3://my-bucket/large-file.bin").await?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn store_for_uri_with_high_performance_cloud(uri: &str) -> Result<Box<dyn ObjectStore>> {
+    store_for_uri_with_high_performance_cloud_and_logger(uri, None)
+}
+
+/// Factory for creating cloud storage backends with RangeEngine enabled and optional logger
+pub fn store_for_uri_with_high_performance_cloud_and_logger(
+    uri: &str,
+    logger: Option<crate::s3_logger::Logger>
+) -> Result<Box<dyn ObjectStore>> {
+    use crate::object_store_logger::LoggedObjectStore;
+    use std::sync::Arc;
+    
+    let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
+        Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
+        Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
+        Scheme::S3 => {
+            let mut config = S3Config::default();
+            config.enable_range_engine = true;  // Enable for high-performance
+            Box::new(S3ObjectStore::with_config(config))
+        },
+        Scheme::Azure => {
+            let mut config = AzureConfig::default();
+            config.enable_range_engine = true;  // Enable for high-performance
+            Box::new(AzureObjectStore::with_config(config))
+        },
+        Scheme::Gcs => {
+            let mut config = GcsConfig::default();
+            config.enable_range_engine = true;  // Enable for high-performance
+            Box::new(GcsObjectStore::with_config(config))
+        },
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     

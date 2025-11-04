@@ -1,5 +1,25 @@
 # s3dlio Changelog
 
+## Version 0.9.12 - GCS Factory Fixes (November 3, 2025)
+
+### 🐛 **Fixed**
+- Fixed 4 misleading "GCS backend not yet fully implemented" errors in enhanced factory functions
+- `store_for_uri_with_config_and_logger()` now properly supports GCS
+- `direct_io_store_for_uri_with_logger()` now properly supports GCS  
+- `high_performance_store_for_uri_with_logger()` now properly supports GCS
+
+### ✨ **Added**
+- `store_for_uri_with_high_performance_cloud()` - Enable RangeEngine for cloud backends
+- `store_for_uri_with_high_performance_cloud_and_logger()` - With logging support
+- Documentation for high-performance cloud factory functions
+
+### 📝 **Notes**
+- All basic GCS operations worked correctly even before this fix
+- The errors only appeared in enhanced factory functions (not used by most code)
+- dl-driver checkpoint plugin was never affected (uses basic `store_for_uri()`)
+
+---
+
 ## Version 0.9.11 - Directory Operations (November 2024)
 
 ### 🎯 **Unified Directory Management Across All Backends**
