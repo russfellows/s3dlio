@@ -4,7 +4,7 @@
 [![Tests](https://img.shields.io/badge/tests-143%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-131%2F132-brightgreen)](docs/Changelog.md)
 [![Python Tests](https://img.shields.io/badge/python%20tests-12%2F16-yellow)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.11-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.12-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -12,6 +12,34 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.12 - GCS Factory Fixes (November 3, 2025)
+
+**🔧 Fixed GCS Factory Functions:**
+
+Resolved 4 "not implemented" errors in GCS factory functions that were blocking dl-driver v0.8.4 checkpoint operations:
+
+```rust
+// Previously broken, now working:
+let store = store_for_uri("gs://bucket/path").await?;
+let store = store_for_uri_with_options("gs://bucket/path", options).await?;
+
+// New high-performance cloud factory:
+let store = store_for_uri_with_high_performance_cloud("gs://bucket/").await?;
+```
+
+**What Changed:**
+- Fixed `store_for_uri()` for GCS URIs (was returning "not implemented")
+- Fixed `store_for_uri_with_options()` for GCS URIs
+- Added `store_for_uri_with_high_performance_cloud()` function family
+- Ensures consistent behavior across S3, Azure, and GCS
+
+**Integration:** Required for dl-driver v0.8.4+ checkpoint reload across all backends  
+**Compatibility:** Zero breaking changes - fixes previously broken functions
+
+📖 [Full Details v0.9.12](docs/Changelog.md#version-0912) | [Previous Release v0.9.11](docs/Changelog.md#version-0911)
+
+---
 
 ### v0.9.11 - Directory Operations (November 2, 2025)
 
@@ -254,7 +282,7 @@ pip install s3dlio
 ### Documentation
 
 - **[Rust API Guide v0.9.0](docs/api/rust-api-v0.9.0.md)** - Complete Rust library reference with migration guide
-- **[Python API Guide v0.9.0](docs/api/python-api-v0.9.0.md)** - Complete Python library reference with migration guide
+- **[Python API Guide](docs/PYTHON_API_GUIDE.md)** - Complete Python library reference with examples
 - **[Changelog](docs/Changelog.md)** - Version history and release notes
 - **[Adaptive Tuning Guide](docs/ADAPTIVE-TUNING.md)** - Optional performance auto-tuning
 - **[Testing Guide](docs/TESTING-GUIDE.md)** - Test suite documentation
