@@ -42,6 +42,8 @@ pub mod sharded_client;
 pub mod range_engine;
 pub mod range_engine_generic;  // Universal stream-based range engine (v0.9.2+)
 pub mod mp;
+pub mod uri_utils;  // v0.9.14: Multi-endpoint URI expansion utilities
+pub mod multi_endpoint;  // v0.9.14: Multi-endpoint load balancing with thread/process control
 
 // Performance monitoring
 pub mod metrics;
@@ -127,6 +129,16 @@ pub use object_store::{
 pub use object_store_arrow::store_for_uri;
 
 pub use file_store::FileSystemObjectStore;
+
+// Multi-endpoint support (v0.9.14+)
+pub use multi_endpoint::{
+    MultiEndpointStore,
+    MultiEndpointStoreConfig,
+    EndpointConfig,
+    LoadBalanceStrategy,
+    EndpointStats,
+    EndpointStatsSnapshot,
+};
 
 // ===== Re-exports expected by src/bin/cli.rs at the crate root =====
 // s3_utils items:

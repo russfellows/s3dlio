@@ -21,6 +21,7 @@
 - **[Changelog.md](Changelog.md)** - Release history and notes
 
 #### Technical References
+- **[MULTI_ENDPOINT_GUIDE.md](MULTI_ENDPOINT_GUIDE.md)** - Multi-endpoint storage with load balancing (v0.9.14+)
 - **[BACKEND-TESTING.md](BACKEND-TESTING.md)** - Comprehensive backend testing guide (S3, Azure, GCS, File, DirectIO)
 - **[v0.9.4_BackEnd_Range-Summary.md](v0.9.4_BackEnd_Range-Summary.md)** - RangeEngine implementation analysis across all backends
 - **[OPLOG-GUIDE.md](OPLOG-GUIDE.md)** - Operation logging and replay functionality
