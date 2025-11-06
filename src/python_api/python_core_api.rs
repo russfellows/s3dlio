@@ -1048,6 +1048,242 @@ pub fn create_direct_filesystem_writer(py: Python<'_>, uri: String, options: Opt
 }
 
 // ---------------------------------------------------------------------------
+// Multi-Endpoint Support (v0.9.14+)
+// ---------------------------------------------------------------------------
+
+use crate::multi_endpoint::{MultiEndpointStore, LoadBalanceStrategy};
+use crate::uri_utils;
+use std::sync::Arc;
+
+/// Python wrapper for MultiEndpointStore
+#[pyclass(name = "MultiEndpointStore")]
+struct PyMultiEndpointStore {
+    store: Arc<MultiEndpointStore>,
+}
+
+#[pymethods]
+impl PyMultiEndpointStore {
+    /// Get an object from the multi-endpoint store (zero-copy via BytesView)
+    fn get<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
+        let uri = uri.to_string();
+        let store = self.store.clone();
+        
+        future_into_py(py, async move {
+            let data = store.get(&uri).await
+                .map_err(|e| PyRuntimeError::new_err(format!("Get failed: {}", e)))?;
+            // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
+            Python::with_gil(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+        })
+    }
+    
+    /// Get a byte range from an object (zero-copy via BytesView)
+    fn get_range<'py>(
+        &self,
+        py: Python<'py>,
+        uri: &str,
+        offset: u64,
+        length: Option<u64>
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let uri = uri.to_string();
+        let store = self.store.clone();
+        
+        future_into_py(py, async move {
+            let data = store.get_range(&uri, offset, length).await
+                .map_err(|e| PyRuntimeError::new_err(format!("Get range failed: {}", e)))?;
+            // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
+            Python::with_gil(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+        })
+    }
+    
+    /// Put an object to the multi-endpoint store
+    fn put<'py>(&self, py: Python<'py>, uri: &str, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        let uri = uri.to_string();
+        let data = data.to_vec();
+        let store = self.store.clone();
+        
+        future_into_py(py, async move {
+            store.put(&uri, &data).await
+                .map_err(|e| PyRuntimeError::new_err(format!("Put failed: {}", e)))?;
+            Ok(())
+        })
+    }
+    
+    /// List objects under a prefix
+    fn list<'py>(
+        &self,
+        py: Python<'py>,
+        prefix: &str,
+        recursive: bool
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let prefix = prefix.to_string();
+        let store = self.store.clone();
+        
+        future_into_py(py, async move {
+            let objects = store.list(&prefix, recursive).await
+                .map_err(|e| PyRuntimeError::new_err(format!("List failed: {}", e)))?;
+            // Return Vec<String> - PyO3 automatically converts to Python list
+            Ok(objects)
+        })
+    }
+    
+    /// Delete an object
+    fn delete<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
+        let uri = uri.to_string();
+        let store = self.store.clone();
+        
+        future_into_py(py, async move {
+            store.delete(&uri).await
+                .map_err(|e| PyRuntimeError::new_err(format!("Delete failed: {}", e)))?;
+            Ok(())
+        })
+    }
+    
+    /// Get per-endpoint statistics
+    fn get_endpoint_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let stats = self.store.get_all_stats();
+        let list = PyList::empty(py);
+        
+        for (uri, stat) in stats {
+            let dict = PyDict::new(py);
+            dict.set_item("uri", uri)?;
+            dict.set_item("total_requests", stat.total_requests)?;
+            dict.set_item("bytes_read", stat.bytes_read)?;
+            dict.set_item("bytes_written", stat.bytes_written)?;
+            dict.set_item("error_count", stat.error_count)?;
+            dict.set_item("active_requests", stat.active_requests)?;
+            list.append(dict)?;
+        }
+        
+        Ok(list.into())
+    }
+    
+    /// Get total aggregated statistics across all endpoints
+    fn get_total_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let total = self.store.get_total_stats();
+        let dict = PyDict::new(py);
+        
+        dict.set_item("total_requests", total.total_requests)?;
+        dict.set_item("bytes_read", total.bytes_read)?;
+        dict.set_item("bytes_written", total.bytes_written)?;
+        dict.set_item("error_count", total.error_count)?;
+        dict.set_item("active_requests", total.active_requests)?;
+        
+        Ok(dict.into())
+    }
+    
+    /// Get the number of configured endpoints
+    fn endpoint_count(&self) -> usize {
+        self.store.endpoint_count()
+    }
+    
+    /// Get the load balancing strategy
+    fn strategy(&self) -> String {
+        match self.store.strategy() {
+            LoadBalanceStrategy::RoundRobin => "round_robin".to_string(),
+            LoadBalanceStrategy::LeastConnections => "least_connections".to_string(),
+        }
+    }
+}
+
+/// Create a multi-endpoint store from a list of URIs
+///
+/// Args:
+///     uris: List of storage URIs (must all use the same scheme: s3://, az://, gs://, file://, or direct://)
+///     strategy: Load balancing strategy - use "round_robin" or "least_connections" (default: "round_robin")
+///
+/// Returns:
+///     MultiEndpointStore instance
+///
+/// Example:
+///     >>> import asyncio
+///     >>> store = s3dlio.create_multi_endpoint_store(
+///     ...     uris=["s3://host1:9000/bucket/", "s3://host2:9000/bucket/"],
+///     ...     strategy="least_connections"
+///     ... )
+///     >>> # All methods are async and require await
+///     >>> data = asyncio.run(store.get("s3://host1:9000/bucket/object.dat"))
+#[pyfunction]
+fn create_multi_endpoint_store(
+    uris: Vec<String>,
+    strategy: Option<&str>
+) -> PyResult<PyMultiEndpointStore> {
+    let strategy = match strategy.unwrap_or("round_robin") {
+        "round_robin" => LoadBalanceStrategy::RoundRobin,
+        "least_connections" => LoadBalanceStrategy::LeastConnections,
+        s => return Err(PyRuntimeError::new_err(format!(
+            "Invalid strategy '{}'. Use 'round_robin' or 'least_connections'", s
+        ))),
+    };
+    
+    let store = MultiEndpointStore::new(uris, strategy, None)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create multi-endpoint store: {}", e)))?;
+    
+    Ok(PyMultiEndpointStore { store: Arc::new(store) })
+}
+
+/// Create a multi-endpoint store from a URI template with range expansion
+///
+/// Args:
+///     uri_template: URI template with {start...end} range syntax (e.g., "s3://bucket-{1...10}/data")
+///     strategy: Load balancing strategy - use "round_robin" or "least_connections" (default: "round_robin")
+///
+/// Returns:
+///     MultiEndpointStore instance
+///
+/// Example:
+///     >>> import asyncio
+///     >>> store = s3dlio.create_multi_endpoint_store_from_template(
+///     ...     "s3://10.0.0.{1...8}:9000/bucket/",
+///     ...     strategy="least_connections"
+///     ... )
+///     >>> # Creates store with 8 endpoints: 10.0.0.1 through 10.0.0.8
+///     >>> # All methods are async and require await
+///     >>> data = asyncio.run(store.get("s3://10.0.0.1:9000/bucket/object.dat"))
+#[pyfunction]
+fn create_multi_endpoint_store_from_template(
+    uri_template: &str,
+    strategy: Option<&str>
+) -> PyResult<PyMultiEndpointStore> {
+    let uris = uri_utils::expand_uri_template(uri_template)
+        .map_err(|e| PyRuntimeError::new_err(format!("Template expansion failed: {}", e)))?;
+    
+    create_multi_endpoint_store(uris, strategy)
+}
+
+/// Create a multi-endpoint store by loading URIs from a file
+///
+/// Args:
+///     file_path: Path to file containing URIs (one per line, # for comments, blank lines ignored)
+///     strategy: Load balancing strategy - use "round_robin" or "least_connections" (default: "round_robin")
+///
+/// Returns:
+///     MultiEndpointStore instance
+///
+/// Example:
+///     >>> import asyncio
+///     >>> # endpoints.txt contains:
+///     >>> # s3://host1:9000/bucket/
+///     >>> # s3://host2:9000/bucket/
+///     >>> # s3://host3:9000/bucket/
+///     >>> store = s3dlio.create_multi_endpoint_store_from_file(
+///     ...     "endpoints.txt",
+///     ...     strategy="round_robin"
+///     ... )
+///     >>> # All methods are async and require await
+///     >>> data = asyncio.run(store.get("s3://host1:9000/bucket/object.dat"))
+#[pyfunction]
+fn create_multi_endpoint_store_from_file(
+    file_path: &str,
+    strategy: Option<&str>
+) -> PyResult<PyMultiEndpointStore> {
+    let path = std::path::Path::new(file_path);
+    let uris = uri_utils::load_uris_from_file(path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load URIs from file: {}", e)))?;
+    
+    create_multi_endpoint_store(uris, strategy)
+}
+
+// ---------------------------------------------------------------------------
 // Module registration function for core API
 // ---------------------------------------------------------------------------
 pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1092,6 +1328,12 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_azure_writer, m)?)?;
     m.add_function(wrap_pyfunction!(create_filesystem_writer, m)?)?;
     m.add_function(wrap_pyfunction!(create_direct_filesystem_writer, m)?)?;
+    
+    // Multi-endpoint support (v0.9.14+)
+    m.add_class::<PyMultiEndpointStore>()?;
+    m.add_function(wrap_pyfunction!(create_multi_endpoint_store, m)?)?;
+    m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_template, m)?)?;
+    m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_file, m)?)?;
     
     Ok(())
 }

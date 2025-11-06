@@ -1,7 +1,7 @@
 # s3dlio Python API Guide
 
-**Version:** 0.9.12  
-**Last Updated:** November 3, 2025
+**Version:** 0.9.14  
+**Last Updated:** November 6, 2025
 
 ## Table of Contents
 
@@ -9,12 +9,13 @@
 2. [Quick Start](#quick-start)
 3. [Core Storage Operations](#core-storage-operations)
 4. [Multi-Backend Support](#multi-backend-support)
-5. [Streaming API](#streaming-api)
-6. [AI/ML Integration](#aiml-integration)
-7. [Checkpoint System](#checkpoint-system)
-8. [Advanced Features](#advanced-features)
-9. [Performance Optimization](#performance-optimization)
-10. [API Reference](#api-reference)
+5. [Multi-Endpoint Load Balancing](#multi-endpoint-load-balancing)
+6. [Streaming API](#streaming-api)
+7. [AI/ML Integration](#aiml-integration)
+8. [Checkpoint System](#checkpoint-system)
+9. [Advanced Features](#advanced-features)
+10. [Performance Optimization](#performance-optimization)
+11. [API Reference](#api-reference)
 
 ---
 
@@ -233,6 +234,341 @@ result = s3dlio.mp_get(
 )
 print(f"Throughput: {result['throughput_mb_s']} MB/s")
 ```
+
+---
+
+## Multi-Endpoint Load Balancing
+
+### Overview
+
+Multi-endpoint storage (v0.9.14+) enables **parallel operations across multiple storage locations** with automatic load balancing. Use this for:
+- **Distributed storage**: Multiple S3 buckets/regions/endpoints
+- **High throughput**: Aggregate bandwidth across endpoints  
+- **Load distribution**: Balance requests across storage systems
+- **Fault tolerance**: Continue operating if endpoints fail
+
+### Creating Multi-Endpoint Stores
+
+#### From URI List
+
+```python
+import s3dlio
+
+# Create store from explicit list of URIs
+store = s3dlio.create_multi_endpoint_store(
+    uris=[
+        "s3://us-east-1-bucket",
+        "s3://us-west-2-bucket", 
+        "s3://eu-west-1-bucket"
+    ],
+    strategy="round_robin"  # or "least_connections"
+)
+```
+
+#### From URI Template
+
+Use `{start...end}` syntax for range expansion:
+
+```python
+# Expands to endpoint1, endpoint2, ..., endpoint10
+store = s3dlio.create_multi_endpoint_store_from_template(
+    uri_template="s3://my-bucket-{1...10}",
+    strategy="round_robin"
+)
+
+# Multiple ranges with zero-padding
+store = s3dlio.create_multi_endpoint_store_from_template(
+    uri_template="s3://region-{1...3}/shard-{01...99}",
+    strategy="least_connections"
+)
+```
+
+#### From File
+
+Load URIs from a text file (one per line):
+
+```python
+# endpoints.txt:
+# s3://bucket-1
+# s3://bucket-2
+# s3://bucket-3
+
+store = s3dlio.create_multi_endpoint_store_from_file(
+    file_path="/path/to/endpoints.txt",
+    strategy="round_robin"
+)
+```
+
+### Load Balancing Strategies
+
+#### Round-Robin (Default)
+
+Distributes requests evenly across all endpoints in rotation:
+
+```python
+store = s3dlio.create_multi_endpoint_store(
+    uris=["s3://endpoint1", "s3://endpoint2", "s3://endpoint3"],
+    strategy="round_robin"
+)
+
+# Requests distributed: endpoint1 → endpoint2 → endpoint3 → endpoint1 → ...
+```
+
+**Best for:**
+- Uniform workloads where all endpoints have similar performance
+- Simple load distribution without overhead
+- Predictable request patterns
+
+#### Least-Connections
+
+Routes requests to the endpoint with fewest active operations:
+
+```python
+store = s3dlio.create_multi_endpoint_store(
+    uris=["s3://endpoint1", "s3://endpoint2"],
+    strategy="least_connections"
+)
+
+# Requests routed to endpoint with lowest active_requests count
+```
+
+**Best for:**
+- Variable request latencies
+- Heterogeneous endpoint performance
+- Adaptive load balancing under varying conditions
+
+### Async Operations
+
+All multi-endpoint operations are **async** and must be awaited:
+
+```python
+import asyncio
+import s3dlio
+
+async def main():
+    store = s3dlio.create_multi_endpoint_store(
+        uris=["s3://bucket-1", "s3://bucket-2"],
+        strategy="round_robin"
+    )
+    
+    # Put operation (async)
+    await store.put("s3://bucket-1/data.bin", b"Hello, World!")
+    
+    # Get operation (async)
+    result = await store.get("s3://bucket-1/data.bin")
+    print(bytes(result))  # Convert BytesView to bytes
+    
+    # List operation (async)
+    objects = await store.list("s3://bucket-1/prefix/", recursive=True)
+    for obj in objects:
+        print(f"URI: {obj['uri']}, Size: {obj['size']}")
+    
+    # Delete operation (async)
+    await store.delete("s3://bucket-1/data.bin")
+
+# Run async code
+asyncio.run(main())
+```
+
+### Zero-Copy Data Access
+
+Multi-endpoint stores return `BytesView` for zero-copy memory access:
+
+```python
+import asyncio
+import numpy as np
+
+async def process_data():
+    store = s3dlio.create_multi_endpoint_store(
+        uris=["s3://bucket-1", "s3://bucket-2"],
+        strategy="round_robin"
+    )
+    
+    # Get data (returns BytesView)
+    view = await store.get("s3://bucket-1/array.bin")
+    
+    # Zero-copy access via memoryview
+    mv = view.memoryview()
+    
+    # Use with NumPy (zero-copy)
+    array = np.frombuffer(mv, dtype=np.float32)
+    print(f"Array shape: {array.shape}")
+    
+    # Convert to bytes if needed (copies data)
+    data = bytes(view)
+
+asyncio.run(process_data())
+```
+
+### Range Requests
+
+```python
+async def get_ranges():
+    store = s3dlio.create_multi_endpoint_store(
+        uris=["s3://bucket-1", "s3://bucket-2"],
+        strategy="least_connections"
+    )
+    
+    # Get bytes 1000-1999 (offset=1000, length=1000)
+    view = await store.get_range(
+        "s3://bucket-1/large_file.bin",
+        offset=1000,
+        length=1000
+    )
+    
+    data = bytes(view)  # 1000 bytes
+    print(f"Retrieved {len(data)} bytes")
+
+asyncio.run(get_ranges())
+```
+
+### Statistics and Monitoring
+
+Track per-endpoint and total statistics:
+
+```python
+import asyncio
+
+async def monitor_stats():
+    store = s3dlio.create_multi_endpoint_store(
+        uris=["s3://bucket-1", "s3://bucket-2", "s3://bucket-3"],
+        strategy="round_robin"
+    )
+    
+    # Perform operations
+    for i in range(100):
+        await store.put(f"s3://bucket-{(i % 3) + 1}/file{i}.bin", b"data")
+    
+    # Get per-endpoint statistics
+    endpoint_stats = store.get_endpoint_stats()
+    for stat in endpoint_stats:
+        print(f"Endpoint: {stat['uri']}")
+        print(f"  Total requests: {stat['total_requests']}")
+        print(f"  Bytes read: {stat['bytes_read']}")
+        print(f"  Bytes written: {stat['bytes_written']}")
+        print(f"  Active requests: {stat['active_requests']}")
+        print(f"  Errors: {stat['error_count']}")
+    
+    # Get total aggregated statistics
+    total_stats = store.get_total_stats()
+    print(f"\nTotal Statistics:")
+    print(f"  Total requests: {total_stats['total_requests']}")
+    print(f"  Total bytes read: {total_stats['bytes_read']}")
+    print(f"  Total bytes written: {total_stats['bytes_written']}")
+    print(f"  Active requests: {total_stats['active_requests']}")
+    print(f"  Total errors: {total_stats['error_count']}")
+
+asyncio.run(monitor_stats())
+```
+
+### Store Properties
+
+Query store configuration:
+
+```python
+store = s3dlio.create_multi_endpoint_store(
+    uris=["s3://bucket-1", "s3://bucket-2"],
+    strategy="least_connections"
+)
+
+# Get number of endpoints
+count = store.endpoint_count()
+print(f"Endpoints: {count}")
+
+# Get current strategy
+strategy = store.strategy()
+print(f"Strategy: {strategy}")  # "least_connections"
+```
+
+### Complete Example
+
+```python
+import asyncio
+import s3dlio
+
+async def distributed_upload():
+    """Upload 1000 files across 10 S3 buckets"""
+    
+    # Create multi-endpoint store with template expansion
+    store = s3dlio.create_multi_endpoint_store_from_template(
+        uri_template="s3://my-bucket-{1...10}",
+        strategy="round_robin"
+    )
+    
+    print(f"Created store with {store.endpoint_count()} endpoints")
+    print(f"Using strategy: {store.strategy()}")
+    
+    # Upload files in parallel
+    tasks = []
+    for i in range(1000):
+        bucket_num = (i % 10) + 1
+        uri = f"s3://my-bucket-{bucket_num}/file{i:04d}.dat"
+        data = f"File {i} data".encode()
+        tasks.append(store.put(uri, data))
+    
+    # Wait for all uploads
+    await asyncio.gather(*tasks)
+    
+    # Check statistics
+    total_stats = store.get_total_stats()
+    print(f"\nUploaded {total_stats['total_requests']} files")
+    print(f"Total bytes written: {total_stats['bytes_written']:,}")
+    print(f"Errors: {total_stats['error_count']}")
+    
+    # List all objects from first bucket
+    objects = await store.list("s3://my-bucket-1/", recursive=False)
+    print(f"\nBucket 1 contains {len(objects)} objects")
+
+# Run
+asyncio.run(distributed_upload())
+```
+
+### Testing with pytest-asyncio
+
+```python
+import pytest
+import s3dlio
+
+@pytest.mark.asyncio
+async def test_multi_endpoint_operations():
+    """Test multi-endpoint store with pytest"""
+    store = s3dlio.create_multi_endpoint_store(
+        uris=["file:///tmp/endpoint1", "file:///tmp/endpoint2"],
+        strategy="round_robin"
+    )
+    
+    # Test put/get
+    test_data = b"test data"
+    await store.put("file:///tmp/endpoint1/test.bin", test_data)
+    
+    result = await store.get("file:///tmp/endpoint1/test.bin")
+    assert bytes(result) == test_data
+    
+    # Test statistics
+    stats = store.get_total_stats()
+    assert stats['total_requests'] >= 2  # put + get
+```
+
+### Best Practices
+
+1. **Use templates for many endpoints**: `{1...100}` is cleaner than listing 100 URIs
+2. **Choose strategy based on workload**: 
+   - Round-robin for uniform access patterns
+   - Least-connections for variable latencies
+3. **Monitor statistics**: Check error counts and per-endpoint load
+4. **Handle BytesView properly**: Call `.memoryview()` for zero-copy or `bytes()` to convert
+5. **Use asyncio.gather() for parallel operations**: Maximize throughput with concurrent requests
+6. **Test with pytest-asyncio**: Use `@pytest.mark.asyncio` decorator for async tests
+
+### Performance Tips
+
+- **Parallel uploads/downloads**: Use `asyncio.gather()` with 100+ concurrent operations
+- **Round-robin for speed**: Lowest overhead when endpoints have similar performance  
+- **Least-connections for mixed latency**: Adapts to slow endpoints automatically
+- **Zero-copy with NumPy/PyTorch**: Use `.memoryview()` to avoid copying large arrays
+- **Monitor endpoint health**: Check `error_count` in statistics to detect failing endpoints
+
+For more details, see [Multi-Endpoint Storage Guide](MULTI_ENDPOINT_GUIDE.md).
 
 ---
 
@@ -563,6 +899,32 @@ print(f"Operations/sec: {result['ops_per_sec']}")
 | `delete(uri)` | Delete object | All |
 | `upload(local, remote)` | Bulk upload | All |
 | `download(remote, local)` | Bulk download | All |
+
+### Multi-Endpoint API (v0.9.14+)
+
+| Function | Description |
+|----------|-------------|
+| `create_multi_endpoint_store(uris, strategy)` | Create store from URI list |
+| `create_multi_endpoint_store_from_template(uri_template, strategy)` | Create store from template with range expansion |
+| `create_multi_endpoint_store_from_file(file_path, strategy)` | Create store from file containing URIs |
+
+**MultiEndpointStore Methods** (all async):
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `put(uri, data)` | Upload bytes | Coroutine[None] |
+| `get(uri)` | Download bytes | Coroutine[BytesView] |
+| `get_range(uri, offset, length)` | Range request | Coroutine[BytesView] |
+| `list(uri, recursive)` | List objects | Coroutine[List[Dict]] |
+| `delete(uri)` | Delete object | Coroutine[None] |
+| `get_endpoint_stats()` | Per-endpoint statistics | List[Dict] |
+| `get_total_stats()` | Aggregated statistics | Dict |
+| `endpoint_count()` | Number of endpoints | int |
+| `strategy()` | Current load balancing strategy | str |
+
+**Load Balancing Strategies:**
+- `"round_robin"` - Distribute requests evenly in rotation
+- `"least_connections"` - Route to endpoint with fewest active requests
 
 ### Streaming API
 

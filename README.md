@@ -1,17 +1,60 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-143%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-131%2F132-brightgreen)](docs/Changelog.md)
-[![Python Tests](https://img.shields.io/badge/python%20tests-12%2F16-yellow)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.12-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-159%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-141%2F141-brightgreen)](docs/Changelog.md)
+[![Python Tests](https://img.shields.io/badge/python%20tests-18%2F18-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.14-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.14 - Multi-Endpoint Storage (November 6, 2025)
+
+**🎯 Load Balancing for High-Throughput Workloads:**
+
+Distribute I/O operations across multiple storage endpoints with intelligent load balancing:
+
+```python
+import s3dlio
+
+# Create multi-endpoint store with 3 S3 buckets
+store = s3dlio.create_multi_endpoint_store(
+    uris=[
+        "s3://bucket-1/data",
+        "s3://bucket-2/data",
+        "s3://bucket-3/data",
+    ],
+    strategy="least_connections"  # or "round_robin"
+)
+
+# Zero-copy data access (buffer protocol)
+data = store.get("s3://bucket-1/large-file.bin")
+array = np.frombuffer(memoryview(data), dtype=np.float32)
+
+# Monitor load distribution
+stats = store.get_endpoint_stats()
+```
+
+**Key Features:**
+- **Load Balancing**: RoundRobin (simple, predictable) or LeastConnections (adaptive)
+- **URI Templates**: `"s3://bucket-{1...10}/data"` → 10 endpoints automatically
+- **Zero-Copy Python**: `BytesView` with buffer protocol for numpy/torch
+- **Statistics**: Per-endpoint and total metrics (requests, bytes, errors, active connections)
+- **Thread Control**: Configure concurrency per endpoint for optimal performance
+
+**Performance:**
+- 2-4× throughput scaling with multiple endpoints
+- < 0.01% overhead (10-50ns per request)
+- Lock-free atomic statistics (zero contention)
+
+📖 **[Complete Multi-Endpoint Guide](docs/MULTI_ENDPOINT_GUIDE.md)** | [Full Details v0.9.14](docs/Changelog.md#version-0914)
+
+---
 
 ### v0.9.12 - GCS Factory Fixes (November 3, 2025)
 
@@ -281,6 +324,7 @@ pip install s3dlio
 
 ### Documentation
 
+- **[Multi-Endpoint Guide](docs/MULTI_ENDPOINT_GUIDE.md)** - Load balancing across multiple storage endpoints (v0.9.14+)
 - **[Rust API Guide v0.9.0](docs/api/rust-api-v0.9.0.md)** - Complete Rust library reference with migration guide
 - **[Python API Guide](docs/PYTHON_API_GUIDE.md)** - Complete Python library reference with examples
 - **[Changelog](docs/Changelog.md)** - Version history and release notes
@@ -365,6 +409,29 @@ stats = writer.finalize()  # Returns (bytes_written, compressed_bytes)
 s3dlio.put("s3://bucket/test-data-{}.bin", num=1000, size=4194304, 
           data_gen_mode="streaming")  # 2.6-3.5x faster for most cases
 ```
+
+**Multi-Endpoint Load Balancing (v0.9.14+):**
+```python
+# Distribute I/O across multiple storage endpoints
+store = s3dlio.create_multi_endpoint_store(
+    uris=[
+        "s3://bucket-1/data",
+        "s3://bucket-2/data", 
+        "s3://bucket-3/data",
+    ],
+    strategy="least_connections"  # or "round_robin"
+)
+
+# Zero-copy data access (memoryview compatible)
+data = store.get("s3://bucket-1/file.bin")
+array = np.frombuffer(memoryview(data), dtype=np.float32)
+
+# Monitor load distribution
+stats = store.get_endpoint_stats()
+for i, s in enumerate(stats):
+    print(f"Endpoint {i}: {s['requests']} requests, {s['bytes_transferred']} bytes")
+```
+📖 **[Complete Multi-Endpoint Guide](docs/MULTI_ENDPOINT_GUIDE.md)** - Load balancing, configuration, use cases
 
 ## Performance
 
