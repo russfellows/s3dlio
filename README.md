@@ -1,10 +1,10 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-159%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-141%2F141-brightgreen)](docs/Changelog.md)
+[![Tests](https://img.shields.io/badge/tests-170%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-156%2F156-brightgreen)](docs/Changelog.md)
 [![Python Tests](https://img.shields.io/badge/python%20tests-18%2F18-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.14-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.15-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -12,6 +12,22 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.15 - S3 URI Endpoint Parsing (November 6, 2025)
+
+**🔧 Enhanced URI parsing for multi-endpoint testing:**
+
+```python
+import s3dlio
+
+# Parse URI with custom endpoint
+result = s3dlio.parse_s3_uri_full("s3://192.168.100.1:9001/mybucket/data.bin")
+# {'endpoint': '192.168.100.1:9001', 'bucket': 'mybucket', 'key': 'data.bin'}
+```
+
+Enables tools like sai3-bench and dl-driver to parse MinIO/Ceph endpoints from config files for multi-process testing scenarios. See [Changelog](docs/Changelog.md#version-0915) for details.
+
+---
 
 ### v0.9.14 - Multi-Endpoint Storage (November 6, 2025)
 
@@ -419,7 +435,7 @@ store = s3dlio.create_multi_endpoint_store(
         "s3://bucket-2/data", 
         "s3://bucket-3/data",
     ],
-    strategy="least_connections"  # or "round_robin"
+    strategy="least_connections"  # or "round_t robin"
 )
 
 # Zero-copy data access (memoryview compatible)

@@ -151,6 +151,8 @@ pub use crate::s3_utils::{
     list_buckets,
     BucketInfo,
     parse_s3_uri,
+    parse_s3_uri_full,
+    S3UriComponents,
     stat_object_uri,
     put_objects_with_random_data_and_type,
     put_objects_with_random_data_and_type_with_progress,
