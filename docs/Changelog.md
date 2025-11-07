@@ -1,5 +1,61 @@
 # s3dlio Changelog
 
+## Version 0.9.16 - Optional Op-Log Sorting (November 7, 2025)
+
+### 📊 **Configurable Operation Log Sorting**
+
+Added optional automatic sorting of operation logs by start timestamp, addressing chronological ordering requirements for multi-threaded workloads while maintaining high performance for large-scale logging (10M+ operations).
+
+**Key Changes:**
+
+- **Optional Auto-Sort at Shutdown** - Controlled via `S3DLIO_OPLOG_SORT` environment variable
+  - **Default behavior**: Streaming write (no sorting, zero memory overhead, immediate output)
+  - **Opt-in sorting**: Set `S3DLIO_OPLOG_SORT=1` to enable chronological sorting
+  - **Performance**: ~1.2μs per entry overhead (~4% for 210K entries)
+  - **Use case**: Small to medium workloads (<1M operations) requiring sorted output
+
+- **Streaming Sort Window Constant** - `DEFAULT_OPLOG_SORT_WINDOW = 1000`
+  - Documented for future streaming sort implementations
+  - Sized based on observation that operations are rarely >1000 lines out of order
+  - Enables constant-memory sorting for huge files (50M+ operations)
+
+**Background:**
+
+Multi-threaded operation logging writes entries as they complete, not in start-time order. Variable I/O latency causes operations to finish out of sequence. For workloads requiring chronological analysis (replay, performance analysis), sorting is now optionally available.
+
+**Environment Variables:**
+
+```bash
+# Default: Fast streaming write (unsorted)
+sai3-bench run --op-log /tmp/ops.tsv --config test.yaml
+
+# Opt-in: Auto-sort at shutdown (sorted output)
+S3DLIO_OPLOG_SORT=1 sai3-bench run --op-log /tmp/ops.tsv --config test.yaml
+```
+
+**Configuration Constants:**
+
+- `ENV_OPLOG_SORT` - Environment variable name for auto-sort control
+- `DEFAULT_OPLOG_SORT_WINDOW` - Window size for streaming sort algorithms (1000 lines)
+
+**Implementation Details:**
+
+- Sort-on-write path collects all entries in `Vec<LogEntry>`, sorts by `start_time`, then writes
+- No-sort path streams directly to file (zero buffering, minimal memory)
+- Both paths use zstd compression (level 1) and auto-add `.zst` extension
+- Proper `info!()` logging for transparency during long sorts
+
+**Rationale:**
+
+This opt-in approach balances three competing needs:
+1. **Performance**: Default streaming mode has zero sorting overhead
+2. **Scalability**: Large workloads (10M+ ops) avoid memory pressure
+3. **Usability**: Small workloads can enable convenient auto-sort
+
+For very large files requiring sorting, downstream tools (sai3-bench) provide streaming window-based offline sorting with constant memory usage.
+
+---
+
 ## Version 0.9.15 - S3 URI Endpoint Parsing (November 6, 2025)
 
 ### 🔧 **Enhanced URI Parsing for Multi-Endpoint Scenarios**

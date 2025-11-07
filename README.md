@@ -1,10 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-170%20passing-brightgreen)](docs/Changelog.md)
+[![Tests](https://img.shields.io/badge/tests-156%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-156%2F156-brightgreen)](docs/Changelog.md)
-[![Python Tests](https://img.shields.io/badge/python%20tests-18%2F18-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.15-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.16-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -12,6 +11,22 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.16 - Optional Op-Log Sorting (November 7, 2025)
+
+**📊 Configurable operation log sorting for chronological analysis:**
+
+```bash
+# Default: Fast streaming write (unsorted)
+sai3-bench run --op-log /tmp/ops.tsv --config test.yaml
+
+# Opt-in: Auto-sort at shutdown (sorted output)
+S3DLIO_OPLOG_SORT=1 sai3-bench run --op-log /tmp/ops.tsv --config test.yaml
+```
+
+Adds optional automatic sorting of operation logs by start timestamp (controlled via `S3DLIO_OPLOG_SORT` environment variable). Default streaming mode has zero overhead; opt-in sorting adds ~1.2μs per entry. See [Changelog](docs/Changelog.md#version-0916) for details.
+
+---
 
 ### v0.9.15 - S3 URI Endpoint Parsing (November 6, 2025)
 
