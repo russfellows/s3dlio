@@ -1,5 +1,63 @@
 # s3dlio Changelog
 
+## Version 0.9.15 - S3 URI Endpoint Parsing (November 6, 2025)
+
+### 🔧 **Enhanced URI Parsing for Multi-Endpoint Scenarios**
+
+Added utilities for parsing S3 URIs with optional custom endpoints, supporting MinIO, Ceph, and other S3-compatible storage systems with explicit endpoint specifications.
+
+**New Functions:**
+
+**Rust API:**
+```rust
+use s3dlio::{parse_s3_uri_full, S3UriComponents};
+
+// Standard AWS format
+let components = parse_s3_uri_full("s3://mybucket/data.bin")?;
+assert_eq!(components.endpoint, None);  // Uses AWS_ENDPOINT_URL env var
+assert_eq!(components.bucket, "mybucket");
+assert_eq!(components.key, "data.bin");
+
+// MinIO/Ceph with custom endpoint
+let components = parse_s3_uri_full("s3://192.168.100.1:9001/mybucket/data.bin")?;
+assert_eq!(components.endpoint, Some("192.168.100.1:9001".to_string()));
+assert_eq!(components.bucket, "mybucket");
+assert_eq!(components.key, "data.bin");
+```
+
+**Python API:**
+```python
+import s3dlio
+
+# Parse standard AWS URI
+result = s3dlio.parse_s3_uri_full("s3://mybucket/data.bin")
+# {'endpoint': None, 'bucket': 'mybucket', 'key': 'data.bin'}
+
+# Parse MinIO URI with endpoint
+result = s3dlio.parse_s3_uri_full("s3://192.168.100.1:9001/mybucket/data.bin")
+# {'endpoint': '192.168.100.1:9001', 'bucket': 'mybucket', 'key': 'data.bin'}
+```
+
+**Key Features:**
+- Heuristic endpoint detection (IP addresses, hostnames, ports)
+- Backwards compatible with existing `parse_s3_uri()`
+- Useful for multi-process benchmarking tools (sai3-bench, dl-driver)
+- Zero overhead - parsing utilities only
+
+**Use Case:**
+Multi-process testing with different endpoints per process:
+```bash
+# Process 1
+AWS_ENDPOINT_URL=http://192.168.100.1:9001 sai3bench-agent
+
+# Process 2  
+AWS_ENDPOINT_URL=http://192.168.100.2:9001 sai3bench-agent
+```
+
+Tools can use `parse_s3_uri_full()` to extract endpoint information from config files for validation and process orchestration.
+
+---
+
 ## Version 0.9.14 - Multi-Endpoint Storage (November 6, 2025)
 
 ### 🎯 **Multi-Endpoint Load Balancing for High-Throughput Workloads**

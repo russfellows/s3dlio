@@ -303,6 +303,42 @@ fn str_to_data_gen_mode(s: &str) -> DataGenMode {
 }
 
 // ------------------------------------------------------------------------
+// URI Parsing utilities
+// ------------------------------------------------------------------------
+
+/// Parse S3 URI with optional endpoint support
+/// 
+/// Returns a dictionary with keys: 'endpoint' (optional), 'bucket', 'key'
+/// 
+/// Examples:
+///     >>> parse_s3_uri_full("s3://mybucket/data.bin")
+///     {'endpoint': None, 'bucket': 'mybucket', 'key': 'data.bin'}
+///     
+///     >>> parse_s3_uri_full("s3://192.168.100.1:9001/mybucket/data.bin")
+///     {'endpoint': '192.168.100.1:9001', 'bucket': 'mybucket', 'key': 'data.bin'}
+#[pyfunction]
+fn parse_s3_uri_full(py: Python<'_>, uri: &str) -> PyResult<PyObject> {
+    use crate::s3_utils::parse_s3_uri_full as parse_full;
+    
+    let components = parse_full(uri).map_err(py_err)?;
+    
+    // Create Python dictionary
+    let dict = pyo3::types::PyDict::new(py);
+    
+    // Add endpoint (None if not present)
+    if let Some(endpoint) = components.endpoint {
+        dict.set_item("endpoint", endpoint)?;
+    } else {
+        dict.set_item("endpoint", py.None())?;
+    }
+    
+    dict.set_item("bucket", components.bucket)?;
+    dict.set_item("key", components.key)?;
+    
+    Ok(dict.into())
+}
+
+// ------------------------------------------------------------------------
 // ------------------------------------------------------------------------
 // DEPRECATED: Python-visible list_objects()  (sync wrapper), with recursion
 // This function is S3-specific and will be removed in v1.0.0.
@@ -1292,6 +1328,9 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(finalize_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(is_op_log_active, m)?)?;
+    
+    // URI parsing utilities
+    m.add_function(wrap_pyfunction!(parse_s3_uri_full, m)?)?;
     
     // Core storage operations
     // DEPRECATED: S3-specific data operations (will be removed in v1.0.0)

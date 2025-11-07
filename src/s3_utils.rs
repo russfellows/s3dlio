@@ -106,12 +106,115 @@ impl<'source> FromPyObject<'source> for ObjectType {
 // -----------------------------------------------------------------------------
 // S3 URI helpers
 // -----------------------------------------------------------------------------
+
+/// Components of an S3 URI
+#[derive(Debug, Clone)]
+pub struct S3UriComponents {
+    /// Optional custom endpoint (e.g., "192.168.100.1:9001" or "minio.local:9000")
+    /// If None, uses AWS_ENDPOINT_URL environment variable or default AWS endpoint
+    pub endpoint: Option<String>,
+    /// Bucket name
+    pub bucket: String,
+    /// Object key/prefix
+    pub key: String,
+}
+
+/// Parse S3 URI with optional endpoint support (Hybrid Approach - Option C)
+///
+/// Supports two formats:
+/// 1. **Standard**: `s3://bucket/key` 
+///    - Uses AWS_ENDPOINT_URL environment variable or default AWS endpoint
+///    - Compatible with existing code
+///
+/// 2. **With custom endpoint**: `s3://host:port/bucket/key` or `s3://host/bucket/key`
+///    - Explicitly specifies endpoint for MinIO, Ceph, or other S3-compatible storage
+///    - Host can be IP address, hostname, or domain
+///    - Port is optional (defaults to 9000 for custom endpoints, 443 for AWS)
+///
+/// # Examples
+///
+/// ```
+/// use s3dlio::s3_utils::parse_s3_uri_full;
+///
+/// // Standard AWS format
+/// let result = parse_s3_uri_full("s3://mybucket/data.bin").unwrap();
+/// assert_eq!(result.endpoint, None);
+/// assert_eq!(result.bucket, "mybucket");
+/// assert_eq!(result.key, "data.bin");
+///
+/// // MinIO with explicit endpoint and port
+/// let result = parse_s3_uri_full("s3://192.168.100.1:9001/mybucket/data.bin").unwrap();
+/// assert_eq!(result.endpoint, Some("192.168.100.1:9001".to_string()));
+/// assert_eq!(result.bucket, "mybucket");
+/// assert_eq!(result.key, "data.bin");
+///
+/// // Custom hostname
+/// let result = parse_s3_uri_full("s3://minio.local:9000/mybucket/path/to/file").unwrap();
+/// assert_eq!(result.endpoint, Some("minio.local:9000".to_string()));
+/// ```
+pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
+    let trimmed = uri.strip_prefix("s3://").context("URI must start with s3://")?;
+    
+    // Find the first slash to split host/bucket from key
+    let slash_pos = trimmed.find('/').context("URI must contain '/' after bucket")?;
+    let before_slash = &trimmed[..slash_pos];
+    let after_slash = &trimmed[slash_pos + 1..];
+    
+    // Heuristic to detect if first part is an endpoint:
+    // - Contains ':' (has port) → definitely endpoint
+    // - Starts with digit → likely IP address → endpoint
+    // - Contains multiple dots → likely IP or FQDN → endpoint
+    // - Common hostnames like "minio", "ceph" → endpoint
+    let is_endpoint = before_slash.contains(':') || 
+                     before_slash.starts_with(|c: char| c.is_ascii_digit()) ||
+                     before_slash.matches('.').count() >= 2 ||
+                     before_slash.starts_with("minio") ||
+                     before_slash.starts_with("ceph") ||
+                     before_slash.contains("localhost");
+    
+    if is_endpoint {
+        // Format: s3://endpoint:port/bucket/key or s3://endpoint/bucket/key
+        let endpoint = before_slash.to_string();
+        
+        // Find next slash for bucket/key split
+        let slash_pos2 = after_slash.find('/').unwrap_or(after_slash.len());
+        let bucket = after_slash[..slash_pos2].to_string();
+        let key = if slash_pos2 < after_slash.len() {
+            after_slash[slash_pos2 + 1..].to_string()
+        } else {
+            String::new()
+        };
+        
+        if bucket.is_empty() {
+            bail!("Bucket name cannot be empty in URI: {}", uri);
+        }
+        
+        Ok(S3UriComponents {
+            endpoint: Some(endpoint),
+            bucket,
+            key,
+        })
+    } else {
+        // Format: s3://bucket/key (standard AWS)
+        let bucket = before_slash.to_string();
+        let key = after_slash.to_string();
+        
+        Ok(S3UriComponents {
+            endpoint: None,
+            bucket,
+            key,
+        })
+    }
+}
+
 /// Split `s3://bucket/key` → (`bucket`, `key`).
 /// `key` may be empty (prefix).
+/// 
+/// **Note**: This is the legacy function for backwards compatibility.
+/// For endpoint-aware parsing, use `parse_s3_uri_full()`.
 pub fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
-    let trimmed = uri.strip_prefix("s3://").context("URI must start with s3://")?;
-    let (bucket, key) = trimmed.split_once('/').context("URI must contain '/' after bucket")?;
-    Ok((bucket.to_string(), key.to_string()))
+    let components = parse_s3_uri_full(uri)?;
+    Ok((components.bucket, components.key))
 }
 
 // -----------------------------------------------------------------------------
@@ -1044,4 +1147,138 @@ pub(crate) fn put_objects_parallel_with_progress(
         Ok(())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_s3_uri_standard_format() {
+        // Standard AWS format: s3://bucket/key
+        let result = parse_s3_uri_full("s3://mybucket/data.bin").unwrap();
+        assert_eq!(result.endpoint, None);
+        assert_eq!(result.bucket, "mybucket");
+        assert_eq!(result.key, "data.bin");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_with_path() {
+        // Standard format with path
+        let result = parse_s3_uri_full("s3://mybucket/path/to/file.txt").unwrap();
+        assert_eq!(result.endpoint, None);
+        assert_eq!(result.bucket, "mybucket");
+        assert_eq!(result.key, "path/to/file.txt");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_endpoint_with_port() {
+        // Custom endpoint with port: s3://host:port/bucket/key
+        let result = parse_s3_uri_full("s3://192.168.100.1:9001/mybucket/data.bin").unwrap();
+        assert_eq!(result.endpoint, Some("192.168.100.1:9001".to_string()));
+        assert_eq!(result.bucket, "mybucket");
+        assert_eq!(result.key, "data.bin");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_endpoint_ip_with_path() {
+        // IP endpoint with nested path
+        let result = parse_s3_uri_full("s3://192.168.100.2:9002/testbucket/path/to/object.dat").unwrap();
+        assert_eq!(result.endpoint, Some("192.168.100.2:9002".to_string()));
+        assert_eq!(result.bucket, "testbucket");
+        assert_eq!(result.key, "path/to/object.dat");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_hostname_with_port() {
+        // Hostname with port
+        let result = parse_s3_uri_full("s3://minio.local:9000/mybucket/file.bin").unwrap();
+        assert_eq!(result.endpoint, Some("minio.local:9000".to_string()));
+        assert_eq!(result.bucket, "mybucket");
+        assert_eq!(result.key, "file.bin");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_fqdn_endpoint() {
+        // FQDN endpoint (detected by multiple dots)
+        let result = parse_s3_uri_full("s3://storage.example.com:9000/mybucket/data.bin").unwrap();
+        assert_eq!(result.endpoint, Some("storage.example.com:9000".to_string()));
+        assert_eq!(result.bucket, "mybucket");
+        assert_eq!(result.key, "data.bin");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_localhost() {
+        // Localhost endpoint
+        let result = parse_s3_uri_full("s3://localhost:9000/testbucket/test.txt").unwrap();
+        assert_eq!(result.endpoint, Some("localhost:9000".to_string()));
+        assert_eq!(result.bucket, "testbucket");
+        assert_eq!(result.key, "test.txt");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_empty_key() {
+        // Empty key (prefix-only)
+        let result = parse_s3_uri_full("s3://mybucket/").unwrap();
+        assert_eq!(result.endpoint, None);
+        assert_eq!(result.bucket, "mybucket");
+        assert_eq!(result.key, "");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_endpoint_empty_key() {
+        // Endpoint with empty key
+        let result = parse_s3_uri_full("s3://192.168.1.1:9000/bucket/").unwrap();
+        assert_eq!(result.endpoint, Some("192.168.1.1:9000".to_string()));
+        assert_eq!(result.bucket, "bucket");
+        assert_eq!(result.key, "");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_backwards_compat() {
+        // Test backwards compatibility with old parse_s3_uri function
+        let (bucket, key) = parse_s3_uri("s3://mybucket/data.bin").unwrap();
+        assert_eq!(bucket, "mybucket");
+        assert_eq!(key, "data.bin");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_error_no_prefix() {
+        // Missing s3:// prefix
+        let result = parse_s3_uri_full("mybucket/data.bin");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must start with s3://"));
+    }
+
+    #[test]
+    fn test_parse_s3_uri_error_no_slash() {
+        // Missing slash after bucket
+        let result = parse_s3_uri_full("s3://mybucket");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_uri_error_empty_bucket() {
+        // Empty bucket name with endpoint
+        let result = parse_s3_uri_full("s3://192.168.1.1:9000//data.bin");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_parse_s3_uri_minio_prefix() {
+        // minio prefix triggers endpoint detection
+        let result = parse_s3_uri_full("s3://minio:9000/bucket/key").unwrap();
+        assert_eq!(result.endpoint, Some("minio:9000".to_string()));
+        assert_eq!(result.bucket, "bucket");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_ceph_prefix() {
+        // ceph prefix triggers endpoint detection
+        let result = parse_s3_uri_full("s3://ceph-rgw:7480/bucket/object").unwrap();
+        assert_eq!(result.endpoint, Some("ceph-rgw:7480".to_string()));
+        assert_eq!(result.bucket, "bucket");
+    }
+}
+
 
