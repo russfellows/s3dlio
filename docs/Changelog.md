@@ -1,5 +1,124 @@
 # s3dlio Changelog
 
+## Version 0.9.17 - NPY/NPZ Enhancements & TFRecord Index API (November 16, 2025)
+
+### 🎯 **Multi-Array NPZ Support**
+
+Added `build_multi_npz()` function for creating NumPy ZIP archives with multiple named arrays, enabling PyTorch/JAX-style dataset creation with data, labels, and metadata in a single file.
+
+**New API:**
+
+```rust
+use s3dlio::data_formats::npz::build_multi_npz;
+use ndarray::ArrayD;
+
+// Create multi-array NPZ (PyTorch/JAX pattern)
+let data = ArrayD::zeros(vec![224, 224, 3]);
+let labels = ArrayD::ones(vec![10]);
+let metadata = ArrayD::from_elem(vec![5], 42.0);
+
+let arrays = vec![
+    ("data", &data),
+    ("labels", &labels),
+    ("metadata", &metadata),
+];
+
+let npz_bytes = build_multi_npz(arrays)?;
+// Write npz_bytes to file or object storage
+```
+
+**Python Interoperability:**
+
+```python
+import numpy as np
+
+# Load multi-array NPZ created by Rust
+data = np.load("dataset.npz")
+print(data.files)  # ['data', 'labels', 'metadata']
+
+images = data['data']      # Shape: (224, 224, 3)
+labels = data['labels']    # Shape: (10,)
+metadata = data['metadata'] # Shape: (5,)
+```
+
+**Key Features:**
+- **Zero-copy design**: Uses `Bytes` for efficient memory handling
+- **Proper ZIP structure**: Compatible with NumPy's `np.load()`
+- **Named arrays**: Custom names for each array in the archive
+- **Type support**: f32 arrays (primary ML use case)
+- **Comprehensive tests**: 5 new tests covering single/multi-array scenarios
+
+**Use Cases:**
+- AI/ML dataset generation (images + labels + metadata)
+- Scientific computing (simulation results + parameters + timestamps)
+- dl-driver workload generation (simplified from 150+ lines to 80 lines)
+
+---
+
+### 🔧 **TFRecord Index Generation API**
+
+Exported `build_tfrecord_with_index()` function and `TfRecordWithIndex` struct for creating TFRecord files with accompanying index files, enabling compatibility with TensorFlow Data Service.
+
+**New Exports:**
+
+```rust
+use s3dlio::data_formats::{build_tfrecord_with_index, TfRecordWithIndex};
+
+// Generate TFRecord with index in single pass
+let raw_data = s3dlio::generate_controlled_data(102400, 1, 1);
+let result = build_tfrecord_with_index(
+    100,    // num_records
+    1024,   // record_size
+    &raw_data
+)?;
+
+// result.data: Bytes containing TFRecord file
+// result.index: Bytes containing index file (16 bytes per record)
+
+// Write both files
+store.put("dataset.tfrecord", &result.data).await?;
+store.put("dataset.tfrecord.index", &result.index).await?;
+```
+
+**Index Format** (TensorFlow Data Service compatible):
+```
+For each record:
+  - offset: u64 (8 bytes, little-endian) - Byte offset in TFRecord file
+  - length: u64 (8 bytes, little-endian) - Record length in bytes
+Total: 16 bytes per record
+```
+
+**Key Features:**
+- **Zero overhead**: Index generated during TFRecord creation (single pass)
+- **Standard format**: Compatible with TensorFlow Data Service expectations
+- **Efficient**: Returns `Bytes` for zero-copy I/O
+- **Documented**: Clear API for downstream tools (dl-driver, custom tools)
+
+**Performance:**
+- No additional I/O operations
+- Minimal memory overhead (16 bytes per record)
+- Example: 1000 records → 16KB index file
+
+**Background:**
+
+TensorFlow Data Service can leverage index files to optimize random access patterns and enable efficient dataset sharding across distributed workers. This API enables tools to generate properly formatted indices alongside TFRecord data files.
+
+---
+
+### 🔄 **Custom NPY/NPZ Implementation**
+
+Previously in v0.9.16, replaced `ndarray-npy` dependency with custom 328-line implementation for better control, zero-copy performance, and elimination of version conflicts.
+
+**Features (continued from v0.9.16):**
+- Full NPY format support (header + data serialization)
+- Multi-array NPZ with proper ZIP structure (NEW in v0.9.17)
+- TFRecord index generation API (NEW in v0.9.17)
+- Zero-copy `Bytes`-based design
+- Python/NumPy interoperability verified
+- 11 comprehensive tests (6 NPY + 5 multi-NPZ)
+
+---
+
 ## Version 0.9.16 - Optional Op-Log Sorting (November 7, 2025)
 
 ### 📊 **Configurable Operation Log Sorting**

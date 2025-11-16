@@ -1,9 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-156%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-156%2F156-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.16-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-166%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-166%2F166-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.17-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -11,6 +11,43 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.17 - NPY/NPZ Enhancements & TFRecord Index API (November 16, 2025)
+
+**🎯 Multi-Array NPZ Support:**
+
+```rust
+use s3dlio::data_formats::npz::build_multi_npz;
+
+// Create NPZ with multiple arrays (data, labels, metadata)
+let arrays = vec![
+    ("data", &data_array),
+    ("labels", &labels_array),
+    ("metadata", &metadata_array),
+];
+let npz_bytes = build_multi_npz(arrays)?;
+```
+
+**🔧 TFRecord Index Generation:**
+
+```rust
+use s3dlio::data_formats::{build_tfrecord_with_index, TfRecordWithIndex};
+
+// Generate TFRecord with index in single pass
+let result = build_tfrecord_with_index(100, 1024, &raw_data)?;
+// result.data: TFRecord file, result.index: Index file (16 bytes/record)
+```
+
+**Key Features:**
+- Multi-array NPZ archives (PyTorch/JAX dataset pattern)
+- TFRecord index generation (TensorFlow Data Service compatible)
+- Zero-copy `Bytes`-based design
+- Full NumPy/Python interoperability
+- 11 comprehensive tests (6 NPY + 5 multi-NPZ)
+
+See [Changelog](docs/Changelog.md#version-0917) for complete details.
+
+---
 
 ### v0.9.16 - Optional Op-Log Sorting (November 7, 2025)
 
