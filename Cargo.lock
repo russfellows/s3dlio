@@ -3465,19 +3465,6 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
-version = "0.15.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb12d4e967ec485a5f71c6311fe28158e9d6f4bc4a447b474184d0f91a8fa32"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "rawpointer",
-]
-
-[[package]]
-name = "ndarray"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
@@ -4838,7 +4825,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3dlio"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4877,7 +4864,7 @@ dependencies = [
  "io",
  "libc",
  "metrics",
- "ndarray 0.15.6",
+ "ndarray 0.17.1",
  "nix 0.29.0",
  "num_cpus",
  "numpy",
@@ -4914,7 +4901,7 @@ dependencies = [
 
 [[package]]
 name = "s3dlio-oplog"
-version = "0.9.16"
+version = "0.9.17"
 dependencies = [
  "anyhow",
  "async-trait",
