@@ -1,7 +1,7 @@
 # s3dlio Python API Guide
 
-**Version:** 0.9.14  
-**Last Updated:** November 6, 2025
+**Version:** 0.9.17  
+**Last Updated:** November 16, 2025
 
 ## Table of Contents
 
@@ -696,6 +696,119 @@ for batch in ds:
     pass
 ```
 
+#### TFRecord Index Generation (v0.9.17+)
+
+**NEW**: Generate TFRecord files with accompanying index files for TensorFlow Data Service compatibility.
+
+**Rust API:**
+```rust
+use s3dlio::data_formats::{build_tfrecord_with_index, TfRecordWithIndex};
+
+// Generate synthetic data
+let raw_data = s3dlio::generate_controlled_data(102400, 1, 1);
+
+// Create TFRecord with index in single pass
+let result = build_tfrecord_with_index(
+    100,    // num_records
+    1024,   // record_size_bytes
+    &raw_data
+)?;
+
+// result.data: Bytes containing TFRecord file
+// result.index: Bytes containing index file
+
+// Write both files to storage
+use s3dlio::object_store::store_for_uri;
+let store = store_for_uri("s3://bucket/tfrecords/")?;
+
+// Write TFRecord data
+store.put("train_00000.tfrecord", &result.data).await?;
+
+// Write index file (16 bytes per record)
+store.put("train_00000.tfrecord.index", &result.index).await?;
+```
+
+**Index Format:**
+- **16 bytes per record**: Little-endian format
+  - 8 bytes: Record offset in TFRecord file (u64)
+  - 8 bytes: Record length in bytes (u64)
+- **TensorFlow compatible**: Standard format for TensorFlow Data Service
+- **Zero overhead**: Generated during TFRecord creation (single pass)
+
+**Python Index Parsing:**
+```python
+import struct
+import s3dlio
+
+# Fetch index from S3
+index_bytes = s3dlio.get("s3://bucket/train_00000.tfrecord.index")
+
+# Parse index (16 bytes per record)
+num_records = len(index_bytes) // 16
+records_info = []
+
+for i in range(num_records):
+    # Unpack little-endian u64 offset and u64 length
+    offset, length = struct.unpack('<QQ', index_bytes[i*16:(i+1)*16])
+    records_info.append((offset, length))
+    print(f"Record {i}: offset={offset}, length={length}")
+
+# Use index for random access
+import tensorflow as tf
+
+def indexed_read(tfrecord_uri, index_info, record_idx):
+    """Read specific record using index."""
+    offset, length = index_info[record_idx]
+    
+    # Fetch specific byte range from S3
+    tfrecord_bytes = s3dlio.get_range(
+        tfrecord_uri, 
+        offset, 
+        offset + length
+    )
+    
+    # Parse TFRecord
+    return tf.train.Example.FromString(tfrecord_bytes)
+```
+
+**TensorFlow Data Service Integration:**
+```python
+import tensorflow as tf
+
+# TensorFlow Data Service can use index files for efficient sharding
+data_service_config = tf.data.experimental.service.DispatcherConfig(
+    work_dir="/tmp/dispatcher_work"
+)
+
+# Dataset with index-aware sharding
+dataset = tf.data.Dataset.list_files("s3://bucket/*.tfrecord")
+dataset = dataset.interleave(
+    lambda x: tf.data.TFRecordDataset(x),
+    num_parallel_calls=tf.data.AUTOTUNE
+)
+
+# Data Service automatically uses .index files if present
+dataset = dataset.apply(
+    tf.data.experimental.service.distribute(
+        processing_mode="distributed_epoch",
+        service="grpc://localhost:5000"
+    )
+)
+```
+
+**Use Cases:**
+- **Distributed training**: Efficient dataset sharding across workers
+- **Random access**: Seek to specific records without scanning
+- **Large-scale datasets**: Minimize I/O for distributed TensorFlow training
+- **Data Service**: Enable TensorFlow Data Service optimizations
+- **Cloud storage**: Works with S3, GCS, Azure Blob for remote datasets
+
+**Performance Benefits:**
+- **No scanning overhead**: Direct access to any record via offset
+- **Worker coordination**: Data Service uses indices for optimal shard distribution
+- **Bandwidth efficiency**: Fetch only required byte ranges from cloud storage
+- **Single-pass generation**: Index computed during TFRecord creation (no extra cost)
+
 ### Generic Data Loaders
 
 ```python
@@ -780,6 +893,112 @@ if rank == 0:
 arrays = s3dlio.read_npz("s3://bucket/data.npz")
 print(arrays.keys())  # ['arr_0', 'arr_1', ...]
 ```
+
+#### Multi-Array NPZ Creation (v0.9.17+)
+
+**NEW**: Create NPZ archives with multiple named arrays for PyTorch/JAX-style datasets.
+
+**Rust API:**
+```rust
+use s3dlio::data_formats::npz::build_multi_npz;
+use ndarray::ArrayD;
+
+// Create arrays
+let data = ArrayD::zeros(vec![100, 224, 224, 3]);     // Images
+let labels = ArrayD::ones(vec![100]);                  // Labels
+let metadata = ArrayD::from_elem(vec![100, 5], 1.0);   // Metadata
+
+// Package into multi-array NPZ
+let arrays = vec![
+    ("data", &data),
+    ("labels", &labels),
+    ("metadata", &metadata),
+];
+
+let npz_bytes = build_multi_npz(arrays)?;
+
+// Write to storage
+use s3dlio::object_store::store_for_uri;
+let store = store_for_uri("s3://bucket/")?;
+store.put("dataset.npz", &npz_bytes).await?;
+```
+
+**Python Loading:**
+```python
+import numpy as np
+import s3dlio
+
+# Load from cloud storage
+data_bytes = s3dlio.get("s3://bucket/dataset.npz")
+
+# Save locally and load with NumPy
+with open("dataset.npz", "wb") as f:
+    f.write(data_bytes)
+
+data = np.load("dataset.npz")
+print(data.files)  # ['data', 'labels', 'metadata']
+
+images = data['data']      # Shape: (100, 224, 224, 3)
+labels = data['labels']    # Shape: (100,)
+metadata = data['metadata'] # Shape: (100, 5)
+```
+
+**PyTorch DataLoader:**
+```python
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import s3dlio
+import io
+
+class S3NPZDataset(Dataset):
+    def __init__(self, s3_uris):
+        """Dataset loading NPZ files from S3.
+        
+        Args:
+            s3_uris: List of S3 URIs to NPZ files
+        """
+        self.uris = s3_uris
+    
+    def __len__(self):
+        return len(self.uris)
+    
+    def __getitem__(self, idx):
+        # Fetch from S3
+        npz_bytes = s3dlio.get(self.uris[idx])
+        
+        # Load into memory
+        with io.BytesIO(npz_bytes) as f:
+            data = np.load(f)
+            return {
+                'data': torch.from_numpy(data['data']),
+                'labels': torch.from_numpy(data['labels']),
+                'metadata': torch.from_numpy(data['metadata'])
+            }
+
+# Use with DataLoader
+uris = [f"s3://bucket/train_{i:06d}.npz" for i in range(1000)]
+dataset = S3NPZDataset(uris)
+loader = DataLoader(dataset, batch_size=32, num_workers=4)
+
+for batch in loader:
+    images = batch['data']    # Tensor: (32, 224, 224, 3)
+    labels = batch['labels']  # Tensor: (32,)
+    # Train your model
+```
+
+**Key Features:**
+- **Zero-copy design**: Efficient memory handling with `Bytes`
+- **Standard format**: 100% compatible with NumPy's `np.load()`
+- **Named arrays**: Organize data, labels, and metadata logically
+- **Cloud-native**: Works seamlessly with S3, GCS, Azure Blob
+- **Framework agnostic**: Use with PyTorch, JAX, TensorFlow, or pure NumPy
+
+**Use Cases:**
+- **Image classification**: Store images + labels + augmentation metadata
+- **Scientific ML**: Store simulation results + parameters + timestamps
+- **NLP datasets**: Store embeddings + labels + text metadata
+- **Distributed training**: Each worker loads different NPZ shards
 
 ### TFRecord Index
 
