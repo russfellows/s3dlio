@@ -91,7 +91,7 @@ pyo3           = { version = "^0.25", features = ["extension-module"], optional 
 pyo3-async-runtimes = { version = "^0.25", features = ["tokio-runtime"], optional = true }
 numpy        = "^0.25"
 ndarray      = "^0.15"
-ndarray-npy = "^0.8"
+# ndarray-npy removed - we use custom NPY/NPZ implementation for better performance and zero-copy
 
 # Other
 rayon       = { version = "^1.10" }
@@ -153,6 +153,7 @@ direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance st
 profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always available
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 experimental-http-client = []        # Enable custom hyper_builder optimizations (requires patched aws-smithy-http-client)
+test-npy-09 = []                     # Test ndarray-npy 0.9 API compatibility (temporary for testing)
 
 # NOTE: Custom aws-smithy-http-client patches are DISABLED by default
 # The fork-patches/aws-smithy-http-client/ directory contains experimental HTTP connection

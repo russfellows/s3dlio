@@ -21,7 +21,6 @@ use tokio::task::JoinSet;
 use numpy::ndarray as nd_np;
 use numpy::PyArrayDyn;
 
-use std::io::Cursor;
 use std::sync::Arc;
 
 // Project crates
@@ -313,13 +312,23 @@ impl PyS3AsyncDataLoader {
 #[pyfunction]
 #[pyo3(signature = (uri, array_name = None))]
 pub fn read_npz(py: Python<'_>, uri: &str, array_name: Option<&str>) -> PyResult<Py<PyAny>> {
+    use crate::data_formats::npz::{read_npz_array, list_npz_arrays};
+    
     let bytes = get_object_uri(uri).map_err(py_err)?;
-    let mut npz = ndarray_npy::NpzReader::new(Cursor::new(bytes)).map_err(py_err)?;
-    let name = array_name
-        .map(|s| s.to_owned())
-        .or_else(|| npz.names().ok().and_then(|mut v| v.pop()))
-        .ok_or_else(|| PyRuntimeError::new_err("NPZ file is empty"))?;
-    let arr: ndarray::ArrayD<f32> = npz.by_name(&name).map_err(py_err)?;
+    
+    // Determine array name
+    let name = if let Some(n) = array_name {
+        n.to_string()
+    } else {
+        // Get first array name from archive
+        let names = list_npz_arrays(&bytes).map_err(py_err)?;
+        names.into_iter().next()
+            .ok_or_else(|| PyRuntimeError::new_err("NPZ file is empty"))?
+    };
+    
+    // Read array using our custom implementation
+    let arr: ndarray::ArrayD<f32> = read_npz_array(&bytes, &name).map_err(py_err)?;
+    
     let shape = arr.shape().to_vec();
     let data = arr.into_raw_vec();
     let arr_np = nd_np::ArrayD::from_shape_vec(nd_np::IxDyn(&shape), data).map_err(py_err)?;
