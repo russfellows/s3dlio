@@ -112,6 +112,8 @@ fn make_npy_header(shape: usize) -> Vec<u8> {
 }
 
 /// Build an **entire** .npz archive in memory and return it.
+/// 
+/// Legacy single-array builder. Use `build_multi_npz()` for multiple arrays.
 pub fn build_npz(elements: usize, _element_size: usize, data: &[u8]) -> Result<Bytes> {
     let mut cursor = Cursor::new(Vec::<u8>::new());
     {
@@ -128,6 +130,84 @@ pub fn build_npz(elements: usize, _element_size: usize, data: &[u8]) -> Result<B
         zip.write_all(data)?;
         zip.finish()?;
     } // <- ZipWriter dropped, borrow ends
+
+    Ok(Bytes::from(cursor.into_inner()))
+}
+
+/// Build an NPZ archive with multiple named arrays (zero-copy).
+///
+/// This function creates a complete NPZ file (ZIP archive) in memory containing
+/// multiple named NumPy arrays. This is the standard format used by numpy.savez()
+/// and commonly used in PyTorch/TensorFlow data pipelines.
+///
+/// # Format
+/// - NPZ files are ZIP archives containing one or more .npy files
+/// - Each array is stored as a separate .npy file inside the archive
+/// - Array names become filenames (with .npy extension added automatically)
+/// - No compression (CompressionMethod::Stored) for maximum I/O performance
+///
+/// # Zero-Copy Strategy
+/// - Uses `array_to_npy_bytes()` which returns Arc-backed `Bytes`
+/// - Multiple arrays share memory allocation when possible
+/// - Returns `Bytes` for efficient cloning/slicing
+///
+/// # PyTorch/NumPy Compatibility
+/// - Fully compatible with `numpy.load()` and `numpy.savez()`
+/// - PyTorch can load via `torch.from_numpy(np.load('file.npz')['array_name'])`
+/// - Common use case: Store training data, labels, metadata in one file
+///
+/// # Example
+/// ```
+/// use s3dlio::data_formats::npz::build_multi_npz;
+/// use ndarray::ArrayD;
+///
+/// let images = ArrayD::from_shape_vec(vec![10, 28, 28], vec![0.0f32; 7840])?;
+/// let labels = ArrayD::from_shape_vec(vec![10], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.0])?;
+/// 
+/// let arrays = vec![
+///     ("images", &images),
+///     ("labels", &labels),
+/// ];
+/// 
+/// let npz_bytes = build_multi_npz(arrays)?;
+/// // npz_bytes can be written to storage or sent over network
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn build_multi_npz(arrays: Vec<(&str, &ArrayD<f32>)>) -> Result<Bytes> {
+    if arrays.is_empty() {
+        return Err(anyhow!("Cannot create NPZ with zero arrays"));
+    }
+    
+    let mut cursor = Cursor::new(Vec::<u8>::new());
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        let opts: FileOptions<()> = FileOptions::default()
+            .compression_method(CompressionMethod::Stored); // No compression for speed
+
+        for (name, array) in arrays {
+            // Ensure .npy extension
+            let npy_name = if name.ends_with(".npy") {
+                name.to_string()
+            } else {
+                format!("{}.npy", name)
+            };
+            
+            // Start new file in ZIP
+            zip.start_file(&npy_name, opts)
+                .with_context(|| format!("Failed to create NPZ entry: {}", npy_name))?;
+            
+            // Convert array to NPY format (zero-copy)
+            let npy_bytes = array_to_npy_bytes(array)
+                .with_context(|| format!("Failed to serialize array: {}", name))?;
+            
+            // Write NPY bytes to ZIP
+            zip.write_all(&npy_bytes)
+                .with_context(|| format!("Failed to write NPZ entry: {}", npy_name))?;
+        }
+        
+        zip.finish()
+            .context("Failed to finalize NPZ archive")?;
+    }
 
     Ok(Bytes::from(cursor.into_inner()))
 }

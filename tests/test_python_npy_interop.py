@@ -260,3 +260,90 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
+def test_multi_array_npz_python_interop():
+    """Test that Python NumPy can read multi-array NPZ files created by Rust"""
+    import tempfile
+    import subprocess
+    import numpy as np
+    
+    # Create a Rust program to generate multi-array NPZ
+    rust_code = """
+use ndarray::ArrayD;
+use s3dlio::data_formats::npz::build_multi_npz;
+
+fn main() -> anyhow::Result<()> {
+    // Create three arrays like PyTorch would use
+    let images = ArrayD::from_shape_vec(
+        vec![4, 28, 28],
+        (0..4*28*28).map(|i| (i % 256) as f32 / 255.0).collect()
+    )?;
+    
+    let labels = ArrayD::from_shape_vec(
+        vec![4],
+        vec![3.0, 7.0, 2.0, 9.0]
+    )?;
+    
+    let metadata = ArrayD::from_shape_vec(vec![2], vec![1.0, 100.0])?;
+    
+    let arrays = vec![
+        ("images", &images),
+        ("labels", &labels),
+        ("metadata", &metadata),
+    ];
+    
+    let npz_bytes = build_multi_npz(arrays)?;
+    
+    // Write to stdout for Python to read
+    use std::io::Write;
+    std::io::stdout().write_all(&npz_bytes)?;
+    
+    Ok(())
+}
+"""
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write Rust code
+        rust_file = f"{tmpdir}/gen_npz.rs"
+        with open(rust_file, 'w') as f:
+            f.write(rust_code)
+        
+        # Compile and run Rust code
+        npz_file = f"{tmpdir}/test_multi.npz"
+        result = subprocess.run(
+            ["cargo", "script", rust_file],
+            capture_output=True,
+            cwd="/home/eval/Documents/Code/s3dlio"
+        )
+        
+        if result.returncode != 0:
+            print(f"Rust stderr: {result.stderr.decode()}")
+            raise RuntimeError("Failed to compile/run Rust code")
+        
+        # Write NPZ bytes to file
+        with open(npz_file, 'wb') as f:
+            f.write(result.stdout)
+        
+        # Load with NumPy
+        data = np.load(npz_file)
+        
+        # Verify all three arrays present
+        assert 'images' in data
+        assert 'labels' in data
+        assert 'metadata' in data
+        
+        # Verify shapes
+        assert data['images'].shape == (4, 28, 28)
+        assert data['labels'].shape == (4,)
+        assert data['metadata'].shape == (2,)
+        
+        # Verify some values
+        assert data['labels'].tolist() == [3.0, 7.0, 2.0, 9.0]
+        assert data['metadata'].tolist() == [1.0, 100.0]
+        
+        # Verify images data is in expected range
+        assert np.all(data['images'] >= 0.0)
+        assert np.all(data['images'] <= 1.0)
+        
+        print("✅ Python can successfully read multi-array NPZ from Rust!")
+
