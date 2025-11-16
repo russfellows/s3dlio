@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use crc32fast::Hasher;
 use std::io::Write;
 use std::collections::HashMap;
-use tracing::{debug, warn, info};
+use tracing::{debug, warn, info, trace};
 use regex::Regex;
 
 // Helper function for integrity validation
@@ -1928,7 +1928,7 @@ impl ObjectStore for GcsObjectStore {
         
         // Check if RangeEngine is enabled and object is large enough
         if !self.config.enable_range_engine {
-            debug!("RangeEngine disabled for GCS, using simple download for {}", uri);
+            trace!("RangeEngine disabled for GCS, using simple download");
             return client.get_object(&bucket, &object).await;
         }
         
