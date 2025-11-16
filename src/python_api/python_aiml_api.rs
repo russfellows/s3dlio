@@ -330,7 +330,7 @@ pub fn read_npz(py: Python<'_>, uri: &str, array_name: Option<&str>) -> PyResult
     let arr: ndarray::ArrayD<f32> = read_npz_array(&bytes, &name).map_err(py_err)?;
     
     let shape = arr.shape().to_vec();
-    let data = arr.into_raw_vec();
+    let (data, _offset) = arr.into_raw_vec_and_offset();
     let arr_np = nd_np::ArrayD::from_shape_vec(nd_np::IxDyn(&shape), data).map_err(py_err)?;
     let py_arr = PyArrayDyn::<f32>::from_owned_array(py, arr_np);
     py_arr.into_py_any(py)
