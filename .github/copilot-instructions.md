@@ -99,6 +99,43 @@ cargo clippy --all-targets --all-features
 **CRITICAL: Virtual Environment Check**
 - **ALWAYS verify virtual environment is active** before any build/install commands
 - Check for `(s3dlio)` prefix in terminal prompt
+
+### Future Enhancements - NPY Format Support
+
+**NEEDS IMPLEMENTATION**: Zero-copy in-memory .npy serialization (November 2025)
+
+**Current State**:
+- s3dlio has `src/data_formats/npz.rs` (reads NPZ files)
+- s3dlio has `src/data_formats/hdf5.rs`, `tfrecord.rs` (format support exists)
+- dl-driver implemented custom zero-copy .npy serializer (November 2025)
+- ndarray-npy 0.9+ only writes to file paths, not in-memory buffers
+
+**What Needs to be Added**:
+- In-memory .npy serialization function (NPY 1.0 format)
+- Zero-copy implementation using `ndarray::as_slice_memory_order()`
+- Integration with existing `src/data_formats/` module
+- Python bindings via PyO3 for numpy interop
+
+**Reference Implementation**:
+- See `dl-driver/crates/formats/src/npz.rs::NpzFormat::array_to_npy_bytes()`
+- 48 lines, implements NPY 1.0: magic (6B) + version (2B) + header_len (2B) + header (padded dict) + data
+- Zero-copy when ndarray is contiguous, one-copy fallback otherwise
+- No temp files, pre-allocated buffers
+
+**Why This Belongs in s3dlio**:
+- s3dlio is explicitly an AI/ML I/O library
+- Already has format support (HDF5, TFRecord, NPZ reading)
+- Would enable direct array → storage without intermediate files
+- Python bindings would benefit numpy/torch users
+- Reusable across dl-driver, sai3-bench, and other tools
+
+**Refactoring Plan**:
+1. Add `array_to_npy_bytes()` to s3dlio `src/data_formats/npz.rs`
+2. Expose via public API and Python bindings
+3. Update dl-driver to use s3dlio implementation
+4. Remove duplicate code from dl-driver
+
+**GitHub Issue**: See future enhancement tracking issue (to be filed)
 - If not active, run: `source .venv/bin/activate`
 - Terminal interrupts (Ctrl-C) may exit the virtual environment
 - Re-activate before continuing work
