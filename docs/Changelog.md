@@ -1,5 +1,97 @@
 # s3dlio Changelog
 
+## Version 0.9.18 - Data Generation Bug Fix & Algorithm Migration (November 17, 2025)
+
+### 🐛 **Critical Bug Fix: Cross-Block Compression**
+
+Fixed a critical bug in the data generation algorithm where `compress=1` (incompressible data) incorrectly produced 7.68:1 compression ratio instead of ~1.0.
+
+**Root Cause:**
+- Original algorithm used shared `BASE_BLOCK` template across all unique blocks
+- Zstd compressor found cross-block patterns, defeating incompressibility guarantee
+- Affected all compress levels (1-6) when combined with dedup > 1
+
+**Solution:**
+- New algorithm uses per-block Xoshiro256++ RNG initialization
+- Each unique block gets independent high-entropy keystream
+- Local back-references within blocks for controlled compressibility
+- `compress=1` now correctly produces ratio ~1.0000 ✅
+
+### ✨ **New Data Generation Algorithm**
+
+Introduced `data_gen_alt.rs` with improved correctness and performance:
+
+**Features:**
+- Per-block RNG seeding (prevents cross-block compression)
+- Xoshiro256++ RNG (5-10x faster than ChaCha20)
+- Streaming generation via `ObjectGenAlt`
+- Parallel single-pass generation for large datasets
+- Performance: 1-7 GB/s depending on size
+
+**API Changes:**
+- **Zero breaking changes** - all existing code works unchanged
+- `generate_controlled_data()` transparently redirected to new algorithm
+- `ObjectGen` now wraps `ObjectGenAlt` internally
+- Old implementations preserved as commented-out code (removal: December 2025)
+
+### 📊 **Validation Results**
+
+**Compression Ratios (16MB test):**
+- compress=1: 1.0000 ✅ (was 7.6845 ❌)
+- compress=5: 1.3734 ✅
+- compress=6: 1.3929 ✅
+
+**Performance:**
+- 1MB: 954 MB/s (3.76x faster than old algorithm)
+- 16MB: 2,816 MB/s
+- 64MB: 7,351 MB/s
+- Streaming: 1,374 MB/s
+
+**Testing:**
+- All 162 library tests passing ✅
+- Comprehensive test suite added (`tests/test_data_gen_alt.rs`)
+- Deduplication behavior validated (dedup=2,6)
+- Old algorithm bug confirmed via regression test
+
+### 📝 **Documentation**
+
+Added comprehensive migration documentation:
+- `docs/DATA_GEN_MIGRATION_SUMMARY.md` - Technical details (9.2KB)
+- `.github/ISSUE_TEMPLATE/data_gen_migration.md` - Tracking issue template (5.4KB)
+- `.github/copilot-instructions.md` - Migration checklist
+- `src/data_gen.rs` - 73-line header explaining changes
+
+### 🔄 **Migration Timeline**
+
+**Phase 1: Production Validation (Nov-Dec 2025)**
+- Extended testing with real workloads
+- Performance monitoring across platforms
+- Compatibility verification with downstream tools
+
+**Phase 2: Code Cleanup (December 2025)**
+- Remove commented-out old algorithm code
+- Update inline documentation
+- Consider renaming data_gen_alt.rs → data_gen.rs
+
+**Phase 3: Optimization (Q1 2026)**
+- Profile Xoshiro256++ performance
+- Evaluate SIMD opportunities
+- Benchmark against industry tools
+
+### 🔧 **Dependencies**
+
+- Updated `rand_chacha` 0.3 → 0.9
+- Fixed API breaking changes (`gen_range` → `random_range`)
+- Updated test code for modern APIs
+
+### 📦 **Test Suite**
+
+- **Total tests**: 162 (all passing)
+- **New tests**: 7 comprehensive tests for data_gen_alt
+- **Coverage**: Compression ratios, dedup behavior, streaming, performance, regression
+
+---
+
 ## Version 0.9.17 - NPY/NPZ Enhancements & TFRecord Index API (November 16, 2025)
 
 ### 🎯 **Multi-Array NPZ Support**
