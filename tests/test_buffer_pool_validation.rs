@@ -7,7 +7,7 @@
 /// 
 /// We test with DirectIO since that's where v0.9.9 buffer pool was implemented.
 
-use s3dlio::{ObjectStore, DirectIOObjectStore, FileSystemObjectStore};
+use s3dlio::{ObjectStore, direct_io_store_for_uri, store_for_uri};
 use anyhow::Result;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -55,7 +55,7 @@ async fn test_buffer_pool_vs_allocate_per_read() -> Result<()> {
     
     // Test with DirectIO (uses buffer pool in v0.9.9)
     println!("\n1. With Buffer Pool (v0.9.9 DirectIO):");
-    let store = DirectIOObjectStore::new();
+    let store = direct_io_store_for_uri("direct://")?;
     
     let start = Instant::now();
     let mut total_bytes = 0u64;
@@ -80,7 +80,7 @@ async fn test_buffer_pool_vs_allocate_per_read() -> Result<()> {
         .map(|(uri, _)| uri.replace("direct://", "file://"))
         .collect();
     
-    let file_store = FileSystemObjectStore::new();
+    let file_store = store_for_uri("file://")?;
     
     let start = Instant::now();
     let mut total_bytes_file = 0u64;
@@ -142,7 +142,7 @@ async fn test_buffer_pool_memory_reuse() -> Result<()> {
         uris.push(uri);
     }
     
-    let store = DirectIOObjectStore::new();
+    let store = direct_io_store_for_uri("direct://")?;
     
     println!("\nReading {} files sequentially...", file_count);
     println!("Buffer pool should reuse buffers across reads");
@@ -200,7 +200,7 @@ async fn test_buffer_pool_concurrent_access() -> Result<()> {
         uris.push(uri);
     }
     
-    let store = Arc::new(DirectIOObjectStore::new());
+    let store = Arc::new(direct_io_store_for_uri("direct://")?);
     
     println!("\nLaunching {} concurrent reads...", file_count);
     
@@ -251,7 +251,7 @@ async fn test_buffer_pool_alignment_verification() -> Result<()> {
         (16, "16MB (aligned)"),
     ];
     
-    let store = DirectIOObjectStore::new();
+    let store = direct_io_store_for_uri("direct://")?;
     
     for (size_mb, description) in test_sizes {
         let filepath = temp_dir.path().join(format!("aligned_{}mb.dat", size_mb));
@@ -308,7 +308,7 @@ async fn test_buffer_pool_claims_validation() -> Result<()> {
     }
     
     println!("\nRunning benchmark with v0.9.9 buffer pool...");
-    let store = DirectIOObjectStore::new();
+    let store = direct_io_store_for_uri("direct://")?;
     
     let start = Instant::now();
     let mut total_bytes = 0u64;
