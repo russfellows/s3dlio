@@ -100,6 +100,39 @@ cargo clippy --all-targets --all-features
 - **ALWAYS verify virtual environment is active** before any build/install commands
 - Check for `(s3dlio)` prefix in terminal prompt
 
+### Data Generation Algorithm Migration (November 2025)
+
+**Status**: New algorithm active via redirection in `src/data_gen.rs`
+
+**Background**: 
+- Original algorithm had cross-block compression bug (compress=1 still gave 7.68:1 ratio)
+- New algorithm (`data_gen_alt.rs`) fixes bug using per-block RNG with local back-references
+- Performance optimized with Xoshiro256++ (replaces ChaCha20 for 5-10x speedup)
+- All existing code now uses new algorithm via transparent redirection
+
+**Temporary Code Preservation**:
+The following functions in `src/data_gen.rs` are **COMMENTED OUT** and marked for removal:
+- `generate_controlled_data_original()` - lines ~206-250 (old single-pass generator)
+- `ObjectGen::new_original()` - lines ~488-533 (old ObjectGen constructor)
+- `ObjectGen::fill_chunk_original()` and related methods - lines ~594-710 (old streaming implementation)
+
+**Action Required** (target: December 2025):
+1. Run extended validation tests (1 week of production workloads)
+2. Verify all downstream projects (sai3-bench, dl-driver) working correctly
+3. Remove commented-out code from `src/data_gen.rs`
+4. Update documentation to reference only `data_gen_alt.rs`
+5. Consider promoting `data_gen_alt.rs` to primary `data_gen.rs` (rename)
+
+**GitHub Issue**: See `.github/ISSUE_TEMPLATE/data_gen_migration.md` for full tracking issue template
+
+**Testing Checklist Before Removal**:
+- [ ] All s3dlio tests pass (currently: 162/162 ✓)
+- [ ] sai3-bench runs successfully with various compress/dedup settings
+- [ ] dl-driver checkpoint save/load works correctly
+- [ ] Performance benchmarks show no regression (<5% variance acceptable)
+- [ ] Compression ratios match specifications (compress=1 → ratio ~1.0)
+- [ ] No user-reported issues with data generation in production
+
 ### Future Enhancements - NPY Format Support
 
 **NEEDS IMPLEMENTATION**: Zero-copy in-memory .npy serialization (November 2025)

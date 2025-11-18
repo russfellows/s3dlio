@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.17"
+version = "0.9.18"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "AGPL-3.0"
@@ -68,9 +68,10 @@ serde       = { version = "^1.0", features = ["derive"] }
 serde_json  = "^1.0"
 regex       = "1.11"
 futures     = "^0.3"
-rand        = { version = "^0.9", features = ["std", "alloc"] }
-rand_chacha = { version = "^0.3" }
-rand_pcg    = { version = "^0.3" }
+rand         = { version = "^0.9", features = ["std", "alloc"] }
+rand_chacha  = { version = "^0.9" }
+rand_xoshiro = { version = "^0.7" }
+rand_pcg     = { version = "^0.3" }
 bytemuck    = "^1.14"
 tempfile    = "^3.20"
 tfrecord    = "^0.15"
@@ -93,7 +94,7 @@ numpy        = "^0.25"
 ndarray      = "^0.17"
 # ndarray-npy removed - we use custom NPY/NPZ implementation for better performance and zero-copy
 
-# Other
+# Other (updated rand ecosystem to 0.9 for consistency)
 rayon       = { version = "^1.10" }
 num_cpus    = "^1.16"
 chrono      = "^0.4"

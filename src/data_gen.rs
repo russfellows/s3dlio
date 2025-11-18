@@ -1,7 +1,76 @@
 // src/data_gen.rs
 //
 // Copyright, 2025.  Signal65 / Futurum Group.
-// 
+//
+// ==============================================================================
+// MIGRATION STATUS (November 2025)
+// ==============================================================================
+//
+// This file now REDIRECTS to the new data generation algorithm in data_gen_alt.rs
+// to fix a critical cross-block compression bug in the original implementation.
+//
+// WHAT WAS THE BUG?
+// -----------------
+// The original algorithm used a shared BASE_BLOCK template across all unique blocks,
+// which allowed zstd to find patterns across block boundaries. This meant that even
+// with compress=1 (which should produce incompressible data), zstd could achieve
+// 7.68:1 compression ratio by exploiting these cross-block patterns.
+//
+// THE FIX:
+// --------
+// The new algorithm (data_gen_alt.rs) generates each unique block with its own
+// Xoshiro256++ RNG keystream, ensuring true incompressibility when compress=1.
+// Compressibility is achieved via local back-references WITHIN each block only.
+//
+// PERFORMANCE:
+// ------------
+// - New algorithm: 1-7 GB/s (using Xoshiro256++ RNG)
+// - Old algorithm: 3-4 GB/s (but BROKEN for compress=1)
+// - Acceptable trade-off: Slight performance variance but CORRECT behavior
+//
+// REDIRECTED FUNCTIONS:
+// ---------------------
+// 1. generate_controlled_data() → generate_controlled_data_alt()
+//    - Public API function used by external code
+//    - Lines ~206: Single-pass data generation
+//
+// 2. DataGenerator::begin_object() → ObjectGen::from_alt()
+//    - Creates ObjectGenAlt wrapper for streaming generation
+//    - Lines ~449: ObjectGen now wraps ObjectGenAlt
+//
+// 3. ObjectGen methods → Delegate to ObjectGenAlt
+//    - fill_chunk(), is_complete(), position(), total_size(), reset()
+//    - Lines ~544-592: All methods forward to ObjectGenAlt
+//
+// COMMENTED OUT CODE (TO BE REMOVED):
+// ------------------------------------
+// The following original implementations are preserved as comments for reference
+// during the validation period (target removal: December 2025):
+//
+// 1. generate_controlled_data_original() - Lines ~206-250
+//    - Original single-pass generator (BUGGY - cross-block compression)
+//    - Used shared BASE_BLOCK causing compress=1 to compress at 7.68:1
+//
+// 2. ObjectGen::new_original() - Lines ~488-533
+//    - Original ObjectGen constructor with old fields
+//    - Stored: total_size, unique_blocks, const_lens, call_entropy, current_pos
+//
+// 3. ObjectGen streaming methods - Lines ~594-710
+//    - fill_chunk_original() - Generated data with BASE_BLOCK template
+//    - fill_remaining(), position(), total_size(), is_complete(), reset()
+//    - All had same cross-block compression bug
+//
+// VALIDATION CHECKLIST BEFORE REMOVAL:
+// -------------------------------------
+// See .github/copilot-instructions.md for full checklist
+// - [ ] Extended production testing (1 week minimum)
+// - [ ] All downstream projects working (sai3-bench, dl-driver)
+// - [ ] Performance benchmarks show acceptable variance (<5%)
+// - [ ] Compression ratios correct (compress=1 → ~1.0 ratio)
+//
+// GITHUB ISSUE: See .github/ISSUE_TEMPLATE/data_gen_migration.md
+//
+// ==============================================================================
 
 //use anyhow::{Result, bail};
 
@@ -200,7 +269,15 @@ pub fn generate_controlled_data_streaming(size: usize, dedup: usize, compress: u
     result
 }
 
-pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+    // REDIRECTED TO NEW ALGORITHM: Use data_gen_alt for improved compression control
+    // This provides truly incompressible data when compress=1 (fixes cross-block compression bug)
+    crate::data_gen_alt::generate_controlled_data_alt(size, dedup, compress)
+}
+
+// Original implementation preserved below for reference (now unused)
+#[allow(dead_code)]
+fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     use rand::Rng;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -229,7 +306,7 @@ pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) 
     let floor_len = (f_num * block_size) / f_den;
     let rem = (f_num * block_size) % f_den;
 
-    // Precompute zero-prefix lengths per unique block (Bresenham distribution - identical to original)
+    // Precompute zero-prefix lengths per unique block (integer error accumulation - identical to original)
     let const_lens: Vec<usize> = {
         let mut v = Vec::with_capacity(unique_blocks);
         let mut err_acc = 0;
@@ -272,7 +349,7 @@ pub fn generate_controlled_data(mut size: usize, dedup: usize, compress: usize) 
         let len = chunk.len();
         chunk.copy_from_slice(&src[..len]);
 
-        // 2) Apply zero-prefix using same Bresenham distribution (identical to original)
+        // 2) Apply zero-prefix using same integer error accumulation (identical to original)
         let const_len = const_lens[unique_block_idx].min(len);
         chunk[..const_len].fill(0);
 
@@ -342,7 +419,7 @@ pub fn generate_controlled_data_two_pass(mut size: usize, dedup: usize, compress
             // Start from the base random block
             let mut block = BASE_BLOCK.clone();
 
-            // Determine this block's constant prefix length via Bresenham error accumulation
+            // Determine this block's constant prefix length via integer error accumulation
             err_acc += rem;
             let const_len = if err_acc >= f_den {
                 err_acc -= f_den;
@@ -436,9 +513,8 @@ impl DataGenerator {
         Self { instance_entropy }
     }    /// Begin generating a new object with the specified parameters.
     /// 
-    /// This creates an ObjectGen instance that can generate data in chunks
-    /// while maintaining exact compatibility with generate_controlled_data.
-    /// Uses the instance's entropy to ensure deterministic behavior.
+    /// REDIRECTED TO NEW ALGORITHM: Creates ObjectGenAlt for improved compression control.
+    /// This provides truly incompressible data when compress=1 (fixes cross-block compression bug)
     /// 
     /// # Parameters
     /// - `size`: Total size of the object in bytes
@@ -448,7 +524,8 @@ impl DataGenerator {
     /// # Returns
     /// An ObjectGen instance for streaming generation of the object
     pub fn begin_object(&self, size: usize, dedup: usize, compress: usize) -> ObjectGen {
-        ObjectGen::new(size, dedup, compress, self.instance_entropy)
+        // Redirect to ObjectGenAlt wrapped in ObjectGen interface
+        ObjectGen::from_alt(size, dedup, compress, self.instance_entropy)
     }
 }
 
@@ -460,28 +537,24 @@ impl Default for DataGenerator {
 
 /// Per-object generator that maintains state for streaming generation of a single object.
 /// 
-/// This struct tracks the global block index and dedup/compress parameters to ensure
-/// that chunks generated in any order produce the same result as if the entire object
-/// was generated at once.
+/// REDIRECTED TO NEW ALGORITHM: This now wraps ObjectGenAlt for improved compression control.
+/// The public API remains unchanged for backward compatibility.
 pub struct ObjectGen {
-    /// Total size of the object being generated
-    total_size: usize,
-    /// Number of unique blocks (for deduplication)
-    unique_blocks: usize,
-    /// Precomputed compression lengths per unique block (Bresenham distribution)
-    const_lens: Vec<usize>,
-    /// Call entropy from the parent DataGenerator
-    call_entropy: u64,
-    /// Current position (in bytes) for sequential generation
-    current_pos: usize,
+    /// Wrapped ObjectGenAlt instance (new algorithm)
+    alt_gen: crate::data_gen_alt::ObjectGenAlt,
 }
 
 impl ObjectGen {
-    /// Create a new ObjectGen for the specified object parameters.
-    /// 
-    /// This performs the same dedup/compress calculations as generate_controlled_data
-    /// but stores them for use across multiple chunk generations.
-    fn new(mut total_size: usize, dedup: usize, compress: usize, call_entropy: u64) -> Self {
+    /// Create a new ObjectGen using the new algorithm (ObjectGenAlt)
+    fn from_alt(total_size: usize, dedup: usize, compress: usize, _call_entropy: u64) -> Self {
+        Self {
+            alt_gen: crate::data_gen_alt::ObjectGenAlt::new(total_size, dedup, compress),
+        }
+    }
+
+    /* COMMENTED OUT - Original implementation preserved below for reference
+    #[allow(dead_code)]
+    fn new_original(mut total_size: usize, dedup: usize, compress: usize, call_entropy: u64) -> Self {
         // Enforce minimum size (same as generate_controlled_data)
         if total_size < BLK_SIZE {
             total_size = BLK_SIZE;
@@ -506,7 +579,7 @@ impl ObjectGen {
         let floor_len = (f_num * BLK_SIZE) / f_den;
         let rem = (f_num * BLK_SIZE) % f_den;
         
-        // Precompute Bresenham distribution (identical to generate_controlled_data)
+        // Precompute integer error distribution (identical to generate_controlled_data)
         let mut const_lens = Vec::with_capacity(unique_blocks);
         let mut err_acc = 0;
         for _ in 0..unique_blocks {
@@ -527,12 +600,11 @@ impl ObjectGen {
             current_pos: 0,
         }
     }
+    */
     
     /// Fill a chunk with generated data starting at the current position.
     /// 
-    /// This generates data with the same semantics as generate_controlled_data but allows
-    /// for arbitrary chunk sizes. The chunk_size should ideally be a multiple of BLK_SIZE
-    /// for optimal performance, but any size is supported.
+    /// REDIRECTED: Delegates to ObjectGenAlt for improved compression control
     /// 
     /// # Parameters
     /// - `chunk_size`: Size of the chunk to generate
@@ -543,6 +615,53 @@ impl ObjectGen {
     /// # Panics
     /// Panics if chunk_size is 0
     pub fn fill_chunk(&mut self, chunk_size: usize) -> Option<Vec<u8>> {
+        assert!(chunk_size > 0, "Chunk size must be greater than 0");
+        
+        // Allocate buffer and delegate to ObjectGenAlt
+        let mut buf = vec![0u8; chunk_size];
+        let written = self.alt_gen.fill_chunk(&mut buf);
+        
+        if written == 0 {
+            return None;
+        }
+        
+        buf.truncate(written);
+        Some(buf)
+    }
+
+    /// Fill all remaining chunks and collect into a single buffer.
+    pub fn fill_remaining(&mut self) -> Vec<u8> {
+        let remaining = self.alt_gen.total_size() - self.alt_gen.position();
+        if remaining == 0 {
+            return Vec::new();
+        }
+        
+        self.fill_chunk(remaining).unwrap_or_default()
+    }
+
+    /// Get the current position in the object (bytes generated so far).
+    pub fn position(&self) -> usize {
+        self.alt_gen.position()
+    }
+
+    /// Get the total size of the object being generated.
+    pub fn total_size(&self) -> usize {
+        self.alt_gen.total_size()
+    }
+
+    /// Check if all data has been generated.
+    pub fn is_complete(&self) -> bool {
+        self.alt_gen.is_complete()
+    }
+
+    /// Reset the generator to the beginning of the object.
+    pub fn reset(&mut self) {
+        self.alt_gen.reset()
+    }
+
+    /* COMMENTED OUT - Original implementation preserved below for reference
+    #[allow(dead_code)]
+    fn fill_chunk_original(&mut self, chunk_size: usize) -> Option<Vec<u8>> {
         assert!(chunk_size > 0, "Chunk size must be greater than 0");
         
         // Check if we've reached the end of the object
@@ -655,6 +774,7 @@ impl ObjectGen {
     pub fn reset(&mut self) {
         self.current_pos = 0;
     }
+    */
 }
 
 

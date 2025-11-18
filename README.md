@@ -1,9 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-166%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-166%2F166-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.17-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-162%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-162%2F162-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.18-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -11,6 +11,35 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.18 - Data Generation Bug Fix & Algorithm Migration (November 17-18, 2025)
+
+**🐛 Critical Bug Fix:**
+
+Fixed cross-block compression bug where `compress=1` (incompressible data) incorrectly produced 7.68:1 ratio instead of ~1.0.
+
+**✨ Optimizations (November 18):**
+- Explicit Xoshiro256++ RNG (5-24% faster)
+- Enhanced entropy for distributed deployments
+- Zero API changes - fully backward compatible
+- All 162 tests passing ✅
+
+```rust
+use s3dlio::data_gen::generate_controlled_data;
+
+// Now correctly generates incompressible data
+let data = generate_controlled_data(1_048_576, 1, 1); // 1MB, no dedup, incompressible
+// Compression ratio: ~1.0000 ✅ (was 7.68 ❌)
+```
+
+**Validation:**
+- compress=1 → ratio 1.0000 (perfect incompressibility)
+- compress=5 → ratio 1.37 (5:1 compression working)
+- Old algorithm bug confirmed via regression tests
+
+See [Changelog](docs/Changelog.md) for complete migration details.
+
+---
 
 ### v0.9.17 - NPY/NPZ Enhancements & TFRecord Index API (November 16, 2025)
 

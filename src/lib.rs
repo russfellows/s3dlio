@@ -70,6 +70,7 @@ pub mod file_store;
 pub mod file_store_direct;
 pub mod page_cache;
 pub mod data_gen;
+pub mod data_gen_alt;  // Alternative data generation with ChaCha20
 pub mod streaming_writer;
 pub mod tfrecord_index;
 pub mod object_store_logger;  // Op-log support for all backends

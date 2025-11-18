@@ -28,3 +28,4 @@ venv/
 # Local environment files with secrets (do not commit)
 *.local
 *-env.local
+API_COMPATIBILITY_REPORT.md
