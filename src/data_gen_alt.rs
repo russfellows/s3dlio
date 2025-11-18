@@ -5,26 +5,26 @@
 // Alternative data generation implementation using Xoshiro256++ PRNG
 // with local back-references for compression control.
 //
-// Key differences from data_gen.rs:
-// - No shared BASE_BLOCK across blocks (eliminates cross-block compression)
-// - Each unique block gets its own Xoshiro256++ keystream (5-10x faster than ChaCha20)
-// - Compressibility achieved via local back-references within each block
-// - When compress=1, blocks are truly incompressible (~1.0 zstd ratio)
+/// # Key Features
+/// - No shared BASE_BLOCK (eliminates cross-block compression)
+/// - Xoshiro256++ RNG (5-10x faster than ChaCha20)
+/// - Compression distributed evenly via integer error accumulation
+/// - Correct compress=1 behavior (truly incompressible, ~1.0 zstd ratio)
 // - When compress>1, compressibility is local to each block
 
 use rand::{Rng, SeedableRng, RngCore};
-use rand::rngs::StdRng;  // StdRng is currently Xoshiro256PlusPlus
+use rand_xoshiro::Xoshiro256PlusPlus;  // Explicit high-performance RNG
 use rayon::prelude::*;
 use tracing::{debug, info};
 
 use crate::constants::BLK_SIZE;
 
 // =============================================================================
-// Helper Functions (No longer needed - StdRng::seed_from_u64 handles this)
+// Helper Functions (No longer needed - Xoshiro256PlusPlus has built-in seeding)
 // =============================================================================
 
-// Note: Xoshiro256++ (via StdRng) has built-in seed_from_u64 that uses
-// SplitMix64 internally, so we don't need custom seed generation helpers.
+// Note: Xoshiro256++ has built-in seed_from_u64 that uses SplitMix64 internally,
+// so we don't need custom seed generation helpers.
 
 // =============================================================================
 // Block Filling Helper
@@ -55,9 +55,9 @@ fn fill_block_alt(
     call_entropy: u64,
 ) {
     // Seed Xoshiro256++ uniquely per unique_block_idx
-    // (StdRng is currently Xoshiro256PlusPlus, with built-in SplitMix64 seeding)
+    // SeedableRng::seed_from_u64 uses built-in SplitMix64 for fast initialization
     let seed = call_entropy ^ ((unique_block_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
 
     // Step 1: Fill entire block with high-entropy keystream
     rng.fill_bytes(out);
@@ -128,7 +128,7 @@ fn fill_block_alt(
 /// # Compress Semantics (improved)
 /// - `compress=1`: Truly incompressible (zstd ratio ~1.00-1.02)
 /// - `compress>1`: Target ratio via local back-refs (no cross-block effects)
-/// - Compression distributed evenly via Bresenham algorithm
+/// - Compression distributed evenly via integer error accumulation
 ///
 /// # Performance
 /// - Parallel block generation via rayon
@@ -172,8 +172,8 @@ pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usi
         size, nblocks, dedup_factor, unique_blocks, compress
     );
 
-    // --- Compress calculation: distribute target copy length via Bresenham ---
-    // This matches the original algorithm's distribution strategy
+    // --- Compress calculation: distribute target copy length via integer error accumulation ---
+    // Standard technique for even distribution (similar to line rasterization algorithms)
     let (f_num, f_den) = if compress > 1 {
         (compress - 1, compress)
     } else {
@@ -182,7 +182,8 @@ pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usi
     let floor_len = (f_num * block_size) / f_den;
     let rem = (f_num * block_size) % f_den;
 
-    // Precompute per-block copy lengths using Bresenham distribution
+    // Precompute per-block copy lengths using integer error accumulation
+    // This ensures compression is spread evenly across all unique blocks
     let copy_lens: Vec<usize> = {
         let mut v = Vec::with_capacity(unique_blocks);
         let mut err = 0;
@@ -202,11 +203,22 @@ pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usi
     let total_size = nblocks * block_size;
     let mut data: Vec<u8> = vec![0u8; total_size];
 
-    // Per-call entropy (same approach as original)
-    let call_entropy = SystemTime::now()
+    // Per-call entropy: Mix system time + high-quality random bytes from /dev/urandom
+    // This ensures global uniqueness across distributed nodes even with synchronized clocks
+    let time_entropy = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
+    
+    // Get 8 bytes of cryptographically random data from /dev/urandom
+    let urandom_entropy: u64 = {
+        use rand::RngCore;
+        let mut rng = rand::rng(); // Uses /dev/urandom on Linux
+        rng.next_u64()
+    };
+    
+    // Combine both sources for maximum uniqueness
+    let call_entropy = time_entropy.wrapping_add(urandom_entropy);
 
     // Parallel block generation
     data.par_chunks_mut(block_size)
@@ -252,7 +264,7 @@ pub struct ObjectGenAlt {
     compress_factor: usize,
     /// Number of unique blocks
     unique_blocks: usize,
-    /// Per-block copy lengths (Bresenham distribution)
+    /// Per-block copy lengths (evenly distributed via error accumulation)
     copy_lens: Vec<usize>,
     /// Per-call entropy for seeding
     call_entropy: u64,
@@ -281,7 +293,7 @@ impl ObjectGenAlt {
             nblocks
         };
 
-        // Compress calculation (Bresenham distribution)
+        // Compress calculation (integer error accumulation for even distribution)
         let (f_num, f_den) = if compress > 1 {
             (compress - 1, compress)
         } else {
@@ -305,10 +317,22 @@ impl ObjectGenAlt {
             v
         };
 
-        let call_entropy = SystemTime::now()
+        // Per-call entropy: Mix system time + high-quality random bytes from /dev/urandom
+        // This ensures global uniqueness across distributed nodes even with synchronized clocks
+        let time_entropy = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+
+        // Get 8 bytes of cryptographically random data from /dev/urandom
+        let urandom_entropy: u64 = {
+            use rand::RngCore;
+            let mut rng = rand::rng(); // Uses /dev/urandom on Linux
+            rng.next_u64()
+        };
+
+        // Combine both sources for maximum uniqueness
+        let call_entropy = time_entropy.wrapping_add(urandom_entropy);
 
         Self {
             total_size,
@@ -419,7 +443,7 @@ pub fn generate_controlled_data_streaming_alt(
 mod tests {
     use super::*;
 
-    // Note: No seed generation tests needed - StdRng::seed_from_u64 is battle-tested
+    // Note: No seed generation tests needed - Xoshiro256PlusPlus::seed_from_u64 is battle-tested
 
     #[test]
     fn test_generate_minimal_size() {

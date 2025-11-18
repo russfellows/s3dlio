@@ -306,7 +306,7 @@ fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: us
     let floor_len = (f_num * block_size) / f_den;
     let rem = (f_num * block_size) % f_den;
 
-    // Precompute zero-prefix lengths per unique block (Bresenham distribution - identical to original)
+    // Precompute zero-prefix lengths per unique block (integer error accumulation - identical to original)
     let const_lens: Vec<usize> = {
         let mut v = Vec::with_capacity(unique_blocks);
         let mut err_acc = 0;
@@ -349,7 +349,7 @@ fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: us
         let len = chunk.len();
         chunk.copy_from_slice(&src[..len]);
 
-        // 2) Apply zero-prefix using same Bresenham distribution (identical to original)
+        // 2) Apply zero-prefix using same integer error accumulation (identical to original)
         let const_len = const_lens[unique_block_idx].min(len);
         chunk[..const_len].fill(0);
 
@@ -419,7 +419,7 @@ pub fn generate_controlled_data_two_pass(mut size: usize, dedup: usize, compress
             // Start from the base random block
             let mut block = BASE_BLOCK.clone();
 
-            // Determine this block's constant prefix length via Bresenham error accumulation
+            // Determine this block's constant prefix length via integer error accumulation
             err_acc += rem;
             let const_len = if err_acc >= f_den {
                 err_acc -= f_den;
@@ -579,7 +579,7 @@ impl ObjectGen {
         let floor_len = (f_num * BLK_SIZE) / f_den;
         let rem = (f_num * BLK_SIZE) % f_den;
         
-        // Precompute Bresenham distribution (identical to generate_controlled_data)
+        // Precompute integer error distribution (identical to generate_controlled_data)
         let mut const_lens = Vec::with_capacity(unique_blocks);
         let mut err_acc = 0;
         for _ in 0..unique_blocks {

@@ -1,6 +1,7 @@
 use s3dlio::data_gen_alt::generate_controlled_data_alt;
 
-fn main() {
+#[test]
+fn test_high_compress_validation() {
     // Test compress=5 (should give ~5:1 compression)
     println!("=== Testing compress=5 (target 5:1) ===");
     let data5 = generate_controlled_data_alt(4 * 1024 * 1024, 1, 5);
@@ -9,6 +10,7 @@ fn main() {
     println!("Original: {} bytes", data5.len());
     println!("Compressed: {} bytes", compressed5.len());
     println!("Ratio: {:.4}", ratio5);
+    assert!(ratio5 >= 1.2, "compress=5 should give at least 1.2:1 ratio");
     
     // Test compress=6 (should give ~6:1 compression)
     println!("\n=== Testing compress=6 (target 6:1) ===");
@@ -18,6 +20,7 @@ fn main() {
     println!("Original: {} bytes", data6.len());
     println!("Compressed: {} bytes", compressed6.len());
     println!("Ratio: {:.4}", ratio6);
+    assert!(ratio6 >= 1.2, "compress=6 should give at least 1.2:1 ratio");
     
     // Test dedup=6 (should give 6 unique blocks out of many)
     println!("\n=== Testing dedup=6 (target 6:1) ===");

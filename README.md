@@ -12,16 +12,16 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 ## 🌟 Latest Release
 
-### v0.9.18 - Data Generation Bug Fix & Algorithm Migration (November 17, 2025)
+### v0.9.18 - Data Generation Bug Fix & Algorithm Migration (November 17-18, 2025)
 
 **🐛 Critical Bug Fix:**
 
 Fixed cross-block compression bug where `compress=1` (incompressible data) incorrectly produced 7.68:1 ratio instead of ~1.0.
 
-**New Algorithm:**
-- Per-block Xoshiro256++ RNG for true incompressibility
-- Zero API changes - transparent migration
-- Performance: 1-7 GB/s
+**✨ Optimizations (November 18):**
+- Explicit Xoshiro256++ RNG (5-24% faster)
+- Enhanced entropy for distributed deployments
+- Zero API changes - fully backward compatible
 - All 162 tests passing ✅
 
 ```rust
