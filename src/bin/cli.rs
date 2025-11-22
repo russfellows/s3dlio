@@ -34,6 +34,7 @@ use tracing_subscriber::EnvFilter;
 use tempfile::NamedTempFile;
 use glob;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 
 
 
@@ -712,6 +713,20 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
     let stdout = io::stdout();
     let mut out = stdout.lock();
     
+    // Create progress bar for count-only mode
+    let pb = if count_only {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] {msg}")
+                .unwrap()
+        );
+        pb.set_message("Listing objects...");
+        Some(pb)
+    } else {
+        None
+    };
+    
     // Display progress every 1000 objects
     let progress_interval = 1000;
     let start = std::time::Instant::now();
@@ -739,18 +754,23 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
             }
         }
         
-        // Show progress every N objects (only when not printing URIs or to stderr)
-        if count % progress_interval == 0 {
-            let elapsed = start.elapsed().as_secs_f64();
-            let rate = count as f64 / elapsed;
-            eprintln!("Listed {} objects (rate: {} objects/s)...", count, format_with_commas(rate));
+        // Show progress with progress bar (count-only mode)
+        if count_only && count % progress_interval == 0 {
+            if let Some(ref pb) = pb {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = count as f64 / elapsed;
+                pb.set_message(format!("Listed {} objects ({} obj/s)", count, format_with_commas(rate)));
+            }
         }
     }
 
     // Final summary
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
     let elapsed = start.elapsed().as_secs_f64();
     let rate = count as f64 / elapsed;
-    writeln!(out, "\nTotal objects: {} ({:.3}s, rate: {} objects/s)", count, elapsed, format_with_commas(rate))?;
+    writeln!(out, "Total objects: {} ({:.3}s, rate: {} objects/s)", count, elapsed, format_with_commas(rate))?;
     Ok(())
 }
 
@@ -1129,9 +1149,18 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             pb.finish_with_message(format!("Deleted {} objects matching pattern", total));
             eprintln!("\nSuccessfully deleted {} objects matching pattern '{}'", total, pat);
         } else {
-            // Delete entire prefix without filter - use streaming pipeline
+            // Delete entire prefix without filter - use streaming pipeline with progress bar
             info!("Starting streaming list+delete pipeline for prefix: {}", uri);
-            eprintln!("Starting list+delete pipeline...");
+            
+            // Create indeterminate progress bar (we don't know total count yet)
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("Deleting: {spinner:.green} [{elapsed_precise}] {msg}")
+                    .unwrap()
+            );
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            pb.set_message("Starting pipeline...");
             
             // Channel for passing batches from lister to deleter (buffer 10 batches)
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(10);
@@ -1139,6 +1168,7 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             // Spawn lister task - streams results and batches them
             let store_list = store.clone();
             let uri_list = uri.to_string();
+            let pb_list = pb.clone();
             let lister = tokio::spawn(async move {
                 use futures::stream::StreamExt;
                 
@@ -1160,14 +1190,14 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                                 }
                                 batch.clear();
                                 
-                                // Progress indicator
-                                if total_listed % 10000 == 0 {
-                                    eprintln!("Listed {} objects (pipeline active)...", total_listed);
+                                // Update progress bar with nice formatting
+                                if total_listed % 1000 == 0 {
+                                    pb_list.set_message(format!("Listed: {} | Deleting in background...", total_listed));
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("List error: {}", e);
+                            pb_list.finish_with_message(format!("List error: {}", e));
                             break;
                         }
                     }
@@ -1181,26 +1211,102 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                 total_listed
             });
             
-            // Deleter task - receives batches and deletes them
+            // Deleter task - receives batches and deletes them IN PARALLEL
             let store_delete = store.clone();
+            let pb_delete = pb.clone();
             let deleter = tokio::spawn(async move {
-                let mut total_deleted = 0u64;
-                let mut batch_count = 0u32;
+                use futures::stream::{FuturesUnordered, StreamExt};
                 
-                while let Some(batch) = rx.recv().await {
-                    let batch_size = batch.len();
-                    
-                    if let Err(e) = store_delete.delete_batch(&batch).await {
-                        eprintln!("Delete batch error: {}", e);
-                        return Err(e);
+                let mut total_deleted = 0u64;
+                let delete_start = std::time::Instant::now();
+                let max_concurrent_deletes = 10; // Allow 10 concurrent DeleteObjects requests
+                let mut active_deletes = FuturesUnordered::new();
+                
+                loop {
+                    // Try to receive batches while we have room for more concurrent deletes
+                    while active_deletes.len() < max_concurrent_deletes {
+                        match rx.try_recv() {
+                            Ok(batch) => {
+                                let store_clone = store_delete.clone();
+                                let batch_size = batch.len();
+                                
+                                // Spawn delete as a future
+                                active_deletes.push(tokio::spawn(async move {
+                                    store_clone.delete_batch(&batch).await.map(|_| batch_size)
+                                }));
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                // No more batches available right now
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                // Lister finished, process remaining deletes
+                                break;
+                            }
+                        }
                     }
                     
-                    total_deleted += batch_size as u64;
-                    batch_count += 1;
-                    
-                    // Progress every 10 batches (10K objects)
-                    if batch_count % 10 == 0 {
-                        eprintln!("Deleted {} objects (pipeline active)...", total_deleted);
+                    // Wait for at least one delete to complete if we have any active
+                    if !active_deletes.is_empty() {
+                        match active_deletes.next().await {
+                            Some(Ok(Ok(batch_size))) => {
+                                total_deleted += batch_size as u64;
+                                
+                                // Update progress bar with rate information
+                                let elapsed = delete_start.elapsed().as_secs_f64().max(0.001);
+                                let rate = (total_deleted as f64 / elapsed) as u64;
+                                pb_delete.set_message(format!(
+                                    "Deleted: {} ({}/s, {} concurrent)",
+                                    total_deleted, rate, active_deletes.len() + 1
+                                ));
+                            }
+                            Some(Ok(Err(e))) => {
+                                pb_delete.finish_with_message(format!("Delete error: {}", e));
+                                return Err(e);
+                            }
+                            Some(Err(e)) => {
+                                pb_delete.finish_with_message(format!("Task error: {}", e));
+                                return Err(anyhow::anyhow!("Delete task failed: {}", e));
+                            }
+                            None => break, // No more active deletes
+                        }
+                    } else {
+                        // Check if lister is done
+                        match rx.try_recv() {
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                // Wait a bit for more work
+                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                            }
+                            Ok(batch) => {
+                                // Got a batch, process it
+                                let store_clone = store_delete.clone();
+                                let batch_size = batch.len();
+                                active_deletes.push(tokio::spawn(async move {
+                                    store_clone.delete_batch(&batch).await.map(|_| batch_size)
+                                }));
+                            }
+                        }
+                    }
+                }
+                
+                // Wait for any remaining deletes to complete
+                while let Some(result) = active_deletes.next().await {
+                    match result {
+                        Ok(Ok(batch_size)) => {
+                            total_deleted += batch_size as u64;
+                            let elapsed = delete_start.elapsed().as_secs_f64().max(0.001);
+                            let rate = (total_deleted as f64 / elapsed) as u64;
+                            pb_delete.set_message(format!("Deleted: {} ({}/s)", total_deleted, rate));
+                        }
+                        Ok(Err(e)) => {
+                            pb_delete.finish_with_message(format!("Delete error: {}", e));
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            pb_delete.finish_with_message(format!("Task error: {}", e));
+                            return Err(anyhow::anyhow!("Delete task failed: {}", e));
+                        }
                     }
                 }
                 
@@ -1212,13 +1318,12 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             let total_deleted = deleter.await??;
             
             if total_listed == 0 {
+                pb.finish_with_message("No objects found");
                 eprintln!("No objects found under prefix: {}", uri);
                 return Ok(());
             }
             
-            eprintln!("\nPipeline complete:");
-            eprintln!("  Listed: {} objects", total_listed);
-            eprintln!("  Deleted: {} objects", total_deleted);
+            pb.finish_with_message(format!("✓ Deleted {} objects", total_deleted));
             eprintln!("Successfully deleted all objects under prefix: {}", uri);
         }
     } else {

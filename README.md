@@ -3,7 +3,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-162%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-162%2F162-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.18-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.20-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -12,32 +12,34 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 ## 🌟 Latest Release
 
-### v0.9.18 - Data Generation Bug Fix & Algorithm Migration (November 17-18, 2025)
+### v0.9.20 - High-Performance List & Delete Optimizations (November 22, 2025)
 
-**🐛 Critical Bug Fix:**
+**🚀 Major Performance Improvements:**
 
-Fixed cross-block compression bug where `compress=1` (incompressible data) incorrectly produced 7.68:1 ratio instead of ~1.0.
+Optimized for workloads with 100K-1M+ objects, targeting **5x faster deletion** (28 min → 5-8 min for 1M objects).
 
-**✨ Optimizations (November 18):**
-- Explicit Xoshiro256++ RNG (5-24% faster)
-- Enhanced entropy for distributed deployments
-- Zero API changes - fully backward compatible
-- All 162 tests passing ✅
+**Key Features:**
+- **Batch Delete API**: 1000 objects/request (S3), efficient batching for all backends
+- **Streaming List**: Memory-efficient iteration with progress indicators (`-c/--count-only`)
+- **Concurrent Pipeline**: Overlapped list+delete operations for maximum throughput
 
-```rust
-use s3dlio::data_gen::generate_controlled_data;
+```bash
+# Count objects with streaming progress
+s3-cli ls -rc s3://bucket/prefix/
+# Output: Total objects: 1,234,567 (12.3s, rate: 100,000 objects/s)
 
-// Now correctly generates incompressible data
-let data = generate_controlled_data(1_048_576, 1, 1); // 1MB, no dedup, incompressible
-// Compression ratio: ~1.0000 ✅ (was 7.68 ❌)
+# Fast deletion with automatic pipeline
+s3-cli delete s3://bucket/prefix/
+# Uses concurrent list+delete (1000-object batches, 10K in-flight)
 ```
 
-**Validation:**
-- compress=1 → ratio 1.0000 (perfect incompressibility)
-- compress=5 → ratio 1.37 (5:1 compression working)
-- Old algorithm bug confirmed via regression tests
+**Benefits:**
+- Works across all 7 storage backends (S3, Azure, GCS, file://, direct://)
+- Python API automatically uses optimizations
+- Proper op-log integration for workload replay
+- Clean abstractions maintained throughout
 
-See [Changelog](docs/Changelog.md) for complete migration details.
+See [Changelog](docs/Changelog.md) for complete details.
 
 ---
 

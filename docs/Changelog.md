@@ -1,5 +1,74 @@
 # s3dlio Changelog
 
+## Version 0.9.20 - High-Performance List & Delete Optimizations (November 22, 2025)
+
+### 🚀 **Performance Improvements for Large Object Operations**
+
+Major optimizations for workloads with 100K-1M+ objects, targeting 5x performance improvement (28 minutes → 5-8 minutes for 1M objects).
+
+**Phase 1: Batch Delete API**
+- Added `delete_batch()` method to ObjectStore trait
+- S3: DeleteObjects API (1000 objects/request)
+- Azure: Batch API with pipeline (up to 256 operations)
+- GCS: Batch delete with parallel execution
+- File/Direct: Parallel deletion with configurable concurrency
+- All 7 backends implement efficient batch operations
+
+**Phase 2: Streaming List with Progress**
+- Added `list_stream()` returning `Pin<Box<dyn Stream<Item = Result<String>>>>`
+- S3: True streaming via paginated ListObjectsV2 (1000-object pages)
+- Azure/GCS/File: Efficient buffered implementation
+- MultiEndpoint: Wraps stream with per-endpoint statistics
+- ObjectStoreLogger: Proper op-log integration for workload replay
+- CLI: Added `-c/--count-only` flag with progress indicators
+- CLI: Rate formatting with comma separators (e.g., "rate: 276,202 objects/s")
+
+**Phase 3: List+Delete Pipeline**
+- Concurrent lister/deleter tasks via tokio channels
+- 1000-object batches, 10-batch buffer (10K objects in-flight)
+- Overlaps LIST and DELETE operations for maximum throughput
+- Progress reporting every 10K objects
+
+**CLI Improvements:**
+```bash
+# Count objects with streaming progress
+s3-cli ls -rc s3://bucket/prefix/
+# Output: Total objects: 1,234,567 (12.345s, rate: 100,000 objects/s)
+
+# Fast deletion with pipeline
+s3-cli delete s3://bucket/prefix/
+# Uses concurrent list+delete pipeline automatically
+```
+
+**Architecture:**
+- Clean abstractions maintained (no backend-specific CLI code)
+- Proper op-log integration for workload replay capability
+- Zero-copy streaming where possible
+- All optimizations work across all 7 storage backends
+
+**Testing:**
+- Comprehensive test suite with file:// backend
+- Pattern matching validated (preserves non-matching objects)
+- Pipeline performance verified (10K files in 0.213s)
+- Progress indicators and rate formatting confirmed
+
+**Documentation:**
+- `docs/LIST_DELETE_PERFORMANCE_OPTIMIZATION.md` - Complete 3-phase plan
+- All phases implemented and tested
+
+### 📝 **API Stability**
+
+**Rust API:**
+- New trait methods: `ObjectStore::delete_batch()`, `ObjectStore::list_stream()`
+- Backward compatible - existing code continues to work
+- Python API automatically benefits from underlying optimizations
+
+**Python API:**
+- No changes required - `delete()` and `list()` use optimized implementations
+- Batch operations work transparently under the hood
+
+---
+
 ## Version 0.9.18 - Data Generation Bug Fix & Algorithm Migration (November 17-18, 2025)
 
 ### 🔧 **Update (November 18, 2025): RNG Optimization & Distributed Safety**
