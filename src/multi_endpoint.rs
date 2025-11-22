@@ -539,6 +539,39 @@ impl ObjectStore for MultiEndpointStore {
         result
     }
     
+    fn list_stream<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+        recursive: bool,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<String>> + Send + 'a>> {
+        use futures::stream::StreamExt;
+        
+        let endpoint = self.select_endpoint();
+        endpoint.stats.total_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        endpoint.stats.active_requests.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        
+        let mut stream = endpoint.store.list_stream(uri_prefix, recursive);
+        let stats = endpoint.stats.clone();
+        let stats_for_end = stats.clone();
+        let mut request_ended = false;
+        
+        Box::pin(async_stream::stream! {
+            while let Some(result) = stream.next().await {
+                if result.is_err() && !request_ended {
+                    stats.error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stats.active_requests.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    request_ended = true;
+                }
+                yield result;
+            }
+            
+            // Decrement active count if not already done due to error
+            if !request_ended {
+                stats_for_end.active_requests.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        })
+    }
+    
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         let endpoint = self.select_endpoint();
         endpoint.stats.total_requests.fetch_add(1, Ordering::Relaxed);

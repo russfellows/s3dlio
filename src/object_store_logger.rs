@@ -209,6 +209,58 @@ impl ObjectStore for LoggedObjectStore {
         result
     }
 
+    fn list_stream<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+        recursive: bool,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<String>> + Send + 'a>> {
+        use futures::stream::StreamExt;
+        
+        let start_time = SystemTime::now();
+        let mut inner_stream = self.inner.list_stream(uri_prefix, recursive);
+        let uri_str = uri_prefix.to_string();
+        let logger = self.logger.clone();
+        
+        // Wrap stream to count objects and log when complete
+        Box::pin(async_stream::stream! {
+            let mut count = 0u32;
+            let mut stream_error: Option<String> = None;
+            
+            while let Some(result) = inner_stream.next().await {
+                match &result {
+                    Ok(_) => {
+                        count += 1;
+                        yield result;
+                    }
+                    Err(e) => {
+                        stream_error = Some(e.to_string());
+                        yield result;
+                        break;
+                    }
+                }
+            }
+            
+            // Log the complete operation
+            let end_time = SystemTime::now();
+            let entry = LogEntry {
+                idx: 0, // Set by logger
+                thread_id: get_thread_id(),
+                operation: "LIST".to_string(),
+                client_id: String::new(),
+                num_objects: count,
+                bytes: 0,
+                endpoint: extract_endpoint(&uri_str),
+                file: strip_uri_scheme(&uri_str),
+                error: stream_error,
+                start_time,
+                first_byte_time: None,
+                end_time,
+            };
+            
+            logger.log(entry);
+        })
+    }
+
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         let start = SystemTime::now();
         let result = self.inner.stat(uri).await;

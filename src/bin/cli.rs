@@ -320,6 +320,10 @@ enum Command {
         /// Example: '.*\.txt$' to match only .txt files
         #[clap(short, long)]
         pattern: Option<String>,
+        
+        /// Count objects only (don't print URIs) - faster for large result sets
+        #[clap(long)]
+        count_only: bool,
     },
 
     /// Generate NVIDIA DALI-compatible index file for TFRecord files
@@ -647,12 +651,12 @@ async fn main() -> Result<()> {
 
         }
 
-        Command::GenericList { uri, recursive, pattern } => {
+        Command::GenericList { uri, recursive, pattern, count_only } => {
             // Check AWS credentials only for S3 URIs
             if requires_aws_credentials(&uri) {
                 check_aws_credentials()?;
             }
-            generic_list_cmd(&uri, recursive, pattern.as_deref()).await?
+            generic_list_cmd(&uri, recursive, pattern.as_deref(), count_only).await?
         }
 
         Command::TfrecordIndex { tfrecord_path, index_path } => {
@@ -676,33 +680,64 @@ async fn main() -> Result<()> {
 
 /// Generic list command that works with any storage backend
 /// Supports optional client-side regex filtering
-async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>) -> Result<()> {
+/// Uses streaming for memory efficiency and visible progress
+async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, count_only: bool) -> Result<()> {
     use regex::Regex;
+    use futures::stream::StreamExt;
     
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger)?;
-    let mut keys = store.list(uri, recursive).await?;
+    
+    // Compile regex pattern if provided
+    let re = pattern.map(|pat| {
+        Regex::new(pat)
+            .with_context(|| format!("Invalid regex pattern: '{}'", pat))
+    }).transpose()?;
 
-    // Apply client-side regex filtering if pattern provided
-    if let Some(pat) = pattern {
-        let re = Regex::new(pat)
-            .with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
-        keys.retain(|k| re.is_match(k));
-    }
-
+    let mut stream = store.list_stream(uri, recursive);
+    let mut count = 0u64;
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    for key in &keys {
-        if let Err(e) = writeln!(out, "{}", key) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(()); // Handle cases like piping to `head`
-            } else {
-                return Err(e.into());
+    
+    // Display progress every 1000 objects
+    let progress_interval = 1000;
+    let start = std::time::Instant::now();
+
+    while let Some(result) = stream.next().await {
+        let key = result?;
+        
+        // Apply client-side regex filtering if pattern provided
+        if let Some(ref regex) = re {
+            if !regex.is_match(&key) {
+                continue;
             }
         }
+        
+        count += 1;
+        
+        // Print URI unless --count-only
+        if !count_only {
+            if let Err(e) = writeln!(out, "{}", key) {
+                if e.kind() == io::ErrorKind::BrokenPipe {
+                    return Ok(()); // Handle cases like piping to `head`
+                } else {
+                    return Err(e.into());
+                }
+            }
+        }
+        
+        // Show progress every N objects (only when not printing URIs or to stderr)
+        if count % progress_interval == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = count as f64 / elapsed;
+            eprintln!("Listed {} objects ({:.0} objects/s)...", count, rate);
+        }
     }
-    writeln!(out, "
-Total objects: {}", keys.len())?;
+
+    // Final summary
+    let elapsed = start.elapsed().as_secs_f64();
+    let rate = count as f64 / elapsed;
+    writeln!(out, "\nTotal objects: {} ({:.3}s, {:.0} objects/s)", count, elapsed, rate)?;
     Ok(())
 }
 

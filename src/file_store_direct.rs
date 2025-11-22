@@ -1223,6 +1223,25 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         Ok(results)
     }
 
+    fn list_stream<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+        recursive: bool,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<String>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            // For file://, delegate to buffered list() since filesystem operations are fast
+            // Streaming doesn't provide significant benefit for local filesystem
+            match self.list(uri_prefix, recursive).await {
+                Ok(keys) => {
+                    for key in keys {
+                        yield Ok(key);
+                    }
+                }
+                Err(e) => yield Err(e),
+            }
+        })
+    }
+
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
