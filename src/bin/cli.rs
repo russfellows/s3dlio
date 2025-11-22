@@ -322,7 +322,7 @@ enum Command {
         pattern: Option<String>,
         
         /// Count objects only (don't print URIs) - faster for large result sets
-        #[clap(long)]
+        #[clap(short, long)]
         count_only: bool,
     },
 
@@ -685,6 +685,19 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
     use regex::Regex;
     use futures::stream::StreamExt;
     
+    // Helper to format numbers with commas
+    fn format_with_commas(n: f64) -> String {
+        let s = format!("{:.0}", n);
+        let mut result = String::new();
+        for (i, c) in s.chars().rev().enumerate() {
+            if i > 0 && i % 3 == 0 {
+                result.push(',');
+            }
+            result.push(c);
+        }
+        result.chars().rev().collect()
+    }
+    
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger)?;
     
@@ -730,14 +743,14 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
         if count % progress_interval == 0 {
             let elapsed = start.elapsed().as_secs_f64();
             let rate = count as f64 / elapsed;
-            eprintln!("Listed {} objects ({:.0} objects/s)...", count, rate);
+            eprintln!("Listed {} objects (rate: {} objects/s)...", count, format_with_commas(rate));
         }
     }
 
     // Final summary
     let elapsed = start.elapsed().as_secs_f64();
     let rate = count as f64 / elapsed;
-    writeln!(out, "\nTotal objects: {} ({:.3}s, {:.0} objects/s)", count, elapsed, rate)?;
+    writeln!(out, "\nTotal objects: {} ({:.3}s, rate: {} objects/s)", count, elapsed, format_with_commas(rate))?;
     Ok(())
 }
 
@@ -1069,10 +1082,11 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
     use s3dlio::object_store::store_for_uri_with_logger;
     use regex::Regex;
     use indicatif::{ProgressBar, ProgressStyle};
+    use std::sync::Arc;
     
     // Use generic object store to delete objects (works with all backends)
     let logger = global_logger();
-    let store = store_for_uri_with_logger(uri, logger)?;
+    let store = Arc::new(store_for_uri_with_logger(uri, logger)?);
     
     // If recursive or URI ends with '/', delete prefix; otherwise check if it's a pattern
     if recursive || uri.ends_with('/') {
@@ -1115,42 +1129,97 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             pb.finish_with_message(format!("Deleted {} objects matching pattern", total));
             eprintln!("\nSuccessfully deleted {} objects matching pattern '{}'", total, pat);
         } else {
-            // Delete entire prefix without filter - need to list first for progress
-            info!("Listing objects under prefix: {}", uri);
-            eprintln!("Listing objects to delete...");
-            let keys = store.list(uri, recursive).await?;
+            // Delete entire prefix without filter - use streaming pipeline
+            info!("Starting streaming list+delete pipeline for prefix: {}", uri);
+            eprintln!("Starting list+delete pipeline...");
             
-            if keys.is_empty() {
+            // Channel for passing batches from lister to deleter (buffer 10 batches)
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(10);
+            
+            // Spawn lister task - streams results and batches them
+            let store_list = store.clone();
+            let uri_list = uri.to_string();
+            let lister = tokio::spawn(async move {
+                use futures::stream::StreamExt;
+                
+                let mut stream = store_list.list_stream(&uri_list, recursive);
+                let mut batch = Vec::with_capacity(1000);
+                let mut total_listed = 0u64;
+                
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(key) => {
+                            batch.push(key);
+                            total_listed += 1;
+                            
+                            // Send batch when it reaches 1000 objects
+                            if batch.len() >= 1000 {
+                                if tx.send(batch.clone()).await.is_err() {
+                                    // Receiver dropped (error in deleter)
+                                    break;
+                                }
+                                batch.clear();
+                                
+                                // Progress indicator
+                                if total_listed % 10000 == 0 {
+                                    eprintln!("Listed {} objects (pipeline active)...", total_listed);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("List error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                
+                // Send final partial batch if any
+                if !batch.is_empty() {
+                    let _ = tx.send(batch).await;
+                }
+                
+                total_listed
+            });
+            
+            // Deleter task - receives batches and deletes them
+            let store_delete = store.clone();
+            let deleter = tokio::spawn(async move {
+                let mut total_deleted = 0u64;
+                let mut batch_count = 0u32;
+                
+                while let Some(batch) = rx.recv().await {
+                    let batch_size = batch.len();
+                    
+                    if let Err(e) = store_delete.delete_batch(&batch).await {
+                        eprintln!("Delete batch error: {}", e);
+                        return Err(e);
+                    }
+                    
+                    total_deleted += batch_size as u64;
+                    batch_count += 1;
+                    
+                    // Progress every 10 batches (10K objects)
+                    if batch_count % 10 == 0 {
+                        eprintln!("Deleted {} objects (pipeline active)...", total_deleted);
+                    }
+                }
+                
+                Ok::<u64, anyhow::Error>(total_deleted)
+            });
+            
+            // Wait for both tasks to complete
+            let total_listed = lister.await?;
+            let total_deleted = deleter.await??;
+            
+            if total_listed == 0 {
                 eprintln!("No objects found under prefix: {}", uri);
                 return Ok(());
             }
             
-            let total = keys.len();
-            info!("Deleting {} objects under prefix '{}'", total, uri);
-            eprintln!("Found {} objects to delete (using adaptive concurrency: ~{})", 
-                     total,
-                     if total < 10 { 1 } else if total < 100 { 10 } else if total < 10_000 { total / 10 } else { total / 10 }.min(1000));
-            
-            // Create progress bar for deletion
-            let pb = ProgressBar::new(total as u64);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("Deleting: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({per_sec}, ETA: {eta})")
-                    .unwrap()
-                    .progress_chars("█▉▊▋▌▍▎▏  ")
-            );
-            
-            // Clone progress bar for the callback
-            let pb_clone = pb.clone();
-            
-            // Use batch delete (backends optimize internally - S3 uses DeleteObjects API)
-            for chunk in keys.chunks(1000) {
-                store.delete_batch(&chunk.to_vec()).await?;
-                pb_clone.inc(chunk.len() as u64);
-            }
-            
-            pb.finish_with_message(format!("Completed deletion of {} objects", total));
-            eprintln!("\nSuccessfully deleted {} objects under prefix: {}", total, uri);
+            eprintln!("\nPipeline complete:");
+            eprintln!("  Listed: {} objects", total_listed);
+            eprintln!("  Deleted: {} objects", total_deleted);
+            eprintln!("Successfully deleted all objects under prefix: {}", uri);
         }
     } else {
         // First, try to list objects with this URI as a prefix to see if it matches multiple objects
