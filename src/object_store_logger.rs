@@ -234,6 +234,20 @@ impl ObjectStore for LoggedObjectStore {
         result
     }
 
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        let start = SystemTime::now();
+        let result = self.inner.delete_batch(uris).await;
+        let end = SystemTime::now();
+        
+        let error = result.as_ref().err().map(|e| e.to_string());
+        
+        // Log batch delete with object count
+        let uri_str = if uris.is_empty() { "(empty)" } else { &uris[0] };
+        self.log_operation("DELETE_BATCH", uri_str, 0, uris.len() as u32, start, end, error);
+        
+        result
+    }
+
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         let start = SystemTime::now();
         let result = self.inner.delete_prefix(uri_prefix).await;

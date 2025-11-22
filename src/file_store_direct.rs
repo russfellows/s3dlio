@@ -1256,6 +1256,25 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         Ok(())
     }
 
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        // FileSystemObjectStore: delete files concurrently
+        use futures::stream::{self, StreamExt};
+        
+        let max_concurrency = (uris.len() / 10).max(10).min(100);
+        let uris_owned: Vec<String> = uris.to_vec();
+        
+        let deletions = stream::iter(uris_owned.into_iter())
+            .map(|uri| async move { self.delete(&uri).await })
+            .buffer_unordered(max_concurrency);
+        
+        let results: Vec<Result<()>> = deletions.collect().await;
+        for result in results {
+            result?;
+        }
+        
+        Ok(())
+    }
+
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         if !Self::is_valid_file_uri(uri_prefix) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let base_path = Self::uri_to_path(uri_prefix)?;

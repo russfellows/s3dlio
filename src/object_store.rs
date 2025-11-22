@@ -283,6 +283,10 @@ pub trait ObjectStore: Send + Sync {
     /// Delete a single object.
     async fn delete(&self, uri: &str) -> Result<()>;
 
+    /// Delete multiple objects efficiently (batched when backend supports it).
+    /// Backends should override for optimal batch delete (e.g., S3 DeleteObjects API).
+    async fn delete_batch(&self, uris: &[String]) -> Result<()>;
+
     /// Delete all objects under a prefix.
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()>;
 
@@ -987,6 +991,19 @@ impl ObjectStore for S3ObjectStore {
         s3_delete_objects(&bucket, &vec![key])
     }
 
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        if uris.is_empty() { return Ok(()); }
+        
+        // Extract bucket and keys from URIs
+        let (bucket, _) = parse_s3_uri(&uris[0])?;
+        let keys: Vec<String> = uris.iter()
+            .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, key)| key))
+            .collect();
+        
+        // Use S3 batch delete API (1000 objects per request)
+        s3_delete_objects(&bucket, &keys)
+    }
+
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         let (bucket, mut key_prefix) = parse_s3_uri(uri_prefix)?;
         if !key_prefix.is_empty() && !key_prefix.ends_with('/') { key_prefix.push('/'); }
@@ -1552,6 +1569,20 @@ impl ObjectStore for AzureObjectStore {
         cli.delete_objects(&[key]).await.map_err(Into::into)
     }
 
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        if uris.is_empty() { return Ok(()); }
+        
+        // Azure Blob batch delete: already supports batching
+        let (cli, _acct, _cont, _) = Self::client_for_uri(&uris[0])?;
+        let keys: Vec<String> = uris.iter()
+            .filter_map(|uri| {
+                Self::client_for_uri(uri).ok().map(|(_, _, _, key)| key)
+            })
+            .collect();
+        
+        cli.delete_objects(&keys).await.map_err(Into::into)
+    }
+
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         let (cli, _acct, _cont, key_prefix) = Self::client_for_prefix(uri_prefix)?;
         let keys = cli.list(Some(&key_prefix)).await?;
@@ -2007,6 +2038,19 @@ impl ObjectStore for GcsObjectStore {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let client = Self::get_client().await?;
         client.delete_object(&bucket, &object).await
+    }
+
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        if uris.is_empty() { return Ok(()); }
+        
+        // GCS batch delete: extract bucket and objects
+        let (bucket, _) = parse_gcs_uri(&uris[0])?;
+        let objects: Vec<String> = uris.iter()
+            .filter_map(|uri| parse_gcs_uri(uri).ok().map(|(_, obj)| obj))
+            .collect();
+        
+        let client = Self::get_client().await?;
+        client.delete_objects(&bucket, objects).await
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {

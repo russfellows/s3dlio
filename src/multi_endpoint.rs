@@ -507,6 +507,22 @@ impl ObjectStore for MultiEndpointStore {
         result
     }
     
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        let endpoint = self.select_endpoint();
+        endpoint.stats.total_requests.fetch_add(uris.len() as u64, Ordering::Relaxed);
+        endpoint.stats.active_requests.fetch_add(1, Ordering::AcqRel);
+        
+        let result = endpoint.store.delete_batch(uris).await;
+        
+        endpoint.stats.active_requests.fetch_sub(1, Ordering::AcqRel);
+        
+        if result.is_err() {
+            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+        }
+        
+        result
+    }
+    
     async fn list(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {
         let endpoint = self.select_endpoint();
         endpoint.stats.total_requests.fetch_add(1, Ordering::Relaxed);
