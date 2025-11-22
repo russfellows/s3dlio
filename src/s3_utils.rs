@@ -9,7 +9,7 @@
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 //use aws_sdk_s3::primitives::ByteStream;
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, Stream, StreamExt};
 #[cfg(feature = "extension-module")]
 use pyo3::{FromPyObject, PyAny, PyResult};
 #[cfg(feature = "extension-module")]
@@ -493,6 +493,147 @@ pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<Str
     })
 }
 
+/// Streaming version of list_objects that yields results as they arrive.
+/// Returns a stream of keys (without the s3:// prefix) for memory efficiency.
+/// Callers can format URIs as needed: format!("s3://{}/{}", bucket, key)
+pub async fn list_objects_stream(
+    bucket: String,
+    path: String,
+    recursive: bool,
+) -> Result<impl Stream<Item = Result<String>> + Send> {
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio::sync::mpsc;
+    
+    // Channel for streaming results (buffer 1000 objects per page)
+    let (tx, rx) = mpsc::channel(1000);
+    
+    // Spawn task to paginate and send results
+    tokio::spawn(async move {
+        // Determine the S3 prefix and regex pattern from the input path
+        let (prefix, pattern) = match path.rfind('/') {
+            Some(index) => {
+                let (p, pat) = path.split_at(index + 1);
+                (p, pat)
+            }
+            None => ("", path.as_str()),
+        };
+
+        let final_pattern = if pattern.is_empty() { ".*" } else { pattern };
+        let effective_recursive = recursive;
+
+        // Compile the regex
+        let re = match Regex::new(final_pattern) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Err(anyhow::anyhow!("Invalid regex pattern '{}': {}", final_pattern, e))).await;
+                return;
+            }
+        };
+
+        // Build client
+        let client = match aws_s3_client_async().await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        };
+
+        let mut cont: Option<String> = None;
+        let delimiter = if effective_recursive { None } else { Some("/") };
+
+        debug!(
+            "list_objects_stream: bucket='{}', prefix='{}', pattern='{}', recursive={}",
+            bucket, prefix, final_pattern, recursive
+        );
+
+        // Paginate through results
+        loop {
+            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix);
+
+            if let Some(d) = delimiter {
+                req_builder = req_builder.delimiter(d);
+            }
+
+            if let Some(token) = &cont {
+                req_builder = req_builder.continuation_token(token);
+            }
+
+            let resp = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::anyhow!("list_objects_v2 failed: {}", e))).await;
+                    return;
+                }
+            };
+
+            debug!(
+                "  page received: {} contents, {} common prefixes",
+                resp.contents().len(),
+                resp.common_prefixes().len()
+            );
+
+            // Stream matching objects from this page
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    if let Some(basename) = key.strip_prefix(prefix) {
+                        if re.is_match(basename) {
+                            debug!("    matched key: '{}'", key);
+                            if tx.send(Ok(key.to_string())).await.is_err() {
+                                // Receiver dropped, stop streaming
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle common prefixes (non-recursive mode)
+            if !effective_recursive {
+                for common_prefix in resp.common_prefixes() {
+                    if let Some(prefix_key) = common_prefix.prefix() {
+                        if let Some(basename) = prefix_key.strip_prefix(prefix) {
+                            if basename.len() == 1 && basename == "/" {
+                                debug!("    found single-slash common prefix, querying recursively: '{}'", prefix_key);
+                                // Recursive call for "/" prefix
+                                let recursive_req = client
+                                    .list_objects_v2()
+                                    .bucket(&bucket)
+                                    .prefix(prefix_key);
+
+                                if let Ok(recursive_resp) = recursive_req.send().await {
+                                    for obj in recursive_resp.contents() {
+                                        if let Some(key) = obj.key() {
+                                            if let Some(obj_basename) = key.strip_prefix(prefix) {
+                                                if re.is_match(obj_basename) {
+                                                    debug!("    matched object under slash prefix: '{}'", key);
+                                                    if tx.send(Ok(key.to_string())).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check for next page
+            if let Some(next) = resp.next_continuation_token() {
+                cont = Some(next.to_string());
+                debug!("  next_continuation_token='{}'", cont.as_ref().unwrap());
+            } else {
+                debug!("  no more pages, streaming complete");
+                break;
+            }
+        }
+    });
+    
+    Ok(ReceiverStream::new(rx))
+}
 
 
 /// NEW: Async GET by byte-range on full s3:// URI.

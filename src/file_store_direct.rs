@@ -1223,6 +1223,25 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         Ok(results)
     }
 
+    fn list_stream<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+        recursive: bool,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<String>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            // For file://, delegate to buffered list() since filesystem operations are fast
+            // Streaming doesn't provide significant benefit for local filesystem
+            match self.list(uri_prefix, recursive).await {
+                Ok(keys) => {
+                    for key in keys {
+                        yield Ok(key);
+                    }
+                }
+                Err(e) => yield Err(e),
+            }
+        })
+    }
+
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
@@ -1251,6 +1270,25 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
             fs::remove_file(&path).await?;
         } else if path.is_dir() {
             fs::remove_dir_all(&path).await?;
+        }
+        
+        Ok(())
+    }
+
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        // FileSystemObjectStore: delete files concurrently
+        use futures::stream::{self, StreamExt};
+        
+        let max_concurrency = (uris.len() / 10).max(10).min(100);
+        let uris_owned: Vec<String> = uris.to_vec();
+        
+        let deletions = stream::iter(uris_owned.into_iter())
+            .map(|uri| async move { self.delete(&uri).await })
+            .buffer_unordered(max_concurrency);
+        
+        let results: Vec<Result<()>> = deletions.collect().await;
+        for result in results {
+            result?;
         }
         
         Ok(())

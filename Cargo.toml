@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.18"
+version = "0.9.20"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "AGPL-3.0"
@@ -49,6 +49,7 @@ tracing-log = "^0.2"  # Bridge to capture log crate messages from dependencies
 tokio   = { version = "^1", features = ["full"] }
 tokio-stream = { version = "^0.1", features = ["sync"] }
 tokio-util = "^0.7"  # For CancellationToken and other utilities
+async-stream = "^0.3"  # For stream! macro in list_stream implementations
 hyper   = { version = "^1", features = ["client"] }		# ← Upgraded
 hyper-util = { version = "^0.1", features = ["client-legacy", "tokio"] }  # ← Added for HTTP client config
 hyper-rustls = "^0.27"                                		# ← matches hyper ^1
@@ -109,7 +110,6 @@ metrics     = "^0.23"    # Metrics collection framework with histogram support
 parking_lot = "^0.12"    # High-performance RwLock for metrics
 
 async-trait  = "^0.1"
-async-stream = "^0.3"
 futures-core = "^0.3"
 futures-util = "^0.3"
 

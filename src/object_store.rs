@@ -12,6 +12,8 @@ use std::io::Write;
 use std::collections::HashMap;
 use tracing::{debug, warn, info, trace};
 use regex::Regex;
+use futures::stream::{Stream, StreamExt};
+use std::pin::Pin;
 
 // Helper function for integrity validation
 fn compute_checksum(data: &[u8]) -> String {
@@ -26,6 +28,7 @@ use crate::s3_utils::{
     ObjectStat as S3ObjectStat,
     parse_s3_uri,
     list_objects as s3_list_objects,
+    list_objects_stream as s3_list_objects_stream,
     get_object_uri_async as s3_get_object_uri_async,
     get_object_range_uri_async as s3_get_object_range_uri_async,
     stat_object_uri_async as s3_stat_object_uri_async,
@@ -277,11 +280,24 @@ pub trait ObjectStore: Send + Sync {
     /// List objects under a prefix. Returns full URIs.
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>>;
 
+    /// List objects as a stream for memory-efficient iteration over large result sets.
+    /// Results are yielded as they arrive from the backend (typically in 1000-object pages).
+    /// This allows displaying progress and avoids buffering millions of URIs in memory.
+    fn list_stream<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+        recursive: bool,
+    ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>>;
+
     /// Stat a single object (HEAD-like).
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata>;
 
     /// Delete a single object.
     async fn delete(&self, uri: &str) -> Result<()>;
+
+    /// Delete multiple objects efficiently (batched when backend supports it).
+    /// Backends should override for optimal batch delete (e.g., S3 DeleteObjects API).
+    async fn delete_batch(&self, uris: &[String]) -> Result<()>;
 
     /// Delete all objects under a prefix.
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()>;
@@ -976,6 +992,37 @@ impl ObjectStore for S3ObjectStore {
         Ok(keys.into_iter().map(|k| format!("s3://{}/{}", bucket, k)).collect())
     }
 
+    fn list_stream<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+        recursive: bool,
+    ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            let (bucket, key_prefix) = match parse_s3_uri(uri_prefix) {
+                Ok((b, k)) => (b, k),
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+            
+            let mut stream = match s3_list_objects_stream(bucket.clone(), key_prefix, recursive).await {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+            
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(key) => yield Ok(format!("s3://{}/{}", bucket, key)),
+                    Err(e) => yield Err(e),
+                }
+            }
+        })
+    }
+
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         s3_stat_object_uri_async(uri).await
@@ -985,6 +1032,19 @@ impl ObjectStore for S3ObjectStore {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         let (bucket, key) = parse_s3_uri(uri)?;
         s3_delete_objects(&bucket, &vec![key])
+    }
+
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        if uris.is_empty() { return Ok(()); }
+        
+        // Extract bucket and keys from URIs
+        let (bucket, _) = parse_s3_uri(&uris[0])?;
+        let keys: Vec<String> = uris.iter()
+            .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, key)| key))
+            .collect();
+        
+        // Use S3 batch delete API (1000 objects per request)
+        s3_delete_objects(&bucket, &keys)
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -1541,6 +1601,25 @@ impl ObjectStore for AzureObjectStore {
         Ok(keys.into_iter().map(|k| az_uri(&account, &container, &k)).collect())
     }
 
+    fn list_stream<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+        recursive: bool,
+    ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            // For Azure, delegate to buffered list() since Azure SDK handles pagination efficiently
+            // Future: could implement true streaming if Azure SDK provides paginator access
+            match self.list(uri_prefix, recursive).await {
+                Ok(keys) => {
+                    for key in keys {
+                        yield Ok(key);
+                    }
+                }
+                Err(e) => yield Err(e),
+            }
+        })
+    }
+
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         let p = cli.stat(&key).await?;
@@ -1550,6 +1629,20 @@ impl ObjectStore for AzureObjectStore {
     async fn delete(&self, uri: &str) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         cli.delete_objects(&[key]).await.map_err(Into::into)
+    }
+
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        if uris.is_empty() { return Ok(()); }
+        
+        // Azure Blob batch delete: already supports batching
+        let (cli, _acct, _cont, _) = Self::client_for_uri(&uris[0])?;
+        let keys: Vec<String> = uris.iter()
+            .filter_map(|uri| {
+                Self::client_for_uri(uri).ok().map(|(_, _, _, key)| key)
+            })
+            .collect();
+        
+        cli.delete_objects(&keys).await.map_err(Into::into)
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -1996,6 +2089,25 @@ impl ObjectStore for GcsObjectStore {
         Ok(keys.into_iter().map(|k| gcs_uri(&bucket, &k)).collect())
     }
 
+    fn list_stream<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+        recursive: bool,
+    ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            // For GCS, delegate to buffered list() since GCS SDK handles pagination efficiently
+            // Future: could implement true streaming if GCS SDK provides paginator access
+            match self.list(uri_prefix, recursive).await {
+                Ok(keys) => {
+                    for key in keys {
+                        yield Ok(key);
+                    }
+                }
+                Err(e) => yield Err(e),
+            }
+        })
+    }
+
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let client = Self::get_client().await?;
@@ -2007,6 +2119,19 @@ impl ObjectStore for GcsObjectStore {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let client = Self::get_client().await?;
         client.delete_object(&bucket, &object).await
+    }
+
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        if uris.is_empty() { return Ok(()); }
+        
+        // GCS batch delete: extract bucket and objects
+        let (bucket, _) = parse_gcs_uri(&uris[0])?;
+        let objects: Vec<String> = uris.iter()
+            .filter_map(|uri| parse_gcs_uri(uri).ok().map(|(_, obj)| obj))
+            .collect();
+        
+        let client = Self::get_client().await?;
+        client.delete_objects(&bucket, objects).await
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -2458,7 +2583,7 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
 use std::path::Path;
 use std::sync::Arc;
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+// StreamExt already imported at top of file
 use tokio::sync::Semaphore;
 use glob;
 use crate::progress::ProgressCallback;
