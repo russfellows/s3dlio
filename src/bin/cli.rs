@@ -1032,6 +1032,7 @@ fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, te
 /// Delete command: deletes objects matching a key, prefix, or pattern.
 async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&str>) -> Result<()> {
     use s3dlio::object_store::{store_for_uri_with_logger, delete_objects_concurrent};
+    use s3dlio::{parse_s3_uri, delete_objects as s3_delete_objects};
     use regex::Regex;
     use indicatif::{ProgressBar, ProgressStyle};
     
@@ -1071,14 +1072,37 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             // Clone progress bar for the callback
             let pb_clone = pb.clone();
             
-            // Use concurrent deletion with progress callback
-            delete_objects_concurrent(
-                store.as_ref(),
-                &keys,
-                Some(move |count: usize| {
-                    pb_clone.set_position(count as u64);
-                })
-            ).await?;
+            // Use S3 batch delete API if S3 URI, otherwise fall back to concurrent individual deletes
+            if uri.starts_with("s3://") {
+                // S3 batch delete: 1000 objects per API call (much faster!)
+                let (bucket, _) = parse_s3_uri(uri)?;
+                
+                // Extract just the keys (not full URIs) for S3 API
+                let s3_keys: Vec<String> = keys.iter()
+                    .filter_map(|full_uri| {
+                        if let Ok((_, key)) = parse_s3_uri(full_uri) {
+                            Some(key)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                
+                // Delete in batches of 1000 with progress
+                for chunk in s3_keys.chunks(1000) {
+                    s3_delete_objects(&bucket, chunk)?;
+                    pb_clone.inc(chunk.len() as u64);
+                }
+            } else {
+                // Non-S3 backends: use concurrent individual deletes
+                delete_objects_concurrent(
+                    store.as_ref(),
+                    &keys,
+                    Some(move |count: usize| {
+                        pb_clone.set_position(count as u64);
+                    })
+                ).await?;
+            }
             
             pb.finish_with_message(format!("Deleted {} objects matching pattern", total));
             eprintln!("\nSuccessfully deleted {} objects matching pattern '{}'", total, pat);
@@ -1111,14 +1135,37 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             // Clone progress bar for the callback
             let pb_clone = pb.clone();
             
-            // Use concurrent deletion with progress callback
-            delete_objects_concurrent(
-                store.as_ref(),
-                &keys,
-                Some(move |count: usize| {
-                    pb_clone.set_position(count as u64);
-                })
-            ).await?;
+            // Use S3 batch delete API if S3 URI, otherwise fall back to concurrent individual deletes
+            if uri.starts_with("s3://") {
+                // S3 batch delete: 1000 objects per API call (much faster!)
+                let (bucket, _) = parse_s3_uri(uri)?;
+                
+                // Extract just the keys (not full URIs) for S3 API
+                let s3_keys: Vec<String> = keys.iter()
+                    .filter_map(|full_uri| {
+                        if let Ok((_, key)) = parse_s3_uri(full_uri) {
+                            Some(key)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                
+                // Delete in batches of 1000 with progress
+                for chunk in s3_keys.chunks(1000) {
+                    s3_delete_objects(&bucket, chunk)?;
+                    pb_clone.inc(chunk.len() as u64);
+                }
+            } else {
+                // Non-S3 backends: use concurrent individual deletes
+                delete_objects_concurrent(
+                    store.as_ref(),
+                    &keys,
+                    Some(move |count: usize| {
+                        pb_clone.set_position(count as u64);
+                    })
+                ).await?;
+            }
             
             pb.finish_with_message(format!("Completed deletion of {} objects", total));
             eprintln!("\nSuccessfully deleted {} objects under prefix: {}", total, uri);
