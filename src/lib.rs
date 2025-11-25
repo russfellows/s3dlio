@@ -95,6 +95,7 @@ mod multipart;
 // ===== Legacy Re-exports for Backward Compatibility =====
 // These maintain compatibility with existing code but may be deprecated
 pub use data_gen::generate_controlled_data;
+pub use data_gen::generate_controlled_data_prand;  // Pseudo-random (fast) method
 
 // ===== Re-exports expected by tests/test_dataloader.rs at the crate root =====
 // Types:
@@ -171,7 +172,7 @@ pub use crate::multipart::{
 pub use crate::config::ObjectType;
 
 // logger helpers:
-pub use crate::s3_logger::{init_op_logger, finalize_op_logger};
+pub use crate::s3_logger::{init_op_logger, finalize_op_logger, set_clock_offset, get_clock_offset};
 
 
 // Bring in Python wrappers from python_api.rs when building as extension.

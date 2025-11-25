@@ -9,9 +9,10 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
 use std::thread;
-use std::sync::{Mutex, mpsc::{sync_channel, channel, SyncSender, Receiver}};
+use std::sync::{Arc, Mutex, mpsc::{sync_channel, channel, SyncSender, Receiver}};
+use std::sync::atomic::{AtomicI64, Ordering};
 use tracing::info;
 use once_cell::sync::OnceCell;
 use zstd::stream::write::Encoder;
@@ -41,6 +42,50 @@ pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
 /// Fetch the global logger (if initialised).
 pub fn global_logger() -> Option<Logger> {
     GLOBAL_LOGGER.get().cloned()
+}
+
+/// Set clock offset for the global logger (convenience function).
+/// 
+/// # Parameters
+/// - `offset_nanos`: Nanoseconds to subtract from local timestamps for distributed sync
+/// 
+/// # Returns
+/// - `Ok(())` if logger is initialized and offset was set
+/// - `Err` if logger is not initialized
+/// 
+/// # Example
+/// ```ignore
+/// // Initialize logger
+/// s3dlio::init_op_logger("operations.log.zst")?;
+/// 
+/// // Calculate clock offset during agent sync
+/// let offset = (local_time - controller_time).as_nanos() as i64;
+/// 
+/// // Set offset for all future log entries
+/// s3dlio::set_clock_offset(offset)?;
+/// ```
+pub fn set_clock_offset(offset_nanos: i64) -> std::io::Result<()> {
+    if let Some(logger) = GLOBAL_LOGGER.get() {
+        logger.set_clock_offset(offset_nanos);
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Logger not initialized - call init_op_logger() first"
+        ))
+    }
+}
+
+/// Get the current clock offset from the global logger.
+pub fn get_clock_offset() -> std::io::Result<i64> {
+    if let Some(logger) = GLOBAL_LOGGER.get() {
+        Ok(logger.get_clock_offset())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Logger not initialized"
+        ))
+    }
 }
 
 /// Signal the background logger to finish and wait for it to flush.
@@ -91,16 +136,42 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    fn to_log_line(&self) -> String {
-        let duration_ns = self
-            .end_time
-            .duration_since(self.start_time)
+    fn to_log_line(&self, clock_offset_nanos: i64) -> String {
+        // Apply clock offset correction for distributed systems
+        // Positive offset means local clock is ahead, so we subtract to align with reference time
+        let offset_duration = if clock_offset_nanos >= 0 {
+            Duration::from_nanos(clock_offset_nanos as u64)
+        } else {
+            Duration::from_nanos((-clock_offset_nanos) as u64)
+        };
+        
+        let corrected_start = if clock_offset_nanos >= 0 {
+            self.start_time.checked_sub(offset_duration).unwrap_or(self.start_time)
+        } else {
+            self.start_time.checked_add(offset_duration).unwrap_or(self.start_time)
+        };
+        
+        let corrected_end = if clock_offset_nanos >= 0 {
+            self.end_time.checked_sub(offset_duration).unwrap_or(self.end_time)
+        } else {
+            self.end_time.checked_add(offset_duration).unwrap_or(self.end_time)
+        };
+        
+        let corrected_first_byte = self.first_byte_time.and_then(|t| {
+            if clock_offset_nanos >= 0 {
+                t.checked_sub(offset_duration)
+            } else {
+                t.checked_add(offset_duration)
+            }
+        });
+        
+        let duration_ns = corrected_end
+            .duration_since(corrected_start)
             .unwrap_or_default()
             .as_nanos();
-        let start_ts = humantime::format_rfc3339_nanos(self.start_time).to_string();
-        let end_ts = humantime::format_rfc3339_nanos(self.end_time).to_string();
-        let first_byte_ts = self
-            .first_byte_time
+        let start_ts = humantime::format_rfc3339_nanos(corrected_start).to_string();
+        let end_ts = humantime::format_rfc3339_nanos(corrected_end).to_string();
+        let first_byte_ts = corrected_first_byte
             .map(|t| humantime::format_rfc3339_nanos(t).to_string())
             .unwrap_or_default();
         let error_str = self.error.as_deref().unwrap_or_default();
@@ -118,6 +189,7 @@ impl LogEntry {
 pub struct Logger {
     sender: SyncSender<LogEntry>,
     done_rx: Mutex<Option<Receiver<()>>>,
+    clock_offset_nanos: Arc<AtomicI64>,  // Nanoseconds to adjust timestamps for distributed sync
 }
 
 impl Clone for Logger {
@@ -125,6 +197,7 @@ impl Clone for Logger {
         Logger {
             sender: self.sender.clone(),
             done_rx: Mutex::new(None),
+            clock_offset_nanos: Arc::clone(&self.clock_offset_nanos),
         }
     }
 }
@@ -176,6 +249,8 @@ impl Logger {
         encoder.flush()?;
 
         // Background writer thread.
+        let clock_offset = Arc::new(AtomicI64::new(0));
+        let clock_offset_clone = Arc::clone(&clock_offset);
         thread::spawn(move || {
             let mut idx: u64 = 0;
             for mut entry in receiver {
@@ -183,7 +258,8 @@ impl Logger {
                     break;
                 }
                 entry.idx = idx;
-                let line = entry.to_log_line();
+                let offset = clock_offset_clone.load(Ordering::Relaxed);
+                let line = entry.to_log_line(offset);
                 if let Err(e) = encoder.write_all(line.as_bytes()) {
                     eprintln!("Error writing to op-log: {e}");
                     break;
@@ -195,7 +271,36 @@ impl Logger {
             let _ = done_tx.send(());
         });
 
-        Ok(Logger { sender, done_rx: Mutex::new(Some(done_rx)) })
+        Ok(Logger { 
+            sender, 
+            done_rx: Mutex::new(Some(done_rx)),
+            clock_offset_nanos: clock_offset,
+        })
+    }
+
+    /// Set the clock offset for timestamp correction in distributed systems.
+    /// 
+    /// # Parameters
+    /// - `offset_nanos`: Nanoseconds to subtract from local timestamps
+    ///   - Positive: local clock is ahead of reference (subtract to correct)
+    ///   - Negative: local clock is behind reference (add to correct)
+    ///   - Zero: no correction needed
+    /// 
+    /// # Example
+    /// ```ignore
+    /// // Agent calculates offset during synchronization
+    /// let clock_offset_nanos = (local_time - controller_time).as_nanos() as i64;
+    /// 
+    /// // Set offset for all future log entries
+    /// logger.set_clock_offset(clock_offset_nanos);
+    /// ```
+    pub fn set_clock_offset(&self, offset_nanos: i64) {
+        self.clock_offset_nanos.store(offset_nanos, Ordering::Relaxed);
+    }
+    
+    /// Get the current clock offset value.
+    pub fn get_clock_offset(&self) -> i64 {
+        self.clock_offset_nanos.load(Ordering::Relaxed)
     }
 
     /// Submit a log entry. Use try_send to avoid blocking; drop if channel is full.

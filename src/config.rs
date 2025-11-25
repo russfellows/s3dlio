@@ -11,6 +11,23 @@ pub enum ObjectType {
     Raw,
 }
 
+/// Data generation algorithm selection.
+#[derive(Clone, Copy, Debug, ValueEnum, Deserialize, Serialize)]
+#[clap(rename_all = "kebab-case")] // CLI shows random, prand
+#[serde(rename_all = "snake_case")] // JSON shows random, prand
+pub enum DataGenAlgorithm {
+    /// Random data generation (variable performance 1-7 GB/s depending on size)
+    Random,
+    /// Pseudo-random using BASE_BLOCK algorithm (consistent 3-4 GB/s, CPU-efficient)
+    Prand,
+}
+
+impl Default for DataGenAlgorithm {
+    fn default() -> Self {
+        Self::Random
+    }
+}
+
 /// Data generation modes for performance optimization.
 #[derive(Clone, Copy, Debug, ValueEnum, Deserialize, Serialize)]
 #[clap(rename_all = "kebab-case")] // CLI shows streaming, single-pass
@@ -94,6 +111,7 @@ pub struct Config {
     pub compress_factor: usize,    // e.g. 1 (random), 2 (≈50 % zeros)
     
     // ---- performance optimization ----
+    pub data_gen_algorithm: DataGenAlgorithm, // random vs prand algorithm
     pub data_gen_mode: DataGenMode,  // streaming vs single-pass generation  
     pub chunk_size: usize,           // chunk size for streaming mode (default 256KB)
 }
@@ -114,9 +132,16 @@ impl Config {
             use_controlled: dedup_factor != 1 || compress_factor != 1,
             dedup_factor,
             compress_factor,
+            data_gen_algorithm: DataGenAlgorithm::default(), // Random by default
             data_gen_mode: DataGenMode::default(), // Streaming by default
             chunk_size: 256 * 1024, // 256KB optimal from benchmarks
         }
+    }
+    
+    /// Override data generation algorithm (random vs prand)
+    pub fn with_data_gen_algorithm(mut self, algorithm: DataGenAlgorithm) -> Self {
+        self.data_gen_algorithm = algorithm;
+        self
     }
     
     /// Override data generation mode for specific performance requirements
