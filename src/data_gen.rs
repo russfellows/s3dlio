@@ -95,25 +95,37 @@ use crate::config::ObjectType;
 // -------------------------------------------------------------
 /// A function to build objects in the correct format
 pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
-    use crate::config::DataGenMode;
+    use crate::config::{DataGenMode, DataGenAlgorithm};
     
     let total_bytes = cfg.elements * cfg.element_size;
     info!(
-        "Generating object: type={:?}, elements={}, element_size={} bytes, total_bytes={}, mode={:?}",
-        cfg.object_type, cfg.elements, cfg.element_size, total_bytes, cfg.data_gen_mode
+        "Generating object: type={:?}, elements={}, element_size={} bytes, total_bytes={}, algorithm={:?}, mode={:?}",
+        cfg.object_type, cfg.elements, cfg.element_size, total_bytes, cfg.data_gen_algorithm, cfg.data_gen_mode
     );
     
     let data = if cfg.use_controlled {
-        match cfg.data_gen_mode {
-            DataGenMode::Streaming => {
-                debug!("Using streaming controlled data: dedup={}, compress={}, chunk_size={}", 
+        // Choose algorithm (random vs prand) and mode (streaming vs single-pass)
+        match (cfg.data_gen_algorithm, cfg.data_gen_mode) {
+            (DataGenAlgorithm::Random, DataGenMode::Streaming) => {
+                debug!("Using streaming random controlled data: dedup={}, compress={}, chunk_size={}", 
                     cfg.dedup_factor, cfg.compress_factor, cfg.chunk_size);
                 generate_controlled_data_streaming(total_bytes, cfg.dedup_factor, cfg.compress_factor, cfg.chunk_size)
             },
-            DataGenMode::SinglePass => {
-                debug!("Using single-pass controlled data: dedup={}, compress={}", 
+            (DataGenAlgorithm::Random, DataGenMode::SinglePass) => {
+                debug!("Using single-pass random controlled data: dedup={}, compress={}", 
                     cfg.dedup_factor, cfg.compress_factor);
                 generate_controlled_data(total_bytes, cfg.dedup_factor, cfg.compress_factor)
+            },
+            (DataGenAlgorithm::Prand, DataGenMode::Streaming) => {
+                debug!("Using streaming prand controlled data: dedup={}, compress={}, chunk_size={}", 
+                    cfg.dedup_factor, cfg.compress_factor, cfg.chunk_size);
+                // Note: prand doesn't have a streaming version yet, use single-pass
+                generate_controlled_data_prand(total_bytes, cfg.dedup_factor, cfg.compress_factor)
+            },
+            (DataGenAlgorithm::Prand, DataGenMode::SinglePass) => {
+                debug!("Using single-pass prand controlled data: dedup={}, compress={}", 
+                    cfg.dedup_factor, cfg.compress_factor);
+                generate_controlled_data_prand(total_bytes, cfg.dedup_factor, cfg.compress_factor)
             }
         }
     } else {
@@ -275,8 +287,42 @@ pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> V
     crate::data_gen_alt::generate_controlled_data_alt(size, dedup, compress)
 }
 
-// Original implementation preserved below for reference (now unused)
-#[allow(dead_code)]
+/// Generate controlled data using the pseudo-random (BASE_BLOCK) method.
+///
+/// This is the original high-performance algorithm that uses a shared BASE_BLOCK
+/// template with zero-prefix compression control. It's significantly faster than
+/// the new algorithm (~3-4 GB/s vs 1-7 GB/s) but has cross-block compression
+/// characteristics that may not be suitable for all use cases.
+///
+/// # When to Use "prand" (pseudo-random)
+/// - Maximum CPU efficiency is critical
+/// - Cross-block compression is acceptable or desired
+/// - Performance benchmarking where data characteristics are less important
+///
+/// # When to Use "random" (default)
+/// - Need truly incompressible data (compress=1 → ~1.0 zstd ratio)
+/// - Compression must be local to each block only
+/// - Data realism is important for production-like testing
+///
+/// # Parameters
+/// - `size`: Total bytes to generate
+/// - `dedup`: Deduplication factor (1 = no dedup)
+/// - `compress`: Compression factor (1 = incompressible, higher = more compressible)
+///
+/// # Performance
+/// - ~3-4 GB/s (consistent, using ThreadRng with BASE_BLOCK template)
+/// - Lower CPU overhead than the new algorithm
+///
+/// # Example
+/// ```rust
+/// // 100MB incompressible data using fast pseudo-random method
+/// let data = generate_controlled_data_prand(100 * 1024 * 1024, 1, 1);
+/// ```
+pub fn generate_controlled_data_prand(size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+    generate_controlled_data_original(size, dedup, compress)
+}
+
+// Original implementation preserved below for reference and now available as "prand" method
 fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     use rand::Rng;
     use std::time::{SystemTime, UNIX_EPOCH};

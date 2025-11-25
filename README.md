@@ -3,7 +3,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-162%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-162%2F162-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.20-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.21-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -11,6 +11,40 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.21 - Clock Offset Support & Pseudo-Random Data Generation (November 25, 2025)
+
+**🆕 New Features:**
+
+**Clock Offset Support for Distributed Op-Log Synchronization**
+- Enable accurate global timeline reconstruction when agents have clock skew
+- Thread-safe timestamp correction with minimal overhead
+- Essential for distributed benchmarking (sai3-bench, dl-driver)
+
+```rust
+// Initialize logger
+s3dlio::init_op_logger("operations.log.zst")?;
+
+// Calculate clock offset during agent sync
+let offset = (local_time - controller_time).as_nanos() as i64;
+
+// Set offset for all future log entries
+s3dlio::set_clock_offset(offset)?;
+```
+
+**Pseudo-Random Data Generation Method**
+- Added `generate_controlled_data_prand()` for CPU-efficient data generation
+- Performance: prand ~3-4 GB/s (consistent), random ~1-7 GB/s (variable)
+- Choose based on needs: `prand` for speed, `random` for true incompressibility
+
+**Issues Resolved:**
+- #100: Clock offset support implemented
+- #98: Old data generation code now serves as "prand" method
+- #95: Range Engine messages confirmed at trace level (already fixed)
+
+See [Changelog](docs/Changelog.md) for complete details.
+
+---
 
 ### v0.9.20 - High-Performance List & Delete Optimizations (November 22, 2025)
 

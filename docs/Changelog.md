@@ -1,5 +1,58 @@
 # s3dlio Changelog
 
+## Version 0.9.21 - Clock Offset Support & Pseudo-Random Data Generation (November 25, 2025)
+
+### 🆕 **New Features**
+
+**Clock Offset Support for Distributed Op-Log Synchronization** (Issue #100)
+- Added `set_clock_offset()` and `get_clock_offset()` public functions
+- Logger now supports timestamp correction for distributed systems
+- Enables accurate global timeline reconstruction when agents have clock skew
+- Thread-safe implementation using `Arc<AtomicI64>`
+- Minimal overhead: single atomic read per log entry
+- Use case: sai3-bench and dl-driver distributed benchmarking
+
+API Usage:
+```rust
+// Initialize logger
+s3dlio::init_op_logger("operations.log.zst")?;
+
+// Calculate clock offset during agent sync
+let offset = (local_time - controller_time).as_nanos() as i64;
+
+// Set offset for all future log entries
+s3dlio::set_clock_offset(offset)?;
+```
+
+**Pseudo-Random Data Generation Method** (Issue #98 resolution)
+- Added `generate_controlled_data_prand()` function
+- Uses original BASE_BLOCK algorithm (~3-4 GB/s, consistent performance)
+- Provides "prand" option alongside "random" (new Xoshiro256++ algorithm)
+- Public API in `s3dlio::api::advanced` module
+- When to use:
+  - `random`: Truly incompressible data (compress=1 → ~1.0 zstd ratio), slower but more realistic
+  - `prand`: Maximum CPU efficiency, faster but allows cross-block compression patterns
+
+### ✅ **Bug Fixes & Improvements**
+
+**Issue #95: Range Engine Messages** (Already Fixed)
+- Confirmed Range Engine messages now at `trace!` level (not `debug!`)
+- Fixed in commit edee657 (November 16, 2025)
+- No longer overwhelms debug output
+
+**Issue #98: Old Data Generation Code**
+- Resolution: Old code now serves as "prand" method, not removed
+- Provides performance option for CPU-constrained scenarios
+- Both algorithms available for different use cases
+
+### 📝 **Documentation**
+
+- Added comprehensive clock offset documentation in `s3_logger.rs`
+- Updated API documentation for both data generation methods
+- Added usage examples for distributed op-log synchronization
+
+---
+
 ## Version 0.9.20 - High-Performance List & Delete Optimizations (November 22, 2025)
 
 ### 🚀 **Performance Improvements for Large Object Operations**

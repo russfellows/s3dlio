@@ -65,6 +65,9 @@ pub use crate::object_store::{Scheme, infer_scheme};
 /// Initialize operation logging to a file
 pub use crate::s3_logger::{init_op_logger, finalize_op_logger, global_logger, Logger};
 
+/// Set clock offset for distributed op-log synchronization (issue #100)
+pub use crate::s3_logger::{set_clock_offset, get_clock_offset};
+
 /// Wrapper that adds logging to any ObjectStore
 pub use crate::object_store_logger::LoggedObjectStore;
 
@@ -214,18 +217,19 @@ pub mod advanced;
 
 // Version information
 /// Current API version
-pub const API_VERSION: &str = "0.8.5";
+pub const API_VERSION: &str = "0.9.21";
 
 /// Check if this API version is compatible with the given version
+/// Uses semantic versioning: major.minor.patch
+/// Compatible if: same major version AND same minor version (patch can differ)
 pub fn is_compatible_version(required: &str) -> bool {
-    // Simple semantic version compatibility check
     let current_parts: Vec<u32> = API_VERSION.split('.').map(|s| s.parse().unwrap_or(0)).collect();
     let required_parts: Vec<u32> = required.split('.').map(|s| s.parse().unwrap_or(0)).collect();
     
     if current_parts.len() >= 2 && required_parts.len() >= 2 {
-        // Major version must match, minor version must be >= required
+        // Major and minor versions must match exactly
         current_parts[0] == required_parts[0] && 
-        current_parts[1] >= required_parts[1]
+        current_parts[1] == required_parts[1]
     } else {
         false
     }
@@ -237,9 +241,14 @@ mod tests {
 
     #[test]
     fn test_version_compatibility() {
-        assert!(is_compatible_version("0.8.0"));
-        assert!(is_compatible_version("0.7.0"));
+        // Current version is 0.9.21, so 0.9.x versions are compatible
+        assert!(is_compatible_version("0.9.0"));
+        assert!(is_compatible_version("0.9.21"));
+        assert!(is_compatible_version("0.9.10"));
+        // 0.8.x and earlier are not compatible (different minor version)
+        assert!(!is_compatible_version("0.8.0"));
+        assert!(!is_compatible_version("0.7.0"));
+        // 1.0.x is not compatible (different major version)
         assert!(!is_compatible_version("1.0.0"));
-        assert!(!is_compatible_version("0.9.0"));
     }
 }
