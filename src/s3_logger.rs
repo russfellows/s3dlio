@@ -20,6 +20,7 @@ use zstd::stream::write::Encoder;
 // Global variables
 static GLOBAL_LOGGER: OnceCell<Logger> = OnceCell::new();
 static LOSSLESS: OnceCell<bool> = OnceCell::new();
+static GLOBAL_CLIENT_ID: OnceCell<Mutex<String>> = OnceCell::new();
 
 const SHUTDOWN_OP: &str = "__SHUTDOWN__";
 const HEADER: &str = "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns\n";
@@ -86,6 +87,54 @@ pub fn get_clock_offset() -> std::io::Result<i64> {
             "Logger not initialized"
         ))
     }
+}
+
+/// Set the global client ID for operation logging.
+/// 
+/// All operations logged after this call will use the specified client_id value.
+/// This is useful for identifying which client/agent generated which operations
+/// in distributed systems or multi-client scenarios.
+/// 
+/// # Parameters
+/// - `client_id`: String identifier for this client (e.g., "agent-1", "worker-3")
+/// 
+/// # Example
+/// ```ignore
+/// // Initialize logger
+/// s3dlio::init_op_logger("operations.log.zst")?;
+/// 
+/// // Set client ID for all subsequent operations
+/// s3dlio::set_client_id("agent-1")?;
+/// ```
+pub fn set_client_id(client_id: &str) -> std::io::Result<()> {
+    // Initialize global client_id storage if not already done
+    let _ = GLOBAL_CLIENT_ID.get_or_init(|| Mutex::new(String::new()));
+    
+    if let Some(global_id) = GLOBAL_CLIENT_ID.get() {
+        if let Ok(mut id) = global_id.lock() {
+            *id = client_id.to_string();
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to acquire client_id lock"
+            ))
+        }
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Failed to initialize client_id storage"
+        ))
+    }
+}
+
+/// Get the current global client ID.
+pub fn get_client_id() -> String {
+    GLOBAL_CLIENT_ID
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|id| id.clone())
+        .unwrap_or_default()
 }
 
 /// Signal the background logger to finish and wait for it to flush.
