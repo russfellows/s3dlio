@@ -112,6 +112,39 @@ impl LoggedObjectStore {
     }
 
     /// Helper to log an operation with standard fields.
+    ///
+    /// # First Byte Tracking Strategy (v0.9.22+)
+    ///
+    /// The `first_byte_time` parameter provides approximate time-to-first-byte tracking:
+    ///
+    /// **For GET operations:**
+    /// - Simple get() calls: first_byte ≈ end time (entire object returned at once)
+    /// - We capture timestamp immediately after inner.get().await completes
+    /// - This is when data first becomes available to caller
+    /// - For network operations (S3/Azure/GCS), this approximates when HTTP response
+    ///   headers are received and body streaming completes
+    /// - Limitation: Can't distinguish header receipt from body completion without
+    ///   deeper instrumentation or streaming APIs
+    ///
+    /// **For PUT operations:**
+    /// - first_byte_time represents when upload acknowledges first chunk sent
+    /// - Currently set to start time (upload begins immediately)
+    /// - Future: Could track when first chunk ACK received for multipart uploads
+    ///
+    /// **Why this approach:**
+    /// - The ObjectStore trait returns Bytes (complete data), not a Stream
+    /// - To capture true first-byte timing, we'd need:
+    ///   1. Streaming GET API that yields Stream<Bytes>
+    ///   2. Internal instrumentation in all backend implementations
+    ///   3. Access to HTTP response header timing
+    /// - Current approach provides useful approximation without major refactoring
+    /// - For large objects, first_byte ≈ end is acceptable for throughput analysis
+    /// - For true TTFB metrics, use dedicated HTTP timing tools
+    ///
+    /// **Future enhancements:**
+    /// - Add streaming get_stream() API to ObjectStore trait
+    /// - Instrument backend implementations (s3_store, azure_store, gcs_store)
+    /// - Track per-chunk timing in RangeEngine for large object analysis
     fn log_operation(
         &self,
         operation: &str,
@@ -119,6 +152,7 @@ impl LoggedObjectStore {
         bytes: u64,
         num_objects: u32,
         start_time: SystemTime,
+        first_byte_time: Option<SystemTime>,
         end_time: SystemTime,
         error: Option<String>,
     ) {
@@ -126,14 +160,14 @@ impl LoggedObjectStore {
             idx: 0, // Set by logger
             thread_id: get_thread_id(),
             operation: operation.to_string(),
-            client_id: String::new(), // Empty for ObjectStore operations
+            client_id: crate::s3_logger::get_client_id(), // Use global client_id
             num_objects,
             bytes,
             endpoint: extract_endpoint(uri),
             file: strip_uri_scheme(uri), // Strip scheme prefix from file column
             error,
             start_time,
-            first_byte_time: None, // Not tracked at ObjectStore level
+            first_byte_time, // Now accepts actual timestamp or None
             end_time,
         };
         
@@ -146,12 +180,17 @@ impl ObjectStore for LoggedObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         let start = SystemTime::now();
         let result = self.inner.get(uri).await;
-        let end = SystemTime::now();
+        // Capture first_byte time immediately after get() completes.
+        // For network operations, this approximates when the full HTTP response
+        // (headers + body) has been received. For local files, this is essentially
+        // the same as end time since file I/O is typically synchronous.
+        let first_byte = SystemTime::now();
+        let end = first_byte; // For simple get(), first_byte ≈ end
         
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("GET", uri, bytes, 1, start, end, error);
+        self.log_operation("GET", uri, bytes, 1, start, Some(first_byte), end, error);
         
         result
     }
@@ -159,12 +198,13 @@ impl ObjectStore for LoggedObjectStore {
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let start = SystemTime::now();
         let result = self.inner.get_range(uri, offset, length).await;
-        let end = SystemTime::now();
+        let first_byte = SystemTime::now();
+        let end = first_byte; // Range requests also return complete data
         
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("GET_RANGE", uri, bytes, 1, start, end, error);
+        self.log_operation("GET_RANGE", uri, bytes, 1, start, Some(first_byte), end, error);
         
         result
     }
@@ -177,7 +217,9 @@ impl ObjectStore for LoggedObjectStore {
         
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("PUT", uri, bytes, 1, start, end, error);
+        // For PUT, first_byte represents when upload begins (start time)
+        // Future: Could track when first chunk ACK received for better accuracy
+        self.log_operation("PUT", uri, bytes, 1, start, Some(start), end, error);
         
         result
     }
@@ -191,7 +233,8 @@ impl ObjectStore for LoggedObjectStore {
         let error = result.as_ref().err().map(|e| e.to_string());
         
         // Still log as PUT (multipart is implementation detail)
-        self.log_operation("PUT", uri, bytes, 1, start, end, error);
+        // For multipart, first_byte = start (upload begins immediately)
+        self.log_operation("PUT", uri, bytes, 1, start, Some(start), end, error);
         
         result
     }
@@ -204,7 +247,8 @@ impl ObjectStore for LoggedObjectStore {
         let num_objects = result.as_ref().map(|v| v.len() as u32).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("LIST", uri_prefix, 0, num_objects, start, end, error);
+        // LIST is metadata-only operation, first_byte not applicable
+        self.log_operation("LIST", uri_prefix, 0, num_objects, start, None, end, error);
         
         result
     }
@@ -269,7 +313,8 @@ impl ObjectStore for LoggedObjectStore {
         let bytes = result.as_ref().map(|m| m.size).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("HEAD", uri, bytes, 1, start, end, error);
+        // STAT/HEAD is metadata-only, first_byte not applicable
+        self.log_operation("HEAD", uri, bytes, 1, start, None, end, error);
         
         result
     }
@@ -281,7 +326,8 @@ impl ObjectStore for LoggedObjectStore {
         
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("DELETE", uri, 0, 1, start, end, error);
+        // DELETE is metadata-only operation, no data transfer
+        self.log_operation("DELETE", uri, 0, 1, start, None, end, error);
         
         result
     }
@@ -293,9 +339,9 @@ impl ObjectStore for LoggedObjectStore {
         
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        // Log batch delete with object count
+        // Log batch delete with object count (metadata-only, no first_byte)
         let uri_str = if uris.is_empty() { "(empty)" } else { &uris[0] };
-        self.log_operation("DELETE_BATCH", uri_str, 0, uris.len() as u32, start, end, error);
+        self.log_operation("DELETE_BATCH", uri_str, 0, uris.len() as u32, start, None, end, error);
         
         result
     }
@@ -307,8 +353,8 @@ impl ObjectStore for LoggedObjectStore {
         
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        // Don't know exact count, use 0 to indicate prefix operation
-        self.log_operation("DELETE_PREFIX", uri_prefix, 0, 0, start, end, error);
+        // Don't know exact count, use 0 to indicate prefix operation (no first_byte)
+        self.log_operation("DELETE_PREFIX", uri_prefix, 0, 0, start, None, end, error);
         
         result
     }
@@ -320,7 +366,8 @@ impl ObjectStore for LoggedObjectStore {
         
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("CREATE_CONTAINER", name, 0, 1, start, end, error);
+        // CREATE_CONTAINER is metadata-only operation
+        self.log_operation("CREATE_CONTAINER", name, 0, 1, start, None, end, error);
         
         result
     }
@@ -332,7 +379,8 @@ impl ObjectStore for LoggedObjectStore {
         
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("DELETE_CONTAINER", name, 0, 1, start, end, error);
+        // DELETE_CONTAINER is metadata-only operation
+        self.log_operation("DELETE_CONTAINER", name, 0, 1, start, None, end, error);
         
         result
     }
@@ -344,8 +392,8 @@ impl ObjectStore for LoggedObjectStore {
         
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        // Log as HEAD operation (existence check)
-        self.log_operation("HEAD", uri, 0, 1, start, end, error);
+        // Log as HEAD operation (existence check, metadata-only)
+        self.log_operation("HEAD", uri, 0, 1, start, None, end, error);
         
         result
     }
@@ -353,13 +401,14 @@ impl ObjectStore for LoggedObjectStore {
     async fn get_with_validation(&self, uri: &str, expected_checksum: Option<&str>) -> Result<Bytes> {
         let start = SystemTime::now();
         let result = self.inner.get_with_validation(uri, expected_checksum).await;
-        let end = SystemTime::now();
+        let first_byte = SystemTime::now();
+        let end = first_byte;
         
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        // Log as GET with validation
-        self.log_operation("GET", uri, bytes, 1, start, end, error);
+        // Log as GET with validation (capture first_byte like regular GET)
+        self.log_operation("GET", uri, bytes, 1, start, Some(first_byte), end, error);
         
         result
     }
@@ -373,12 +422,13 @@ impl ObjectStore for LoggedObjectStore {
     ) -> Result<Bytes> {
         let start = SystemTime::now();
         let result = self.inner.get_range_with_validation(uri, offset, length, expected_checksum).await;
-        let end = SystemTime::now();
+        let first_byte = SystemTime::now();
+        let end = first_byte;
         
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("GET_RANGE", uri, bytes, 1, start, end, error);
+        self.log_operation("GET_RANGE", uri, bytes, 1, start, Some(first_byte), end, error);
         
         result
     }
@@ -390,12 +440,14 @@ impl ObjectStore for LoggedObjectStore {
     ) -> Result<Vec<u8>> {
         let start = SystemTime::now();
         let result = self.inner.load_checkpoint_with_validation(checkpoint_uri, expected_checksum).await;
-        let end = SystemTime::now();
+        let first_byte = SystemTime::now();
+        let end = first_byte;
         
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
         
-        self.log_operation("GET", checkpoint_uri, bytes, 1, start, end, error);
+        // Checkpoint load is a GET operation
+        self.log_operation("GET", checkpoint_uri, bytes, 1, start, Some(first_byte), end, error);
         
         result
     }

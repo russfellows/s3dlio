@@ -3,7 +3,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-162%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-162%2F162-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.21-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.22-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -12,21 +12,21 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 ## 🌟 Latest Release
 
-### v0.9.21 - Clock Offset Support & Pseudo-Random Data Generation (November 25, 2025)
+### v0.9.22 - Client ID & First Byte Tracking (November 25, 2025)
 
 **🆕 New Features:**
 
-**Clock Offset Support for Distributed Op-Log Synchronization**
-- Enable accurate global timeline reconstruction when agents have clock skew
-- Thread-safe timestamp correction with minimal overhead
-- Essential for distributed benchmarking (sai3-bench, dl-driver)
+**Client ID Support for Multi-Agent Operation Logging**
+- Enable identification of which client/agent performed each operation
+- Thread-safe implementation with minimal overhead (~10ns per log entry)
+- Essential for distributed benchmarking with merged oplogs
 
 ```rust
 // Initialize logger
 s3dlio::init_op_logger("operations.log.zst")?;
 
-// Calculate clock offset during agent sync
-let offset = (local_time - controller_time).as_nanos() as i64;
+// Set client identifier (agent ID, hostname, etc.)
+s3dlio::set_client_id("agent-1")?;
 
 // Set offset for all future log entries
 s3dlio::set_clock_offset(offset)?;

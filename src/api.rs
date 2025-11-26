@@ -68,6 +68,10 @@ pub use crate::s3_logger::{init_op_logger, finalize_op_logger, global_logger, Lo
 /// Set clock offset for distributed op-log synchronization (issue #100)
 pub use crate::s3_logger::{set_clock_offset, get_clock_offset};
 
+/// Set client ID for operation logging (v0.9.22)
+/// All operations logged after this call will use the specified client_id value
+pub use crate::s3_logger::{set_client_id, get_client_id};
+
 /// Wrapper that adds logging to any ObjectStore
 pub use crate::object_store_logger::LoggedObjectStore;
 

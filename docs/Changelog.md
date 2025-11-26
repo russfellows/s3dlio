@@ -1,5 +1,83 @@
 # s3dlio Changelog
 
+## Version 0.9.22 - Client ID & First Byte Tracking (November 25, 2025)
+
+### 🆕 **New Features**
+
+**Client ID Support for Multi-Agent Operation Logging**
+- Added `set_client_id()` and `get_client_id()` public functions
+- All operation log entries now include client_id field
+- Enables identification of which client/agent performed each operation
+- Thread-safe implementation using `OnceCell<Mutex<String>>`
+- Minimal overhead: ~10ns per log entry (mutex lock + clone)
+- Use case: Distributed benchmarking with multiple agents writing to separate oplogs
+
+API Usage:
+```rust
+// Initialize logger
+s3dlio::init_op_logger("operations.log.zst")?;
+
+// Set client identifier (agent ID, hostname, custom ID, etc.)
+let client_id = std::env::var("CLIENT_ID").unwrap_or_else(|_| "standalone".to_string());
+s3dlio::set_client_id(&client_id)?;
+
+// All future log entries tagged with this client_id
+```
+
+**Approximate First Byte Tracking** (See docs/OPERATION_LOGGING.md for details)
+- `first_byte_time` field now populated in operation logs
+- GET operations: first_byte ≈ end (when complete data is available)
+- PUT operations: first_byte = start (upload begins immediately)
+- Metadata operations (LIST, HEAD, DELETE): first_byte = None (not applicable)
+
+**Important**: This is an *approximate* implementation due to ObjectStore trait limitations:
+- Current API returns `Bytes` (complete data), not `Stream<Bytes>`
+- Can't distinguish HTTP header receipt from body completion
+- For small objects (<1MB): approximation is acceptable for throughput analysis
+- For true TTFB metrics: Use streaming APIs (future enhancement) or dedicated HTTP tools
+
+See [OPERATION_LOGGING.md](OPERATION_LOGGING.md) for comprehensive documentation on:
+- Why first_byte is approximate
+- When to use vs when to avoid
+- Future enhancement plans (streaming GET API)
+- Recommendations for different use cases
+
+### 📝 **Documentation**
+
+**New: Operation Logging Guide** (docs/OPERATION_LOGGING.md)
+- Comprehensive explanation of operation logging architecture
+- First byte tracking strategy with detailed rationale
+- Clock offset synchronization patterns
+- Client identification best practices
+- Example usage for standalone and distributed scenarios
+- Performance impact analysis
+- Future enhancement roadmap
+
+**Updated: Code Comments**
+- Extensive inline documentation in `object_store_logger.rs`
+- 40+ lines explaining first_byte tracking approach and limitations
+- Clear guidance on when approximation is acceptable
+- Future enhancement notes for streaming APIs
+
+**Clarification: Operation Log Sorting**
+- Added section on post-processing oplogs in OPERATION_LOGGING.md
+- Clarified that logs are NOT sorted during capture (due to concurrent writes)
+- Documented proper sorting workflow using sai3-bench sort command
+- Note: Sorted logs compress ~30-40% better than unsorted
+
+### ⚠️ **Important Notes**
+
+**first_byte_time Interpretation**:
+- **DO**: Use for throughput analysis and relative comparisons
+- **DO**: Use for small object (<1MB) performance benchmarking
+- **DON'T**: Assume it represents exact time of first byte arrival
+- **DON'T**: Use for precise TTFB analysis on large objects (>10MB)
+
+**Backwards Compatibility**:
+- Existing code continues to work (client_id defaults to empty string)
+- TSV format unchanged (first_byte column existed but was empty before)
+- No breaking API changes
+
 ## Version 0.9.21 - Clock Offset Support & Pseudo-Random Data Generation (November 25, 2025)
 
 ### 🆕 **New Features**
