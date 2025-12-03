@@ -1,5 +1,69 @@
 # s3dlio Changelog
 
+## Version 0.9.23 - Azure Blob & GCS Custom Endpoint Support (December 3, 2025)
+
+### 🆕 **New Features**
+
+**Custom Endpoint Support for Azure Blob Storage**
+- Added environment variable support for custom Azure endpoints
+- Primary: `AZURE_STORAGE_ENDPOINT` (e.g., `http://localhost:10000`)
+- Alternative: `AZURE_BLOB_ENDPOINT_URL`
+- Enables use with Azurite, WarpIO, or other Azure-compatible emulators/proxies
+- Account name is appended to endpoint URL automatically
+
+Usage:
+```bash
+# Azurite (local emulator)
+export AZURE_STORAGE_ENDPOINT=http://127.0.0.1:10000
+sai3-bench util ls az://devstoreaccount1/testcontainer/
+
+# WarpIO multi-protocol proxy
+export AZURE_STORAGE_ENDPOINT=http://localhost:9001
+sai3-bench util ls az://myaccount/mycontainer/
+```
+
+**Custom Endpoint Support for Google Cloud Storage**
+- Added environment variable support for custom GCS endpoints
+- Primary: `GCS_ENDPOINT_URL` (e.g., `http://localhost:4443`)
+- Alternative: `STORAGE_EMULATOR_HOST` (GCS emulator convention, `http://` prepended if missing)
+- Enables use with fake-gcs-server, WarpIO, or other GCS-compatible emulators/proxies
+- Anonymous authentication used automatically for custom endpoints (typical for emulators)
+
+Usage:
+```bash
+# fake-gcs-server (local emulator)
+export GCS_ENDPOINT_URL=http://localhost:4443
+sai3-bench util ls gs://testbucket/
+
+# Using STORAGE_EMULATOR_HOST convention
+export STORAGE_EMULATOR_HOST=localhost:4443
+sai3-bench util ls gs://testbucket/
+
+# WarpIO multi-protocol proxy
+export GCS_ENDPOINT_URL=http://localhost:9002
+sai3-bench util ls gs://testbucket/
+```
+
+### 📝 **Documentation**
+
+- Updated `docs/api/Environment_Variables.md` with Azure and GCS endpoint configuration
+- Added new constants in `src/constants.rs` for endpoint environment variable names:
+  - `ENV_AZURE_STORAGE_ENDPOINT`
+  - `ENV_AZURE_BLOB_ENDPOINT_URL`
+  - `ENV_GCS_ENDPOINT_URL`
+  - `ENV_STORAGE_EMULATOR_HOST`
+
+### ⚡ **Compatibility**
+
+**Backwards Compatibility**: No breaking changes
+- When environment variables are not set, behavior remains identical to previous versions
+- Connects to public cloud endpoints by default (Azure Blob, GCS)
+- S3 custom endpoint support via `AWS_ENDPOINT_URL` remains unchanged
+
+**Related Issue**: https://github.com/russfellows/sai3-bench/issues/56
+
+---
+
 ## Version 0.9.22 - Client ID & First Byte Tracking (November 25, 2025)
 
 ### 🆕 **New Features**

@@ -1,9 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-162%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-162%2F162-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.22-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-175%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-175%2F175-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.23-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -11,6 +11,47 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.23 - Azure Blob & GCS Custom Endpoint Support (December 3, 2025)
+
+**🆕 New Features:**
+
+**Custom Endpoint Support for Azure Blob Storage**
+- Added environment variable support for custom Azure endpoints
+- Primary: `AZURE_STORAGE_ENDPOINT` (e.g., `http://localhost:10000`)
+- Alternative: `AZURE_BLOB_ENDPOINT_URL`
+- Enables use with Azurite, WarpIO, or other Azure-compatible emulators/proxies
+
+```bash
+# Azurite (local emulator)
+export AZURE_STORAGE_ENDPOINT=http://127.0.0.1:10000
+sai3-bench util ls az://devstoreaccount1/testcontainer/
+
+# WarpIO multi-protocol proxy
+export AZURE_STORAGE_ENDPOINT=http://localhost:9001
+sai3-bench util ls az://myaccount/mycontainer/
+```
+
+**Custom Endpoint Support for Google Cloud Storage**
+- Primary: `GCS_ENDPOINT_URL` (e.g., `http://localhost:4443`)
+- Alternative: `STORAGE_EMULATOR_HOST` (GCS emulator convention)
+- Enables use with fake-gcs-server, WarpIO, or other GCS-compatible emulators
+
+```bash
+# fake-gcs-server (local emulator)
+export GCS_ENDPOINT_URL=http://localhost:4443
+sai3-bench util ls gs://testbucket/
+
+# Using STORAGE_EMULATOR_HOST convention
+export STORAGE_EMULATOR_HOST=localhost:4443
+sai3-bench util ls gs://testbucket/
+```
+
+**Related Issue:** [sai3-bench#56](https://github.com/russfellows/sai3-bench/issues/56)
+
+See [Changelog](docs/Changelog.md) for complete details.
+
+---
 
 ### v0.9.22 - Client ID & First Byte Tracking (November 25, 2025)
 
