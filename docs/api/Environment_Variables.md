@@ -45,8 +45,56 @@ Standard AWS environment variables are also supported:
 | `AWS_SECRET_ACCESS_KEY` | AWS secret key |
 | `AWS_SESSION_TOKEN` | AWS session token (for temporary credentials) |
 | `AWS_REGION` | AWS region (e.g., `us-east-1`) |
-| `AWS_ENDPOINT_URL` | Custom S3 endpoint URL |
+| `AWS_ENDPOINT_URL` | Custom S3 endpoint URL (for MinIO, WarpIO, or S3-compatible storage) |
 | `AWS_CA_BUNDLE_PATH` | Path to custom CA certificate bundle |
+
+## Azure Blob Storage Configuration
+
+| Variable | Description |
+|----------|-------------|
+| `AZURE_STORAGE_ACCOUNT` | Azure storage account name |
+| `AZURE_STORAGE_KEY` | Azure storage account key |
+| `AZURE_CLIENT_ID` | Azure AD client ID (for service principal auth) |
+| `AZURE_CLIENT_SECRET` | Azure AD client secret |
+| `AZURE_TENANT_ID` | Azure AD tenant ID |
+| `AZURE_STORAGE_ENDPOINT` | **Custom Azure endpoint** (e.g., `http://localhost:10000` for Azurite or WarpIO) |
+| `AZURE_BLOB_ENDPOINT_URL` | Alternative for `AZURE_STORAGE_ENDPOINT` |
+
+### Azure Custom Endpoint Examples
+
+```bash
+# Azurite (local emulator)
+export AZURE_STORAGE_ENDPOINT=http://127.0.0.1:10000
+sai3-bench util ls az://devstoreaccount1/testcontainer/
+
+# WarpIO multi-protocol proxy
+export AZURE_STORAGE_ENDPOINT=http://localhost:9001
+sai3-bench util ls az://myaccount/mycontainer/
+```
+
+## Google Cloud Storage Configuration
+
+| Variable | Description |
+|----------|-------------|
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCS service account JSON key file |
+| `GCS_ENDPOINT_URL` | **Custom GCS endpoint** (e.g., `http://localhost:4443` for fake-gcs-server or WarpIO) |
+| `STORAGE_EMULATOR_HOST` | GCS emulator convention (`host:port`), `http://` prepended if missing |
+
+### GCS Custom Endpoint Examples
+
+```bash
+# fake-gcs-server (local emulator)
+export GCS_ENDPOINT_URL=http://localhost:4443
+sai3-bench util ls gs://testbucket/
+
+# Using STORAGE_EMULATOR_HOST convention
+export STORAGE_EMULATOR_HOST=localhost:4443
+sai3-bench util ls gs://testbucket/
+
+# WarpIO multi-protocol proxy
+export GCS_ENDPOINT_URL=http://localhost:9002
+sai3-bench util ls gs://testbucket/
+```
 
 ## Usage Examples
 

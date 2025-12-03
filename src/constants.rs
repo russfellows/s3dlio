@@ -221,6 +221,27 @@ pub const ENV_OPLOG_READ_BUF: &str = "S3DLIO_OPLOG_READ_BUF";
 /// Environment variable for op-log chunk size
 pub const ENV_OPLOG_CHUNK_SIZE: &str = "S3DLIO_OPLOG_CHUNK_SIZE";
 
+// =============================================================================
+// Custom Endpoint Environment Variables
+// =============================================================================
+
+/// Primary environment variable for custom Azure Blob Storage endpoint
+/// Example: AZURE_STORAGE_ENDPOINT=http://localhost:10000
+pub const ENV_AZURE_STORAGE_ENDPOINT: &str = "AZURE_STORAGE_ENDPOINT";
+
+/// Alternative environment variable for custom Azure Blob Storage endpoint
+/// Example: AZURE_BLOB_ENDPOINT_URL=http://localhost:10000
+pub const ENV_AZURE_BLOB_ENDPOINT_URL: &str = "AZURE_BLOB_ENDPOINT_URL";
+
+/// Primary environment variable for custom GCS endpoint
+/// Example: GCS_ENDPOINT_URL=http://localhost:4443
+pub const ENV_GCS_ENDPOINT_URL: &str = "GCS_ENDPOINT_URL";
+
+/// GCS emulator convention environment variable (STORAGE_EMULATOR_HOST=host:port)
+/// If value doesn't start with http://, "http://" is prepended automatically
+/// Example: STORAGE_EMULATOR_HOST=localhost:4443
+pub const ENV_STORAGE_EMULATOR_HOST: &str = "STORAGE_EMULATOR_HOST";
+
 /// A base random block of BLK_SIZE bytes, generated once and shared.
 /// Used by the single-pass data generation algorithm.
 pub static A_BASE_BLOCK: Lazy<Arc<Vec<u8>>> = Lazy::new(|| {

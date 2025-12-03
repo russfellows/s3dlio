@@ -52,7 +52,30 @@ impl AzureBlob {
     }
 
     /// Build with Entra ID (AAD) default chain (env, managed identity, etc).
+    /// 
+    /// Supports custom endpoints via environment variables for local emulators and proxies:
+    /// - `AZURE_STORAGE_ENDPOINT`: Primary endpoint URL (e.g., http://localhost:10000)
+    /// - `AZURE_BLOB_ENDPOINT_URL`: Alternative endpoint URL
+    /// 
+    /// When a custom endpoint is set, the account name is appended to form the full URL.
+    /// Example: AZURE_STORAGE_ENDPOINT=http://localhost:10000 + account="devstoreaccount1"
+    ///          → http://localhost:10000/devstoreaccount1
     pub fn with_default_credential(account: &str, container: &str) -> Result<Self> {
+        // Check for custom endpoint (for Azurite, WarpIO, or other emulators/proxies)
+        if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
+            .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
+        {
+            // Use custom endpoint (e.g., http://localhost:10000/account)
+            let account_url = if endpoint.ends_with('/') {
+                format!("{}{}", endpoint, account)
+            } else {
+                format!("{}/{}", endpoint, account)
+            };
+            tracing::info!("Using custom Azure endpoint: {}", account_url);
+            return Self::with_default_credential_from_url(&account_url, container);
+        }
+        
+        // Default: public Azure endpoint
         let account_url = Self::account_url_from_account(account);
         
         // Get or initialize the global credential (only authenticates once per process)
@@ -346,6 +369,130 @@ impl AzureBlob {
         Ok(())
     }
 
+}
+
+// ============================================================================
+// Helper Functions for Custom Endpoint URL Construction
+// ============================================================================
+
+/// Constructs the Azure account URL based on environment variables.
+/// 
+/// Returns the custom endpoint URL if `AZURE_STORAGE_ENDPOINT` or `AZURE_BLOB_ENDPOINT_URL`
+/// is set, otherwise returns the standard Azure Blob endpoint.
+/// 
+/// This is extracted as a pure function for testability.
+pub fn resolve_azure_account_url(account: &str) -> String {
+    if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
+        .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
+    {
+        // Use custom endpoint (e.g., http://localhost:10000/account)
+        if endpoint.ends_with('/') {
+            format!("{}{}", endpoint, account)
+        } else {
+            format!("{}/{}", endpoint, account)
+        }
+    } else {
+        // Default: public Azure endpoint
+        format!("https://{}.blob.core.windows.net", account)
+    }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    
+    // Mutex to serialize tests that modify environment variables
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_account_url_from_account() {
+        let url = AzureBlob::account_url_from_account("mystorageaccount");
+        assert_eq!(url, "https://mystorageaccount.blob.core.windows.net");
+    }
+
+    #[test]
+    fn test_azurite_url() {
+        let url = AzureBlob::azurite_url("127.0.0.1", 10000, "devstoreaccount1");
+        assert_eq!(url, "http://127.0.0.1:10000/devstoreaccount1");
+    }
+
+    #[test]
+    fn test_resolve_azure_account_url_default() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Clear any existing endpoint env vars
+        std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
+        std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
+        
+        let url = resolve_azure_account_url("mystorageaccount");
+        assert_eq!(url, "https://mystorageaccount.blob.core.windows.net");
+    }
+
+    #[test]
+    fn test_resolve_azure_account_url_with_primary_env_var() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Set primary env var
+        std::env::set_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT, "http://localhost:10000");
+        std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
+        
+        let url = resolve_azure_account_url("devstoreaccount1");
+        assert_eq!(url, "http://localhost:10000/devstoreaccount1");
+        
+        // Cleanup
+        std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
+    }
+
+    #[test]
+    fn test_resolve_azure_account_url_with_alternative_env_var() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Set alternative env var (primary not set)
+        std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
+        std::env::set_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL, "http://127.0.0.1:9001");
+        
+        let url = resolve_azure_account_url("testaccount");
+        assert_eq!(url, "http://127.0.0.1:9001/testaccount");
+        
+        // Cleanup
+        std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
+    }
+
+    #[test]
+    fn test_resolve_azure_account_url_with_trailing_slash() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Set env var with trailing slash
+        std::env::set_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT, "http://localhost:10000/");
+        std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
+        
+        let url = resolve_azure_account_url("devstoreaccount1");
+        assert_eq!(url, "http://localhost:10000/devstoreaccount1");
+        
+        // Cleanup
+        std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
+    }
+
+    #[test]
+    fn test_resolve_azure_account_url_primary_takes_precedence() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Set both env vars - primary should take precedence
+        std::env::set_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT, "http://primary:10000");
+        std::env::set_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL, "http://alternative:9001");
+        
+        let url = resolve_azure_account_url("testaccount");
+        assert_eq!(url, "http://primary:10000/testaccount");
+        
+        // Cleanup
+        std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
+        std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
+    }
 }
 
 

@@ -48,20 +48,49 @@ impl GcsClient {
     /// - GOOGLE_APPLICATION_CREDENTIALS env var (loaded by dotenvy)
     /// - Metadata server (if running on GCP)
     /// - gcloud CLI credentials
+    /// 
+    /// Supports custom endpoints via environment variables for local emulators and proxies:
+    /// - `GCS_ENDPOINT_URL`: Full endpoint URL (e.g., http://localhost:4443)
+    /// - `STORAGE_EMULATOR_HOST`: GCS emulator convention (host:port, http:// prepended if missing)
+    /// 
+    /// When a custom endpoint is set, anonymous authentication is used (typical for emulators).
     pub async fn new() -> Result<Self> {
         let client = GCS_CLIENT
             .get_or_try_init(|| async {
-                debug!("Initializing GCS client with Application Default Credentials (first time only)");
+                // Check for custom endpoint (for fake-gcs-server, WarpIO, or other emulators/proxies)
+                let custom_endpoint = std::env::var(crate::constants::ENV_GCS_ENDPOINT_URL).ok()
+                    .or_else(|| {
+                        // GCS emulator convention: STORAGE_EMULATOR_HOST=host:port
+                        std::env::var(crate::constants::ENV_STORAGE_EMULATOR_HOST).ok()
+                            .map(|host| {
+                                if host.starts_with("http://") || host.starts_with("https://") {
+                                    host
+                                } else {
+                                    format!("http://{}", host)
+                                }
+                            })
+                    });
                 
-                // Use with_auth() to automatically discover credentials
-                let config = ClientConfig::default()
-                    .with_auth()
-                    .await
-                    .map_err(|e| anyhow!("Failed to initialize GCS authentication: {}", e))?;
+                let config = if let Some(endpoint) = custom_endpoint {
+                    info!("Using custom GCS endpoint: {}", endpoint);
+                    // Local emulators typically don't need auth
+                    // ClientConfig has a public storage_endpoint field
+                    ClientConfig {
+                        storage_endpoint: endpoint,
+                        ..ClientConfig::default()
+                    }.anonymous()
+                } else {
+                    debug!("Initializing GCS client with Application Default Credentials (first time only)");
+                    // Use with_auth() to automatically discover credentials
+                    ClientConfig::default()
+                        .with_auth()
+                        .await
+                        .map_err(|e| anyhow!("Failed to initialize GCS authentication: {}", e))?
+                };
                 
                 let client = Client::new(config);
                 
-                info!("GCS client initialized successfully with Application Default Credentials (cached for reuse)");
+                info!("GCS client initialized successfully (cached for reuse)");
                 Ok::<Arc<Client>, anyhow::Error>(Arc::new(client))
             })
             .await?;
@@ -437,12 +466,41 @@ pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
 }
 
 // ============================================================================
+// Helper Functions for Custom Endpoint URL Construction
+// ============================================================================
+
+/// Resolves the GCS storage endpoint based on environment variables.
+/// 
+/// Returns a custom endpoint URL if `GCS_ENDPOINT_URL` or `STORAGE_EMULATOR_HOST`
+/// is set, otherwise returns `None` (indicating default GCS endpoint should be used).
+/// 
+/// This is extracted as a pure function for testability.
+pub fn resolve_gcs_endpoint() -> Option<String> {
+    std::env::var(crate::constants::ENV_GCS_ENDPOINT_URL).ok()
+        .or_else(|| {
+            // GCS emulator convention: STORAGE_EMULATOR_HOST=host:port
+            std::env::var(crate::constants::ENV_STORAGE_EMULATOR_HOST).ok()
+                .map(|host| {
+                    if host.starts_with("http://") || host.starts_with("https://") {
+                        host
+                    } else {
+                        format!("http://{}", host)
+                    }
+                })
+        })
+}
+
+// ============================================================================
 // Unit Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    
+    // Mutex to serialize tests that modify environment variables
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_parse_gcs_uri_basic() {
@@ -491,5 +549,97 @@ mod tests {
         let result = parse_gcs_uri("gs:///path/to/file.txt");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty bucket name"));
+    }
+
+    // ========================================================================
+    // Custom Endpoint Tests
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_gcs_endpoint_default() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Clear any existing endpoint env vars
+        std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
+        std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
+        
+        let endpoint = resolve_gcs_endpoint();
+        assert!(endpoint.is_none(), "Expected None when no env vars set");
+    }
+
+    #[test]
+    fn test_resolve_gcs_endpoint_with_primary_env_var() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Set primary env var
+        std::env::set_var(crate::constants::ENV_GCS_ENDPOINT_URL, "http://localhost:4443");
+        std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
+        
+        let endpoint = resolve_gcs_endpoint();
+        assert_eq!(endpoint, Some("http://localhost:4443".to_string()));
+        
+        // Cleanup
+        std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
+    }
+
+    #[test]
+    fn test_resolve_gcs_endpoint_with_emulator_host_no_scheme() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Set STORAGE_EMULATOR_HOST without http:// prefix (common convention)
+        std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
+        std::env::set_var(crate::constants::ENV_STORAGE_EMULATOR_HOST, "localhost:4443");
+        
+        let endpoint = resolve_gcs_endpoint();
+        assert_eq!(endpoint, Some("http://localhost:4443".to_string()));
+        
+        // Cleanup
+        std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
+    }
+
+    #[test]
+    fn test_resolve_gcs_endpoint_with_emulator_host_with_scheme() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Set STORAGE_EMULATOR_HOST with http:// prefix
+        std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
+        std::env::set_var(crate::constants::ENV_STORAGE_EMULATOR_HOST, "http://127.0.0.1:9002");
+        
+        let endpoint = resolve_gcs_endpoint();
+        assert_eq!(endpoint, Some("http://127.0.0.1:9002".to_string()));
+        
+        // Cleanup
+        std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
+    }
+
+    #[test]
+    fn test_resolve_gcs_endpoint_with_https_scheme() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Set STORAGE_EMULATOR_HOST with https:// prefix
+        std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
+        std::env::set_var(crate::constants::ENV_STORAGE_EMULATOR_HOST, "https://secure-emulator:4443");
+        
+        let endpoint = resolve_gcs_endpoint();
+        assert_eq!(endpoint, Some("https://secure-emulator:4443".to_string()));
+        
+        // Cleanup
+        std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
+    }
+
+    #[test]
+    fn test_resolve_gcs_endpoint_primary_takes_precedence() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        
+        // Set both env vars - primary should take precedence
+        std::env::set_var(crate::constants::ENV_GCS_ENDPOINT_URL, "http://primary:4443");
+        std::env::set_var(crate::constants::ENV_STORAGE_EMULATOR_HOST, "emulator:9999");
+        
+        let endpoint = resolve_gcs_endpoint();
+        assert_eq!(endpoint, Some("http://primary:4443".to_string()));
+        
+        // Cleanup
+        std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
+        std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
     }
 }
