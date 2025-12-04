@@ -1255,6 +1255,9 @@ pub(crate) fn put_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> anyhow::Result<()> {
+    // Get the global logger once, outside the async block
+    let logger = global_logger();
+    
     run_on_global_rt(async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));
         let mut futs = FuturesUnordered::new();
@@ -1263,12 +1266,13 @@ pub(crate) fn put_objects_parallel_with_progress(
             let sem = Arc::clone(&sem);
             let payload = data.clone();           // zero-copy clone
             let progress = progress_callback.clone();
+            let logger = logger.clone();          // clone logger for each task
 
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 
-                // Use universal ObjectStore API instead of S3-specific code
-                let store = crate::object_store::store_for_uri(&uri)?;
+                // Use universal ObjectStore API with op-log support
+                let store = crate::object_store::store_for_uri_with_logger(&uri, logger)?;
                 // &[u8] view over Bytes — no copy here
                 store.put(&uri, payload.as_ref()).await?;
                 

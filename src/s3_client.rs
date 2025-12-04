@@ -20,7 +20,7 @@ use tokio::sync::{oneshot, OnceCell};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use std::path::Path;
 use std::sync::mpsc;
-use tracing::{info, debug}; // For logging
+use tracing::debug; // For logging
 
 
 // -----------------------------------------------------------------------------
@@ -149,6 +149,7 @@ fn tls_context_from_pem(filename: impl AsRef<Path>) -> Result<tls::TlsContext> {
 // -----------------------------------------------------------------------------
 
 /// Get HTTP configuration values from environment with performance-oriented defaults
+#[cfg(feature = "experimental-http-client")]
 fn get_max_http_connections() -> usize {
     std::env::var("S3DLIO_MAX_HTTP_CONNECTIONS")
         .ok()
@@ -162,6 +163,7 @@ fn get_max_http_connections() -> usize {
 
 /// Get HTTP idle timeout optimized for storage speed
 /// User suggested: ~100ms per MB for fast local storage
+#[cfg(feature = "experimental-http-client")]
 fn get_http_idle_timeout() -> Duration {
     std::env::var("S3DLIO_HTTP_IDLE_TIMEOUT_MS")
         .ok()

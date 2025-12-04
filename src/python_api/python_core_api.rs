@@ -648,11 +648,12 @@ pub (crate) fn get_many_async_py<'p>(
 
 #[pyfunction]
 pub fn get(py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
-    // Use universal ObjectStore API for all backends
+    // Use universal ObjectStore API for all backends (with op-log support)
     py.allow_threads(|| {
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(async {
-            let store = store_for_uri(uri).map_err(py_err)?;
+            let logger = global_logger();
+            let store = store_for_uri_with_logger(uri, logger).map_err(py_err)?;
             let bytes = store.get(uri).await.map_err(py_err)?;
             Ok(PyBytesView::new(bytes))
         })
@@ -832,11 +833,12 @@ pub fn get_many(
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false))]
 pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
-    // Use universal ObjectStore API for deletion
+    // Use universal ObjectStore API for deletion (with op-log support)
     py.allow_threads(|| {
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(async {
-            let store = store_for_uri(uri).map_err(py_err)?;
+            let logger = global_logger();
+            let store = store_for_uri_with_logger(uri, logger).map_err(py_err)?;
             
             // Check if URI contains wildcards or ends with / (pattern/directory)
             let has_pattern = uri.contains('*') || uri.contains('?') || uri.ends_with('/');

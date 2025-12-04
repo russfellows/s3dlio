@@ -25,6 +25,32 @@
 - Debug statements outside `tokio::spawn` work correctly
 - The `s3-cli` `-v` and `-vv` flags use the workaround filter automatically
 
+### 📦 **Examples & Project Organization**
+
+**Python Examples** (6 comprehensive examples in `examples/python/`)
+- `basic_operations.py` - Core put/get/list/stat/delete operations
+- `parallel_operations.py` - High-performance parallel get/put with concurrency tuning
+- `data_loader.py` - ML data loader patterns with batch iteration
+- `streaming_writer.py` - Chunked/streaming upload API with compression
+- `upload_download.py` - File upload/download workflows
+- `oplog_example.py` - Operation logging/tracing demonstration
+
+**Examples Directory Reorganization**
+- Moved Python examples to `examples/python/`
+- Moved Rust examples to `examples/rust/`
+- Moved shell scripts to `scripts/`
+- Deleted broken examples that used outdated APIs
+
+**Op-Log Fixes**
+- Fixed `get()` and `delete()` in Python API to use `store_for_uri_with_logger()`
+- Fixed `put_objects_parallel_with_progress()` to use logger
+- All Python operations now properly logged via `LoggedObjectStore` wrapper
+
+**Code Quality**
+- Fixed unused import warning (`info` in `s3_client.rs`)
+- Added `#[cfg(feature = "experimental-http-client")]` to functions only used with that feature
+- Zero non-deprecation warnings
+
 ### 📝 **Documentation**
 
 - Created `docs/bugs/AWS_SDK_TRACING_HANG_BUG_REPORT.md` with full investigation details

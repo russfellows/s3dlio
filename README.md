@@ -26,6 +26,11 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 - Root cause: tracing `debug!()` macros inside `tokio::spawn` with AWS SDK operations cause indefinite hangs
 - Workaround: Use `RUST_LOG=warn,s3dlio=debug` to filter AWS SDK debug logging
 
+**📦 Python Examples & Project Organization:**
+- Added 6 comprehensive Python examples in `examples/python/`
+- Reorganized examples into `python/` and `rust/` subdirectories
+- Fixed op-log to capture ALL operations (GET/PUT/DELETE) via ObjectStore interface
+
 **⚠️ Known Issue:** Tracing debug macros inside `tokio::spawn` with AWS SDK operations can cause hangs.
 See [aws-sdk-rust#1388](https://github.com/awslabs/aws-sdk-rust/issues/1388). The CLI now applies a safe filter automatically.
 
