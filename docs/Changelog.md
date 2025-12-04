@@ -1,5 +1,64 @@
 # s3dlio Changelog
 
+## Version 0.9.24 - S3-Compatible Endpoint Fix & Tracing Workaround (December 2025)
+
+### 🐛 **Bug Fixes**
+
+**S3-Compatible Endpoint Support (force_path_style)**
+- Fixed S3 requests to custom endpoints (MinIO, Ceph, WarpIO, etc.)
+- Added `force_path_style(true)` to S3 config builder in `s3_client.rs`
+- **Root cause**: AWS SDK defaults to virtual-hosted style addressing (e.g., `bucket.endpoint.com`) which doesn't work with custom endpoints that expect path-style (e.g., `endpoint.com/bucket`)
+- Now matches AWS CLI behavior when using custom endpoints
+
+**Tracing Hang Workaround**
+- Fixed hang when using verbose flags (`-v`, `-vv`) with `s3-cli`
+- **Root cause**: `tracing::debug!()` macros inside `tokio::spawn` async tasks cause indefinite hangs when AWS SDK S3 operations are also running in that task
+- **Solution**: CLI now uses `warn,s3dlio=debug` filter to exclude AWS SDK debug logging
+- Commented out debug statements inside `tokio::spawn` in `s3_utils.rs` as an additional safeguard
+
+### 🐛 **Known Issues**
+
+**AWS SDK Tracing Hang Bug** ([aws-sdk-rust#1388](https://github.com/awslabs/aws-sdk-rust/issues/1388))
+- `tracing::debug!()` inside `tokio::spawn` + AWS SDK operations = hang
+- Affects both SDK 1.104.0 and 1.116.0 (not a recent regression)
+- **Workaround**: Filter tracing with `RUST_LOG=warn,s3dlio=debug`
+- Debug statements outside `tokio::spawn` work correctly
+- The `s3-cli` `-v` and `-vv` flags use the workaround filter automatically
+
+### 📦 **Examples & Project Organization**
+
+**Python Examples** (6 comprehensive examples in `examples/python/`)
+- `basic_operations.py` - Core put/get/list/stat/delete operations
+- `parallel_operations.py` - High-performance parallel get/put with concurrency tuning
+- `data_loader.py` - ML data loader patterns with batch iteration
+- `streaming_writer.py` - Chunked/streaming upload API with compression
+- `upload_download.py` - File upload/download workflows
+- `oplog_example.py` - Operation logging/tracing demonstration
+
+**Examples Directory Reorganization**
+- Moved Python examples to `examples/python/`
+- Moved Rust examples to `examples/rust/`
+- Moved shell scripts to `scripts/`
+- Deleted broken examples that used outdated APIs
+
+**Op-Log Fixes**
+- Fixed `get()` and `delete()` in Python API to use `store_for_uri_with_logger()`
+- Fixed `put_objects_parallel_with_progress()` to use logger
+- All Python operations now properly logged via `LoggedObjectStore` wrapper
+
+**Code Quality**
+- Fixed unused import warning (`info` in `s3_client.rs`)
+- Added `#[cfg(feature = "experimental-http-client")]` to functions only used with that feature
+- Zero non-deprecation warnings
+
+### 📝 **Documentation**
+
+- Created `docs/bugs/AWS_SDK_TRACING_HANG_BUG_REPORT.md` with full investigation details
+- Added doc comments to `list_objects_stream()` in `s3_utils.rs` warning about the bug
+- Updated README.md with v0.9.24 release notes
+
+---
+
 ## Version 0.9.23 - Azure Blob & GCS Custom Endpoint Support (December 3, 2025)
 
 ### 🆕 **New Features**

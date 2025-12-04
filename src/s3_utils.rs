@@ -496,6 +496,10 @@ pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<Str
 /// Streaming version of list_objects that yields results as they arrive.
 /// Returns a stream of keys (without the s3:// prefix) for memory efficiency.
 /// Callers can format URIs as needed: format!("s3://{}/{}", bucket, key)
+///
+/// **NOTE**: Due to AWS SDK bug [aws-sdk-rust#1388](https://github.com/awslabs/aws-sdk-rust/issues/1388),
+/// tracing macros (debug!, info!, etc.) inside the spawned task cause hangs.
+/// Keep tracing calls OUTSIDE the tokio::spawn block.
 pub async fn list_objects_stream(
     bucket: String,
     path: String,
@@ -504,11 +508,18 @@ pub async fn list_objects_stream(
     use tokio_stream::wrappers::ReceiverStream;
     use tokio::sync::mpsc;
     
+    // This debug! call is OUTSIDE tokio::spawn - should work fine
+    debug!("list_objects_stream called: bucket='{}', path='{}', recursive={}", bucket, path, recursive);
+    
     // Channel for streaming results (buffer 1000 objects per page)
     let (tx, rx) = mpsc::channel(1000);
     
     // Spawn task to paginate and send results
     tokio::spawn(async move {
+        // NOTE: 2025-12-03 - tracing debug!() calls INSIDE this tokio::spawn cause hangs
+        // when verbose mode is enabled. Root cause unknown - possibly interaction between
+        // tracing subscriber and AWS SDK async code. Keep tracing macros outside spawn.
+        
         // Determine the S3 prefix and regex pattern from the input path
         let (prefix, pattern) = match path.rfind('/') {
             Some(index) => {
@@ -542,10 +553,9 @@ pub async fn list_objects_stream(
         let mut cont: Option<String> = None;
         let delimiter = if effective_recursive { None } else { Some("/") };
 
-        debug!(
-            "list_objects_stream: bucket='{}', prefix='{}', pattern='{}', recursive={}",
-            bucket, prefix, final_pattern, recursive
-        );
+        // NOTE: 2025-12-03 - tracing debug!() causes hangs in spawned async tasks when verbose mode enabled
+        // Root cause: Unknown interaction between tracing subscriber and AWS SDK async code
+        // Workaround: Keep tracing macros commented out in this spawned task context
 
         // Paginate through results
         loop {
@@ -567,18 +577,11 @@ pub async fn list_objects_stream(
                 }
             };
 
-            debug!(
-                "  page received: {} contents, {} common prefixes",
-                resp.contents().len(),
-                resp.common_prefixes().len()
-            );
-
             // Stream matching objects from this page
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
                     if let Some(basename) = key.strip_prefix(prefix) {
                         if re.is_match(basename) {
-                            debug!("    matched key: '{}'", key);
                             if tx.send(Ok(key.to_string())).await.is_err() {
                                 // Receiver dropped, stop streaming
                                 return;
@@ -594,7 +597,6 @@ pub async fn list_objects_stream(
                     if let Some(prefix_key) = common_prefix.prefix() {
                         if let Some(basename) = prefix_key.strip_prefix(prefix) {
                             if basename.len() == 1 && basename == "/" {
-                                debug!("    found single-slash common prefix, querying recursively: '{}'", prefix_key);
                                 // Recursive call for "/" prefix
                                 let recursive_req = client
                                     .list_objects_v2()
@@ -606,7 +608,6 @@ pub async fn list_objects_stream(
                                         if let Some(key) = obj.key() {
                                             if let Some(obj_basename) = key.strip_prefix(prefix) {
                                                 if re.is_match(obj_basename) {
-                                                    debug!("    matched object under slash prefix: '{}'", key);
                                                     if tx.send(Ok(key.to_string())).await.is_err() {
                                                         return;
                                                     }
@@ -624,9 +625,7 @@ pub async fn list_objects_stream(
             // Check for next page
             if let Some(next) = resp.next_continuation_token() {
                 cont = Some(next.to_string());
-                debug!("  next_continuation_token='{}'", cont.as_ref().unwrap());
             } else {
-                debug!("  no more pages, streaming complete");
                 break;
             }
         }
@@ -1256,6 +1255,9 @@ pub(crate) fn put_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> anyhow::Result<()> {
+    // Get the global logger once, outside the async block
+    let logger = global_logger();
+    
     run_on_global_rt(async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));
         let mut futs = FuturesUnordered::new();
@@ -1264,12 +1266,13 @@ pub(crate) fn put_objects_parallel_with_progress(
             let sem = Arc::clone(&sem);
             let payload = data.clone();           // zero-copy clone
             let progress = progress_callback.clone();
+            let logger = logger.clone();          // clone logger for each task
 
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 
-                // Use universal ObjectStore API instead of S3-specific code
-                let store = crate::object_store::store_for_uri(&uri)?;
+                // Use universal ObjectStore API with op-log support
+                let store = crate::object_store::store_for_uri_with_logger(&uri, logger)?;
                 // &[u8] view over Bytes — no copy here
                 store.put(&uri, payload.as_ref()).await?;
                 
