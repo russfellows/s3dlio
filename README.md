@@ -3,7 +3,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-175%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-175%2F175-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.23-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.24-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -11,6 +11,27 @@
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 ## 🌟 Latest Release
+
+### v0.9.24 - S3-Compatible Endpoint Fix & Tracing Workaround (December 2025)
+
+**🐛 Bug Fixes:**
+
+**S3-Compatible Endpoint Support (force_path_style)**
+- Fixed S3 requests to custom endpoints (MinIO, Ceph, WarpIO, etc.)
+- Added `force_path_style(true)` to S3 config builder
+- Prevents virtual-hosted style addressing that doesn't work with custom endpoints
+
+**Tracing Hang Workaround**
+- Fixed hang when using verbose flags (`-v`, `-vv`) with `s3-cli`
+- Root cause: tracing `debug!()` macros inside `tokio::spawn` with AWS SDK operations cause indefinite hangs
+- Workaround: Use `RUST_LOG=warn,s3dlio=debug` to filter AWS SDK debug logging
+
+**⚠️ Known Issue:** Tracing debug macros inside `tokio::spawn` with AWS SDK operations can cause hangs.
+See [aws-sdk-rust#1388](https://github.com/awslabs/aws-sdk-rust/issues/1388). The CLI now applies a safe filter automatically.
+
+See [Changelog](docs/Changelog.md) for complete details.
+
+---
 
 ### v0.9.23 - Azure Blob & GCS Custom Endpoint Support (December 3, 2025)
 

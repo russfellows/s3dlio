@@ -391,23 +391,28 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Initialise logging once, based on how many `-v` flags were given:
-    // Initialize tracing subscriber based on verbosity
-    let filter = match cli.verbose {
-        0 => "warn",        // no -v: WARN level
-        1 => "info",        // -v: INFO level
-        _ => "debug",       // -vv or more: DEBUG level
+    // Initialize tracing with env filter (compatible with dl-driver/s3-bench)
+    // NOTE: 2025-12-03 - Debug-level logging for ALL crates causes hangs during AWS SDK operations.
+    // Root cause: Unknown interaction between tracing subscriber and AWS SDK async code inside tokio::spawn.
+    // Workaround: Only enable verbose logging for our s3dlio crate, keep everything else at warn.
+    // Bug filed: https://github.com/awslabs/aws-sdk-rust/issues/1388
+    let safe_filter = match cli.verbose {
+        0 => "warn".to_string(),
+        1 => "warn,s3dlio=info".to_string(),   // -v: our code at info, deps at warn
+        _ => "warn,s3dlio=debug".to_string(),  // -vv: our code at debug, deps at warn
     };
     
-    // Initialize tracing with env filter (compatible with dl-driver/s3-bench)
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(filter)))
+            .unwrap_or_else(|_| EnvFilter::new(&safe_filter)))
         .with_target(false)
         .init();
     
-    // Initialize tracing-log bridge to capture log crate messages from dependencies
-    tracing_log::LogTracer::init().ok();
+    // NOTE: tracing_log::LogTracer disabled 2025-12-03
+    // This bridge from log->tracing causes deadlocks when AWS SDK logs from within
+    // async OnceCell initialization. The AWS SDK uses the `log` crate internally.
+    // Symptom: s3-cli hangs with -v or -vv flags.
+    // tracing_log::LogTracer::init().ok();
 
 
     // If set, start the op‑logger *before* the first S3 call

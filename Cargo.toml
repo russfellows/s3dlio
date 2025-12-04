@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.23"
+version = "0.9.24"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "AGPL-3.0"
@@ -25,8 +25,10 @@ name = "s3-cli"
 path = "src/bin/cli.rs"
 
 [dependencies]
-aws-config         = "^1"
-aws-sdk-s3         = "^1"
+# AWS SDK - pinned to latest (2025-12-03 testing for -v hang issue)
+# AWS SDK - restored to latest after confirming tracing hang exists in 1.104 too
+aws-config         = "=1.8.11"
+aws-sdk-s3         = "=1.116.0"
 
 # Azure SDK crates (keep minor versions flexible; they evolve together)
 azure_core = { version = "0.27.0" }          # Response/Body, paging, errors
@@ -50,11 +52,12 @@ tokio   = { version = "^1", features = ["full"] }
 tokio-stream = { version = "^0.1", features = ["sync"] }
 tokio-util = "^0.7"  # For CancellationToken and other utilities
 async-stream = "^0.3"  # For stream! macro in list_stream implementations
-hyper   = { version = "^1", features = ["client"] }		# ← Upgraded
-hyper-util = { version = "^0.1", features = ["client-legacy", "tokio"] }  # ← Added for HTTP client config
-hyper-rustls = "^0.27"                                		# ← matches hyper ^1
-aws-smithy-http-client = { version = "1.1.0", features = ["rustls-aws-lc"] }
-aws-smithy-runtime-api = "^1.9"                         # ← Added for HTTP client types
+# HTTP stack
+hyper   = { version = "^1", features = ["client"] }
+hyper-util = { version = "^0.1", features = ["client-legacy", "tokio"] }
+hyper-rustls = "^0.27"
+aws-smithy-http-client = { version = "^1", features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = "^1"                         # ← Added for HTTP client types
 rustls  = { version = "^0.23" }					# ← matches hyper‑rustls 0.27
 webpki-roots = "^0.26"
 
