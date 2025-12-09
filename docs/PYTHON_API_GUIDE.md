@@ -1,7 +1,7 @@
 # s3dlio Python API Guide
 
-**Version:** 0.9.17  
-**Last Updated:** November 16, 2025
+**Version:** 0.9.25  
+**Last Updated:** December 9, 2025
 
 ## Table of Contents
 
@@ -213,6 +213,50 @@ import os
 os.environ['AZURE_STORAGE_ACCOUNT'] = 'myaccount'
 os.environ['AZURE_STORAGE_KEY'] = 'mykey'
 ```
+
+### Custom Endpoints (S3-Compatible, Emulators, Proxies)
+
+s3dlio supports custom endpoints for all three cloud backends, enabling use with:
+- **S3-compatible systems**: MinIO, Ceph, VAST, WarpIO
+- **Local emulators**: Azurite (Azure), fake-gcs-server (GCS)
+- **Multi-protocol proxies**: WarpIO
+
+**Amazon S3 / S3-Compatible:**
+```python
+import os
+# Path-style addressing is automatic when endpoint is set
+os.environ['AWS_ENDPOINT_URL'] = 'http://localhost:9000'  # MinIO
+os.environ['AWS_ACCESS_KEY_ID'] = 'minioadmin'
+os.environ['AWS_SECRET_ACCESS_KEY'] = 'minioadmin'
+
+data = s3dlio.get("s3://mybucket/mykey")
+```
+
+**Azure Blob (Azurite/Custom):**
+```python
+import os
+os.environ['AZURE_STORAGE_ENDPOINT'] = 'http://127.0.0.1:10000'  # Azurite
+os.environ['AZURE_STORAGE_ACCOUNT'] = 'devstoreaccount1'
+os.environ['AZURE_STORAGE_KEY'] = 'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=='
+
+data = s3dlio.get("az://devstoreaccount1/container/blob")
+```
+
+**Google Cloud Storage (fake-gcs-server/Custom):**
+```python
+import os
+os.environ['GCS_ENDPOINT_URL'] = 'http://localhost:4443'  # fake-gcs-server
+# OR use the standard GCS emulator convention:
+os.environ['STORAGE_EMULATOR_HOST'] = 'localhost:4443'
+
+data = s3dlio.get("gs://testbucket/testkey")
+```
+
+| Backend | Environment Variable | Alternative |
+|---------|---------------------|-------------|
+| S3 | `AWS_ENDPOINT_URL` | - |
+| Azure | `AZURE_STORAGE_ENDPOINT` | `AZURE_BLOB_ENDPOINT_URL` |
+| GCS | `GCS_ENDPOINT_URL` | `STORAGE_EMULATOR_HOST` |
 
 ### Backend-Specific Features
 

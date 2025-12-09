@@ -714,12 +714,13 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
     }).transpose()?;
 
     let mut stream = store.list_stream(uri, recursive);
-    let mut count = 0u64;
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stdout = io::stdout();
     let mut out = stdout.lock();
     
-    // Create progress bar for count-only mode
-    let pb = if count_only {
+    // Create progress bar for count-only mode with background update task
+    let start = std::time::Instant::now();
+    let progress_handle = if count_only {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_bar()
@@ -727,14 +728,27 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
                 .unwrap()
         );
         pb.set_message("Listing objects...");
-        Some(pb)
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        
+        // Spawn background task to update progress every second
+        let count_clone = count.clone();
+        let pb_clone = pb.clone();
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.tick().await; // First tick is immediate, skip it
+            loop {
+                interval.tick().await;
+                let current_count = count_clone.load(std::sync::atomic::Ordering::Relaxed);
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 { current_count as f64 / elapsed } else { 0.0 };
+                pb_clone.set_message(format!("{} objects ({} obj/s)", 
+                    format_with_commas(current_count as f64), format_with_commas(rate)));
+            }
+        });
+        Some((pb, handle))
     } else {
         None
     };
-    
-    // Display progress every 1000 objects
-    let progress_interval = 1000;
-    let start = std::time::Instant::now();
 
     while let Some(result) = stream.next().await {
         let key = result?;
@@ -746,7 +760,7 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
             }
         }
         
-        count += 1;
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         
         // Print URI unless --count-only
         if !count_only {
@@ -758,24 +772,17 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
                 }
             }
         }
-        
-        // Show progress with progress bar (count-only mode)
-        if count_only && count % progress_interval == 0 {
-            if let Some(ref pb) = pb {
-                let elapsed = start.elapsed().as_secs_f64();
-                let rate = count as f64 / elapsed;
-                pb.set_message(format!("Listed {} objects ({} obj/s)", count, format_with_commas(rate)));
-            }
-        }
     }
 
     // Final summary
-    if let Some(pb) = pb {
+    let final_count = count.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some((pb, handle)) = progress_handle {
+        handle.abort(); // Stop the background update task
         pb.finish_and_clear();
     }
     let elapsed = start.elapsed().as_secs_f64();
-    let rate = count as f64 / elapsed;
-    writeln!(out, "Total objects: {} ({:.3}s, rate: {} objects/s)", count, elapsed, format_with_commas(rate))?;
+    let rate = final_count as f64 / elapsed;
+    writeln!(out, "Total objects: {} ({:.3}s, rate: {} objects/s)", final_count, elapsed, format_with_commas(rate))?;
     Ok(())
 }
 

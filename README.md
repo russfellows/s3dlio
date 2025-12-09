@@ -524,9 +524,10 @@ pip install s3dlio
 
 ### Documentation
 
+- **[CLI Guide](docs/CLI_GUIDE.md)** - Complete command-line interface reference with examples
+- **[Python API Guide](docs/PYTHON_API_GUIDE.md)** - Complete Python library reference with examples
 - **[Multi-Endpoint Guide](docs/MULTI_ENDPOINT_GUIDE.md)** - Load balancing across multiple storage endpoints (v0.9.14+)
 - **[Rust API Guide v0.9.0](docs/api/rust-api-v0.9.0.md)** - Complete Rust library reference with migration guide
-- **[Python API Guide](docs/PYTHON_API_GUIDE.md)** - Complete Python library reference with examples
 - **[Changelog](docs/Changelog.md)** - Version history and release notes
 - **[Adaptive Tuning Guide](docs/ADAPTIVE-TUNING.md)** - Optional performance auto-tuning
 - **[Testing Guide](docs/TESTING-GUIDE.md)** - Test suite documentation
@@ -560,14 +561,25 @@ s3-cli upload ./temp/* gs://dest-bucket/data/
 
 **Advanced Pattern Matching:**
 ```bash
-# Glob patterns for file selection
+# Glob patterns for file selection (upload)
 s3-cli upload "/data/*.log" s3://bucket/logs/
 s3-cli upload "/files/data_*.csv" az://container/data/
 
-# Regex patterns for powerful matching  
-s3-cli upload "/logs/.*\.log$" s3://bucket/logs/
-s3-cli upload "/data/file_[0-9]+\.txt" direct:///storage/data/
+# Regex patterns for listing (use single quotes to prevent shell expansion)
+s3-cli ls -r s3://bucket/ -p '.*\.txt$'           # Only .txt files
+s3-cli ls -r gs://bucket/ -p '.*\.(csv|json)$'    # CSV or JSON files
+s3-cli ls -r az://acct/cont/ -p '.*/data_.*'      # Files with "data_" in path
+
+# Count objects matching pattern (with progress indicator)
+s3-cli ls -rc gs://bucket/data/ -p '.*\.npz$'
+# Output: ⠙ [00:00:05] 71,305 objects (14,261 obj/s)
+#         Total objects: 142,610 (10.0s, rate: 14,261 objects/s)
+
+# Delete only matching files
+s3-cli delete -r s3://bucket/logs/ -p '.*\.log$'
 ```
+
+See **[CLI Guide](docs/CLI_GUIDE.md)** for complete command reference and pattern syntax.
 
 ### 🐍 Python Integration
 
@@ -751,6 +763,8 @@ podman build -t s3dlio .
 
 ## Documentation & Support
 
+- **🖥️ CLI Guide**: [docs/CLI_GUIDE.md](docs/CLI_GUIDE.md) - Complete command-line reference
+- **🐍 Python API**: [docs/PYTHON_API_GUIDE.md](docs/PYTHON_API_GUIDE.md) - Python library reference
 - **📚 API Documentation**: [docs/api/](docs/api/)
 - **📝 Changelog**: [docs/Changelog.md](docs/Changelog.md)
 - **🧪 Testing Guide**: [docs/TESTING-GUIDE.md](docs/TESTING-GUIDE.md)

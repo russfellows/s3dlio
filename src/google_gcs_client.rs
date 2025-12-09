@@ -367,6 +367,10 @@ impl GcsClient {
 
 
 /// Parse a GCS URI (gs://bucket/path/to/object) into (bucket, object_path).
+/// 
+/// Bucket-only URIs are also supported (for prefix listings):
+/// - gs://bucket/ → ("bucket", "")
+/// - gs://bucket  → ("bucket", "") - requires trailing slash for proper parsing
 pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
     // Strip gs:// or gcs:// prefix
     let path = uri
@@ -381,18 +385,13 @@ pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
         .ok_or_else(|| anyhow!("Invalid GCS URI (missing bucket): {}", uri))?
         .to_string();
 
-    let object_path = parts
-        .next()
-        .ok_or_else(|| anyhow!("Invalid GCS URI (missing object path): {}", uri))?
-        .to_string();
+    // Object path is optional (empty for bucket-only URIs like gs://bucket/ for listings)
+    let object_path = parts.next().unwrap_or("").to_string();
 
     if bucket.is_empty() {
         bail!("Invalid GCS URI (empty bucket name): {}", uri);
     }
 
-    if object_path.is_empty() {
-        bail!("Invalid GCS URI (empty object path): {}", uri);
-    }
-
     Ok((bucket, object_path))
 }
+

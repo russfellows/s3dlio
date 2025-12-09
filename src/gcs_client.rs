@@ -376,6 +376,88 @@ impl GcsClient {
         Ok(results)
     }
 
+    /// List objects in a GCS bucket as a stream, yielding results page by page.
+    /// This is more memory-efficient for large listings and enables progress updates.
+    /// 
+    /// # Arguments
+    /// * `bucket` - The GCS bucket name
+    /// * `prefix` - Optional prefix filter for object names
+    /// * `recursive` - If false, uses delimiter "/" for directory-like listing
+    /// 
+    /// # Returns
+    /// A stream of object names (not URIs)
+    pub fn list_objects_stream<'a>(
+        &'a self,
+        bucket: &'a str,
+        prefix: Option<&'a str>,
+        recursive: bool,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            debug!(
+                "GCS LIST STREAM: bucket={}, prefix={:?}, recursive={}",
+                bucket, prefix, recursive
+            );
+
+            let mut page_token: Option<String> = None;
+
+            // Normalize folder-like prefix for non-recursive listings
+            let normalized_prefix = prefix.map(|p| {
+                if !recursive && !p.is_empty() && !p.ends_with('/') {
+                    format!("{}/", p)
+                } else {
+                    p.to_string()
+                }
+            });
+
+            // Pagination loop - GCS returns max 1000 objects per page by default
+            loop {
+                let mut request = ListObjectsRequest {
+                    bucket: bucket.to_string(),
+                    prefix: normalized_prefix.clone(),
+                    page_token: page_token.clone(),
+                    ..Default::default()
+                };
+
+                if !recursive {
+                    request.delimiter = Some("/".to_string());
+                }
+
+                let response = match self.client.list_objects(&request).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        yield Err(anyhow!("GCS LIST failed for bucket {}: {}", bucket, e));
+                        return;
+                    }
+                };
+
+                // Yield files at this level (from items[])
+                if let Some(items) = response.items {
+                    for obj in items {
+                        yield Ok(obj.name);
+                    }
+                }
+
+                // For non-recursive, also yield subdirectory prefixes
+                if !recursive {
+                    if let Some(prefixes) = response.prefixes {
+                        for prefix in prefixes {
+                            yield Ok(prefix);
+                        }
+                    }
+                }
+
+                // Check for next page token
+                if let Some(next_token) = response.next_page_token {
+                    page_token = Some(next_token);
+                } else {
+                    break;
+                }
+            }
+
+            debug!("GCS LIST STREAM complete");
+        })
+    }
+
     /// Create a new GCS bucket.
     pub async fn create_bucket(&self, bucket: &str, _location: Option<&str>) -> Result<()> {
         debug!("GCS CREATE BUCKET: bucket={}", bucket);
@@ -434,6 +516,11 @@ impl GcsClient {
 /// let (bucket, object) = parse_gcs_uri("gcs://my-bucket/path/to/file.txt").unwrap();
 /// assert_eq!(bucket, "my-bucket");
 /// assert_eq!(object, "path/to/file.txt");
+/// 
+/// // Bucket-only URIs are also supported (for prefix listings)
+/// let (bucket, object) = parse_gcs_uri("gs://my-bucket/").unwrap();
+/// assert_eq!(bucket, "my-bucket");
+/// assert_eq!(object, "");
 /// ```
 pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
     // Strip gs:// or gcs:// prefix
@@ -449,17 +536,11 @@ pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
         .ok_or_else(|| anyhow!("Invalid GCS URI (missing bucket): {}", uri))?
         .to_string();
 
-    let object_path = parts
-        .next()
-        .ok_or_else(|| anyhow!("Invalid GCS URI (missing object path): {}", uri))?
-        .to_string();
+    // Object path is optional (empty for bucket-only URIs like gs://bucket/ for listings)
+    let object_path = parts.next().unwrap_or("").to_string();
 
     if bucket.is_empty() {
         bail!("Invalid GCS URI (empty bucket name): {}", uri);
-    }
-
-    if object_path.is_empty() {
-        bail!("Invalid GCS URI (empty object path): {}", uri);
     }
 
     Ok((bucket, object_path))
