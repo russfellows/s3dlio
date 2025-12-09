@@ -1607,15 +1607,41 @@ impl ObjectStore for AzureObjectStore {
         recursive: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
         Box::pin(async_stream::stream! {
-            // For Azure, delegate to buffered list() since Azure SDK handles pagination efficiently
-            // Future: could implement true streaming if Azure SDK provides paginator access
-            match self.list(uri_prefix, recursive).await {
-                Ok(keys) => {
-                    for key in keys {
-                        yield Ok(key);
-                    }
+            let (cli, account, container, key_prefix) = match Self::client_for_prefix(uri_prefix) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(e);
+                    return;
                 }
-                Err(e) => yield Err(e),
+            };
+
+            let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.as_str()) };
+            let base = if !key_prefix.is_empty() && !key_prefix.ends_with('/') { 
+                format!("{}/", key_prefix) 
+            } else { 
+                key_prefix.clone() 
+            };
+
+            // Use streaming list to get blobs page by page
+            let mut stream = cli.list_stream(prefix);
+            
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(key) => {
+                        // For non-recursive, filter to immediate children only
+                        if !recursive && !key_prefix.is_empty() {
+                            if let Some(rest) = key.strip_prefix(&base) {
+                                if rest.contains('/') {
+                                    continue; // Skip nested items
+                                }
+                            } else if key != key_prefix {
+                                continue;
+                            }
+                        }
+                        yield Ok(az_uri(&account, &container, &key));
+                    }
+                    Err(e) => yield Err(e),
+                }
             }
         })
     }
@@ -2070,20 +2096,12 @@ impl ObjectStore for GcsObjectStore {
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
-        let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)
-            .or_else(|_| {
-                // Handle bucket-only URIs like "gs://bucket" or "gs://bucket/"
-                if let Some(rest) = uri_prefix.strip_prefix("gs://").or_else(|| uri_prefix.strip_prefix("gcs://")) {
-                    let bucket = rest.trim_end_matches('/').to_string();
-                    if !bucket.is_empty() {
-                        return Ok((bucket, String::new()));
-                    }
-                }
-                bail!("Invalid GCS URI for list operation: {}", uri_prefix)
-            })?;
+        // parse_gcs_uri now handles bucket-only URIs (gs://bucket/ → ("bucket", ""))
+        let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)?;
 
         let client = Self::get_client().await?;
-        let keys = client.list_objects(&bucket, Some(&key_prefix), recursive).await?;
+        let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.as_str()) };
+        let keys = client.list_objects(&bucket, prefix, recursive).await?;
 
         // Convert keys to full URIs
         Ok(keys.into_iter().map(|k| gcs_uri(&bucket, &k)).collect())
@@ -2095,15 +2113,33 @@ impl ObjectStore for GcsObjectStore {
         recursive: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
         Box::pin(async_stream::stream! {
-            // For GCS, delegate to buffered list() since GCS SDK handles pagination efficiently
-            // Future: could implement true streaming if GCS SDK provides paginator access
-            match self.list(uri_prefix, recursive).await {
-                Ok(keys) => {
-                    for key in keys {
-                        yield Ok(key);
-                    }
+            // parse_gcs_uri now handles bucket-only URIs (gs://bucket/ → ("bucket", ""))
+            let (bucket, key_prefix) = match parse_gcs_uri(uri_prefix) {
+                Ok((b, k)) => (b, k),
+                Err(e) => {
+                    yield Err(e);
+                    return;
                 }
-                Err(e) => yield Err(e),
+            };
+
+            let client = match Self::get_client().await {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            // Use streaming list to get objects page by page
+            let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.as_str()) };
+            let mut stream = client.list_objects_stream(&bucket, prefix, recursive);
+            
+            use futures::stream::StreamExt;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(key) => yield Ok(gcs_uri(&bucket, &key)),
+                    Err(e) => yield Err(e),
+                }
             }
         })
     }

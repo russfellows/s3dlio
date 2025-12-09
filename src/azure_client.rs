@@ -220,6 +220,59 @@ impl AzureBlob {
         Ok(out)
     }
 
+    /// List blobs as a stream, yielding results page by page.
+    /// This is more memory-efficient for large listings and enables progress updates.
+    pub fn list_stream<'a>(
+        &'a self,
+        prefix: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            let container = match self.container_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+            
+            let mut opts = BlobContainerClientListBlobFlatSegmentOptions::default();
+            if let Some(p) = prefix {
+                if !p.is_empty() { opts.prefix = Some(p.to_string()); }
+            }
+            
+            let mut pager = match container.list_blobs(Some(opts)) {
+                Ok(p) => p,
+                Err(e) => {
+                    yield Err(e.into());
+                    return;
+                }
+            };
+
+            while let Some(next) = pager.next().await {
+                let resp = match next {
+                    Ok(r) => r,
+                    Err(e) => {
+                        yield Err(e.into());
+                        return;
+                    }
+                };
+                let body: ListBlobsFlatSegmentResponse = match resp.into_body().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        yield Err(e.into());
+                        return;
+                    }
+                };
+                
+                for it in body.segment.blob_items {
+                    if let Some(name) = it.name.and_then(|bn| bn.content) {
+                        yield Ok(name);
+                    }
+                }
+            }
+        })
+    }
+
     // src/azure_client.rs  (inside impl AzureBlob)
     /// Delete multiple blobs (simple loop; batch is possible later).
     pub async fn delete_objects(&self, blobs: &[String]) -> anyhow::Result<()> {
