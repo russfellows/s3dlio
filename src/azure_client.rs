@@ -61,7 +61,7 @@ impl AzureBlob {
     /// Example: AZURE_STORAGE_ENDPOINT=http://localhost:10000 + account="devstoreaccount1"
     ///          → http://localhost:10000/devstoreaccount1
     pub fn with_default_credential(account: &str, container: &str) -> Result<Self> {
-        // Check for custom endpoint (for Azurite, WarpIO, or other emulators/proxies)
+        // Check for custom endpoint (for Azurite or other emulators/proxies)
         if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
             .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
         {

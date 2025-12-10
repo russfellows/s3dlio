@@ -57,7 +57,7 @@ impl GcsClient {
     pub async fn new() -> Result<Self> {
         let client = GCS_CLIENT
             .get_or_try_init(|| async {
-                // Check for custom endpoint (for fake-gcs-server, WarpIO, or other emulators/proxies)
+                // Check for custom endpoint (for fake-gcs-server or other emulators/proxies)
                 let custom_endpoint = std::env::var(crate::constants::ENV_GCS_ENDPOINT_URL).ok()
                     .or_else(|| {
                         // GCS emulator convention: STORAGE_EMULATOR_HOST=host:port

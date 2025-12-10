@@ -352,7 +352,7 @@ pub async fn aws_s3_client_async() -> Result<Client> {
 
             // =========================================================================
             // FORCE PATH-STYLE ADDRESSING (added 2025-12-03)
-            // Required for S3-compatible services (MinIO, Ceph, WarpIO, etc.)
+            // Required for S3-compatible services (MinIO, Ceph, etc.)
             // Virtual-hosted style (bucket.endpoint) doesn't work with custom endpoints.
             // Path-style (endpoint/bucket) is the standard for S3-compatible services.
             // To revert: replace this block with just `Client::new(&cfg)`

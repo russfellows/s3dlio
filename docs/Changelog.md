@@ -5,7 +5,7 @@
 ### 🐛 **Bug Fixes**
 
 **S3-Compatible Endpoint Support (force_path_style)**
-- Fixed S3 requests to custom endpoints (MinIO, Ceph, WarpIO, etc.)
+- Fixed S3 requests to custom endpoints (MinIO, Ceph, etc.)
 - Added `force_path_style(true)` to S3 config builder in `s3_client.rs`
 - **Root cause**: AWS SDK defaults to virtual-hosted style addressing (e.g., `bucket.endpoint.com`) which doesn't work with custom endpoints that expect path-style (e.g., `endpoint.com/bucket`)
 - Now matches AWS CLI behavior when using custom endpoints
@@ -67,7 +67,7 @@
 - Added environment variable support for custom Azure endpoints
 - Primary: `AZURE_STORAGE_ENDPOINT` (e.g., `http://localhost:10000`)
 - Alternative: `AZURE_BLOB_ENDPOINT_URL`
-- Enables use with Azurite, WarpIO, or other Azure-compatible emulators/proxies
+- Enables use with Azurite or other Azure-compatible emulators/proxies
 - Account name is appended to endpoint URL automatically
 
 Usage:
@@ -76,7 +76,7 @@ Usage:
 export AZURE_STORAGE_ENDPOINT=http://127.0.0.1:10000
 sai3-bench util ls az://devstoreaccount1/testcontainer/
 
-# WarpIO multi-protocol proxy
+# Multi-protocol proxy
 export AZURE_STORAGE_ENDPOINT=http://localhost:9001
 sai3-bench util ls az://myaccount/mycontainer/
 ```
@@ -85,7 +85,7 @@ sai3-bench util ls az://myaccount/mycontainer/
 - Added environment variable support for custom GCS endpoints
 - Primary: `GCS_ENDPOINT_URL` (e.g., `http://localhost:4443`)
 - Alternative: `STORAGE_EMULATOR_HOST` (GCS emulator convention, `http://` prepended if missing)
-- Enables use with fake-gcs-server, WarpIO, or other GCS-compatible emulators/proxies
+- Enables use with fake-gcs-server or other GCS-compatible emulators/proxies
 - Anonymous authentication used automatically for custom endpoints (typical for emulators)
 
 Usage:
@@ -98,7 +98,7 @@ sai3-bench util ls gs://testbucket/
 export STORAGE_EMULATOR_HOST=localhost:4443
 sai3-bench util ls gs://testbucket/
 
-# WarpIO multi-protocol proxy
+# Multi-protocol proxy
 export GCS_ENDPOINT_URL=http://localhost:9002
 sai3-bench util ls gs://testbucket/
 ```

@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     // Set up credentials (can be dummy for S3-compatible endpoints)
     std::env::set_var("AWS_ACCESS_KEY_ID", "test");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    std::env::set_var("AWS_ENDPOINT_URL", "http://127.0.0.1:9000"); // MinIO/WarpIO/etc
+    std::env::set_var("AWS_ENDPOINT_URL", "http://127.0.0.1:9000"); // MinIO/LocalStack/etc
     
     let (tx, rx) = mpsc::channel::<Result<String, anyhow::Error>>(1000);
     
@@ -240,7 +240,7 @@ Through debugging with `eprintln!()` statements (which don't hang), we observed:
 
 ### 3. Consistent reproduction
 
-- Tested against MinIO and WarpIO (S3-compatible gateways)
+- Tested against MinIO and LocalStack (S3-compatible gateways)
 - Tested with both default AWS SDK HTTP client and custom hyper configurations
 - **Tested with SDK 1.104.0 and 1.116.0 - bug exists in both (not a recent regression)**
 - Issue reproduces 100% of the time when debug!() is inside spawn
@@ -341,4 +341,4 @@ To reproduce, you need an S3-compatible endpoint. Options:
 
 **Reported by**: s3dlio project (https://github.com/russfellows/s3dlio)  
 **Date**: December 3, 2025  
-**Discovered during**: Integration testing with WarpIO multi-protocol gateway
+**Discovered during**: Integration testing with multi-protocol gateway

@@ -217,9 +217,9 @@ os.environ['AZURE_STORAGE_KEY'] = 'mykey'
 ### Custom Endpoints (S3-Compatible, Emulators, Proxies)
 
 s3dlio supports custom endpoints for all three cloud backends, enabling use with:
-- **S3-compatible systems**: MinIO, Ceph, VAST, WarpIO
+- **S3-compatible systems**: MinIO, Ceph, VAST
 - **Local emulators**: Azurite (Azure), fake-gcs-server (GCS)
-- **Multi-protocol proxies**: WarpIO
+- **Multi-protocol proxies**
 
 **Amazon S3 / S3-Compatible:**
 ```python

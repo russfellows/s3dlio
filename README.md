@@ -17,7 +17,7 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 **🐛 Bug Fixes:**
 
 **S3-Compatible Endpoint Support (force_path_style)**
-- Fixed S3 requests to custom endpoints (MinIO, Ceph, WarpIO, etc.)
+- Fixed S3 requests to custom endpoints (MinIO, Ceph, etc.)
 - Added `force_path_style(true)` to S3 config builder
 - Prevents virtual-hosted style addressing that doesn't work with custom endpoints
 
@@ -46,14 +46,14 @@ See [Changelog](docs/Changelog.md) for complete details.
 - Added environment variable support for custom Azure endpoints
 - Primary: `AZURE_STORAGE_ENDPOINT` (e.g., `http://localhost:10000`)
 - Alternative: `AZURE_BLOB_ENDPOINT_URL`
-- Enables use with Azurite, WarpIO, or other Azure-compatible emulators/proxies
+- Enables use with Azurite or other Azure-compatible emulators/proxies
 
 ```bash
 # Azurite (local emulator)
 export AZURE_STORAGE_ENDPOINT=http://127.0.0.1:10000
 sai3-bench util ls az://devstoreaccount1/testcontainer/
 
-# WarpIO multi-protocol proxy
+# Multi-protocol proxy
 export AZURE_STORAGE_ENDPOINT=http://localhost:9001
 sai3-bench util ls az://myaccount/mycontainer/
 ```
@@ -61,7 +61,7 @@ sai3-bench util ls az://myaccount/mycontainer/
 **Custom Endpoint Support for Google Cloud Storage**
 - Primary: `GCS_ENDPOINT_URL` (e.g., `http://localhost:4443`)
 - Alternative: `STORAGE_EMULATOR_HOST` (GCS emulator convention)
-- Enables use with fake-gcs-server, WarpIO, or other GCS-compatible emulators
+- Enables use with fake-gcs-server or other GCS-compatible emulators
 
 ```bash
 # fake-gcs-server (local emulator)
