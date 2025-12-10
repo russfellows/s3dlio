@@ -770,6 +770,11 @@ podman build -t s3dlio .
 - **🧪 Testing Guide**: [docs/TESTING-GUIDE.md](docs/TESTING-GUIDE.md)
 - **🚀 Performance**: [docs/performance/](docs/performance/)
 
+## 🔗 Related Projects
+
+- **[sai3-bench](https://github.com/russfellows/sai3-bench)** - Multi-protocol I/O benchmarking suite built on s3dlio
+- **[polarWarp](https://github.com/russfellows/polarWarp)** - Op-log analysis tool for parsing and visualizing s3dlio operation logs
+
 ## License
 
 Licensed under the Apache License 2.0 - see [LICENSE](LICENSE) file.
