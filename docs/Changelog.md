@@ -1,5 +1,56 @@
 # s3dlio Changelog
 
+## Version 0.9.26 - DLIO Benchmark Integration (December 2025)
+
+### 🆕 **New Features**
+
+**DLIO Benchmark Integration**
+- Added comprehensive integration support for [Argonne DLIO Benchmark](https://github.com/argonne-lcf/dlio_benchmark)
+- Two installation options:
+  - **Option 1 (Recommended):** New `storage_type: s3dlio` with explicit configuration
+  - **Option 2:** Drop-in replacement for existing S3 configurations
+- Enables DLIO to use all s3dlio backends: S3, Azure, GCS, file://, direct://
+
+**Zero-Copy Write Functions (Rust + Python)**
+- `put_bytes(uri, data)` - Write bytes to any backend using zero-copy from Python memory
+- `put_bytes_async(uri, data)` - Async version
+- `mkdir(uri)` - Create directories/prefixes via ObjectStore trait
+- `mkdir_async(uri)` - Async version
+- Uses `PyBytes.as_bytes()` for zero-copy data transfer, avoiding allocation overhead
+
+### 📦 **New Files**
+
+```
+python/s3dlio/integrations/dlio/
+├── __init__.py           # Helper functions for installation
+├── s3dlio_storage.py     # Option 1: S3dlioStorage class
+└── s3_torch_storage.py   # Option 2: Drop-in replacement
+
+docs/integration/
+└── DLIO_BENCHMARK_INTEGRATION.md  # Comprehensive guide (477 lines)
+```
+
+### 🔧 **Other Changes**
+
+**Azure SDK Update**
+- Updated from Azure SDK 0.4.0 to 0.7.0 API
+- Maintains backward compatibility with existing functionality
+
+### 📝 **Documentation**
+
+- Added `docs/integration/DLIO_BENCHMARK_INTEGRATION.md` - comprehensive guide with:
+  - Architecture diagram
+  - Step-by-step instructions for both integration options
+  - Environment variable configuration (S3/Azure/GCS)
+  - API mapping table (DLIO → s3dlio)
+  - Troubleshooting section
+  - Multi-protocol examples
+  - Advanced features (multi-endpoint load balancing, performance tuning)
+  - Feature compatibility table
+- Updated `docs/PYTHON_API_GUIDE.md` with new functions
+
+---
+
 ## Version 0.9.24 - S3-Compatible Endpoint Fix & Tracing Workaround (December 2025)
 
 ### 🐛 **Bug Fixes**

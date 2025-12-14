@@ -3,7 +3,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-175%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-175%2F175-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.24-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.26-blue)](https://github.com/russfellows/s3dlio/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
@@ -12,29 +12,32 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 ## 🌟 Latest Release
 
-### v0.9.24 - S3-Compatible Endpoint Fix & Tracing Workaround (December 2025)
+### v0.9.26 - DLIO Benchmark Integration (December 2025)
 
-**🐛 Bug Fixes:**
+**🆕 New Features:**
 
-**S3-Compatible Endpoint Support (force_path_style)**
-- Fixed S3 requests to custom endpoints (MinIO, Ceph, etc.)
-- Added `force_path_style(true)` to S3 config builder
-- Prevents virtual-hosted style addressing that doesn't work with custom endpoints
+**DLIO Benchmark Integration**
+- Added comprehensive integration support for [Argonne DLIO Benchmark](https://github.com/argonne-lcf/dlio_benchmark)
+- Two installation options:
+  - **Option 1 (Recommended):** New `storage_type: s3dlio` with explicit configuration
+  - **Option 2:** Drop-in replacement for existing S3 configurations
+- Enables DLIO to use all s3dlio backends: S3, Azure, GCS, file://, direct://
 
-**Tracing Hang Workaround**
-- Fixed hang when using verbose flags (`-v`, `-vv`) with `s3-cli`
-- Root cause: tracing `debug!()` macros inside `tokio::spawn` with AWS SDK operations cause indefinite hangs
-- Workaround: Use `RUST_LOG=warn,s3dlio=debug` to filter AWS SDK debug logging
+**Zero-Copy Write Functions**
+```python
+import s3dlio
 
-**📦 Python Examples & Project Organization:**
-- Added 6 comprehensive Python examples in `examples/python/`
-- Reorganized examples into `python/` and `rust/` subdirectories
-- Fixed op-log to capture ALL operations (GET/PUT/DELETE) via ObjectStore interface
+# Write bytes directly to any backend
+s3dlio.put_bytes("s3://bucket/file.bin", data)
 
-**⚠️ Known Issue:** Tracing debug macros inside `tokio::spawn` with AWS SDK operations can cause hangs.
-See [aws-sdk-rust#1388](https://github.com/awslabs/aws-sdk-rust/issues/1388). The CLI now applies a safe filter automatically.
+# Create directories/prefixes
+s3dlio.mkdir("s3://bucket/my-prefix/")
+```
 
-See [Changelog](docs/Changelog.md) for complete details.
+**Azure SDK Update**
+- Updated from Azure SDK 0.4.0 to 0.7.0 API
+
+See [Changelog](docs/Changelog.md) for complete details and [DLIO Integration Guide](docs/integration/DLIO_BENCHMARK_INTEGRATION.md) for setup instructions.
 
 ---
 
