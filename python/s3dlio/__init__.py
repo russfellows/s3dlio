@@ -18,7 +18,14 @@ from importlib import import_module
 import sys as _sys
 from typing import List  # avoid confusion with Rust-exported `list` symbol
 
-from .torch import S3MapDataset, S3IterableDataset
+# PyTorch integration (optional - only import if torch is available)
+try:
+    from .torch import S3MapDataset, S3IterableDataset
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+    S3MapDataset = None
+    S3IterableDataset = None
 
 # ------------------------------------------------------------------
 # 1) Import the native module and re-export *public* names
@@ -67,8 +74,16 @@ def stat_key(bucket: str, key: str) -> dict:
     return stat(f"s3://{bucket}/{key}")
 
 # ------------------------------------------------------------------
-# 3) high-level loaders (Rust engine only)
+# 3) high-level loaders (optional - only if frameworks are available)
 # ------------------------------------------------------------------
-from .torch  import S3IterableDataset     # noqa: E402
-from .jax_tf import S3JaxIterable, make_tf_dataset  # noqa: E402
+# PyTorch loaders - imported at top with try/except (S3MapDataset, S3IterableDataset)
+
+# JAX/TensorFlow loaders (optional)
+try:
+    from .jax_tf import S3JaxIterable, make_tf_dataset  # noqa: E402
+    _HAS_JAX_TF = True
+except ImportError:
+    _HAS_JAX_TF = False
+    S3JaxIterable = None
+    make_tf_dataset = None
 

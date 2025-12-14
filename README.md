@@ -3,25 +3,33 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-175%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-175%2F175-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.26-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.27-blue)](https://github.com/russfellows/s3dlio/releases)
+[![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
+## 📦 Installation
+
+```bash
+pip install s3dlio
+```
+
 ## 🌟 Latest Release
 
-### v0.9.26 - DLIO Benchmark Integration (December 2025)
+### v0.9.27 - PyPI Release & DLIO Integration (December 2025)
 
-**🆕 New Features:**
+**First PyPI Release** - s3dlio is now available via `pip install s3dlio`
 
-**DLIO Benchmark Integration**
-- Added comprehensive integration support for [Argonne DLIO Benchmark](https://github.com/argonne-lcf/dlio_benchmark)
+**🆕 DLIO Benchmark Integration**
+- Comprehensive integration support for [Argonne DLIO Benchmark](https://github.com/argonne-lcf/dlio_benchmark)
 - Two installation options:
   - **Option 1 (Recommended):** New `storage_type: s3dlio` with explicit configuration
   - **Option 2:** Drop-in replacement for existing S3 configurations
 - Enables DLIO to use all s3dlio backends: S3, Azure, GCS, file://, direct://
+- See [DLIO Integration Guide](docs/integration/DLIO_BENCHMARK_INTEGRATION.md) for setup instructions
 
 **Zero-Copy Write Functions**
 ```python
@@ -34,10 +42,11 @@ s3dlio.put_bytes("s3://bucket/file.bin", data)
 s3dlio.mkdir("s3://bucket/my-prefix/")
 ```
 
-**Azure SDK Update**
-- Updated from Azure SDK 0.4.0 to 0.7.0 API
+**Bug Fixes**
+- Fixed optional imports (no crash without PyTorch/JAX/TensorFlow)
+- Fixed `exists_async()` and `stat_async()` to work with all backends
 
-See [Changelog](docs/Changelog.md) for complete details and [DLIO Integration Guide](docs/integration/DLIO_BENCHMARK_INTEGRATION.md) for setup instructions.
+See [Changelog](docs/Changelog.md) for complete details.
 
 ---
 

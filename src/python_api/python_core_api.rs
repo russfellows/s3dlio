@@ -27,7 +27,6 @@ use crate::s3_utils::{
     list_objects as list_objects_rs, get_range as s3_get_range,
     parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
     create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs,
-    stat_object_uri_async,
     stat_object_many_async,
 };
 use crate::{generic_upload_files, generic_download_objects};
@@ -537,8 +536,11 @@ pub fn stat(py: Python<'_>, uri: &str) -> PyResult<PyObject> {
 #[pyfunction]
 fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
+    let logger = global_logger();
+    let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+    
     future_into_py(py, async move {
-        let os = stat_object_uri_async(&uri).await.map_err(py_err)?;
+        let os = store.stat(&uri).await.map_err(py_err)?;
         Python::with_gil(|py| {
             let obj: PyObject = stat_to_pydict(py, os)?.unbind().into();
             Ok::<PyObject, PyErr>(obj)
@@ -614,11 +616,15 @@ pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
 }
 
 /// Async version of exists()
+/// Works with all backends: S3, GCS, Azure, file://, direct://
 #[pyfunction]
 fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
+    let logger = global_logger();
+    let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+    
     future_into_py(py, async move {
-        match stat_object_uri_async(&uri).await {
+        match store.stat(&uri).await {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }

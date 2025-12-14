@@ -1,5 +1,37 @@
 # s3dlio Changelog
 
+## Version 0.9.27 - PyPI Release & Bug Fixes (December 2025)
+
+### 🆕 **First PyPI Release**
+
+s3dlio is now available on PyPI! Install with:
+```bash
+pip install s3dlio
+```
+
+### 🐛 **Bug Fixes**
+
+**Optional ML Framework Imports**
+- Fixed crash when importing s3dlio without PyTorch/JAX/TensorFlow installed
+- ML-specific loaders (S3MapDataset, S3IterableDataset, etc.) now return `None` if frameworks unavailable
+- Core storage functions work without any ML dependencies
+
+**Universal Backend Support for Async Functions**
+- Fixed `exists_async()` to work with all backends (was S3-only)
+- Fixed `stat_async()` to work with all backends (was S3-only)
+- Both now use the universal ObjectStore interface like their sync counterparts
+
+### 📦 **Package Metadata**
+
+- Added author information: Russ Fellows
+- Proper package metadata for PyPI listing
+
+### ⚠️ **Note**
+
+v0.9.26 was yanked from PyPI due to the import bug. Use v0.9.27.
+
+---
+
 ## Version 0.9.26 - DLIO Benchmark Integration (December 2025)
 
 ### 🆕 **New Features**
