@@ -8,7 +8,7 @@ use tokio::sync::OnceCell;
 
 use azure_core::credentials::TokenCredential;
 use azure_core::http::{Body, NoFormat, RequestContent, XmlFormat};
-use azure_identity::DefaultAzureCredential;
+use azure_identity::DeveloperToolsCredential;
 
 use azure_storage_blob::clients::{
     BlobClient, BlobClientOptions, BlobContainerClient, BlobContainerClientOptions, BlobServiceClient,
@@ -18,7 +18,7 @@ use azure_storage_blob::models::{
     BlobClientDownloadOptions, BlobClientGetPropertiesOptions, BlobClientGetPropertiesResultHeaders,
     BlobContainerClientListBlobFlatSegmentOptions, BlockBlobClientCommitBlockListOptions,
     BlockBlobClientStageBlockOptions, BlockBlobClientUploadOptions, BlockList, BlockListType,
-    BlockLookupList, ListBlobsFlatSegmentResponse,
+    BlockLookupList,
 };
 
 // Global credential cache to avoid repeated authentication
@@ -82,7 +82,7 @@ impl AzureBlob {
         let credential = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 AZURE_CREDENTIAL.get_or_try_init(|| async {
-                    let credential_arc = DefaultAzureCredential::new()?;
+                    let credential_arc = DeveloperToolsCredential::new(None)?;
                     let credential: Arc<dyn TokenCredential> = credential_arc;
                     Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
                 }).await
@@ -102,7 +102,7 @@ impl AzureBlob {
         let credential = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 AZURE_CREDENTIAL.get_or_try_init(|| async {
-                    let credential_arc = DefaultAzureCredential::new()?;
+                    let credential_arc = DeveloperToolsCredential::new(None)?;
                     let credential: Arc<dyn TokenCredential> = credential_arc;
                     Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
                 }).await
@@ -119,15 +119,19 @@ impl AzureBlob {
     /// Blob service (rarely needed directly).
     #[allow(dead_code)]
     fn service_client(&self) -> Result<BlobServiceClient> {
-        BlobServiceClient::new(&self.account_url, self.credential.clone(), Some(BlobServiceClientOptions::default()))
-            .map_err(|e| anyhow!(e))
+        BlobServiceClient::new(
+            &self.account_url,
+            Some(self.credential.clone()),
+            Some(BlobServiceClientOptions::default()),
+        )
+        .map_err(|e| anyhow!(e))
     }
 
     fn container_client(&self) -> Result<BlobContainerClient> {
         BlobContainerClient::new(
             &self.account_url,
-            self.container.clone(),
-            self.credential.clone(),
+            &self.container,
+            Some(self.credential.clone()),
             Some(BlobContainerClientOptions::default()),
         )
         .map_err(|e| anyhow!(e))
@@ -136,9 +140,9 @@ impl AzureBlob {
     fn blob_client(&self, blob: &str) -> Result<BlobClient> {
         BlobClient::new(
             &self.account_url,
-            self.container.clone(),
-            blob.to_string(),
-            self.credential.clone(),
+            &self.container,
+            blob,
+            Some(self.credential.clone()),
             Some(BlobClientOptions::default()),
         )
         .map_err(|e| anyhow!(e))
@@ -174,7 +178,7 @@ impl AzureBlob {
         };
         opts.range = Some(range);
         let resp = blob.download(Some(opts)).await?;
-        let body = resp.into_raw_body().collect().await?;
+        let body = resp.into_body().collect().await?;
         Ok(body)
     }
 
@@ -182,7 +186,7 @@ impl AzureBlob {
     pub async fn get(&self, key: &str) -> Result<Bytes> {
         let blob = self.blob_client(key)?;
         let resp = blob.download(Some(BlobClientDownloadOptions::default())).await?;
-        let body = resp.into_raw_body().collect().await?;
+        let body = resp.into_body().collect().await?;
         Ok(body)
     }
 
@@ -197,6 +201,7 @@ impl AzureBlob {
     }
 
     /// Flat list with optional prefix.
+    /// In SDK 0.7+, the Pager yields BlobItemInternal directly (not Response pages).
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
         let container = self.container_client()?;
         let mut opts = BlobContainerClientListBlobFlatSegmentOptions::default();
@@ -206,21 +211,18 @@ impl AzureBlob {
         let mut pager = container.list_blobs(Some(opts))?;
         let mut out = Vec::new();
 
-        while let Some(next) = pager.next().await {
-            let resp = next?; // Result<Response<...>>
-            let body: ListBlobsFlatSegmentResponse = resp.into_body().await?;
-            // In 0.4.0, `blob_items` is a Vec<BlobItemInternal>
-            for it in body.segment.blob_items {
-                // `name` is Option<BlobName>, and BlobName.content is Option<String>
-                if let Some(name) = it.name.and_then(|bn| bn.content) {
-                    out.push(name);
-                }
+        // In 0.7.0, pager yields Result<BlobItemInternal> directly
+        while let Some(item_result) = pager.next().await {
+            let item = item_result?;
+            // `name` is Option<BlobName>, and BlobName.content is Option<String>
+            if let Some(name) = item.name.and_then(|bn| bn.content) {
+                out.push(name);
             }
         }
         Ok(out)
     }
 
-    /// List blobs as a stream, yielding results page by page.
+    /// List blobs as a stream, yielding results one by one.
     /// This is more memory-efficient for large listings and enables progress updates.
     pub fn list_stream<'a>(
         &'a self,
@@ -248,26 +250,18 @@ impl AzureBlob {
                 }
             };
 
-            while let Some(next) = pager.next().await {
-                let resp = match next {
-                    Ok(r) => r,
-                    Err(e) => {
-                        yield Err(e.into());
-                        return;
-                    }
-                };
-                let body: ListBlobsFlatSegmentResponse = match resp.into_body().await {
-                    Ok(b) => b,
+            // In 0.7.0, pager yields Result<BlobItemInternal> directly
+            while let Some(item_result) = pager.next().await {
+                let item = match item_result {
+                    Ok(i) => i,
                     Err(e) => {
                         yield Err(e.into());
                         return;
                     }
                 };
                 
-                for it in body.segment.blob_items {
-                    if let Some(name) = it.name.and_then(|bn| bn.content) {
-                        yield Ok(name);
-                    }
+                if let Some(name) = item.name.and_then(|bn| bn.content) {
+                    yield Ok(name);
                 }
             }
         })
@@ -278,7 +272,7 @@ impl AzureBlob {
     pub async fn delete_objects(&self, blobs: &[String]) -> anyhow::Result<()> {
         let container = self.container_client()?;
         for name in blobs {
-            let b = container.blob_client(name.clone());
+            let b = container.blob_client(name);
             b.delete(None).await?;
         }
         Ok(())
@@ -303,21 +297,12 @@ impl AzureBlob {
     /// Commit previously staged block IDs (order matters).
     pub async fn commit_block_list(&self, key: &str, committed_block_ids: Vec<Vec<u8>>) -> Result<()> {
         let bb = self.block_blob_client(key)?;
-        /*
-         * Old
-         *
-        let lookup = BlockLookupList {
-            committed: Some(committed_block_ids),
-            latest: None,
-            uncommitted: None,
-        };
-        */
         let lookup = BlockLookupList {
             committed: None,
             latest: Some(committed_block_ids),
             uncommitted: None,
         };
-        let body: RequestContent<BlockLookupList, XmlFormat> = lookup.try_into()?; // TryInto is provided by SDK
+        let body: RequestContent<BlockLookupList, XmlFormat> = lookup.try_into()?;
         let _resp = bb
             .commit_block_list(body, Some(BlockBlobClientCommitBlockListOptions::default()))
             .await?;
@@ -328,7 +313,8 @@ impl AzureBlob {
     pub async fn get_block_list_committed(&self, key: &str) -> Result<Vec<Vec<u8>>> {
         let bb = self.block_blob_client(key)?;
         let resp = bb.get_block_list(BlockListType::Committed, None).await?;
-        let list: BlockList = resp.into_body().await?;
+        // In 0.7.0, Response::into_model() deserializes directly (not async)
+        let list: BlockList = resp.into_model()?;
         let mut out = Vec::new();
         if let Some(blocks) = list.committed_blocks {
             for b in blocks {
@@ -547,6 +533,3 @@ mod tests {
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
     }
 }
-
-
-
