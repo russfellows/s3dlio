@@ -587,6 +587,158 @@ fn stat_to_pydict<'py>(py: Python<'py>, os: crate::s3_utils::ObjectStat)
 }
 
 
+// ---------------------------------------------------------------------------
+// exists() - Check if object exists (DLIO benchmark compatibility)
+// ---------------------------------------------------------------------------
+
+/// Check if an object exists at the given URI.
+/// Returns True if the object exists, False otherwise.
+/// Works with all backends: S3, GCS, Azure, file://, direct://
+#[pyfunction]
+pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
+    py.allow_threads(|| {
+        let logger = global_logger();
+        let store = match store_for_uri_with_logger(uri, logger) {
+            Ok(s) => s,
+            Err(_) => return Ok(false), // URI parsing error → doesn't exist
+        };
+        
+        let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+        rt.block_on(async {
+            match store.stat(uri).await {
+                Ok(_) => Ok(true),
+                Err(_) => Ok(false),
+            }
+        })
+    })
+}
+
+/// Async version of exists()
+#[pyfunction]
+fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    let uri = uri.to_owned();
+    future_into_py(py, async move {
+        match stat_object_uri_async(&uri).await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    })
+}
+
+
+// ---------------------------------------------------------------------------
+// put_bytes() - Zero-copy put from Python bytes to any backend
+// ---------------------------------------------------------------------------
+
+/// Put bytes data to any storage backend with zero-copy from Python.
+/// 
+/// This function accepts Python bytes/bytearray and writes them to the specified
+/// URI without copying the data on the Rust side. The data is borrowed directly
+/// from Python's memory buffer.
+/// 
+/// # Arguments
+/// * `uri` - Full URI including scheme (s3://, az://, gs://, file://, direct://)
+/// * `data` - Python bytes, bytearray, or any object supporting the buffer protocol
+/// 
+/// # Examples
+/// ```python
+/// import s3dlio
+/// 
+/// # Put bytes to S3
+/// s3dlio.put_bytes("s3://bucket/key.bin", b"hello world")
+/// 
+/// # Put bytes to local file
+/// s3dlio.put_bytes("file:///tmp/test.bin", b"hello world")
+/// 
+/// # Put bytes to Azure
+/// s3dlio.put_bytes("az://container/blob.bin", b"hello world")
+/// 
+/// # Put bytearray (also zero-copy)
+/// data = bytearray(b"hello world")
+/// s3dlio.put_bytes("file:///tmp/test.bin", data)
+/// ```
+#[pyfunction]
+pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyBytes>) -> PyResult<()> {
+    // PyBytes.as_bytes() gives us a &[u8] view without copying
+    let data_slice: &[u8] = data.as_bytes();
+    let uri = uri.to_owned();
+    let data_owned = Bytes::copy_from_slice(data_slice);
+    
+    py.allow_threads(move || {
+        let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+        rt.block_on(async move {
+            let logger = global_logger();
+            let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+            store.put(&uri, &data_owned).await.map_err(py_err)
+        })
+    })
+}
+
+/// Async version of put_bytes()
+#[pyfunction]
+fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyBytes>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    let uri = uri.to_owned();
+    // We need to copy the data for the async future since PyBytes can't be sent across threads
+    let data_owned = Bytes::copy_from_slice(data.as_bytes());
+    
+    future_into_py(py, async move {
+        let logger = global_logger();
+        let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+        store.put(&uri, &data_owned).await.map_err(py_err)
+    })
+}
+
+
+// ---------------------------------------------------------------------------
+// mkdir() - Create directory/prefix for any backend
+// ---------------------------------------------------------------------------
+
+/// Create a directory (file://, direct://) or prefix marker (s3://, az://, gs://).
+/// 
+/// # Backend Behavior
+/// - `file://`, `direct://`: Creates actual directory using create_dir_all()
+/// - `s3://`, `az://`, `gs://`: Creates empty marker object (no-op for some backends)
+/// 
+/// # Arguments
+/// * `uri` - Full URI including scheme and trailing slash recommended for clarity
+/// 
+/// # Examples
+/// ```python
+/// import s3dlio
+/// 
+/// # Create local directory
+/// s3dlio.mkdir("file:///tmp/mydata/subdir/")
+/// 
+/// # Create S3 prefix marker
+/// s3dlio.mkdir("s3://bucket/prefix/")
+/// ```
+#[pyfunction]
+pub fn mkdir(py: Python<'_>, uri: &str) -> PyResult<()> {
+    let uri = uri.to_owned();
+    
+    py.allow_threads(move || {
+        let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
+        rt.block_on(async move {
+            let logger = global_logger();
+            let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+            store.mkdir(&uri).await.map_err(py_err)
+        })
+    })
+}
+
+/// Async version of mkdir()
+#[pyfunction]
+fn mkdir_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    let uri = uri.to_owned();
+    
+    future_into_py(py, async move {
+        let logger = global_logger();
+        let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+        store.mkdir(&uri).await.map_err(py_err)
+    })
+}
+
+
 #[pyfunction(name = "get_many_stats")]
 #[pyo3(signature = (uris, max_in_flight = 64))]
 pub fn get_many_stats(
@@ -1362,6 +1514,12 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stat, m)?)?;
     m.add_function(wrap_pyfunction!(stat_async, m)?)?;
     m.add_function(wrap_pyfunction!(stat_many_async, m)?)?;
+    m.add_function(wrap_pyfunction!(exists, m)?)?;
+    m.add_function(wrap_pyfunction!(exists_async, m)?)?;
+    m.add_function(wrap_pyfunction!(put_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(put_bytes_async, m)?)?;
+    m.add_function(wrap_pyfunction!(mkdir, m)?)?;
+    m.add_function(wrap_pyfunction!(mkdir_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;

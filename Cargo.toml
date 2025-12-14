@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.25"
+version = "0.9.26"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "AGPL-3.0"
@@ -31,9 +31,9 @@ aws-config         = "=1.8.11"
 aws-sdk-s3         = "=1.116.0"
 
 # Azure SDK crates (keep minor versions flexible; they evolve together)
-azure_core = { version = "0.27.0" }          # Response/Body, paging, errors
-azure_identity = { version = "0.27.0" }      # DefaultAzureCredential
-azure_storage_blob = { version = "0.4.0" }   # Blob/Container/BlockBlob clients
+azure_core = { version = "0.30" }          # Response/Body, paging, errors
+azure_identity = { version = "0.30" }      # DefaultAzureCredential
+azure_storage_blob = { version = "0.7" }   # Blob/Container/BlockBlob clients
 
 # Google Cloud Storage SDK - Two implementations available via feature flags:
 # - gcs-community: Community-maintained gcloud-storage (default, stable)

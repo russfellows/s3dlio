@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dlio-s3dlio-storage"
+version = "0.1.0"
+description = "s3dlio storage backend for Argonne DLIO Benchmark"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Signal65 / Futurum Group"}
+]
+maintainers = [
+    {name = "Russ Fellows"}
+]
+keywords = ["s3dlio", "dlio", "benchmark", "storage", "s3", "azure", "gcs", "ai", "ml"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Benchmark",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "s3dlio>=0.9.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "numpy>=1.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/russfellows/s3dlio"
+Documentation = "https://github.com/russfellows/s3dlio/blob/main/docs/integration/DLIO_BENCHMARK_INTEGRATION.md"
+Repository = "https://github.com/russfellows/s3dlio"
+Issues = "https://github.com/russfellows/s3dlio/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.md"]

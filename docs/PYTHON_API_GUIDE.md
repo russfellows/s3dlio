@@ -152,6 +152,26 @@ stats = await s3dlio.stat_many_async([
 ])
 ```
 
+### exists() - Check Object Existence
+
+Check if an object exists without downloading it:
+
+```python
+# Check single object
+if s3dlio.exists("s3://bucket/key"):
+    print("Object exists")
+    
+# Check before operation
+if not s3dlio.exists("s3://bucket/config.json"):
+    s3dlio.put("s3://bucket/config.json", b'{}')
+
+# Async version (returns coroutine)
+exists = await s3dlio.exists_async("s3://bucket/key")
+```
+
+**Note:** `exists()` uses `stat()` internally, so it's efficient for single checks.
+For bulk existence checks, consider using `stat_many_async()`.
+
 ### delete() - Remove Objects
 
 Delete objects from storage:
