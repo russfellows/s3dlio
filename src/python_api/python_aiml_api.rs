@@ -7,6 +7,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use bytes::Bytes;
 use pyo3::prelude::*;
 use pyo3::{PyObject, Bound};
 use pyo3::types::{PyAny, PyBytes, PyDict, PyDictMethods, PyList};
@@ -62,7 +63,7 @@ impl PyS3Dataset {
 // Generic dataset that works with all URI schemes
 #[pyclass]
 pub struct PyDataset {
-    inner: Arc<dyn Dataset<Item = Vec<u8>>>,
+    inner: Arc<dyn Dataset<Item = Bytes>>,
 }
 
 #[pymethods]
@@ -81,15 +82,16 @@ impl PyDataset {
     }
 
     /// Get an item by index (for map-style datasets) 
+    /// Returns a PyBytesView for zero-copy access
     fn get_item<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Py<PyAny>> {
         let inner = Arc::clone(&self.inner);
         let bound_result = future_into_py(py, async move {
             let data = inner.get(index).await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Python::with_gil(|py| {
-                // Bound<'py, PyBytes> -> Bound<'py, PyAny> -> Py<PyAny>
-                let obj: Py<PyAny> = PyBytes::new(py, &data).into_any().unbind();
-                Ok(obj)
+                // Return PyBytesView for zero-copy access
+                let view = PyBytesView::new(data);
+                Ok(Py::new(py, view)?.into_any())
             })
         })?;
         Ok(bound_result.unbind())
@@ -134,7 +136,7 @@ impl PyBytesAsyncDataLoader {
 
 #[pyclass]
 pub struct PyBytesAsyncDataLoaderIter {
-    rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Vec<u8>>, DatasetError>>>>,
+    rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Bytes>, DatasetError>>>>,
 }
 
 impl PyBytesAsyncDataLoaderIter {
@@ -143,7 +145,7 @@ impl PyBytesAsyncDataLoaderIter {
         dataset: PyDataset,
         opts: LoaderOptions,
     ) -> PyResult<Py<Self>> {
-        let (tx, rx) = mpsc::channel::<Result<Vec<Vec<u8>>, DatasetError>>(opts.prefetch.max(1));
+        let (tx, rx) = mpsc::channel::<Result<Vec<Bytes>, DatasetError>>(opts.prefetch.max(1));
 
         // Extract concurrency setting for concurrent batch fetching
         // Default to 8 workers if num_workers is 0
@@ -178,12 +180,13 @@ impl PyBytesAsyncDataLoaderIter {
                             join_set.spawn(async move {
                                 let _permit = sem.acquire().await.unwrap();
                                 let data = dataset_clone.inner.get(idx).await?;
-                                Ok::<(usize, Vec<u8>), DatasetError>((order, data))
+                                // Now returns Bytes directly - zero-copy!
+                                Ok::<(usize, Bytes), DatasetError>((order, data))
                             });
                         }
                         
                         // Collect results preserving order
-                        let mut batch_results: Vec<Option<Vec<u8>>> = vec![None; batch_indices.len()];
+                        let mut batch_results: Vec<Option<Bytes>> = vec![None; batch_indices.len()];
                         while let Some(result) = join_set.join_next().await {
                             match result {
                                 Ok(Ok((order, data))) => {
@@ -201,7 +204,7 @@ impl PyBytesAsyncDataLoaderIter {
                         }
                         
                         // Convert to batch (filter_map skips None, but all should be Some)
-                        let batch: Vec<Vec<u8>> = batch_results.into_iter()
+                        let batch: Vec<Bytes> = batch_results.into_iter()
                             .filter_map(|x| x)
                             .collect();
                         
@@ -229,11 +232,11 @@ impl PyBytesAsyncDataLoaderIter {
             match guard.recv().await {
                 Some(Ok(batch)) => {
                     Python::with_gil(|py| {
-                        // Always return list[bytes] for consistent type contract
-                        // This ensures PyTorch/JAX/TF pipelines get stable types
+                        // Return list of PyBytesView for zero-copy access
                         let py_list = PyList::empty(py);
                         for item in batch {
-                            py_list.append(PyBytes::new(py, &item))?;
+                            let view = PyBytesView::new(item);
+                            py_list.append(Py::new(py, view)?)?;
                         }
                         Ok(py_list.into_any().unbind())
                     })
@@ -249,7 +252,7 @@ impl PyBytesAsyncDataLoaderIter {
 // async loader over S3BytesDataset
 #[pyclass]
 pub struct PyS3AsyncDataLoader {
-    rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Vec<u8>>, DatasetError>>>>,
+    rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Bytes>, DatasetError>>>>,
 }
 
 
@@ -269,7 +272,7 @@ impl PyS3AsyncDataLoader {
 
         // Use the SAME options for DataLoader and for channel capacity.
         let (tx, rx) =
-            mpsc::channel::<Result<Vec<Vec<u8>>, DatasetError>>(o.prefetch.max(1));
+            mpsc::channel::<Result<Vec<Bytes>, DatasetError>>(o.prefetch.max(1));
 
         pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
             let loader = DataLoader::new(ds, o);
@@ -290,10 +293,13 @@ impl PyS3AsyncDataLoader {
             let mut guard = rx.lock().await;
             match guard.recv().await {
                 Some(Ok(batch)) => Python::with_gil(|py| {
-                    let out: Vec<Py<PyBytes>> = batch.into_iter()
-                        .map(|b| PyBytes::new(py, &b).unbind())
-                        .collect();
-                    // Vec<Py<PyBytes>> -> Py<PyAny> via IntoPyObjectExt
+                    // Return list of PyBytesView for zero-copy access
+                    let out: Vec<Py<PyAny>> = batch.into_iter()
+                        .map(|b| {
+                            let view = PyBytesView::new(b);
+                            Py::new(py, view).map(|p| p.into_any())
+                        })
+                        .collect::<PyResult<Vec<_>>>()?;
                     Ok(out.into_py_any(py)?)
                 }),
                 Some(Err(e)) => Err(PyRuntimeError::new_err(format!("{:?}", e))),

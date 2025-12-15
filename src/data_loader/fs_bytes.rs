@@ -3,6 +3,7 @@
 // FileSystem bytes dataset implementation that provides the same Dataset interface
 // for local file operations as S3BytesDataset does for S3 operations.
 
+use bytes::Bytes;
 use crate::data_loader::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, ReaderMode};
 use async_trait::async_trait;
@@ -105,10 +106,11 @@ impl FileSystemBytesDataset {
             .ok_or_else(|| DatasetError::from(format!("Index {} out of bounds (dataset has {} files)", index, self.files.len())))
     }
 
-    /// Read entire file contents
-    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, DatasetError> {
-        tokio::fs::read(path).await
-            .map_err(|e| DatasetError::from(format!("Failed to read file {}: {}", path.display(), e)))
+    /// Read entire file contents - returns Bytes for zero-copy
+    async fn read_file(&self, path: &Path) -> Result<Bytes, DatasetError> {
+        let data = tokio::fs::read(path).await
+            .map_err(|e| DatasetError::from(format!("Failed to read file {}: {}", path.display(), e)))?;
+        Ok(Bytes::from(data))
     }
 
 
@@ -116,7 +118,7 @@ impl FileSystemBytesDataset {
 
 #[async_trait]
 impl Dataset for FileSystemBytesDataset {
-    type Item = Vec<u8>;
+    type Item = Bytes;
 
     fn len(&self) -> Option<usize> {
         Some(self.files.len())

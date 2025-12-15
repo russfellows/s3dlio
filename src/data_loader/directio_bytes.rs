@@ -3,6 +3,7 @@
 // Direct I/O bytes dataset implementation that provides the same Dataset interface
 // for local file operations using O_DIRECT as S3BytesDataset does for S3 operations.
 
+use bytes::Bytes;
 use crate::data_loader::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, ReaderMode};
 use crate::object_store::store_for_uri;
@@ -99,21 +100,20 @@ impl DirectIOBytesDataset {
             .ok_or_else(|| DatasetError::from(format!("Index {} out of bounds (dataset has {} files)", index, self.files.len())))
     }
 
-    /// Read entire file contents using Direct I/O object store
-    async fn read_file(&self, uri: &str) -> Result<Vec<u8>, DatasetError> {
+    /// Read entire file contents using Direct I/O object store - returns Bytes for zero-copy
+    async fn read_file(&self, uri: &str) -> Result<Bytes, DatasetError> {
         let store = store_for_uri(uri)
             .map_err(|e| DatasetError::from(format!("Failed to create Direct I/O store: {}", e)))?;
         
-        // Convert Bytes to Vec<u8> for Dataset API compatibility
+        // Return Bytes directly - zero-copy!
         store.get(uri).await
-            .map(|bytes| bytes.to_vec())
             .map_err(|e| DatasetError::from(format!("Failed to read file with Direct I/O {}: {}", uri, e)))
     }
 }
 
 #[async_trait]
 impl Dataset for DirectIOBytesDataset {
-    type Item = Vec<u8>;
+    type Item = Bytes;
 
     fn len(&self) -> Option<usize> {
         Some(self.files.len())

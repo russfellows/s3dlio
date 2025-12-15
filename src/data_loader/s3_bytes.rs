@@ -3,6 +3,7 @@
 
 // src/data_loader/s3_bytes.rs
 //
+use bytes::Bytes;
 use crate::s3_utils::{
     parse_s3_uri,
     get_object_uri_async,
@@ -54,7 +55,7 @@ impl S3BytesDataset {
 
 #[async_trait]
 impl Dataset for S3BytesDataset {
-    type Item = Vec<u8>;
+    type Item = Bytes;
 
     fn len(&self) -> Option<usize> { Some(self.keys.len()) }
 
@@ -73,14 +74,14 @@ impl Dataset for S3BytesDataset {
                 let bytes = get_object_uri_async(&uri)
                     .await
                     .map_err(DatasetError::from)?;
-                // Convert Bytes to Vec<u8> for Dataset API compatibility
-                Ok(bytes.to_vec())
+                // Return Bytes directly - zero-copy!
+                Ok(bytes)
             }
             ReaderMode::Range => {
                 // HEAD to learn size
                 let meta = stat_object_uri_async(&uri).await.map_err(DatasetError::from)?;
                 let size = meta.size;
-                if size == 0 { return Ok(Vec::new()); }
+                if size == 0 { return Ok(Bytes::new()); }
                 let part = self.part_size.max(1) as u64;
                 let n_parts = ((size + part - 1) / part) as usize;
                 let max_inflight = self.max_inflight_parts.max(1);
@@ -103,7 +104,7 @@ impl Dataset for S3BytesDataset {
                     // Extend Vec with bytes from Bytes
                     out.extend_from_slice(&bytes);
                 }
-                Ok(out)
+                Ok(Bytes::from(out))
             }
         }
     }
