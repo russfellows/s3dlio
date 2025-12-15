@@ -11,6 +11,7 @@ use pyo3::{PyObject, Bound};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3_async_runtimes::tokio::future_into_py;
+use pyo3::ffi;
 use bytes::Bytes;
 
 use tokio::task;
@@ -65,13 +66,22 @@ impl PyBytesView {
         PyBytes::new(py, &self.bytes)
     }
     
-    /// Get a memoryview (zero-copy readonly access)
-    fn memoryview<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
-        // Create a memoryview from our data
-        // Note: This creates a Python memoryview object that references our Bytes
-        let bytes_obj = PyBytes::new(py, &self.bytes);
-        let memoryview_class = py.import("builtins")?.getattr("memoryview")?;
-        Ok(memoryview_class.call1((bytes_obj,))?.into())
+    /// Get a memoryview (TRUE zero-copy readonly access)
+    /// Uses PyMemoryView_FromMemory from the Python C API to create a memoryview
+    /// that directly references the Rust Bytes buffer without copying.
+    fn memoryview(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let ptr = self.bytes.as_ptr() as *mut i8;
+        let len = self.bytes.len() as isize;
+        
+        // PyBUF_READ = 0x100 (read-only buffer)
+        let raw_mv = unsafe { ffi::PyMemoryView_FromMemory(ptr, len, ffi::PyBUF_READ) };
+        if raw_mv.is_null() {
+            // If something went wrong, fetch and return the Python exception
+            Err(PyErr::fetch(py))
+        } else {
+            // Convert the raw pointer into a safe Py<PyAny> object
+            Ok(unsafe { Py::from_owned_ptr(py, raw_mv) })
+        }
     }
     
     /// Convert to Python bytes (copy)

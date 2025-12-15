@@ -119,6 +119,18 @@ impl Dataset for DirectIOBytesDataset {
         Some(self.files.len())
     }
 
+    fn keys(&self) -> Option<Vec<String>> {
+        // Return just the filenames, stripping the direct:// prefix and path
+        Some(self.files.iter()
+            .filter_map(|uri| {
+                // Strip "direct://" prefix and get just the filename
+                uri.strip_prefix("direct://")
+                    .and_then(|p| Path::new(p).file_name())
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .collect())
+    }
+
     async fn get(&self, index: usize) -> Result<Self::Item, DatasetError> {
         let uri = self.get_file_uri(index)?;
         

@@ -58,6 +58,10 @@ impl Dataset for S3BytesDataset {
 
     fn len(&self) -> Option<usize> { Some(self.keys.len()) }
 
+    fn keys(&self) -> Option<Vec<String>> {
+        Some(self.keys.clone())
+    }
+
     async fn get(&self, idx: usize) -> Result<Self::Item, DatasetError> {
         let key = self.keys.get(idx)
             .ok_or(DatasetError::IndexOutOfRange(idx))?;

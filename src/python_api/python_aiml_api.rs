@@ -95,11 +95,10 @@ impl PyDataset {
         Ok(bound_result.unbind())
     }
 
-    /// Return list of keys if supported (for debugging S3 datasets)
+    /// Return list of keys if supported (for map-style datasets)
     fn keys(&self) -> PyResult<Vec<String>> {
-        // This is a bit of a hack - we try to downcast to S3BytesDataset
-        // TODO: Make this more elegant with a proper trait
-        Err(PyRuntimeError::new_err("keys() not supported for generic datasets yet"))
+        self.inner.keys()
+            .ok_or_else(|| PyRuntimeError::new_err("keys() not supported for this dataset type"))
     }
 }
 

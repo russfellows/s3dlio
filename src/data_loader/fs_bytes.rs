@@ -122,6 +122,14 @@ impl Dataset for FileSystemBytesDataset {
         Some(self.files.len())
     }
 
+    fn keys(&self) -> Option<Vec<String>> {
+        // Return file paths as strings (just the filename, not full path)
+        Some(self.files.iter()
+            .filter_map(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect())
+    }
+
     async fn get(&self, index: usize) -> Result<Self::Item, DatasetError> {
         let path = self.get_file_path(index)?;
         
