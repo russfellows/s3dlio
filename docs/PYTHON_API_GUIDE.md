@@ -285,9 +285,6 @@ data = s3dlio.get("gs://testbucket/testkey")
 s3dlio.create_bucket("my-bucket")
 s3dlio.delete_bucket("my-bucket")
 
-# S3-specific list (returns keys only, not full URIs)
-keys = s3dlio.list_objects("s3://bucket/prefix/")  # DEPRECATED
-
 # Multi-process GET for maximum throughput
 result = s3dlio.mp_get(
     uri="s3://bucket/prefix/",
@@ -1307,17 +1304,18 @@ for batch in loader:
 
 ## Migration from v0.8.x
 
-### Deprecated Functions
+### Removed Functions (v0.9.30+)
 
-| Old (v0.8.x) | New (v0.9.x) | Notes |
-|--------------|--------------|-------|
-| `list_objects(uri)` | `list(uri)` | Returns full URIs |
-| `get_object(uri)` | `get(uri)` | Unified interface |
-| `stat_object(uri)` | `stat(uri)` | Unified interface |
+The following S3-specific functions have been **removed** in favor of universal alternatives:
 
-### Backward Compatibility
+| Removed (v0.8.x) | Replacement (v0.9.x+) | Notes |
+|------------------|----------------------|-------|
+| `list_objects(bucket, prefix)` | `list(uri)` | Returns full URIs, works with all backends |
+| `get_object(bucket, key, offset, length)` | `get(uri)` or `get_range(uri, offset, length)` | Works with all backends |
 
-v0.9.x maintains backward compatibility. Old functions still work but are deprecated.
+### Why?
+
+s3dlio treats all storage protocols equally. The removed functions were S3-specific, which contradicted the library's design principle of protocol-agnostic storage access.
 
 ---
 

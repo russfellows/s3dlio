@@ -1,5 +1,66 @@
 # s3dlio Changelog
 
+## Version 0.9.30 - Zero-Copy Refactor & PyO3 0.27 (December 2025)
+
+### 🆕 **Zero-Copy Architecture**
+
+**True Zero-Copy Data Path**
+- Refactored entire read path to use `bytes::Bytes` throughout the stack
+- Eliminated intermediate allocations between storage backends and Python
+- `BytesView` wrapper provides direct access to storage data without copying
+
+**Python Buffer Protocol**
+- Implemented `__getbuffer__` / `__releasebuffer__` for `BytesView` class
+- Enables true zero-copy access via `memoryview(data)`
+- Compatible with NumPy, PyTorch, and other frameworks that use buffer protocol
+
+```python
+import s3dlio
+
+# Zero-copy read - data stays in same memory location
+data = s3dlio.get("s3://bucket/file.bin")
+view = memoryview(data)  # No copy! Direct buffer access
+arr = np.frombuffer(view, dtype=np.float32)  # Still no copy
+```
+
+### 🔄 **PyO3 0.27 Migration**
+
+- Upgraded PyO3 from 0.25 to 0.27.2
+- Updated all APIs to use non-deprecated patterns:
+  - `Python::attach()` (was `Python::with_gil`)
+  - `py.detach()` (was `py.allow_threads`)
+  - `Py<PyAny>` (was `PyObject`)
+  - `.cast()` (was `.downcast()`)
+- Updated dependencies: pyo3-async-runtimes 0.27.0, numpy 0.27.1
+
+### 🧹 **API Cleanup: Protocol Equality**
+
+**Removed S3-Specific Public APIs**
+- All storage protocols now treated equally (S3, Azure, GCS, file://, direct://)
+- Internal S3 functions changed from `pub fn` to `pub(crate) fn`
+- Removed deprecated Python functions:
+  - `list_objects(bucket, prefix)` → Use `list(uri)`
+  - `get_object(bucket, key, offset, length)` → Use `get(uri)` or `get_range(uri, offset, length)`
+
+**CLI: `list` is Now a True Alias for `ls`**
+- Both commands execute identical code paths
+- All protocols supported: `s3://`, `az://`, `gs://`, `file://`, `direct://`
+- Same options available: `-r`, `-p`, `-c`
+
+```bash
+s3dlio ls s3://bucket/prefix/ -r     # Works
+s3dlio list az://container/path/ -r  # Also works - same command
+```
+
+### 📦 **Technical Details**
+
+- **Branch:** fix/multi-backend-zero-copy
+- **Files changed:** 12
+- **Tests:** 175 Rust tests passing, Python tests passing
+- **Warnings:** Zero compiler warnings
+
+---
+
 ## Version 0.9.27 - PyPI Release & Bug Fixes (December 2025)
 
 ### 🆕 **First PyPI Release**
