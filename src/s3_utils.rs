@@ -11,9 +11,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 //use aws_sdk_s3::primitives::ByteStream;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 #[cfg(feature = "extension-module")]
-use pyo3::{FromPyObject, Bound, PyAny, PyResult};
-#[cfg(feature = "extension-module")]
-use pyo3::types::PyAnyMethods;
+use pyo3::{FromPyObject, PyAny};
 use std::sync::Arc;
 use std::collections::HashMap;
 use regex::Regex;

@@ -7,7 +7,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods};
-use pyo3::{PyObject, Bound};
+use pyo3::Bound;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3_async_runtimes::tokio::future_into_py;
@@ -237,12 +237,12 @@ pub fn mp_get(
     jobs: usize,
     num: usize,
     template: &str,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     use crate::mp::{MpGetConfigBuilder, run_get_shards};
     use std::io::Write;
     use tempfile::NamedTempFile;
     
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         // Parse S3 URI
         let (bucket, key_prefix) = parse_s3_uri(uri).map_err(py_err)?;
         
@@ -407,7 +407,7 @@ fn str_to_data_gen_mode(s: &str) -> DataGenMode {
 ///     >>> parse_s3_uri_full("s3://192.168.100.1:9001/mybucket/data.bin")
 ///     {'endpoint': '192.168.100.1:9001', 'bucket': 'mybucket', 'key': 'data.bin'}
 #[pyfunction]
-fn parse_s3_uri_full(py: Python<'_>, uri: &str) -> PyResult<PyObject> {
+fn parse_s3_uri_full(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
     use crate::s3_utils::parse_s3_uri_full as parse_full;
     
     let components = parse_full(uri).map_err(py_err)?;
@@ -474,7 +474,7 @@ pub fn create_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
         .to_string(); // Own the string to move it across the thread boundary
 
     // Release the GIL to allow other Python threads to run
-    py.allow_threads(move || {
+    py.detach(move || {
         create_bucket_rs(&final_bucket_name).map_err(py_err)
     })
 }
@@ -490,7 +490,7 @@ pub fn delete_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
         .to_string(); // Own the string to move across the thread boundary
 
     // Release the GIL for the blocking S3 call
-    py.allow_threads(move || {
+    py.detach(move || {
         delete_bucket_rs(&final_bucket_name).map_err(py_err)
     })
 }
@@ -525,7 +525,7 @@ pub fn put(
         .with_data_gen_algorithm(algorithm)
         .with_data_gen_mode(mode)
         .with_chunk_size(chunk_size);
-    py.allow_threads(|| {
+    py.detach(|| {
         if should_create_bucket { let _ = create_bucket_rs(&bucket); }
         put_objects_with_random_data_and_type(&uris, sz, jobs, config)
             .map_err(py_err)
@@ -568,7 +568,7 @@ pub (crate) fn put_async_py<'p>(
         })
         .await
         .map_err(py_err)??;
-        Python::with_gil(|py| Ok(py.None()))
+        Python::attach(|py| Ok(py.None()))
     })
 }
 
@@ -601,7 +601,7 @@ pub fn list(uri: &str, recursive: bool, pattern: Option<&str>) -> PyResult<Vec<S
 // New stat calls, almost the same ????
 //
 #[pyfunction]
-pub fn stat(py: Python<'_>, uri: &str) -> PyResult<PyObject> {
+pub fn stat(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
     // Universal stat using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger).map_err(py_err)?;
@@ -624,9 +624,9 @@ fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAn
     
     future_into_py(py, async move {
         let os = store.stat(&uri).await.map_err(py_err)?;
-        Python::with_gil(|py| {
-            let obj: PyObject = stat_to_pydict(py, os)?.unbind().into();
-            Ok::<PyObject, PyErr>(obj)
+        Python::attach(|py| {
+            let obj: Py<PyAny> = stat_to_pydict(py, os)?.unbind().into();
+            Ok::<Py<PyAny>, PyErr>(obj)
         })
     })
 }
@@ -635,13 +635,13 @@ fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAn
 fn stat_many_async<'py>(py: Python<'py>, uris: Vec<String>) -> PyResult<pyo3::Bound<'py, PyAny>> {
     future_into_py(py, async move {
         let metas = stat_object_many_async(uris).await.map_err(py_err)?;
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let list = PyList::empty(py);
             for os in metas {
                 // append accepts any IntoPyObject<'py>; Bound<'py, PyDict> works directly
                 list.append(stat_to_pydict(py, os)?)?;
             }
-            Ok::<PyObject, PyErr>(list.unbind().into())
+            Ok::<Py<PyAny>, PyErr>(list.unbind().into())
         })
     })
 }
@@ -681,7 +681,7 @@ fn stat_to_pydict<'py>(py: Python<'py>, os: crate::s3_utils::ObjectStat)
 /// Works with all backends: S3, GCS, Azure, file://, direct://
 #[pyfunction]
 pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
-    py.allow_threads(|| {
+    py.detach(|| {
         let logger = global_logger();
         let store = match store_for_uri_with_logger(uri, logger) {
             Ok(s) => s,
@@ -753,7 +753,7 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyBytes>) -> PyResu
     let uri = uri.to_owned();
     let data_owned = Bytes::copy_from_slice(data_slice);
     
-    py.allow_threads(move || {
+    py.detach(move || {
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(async move {
             let logger = global_logger();
@@ -805,7 +805,7 @@ fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyBytes>) -
 pub fn mkdir(py: Python<'_>, uri: &str) -> PyResult<()> {
     let uri = uri.to_owned();
     
-    py.allow_threads(move || {
+    py.detach(move || {
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(async move {
             let logger = global_logger();
@@ -835,7 +835,7 @@ pub fn get_many_stats(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<(usize, usize)> {
-    py.allow_threads(|| {
+    py.detach(|| {
         let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
         let total: usize = res.iter().map(|(_, b)| b.len()).sum();
         Ok((res.len(), total))
@@ -858,7 +858,7 @@ pub fn get_many_stats_async<'p>(
         .await
         .map_err(py_err)??;
 
-        Python::with_gil(|py| (count, total).into_py_any(py))
+        Python::attach(|py| (count, total).into_py_any(py))
     })
 }
 
@@ -878,7 +878,7 @@ pub (crate) fn get_many_async_py<'p>(
         .await
         .map_err(py_err)??;
 
-        Python::with_gil(|_py| {
+        Python::attach(|_py| {
             let out = pairs.into_iter()
                 .map(|(u, b)| (u, PyBytesView::new(b)))
                 .collect::<Vec<_>>();
@@ -890,7 +890,7 @@ pub (crate) fn get_many_async_py<'p>(
 #[pyfunction]
 pub fn get(py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
     // Use universal ObjectStore API for all backends (with op-log support)
-    py.allow_threads(|| {
+    py.detach(|| {
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(async {
             let logger = global_logger();
@@ -906,7 +906,7 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
 #[pyo3(signature = (uri, offset, length = None))]
 pub fn get_range_py(py: Python<'_>, uri: &str, offset: u64, length: Option<u64>) -> PyResult<PyBytesView> {
     // Use universal ObjectStore interface for range requests
-    py.allow_threads(|| {
+    py.detach(|| {
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(async {
             let logger = global_logger();
@@ -930,7 +930,7 @@ pub fn download(
     let dir = PathBuf::from(dest_dir);
     // The `download_objects` function in `s3_copy.rs` needs a `recursive` flag.
     // We'll assume for now it has been added.
-    py.allow_threads(move || {
+    py.detach(move || {
         // Use the new generic download function that works with all backends
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(generic_download_objects(src_uri, &dir, max_in_flight, recursive, None)).map_err(py_err)
@@ -951,7 +951,7 @@ pub fn get_many(
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::sync::Arc;
     
-    py.allow_threads(|| {
+    py.detach(|| {
         // Check all URIs are the same scheme
         let schemes: Vec<_> = uris.iter().map(|u| infer_scheme(u)).collect();
         let first_scheme = schemes.first().ok_or_else(|| {
@@ -1075,7 +1075,7 @@ pub fn get_many(
 #[pyo3(signature = (uri, recursive = false))]
 pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
     // Use universal ObjectStore API for deletion (with op-log support)
-    py.allow_threads(|| {
+    py.detach(|| {
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(async {
             let logger = global_logger();
@@ -1118,7 +1118,7 @@ pub fn upload(
     create_bucket: bool,
 ) -> PyResult<()> {
     let paths: Vec<PathBuf> = src_patterns.into_iter().map(PathBuf::from).collect();
-    py.allow_threads(|| {
+    py.detach(|| {
         // Use the new generic upload function that works with all backends
         let rt = tokio::runtime::Runtime::new().map_err(py_err)?;
         rt.block_on(async {
@@ -1231,7 +1231,7 @@ impl PyObjectWriter {
     /// Finalize the writer and complete the upload
     fn finalize(&mut self, py: Python<'_>) -> PyResult<(u64, u64)> {
         if let Some(writer) = self.inner.take() {
-            py.allow_threads(|| {
+            py.detach(|| {
                 pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
                     let stats = (writer.bytes_written(), writer.compressed_bytes());
                     writer.finalize().await.map_err(py_err)?;
@@ -1279,7 +1279,7 @@ impl PyObjectWriter {
 pub fn create_s3_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
     let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
     
-    py.allow_threads(|| {
+    py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
             let store = S3ObjectStore::new();
             let writer = store.create_writer(&uri, opts).await
@@ -1295,7 +1295,7 @@ pub fn create_s3_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOp
 pub fn create_azure_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
     let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
     
-    py.allow_threads(|| {
+    py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
             let store = AzureObjectStore::new();
             let writer = store.create_writer(&uri, opts).await
@@ -1311,7 +1311,7 @@ pub fn create_azure_writer(py: Python<'_>, uri: String, options: Option<&PyWrite
 pub fn create_filesystem_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
     let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
     
-    py.allow_threads(|| {
+    py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
             let store = FileSystemObjectStore::new();
             let writer = store.create_writer(&uri, opts).await
@@ -1327,7 +1327,7 @@ pub fn create_filesystem_writer(py: Python<'_>, uri: String, options: Option<&Py
 pub fn create_direct_filesystem_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
     let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
     
-    py.allow_threads(|| {
+    py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
             let store = ConfigurableFileSystemObjectStore::new(Default::default());
             let writer = store.create_writer(&uri, opts).await
@@ -1363,7 +1363,7 @@ impl PyMultiEndpointStore {
             let data = store.get(&uri).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Get failed: {}", e)))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::with_gil(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
         })
     }
     
@@ -1382,7 +1382,7 @@ impl PyMultiEndpointStore {
             let data = store.get_range(&uri, offset, length).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Get range failed: {}", e)))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
-            Python::with_gil(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
         })
     }
     
@@ -1430,7 +1430,7 @@ impl PyMultiEndpointStore {
     }
     
     /// Get per-endpoint statistics
-    fn get_endpoint_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn get_endpoint_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let stats = self.store.get_all_stats();
         let list = PyList::empty(py);
         
@@ -1449,7 +1449,7 @@ impl PyMultiEndpointStore {
     }
     
     /// Get total aggregated statistics across all endpoints
-    fn get_total_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn get_total_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let total = self.store.get_total_stats();
         let dict = PyDict::new(py);
         

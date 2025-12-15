@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 use pyo3::prelude::*;
-use pyo3::{PyObject, Bound};
+use pyo3::Bound;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyDictMethods, PyList};
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::conversion::IntoPyObjectExt;
@@ -88,7 +88,7 @@ impl PyDataset {
         let bound_result = future_into_py(py, async move {
             let data = inner.get(index).await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 // Return PyBytesView for zero-copy access
                 let view = PyBytesView::new(data);
                 Ok(Py::new(py, view)?.into_any())
@@ -231,7 +231,7 @@ impl PyBytesAsyncDataLoaderIter {
             let mut guard = rx.lock().await;
             match guard.recv().await {
                 Some(Ok(batch)) => {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         // Return list of PyBytesView for zero-copy access
                         let py_list = PyList::empty(py);
                         for item in batch {
@@ -292,7 +292,7 @@ impl PyS3AsyncDataLoader {
         let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
             match guard.recv().await {
-                Some(Ok(batch)) => Python::with_gil(|py| {
+                Some(Ok(batch)) => Python::attach(|py| {
                     // Return list of PyBytesView for zero-copy access
                     let out: Vec<Py<PyAny>> = batch.into_iter()
                         .map(|b| {
@@ -691,7 +691,7 @@ impl PyAsyncDataLoaderIter {
         let bound_result = future_into_py(py, async move {
             let mut guard = rx.lock().await;
             match guard.recv().await {
-                Some(Ok(batch)) => Python::with_gil(|py| batch.into_py_any(py)),
+                Some(Ok(batch)) => Python::attach(|py| batch.into_py_any(py)),
                 Some(Err(e))    => Err(PyRuntimeError::new_err(format!("{:?}", e))),
                 None            => Err(PyStopAsyncIteration::new_err("end of loader")),
             }
@@ -764,7 +764,7 @@ impl PyCheckpointStore {
         epoch: u64,
         framework: String,
         data: &[u8],
-        user_meta: Option<PyObject>,
+        user_meta: Option<Py<PyAny>>,
     ) -> PyResult<String> {
         let user_meta = user_meta.map(|_obj| {
             // For now, just use null for user metadata
@@ -775,7 +775,7 @@ impl PyCheckpointStore {
         let inner = self.inner.clone();
         let data = data.to_vec();
 
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime.block_on(async {
                 let store = inner.lock().await;
                 store.save(step, epoch, &framework, &data, user_meta).await
@@ -785,24 +785,24 @@ impl PyCheckpointStore {
 
     /// Load the latest checkpoint
     #[pyo3(text_signature = "(self)")]
-    fn load_latest(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn load_latest(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let inner = self.inner.clone();
 
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime.block_on(async {
                 let store = inner.lock().await;
                 store.load_latest().await
             })
         }).map_err(|e| PyRuntimeError::new_err(format!("Load failed: {}", e)))
-        .map(|opt_data| opt_data.map(|data| Python::with_gil(|py| PyBytesView::new(data).into_py_any(py).unwrap())))
+        .map(|opt_data| opt_data.map(|data| Python::attach(|py| PyBytesView::new(data).into_py_any(py).unwrap())))
     }
 
     /// List available checkpoints
     #[pyo3(text_signature = "(self)")]
-    fn list_checkpoints(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+    fn list_checkpoints(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let inner = self.inner.clone();
 
-        let infos = py.allow_threads(|| {
+        let infos = py.detach(|| {
             self.runtime.block_on(async {
                 let store = inner.lock().await;
                 store.list_checkpoints().await
@@ -819,7 +819,7 @@ impl PyCheckpointStore {
     fn delete_checkpoint(&self, py: Python<'_>, step: u64) -> PyResult<bool> {
         let inner = self.inner.clone();
 
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime.block_on(async {
                 let store = inner.lock().await;
                 store.delete_checkpoint(step).await
@@ -883,7 +883,7 @@ impl PyCheckpointStream {
             let _epoch = self.epoch; // May be used in future for enhanced metadata
             let _framework = self.framework.clone(); // May be used in future for enhanced metadata
 
-            let (writer, key) = py.allow_threads(|| {
+            let (writer, key) = py.detach(|| {
                 self.runtime.block_on(async {
                     let store_guard = store.lock().await;
                     let ckpt_writer = store_guard.writer(world_size, rank);
@@ -901,7 +901,7 @@ impl PyCheckpointStream {
 
         // Write the chunk
         if let Some(ref mut writer) = self.writer {
-            py.allow_threads(|| {
+            py.detach(|| {
                 self.runtime.block_on(async {
                     writer.write_chunk(data).await
                 })
@@ -921,7 +921,7 @@ impl PyCheckpointStream {
 
     /// Finalize the stream and return shard metadata
     #[pyo3(text_signature = "(self)")]
-    fn finalize(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+    fn finalize(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if self.finalized {
             return Err(PyRuntimeError::new_err("Stream already finalized"));
         }
@@ -933,7 +933,7 @@ impl PyCheckpointStream {
             let step = self.step;
             let epoch = self.epoch;
 
-            let shard_meta = py.allow_threads(|| {
+            let shard_meta = py.detach(|| {
                 self.runtime.block_on(async {
                     // Finalize the writer
                     writer.finalize().await?;
@@ -971,7 +971,7 @@ impl PyCheckpointStream {
     #[pyo3(text_signature = "(self)")]
     fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(writer) = self.writer.take() {
-            py.allow_threads(|| {
+            py.detach(|| {
                 self.runtime.block_on(async {
                     writer.cancel().await
                 })
@@ -1005,13 +1005,13 @@ impl PyCheckpointWriter {
         epoch: u64,
         framework: String,
         data: &[u8],
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let store = self.store.clone();
         let data = data.to_vec();
         let world_size = self.world_size;
         let rank = self.rank;
 
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime.block_on(async {
                 let store_guard = store.lock().await;
                 let writer = store_guard.writer(world_size, rank);
@@ -1070,8 +1070,8 @@ impl PyCheckpointWriter {
         step: u64,
         epoch: u64,
         framework: String,
-        shard_metas: Vec<PyObject>,
-        user_meta: Option<PyObject>,
+        shard_metas: Vec<Py<PyAny>>,
+        user_meta: Option<Py<PyAny>>,
     ) -> PyResult<String> {
         let user_meta = user_meta.map(|_obj| {
             // For now, just use null for user metadata
@@ -1082,7 +1082,7 @@ impl PyCheckpointWriter {
         // Convert shard metas from Python objects
         let mut shards = Vec::new();
         for shard_obj in shard_metas {
-            let dict = shard_obj.downcast_bound::<PyDict>(py)
+            let dict = shard_obj.cast_bound::<PyDict>(py)
                 .map_err(|_| PyRuntimeError::new_err("Shard meta must be a dict"))?;
 
             let rank = dict.get_item("rank")?
@@ -1109,7 +1109,7 @@ impl PyCheckpointWriter {
         let world_size = self.world_size;
         let rank = self.rank;
 
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime.block_on(async {
                 use crate::checkpoint::KeyLayout;
                 let layout = KeyLayout::new(
@@ -1142,10 +1142,10 @@ pub struct PyCheckpointReader {
 impl PyCheckpointReader {
     /// Load latest manifest
     #[pyo3(text_signature = "(self)")]
-    fn load_latest_manifest(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn load_latest_manifest(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let store = self.store.clone();
 
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime.block_on(async {
                 let store_guard = store.lock().await;
                 let reader = store_guard.reader();
@@ -1183,20 +1183,20 @@ impl PyCheckpointReader {
     fn read_shard_by_rank(
         &self,
         py: Python<'_>,
-        manifest: PyObject,
+        manifest: Py<PyAny>,
         rank: u32,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         // Parse manifest from Python dict
-        let manifest_dict = manifest.downcast_bound::<PyDict>(py)
+        let manifest_dict = manifest.cast_bound::<PyDict>(py)
             .map_err(|_| PyRuntimeError::new_err("Manifest must be a dict"))?;
 
         let shards_item = manifest_dict.get_item("shards")?
             .ok_or_else(|| PyRuntimeError::new_err("Missing shards in manifest"))?;
-        let shards_list = shards_item.downcast::<PyList>()?;
+        let shards_list = shards_item.cast::<PyList>()?;
 
         let mut target_key = None;
         for shard_obj in shards_list.iter() {
-            let shard_dict = shard_obj.downcast::<PyDict>()?;
+            let shard_dict = shard_obj.cast::<PyDict>()?;
             let shard_rank = shard_dict.get_item("rank")?
                 .ok_or_else(|| PyRuntimeError::new_err("Missing rank in shard"))?
                 .extract::<u32>()?;
@@ -1212,7 +1212,7 @@ impl PyCheckpointReader {
 
         let store = self.store.clone();
 
-        let data = py.allow_threads(|| {
+        let data = py.detach(|| {
             self.runtime.block_on(async {
                 let store_guard = store.lock().await;
                 let reader = store_guard.reader();
@@ -1279,7 +1279,7 @@ fn save_checkpoint(
     epoch: u64,
     framework: String,
     data: &[u8],
-    user_meta: Option<PyObject>,
+    user_meta: Option<Py<PyAny>>,
 ) -> PyResult<String> {
     let store = PyCheckpointStore::new(uri, None, None, None)?;
     store.save(py, step, epoch, framework, data, user_meta)
@@ -1288,7 +1288,7 @@ fn save_checkpoint(
 #[cfg(feature = "extension-module")]
 #[pyfunction]
 #[pyo3(text_signature = "(uri)")]
-fn load_checkpoint(py: Python<'_>, uri: String) -> PyResult<Option<PyObject>> {
+fn load_checkpoint(py: Python<'_>, uri: String) -> PyResult<Option<Py<PyAny>>> {
     let store = PyCheckpointStore::new(uri, None, None, None)?;
     store.load_latest(py)
 }
@@ -1305,7 +1305,7 @@ fn save_distributed_shard(
     data: &[u8],
     world_size: u32,
     rank: u32,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let store = PyCheckpointStore::new(uri, None, None, None)?;
     let writer = store.writer(world_size, rank)?;
     writer.save_distributed_shard(py, step, epoch, framework, data)
@@ -1320,10 +1320,10 @@ fn finalize_distributed_checkpoint(
     step: u64,
     epoch: u64,
     framework: String,
-    shard_metas: Vec<PyObject>,
+    shard_metas: Vec<Py<PyAny>>,
     world_size: u32,
     rank: u32,
-    user_meta: Option<PyObject>,
+    user_meta: Option<Py<PyAny>>,
 ) -> PyResult<String> {
     let store = PyCheckpointStore::new(uri, None, None, None)?;
     let writer = store.writer(world_size, rank)?;
@@ -1341,10 +1341,10 @@ pub fn load_checkpoint_with_validation(
     py: Python<'_>,
     uri: &str,
     validate_integrity: bool,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let store = store_for_uri(uri).map_err(py_err)?;
 
-    py.allow_threads(|| {
+    py.detach(|| {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             if validate_integrity {
                 // load_checkpoint_with_validation returns Vec<u8> for backward compatibility
@@ -1384,7 +1384,7 @@ pub fn load_numpy_array(
     _shape: Vec<usize>,
     _dtype: &str,
     _validate_checksum: Option<&str>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     Err(PyRuntimeError::new_err("load_numpy_array is temporarily disabled"))
 }
 

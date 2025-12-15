@@ -186,7 +186,7 @@ mod python_api;
 #[cfg(feature = "extension-module")]
 #[pymodule]
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
 
     // Register all functions from modular API
     python_api::register_all_functions(m)?;
