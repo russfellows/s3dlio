@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use pyo3::ffi;
 use std::os::raw::c_char;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods};
-use pyo3::{PyObject, Bound};
+use pyo3::Bound;
 use pyo3::exceptions::PyRuntimeError;
 
 // Project crates
@@ -117,9 +117,9 @@ impl PyMultipartUploadWriter {
                 .map_err(|e| PyRuntimeError::new_err(format!("buffer copy failed: {e}")))?;
 
             let res = if len >= OWNED_THRESHOLD {
-                py.allow_threads(|| inner.write_owned_blocking(vec))
+                py.detach(|| inner.write_owned_blocking(vec))
             } else {
-                py.allow_threads(|| inner.write_blocking(&vec))
+                py.detach(|| inner.write_blocking(&vec))
             };
             return res
                 .map(|_| len)
@@ -127,17 +127,17 @@ impl PyMultipartUploadWriter {
         }
 
         // 2) Fallback for plain bytes objects
-        if let Ok(bytes) = data.downcast::<PyBytes>() {
+        if let Ok(bytes) = data.cast::<PyBytes>() {
             let slice = bytes.as_bytes(); // needs PyBytesMethods import
             let len = slice.len();
             if len >= OWNED_THRESHOLD {
                 let vec = slice.to_vec();
-                let res = py.allow_threads(|| inner.write_owned_blocking(vec));
+                let res = py.detach(|| inner.write_owned_blocking(vec));
                 return res
                     .map(|_| len)
                     .map_err(|e| PyRuntimeError::new_err(format!("write failed: {e}")));
             } else {
-                let res = py.allow_threads(|| inner.write_blocking(slice));
+                let res = py.detach(|| inner.write_blocking(slice));
                 return res
                     .map(|_| len)
                     .map_err(|e| PyRuntimeError::new_err(format!("write failed: {e}")));
@@ -160,7 +160,7 @@ impl PyMultipartUploadWriter {
     /// Returns:
     ///     memoryview: writable view into the reserved buffer
     #[pyo3(text_signature = "(self, size, /)")]
-    fn reserve(&mut self, py: Python<'_>, size: usize) -> PyResult<PyObject> {
+    fn reserve(&mut self, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {
         // Disallow overlapping reserves
         if self.pending_buf.is_some() {
             return Err(PyRuntimeError::new_err(
@@ -175,7 +175,7 @@ impl PyMultipartUploadWriter {
             let ptr = std::ptr::null_mut::<std::os::raw::c_char>();
             let mv_ptr = unsafe { pyo3::ffi::PyMemoryView_FromMemory(ptr, 0, pyo3::ffi::PyBUF_WRITE) };
             if mv_ptr.is_null() { return Err(PyErr::fetch(py)); }
-            return Ok(unsafe { PyObject::from_owned_ptr(py, mv_ptr) });
+            return Ok(unsafe { Py::<PyAny>::from_owned_ptr(py, mv_ptr) });
         }
 
         // Allocate Rust-owned buffer and keep it alive in self.pending_buf so the
@@ -198,7 +198,7 @@ impl PyMultipartUploadWriter {
         }
 
         // Convert the owned PyObject* into a safe PyObject handle.
-        let mv = unsafe { PyObject::from_owned_ptr(py, mv_ptr) };
+        let mv = unsafe { Py::<PyAny>::from_owned_ptr(py, mv_ptr) };
 
         // Stash the Vec; this guarantees the pointer remains valid until commit().
         self.pending_buf = Some(buf);
@@ -225,7 +225,7 @@ impl PyMultipartUploadWriter {
             ));
         }
         unsafe { buf.set_len(nbytes); }
-        py.allow_threads(|| inner.write_owned_blocking(buf))
+        py.detach(|| inner.write_owned_blocking(buf))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("commit failed: {e}")))
     }
 
@@ -236,7 +236,7 @@ impl PyMultipartUploadWriter {
     fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("writer is closed"))?;
-        py.allow_threads(|| inner.flush_blocking())
+        py.detach(|| inner.flush_blocking())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("flush failed: {e}")))
     }
 
@@ -251,10 +251,10 @@ impl PyMultipartUploadWriter {
     ///        'completed_at': float (unix seconds)
     ///     }
     #[pyo3(text_signature = "(self)")]
-    fn close(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+    fn close(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.take()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("writer already closed"))?;
-        let info = py.allow_threads(|| { let mut owned = inner; owned.finish_blocking() })
+        let info = py.detach(|| { let mut owned = inner; owned.finish_blocking() })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("finish failed: {e}")))?;
         let dict = PyDict::new(py);
         if let Some(etag) = info.e_tag { dict.set_item("etag", etag).ok(); }
@@ -274,7 +274,7 @@ impl PyMultipartUploadWriter {
     #[pyo3(text_signature = "(self)")]
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(mut inner) = self.inner.take() {
-            py.allow_threads(|| inner.abort_blocking())
+            py.detach(|| inner.abort_blocking())
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("abort failed: {e}")))?;
         }
         Ok(())
@@ -286,11 +286,11 @@ impl PyMultipartUploadWriter {
 
     /// Context manager exit: closes on success; aborts on exception.
     #[pyo3(text_signature = "(self, exc_type, exc, tb)")]
-    fn __exit__(&mut self, py: Python<'_>, _t: PyObject, _v: PyObject, _tb: PyObject) -> PyResult<()> {
+    fn __exit__(&mut self, py: Python<'_>, _t: Py<PyAny>, _v: Py<PyAny>, _tb: Py<PyAny>) -> PyResult<()> {
         if self.inner.is_some() {
             if let Some(mut inner) = self.inner.take() {
-                if let Err(_e) = py.allow_threads(|| inner.finish_blocking()) {
-                    let _ = py.allow_threads(|| inner.abort_blocking());
+                if let Err(_e) = py.detach(|| inner.finish_blocking()) {
+                    let _ = py.detach(|| inner.abort_blocking());
                 }
             }
         }

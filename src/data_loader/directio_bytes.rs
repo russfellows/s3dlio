@@ -3,6 +3,7 @@
 // Direct I/O bytes dataset implementation that provides the same Dataset interface
 // for local file operations using O_DIRECT as S3BytesDataset does for S3 operations.
 
+use bytes::Bytes;
 use crate::data_loader::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, ReaderMode};
 use crate::object_store::store_for_uri;
@@ -99,24 +100,35 @@ impl DirectIOBytesDataset {
             .ok_or_else(|| DatasetError::from(format!("Index {} out of bounds (dataset has {} files)", index, self.files.len())))
     }
 
-    /// Read entire file contents using Direct I/O object store
-    async fn read_file(&self, uri: &str) -> Result<Vec<u8>, DatasetError> {
+    /// Read entire file contents using Direct I/O object store - returns Bytes for zero-copy
+    async fn read_file(&self, uri: &str) -> Result<Bytes, DatasetError> {
         let store = store_for_uri(uri)
             .map_err(|e| DatasetError::from(format!("Failed to create Direct I/O store: {}", e)))?;
         
-        // Convert Bytes to Vec<u8> for Dataset API compatibility
+        // Return Bytes directly - zero-copy!
         store.get(uri).await
-            .map(|bytes| bytes.to_vec())
             .map_err(|e| DatasetError::from(format!("Failed to read file with Direct I/O {}: {}", uri, e)))
     }
 }
 
 #[async_trait]
 impl Dataset for DirectIOBytesDataset {
-    type Item = Vec<u8>;
+    type Item = Bytes;
 
     fn len(&self) -> Option<usize> {
         Some(self.files.len())
+    }
+
+    fn keys(&self) -> Option<Vec<String>> {
+        // Return just the filenames, stripping the direct:// prefix and path
+        Some(self.files.iter()
+            .filter_map(|uri| {
+                // Strip "direct://" prefix and get just the filename
+                uri.strip_prefix("direct://")
+                    .and_then(|p| Path::new(p).file_name())
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .collect())
     }
 
     async fn get(&self, index: usize) -> Result<Self::Item, DatasetError> {
@@ -154,7 +166,7 @@ mod tests {
         assert_eq!(dataset.len(), Some(1));
         
         let content = dataset.get(0).await.unwrap();
-        assert_eq!(content, b"test content");
+        assert_eq!(&content[..], b"test content");
     }
 
     #[tokio::test]
@@ -175,8 +187,8 @@ mod tests {
         let content1 = dataset.get(0).await.unwrap();
         let content2 = dataset.get(1).await.unwrap();
         
-        let contents = vec![content1, content2];
-        assert!(contents.contains(&b"content 1".to_vec()));
-        assert!(contents.contains(&b"content 2".to_vec()));
+        let contents: Vec<&[u8]> = vec![&content1[..], &content2[..]];
+        assert!(contents.contains(&b"content 1".as_slice()));
+        assert!(contents.contains(&b"content 2".as_slice()));
     }
 }

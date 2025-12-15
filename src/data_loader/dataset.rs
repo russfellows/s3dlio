@@ -72,6 +72,13 @@ pub trait Dataset: Send + Sync + 'static {
         None
     }
 
+    /// Return the keys/identifiers for all items in the dataset.
+    /// For object storage, these are typically object keys or file paths.
+    /// Returns `None` if the dataset doesn't support key enumeration.
+    fn keys(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// Convenience helper.
     fn is_empty(&self) -> bool {
         self.len().map(|n| n == 0).unwrap_or(false)

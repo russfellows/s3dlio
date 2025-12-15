@@ -178,12 +178,14 @@ pub use crate::data_loader::directio_bytes::DirectIOBytesDataset;
 pub type S3dlioResult<T> = Result<T>;
 
 /// Create a dataset from a URI with default options
-pub fn dataset_for_uri(uri: &str) -> Result<Box<dyn Dataset<Item = Vec<u8>>>> {
+/// Returns a Dataset that produces Bytes (zero-copy)
+pub fn dataset_for_uri(uri: &str) -> Result<Box<dyn Dataset<Item = bytes::Bytes>>> {
     dataset_for_uri_with_options(uri, &LoaderOptions::default())
 }
 
 /// Create a dataset from a URI with custom options
-pub fn dataset_for_uri_with_options(uri: &str, opts: &LoaderOptions) -> Result<Box<dyn Dataset<Item = Vec<u8>>>> {
+/// Returns a Dataset that produces Bytes (zero-copy)
+pub fn dataset_for_uri_with_options(uri: &str, opts: &LoaderOptions) -> Result<Box<dyn Dataset<Item = bytes::Bytes>>> {
     use crate::object_store::infer_scheme;
     
     match infer_scheme(uri) {

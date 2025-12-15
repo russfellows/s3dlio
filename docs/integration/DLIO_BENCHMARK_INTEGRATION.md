@@ -1,13 +1,13 @@
 # DLIO Benchmark Integration Guide
 
-**Version:** 0.9.26+  
-**Last Updated:** December 13, 2025
+**Version:** 0.9.30+  
+**Last Updated:** December 14, 2025
 
 ## Overview
 
 This guide explains how to integrate s3dlio with the [Argonne DLIO Benchmark](https://github.com/argonne-lcf/dlio_benchmark) as a storage backend. s3dlio provides high-performance multi-protocol storage supporting S3, Azure Blob, GCS, and local filesystems.
 
-> **Note:** This integration requires s3dlio v0.9.26 or later for the `exists()`, `put_bytes()`, and `mkdir()` functions.
+> **Note:** This integration requires s3dlio v0.9.26 or later for the `exists()`, `put_bytes()`, and `mkdir()` functions. Version 0.9.30+ recommended for zero-copy performance.
 
 ## Why Use s3dlio with DLIO?
 
@@ -442,7 +442,7 @@ s3dlio.delete("s3://my-bucket/test.npy")
 
 ## Feature Compatibility
 
-s3dlio v0.9.26+ includes all functions needed for DLIO:
+s3dlio v0.9.30+ includes all functions needed for DLIO with zero-copy performance:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -450,10 +450,11 @@ s3dlio v0.9.26+ includes all functions needed for DLIO:
 | `put_bytes()` | ✅ v0.9.26+ | Zero-copy write from Python |
 | `mkdir()` | ✅ v0.9.26+ | Create directories/prefixes |
 | `stat()` | ✅ Available | Returns metadata dict |
-| `get()` / `get_range()` | ✅ Available | Single object read |
+| `get()` / `get_range()` | ✅ Available | Zero-copy read (v0.9.30+) |
 | `list()` | ✅ Available | Returns full URIs |
 | `delete()` | ✅ Available | Single object deletion |
 | Multi-protocol | ✅ Available | S3, GCS, Azure, file://, direct:// |
+| Buffer protocol | ✅ v0.9.30+ | `memoryview(data)` for zero-copy |
 
 ---
 

@@ -149,7 +149,6 @@ pub use crate::s3_utils::{
     get_object_uri,
     get_objects_parallel,
     get_objects_parallel_with_progress,
-    list_objects,
     list_buckets,
     BucketInfo,
     parse_s3_uri,
@@ -186,7 +185,7 @@ mod python_api;
 #[cfg(feature = "extension-module")]
 #[pymodule]
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
 
     // Register all functions from modular API
     python_api::register_all_functions(m)?;

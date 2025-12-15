@@ -1,10 +1,11 @@
 """
-JAX / TensorFlow helpers that stream from the Rust S3 DataLoader.
+JAX / TensorFlow helpers that stream from the Rust ObjectStore DataLoader.
 
-• Uses ONLY the Rust async dataloader (`PyS3AsyncDataLoader`).
+• Uses the generic Rust async dataloader (`create_async_loader`).
+• Supports all URI schemes: file://, s3://, az://, gs://, direct://
 • JAX path yields NumPy uint8 arrays (zero-copy view over bytes).
 • TF path builds a tf.data.Dataset from a Python generator fed by the loader.
-• NEW: `writable` option — when True, wrap each `bytes` in `bytearray` so the
+• `writable` option — when True, wrap each `bytes` in `bytearray` so the
   NumPy view is writeable (one extra copy). Default is False (zero extra copy).
 """
 
@@ -18,7 +19,6 @@ from typing import Optional, Dict, Any, Iterable, Callable
 import numpy as np
 import jax.numpy as jnp
 
-#import _pymod as _core  # native module built by maturin
 from . import _pymod as _core
 
 
@@ -35,6 +35,12 @@ def _normalize_opts(**kwargs) -> Dict[str, Any]:
 
 
 class _AsyncBytesSource:
+    """
+    Drives the Rust async dataloader in a background thread + event loop,
+    pushing samples (bytes) into a Queue for synchronous consumption.
+    
+    Works with any URI scheme supported by the ObjectStore interface.
+    """
     def __init__(
         self,
         uri: str,
@@ -56,7 +62,8 @@ class _AsyncBytesSource:
     def start(self) -> "_AsyncBytesSource":
         def runner():
             async def run():
-                loader = _core.PyS3AsyncDataLoader(self._uri, self._opts)
+                # Use generic create_async_loader - works with any URI scheme
+                loader = _core.create_async_loader(self._uri, self._opts)
                 try:
                     async for batch in loader:     # batch: List[bytes]
                         for b in batch:
@@ -91,11 +98,13 @@ class _AsyncBytesSource:
             self._thread.join(timeout=timeout)
 
 
-class S3JaxIterable:
+class JaxIterable:
     """
     JAX-friendly iterator yielding NumPy uint8 arrays (caller can jnp.asarray).
+    
+    Supports all URI schemes: file://, s3://, az://, gs://, direct://
 
-    >>> it = S3JaxIterable.from_prefix("s3://bucket/prefix/", prefetch=8, num_workers=32)
+    >>> it = JaxIterable.from_prefix("file:///data/prefix/", prefetch=8, num_workers=32)
     >>> import jax.numpy as jnp
     >>> for a in it:
     ...     x = jnp.asarray(a)
@@ -132,7 +141,7 @@ class S3JaxIterable:
         transform: Optional[Callable] = None,
         writable: bool = False,             # NEW
         suppress_nonwritable_warning: bool = True,
-    ) -> "S3JaxIterable":
+    ) -> "JaxIterable":
         opts = _normalize_opts(
             batch_size=batch_size, drop_last=drop_last, shuffle=shuffle, seed=seed,
             num_workers=num_workers, prefetch=prefetch, auto_tune=auto_tune
@@ -170,11 +179,13 @@ def make_tf_dataset(
     seed: int = 0,
     auto_tune: bool = False,
     map_fn: Optional[Callable] = None,
-    writable: bool = False,                      # NEW (parity; TF will still copy)
-    suppress_nonwritable_warning: bool = True,   # NEW
+    writable: bool = False,
+    suppress_nonwritable_warning: bool = True,
 ):
     """
-    Build a tf.data.Dataset that streams uint8 tensors from the Rust loader.
+    Build a tf.data.Dataset that streams uint8 tensors from the Rust ObjectStore loader.
+    
+    Supports all URI schemes: file://, s3://, az://, gs://, direct://
     """
     import tensorflow as tf  # lazy import
 
@@ -205,4 +216,24 @@ def make_tf_dataset(
     if map_fn is not None:
         ds = ds.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE)
     return ds
+
+
+# -----------------------------------------------------------------------------
+# Deprecated alias for backward compatibility
+# -----------------------------------------------------------------------------
+import warnings as _warnings
+
+class S3JaxIterable(JaxIterable):
+    """
+    DEPRECATED: Use JaxIterable instead. This alias exists for backward compatibility.
+    
+    JaxIterable now supports all URI schemes (file://, s3://, az://, gs://, direct://).
+    """
+    def __init__(self, *args, **kwargs):
+        _warnings.warn(
+            "S3JaxIterable is deprecated. Use JaxIterable instead - it supports all URI schemes.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        super().__init__(*args, **kwargs)
 

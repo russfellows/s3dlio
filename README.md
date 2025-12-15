@@ -3,7 +3,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-175%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-175%2F175-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.27-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.30-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -18,6 +18,35 @@ pip install s3dlio
 ```
 
 ## 🌟 Latest Release
+
+### v0.9.30 - Zero-Copy Refactor & PyO3 0.27 (December 2025)
+
+**🆕 True Zero-Copy Architecture**
+- Refactored entire read path to use `bytes::Bytes` throughout the stack
+- Eliminated intermediate allocations between storage backends and Python
+- Python buffer protocol (`__getbuffer__`) enables `memoryview(data)` without copying
+
+```python
+import s3dlio
+import numpy as np
+
+# Zero-copy read - data stays in same memory location
+data = s3dlio.get("s3://bucket/file.bin")
+view = memoryview(data)  # No copy! Direct buffer access
+arr = np.frombuffer(view, dtype=np.float32)  # Still no copy
+```
+
+**🔄 PyO3 0.27 Migration**
+- Upgraded from PyO3 0.25 to 0.27.2 with all non-deprecated APIs
+
+**🧹 API Cleanup: Protocol Equality**
+- All protocols treated equally (S3, Azure, GCS, file://, direct://)
+- CLI `list` is now a true alias for `ls` (identical behavior)
+- Removed S3-specific public APIs (internal functions remain available)
+
+See [Changelog](docs/Changelog.md) for complete details.
+
+---
 
 ### v0.9.27 - PyPI Release & DLIO Integration (December 2025)
 

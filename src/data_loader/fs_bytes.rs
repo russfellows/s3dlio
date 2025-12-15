@@ -3,6 +3,7 @@
 // FileSystem bytes dataset implementation that provides the same Dataset interface
 // for local file operations as S3BytesDataset does for S3 operations.
 
+use bytes::Bytes;
 use crate::data_loader::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, ReaderMode};
 use async_trait::async_trait;
@@ -105,10 +106,11 @@ impl FileSystemBytesDataset {
             .ok_or_else(|| DatasetError::from(format!("Index {} out of bounds (dataset has {} files)", index, self.files.len())))
     }
 
-    /// Read entire file contents
-    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, DatasetError> {
-        tokio::fs::read(path).await
-            .map_err(|e| DatasetError::from(format!("Failed to read file {}: {}", path.display(), e)))
+    /// Read entire file contents - returns Bytes for zero-copy
+    async fn read_file(&self, path: &Path) -> Result<Bytes, DatasetError> {
+        let data = tokio::fs::read(path).await
+            .map_err(|e| DatasetError::from(format!("Failed to read file {}: {}", path.display(), e)))?;
+        Ok(Bytes::from(data))
     }
 
 
@@ -116,10 +118,18 @@ impl FileSystemBytesDataset {
 
 #[async_trait]
 impl Dataset for FileSystemBytesDataset {
-    type Item = Vec<u8>;
+    type Item = Bytes;
 
     fn len(&self) -> Option<usize> {
         Some(self.files.len())
+    }
+
+    fn keys(&self) -> Option<Vec<String>> {
+        // Return file paths as strings (just the filename, not full path)
+        Some(self.files.iter()
+            .filter_map(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect())
     }
 
     async fn get(&self, index: usize) -> Result<Self::Item, DatasetError> {
@@ -161,7 +171,7 @@ mod tests {
 
         assert_eq!(dataset.len(), Some(1));
         let data = dataset.get(0).await.unwrap();
-        assert_eq!(data, b"Hello, World!");
+        assert_eq!(&data[..], b"Hello, World!");
         
         // TempDir automatically cleans up when dropped
     }
@@ -187,8 +197,8 @@ mod tests {
         let data2 = dataset.get(1).await.unwrap();
         
         // Note: exact order depends on filesystem but should be consistent
-        assert!(data1 == b"File 1 content" || data1 == b"File 2 content");
-        assert!(data2 == b"File 1 content" || data2 == b"File 2 content");
+        assert!(&data1[..] == b"File 1 content" || &data1[..] == b"File 2 content");
+        assert!(&data2[..] == b"File 1 content" || &data2[..] == b"File 2 content");
         assert_ne!(data1, data2);
         
         // TempDir automatically cleans up when dropped

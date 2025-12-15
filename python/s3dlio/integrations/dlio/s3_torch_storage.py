@@ -4,10 +4,18 @@ Drop-in replacement for DLIO's s3_torch_storage.py using s3dlio
 This file replaces dlio_benchmark/storage/s3_torch_storage.py
 to use s3dlio instead of s3torchconnector.
 
+IMPORTANT: While this file is named "s3_torch_storage.py" for compatibility
+with DLIO's existing infrastructure, it supports ALL s3dlio backends:
+  - s3://   - Amazon S3, MinIO, Ceph, S3-compatible stores
+  - az://   - Azure Blob Storage  
+  - gs://   - Google Cloud Storage
+  - file:// - Local filesystem (POSIX)
+  - direct:// - Direct I/O filesystem (O_DIRECT)
+
 Installation:
     1. pip install s3dlio  (or install from wheel)
     2. Copy this file to: dlio_benchmark/storage/s3_torch_storage.py
-    3. Run DLIO benchmark as normal
+    3. Run DLIO benchmark as normal with any supported URI scheme
 
 Licensed under Apache 2.0
 
@@ -31,24 +39,31 @@ class S3PyTorchConnectorStorage(S3Storage):
     """
     Storage backend using s3dlio for high-performance multi-protocol I/O.
     
-    This is a drop-in replacement for the original S3PyTorchConnectorStorage
-    that uses s3torchconnector. It provides the same interface but uses
-    s3dlio's multi-backend support (S3, Azure, GCS, file://, direct://).
+    Despite the class name (kept for DLIO compatibility), this backend
+    supports ALL s3dlio storage protocols:
     
-    Environment Variables (for S3):
-        AWS_ACCESS_KEY_ID: S3 access key
-        AWS_SECRET_ACCESS_KEY: S3 secret key
-        AWS_REGION: S3 region (default: us-east-1)
-        AWS_ENDPOINT_URL: Custom endpoint for MinIO, Ceph, etc.
+    - s3://     Amazon S3, MinIO, Ceph, S3-compatible stores
+    - az://     Azure Blob Storage
+    - gs://     Google Cloud Storage
+    - file://   Local filesystem (POSIX)
+    - direct:// Direct I/O filesystem (O_DIRECT)
     
-    Environment Variables (for Azure):
-        AZURE_STORAGE_ACCOUNT_NAME: Azure account name
-        AZURE_STORAGE_ACCOUNT_KEY: Azure account key
-        AZURE_STORAGE_ENDPOINT: Custom endpoint (optional)
+    Environment Variables by Backend:
     
-    Environment Variables (for GCS):
-        GOOGLE_APPLICATION_CREDENTIALS: Path to service account JSON
-        GCS_ENDPOINT_URL: Custom endpoint (optional)
+    S3 (s3://):
+        AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+        AWS_ENDPOINT_URL (for MinIO, Ceph, etc.)
+    
+    Azure (az://):
+        AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCOUNT_KEY
+        AZURE_STORAGE_ENDPOINT (optional)
+    
+    GCS (gs://):
+        GOOGLE_APPLICATION_CREDENTIALS (path to service account JSON)
+        GCS_ENDPOINT_URL (optional)
+    
+    File/Direct (file://, direct://):
+        No credentials needed - uses local filesystem
     """
 
     @dlp.log_init
@@ -130,38 +145,43 @@ class S3PyTorchConnectorStorage(S3Storage):
         """
         List objects under a path. Returns relative filenames.
         
+        Works with all URI schemes: s3://, az://, gs://, file://, direct://
+        
         This matches the original s3_torch_storage.py behavior where
         walk_node returns just the filenames, not full URIs.
         """
-        # Parse s3://bucket/prefix path
+        # Parse URI - support all schemes
         parsed = urlparse(id)
-        if parsed.scheme not in ('s3', 'gs', 'az', 'azure', 'file', 'direct'):
-            # Assume S3 if no scheme
-            id = f"s3://{id}"
-            parsed = urlparse(id)
-        
-        bucket = parsed.netloc
-        prefix = parsed.path.lstrip('/')
-        
-        # Ensure prefix ends with / for directory listing
-        if prefix and not prefix.endswith('/'):
-            prefix += '/'
+        if not parsed.scheme:
+            # No scheme provided - treat as a relative path
+            # This shouldn't happen in normal DLIO usage but handle gracefully
+            raise ValueError(
+                f"URI must include scheme (s3://, az://, gs://, file://, direct://): {id}"
+            )
         
         try:
-            # Build full URI for listing
-            full_uri = f"{parsed.scheme}://{bucket}/{prefix}"
+            # Handle file:// URIs differently (no netloc, path is the full path)
+            if parsed.scheme in ('file', 'direct'):
+                base_path = parsed.path
+                prefix = base_path.rstrip('/')
+                if prefix and not prefix.endswith('/'):
+                    prefix += '/'
+                full_uri = f"{parsed.scheme}://{prefix}"
+            else:
+                # Cloud storage: scheme://bucket/prefix
+                bucket = parsed.netloc
+                prefix = parsed.path.lstrip('/')
+                if prefix and not prefix.endswith('/'):
+                    prefix += '/'
+                full_uri = f"{parsed.scheme}://{bucket}/{prefix}"
             
-            # s3dlio.list returns full URIs
-            full_uris = s3dlio.list(full_uri)
+            # s3dlio.list returns keys (not full URIs)
+            keys = s3dlio.list(full_uri)
             
             # Convert to relative paths (just filenames)
             # This matches the original s3_torch_storage.py behavior
             paths = []
-            for uri in full_uris:
-                # Extract key from full URI
-                uri_parsed = urlparse(uri)
-                key = uri_parsed.path.lstrip('/')
-                
+            for key in keys:
                 # Strip the prefix to get relative path
                 if key.startswith(prefix):
                     relative = key[len(prefix):]
@@ -193,7 +213,7 @@ class S3PyTorchConnectorStorage(S3Storage):
         Write data to storage.
         
         Args:
-            id: Full URI (s3://bucket/key)
+            id: Full URI (e.g., s3://bucket/key, az://container/blob, file:///path)
             data: bytes or BytesIO object
             offset: Not supported (full object write only)
             length: Not supported (full object write only)
@@ -222,7 +242,7 @@ class S3PyTorchConnectorStorage(S3Storage):
         Read data from storage.
         
         Args:
-            id: Full URI (s3://bucket/key)
+            id: Full URI (e.g., s3://bucket/key, az://container/blob, file:///path)
             data: Ignored (buffer not needed with s3dlio)
             offset: Start byte offset (optional)
             length: Number of bytes to read (optional)

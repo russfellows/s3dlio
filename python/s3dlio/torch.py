@@ -1,9 +1,11 @@
 """
-PyTorch wrappers that stream bytes from the Rust S3 DataLoader.
+PyTorch wrappers that stream bytes from the Rust ObjectStore DataLoader.
+
+Supports all URI schemes: file://, s3://, az://, gs://, direct://
 
 Notes
 -----
-• This uses ONLY the Rust async dataloader (`PyS3AsyncDataLoader`).
+• Uses the generic Rust async dataloader (`create_async_loader`).
 • Set concurrency via Rust `LoaderOptions` (prefetch, num_workers, shuffle…).
 • Recommended: use PyTorch DataLoader with `num_workers=0` and let Rust do I/O.
   If you want batching, either:
@@ -18,7 +20,7 @@ Stage-0 additions
 • return_type toggle:
     - "tensor" (default): yields torch.Tensor([L], dtype=uint8)
     - "bytes"           : yields Python bytes
-    - "reader"          : yields a file-like object with .read(), .close(), etc. (AWS-style)
+    - "reader"          : yields a file-like object with .read(), .close(), etc.
 """
 
 from __future__ import annotations
@@ -137,9 +139,10 @@ def _dist_info() -> Tuple[int, int]:
 
 class _AsyncBytesSource:
     """
-    Drives the Rust `PyS3AsyncDataLoader` in a background thread +
-    event loop, pushing *samples* (bytes) into a Queue for synchronous
-    consumption on the main thread.
+    Drives the Rust async dataloader in a background thread + event loop,
+    pushing *samples* (bytes) into a Queue for synchronous consumption.
+    
+    Works with any URI scheme supported by the ObjectStore interface.
     """
 
     def __init__(self, uri: str, opts: Dict[str, Any]):
@@ -190,14 +193,16 @@ class _AsyncBytesSource:
             self._thread.join(timeout=timeout)
 
 
-class S3IterableDataset(IterableDataset):
+class ObjectStoreIterableDataset(IterableDataset):
     """
-    Stream objects as 1D uint8 tensors (or bytes/reader) directly from S3 via the Rust DataLoader.
+    Stream objects as 1D uint8 tensors (or bytes/reader) via the Rust ObjectStore DataLoader.
+    
+    Supports all URI schemes: file://, s3://, az://, gs://, direct://
 
     Usage
     -----
-    >>> ds = S3IterableDataset.from_prefix(
-    ...     "s3://bucket/prefix/",
+    >>> ds = ObjectStoreIterableDataset.from_prefix(
+    ...     "file:///data/prefix/",
     ...     prefetch=8, num_workers=32, shuffle=True, seed=123
     ... )
     >>> loader = torch.utils.data.DataLoader(ds, batch_size=2, num_workers=0)
@@ -211,10 +216,10 @@ class S3IterableDataset(IterableDataset):
         uri: str,
         *,
         loader_opts: Dict[str, Any],
-        writable: bool = False,                     # keep
-        suppress_nonwritable_warning: bool = True,  # keep
-        enable_sharding: bool = False,              # keep
-        return_type: str = "tensor",                # NEW: "tensor" | "bytes" | "reader"
+        writable: bool = False,
+        suppress_nonwritable_warning: bool = True,
+        enable_sharding: bool = False,
+        return_type: str = "tensor",  # "tensor" | "bytes" | "reader"
     ):
         self._uri = uri
         self._opts = loader_opts
@@ -238,18 +243,18 @@ class S3IterableDataset(IterableDataset):
         num_workers: int = 0,
         prefetch: int = 8,
         auto_tune: bool = False,
-        # NEW reader controls
+        # reader controls
         reader_mode: str = "sequential",
         part_size: int = 8 << 20,
         max_inflight_parts: int = 4,
         # sharding toggle
         enable_sharding: bool = False,
-        # existing tensor controls
+        # tensor controls
         writable: bool = False,
         suppress_nonwritable_warning: bool = True,
-        # NEW return type
+        # return type
         return_type: str = "tensor",
-    ) -> "S3IterableDataset":
+    ) -> "ObjectStoreIterableDataset":
         opts = _normalize_opts(
             batch_size=batch_size, drop_last=drop_last, shuffle=shuffle, seed=seed,
             num_workers=num_workers, prefetch=prefetch, auto_tune=auto_tune,
@@ -317,14 +322,16 @@ class S3IterableDataset(IterableDataset):
 # ---------------------------------------------------------------------------
 # Map-style dataset for PyTorch parity
 # ---------------------------------------------------------------------------
-class S3MapDataset(Dataset):
+class ObjectStoreMapDataset(Dataset):
     """
-    Map-style Dataset over S3 objects under a prefix.
+    Map-style Dataset over objects under a URI prefix.
+    
+    Supports all URI schemes: file://, s3://, az://, gs://, direct://
 
     Yields:
       return_type = "tensor" -> torch.Tensor([L], dtype=uint8)
                    "bytes"   -> bytes
-                   "reader"  -> file-like object with .read()/.close() (AWS-style)
+                   "reader"  -> file-like object with .read()/.close()
 
     By default returns 1-D uint8 tensors backed by a read-only buffer. To make
     them writable in tensor mode, set `writable=True` (incurs one copy per item).
@@ -338,7 +345,7 @@ class S3MapDataset(Dataset):
         max_inflight_parts: int = 4,
         writable: bool = False,
         suppress_nonwritable_warning: bool = True,
-        return_type: str = "tensor",  # NEW
+        return_type: str = "tensor",
     ) -> None:
         self._uri = uri
         self._opts = _normalize_opts(
@@ -350,12 +357,22 @@ class S3MapDataset(Dataset):
         if rt not in ("tensor", "bytes", "reader"):
             raise ValueError("return_type must be 'tensor', 'bytes', or 'reader'")
         self._return_type = rt
-        # Use the Rust indexable dataset to list keys and retain options
-        self._core_ds = _core.PyS3Dataset(uri, self._opts)
+        
+        # Parse URI to extract scheme and base path for later reconstruction
+        if "://" in uri:
+            self._scheme, rest = uri.split("://", 1)
+            # Keep the full path as the base (strip trailing slash for consistent joining)
+            self._base = rest.rstrip("/")
+        else:
+            self._scheme = "file"
+            self._base = uri.rstrip("/")
+        
+        # Use the generic Rust dataset - works with any URI scheme
+        self._core_ds = _core.create_dataset(uri, self._opts)
         self._keys: Sequence[str] = self._core_ds.keys()
 
     @classmethod
-    def from_prefix(cls, uri: str, **kwargs) -> "S3MapDataset":
+    def from_prefix(cls, uri: str, **kwargs) -> "ObjectStoreMapDataset":
         return cls(uri, **kwargs)
 
     def __len__(self) -> int:
@@ -365,23 +382,30 @@ class S3MapDataset(Dataset):
         if index < 0 or index >= len(self._keys):
             raise IndexError(index)
         from . import _pymod as _core_mod
-        scheme, rest = self._uri.split("://", 1)
-        bucket = rest.split("/", 1)[0]
+        
+        # Reconstruct full URI preserving the original scheme
         key = self._keys[index]
-        full_uri = f"s3://{bucket}/{key}"
-        b = _core_mod.get(full_uri)
+        full_uri = f"{self._scheme}://{self._base}/{key}"
+        
+        # get() returns BytesView which supports zero-copy memoryview()
+        bytesview = _core_mod.get(full_uri)
 
         # Return-style switch
         if self._return_type == "reader":
-            return _BytesReader(b)
+            # Reader needs bytes, not BytesView
+            return _BytesReader(bytes(bytesview))
         if self._return_type == "bytes":
-            return b
+            return bytes(bytesview)
 
-        # Tensor mode
+        # Tensor mode - use zero-copy memoryview from BytesView
+        mv = bytesview.memoryview()  # TRUE zero-copy!
+        
         if self._writable:
-            buf = bytearray(b)  # one copy → writable
+            # If writable is requested, we must copy to a bytearray
+            buf = bytearray(mv)
             return torch.frombuffer(memoryview(buf), dtype=torch.uint8)
-        mv = memoryview(b)  # zero-copy, read-only
+        
+        # Zero-copy path: memoryview directly to tensor
         import warnings
         if self._suppress_nonwritable_warning:
             with warnings.catch_warnings():
@@ -395,5 +419,42 @@ class S3MapDataset(Dataset):
                 )
                 return torch.frombuffer(mv, dtype=torch.uint8)
         return torch.frombuffer(mv, dtype=torch.uint8)
+
+
+# -----------------------------------------------------------------------------
+# Deprecated aliases for backward compatibility
+# -----------------------------------------------------------------------------
+import warnings as _warnings
+
+class S3IterableDataset(ObjectStoreIterableDataset):
+    """
+    DEPRECATED: Use ObjectStoreIterableDataset instead. 
+    
+    This alias exists for backward compatibility. ObjectStoreIterableDataset 
+    supports all URI schemes (file://, s3://, az://, gs://, direct://).
+    """
+    def __init__(self, *args, **kwargs):
+        _warnings.warn(
+            "S3IterableDataset is deprecated. Use ObjectStoreIterableDataset instead - it supports all URI schemes.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        super().__init__(*args, **kwargs)
+
+
+class S3MapDataset(ObjectStoreMapDataset):
+    """
+    DEPRECATED: Use ObjectStoreMapDataset instead.
+    
+    This alias exists for backward compatibility. ObjectStoreMapDataset
+    supports all URI schemes (file://, s3://, az://, gs://, direct://).
+    """
+    def __init__(self, *args, **kwargs):
+        _warnings.warn(
+            "S3MapDataset is deprecated. Use ObjectStoreMapDataset instead - it supports all URI schemes.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        super().__init__(*args, **kwargs)
 
 

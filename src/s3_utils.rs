@@ -11,9 +11,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 //use aws_sdk_s3::primitives::ByteStream;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 #[cfg(feature = "extension-module")]
-use pyo3::{FromPyObject, PyAny, PyResult};
-#[cfg(feature = "extension-module")]
-use pyo3::types::PyAnyMethods;
+use pyo3::{FromPyObject, PyAny};
 use std::sync::Arc;
 use std::collections::HashMap;
 use regex::Regex;
@@ -93,10 +91,12 @@ impl From<&str> for ObjectType {
 }
 
 
-// New pyo3 version 0.25 API
+// pyo3 0.27 API - FromPyObject now takes two lifetime parameters and uses Borrowed
 #[cfg(feature = "extension-module")]
-impl<'source> FromPyObject<'source> for ObjectType {
-    fn extract_bound(ob: &pyo3::Bound<'source, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for ObjectType {
+    type Error = pyo3::PyErr;
+    
+    fn extract(ob: pyo3::Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
         let s = ob.extract::<&str>()?;
         Ok(ObjectType::from(s))
     }
@@ -358,8 +358,7 @@ pub struct BucketInfo {
 /// let store = store_for_uri("s3://bucket/prefix/")?;
 /// let objects = store.list("", true, None).await?;
 /// ```
-#[deprecated(since = "0.9.4", note = "S3-specific listing will be removed in v1.0.0. Use ObjectStore::list() for backend-agnostic code.")]
-pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<String>> {
+pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<String>> {
     // Clone inputs to move them into the async block
     let bucket = bucket.to_string();
     let path = path.to_string();

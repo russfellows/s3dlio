@@ -3,6 +3,7 @@
 // Enhanced DataLoader with async request pooling and dynamic batch formation
 // Implements out-of-order completion with multi-backend support
 
+use bytes::Bytes;
 use crate::object_store::{ObjectStore, store_for_uri};
 use crate::data_loader::dataset::{DatasetError, Dataset};
 use crate::data_loader::options::{LoaderOptions, LoadingMode};
@@ -80,7 +81,7 @@ impl MultiBackendDataset {
 
 #[async_trait]
 impl Dataset for MultiBackendDataset {
-    type Item = Vec<u8>;
+    type Item = Bytes;
 
     fn len(&self) -> Option<usize> {
         Some(self.uris.len())
@@ -90,9 +91,8 @@ impl Dataset for MultiBackendDataset {
         let uri = self.uris.get(idx)
             .ok_or(DatasetError::IndexOutOfRange(idx))?;
         
-        // Convert Bytes to Vec<u8> for Dataset API compatibility
+        // Return Bytes directly - zero-copy!
         self.store.get(uri).await
-            .map(|bytes| bytes.to_vec())
             .map_err(|e| DatasetError::from(e.to_string()))
     }
 }
@@ -176,13 +176,13 @@ impl AsyncPoolDataLoader {
     /// 
     /// Supports graceful cancellation via `LoaderOptions::cancellation_token`.
     /// When cancelled, the pool stops submitting new requests and drains pending ones.
-    pub fn stream_with_pool(self, pool_config: PoolConfig) -> ReceiverStream<Result<Vec<Vec<u8>>, DatasetError>> {
+    pub fn stream_with_pool(self, pool_config: PoolConfig) -> ReceiverStream<Result<Vec<Bytes>, DatasetError>> {
         let batch_size = self.options.batch_size.max(1);
         let drop_last = self.options.drop_last;
         let dataset_len = self.dataset.len();
         let cancel_token = self.options.cancellation_token.clone();
         
-        let (tx, rx) = mpsc::channel::<Result<Vec<Vec<u8>>, DatasetError>>(pool_config.readahead_batches);
+        let (tx, rx) = mpsc::channel::<Result<Vec<Bytes>, DatasetError>>(pool_config.readahead_batches);
         
         let dataset = Arc::clone(&self.dataset);
         
@@ -206,14 +206,14 @@ impl AsyncPoolDataLoader {
     /// Core async pooling worker with cancellation support
     async fn run_async_pool_worker(
         dataset: Arc<MultiBackendDataset>,
-        tx: mpsc::Sender<Result<Vec<Vec<u8>>, DatasetError>>,
+        tx: mpsc::Sender<Result<Vec<Bytes>, DatasetError>>,
         batch_size: usize,
         drop_last: bool,
         pool_config: PoolConfig,
         dataset_len: usize,
         cancel_token: Option<CancellationToken>,
     ) -> Result<()> {
-        type RequestFuture = Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, anyhow::Error>)> + Send>>;
+        type RequestFuture = Pin<Box<dyn std::future::Future<Output = (usize, Result<Bytes, anyhow::Error>)> + Send>>;
         
         let mut pending_requests: FuturesUnordered<RequestFuture> = FuturesUnordered::new();
         let mut next_index = 0;
@@ -239,7 +239,7 @@ impl AsyncPoolDataLoader {
                     
                     let fut: RequestFuture = Box::pin(async move {
                         let result = match tokio::time::timeout(timeout, store.get(&uri)).await {
-                            Ok(Ok(data)) => Ok(data.to_vec()), // Convert Bytes to Vec<u8>
+                            Ok(Ok(data)) => Ok(data), // Return Bytes directly - zero-copy!
                             Ok(Err(e)) => Err(anyhow::anyhow!("Store error: {}", e)),
                             Err(_) => Err(anyhow::anyhow!("Request timeout after {:?}", timeout)),
                         };
@@ -282,7 +282,7 @@ impl AsyncPoolDataLoader {
                                 
                                 let fut: RequestFuture = Box::pin(async move {
                                     let result = match tokio::time::timeout(timeout, store.get(&uri)).await {
-                                        Ok(Ok(data)) => Ok(data.to_vec()), // Convert Bytes to Vec<u8>
+                                        Ok(Ok(data)) => Ok(data), // Return Bytes directly - zero-copy!
                                         Ok(Err(e)) => Err(anyhow::anyhow!("Store error: {}", e)),
                                         Err(_) => Err(anyhow::anyhow!("Request timeout after {:?}", timeout)),
                                     };
@@ -351,7 +351,7 @@ impl AsyncPoolDataLoader {
     }
 
     /// Standard stream interface (maintains compatibility)
-    pub fn stream(self) -> ReceiverStream<Result<Vec<Vec<u8>>, DatasetError>> {
+    pub fn stream(self) -> ReceiverStream<Result<Vec<Bytes>, DatasetError>> {
         self.stream_with_pool(PoolConfig::default())
     }
 }
@@ -381,7 +381,7 @@ impl UnifiedDataLoader {
     }
 
     /// Get stream using the configured loading mode
-    pub fn stream(self) -> ReceiverStream<Result<Vec<Vec<u8>>, DatasetError>> {
+    pub fn stream(self) -> ReceiverStream<Result<Vec<Bytes>, DatasetError>> {
         let loading_mode = self.options.loading_mode.clone();
         match loading_mode {
             LoadingMode::Sequential => {
@@ -414,7 +414,7 @@ impl LoaderOptions {
     }
     
     /// Enhanced stream with automatic pool configuration
-    pub fn enhanced_stream(self, dataset: MultiBackendDataset) -> ReceiverStream<Result<Vec<Vec<u8>>, DatasetError>> {
+    pub fn enhanced_stream(self, dataset: MultiBackendDataset) -> ReceiverStream<Result<Vec<Bytes>, DatasetError>> {
         let pool_config = self.to_pool_config();
         AsyncPoolDataLoader::new(dataset, self).stream_with_pool(pool_config)
     }
