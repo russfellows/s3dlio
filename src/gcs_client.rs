@@ -620,9 +620,10 @@ mod tests {
 
     #[test]
     fn test_parse_gcs_uri_bucket_only() {
-        let result = parse_gcs_uri("gs://bucket");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("missing object path"));
+        // Bucket-only URIs are now allowed for listing operations
+        let (bucket, path) = parse_gcs_uri("gs://bucket").unwrap();
+        assert_eq!(bucket, "bucket");
+        assert_eq!(path, "");
     }
 
     #[test]

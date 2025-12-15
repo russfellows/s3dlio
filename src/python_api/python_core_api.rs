@@ -48,6 +48,9 @@ use crate::file_store_direct::ConfigurableFileSystemObjectStore;
 
 /// A Python-visible wrapper around Rust Bytes that exposes buffer protocol
 /// This allows Python code to get a memoryview without copying data
+/// 
+/// Implements the Python buffer protocol via __getbuffer__ and __releasebuffer__
+/// so that `memoryview(bytes_view)` works directly with zero-copy access.
 #[pyclass(name = "BytesView")]
 pub struct PyBytesView {
     /// The underlying Bytes (reference-counted, cheap to clone)
@@ -64,6 +67,76 @@ impl PyBytesView {
     /// Support bytes() conversion - returns a copy
     fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.bytes)
+    }
+    
+    /// Implement Python buffer protocol for zero-copy access.
+    /// This allows `memoryview(bytes_view)` to work directly.
+    /// 
+    /// The buffer is read-only; requesting a writable buffer will raise BufferError.
+    unsafe fn __getbuffer__(
+        slf: PyRef<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        // Check for writable request - we only support read-only buffers
+        if (flags & ffi::PyBUF_WRITABLE) != 0 {
+            return Err(pyo3::exceptions::PyBufferError::new_err(
+                "BytesView is read-only and does not support writable buffers"
+            ));
+        }
+        
+        let bytes = &slf.bytes;
+        
+        // Fill in the Py_buffer struct
+        // Safety: view is a valid pointer provided by Python
+        unsafe {
+            (*view).buf = bytes.as_ptr() as *mut std::os::raw::c_void;
+            (*view).len = bytes.len() as isize;
+            (*view).readonly = 1;
+            (*view).itemsize = 1;
+            
+            // Format string: "B" = unsigned byte (matches u8)
+            (*view).format = if (flags & ffi::PyBUF_FORMAT) != 0 {
+                // Static string that lives for the duration of the program
+                b"B\0".as_ptr() as *mut std::os::raw::c_char
+            } else {
+                std::ptr::null_mut()
+            };
+            
+            (*view).ndim = 1;
+            
+            // Shape: pointer to the length (1D array of len elements)
+            (*view).shape = if (flags & ffi::PyBUF_ND) != 0 {
+                // Point to our len field - this is a 1D array
+                &(*view).len as *const isize as *mut isize
+            } else {
+                std::ptr::null_mut()
+            };
+            
+            // Strides: 1 byte per element
+            (*view).strides = if (flags & ffi::PyBUF_STRIDES) != 0 {
+                &(*view).itemsize as *const isize as *mut isize
+            } else {
+                std::ptr::null_mut()
+            };
+            
+            (*view).suboffsets = std::ptr::null_mut();
+            (*view).internal = std::ptr::null_mut();
+            
+            // CRITICAL: Store a reference to the PyBytesView object
+            // This prevents the Bytes data from being deallocated while the buffer is in use
+            (*view).obj = slf.as_ptr() as *mut ffi::PyObject;
+            ffi::Py_INCREF((*view).obj);
+        }
+        
+        Ok(())
+    }
+    
+    /// Release the buffer - called when the memoryview is garbage collected.
+    /// We don't need to do anything here since the Bytes is reference-counted.
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
+        // Nothing to do - the Py_DECREF on view.obj will be handled by Python
+        // and will eventually drop the PyBytesView (and thus the Bytes) when refcount hits 0
     }
     
     /// Get a memoryview (TRUE zero-copy readonly access)

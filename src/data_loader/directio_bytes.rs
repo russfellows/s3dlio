@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(dataset.len(), Some(1));
         
         let content = dataset.get(0).await.unwrap();
-        assert_eq!(content, b"test content");
+        assert_eq!(&content[..], b"test content");
     }
 
     #[tokio::test]
@@ -187,8 +187,8 @@ mod tests {
         let content1 = dataset.get(0).await.unwrap();
         let content2 = dataset.get(1).await.unwrap();
         
-        let contents = vec![content1, content2];
-        assert!(contents.contains(&b"content 1".to_vec()));
-        assert!(contents.contains(&b"content 2".to_vec()));
+        let contents: Vec<&[u8]> = vec![&content1[..], &content2[..]];
+        assert!(contents.contains(&b"content 1".as_slice()));
+        assert!(contents.contains(&b"content 2".as_slice()));
     }
 }

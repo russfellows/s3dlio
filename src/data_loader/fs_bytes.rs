@@ -171,7 +171,7 @@ mod tests {
 
         assert_eq!(dataset.len(), Some(1));
         let data = dataset.get(0).await.unwrap();
-        assert_eq!(data, b"Hello, World!");
+        assert_eq!(&data[..], b"Hello, World!");
         
         // TempDir automatically cleans up when dropped
     }
@@ -197,8 +197,8 @@ mod tests {
         let data2 = dataset.get(1).await.unwrap();
         
         // Note: exact order depends on filesystem but should be consistent
-        assert!(data1 == b"File 1 content" || data1 == b"File 2 content");
-        assert!(data2 == b"File 1 content" || data2 == b"File 2 content");
+        assert!(&data1[..] == b"File 1 content" || &data1[..] == b"File 2 content");
+        assert!(&data2[..] == b"File 1 content" || &data2[..] == b"File 2 content");
         assert_ne!(data1, data2);
         
         // TempDir automatically cleans up when dropped
