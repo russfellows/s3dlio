@@ -26,7 +26,6 @@ use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use std::io::{self, Write, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::str::FromStr; // For the custom S3Path type
 use std::time::Instant;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -67,39 +66,6 @@ macro_rules! safe_println {
     };
 }
 
-
-
-// --- Define the S3Path struct for clap to use as a custom parser.
-// This struct neatly encapsulates the bucket and key.
-#[derive(Clone, Debug)]
-struct S3Path {
-    bucket: String,
-    key: String,
-}
-
-impl S3Path {
-    fn bucket(&self) -> &str {
-        &self.bucket
-    }
-
-    fn key(&self) -> &str {
-        &self.key
-    }
-}
-
-/// Implement `FromStr` so that `clap` can parse a string like "s3://bucket/key"
-/// directly into our `S3Path` struct.
-impl FromStr for S3Path {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (bucket, key) = parse_s3_uri(s)?;
-        Ok(S3Path {
-            bucket,
-            key,
-        })
-    }
-}
 
 // -- Commands
 
@@ -294,21 +260,10 @@ enum Command {
         recursive: bool,     
     },
 
-    /// Alias for 'ls' - List objects in a storage path (supports all backends via S3 URI format)
-    /// Kept for backward compatibility. Prefer using 'ls' directly.
-    List {
-        #[clap(value_parser)]
-        s3_path: S3Path,
-
-        /// List objects recursively
-        #[clap(short, long)]
-        recursive: bool,
-    },
-
     /// List objects using generic storage URI (supports s3://, az://, gs://, file://, direct://)
     /// Example: s3dlio ls s3://bucket/prefix/ -r
     /// Example: s3dlio ls gs://bucket/prefix/ -r
-    #[clap(name = "ls")]
+    #[clap(name = "ls", visible_alias = "list")]
     GenericList {
         /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, gs://bucket/prefix/, file:///path/)
         uri: String,
@@ -455,21 +410,6 @@ async fn main() -> Result<()> {
             info!("Attempting to delete bucket: {}...", final_bucket_name);
             s3dlio::s3_utils::delete_bucket(final_bucket_name)?;
             safe_println!("Successfully deleted bucket '{}'.", final_bucket_name);
-        }
-
-        // 'list' is now just an alias for 'ls' (GenericList)
-        // Both commands use the universal ObjectStore::list() implementation
-        Command::List { s3_path, recursive } => {
-            // Convert S3Path to a full URI for the generic list command
-            let uri = format!("s3://{}/{}", s3_path.bucket(), s3_path.key());
-            
-            // Check AWS credentials for S3
-            if requires_aws_credentials(&uri) {
-                check_aws_credentials()?;
-            }
-            
-            // Delegate to the universal list command (same as 'ls')
-            generic_list_cmd(&uri, recursive, None, false).await?
         }
     
         Command::Stat { uri } => {
