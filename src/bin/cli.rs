@@ -294,8 +294,8 @@ enum Command {
         recursive: bool,     
     },
 
-    /// [DEPRECATED - Use 'ls' instead] List objects in an S3 path (S3-only).
-    /// This S3-only command will be removed soon, use 'ls' for universal support.
+    /// Alias for 'ls' - List objects in a storage path (supports all backends via S3 URI format)
+    /// Kept for backward compatibility. Prefer using 'ls' directly.
     List {
         #[clap(value_parser)]
         s3_path: S3Path,
@@ -457,33 +457,19 @@ async fn main() -> Result<()> {
             safe_println!("Successfully deleted bucket '{}'.", final_bucket_name);
         }
 
-        // --- Update the `List` command handler.
-        // It now unpacks `s3_path` and `recursive` and calls our new backend function.
+        // 'list' is now just an alias for 'ls' (GenericList)
+        // Both commands use the universal ObjectStore::list() implementation
         Command::List { s3_path, recursive } => {
-            check_aws_credentials()?;  // S3-only command
-            // Deprecation warning
-            eprintln!("WARNING: The 'list' command is deprecated and S3-only.");
-            eprintln!("Please use 'ls' for universal multi-backend support:");
-            eprintln!("  s3-cli ls s3://bucket/prefix/ -r");
-            eprintln!("  s3-cli ls s3://bucket/prefix/ -p '.*\\.txt$'  # with regex pattern");
-            eprintln!("This command will be removed in v1.0.0.");
-            eprintln!();
+            // Convert S3Path to a full URI for the generic list command
+            let uri = format!("s3://{}/{}", s3_path.bucket(), s3_path.key());
             
-            #[allow(deprecated)]
-            let keys = s3dlio::s3_utils::list_objects(s3_path.bucket(), s3_path.key(), recursive)?;
-    
-            let stdout = io::stdout();
-            let mut out = stdout.lock();
-            for key in &keys {
-                if let Err(e) = writeln!(out, "{}", key) {
-                    if e.kind() == io::ErrorKind::BrokenPipe {
-                        return Ok(()); // Handle cases like piping to `head`
-                    } else {
-                        return Err(e.into());
-                    }
-                }
+            // Check AWS credentials for S3
+            if requires_aws_credentials(&uri) {
+                check_aws_credentials()?;
             }
-            writeln!(out, "\nTotal objects: {}", keys.len())?;
+            
+            // Delegate to the universal list command (same as 'ls')
+            generic_list_cmd(&uri, recursive, None, false).await?
         }
     
         Command::Stat { uri } => {

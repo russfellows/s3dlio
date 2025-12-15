@@ -25,7 +25,6 @@ use tracing_subscriber;
 use crate::config::{ObjectType, DataGenMode, DataGenAlgorithm, Config};
 use crate::s3_utils::{
     get_objects_parallel,
-    list_objects as list_objects_rs, get_range as s3_get_range,
     parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
     create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs,
     stat_object_many_async,
@@ -426,41 +425,6 @@ fn parse_s3_uri_full(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
     dict.set_item("key", components.key)?;
     
     Ok(dict.into())
-}
-
-// ------------------------------------------------------------------------
-// ------------------------------------------------------------------------
-// DEPRECATED: Python-visible list_objects()  (sync wrapper), with recursion
-// This function is S3-specific and will be removed in v1.0.0.
-// Use the universal `list(uri, recursive, pattern)` function instead.
-// ------------------------------------------------------------------------
-#[pyfunction]
-#[pyo3(signature = (bucket, prefix, recursive = false))]
-#[deprecated(since = "0.9.4", note = "Use universal `list(uri, recursive, pattern)` instead. This S3-specific function will be removed in v1.0.0.")]
-fn list_objects(bucket: &str, prefix: &str, recursive: bool) -> PyResult<Vec<String>> {
-    eprintln!("WARNING: list_objects() is deprecated and will be removed in v1.0.0. Use list(uri, recursive, pattern) instead.");
-    list_objects_rs(bucket, prefix, recursive).map_err(py_err)
-}
-
-// ------------------------------------------------------------------------
-// DEPRECATED: Python-visible get_object()  (sync wrapper)
-// This function is S3-specific and will be removed in v1.0.0.
-// Use the universal `get(uri)` or `get_range(uri, offset, length)` function instead.
-// ------------------------------------------------------------------------
-#[pyfunction]
-#[deprecated(since = "0.9.4", note = "Use universal `get(uri)` or `get_range(uri, offset, length)` instead. This S3-specific function will be removed in v1.0.0.")]
-fn get_object(
-    _py: Python<'_>,
-    bucket: &str,
-    key: &str,
-    offset: Option<u64>,
-    length: Option<u64>,
-) -> PyResult<PyBytesView> {
-    eprintln!("WARNING: get_object() is deprecated and will be removed in v1.0.0. Use get(uri) or get_range(uri, offset, length) instead.");
-    let bytes = s3_get_range(bucket, key, offset.unwrap_or(0), length)
-        .map_err(py_err)?;
-    // Return zero-copy BytesView wrapper
-    Ok(PyBytesView::new(bytes))
 }
 
 // - create-bucket command
@@ -1586,11 +1550,6 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     
     // URI parsing utilities
     m.add_function(wrap_pyfunction!(parse_s3_uri_full, m)?)?;
-    
-    // Core storage operations
-    // DEPRECATED: S3-specific data operations (will be removed in v1.0.0)
-    m.add_function(wrap_pyfunction!(list_objects, m)?)?;      // Use list() instead
-    m.add_function(wrap_pyfunction!(get_object, m)?)?;        // Use get() or get_range() instead
     
     // Bucket management (S3-specific but kept for convenience)
     m.add_function(wrap_pyfunction!(create_bucket, m)?)?;

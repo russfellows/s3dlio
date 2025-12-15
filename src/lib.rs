@@ -149,7 +149,6 @@ pub use crate::s3_utils::{
     get_object_uri,
     get_objects_parallel,
     get_objects_parallel_with_progress,
-    list_objects,
     list_buckets,
     BucketInfo,
     parse_s3_uri,

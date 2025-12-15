@@ -358,8 +358,7 @@ pub struct BucketInfo {
 /// let store = store_for_uri("s3://bucket/prefix/")?;
 /// let objects = store.list("", true, None).await?;
 /// ```
-#[deprecated(since = "0.9.4", note = "S3-specific listing will be removed in v1.0.0. Use ObjectStore::list() for backend-agnostic code.")]
-pub fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<String>> {
+pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<String>> {
     // Clone inputs to move them into the async block
     let bucket = bucket.to_string();
     let path = path.to_string();

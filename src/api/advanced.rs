@@ -77,9 +77,6 @@ pub use crate::s3_utils::get_objects_parallel;
 /// Bucket management
 pub use crate::s3_utils::{list_buckets, BucketInfo};
 
-/// Object listing with advanced options
-pub use crate::s3_utils::list_objects;
-
 /// Bulk object deletion
 pub use crate::s3_utils::delete_objects;
 
