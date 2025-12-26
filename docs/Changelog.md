@@ -1,5 +1,11 @@
 # s3dlio Changelog
 
+## Version 0.9.31 - Maintenance Release (December 2025)
+
+- Changed license to Apache-2.0
+- Updated all source files to SPDX-compliant headers
+- Removed fork-patches directory
+
 ## Version 0.9.30 - Zero-Copy Refactor & PyO3 0.27 (December 2025)
 
 ### 🆕 **Zero-Copy Architecture**
