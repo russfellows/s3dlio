@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Example demonstrating OpLogStreamReader for memory-efficient op-log processing
 //!
 //! This example shows how to use OpLogStreamReader to process large operation logs

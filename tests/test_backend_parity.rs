@@ -1,4 +1,7 @@
 // Test summary of ObjectStore implementation completion
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::object_store::{store_for_uri, Scheme, infer_scheme};
 use anyhow::Result;

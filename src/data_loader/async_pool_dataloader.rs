@@ -1,7 +1,7 @@
 // src/data_loader/async_pool_dataloader.rs
 //
-// Enhanced DataLoader with async request pooling and dynamic batch formation
-// Implements out-of-order completion with multi-backend support
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use bytes::Bytes;
 use crate::object_store::{ObjectStore, store_for_uri};

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Performance metrics and monitoring infrastructure
 //! 
 //! This module provides comprehensive metrics collection for AI/ML workloads

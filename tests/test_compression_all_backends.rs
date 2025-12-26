@@ -1,6 +1,7 @@
 // tests/test_compression_all_backends.rs
 //
-// Comprehensive compression tests across all 4 backends
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use tempfile::tempdir;

@@ -1,7 +1,7 @@
 // tests/test_streaming_data_generation.rs
 //
-// Copyright, 2025.  Signal65 / Futurum Group.
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
 use s3dlio::constants::BLK_SIZE;

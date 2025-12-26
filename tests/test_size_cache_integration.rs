@@ -1,9 +1,7 @@
 // v0.9.10: Integration tests for ObjectSizeCache across all backends
 //
-// This test verifies that:
-// 1. All backends (S3, GCS, Azure, file://) support pre_stat_and_cache()
-// 2. Size cache reduces stat operations (cache hits work)
-// 3. Pre-stat provides performance improvements for multi-object workloads
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::object_store::store_for_uri;
 use s3dlio::object_size_cache::ObjectSizeCache;

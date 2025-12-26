@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 use std::time::Instant;
 use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
 use anyhow::Result;

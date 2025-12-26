@@ -1,7 +1,7 @@
 // src/sharded_client.rs
 //
-// Sharded HTTP client pools to reduce lock contention and improve concurrency
-// Multiple independent clients distribute load and avoid bottlenecks
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use std::sync::Arc;

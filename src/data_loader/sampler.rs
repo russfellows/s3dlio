@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! src/data_loader/sampler.rs
 //! Samplers for the data loader (Stage 2).
 //!

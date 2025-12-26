@@ -1,7 +1,7 @@
 // src/memory.rs
 //
-// High-performance memory management for zero-copy S3 operations
-// Optimized for AI/ML workloads with aligned buffers and buffer pools
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;

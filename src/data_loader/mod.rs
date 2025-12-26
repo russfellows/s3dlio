@@ -1,4 +1,7 @@
 // src/data_loader/mod.rs
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 //! Public API surface for the s3dlio data_loader layer.
 /// expose the `dataloader` module (file dataloader.rs)

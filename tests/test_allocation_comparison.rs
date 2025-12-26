@@ -1,17 +1,7 @@
 // tests/test_allocation_comparison.rs
 //
-// Allocation overhead comparison test for Phase 1 buffer pool optimization
-//
-// This test attempts to measure the allocation overhead difference between:
-// 1. DEFAULT path: No buffer pool (allocates fresh Vec on each range read)
-// 2. OPTIMIZED path: Buffer pool enabled (reuses pooled buffers)
-//
-// Without specialized profiling tools, we can't measure exact allocations,
-// but we CAN measure the observable effects:
-// - Execution time (allocations cause overhead)
-// - Memory stats from /proc/self/status (Linux only)
-//
-// For precise allocation counting, use: perf stat -e page-faults,syscalls:sys_enter_mmap
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::file_store_direct::{ConfigurableFileSystemObjectStore, FileSystemConfig};

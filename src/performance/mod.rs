@@ -1,6 +1,7 @@
 // src/performance/mod.rs
 //
-// Performance optimization module
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 pub mod config;
 

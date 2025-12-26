@@ -1,10 +1,8 @@
 // src/data_gen_alt.rs
 //
-// Copyright, 2025.  Signal65 / Futurum Group.
-//
-// Alternative data generation implementation using Xoshiro256++ PRNG
-// with local back-references for compression control.
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 /// # Key Features
 /// - No shared BASE_BLOCK (eliminates cross-block compression)
 /// - Xoshiro256++ RNG (5-10x faster than ChaCha20)

@@ -1,9 +1,7 @@
 // Comprehensive performance comparison between old and new data generation algorithms
 //
-// Measures:
-// 1. Throughput (MB/s) - PRIMARY CONCERN
-// 2. CPU time - SECONDARY CONCERN
-// 3. Memory allocation - TERTIARY CONCERN
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use std::time::{Duration, Instant};

@@ -1,9 +1,7 @@
 // src/python_api/python_core_api.rs
 //
-// Copyright 2025
-// Signal65 / Futurum Group.
-//
-// Contains core S3 operations: put, get, list, delete, stat, create/delete buckets
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods};

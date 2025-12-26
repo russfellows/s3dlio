@@ -1,6 +1,7 @@
 // tests/test_phase3_priority3_integrity.rs
 //
-// Tests for Phase 3 Priority 3: Advanced Integrity Validation
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::store_for_uri;

@@ -1,15 +1,7 @@
 // tests/test_buffer_pool_directio.rs
 //
-// Comprehensive functional tests for Phase 1 buffer pool optimization (v0.9.9)
-//
-// This test suite validates:
-// 1. Buffer pool initialization in DirectIO constructors
-// 2. Correct buffer reuse behavior for range reads
-// 3. Edge cases: small ranges, large ranges, unaligned offsets
-// 4. Graceful fallback when pool is exhausted or disabled
-// 5. Memory allocation overhead comparison (old vs new path)
-//
-// Performance validation will be done separately with sai3-bench.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::file_store_direct::{ConfigurableFileSystemObjectStore, FileSystemConfig};

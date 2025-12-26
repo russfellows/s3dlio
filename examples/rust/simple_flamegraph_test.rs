@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 #[cfg(feature = "profiling")]
 use s3dlio::profiling::{init_profiling, profile_section};
 #[cfg(feature = "profiling")]

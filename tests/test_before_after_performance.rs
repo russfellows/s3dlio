@@ -1,5 +1,7 @@
 // Direct performance comparison between single-pass and streaming approaches
-// for 8MB data generation to validate claimed performance improvements
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
 use std::time::Instant;

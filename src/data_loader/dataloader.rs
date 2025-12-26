@@ -1,8 +1,7 @@
 // src/data_loader/dataloader.rs
 //
-// Stage-2 DataLoader: batching, shuffle+seed, prefetch; returns a concrete
-// ReceiverStream so tests can use `.next().await` and `.collect().await`
-// without pinning/boxing issues.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use crate::data_loader::dataset::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, LoadingMode};

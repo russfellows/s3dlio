@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Core dataset abstractions for s3dlio’s high‑level data‑loader.
 //!
 //! Stage 1 gives you the minimum surface needed to iterate over samples

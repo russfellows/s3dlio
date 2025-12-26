@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 /// Multi-process performance testing for s3dlio v0.8.2+
 /// Tests the multi-process capability to achieve 20+ GB/s aggregate throughput
 

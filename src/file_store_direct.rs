@@ -1,7 +1,7 @@
 // src/file_store_direct.rs
 //
-// Enhanced FileSystemObjectStore with O_DIRECT support for AI/ML workloads
-// This module provides direct I/O capabilities that bypass the page cache
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::{bail, Result};
 use bytes::{Bytes, BytesMut};

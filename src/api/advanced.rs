@@ -1,4 +1,8 @@
 // src/api/advanced.rs
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! # Advanced S3DL-IO API
 //!
 //! This module provides advanced functionality for power users who need

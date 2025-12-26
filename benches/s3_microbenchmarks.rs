@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use s3dlio::{data_gen::generate_controlled_data, s3_utils::*};
 use std::env;

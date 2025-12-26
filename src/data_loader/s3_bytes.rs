@@ -1,8 +1,8 @@
 // src/data_loader/s3_bytes.rs
-// 
-
-// src/data_loader/s3_bytes.rs
 //
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 use bytes::Bytes;
 use crate::s3_utils::{
     parse_s3_uri,

@@ -1,7 +1,7 @@
 // src/mp.rs
 //
-// Multi-process supervisor for maximum S3 GET performance
-// Shards keys across N worker processes to achieve warp-level throughput
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

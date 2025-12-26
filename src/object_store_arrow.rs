@@ -1,15 +1,7 @@
 // src/object_store_arrow.rs
 //
-// Arrow-backed adapter for s3dlio's ObjectStore trait.
-// Routes I/O through the Apache Arrow `object_store` crate.
-//
-// Build: gated behind feature "arrow-backend" (EXPERIMENTAL - NOT production ready).
-//
-// NOTE: This backend is experimental and has NOT shown performance benefits over
-// native-backends in production testing. Kept for comparison testing only.
-//
-// This module is intentionally "stateless": each call parses the full URI and
-// constructs (or reuses) the appropriate backend via object_store::parse_url.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;

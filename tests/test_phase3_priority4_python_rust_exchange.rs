@@ -1,6 +1,7 @@
 // tests/test_phase3_priority4_python_rust_exchange.rs
 //
-// Tests for Phase 3 Priority 4: Rich Python-Rust Data Exchange
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::store_for_uri;

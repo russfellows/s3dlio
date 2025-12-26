@@ -1,9 +1,7 @@
 // examples/large_scale_s3_test.rs
 //
-// Large-scale S3 performance test with comprehensive profiling
-// - Creates 50+ GB of test data (1MB to 24MB objects)
-// - Tests complete S3 lifecycle: bucket creation, upload, download, cleanup
-// - Comprehensive profiling and performance analysis
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::{Result, Context};
 use dotenvy;

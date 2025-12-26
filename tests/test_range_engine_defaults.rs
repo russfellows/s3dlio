@@ -1,6 +1,7 @@
 // tests/test_range_engine_defaults.rs
 //
-// Test to verify RangeEngine is disabled by default across all backends (v0.9.6+)
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 #[cfg(test)]
 mod range_engine_defaults {

@@ -1,16 +1,7 @@
 // tests/test_azure_comprehensive.rs
 //
-// Comprehensive integration tests for Azure Backend
-// Tests ALL ObjectStore trait methods with ACTUAL Azure Blob Storage
-// Validates zero-copy Bytes API changes from v0.9.0
-//
-// Prerequisites:
-// 1. Azure credentials configured (az login)
-// 2. Environment variables:
-//    - AZURE_BLOB_ACCOUNT: Your storage account name
-//    - AZURE_BLOB_CONTAINER: Container to use for testing
-//
-// Run: cargo test --release --test test_azure_comprehensive -- --nocapture --test-threads=1
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use bytes::Bytes;

@@ -1,22 +1,7 @@
 // src/multipart.rs
 //
-// Streaming, concurrent Multipart Upload (MPU) for very large objects.
-// Keeps nearly all MPU logic self-contained in this module.
-//
-// Design:
-// - MultipartUploadConfig configures part sizing and concurrency.
-// - MultipartUploadSink provides a streaming writer API:
-//     - write(&[u8]) buffers until part_size and schedules concurrent UploadPart
-//     - finish() uploads any tail and issues CompleteMultipartUpload
-//     - abort() aborts the MPU; also runs on Drop if not finished and abort_on_drop
-//
-// Integrations:
-// - Uses the global Tokio runtime and S3 client from s3_client.rs
-// - Accepts "s3://bucket/key" via from_uri() using parse_s3_uri() from s3_utils.rs
-//
-// Notes:
-// - All public APIs return anyhow::Result to match the crate style.
-// - Logging hooks can be added later to feed s3_logger; kept minimal here.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::{Context, Result, bail};
 use aws_sdk_s3::Client;

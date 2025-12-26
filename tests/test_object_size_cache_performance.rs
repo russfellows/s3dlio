@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 /// Performance validation tests for v0.9.10 ObjectSizeCache optimization
 /// 
 /// This test suite validates the actual performance improvements claimed for the

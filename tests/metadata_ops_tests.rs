@@ -1,7 +1,7 @@
 // tests/metadata_ops_tests.rs
 //
-// Integration tests for metadata operations (mkdir, rmdir, update_metadata, update_properties)
-// v0.10.0+ - Tests new ObjectStore trait methods
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::object_store::{ObjectStore, ObjectProperties};

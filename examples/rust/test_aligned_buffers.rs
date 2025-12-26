@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 #!/usr/bin/env rust
 //! Test script to validate O_DIRECT aligned buffer operations
 //! This tests that buffers are properly page-aligned for direct I/O

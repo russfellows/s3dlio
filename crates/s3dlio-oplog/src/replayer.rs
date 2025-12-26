@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Operation replay engine with timing-faithful execution
 //!
 //! Provides timeline-based replay of operation logs with microsecond precision,

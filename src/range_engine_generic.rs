@@ -1,7 +1,7 @@
 // src/range_engine_generic.rs
 //
-// Universal stream-based range engine for concurrent downloads
-// Works with ANY backend that implements async get_range(offset, length)
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};

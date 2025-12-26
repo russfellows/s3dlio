@@ -1,12 +1,7 @@
 // examples/async_pool_dataloader_demo.rs
 //
-// Demonstration of the enhanced async pooling dataloader with multi-backend support
-// 
-// This example shows:
-// 1. Multi-backend dataset creation from different URI schemes
-// 2. Dynamic batch formation with out-of-order completion
-// 3. Performance comparison between traditional and async pooling approaches
-// 4. Configuration tuning for different workloads
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::data_loader::{

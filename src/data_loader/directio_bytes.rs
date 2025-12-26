@@ -1,7 +1,7 @@
 // src/data_loader/directio_bytes.rs
 //
-// Direct I/O bytes dataset implementation that provides the same Dataset interface
-// for local file operations using O_DIRECT as S3BytesDataset does for S3 operations.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use bytes::Bytes;
 use crate::data_loader::{Dataset, DatasetError};

@@ -1,12 +1,7 @@
 // TFRecord index generation compatible with NVIDIA DALI tfrecord2idx format
 //
-// Generates text-format index files: "{offset} {size}\n" (space-separated, ASCII)
-// This format is compatible with:
-// - NVIDIA DALI fn.readers.tfrecord(index_path=...)
-// - TensorFlow tooling
-// - Python ML pipelines
-//
-// Zero dependencies - uses only Rust standard library
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};

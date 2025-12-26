@@ -1,14 +1,7 @@
 // tests/test_gcs_smoke.rs
 //
-// Quick smoke tests for GCS Backend with RangeEngine
-// Tests key ObjectStore trait methods with ACTUAL Google Cloud Storage
-//
-// Prerequisites:
-// 1. GCS authentication: gcloud auth application-default login
-// 2. Environment variable:
-//    - GCS_TEST_BUCKET: Your GCS bucket name (e.g., signal65-russ-b1)
-//
-// Run: cargo test --release --test test_gcs_smoke -- --nocapture --test-threads=1
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use bytes::Bytes;

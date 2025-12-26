@@ -1,8 +1,7 @@
 // src/adaptive_config.rs
 //
-// Optional adaptive tuning for s3dlio operations
-// Provides smart defaults based on workload characteristics
-// CRITICAL: Adaptive behavior is OPTIONAL - explicit user settings always override
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;

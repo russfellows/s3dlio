@@ -1,6 +1,5 @@
-//
-// Copyright, 2025.  Signal65 / Futurum Group.
-// 
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::{Context, Result};
 use futures::{stream::FuturesUnordered, StreamExt};

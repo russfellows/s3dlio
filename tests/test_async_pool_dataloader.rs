@@ -1,6 +1,7 @@
 // tests/test_async_pool_dataloader.rs
 //
-// Tests for enhanced async pooling dataloader with multi-backend support
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::data_loader::{

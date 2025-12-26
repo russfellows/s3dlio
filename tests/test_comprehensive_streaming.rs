@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 /// Comprehensive testing suite for streaming data generation
 /// Tests edge cases, error conditions, and multi-process scenarios for production readiness
 

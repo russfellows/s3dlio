@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Integration tests for the Stage-1 DataLoader.
 //!
 //! We use small, in-memory mock datasets so the tests are deterministic

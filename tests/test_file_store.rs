@@ -1,17 +1,7 @@
 // tests/test_file_store.rs
 //
-// Integration tests for FileSystemObjectStore
-// Tests the file:// URI scheme and POSIX filesystem operations
-//
-// This test suite demonstrates the new consistent URI scheme approach:
-// - s3://bucket/path/file.txt    (S3)
-// - az://container/path/file.txt (Azure - coming in Phase 3.3)
-// - file:///absolute/path/file.txt (Local filesystem)
-//
-// Same ObjectStore API works for all backends:
-//   let store = store_for_uri(uri)?;
-//   let data = store.get(uri).await?;
-//   store.put(uri, &data).await?;
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::{store_for_uri, infer_scheme, Scheme};

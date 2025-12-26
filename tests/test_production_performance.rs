@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 /// Large-scale performance test for production streaming scenarios
 /// Tests the actual usage pattern: generating multiple 1-8 MB buffers in a loop
 use s3dlio::data_gen::{generate_controlled_data, DataGenerator};

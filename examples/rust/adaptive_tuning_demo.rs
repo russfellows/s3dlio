@@ -1,7 +1,7 @@
 // examples/adaptive_tuning_demo.rs
 //
-// Demonstrates optional adaptive tuning in s3dlio
-// Shows how explicit settings ALWAYS override adaptive behavior
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::api::{AdaptiveConfig, WorkloadType, AdaptiveParams, WriterOptions, LoaderOptions};
 

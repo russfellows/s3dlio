@@ -1,6 +1,7 @@
 // tests/test_directio_range_engine.rs
 //
-// Integration tests for DirectIO backend with RangeEngine
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::file_store_direct::{ConfigurableFileSystemObjectStore, FileSystemConfig};

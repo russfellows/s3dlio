@@ -1,7 +1,7 @@
 // tests/test_s3_backend_comparison.rs
 //
-// Integration tests comparing native AWS SDK vs Apache Arrow backends
-// against real S3 storage using credentials from .env file
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use std::env;

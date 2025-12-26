@@ -1,7 +1,7 @@
 // examples/profile_s3_operations.rs
 //
-// Example demonstrating how to profile s3dlio operations to identify performance bottlenecks.
-// This example shows different profiling approaches for various workload patterns.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::profiling::*;

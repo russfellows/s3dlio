@@ -1,4 +1,8 @@
 // src/data_loader/options.rs
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //!
 //! Stage 1 exposed only `batch_size` and `drop_last`.
 //! Stage 2 adds shuffle, num_workers, prefetch, and auto_tune.

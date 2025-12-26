@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 /// Error handling and edge case tests for streaming data generation
 /// Ensures robust behavior under adverse conditions
 
