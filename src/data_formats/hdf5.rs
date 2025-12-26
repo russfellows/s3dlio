@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use hdf5_metno::File;

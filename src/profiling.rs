@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Profiling infrastructure for s3dlio performance analysis
 //! 
 //! This module provides CPU sampling profiling, async task monitoring, and structured tracing

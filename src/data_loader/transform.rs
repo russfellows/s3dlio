@@ -1,7 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-
-// Similarly you could add FilterDataset and FlatMapDataset here...
-// For brevity you can start with MapDataset only and add others later.//! Dataset combinators: map, filter, flat_map (Stage 2).
 //!
 //! We currently implement MapDataset as an example; add FilterDataset and FlatMapDataset similarly.
 

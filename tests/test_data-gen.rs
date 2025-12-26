@@ -1,7 +1,7 @@
 // tests/test_data-gen.rs
 //
-// Test cases to test data generation
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::data_gen::generate_controlled_data;
 

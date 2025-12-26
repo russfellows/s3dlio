@@ -1,4 +1,8 @@
 // Comprehensive validation tests for Phase 2 streaming infrastructure
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 use tempfile::TempDir;
 use anyhow::Result;
 use tokio::fs;

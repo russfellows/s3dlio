@@ -1,6 +1,7 @@
 // src/performance/config.rs
 //
-// Performance configuration management
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use crate::concurrency::{ConcurrencyMode, S3PerformanceProfile, Throughput};

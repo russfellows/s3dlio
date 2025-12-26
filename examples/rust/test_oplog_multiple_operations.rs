@@ -1,4 +1,8 @@
 // Test program to generate multiple op-log entries for file:// and direct:// backends
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 use anyhow::Result;
 use s3dlio::{init_op_logger, store_for_uri_with_logger, global_logger, finalize_op_logger};
 use s3dlio::s3_logger::Logger;

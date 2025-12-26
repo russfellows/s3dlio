@@ -1,7 +1,8 @@
 // src/page_cache.rs
 //
-// Copyright, 2025. Signal65 / Futurum Group.
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Page cache control via posix_fadvise() on Linux/Unix systems
 //!
 //! Provides hints to the kernel about file access patterns to optimize

@@ -1,12 +1,7 @@
 // src/python_api.rs
-// 
-// Copyright 2025
-// Signal65 / Futurum Group.
 //
-
-//
-// Main Python API - imports and re-exports from modular structure
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use pyo3::prelude::*;
 

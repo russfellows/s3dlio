@@ -1,7 +1,7 @@
 // tests/test_cancellation.rs
 //
-// Integration tests for CancellationToken support across DataLoader components
-// Tests graceful shutdown behavior for prefetching and async pooling operations
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::data_loader::{
     LoaderOptions, DataLoader, AsyncPoolDataLoader, PoolConfig,

@@ -3,10 +3,10 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.30"
+version = "0.9.31"
 edition = "2021"
 authors = ["Russ Fellows"]
-license = "AGPL-3.0"
+license = "Apache-2.0"
 
 [package]
 name = "s3dlio"
@@ -158,19 +158,6 @@ profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always a
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 experimental-http-client = []        # Enable custom hyper_builder optimizations (requires patched aws-smithy-http-client)
 test-npy-09 = []                     # Test ndarray-npy 0.9 API compatibility (temporary for testing)
-
-# NOTE: Custom aws-smithy-http-client patches are DISABLED by default
-# The fork-patches/aws-smithy-http-client/ directory contains experimental HTTP connection
-# pool configuration changes that were tested but showed no measurable performance benefit.
-# Keeping fork available for reference/experimentation but not forcing downstream users
-# to patch their dependencies.
-#
-# To enable experimental HTTP client optimizations (NOT RECOMMENDED):
-# 1. Uncomment the [patch.crates-io] section below
-# 2. Build with: cargo build --features experimental-http-client
-#
-# [patch.crates-io]
-# aws-smithy-http-client = { path = "fork-patches/aws-smithy-http-client" }
 
 [[example]]
 name = "s3_backend_comparison"

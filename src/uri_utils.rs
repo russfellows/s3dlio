@@ -1,4 +1,8 @@
 // src/uri_utils.rs
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! URI manipulation utilities for multi-endpoint support
 //!
 //! This module provides functions for expanding URI templates and parsing

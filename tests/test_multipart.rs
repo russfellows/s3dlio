@@ -1,4 +1,8 @@
 // tests/test_multipart.rs
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 use anyhow::{Context, Result, ensure};
 use std::time::{SystemTime, UNIX_EPOCH};
 

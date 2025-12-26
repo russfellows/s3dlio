@@ -1,5 +1,7 @@
 // Integration tests for S3 URI parsing with endpoint support
-// Tests the public API as external users would interact with it
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::{parse_s3_uri_full, parse_s3_uri, S3UriComponents};
 

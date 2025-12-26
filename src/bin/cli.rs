@@ -1,6 +1,6 @@
-//
-// Copyright, 2025.  Signal65 / Futurum Group.
-// 
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! CLI supporting `list`, `get`, `delete`, `put`, and `putmany`.
 //!
 //! Examples:

@@ -1,5 +1,8 @@
 // tests/test_performance.rs
 //
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 use std::time::Instant;
 //use s3dlio::data_gen::{generate_random_data, generate_controlled_data};
 use s3dlio::data_gen::generate_controlled_data;

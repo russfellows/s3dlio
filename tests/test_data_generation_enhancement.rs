@@ -1,5 +1,7 @@
 // Test for data generation improvements - verifies single-pass generator maintains identical output
-// to the two-pass version while preserving dedup/compress guarantees.
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::constants::{BLK_SIZE, MOD_SIZE, A_BASE_BLOCK};
 use s3dlio::data_gen::{generate_controlled_data, generate_controlled_data_two_pass};

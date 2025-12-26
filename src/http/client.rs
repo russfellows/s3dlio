@@ -1,6 +1,7 @@
 // src/http/client.rs
 //
-// Enhanced HTTP client with HTTP/2 support and performance optimizations
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::{Context, Result};
 use std::time::Duration;

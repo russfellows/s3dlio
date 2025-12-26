@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Multi-endpoint storage support with configurable load balancing and per-endpoint thread/process control.
 //!
 //! This module provides a wrapper around multiple ObjectStore instances, enabling:

@@ -1,6 +1,7 @@
 // tests/test_phase3_priority2_compression.rs
 //
-// Test Phase 3 Priority 2: Compression Support in Streaming Pipeline
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use tempfile::tempdir;

@@ -1,10 +1,8 @@
 // src/lib.rs
 //
-// Copyright, 2025.  Signal65 / Futurum Group.
-//
-// Crate root — public re-exports plus the Python module glue.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-// Compile-time feature compatibility check
 #[cfg(all(feature = "native-backends", feature = "arrow-backend"))]
 compile_error!("Enable only one of: native-backends or arrow-backend");
 

@@ -1,14 +1,7 @@
 // tests/test_direct_io.rs
 //
-// Comprehensive test suite for O_DIRECT file I/O functionality in s3dlio.
-// 
-// These tests ensure that:
-// - O_DIRECT works when supported by the filesystem
-// - Graceful fallback to regular I/O when O_DIRECT is not supported
-// - System page size detection works correctly across platforms
-// - Various data sizes and alignment scenarios are handled properly
-// - Factory functions create correctly configured stores
-// - Range reads work with both direct I/O and fallback modes
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio::file_store_direct::{ConfigurableFileSystemObjectStore, FileSystemConfig};

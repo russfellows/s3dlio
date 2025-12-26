@@ -1,7 +1,8 @@
 // src/s3_client.rs
-// 
-// Copyright, 2025.  Signal65 / Futurum Group.
 //
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Thread‑safe, blocking wrapper around the async AWS Rust SDK.
 //! Owns a single global multi-thread Tokio runtime and the global S3 client.
 //!

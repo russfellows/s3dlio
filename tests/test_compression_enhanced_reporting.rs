@@ -1,6 +1,7 @@
 // tests/test_compression_enhanced_reporting.rs
 //
-// Enhanced compression tests with improved reporting and varied data patterns
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use tempfile::tempdir;

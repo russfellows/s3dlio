@@ -1,7 +1,8 @@
 // src/s3_ops.rs
 //
-// Copyright, 2025. Signal65 / Futurum Group.
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! High-level, logged S3 operations (GET, PUT, STAT, etc.).
 //!
 //! This module provides an `S3Ops` struct that wraps the AWS S3 client

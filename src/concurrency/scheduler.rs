@@ -1,7 +1,7 @@
 // src/concurrency/scheduler.rs
 //
-// Adaptive Concurrency Scheduler
-// Based on AWS S3 Transfer Manager patterns for intelligent throughput optimization
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;

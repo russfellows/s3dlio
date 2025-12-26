@@ -1,7 +1,7 @@
 // Example: Basic usage of s3dlio-oplog replay functionality
 //
-// This demonstrates how to use the shared s3dlio-oplog crate to replay
-// a captured workload with timing preservation and backend retargeting.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use s3dlio_oplog::{OpType, ReplayConfig, replay_with_s3dlio};

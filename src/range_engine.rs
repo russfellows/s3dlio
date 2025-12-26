@@ -1,7 +1,7 @@
 // src/range_engine.rs
 //
-// High-performance concurrent range-GET engine for S3 operations
-// Zero-copy memory operations with optimal concurrency and minimal allocations
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use crate::memory::BufferPool;
 use crate::sharded_client::{ShardedS3Clients, RangeRequest, RangeResponse};

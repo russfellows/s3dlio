@@ -1,4 +1,8 @@
 // src/api.rs
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! # S3DL-IO Public API
 //!
 //! This module provides the clean, stable public API for the s3dlio library.

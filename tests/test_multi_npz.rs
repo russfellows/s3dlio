@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
-// SPDX-License-Identifier: GPL-3.0-or-later
-
-// Tests for multi-array NPZ functionality
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use ndarray::ArrayD;

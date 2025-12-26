@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! URI translation utilities for backend retargeting
 //!
 //! Provides simple 1:1 URI translation to replay operations from one backend to another.

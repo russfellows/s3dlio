@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Prefetch helper for data loader (Stage 2).
 //!
 //! Spawn a simple async prefetcher over a producer function.

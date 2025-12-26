@@ -1,7 +1,8 @@
 // src/s3_logger.rs
 //
-// Copyright, 2025. Signal65 / Futurum Group.
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! I/O logging functionality to trace S3 operations.
 //!
 //! Creates a zstd-compressed, tab-separated log file with a format

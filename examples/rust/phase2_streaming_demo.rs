@@ -1,6 +1,7 @@
 // examples/phase2_streaming_demo.rs
 //
-// Demonstration of Phase 2 streaming PUT optimization
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 

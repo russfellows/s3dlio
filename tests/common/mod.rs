@@ -1,6 +1,7 @@
 // tests/common/mod.rs
 //
-// Common test utilities and configuration for GCS tests.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use std::env;
 

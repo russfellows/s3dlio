@@ -1,17 +1,7 @@
 // src/python_api/zero_copy_api.rs
 //
-// Zero-Copy Python API for s3dlio
-// Provides efficient data transfer between Python and Rust without copying
-//
-// ⚠️  WORK IN PROGRESS - NOT CURRENTLY ENABLED ⚠️
-// This module contains advanced zero-copy API implementations but is disabled
-// due to numpy dependency requirements. To enable:
-// 1. Add numpy dependency to Cargo.toml 
-// 2. Uncomment module in src/python_api.rs
-// 3. Add registration calls in register_all_functions
-//
-// Status: Implementation complete, needs dependency integration
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyByteArray};

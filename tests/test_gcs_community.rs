@@ -1,16 +1,7 @@
 // tests/test_gcs_community.rs
 //
-// Comprehensive functional tests for GCS backend using gcs-community (gcloud-storage crate).
-//
-// These tests run against real GCS infrastructure and require:
-// - GCS_TEST_BUCKET environment variable set to a valid bucket name
-// - Valid GCS authentication (gcloud CLI, service account, or ADC)
-//
-// All test objects use the prefix "s3dlio-test/" and are cleaned up after tests.
-//
-// Run with:
-//   cargo test --test test_gcs_community --no-default-features --features native-backends,gcs-community
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 mod common;
 

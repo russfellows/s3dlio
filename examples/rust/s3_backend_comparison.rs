@@ -1,7 +1,7 @@
 // examples/s3_backend_comparison.rs
 //
-// Compare performance and functionality between native AWS SDK and Apache Arrow backends
-// for real S3 operations using the configured S3 endpoint and credentials.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use std::env;

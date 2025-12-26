@@ -1,7 +1,7 @@
 // src/download.rs
 //
-// High-performance download engine for S3 operations
-// Optimized for AI/ML workloads with memory-first architecture and optional O_DIRECT file I/O
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use std::path::PathBuf;

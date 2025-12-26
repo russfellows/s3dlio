@@ -1,22 +1,7 @@
 // tests/test_gcs_functional.rs
 //
-// Comprehensive functional tests for Google Cloud Storage (GCS) client.
-// Tests all GcsClient operations against REAL Google Cloud Storage.
-//
-// PREREQUISITES:
-// 1. Valid GCS bucket (set GCS_TEST_BUCKET env var)
-// 2. Authentication via one of:
-//    - GOOGLE_APPLICATION_CREDENTIALS env var pointing to service account JSON
-//    - gcloud CLI authentication (`gcloud auth application-default login`)
-//    - GCE/GKE metadata server (if running on Google Cloud)
-//
-// RUN TESTS:
-// # Test with community backend (default)
-// GCS_TEST_BUCKET=your-bucket cargo test --test test_gcs_functional --release -- --nocapture
-//
-// # Test with official backend (requires implementation)
-// GCS_TEST_BUCKET=your-bucket cargo test --test test_gcs_functional --release \
-//   --no-default-features --features native-backends,s3,gcs-official -- --nocapture
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use std::env;

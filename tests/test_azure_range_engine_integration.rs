@@ -1,14 +1,7 @@
 // tests/test_azure_range_engine_integration.rs
 //
-// Integration tests for Azure Backend RangeEngine
-// Tests concurrent range downloads with ACTUAL Azure Blob Storage
-//
-// Prerequisites:
-// 1. Azure credentials configured (az login)
-// 2. Environment variables:
-//    - AZURE_BLOB_ACCOUNT: Your storage account name
-//    - AZURE_BLOB_CONTAINER: Container to use for testing
-// 3. Test data uploaded to the container
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use bytes::Bytes;

@@ -1,7 +1,7 @@
 // tests/test_backend_performance_comparison.rs
 //
-// Comprehensive performance comparison between native and Arrow backends
-// Tests PUT and GET operations with 1-8MB objects for at least 2 minutes
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
 use std::time::{Duration, Instant};

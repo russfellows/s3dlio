@@ -1,7 +1,7 @@
 // src/gcs_client.rs
 //
-// Google Cloud Storage client implementation using gcloud-storage crate.
-// Provides high-level operations for GCS buckets and objects with Application Default Credentials (ADC).
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;

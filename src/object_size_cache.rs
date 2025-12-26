@@ -1,11 +1,7 @@
 // src/object_size_cache.rs
 //
-// Thread-safe cache for object sizes with TTL expiration
-//
-// Enables pre-statting objects before download to eliminate per-object stat latency
-// in high-throughput benchmarking workloads like sai3-bench.
-//
-// v0.9.10 optimization: Pre-stat 1000 objects in 200ms instead of 20 seconds
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use std::collections::HashMap;
 use std::sync::Arc;

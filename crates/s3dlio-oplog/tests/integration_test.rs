@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Integration tests for s3dlio-oplog crate
 //!
 //! These tests verify the public API and end-to-end functionality

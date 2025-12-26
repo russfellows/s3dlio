@@ -1,6 +1,7 @@
 // tests/test_file_range_engine.rs
 //
-// Integration tests for File backend with RangeEngine
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use s3dlio::object_store::{ObjectStore, store_for_uri};
 use s3dlio::file_store::{FileSystemObjectStore, FileSystemConfig};

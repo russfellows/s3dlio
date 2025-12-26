@@ -1,7 +1,8 @@
 // src/object_store_logger.rs
 //
-// Copyright, 2025. Signal65 / Futurum Group.
-//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
 //! Logging wrapper for ObjectStore trait to enable op-log tracing for all backends.
 //!
 //! This module provides a decorator pattern wrapper that adds operation logging
