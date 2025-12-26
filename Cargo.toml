@@ -6,7 +6,7 @@ members = [".", "crates/s3dlio-oplog"]
 version = "0.9.30"
 edition = "2021"
 authors = ["Russ Fellows"]
-license = "AGPL-3.0"
+license = "Apache-2.0"
 
 [package]
 name = "s3dlio"

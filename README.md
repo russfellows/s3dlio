@@ -5,7 +5,7 @@
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-175%2F175-brightgreen)](docs/Changelog.md)
 [![Version](https://img.shields.io/badge/version-0.9.30-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
-[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
 

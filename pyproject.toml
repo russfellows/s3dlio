@@ -5,7 +5,7 @@ description = "High-performance S3, Azure, GCS, and file system operations for A
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
-license = { text = "AGPL-3.0" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Russ Fellows", email = "russ.fellows@gmail.com" }]
 
 [build-system]
