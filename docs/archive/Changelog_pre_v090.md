@@ -617,8 +617,8 @@ See `docs/GCS_TODO.md` for complete roadmap.
 ### 👥 **Contributors**
 
 - Implementation: GitHub Copilot AI
-- Testing: Signal65 team
-- GCS Bucket: signal65-russ-b1
+- Testing: Test team
+- GCS Bucket: private-bucket 
 
 ---
 

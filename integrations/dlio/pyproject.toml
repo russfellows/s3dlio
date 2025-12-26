@@ -9,7 +9,7 @@ description = "s3dlio storage backend for Argonne DLIO Benchmark"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "Signal65 / Futurum Group"}
+    {name = "Russ Fellows"}
 ]
 maintainers = [
     {name = "Russ Fellows"}
