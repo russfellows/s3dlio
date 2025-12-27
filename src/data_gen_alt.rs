@@ -8,8 +8,7 @@
 /// - Xoshiro256++ RNG (5-10x faster than ChaCha20)
 /// - Compression distributed evenly via integer error accumulation
 /// - Correct compress=1 behavior (truly incompressible, ~1.0 zstd ratio)
-// - When compress>1, compressibility is local to each block
-
+/// - When compress>1, compressibility is local to each block
 use rand::{Rng, SeedableRng, RngCore};
 use rand_xoshiro::Xoshiro256PlusPlus;  // Explicit high-performance RNG
 use rayon::prelude::*;

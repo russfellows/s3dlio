@@ -66,7 +66,7 @@ impl<'a> Writer<'a> {
         if let Some(compression) = &self.compression {
             let (mut writer, _) = self.get_shard_writer(layout).await?;
             writer.write_chunk(data).await?;
-            let _ = writer.finalize().await?;
+            writer.finalize().await?;
             
             // When compression is enabled, the file gets the compression extension
             let compressed_uri = if compression.is_enabled() {
@@ -102,7 +102,7 @@ impl<'a> Writer<'a> {
             let meta = self.store.stat(&uri).await?;
             Ok(ShardMeta {
                 rank: self.rank,
-                key: key,
+                key,
                 size: meta.size,
                 etag: meta.e_tag,
                 checksum: None, // TODO: Add checksum support if needed
@@ -118,7 +118,7 @@ impl<'a> Writer<'a> {
         if let Some(compression) = &self.compression {
             let mut writer = self.get_shard_writer_with_key(key).await?;
             writer.write_chunk(data).await?;
-            let _ = writer.finalize().await?;
+            writer.finalize().await?;
             
             // When compression is enabled, the file gets the compression extension
             let compressed_uri = if compression.is_enabled() {

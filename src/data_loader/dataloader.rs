@@ -70,10 +70,9 @@ impl<D: Dataset> DataLoader<D> {
                     match ds_idx.get(idx).await {
                         Ok(item) => {
                             buf.push(item);
-                            if buf.len() == batch {
-                                if tx_idx.send(Ok(std::mem::take(&mut buf))).await.is_err() {
-                                    break;
-                                }
+                            if buf.len() == batch
+                                && tx_idx.send(Ok(std::mem::take(&mut buf))).await.is_err() {
+                                break;
                             }
                         }
                         Err(e) => {
@@ -120,10 +119,9 @@ impl<D: Dataset> DataLoader<D> {
                             if !take { continue; }
 
                             buf.push(item);
-                            if buf.len() == batch {
-                                if tx_it.send(Ok(std::mem::take(&mut buf))).await.is_err() {
-                                    break;
-                                }
+                            if buf.len() == batch
+                                && tx_it.send(Ok(std::mem::take(&mut buf))).await.is_err() {
+                                break;
                             }
                         }
                         Err(e) => {
@@ -155,10 +153,9 @@ impl<D: Dataset> DataLoader<D> {
                     match ds_un.get(idx).await {
                         Ok(item) => {
                             buf.push(item);
-                            if buf.len() == batch {
-                                if tx_un.send(Ok(std::mem::take(&mut buf))).await.is_err() {
-                                    break;
-                                }
+                            if buf.len() == batch
+                                && tx_un.send(Ok(std::mem::take(&mut buf))).await.is_err() {
+                                break;
                             }
                             idx += 1;
                         }

@@ -1031,7 +1031,7 @@ impl ObjectStore for S3ObjectStore {
     async fn delete(&self, uri: &str) -> Result<()> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         let (bucket, key) = parse_s3_uri(uri)?;
-        s3_delete_objects(&bucket, &vec![key])
+        s3_delete_objects(&bucket, &[key])
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
@@ -1799,7 +1799,6 @@ impl ObjectStore for AzureObjectStore {
 }
 
 /// Buffered writer for Azure that collects chunks and uses multipart upload
-
 pub struct AzureBufferedWriter {
     uri: String,
     buffer: Vec<u8>,

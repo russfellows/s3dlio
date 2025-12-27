@@ -305,10 +305,9 @@ impl AsyncPoolDataLoader {
                         }
                         
                         // Send complete batch
-                        if current_batch.len() == batch_size {
-                            if tx.send(Ok(std::mem::take(&mut current_batch))).await.is_err() {
-                                break; // Receiver dropped
-                            }
+                        if current_batch.len() == batch_size
+                            && tx.send(Ok(std::mem::take(&mut current_batch))).await.is_err() {
+                            break; // Receiver dropped
                         }
                     }
                     Err(e) => {
@@ -335,10 +334,9 @@ impl AsyncPoolDataLoader {
             }
             
             // Send complete batch
-            if current_batch.len() == batch_size {
-                if tx.send(Ok(std::mem::take(&mut current_batch))).await.is_err() {
-                    break;
-                }
+            if current_batch.len() == batch_size
+                && tx.send(Ok(std::mem::take(&mut current_batch))).await.is_err() {
+                break;
             }
         }
         

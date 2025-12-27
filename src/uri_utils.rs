@@ -295,7 +295,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "# Test endpoints").unwrap();
         writeln!(file, "s3://10.0.0.1:9000/bucket/").unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         writeln!(file, "s3://10.0.0.2:9000/bucket/").unwrap();
         writeln!(file, "# Another comment").unwrap();
         writeln!(file, "s3://10.0.0.3:9000/bucket/").unwrap();
@@ -313,7 +313,7 @@ mod tests {
     fn test_load_from_file_empty() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "# Only comments").unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         file.flush().unwrap();
         
         let result = load_uris_from_file(file.path());

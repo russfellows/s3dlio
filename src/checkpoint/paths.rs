@@ -20,8 +20,10 @@ impl fmt::Display for Strategy {
     }
 }
 
-impl Strategy {
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+impl std::str::FromStr for Strategy {
+    type Err = anyhow::Error;
+    
+    fn from_str(s: &str) -> anyhow::Result<Self> {
         match s.to_lowercase().as_str() {
             "flat" => Ok(Strategy::Flat),
             "round_robin" | "roundrobin" => Ok(Strategy::RoundRobin),
@@ -234,11 +236,11 @@ mod tests {
 
     #[test]
     fn test_strategy_from_str() {
-        assert_eq!(Strategy::from_str("flat").unwrap(), Strategy::Flat);
-        assert_eq!(Strategy::from_str("round_robin").unwrap(), Strategy::RoundRobin);
-        assert_eq!(Strategy::from_str("roundrobin").unwrap(), Strategy::RoundRobin);
-        assert_eq!(Strategy::from_str("binary").unwrap(), Strategy::Binary);
-        assert!(Strategy::from_str("invalid").is_err());
+        assert_eq!("flat".parse::<Strategy>().unwrap(), Strategy::Flat);
+        assert_eq!("round_robin".parse::<Strategy>().unwrap(), Strategy::RoundRobin);
+        assert_eq!("roundrobin".parse::<Strategy>().unwrap(), Strategy::RoundRobin);
+        assert_eq!("binary".parse::<Strategy>().unwrap(), Strategy::Binary);
+        assert!("invalid".parse::<Strategy>().is_err());
     }
 
     #[test]

@@ -424,7 +424,7 @@ mod tests {
 
         // Large object - should use ranges
         assert!(engine.would_use_ranges(500 * 1024 * 1024)); // 500MB
-        let expected_ranges = (500 + 64 - 1) / 64; // Ceiling division
+        let expected_ranges = 500_usize.div_ceil(64); // Ceiling division
         assert_eq!(engine.estimate_range_count(500 * 1024 * 1024), expected_ranges);
     }
 
