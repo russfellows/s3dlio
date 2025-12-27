@@ -85,7 +85,7 @@ fn fill_block_alt(
 
         // Choose source position (back-reference from earlier in block)
         // Distance: 1-1024 bytes (or less if near start of block)
-        let max_back = dst.min(1024).max(1);
+        let max_back = dst.clamp(1, 1024);
         let back = rng.random_range(1..=max_back);
         let src = dst.saturating_sub(back);
 
@@ -152,7 +152,7 @@ pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usi
     }
 
     let block_size = BLK_SIZE;
-    let nblocks = (size + block_size - 1) / block_size;
+    let nblocks = size.div_ceil(block_size);
 
     // --- Dedupe calculation (identical to original) ---
     let dedup_factor = if dedup == 0 { 1 } else { dedup };
@@ -278,7 +278,7 @@ impl ObjectGenAlt {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let block_size = BLK_SIZE;
-        let nblocks = (total_size + block_size - 1) / block_size;
+        let nblocks = total_size.div_ceil(block_size);
 
         // Dedupe calculation
         let dedup_factor = if dedup == 0 { 1 } else { dedup };

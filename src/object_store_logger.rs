@@ -146,6 +146,7 @@ impl LoggedObjectStore {
     /// - Add streaming get_stream() API to ObjectStore trait
     /// - Instrument backend implementations (s3_store, azure_store, gcs_store)
     /// - Track per-chunk timing in RangeEngine for large object analysis
+    #[allow(clippy::too_many_arguments)]
     fn log_operation(
         &self,
         operation: &str,

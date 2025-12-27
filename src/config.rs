@@ -18,36 +18,29 @@ pub enum ObjectType {
 #[derive(Clone, Copy, Debug, ValueEnum, Deserialize, Serialize)]
 #[clap(rename_all = "kebab-case")] // CLI shows random, prand
 #[serde(rename_all = "snake_case")] // JSON shows random, prand
+#[derive(Default)]
 pub enum DataGenAlgorithm {
     /// Random data generation (variable performance 1-7 GB/s depending on size)
+    #[default]
     Random,
     /// Pseudo-random using BASE_BLOCK algorithm (consistent 3-4 GB/s, CPU-efficient)
     Prand,
 }
 
-impl Default for DataGenAlgorithm {
-    fn default() -> Self {
-        Self::Random
-    }
-}
 
 /// Data generation modes for performance optimization.
 #[derive(Clone, Copy, Debug, ValueEnum, Deserialize, Serialize)]
 #[clap(rename_all = "kebab-case")] // CLI shows streaming, single-pass
 #[serde(rename_all = "snake_case")] // JSON shows streaming, single_pass
+#[derive(Default)]
 pub enum DataGenMode {
     /// Streaming generation with configurable chunk size (default, faster for most workloads)
+    #[default]
     Streaming,
     /// Single-pass generation (legacy, faster for 16-32MB objects)
     SinglePass,
 }
 
-impl Default for DataGenMode {
-    fn default() -> Self {
-        // Default to streaming based on performance benchmarks showing 64% win rate
-        Self::Streaming
-    }
-}
 
 /// S3-specific configuration
 #[derive(Deserialize, Serialize, Debug, Clone)]

@@ -252,7 +252,7 @@ fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: us
     }
 
     let block_size = BLK_SIZE;
-    let nblocks = (size + block_size - 1) / block_size;
+    let nblocks = size.div_ceil(block_size);
 
     // Determine deduplication factor and number of unique blocks (identical to original)
     let dedup_factor = if dedup == 0 { 1 } else { dedup };
@@ -347,7 +347,7 @@ pub fn generate_controlled_data_two_pass(mut size: usize, dedup: usize, compress
     }
 
     let block_size = BLK_SIZE;
-    let nblocks = (size + block_size - 1) / block_size;
+    let nblocks = size.div_ceil(block_size);
 
     // Determine deduplication: target ratio = 1/dedup_factor
     let dedup_factor = if dedup == 0 { 1 } else { dedup };
@@ -391,8 +391,8 @@ pub fn generate_controlled_data_two_pass(mut size: usize, dedup: usize, compress
             };
 
             // Zero out the constant prefix
-            for j in 0..const_len {
-                block[j] = 0;
+            for item in block.iter_mut().take(const_len) {
+                *item = 0;
             }
 
             // Compute region for unique modifications
@@ -456,7 +456,7 @@ impl DataGenerator {
         // Add thread-local counter to ensure uniqueness even with rapid creation
         use std::cell::Cell;
         thread_local! {
-            static ENTROPY_COUNTER: Cell<u64> = Cell::new(0);
+            static ENTROPY_COUNTER: Cell<u64> = const { Cell::new(0) };
         }
         
         let base_entropy = SystemTime::now()

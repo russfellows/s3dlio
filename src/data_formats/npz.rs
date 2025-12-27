@@ -78,7 +78,7 @@ pub fn array_to_npy_bytes(array: &ArrayD<f32>) -> Result<Bytes> {
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 slice.as_ptr() as *const u8,
-                slice.len() * std::mem::size_of::<f32>()
+                std::mem::size_of_val(slice)
             )
         };
         buffer.write_all(bytes)?;
@@ -103,7 +103,7 @@ fn make_npy_header(shape: usize) -> Vec<u8> {
     const BASE: usize = 10; // magic (6) + version (2) + hdr‑len (2)
     let with_nl = BASE + header.len() + 1;
     let pad = (16 - (with_nl % 16)) % 16;
-    header.extend(std::iter::repeat(b' ').take(pad));
+    header.extend(std::iter::repeat_n(b' ', pad));
     header.push(b'\n');
 
     // Magic + version = v1.0
@@ -395,8 +395,8 @@ pub fn list_npz_arrays(data: &[u8]) -> Result<Vec<String>> {
             archive.name_for_index(i)
                 .map(|name| {
                     // Strip .npy extension
-                    if name.ends_with(".npy") {
-                        name[..name.len() - 4].to_string()
+                    if let Some(stripped) = name.strip_suffix(".npy") {
+                        stripped.to_string()
                     } else {
                         name.to_string()
                     }

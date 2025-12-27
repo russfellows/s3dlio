@@ -31,7 +31,6 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tempfile::NamedTempFile;
-use glob;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -507,7 +506,7 @@ async fn main() -> Result<()> {
                     } else if dest.starts_with("az://") || dest.starts_with("azure://") {
                         // For Azure, extract container name
                         let parts: Vec<&str> = dest.trim_start_matches("az://").trim_start_matches("azure://").split('/').collect();
-                        if let Some(container) = parts.get(0) {
+                        if let Some(container) = parts.first() {
                             if let Err(e) = store.create_container(container).await {
                                 warn!("Failed to create container {}: {}", container, e);
                             }
@@ -515,7 +514,7 @@ async fn main() -> Result<()> {
                     } else if dest.starts_with("gs://") || dest.starts_with("gcs://") {
                         // For GCS, extract bucket name
                         let parts: Vec<&str> = dest.trim_start_matches("gs://").trim_start_matches("gcs://").split('/').collect();
-                        if let Some(bucket) = parts.get(0) {
+                        if let Some(bucket) = parts.first() {
                             if let Err(e) = store.create_container(bucket).await {
                                 warn!("Failed to create GCS bucket {}: {}", bucket, e);
                             }
@@ -1064,7 +1063,7 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             info!("Deleting {} objects matching pattern '{}' under prefix '{}'", total, pat, uri);
             eprintln!("Found {} objects matching pattern '{}' (using adaptive concurrency: ~{})", 
                      total, pat, 
-                     if total < 10 { 1 } else if total < 100 { 10 } else if total < 10_000 { total / 10 } else { total / 10 }.min(1000));
+                     if total < 10 { 1 } else if total < 100 { 10 } else { (total / 10).min(1000) });
             
             // Create progress bar for deletion
             let pb = ProgressBar::new(total as u64);
@@ -1080,7 +1079,7 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             
             // Use batch delete (backends optimize internally - S3 uses DeleteObjects API)
             for chunk in keys.chunks(1000) {
-                store.delete_batch(&chunk.to_vec()).await?;
+                store.delete_batch(chunk).await?;
                 pb_clone.inc(chunk.len() as u64);
             }
             
@@ -1129,7 +1128,7 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                                 batch.clear();
                                 
                                 // Update progress bar with nice formatting
-                                if total_listed % 1000 == 0 {
+                                if total_listed.is_multiple_of(1000) {
                                     pb_list.set_message(format!("Listed: {} | Deleting in background...", total_listed));
                                 }
                             }
@@ -1325,6 +1324,7 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
 
 
 /// Put command supports 1 or more objects, also takes our ObjectType
+#[allow(clippy::too_many_arguments)]
 async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize, data_gen_mode: DataGenMode, chunk_size: usize) -> Result<()> {
     // Ensure prefix ends with '/' for consistent URI generation
     let mut prefix = uri_prefix.to_string();

@@ -86,16 +86,13 @@ fn get_concurrent_threshold() -> u64 {
 
 /// Compression configuration for ObjectWriter implementations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CompressionConfig {
+    #[default]
     None,
     Zstd { level: i32 },
 }
 
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        CompressionConfig::None
-    }
-}
 
 impl CompressionConfig {
     /// Create Zstd compression with default level (3)
@@ -698,7 +695,7 @@ where
     } else if total < 100 {
         10  // Small batches: minimum 10 concurrent
     } else if total < 10_000 {
-        (total / 10).max(10).min(100)  // Medium batches: 10% with max 100
+        (total / 10).clamp(10, 100)  // Medium batches: 10% with max 100
     } else {
         (total / 10).min(1000)  // Large batches: 10% capped at 1000
     };
@@ -730,11 +727,10 @@ where
                 // Report progress in batches or on completion
                 if let Some(ref cb) = callback {
                     let last = last_reported.load(Ordering::Relaxed);
-                    if count - last >= report_interval || count == total || idx == keys.len() - 1 {
-                        if last_reported.compare_exchange(last, count, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    if (count - last >= report_interval || count == total || idx == keys.len() - 1)
+                        && last_reported.compare_exchange(last, count, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                             cb(count);
                         }
-                    }
                 }
                 
                 Ok::<_, anyhow::Error>(())
@@ -926,6 +922,12 @@ pub struct S3ObjectStore {
     // (unlike GCS/Azure which do). The config is only used during construction to set
     // the cache TTL. If RangeEngine support is added later, we can add the config field.
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
+}
+
+impl Default for S3ObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl S3ObjectStore {
@@ -1237,10 +1239,7 @@ impl S3BufferedWriter {
         let compressor = match &compression {
             CompressionConfig::None => None,
             CompressionConfig::Zstd { level } => {
-                match zstd::Encoder::new(Vec::new(), *level) {
-                    Ok(encoder) => Some(encoder),
-                    Err(_) => None, // Fall back to no compression on error
-                }
+                zstd::Encoder::new(Vec::new(), *level).ok()
             }
         };
         
@@ -1297,11 +1296,10 @@ impl ObjectWriter for S3BufferedWriter {
         
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
-        if self.compression.is_enabled() {
-            if !final_uri.ends_with(self.compression.extension()) {
+        if self.compression.is_enabled()
+            && !final_uri.ends_with(self.compression.extension()) {
                 final_uri.push_str(self.compression.extension());
             }
-        }
         
         // Use S3 multipart upload for the buffered data
         s3_put_object_multipart_uri_async(&final_uri, &self.buffer, None).await
@@ -1316,7 +1314,7 @@ impl ObjectWriter for S3BufferedWriter {
     }
     
     fn compression(&self) -> CompressionConfig {
-        self.compression.clone()
+        self.compression
     }
     
     fn compression_ratio(&self) -> f64 {
@@ -1450,6 +1448,12 @@ pub struct AzureObjectStore {
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
 }
 
+
+impl Default for AzureObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl AzureObjectStore {
     pub fn new() -> Self {
@@ -1598,7 +1602,7 @@ impl ObjectStore for AzureObjectStore {
         // Stream the provided buffer as Bytes chunks of size `part`
         let chunks = data
             .chunks(part)
-            .map(|c| Bytes::copy_from_slice(c))
+            .map(Bytes::copy_from_slice)
             .collect::<Vec<_>>();
         let stream = stream::iter(chunks);
 
@@ -1685,8 +1689,7 @@ impl ObjectStore for AzureObjectStore {
 
     async fn delete(&self, uri: &str) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
-        cli.delete_objects(&[key]).await.map_err(Into::into)
-    }
+        cli.delete_objects(&[key]).await}
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
         if uris.is_empty() { return Ok(()); }
@@ -1699,8 +1702,7 @@ impl ObjectStore for AzureObjectStore {
             })
             .collect();
         
-        cli.delete_objects(&keys).await.map_err(Into::into)
-    }
+        cli.delete_objects(&keys).await}
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         use futures::stream::StreamExt;
@@ -1724,7 +1726,7 @@ impl ObjectStore for AzureObjectStore {
                         batch.clear();
                     }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
         
@@ -1820,10 +1822,7 @@ impl AzureBufferedWriter {
         let compressor = match &compression {
             CompressionConfig::None => None,
             CompressionConfig::Zstd { level } => {
-                match zstd::Encoder::new(Vec::new(), *level) {
-                    Ok(encoder) => Some(encoder),
-                    Err(_) => None, // Fall back to no compression on error
-                }
+                zstd::Encoder::new(Vec::new(), *level).ok()
             }
         };
         
@@ -1900,7 +1899,7 @@ impl ObjectWriter for AzureBufferedWriter {
     }
     
     fn compression(&self) -> CompressionConfig {
-        self.compression.clone()
+        self.compression
     }
     
     fn compression_ratio(&self) -> f64 {
@@ -2012,6 +2011,12 @@ impl Default for GcsConfig {
 pub struct GcsObjectStore {
     config: GcsConfig,
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
+}
+
+impl Default for GcsObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GcsObjectStore {
@@ -2354,10 +2359,7 @@ impl GcsBufferedWriter {
         let compressor = match &compression {
             CompressionConfig::None => None,
             CompressionConfig::Zstd { level } => {
-                match zstd::Encoder::new(Vec::new(), *level) {
-                    Ok(encoder) => Some(encoder),
-                    Err(_) => None, // Fall back to no compression on error
-                }
+                zstd::Encoder::new(Vec::new(), *level).ok()
             }
         };
         
@@ -2414,11 +2416,10 @@ impl ObjectWriter for GcsBufferedWriter {
         
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
-        if self.compression.is_enabled() {
-            if !final_uri.ends_with(self.compression.extension()) {
+        if self.compression.is_enabled()
+            && !final_uri.ends_with(self.compression.extension()) {
                 final_uri.push_str(self.compression.extension());
             }
-        }
         
         // Parse URI and upload via GCS client
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
@@ -2441,7 +2442,7 @@ impl ObjectWriter for GcsBufferedWriter {
     }
     
     fn compression(&self) -> CompressionConfig {
-        self.compression.clone()
+        self.compression
     }
     
     fn compression_ratio(&self) -> f64 {
@@ -2674,18 +2675,24 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => {
-            let mut config = S3Config::default();
-            config.enable_range_engine = true;  // Enable for high-performance
+            let config = S3Config {
+                enable_range_engine: true,  // Enable for high-performance
+                ..Default::default()
+            };
             Box::new(S3ObjectStore::with_config(config))
         },
         Scheme::Azure => {
-            let mut config = AzureConfig::default();
-            config.enable_range_engine = true;  // Enable for high-performance
+            let config = AzureConfig {
+                enable_range_engine: true,  // Enable for high-performance
+                ..Default::default()
+            };
             Box::new(AzureObjectStore::with_config(config))
         },
         Scheme::Gcs => {
-            let mut config = GcsConfig::default();
-            config.enable_range_engine = true;  // Enable for high-performance
+            let config = GcsConfig {
+                enable_range_engine: true,  // Enable for high-performance
+                ..Default::default()
+            };
             Box::new(GcsObjectStore::with_config(config))
         },
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
@@ -2754,9 +2761,8 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                 Ok(re) => {
                     let dir_path = std::path::Path::new(dir_part);
                     if dir_path.is_dir() {
-                        for entry in std::fs::read_dir(dir_path)
-                            .map_err(|e| anyhow!("Cannot read directory '{}': {}", dir_part, e))? {
-                            if let Ok(entry) = entry {
+                        for entry in (std::fs::read_dir(dir_path)
+                            .map_err(|e| anyhow!("Cannot read directory '{}': {}", dir_part, e))?).flatten() {
                                 let path = entry.path();
                                 if path.is_file() {
                                     if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
@@ -2767,7 +2773,6 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                                     }
                                 }
                             }
-                        }
                     }
                 },
                 Err(_) => {
@@ -2786,15 +2791,13 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                 paths.push(path.to_path_buf());
             } else if path.is_dir() {
                 // If it's a directory, add all files in it
-                for entry in std::fs::read_dir(path)
-                    .map_err(|e| anyhow!("Cannot read directory '{:?}': {}", path, e))? {
-                    if let Ok(entry) = entry {
+                for entry in (std::fs::read_dir(path)
+                    .map_err(|e| anyhow!("Cannot read directory '{:?}': {}", path, e))?).flatten() {
                         let entry_path = entry.path();
                         if entry_path.is_file() {
                             paths.push(entry_path);
                         }
                     }
-                }
             } else {
                 warn!("Path does not exist or is not accessible: {:?}", path);
             }
@@ -2924,7 +2927,7 @@ pub async fn generic_download_objects(
             let byte_count = bytes.len() as u64;
 
             // Extract filename from URI
-            let fname = uri.split('/').last()
+            let fname = uri.split('/').next_back()
                 .ok_or_else(|| anyhow!("Cannot extract filename from URI: {}", uri))?;
             let out_path = out_dir.join(fname);
 

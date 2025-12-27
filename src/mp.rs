@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault};
 use std::collections::hash_map::DefaultHasher;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -446,9 +446,9 @@ fn parse_oplog(worker_id: usize, path: &Path) -> Result<WorkerSummary> {
 
 // Simple hash function for sharding keys
 fn hash64(data: &[u8]) -> u64 {
-    let mut hasher = BuildHasherDefault::<DefaultHasher>::default().build_hasher();
-    data.hash(&mut hasher);
-    hasher.finish()
+    
+    
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(data)
 }
 
 #[cfg(test)]

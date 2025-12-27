@@ -137,7 +137,7 @@ impl BufferPool {
         
         // Try to get a buffer from the pool
         let mut rx = self.rx.lock().await;
-        if let Some(buf) = rx.try_recv().ok() {
+        if let Ok(buf) = rx.try_recv() {
             buf
         } else {
             // Pool is temporarily empty, allocate a new one

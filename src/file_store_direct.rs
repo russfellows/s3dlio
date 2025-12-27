@@ -139,7 +139,7 @@ fn get_system_page_size() -> usize {
                 
                 // Validate the detected page size is within reasonable bounds
                 // Most systems use 4KB pages, some use 8KB, 16KB, or 64KB
-                if detected_size >= 512 && detected_size <= 65536 && detected_size.is_power_of_two() {
+                if (512..=65536).contains(&detected_size) && detected_size.is_power_of_two() {
                     detected_size
                 } else {
                     // Invalid page size detected, use safe default
@@ -169,7 +169,7 @@ fn create_aligned_buffer(size: usize, alignment: usize) -> Vec<u8> {
         }
         
         // Ensure size is aligned to alignment boundary
-        let aligned_size = ((size + alignment - 1) / alignment) * alignment;
+        let aligned_size = size.div_ceil(alignment) * alignment;
         
         unsafe {
             let layout = Layout::from_size_align(aligned_size, alignment)
@@ -263,10 +263,7 @@ impl DirectIOWriter {
         let compressor = match &compression {
             CompressionConfig::None => None,
             CompressionConfig::Zstd { level } => {
-                match zstd::Encoder::new(Vec::new(), *level) {
-                    Ok(encoder) => Some(encoder),
-                    Err(_) => None, // Fall back to no compression on error
-                }
+                zstd::Encoder::new(Vec::new(), *level).ok()
             }
         };
         
@@ -359,7 +356,7 @@ impl ObjectWriter for DirectIOWriter {
             // Ensure buffer has enough capacity for the new data
             let new_len = self.buffer.len() + data_to_write.len();
             if new_len > self.buffer.capacity() {
-                let new_capacity = ((new_len + min_io_size - 1) / min_io_size) * min_io_size;
+                let new_capacity = new_len.div_ceil(min_io_size) * min_io_size;
                 resize_aligned_buffer(&mut self.buffer, new_capacity, alignment);
             }
             
@@ -426,7 +423,7 @@ impl ObjectWriter for DirectIOWriter {
                         // Ensure buffer has enough capacity for the compressed data
                         let new_len = self.buffer.len() + compressed_data.len();
                         if new_len > self.buffer.capacity() {
-                            let new_capacity = ((new_len + min_io_size - 1) / min_io_size) * min_io_size;
+                            let new_capacity = new_len.div_ceil(min_io_size) * min_io_size;
                             resize_aligned_buffer(&mut self.buffer, new_capacity, alignment);
                         }
                         
@@ -536,7 +533,7 @@ impl ObjectWriter for DirectIOWriter {
     }
     
     fn compression(&self) -> CompressionConfig {
-        self.compression.clone()
+        self.compression
     }
     
     fn compression_ratio(&self) -> f64 {
@@ -649,10 +646,10 @@ impl ConfigurableFileSystemObjectStore {
 
     /// Convert a URI to a filesystem path (accepts both file:// and direct:// schemes)
     fn uri_to_path(uri: &str) -> Result<PathBuf> {
-        let path = if uri.starts_with("file://") {
-            &uri[7..] // Strip "file://" prefix
-        } else if uri.starts_with("direct://") {
-            &uri[9..] // Strip "direct://" prefix  
+        let path = if let Some(stripped) = uri.strip_prefix("file://") {
+            stripped // Strip "file://" prefix
+        } else if let Some(stripped) = uri.strip_prefix("direct://") {
+            stripped // Strip "direct://" prefix  
         } else {
             bail!("FileSystemObjectStore expects file:// or direct:// URI, got: {}", uri);
         };
@@ -725,7 +722,7 @@ impl ConfigurableFileSystemObjectStore {
         }
 
         let alignment = self.config.alignment;
-        let aligned_size = ((data.len() + alignment - 1) / alignment) * alignment;
+        let aligned_size = data.len().div_ceil(alignment) * alignment;
         let mut aligned_buffer = create_aligned_buffer(aligned_size, alignment);
         unsafe { 
             aligned_buffer.set_len(aligned_size);
@@ -1001,7 +998,7 @@ impl ConfigurableFileSystemObjectStore {
         });
         
         let total_length = offset_adjustment + read_length as usize;
-        let aligned_length = ((total_length + self.config.alignment - 1) / self.config.alignment) * self.config.alignment;
+        let aligned_length = total_length.div_ceil(self.config.alignment) * self.config.alignment;
         
         // Borrow aligned buffer from pool if available, otherwise allocate fresh (v0.9.9+)
         let mut aligned: AlignedBuf = if let Some(pool) = &self.config.buffer_pool {
@@ -1279,10 +1276,10 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         // FileSystemObjectStore: delete files concurrently
         use futures::stream::{self, StreamExt};
         
-        let max_concurrency = (uris.len() / 10).max(10).min(100);
+        let max_concurrency = (uris.len() / 10).clamp(10, 100);
         let uris_owned: Vec<String> = uris.to_vec();
         
-        let deletions = stream::iter(uris_owned.into_iter())
+        let deletions = stream::iter(uris_owned)
             .map(|uri| async move { self.delete(&uri).await })
             .buffer_unordered(max_concurrency);
         
@@ -1312,7 +1309,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
             }
             
             // Try to remove the directory if it's empty
-            if let Err(_) = fs::remove_dir(&base_path).await {
+            if (fs::remove_dir(&base_path).await).is_err() {
                 // Directory might not be empty due to subdirectories
                 // For now, we'll leave non-empty directories
             }
