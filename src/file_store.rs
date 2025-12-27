@@ -397,6 +397,7 @@ impl FileSystemObjectStore {
         
         // Apply page cache hint (use configured mode or Auto by default)
         let cache_mode = self.config.page_cache_mode.unwrap_or(PageCacheMode::Auto);
+        debug!("Applying page cache hint {:?} for file {} (size: {} bytes)", cache_mode, uri, file_size);
         let _ = apply_page_cache_hint(&std_file, cache_mode, file_size);
         
         // Convert back to tokio file and read
@@ -471,6 +472,8 @@ impl ObjectStore for FileSystemObjectStore {
         
         // Apply page cache hint (use configured mode, or Random for range reads by default)
         let cache_mode = self.config.page_cache_mode.unwrap_or(PageCacheMode::Random);
+        debug!("Applying page cache hint {:?} for range read {} offset={} length={:?} (file size: {} bytes)", 
+               cache_mode, uri, offset, length, file_size);
         let _ = apply_page_cache_hint(&std_file, cache_mode, file_size);
         
         let mut file = fs::File::from_std(std_file);

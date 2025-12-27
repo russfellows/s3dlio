@@ -1,5 +1,66 @@
 # s3dlio Changelog
 
+## Version 0.9.32 - Bug Fix: FileSystemConfig Type Mismatch (December 2025)
+
+### 🐛 **Fixed Issue #85: FileSystemConfig Type Mismatch**
+
+**Problem**: The public API exported `crate::file_store::FileSystemConfig` (with `page_cache_mode`) but `store_for_uri_with_config()` used `crate::file_store_direct::FileSystemConfig` (with `direct_io`, `alignment`, etc.). This made it impossible to configure page cache behavior via the public API.
+
+**Solution**: Introduced unified `StorageConfig` enum:
+
+```rust
+pub enum StorageConfig {
+    File(FileSystemConfig),      // For file:// URIs
+    Direct(DirectFileSystemConfig),  // For direct:// URIs
+}
+```
+
+**⚠️ BREAKING CHANGE**: `store_for_uri_with_config()` signature changed:
+
+```rust
+// OLD (v0.9.31 and earlier)
+store_for_uri_with_config(uri, Some(config))
+
+// NEW (v0.9.32+)
+store_for_uri_with_config(uri, Some(StorageConfig::File(config)))
+store_for_uri_with_config(uri, Some(StorageConfig::Direct(config)))
+```
+
+**Migration**:
+- Import `StorageConfig` from `s3dlio::api`
+- Wrap `FileSystemConfig` in `StorageConfig::File(...)` for file:// URIs
+- Wrap `DirectFileSystemConfig` in `StorageConfig::Direct(...)` for direct:// URIs
+- Type checking now prevents using wrong config with wrong URI scheme
+
+**Improvements**:
+- ✅ Public API now compiles and works as documented
+- ✅ Page cache hints (Sequential, Random, DontNeed) now functional
+- ✅ Added debug logging to show page cache mode being applied
+- ✅ Clear error messages if wrong config type used with URI scheme
+- ✅ Comprehensive tests for all configuration scenarios
+
+**New Exports**:
+- `pub use crate::api::StorageConfig` - Unified config enum
+- `pub use crate::file_store_direct::FileSystemConfig as DirectFileSystemConfig` - O_DIRECT config
+
+**Example**:
+
+```rust
+use s3dlio::api::{FileSystemConfig, StorageConfig, PageCacheMode, store_for_uri_with_config};
+
+let config = FileSystemConfig {
+    enable_range_engine: false,
+    range_engine: Default::default(),
+    page_cache_mode: Some(PageCacheMode::Sequential),
+};
+
+// This now works!
+let store = store_for_uri_with_config(
+    "file:///data/test/", 
+    Some(StorageConfig::File(config))
+)?;
+```
+
 ## Version 0.9.31 - Maintenance Release (December 2025)
 
 - Changed license to Apache-2.0

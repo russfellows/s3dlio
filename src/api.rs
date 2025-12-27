@@ -59,8 +59,24 @@ pub use crate::object_store::ObjectMetadata;
 /// FileSystem-specific configuration (page cache, range engine, etc.)
 pub use crate::file_store::FileSystemConfig;
 
+/// Direct I/O FileSystem configuration (O_DIRECT, alignment, etc.)
+pub use crate::file_store_direct::FileSystemConfig as DirectFileSystemConfig;
+
 /// Page cache behavior hint for file I/O (maps to posix_fadvise on Linux/Unix)
 pub use crate::data_loader::options::PageCacheMode;
+
+/// Unified storage configuration for all backends
+/// 
+/// Use this enum to configure backend-specific options when creating stores
+/// with `store_for_uri_with_config()`. This allows you to pass the correct
+/// configuration type for each storage backend (file://, direct://, etc.)
+#[derive(Debug, Clone)]
+pub enum StorageConfig {
+    /// Configuration for regular file:// URIs (page cache, range engine)
+    File(crate::file_store::FileSystemConfig),
+    /// Configuration for direct:// URIs and O_DIRECT operations
+    Direct(crate::file_store_direct::FileSystemConfig),
+}
 
 /// URI scheme detection
 pub use crate::object_store::{Scheme, infer_scheme};
