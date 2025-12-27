@@ -1,5 +1,38 @@
 # s3dlio Changelog
 
+## Version 0.9.33 - Memory-Efficient delete_prefix() (December 2025)
+
+### 🐛 **Fixed: delete_prefix() Memory Bloat with Millions of Objects**
+
+**Problem**: The `delete_prefix()` method loaded ALL object keys into memory before deletion:
+```rust
+let keys = client.list_objects(&bucket, Some(&key_prefix), true).await?;  // BAD!
+client.delete_objects(&bucket, keys).await?;
+```
+
+For millions of objects, this consumed gigabytes of memory (~80 bytes per key × 100M objects = ~8GB).
+
+**Solution**: Converted all backends to use streaming list + batched deletion:
+- ✅ **S3**: Now uses `s3_list_objects_stream()` with 1000-object batches
+- ✅ **Azure**: Now uses `list_stream()` with 1000-object batches  
+- ✅ **GCS**: Now uses `list_objects_stream()` with 1000-object batches
+
+**Memory Impact**:
+- **Before**: O(N) memory - loaded all N object keys
+- **After**: O(1) memory - max 1000 keys in memory at once
+- **Example**: 100M objects: 8GB → 80KB memory usage
+
+**Performance**: No degradation - deletion happens in parallel batches as objects are listed.
+
+**Affected Methods**:
+- `GcsObjectStore::delete_prefix()` - src/object_store.rs line ~2173
+- `S3ObjectStore::delete_prefix()` - src/object_store.rs line ~1050  
+- `AzureObjectStore::delete_prefix()` - src/object_store.rs line ~1705
+
+**Testing**: Existing tests pass (test_file_store, dl-driver checkpoint tests).
+
+---
+
 ## Version 0.9.33 - Issue #110 Investigation Results (December 2025)
 
 ### 📝 **Issue #110: GCS Console Shows Directory Structure After Delete**

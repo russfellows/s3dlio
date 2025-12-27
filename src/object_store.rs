@@ -1048,11 +1048,42 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+        use futures::stream::StreamExt;
+        
         let (bucket, mut key_prefix) = parse_s3_uri(uri_prefix)?;
-        if !key_prefix.is_empty() && !key_prefix.ends_with('/') { key_prefix.push('/'); }
-        let keys = s3_list_objects(&bucket, &key_prefix, true)?;
-        if keys.is_empty() { return Ok(()); }
-        s3_delete_objects(&bucket, &keys)
+        if !key_prefix.is_empty() && !key_prefix.ends_with('/') { 
+            key_prefix.push('/'); 
+        }
+        
+        // Use streaming list to avoid loading millions of keys into memory
+        let mut stream = s3_list_objects_stream(bucket.clone(), key_prefix, true).await?;
+        let mut batch = Vec::with_capacity(1000);
+        let mut total_deleted = 0;
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(key) => {
+                    batch.push(key);
+                    
+                    // Delete in batches of 1000 (S3 DeleteObjects API limit)
+                    if batch.len() >= 1000 {
+                        s3_delete_objects(&bucket, &batch)?;
+                        total_deleted += batch.len();
+                        batch.clear();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        
+        // Delete final partial batch if any
+        if !batch.is_empty() {
+            s3_delete_objects(&bucket, &batch)?;
+            total_deleted += batch.len();
+        }
+        
+        debug!("S3 delete_prefix deleted {} objects total", total_deleted);
+        Ok(())
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
@@ -1672,10 +1703,39 @@ impl ObjectStore for AzureObjectStore {
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+        use futures::stream::StreamExt;
+        
         let (cli, _acct, _cont, key_prefix) = Self::client_for_prefix(uri_prefix)?;
-        let keys = cli.list(Some(&key_prefix)).await?;
-        if keys.is_empty() { return Ok(()); }
-        cli.delete_objects(&keys).await.map_err(Into::into)
+        
+        // Use streaming list to avoid loading millions of keys into memory
+        let mut stream = cli.list_stream(Some(&key_prefix));
+        let mut batch = Vec::with_capacity(1000);
+        let mut total_deleted = 0;
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(key) => {
+                    batch.push(key);
+                    
+                    // Delete in batches of 1000 to avoid memory bloat
+                    if batch.len() >= 1000 {
+                        cli.delete_objects(&batch).await?;
+                        total_deleted += batch.len();
+                        batch.clear();
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        
+        // Delete final partial batch if any
+        if !batch.is_empty() {
+            cli.delete_objects(&batch).await?;
+            total_deleted += batch.len();
+        }
+        
+        debug!("Azure delete_prefix deleted {} objects total", total_deleted);
+        Ok(())
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
@@ -2171,6 +2231,8 @@ impl ObjectStore for GcsObjectStore {
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+        use futures::stream::StreamExt;
+        
         let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)
             .or_else(|_| {
                 // Handle bucket-only URIs
@@ -2184,15 +2246,37 @@ impl ObjectStore for GcsObjectStore {
             })?;
 
         let client = Self::get_client().await?;
-        // List all objects with the prefix
-        let keys = client.list_objects(&bucket, Some(&key_prefix), true).await?;
         
-        if keys.is_empty() {
-            return Ok(());
+        // Use streaming list to avoid loading millions of keys into memory
+        let mut stream = client.list_objects_stream(&bucket, Some(&key_prefix), true);
+        let mut batch = Vec::with_capacity(1000);
+        let mut total_deleted = 0;
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(key) => {
+                    batch.push(key);
+                    
+                    // Delete in batches of 1000 to avoid memory bloat
+                    if batch.len() >= 1000 {
+                        client.delete_objects(&bucket, batch.clone()).await?;
+                        total_deleted += batch.len();
+                        batch.clear();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
-
-        // Delete all objects
-        client.delete_objects(&bucket, keys).await
+        
+        // Delete final partial batch if any
+        if !batch.is_empty() {
+            let batch_size = batch.len();
+            client.delete_objects(&bucket, batch).await?;
+            total_deleted += batch_size;
+        }
+        
+        debug!("GCS delete_prefix deleted {} objects total", total_deleted);
+        Ok(())
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
