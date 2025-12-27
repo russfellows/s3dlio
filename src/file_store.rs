@@ -479,16 +479,25 @@ impl ObjectStore for FileSystemObjectStore {
         let mut file = fs::File::from_std(std_file);
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         
-        let read_length = length.unwrap_or(u64::MAX);
+        // Calculate how many bytes are actually available from offset to end of file
+        let bytes_available = file_size.saturating_sub(offset);
+        let read_length = match length {
+            Some(len) => len.min(bytes_available), // Read at most what's available
+            None => bytes_available,                // Read to end
+        };
+        
         let mut buffer = Vec::new();
         
-        if read_length == u64::MAX {
-            // Read to end of file
-            file.read_to_end(&mut buffer).await?;
-        } else {
-            // Read specific length - use read_exact to ensure we get all bytes
+        if read_length == 0 {
+            // Nothing to read (offset >= file_size)
+            return Ok(Bytes::new());
+        } else if read_length < u64::MAX {
+            // Read specific length - only what's available
             buffer.resize(read_length as usize, 0);
             file.read_exact(&mut buffer).await?;
+        } else {
+            // Read to end of file
+            file.read_to_end(&mut buffer).await?;
         }
         
         // Convert to Bytes (cheap, just wraps in Arc)
