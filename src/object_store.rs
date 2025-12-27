@@ -86,16 +86,13 @@ fn get_concurrent_threshold() -> u64 {
 
 /// Compression configuration for ObjectWriter implementations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CompressionConfig {
+    #[default]
     None,
     Zstd { level: i32 },
 }
 
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        CompressionConfig::None
-    }
-}
 
 impl CompressionConfig {
     /// Create Zstd compression with default level (3)
@@ -698,7 +695,7 @@ where
     } else if total < 100 {
         10  // Small batches: minimum 10 concurrent
     } else if total < 10_000 {
-        (total / 10).max(10).min(100)  // Medium batches: 10% with max 100
+        (total / 10).clamp(10, 100)  // Medium batches: 10% with max 100
     } else {
         (total / 10).min(1000)  // Large batches: 10% capped at 1000
     };
@@ -730,11 +727,10 @@ where
                 // Report progress in batches or on completion
                 if let Some(ref cb) = callback {
                     let last = last_reported.load(Ordering::Relaxed);
-                    if count - last >= report_interval || count == total || idx == keys.len() - 1 {
-                        if last_reported.compare_exchange(last, count, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    if (count - last >= report_interval || count == total || idx == keys.len() - 1)
+                        && last_reported.compare_exchange(last, count, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                             cb(count);
                         }
-                    }
                 }
                 
                 Ok::<_, anyhow::Error>(())
@@ -928,6 +924,12 @@ pub struct S3ObjectStore {
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
 }
 
+impl Default for S3ObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl S3ObjectStore {
     pub fn new() -> Self {
         let config = S3Config::default();
@@ -1031,7 +1033,7 @@ impl ObjectStore for S3ObjectStore {
     async fn delete(&self, uri: &str) -> Result<()> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         let (bucket, key) = parse_s3_uri(uri)?;
-        s3_delete_objects(&bucket, &vec![key])
+        s3_delete_objects(&bucket, &[key])
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
@@ -1048,11 +1050,42 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+        use futures::stream::StreamExt;
+        
         let (bucket, mut key_prefix) = parse_s3_uri(uri_prefix)?;
-        if !key_prefix.is_empty() && !key_prefix.ends_with('/') { key_prefix.push('/'); }
-        let keys = s3_list_objects(&bucket, &key_prefix, true)?;
-        if keys.is_empty() { return Ok(()); }
-        s3_delete_objects(&bucket, &keys)
+        if !key_prefix.is_empty() && !key_prefix.ends_with('/') { 
+            key_prefix.push('/'); 
+        }
+        
+        // Use streaming list to avoid loading millions of keys into memory
+        let mut stream = s3_list_objects_stream(bucket.clone(), key_prefix, true).await?;
+        let mut batch = Vec::with_capacity(1000);
+        let mut total_deleted = 0;
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(key) => {
+                    batch.push(key);
+                    
+                    // Delete in batches of 1000 (S3 DeleteObjects API limit)
+                    if batch.len() >= 1000 {
+                        s3_delete_objects(&bucket, &batch)?;
+                        total_deleted += batch.len();
+                        batch.clear();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        
+        // Delete final partial batch if any
+        if !batch.is_empty() {
+            s3_delete_objects(&bucket, &batch)?;
+            total_deleted += batch.len();
+        }
+        
+        debug!("S3 delete_prefix deleted {} objects total", total_deleted);
+        Ok(())
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
@@ -1206,10 +1239,7 @@ impl S3BufferedWriter {
         let compressor = match &compression {
             CompressionConfig::None => None,
             CompressionConfig::Zstd { level } => {
-                match zstd::Encoder::new(Vec::new(), *level) {
-                    Ok(encoder) => Some(encoder),
-                    Err(_) => None, // Fall back to no compression on error
-                }
+                zstd::Encoder::new(Vec::new(), *level).ok()
             }
         };
         
@@ -1266,11 +1296,10 @@ impl ObjectWriter for S3BufferedWriter {
         
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
-        if self.compression.is_enabled() {
-            if !final_uri.ends_with(self.compression.extension()) {
+        if self.compression.is_enabled()
+            && !final_uri.ends_with(self.compression.extension()) {
                 final_uri.push_str(self.compression.extension());
             }
-        }
         
         // Use S3 multipart upload for the buffered data
         s3_put_object_multipart_uri_async(&final_uri, &self.buffer, None).await
@@ -1285,7 +1314,7 @@ impl ObjectWriter for S3BufferedWriter {
     }
     
     fn compression(&self) -> CompressionConfig {
-        self.compression.clone()
+        self.compression
     }
     
     fn compression_ratio(&self) -> f64 {
@@ -1419,6 +1448,12 @@ pub struct AzureObjectStore {
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
 }
 
+
+impl Default for AzureObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl AzureObjectStore {
     pub fn new() -> Self {
@@ -1567,7 +1602,7 @@ impl ObjectStore for AzureObjectStore {
         // Stream the provided buffer as Bytes chunks of size `part`
         let chunks = data
             .chunks(part)
-            .map(|c| Bytes::copy_from_slice(c))
+            .map(Bytes::copy_from_slice)
             .collect::<Vec<_>>();
         let stream = stream::iter(chunks);
 
@@ -1654,8 +1689,7 @@ impl ObjectStore for AzureObjectStore {
 
     async fn delete(&self, uri: &str) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
-        cli.delete_objects(&[key]).await.map_err(Into::into)
-    }
+        cli.delete_objects(&[key]).await}
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
         if uris.is_empty() { return Ok(()); }
@@ -1668,14 +1702,42 @@ impl ObjectStore for AzureObjectStore {
             })
             .collect();
         
-        cli.delete_objects(&keys).await.map_err(Into::into)
-    }
+        cli.delete_objects(&keys).await}
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+        use futures::stream::StreamExt;
+        
         let (cli, _acct, _cont, key_prefix) = Self::client_for_prefix(uri_prefix)?;
-        let keys = cli.list(Some(&key_prefix)).await?;
-        if keys.is_empty() { return Ok(()); }
-        cli.delete_objects(&keys).await.map_err(Into::into)
+        
+        // Use streaming list to avoid loading millions of keys into memory
+        let mut stream = cli.list_stream(Some(&key_prefix));
+        let mut batch = Vec::with_capacity(1000);
+        let mut total_deleted = 0;
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(key) => {
+                    batch.push(key);
+                    
+                    // Delete in batches of 1000 to avoid memory bloat
+                    if batch.len() >= 1000 {
+                        cli.delete_objects(&batch).await?;
+                        total_deleted += batch.len();
+                        batch.clear();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        
+        // Delete final partial batch if any
+        if !batch.is_empty() {
+            cli.delete_objects(&batch).await?;
+            total_deleted += batch.len();
+        }
+        
+        debug!("Azure delete_prefix deleted {} objects total", total_deleted);
+        Ok(())
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
@@ -1739,7 +1801,6 @@ impl ObjectStore for AzureObjectStore {
 }
 
 /// Buffered writer for Azure that collects chunks and uses multipart upload
-
 pub struct AzureBufferedWriter {
     uri: String,
     buffer: Vec<u8>,
@@ -1761,10 +1822,7 @@ impl AzureBufferedWriter {
         let compressor = match &compression {
             CompressionConfig::None => None,
             CompressionConfig::Zstd { level } => {
-                match zstd::Encoder::new(Vec::new(), *level) {
-                    Ok(encoder) => Some(encoder),
-                    Err(_) => None, // Fall back to no compression on error
-                }
+                zstd::Encoder::new(Vec::new(), *level).ok()
             }
         };
         
@@ -1841,7 +1899,7 @@ impl ObjectWriter for AzureBufferedWriter {
     }
     
     fn compression(&self) -> CompressionConfig {
-        self.compression.clone()
+        self.compression
     }
     
     fn compression_ratio(&self) -> f64 {
@@ -1953,6 +2011,12 @@ impl Default for GcsConfig {
 pub struct GcsObjectStore {
     config: GcsConfig,
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
+}
+
+impl Default for GcsObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GcsObjectStore {
@@ -2171,6 +2235,8 @@ impl ObjectStore for GcsObjectStore {
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+        use futures::stream::StreamExt;
+        
         let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)
             .or_else(|_| {
                 // Handle bucket-only URIs
@@ -2184,15 +2250,37 @@ impl ObjectStore for GcsObjectStore {
             })?;
 
         let client = Self::get_client().await?;
-        // List all objects with the prefix
-        let keys = client.list_objects(&bucket, Some(&key_prefix), true).await?;
         
-        if keys.is_empty() {
-            return Ok(());
+        // Use streaming list to avoid loading millions of keys into memory
+        let mut stream = client.list_objects_stream(&bucket, Some(&key_prefix), true);
+        let mut batch = Vec::with_capacity(1000);
+        let mut total_deleted = 0;
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(key) => {
+                    batch.push(key);
+                    
+                    // Delete in batches of 1000 to avoid memory bloat
+                    if batch.len() >= 1000 {
+                        client.delete_objects(&bucket, batch.clone()).await?;
+                        total_deleted += batch.len();
+                        batch.clear();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
-
-        // Delete all objects
-        client.delete_objects(&bucket, keys).await
+        
+        // Delete final partial batch if any
+        if !batch.is_empty() {
+            let batch_size = batch.len();
+            client.delete_objects(&bucket, batch).await?;
+            total_deleted += batch_size;
+        }
+        
+        debug!("GCS delete_prefix deleted {} objects total", total_deleted);
+        Ok(())
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
@@ -2271,10 +2359,7 @@ impl GcsBufferedWriter {
         let compressor = match &compression {
             CompressionConfig::None => None,
             CompressionConfig::Zstd { level } => {
-                match zstd::Encoder::new(Vec::new(), *level) {
-                    Ok(encoder) => Some(encoder),
-                    Err(_) => None, // Fall back to no compression on error
-                }
+                zstd::Encoder::new(Vec::new(), *level).ok()
             }
         };
         
@@ -2331,11 +2416,10 @@ impl ObjectWriter for GcsBufferedWriter {
         
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
-        if self.compression.is_enabled() {
-            if !final_uri.ends_with(self.compression.extension()) {
+        if self.compression.is_enabled()
+            && !final_uri.ends_with(self.compression.extension()) {
                 final_uri.push_str(self.compression.extension());
             }
-        }
         
         // Parse URI and upload via GCS client
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
@@ -2358,7 +2442,7 @@ impl ObjectWriter for GcsBufferedWriter {
     }
     
     fn compression(&self) -> CompressionConfig {
-        self.compression.clone()
+        self.compression
     }
     
     fn compression_ratio(&self) -> f64 {
@@ -2591,18 +2675,24 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => {
-            let mut config = S3Config::default();
-            config.enable_range_engine = true;  // Enable for high-performance
+            let config = S3Config {
+                enable_range_engine: true,  // Enable for high-performance
+                ..Default::default()
+            };
             Box::new(S3ObjectStore::with_config(config))
         },
         Scheme::Azure => {
-            let mut config = AzureConfig::default();
-            config.enable_range_engine = true;  // Enable for high-performance
+            let config = AzureConfig {
+                enable_range_engine: true,  // Enable for high-performance
+                ..Default::default()
+            };
             Box::new(AzureObjectStore::with_config(config))
         },
         Scheme::Gcs => {
-            let mut config = GcsConfig::default();
-            config.enable_range_engine = true;  // Enable for high-performance
+            let config = GcsConfig {
+                enable_range_engine: true,  // Enable for high-performance
+                ..Default::default()
+            };
             Box::new(GcsObjectStore::with_config(config))
         },
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
@@ -2671,9 +2761,8 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                 Ok(re) => {
                     let dir_path = std::path::Path::new(dir_part);
                     if dir_path.is_dir() {
-                        for entry in std::fs::read_dir(dir_path)
-                            .map_err(|e| anyhow!("Cannot read directory '{}': {}", dir_part, e))? {
-                            if let Ok(entry) = entry {
+                        for entry in (std::fs::read_dir(dir_path)
+                            .map_err(|e| anyhow!("Cannot read directory '{}': {}", dir_part, e))?).flatten() {
                                 let path = entry.path();
                                 if path.is_file() {
                                     if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
@@ -2684,7 +2773,6 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                                     }
                                 }
                             }
-                        }
                     }
                 },
                 Err(_) => {
@@ -2703,15 +2791,13 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
                 paths.push(path.to_path_buf());
             } else if path.is_dir() {
                 // If it's a directory, add all files in it
-                for entry in std::fs::read_dir(path)
-                    .map_err(|e| anyhow!("Cannot read directory '{:?}': {}", path, e))? {
-                    if let Ok(entry) = entry {
+                for entry in (std::fs::read_dir(path)
+                    .map_err(|e| anyhow!("Cannot read directory '{:?}': {}", path, e))?).flatten() {
                         let entry_path = entry.path();
                         if entry_path.is_file() {
                             paths.push(entry_path);
                         }
                     }
-                }
             } else {
                 warn!("Path does not exist or is not accessible: {:?}", path);
             }
@@ -2841,7 +2927,7 @@ pub async fn generic_download_objects(
             let byte_count = bytes.len() as u64;
 
             // Extract filename from URI
-            let fname = uri.split('/').last()
+            let fname = uri.split('/').next_back()
                 .ok_or_else(|| anyhow!("Cannot extract filename from URI: {}", uri))?;
             let out_path = out_dir.join(fname);
 

@@ -13,20 +13,14 @@ use crate::constants::{
 };
 
 /// Adaptive tuning mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AdaptiveMode {
     /// No adaptive tuning - use explicit settings or defaults
+    #[default]
     Disabled,
     /// Enable adaptive tuning for performance optimization
     Enabled,
-}
-
-impl Default for AdaptiveMode {
-    fn default() -> Self {
-        // Default is DISABLED - users opt-in to adaptive behavior
-        Self::Disabled
-    }
 }
 
 /// Workload characteristics for adaptive tuning

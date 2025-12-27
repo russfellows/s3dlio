@@ -179,19 +179,9 @@ pub fn generate_random_data(mut size: usize) -> Vec<u8> {
 ///
 /// # Returns
 /// A `Vec<u8>` with the requested size, containing data with the specified deduplication and compressibility characteristics.
-
-/// Enhanced single-pass data generation function that supports specifying deduplication and compression ratios.
-/// 
-/// This version eliminates the intermediate `unique` vector and generates data directly into the final buffer
-/// in a single pass, while preserving exact dedup/compress ratios and uniqueness guarantees.
 ///
-/// # Performance improvements over the two-pass version:
-/// - Eliminates intermediate allocations (no `unique` vector)
-/// - Reduces memory passes from 2 to 1  
-/// - Uses deterministic per-block seeding for deduplication consistency
-/// - Maintains identical dedup/compress math and block-level uniqueness
-/// Generate controlled data using streaming approach for optimal performance
-/// Based on benchmarks showing streaming is faster for most workload sizes
+/// Generate controlled data using streaming approach for optimal performance.
+/// Based on benchmarks showing streaming is faster for most workload sizes.
 pub fn generate_controlled_data_streaming(size: usize, dedup: usize, compress: usize, chunk_size: usize) -> Vec<u8> {
     let generator = DataGenerator::new();
     let mut object_gen = generator.begin_object(size, dedup, compress);
@@ -262,7 +252,7 @@ fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: us
     }
 
     let block_size = BLK_SIZE;
-    let nblocks = (size + block_size - 1) / block_size;
+    let nblocks = size.div_ceil(block_size);
 
     // Determine deduplication factor and number of unique blocks (identical to original)
     let dedup_factor = if dedup == 0 { 1 } else { dedup };
@@ -299,10 +289,7 @@ fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: us
 
     // SINGLE-PASS OPTIMIZATION: Generate directly into final buffer
     let total_size = nblocks * block_size;
-    let mut data: Vec<u8> = Vec::with_capacity(total_size);
-    unsafe {
-        data.set_len(total_size);
-    }
+    let mut data: Vec<u8> = vec![0u8; total_size];
 
     // Generate call-specific entropy while preserving deduplication within this call
     let call_entropy = SystemTime::now()
@@ -360,7 +347,7 @@ pub fn generate_controlled_data_two_pass(mut size: usize, dedup: usize, compress
     }
 
     let block_size = BLK_SIZE;
-    let nblocks = (size + block_size - 1) / block_size;
+    let nblocks = size.div_ceil(block_size);
 
     // Determine deduplication: target ratio = 1/dedup_factor
     let dedup_factor = if dedup == 0 { 1 } else { dedup };
@@ -404,8 +391,8 @@ pub fn generate_controlled_data_two_pass(mut size: usize, dedup: usize, compress
             };
 
             // Zero out the constant prefix
-            for j in 0..const_len {
-                block[j] = 0;
+            for item in block.iter_mut().take(const_len) {
+                *item = 0;
             }
 
             // Compute region for unique modifications
@@ -469,7 +456,7 @@ impl DataGenerator {
         // Add thread-local counter to ensure uniqueness even with rapid creation
         use std::cell::Cell;
         thread_local! {
-            static ENTROPY_COUNTER: Cell<u64> = Cell::new(0);
+            static ENTROPY_COUNTER: Cell<u64> = const { Cell::new(0) };
         }
         
         let base_entropy = SystemTime::now()

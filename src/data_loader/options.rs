@@ -32,35 +32,30 @@
 // - Sharding hints: shard_rank, shard_world_size, worker_id, num_workers_pytorch
 
 /// How the dataset reads object bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReaderMode {
     /// Fetch the whole object with a single GET.
+    #[default]
     Sequential,
     /// Fetch object via HTTP byte-ranges (optionally in parts).
     Range,
 }
 
-impl Default for ReaderMode {
-    fn default() -> Self { ReaderMode::Sequential }
-}
-
 /// How the dataloader processes batches.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum LoadingMode {
     /// Traditional sequential loading - maintains order, waits for full batches
+    #[default]
     Sequential,
     /// Async pooling with out-of-order completion and dynamic batch formation
     AsyncPool(crate::data_loader::async_pool_dataloader::PoolConfig),
 }
 
-impl Default for LoadingMode {
-    fn default() -> Self { LoadingMode::Sequential }
-}
-
 /// Multiprocessing context for worker processes (mirrors PyTorch DataLoader options)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum MultiprocessingContext {
     /// Use spawn method (safest, slower startup)
+    #[default]
     Spawn,
     /// Use fork method (faster startup, potential issues with CUDA)
     Fork,
@@ -68,14 +63,11 @@ pub enum MultiprocessingContext {
     ForkServer,
 }
 
-impl Default for MultiprocessingContext {
-    fn default() -> Self { MultiprocessingContext::Spawn }
-}
-
 /// Sampling strategy for dataset iteration
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum SamplerType {
     /// Sequential iteration through dataset
+    #[default]
     Sequential,
     /// Random sampling (with replacement if specified)
     Random { replacement: bool },
@@ -85,27 +77,20 @@ pub enum SamplerType {
     DistributedRandom { rank: usize, world_size: usize },
 }
 
-impl Default for SamplerType {
-    fn default() -> Self { SamplerType::Sequential }
-}
-
 /// Memory format optimization for tensor layouts
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemoryFormat {
     /// Channels-last format (NHWC) - better for some GPUs
     ChannelsLast,
     /// Channels-first format (NCHW) - traditional PyTorch default
     ChannelsFirst,
     /// Let the framework decide optimal format
+    #[default]
     Auto,
 }
 
-impl Default for MemoryFormat {
-    fn default() -> Self { MemoryFormat::Auto }
-}
-
 /// Page cache behavior hint for file I/O (maps to posix_fadvise on Linux/Unix)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PageCacheMode {
     /// Sequential access pattern - prefetch data ahead (POSIX_FADV_SEQUENTIAL)
     Sequential,
@@ -116,11 +101,8 @@ pub enum PageCacheMode {
     /// Let OS decide based on default heuristics (POSIX_FADV_NORMAL)
     Normal,
     /// Automatically choose based on file size (Sequential for large, Random for small)
+    #[default]
     Auto,
-}
-
-impl Default for PageCacheMode {
-    fn default() -> Self { PageCacheMode::Auto }
 }
 
 #[derive(Debug, Clone)]

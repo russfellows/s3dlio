@@ -197,7 +197,7 @@ impl AzureBlob {
     pub async fn stat(&self, key: &str) -> Result<AzureBlobProperties> {
         let blob = self.blob_client(key)?;
         let resp = blob.get_properties(Some(BlobClientGetPropertiesOptions::default())).await?;
-        let content_length = resp.content_length()?.unwrap_or(0) as u64;
+        let content_length = resp.content_length()?.unwrap_or(0);
         let etag = resp.etag()?.map(|e| e.to_string());
         let last_modified = resp.last_modified()?.map(|dt| dt.to_string());
         Ok(AzureBlobProperties { content_length, etag, last_modified })

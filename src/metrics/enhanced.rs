@@ -201,11 +201,10 @@ impl EnhancedMetricsCollector {
     /// Record operation metrics
     pub fn record_operation(&mut self, operation: &str, latency_us: u64, request_size: u64, response_size: u64) -> Result<()> {
         // Apply sampling if configured
-        if self.config.sampling_rate < 1.0 {
-            if rand::random::<f64>() > self.config.sampling_rate {
+        if self.config.sampling_rate < 1.0
+            && rand::random::<f64>() > self.config.sampling_rate {
                 return Ok(());
             }
-        }
         
         // Ensure histograms exist for this operation
         if !self.latency_histograms.contains_key(operation) {

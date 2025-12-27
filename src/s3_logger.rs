@@ -116,8 +116,7 @@ pub fn set_client_id(client_id: &str) -> std::io::Result<()> {
             *id = client_id.to_string();
             Ok(())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "Failed to acquire client_id lock"
             ))
         }
@@ -302,8 +301,7 @@ impl Logger {
         let clock_offset = Arc::new(AtomicI64::new(0));
         let clock_offset_clone = Arc::clone(&clock_offset);
         thread::spawn(move || {
-            let mut idx: u64 = 0;
-            for mut entry in receiver {
+            for (idx, mut entry) in (0_u64..).zip(receiver.into_iter()) {
                 if entry.operation == SHUTDOWN_OP {
                     break;
                 }
@@ -314,7 +312,6 @@ impl Logger {
                     eprintln!("Error writing to op-log: {e}");
                     break;
                 }
-                idx += 1;
             }
             // Drop encoder here to finish the zstd stream.
             drop(encoder);

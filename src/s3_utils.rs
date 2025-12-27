@@ -581,12 +581,11 @@ pub async fn list_objects_stream(
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
                     if let Some(basename) = key.strip_prefix(prefix) {
-                        if re.is_match(basename) {
-                            if tx.send(Ok(key.to_string())).await.is_err() {
+                        if re.is_match(basename)
+                            && tx.send(Ok(key.to_string())).await.is_err() {
                                 // Receiver dropped, stop streaming
                                 return;
                             }
-                        }
                     }
                 }
             }
@@ -607,11 +606,10 @@ pub async fn list_objects_stream(
                                     for obj in recursive_resp.contents() {
                                         if let Some(key) = obj.key() {
                                             if let Some(obj_basename) = key.strip_prefix(prefix) {
-                                                if re.is_match(obj_basename) {
-                                                    if tx.send(Ok(key.to_string())).await.is_err() {
+                                                if re.is_match(obj_basename)
+                                                    && tx.send(Ok(key.to_string())).await.is_err() {
                                                         return;
                                                     }
-                                                }
                                             }
                                         }
                                     }
@@ -868,7 +866,7 @@ fn get_optimal_chunk_size(total_bytes: u64) -> usize {
     std::env::var("S3DLIO_CHUNK_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
+        .unwrap_or({
             // Intelligent defaults based on object size
             if total_bytes < 16 * 1024 * 1024 {
                 // < 16MB: Use 1MB chunks
@@ -1192,7 +1190,7 @@ pub fn put_objects_with_random_data_and_type_with_progress(
         config.object_type, size, uris.len(), max_in_flight
     );
 
-    let buffer: Bytes = generate_object(&config)?.into();  // or: Bytes::from(generate_object(&config)?)
+    let buffer: Bytes = generate_object(&config)?;  // or: Bytes::from(generate_object(&config)?)
     let uris_vec = uris.to_vec();                     // own for 'static
     debug!("Uploading buffer of {} bytes to {} URIs", buffer.len(), uris_vec.len());
     put_objects_parallel_with_progress(uris_vec, buffer, max_in_flight, progress_callback)

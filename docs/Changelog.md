@@ -1,5 +1,122 @@
 # s3dlio Changelog
 
+## Version 0.9.33 - Clippy Cleanup (December 26, 2025)
+
+### 🧹 **Code Quality: Zero Clippy Warnings**
+
+**Comprehensive clippy cleanup across library and binary targets**:
+
+**Phase 1 Fixes** (69 warnings resolved):
+- Fixed `empty_line_after_doc_comments` (3 instances)
+- Fixed `unused_unit` in profiling macros
+- Fixed `redundant_field_names` (key: key → key)
+- Fixed `derivable_impls` (7 enums with #[derive(Default)])
+- Fixed `collapsible_if` (5 instances)
+- Fixed `manual_div_ceil` (2 instances with .div_ceil())
+- Fixed `manual_clamp` (2 instances with .clamp())
+- Fixed `let_unit_value` warnings (5 instances)
+- Fixed `writeln_empty_string` warnings (3 instances)
+- Fixed `clone_on_copy`, `unnecessary_cast`, `unnecessary_map_or`
+- Implemented FromStr trait properly for Strategy enum
+
+**Phase 2 Fixes** (additional cleanup):
+- Fixed `manual_strip`: Use strip_prefix/strip_suffix methods
+- Fixed `explicit_counter_loop`: Use zip with enumerate for s3_logger
+- Fixed `manual_clamp`: Replace max().min() with clamp()
+- Fixed `manual_ok`: Replace match Ok/Err patterns with .ok()
+- Fixed `needless_range_loop`: Use iterator patterns
+- Fixed `if_same_then_else`: Simplify redundant conditional branches
+- Fixed `doc_lazy_continuation`: Add proper indentation
+- Fixed `redundant_pattern_matching`: Use is_err() methods
+- Fixed unused imports: Remove Hash, keep BuildHasher for hash_one
+- Fixed `too_many_arguments`: Add allow annotations where necessary
+- Applied auto-fixes for 51 additional warnings
+
+**Result**:
+- ✅ **Library (lib)**: Zero warnings (was 69)
+- ✅ **Binary (s3-cli)**: Zero warnings (was 2)
+- ⏭️ **Tests**: 32 warnings remain (deferred to future work)
+
+**Files Modified**: 16 files (src/object_store.rs, src/file_store.rs, src/file_store_direct.rs, src/data_gen.rs, src/s3_logger.rs, src/mp.rs, src/bin/cli.rs, and others)
+
+---
+
+## Version 0.9.32 - Memory-Efficient delete_prefix() (December 2025)
+
+### 🐛 **Fixed: delete_prefix() Memory Bloat with Millions of Objects**
+
+**Problem**: The `delete_prefix()` method loaded ALL object keys into memory before deletion:
+```rust
+let keys = client.list_objects(&bucket, Some(&key_prefix), true).await?;  // BAD!
+client.delete_objects(&bucket, keys).await?;
+```
+
+For millions of objects, this consumed gigabytes of memory (~80 bytes per key × 100M objects = ~8GB).
+
+**Solution**: Converted all backends to use streaming list + batched deletion:
+- ✅ **S3**: Now uses `s3_list_objects_stream()` with 1000-object batches
+- ✅ **Azure**: Now uses `list_stream()` with 1000-object batches  
+- ✅ **GCS**: Now uses `list_objects_stream()` with 1000-object batches
+
+**Memory Impact**:
+- **Before**: O(N) memory - loaded all N object keys
+- **After**: O(1) memory - max 1000 keys in memory at once
+- **Example**: 100M objects: 8GB → 80KB memory usage
+
+**Performance**: No degradation - deletion happens in parallel batches as objects are listed.
+
+**Affected Methods**:
+- `GcsObjectStore::delete_prefix()` - src/object_store.rs line ~2173
+- `S3ObjectStore::delete_prefix()` - src/object_store.rs line ~1050  
+- `AzureObjectStore::delete_prefix()` - src/object_store.rs line ~1705
+
+**Testing**: Existing tests pass (test_file_store, dl-driver checkpoint tests).
+
+---
+
+## Version 0.9.33 - Issue #110 Investigation Results (December 2025)
+
+### 📝 **Issue #110: GCS Console Shows Directory Structure After Delete**
+
+**Investigation**: User reported that after using `s3-cli delete -r` on GCS buckets, empty directory structures remained visible in the GCS Console UI.
+
+**Root Cause Analysis**: Extensive testing revealed that:
+- ✅ `delete -r` successfully deletes ALL objects (verified with `gsutil ls -r`)
+- ✅ GCS API correctly reports zero objects in bucket
+- ✅ Both s3-cli and gsutil confirm bucket is empty
+- ❌ **GCS Console UI continues to show "folder icons"** (📁)
+
+**Conclusion**: The directory icons are **virtual UI artifacts** created by the GCS Console based on object path structure (the `/` delimiter). These are NOT actual objects in storage - they're purely a Console rendering/caching issue that eventually expires (hours to days).
+
+**Verification Test**:
+```bash
+# Delete all objects with s3-cli v0.9.25 (before any "fix")
+./s3-cli delete -r gs://bucket/
+# Deleted: 25088 objects ✅
+
+# Verify with gsutil
+gsutil ls -r gs://bucket/
+# (no output - bucket is empty) ✅
+
+# Verify with s3-cli
+./s3-cli ls -r gs://bucket/
+# Total objects: 0 ✅
+
+# Check Console UI
+# Still shows directory icons ❌ (UI caching artifact)
+```
+
+**Resolution**: No code changes required. This is expected GCS Console behavior. The bucket is actually empty according to the API - the Console UI just hasn't invalidated its cache.
+
+**Workarounds for Console Display**:
+1. **Wait**: Console cache expires eventually (hours to days)
+2. **Different browser/incognito mode**: May show correct (empty) state
+3. **Ignore**: Doesn't affect storage costs, API operations, or functionality
+
+**Status**: Closing as "Not a Bug" - this is GCS Console UI behavior, not a code issue.
+
+---
+
 ## Version 0.9.32 - Bug Fix: FileSystemConfig Type Mismatch (December 2025)
 
 ### 🐛 **Fixed Issue #85: FileSystemConfig Type Mismatch**

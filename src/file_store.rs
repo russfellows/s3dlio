@@ -43,7 +43,7 @@ pub struct FileSystemConfig {
     /// Page cache behavior hint (maps to posix_fadvise on Linux/Unix)
     /// - None: Use Auto mode (Sequential for large files >=64MB, Random for small)
     /// - Some(mode): Explicitly set Sequential, Random, DontNeed, or Normal
-    /// Default: None (Auto mode)
+    ///   Default: None (Auto mode)
     pub page_cache_mode: Option<PageCacheMode>,
 }
 
@@ -238,6 +238,12 @@ impl ObjectWriter for FileSystemWriter {
     }
 }
 
+impl Default for FileSystemObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileSystemObjectStore {
     /// Create a new FileSystemObjectStore with default configuration
     /// 
@@ -346,11 +352,7 @@ impl FileSystemObjectStore {
                 };
                 Box::pin(Self::collect_files_recursive(&entry_path, &new_prefix, results)).await?;
             } else {
-                let file_uri = if prefix.is_empty() {
-                    Self::path_to_uri(&entry_path)
-                } else {
-                    Self::path_to_uri(&entry_path)
-                };
+                let file_uri = Self::path_to_uri(&entry_path);
                 results.push(file_uri);
             }
         }
@@ -479,16 +481,25 @@ impl ObjectStore for FileSystemObjectStore {
         let mut file = fs::File::from_std(std_file);
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         
-        let read_length = length.unwrap_or(u64::MAX);
+        // Calculate how many bytes are actually available from offset to end of file
+        let bytes_available = file_size.saturating_sub(offset);
+        let read_length = match length {
+            Some(len) => len.min(bytes_available), // Read at most what's available
+            None => bytes_available,                // Read to end
+        };
+        
         let mut buffer = Vec::new();
         
-        if read_length == u64::MAX {
-            // Read to end of file
-            file.read_to_end(&mut buffer).await?;
-        } else {
-            // Read specific length - use read_exact to ensure we get all bytes
+        if read_length == 0 {
+            // Nothing to read (offset >= file_size)
+            return Ok(Bytes::new());
+        } else if read_length < u64::MAX {
+            // Read specific length - only what's available
             buffer.resize(read_length as usize, 0);
             file.read_exact(&mut buffer).await?;
+        } else {
+            // Read to end of file
+            file.read_to_end(&mut buffer).await?;
         }
         
         // Convert to Bytes (cheap, just wraps in Arc)
@@ -604,10 +615,10 @@ impl ObjectStore for FileSystemObjectStore {
         // FileSystemObjectStore: delete files concurrently
         use futures::stream::{self, StreamExt};
         
-        let max_concurrency = (uris.len() / 10).max(10).min(100);
+        let max_concurrency = (uris.len() / 10).clamp(10, 100);
         let uris_owned: Vec<String> = uris.to_vec();
         
-        let deletions = stream::iter(uris_owned.into_iter())
+        let deletions = stream::iter(uris_owned)
             .map(|uri| async move { self.delete(&uri).await })
             .buffer_unordered(max_concurrency);
         
@@ -637,7 +648,7 @@ impl ObjectStore for FileSystemObjectStore {
             }
             
             // Try to remove the directory if it's empty
-            if let Err(_) = fs::remove_dir(&base_path).await {
+            if (fs::remove_dir(&base_path).await).is_err() {
                 // Directory might not be empty due to subdirectories
                 // For now, we'll leave non-empty directories
             }

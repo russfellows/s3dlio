@@ -171,7 +171,6 @@ macro_rules! profile_span {
             }
             #[cfg(not(feature = "profiling"))]
             {
-                () // No-op when profiling disabled
             }
         }
     };
@@ -183,7 +182,6 @@ macro_rules! profile_span {
             }
             #[cfg(not(feature = "profiling"))]
             {
-                () // No-op when profiling disabled  
             }
         }
     };
@@ -222,8 +220,8 @@ mod tests {
     #[tokio::test] 
     async fn test_profiling_macros() {
         // These should compile and run without panicking
-        let _span = profile_span!("test_span");
-        let _span_with_fields = profile_span!("test_span", field1 = "value1");
+        profile_span!("test_span");
+        profile_span!("test_span", field1 = "value1");
         
         let result = profile_async!("test_async", async { 42 }).await;
         assert_eq!(result, 42);

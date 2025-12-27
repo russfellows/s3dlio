@@ -8,7 +8,7 @@ use std::io::{Cursor, Write};
 
 /* ---------- low‑level helpers, unchanged ---------- */
 fn mask_crc(crc: u32) -> u32 {
-    (((crc >> 15) | (crc << 17)).wrapping_add(0xa282_ead8)) & 0xFFFF_FFFF
+    crc.rotate_right(15).wrapping_add(0xa282_ead8)
 }
 
 fn write_raw_record<W: Write>(w: &mut W, data: &[u8]) -> std::io::Result<usize> {

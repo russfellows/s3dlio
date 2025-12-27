@@ -83,7 +83,7 @@ impl Dataset for S3BytesDataset {
                 let size = meta.size;
                 if size == 0 { return Ok(Bytes::new()); }
                 let part = self.part_size.max(1) as u64;
-                let n_parts = ((size + part - 1) / part) as usize;
+                let n_parts = size.div_ceil(part) as usize;
                 let max_inflight = self.max_inflight_parts.max(1);
 
                 // Fetch parts concurrently, preserving order

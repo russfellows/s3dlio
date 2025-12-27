@@ -43,18 +43,18 @@ pub fn build_hdf5(
     let image_size = image_size as usize;
 
     // Allocate and fill
-    let mut buf = Vec::with_capacity(image_size);
-    unsafe {
-        buf.set_len(image_size);
-        //let ret = sys::H5Fget_file_image(
-        let ret = H5Fget_file_image(
+    let mut buf = vec![0u8; image_size];
+    
+    // SAFETY: H5Fget_file_image writes to the buffer we allocated
+    let ret = unsafe {
+        H5Fget_file_image(
             fid,
             buf.as_mut_ptr() as *mut c_void,
             image_size,
-        );
-        if ret < 0 {
-            bail!("H5Fget_file_image failed to retrieve image");
-        }
+        )
+    };
+    if ret < 0 {
+        bail!("H5Fget_file_image failed to retrieve image");
     }
 
     Ok(Bytes::from(buf))

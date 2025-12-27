@@ -148,7 +148,7 @@ impl CheckpointStore {
             .with_part_size(self.config.part_size.unwrap_or(8 * 1024 * 1024));
         
         if let Some(compression) = &self.config.compression {
-            writer = writer.with_compression(compression.clone());
+            writer = writer.with_compression(*compression);
         }
         
         writer

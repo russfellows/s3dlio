@@ -298,7 +298,7 @@ impl AdaptiveScheduler {
                 };
                 
                 let new_optimal = (target_throughput / throughput_per_connection) as usize;
-                let new_optimal = std::cmp::max(8, std::cmp::min(256, new_optimal));
+                let new_optimal = new_optimal.clamp(8, 256);
                 
                 self.optimal_concurrency.store(new_optimal, Ordering::Relaxed);
             }
@@ -404,5 +404,5 @@ pub fn calculate_optimal_part_size(object_size: u64, target_part_size: u64) -> u
     let optimal_size = std::cmp::max(target_part_size, required_part_size);
     
     // Ensure within bounds
-    std::cmp::max(MIN_PART_SIZE, std::cmp::min(MAX_PART_SIZE, optimal_size))
+    optimal_size.clamp(MIN_PART_SIZE, MAX_PART_SIZE)
 }

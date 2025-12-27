@@ -3,7 +3,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-182%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-182%2F182-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.32-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.33-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -18,6 +18,12 @@ pip install s3dlio
 ```
 
 ## 🌟 Latest Release
+
+### v0.9.33 - Clippy Cleanup (December 26, 2025)
+
+**🧹 Code Quality Improvements**
+- Comprehensive clippy cleanup: Zero warnings in library and binary targets
+- Fixed 69+ clippy warnings across 16 files
 
 ### v0.9.32 - Bug Fix: FileSystemConfig Type Mismatch (December 2025)
 

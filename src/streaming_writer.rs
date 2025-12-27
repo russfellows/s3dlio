@@ -116,7 +116,7 @@ impl StreamingDataWriter {
     /// Check if all target data has been generated.
     pub fn is_complete(&self) -> bool {
         self.bytes_generated >= self.target_size as u64 ||
-        self.object_gen.as_ref().map_or(true, |obj_gen| obj_gen.is_complete())
+        self.object_gen.as_ref().is_none_or(|obj_gen| obj_gen.is_complete())
     }
     
     /// Get the total bytes of synthetic data generated so far.
