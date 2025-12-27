@@ -1,9 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-175%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-175%2F175-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.31-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-182%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-182%2F182-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.32-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -18,6 +18,16 @@ pip install s3dlio
 ```
 
 ## 🌟 Latest Release
+
+### v0.9.32 - Bug Fix: FileSystemConfig Type Mismatch (December 2025)
+
+**🐛 Fixed Issue #85**
+- Resolved type collision between `file_store::FileSystemConfig` and `file_store_direct::FileSystemConfig`
+- Introduced unified `StorageConfig` enum for type-safe configuration
+- Added debug logging for page cache mode application
+- 7 new comprehensive tests for API configuration scenarios
+
+**⚠️ Breaking Change**: `store_for_uri_with_config()` now requires `StorageConfig` wrapper
 
 ### v0.9.30 - Zero-Copy Refactor & PyO3 0.27 (December 2025)
 

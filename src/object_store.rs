@@ -45,7 +45,8 @@ use crate::s3_logger::global_logger;
 use crate::file_store::FileSystemObjectStore;
 
 // Expose enhanced FS adapter with O_DIRECT support
-use crate::file_store_direct::{ConfigurableFileSystemObjectStore, FileSystemConfig};
+use crate::file_store_direct::ConfigurableFileSystemObjectStore;
+
 
 // --- Azure ---------------------------------------------------
 use bytes::Bytes;
@@ -2439,38 +2440,42 @@ pub fn store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Log
 }
 
 /// Enhanced factory that supports configuration options for file I/O
-pub fn store_for_uri_with_config(uri: &str, file_config: Option<FileSystemConfig>) -> Result<Box<dyn ObjectStore>> {
-    store_for_uri_with_config_and_logger(uri, file_config, None)
+pub fn store_for_uri_with_config(uri: &str, config: Option<crate::api::StorageConfig>) -> Result<Box<dyn ObjectStore>> {
+    store_for_uri_with_config_and_logger(uri, config, None)
 }
 
 /// Enhanced factory with configuration and optional logger support
 pub fn store_for_uri_with_config_and_logger(
     uri: &str, 
-    file_config: Option<FileSystemConfig>,
+    config: Option<crate::api::StorageConfig>,
     logger: Option<crate::s3_logger::Logger>
 ) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
     
-    let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
-        Scheme::File => {
-            if let Some(config) = file_config {
-                ConfigurableFileSystemObjectStore::boxed(config)
-            } else {
-                FileSystemObjectStore::boxed()
-            }
+    let store: Box<dyn ObjectStore> = match (infer_scheme(uri), config) {
+        (Scheme::File, Some(crate::api::StorageConfig::File(cfg))) => {
+            Box::new(FileSystemObjectStore::with_config(cfg))
         }
-        Scheme::Direct => {
-            if let Some(config) = file_config {
-                ConfigurableFileSystemObjectStore::boxed(config)
-            } else {
-                ConfigurableFileSystemObjectStore::boxed_direct_io()
-            }
+        (Scheme::File, None) => {
+            FileSystemObjectStore::boxed()
         }
-        Scheme::S3 => S3ObjectStore::boxed(),
-        Scheme::Azure => AzureObjectStore::boxed(),
-        Scheme::Gcs => GcsObjectStore::boxed(),
-        Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
+        (Scheme::Direct, Some(crate::api::StorageConfig::Direct(cfg))) => {
+            ConfigurableFileSystemObjectStore::boxed(cfg)
+        }
+        (Scheme::Direct, None) => {
+            ConfigurableFileSystemObjectStore::boxed_direct_io()
+        }
+        (Scheme::Direct, Some(crate::api::StorageConfig::File(_))) => {
+            bail!("Cannot use FileSystemConfig with direct:// URI - use DirectFileSystemConfig instead")
+        }
+        (Scheme::File, Some(crate::api::StorageConfig::Direct(_))) => {
+            bail!("Cannot use DirectFileSystemConfig with file:// URI - use FileSystemConfig instead")
+        }
+        (Scheme::S3, _) => S3ObjectStore::boxed(),
+        (Scheme::Azure, _) => AzureObjectStore::boxed(),
+        (Scheme::Gcs, _) => GcsObjectStore::boxed(),
+        (Scheme::Unknown, _) => bail!("Unable to infer backend from URI: {uri}"),
     };
     
     // Wrap with logger if provided

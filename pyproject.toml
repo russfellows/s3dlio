@@ -1,15 +1,30 @@
 [project]
 name = "s3dlio"
-version = "0.9.31"
+version = "0.9.32"
 description = "High-performance S3, Azure, GCS, and file system operations for AI/ML"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy>=2.0.0",
+]
 license = { text = "Apache-2.0" }
 authors = [{ name = "Russ Fellows", email = "russ.fellows@gmail.com" }]
 
+[project.optional-dependencies]
+torch = ["torch>=2.0.0"]
+jax = ["jax>=0.4.0", "jaxlib>=0.4.0"]
+tensorflow = ["tensorflow>=2.16.0"]
+all = ["torch>=2.0.0", "jax>=0.4.0", "jaxlib>=0.4.0", "tensorflow>=2.16.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "h5py>=3.0.0",
+    "maturin>=1.0.0",
+    "patchelf>=0.17.0",  # Required for maturin on Linux
+]
+
 [build-system]
-requires = ["maturin>=0.12"]
+requires = ["maturin>=1.0.0"]
 build-backend = "maturin"
 
 [tool.maturin]
