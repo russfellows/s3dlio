@@ -1,5 +1,48 @@
 # s3dlio Changelog
 
+## Version 0.9.33 - Issue #110 Investigation Results (December 2025)
+
+### 📝 **Issue #110: GCS Console Shows Directory Structure After Delete**
+
+**Investigation**: User reported that after using `s3-cli delete -r` on GCS buckets, empty directory structures remained visible in the GCS Console UI.
+
+**Root Cause Analysis**: Extensive testing revealed that:
+- ✅ `delete -r` successfully deletes ALL objects (verified with `gsutil ls -r`)
+- ✅ GCS API correctly reports zero objects in bucket
+- ✅ Both s3-cli and gsutil confirm bucket is empty
+- ❌ **GCS Console UI continues to show "folder icons"** (📁)
+
+**Conclusion**: The directory icons are **virtual UI artifacts** created by the GCS Console based on object path structure (the `/` delimiter). These are NOT actual objects in storage - they're purely a Console rendering/caching issue that eventually expires (hours to days).
+
+**Verification Test**:
+```bash
+# Delete all objects with s3-cli v0.9.25 (before any "fix")
+./s3-cli delete -r gs://bucket/
+# Deleted: 25088 objects ✅
+
+# Verify with gsutil
+gsutil ls -r gs://bucket/
+# (no output - bucket is empty) ✅
+
+# Verify with s3-cli
+./s3-cli ls -r gs://bucket/
+# Total objects: 0 ✅
+
+# Check Console UI
+# Still shows directory icons ❌ (UI caching artifact)
+```
+
+**Resolution**: No code changes required. This is expected GCS Console behavior. The bucket is actually empty according to the API - the Console UI just hasn't invalidated its cache.
+
+**Workarounds for Console Display**:
+1. **Wait**: Console cache expires eventually (hours to days)
+2. **Different browser/incognito mode**: May show correct (empty) state
+3. **Ignore**: Doesn't affect storage costs, API operations, or functionality
+
+**Status**: Closing as "Not a Bug" - this is GCS Console UI behavior, not a code issue.
+
+---
+
 ## Version 0.9.32 - Bug Fix: FileSystemConfig Type Mismatch (December 2025)
 
 ### 🐛 **Fixed Issue #85: FileSystemConfig Type Mismatch**
