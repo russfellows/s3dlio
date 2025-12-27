@@ -1,6 +1,47 @@
 # s3dlio Changelog
 
-## Version 0.9.33 - Memory-Efficient delete_prefix() (December 2025)
+## Version 0.9.33 - Clippy Cleanup (December 26, 2025)
+
+### 🧹 **Code Quality: Zero Clippy Warnings**
+
+**Comprehensive clippy cleanup across library and binary targets**:
+
+**Phase 1 Fixes** (69 warnings resolved):
+- Fixed `empty_line_after_doc_comments` (3 instances)
+- Fixed `unused_unit` in profiling macros
+- Fixed `redundant_field_names` (key: key → key)
+- Fixed `derivable_impls` (7 enums with #[derive(Default)])
+- Fixed `collapsible_if` (5 instances)
+- Fixed `manual_div_ceil` (2 instances with .div_ceil())
+- Fixed `manual_clamp` (2 instances with .clamp())
+- Fixed `let_unit_value` warnings (5 instances)
+- Fixed `writeln_empty_string` warnings (3 instances)
+- Fixed `clone_on_copy`, `unnecessary_cast`, `unnecessary_map_or`
+- Implemented FromStr trait properly for Strategy enum
+
+**Phase 2 Fixes** (additional cleanup):
+- Fixed `manual_strip`: Use strip_prefix/strip_suffix methods
+- Fixed `explicit_counter_loop`: Use zip with enumerate for s3_logger
+- Fixed `manual_clamp`: Replace max().min() with clamp()
+- Fixed `manual_ok`: Replace match Ok/Err patterns with .ok()
+- Fixed `needless_range_loop`: Use iterator patterns
+- Fixed `if_same_then_else`: Simplify redundant conditional branches
+- Fixed `doc_lazy_continuation`: Add proper indentation
+- Fixed `redundant_pattern_matching`: Use is_err() methods
+- Fixed unused imports: Remove Hash, keep BuildHasher for hash_one
+- Fixed `too_many_arguments`: Add allow annotations where necessary
+- Applied auto-fixes for 51 additional warnings
+
+**Result**:
+- ✅ **Library (lib)**: Zero warnings (was 69)
+- ✅ **Binary (s3-cli)**: Zero warnings (was 2)
+- ⏭️ **Tests**: 32 warnings remain (deferred to future work)
+
+**Files Modified**: 16 files (src/object_store.rs, src/file_store.rs, src/file_store_direct.rs, src/data_gen.rs, src/s3_logger.rs, src/mp.rs, src/bin/cli.rs, and others)
+
+---
+
+## Version 0.9.32 - Memory-Efficient delete_prefix() (December 2025)
 
 ### 🐛 **Fixed: delete_prefix() Memory Bloat with Millions of Objects**
 
