@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.91'
+      
+      - name: Build (Rust)
+        run: cargo build --release
+      
+      - name: Test (Rust)
+        run: cargo test --release --lib
+      
+      - name: Build (Python)
+        run: |
+          pip install maturin
+          maturin build --release --out dist --features extension-module
+          pip install dist/*.whl
+      
+      - name: Test (Python - Basic)
+        run: |
+          python -c "import s3dlio; data = s3dlio.generate_data(1024); print(f'✓ Generated {len(data)} bytes')"
+          python -c "import s3dlio; t = s3dlio.py_total_cpus(); d = s3dlio.py_default_data_gen_threads(); print(f'✓ CPUs: {t}, Default threads: {d}')"
+      
+      - name: Test (Python - Zero-Copy)
+        run: |
+          python -c "import s3dlio; data = s3dlio.generate_data(1024*1024); view = memoryview(data); print(f'✓ Zero-copy memoryview: {len(view)} bytes')"
+          python -c "import s3dlio; buf = bytearray(1024); n = s3dlio.generate_into_buffer(buf); print(f'✓ Zero-copy write: {n} bytes')"
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
