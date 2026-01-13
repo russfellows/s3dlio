@@ -34,6 +34,7 @@ docs/
 ├── supplemental/                ← Additional guides
 │   ├── ADAPTIVE-TUNING.md
 │   ├── CONFIGURATION-HIERARCHY.md
+│   ├── DATA-GENERATION-GUIDE.md
 │   ├── GCS-BACKEND-SELECTION.md
 │   ├── GCS-QUICK-START.md
 │   ├── MULTI_ENDPOINT_GUIDE.md
@@ -78,6 +79,7 @@ docs/
 |------|----------|
 | Use the CLI (`s3-cli`) | [CLI_GUIDE.md](CLI_GUIDE.md) |
 | Use the Python API | [PYTHON_API_GUIDE.md](PYTHON_API_GUIDE.md) |
+| Generate test data with NUMA optimization | [supplemental/DATA-GENERATION-GUIDE.md](supplemental/DATA-GENERATION-GUIDE.md) |
 | See what's new | [Changelog.md](Changelog.md) |
 | Configure s3dlio | [supplemental/CONFIGURATION-HIERARCHY.md](supplemental/CONFIGURATION-HIERARCHY.md) |
 | Use environment variables | [api/Environment_Variables.md](api/Environment_Variables.md) |

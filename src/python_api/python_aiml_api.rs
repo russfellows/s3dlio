@@ -13,6 +13,7 @@ use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3_async_runtimes::tokio::future_into_py;
 
+use std::str::FromStr;
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;

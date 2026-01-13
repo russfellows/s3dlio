@@ -1,9 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-182%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-182%2F182-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.33-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-185%2F185-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.34-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -18,6 +18,22 @@ pip install s3dlio
 ```
 
 ## 🌟 Latest Release
+
+### v0.9.34 - NUMA-Aware Data Generation (January 2026)
+
+**🚀 Enhanced Data Generation**
+- Smart CPU allocation: Uses 50% of CPUs for data generation, reserves 50% for I/O
+- Auto NUMA detection: Optimizes thread placement on multi-socket systems
+- Thread pinning: Pins threads to CPU cores on NUMA systems for better cache locality
+- Zero breaking changes: All existing APIs work unchanged
+
+**New Features**:
+- `src/numa.rs`: NUMA topology detection module
+- `GeneratorConfig`: Fine-grained control over data generation
+- Helper functions: `default_data_gen_threads()`, `total_cpus()`
+- Optional features: `numa` (topology detection), `thread-pinning` (CPU affinity)
+
+**Performance**: On NUMA systems, reduces cross-node memory access; on all systems, balances data generation with I/O operations.
 
 ### v0.9.33 - Clippy Cleanup (December 26, 2025)
 

@@ -1,5 +1,62 @@
 # s3dlio Changelog
 
+## Version 0.9.34 - NUMA-Aware Data Generation (January 2026)
+
+### 🚀 **Enhanced Data Generation with NUMA Optimization**
+
+**Intelligent CPU Allocation for Data Generation + I/O Workloads**:
+
+**Key Features**:
+- **Smart Default**: Uses 50% of available CPUs for data generation, leaving 50% for I/O operations
+- **Auto NUMA Detection**: Automatically detects UMA (single-node) vs NUMA (multi-socket) systems
+- **Thread Pinning**: Pins threads to specific CPU cores on NUMA systems for better cache locality
+- **First-Touch Initialization**: Memory allocated on local NUMA node for optimal performance
+- **Zero Breaking Changes**: All existing APIs work unchanged
+
+**New Components**:
+- `src/numa.rs`: NUMA topology detection module (Linux)
+  - Detects number of NUMA nodes, physical cores, logical CPUs
+  - Reads from `/sys/devices/system/node` and `/proc/cpuinfo`
+- `NumaMode` enum: Auto (default) or Force (testing)
+- `GeneratorConfig` struct: Fine-grained control over data generation
+- Helper functions:
+  - `default_data_gen_threads()`: Returns 50% of available CPUs
+  - `total_cpus()`: Returns total logical CPUs available
+
+**Performance Benefits**:
+- **NUMA Systems**: Thread pinning + first-touch reduces cross-node memory access
+- **All Systems**: Reserves CPU capacity for concurrent I/O operations
+- **Balanced Workloads**: Optimal for PUT operations (data gen + upload)
+
+**Optional Cargo Features**:
+- `numa`: Enable NUMA topology detection (requires hwloc2)
+- `thread-pinning`: Enable CPU core affinity (requires core_affinity)
+
+**Example Usage**:
+```rust
+// Use defaults (50% CPUs, auto NUMA detection)
+let data = generate_controlled_data_alt(100 * 1024 * 1024, 1, 1);
+
+// Override to use all CPUs
+let config = GeneratorConfig {
+    max_threads: Some(total_cpus()),
+    ..Default::default()
+};
+let data = generate_data_with_config(config);
+```
+
+**New Tests** (8 added):
+- `test_default_thread_count`: Verify 50% CPU allocation
+- `test_generator_config_defaults`: Verify default configuration
+- `test_detect_topology`: NUMA topology detection (when feature enabled)
+- 5 existing tests updated for new defaults
+
+**Dependencies Added**:
+- `hwloc2 = "2.2"` (optional, for NUMA)
+- `core_affinity = "0.8"` (optional, for thread pinning)
+
+---
+
 ## Version 0.9.33 - Clippy Cleanup (December 26, 2025)
 
 ### 🧹 **Code Quality: Zero Clippy Warnings**

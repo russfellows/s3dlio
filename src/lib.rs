@@ -76,6 +76,10 @@ pub mod data_loader;
 pub mod checkpoint;
 pub mod azure_client;
 
+// NUMA topology detection (optional, feature-gated)
+#[cfg(feature = "numa")]
+pub mod numa;
+
 // Google Cloud Storage client - feature-gated backend selection
 #[cfg(feature = "gcs-community")]
 pub mod gcs_client;  // Community-maintained gcloud-storage implementation
