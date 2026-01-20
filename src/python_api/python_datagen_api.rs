@@ -154,7 +154,7 @@ fn generate_data(
     compress: usize,
 ) -> PyResult<Py<PyBytesView>> {
     // Generate data WITHOUT holding GIL (allows parallel Python threads)
-    let data = py.detach(|| generate_controlled_data_alt(size, dedup, compress));
+    let data = py.detach(|| generate_controlled_data_alt(size, dedup, compress, None));
 
     // Convert Vec<u8> to Bytes (cheap, just wraps the Vec's heap allocation)
     let bytes = Bytes::from(data);
@@ -203,6 +203,9 @@ fn generate_data_with_threads(
             compress_factor: compress,
             numa_mode: NumaMode::Auto,
             max_threads: Some(num_threads),
+            numa_node: None,
+            block_size: None,
+            seed: None,
         };
         
         generate_data_with_config(config)
@@ -276,6 +279,9 @@ fn generate_into_buffer(
             compress_factor: compress,
             numa_mode: NumaMode::Auto,
             max_threads: Some(num_threads),
+            numa_node: None,
+            block_size: None,
+            seed: None,
         };
         
         generate_data_with_config(config)

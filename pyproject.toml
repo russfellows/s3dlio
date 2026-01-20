@@ -1,6 +1,6 @@
 [project]
 name = "s3dlio"
-version = "0.9.34"
+version = "0.9.35"
 description = "High-performance S3, Azure, GCS, and file system operations for AI/ML"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -9,6 +9,12 @@ dependencies = [
 ]
 license = { text = "Apache-2.0" }
 authors = [{ name = "Russ Fellows", email = "russ.fellows@gmail.com" }]
+
+[project.urls]
+Homepage = "https://github.com/russfellows/s3dlio"
+Repository = "https://github.com/russfellows/s3dlio"
+Documentation = "https://github.com/russfellows/s3dlio/blob/main/README.md"
+Issues = "https://github.com/russfellows/s3dlio/issues"
 
 [project.optional-dependencies]
 torch = ["torch>=2.0.0"]

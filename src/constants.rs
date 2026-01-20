@@ -193,12 +193,31 @@ impl IoMode {
 // Data Generation Constants
 // =============================================================================
 
-/// Block size for data generation (512 bytes)
-/// This is the fundamental unit for deduplication and compression calculations
+/// Block size for LEGACY data_gen.rs algorithm (512 bytes)
+/// This is the fundamental unit for the old BASE_BLOCK-based algorithm.
+/// DO NOT CHANGE - the old algorithm depends on 512-byte blocks.
 pub const BLK_SIZE: usize = 512;
 
-/// Half block size for internal calculations
+/// Half block size for LEGACY data_gen.rs internal calculations
 pub const HALF_BLK: usize = BLK_SIZE / 2;
+
+/// Data generation block size for OPTIMIZED data_gen_alt.rs algorithm (1 MiB)
+/// 
+/// **PERFORMANCE OPTIMIZATION (backported from dgen-rs v0.1.5)**:
+/// Optimal L3 cache utilization provides ~3x performance improvement:
+/// - Better parallelization across cores  
+/// - Reduced thread pool overhead
+/// - Optimal for modern CPUs (Emerald Rapid, Sapphire Rapids)
+/// - 34% performance boost vs 64 KB blocks
+/// 
+/// **Benchmarks (dgen-rs v0.1.5)**:
+/// - UMA systems: 10.80 GB/s per core (C4-16, 8 cores)
+/// - Aggregate: 86-163 GB/s on single-socket systems
+/// - Compression ratio 2.0: 1.3-1.5x additional speedup
+pub const DATA_GEN_BLOCK_SIZE: usize = 1 * 1024 * 1024;  // 1 MiB
+
+/// Alias for DATA_GEN_BLOCK_SIZE (for dgen-rs compatibility)
+pub const BLOCK_SIZE: usize = DATA_GEN_BLOCK_SIZE;
 
 /// Modification region size for randomization (32 bytes)
 /// This determines the size of regions that get randomized within blocks

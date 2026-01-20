@@ -43,6 +43,9 @@ pub mod mp;
 pub mod uri_utils;  // v0.9.14: Multi-endpoint URI expansion utilities
 pub mod multi_endpoint;  // v0.9.14: Multi-endpoint load balancing with thread/process control
 
+// Hardware detection and optimization (v0.9.35+: always available, runtime detection)
+pub mod hardware;
+
 // Performance monitoring
 pub mod metrics;
 

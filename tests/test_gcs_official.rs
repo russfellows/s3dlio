@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+#[allow(dead_code)]
 mod common;
 
+#[cfg(feature = "gcs-official")]
 use anyhow::{Context, Result};
+#[cfg(feature = "gcs-official")]
 use common::{get_test_config, print_test_header, print_test_result};
 
 #[cfg(feature = "gcs-official")]

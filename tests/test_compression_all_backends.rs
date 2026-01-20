@@ -65,6 +65,7 @@ async fn test_directio_compression() -> Result<()> {
         min_io_size: 4096,
         enable_range_engine: false,
         range_engine: Default::default(),
+        buffer_pool: None,
     };
     
     // Test with compression

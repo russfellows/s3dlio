@@ -21,7 +21,7 @@ fn test_generate_controlled_data_alt_basic() -> Result<()> {
     
     for (size, dedup, compress, description) in test_cases {
         println!("\nTesting: {}", description);
-        let data = generate_controlled_data_alt(size, dedup, compress);
+        let data = generate_controlled_data_alt(size, dedup, compress, None);
         
         assert_eq!(data.len(), size, "Size mismatch for {}", description);
         println!("  ✓ Generated {} bytes", data.len());
@@ -46,7 +46,7 @@ fn test_incompressible_with_compress_1() -> Result<()> {
     
     // Generate 4MB of data with compress=1 (should be incompressible)
     let size = 4 * 1024 * 1024;
-    let data = generate_controlled_data_alt(size, 1, 1);
+    let data = generate_controlled_data_alt(size, 1, 1, None);
     
     println!("Generated {} bytes with compress=1", data.len());
     
@@ -97,7 +97,7 @@ fn test_compressible_with_higher_compress() -> Result<()> {
     ];
     
     for (compress, description) in test_cases {
-        let data = generate_controlled_data_alt(size, 1, compress);
+        let data = generate_controlled_data_alt(size, 1, compress, None);
         
         let mut child = Command::new("zstd")
             .args(&["-c", "-1", "-q"])
@@ -136,8 +136,8 @@ fn test_deduplication_behavior() -> Result<()> {
     let expected_blocks = size / block_size;
     
     // Generate with dedup=2 (half unique blocks)
-    let data1 = generate_controlled_data_alt(size, 2, 1);
-    let data2 = generate_controlled_data_alt(size, 2, 1);
+    let data1 = generate_controlled_data_alt(size, 2, 1, None);
+    let data2 = generate_controlled_data_alt(size, 2, 1, None);
     
     println!("Generated two datasets with dedup=2");
     println!("Block size: {} bytes", block_size);
@@ -237,7 +237,7 @@ fn test_performance_comparison() -> Result<()> {
         
         // New generator
         let start = Instant::now();
-        let _data_new = generate_controlled_data_alt(size, 1, 1);
+        let _data_new = generate_controlled_data_alt(size, 1, 1, None);
         let time_new = start.elapsed();
         let throughput_new = size as f64 / time_new.as_secs_f64() / (1024.0 * 1024.0);
         

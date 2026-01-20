@@ -3,7 +3,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen)](docs/Changelog.md)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-185%2F185-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.34-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.35-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -19,21 +19,28 @@ pip install s3dlio
 
 ## 🌟 Latest Release
 
-### v0.9.34 - NUMA-Aware Data Generation (January 2026)
+### v0.9.35 - Runtime Hardware Detection & Performance Optimization (January 2026)
 
-**🚀 Enhanced Data Generation**
-- Smart CPU allocation: Uses 50% of CPUs for data generation, reserves 50% for I/O
-- Auto NUMA detection: Optimizes thread placement on multi-socket systems
-- Thread pinning: Pins threads to CPU cores on NUMA systems for better cache locality
-- Zero breaking changes: All existing APIs work unchanged
+**🔍 Runtime Hardware Detection API**
+- New public `hardware` module for CPU/NUMA detection at runtime
+- Zero configuration required - automatically adapts to any hardware
+- Portable binaries work optimally from VMs to multi-socket servers
+- External tools can leverage same detection API
 
-**New Features**:
-- `src/numa.rs`: NUMA topology detection module
-- `GeneratorConfig`: Fine-grained control over data generation
-- Helper functions: `default_data_gen_threads()`, `total_cpus()`
-- Optional features: `numa` (topology detection), `thread-pinning` (CPU affinity)
+**⚡ Data Generation Performance**
+- **51.09 GB/s** validated throughput (100 GB in 1.96s)
+- Optimal defaults: 1 MB blocks, all cores, automatic NUMA adaptation
+- New reproducible seeding with `seed: Option<u64>` parameter
+- Backported optimizations from high-performance dgen-rs project
 
-**Performance**: On NUMA systems, reduces cross-node memory access; on all systems, balances data generation with I/O operations.
+**🐍 Python Bindings Updated**
+- Zero-copy support maintained
+- New seed parameter for reproducible data generation
+- Automatic hardware detection for optimal performance
+
+**✅ Zero Breaking Changes**: All existing code works unchanged
+
+See [Changelog](docs/Changelog.md) for complete details.
 
 ### v0.9.33 - Clippy Cleanup (December 26, 2025)
 
