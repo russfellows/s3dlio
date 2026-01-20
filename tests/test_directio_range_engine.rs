@@ -82,6 +82,7 @@ async fn test_directio_range_engine_custom_config() -> Result<()> {
             min_split_size: 4 * 1024 * 1024,  // 4MB threshold (lower for testing)
             ..Default::default()
         },
+        buffer_pool: None,
     };
     
     let store = ConfigurableFileSystemObjectStore::with_config(config);

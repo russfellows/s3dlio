@@ -203,7 +203,8 @@ pub fn generate_controlled_data_streaming(size: usize, dedup: usize, compress: u
 pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     // REDIRECTED TO NEW ALGORITHM: Use data_gen_alt for improved compression control
     // This provides truly incompressible data when compress=1 (fixes cross-block compression bug)
-    crate::data_gen_alt::generate_controlled_data_alt(size, dedup, compress)
+    // Convert bytes::Bytes to Vec<u8> for compatibility
+    crate::data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec()
 }
 
 /// Generate controlled data using the pseudo-random (BASE_BLOCK) method.

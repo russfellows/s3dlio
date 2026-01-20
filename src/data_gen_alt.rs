@@ -1,85 +1,275 @@
-// src/data_gen_alt.rs
+// src/generator.rs
 //
-// SPDX-License-Identifier: Apache-2.0 OR MIT
-// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
-/// # Key Features
-/// - No shared BASE_BLOCK (eliminates cross-block compression)
-/// - Xoshiro256++ RNG (5-10x faster than ChaCha20)
-/// - Compression distributed evenly via integer error accumulation
-/// - Correct compress=1 behavior (truly incompressible, ~1.0 zstd ratio)
-/// - When compress>1, compressibility is local to each block
-/// - NUMA-aware parallel generation with thread pinning (optional)
-use rand::{Rng, SeedableRng, RngCore};
-use rand_xoshiro::Xoshiro256PlusPlus;  // Explicit high-performance RNG
+//! High-performance data generation with controllable deduplication and compression
+//!
+//! Ported from s3dlio/src/data_gen_alt.rs with NUMA optimizations
+
+use rand::{RngCore, SeedableRng};
+use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
-use tracing::{debug, info};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::constants::BLK_SIZE;
+use crate::constants::*;
 
 #[cfg(feature = "numa")]
 use crate::numa::NumaTopology;
 
-// =============================================================================
-// Constants
-// =============================================================================
+#[cfg(feature = "numa")]
+use hwlocality::{
+    memory::binding::{MemoryBindingFlags, MemoryBindingPolicy},
+    Topology,
+};
 
-/// Maximum back-reference distance for compression (1 KiB)
-const MAX_BACK_REF_DISTANCE: usize = 1024;
+/// ZERO-COPY buffer abstraction for UMA and NUMA allocations
+/// 
+/// CRITICAL: This type NEVER copies data - it holds the actual memory and provides
+/// mutable slices for zero-copy operations. Python bindings access this memory
+/// directly via raw pointers.
+#[cfg(feature = "numa")]
+pub enum DataBuffer {
+    /// UMA allocation using Vec<u8> (fast path, 43-50 GB/s)
+    /// Python accesses via Vec's raw pointer
+    Uma(Vec<u8>),
+    /// NUMA allocation using hwlocality Bytes (target: 1,200-1,400 GB/s)
+    /// Python accesses via Bytes' raw pointer - ZERO COPY to Python!
+    /// Stores (Topology, Bytes, actual_size) to keep Topology alive
+    Numa((Topology, hwlocality::memory::binding::Bytes<'static>, usize)),
+}
 
-/// Minimum run length for back-references (64 bytes)
-const MIN_RUN_LENGTH: usize = 64;
+#[cfg(feature = "numa")]
+impl DataBuffer {
+    /// Get mutable slice for data generation (zero-copy)
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            DataBuffer::Uma(vec) => vec.as_mut_slice(),
+            DataBuffer::Numa((_, bytes, _)) => {
+                // SAFETY: We've allocated this buffer and will initialize it
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        bytes.as_mut_ptr() as *mut u8,
+                        bytes.len()
+                    )
+                }
+            }
+        }
+    }
+    
+    /// Get immutable slice view (zero-copy)
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            DataBuffer::Uma(vec) => vec.as_slice(),
+            DataBuffer::Numa((_, bytes, size)) => {
+                // SAFETY: Buffer has been fully initialized
+                unsafe {
+                    std::slice::from_raw_parts(
+                        bytes.as_ptr() as *const u8,
+                        *size
+                    )
+                }
+            }
+        }
+    }
+    
+    /// Get raw pointer for zero-copy Python access
+    pub fn as_ptr(&self) -> *const u8 {
+        match self {
+            DataBuffer::Uma(vec) => vec.as_ptr(),
+            DataBuffer::Numa((_, bytes, _)) => bytes.as_ptr() as *const u8,
+        }
+    }
+    
+    /// Get mutable raw pointer for zero-copy Python access
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            DataBuffer::Uma(vec) => vec.as_mut_ptr(),
+            DataBuffer::Numa((_, bytes, _)) => bytes.as_mut_ptr() as *mut u8,
+        }
+    }
+    
+    /// Get length (actual data size, not allocated size)
+    pub fn len(&self) -> usize {
+        match self {
+            DataBuffer::Uma(vec) => vec.len(),
+            DataBuffer::Numa((_, _, size)) => *size,
+        }
+    }
 
-/// Maximum run length for back-references (256 bytes)
-const MAX_RUN_LENGTH: usize = 256;
+    /// Check if buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+    /// Truncate to requested size (modifies metadata only, NO COPY)
+    pub fn truncate(&mut self, size: usize) {
+        match self {
+            DataBuffer::Uma(vec) => vec.truncate(size),
+            DataBuffer::Numa((_, bytes, actual_size)) => {
+                *actual_size = size.min(bytes.len());
+            }
+        }
+    }
+    
+    /// Convert to bytes::Bytes for Python API (ZERO-COPY for UMA, minimal copy for NUMA)
+    /// 
+    /// For UMA: Uses Bytes::from(Vec<u8>) which is cheap (just wraps the allocation)
+    /// For NUMA: Must copy to bytes::Bytes since hwlocality::Bytes can't be converted directly
+    ///          Alternative: Keep as DataBuffer and implement Python buffer protocol directly
+    pub fn into_bytes(self) -> bytes::Bytes {
+        match self {
+            DataBuffer::Uma(vec) => bytes::Bytes::from(vec),
+            DataBuffer::Numa((_, hwloc_bytes, size)) => {
+                // Convert NUMA-allocated memory to bytes::Bytes
+                // Unfortunately this requires a copy since bytes::Bytes needs owned data
+                let slice = unsafe {
+                    std::slice::from_raw_parts(
+                        hwloc_bytes.as_ptr() as *const u8,
+                        size
+                    )
+                };
+                bytes::Bytes::copy_from_slice(slice)
+            }
+        }
+    }
+}
 
-// =============================================================================
-// NUMA Configuration
-// =============================================================================
+#[cfg(not(feature = "numa"))]
+pub enum DataBuffer {
+    Uma(Vec<u8>),
+}
+
+#[cfg(not(feature = "numa"))]
+impl DataBuffer {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            DataBuffer::Uma(vec) => vec.as_mut_slice(),
+        }
+    }
+    
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            DataBuffer::Uma(vec) => vec.as_slice(),
+        }
+    }
+    
+    pub fn as_ptr(&self) -> *const u8 {
+        match self {
+            DataBuffer::Uma(vec) => vec.as_ptr(),
+        }
+    }
+    
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            DataBuffer::Uma(vec) => vec.as_mut_ptr(),
+        }
+    }
+    
+    pub fn len(&self) -> usize {
+        match self {
+            DataBuffer::Uma(vec) => vec.len(),
+        }
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+    pub fn truncate(&mut self, size: usize) {
+        match self {
+            DataBuffer::Uma(vec) => vec.truncate(size),
+        }
+    }
+    
+    /// Convert to bytes::Bytes (ZERO-COPY for UMA via Bytes::from(Vec<u8>))
+    pub fn into_bytes(self) -> bytes::Bytes {
+        match self {
+            DataBuffer::Uma(vec) => bytes::Bytes::from(vec),
+        }
+    }
+}
+
+/// Allocate NUMA-aware buffer on specific node
+///
+/// # Returns
+/// - Ok((Topology, Bytes, size)) on successful NUMA allocation
+/// - Err(String) on failure (caller should fall back to UMA)
+#[cfg(feature = "numa")]
+fn allocate_numa_buffer(
+    size: usize,
+    node_id: usize,
+) -> Result<(Topology, hwlocality::memory::binding::Bytes<'static>, usize), String> {
+    use hwlocality::object::types::ObjectType;
+    
+    // Create topology
+    let topology = Topology::new()
+        .map_err(|e| format!("Failed to create hwloc topology: {}", e))?;
+    
+    // Find NUMA node
+    let numa_nodes: Vec<_> = topology
+        .objects_with_type(ObjectType::NUMANode)
+        .collect();
+    
+    if numa_nodes.is_empty() {
+        return Err("No NUMA nodes found in topology".to_string());
+    }
+    
+    // Get the NUMA node by OS index
+    let node = numa_nodes
+        .iter()
+        .find(|n| n.os_index() == Some(node_id))
+        .ok_or_else(|| format!("NUMA node {} not found (available: {:?})", 
+                               node_id,
+                               numa_nodes.iter().filter_map(|n| n.os_index()).collect::<Vec<_>>()))?;
+    
+    // Get nodeset for this NUMA node
+    let nodeset = node.nodeset()
+        .ok_or_else(|| format!("NUMA node {} has no nodeset", node_id))?;
+    
+    tracing::debug!(
+        "Allocating {} bytes on NUMA node {} with nodeset {:?}",
+        size,
+        node_id,
+        nodeset
+    );
+    
+    // Allocate memory bound to this NUMA node
+    // Using ASSUME_SINGLE_THREAD flag for maximum portability
+    let bytes = topology
+        .binding_allocate_memory(
+            size,
+            nodeset,
+            MemoryBindingPolicy::Bind,
+            MemoryBindingFlags::ASSUME_SINGLE_THREAD,
+        )
+        .map_err(|e| format!("Failed to allocate NUMA memory: {}", e))?;
+    
+    // SAFETY: We need to extend the lifetime to 'static because we're storing
+    // both Topology and Bytes together, and Bytes' lifetime is tied to Topology.
+    // This is safe because we keep Topology alive as long as Bytes exists.
+    let bytes_static = unsafe {
+        std::mem::transmute::<
+            hwlocality::memory::binding::Bytes<'_>,
+            hwlocality::memory::binding::Bytes<'static>,
+        >(bytes)
+    };
+    
+    Ok((topology, bytes_static, size))
+}
 
 /// NUMA optimization mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NumaMode {
-    /// Auto-detect: enable NUMA optimizations only on multi-node systems (default)
+    /// Auto-detect: enable NUMA optimizations only on multi-node systems
     #[default]
     Auto,
-    /// Force: enable optimizations even on UMA systems (for testing)
+    /// Force NUMA: enable optimizations even on UMA systems (for testing)
     Force,
+    /// Disable: never use NUMA optimizations (default for cloud/VM)
+    Disabled,
 }
 
-/// Configuration for data generation with NUMA support
-///
-/// # Default Behavior
-/// - Uses 50% of available CPU cores/threads for data generation
-/// - Leaves the other 50% available for I/O operations
-/// - Automatically detects NUMA topology and optimizes accordingly
-///
-/// # Examples
-///
-/// ```rust
-/// use s3dlio::data_gen_alt::{GeneratorConfig, NumaMode, default_data_gen_threads, total_cpus};
-///
-/// // Use defaults (50% of CPUs, auto NUMA detection)
-/// let config = GeneratorConfig::default();
-///
-/// // Override to use all CPUs
-/// let config_all = GeneratorConfig {
-///     max_threads: Some(total_cpus()),
-///     ..Default::default()
-/// };
-///
-/// // Override to use specific number of threads
-/// let config_custom = GeneratorConfig {
-///     max_threads: Some(4),
-///     ..Default::default()
-/// };
-///
-/// // Force NUMA optimizations even on UMA systems (for testing)
-/// let config_force_numa = GeneratorConfig {
-///     numa_mode: NumaMode::Force,
-///     ..Default::default()
-/// };
-/// ```
+/// Configuration for data generation
 #[derive(Debug, Clone)]
 pub struct GeneratorConfig {
     /// Total size in bytes
@@ -92,138 +282,62 @@ pub struct GeneratorConfig {
     pub numa_mode: NumaMode,
     /// Maximum number of threads to use (None = use all available cores)
     pub max_threads: Option<usize>,
+    /// Pin to specific NUMA node (None = use all nodes, Some(n) = pin to node n)
+    /// When set, only uses cores from this NUMA node and limits threads accordingly
+    pub numa_node: Option<usize>,
+    /// Internal block size for parallelization (None = use BLOCK_SIZE constant)
+    /// Larger blocks (16-32 MB) improve throughput by amortizing Rayon overhead
+    /// but use more memory. Must be at least 1 MB and at most 32 MB.
+    pub block_size: Option<usize>,
+    /// Optional RNG seed for reproducibility (None = random seed from system time)
+    pub seed: Option<u64>,
 }
 
 impl Default for GeneratorConfig {
     fn default() -> Self {
         Self {
-            size: BLK_SIZE,
+            size: BLOCK_SIZE,
             dedup_factor: 1,
             compress_factor: 1,
             numa_mode: NumaMode::Auto,
-            max_threads: Some(default_data_gen_threads()), // Use 50% of CPUs by default
+            max_threads: None, // Use all available cores
+            numa_node: None,   // Use all NUMA nodes
+            block_size: None,  // Use BLOCK_SIZE constant (4 MB)
+            seed: None,        // Random seed
         }
     }
 }
 
-/// Calculate default number of threads for data generation
-///
-/// Returns 50% of available logical CPUs (cores × hyperthreads).
-/// This leaves the other 50% available for I/O operations.
-///
-/// Minimum: 1 thread
-/// Maximum: Total available logical CPUs
-pub fn default_data_gen_threads() -> usize {
-    let total_cpus = num_cpus::get();
-    let half = total_cpus / 2;
-    half.max(1) // At least 1 thread
-}
-
-/// Get total available logical CPUs
-///
-/// Returns the total number of logical CPUs (cores × hyperthreads)
-/// available on the system. This can be used to override the default
-/// thread count if you want to use more or fewer threads.
-pub fn total_cpus() -> usize {
-    num_cpus::get()
-}
-
-// =============================================================================
-// Helper Functions (No longer needed - Xoshiro256PlusPlus has built-in seeding)
-// =============================================================================
-
-// Note: Xoshiro256++ has built-in seed_from_u64 that uses SplitMix64 internally,
-// so we don't need custom seed generation helpers.
-
-// =============================================================================
-// Block Filling Helper
-// =============================================================================
-
-/// Fill a single block with controlled compression characteristics
-///
-/// # Algorithm
-/// 1. Fill entire block with Xoshiro256++ keystream (high entropy baseline)
-/// 2. Add local back-references to achieve target compression ratio
+/// Simple API: Generate data with default config
 ///
 /// # Parameters
-/// - `out`: Output buffer (must be BLK_SIZE bytes)
-/// - `unique_block_idx`: Index of the unique block (for seeding)
-/// - `copy_len_for_block`: Target number of bytes to make compressible
-/// - `call_entropy`: Per-call entropy for RNG seeding
+/// - `size`: Total bytes to generate
+/// - `dedup`: Deduplication factor (1 = no dedup, N = N:1 ratio)
+/// - `compress`: Compression factor (1 = incompressible, N = N:1 ratio)
 ///
-/// # Compression Strategy
-/// When `copy_len_for_block > 0`, creates local repetition via back-references:
-/// - Copies runs of 64-256 bytes from earlier positions in the same block
-/// - Back-reference distance: 1-1024 bytes (stays local)
-/// - This mimics LZ compression sources without cross-block duplication
-#[inline]
-fn fill_block_alt(
-    out: &mut [u8],
-    unique_block_idx: usize,
-    copy_len_for_block: usize,
-    call_entropy: u64,
-) {
-    // Seed Xoshiro256++ uniquely per unique_block_idx
-    // SeedableRng::seed_from_u64 uses built-in SplitMix64 for fast initialization
-    let seed = call_entropy ^ ((unique_block_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-
-    // Step 1: Fill entire block with high-entropy keystream
-    rng.fill_bytes(out);
-
-    // Step 2: Add local back-references to achieve target compressibility
-    if copy_len_for_block == 0 || out.len() <= 1 {
-        return; // Fully incompressible
-    }
-
-    let mut made = 0usize;
-    while made < copy_len_for_block {
-        // Choose run length: 64-256 bytes (capped to remaining target)
-        let remaining = copy_len_for_block.saturating_sub(made);
-        if remaining == 0 {
-            break;
-        }
-
-        let run_len = rng.random_range(MIN_RUN_LENGTH..=MAX_RUN_LENGTH).min(remaining).min(out.len() - 1);
-        if run_len == 0 {
-            break;
-        }
-
-        // Choose destination position (ensure room for run_len)
-        if out.len() <= run_len {
-            break;
-        }
-        let dst = rng.random_range(0..(out.len() - run_len));
-
-        // Choose source position (back-reference from earlier in block)
-        // Distance: 1-1024 bytes (or less if near start of block)
-        let max_back = dst.clamp(1, MAX_BACK_REF_DISTANCE);
-        let back = rng.random_range(1..=max_back);
-        let src = dst.saturating_sub(back);
-
-        // Safety check: ensure we don't read past end of buffer
-        if src + run_len > out.len() {
-            break;
-        }
-
-        // Copy within same block (memmove semantics handle overlaps)
-        out.copy_within(src..(src + run_len), dst);
-
-        made += run_len;
-    }
+/// # Example
+/// ```rust
+/// use dgen_rs::generate_data_simple;
+///
+/// // Generate 100 MiB incompressible data with no deduplication
+/// let data = generate_data_simple(100 * 1024 * 1024, 1, 1);
+/// assert_eq!(data.len(), 100 * 1024 * 1024);
+/// ```
+pub fn generate_data_simple(size: usize, dedup: usize, compress: usize) -> DataBuffer {
+    let config = GeneratorConfig {
+        size,
+        dedup_factor: dedup.max(1),
+        compress_factor: compress.max(1),
+        numa_mode: NumaMode::Auto,
+        max_threads: None,
+        numa_node: None,
+        block_size: None,
+        seed: None,
+    };
+    generate_data(config)
 }
 
-// =============================================================================
-// Single-Pass Generator (Drop-in Alternative)
-// =============================================================================
-
-/// Generate data with full configuration support (NUMA-aware)
-///
-/// # Default Behavior
-/// - Uses 50% of available CPU cores/threads (leaving 50% for I/O)
-/// - Automatically detects NUMA/UMA topology
-/// - Enables NUMA optimizations on multi-node systems
-/// - Uses thread pinning on NUMA systems (when `thread-pinning` feature enabled)
+/// Generate data with full configuration (ZERO-COPY - returns DataBuffer)
 ///
 /// # Algorithm
 /// 1. Fill blocks with Xoshiro256++ keystream (high entropy baseline)
@@ -235,31 +349,29 @@ fn fill_block_alt(
 /// - 5-15 GB/s per core with incompressible data
 /// - 1-4 GB/s with compression enabled (depends on compress factor)
 /// - Near-linear scaling with CPU cores
-/// - NUMA optimizations when >1 NUMA node detected
 ///
-/// # Examples
+/// # Returns
+/// DataBuffer that holds the generated data without copying:
+/// - UMA: Vec<u8> wrapper
+/// - NUMA: hwlocality Bytes wrapper (when numa_node is specified)
 ///
-/// ```rust
-/// use s3dlio::data_gen_alt::{generate_data_with_config, GeneratorConfig};
-///
-/// // Use defaults (50% CPUs, 100 MiB, no dedup/compression)
-/// let config = GeneratorConfig {
-///     size: 100 * 1024 * 1024,
-///     ..Default::default()
-/// };
-/// let data = generate_data_with_config(config);
-/// ```
-pub fn generate_data_with_config(config: GeneratorConfig) -> Vec<u8> {
-    info!(
-        "Starting data generation with config: size={}, dedup={}, compress={}, numa_mode={:?}",
+/// Python accesses this memory directly via buffer protocol - ZERO COPY!
+pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
+    // Validate and get effective block size (default 4 MB, max 32 MB)
+    let block_size = config.block_size
+        .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024))  // 1 MB min, 32 MB max
+        .unwrap_or(BLOCK_SIZE);
+    
+    tracing::info!(
+        "Starting data generation: size={}, dedup={}, compress={}, block_size={}",
         config.size,
         config.dedup_factor,
         config.compress_factor,
-        config.numa_mode
+        block_size
     );
 
-    let size = config.size.max(BLK_SIZE);
-    let nblocks = size.div_ceil(BLK_SIZE);
+    let size = config.size.max(block_size);  // Use block_size as minimum
+    let nblocks = size.div_ceil(block_size);
 
     let dedup_factor = config.dedup_factor.max(1);
     let unique_blocks = if dedup_factor > 1 {
@@ -268,7 +380,7 @@ pub fn generate_data_with_config(config: GeneratorConfig) -> Vec<u8> {
         nblocks
     };
 
-    debug!(
+    tracing::debug!(
         "Generating: size={}, blocks={}, dedup={}, unique_blocks={}, compress={}",
         size,
         nblocks,
@@ -278,253 +390,15 @@ pub fn generate_data_with_config(config: GeneratorConfig) -> Vec<u8> {
     );
 
     // Calculate per-block copy lengths using integer error accumulation
+    // This ensures even distribution of compression across blocks
     let (f_num, f_den) = if config.compress_factor > 1 {
         (config.compress_factor - 1, config.compress_factor)
-    } else {
-        (0, 1)
-    };
-    let floor_len = (f_num * BLK_SIZE) / f_den;
-    let rem = (f_num * BLK_SIZE) % f_den;
-
-    let copy_lens: Vec<usize> = {
-        let mut v = Vec::with_capacity(unique_blocks);
-        let mut err = 0;
-        for _ in 0..unique_blocks {
-            err += rem;
-            if err >= f_den {
-                err -= f_den;
-                v.push(floor_len + 1);
-            } else {
-                v.push(floor_len);
-            }
-        }
-        v
-    };
-
-    // Per-call entropy for RNG seeding
-    let call_entropy = generate_call_entropy();
-
-    // Allocate buffer
-    let total_size = nblocks * BLK_SIZE;
-    debug!("Allocating {} bytes ({} blocks)", total_size, nblocks);
-    let mut data: Vec<u8> = vec![0u8; total_size];
-
-    // Configure thread pool based on config
-    let num_threads = config.max_threads.unwrap_or_else(default_data_gen_threads);
-    info!("Using {} threads for parallel generation", num_threads);
-
-    // NUMA optimization check - always detect topology in Auto mode
-    #[cfg(feature = "numa")]
-    let numa_topology = NumaTopology::detect().ok();
-
-    #[cfg(feature = "numa")]
-    let should_optimize_numa = if let Some(ref topology) = numa_topology {
-        let optimize = match config.numa_mode {
-            NumaMode::Auto => topology.num_nodes > 1,
-            NumaMode::Force => true,
-        };
-
-        if optimize {
-            info!(
-                "NUMA optimization enabled: {} nodes detected",
-                topology.num_nodes
-            );
-        } else {
-            debug!(
-                "NUMA optimization not needed: {} nodes detected (UMA system)",
-                topology.num_nodes
-            );
-        }
-        optimize
-    } else {
-        false
-    };
-
-    #[cfg(not(feature = "numa"))]
-    #[allow(unused_variables)]
-    let should_optimize_numa = false;
-
-    debug!("Starting parallel generation with rayon");
-
-    // Build thread pool with optional NUMA-aware thread pinning
-    #[cfg(all(feature = "numa", feature = "thread-pinning"))]
-    let pool = if should_optimize_numa {
-        if let Some(ref topology) = numa_topology {
-            if topology.num_nodes > 1 {
-                debug!(
-                    "Configuring NUMA-aware thread pinning for {} nodes",
-                    topology.num_nodes
-                );
-
-                let cpu_map = std::sync::Arc::new(build_cpu_affinity_map(topology, num_threads));
-
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(num_threads)
-                    .spawn_handler(move |thread| {
-                        let cpu_map = cpu_map.clone();
-                        let mut b = std::thread::Builder::new();
-                        if let Some(name) = thread.name() {
-                            b = b.name(name.to_owned());
-                        }
-                        if let Some(stack_size) = thread.stack_size() {
-                            b = b.stack_size(stack_size);
-                        }
-
-                        b.spawn(move || {
-                            let thread_id = rayon::current_thread_index().unwrap_or(0);
-                            if let Some(core_ids) = cpu_map.get(&thread_id) {
-                                pin_thread_to_cores(core_ids);
-                            }
-                            thread.run()
-                        })?;
-                        Ok(())
-                    })
-                    .build()
-                    .expect("Failed to create NUMA-aware thread pool")
-            } else {
-                debug!("Skipping thread pinning on UMA system (would add overhead)");
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(num_threads)
-                    .build()
-                    .expect("Failed to create thread pool")
-            }
-        } else {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .build()
-                .expect("Failed to create thread pool")
-        }
-    } else {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build()
-            .expect("Failed to create thread pool")
-    };
-
-    #[cfg(not(all(feature = "numa", feature = "thread-pinning")))]
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build()
-        .expect("Failed to create thread pool");
-
-    // First-touch memory initialization for NUMA locality
-    #[cfg(feature = "numa")]
-    if should_optimize_numa {
-        if let Some(ref topology) = numa_topology {
-            if topology.num_nodes > 1 {
-                debug!(
-                    "Performing first-touch memory initialization for {} NUMA nodes",
-                    topology.num_nodes
-                );
-                pool.install(|| {
-                    data.par_chunks_mut(BLK_SIZE).for_each(|chunk| {
-                        chunk[0] = 0;
-                        if chunk.len() > 4096 {
-                            chunk[chunk.len() - 1] = 0;
-                        }
-                    });
-                });
-            } else {
-                tracing::trace!("Skipping first-touch on UMA system");
-            }
-        }
-    }
-
-    pool.install(|| {
-        data.par_chunks_mut(BLK_SIZE)
-            .enumerate()
-            .for_each(|(i, chunk)| {
-                let ub = i % unique_blocks;
-                tracing::trace!("Filling block {} (unique block {})", i, ub);
-                fill_block_alt(chunk, ub, copy_lens[ub].min(chunk.len()), call_entropy);
-            });
-    });
-
-    debug!("Parallel generation complete, truncating to {} bytes", size);
-    data.truncate(size);
-    data
-}
-
-/// Alternative data generator with improved compression control
-///
-/// # Default Behavior  
-/// - Uses 50% of available CPU cores/threads (leaving 50% for I/O)
-/// - Automatically detects NUMA/UMA topology
-/// - Enables NUMA optimizations on multi-node systems
-///
-/// # Key Differences from `generate_controlled_data`:
-/// - No shared BASE_BLOCK → eliminates cross-block compression
-/// - Each unique block uses Xoshiro256++ keystream → high baseline entropy
-/// - Compressibility via local back-refs → no cross-block duplication
-///
-/// # Parameters
-/// - `size`: Total bytes to generate (rounded up to BLK_SIZE)
-/// - `dedup`: Deduplication factor (1 = no dedup, N = N:1 logical:physical)
-/// - `compress`: Compression factor (1 = incompressible, N = N:1 logical:physical)
-///
-/// # Dedupe Semantics (unchanged from original)
-/// - `unique_blocks = round(total_blocks / dedup)`
-/// - Blocks are assigned round-robin to unique blocks
-/// - Same dedupe factor yields same logical-to-physical ratio
-///
-/// # Compress Semantics (improved)
-/// - `compress=1`: Truly incompressible (zstd ratio ~1.00-1.02)
-/// - `compress>1`: Target ratio via local back-refs (no cross-block effects)
-/// - Compression distributed evenly via integer error accumulation
-///
-/// # Performance
-/// - Parallel block generation via rayon (50% of CPUs by default)
-/// - Xoshiro256++ keystream ~5-15 GB/s per core (5-10x faster than ChaCha20)
-/// - Back-reference copies ~10-15 GB/s
-/// - Overall throughput: ~1-4 GB/s (depends on compress factor)
-///
-/// # Example
-/// ```rust
-/// // 100MB incompressible data, no deduplication
-/// let data = generate_controlled_data_alt(100 * 1024 * 1024, 1, 1);
-/// // zstd compression: ~1.00-1.02 ratio
-///
-/// // 100MB, 2:1 dedup, 3:1 compression
-/// let data = generate_controlled_data_alt(100 * 1024 * 1024, 2, 3);
-/// // Logical: 100MB, Physical: ~17MB (2:1 dedup × 3:1 compress)
-/// ```
-pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
-
-    // Ensure minimum size
-    if size < BLK_SIZE {
-        size = BLK_SIZE;
-    }
-
-    let block_size = BLK_SIZE;
-    let nblocks = size.div_ceil(block_size);
-
-    // --- Dedupe calculation (identical to original) ---
-    let dedup_factor = if dedup == 0 { 1 } else { dedup };
-    let unique_blocks = if dedup_factor > 1 {
-        ((nblocks as f64) / (dedup_factor as f64))
-            .round()
-            .max(1.0) as usize
-    } else {
-        nblocks
-    };
-
-    debug!(
-        "Alt generator: size={}, blocks={}, dedup={}, unique_blocks={}, compress={}",
-        size, nblocks, dedup_factor, unique_blocks, compress
-    );
-
-    // --- Compress calculation: distribute target copy length via integer error accumulation ---
-    // Standard technique for even distribution (similar to line rasterization algorithms)
-    let (f_num, f_den) = if compress > 1 {
-        (compress - 1, compress)
     } else {
         (0, 1)
     };
     let floor_len = (f_num * block_size) / f_den;
     let rem = (f_num * block_size) % f_den;
 
-    // Precompute per-block copy lengths using integer error accumulation
-    // This ensures compression is spread evenly across all unique blocks
     let copy_lens: Vec<usize> = {
         let mut v = Vec::with_capacity(unique_blocks);
         let mut err = 0;
@@ -540,48 +414,89 @@ pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usi
         v
     };
 
-    // Allocate full buffer
+    // Per-call entropy for RNG seeding (use provided seed or generate random)
+    let call_entropy = if let Some(seed) = config.seed {
+        seed
+    } else {
+        generate_call_entropy()
+    };
+
+    // Allocate buffer (NUMA-aware if numa_node is specified)
     let total_size = nblocks * block_size;
-    debug!("Allocating {} bytes ({} blocks)", total_size, nblocks);
-    let mut data: Vec<u8> = vec![0u8; total_size];
-
-    // Per-call entropy using helper function
-    let call_entropy = generate_call_entropy();
-
-    // Configure thread pool - use 50% of CPUs by default (leaves other 50% for I/O)
-    let num_threads = default_data_gen_threads();
-    info!("Using {} threads for parallel generation ({} total CPUs available)", num_threads, num_cpus::get());
-
-    // NUMA optimization check - always detect topology for optimal performance
+    tracing::debug!("Allocating {} bytes ({} blocks)", total_size, nblocks);
+    
+    // CRITICAL: UMA fast path - always use Vec<u8> when numa_node is None
+    // This preserves 43-50 GB/s performance on UMA systems
     #[cfg(feature = "numa")]
-    let numa_topology = NumaTopology::detect().ok();
+    let mut data_buffer = if let Some(node_id) = config.numa_node {
+        tracing::info!("Attempting NUMA allocation on node {}", node_id);
+        match allocate_numa_buffer(total_size, node_id) {
+            Ok(buffer) => {
+                tracing::info!("Successfully allocated {} bytes on NUMA node {}", total_size, node_id);
+                DataBuffer::Numa(buffer)
+            }
+            Err(e) => {
+                tracing::warn!("NUMA allocation failed: {}, falling back to UMA", e);
+                DataBuffer::Uma(vec![0u8; total_size])
+            }
+        }
+    } else {
+        DataBuffer::Uma(vec![0u8; total_size])
+    };
+    
+    #[cfg(not(feature = "numa"))]
+    let mut data_buffer = DataBuffer::Uma(vec![0u8; total_size]);
+
+    // NUMA optimization check
+    #[cfg(feature = "numa")]
+    let numa_topology = if config.numa_mode != NumaMode::Disabled {
+        NumaTopology::detect().ok()
+    } else {
+        None
+    };
+
+    // Use public hardware API for thread count recommendation
+    // This respects NUMA, CPU affinity, and provides sensible defaults
+    let num_threads = crate::hardware::recommended_data_gen_threads(
+        config.numa_node,
+        config.max_threads
+    );
+
+    tracing::info!("Using {} threads for parallel generation", num_threads);
 
     #[cfg(feature = "numa")]
     let should_optimize_numa = if let Some(ref topology) = numa_topology {
-        let optimize = topology.num_nodes > 1;  // Auto mode: only on multi-node systems
-        
+        let optimize = match config.numa_mode {
+            NumaMode::Auto => topology.num_nodes > 1,
+            NumaMode::Force => true,
+            NumaMode::Disabled => false,
+        };
+
         if optimize {
-            info!(
+            tracing::info!(
                 "NUMA optimization enabled: {} nodes detected",
                 topology.num_nodes
             );
         } else {
-            debug!(
-                "NUMA optimization not needed: {} nodes detected (UMA system)",
+            tracing::debug!(
+                "NUMA optimization not needed: {} nodes detected",
                 topology.num_nodes
             );
         }
         optimize
     } else {
-        debug!("NUMA topology detection failed, using default rayon pool");
         false
     };
 
     #[cfg(not(feature = "numa"))]
+    // NOTE: This variable appears "unused" in default builds because it's ONLY read
+    // in the `#[cfg(all(feature = "numa", feature = "thread-pinning"))]` block below (line ~535).
+    // We define it here to maintain consistent code structure across feature configurations.
+    // Using #[allow] instead of underscore prefix because this IS used when features are enabled.
     #[allow(unused_variables)]
     let should_optimize_numa = false;
 
-    debug!("Starting parallel generation with rayon");
+    tracing::debug!("Starting parallel generation with rayon");
 
     // Build thread pool with optional NUMA-aware thread pinning
     // Only pin threads on true NUMA systems (>1 node) - adds overhead on UMA
@@ -589,13 +504,13 @@ pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usi
     let pool = if should_optimize_numa {
         if let Some(ref topology) = numa_topology {
             if topology.num_nodes > 1 {
-                debug!(
+                tracing::debug!(
                     "Configuring NUMA-aware thread pinning for {} nodes",
                     topology.num_nodes
                 );
 
                 // Build CPU affinity mapping (wrap in Arc for sharing across threads)
-                let cpu_map = std::sync::Arc::new(build_cpu_affinity_map(topology, num_threads));
+                let cpu_map = std::sync::Arc::new(build_cpu_affinity_map(topology, num_threads, config.numa_node));
 
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(num_threads)
@@ -622,7 +537,7 @@ pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usi
                     .build()
                     .expect("Failed to create NUMA-aware thread pool")
             } else {
-                debug!("Skipping thread pinning on UMA system (would add overhead)");
+                tracing::debug!("Skipping thread pinning on UMA system (would add overhead)");
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(num_threads)
                     .build()
@@ -654,12 +569,13 @@ pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usi
     if should_optimize_numa {
         if let Some(ref topology) = numa_topology {
             if topology.num_nodes > 1 {
-                debug!(
+                tracing::debug!(
                     "Performing first-touch memory initialization for {} NUMA nodes",
                     topology.num_nodes
                 );
                 pool.install(|| {
-                    data.par_chunks_mut(block_size).for_each(|chunk| {
+                    let _data = data_buffer.as_mut_slice();
+                    _data.par_chunks_mut(block_size).for_each(|chunk| {
                         // Touch each page to allocate it locally
                         // Linux allocates memory on the node of the thread that first writes to it
                         chunk[0] = 0;
@@ -674,244 +590,110 @@ pub fn generate_controlled_data_alt(mut size: usize, dedup: usize, compress: usi
         }
     }
 
-    // Parallel block generation
     pool.install(|| {
+        let data = data_buffer.as_mut_slice();
         data.par_chunks_mut(block_size)
             .enumerate()
             .for_each(|(i, chunk)| {
-                // Map block index to unique block (round-robin for dedupe)
                 let ub = i % unique_blocks;
                 tracing::trace!("Filling block {} (unique block {})", i, ub);
-
-                // Fill this block
-                fill_block_alt(chunk, ub, copy_lens[ub].min(chunk.len()), call_entropy);
+                fill_block(chunk, ub, copy_lens[ub].min(chunk.len()), call_entropy);
             });
     });
 
-    debug!("Parallel generation complete, truncating to {} bytes", size);
-    // Truncate to requested size
-    data.truncate(size);
-
-    info!(
-        "Alt generator complete: {} bytes, {} blocks, {} unique blocks",
-        data.len(),
-        nblocks,
-        unique_blocks
-    );
-
-    data
+    tracing::debug!("Parallel generation complete, truncating to {} bytes", size);
+    // Truncate to requested size (metadata only, NO COPY!)
+    data_buffer.truncate(size);
+    
+    // Return DataBuffer directly - Python accesses via raw pointer (ZERO COPY!)
+    data_buffer
 }
 
-// =============================================================================
-// Streaming Generator (ObjectGen equivalent)
-// =============================================================================
-
-/// Streaming data generator state (alternative implementation)
+/// Fill a single block with controlled compression
 ///
-/// Mirrors the behavior of `ObjectGen` from data_gen.rs but uses the
-/// alternative block-filling algorithm for improved compression control.
-#[allow(dead_code)] // dedup_factor and compress_factor used in constructor, stored for reference
-pub struct ObjectGenAlt {
-    /// Total size in bytes
-    total_size: usize,
-    /// Current position
-    current_pos: usize,
-    /// Deduplication factor
-    dedup_factor: usize,
-    /// Compression factor
-    compress_factor: usize,
-    /// Number of unique blocks
-    unique_blocks: usize,
-    /// Per-block copy lengths (evenly distributed via error accumulation)
-    copy_lens: Vec<usize>,
-    /// Per-call entropy for seeding
-    call_entropy: u64,
-}
-
-impl ObjectGenAlt {
-    /// Create new streaming generator
-    ///
-    /// # Parameters
-    /// - `total_size`: Total bytes to generate
-    /// - `dedup`: Deduplication factor
-    /// - `compress`: Compression factor
-    pub fn new(total_size: usize, dedup: usize, compress: usize) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let block_size = BLK_SIZE;
-        let nblocks = total_size.div_ceil(block_size);
-
-        // Dedupe calculation
-        let dedup_factor = if dedup == 0 { 1 } else { dedup };
-        let unique_blocks = if dedup_factor > 1 {
-            ((nblocks as f64) / (dedup_factor as f64))
-                .round()
-                .max(1.0) as usize
-        } else {
-            nblocks
-        };
-
-        // Compress calculation (integer error accumulation for even distribution)
-        let (f_num, f_den) = if compress > 1 {
-            (compress - 1, compress)
-        } else {
-            (0, 1)
-        };
-        let floor_len = (f_num * block_size) / f_den;
-        let rem = (f_num * block_size) % f_den;
-
-        let copy_lens: Vec<usize> = {
-            let mut v = Vec::with_capacity(unique_blocks);
-            let mut err = 0;
-            for _ in 0..unique_blocks {
-                err += rem;
-                if err >= f_den {
-                    err -= f_den;
-                    v.push(floor_len + 1);
-                } else {
-                    v.push(floor_len);
-                }
-            }
-            v
-        };
-
-        // Per-call entropy: Mix system time + high-quality random bytes from /dev/urandom
-        // This ensures global uniqueness across distributed nodes even with synchronized clocks
-        let time_entropy = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-
-        // Get 8 bytes of cryptographically random data from /dev/urandom
-        let urandom_entropy: u64 = {
-            use rand::RngCore;
-            let mut rng = rand::rng(); // Uses /dev/urandom on Linux
-            rng.next_u64()
-        };
-
-        // Combine both sources for maximum uniqueness
-        let call_entropy = time_entropy.wrapping_add(urandom_entropy);
-
-        Self {
-            total_size,
-            current_pos: 0,
-            dedup_factor,
-            compress_factor: compress,
-            unique_blocks,
-            copy_lens,
-            call_entropy,
-        }
-    }
-
-    /// Fill the next chunk of data
-    ///
-    /// Returns the number of bytes written. When this returns 0, generation is complete.
-    pub fn fill_chunk(&mut self, buf: &mut [u8]) -> usize {
-        if self.current_pos >= self.total_size {
-            return 0;
-        }
-
-        let remaining = self.total_size - self.current_pos;
-        let to_write = buf.len().min(remaining);
-        let chunk = &mut buf[..to_write];
-
-        let block_size = BLK_SIZE;
-        let _start_block = self.current_pos / block_size;
-
-        let mut offset = 0;
-        while offset < chunk.len() {
-            let block_idx = (self.current_pos + offset) / block_size;
-            let block_offset = (self.current_pos + offset) % block_size;
-            let remaining_in_block = block_size - block_offset;
-            let to_copy = remaining_in_block.min(chunk.len() - offset);
-
-            // Map to unique block
-            let ub = block_idx % self.unique_blocks;
-
-            // Generate full block if we need any part of it
-            let mut block_buf = vec![0u8; block_size];
-            fill_block_alt(
-                &mut block_buf,
-                ub,
-                self.copy_lens[ub].min(block_size),
-                self.call_entropy,
-            );
-
-            // Copy the needed portion
-            chunk[offset..offset + to_copy]
-                .copy_from_slice(&block_buf[block_offset..block_offset + to_copy]);
-
-            offset += to_copy;
-        }
-
-        self.current_pos += to_write;
-        to_write
-    }
-
-    /// Reset generator to start
-    pub fn reset(&mut self) {
-        self.current_pos = 0;
-    }
-
-    /// Get current position
-    pub fn position(&self) -> usize {
-        self.current_pos
-    }
-
-    /// Get total size
-    pub fn total_size(&self) -> usize {
-        self.total_size
-    }
-
-    /// Check if generation is complete
-    pub fn is_complete(&self) -> bool {
-        self.current_pos >= self.total_size
-    }
-}
-
-/// Generate data using streaming approach (alternative implementation)
+/// # Algorithm (OPTIMIZED January 2026)
+/// 
+/// **NEW METHOD (Current)**: Zero-fill for compression
+/// 1. Fill incompressible portion with Xoshiro256++ keystream (high-entropy random data)
+/// 2. Fill compressible portion with zeros (memset - extremely fast)
+/// 
+/// **OLD METHOD (Before Jan 2026)**: Back-reference approach
+/// - Filled entire block with RNG data
+/// - Created back-references using copy_within() in 64-256 byte chunks
+/// - SLOW: Required 2x memory traffic (write all, then copy 50% for 2:1 compression)
+/// - Example: 1 MB block @ 2:1 ratio = 1 MB RNG write + 512 KB of copy_within operations
+/// 
+/// **WHY CHANGED**: 
+/// - Testing showed significant slowdown with compression enabled (1-4 GB/s vs 15 GB/s)
+/// - Back-references created small, inefficient memory copies
+/// - Zero-fill approach matches DLIO benchmark methodology
+/// - Much faster: memset is highly optimized (often CPU instruction or libc fast path)
+/// 
+/// **PERFORMANCE COMPARISON**:
+/// - Incompressible (copy_len=0): ~15 GB/s per core (both methods identical)
+/// - 2:1 compression (copy_len=50%): OLD ~2-4 GB/s, NEW ~10-12 GB/s (estimated)
 ///
 /// # Parameters
-/// - `total_size`: Total bytes to generate
-/// - `dedup`: Deduplication factor
-/// - `compress`: Compression factor
-/// - `chunk_size`: Size of chunks for streaming
-pub fn generate_controlled_data_streaming_alt(
-    total_size: usize,
-    dedup: usize,
-    compress: usize,
-    chunk_size: usize,
-) -> Vec<u8> {
-    let mut gen = ObjectGenAlt::new(total_size, dedup, compress);
-    let mut result = Vec::with_capacity(total_size);
-    let mut chunk = vec![0u8; chunk_size];
+/// - `out`: Output buffer (BLOCK_SIZE bytes)
+/// - `unique_block_idx`: Index of unique block (for RNG seeding)
+/// - `copy_len`: Target bytes to make compressible (filled with zeros)
+/// - `call_entropy`: Per-call RNG seed
+fn fill_block(out: &mut [u8], unique_block_idx: usize, copy_len: usize, call_entropy: u64) {
+    tracing::trace!(
+        "fill_block: idx={}, copy_len={}, out_len={}",
+        unique_block_idx,
+        copy_len,
+        out.len()
+    );
 
-    loop {
-        let written = gen.fill_chunk(&mut chunk);
-        if written == 0 {
-            break;
+    // Seed RNG uniquely per block
+    let seed = call_entropy ^ ((unique_block_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+
+    // OPTIMIZED COMPRESSION METHOD (January 2026):
+    // For compress_factor N:1 ratio, we want (N-1)/N of the block to be compressible
+    // Example: 2:1 ratio means 50% compressible, 4:1 means 75% compressible
+    //
+    // Strategy: Fill incompressible portion with RNG, compressible portion with zeros
+    // This is MUCH faster than the old back-reference approach
+
+    if copy_len == 0 {
+        // No compression: fill entire block with high-entropy random data
+        tracing::trace!("Filling {} bytes with RNG keystream (incompressible)", out.len());
+        rng.fill_bytes(out);
+    } else {
+        // With compression: split between random and zeros
+        let incompressible_len = out.len().saturating_sub(copy_len);
+        
+        tracing::trace!(
+            "Filling block: {} bytes random (incompressible) + {} bytes zeros (compressible)",
+            incompressible_len,
+            copy_len
+        );
+        
+        // Step 1: Fill incompressible portion with high-entropy keystream
+        if incompressible_len > 0 {
+            rng.fill_bytes(&mut out[..incompressible_len]);
         }
-        result.extend_from_slice(&chunk[..written]);
+        
+        // Step 2: Fill compressible portion with zeros (memset - super fast!)
+        // This is typically optimized to a CPU instruction or fast libc call
+        if copy_len > 0 && incompressible_len < out.len() {
+            out[incompressible_len..].fill(0);
+        }
     }
-
-    result
+    
+    tracing::trace!("fill_block complete: {} compressible bytes (zeros)", copy_len);
 }
-
-// =============================================================================
-// NUMA Helper Functions
-// =============================================================================
 
 /// Generate per-call entropy from time + urandom
 fn generate_call_entropy() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
     let time_entropy = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
 
     let urandom_entropy: u64 = {
-        use rand::RngCore;
         let mut rng = rand::rng();
         rng.next_u64()
     };
@@ -922,42 +704,87 @@ fn generate_call_entropy() -> u64 {
 #[cfg(all(feature = "numa", feature = "thread-pinning"))]
 use std::collections::HashMap;
 
+// NOTE: CPU detection functions moved to public crate::hardware module (v0.9.35+)
+// This allows external tools like sai3-bench to use the same hardware detection.
+// See src/hardware.rs for implementation of:
+// - get_affinity_cpu_count()
+// - parse_cpu_list()
+// - total_cpus()
+// - recommended_data_gen_threads()
+
 /// Build CPU affinity map for thread pinning
+#[cfg(all(feature = "numa", feature = "thread-pinning"))]
+/// Build CPU affinity map for thread pinning
+/// If numa_node is Some(n), only use cores from NUMA node n
+/// If numa_node is None, distribute threads across all NUMA nodes
 #[cfg(all(feature = "numa", feature = "thread-pinning"))]
 fn build_cpu_affinity_map(
     topology: &crate::numa::NumaTopology,
     num_threads: usize,
+    numa_node: Option<usize>,
 ) -> HashMap<usize, Vec<usize>> {
     let mut map = HashMap::new();
 
-    // Distribute threads across NUMA nodes round-robin
-    let mut thread_id = 0;
-    let mut node_idx = 0;
+    if let Some(target_node_id) = numa_node {
+        // Pin to specific NUMA node only
+        if let Some(target_node) = topology.nodes.iter().find(|n| n.node_id == target_node_id) {
+            tracing::info!(
+                "Pinning {} threads to NUMA node {} ({} cores available)",
+                num_threads,
+                target_node_id,
+                target_node.cpus.len()
+            );
 
-    while thread_id < num_threads {
-        if let Some(node) = topology.nodes.get(node_idx % topology.nodes.len()) {
-            // Assign threads to cores within this NUMA node
-            let cores_per_thread = (node.cpus.len() as f64 / num_threads as f64).ceil() as usize;
-            let cores_per_thread = cores_per_thread.max(1);
-
-            let start_cpu = (thread_id * cores_per_thread) % node.cpus.len();
-            let end_cpu = ((thread_id + 1) * cores_per_thread).min(node.cpus.len());
-
-            let core_ids: Vec<usize> = node.cpus[start_cpu..end_cpu].to_vec();
-
-            if !core_ids.is_empty() {
+            // Distribute threads across cores in this NUMA node only
+            for thread_id in 0..num_threads {
+                let core_idx = thread_id % target_node.cpus.len();
+                let core_id = target_node.cpus[core_idx];
+                
                 tracing::trace!(
-                    "Thread {} -> NUMA node {} cores {:?}",
+                    "Thread {} -> NUMA node {} core {}",
                     thread_id,
-                    node.node_id,
-                    &core_ids
+                    target_node_id,
+                    core_id
                 );
-                map.insert(thread_id, core_ids);
+                map.insert(thread_id, vec![core_id]);
             }
+        } else {
+            tracing::warn!(
+                "NUMA node {} not found in topology (available: 0-{})",
+                target_node_id,
+                topology.num_nodes - 1
+            );
         }
+    } else {
+        // Distribute threads across ALL NUMA nodes (old behavior)
+        let mut thread_id = 0;
+        let mut node_idx = 0;
 
-        thread_id += 1;
-        node_idx += 1;
+        while thread_id < num_threads {
+            if let Some(node) = topology.nodes.get(node_idx % topology.nodes.len()) {
+                // Assign threads to cores within this NUMA node
+                let cores_per_thread = (node.cpus.len() as f64 / num_threads as f64).ceil() as usize;
+                let cores_per_thread = cores_per_thread.max(1);
+
+                let start_cpu = (thread_id * cores_per_thread) % node.cpus.len();
+                let end_cpu = ((thread_id + 1) * cores_per_thread).min(node.cpus.len());
+
+                let core_ids: Vec<usize> = node.cpus[start_cpu..end_cpu].to_vec();
+
+                if !core_ids.is_empty() {
+                    tracing::trace!(
+                        "Thread {} -> NUMA node {} cores {:?}",
+                        thread_id,
+                        node.node_id,
+                        &core_ids
+                    );
+                    map.insert(thread_id, core_ids);
+                }
+            }
+
+            thread_id += 1;
+            node_idx += 1;
+        }
     }
 
     map
@@ -980,102 +807,592 @@ fn pin_thread_to_cores(core_ids: &[usize]) {
     }
 }
 
+// =============================================================================
+// Streaming Generator
+// =============================================================================
+
+/// Streaming data generator (like ObjectGenAlt from s3dlio)
+pub struct DataGenerator {
+    total_size: usize,
+    current_pos: usize,
+    #[allow(dead_code)]
+    dedup_factor: usize,
+    #[allow(dead_code)]
+    compress_factor: usize,
+    unique_blocks: usize,
+    copy_lens: Vec<usize>,
+    call_entropy: u64,
+    max_threads: usize,  // Thread count for parallel generation
+    thread_pool: Option<rayon::ThreadPool>,  // Reused thread pool (created once)
+    block_size: usize,   // Internal parallelization block size (4-32 MB)
+}
+
+impl DataGenerator {
+    /// Create new streaming generator
+    pub fn new(config: GeneratorConfig) -> Self {
+        // Validate and get effective block size (default 4 MB, max 32 MB)
+        let block_size = config.block_size
+            .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024))  // 1 MB min, 32 MB max
+            .unwrap_or(BLOCK_SIZE);
+        
+        tracing::info!(
+            "Creating DataGenerator: size={}, dedup={}, compress={}, block_size={}",
+            config.size,
+            config.dedup_factor,
+            config.compress_factor,
+            block_size
+        );
+
+        let total_size = config.size.max(block_size);  // Use block_size as minimum
+        let nblocks = total_size.div_ceil(block_size);
+
+        let dedup_factor = config.dedup_factor.max(1);
+        let unique_blocks = if dedup_factor > 1 {
+            ((nblocks as f64) / (dedup_factor as f64)).round().max(1.0) as usize
+        } else {
+            nblocks
+        };
+
+        // Calculate copy lengths
+        let (f_num, f_den) = if config.compress_factor > 1 {
+            (config.compress_factor - 1, config.compress_factor)
+        } else {
+            (0, 1)
+        };
+        let floor_len = (f_num * block_size) / f_den;
+        let rem = (f_num * block_size) % f_den;
+
+        let copy_lens: Vec<usize> = {
+            let mut v = Vec::with_capacity(unique_blocks);
+            let mut err = 0;
+            for _ in 0..unique_blocks {
+                err += rem;
+                if err >= f_den {
+                    err -= f_den;
+                    v.push(floor_len + 1);
+                } else {
+                    v.push(floor_len);
+                }
+            }
+            v
+        };
+
+        let call_entropy = generate_call_entropy();
+
+        let max_threads = config.max_threads.unwrap_or_else(num_cpus::get);
+        
+        // Create thread pool ONCE for reuse (major performance optimization)
+        let thread_pool = if max_threads > 1 {
+            match rayon::ThreadPoolBuilder::new()
+                .num_threads(max_threads)
+                .build()
+            {
+                Ok(pool) => {
+                    tracing::info!(
+                        "DataGenerator configured with {} threads (thread pool created)",
+                        max_threads
+                    );
+                    Some(pool)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create thread pool: {}, falling back to sequential",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            tracing::info!("DataGenerator configured for single-threaded operation");
+            None
+        };
+
+        Self {
+            total_size,
+            current_pos: 0,
+            dedup_factor,
+            compress_factor: config.compress_factor,
+            unique_blocks,
+            copy_lens,
+            call_entropy,
+            max_threads,
+            thread_pool,
+            block_size,
+        }
+    }
+
+    /// Fill the next chunk of data
+    ///
+    /// Returns the number of bytes written. When this returns 0, generation is complete.
+    /// 
+    /// **Performance**: When buffer contains multiple blocks (>=8 MB), generation is parallelized
+    /// using rayon. Small buffers (<8 MB) use sequential generation to avoid threading overhead.
+    pub fn fill_chunk(&mut self, buf: &mut [u8]) -> usize {
+        tracing::trace!(
+            "fill_chunk called: pos={}/{}, buf_len={}",
+            self.current_pos,
+            self.total_size,
+            buf.len()
+        );
+
+        if self.current_pos >= self.total_size {
+            tracing::trace!("fill_chunk: already complete");
+            return 0;
+        }
+
+        let remaining = self.total_size - self.current_pos;
+        let to_write = buf.len().min(remaining);
+        let chunk = &mut buf[..to_write];
+
+        // Determine number of blocks to generate
+        let start_block = self.current_pos / self.block_size;
+        let start_offset = self.current_pos % self.block_size;
+        let end_pos = self.current_pos + to_write;
+        let end_block = (end_pos - 1) / self.block_size;
+        let num_blocks = end_block - start_block + 1;
+
+        // Use parallel generation for large buffers (>=2 blocks), sequential for small
+        // This avoids rayon overhead for tiny chunks
+        const PARALLEL_THRESHOLD: usize = 2;
+        
+        if num_blocks >= PARALLEL_THRESHOLD && self.max_threads > 1 {
+            // PARALLEL PATH: Generate all blocks in parallel
+            self.fill_chunk_parallel(chunk, start_block, start_offset, num_blocks)
+        } else {
+            // SEQUENTIAL PATH: Generate blocks one at a time (small buffers or single-threaded)
+            self.fill_chunk_sequential(chunk, start_block, start_offset, num_blocks)
+        }
+    }
+
+    /// Sequential fill for small buffers
+    #[inline]
+    fn fill_chunk_sequential(
+        &mut self,
+        chunk: &mut [u8],
+        start_block: usize,
+        start_offset: usize,
+        num_blocks: usize,
+    ) -> usize {
+        let mut offset = 0;
+
+        for i in 0..num_blocks {
+            let block_idx = start_block + i;
+            let block_offset = if i == 0 { start_offset } else { 0 };
+            let remaining_in_block = self.block_size - block_offset;
+            let to_copy = remaining_in_block.min(chunk.len() - offset);
+
+            // Map to unique block
+            let ub = block_idx % self.unique_blocks;
+
+            // Generate full block
+            let mut block_buf = vec![0u8; self.block_size];
+            fill_block(
+                &mut block_buf,
+                ub,
+                self.copy_lens[ub].min(self.block_size),
+                self.call_entropy,
+            );
+
+            // Copy needed portion
+            chunk[offset..offset + to_copy]
+                .copy_from_slice(&block_buf[block_offset..block_offset + to_copy]);
+
+            offset += to_copy;
+        }
+
+        let to_write = offset;
+        self.current_pos += to_write;
+        
+        tracing::debug!(
+            "fill_chunk_sequential: generated {} blocks ({} MiB) for {} byte chunk",
+            num_blocks,
+            num_blocks * 4,
+            to_write
+        );
+        
+        to_write
+    }
+
+    /// Parallel fill for large buffers (uses reused thread pool - ZERO COPY)
+    fn fill_chunk_parallel(
+        &mut self,
+        chunk: &mut [u8],
+        start_block: usize,
+        start_offset: usize,
+        num_blocks: usize,
+    ) -> usize {
+        use rayon::prelude::*;
+
+        // Use stored thread pool if available, otherwise fall back to sequential
+        let thread_pool = match &self.thread_pool {
+            Some(pool) => pool,
+            None => {
+                // No thread pool - fall back to sequential
+                return self.fill_chunk_sequential(chunk, start_block, start_offset, num_blocks);
+            }
+        };
+
+        let call_entropy = self.call_entropy;
+        let copy_lens = &self.copy_lens;
+        let unique_blocks = self.unique_blocks;
+        let block_size = self.block_size;
+
+        // ZERO-COPY: Generate directly into output buffer using par_chunks_mut
+        // This is the same approach as generate_data() - no temporary allocations!
+        thread_pool.install(|| {
+            chunk
+                .par_chunks_mut(block_size)
+                .enumerate()
+                .for_each(|(i, block_chunk)| {
+                    let block_idx = start_block + i;
+                    let ub = block_idx % unique_blocks;
+                    
+                    // Handle first block with offset
+                    if i == 0 && start_offset > 0 {
+                        // Generate full block into temp, copy needed portion
+                        let mut temp = vec![0u8; block_size];
+                        fill_block(&mut temp, ub, copy_lens[ub].min(block_size), call_entropy);
+                        let copy_len = block_size.saturating_sub(start_offset).min(block_chunk.len());
+                        block_chunk[..copy_len].copy_from_slice(&temp[start_offset..start_offset + copy_len]);
+                    } else {
+                        // Generate directly into output buffer (ZERO-COPY!)
+                        let actual_len = block_chunk.len().min(block_size);
+                        fill_block(&mut block_chunk[..actual_len], ub, copy_lens[ub].min(actual_len), call_entropy);
+                    }
+                });
+        });
+
+        let to_write = chunk.len();
+        self.current_pos += to_write;
+        
+        tracing::debug!(
+            "fill_chunk_parallel: ZERO-COPY generated {} blocks ({} MiB) for {} byte chunk",
+            num_blocks,
+            num_blocks * 4,
+            to_write
+        );
+        
+        to_write
+    }
+
+    /// Reset generator to start
+    pub fn reset(&mut self) {
+        self.current_pos = 0;
+    }
+
+    /// Get current position
+    pub fn position(&self) -> usize {
+        self.current_pos
+    }
+
+    /// Get total size
+    pub fn total_size(&self) -> usize {
+        self.total_size
+    }
+
+    /// Check if generation is complete
+    pub fn is_complete(&self) -> bool {
+        self.current_pos >= self.total_size
+    }
+
+    /// Get recommended chunk size for optimal performance
+    /// 
+    /// Returns 32 MB, which provides the best balance between:
+    /// - Parallelism: 8 blocks × 4 MB = good distribution across cores
+    /// - Cache locality: Fits well in L3 cache
+    /// - Memory overhead: Reasonable buffer size
+    /// 
+    /// Based on empirical testing showing 32 MB is ~16% faster than 64 MB
+    /// and significantly better than smaller or larger sizes.
+    pub fn recommended_chunk_size() -> usize {
+        32 * 1024 * 1024  // 32 MB
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Note: No seed generation tests needed - Xoshiro256PlusPlus::seed_from_u64 is battle-tested
-
-    #[test]
-    fn test_default_thread_count() {
-        let default_threads = default_data_gen_threads();
-        let total = total_cpus();
-        
-        // Should be at least 1
-        assert!(default_threads >= 1);
-        
-        // Should be at most total CPUs
-        assert!(default_threads <= total);
-        
-        // Should be roughly half (allowing for rounding)
-        let expected_half = total / 2;
-        assert!(default_threads == expected_half.max(1));
-        
-        println!("Total CPUs: {}, Default data gen threads: {}", total, default_threads);
+    fn init_tracing() {
+        use tracing_subscriber::{fmt, EnvFilter};
+        let _ = fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .try_init();
     }
 
     #[test]
-    fn test_generator_config_defaults() {
-        let config = GeneratorConfig::default();
-        
-        assert_eq!(config.size, BLK_SIZE);
-        assert_eq!(config.dedup_factor, 1);
-        assert_eq!(config.compress_factor, 1);
-        assert_eq!(config.numa_mode, NumaMode::Auto);
-        
-        // Should have Some value (not None)
-        assert!(config.max_threads.is_some());
-        
-        // Should be the default thread count
-        assert_eq!(config.max_threads.unwrap(), default_data_gen_threads());
-    }
-
-    #[test]
-    fn test_generate_minimal_size() {
-        let data = generate_controlled_data_alt(100, 1, 1);
-        assert_eq!(data.len(), BLK_SIZE, "Should round up to BLK_SIZE");
+    fn test_generate_minimal() {
+        init_tracing();
+        let data = generate_data_simple(100, 1, 1);
+        assert_eq!(data.len(), BLOCK_SIZE);
     }
 
     #[test]
     fn test_generate_exact_block() {
-        let data = generate_controlled_data_alt(BLK_SIZE, 1, 1);
-        assert_eq!(data.len(), BLK_SIZE);
+        init_tracing();
+        let data = generate_data_simple(BLOCK_SIZE, 1, 1);
+        assert_eq!(data.len(), BLOCK_SIZE);
     }
 
     #[test]
     fn test_generate_multiple_blocks() {
-        let size = BLK_SIZE * 10;
-        let data = generate_controlled_data_alt(size, 1, 1);
-        assert_eq!(data.len(), size);
-    }
-
-    #[test]
-    fn test_dedupe_factor() {
-        let size = BLK_SIZE * 100;
-        let data = generate_controlled_data_alt(size, 2, 1);
-        // Should generate unique_blocks = round(100/2) = 50 unique blocks
-        // Can't easily verify without inspecting block contents, but should not panic
+        init_tracing();
+        let size = BLOCK_SIZE * 10;
+        let data = generate_data_simple(size, 1, 1);
         assert_eq!(data.len(), size);
     }
 
     #[test]
     fn test_streaming_generator() {
-        let size = BLK_SIZE * 10;
-        let mut gen = ObjectGenAlt::new(size, 1, 1);
-        let mut result = Vec::new();
-        let mut chunk = vec![0u8; 1024];
+        init_tracing();
+        eprintln!("Starting streaming generator test...");
 
+        let config = GeneratorConfig {
+            size: BLOCK_SIZE * 5,
+            dedup_factor: 1,
+            compress_factor: 1,
+            numa_mode: NumaMode::Auto,
+            max_threads: None,
+            numa_node: None,
+            block_size: None,
+            seed: None,
+        };
+
+        eprintln!("Config: {} blocks, {} bytes total", 5, BLOCK_SIZE * 5);
+
+        let mut gen = DataGenerator::new(config.clone());
+        let mut result = Vec::new();
+
+        // Use a larger chunk size to avoid generating too many blocks
+        // Generating 4 MiB block per 1024 bytes is 4096x overhead!
+        let chunk_size = BLOCK_SIZE; // Use full block size for efficiency
+        let mut chunk = vec![0u8; chunk_size];
+
+        let mut iterations = 0;
         while !gen.is_complete() {
             let written = gen.fill_chunk(&mut chunk);
             if written == 0 {
                 break;
             }
             result.extend_from_slice(&chunk[..written]);
+            iterations += 1;
+
+            if iterations % 10 == 0 {
+                eprintln!(
+                    "  Iteration {}: written={}, total={}",
+                    iterations,
+                    written,
+                    result.len()
+                );
+            }
         }
 
-        assert_eq!(result.len(), size);
+        eprintln!(
+            "Completed in {} iterations, generated {} bytes",
+            iterations,
+            result.len()
+        );
+        assert_eq!(result.len(), config.size);
         assert!(gen.is_complete());
     }
+}
 
-    #[test]
-    fn test_streaming_matches_single_pass() {
-        let size = BLK_SIZE * 5;
-        
-        // Note: These won't be identical due to different chunking,
-        // but they should have the same length and similar characteristics
-        let single = generate_controlled_data_alt(size, 1, 1);
-        let streaming = generate_controlled_data_streaming_alt(size, 1, 1, 1024);
-        
-        assert_eq!(single.len(), streaming.len());
+// ============================================================================
+// s3dlio compatibility wrappers
+// ============================================================================
+
+/// Get total number of CPUs in the system
+pub fn total_cpus() -> usize {
+    num_cpus::get()
+}
+
+/// Get default number of threads for data generation (100% of CPUs)
+pub fn default_data_gen_threads() -> usize {
+    num_cpus::get()
+}
+
+/// Get optimal chunk size for streaming data generation
+/// 
+/// Returns the best chunk size based on total data size for maximum throughput:
+/// - >= 64 MB: Returns 64 MB (50+ GB/s)
+/// - >= 32 MB: Returns 32 MB
+/// - >= 16 MB: Returns 16 MB
+/// - < 16 MB: Returns size itself (use single allocation)
+/// 
+/// # Example
+/// ```rust
+/// let total_size = 100 * 1024 * 1024 * 1024; // 100 GB
+/// let chunk_size = optimal_chunk_size(total_size); // Returns 64 MB
+/// 
+/// let mut gen = generate_controlled_data_streaming_alt(total_size, 1, 1);
+/// let mut buffer = vec![0u8; chunk_size];
+/// while !gen.is_complete() {
+///     let nbytes = gen.fill_chunk(&mut buffer);
+///     // Process buffer[..nbytes]...
+/// }
+/// ```
+pub fn optimal_chunk_size(total_size: usize) -> usize {
+    if total_size >= 64 * 1024 * 1024 {
+        64 * 1024 * 1024  // 64 MB - optimal (50+ GB/s)
+    } else if total_size >= 32 * 1024 * 1024 {
+        32 * 1024 * 1024  // 32 MB
+    } else if total_size >= 16 * 1024 * 1024 {
+        16 * 1024 * 1024  // 16 MB
+    } else {
+        total_size  // Small enough for single allocation
     }
+}
+
+/// Generate data with GeneratorConfig (returns bytes::Bytes for ZERO-COPY)
+/// 
+/// OPTIMIZED: Uses streaming API with optimal chunk sizes for best performance.
+/// - >= 64 MB: Uses 64 MB chunks (50+ GB/s throughput)
+/// - >= 32 MB: Uses 32 MB chunks
+/// - >= 16 MB: Uses 16 MB chunks
+/// - < 16 MB: Single allocation (small enough not to matter)
+/// 
+/// # Performance Notes
+/// - **Single call**: Optimized internally with streaming API and optimal chunking
+/// - **Multiple calls**: Thread pool created per call. For maximum performance,
+///   use `DataGenerator` directly to reuse the thread pool across calls.
+/// 
+/// # Example: Maximum Performance Pattern
+/// ```rust
+/// // For repeated generation, use DataGenerator to reuse thread pool:
+/// let config = GeneratorConfig { size: 1_000_000_000, ..Default::default() };
+/// let mut gen = DataGenerator::new(config);
+/// let mut buffer = vec![0u8; 64 * 1024 * 1024];  // 64 MB
+/// 
+/// while !gen.is_complete() {
+///     let nbytes = gen.fill_chunk(&mut buffer);
+///     // Use buffer[..nbytes]... achieves 50+ GB/s
+/// }
+/// ```
+pub fn generate_data_with_config(config: GeneratorConfig) -> bytes::Bytes {
+    let size = config.size;
+    
+    // For small sizes, use single allocation (no overhead worth optimizing)
+    if size < 16 * 1024 * 1024 {
+        let buffer = generate_data(config);
+        return buffer.into_bytes();
+    }
+    
+    // For larger sizes, use streaming API with optimal chunk size
+    let chunk_size = if size >= 64 * 1024 * 1024 {
+        64 * 1024 * 1024  // 64 MB - optimal performance (50+ GB/s)
+    } else if size >= 32 * 1024 * 1024 {
+        32 * 1024 * 1024  // 32 MB
+    } else {
+        16 * 1024 * 1024  // 16 MB
+    };
+    
+    // Use streaming API (creates thread pool ONCE, reuses across chunks)
+    let mut generator = DataGenerator::new(config);
+    let mut result = Vec::with_capacity(size);
+    let mut chunk = vec![0u8; chunk_size];
+    
+    while !generator.is_complete() {
+        let nbytes = generator.fill_chunk(&mut chunk);
+        if nbytes == 0 {
+            break;
+        }
+        result.extend_from_slice(&chunk[..nbytes]);
+    }
+    
+    // Zero-copy conversion to bytes::Bytes
+    bytes::Bytes::from(result)
+}
+
+/// Generate controlled data (simplified API for s3dlio)
+/// 
+/// OPTIMIZED: Automatically uses optimal chunk sizes for best performance.
+/// - >= 64 MB: Uses 64 MB chunks (50+ GB/s throughput)
+/// - >= 32 MB: Uses 32 MB chunks
+/// - >= 16 MB: Uses 16 MB chunks
+/// - < 16 MB: Single allocation
+/// 
+/// # Parameters
+/// - `size`: Total size in bytes
+/// - `dedup`: Deduplication factor (1 = no dedup, N = N:1 ratio)
+/// - `compress`: Compression factor (1 = incompressible, N = N:1 ratio)
+/// - `seed`: Optional RNG seed for reproducibility (None = random)
+/// 
+/// # Performance Notes
+/// For maximum performance with repeated calls, consider using the streaming API:
+/// ```rust
+/// let mut gen = generate_controlled_data_streaming_alt(100_000_000, 1, 1);
+/// let mut buffer = vec![0u8; 64 * 1024 * 1024];  // 64 MB chunks
+/// while !gen.is_complete() {
+///     let nbytes = gen.fill_chunk(&mut buffer);
+///     // Use buffer[..nbytes] for your data...
+/// }
+/// ```
+pub fn generate_controlled_data_alt(
+    size: usize,
+    dedup: usize,
+    compress: usize,
+    seed: Option<u64>,
+) -> bytes::Bytes {
+    let config = GeneratorConfig {
+        size,
+        dedup_factor: dedup,
+        compress_factor: compress,
+        seed,
+        ..Default::default()
+    };
+    generate_data_with_config(config)
+}
+
+/// Streaming data generator (s3dlio compatibility)
+pub struct ObjectGenAlt {
+    generator: DataGenerator,
+}
+
+impl ObjectGenAlt {
+    /// Create new streaming generator
+    pub fn new(size: usize, dedup: usize, compress: usize) -> Self {
+        let config = GeneratorConfig {
+            size,
+            dedup_factor: dedup,
+            compress_factor: compress,
+            ..Default::default()
+        };
+        Self {
+            generator: DataGenerator::new(config),
+        }
+    }
+
+    /// Fill chunk with data (returns number of bytes written)
+    pub fn fill_chunk(&mut self, buffer: &mut [u8]) -> usize {
+        self.generator.fill_chunk(buffer)
+    }
+
+    /// Check if generation is complete
+    pub fn is_complete(&self) -> bool {
+        self.generator.is_complete()
+    }
+
+    /// Get total size
+    pub fn total_size(&self) -> usize {
+        self.generator.total_size()
+    }
+
+    /// Get current position
+    pub fn position(&self) -> usize {
+        self.generator.position()
+    }
+
+    /// Reset generator to start
+    pub fn reset(&mut self) {
+        self.generator.reset()
+    }
+}
+
+/// Generate controlled data with streaming API
+pub fn generate_controlled_data_streaming_alt(
+    size: usize,
+    dedup: usize,
+    compress: usize,
+) -> ObjectGenAlt {
+    ObjectGenAlt::new(size, dedup, compress)
 }

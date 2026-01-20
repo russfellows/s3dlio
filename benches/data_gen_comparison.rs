@@ -146,7 +146,7 @@ fn bench_single_pass_generation(c: &mut Criterion) {
             &size,
             |b, &size| {
                 b.iter(|| {
-                    let data = generate_controlled_data_alt(size, 1, 1);
+                    let data = generate_controlled_data_alt(size, 1, 1, None);
                     black_box(data);
                 });
             },
@@ -170,7 +170,7 @@ fn bench_single_pass_generation(c: &mut Criterion) {
             &size,
             |b, &size| {
                 b.iter(|| {
-                    let data = generate_controlled_data_alt(size, 1, 5);
+                    let data = generate_controlled_data_alt(size, 1, 5, None);
                     black_box(data);
                 });
             },
@@ -202,11 +202,11 @@ fn bench_streaming_generation(c: &mut Criterion) {
                 b.iter(|| {
                     let mut data_gen = DataGenerator::new();
                     let mut obj_gen = data_gen.begin_object(total_size, 1, 1);
-                    let mut buffer = vec![0u8; chunk_size];
                     
                     while !obj_gen.is_complete() {
-                        obj_gen.fill_chunk(&mut buffer);
-                        black_box(&buffer);
+                        if let Some(chunk) = obj_gen.fill_chunk(chunk_size) {
+                            black_box(&chunk);
+                        }
                     }
                 });
             },
@@ -261,7 +261,7 @@ fn bench_with_dedup(c: &mut Criterion) {
             &dedup,
             |b, &dedup| {
                 b.iter(|| {
-                    let data = generate_controlled_data_alt(size, dedup, 1);
+                    let data = generate_controlled_data_alt(size, dedup, 1, None);
                     black_box(data);
                 });
             },

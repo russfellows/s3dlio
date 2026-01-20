@@ -156,15 +156,16 @@ async fn test_rmdir_recursive_removes_non_empty_directory() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_rmdir_on_nonexistent_directory_fails() -> Result<()> {
+async fn test_rmdir_on_nonexistent_directory_is_idempotent() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let store = FileSystemObjectStore::new();
     
     let test_uri = test_uri(&temp_dir, "nonexistent");
     
-    // Should fail on non-existent directory
+    // rmdir is idempotent - removing a non-existent directory should succeed
+    // This matches cloud storage behavior and prevents race conditions
     let result = store.rmdir(&test_uri, false).await;
-    assert!(result.is_err(), "rmdir should fail on non-existent directory");
+    assert!(result.is_ok(), "rmdir should be idempotent (succeed on non-existent directory)");
     
     Ok(())
 }

@@ -141,7 +141,7 @@ fn test_performance_1mb_compress1() {
         "NEW: 1MB compress=1 (incompressible)",
         size,
         iterations,
-        || generate_controlled_data_alt(size, 1, 1)
+        || generate_controlled_data_alt(size, 1, 1, None).to_vec()
     );
     
     println!("\n📊 COMPARISON:");
@@ -171,7 +171,7 @@ fn test_performance_16mb_compress1() {
         "NEW: 16MB compress=1 (incompressible)",
         size,
         iterations,
-        || generate_controlled_data_alt(size, 1, 1)
+        || generate_controlled_data_alt(size, 1, 1, None).to_vec()
     );
     
     println!("\n📊 COMPARISON:");
@@ -200,7 +200,7 @@ fn test_performance_64mb_compress1() {
         "NEW: 64MB compress=1 (incompressible)",
         size,
         iterations,
-        || generate_controlled_data_alt(size, 1, 1)
+        || generate_controlled_data_alt(size, 1, 1, None).to_vec()
     );
     
     println!("\n📊 COMPARISON:");
@@ -229,7 +229,7 @@ fn test_performance_compress5() {
         "NEW: 16MB compress=5",
         size,
         iterations,
-        || generate_controlled_data_alt(size, 1, 5)
+        || generate_controlled_data_alt(size, 1, 5, None).to_vec()
     );
     
     println!("\n📊 COMPARISON:");
@@ -254,7 +254,7 @@ fn test_performance_streaming() {
         chunk_size,
         iterations,
         || {
-            let mut data_gen = DataGenerator::new();
+            let data_gen = DataGenerator::new();
             let mut obj_gen = data_gen.begin_object(total_size, 1, 1);
             while !obj_gen.is_complete() {
                 if let Some(chunk) = obj_gen.fill_chunk(chunk_size) {
@@ -305,7 +305,7 @@ fn test_performance_with_dedup() {
         "NEW: 16MB dedup=4",
         size,
         iterations,
-        || generate_controlled_data_alt(size, dedup, 1)
+        || generate_controlled_data_alt(size, dedup, 1, None).to_vec()
     );
     
     println!("\n📊 COMPARISON:");

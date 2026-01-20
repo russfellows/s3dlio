@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.34"
+version = "0.9.35"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -164,10 +164,6 @@ profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always a
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 experimental-http-client = []        # Enable custom hyper_builder optimizations (requires patched aws-smithy-http-client)
 test-npy-09 = []                     # Test ndarray-npy 0.9 API compatibility (temporary for testing)
-
-[[example]]
-name = "s3_backend_comparison"
-path = "examples/s3_backend_comparison.rs"
 
 [[bench]]
 name = "performance_microbenchmarks"

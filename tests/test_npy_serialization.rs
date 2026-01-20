@@ -40,10 +40,10 @@ fn test_s3dlio_array_to_npy_bytes() -> Result<()> {
 #[test]
 fn test_npy_09_write_to_vec() -> Result<()> {
     // Create test array: 2x3 float32
-    let array = Array::from_shape_vec((2, 3), vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+    let _array = Array::from_shape_vec((2, 3), vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0])?;
     
     // Test 1: Can we write to Vec<u8> with ndarray-npy 0.9?
-    let mut buffer: Vec<u8> = Vec::new();
+    let _buffer: Vec<u8> = Vec::new();
     
     // This is what Jim Turner claims works in 0.9:
     #[cfg(feature = "test-npy-09")]

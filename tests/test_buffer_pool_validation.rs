@@ -10,7 +10,7 @@
 /// 
 /// We test with DirectIO since that's where v0.9.9 buffer pool was implemented.
 
-use s3dlio::{ObjectStore, direct_io_store_for_uri, store_for_uri};
+use s3dlio::{direct_io_store_for_uri, store_for_uri};
 use anyhow::Result;
 use std::time::Instant;
 use tempfile::TempDir;
