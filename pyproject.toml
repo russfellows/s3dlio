@@ -1,7 +1,7 @@
 [project]
 name = "s3dlio"
 version = "0.9.35"
-description = "High-performance S3, Azure, GCS, and file system operations for AI/ML"
+description = "High-performance Object Storage Library for Pytorch, Jax and Tensorflow: Object support inlcudes S3, Azure, GCS, and file system operations for AI/ML"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
