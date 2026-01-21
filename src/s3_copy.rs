@@ -99,7 +99,7 @@ pub async fn upload_files<P: AsRef<Path>>(
                 debug!("starting upload of {:?} → s3://{}/{}", path, bucket, key);
                 let _permit = sem.acquire_owned().await.unwrap();
                 let body = ByteStream::from_path(&path).await?;
-                put_object_async(&bucket, &key, &body.collect().await?.into_bytes()).await?;
+                put_object_async(&bucket, &key, body.collect().await?.into_bytes()).await?;
                 debug!("finished upload of {:?} → s3://{}/{}", path, bucket, key);
                 
                 // Update progress if callback provided

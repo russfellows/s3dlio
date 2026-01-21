@@ -211,9 +211,10 @@ impl ObjectStore for LoggedObjectStore {
         result
     }
 
-    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let start = SystemTime::now();
         let bytes = data.len() as u64;
+        // Bytes is zero-copy (reference counted, can be cloned cheaply)
         let result = self.inner.put(uri, data).await;
         let end = SystemTime::now();
         
@@ -226,9 +227,10 @@ impl ObjectStore for LoggedObjectStore {
         result
     }
 
-    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let start = SystemTime::now();
         let bytes = data.len() as u64;
+        // Bytes is zero-copy (reference counted, can be cloned cheaply)
         let result = self.inner.put_multipart(uri, data, part_size).await;
         let end = SystemTime::now();
         

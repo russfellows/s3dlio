@@ -1199,25 +1199,31 @@ pub fn put_objects_with_random_data_and_type_with_progress(
 
 
 /// Upload a single object to S3 **with op‑logging**.
-pub async fn put_object_async(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
-    // delegate to S3Ops (which records the PUT) and propagate errors
-    build_ops_async().await?.put_object(bucket, key, data.to_vec()).await?;
+/// 
+/// Accepts `Bytes` for zero-copy efficiency (no .to_vec() call).
+pub async fn put_object_async(bucket: &str, key: &str, data: Bytes) -> Result<()> {
+    // delegate to S3Ops (which records the PUT) - data moved, no copy
+    build_ops_async().await?.put_object(bucket, key, data).await?;
     
     // Emit an info‑level message 
-    info!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
+    info!("S3 PUT s3://{}/{} (Bytes)", bucket, key);
     Ok(())
 }
 
 /// Upload a single object to S3 by URI **with op‑logging**.
-pub async fn put_object_uri_async(uri: &str, data: &[u8]) -> Result<()> {
+/// 
+/// Accepts `Bytes` for zero-copy efficiency.
+pub async fn put_object_uri_async(uri: &str, data: Bytes) -> Result<()> {
     let (bucket, key) = parse_s3_uri(uri)?;
     put_object_async(&bucket, &key, data).await
 }
 
 /// Upload object via multipart using existing MultipartUploadSink infrastructure.
+/// 
+/// Accepts `Bytes` for zero-copy efficiency.
 pub async fn put_object_multipart_uri_async(
     uri: &str,
-    data: &[u8],
+    data: Bytes,
     part_size: Option<usize>,
 ) -> Result<()> {
     use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
@@ -1226,7 +1232,7 @@ pub async fn put_object_multipart_uri_async(
         ..Default::default()
     };
     let mut sink = MultipartUploadSink::from_uri(uri, cfg)?;
-    sink.write_blocking(data)?;
+    sink.write_blocking(&data)?;  // Pass as &[u8] slice
     sink.finish_blocking()?;
     Ok(())
 }
@@ -1269,14 +1275,17 @@ pub(crate) fn put_objects_parallel_with_progress(
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 
+                // Capture len before move (Bytes is cheap to clone, but we only need len)
+                let payload_len = payload.len() as u64;
+                
                 // Use universal ObjectStore API with op-log support
                 let store = crate::object_store::store_for_uri_with_logger(&uri, logger)?;
-                // &[u8] view over Bytes — no copy here
-                store.put(&uri, payload.as_ref()).await?;
+                // Bytes passed directly for zero-copy
+                store.put(&uri, payload).await?;
                 
                 // Update progress after successful upload
                 if let Some(progress) = progress {
-                    progress.object_completed(payload.len() as u64);
+                    progress.object_completed(payload_len);
                 }
                 
                 Ok::<_, anyhow::Error>(())

@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use bytes::Bytes;
 use tracing::warn;
 use crate::object_store::ObjectStore;
 
@@ -57,7 +58,7 @@ pub async fn write_latest_atomic(
     let marker_key = latest_marker_key(latest.global_step, &latest.ts);
     let marker_uri = format!("{}/{}", base_uri.trim_end_matches('/'), marker_key);
     let marker_bytes = serde_json::to_vec_pretty(latest)?;
-    store.put(&marker_uri, &marker_bytes).await?;
+    store.put(&marker_uri, Bytes::from(marker_bytes)).await?;
     
     // Then update the main latest.json
     // For file:// URIs, we can use atomic rename; for others, we do best-effort
@@ -78,13 +79,13 @@ async fn write_latest_with_atomic_rename(
     let bytes = serde_json::to_vec_pretty(latest)?;
     
     // Write to temporary file
-    store.put(&temp_uri, &bytes).await?;
+    store.put(&temp_uri, Bytes::from(bytes.clone())).await?;
     
     // Attempt atomic rename (filesystem backend should support this)
     if let Err(e) = store.rename(&temp_uri, latest_uri).await {
         // If rename fails, fall back to regular write and clean up temp
         let _ = store.delete(&temp_uri).await; // ignore errors
-        store.put(latest_uri, &bytes).await?;
+        store.put(latest_uri, Bytes::from(bytes)).await?;
         warn!("Atomic rename failed, used fallback write: {}", e);
     }
     
@@ -98,7 +99,7 @@ pub async fn write_latest(
     latest: &Latest,
 ) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(latest)?;
-    store.put(latest_uri, &bytes).await
+    store.put(latest_uri, Bytes::from(bytes)).await
 }
 
 /// Read the latest pointer, returns None if not found

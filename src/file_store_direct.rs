@@ -1146,14 +1146,15 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         self.read_range_direct(&path, offset, length).await
     }
 
-    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
-        self.write_file_direct(&path, data).await
+        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
+        self.write_file_direct(&path, data.as_ref()).await
     }
 
-    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         
         if !self.config.direct_io {
@@ -1174,7 +1175,9 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         let options = self.create_open_options(false, true);
         let mut file = options.open(&path).await?;
         
-        for chunk in data.chunks(chunk_size) {
+        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
+        let data_slice = data.as_ref();
+        for chunk in data_slice.chunks(chunk_size) {
             let aligned_chunk = self.align_buffer(chunk);
             file.write_all(&aligned_chunk).await?;
         }
@@ -1182,7 +1185,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         file.flush().await?;
         
         // Truncate to exact size
-        file.set_len(data.len() as u64).await?;
+        file.set_len(data_slice.len() as u64).await?;
         
         Ok(())
     }

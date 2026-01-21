@@ -1,5 +1,58 @@
 # s3dlio Changelog
 
+## Version 0.9.36 - BREAKING: Zero-Copy API (January 2026)
+
+### ⚠️ **BREAKING CHANGE: ObjectStore API Zero-Copy Conversion**
+
+**Critical Performance Fix**: Eliminated internal `.to_vec()` call that forced memcpy, defeating zero-copy architecture.
+
+**What Changed**:
+```rust
+// OLD API (v0.9.35 and earlier)
+pub trait ObjectStore {
+    async fn put(&self, uri: &str, data: &[u8]) -> Result<()>;
+    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()>;
+}
+
+// NEW API (v0.9.36+) - Zero-copy throughout
+pub trait ObjectStore {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()>;
+    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()>;
+}
+```
+
+**Why This Matters**:
+- **Eliminated Hidden Copy**: Previous API took `&[u8]` but internally converted to `Vec<u8>` via `.to_vec()`, forcing memcpy
+- **True Zero-Copy**: `Bytes` is reference-counted (Arc-like) - no memcpy when passed, cloned, or sliced
+- **Maintains Performance**: 20-40 GB/s streaming writes now achievable without internal copies
+- **Consistent Architecture**: Matches get() API which already returns `Bytes`
+
+**Migration Guide**:
+```rust
+// Before (v0.9.35):
+let data = vec![0u8; 1024];
+store.put("s3://bucket/key", &data).await?;
+
+// After (v0.9.36):
+let data = Bytes::from(vec![0u8; 1024]);  // Or Bytes::copy_from_slice(&data) for &[u8]
+store.put("s3://bucket/key", data).await?;
+```
+
+**Zero-Copy Conversions**:
+- `Bytes::from(vec)` - Takes ownership (zero-copy, just wraps Arc)
+- `Bytes::copy_from_slice(&[u8])` - Allocates new buffer (one copy, unavoidable)
+- `bytes.as_ref()` → `&[u8]` - Zero-copy view (fat pointer only)
+- `bytes.slice(range)` - Zero-copy subslice (shares Arc)
+
+**Internal Changes**:
+- S3: `Bytes` → `ByteStream` via `.into()` (zero-copy)
+- Azure: `Bytes` passed directly to SDK (zero-copy)
+- GCS: `Bytes` → `&[u8]` via `.as_ref()` (zero-copy view)
+- File/Direct: `Bytes` → `&[u8]` via `.as_ref()` (zero-copy view)
+- MultiEndpoint: `Bytes` cloned cheaply (reference count, not data)
+
+---
+
 ## Version 0.9.35 - Runtime Hardware Detection API & Data Generation Optimization (January 2026)
 
 ### 🔍 **New: Public Hardware Detection API**

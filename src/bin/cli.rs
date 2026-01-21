@@ -1377,8 +1377,9 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
         futs.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
             let store = store_for_uri_with_logger(&uri, logger)?;
-            store.put(&uri, &data).await?;
             let byte_count = data.len() as u64;
+            // Bytes passed directly (zero-copy, reference counted)
+            store.put(&uri, data).await?;
             
             // Update progress
             progress.object_completed(byte_count);
