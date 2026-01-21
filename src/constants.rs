@@ -214,7 +214,7 @@ pub const HALF_BLK: usize = BLK_SIZE / 2;
 /// - UMA systems: 10.80 GB/s per core (C4-16, 8 cores)
 /// - Aggregate: 86-163 GB/s on single-socket systems
 /// - Compression ratio 2.0: 1.3-1.5x additional speedup
-pub const DATA_GEN_BLOCK_SIZE: usize = 1 * 1024 * 1024;  // 1 MiB
+pub const DATA_GEN_BLOCK_SIZE: usize = 1024 * 1024;  // 1 MiB
 
 /// Alias for DATA_GEN_BLOCK_SIZE (for dgen-rs compatibility)
 pub const BLOCK_SIZE: usize = DATA_GEN_BLOCK_SIZE;

@@ -929,9 +929,9 @@ mod tests {
         ).unwrap();
         
         // Put data
-        let test_data = b"Hello, multi-endpoint world!";
+        let test_data = bytes::Bytes::from_static(b"Hello, multi-endpoint world!");
         let uri = format!("file://{}/output.txt", tmp1.path().display());
-        store.put(&uri, test_data).await.unwrap();
+        store.put(&uri, test_data.clone()).await.unwrap();
         
         // Get data back
         let retrieved = store.get(&uri).await.unwrap();

@@ -295,7 +295,7 @@ mod tests {
         let dst_uri = format!("file://{}/dest_file.txt", base_path.display());
         
         // Create source file
-        store.put(&src_uri, b"test atomic rename content").await?;
+        store.put(&src_uri, bytes::Bytes::from_static(b"test atomic rename content")).await?;
         assert!(store.exists(&src_uri).await?);
         
         // Perform rename
@@ -355,7 +355,7 @@ mod tests {
         let dst_uri = format!("file://{}/subdir2/destination.txt", base_path.display());
         
         // Create source file
-        store.put(&src_uri, b"cross-directory rename test").await?;
+        store.put(&src_uri, bytes::Bytes::from_static(b"cross-directory rename test")).await?;
         assert!(store.exists(&src_uri).await?);
         
         // Perform rename (should create destination directory)

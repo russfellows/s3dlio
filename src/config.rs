@@ -20,11 +20,9 @@ pub enum ObjectType {
 #[serde(rename_all = "snake_case")] // JSON shows random, prand
 #[derive(Default)]
 pub enum DataGenAlgorithm {
-    /// Random data generation (variable performance 1-7 GB/s depending on size)
+    /// High-performance data generation (86-163 GB/s with Rayon parallelism)
     #[default]
     Random,
-    /// Pseudo-random using BASE_BLOCK algorithm (consistent 3-4 GB/s, CPU-efficient)
-    Prand,
 }
 
 

@@ -51,6 +51,68 @@ store.put("s3://bucket/key", data).await?;
 - File/Direct: `Bytes` → `&[u8]` via `.as_ref()` (zero-copy view)
 - MultiEndpoint: `Bytes` cloned cheaply (reference count, not data)
 
+### ✨ **New: `fill_controlled_data()` - In-Place Buffer Filling**
+
+**High-performance data generation without allocation** (86-163 GB/s with Rayon parallelism):
+
+**Key Innovation**: Fill pre-allocated buffers instead of allocating new `Vec<u8>`:
+```rust
+/// Fill existing buffer with controlled data (ZERO-COPY workflows)
+pub fn fill_controlled_data(buf: &mut [u8], dedup: usize, compress: usize)
+```
+
+**Why This Matters**:
+- **Streaming Workflows**: Pre-allocate buffers once, reuse for entire stream
+- **Zero-Copy Architecture**: Works with `BytesMut` → `Bytes` pipeline
+- **Rayon Pool Control**: Respects `ThreadPool::install()` context (unlike allocation-based methods)
+- **86-163 GB/s**: Parallel generation scales across all cores
+
+**Usage Example**:
+```rust
+use bytes::BytesMut;
+use s3dlio::fill_controlled_data;
+
+// Allocate buffer once
+let mut buf = BytesMut::zeroed(4 * 1024 * 1024);  // 4 MB
+
+// Fill in-place (no additional allocation)
+fill_controlled_data(&mut buf, 1, 1);  // Incompressible, no dedup
+
+// Convert to Bytes (zero-copy)
+let data: Bytes = buf.freeze();
+```
+
+**Benefits**:
+- **Memory Efficiency**: Reuse buffers in streaming loops
+- **Performance**: 20-50x faster than deprecated `generate_controlled_data_prand()`
+- **Thread Control**: Works with custom Rayon thread pools
+
+### 🚨 **Deprecated: `generate_controlled_data_prand()`**
+
+**Old slow method marked deprecated** - replaced by `fill_controlled_data()`:
+
+```rust
+#[deprecated(since = "0.9.36", note = "Use fill_controlled_data() instead - MUCH faster (86-163 GB/s vs 3-4 GB/s)")]
+pub fn generate_controlled_data_prand(size: usize, dedup: usize, compress: usize) -> Vec<u8>
+```
+
+**Performance Comparison**:
+- **Old**: `generate_controlled_data_prand()` - 3-4 GB/s (sequential, Vec allocation)
+- **New**: `fill_controlled_data()` - 86-163 GB/s (parallel Rayon, in-place)
+
+**Migration**:
+```rust
+// OLD (deprecated):
+let data = generate_controlled_data_prand(size, 1, 1);
+
+// NEW (recommended):
+let mut buf = BytesMut::zeroed(size);
+fill_controlled_data(&mut buf, 1, 1);
+let data = buf.freeze();
+```
+
+**Note**: `DataGenAlgorithm::Prand` enum variant removed - all code now uses high-performance Random algorithm.
+
 ---
 
 ## Version 0.9.35 - Runtime Hardware Detection API & Data Generation Optimization (January 2026)
