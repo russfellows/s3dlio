@@ -24,7 +24,7 @@ use crate::config::ObjectType;
 // -------------------------------------------------------------
 /// A function to build objects in the correct format
 pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
-    use crate::config::{DataGenMode, DataGenAlgorithm};
+    use crate::config::DataGenMode;
     
     let total_bytes = cfg.elements * cfg.element_size;
     info!(
@@ -33,29 +33,18 @@ pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
     );
     
     let data = if cfg.use_controlled {
-        // Choose algorithm (random vs prand) and mode (streaming vs single-pass)
-        match (cfg.data_gen_algorithm, cfg.data_gen_mode) {
-            (DataGenAlgorithm::Random, DataGenMode::Streaming) => {
-                debug!("Using streaming random controlled data: dedup={}, compress={}, chunk_size={}", 
+        // Choose mode (streaming vs single-pass)
+        match cfg.data_gen_mode {
+            DataGenMode::Streaming => {
+                debug!("Using streaming controlled data: dedup={}, compress={}, chunk_size={}", 
                     cfg.dedup_factor, cfg.compress_factor, cfg.chunk_size);
                 generate_controlled_data_streaming(total_bytes, cfg.dedup_factor, cfg.compress_factor, cfg.chunk_size)
             },
-            (DataGenAlgorithm::Random, DataGenMode::SinglePass) => {
-                debug!("Using single-pass random controlled data: dedup={}, compress={}", 
+            DataGenMode::SinglePass => {
+                debug!("Using single-pass controlled data: dedup={}, compress={}", 
                     cfg.dedup_factor, cfg.compress_factor);
                 generate_controlled_data(total_bytes, cfg.dedup_factor, cfg.compress_factor)
             },
-            (DataGenAlgorithm::Prand, DataGenMode::Streaming) => {
-                debug!("Using streaming prand controlled data: dedup={}, compress={}, chunk_size={}", 
-                    cfg.dedup_factor, cfg.compress_factor, cfg.chunk_size);
-                // Note: prand doesn't have a streaming version yet, use single-pass
-                generate_controlled_data_prand(total_bytes, cfg.dedup_factor, cfg.compress_factor)
-            },
-            (DataGenAlgorithm::Prand, DataGenMode::SinglePass) => {
-                debug!("Using single-pass prand controlled data: dedup={}, compress={}", 
-                    cfg.dedup_factor, cfg.compress_factor);
-                generate_controlled_data_prand(total_bytes, cfg.dedup_factor, cfg.compress_factor)
-            }
         }
     } else {
         debug!("Using generic random data");
@@ -238,8 +227,110 @@ pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> V
 /// // 100MB incompressible data using fast pseudo-random method
 /// let data = generate_controlled_data_prand(100 * 1024 * 1024, 1, 1);
 /// ```
+#[deprecated(since = "0.9.36", note = "Use fill_controlled_data() instead - MUCH faster (86-163 GB/s vs 3-4 GB/s) and supports zero-copy workflows")]
 pub fn generate_controlled_data_prand(size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     generate_controlled_data_original(size, dedup, compress)
+}
+
+/// Fill a buffer in-place with controlled random data (dedup/compress).
+/// 
+/// **CRITICAL**: This uses the global Rayon pool, which means it respects any
+/// `rayon::ThreadPool::install()` context. Use this when you need to control
+/// which thread pool does the parallel work.
+///
+/// Unlike `generate_controlled_data_prand` which allocates a new Vec, this fills
+/// an existing buffer. Ideal for streaming workloads with pre-allocated buffers.
+///
+/// # Parameters
+/// - `buf`: Mutable buffer to fill with generated data
+/// - `dedup`: Deduplication factor (0 or 1 = no dedup, N = N:1 dedup ratio)
+/// - `compress`: Compression factor (1 = incompressible, N = N:1 compressible)
+///
+/// # Example
+/// ```rust
+/// // Fill 4 MB buffer with incompressible random data
+/// let mut buf = vec![0u8; 4 * 1024 * 1024];
+/// s3dlio::fill_controlled_data(&mut buf, 1, 1);
+/// ```
+pub fn fill_controlled_data(buf: &mut [u8], dedup: usize, compress: usize) {
+    use rand::Rng;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if buf.is_empty() {
+        return;
+    }
+
+    let size = buf.len();
+    let block_size = BLK_SIZE;
+    let nblocks = size.div_ceil(block_size);
+
+    // Deduplication factor
+    let dedup_factor = if dedup == 0 { 1 } else { dedup };
+    let unique_blocks = if dedup_factor > 1 {
+        ((nblocks as f64) / (dedup_factor as f64)).round().max(1.0) as usize
+    } else {
+        nblocks
+    };
+
+    // Compression parameters
+    let (f_num, f_den) = if compress > 1 {
+        (compress - 1, compress)
+    } else {
+        (0, 1)
+    };
+    let floor_len = (f_num * block_size) / f_den;
+    let rem = (f_num * block_size) % f_den;
+
+    // Precompute zero-prefix lengths per unique block
+    let const_lens: Vec<usize> = {
+        let mut v = Vec::with_capacity(unique_blocks);
+        let mut err_acc = 0;
+        for _ in 0..unique_blocks {
+            err_acc += rem;
+            if err_acc >= f_den {
+                err_acc -= f_den;
+                v.push(floor_len + 1);
+            } else {
+                v.push(floor_len);
+            }
+        }
+        v
+    };
+
+    // Per-call entropy
+    let call_entropy = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    // FILL IN PLACE using global Rayon pool (respects install() context!)
+    buf.par_chunks_mut(block_size).enumerate().for_each(|(i, chunk)| {
+        let unique_block_idx = i % unique_blocks;
+        let seed = (unique_block_idx as u64).wrapping_add(call_entropy);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+
+        // Copy from base block
+        let src = &*A_BASE_BLOCK;
+        let len = chunk.len();
+        chunk.copy_from_slice(&src[..len]);
+
+        // Apply zero-prefix for compression
+        let const_len = const_lens[unique_block_idx].min(len);
+        chunk[..const_len].fill(0);
+
+        // Inject uniqueness
+        let region_start = const_len;
+        let region_len = len - region_start;
+        let modify_len = region_len.min(MOD_SIZE);
+
+        if modify_len > 0 {
+            rng.fill(&mut chunk[region_start..region_start + modify_len]);
+            let second_offset = HALF_BLK.max(region_start);
+            if second_offset + modify_len <= len {
+                rng.fill(&mut chunk[second_offset..second_offset + modify_len]);
+            }
+        }
+    });
 }
 
 // Original implementation preserved below for reference and now available as "prand" method

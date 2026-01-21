@@ -100,7 +100,9 @@ mod multipart;
 // ===== Legacy Re-exports for Backward Compatibility =====
 // These maintain compatibility with existing code but may be deprecated
 pub use data_gen::generate_controlled_data;
-pub use data_gen::generate_controlled_data_prand;  // Pseudo-random (fast) method
+#[allow(deprecated)]
+pub use data_gen::generate_controlled_data_prand;  // DEPRECATED: Use fill_controlled_data instead
+pub use data_gen::fill_controlled_data;  // Fill-in-place (respects Rayon pool context)
 
 // ===== Re-exports expected by tests/test_dataloader.rs at the crate root =====
 // Types:

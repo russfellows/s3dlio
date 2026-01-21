@@ -506,7 +506,7 @@ impl ObjectStore for FileSystemObjectStore {
         Ok(Bytes::from(buffer))
     }
 
-    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let path = Self::uri_to_path(uri)?;
         
@@ -515,11 +515,12 @@ impl ObjectStore for FileSystemObjectStore {
             fs::create_dir_all(parent).await?;
         }
         
-        fs::write(&path, data).await?;
+        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
+        fs::write(&path, data.as_ref()).await?;
         Ok(())
     }
 
-    async fn put_multipart(&self, uri: &str, data: &[u8], _part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, _part_size: Option<usize>) -> Result<()> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         // For filesystem, multipart is the same as regular put
         // In a more sophisticated implementation, we could write in chunks

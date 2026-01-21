@@ -92,7 +92,8 @@ impl OpExecutor for S3dlioExecutor {
         
         let store = s3dlio::api::store_for_uri(uri)
             .with_context(|| format!("Failed to create store for URI: {}", uri))?;
-        store.put(uri, &data).await
+        // s3dlio v0.9.36: put() takes Bytes directly for zero-copy
+        store.put(uri, bytes::Bytes::from(data)).await
             .with_context(|| format!("Failed to PUT {} ({} bytes)", uri, bytes))?;
         Ok(())
     }

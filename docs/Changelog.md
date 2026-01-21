@@ -1,5 +1,120 @@
 # s3dlio Changelog
 
+## Version 0.9.36 - BREAKING: Zero-Copy API (January 2026)
+
+### ⚠️ **BREAKING CHANGE: ObjectStore API Zero-Copy Conversion**
+
+**Critical Performance Fix**: Eliminated internal `.to_vec()` call that forced memcpy, defeating zero-copy architecture.
+
+**What Changed**:
+```rust
+// OLD API (v0.9.35 and earlier)
+pub trait ObjectStore {
+    async fn put(&self, uri: &str, data: &[u8]) -> Result<()>;
+    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()>;
+}
+
+// NEW API (v0.9.36+) - Zero-copy throughout
+pub trait ObjectStore {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()>;
+    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()>;
+}
+```
+
+**Why This Matters**:
+- **Eliminated Hidden Copy**: Previous API took `&[u8]` but internally converted to `Vec<u8>` via `.to_vec()`, forcing memcpy
+- **True Zero-Copy**: `Bytes` is reference-counted (Arc-like) - no memcpy when passed, cloned, or sliced
+- **Maintains Performance**: 20-40 GB/s streaming writes now achievable without internal copies
+- **Consistent Architecture**: Matches get() API which already returns `Bytes`
+
+**Migration Guide**:
+```rust
+// Before (v0.9.35):
+let data = vec![0u8; 1024];
+store.put("s3://bucket/key", &data).await?;
+
+// After (v0.9.36):
+let data = Bytes::from(vec![0u8; 1024]);  // Or Bytes::copy_from_slice(&data) for &[u8]
+store.put("s3://bucket/key", data).await?;
+```
+
+**Zero-Copy Conversions**:
+- `Bytes::from(vec)` - Takes ownership (zero-copy, just wraps Arc)
+- `Bytes::copy_from_slice(&[u8])` - Allocates new buffer (one copy, unavoidable)
+- `bytes.as_ref()` → `&[u8]` - Zero-copy view (fat pointer only)
+- `bytes.slice(range)` - Zero-copy subslice (shares Arc)
+
+**Internal Changes**:
+- S3: `Bytes` → `ByteStream` via `.into()` (zero-copy)
+- Azure: `Bytes` passed directly to SDK (zero-copy)
+- GCS: `Bytes` → `&[u8]` via `.as_ref()` (zero-copy view)
+- File/Direct: `Bytes` → `&[u8]` via `.as_ref()` (zero-copy view)
+- MultiEndpoint: `Bytes` cloned cheaply (reference count, not data)
+
+### ✨ **New: `fill_controlled_data()` - In-Place Buffer Filling**
+
+**High-performance data generation without allocation** (86-163 GB/s with Rayon parallelism):
+
+**Key Innovation**: Fill pre-allocated buffers instead of allocating new `Vec<u8>`:
+```rust
+/// Fill existing buffer with controlled data (ZERO-COPY workflows)
+pub fn fill_controlled_data(buf: &mut [u8], dedup: usize, compress: usize)
+```
+
+**Why This Matters**:
+- **Streaming Workflows**: Pre-allocate buffers once, reuse for entire stream
+- **Zero-Copy Architecture**: Works with `BytesMut` → `Bytes` pipeline
+- **Rayon Pool Control**: Respects `ThreadPool::install()` context (unlike allocation-based methods)
+- **86-163 GB/s**: Parallel generation scales across all cores
+
+**Usage Example**:
+```rust
+use bytes::BytesMut;
+use s3dlio::fill_controlled_data;
+
+// Allocate buffer once
+let mut buf = BytesMut::zeroed(4 * 1024 * 1024);  // 4 MB
+
+// Fill in-place (no additional allocation)
+fill_controlled_data(&mut buf, 1, 1);  // Incompressible, no dedup
+
+// Convert to Bytes (zero-copy)
+let data: Bytes = buf.freeze();
+```
+
+**Benefits**:
+- **Memory Efficiency**: Reuse buffers in streaming loops
+- **Performance**: 20-50x faster than deprecated `generate_controlled_data_prand()`
+- **Thread Control**: Works with custom Rayon thread pools
+
+### 🚨 **Deprecated: `generate_controlled_data_prand()`**
+
+**Old slow method marked deprecated** - replaced by `fill_controlled_data()`:
+
+```rust
+#[deprecated(since = "0.9.36", note = "Use fill_controlled_data() instead - MUCH faster (86-163 GB/s vs 3-4 GB/s)")]
+pub fn generate_controlled_data_prand(size: usize, dedup: usize, compress: usize) -> Vec<u8>
+```
+
+**Performance Comparison**:
+- **Old**: `generate_controlled_data_prand()` - 3-4 GB/s (sequential, Vec allocation)
+- **New**: `fill_controlled_data()` - 86-163 GB/s (parallel Rayon, in-place)
+
+**Migration**:
+```rust
+// OLD (deprecated):
+let data = generate_controlled_data_prand(size, 1, 1);
+
+// NEW (recommended):
+let mut buf = BytesMut::zeroed(size);
+fill_controlled_data(&mut buf, 1, 1);
+let data = buf.freeze();
+```
+
+**Note**: `DataGenAlgorithm::Prand` enum variant removed - all code now uses high-performance Random algorithm.
+
+---
+
 ## Version 0.9.35 - Runtime Hardware Detection API & Data Generation Optimization (January 2026)
 
 ### 🔍 **New: Public Hardware Detection API**

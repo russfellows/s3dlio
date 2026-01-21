@@ -1,9 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-185%2F185-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.35-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-178%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-178%2F178-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.36-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -19,16 +19,17 @@ pip install s3dlio
 
 ## 🌟 Latest Release
 
+### v0.9.36 - Zero-Copy API & High-Performance Data Generation (January 2026)
+
+**⚠️ BREAKING CHANGE**: `ObjectStore::put()` now takes `Bytes` instead of `&[u8]` for true zero-copy.  
+**NEW**: `fill_controlled_data()` for in-place buffer filling (appx. 8 GB/s per CPU core).  
+**DEPRECATED**: `generate_controlled_data_prand()` - use faster alternative.
+
+See [Changelog](docs/Changelog.md) for migration guide and complete details.
+
 ### v0.9.35 - Runtime Hardware Detection & Performance Optimization (January 2026)
 
-**🔍 Runtime Hardware Detection API**
-- New public `hardware` module for CPU/NUMA detection at runtime
-- Zero configuration required - automatically adapts to any hardware
-- Portable binaries work optimally from VMs to multi-socket servers
-- External tools can leverage same detection API
-
-**⚡ Data Generation Performance**
-- **51.09 GB/s** validated throughput (100 GB in 1.96s)
+New public `hardware` module for CPU/NUMA detection. Data generation performance: 51.09 GB/s validated.
 - Optimal defaults: 1 MB blocks, all cores, automatic NUMA adaptation
 - New reproducible seeding with `seed: Option<u64>` parameter
 - Backported optimizations from high-performance dgen-rs project

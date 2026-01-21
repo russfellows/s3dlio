@@ -472,12 +472,13 @@ impl ObjectStore for MultiEndpointStore {
         result
     }
     
-    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let endpoint = self.select_endpoint();
         endpoint.stats.total_requests.fetch_add(1, Ordering::Relaxed);
         endpoint.stats.active_requests.fetch_add(1, Ordering::AcqRel);
         
         let data_len = data.len() as u64;
+        // Bytes is zero-copy (reference counted, can be cloned cheaply)
         let result = endpoint.store.put(uri, data).await;
         
         endpoint.stats.active_requests.fetch_sub(1, Ordering::AcqRel);
@@ -591,12 +592,13 @@ impl ObjectStore for MultiEndpointStore {
         result
     }
     
-    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let endpoint = self.select_endpoint();
         endpoint.stats.total_requests.fetch_add(1, Ordering::Relaxed);
         endpoint.stats.active_requests.fetch_add(1, Ordering::AcqRel);
         
         let data_len = data.len() as u64;
+        // Bytes is zero-copy (reference counted, can be cloned cheaply)
         let result = endpoint.store.put_multipart(uri, data, part_size).await;
         
         endpoint.stats.active_requests.fetch_sub(1, Ordering::AcqRel);
@@ -927,9 +929,9 @@ mod tests {
         ).unwrap();
         
         // Put data
-        let test_data = b"Hello, multi-endpoint world!";
+        let test_data = bytes::Bytes::from_static(b"Hello, multi-endpoint world!");
         let uri = format!("file://{}/output.txt", tmp1.path().display());
-        store.put(&uri, test_data).await.unwrap();
+        store.put(&uri, test_data.clone()).await.unwrap();
         
         // Get data back
         let retrieved = store.get(&uri).await.unwrap();

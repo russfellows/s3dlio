@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
+use bytes::Bytes;
 use crate::object_store::ObjectStore;
 use super::manifest::{Manifest, ShardMeta};
 use super::paths::{KeyLayout, Strategy};
@@ -93,9 +94,9 @@ impl<'a> Writer<'a> {
         } else {
             // Choose upload method based on size for uncompressed data
             if data.len() >= self.multipart_threshold {
-                self.store.put_multipart(&uri, data, self.part_size).await?;
+                self.store.put_multipart(&uri, Bytes::copy_from_slice(data), self.part_size).await?;
             } else {
-                self.store.put(&uri, data).await?;
+                self.store.put(&uri, Bytes::copy_from_slice(data)).await?;
             }
             
             // Collect metadata
@@ -145,9 +146,9 @@ impl<'a> Writer<'a> {
         } else {
             // Choose upload method based on size for uncompressed data
             if data.len() >= self.multipart_threshold {
-                self.store.put_multipart(&uri, data, self.part_size).await?;
+                self.store.put_multipart(&uri, Bytes::copy_from_slice(data), self.part_size).await?;
             } else {
-                self.store.put(&uri, data).await?;
+                self.store.put(&uri, Bytes::copy_from_slice(data)).await?;
             }
             
             let meta = self.store.stat(&uri).await?;
@@ -235,7 +236,7 @@ impl<'a> Writer<'a> {
         let manifest_key = layout.manifest_key();
         let uri = layout.to_uri(&self.base_uri, &manifest_key);
         let bytes = serde_json::to_vec_pretty(manifest)?;
-        self.store.put(&uri, &bytes).await?;
+        self.store.put(&uri, Bytes::from(bytes)).await?;
         Ok(manifest_key)
     }
 

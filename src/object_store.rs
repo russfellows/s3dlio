@@ -269,10 +269,14 @@ pub trait ObjectStore: Send + Sync {
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes>;
 
     /// Put full object (single-shot).
-    async fn put(&self, uri: &str, data: &[u8]) -> Result<()>;
+    /// 
+    /// Accepts `Bytes` for zero-copy efficiency (no memcpy when converting to SDK types).
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()>;
 
     /// Put via multipart semantics (or an equivalent high-throughput path).
-    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()>;
+    /// 
+    /// Accepts `Bytes` for zero-copy efficiency.
+    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()>;
 
     /// List objects under a prefix. Returns full URIs.
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>>;
@@ -373,7 +377,7 @@ pub trait ObjectStore: Send + Sync {
     /// Default copy reads then writes. Backends can override with server-side copy.
     async fn copy(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
         let data = self.get(src_uri).await?;
-        self.put(dst_uri, &data).await
+        self.put(dst_uri, data).await
     }
 
     /// Atomic rename/move operation. For file:// backends, this uses filesystem rename
@@ -850,7 +854,7 @@ impl<'a> ObjectWriter for BufferedObjectWriter<'a> {
             return Ok(());
         }
         self.finalized = true;
-        self.store.put(&self.uri, &self.buffer).await
+        self.store.put(&self.uri, Bytes::from(std::mem::take(&mut self.buffer))).await
     }
     
     fn bytes_written(&self) -> u64 {
@@ -978,12 +982,12 @@ impl ObjectStore for S3ObjectStore {
         s3_get_object_range_uri_async(uri, offset, length).await
     }
 
-    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         s3_put_object_uri_async(uri, data).await
     }
 
-    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         s3_put_object_multipart_uri_async(uri, data, part_size).await
     }
@@ -1302,7 +1306,7 @@ impl ObjectWriter for S3BufferedWriter {
             }
         
         // Use S3 multipart upload for the buffered data
-        s3_put_object_multipart_uri_async(&final_uri, &self.buffer, None).await
+        s3_put_object_multipart_uri_async(&final_uri, Bytes::from(std::mem::take(&mut self.buffer)), None).await
     }
     
     fn bytes_written(&self) -> u64 {
@@ -1586,12 +1590,13 @@ impl ObjectStore for AzureObjectStore {
         Ok(b)
     }
 
-    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
-        cli.put(&key, Bytes::from(data.to_vec()), true).await
+        // Bytes→Bytes is zero-copy (reference counted buffer)
+        cli.put(&key, data, true).await
     }
 
-    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         let part = part_size.unwrap_or(crate::constants::DEFAULT_AZURE_MULTIPART_PART_SIZE);
         let max_in_flight = std::env::var("AZURE_MAX_INFLIGHT")
@@ -1599,10 +1604,13 @@ impl ObjectStore for AzureObjectStore {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(crate::constants::DEFAULT_CONCURRENT_UPLOADS);
 
-        // Stream the provided buffer as Bytes chunks of size `part`
-        let chunks = data
-            .chunks(part)
-            .map(Bytes::copy_from_slice)
+        // Stream the Bytes buffer as chunks of size `part` (zero-copy via Bytes::slice)
+        let chunks = (0..data.len())
+            .step_by(part)
+            .map(|offset| {
+                let end = (offset + part).min(data.len());
+                data.slice(offset..end)  // Zero-copy slice (shares same Arc)
+            })
             .collect::<Vec<_>>();
         let stream = stream::iter(chunks);
 
@@ -2146,17 +2154,19 @@ impl ObjectStore for GcsObjectStore {
         client.get_object_range(&bucket, &object, offset, length).await
     }
 
-    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let client = Self::get_client().await?;
-        client.put_object(&bucket, &object, data).await
+        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
+        client.put_object(&bucket, &object, data.as_ref()).await
     }
 
-    async fn put_multipart(&self, uri: &str, data: &[u8], part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let chunk_size = part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE);
         let client = Self::get_client().await?;
-        client.put_object_multipart(&bucket, &object, data, chunk_size).await
+        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
+        client.put_object_multipart(&bucket, &object, data.as_ref(), chunk_size).await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
@@ -2850,7 +2860,7 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
             let data = tokio::fs::read(&path).await?;
 
             // Upload via ObjectStore trait
-            store.put(&dest_uri, &data).await?;
+            store.put(&dest_uri, Bytes::from(data)).await?;
 
             debug!("finished upload of {:?} → {}", path, dest_uri);
 

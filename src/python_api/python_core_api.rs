@@ -376,8 +376,7 @@ fn str_to_obj(s: &str) -> ObjectType { ObjectType::from(s) }
 fn str_to_data_gen_algorithm(s: &str) -> DataGenAlgorithm {
     match s.to_lowercase().as_str() {
         "random" => DataGenAlgorithm::Random,
-        "prand" => DataGenAlgorithm::Prand,
-        _ => DataGenAlgorithm::Random, // Default to random
+        _ => DataGenAlgorithm::Random, // Default to random (prand deprecated)
     }
 }
 
@@ -720,7 +719,7 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyBytes>) -> PyResu
         rt.block_on(async move {
             let logger = global_logger();
             let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
-            store.put(&uri, &data_owned).await.map_err(py_err)
+            store.put(&uri, data_owned).await.map_err(py_err)
         })
     })
 }
@@ -735,7 +734,7 @@ fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyBytes>) -
     future_into_py(py, async move {
         let logger = global_logger();
         let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
-        store.put(&uri, &data_owned).await.map_err(py_err)
+        store.put(&uri, data_owned).await.map_err(py_err)
     })
 }
 
@@ -1351,11 +1350,11 @@ impl PyMultiEndpointStore {
     /// Put an object to the multi-endpoint store
     fn put<'py>(&self, py: Python<'py>, uri: &str, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
-        let data = data.to_vec();
+        let data = Bytes::copy_from_slice(data);
         let store = self.store.clone();
         
         future_into_py(py, async move {
-            store.put(&uri, &data).await
+            store.put(&uri, data).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Put failed: {}", e)))?;
             Ok(())
         })

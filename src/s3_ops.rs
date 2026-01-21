@@ -146,7 +146,9 @@ impl S3Ops {
     }
 
     /// PUT (Upload) an object.
-    pub async fn put_object(&self, bucket: &str, key: &str, data: Vec<u8>) -> Result<()> {
+    /// 
+    /// Accepts `Bytes` for zero-copy conversion to AWS SDK ByteStream.
+    pub async fn put_object(&self, bucket: &str, key: &str, data: Bytes) -> Result<()> {
         let ctx = LogContext {
             operation: "PUT",
             key: key.to_string(),
@@ -154,7 +156,7 @@ impl S3Ops {
             start_time: SystemTime::now(),
         };
         let bytes = data.len() as u64;
-        let body = data.into();
+        let body = data.into();  // Bytes → ByteStream is zero-copy (refcount bump)
 
         let result = self
             .client
