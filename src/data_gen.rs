@@ -43,6 +43,7 @@ pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
             DataGenMode::SinglePass => {
                 debug!("Using single-pass controlled data: dedup={}, compress={}", 
                     cfg.dedup_factor, cfg.compress_factor);
+                #[allow(deprecated)]
                 generate_controlled_data(total_bytes, cfg.dedup_factor, cfg.compress_factor)
             },
         }

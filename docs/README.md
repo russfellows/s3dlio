@@ -1,6 +1,6 @@
 # s3dlio Documentation
 
-> **Version**: v0.9.24 (November 2025)  
+> **Version**: v0.9.37 (January 2026)  
 > **Status**: Production-Ready (All 5 Backends Active)
 
 Welcome to s3dlio documentation! This README provides an overview of the documentation structure.
