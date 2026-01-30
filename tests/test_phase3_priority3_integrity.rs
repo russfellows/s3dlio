@@ -23,16 +23,16 @@ async fn test_object_store_integrity_validation() -> Result<()> {
     let store = store_for_uri(&base_uri)?;
     
     // Create test data
-    let test_data = b"test data for integrity validation";
-    let expected_checksum = compute_checksum(test_data);
+    let test_data = bytes::Bytes::from_static(b"test data for integrity validation");
+    let expected_checksum = compute_checksum(&test_data);
     
     // Write test file
     let test_uri = format!("{}/test.bin", base_uri);
-    store.put(&test_uri, test_data).await?;
+    store.put(&test_uri, test_data.clone()).await?;
     
     // Test successful validation
     let validated_data = store.get_with_validation(&test_uri, Some(&expected_checksum)).await?;
-    assert_eq!(validated_data.as_ref(), test_data);
+    assert_eq!(validated_data.as_ref(), &test_data[..]);
     
     // Test validation failure
     let wrong_checksum = "00000000";
@@ -41,7 +41,7 @@ async fn test_object_store_integrity_validation() -> Result<()> {
     
     // Test validation with None checksum (should succeed)
     let data_no_validation = store.get_with_validation(&test_uri, None).await?;
-    assert_eq!(data_no_validation.as_ref(), test_data);
+    assert_eq!(data_no_validation.as_ref(), &test_data[..]);
     
     Ok(())
 }
@@ -53,9 +53,9 @@ async fn test_range_validation() -> Result<()> {
     let store = store_for_uri(&base_uri)?;
     
     // Create test data
-    let test_data = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let test_data = bytes::Bytes::from_static(b"0123456789abcdefghijklmnopqrstuvwxyz");
     let test_uri = format!("{}/range_test.bin", base_uri);
-    store.put(&test_uri, test_data).await?;
+    store.put(&test_uri, test_data.clone()).await?;
     
     // Test range with validation
     let range_data = store.get_range(&test_uri, 5, Some(10)).await?;
@@ -94,7 +94,7 @@ async fn test_checkpoint_integrity_validation() -> Result<()> {
         let checksum = compute_checksum(data);
         
         // Write shard data
-        store.put(&shard_uri, data).await?;
+        store.put(&shard_uri, bytes::Bytes::from(data.clone())).await?;
         
         // Add to manifest with checksum
         manifest.shards.push(ShardMeta {
@@ -112,7 +112,7 @@ async fn test_checkpoint_integrity_validation() -> Result<()> {
     let manifest_key = "manifests/manifest_step_100.json";
     let manifest_uri = format!("{}/{}", base_uri, manifest_key);
     let manifest_data = serde_json::to_vec(&manifest)?;
-    store.put(&manifest_uri, &manifest_data).await?;
+    store.put(&manifest_uri, bytes::Bytes::from(manifest_data)).await?;
     
     // Test reading with validation
     let reader = Reader::new(store.as_ref(), base_uri.clone());
@@ -144,12 +144,12 @@ async fn test_corrupted_checkpoint_detection() -> Result<()> {
     
     // Create test data
     let original_data = b"original shard data";
-    let corrupted_data = b"corrupted shard data";
+    let corrupted_data = bytes::Bytes::from_static(b"corrupted shard data");
     let checksum = compute_checksum(original_data);
     
     // Write corrupted data but with checksum for original data
     let shard_uri = format!("{}/corrupted_shard.bin", base_uri);
-    store.put(&shard_uri, corrupted_data).await?;
+    store.put(&shard_uri, corrupted_data.clone()).await?;
     
     // Create manifest with original checksum
     let mut manifest = Manifest::new("torch".to_string(), 200, 10, 1);
@@ -191,7 +191,7 @@ async fn test_concurrent_validation() -> Result<()> {
         let shard_uri = format!("{}/{}", base_uri, key);
         let checksum = compute_checksum(&data);
         
-        store.put(&shard_uri, &data).await?;
+        store.put(&shard_uri, bytes::Bytes::from(data.clone())).await?;
         
         manifest.shards.push(ShardMeta {
             rank,
@@ -226,15 +226,15 @@ async fn test_checkpoint_loading_with_validation() -> Result<()> {
     let store = store_for_uri(&base_uri)?;
     
     // Create checkpoint data
-    let checkpoint_data = b"checkpoint state data";
-    let checksum = compute_checksum(checkpoint_data);
+    let checkpoint_data = bytes::Bytes::from_static(b"checkpoint state data");
+    let checksum = compute_checksum(&checkpoint_data);
     
     let checkpoint_uri = format!("{}/checkpoint.ckpt", base_uri);
-    store.put(&checkpoint_uri, checkpoint_data).await?;
+    store.put(&checkpoint_uri, checkpoint_data.clone()).await?;
     
     // Test checkpoint loading with validation
     let loaded_data = store.load_checkpoint_with_validation(&checkpoint_uri, Some(&checksum)).await?;
-    assert_eq!(loaded_data, checkpoint_data);
+    assert_eq!(loaded_data, &checkpoint_data[..]);
     
     // Test with wrong checksum
     let wrong_checksum = "deadbeef";
@@ -243,7 +243,7 @@ async fn test_checkpoint_loading_with_validation() -> Result<()> {
     
     // Test without checksum validation
     let loaded_no_validation = store.load_checkpoint_with_validation(&checkpoint_uri, None).await?;
-    assert_eq!(loaded_no_validation, checkpoint_data);
+    assert_eq!(loaded_no_validation, &checkpoint_data[..]);
     
     Ok(())
 }

@@ -55,7 +55,7 @@ async fn test_file_store_basic_operations() -> Result<()> {
     assert!(!store.exists(&file_uri).await?);
     
     // Test put operation
-    store.put(&file_uri, test_data).await?;
+    store.put(&file_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     
     // Test that file now exists
     assert!(store.exists(&file_uri).await?);
@@ -71,7 +71,7 @@ async fn test_file_store_basic_operations() -> Result<()> {
     assert_eq!(metadata.storage_class, Some("STANDARD".to_string()));
     
     // Test put with updated data
-    store.put(&file_uri, updated_data).await?;
+    store.put(&file_uri, bytes::Bytes::from_static(updated_data)).await?;
     let retrieved_updated = store.get(&file_uri).await?;
     assert_eq!(retrieved_updated.as_ref(), updated_data);
     
@@ -92,7 +92,7 @@ async fn test_file_store_range_operations() -> Result<()> {
     
     // Create test data with known pattern
     let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    store.put(&file_uri, test_data).await?;
+    store.put(&file_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     
     // Test range read from beginning
     let range1 = store.get_range(&file_uri, 0, Some(10)).await?;
@@ -134,8 +134,8 @@ async fn test_file_store_directory_operations() -> Result<()> {
     assert!(dir1.exists());
     
     // Test putting files (should create subdirectories automatically)
-    store.put(&file1_uri, b"File 1 content").await?;
-    store.put(&file2_uri, b"File 2 content").await?;
+    store.put(&file1_uri, bytes::Bytes::from_static(b"File 1 content")).await?;
+    store.put(&file2_uri, bytes::Bytes::from_static(b"File 2 content")).await?;
     
     // Test listing files non-recursively
     let files_non_recursive = store.list(&dir1_uri, false).await?;
@@ -166,7 +166,7 @@ async fn test_file_store_multipart_operations() -> Result<()> {
     
     // Test multipart put (should work the same as regular put for filesystem)
     let large_data = vec![b'X'; 1024 * 1024]; // 1MB of X's
-    store.put_multipart(&file_uri, &large_data, Some(64 * 1024)).await?;
+    store.put_multipart(&file_uri, bytes::Bytes::from(large_data.clone()), Some(64 * 1024)).await?;
     
     // Verify the data was written correctly
     let retrieved_data = store.get(&file_uri).await?;
@@ -189,7 +189,7 @@ async fn test_file_store_copy_operations() -> Result<()> {
     
     // Create source file
     let test_data = b"Data to be copied";
-    store.put(&src_uri, test_data).await?;
+    store.put(&src_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     
     // Test copy operation (uses default trait implementation)
     store.copy(&src_uri, &dst_uri).await?;
@@ -234,7 +234,7 @@ async fn test_file_store_relative_paths() -> Result<()> {
     let store = store_for_uri("file://./test.txt")?;
     
     let test_data = b"Relative path test";
-    store.put("file://./test.txt", test_data).await?;
+    store.put("file://./test.txt", bytes::Bytes::from(test_data.as_ref())).await?;
     
     let retrieved_data = store.get("file://./test.txt").await?;
     assert_eq!(retrieved_data.as_ref(), test_data);

@@ -1,0 +1,225 @@
+// tests/test_data-gen.rs
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
+use s3dlio::data_gen::generate_controlled_data;
+
+
+#[cfg(test)]
+mod tests {
+    use super::generate_controlled_data;
+    // Use DGEN_BLOCK_SIZE (1 MiB) - the data generation block size constant
+    use s3dlio::constants::DGEN_BLOCK_SIZE;
+    use std::io::{self, Write};
+
+    // How close our dedupe and compression ratios must be, set to 0.15 = 15%
+    // (increased tolerance for new algorithm which has different block structure)
+    const TOLERANCE: f64 = 0.15;
+
+    /// Check that min buffer size of DGEN_BLOCK_SIZE (1 MiB) is enforced
+    /// The new data_gen_alt algorithm uses 1 MiB minimum block size
+    #[test]
+    fn test_generate_controlled_data() {
+        let size = 1024;
+        let dedup = 3;
+        let compress = 2;
+
+        let data = generate_controlled_data(size, dedup, compress);
+
+        // New algorithm enforces minimum of DGEN_BLOCK_SIZE (1 MiB)
+        assert!(data.len() >= DGEN_BLOCK_SIZE, 
+            "Minimum size of {} should be enforced. Requested {} bytes but got {}", 
+            DGEN_BLOCK_SIZE, size, data.len());
+    }
+
+    /// Check if our min buffer size of DGEN_BLOCK_SIZE is enforced 
+    #[test]
+    fn test_min_size_enforcement() {
+        let size = 256; // Smaller than DGEN_BLOCK_SIZE
+        let dedup = 1;
+        let compress = 1;
+
+        let data = generate_controlled_data(size, dedup, compress);
+        assert!(data.len() >= DGEN_BLOCK_SIZE, 
+            "Minimum size of {} should be enforced. Asked for {} bytes, returned {} bytes", 
+            DGEN_BLOCK_SIZE, size, data.len());
+    }
+
+    /// Check if one file gets created with random data 
+    /// We need to check manually, so just create the file and examine offline
+    #[test]
+    fn test_write_random_data_to_file() {
+        // Step 1: Generate random data (using your existing function)
+        let size = 8 * DGEN_BLOCK_SIZE;  // 8 MiB
+        let dedup = 3;
+        let compress = 2;
+        let output_dir = "/tmp";
+
+        let data = generate_controlled_data(size, dedup, compress);
+    
+        // Step 2: Define the output file path
+        let filename = format!("{output_dir}/random_data_{}.bin", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+        std::fs::create_dir_all(output_dir).expect("Failed to create test directory");
+    
+        // Step 3: Write data to the file
+        let mut file = std::fs::File::create(&filename).expect("Failed to create file");
+        file.write_all(&data).expect("Failed to write data");
+    
+        // Step 4: Print the filename for offline inspection
+        println!("Generated file: {}", filename);
+    }
+
+    /// Check if multiple files seem to have different data, with the correct bits changed 
+    /// We need to check manually, so just create the files and examine offline
+    #[test]
+    fn test_create_multiple_files() {
+        // Step 1: Generate random data (using your existing function)
+        let size = 4 * DGEN_BLOCK_SIZE;  // 4 MiB
+        let dedup = 3;
+        let compress = 2;
+        let output_dir = "/tmp";
+
+        // Step 2: Define the output file path
+        // Create data in loop
+        for i in 0..4 {
+            // Generate random data
+            let data = generate_controlled_data(size, dedup, compress);
+
+            // Create unique filename with index
+            let file_name = format!("{}/random_data_{}.bin", output_dir, i);
+
+            // Write to file (ensure the directory exists)
+            std::fs::write(&file_name, &data).expect("Failed to write file");
+
+            // Print filename for verification
+            println!("Created: {}", file_name);
+        }
+    }
+
+    /// Check if dedupe and compression ratios seem to work
+    /// Note: The algorithm operates on DGEN_BLOCK_SIZE (1 MiB) blocks
+    /// dedup=2 means 50% unique blocks (1 unique per 2 blocks)
+    /// compress=1 means no compression (1:1 ratio)
+    #[test]
+    fn test_data_dedup_compress1() {
+        // Use multiple DGEN_BLOCK_SIZE blocks to test dedup ratios
+        let num_blocks_to_generate = 64;  // 64 MiB total
+        let size = num_blocks_to_generate * DGEN_BLOCK_SIZE;
+        let dedup = 2;
+        let compress = 1;
+
+        let data = generate_controlled_data(size, dedup, compress);
+
+        let num_blocks = (data.len() + DGEN_BLOCK_SIZE - 1) / DGEN_BLOCK_SIZE;
+        let mut unique_blocks = std::collections::HashSet::new();
+        let mut total_constant_bytes = 0;
+
+        for i in 0..num_blocks {
+            let start = i * DGEN_BLOCK_SIZE;
+            let end = std::cmp::min(start + DGEN_BLOCK_SIZE, data.len());
+            let block = &data[start..end];
+
+            // Count zero bytes (used for compression estimation)
+            total_constant_bytes += block.iter().filter(|&&b| b == 0).count();
+
+            // Insert the entire block for true dedup detection
+            unique_blocks.insert(block.to_vec());
+        }
+
+        let dedup_ratio = unique_blocks.len() as f64 / num_blocks as f64;
+        let total_bytes = num_blocks * DGEN_BLOCK_SIZE;
+        let compression_ratio = total_constant_bytes as f64 / total_bytes as f64;
+
+        let expected_dedup_ratio = 1.0 / dedup as f64;       // 0.5 for dedup=2
+        let expected_compress_ratio = (compress as f64 - 1.0) / compress as f64; // 0.0 for compress=1
+
+        eprintln!("Num blocks: {} ({} MiB)", num_blocks, num_blocks);
+        eprintln!("Unique blocks: {}", unique_blocks.len());
+        eprintln!("Calculated Dedup Ratio: {:.4}", dedup_ratio);
+        eprintln!("Expected Dedup Ratio: {:.4}", expected_dedup_ratio);
+        eprintln!("Calculated Compression Ratio: {:.4}", compression_ratio);
+        eprintln!("Expected Compression Ratio: {:.4}", expected_compress_ratio);
+        // FORCE a flush so the lines hit the terminal immediately
+        io::stdout().flush().unwrap();
+
+        // this will panic with full output if it's out of tolerance
+        assert!(
+            (dedup_ratio - expected_dedup_ratio).abs() < TOLERANCE &&
+            (compression_ratio - expected_compress_ratio).abs() < TOLERANCE,
+            "Dedup or compression ratio check failed. \
+             Dedup: got {:.4}, expected {:.4} (diff {:.4}). \
+             Compress: got {:.4}, expected {:.4} (diff {:.4})",
+            dedup_ratio, expected_dedup_ratio, (dedup_ratio - expected_dedup_ratio).abs(),
+            compression_ratio, expected_compress_ratio, (compression_ratio - expected_compress_ratio).abs()
+        );
+
+        println!("✅ Test Passed!");
+        // FORCE a flush so the lines hit the terminal immediately
+        io::stdout().flush().unwrap();
+    }
+
+    /// Check if dedupe and compression ratios seem to work
+    /// Note: The algorithm operates on DGEN_BLOCK_SIZE (1 MiB) blocks
+    /// dedup=3 means 33% unique blocks (1 unique per 3 blocks)
+    /// compress=2 means 50% compressible (half zero bytes)
+    #[test]
+    fn test_data_dedup_compress2() {
+        // Use multiple DGEN_BLOCK_SIZE blocks to test dedup ratios
+        let num_blocks_to_generate = 66;  // 66 MiB total (divisible by 3 for dedup=3)
+        let size = num_blocks_to_generate * DGEN_BLOCK_SIZE;
+        let dedup = 3;
+        let compress = 2;
+
+        let data = generate_controlled_data(size, dedup, compress);
+
+        let num_blocks = (data.len() + DGEN_BLOCK_SIZE - 1) / DGEN_BLOCK_SIZE;
+        let mut unique_blocks = std::collections::HashSet::new();
+        let mut total_constant_bytes = 0;
+
+        for i in 0..num_blocks {
+            let start = i * DGEN_BLOCK_SIZE;
+            let end = std::cmp::min(start + DGEN_BLOCK_SIZE, data.len());
+            let block = &data[start..end];
+
+            // Count zero bytes (used for compression estimation)
+            total_constant_bytes += block.iter().filter(|&&b| b == 0).count();
+
+            // Insert the entire block for true dedup detection
+            unique_blocks.insert(block.to_vec());
+        }
+
+        let dedup_ratio = unique_blocks.len() as f64 / num_blocks as f64;
+        let total_bytes = num_blocks * DGEN_BLOCK_SIZE;
+        let compression_ratio = total_constant_bytes as f64 / total_bytes as f64;
+
+        let expected_dedup_ratio = 1.0 / dedup as f64;       // ~0.333 for dedup=3
+        let expected_compress_ratio = (compress as f64 - 1.0) / compress as f64; // 0.5 for compress=2
+
+        eprintln!("Num blocks: {} ({} MiB)", num_blocks, num_blocks);
+        eprintln!("Unique blocks: {}", unique_blocks.len());
+        eprintln!("Calculated Dedup Ratio: {:.4}", dedup_ratio);
+        eprintln!("Expected Dedup Ratio: {:.4}", expected_dedup_ratio);
+        eprintln!("Calculated Compression Ratio: {:.4}", compression_ratio);
+        eprintln!("Expected Compression Ratio: {:.4}", expected_compress_ratio);
+        // FORCE a flush so the lines hit the terminal immediately
+        io::stdout().flush().unwrap();
+
+        // this will panic with full output if it's out of tolerance
+        assert!(
+            (dedup_ratio - expected_dedup_ratio).abs() < TOLERANCE &&
+            (compression_ratio - expected_compress_ratio).abs() < TOLERANCE,
+            "Dedup or compression ratio check failed. \
+             Dedup: got {:.4}, expected {:.4} (diff {:.4}). \
+             Compress: got {:.4}, expected {:.4} (diff {:.4})",
+            dedup_ratio, expected_dedup_ratio, (dedup_ratio - expected_dedup_ratio).abs(),
+            compression_ratio, expected_compress_ratio, (compression_ratio - expected_compress_ratio).abs()
+        );
+
+        println!("✅ Test Passed!");
+        // FORCE a flush so the lines hit the terminal immediately
+        io::stdout().flush().unwrap();
+    }
+
+// End of tests
+}

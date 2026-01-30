@@ -321,6 +321,7 @@ async fn test_arrow_backend_performance() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore] // Requires AWS credentials
 #[cfg(feature = "native-backends")]
 async fn test_native_backend_performance() -> Result<()> {
     println!("🚀 NATIVE AWS SDK BACKEND PERFORMANCE TEST");

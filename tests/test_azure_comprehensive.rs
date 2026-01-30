@@ -42,7 +42,7 @@ async fn test_azure_get_returns_bytes_small() -> Result<()> {
     
     // Upload
     println!("📤 Uploading 1KB test file...");
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Download - should return Bytes (zero-copy)
     println!("📥 Downloading with get()...");
@@ -78,7 +78,7 @@ async fn test_azure_get_returns_bytes_large() -> Result<()> {
     // Upload
     println!("📤 Uploading 10MB test file...");
     let start = std::time::Instant::now();
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     let upload_time = start.elapsed();
     println!("   Upload time: {:?}", upload_time);
     
@@ -131,7 +131,7 @@ async fn test_azure_get_range_returns_bytes() -> Result<()> {
     
     // Upload
     println!("📤 Uploading 3KB test file with distinct patterns...");
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Test get_range - first 1KB
     println!("📥 Testing get_range(0, 1024)...");
@@ -197,7 +197,7 @@ async fn test_azure_put_various_sizes() -> Result<()> {
         let test_data = Bytes::from(vec![77u8; size]);
         
         // Upload
-        store.put(&test_uri, &test_data).await?;
+        store.put(&test_uri, test_data.clone().into()).await?;
         
         // Verify by downloading
         let downloaded = store.get(&test_uri).await?;
@@ -237,7 +237,7 @@ async fn test_azure_put_multipart() -> Result<()> {
     // Upload with multipart (16MB part size)
     println!("📤 Uploading 20MB with put_multipart (16MB parts)...");
     let start = std::time::Instant::now();
-    store.put_multipart(&test_uri, &test_data, Some(16 * 1024 * 1024)).await?;
+    store.put_multipart(&test_uri, test_data.clone(), Some(16 * 1024 * 1024)).await?;
     let upload_time = start.elapsed();
     
     let throughput = (size as f64 / 1024.0 / 1024.0) / upload_time.as_secs_f64();
@@ -287,7 +287,7 @@ async fn test_azure_list_operations() -> Result<()> {
     for key in &test_blobs {
         let uri = get_test_uri(key);
         let data = Bytes::from(vec![99u8; 100]);
-        store.put(&uri, &data).await?;
+        store.put(&uri, data.clone().into()).await?;
     }
     
     // Test recursive list
@@ -334,7 +334,7 @@ async fn test_azure_stat_operations() -> Result<()> {
     let test_data = Bytes::from(vec![55u8; size]);
     
     println!("📤 Uploading 5MB test file...");
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Stat the blob
     println!("📊 Getting blob metadata with stat()...");
@@ -373,7 +373,7 @@ async fn test_azure_delete_operations() -> Result<()> {
     println!("🗑️  Testing single delete()...");
     let test_uri = get_test_uri("test-delete-single.bin");
     let test_data = Bytes::from(vec![66u8; 1024]);
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Verify exists
     let metadata = store.stat(&test_uri).await?;
@@ -398,7 +398,7 @@ async fn test_azure_delete_operations() -> Result<()> {
     // Create multiple blobs
     for key in &test_blobs {
         let uri = get_test_uri(key);
-        store.put(&uri, &test_data).await?;
+        store.put(&uri, test_data.clone().into()).await?;
     }
     
     // Delete prefix
@@ -435,7 +435,7 @@ async fn test_azure_edge_cases() -> Result<()> {
     println!("  Testing empty blob (0 bytes)...");
     let test_uri = get_test_uri("test-edge-empty.bin");
     let empty_data = Bytes::new();
-    store.put(&test_uri, &empty_data).await?;
+    store.put(&test_uri, empty_data.clone().into()).await?;
     let downloaded = store.get(&test_uri).await?;
     assert_eq!(downloaded.len(), 0);
     store.delete(&test_uri).await?;
@@ -455,7 +455,7 @@ async fn test_azure_edge_cases() -> Result<()> {
     println!("  Testing get_range() with offset beyond size...");
     let test_uri = get_test_uri("test-edge-invalid-range.bin");
     let test_data = Bytes::from(vec![44u8; 1024]);
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Request range beyond file size - should return empty or error
     let result = store.get_range(&test_uri, 2048, Some(1024)).await;
@@ -494,7 +494,7 @@ async fn test_azure_concurrent_operations() -> Result<()> {
             let uri = get_test_uri(&format!("test-concurrent-{}.bin", i));
             let data = Bytes::from(vec![i as u8; 1024 * 100]); // 100KB each
             async move {
-                store_clone.put(&uri, &data).await?;
+                store_clone.put(&uri, data.clone().into()).await?;
                 Ok::<_, anyhow::Error>((uri, data))
             }
         })
@@ -558,7 +558,7 @@ async fn test_azure_via_factory() -> Result<()> {
     let test_data = Bytes::from(vec![33u8; 2 * 1024 * 1024]); // 2MB
     
     println!("📤 Uploading via factory-created store...");
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     println!("📥 Downloading via factory-created store...");
     let downloaded = store.get(&test_uri).await?;

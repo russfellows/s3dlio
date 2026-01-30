@@ -189,6 +189,11 @@ pub fn generate_controlled_data_streaming(size: usize, dedup: usize, compress: u
     result
 }
 
+/// DEPRECATED: Use `data_gen_alt::generate_data_simple()` or `data_gen_alt::ObjectGenAlt` instead.
+///
+/// This function is a compatibility shim that redirects to data_gen_alt.
+/// Direct use of the new API is preferred for clarity and to avoid the Vec<u8> allocation.
+#[deprecated(since = "0.9.37", note = "Use data_gen_alt::generate_data_simple() instead")]
 pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     // REDIRECTED TO NEW ALGORITHM: Use data_gen_alt for improved compression control
     // This provides truly incompressible data when compress=1 (fixes cross-block compression bug)

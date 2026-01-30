@@ -110,7 +110,7 @@ async fn test_rmdir_fails_on_non_empty_directory_without_recursive() -> Result<(
     
     // Create directory with a file
     store.mkdir(&dir_uri).await?;
-    store.put(&file_uri, b"test content").await?;
+    store.put(&file_uri, bytes::Bytes::from_static(b"test content")).await?;
     
     assert!(dir_exists(&temp_dir, "test_dir"));
     assert!(file_exists(&temp_dir, "test_dir/file.txt"));
@@ -137,8 +137,8 @@ async fn test_rmdir_recursive_removes_non_empty_directory() -> Result<()> {
     
     // Create directory structure with files
     store.mkdir(&test_uri(&temp_dir, "test_dir/subdir")).await?;
-    store.put(&file1_uri, b"content 1").await?;
-    store.put(&file2_uri, b"content 2").await?;
+    store.put(&file1_uri, bytes::Bytes::from_static(b"content 1")).await?;
+    store.put(&file2_uri, bytes::Bytes::from_static(b"content 2")).await?;
     
     assert!(dir_exists(&temp_dir, "test_dir"));
     assert!(file_exists(&temp_dir, "test_dir/file1.txt"));
@@ -178,7 +178,7 @@ async fn test_update_metadata_not_supported_for_file_backend() -> Result<()> {
     let file_uri = test_uri(&temp_dir, "test.txt");
     
     // Create a file
-    store.put(&file_uri, b"test content").await?;
+    store.put(&file_uri, bytes::Bytes::from_static(b"test content")).await?;
     
     // Attempt to update metadata
     let mut metadata = HashMap::new();
@@ -201,7 +201,7 @@ async fn test_update_properties_http_properties_not_supported() -> Result<()> {
     let file_uri = test_uri(&temp_dir, "test.txt");
     
     // Create a file
-    store.put(&file_uri, b"test content").await?;
+    store.put(&file_uri, bytes::Bytes::from_static(b"test content")).await?;
     
     // Attempt to set HTTP properties (not supported for file backend)
     let properties = ObjectProperties {
@@ -231,7 +231,7 @@ async fn test_update_properties_storage_class_ignored() -> Result<()> {
     let file_uri = test_uri(&temp_dir, "test.txt");
     
     // Create a file
-    store.put(&file_uri, b"test content").await?;
+    store.put(&file_uri, bytes::Bytes::from_static(b"test content")).await?;
     
     // Set only storage_class (should be accepted but ignored)
     let properties = ObjectProperties {
@@ -260,7 +260,7 @@ async fn test_update_properties_empty_properties_accepted() -> Result<()> {
     let file_uri = test_uri(&temp_dir, "test.txt");
     
     // Create a file
-    store.put(&file_uri, b"test content").await?;
+    store.put(&file_uri, bytes::Bytes::from_static(b"test content")).await?;
     
     // Empty properties (all None)
     let properties = ObjectProperties::default();

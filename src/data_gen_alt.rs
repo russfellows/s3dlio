@@ -285,7 +285,7 @@ pub struct GeneratorConfig {
     /// Pin to specific NUMA node (None = use all nodes, Some(n) = pin to node n)
     /// When set, only uses cores from this NUMA node and limits threads accordingly
     pub numa_node: Option<usize>,
-    /// Internal block size for parallelization (None = use BLOCK_SIZE constant)
+    /// Internal block size for parallelization (None = use DGEN_BLOCK_SIZE constant)
     /// Larger blocks (16-32 MB) improve throughput by amortizing Rayon overhead
     /// but use more memory. Must be at least 1 MB and at most 32 MB.
     pub block_size: Option<usize>,
@@ -296,13 +296,13 @@ pub struct GeneratorConfig {
 impl Default for GeneratorConfig {
     fn default() -> Self {
         Self {
-            size: BLOCK_SIZE,
+            size: DGEN_BLOCK_SIZE,
             dedup_factor: 1,
             compress_factor: 1,
             numa_mode: NumaMode::Auto,
             max_threads: None, // Use all available cores
             numa_node: None,   // Use all NUMA nodes
-            block_size: None,  // Use BLOCK_SIZE constant (4 MB)
+            block_size: None,  // Use DGEN_BLOCK_SIZE constant (1 MiB)
             seed: None,        // Random seed
         }
     }
@@ -357,10 +357,10 @@ pub fn generate_data_simple(size: usize, dedup: usize, compress: usize) -> DataB
 ///
 /// Python accesses this memory directly via buffer protocol - ZERO COPY!
 pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
-    // Validate and get effective block size (default 4 MB, max 32 MB)
+    // Validate and get effective block size (default 1 MiB, max 32 MiB)
     let block_size = config.block_size
-        .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024))  // 1 MB min, 32 MB max
-        .unwrap_or(BLOCK_SIZE);
+        .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024))  // 1 MiB min, 32 MiB max
+        .unwrap_or(DGEN_BLOCK_SIZE);
     
     tracing::info!(
         "Starting data generation: size={}, dedup={}, compress={}, block_size={}",
@@ -596,8 +596,10 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
             .enumerate()
             .for_each(|(i, chunk)| {
                 let ub = i % unique_blocks;
+                // Use unique_block_idx for RNG seeding to ensure duplicate blocks are identical
+                // block_idx (i) is NOT used for RNG - only for round-robin assignment
                 tracing::trace!("Filling block {} (unique block {})", i, ub);
-                fill_block(chunk, ub, copy_lens[ub].min(chunk.len()), call_entropy);
+                fill_block(chunk, ub, copy_lens[ub].min(chunk.len()), ub as u64, call_entropy);
             });
     });
 
@@ -633,21 +635,31 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
 /// - Incompressible (copy_len=0): ~15 GB/s per core (both methods identical)
 /// - 2:1 compression (copy_len=50%): OLD ~2-4 GB/s, NEW ~10-12 GB/s (estimated)
 ///
+/// # Deduplication
+/// Blocks with the same `unique_block_idx` will have IDENTICAL content (same RNG seed).
+/// This is how dedup ratios work:
+/// - dedup=1: All blocks unique (unique_block_idx = block_index)
+/// - dedup=2: 50% unique (blocks 0,2,4... identical to 1,3,5... via modulo)
+/// - dedup=N: 1/N unique blocks
+///
 /// # Parameters
-/// - `out`: Output buffer (BLOCK_SIZE bytes)
-/// - `unique_block_idx`: Index of unique block (for RNG seeding)
+/// - `out`: Output buffer (DGEN_BLOCK_SIZE bytes, i.e. 1 MiB)
+/// - `unique_block_idx`: Index into the pool of unique blocks (determines RNG seed for dedup)
 /// - `copy_len`: Target bytes to make compressible (filled with zeros)
-/// - `call_entropy`: Per-call RNG seed
-fn fill_block(out: &mut [u8], unique_block_idx: usize, copy_len: usize, call_entropy: u64) {
+/// - `seed_base`: Base seed for this generation session
+fn fill_block(out: &mut [u8], unique_block_idx: usize, copy_len: usize, unique_block_sequence: u64, seed_base: u64) {
     tracing::trace!(
-        "fill_block: idx={}, copy_len={}, out_len={}",
+        "fill_block: idx={}, seq={}, copy_len={}, out_len={}",
         unique_block_idx,
+        unique_block_sequence,
         copy_len,
         out.len()
     );
 
-    // Seed RNG uniquely per block
-    let seed = call_entropy ^ ((unique_block_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    // Derive RNG from seed_base + unique block index
+    // This ensures: blocks with same unique_block_idx → identical output (DEDUPLICATION)
+    // Note: unique_block_idx determines which "unique block pattern" to use
+    let seed = seed_base.wrapping_add(unique_block_sequence);
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
 
     // OPTIMIZED COMPRESSION METHOD (January 2026):
@@ -822,6 +834,7 @@ pub struct DataGenerator {
     unique_blocks: usize,
     copy_lens: Vec<usize>,
     call_entropy: u64,
+    block_sequence: u64,  // Sequential counter for RNG derivation (ensures determinism)
     max_threads: usize,  // Thread count for parallel generation
     thread_pool: Option<rayon::ThreadPool>,  // Reused thread pool (created once)
     block_size: usize,   // Internal parallelization block size (4-32 MB)
@@ -830,10 +843,10 @@ pub struct DataGenerator {
 impl DataGenerator {
     /// Create new streaming generator
     pub fn new(config: GeneratorConfig) -> Self {
-        // Validate and get effective block size (default 4 MB, max 32 MB)
+        // Validate and get effective block size (default 1 MiB, max 32 MiB)
         let block_size = config.block_size
-            .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024))  // 1 MB min, 32 MB max
-            .unwrap_or(BLOCK_SIZE);
+            .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024))  // 1 MiB min, 32 MiB max
+            .unwrap_or(DGEN_BLOCK_SIZE);
         
         tracing::info!(
             "Creating DataGenerator: size={}, dedup={}, compress={}, block_size={}",
@@ -877,7 +890,8 @@ impl DataGenerator {
             v
         };
 
-        let call_entropy = generate_call_entropy();
+        // Use explicit seed if provided, otherwise generate unique entropy
+        let call_entropy = config.seed.unwrap_or_else(generate_call_entropy);
 
         let max_threads = config.max_threads.unwrap_or_else(num_cpus::get);
         
@@ -915,10 +929,29 @@ impl DataGenerator {
             unique_blocks,
             copy_lens,
             call_entropy,
+            block_sequence: 0,  // Start from 0 for deterministic generation
             max_threads,
             thread_pool,
             block_size,
         }
+    }
+    
+    /// Set or reset the random seed for subsequent data generation
+    /// 
+    /// This allows changing the data pattern mid-stream while maintaining generation position.
+    /// The new seed takes effect on the next `fill_chunk()` call.
+    /// 
+    /// # Arguments
+    /// * `seed` - New seed value, or None to use time+urandom entropy (non-deterministic)
+    pub fn set_seed(&mut self, seed: Option<u64>) {
+        self.call_entropy = seed.unwrap_or_else(generate_call_entropy);
+        // Reset block sequence counter - this ensures same seed → identical stream
+        self.block_sequence = 0;
+        tracing::debug!(
+            "Seed reset: {} (entropy={}) - block_sequence reset to 0",
+            if seed.is_some() { "deterministic" } else { "non-deterministic" },
+            self.call_entropy
+        );
     }
 
     /// Fill the next chunk of data
@@ -990,6 +1023,7 @@ impl DataGenerator {
                 &mut block_buf,
                 ub,
                 self.copy_lens[ub].min(self.block_size),
+                block_idx as u64,  // Use block_idx for deterministic output regardless of chunk size
                 self.call_entropy,
             );
 
@@ -1037,8 +1071,12 @@ impl DataGenerator {
         let unique_blocks = self.unique_blocks;
         let block_size = self.block_size;
 
-        // ZERO-COPY: Generate directly into output buffer using par_chunks_mut
-        // This is the same approach as generate_data() - no temporary allocations!
+        // DETERMINISTIC GENERATION: Always generate full blocks then copy needed portion
+        // This ensures identical output regardless of chunk size (critical for streaming determinism)
+        // 
+        // Note: We cannot use zero-copy for partial blocks because fill_block() uses
+        // out.len() to determine the random/zero split. Different buffer sizes would
+        // produce different data, breaking determinism.
         thread_pool.install(|| {
             chunk
                 .par_chunks_mut(block_size)
@@ -1047,17 +1085,20 @@ impl DataGenerator {
                     let block_idx = start_block + i;
                     let ub = block_idx % unique_blocks;
                     
-                    // Handle first block with offset
-                    if i == 0 && start_offset > 0 {
+                    // Determine if this is a partial block (first with offset, or last not full)
+                    let block_offset = if i == 0 { start_offset } else { 0 };
+                    let is_partial = block_offset > 0 || block_chunk.len() < block_size;
+                    
+                    if is_partial {
                         // Generate full block into temp, copy needed portion
+                        // This ensures deterministic output regardless of chunk boundaries
                         let mut temp = vec![0u8; block_size];
-                        fill_block(&mut temp, ub, copy_lens[ub].min(block_size), call_entropy);
-                        let copy_len = block_size.saturating_sub(start_offset).min(block_chunk.len());
-                        block_chunk[..copy_len].copy_from_slice(&temp[start_offset..start_offset + copy_len]);
+                        fill_block(&mut temp, ub, copy_lens[ub].min(block_size), block_idx as u64, call_entropy);
+                        let copy_len = (block_size - block_offset).min(block_chunk.len());
+                        block_chunk[..copy_len].copy_from_slice(&temp[block_offset..block_offset + copy_len]);
                     } else {
-                        // Generate directly into output buffer (ZERO-COPY!)
-                        let actual_len = block_chunk.len().min(block_size);
-                        fill_block(&mut block_chunk[..actual_len], ub, copy_lens[ub].min(actual_len), call_entropy);
+                        // Full block: generate directly into output buffer (ZERO-COPY!)
+                        fill_block(block_chunk, ub, copy_lens[ub].min(block_size), block_idx as u64, call_entropy);
                     }
                 });
         });
@@ -1124,20 +1165,20 @@ mod tests {
     fn test_generate_minimal() {
         init_tracing();
         let data = generate_data_simple(100, 1, 1);
-        assert_eq!(data.len(), BLOCK_SIZE);
+        assert_eq!(data.len(), DGEN_BLOCK_SIZE);
     }
 
     #[test]
     fn test_generate_exact_block() {
         init_tracing();
-        let data = generate_data_simple(BLOCK_SIZE, 1, 1);
-        assert_eq!(data.len(), BLOCK_SIZE);
+        let data = generate_data_simple(DGEN_BLOCK_SIZE, 1, 1);
+        assert_eq!(data.len(), DGEN_BLOCK_SIZE);
     }
 
     #[test]
     fn test_generate_multiple_blocks() {
         init_tracing();
-        let size = BLOCK_SIZE * 10;
+        let size = DGEN_BLOCK_SIZE * 10;
         let data = generate_data_simple(size, 1, 1);
         assert_eq!(data.len(), size);
     }
@@ -1148,7 +1189,7 @@ mod tests {
         eprintln!("Starting streaming generator test...");
 
         let config = GeneratorConfig {
-            size: BLOCK_SIZE * 5,
+            size: DGEN_BLOCK_SIZE * 5,
             dedup_factor: 1,
             compress_factor: 1,
             numa_mode: NumaMode::Auto,
@@ -1158,14 +1199,14 @@ mod tests {
             seed: None,
         };
 
-        eprintln!("Config: {} blocks, {} bytes total", 5, BLOCK_SIZE * 5);
+        eprintln!("Config: {} blocks, {} bytes total", 5, DGEN_BLOCK_SIZE * 5);
 
         let mut gen = DataGenerator::new(config.clone());
         let mut result = Vec::new();
 
         // Use a larger chunk size to avoid generating too many blocks
-        // Generating 4 MiB block per 1024 bytes is 4096x overhead!
-        let chunk_size = BLOCK_SIZE; // Use full block size for efficiency
+        // Generating 1 MiB block per 1024 bytes is 1024x overhead!
+        let chunk_size = DGEN_BLOCK_SIZE; // Use full block size for efficiency
         let mut chunk = vec![0u8; chunk_size];
 
         let mut iterations = 0;
@@ -1360,6 +1401,31 @@ impl ObjectGenAlt {
         Self {
             generator: DataGenerator::new(config),
         }
+    }
+    
+    /// Create new streaming generator with explicit seed for deterministic output
+    /// 
+    /// When using the same seed, multiple generators will produce identical data
+    /// regardless of chunk size used in fill_chunk() calls.
+    pub fn new_with_seed(size: usize, dedup: usize, compress: usize, seed: u64) -> Self {
+        let config = GeneratorConfig {
+            size,
+            dedup_factor: dedup,
+            compress_factor: compress,
+            seed: Some(seed),
+            ..Default::default()
+        };
+        Self {
+            generator: DataGenerator::new(config),
+        }
+    }
+    
+    /// Set or reset the random seed for subsequent data generation
+    /// 
+    /// This allows changing the data pattern mid-stream. The new seed takes effect
+    /// on the next fill_chunk() call and resets the internal block sequence counter.
+    pub fn set_seed(&mut self, seed: Option<u64>) {
+        self.generator.set_seed(seed);
     }
 
     /// Fill chunk with data (returns number of bytes written)

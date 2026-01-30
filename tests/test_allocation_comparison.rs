@@ -45,7 +45,7 @@ async fn test_allocation_overhead_comparison() -> Result<()> {
     let store_no_pool = ConfigurableFileSystemObjectStore::new(config_no_pool);
     let uri_no_pool = format!("file://{}/test_no_pool.dat", base_path.to_str().unwrap());
     
-    store_no_pool.put(&uri_no_pool, &test_data).await?;
+    store_no_pool.put(&uri_no_pool, test_data.clone().into()).await?;
     
     // Warmup
     let _ = benchmark_range_reads(&store_no_pool, &uri_no_pool, 10).await?;
@@ -66,7 +66,7 @@ async fn test_allocation_overhead_comparison() -> Result<()> {
     let store_with_pool = ConfigurableFileSystemObjectStore::new(config_with_pool);
     let uri_with_pool = format!("file://{}/test_with_pool.dat", base_path.to_str().unwrap());
     
-    store_with_pool.put(&uri_with_pool, &test_data).await?;
+    store_with_pool.put(&uri_with_pool, test_data.clone().into()).await?;
     
     // Warmup
     let _ = benchmark_range_reads(&store_with_pool, &uri_with_pool, 10).await?;
@@ -91,7 +91,7 @@ async fn test_allocation_overhead_comparison() -> Result<()> {
     let store_with_pool_2 = ConfigurableFileSystemObjectStore::new(config_with_pool_2);
     let uri_with_pool_2 = format!("file://{}/test_with_pool_2.dat", base_path.to_str().unwrap());
     
-    store_with_pool_2.put(&uri_with_pool_2, &test_data).await?;
+    store_with_pool_2.put(&uri_with_pool_2, test_data.clone().into()).await?;
     let _ = benchmark_range_reads(&store_with_pool_2, &uri_with_pool_2, 10).await?;
     let time_with_pool_2 = benchmark_range_reads(&store_with_pool_2, &uri_with_pool_2, 1000).await?;
     println!("   Time for 1000 range reads: {:?}", time_with_pool_2);
@@ -107,7 +107,7 @@ async fn test_allocation_overhead_comparison() -> Result<()> {
     let store_no_pool_2 = ConfigurableFileSystemObjectStore::new(config_no_pool_2);
     let uri_no_pool_2 = format!("file://{}/test_no_pool_2.dat", base_path.to_str().unwrap());
     
-    store_no_pool_2.put(&uri_no_pool_2, &test_data).await?;
+    store_no_pool_2.put(&uri_no_pool_2, test_data.clone().into()).await?;
     let _ = benchmark_range_reads(&store_no_pool_2, &uri_no_pool_2, 10).await?;
     let time_no_pool_2 = benchmark_range_reads(&store_no_pool_2, &uri_no_pool_2, 1000).await?;
     println!("   Time for 1000 range reads: {:?}", time_no_pool_2);
@@ -210,7 +210,7 @@ async fn test_memory_allocation_stats() -> Result<()> {
     let config_no_pool = FileSystemConfig::default();
     let store_no_pool = ConfigurableFileSystemObjectStore::new(config_no_pool);
     let uri_no_pool = format!("file://{}/test_mem_no_pool.dat", base_path.to_str().unwrap());
-    store_no_pool.put(&uri_no_pool, &test_data).await?;
+    store_no_pool.put(&uri_no_pool, test_data.clone().into()).await?;
     
     let rss_before = get_vm_rss_kb()?;
     println!("   RSS before reads: {} KB", rss_before);
@@ -237,7 +237,7 @@ async fn test_memory_allocation_stats() -> Result<()> {
     let config_with_pool = FileSystemConfig::direct_io();
     let store_with_pool = ConfigurableFileSystemObjectStore::new(config_with_pool);
     let uri_with_pool = format!("file://{}/test_mem_with_pool.dat", base_path.to_str().unwrap());
-    store_with_pool.put(&uri_with_pool, &test_data).await?;
+    store_with_pool.put(&uri_with_pool, test_data.clone().into()).await?;
     
     let rss_before_pool = get_vm_rss_kb()?;
     println!("   RSS before reads: {} KB", rss_before_pool);
