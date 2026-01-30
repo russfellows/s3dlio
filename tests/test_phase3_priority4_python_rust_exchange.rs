@@ -23,19 +23,19 @@ async fn test_enhanced_checkpoint_loading_with_validation() -> Result<()> {
     let store = store_for_uri(&base_uri)?;
     
     // Create test checkpoint data
-    let checkpoint_data = b"enhanced checkpoint state data for priority 4";
-    let expected_checksum = compute_checksum(checkpoint_data);
+    let checkpoint_data = bytes::Bytes::from_static(b"enhanced checkpoint state data for priority 4");
+    let expected_checksum = compute_checksum(&checkpoint_data);
     
     let checkpoint_uri = format!("{}/checkpoint_priority4.ckpt", base_uri);
-    store.put(&checkpoint_uri, checkpoint_data).await?;
+    store.put(&checkpoint_uri, checkpoint_data.clone()).await?;
     
     // Test loading with validation enabled
     let loaded_data = store.load_checkpoint_with_validation(&checkpoint_uri, Some(&expected_checksum)).await?;
-    assert_eq!(loaded_data, checkpoint_data);
+    assert_eq!(loaded_data, &checkpoint_data[..]);
     
     // Test loading with validation disabled (should still work)
     let loaded_no_validation = store.get(&checkpoint_uri).await?;
-    assert_eq!(loaded_no_validation.as_ref(), checkpoint_data);
+    assert_eq!(loaded_no_validation.as_ref(), &checkpoint_data[..]);
     
     // Test validation failure
     let wrong_checksum = "deadbeef";
@@ -53,11 +53,11 @@ async fn test_tensor_like_data_exchange() -> Result<()> {
     
     // Simulate tensor data (4x4 matrix of f32)
     let tensor_data: Vec<f32> = (0..16).map(|i| i as f32).collect();
-    let tensor_bytes = bytemuck::cast_slice(&tensor_data);
-    let checksum = compute_checksum(tensor_bytes);
+    let tensor_bytes = bytes::Bytes::copy_from_slice(bytemuck::cast_slice(&tensor_data));
+    let checksum = compute_checksum(&tensor_bytes);
     
     let tensor_uri = format!("{}/tensor_4x4.bin", base_uri);
-    store.put(&tensor_uri, tensor_bytes).await?;
+    store.put(&tensor_uri, tensor_bytes.clone()).await?;
     
     // Test loading with validation
     let loaded_bytes = store.get_with_validation(&tensor_uri, Some(&checksum)).await?;
@@ -94,13 +94,13 @@ async fn test_distributed_checkpoint_with_validation() -> Result<()> {
     
     for rank in 0..world_size {
         // Create rank-specific data
-        let shard_data = format!("rank {} shard data for distributed checkpoint", rank).into_bytes();
+        let shard_data = bytes::Bytes::from(format!("rank {} shard data for distributed checkpoint", rank));
         let key = format!("priority4/shard_{}.bin", rank);
         let shard_uri = format!("{}/{}", base_uri, key);
         let checksum = compute_checksum(&shard_data);
         
         // Store shard
-        store.put(&shard_uri, &shard_data).await?;
+        store.put(&shard_uri, shard_data.clone()).await?;
         all_checksums.push(checksum.clone());
         
         // Add to manifest with checksum
@@ -153,7 +153,7 @@ async fn test_compression_integration() -> Result<()> {
     let checksum = compute_checksum(&large_data);
     
     let data_uri = format!("{}/large_compressible.bin", base_uri);
-    store.put(&data_uri, &large_data).await?;
+    store.put(&data_uri, bytes::Bytes::from(large_data.clone())).await?;
     
     // Test loading with validation (data should compress well)
     let loaded_data = store.get_with_validation(&data_uri, Some(&checksum)).await?;
@@ -174,15 +174,15 @@ async fn test_zero_copy_capabilities() -> Result<()> {
     let store = store_for_uri(&base_uri)?;
     
     // Create data that demonstrates zero-copy potential
-    let original_data = b"zero-copy test data for efficient transfers";
-    let checksum = compute_checksum(original_data);
+    let original_data = bytes::Bytes::from_static(b"zero-copy test data for efficient transfers");
+    let checksum = compute_checksum(&original_data);
     
     let zero_copy_uri = format!("{}/zero_copy_test.bin", base_uri);
-    store.put(&zero_copy_uri, original_data).await?;
+    store.put(&zero_copy_uri, original_data.clone()).await?;
     
     // Test efficient loading
     let loaded_data = store.get_with_validation(&zero_copy_uri, Some(&checksum)).await?;
-    assert_eq!(loaded_data.as_ref(), original_data);
+    assert_eq!(loaded_data.as_ref(), &original_data[..]);
     
     // Test that the data is properly validated without extra copies
     assert_eq!(compute_checksum(&loaded_data), checksum);
@@ -204,7 +204,7 @@ async fn test_enhanced_error_handling() -> Result<()> {
     // Test validation with missing checksum data
     let test_data = b"test data for error handling";
     let test_uri = format!("{}/error_test.bin", base_uri);
-    store.put(&test_uri, test_data).await?;
+    store.put(&test_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     
     // Should succeed without validation
     let data = store.get(&test_uri).await?;
@@ -225,8 +225,8 @@ async fn test_metadata_preservation() -> Result<()> {
     let store = store_for_uri(&base_uri)?;
     
     // Create checkpoint with rich metadata
-    let checkpoint_data = b"checkpoint with metadata";
-    let checksum = compute_checksum(checkpoint_data);
+    let checkpoint_data = bytes::Bytes::from_static(b"checkpoint with metadata");
+    let checksum = compute_checksum(&checkpoint_data);
     
     let mut manifest = Manifest::new("pytorch".to_string(), 1000, 50, 1);
     
@@ -243,12 +243,12 @@ async fn test_metadata_preservation() -> Result<()> {
     
     // Store the checkpoint data
     let checkpoint_uri = format!("{}/metadata_checkpoint.bin", base_uri);
-    store.put(&checkpoint_uri, checkpoint_data).await?;
+    store.put(&checkpoint_uri, checkpoint_data.clone()).await?;
     
     // Test that metadata is preserved through the validation process
     let reader = Reader::new(store.as_ref(), base_uri);
     let loaded_data = reader.read_shard_by_rank_with_validation(&manifest, 0).await?;
-    assert_eq!(loaded_data.as_ref(), checkpoint_data);
+    assert_eq!(loaded_data.as_ref(), &checkpoint_data[..]);
     
     // Verify metadata integrity
     let shard = &manifest.shards[0];

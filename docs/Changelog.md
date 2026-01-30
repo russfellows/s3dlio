@@ -1,5 +1,32 @@
 # s3dlio Changelog
 
+## Version 0.9.37 - Test Suite Modernization (January 2026)
+
+### 🧹 **Build & Test Cleanup**
+
+Comprehensive test suite modernization and build cleanup to achieve zero warnings.
+
+**Changes:**
+- Updated 25+ test files to use `bytes::Bytes::from()` for `ObjectStore::put()` calls
+- Added `#[ignore]` to slow benchmark tests with proper run instructions in comments
+- Deprecated `performance_comparison.rs` (old vs new algorithm comparison)
+- Added `#[allow(deprecated)]` where legacy APIs are intentionally tested
+- Fixed clippy warning in `object_format_tests.rs` (redundant clone)
+- Fixed `test_comprehensive_streaming.rs` to use `ObjectGenAlt` API correctly
+- Removed obsolete `test_data_generation_enhancement.rs` (two-pass comparison)
+
+**New Test Files:**
+- `test_datagen_performance_validation.rs` - Validates 35+ GB/s generation throughput
+- `test_high_speed_data_gen.rs` - Comprehensive data generation benchmarks
+
+**Deprecated Function Suppression:**
+- Added `#[allow(deprecated)]` to re-exports and call sites for backward compatibility
+- `generate_controlled_data()` remains available but deprecated (use `data_gen_alt` APIs)
+
+**Build Status:** Zero warnings in library, binary, and test targets.
+
+---
+
 ## Version 0.9.36 - BREAKING: Zero-Copy API (January 2026)
 
 ### ⚠️ **BREAKING CHANGE: ObjectStore API Zero-Copy Conversion**

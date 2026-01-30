@@ -39,7 +39,7 @@ async fn test_azure_small_blob_simple_download() -> Result<()> {
     
     // Upload test data - pass as slice reference (zero-copy)
     println!("📤 Uploading 1MB test file...");
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Download and verify (should use simple download, not RangeEngine)
     println!("📥 Downloading with simple download (size < threshold)...");
@@ -74,7 +74,7 @@ async fn test_azure_large_blob_range_engine() -> Result<()> {
     
     // Upload test data - pass as slice reference (zero-copy)
     println!("📤 Uploading 8MB test file...");
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Download and verify (should use RangeEngine for concurrent download)
     println!("📥 Downloading with RangeEngine (size > 4MB threshold)...");
@@ -123,7 +123,7 @@ async fn test_azure_range_engine_with_custom_config() -> Result<()> {
     
     // Upload test data - pass as slice reference (zero-copy)
     println!("📤 Uploading 6MB test file...");
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Download with custom config
     println!("📥 Downloading with custom RangeEngine config (2MB threshold, 32MB chunks, 16 concurrent)...");
@@ -169,7 +169,7 @@ async fn test_azure_range_engine_disabled() -> Result<()> {
     
     // Upload test data - pass as slice reference (zero-copy)
     println!("📤 Uploading 8MB test file...");
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Download with RangeEngine disabled (should use simple download)
     println!("📥 Downloading with RangeEngine DISABLED (simple download for 8MB file)...");
@@ -211,7 +211,7 @@ async fn test_azure_via_factory_function() -> Result<()> {
     
     // Upload - pass as slice reference (zero-copy)
     println!("📤 Uploading 5MB test file via factory-created store...");
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Download (should use RangeEngine since > 4MB)
     println!("📥 Downloading via factory-created store...");
@@ -252,7 +252,7 @@ async fn test_azure_very_large_blob() -> Result<()> {
     let test_data = Bytes::from(vec![33u8; size]);
     
     let upload_start = std::time::Instant::now();
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     let upload_elapsed = upload_start.elapsed();
     let upload_mbps = (size as f64 / 1024.0 / 1024.0) / upload_elapsed.as_secs_f64();
     

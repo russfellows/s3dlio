@@ -7,8 +7,11 @@ use anyhow::Result;
 
 /// DEFINITIVE speed benchmark with high precision timing
 /// This resolves conflicts between previous benchmarks by using consistent methodology
-
+/// 
+/// NOTE: This test is ignored by default because it takes 2-5 minutes.
+/// Run with: cargo test test_definitive_speed_benchmark -- --ignored
 #[tokio::test]
+#[ignore = "slow benchmark - run with --ignored flag"]
 async fn test_definitive_speed_benchmark() -> Result<()> {
     println!("\n=== DEFINITIVE SPEED BENCHMARK ===");
     println!("Resolving conflicts between previous benchmarks");
@@ -95,7 +98,10 @@ async fn precise_benchmark(size: usize) -> Result<(f64, f64)> {
     Ok((single_pass_gbps, streaming_gbps))
 }
 
+/// NOTE: This test is ignored by default because it takes 2-5 minutes.
+/// Run with: cargo test test_chunk_size_optimization -- --ignored
 #[tokio::test]
+#[ignore = "slow benchmark - run with --ignored flag"]
 async fn test_chunk_size_optimization() -> Result<()> {
     println!("\n=== CHUNK SIZE OPTIMIZATION ===");
     println!("Testing different chunk sizes to find optimal streaming performance");

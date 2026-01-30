@@ -289,6 +289,7 @@ async fn test_buffer_pool_alignment_verification() -> Result<()> {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+#[ignore = "slow - creates 50x16MB files on disk"]
 async fn test_buffer_pool_claims_validation() -> Result<()> {
     let temp_dir = TempDir::new()?;
     

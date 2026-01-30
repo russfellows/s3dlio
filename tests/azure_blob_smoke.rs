@@ -176,24 +176,24 @@ async fn factory_roundtrip_smoke() -> Result<()> {
     let base_https = opt_env("AZURE_BLOB_ACCOUNT_URL")
         .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", account));
 
-    let payload = b"hello via ObjectStore";
+    let payload = bytes::Bytes::from_static(b"hello via ObjectStore");
 
     // 1) az:// form
     let key1 = random_key("s3dlio-factory-az");
     let uri1 = format!("az://{}/{}/{}", account, container, key1);
     let store1 = store_for_uri(&uri1)?;
-    store1.put(&uri1, payload).await?;
+    store1.put(&uri1, payload.clone()).await?;
     let got1 = store1.get(&uri1).await?;
-    assert_eq!(&got1[..], payload);
+    assert_eq!(&got1[..], &payload[..]);
     store1.delete(&uri1).await?;
 
     // 2) full https form
     let key2 = random_key("s3dlio-factory-https");
     let uri2 = format!("{}/{}/{}", base_https.trim_end_matches('/'), container, key2);
     let store2 = store_for_uri(&uri2)?;
-    store2.put(&uri2, payload).await?;
+    store2.put(&uri2, payload.clone()).await?;
     let got2 = store2.get(&uri2).await?;
-    assert_eq!(&got2[..], payload);
+    assert_eq!(&got2[..], &payload[..]);
     store2.delete(&uri2).await?;
 
     Ok(())

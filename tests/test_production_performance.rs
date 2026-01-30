@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+//
+// Large-scale performance test for production streaming scenarios
+// Tests the actual usage pattern: generating multiple 1-8 MB buffers in a loop
+// 
+// NOTE: These tests are slow (generate 1 GB of data). Run with --ignored.
+#![allow(deprecated)]  // Uses old API for comparison
 
-/// Large-scale performance test for production streaming scenarios
-/// Tests the actual usage pattern: generating multiple 1-8 MB buffers in a loop
 use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
 use std::time::Instant;
 
@@ -11,6 +15,7 @@ fn throughput_mb_per_sec(bytes: usize, duration_ms: f64) -> f64 {
 }
 
 #[test]
+#[ignore = "slow benchmark - generates 1 GB data"]
 fn test_production_streaming_performance() {
     println!("=== Production Streaming Performance Test ===");
     
@@ -59,6 +64,7 @@ fn test_production_streaming_performance() {
 }
 
 #[test]
+#[ignore = "slow benchmark - generates 1 GB data"]
 fn test_sustained_generation_performance() {
     println!("\n=== Sustained Generation Test (Target: Multi-GB/s) ===");
     
@@ -96,6 +102,7 @@ fn test_sustained_generation_performance() {
 }
 
 #[test]
+#[ignore = "slow benchmark - 100 iterations"]
 fn test_rng_overhead_measurement() {
     println!("\n=== RNG Overhead Detailed Analysis ===");
     

@@ -99,6 +99,7 @@ mod multipart;
 
 // ===== Legacy Re-exports for Backward Compatibility =====
 // These maintain compatibility with existing code but may be deprecated
+#[allow(deprecated)]
 pub use data_gen::generate_controlled_data;
 #[allow(deprecated)]
 pub use data_gen::generate_controlled_data_prand;  // DEPRECATED: Use fill_controlled_data instead

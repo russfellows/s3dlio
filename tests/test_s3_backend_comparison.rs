@@ -93,7 +93,7 @@ async fn test_s3_basic_operations() -> Result<()> {
     // PUT operation
     println!("\n📤 Testing PUT operation");
     let start = Instant::now();
-    store.put(&test_key, test_data).await?;
+    store.put(&test_key, bytes::Bytes::from(test_data.as_ref())).await?;
     let put_time = start.elapsed();
     println!("   ✅ PUT ({} bytes): {:?}", test_data.len(), put_time);
     
@@ -330,7 +330,7 @@ async fn test_s3_range_operations() -> Result<()> {
     let range_key = format!("{}range_test.dat", base_uri);
     
     println!("📤 Uploading test data ({} bytes)", test_data.len());
-    store.put(&range_key, &test_data).await?;
+    store.put(&range_key, test_data.clone().into()).await?;
     
     // Test various range operations
     let test_ranges = [

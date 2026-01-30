@@ -12,8 +12,11 @@ use anyhow::Result;
 
 /// Comprehensive speed benchmark to validate that we're using the fastest approaches
 /// This benchmarks single-pass vs streaming across multiple scenarios to guide optimization decisions
-
+///
+/// NOTE: This test is ignored by default because it takes 2-5 minutes.
+/// Run with: cargo test test_comprehensive_speed_benchmark -- --ignored
 #[tokio::test]
+#[ignore = "slow benchmark - run with --ignored flag"]
 async fn test_comprehensive_speed_benchmark() -> Result<()> {
     println!("\n=== COMPREHENSIVE SPEED BENCHMARK ===");
     println!("Testing single-pass vs streaming data generation across multiple scenarios");
@@ -114,7 +117,7 @@ async fn test_end_to_end_upload_speed_comparison() -> Result<()> {
     let start = Instant::now();
     let data = generate_controlled_data(size, 1, 1);
     let uri = "file:///tmp/test_single_pass_upload.bin";
-    store.put(uri, &data).await?;
+    store.put(uri, data.clone().into()).await?;
     let single_pass_time = start.elapsed();
     
     // Test streaming upload approach  

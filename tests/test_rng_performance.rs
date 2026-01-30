@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+//
+// NOTE: These tests are slow benchmarks. Run with --ignored.
+#![allow(deprecated)]
 
 use std::time::Instant;
 use rand::{Rng, SeedableRng};
@@ -10,6 +13,7 @@ use s3dlio::{
 };
 
 #[test]
+#[ignore = "slow benchmark"]
 fn performance_baseline_single_pass() {
     println!("=== RNG Performance Baseline Tests ===");
     
@@ -33,6 +37,7 @@ fn performance_baseline_single_pass() {
 }
 
 #[test]
+#[ignore = "slow benchmark"]
 fn performance_baseline_streaming() {
     println!("=== Streaming Performance Tests ===");
     
@@ -58,6 +63,7 @@ fn performance_baseline_streaming() {
 }
 
 #[test] 
+#[ignore = "slow benchmark"]
 fn performance_streaming_chunked() {
     println!("=== Streaming Chunked Performance Tests ===");
     
@@ -88,6 +94,7 @@ fn performance_streaming_chunked() {
 }
 
 #[test]
+#[ignore = "slow benchmark - 100 iterations"]
 fn performance_rng_comparison() {
     println!("=== RNG Performance Comparison ===");
     

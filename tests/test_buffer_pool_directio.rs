@@ -108,7 +108,7 @@ async fn test_range_read_with_buffer_pool() -> Result<()> {
         .collect();
     
     // Write test file
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Test various range reads to exercise buffer pool
     let test_cases = vec![
@@ -160,7 +160,7 @@ async fn test_unaligned_range_reads() -> Result<()> {
     
     // Create test data with prime number length (definitely unaligned)
     let test_data: Vec<u8> = (0..65537).map(|i| (i % 256) as u8).collect();
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Test unaligned ranges that exercise alignment logic
     let unaligned_cases = vec![
@@ -202,7 +202,7 @@ async fn test_concurrent_range_reads() -> Result<()> {
     
     // Create 512KB test file
     let test_data: Vec<u8> = (0..512*1024).map(|i| (i % 256) as u8).collect();
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Launch 64 concurrent range reads (double the pool size of 32)
     // This tests both pool reuse and grow-on-demand logic
@@ -247,7 +247,7 @@ async fn test_no_buffer_pool_fallback() -> Result<()> {
     let test_uri = format!("file://{}/test_no_pool.dat", base_path.to_str().unwrap());
     
     let test_data: Vec<u8> = (0..1024*1024).map(|i| (i % 256) as u8).collect();
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Range read should still work (using AllocatedBuf fallback)
     let retrieved = store.get_range(&test_uri, 1024, Some(8192)).await?;
@@ -274,7 +274,7 @@ async fn test_range_larger_than_pool_buffer() -> Result<()> {
     // Create 128MB test file (larger than pooled buffer size of 64MB)
     // Using simple repeating pattern for memory efficiency
     let test_data: Vec<u8> = (0..128 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Attempt to read 96MB range (larger than 64MB pool buffer)
     // This should trigger grow-on-demand logic
@@ -312,7 +312,7 @@ async fn test_data_integrity_multiple_reads() -> Result<()> {
         .map(|i| ((i * 7 + 13) % 256) as u8)
         .collect();
     
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Read entire file in 64KB chunks and verify integrity
     let chunk_size = 64 * 1024;
@@ -363,7 +363,7 @@ async fn test_buffer_pool_reuse_pattern() -> Result<()> {
     
     // Create test file
     let test_data: Vec<u8> = (0..1024*1024).map(|i| (i % 256) as u8).collect();
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Perform 100 sequential range reads
     // With pool of 32 buffers, we should see extensive reuse
@@ -395,7 +395,7 @@ async fn test_range_read_beyond_file_end() -> Result<()> {
     
     // Create small test file
     let test_data = b"Short file content";
-    store.put(&test_uri, test_data).await?;
+    store.put(&test_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     
     // Attempt to read beyond file end - should return partial data or error
     let result = store.get_range(&test_uri, 0, Some(1024*1024)).await;

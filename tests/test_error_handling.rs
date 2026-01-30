@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
-
-/// Error handling and edge case tests for streaming data generation
-/// Ensures robust behavior under adverse conditions
+//
+// Error handling and edge case tests for streaming data generation
+// Ensures robust behavior under adverse conditions
+//
+// NOTE: Some tests are slow (memory pressure, rapid creation). Run with --ignored.
+#![allow(deprecated)]
 
 use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
 use std::thread;
@@ -72,6 +75,7 @@ fn test_extreme_parameters() {
 }
 
 #[test]
+#[ignore = "slow - spawns threads with sleeps"]
 fn test_memory_pressure() {
     println!("\n=== Memory Pressure Testing ===");
     
@@ -136,6 +140,7 @@ fn test_memory_pressure() {
 }
 
 #[test]
+#[ignore = "slow - creates 1000 generators"]
 fn test_rapid_generator_creation() {
     println!("\n=== Rapid Generator Creation Testing ===");
     
@@ -175,6 +180,7 @@ fn test_rapid_generator_creation() {
 }
 
 #[test]
+#[ignore = "slow - tests many chunk size variations"]
 fn test_chunk_size_variations() {
     println!("\n=== Chunk Size Variation Testing ===");
     

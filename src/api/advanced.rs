@@ -96,6 +96,7 @@ pub use crate::profiling::*;
 
 // Data generation utilities
 /// Generate test data with controlled characteristics (new algorithm - high randomness)
+#[allow(deprecated)]
 pub use crate::data_gen::generate_controlled_data;
 
 /// Generate test data with pseudo-random method (old algorithm - high performance)

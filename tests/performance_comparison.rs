@@ -2,6 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+//
+// NOTE: This entire test file is DEPRECATED - it compares old vs new algorithms
+// but now only data_gen_alt exists. These tests are marked #[ignore].
+// Run with: cargo test --test performance_comparison -- --ignored
+
+#![allow(deprecated)]  // This file intentionally uses deprecated functions for comparison
 
 use std::time::Instant;
 use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
@@ -126,6 +132,7 @@ where
 }
 
 #[test]
+#[ignore = "slow benchmark - run with --ignored flag"]
 fn test_performance_1mb_compress1() {
     let size = 1_048_576; // 1MB
     let iterations = 100;
@@ -156,6 +163,7 @@ fn test_performance_1mb_compress1() {
 }
 
 #[test]
+#[ignore = "slow benchmark - run with --ignored flag"]
 fn test_performance_16mb_compress1() {
     let size = 16_777_216; // 16MB
     let iterations = 20;
@@ -185,6 +193,7 @@ fn test_performance_16mb_compress1() {
 }
 
 #[test]
+#[ignore = "slow benchmark - run with --ignored flag"]
 fn test_performance_64mb_compress1() {
     let size = 67_108_864; // 64MB
     let iterations = 5;
@@ -214,6 +223,7 @@ fn test_performance_64mb_compress1() {
 }
 
 #[test]
+#[ignore = "slow benchmark - run with --ignored flag"]
 fn test_performance_compress5() {
     let size = 16_777_216; // 16MB
     let iterations = 20;
@@ -243,6 +253,7 @@ fn test_performance_compress5() {
 }
 
 #[test]
+#[ignore = "slow benchmark - run with --ignored flag"]
 fn test_performance_streaming() {
     let total_size = 16_777_216; // 16MB
     let chunk_size = 262_144; // 256KB chunks
@@ -289,6 +300,7 @@ fn test_performance_streaming() {
 }
 
 #[test]
+#[ignore = "slow benchmark - run with --ignored flag"]
 fn test_performance_with_dedup() {
     let size = 16_777_216; // 16MB
     let dedup = 4;

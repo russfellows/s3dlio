@@ -18,7 +18,7 @@ use s3dlio::data_formats::tfrecord::build_tfrecord_with_index;
 fn raw_roundtrip() -> anyhow::Result<()> {
     let data = vec![0u8, 1, 2, 3, 4, 5, 255];
     let out = build_raw(&data)?;
-    assert_eq!(out, Bytes::from(data.clone()));
+    assert_eq!(out, Bytes::from(data));
     Ok(())
 }
 

@@ -31,7 +31,7 @@ async fn test_direct_io_basic_operations() -> Result<()> {
     let test_data = b"Hello, O_DIRECT world! This is a test of direct I/O functionality.";
     
     // Test put operation
-    store.put(&test_uri, test_data).await?;
+    store.put(&test_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     
     // Test get operation
     let retrieved_data = store.get(&test_uri).await?;
@@ -66,15 +66,15 @@ async fn test_high_performance_config() -> Result<()> {
     let store = ConfigurableFileSystemObjectStore::high_performance();
     
     let test_uri = format!("file://{}/test_high_perf.dat", base_path);
-    let test_data = vec![0xAB; 1024 * 1024]; // 1MB of test data
+    let test_data = bytes::Bytes::from(vec![0xABu8; 1024 * 1024]); // 1MB of test data
     
     // Test multipart put operation with large data
-    store.put_multipart(&test_uri, &test_data, Some(64 * 1024)).await?;
+    store.put_multipart(&test_uri, test_data.clone(), Some(64 * 1024)).await?;
     
     // Verify data integrity
     let retrieved_data = store.get(&test_uri).await?;
     assert_eq!(retrieved_data.len(), test_data.len());
-    assert_eq!(retrieved_data, test_data);
+    assert_eq!(&retrieved_data[..], &test_data[..]);
     
     // Clean up
     store.delete(&test_uri).await?;
@@ -96,7 +96,7 @@ async fn test_fallback_to_normal_io() -> Result<()> {
     let test_data = b"This should work with normal I/O";
     
     // Test basic operations
-    store.put(&test_uri, test_data).await?;
+    store.put(&test_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     let retrieved_data = store.get(&test_uri).await?;
     assert_eq!(retrieved_data.as_ref(), test_data);
     
@@ -122,7 +122,7 @@ async fn test_large_file_with_direct_io() -> Result<()> {
     }
     
     // Test large file I/O
-    store.put(&test_uri, &test_data).await?;
+    store.put(&test_uri, test_data.clone().into()).await?;
     
     // Test range reads at various offsets
     let chunk1 = store.get_range(&test_uri, 0, Some(4096)).await?;
@@ -160,7 +160,7 @@ async fn test_alignment_handling() -> Result<()> {
     let test_data = b"This is unaligned data with exactly 73 bytes for alignment testing!!";
     assert_eq!(test_data.len(), 68); // Ensure it's not aligned to 512
     
-    store.put(&test_uri, test_data).await?;
+    store.put(&test_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     let retrieved_data = store.get(&test_uri).await?;
     
     // Should retrieve exactly the original data, not the padded version
@@ -221,7 +221,7 @@ async fn test_regular_filesystem_baseline() -> Result<()> {
     let test_data = b"Hello, regular filesystem baseline test!";
     
     // Test basic operations work with regular I/O
-    store.put(&test_uri, test_data).await?;
+    store.put(&test_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     let retrieved_data = store.get(&test_uri).await?;
     assert_eq!(retrieved_data.as_ref(), test_data);
     
@@ -251,7 +251,7 @@ async fn test_direct_io_graceful_fallback() -> Result<()> {
     let test_data = b"Hello, graceful fallback filesystem test!";
     
     // All operations should work via fallback when O_DIRECT isn't supported
-    store.put(&test_uri, test_data).await?;
+    store.put(&test_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     let retrieved_data = store.get(&test_uri).await?;
     assert_eq!(retrieved_data.as_ref(), test_data);
     
@@ -280,7 +280,7 @@ async fn test_factory_functions() -> Result<()> {
     let direct_store = direct_io_store_for_uri(&test_uri)?;
     let test_data = b"Testing direct I/O factory function";
     
-    direct_store.put(&test_uri, test_data).await?;
+    direct_store.put(&test_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     let retrieved = direct_store.get(&test_uri).await?;
     assert_eq!(retrieved.as_ref(), test_data);
     direct_store.delete(&test_uri).await?;
@@ -289,7 +289,7 @@ async fn test_factory_functions() -> Result<()> {
     let hp_store = high_performance_store_for_uri(&test_uri)?;
     let large_data = vec![0xAB; 1024 * 1024]; // 1MB test data
     
-    hp_store.put(&test_uri, &large_data).await?;
+    hp_store.put(&test_uri, bytes::Bytes::from(large_data.clone())).await?;
     let retrieved_large = hp_store.get(&test_uri).await?;
     assert_eq!(retrieved_large, large_data);
     hp_store.delete(&test_uri).await?;

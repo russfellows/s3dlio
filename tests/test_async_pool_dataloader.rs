@@ -26,7 +26,7 @@ async fn create_test_files(base_dir: &std::path::Path, count: usize) -> Result<V
         let data = vec![i as u8; size];
         
         let store = store_for_uri(&uri)?;
-        store.put(&uri, &data).await?;
+        store.put(&uri, data.clone().into()).await?;
         
         uris.push(uri);
     }
@@ -108,7 +108,7 @@ async fn test_async_pool_out_of_order_completion() -> Result<()> {
         let data = vec![i as u8; size];
         
         let store = store_for_uri(&uri)?;
-        store.put(&uri, &data).await?;
+        store.put(&uri, data.clone().into()).await?;
         
         uris.push(uri);
     }

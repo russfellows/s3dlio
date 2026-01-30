@@ -28,7 +28,7 @@ async fn test_file_store_operations() -> Result<()> {
     let test_data = b"Hello, ObjectStore!";
     
     // Put operation
-    store.put(&file_uri, test_data).await?;
+    store.put(&file_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     
     // Get operation
     let retrieved = store.get(&file_uri).await?;
@@ -73,7 +73,7 @@ async fn test_multipart_operations() -> Result<()> {
     let combined_data: Vec<u8> = [part1.as_slice(), part2.as_slice(), part3.as_slice()].concat();
     
     // Use multipart upload with 5MB part size
-    store.put_multipart(&file_uri, &combined_data, Some(5 * 1024 * 1024)).await?;
+    store.put_multipart(&file_uri, bytes::Bytes::from(combined_data.clone()), Some(5 * 1024 * 1024)).await?;
     
     // Verify multipart upload result
     let retrieved = store.get(&file_uri).await?;
@@ -104,7 +104,7 @@ async fn test_cross_backend_consistency() -> Result<()> {
     let test_data = b"test data";
     
     // File store operations
-    file_store.put(&file_uri, test_data).await?;
+    file_store.put(&file_uri, bytes::Bytes::from(test_data.as_ref())).await?;
     let file_result = file_store.get(&file_uri).await?;
     assert_eq!(file_result.as_ref(), test_data);
     
