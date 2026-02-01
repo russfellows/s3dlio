@@ -214,6 +214,7 @@ fn bench_direct_io_write(c: &mut Criterion) {
                         .expect("Failed to open with O_DIRECT");
                     
                     use std::os::unix::io::AsRawFd;
+                    #[allow(unused_imports)]
                     use std::io::Write;
                     
                     let fd = file.as_raw_fd();

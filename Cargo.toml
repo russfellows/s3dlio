@@ -170,6 +170,14 @@ name = "performance_microbenchmarks"
 harness = false
 
 [[bench]]
+name = "filesystem_io_benchmark"
+harness = false
+
+[[bench]]
+name = "s3_microbenchmarks"
+harness = false
+
+[[bench]]
 name = "simple_test"
 harness = false
 
