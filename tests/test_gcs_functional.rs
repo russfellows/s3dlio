@@ -26,6 +26,7 @@ fn get_test_bucket() -> Result<String> {
 const TEST_PREFIX: &str = "s3dlio-test/";
 
 #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
 async fn test_gcs_authentication() -> Result<()> {
     println!("\n=== Testing GCS Authentication ===");
     
@@ -44,6 +45,7 @@ async fn test_gcs_authentication() -> Result<()> {
 }
 
 #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
 async fn test_gcs_put_get_object() -> Result<()> {
     println!("\n=== Testing GCS PUT and GET Operations ===");
     
@@ -80,6 +82,7 @@ async fn test_gcs_put_get_object() -> Result<()> {
 }
 
 #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
 async fn test_gcs_get_object_range() -> Result<()> {
     println!("\n=== Testing GCS Range GET Operations ===");
     
@@ -128,6 +131,7 @@ async fn test_gcs_get_object_range() -> Result<()> {
 }
 
 #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
 async fn test_gcs_stat_object() -> Result<()> {
     println!("\n=== Testing GCS STAT (Metadata) Operations ===");
     
@@ -167,6 +171,7 @@ async fn test_gcs_stat_object() -> Result<()> {
 }
 
 #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
 async fn test_gcs_list_objects() -> Result<()> {
     println!("\n=== Testing GCS LIST Operations ===");
     
@@ -235,6 +240,7 @@ async fn test_gcs_list_objects() -> Result<()> {
 }
 
 #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
 async fn test_gcs_delete_single_object() -> Result<()> {
     println!("\n=== Testing GCS DELETE Single Object ===");
     
@@ -269,6 +275,7 @@ async fn test_gcs_delete_single_object() -> Result<()> {
 }
 
 #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
 async fn test_gcs_delete_multiple_objects() -> Result<()> {
     println!("\n=== Testing GCS DELETE Batch (Multiple Objects) ===");
     
@@ -309,6 +316,7 @@ async fn test_gcs_delete_multiple_objects() -> Result<()> {
 }
 
 #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
 async fn test_gcs_multipart_upload() -> Result<()> {
     println!("\n=== Testing GCS Multipart Upload ===");
     
@@ -348,6 +356,7 @@ async fn test_gcs_multipart_upload() -> Result<()> {
 }
 
 #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
 async fn test_parse_gcs_uri() -> Result<()> {
     println!("\n=== Testing GCS URI Parsing ===");
     
@@ -394,6 +403,7 @@ mod integration_tests {
     /// Run ALL tests in sequence (for comprehensive testing)
     /// NOTE: This is just a convenience wrapper - each test can run individually
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn run_all_gcs_tests() -> Result<()> {
         println!("\n");
         println!("╔══════════════════════════════════════════════════════════════╗");

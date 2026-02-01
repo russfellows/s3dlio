@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use std::time::Instant;
-use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
+use s3dlio::data_gen::DataGenerator;
+use s3dlio::data_gen_alt;
 use anyhow::Result;
 
 /// DEFINITIVE speed benchmark with high precision timing
@@ -54,8 +55,8 @@ async fn precise_benchmark(size: usize) -> Result<(f64, f64)> {
     
     // Warmup phase
     for _ in 0..WARMUP_ITERATIONS {
-        let _data = generate_controlled_data(size, 1, 1);
-        let generator = DataGenerator::new();
+        let _data = data_gen_alt::generate_controlled_data_alt(size, 1, 1, None).to_vec();
+        let generator = DataGenerator::new(None);
         let mut object_gen = generator.begin_object(size, 1, 1);
         let _remaining = object_gen.fill_remaining();
     }
@@ -64,7 +65,7 @@ async fn precise_benchmark(size: usize) -> Result<(f64, f64)> {
     let mut single_pass_durations = Vec::new();
     for _ in 0..ITERATIONS {
         let start = Instant::now();
-        let _data = generate_controlled_data(size, 1, 1);
+        let _data = data_gen_alt::generate_controlled_data_alt(size, 1, 1, None).to_vec();
         single_pass_durations.push(start.elapsed());
     }
     
@@ -72,7 +73,7 @@ async fn precise_benchmark(size: usize) -> Result<(f64, f64)> {
     let mut streaming_durations = Vec::new();
     for _ in 0..ITERATIONS {
         let start = Instant::now();
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut object_gen = generator.begin_object(size, 1, 1);
         
         let chunk_size = 256 * 1024; // 256KB chunks to match original test
@@ -119,7 +120,7 @@ async fn test_chunk_size_optimization() -> Result<()> {
         let mut times = Vec::new();
         for _ in 0..50 {
             let start = Instant::now();
-            let _data = generate_controlled_data(size, 1, 1);
+            let _data = data_gen_alt::generate_controlled_data_alt(size, 1, 1, None).to_vec();
             times.push(start.elapsed());
         }
         times.sort();
@@ -140,7 +141,7 @@ async fn test_chunk_size_optimization() -> Result<()> {
             let mut times = Vec::new();
             for _ in 0..50 {
                 let start = Instant::now();
-                let generator = DataGenerator::new();
+                let generator = DataGenerator::new(None);
                 let mut object_gen = generator.begin_object(size, 1, 1);
                 
                 while !object_gen.is_complete() {

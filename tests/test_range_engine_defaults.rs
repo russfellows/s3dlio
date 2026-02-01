@@ -54,8 +54,8 @@ mod range_engine_defaults {
         println!("✅ DirectIOConfig (default): RangeEngine disabled");
     }
 
-    #[test]
-    fn test_directio_config_direct_io_range_engine_disabled() {
+    #[tokio::test]
+    async fn test_directio_config_direct_io_range_engine_disabled() {
         let config = DirectIOConfig::direct_io();
         assert_eq!(
             config.enable_range_engine,
@@ -65,8 +65,8 @@ mod range_engine_defaults {
         println!("✅ DirectIOConfig (direct_io): RangeEngine disabled");
     }
 
-    #[test]
-    fn test_directio_config_high_performance_range_engine_disabled() {
+    #[tokio::test]
+    async fn test_directio_config_high_performance_range_engine_disabled() {
         let config = DirectIOConfig::high_performance();
         assert_eq!(
             config.enable_range_engine,
@@ -76,8 +76,8 @@ mod range_engine_defaults {
         println!("✅ DirectIOConfig (high_performance): RangeEngine disabled");
     }
 
-    #[test]
-    fn test_configs_can_enable_range_engine() {
+    #[tokio::test]
+    async fn test_configs_can_enable_range_engine() {
         let azure = AzureConfig {
             enable_range_engine: true,
             ..Default::default()

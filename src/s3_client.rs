@@ -329,7 +329,7 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                     .or_else(Region::new(DEFAULT_REGION));
 
             let mut loader =
-                aws_config::defaults(aws_config::BehaviorVersion::v2025_08_07()).region(region);
+                aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12()).region(region);
             if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL") {
                 if !endpoint.is_empty() {
                     loader = loader.endpoint_url(endpoint);

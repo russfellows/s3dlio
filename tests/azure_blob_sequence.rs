@@ -81,6 +81,7 @@ fn read_manifest() -> Result<(String, Vec<String>)> {
 /// - show listing again & GET one
 /// - write a manifest for the cleanup test
 #[tokio::test]
+#[ignore = "requires Azure credentials (AZURE_BLOB_CONTAINER, AZURE_BLOB_ACCOUNT)"]
 async fn sequence_1_upload_and_list() -> Result<()> {
     if env::var("AZURE_BLOB_CONTAINER").is_err() ||
         (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
@@ -128,6 +129,7 @@ async fn sequence_1_upload_and_list() -> Result<()> {
 /// - delete those blobs
 /// - show the prefix count returns to zero
 #[tokio::test]
+#[ignore = "requires Azure credentials (AZURE_BLOB_CONTAINER, AZURE_BLOB_ACCOUNT)"]
 async fn sequence_2_cleanup_and_verify() -> Result<()> {
     if env::var("AZURE_BLOB_CONTAINER").is_err() ||
         (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())

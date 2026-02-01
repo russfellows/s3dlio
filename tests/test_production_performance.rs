@@ -7,7 +7,8 @@
 // NOTE: These tests are slow (generate 1 GB of data). Run with --ignored.
 #![allow(deprecated)]  // Uses old API for comparison
 
-use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
+use s3dlio::data_gen::DataGenerator;
+use s3dlio::data_gen_alt;
 use std::time::Instant;
 
 fn throughput_mb_per_sec(bytes: usize, duration_ms: f64) -> f64 {
@@ -35,7 +36,7 @@ fn test_production_streaming_performance() {
         let start = Instant::now();
         let mut total_bytes = 0;
         for _ in 0..iterations {
-            let data = generate_controlled_data(size, 4, 2);
+            let data = data_gen_alt::generate_controlled_data_alt(size, 4, 2, None).to_vec();
             total_bytes += data.len();
         }
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -47,7 +48,7 @@ fn test_production_streaming_performance() {
         let start = Instant::now();
         let mut total_bytes = 0;
         for _ in 0..iterations {
-            let generator = DataGenerator::new();
+            let generator = DataGenerator::new(None);
             let mut obj_gen = generator.begin_object(size, 4, 2);
             
             // Generate in 256KB chunks (typical streaming pattern)
@@ -78,7 +79,7 @@ fn test_sustained_generation_performance() {
     let start = Instant::now();
     let mut total_bytes = 0;
     for i in 0..iterations {
-        let data = generate_controlled_data(buffer_size, 4, 2);
+        let data = data_gen_alt::generate_controlled_data_alt(buffer_size, 4, 2, None).to_vec();
         total_bytes += data.len();
         
         if i % 64 == 0 {
@@ -116,7 +117,7 @@ fn test_rng_overhead_measurement() {
     let start = Instant::now();
     let mut total_bytes = 0;
     for _ in 0..iterations {
-        let data = generate_controlled_data(size, 4, 2);
+        let data = data_gen_alt::generate_controlled_data_alt(size, 4, 2, None).to_vec();
         total_bytes += data.len();
     }
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;

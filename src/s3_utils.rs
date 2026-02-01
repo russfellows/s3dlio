@@ -291,7 +291,7 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
         // Force us-east-1 for global ListBuckets operation
         let region = RegionProviderChain::first_try(Some(Region::new("us-east-1")));
         
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::v2025_08_07())
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12())
             .region(region);
             
         // Respect endpoint URL if set (for MinIO, etc.)

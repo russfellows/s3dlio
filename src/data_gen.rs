@@ -43,8 +43,13 @@ pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
             DataGenMode::SinglePass => {
                 debug!("Using single-pass controlled data: dedup={}, compress={}", 
                     cfg.dedup_factor, cfg.compress_factor);
-                #[allow(deprecated)]
-                generate_controlled_data(total_bytes, cfg.dedup_factor, cfg.compress_factor)
+                // Use data_gen_alt for single-pass generation
+                crate::data_gen_alt::generate_controlled_data_alt(
+                    total_bytes, 
+                    cfg.dedup_factor, 
+                    cfg.compress_factor, 
+                    None
+                ).to_vec()
             },
         }
     } else {
@@ -173,7 +178,7 @@ pub fn generate_random_data(mut size: usize) -> Vec<u8> {
 /// Generate controlled data using streaming approach for optimal performance.
 /// Based on benchmarks showing streaming is faster for most workload sizes.
 pub fn generate_controlled_data_streaming(size: usize, dedup: usize, compress: usize, chunk_size: usize) -> Vec<u8> {
-    let generator = DataGenerator::new();
+    let generator = DataGenerator::new(None);
     let mut object_gen = generator.begin_object(size, dedup, compress);
     
     let mut result = Vec::with_capacity(size);
@@ -190,6 +195,13 @@ pub fn generate_controlled_data_streaming(size: usize, dedup: usize, compress: u
     result
 }
 
+// ============================================================================
+// DEPRECATED FUNCTION - COMMENTED OUT TO PREVENT ACCIDENTAL USAGE
+// ============================================================================
+// Use fill_controlled_data() for in-place generation (86-163 GB/s performance)
+// or data_gen_alt::generate_controlled_data_alt() for bytes::Bytes return type
+// ============================================================================
+/*
 /// DEPRECATED: Use `data_gen_alt::generate_data_simple()` or `data_gen_alt::ObjectGenAlt` instead.
 ///
 /// This function is a compatibility shim that redirects to data_gen_alt.
@@ -201,6 +213,7 @@ pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> V
     // Convert bytes::Bytes to Vec<u8> for compatibility
     crate::data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec()
 }
+*/
 
 /// Generate controlled data using the pseudo-random (BASE_BLOCK) method.
 ///
@@ -233,10 +246,17 @@ pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> V
 /// // 100MB incompressible data using fast pseudo-random method
 /// let data = generate_controlled_data_prand(100 * 1024 * 1024, 1, 1);
 /// ```
+// ============================================================================
+// DEPRECATED FUNCTION - COMMENTED OUT TO PREVENT ACCIDENTAL USAGE
+// ============================================================================
+// Use fill_controlled_data() instead - 20-40x faster!
+// ============================================================================
+/*
 #[deprecated(since = "0.9.36", note = "Use fill_controlled_data() instead - MUCH faster (86-163 GB/s vs 3-4 GB/s) and supports zero-copy workflows")]
 pub fn generate_controlled_data_prand(size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     generate_controlled_data_original(size, dedup, compress)
 }
+*/
 
 /// Fill a buffer in-place with controlled random data (dedup/compress).
 /// 
@@ -339,6 +359,13 @@ pub fn fill_controlled_data(buf: &mut [u8], dedup: usize, compress: usize) {
     });
 }
 
+// ============================================================================
+// DEPRECATED INTERNAL FUNCTION - COMMENTED OUT
+// ============================================================================
+// This was the implementation behind generate_controlled_data_prand()
+// Use fill_controlled_data() instead for 20-40x better performance
+// ============================================================================
+/*
 // Original implementation preserved below for reference and now available as "prand" method
 fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
     use rand::Rng;
@@ -435,6 +462,7 @@ fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: us
     data.truncate(size);
     data
 }
+*/  // End of commented-out generate_controlled_data_original
 
 
 /// Two-pass version (original implementation) - kept for testing parity
@@ -544,33 +572,76 @@ pub struct DataGenerator {
 impl DataGenerator {
     /// Create a new DataGenerator.
     /// 
-    /// Each instance gets unique entropy at creation time, ensuring different
-    /// generators produce different data while the same generator remains
-    /// deterministic for the same parameters.
-    pub fn new() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        
-        // Generate instance-specific entropy at creation time
-        // Add thread-local counter to ensure uniqueness even with rapid creation
-        use std::cell::Cell;
-        thread_local! {
-            static ENTROPY_COUNTER: Cell<u64> = const { Cell::new(0) };
-        }
-        
-        let base_entropy = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-            
-        let counter = ENTROPY_COUNTER.with(|c| {
-            let val = c.get();
-            c.set(val.wrapping_add(1));
-            val
-        });
-        
-        let instance_entropy = base_entropy.wrapping_add(counter);
+    /// # Parameters
+    /// - `seed`: Optional seed for reproducible data generation. If `None`, uses system entropy
+    ///   to generate unique data on each invocation. If `Some(seed)`, all generators with the
+    ///   same seed will produce identical data patterns.
+    /// 
+    /// # Examples
+    /// 
+    /// ```rust
+    /// use s3dlio::DataGenerator;
+    /// 
+    /// // Default: use system entropy (unique data per instance)
+    /// let gen1 = DataGenerator::new(None);
+    /// let gen2 = DataGenerator::new(None);
+    /// // gen1 and gen2 will produce different data
+    /// 
+    /// // Reproducible: use explicit seed
+    /// let gen3 = DataGenerator::new(Some(42));
+    /// let gen4 = DataGenerator::new(Some(42));
+    /// // gen3 and gen4 will produce identical data
+    /// ```
+    pub fn new(seed: Option<u64>) -> Self {
+        let instance_entropy = match seed {
+            Some(s) => s,
+            None => {
+                // Generate instance-specific entropy at creation time
+                use std::time::{SystemTime, UNIX_EPOCH};
+                use std::cell::Cell;
+                thread_local! {
+                    static ENTROPY_COUNTER: Cell<u64> = const { Cell::new(0) };
+                }
+                
+                let base_entropy = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                    
+                let counter = ENTROPY_COUNTER.with(|c| {
+                    let val = c.get();
+                    c.set(val.wrapping_add(1));
+                    val
+                });
+                
+                base_entropy.wrapping_add(counter)
+            }
+        };
             
         Self { instance_entropy }
+    }
+    
+    /// Create a new DataGenerator with an explicit seed for reproducible data generation.
+    /// 
+    /// **Deprecated**: Use `DataGenerator::new(Some(seed))` instead.
+    /// 
+    /// This is useful when you need deterministic data generation across different runs,
+    /// such as for testing or when recreating the same dataset.
+    /// 
+    /// # Example
+    /// ```
+    /// use s3dlio::data_gen::DataGenerator;
+    /// 
+    /// // Create two generators with the same seed - they will produce identical data
+    /// let gen1 = DataGenerator::new_with_seed(42);
+    /// let gen2 = DataGenerator::new_with_seed(42);
+    /// 
+    /// let obj1 = gen1.begin_object(1024 * 1024, 1, 1);
+    /// let obj2 = gen2.begin_object(1024 * 1024, 1, 1);
+    /// // obj1 and obj2 will generate identical bytes
+    /// ```
+    pub fn new_with_seed(seed: u64) -> Self {
+        Self { instance_entropy: seed }
     }    /// Begin generating a new object with the specified parameters.
     /// 
     /// REDIRECTED TO NEW ALGORITHM: Creates ObjectGenAlt for improved compression control.
@@ -591,7 +662,7 @@ impl DataGenerator {
 
 impl Default for DataGenerator {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -606,9 +677,9 @@ pub struct ObjectGen {
 
 impl ObjectGen {
     /// Create a new ObjectGen using the new algorithm (ObjectGenAlt)
-    fn from_alt(total_size: usize, dedup: usize, compress: usize, _call_entropy: u64) -> Self {
+    fn from_alt(total_size: usize, dedup: usize, compress: usize, call_entropy: u64) -> Self {
         Self {
-            alt_gen: crate::data_gen_alt::ObjectGenAlt::new(total_size, dedup, compress),
+            alt_gen: crate::data_gen_alt::ObjectGenAlt::new_with_seed(total_size, dedup, compress, call_entropy),
         }
     }
 

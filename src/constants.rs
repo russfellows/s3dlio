@@ -193,10 +193,13 @@ impl IoMode {
 // Data Generation Constants
 // =============================================================================
 
-/// Block size for LEGACY data_gen.rs algorithm (512 bytes)
+/// Block size for LEGACY data_gen.rs algorithm (4096 bytes = 4 KiB)
 /// This is the fundamental unit for the old BASE_BLOCK-based algorithm.
-/// DO NOT CHANGE - the old algorithm depends on 512-byte blocks.
-pub const BLK_SIZE: usize = 512;
+/// Changed to 4096 (standard page size) for:
+/// - Memory page alignment (optimal for direct I/O)
+/// - Better compatibility with O_DIRECT operations
+/// - Standard filesystem block size
+pub const BLK_SIZE: usize = 4096;
 
 /// Half block size for LEGACY data_gen.rs internal calculations
 pub const HALF_BLK: usize = BLK_SIZE / 2;

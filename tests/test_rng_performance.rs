@@ -8,7 +8,8 @@ use std::time::Instant;
 use rand::{Rng, SeedableRng};
 
 use s3dlio::{
-    data_gen::{generate_controlled_data, DataGenerator},
+    data_gen::DataGenerator,
+    data_gen_alt,
     constants::BLK_SIZE,
 };
 
@@ -24,7 +25,7 @@ fn performance_baseline_single_pass() {
         let iterations = 10;
         
         for _ in 0..iterations {
-            let _data = generate_controlled_data(size, 1, 1);
+            let _data = data_gen_alt::generate_controlled_data_alt(size, 1, 1, None).to_vec();
         }
         
         let elapsed = start.elapsed();
@@ -48,7 +49,7 @@ fn performance_baseline_streaming() {
         let iterations = 10;
         
         for _ in 0..iterations {
-            let generator = DataGenerator::new();
+            let generator = DataGenerator::new(None);
             let mut object_gen = generator.begin_object(size, 1, 1);
             let _data = object_gen.fill_remaining();
         }
@@ -75,7 +76,7 @@ fn performance_streaming_chunked() {
         let iterations = 10;
         
         for _ in 0..iterations {
-            let generator = DataGenerator::new();
+            let generator = DataGenerator::new(None);
             let mut object_gen = generator.begin_object(size, 1, 1);
             let mut _total_data = Vec::new();
             

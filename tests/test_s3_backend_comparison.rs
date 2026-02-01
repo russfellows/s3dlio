@@ -69,6 +69,7 @@ fn print_backend_info() {
 }
 
 #[tokio::test]
+#[ignore = "requires S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_TEST_BUCKET)"]
 async fn test_s3_basic_operations() -> Result<()> {
     // Load .env file if it exists
     let _ = dotenvy::dotenv();
@@ -155,6 +156,7 @@ async fn test_s3_basic_operations() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_TEST_BUCKET)"]
 async fn test_s3_streaming_operations() -> Result<()> {
     let _ = dotenvy::dotenv();
     
@@ -237,6 +239,7 @@ async fn test_s3_streaming_operations() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_TEST_BUCKET)"]
 async fn test_s3_compression_operations() -> Result<()> {
     let _ = dotenvy::dotenv();
     
@@ -310,6 +313,7 @@ async fn test_s3_compression_operations() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_TEST_BUCKET)"]
 async fn test_s3_range_operations() -> Result<()> {
     let _ = dotenvy::dotenv();
     

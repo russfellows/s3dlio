@@ -7,7 +7,7 @@ use anyhow::{Result, Context};
 use dotenvy;
 use s3dlio::profiling::*;
 use s3dlio::profile_span;
-use s3dlio::data_gen::generate_controlled_data;
+use s3dlio::data_gen::fill_controlled_data;
 use s3dlio::s3_utils::{self, put_object_uri_async, get_object_uri_optimized_async, stat_object_uri_async};
 use std::env;
 use std::time::Instant;
@@ -261,7 +261,8 @@ impl S3TestRunner {
                 let _span = profile_span!("upload_single_object", size_mb = size / (1024 * 1024), index = i);
                 
                 // Generate controlled data
-                let data = generate_controlled_data(size, dedup, compress);
+                let mut data = vec![0u8; size];
+                fill_controlled_data(&mut data, dedup, compress);
                 
                 // Upload to S3
                 put_object_uri_async(&uri, &data).await

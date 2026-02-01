@@ -37,7 +37,7 @@ fn main() {
     
     // Use streaming API for performance
     for _i in 0..iterations {
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut obj_gen = generator.begin_object(buffer_size, dedup, compress);
         
         while let Some(chunk) = obj_gen.fill_chunk(256 * 1024) {
@@ -78,7 +78,7 @@ fn test_single_process_baseline() {
     let mut total_bytes = 0;
     
     for i in 0..iterations {
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut obj_gen = generator.begin_object(buffer_size, 4, 2);
         
         while let Some(chunk) = obj_gen.fill_chunk(256 * 1024) {
@@ -184,7 +184,7 @@ fn test_multi_process_data_uniqueness() {
     for process_id in 0..num_simulated_processes {
         for iteration in 0..iterations_per_process {
             // Each "process" gets its own generator (simulating separate process)
-            let generator = DataGenerator::new();
+            let generator = DataGenerator::new(None);
             let mut obj_gen = generator.begin_object(buffer_size, 4, 2);
             
             let mut data = Vec::new();
@@ -241,7 +241,7 @@ fn test_scaling_analysis() {
     let mut total_bytes = 0;
     
     for _ in 0..iterations {
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut obj_gen = generator.begin_object(buffer_size, 4, 2);
         
         while let Some(chunk) = obj_gen.fill_chunk(256 * 1024) {

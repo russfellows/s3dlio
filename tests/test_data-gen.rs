@@ -17,8 +17,9 @@ mod tests {
     // How close our dedupe and compression ratios must be, set to 0.15 = 15%
     const TOLERANCE: f64 = 0.15;
 
-    /// Check that min buffer size of DGEN_BLOCK_SIZE (1 MiB) is enforced
-    /// The data_gen_alt algorithm uses 1 MiB minimum block size
+    /// Check that small sizes are now correctly generated (no longer enforcing 1 MiB minimum)
+    /// FIXED: The old algorithm incorrectly enforced DGEN_BLOCK_SIZE (1 MiB) minimum,
+    /// which broke compression for small objects. Now generates exact size requested.
     #[test]
     fn test_min_size_enforcement() {
         let size = 1024;  // Request less than DGEN_BLOCK_SIZE
@@ -27,10 +28,10 @@ mod tests {
 
         let data = generate_data_simple(size, dedup, compress);
 
-        // Algorithm enforces minimum of DGEN_BLOCK_SIZE (1 MiB)
-        assert!(data.len() >= DGEN_BLOCK_SIZE, 
-            "Minimum size of {} should be enforced. Requested {} bytes but got {}", 
-            DGEN_BLOCK_SIZE, size, data.len());
+        // Verify we get exactly the requested size (FIX: no longer enforces 1 MiB minimum)
+        assert_eq!(data.len(), size, 
+            "Should get exact requested size. Requested {} bytes and got {}", 
+            size, data.len());
     }
 
     /// Check if one file gets created with random data 

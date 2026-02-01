@@ -16,6 +16,7 @@ fn unique(prefix: &str) -> String {
 }
 
 #[test]
+#[ignore = "requires S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"]
 fn multipart_upload_basic() -> Result<()> {
     let bucket = unique("mpu-basic");
     let key = "test-mpu.bin";
@@ -71,6 +72,7 @@ fn multipart_upload_basic() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires S3 credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"]
 fn multipart_upload_abort() -> Result<()> {
     let bucket = unique("mpu-abort");
     let key = "abort.bin";

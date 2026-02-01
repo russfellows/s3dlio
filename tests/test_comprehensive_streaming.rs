@@ -4,7 +4,8 @@
 /// Comprehensive testing suite for streaming data generation
 /// Tests edge cases, error conditions, and multi-process scenarios for production readiness
 
-use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
+use s3dlio::data_gen::DataGenerator;
+use s3dlio::data_gen_alt;
 use s3dlio::data_gen_alt::ObjectGenAlt;
 use std::thread;
 use std::time::Instant;
@@ -35,11 +36,11 @@ fn test_edge_case_buffer_sizes() {
         println!("Testing size: {} bytes", size);
         
         // Test single-pass generation
-        let data1 = generate_controlled_data(size, 4, 2);
+        let data1 = data_gen_alt::generate_controlled_data_alt(size, 4, 2, None).to_vec();
         assert!(!data1.is_empty(), "Single-pass generated empty data for size {}", size);
         
         // Test streaming generation
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut obj_gen = generator.begin_object(size, 4, 2);
         let mut total_streamed = 0;
         let mut chunks = Vec::new();
@@ -83,7 +84,7 @@ fn test_deduplication_edge_cases() {
     for (size, dedup, compress) in test_cases {
         println!("Testing: size={}, dedup={}, compress={}", size, dedup, compress);
         
-        let data = generate_controlled_data(size, dedup, compress);
+        let data = data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec();
         assert!(!data.is_empty(), "Generated empty data for dedup case");
         
         // Test that streaming with SAME SEED and different chunk sizes produces identical output
@@ -143,7 +144,7 @@ fn test_compression_edge_cases() {
     for (size, dedup, compress) in test_cases {
         println!("Testing: size={}, dedup={}, compress={}", size, dedup, compress);
         
-        let data = generate_controlled_data(size, dedup, compress);
+        let data = data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec();
         assert!(!data.is_empty(), "Generated empty data for compress case");
         
         // Verify compression actually affects data (for compress > 1)

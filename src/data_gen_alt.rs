@@ -370,8 +370,9 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
         block_size
     );
 
-    let size = config.size.max(block_size);  // Use block_size as minimum
-    let nblocks = size.div_ceil(block_size);
+    // FIXED: Allow zero-size generation without enforcing block_size minimum
+    let size = config.size;
+    let nblocks = if size == 0 { 0 } else { size.div_ceil(block_size) };
 
     let dedup_factor = config.dedup_factor.max(1);
     let unique_blocks = if dedup_factor > 1 {
@@ -389,15 +390,23 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
         config.compress_factor
     );
 
-    // Calculate per-block copy lengths using integer error accumulation
+    // CRITICAL FIX: For objects smaller than one block, use object size as effective block size
+    // This ensures compression works correctly for small objects
+    let effective_block_size = if nblocks == 1 && size < block_size {
+        size
+    } else {
+        block_size
+    };
+
+    // Calculate per-block copy lengths using integer error accumulation and effective block size
     // This ensures even distribution of compression across blocks
     let (f_num, f_den) = if config.compress_factor > 1 {
         (config.compress_factor - 1, config.compress_factor)
     } else {
         (0, 1)
     };
-    let floor_len = (f_num * block_size) / f_den;
-    let rem = (f_num * block_size) % f_den;
+    let floor_len = (f_num * effective_block_size) / f_den;
+    let rem = (f_num * effective_block_size) % f_den;
 
     let copy_lens: Vec<usize> = {
         let mut v = Vec::with_capacity(unique_blocks);
@@ -422,7 +431,13 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
     };
 
     // Allocate buffer (NUMA-aware if numa_node is specified)
-    let total_size = nblocks * block_size;
+    // CRITICAL FIX: For small objects (<1 block), use actual size not nblocks * block_size
+    // This ensures compression zeros are in the correct position after truncation
+    let total_size = if nblocks == 1 && size < block_size {
+        size
+    } else {
+        nblocks * block_size
+    };
     tracing::debug!("Allocating {} bytes ({} blocks)", total_size, nblocks);
     
     // CRITICAL: UMA fast path - always use Vec<u8> when numa_node is None
@@ -856,8 +871,9 @@ impl DataGenerator {
             block_size
         );
 
-        let total_size = config.size.max(block_size);  // Use block_size as minimum
-        let nblocks = total_size.div_ceil(block_size);
+        // FIXED: Allow zero-size generation without enforcing block_size minimum
+        let total_size = config.size;
+        let nblocks = if total_size == 0 { 0 } else { total_size.div_ceil(block_size) };
 
         let dedup_factor = config.dedup_factor.max(1);
         let unique_blocks = if dedup_factor > 1 {
@@ -866,14 +882,22 @@ impl DataGenerator {
             nblocks
         };
 
-        // Calculate copy lengths
+        // CRITICAL FIX: For objects smaller than one block, use object size as effective block size
+        // This ensures compression works correctly for small objects
+        let effective_block_size = if nblocks == 1 && total_size < block_size {
+            total_size
+        } else {
+            block_size
+        };
+
+        // Calculate copy lengths using effective block size
         let (f_num, f_den) = if config.compress_factor > 1 {
             (config.compress_factor - 1, config.compress_factor)
         } else {
             (0, 1)
         };
-        let floor_len = (f_num * block_size) / f_den;
-        let rem = (f_num * block_size) % f_den;
+        let floor_len = (f_num * effective_block_size) / f_den;
+        let rem = (f_num * effective_block_size) % f_den;
 
         let copy_lens: Vec<usize> = {
             let mut v = Vec::with_capacity(unique_blocks);
@@ -1017,12 +1041,20 @@ impl DataGenerator {
             // Map to unique block
             let ub = block_idx % self.unique_blocks;
 
-            // Generate full block
-            let mut block_buf = vec![0u8; self.block_size];
+            // CRITICAL FIX: For objects smaller than one block, generate only the needed size
+            // This ensures compression works correctly for small objects
+            let actual_block_size = if self.total_size < self.block_size {
+                self.total_size
+            } else {
+                self.block_size
+            };
+            
+            // Generate block of the actual size needed
+            let mut block_buf = vec![0u8; actual_block_size];
             fill_block(
                 &mut block_buf,
                 ub,
-                self.copy_lens[ub].min(self.block_size),
+                self.copy_lens[ub].min(actual_block_size),
                 block_idx as u64,  // Use block_idx for deterministic output regardless of chunk size
                 self.call_entropy,
             );
@@ -1070,6 +1102,16 @@ impl DataGenerator {
         let copy_lens = &self.copy_lens;
         let unique_blocks = self.unique_blocks;
         let block_size = self.block_size;
+        
+        // CRITICAL: For small objects (<1 MiB), use actual object size as block size
+        // to ensure compression works correctly (zeros are at END of block)
+        let total_size = self.total_size;
+        let nblocks = (total_size + block_size - 1) / block_size;
+        let actual_block_size = if nblocks == 1 && total_size < block_size {
+            total_size
+        } else {
+            block_size
+        };
 
         // DETERMINISTIC GENERATION: Always generate full blocks then copy needed portion
         // This ensures identical output regardless of chunk size (critical for streaming determinism)
@@ -1092,13 +1134,13 @@ impl DataGenerator {
                     if is_partial {
                         // Generate full block into temp, copy needed portion
                         // This ensures deterministic output regardless of chunk boundaries
-                        let mut temp = vec![0u8; block_size];
-                        fill_block(&mut temp, ub, copy_lens[ub].min(block_size), block_idx as u64, call_entropy);
-                        let copy_len = (block_size - block_offset).min(block_chunk.len());
+                        let mut temp = vec![0u8; actual_block_size];
+                        fill_block(&mut temp, ub, copy_lens[ub].min(actual_block_size), block_idx as u64, call_entropy);
+                        let copy_len = (actual_block_size - block_offset).min(block_chunk.len());
                         block_chunk[..copy_len].copy_from_slice(&temp[block_offset..block_offset + copy_len]);
                     } else {
                         // Full block: generate directly into output buffer (ZERO-COPY!)
-                        fill_block(block_chunk, ub, copy_lens[ub].min(block_size), block_idx as u64, call_entropy);
+                        fill_block(block_chunk, ub, copy_lens[ub].min(actual_block_size), block_idx as u64, call_entropy);
                     }
                 });
         });
@@ -1165,7 +1207,7 @@ mod tests {
     fn test_generate_minimal() {
         init_tracing();
         let data = generate_data_simple(100, 1, 1);
-        assert_eq!(data.len(), DGEN_BLOCK_SIZE);
+        assert_eq!(data.len(), 100, "Should generate exactly 100 bytes, not rounded up to block_size");
     }
 
     #[test]

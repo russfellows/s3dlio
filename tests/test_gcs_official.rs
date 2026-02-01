@@ -32,6 +32,7 @@ mod gcs_official_tests {
 
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn test_parse_gcs_uri() -> Result<()> {
         print_test_header("Testing GCS URI Parsing", BACKEND_NAME);
 
@@ -68,6 +69,7 @@ mod gcs_official_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn test_gcs_authentication() -> Result<()> {
         print_test_header("Testing GCS Authentication", BACKEND_NAME);
         let config = get_test_config();
@@ -86,6 +88,7 @@ mod gcs_official_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn test_gcs_put_get_object() -> Result<()> {
         print_test_header("Testing GCS PUT and GET Operations", BACKEND_NAME);
         let config = get_test_config();
@@ -114,6 +117,7 @@ mod gcs_official_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn test_gcs_get_object_range() -> Result<()> {
         print_test_header("Testing GCS Range GET Operations", BACKEND_NAME);
         let config = get_test_config();
@@ -149,6 +153,7 @@ mod gcs_official_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn test_gcs_stat_object() -> Result<()> {
         print_test_header("Testing GCS STAT (Metadata) Operations", BACKEND_NAME);
         let config = get_test_config();
@@ -183,6 +188,7 @@ mod gcs_official_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn test_gcs_list_objects() -> Result<()> {
         print_test_header("Testing GCS LIST Operations", BACKEND_NAME);
         let config = get_test_config();
@@ -249,6 +255,7 @@ mod gcs_official_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn test_gcs_delete_single_object() -> Result<()> {
         print_test_header("Testing GCS DELETE Single Object", BACKEND_NAME);
         let config = get_test_config();
@@ -279,6 +286,7 @@ mod gcs_official_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn test_gcs_delete_multiple_objects() -> Result<()> {
         print_test_header("Testing GCS DELETE Batch (Multiple Objects)", BACKEND_NAME);
         let config = get_test_config();
@@ -317,6 +325,7 @@ mod gcs_official_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn test_gcs_multipart_upload() -> Result<()> {
         print_test_header("Testing GCS Multipart Upload", BACKEND_NAME);
         let config = get_test_config();
@@ -356,6 +365,7 @@ mod gcs_official_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
     async fn integration_tests_run_all_gcs_tests() -> Result<()> {
         println!("\n╔══════════════════════════════════════════════════════════════╗");
         println!("║  Comprehensive GCS Functional Test Suite                    ║");

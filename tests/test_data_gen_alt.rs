@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
-use std::time::Instant;
 
 // The data generation algorithm operates on 1 MiB blocks
 use s3dlio::constants::DGEN_BLOCK_SIZE;
@@ -212,109 +211,6 @@ fn test_streaming_generator() -> Result<()> {
     assert!(!all_zeros, "Streamed data should not be all zeros");
     
     println!("  ✓ Streaming generator works correctly");
-    
-    Ok(())
-}
-
-#[test]
-fn test_performance_comparison() -> Result<()> {
-    use s3dlio::data_gen::generate_controlled_data;
-    use s3dlio::data_gen_alt::{generate_controlled_data_alt, ObjectGenAlt};
-    
-    println!("\n=== Performance Benchmark ===");
-    println!("Comparing original vs new data generation\n");
-    
-    let sizes = vec![
-        (1 * 1024 * 1024, "1MB"),
-        (16 * 1024 * 1024, "16MB"),
-        (64 * 1024 * 1024, "64MB"),
-    ];
-    
-    for (size, label) in sizes {
-        println!("--- {} dataset ---", label);
-        
-        // Original generator
-        let start = Instant::now();
-        let _data_old = generate_controlled_data(size, 1, 1);
-        let time_old = start.elapsed();
-        let throughput_old = size as f64 / time_old.as_secs_f64() / (1024.0 * 1024.0);
-        
-        println!("Original:  {:?} ({:.2} MB/s)", time_old, throughput_old);
-        
-        // New generator
-        let start = Instant::now();
-        let _data_new = generate_controlled_data_alt(size, 1, 1, None);
-        let time_new = start.elapsed();
-        let throughput_new = size as f64 / time_new.as_secs_f64() / (1024.0 * 1024.0);
-        
-        println!("New (alt): {:?} ({:.2} MB/s)", time_new, throughput_new);
-        
-        let speedup = time_old.as_secs_f64() / time_new.as_secs_f64();
-        if speedup > 1.0 {
-            println!("  → Speedup: {:.2}x faster", speedup);
-        } else {
-            println!("  → Slowdown: {:.2}x slower", 1.0 / speedup);
-        }
-        println!();
-    }
-    
-    // Test new streaming generator
-    println!("--- Streaming (16MB in 64KB chunks) ---");
-    let total_size = 16 * 1024 * 1024;
-    let chunk_size = 64 * 1024;
-    
-    let start = Instant::now();
-    let mut gen_new = ObjectGenAlt::new(total_size, 1, 1);
-    let mut buf_new = vec![0u8; chunk_size];
-    let mut bytes_new = 0;
-    while bytes_new < total_size {
-        let written = gen_new.fill_chunk(&mut buf_new);
-        bytes_new += written;
-    }
-    let time_new = start.elapsed();
-    let throughput_new = total_size as f64 / time_new.as_secs_f64() / (1024.0 * 1024.0);
-    
-    println!("Streaming: {:?} ({:.2} MB/s)", time_new, throughput_new);
-    println!("  (Note: Original ObjectGen has private constructor, can't compare streaming)");
-    
-    Ok(())
-}
-
-#[test]
-fn test_original_cross_block_compression_issue() -> Result<()> {
-    use s3dlio::data_gen::generate_controlled_data;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    
-    println!("\n=== Original Generator Compression Issue ===");
-    println!("Demonstrating that original compress=1 is still compressible\n");
-    
-    let size = 4 * 1024 * 1024;
-    let data = generate_controlled_data(size, 1, 1);
-    
-    let mut child = Command::new("zstd")
-        .args(&["-c", "-1", "-q"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&data)?;
-    }
-    
-    let output = child.wait_with_output()?;
-    let compressed_size = output.stdout.len();
-    let ratio = data.len() as f64 / compressed_size as f64;
-    
-    println!("Original generator (compress=1):");
-    println!("  Original size:    {} bytes", data.len());
-    println!("  Compressed size:  {} bytes", compressed_size);
-    println!("  Compression ratio: {:.4}", ratio);
-    
-    if ratio > 1.05 {
-        println!("  ⚠ Still compressible! (ratio {:.4} > 1.05)", ratio);
-        println!("  This confirms the cross-block pattern issue");
-    }
     
     Ok(())
 }
