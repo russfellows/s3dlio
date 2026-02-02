@@ -2204,16 +2204,15 @@ impl ObjectStore for GcsObjectStore {
                 }
             };
 
-            // Use streaming list to get objects page by page
+            // List all objects (returns Vec, not a stream)
             let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.as_str()) };
-            let mut stream = client.list_objects_stream(&bucket, prefix, recursive);
-            
-            use futures::stream::StreamExt;
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(key) => yield Ok(gcs_uri(&bucket, &key)),
-                    Err(e) => yield Err(e),
+            match client.list_objects(&bucket, prefix, recursive).await {
+                Ok(keys) => {
+                    for key in keys {
+                        yield Ok(gcs_uri(&bucket, &key));
+                    }
                 }
+                Err(e) => yield Err(e),
             }
         })
     }
@@ -2245,8 +2244,6 @@ impl ObjectStore for GcsObjectStore {
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
-        use futures::stream::StreamExt;
-        
         let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)
             .or_else(|_| {
                 // Handle bucket-only URIs
@@ -2262,31 +2259,13 @@ impl ObjectStore for GcsObjectStore {
         let client = Self::get_client().await?;
         
         // Use streaming list to avoid loading millions of keys into memory
-        let mut stream = client.list_objects_stream(&bucket, Some(&key_prefix), true);
-        let mut batch = Vec::with_capacity(1000);
-        let mut total_deleted = 0;
+        // List all objects (returns Vec, not a stream)
+        let keys = client.list_objects(&bucket, Some(&key_prefix), true).await?;
+        let total_deleted = keys.len();
         
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(key) => {
-                    batch.push(key);
-                    
-                    // Delete in batches of 1000 to avoid memory bloat
-                    if batch.len() >= 1000 {
-                        client.delete_objects(&bucket, batch.clone()).await?;
-                        total_deleted += batch.len();
-                        batch.clear();
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        
-        // Delete final partial batch if any
-        if !batch.is_empty() {
-            let batch_size = batch.len();
-            client.delete_objects(&bucket, batch).await?;
-            total_deleted += batch_size;
+        // Delete in batches of 1000 to avoid overloading the API
+        for chunk in keys.chunks(1000) {
+            client.delete_objects(&bucket, chunk.to_vec()).await?;
         }
         
         debug!("GCS delete_prefix deleted {} objects total", total_deleted);

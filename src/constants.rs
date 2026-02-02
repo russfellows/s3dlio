@@ -217,9 +217,10 @@ pub const HALF_BLK: usize = BLK_SIZE / 2;
 /// - UMA systems: 10.80 GB/s per core (C4-16, 8 cores)
 /// - Aggregate: 86-163 GB/s on single-socket systems
 /// - Compression ratio 2.0: 1.3-1.5x additional speedup
+///
 /// Data generation block size (1 MiB) - used by data_gen_alt for controlled
 /// deduplication and compression patterns. Named specifically to avoid
-/// confusion with other block size concepts (filesystem, storage, etc.)
+/// confusion with other block size concepts (filesystem, storage, etc.).
 pub const DGEN_BLOCK_SIZE: usize = 1024 * 1024;  // 1 MiB
 
 /// Modification region size for randomization (32 bytes)

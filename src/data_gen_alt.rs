@@ -1106,7 +1106,7 @@ impl DataGenerator {
         // CRITICAL: For small objects (<1 MiB), use actual object size as block size
         // to ensure compression works correctly (zeros are at END of block)
         let total_size = self.total_size;
-        let nblocks = (total_size + block_size - 1) / block_size;
+        let nblocks = total_size.div_ceil(block_size);
         let actual_block_size = if nblocks == 1 && total_size < block_size {
             total_size
         } else {

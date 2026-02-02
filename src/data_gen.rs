@@ -246,6 +246,7 @@ pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> V
 /// // 100MB incompressible data using fast pseudo-random method
 /// let data = generate_controlled_data_prand(100 * 1024 * 1024, 1, 1);
 /// ```
+///
 // ============================================================================
 // DEPRECATED FUNCTION - COMMENTED OUT TO PREVENT ACCIDENTAL USAGE
 // ============================================================================
@@ -257,7 +258,6 @@ pub fn generate_controlled_data_prand(size: usize, dedup: usize, compress: usize
     generate_controlled_data_original(size, dedup, compress)
 }
 */
-
 /// Fill a buffer in-place with controlled random data (dedup/compress).
 /// 
 /// **CRITICAL**: This uses the global Rayon pool, which means it respects any
