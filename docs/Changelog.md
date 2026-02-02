@@ -1,5 +1,38 @@
 # s3dlio Changelog
 
+## Version 0.9.39 - s3dlio-oplog API Fix (February 2026)
+
+### 🐛 **Bug Fix**
+
+**s3dlio-oplog compatibility:**
+- Fixed `s3dlio-oplog` crate to use new `data_gen_alt::generate_controlled_data_alt()` API
+- Removed usage of deprecated `generate_controlled_data()` function
+- Improved zero-copy performance: `generate_controlled_data_alt()` returns `Bytes` directly
+
+**Impact:** Fixes compilation errors when using s3dlio-oplog with s3dlio v0.9.38+
+
+---
+
+## Version 0.9.38 - Critical Compression Fixes (February 2026)
+
+### 🐛 **Critical Bug Fixes**
+
+**Data Generation Compression:**
+- Fixed zero-prefix compression calculation for objects <1 MiB
+- Fixed small object alignment in `generate_controlled_data`
+- All object sizes now compress to exact target ratios
+
+**GCS Backend:**
+- Fixed GCS API compatibility (removed non-existent `list_objects_stream()` calls)
+- Replaced with `list_objects()` and manual chunking
+
+**Code Quality:**
+- Fixed all clippy warnings (zero-warning policy maintained)
+- Added missing benchmark configurations
+- Repository cleanup
+
+---
+
 ## Version 0.9.37 - Test Suite Modernization (January 2026)
 
 ### 🧹 **Build & Test Cleanup**

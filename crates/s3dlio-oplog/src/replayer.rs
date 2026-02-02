@@ -87,13 +87,13 @@ impl OpExecutor for S3dlioExecutor {
     }
 
     async fn put(&self, uri: &str, bytes: usize) -> Result<()> {
-        // Generate random data using s3dlio's data generation
-        let data = s3dlio::data_gen::generate_controlled_data(bytes, 1, 1);
+        // Generate random data using s3dlio's new data_gen_alt (returns Bytes directly)
+        let data = s3dlio::data_gen_alt::generate_controlled_data_alt(bytes, 1, 1, None);
         
         let store = s3dlio::api::store_for_uri(uri)
             .with_context(|| format!("Failed to create store for URI: {}", uri))?;
-        // s3dlio v0.9.36: put() takes Bytes directly for zero-copy
-        store.put(uri, bytes::Bytes::from(data)).await
+        // s3dlio v0.9.36+: put() takes Bytes directly for zero-copy
+        store.put(uri, data).await
             .with_context(|| format!("Failed to PUT {} ({} bytes)", uri, bytes))?;
         Ok(())
     }
