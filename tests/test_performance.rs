@@ -4,8 +4,7 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use std::time::Instant;
-//use s3dlio::data_gen::{generate_random_data, generate_controlled_data};
-use s3dlio::data_gen::generate_controlled_data;
+use s3dlio::data_gen_alt;
 
 /// Measure generate_random_data() over 100 runs of 1 GiB each.
 /// Run with: `cargo test -- --ignored --nocapture perf_random`
@@ -30,7 +29,7 @@ fn perf_random() {
 }
 */
 
-/// Measure generate_controlled_data() over 100 runs of 1 GiB each.
+/// Measure data_gen_alt::generate_controlled_data_alt() over 100 runs of 1 GiB each.
 /// Run with: `cargo test -- --ignored --nocapture perf_controlled`
 #[test]
 #[ignore]
@@ -42,11 +41,11 @@ fn perf_controll1() {
 
     let t0 = Instant::now();
     for _ in 0..runs {
-        let _buf = generate_controlled_data(size, dedup, compress);
+        let _buf = data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec();
     }
     let elapsed = t0.elapsed();
     println!(
-        "generate_controlled_data: {} × {:.1} MB (dedup={}, compress={}) → {:?}",
+        "data_gen_alt::generate_controlled_data_alt: {} × {:.1} MB (dedup={}, compress={}) → {:?}",
         runs,
         size as f64 / (1024.0*1024.0),
         dedup,
@@ -55,7 +54,7 @@ fn perf_controll1() {
     );
 }
 
-/// Measure generate_controlled_data() over 100 runs of 1 GiB each.
+/// Measure data_gen_alt::generate_controlled_data_alt() over 100 runs of 1 GiB each.
 /// Run with: `cargo test -- --ignored --nocapture perf_controlled`
 #[test]
 #[ignore]
@@ -67,11 +66,11 @@ fn perf_controll2() {
 
     let t0 = Instant::now();
     for _ in 0..runs {
-        let _buf = generate_controlled_data(size, dedup, compress);
+        let _buf = data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec();
     }
     let elapsed = t0.elapsed();
     println!(
-        "generate_controlled_data: {} × {:.1} MB (dedup={}, compress={}) → {:?}",
+        "data_gen_alt::generate_controlled_data_alt: {} × {:.1} MB (dedup={}, compress={}) → {:?}",
         runs,
         size as f64 / (1024.0*1024.0),
         dedup,

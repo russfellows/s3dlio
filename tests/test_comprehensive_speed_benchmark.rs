@@ -3,7 +3,8 @@
 
 use std::time::Instant;
 use s3dlio::{
-    data_gen::{generate_controlled_data, DataGenerator},
+    data_gen::DataGenerator,
+    data_gen_alt,
     streaming_writer::StreamingDataWriter,
     file_store::FileSystemObjectStore,
     object_store::{ObjectStore, WriterOptions},
@@ -72,7 +73,7 @@ async fn benchmark_approaches(size: usize, dedup: usize, compress: usize) -> Res
     let mut single_pass_times = Vec::new();
     for _ in 0..ITERATIONS {
         let start = Instant::now();
-        let _data = generate_controlled_data(size, dedup, compress);
+        let _data = data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec();
         single_pass_times.push(start.elapsed());
     }
     
@@ -80,7 +81,7 @@ async fn benchmark_approaches(size: usize, dedup: usize, compress: usize) -> Res
     let mut streaming_times = Vec::new();
     for _ in 0..ITERATIONS {
         let start = Instant::now();
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut object_gen = generator.begin_object(size, dedup, compress);
         
         // Generate all chunks to measure total generation time
@@ -115,7 +116,7 @@ async fn test_end_to_end_upload_speed_comparison() -> Result<()> {
     
     // Test single-pass upload approach (current CLI/Python method)
     let start = Instant::now();
-    let data = generate_controlled_data(size, 1, 1);
+    let data = data_gen_alt::generate_controlled_data_alt(size, 1, 1, None).to_vec();
     let uri = "file:///tmp/test_single_pass_upload.bin";
     store.put(uri, data.clone().into()).await?;
     let single_pass_time = start.elapsed();
@@ -179,7 +180,7 @@ async fn test_memory_pressure_vs_speed_tradeoff() -> Result<()> {
     for (size_name, size) in test_sizes {
         // Single-pass benchmark
         let start = Instant::now();
-        let data = generate_controlled_data(size, 1, 1);
+        let data = data_gen_alt::generate_controlled_data_alt(size, 1, 1, None).to_vec();
         let single_pass_time = start.elapsed();
         let single_pass_memory_mb = data.len() as f64 / (1024.0 * 1024.0);
         drop(data); // Free memory
@@ -187,7 +188,7 @@ async fn test_memory_pressure_vs_speed_tradeoff() -> Result<()> {
         // Streaming benchmark (chunked)
         let chunk_size = 256 * 1024; // 256KB chunks
         let start = Instant::now();
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut object_gen = generator.begin_object(size, 1, 1);
         
         while !object_gen.is_complete() {

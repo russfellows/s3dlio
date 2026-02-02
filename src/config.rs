@@ -100,7 +100,7 @@ pub struct Config {
     pub element_size:   usize,   // bytes per element
                                
     // ---- knobs for data pattern generation ----
-    pub use_controlled: bool,    // true => call generate_controlled_data()
+    pub use_controlled: bool,    // true => use controlled data generation (data_gen_alt)
     pub dedup_factor:   usize,       // e.g. 1 (all unique), 3 (1/3 unique)
     pub compress_factor: usize,    // e.g. 1 (random), 2 (≈50 % zeros)
     

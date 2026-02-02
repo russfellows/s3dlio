@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
 /// Profile real S3 operations using configuration from .env file
 async fn profile_real_s3_operations() -> Result<()> {
     use s3dlio::s3_utils::*;
-    use s3dlio::data_gen::generate_controlled_data;
+    use s3dlio::data_gen::fill_controlled_data;
     
     println!("\n📊 Profiling Real S3 Operations");
     println!("==============================");
@@ -78,7 +78,8 @@ async fn profile_real_s3_operations() -> Result<()> {
             let _upload_span = profile_span!("upload_single", key = %key, size = %size);
             
             // Generate test data
-            let data = generate_controlled_data(*size, 10, 1);
+            let mut data = vec![0u8; *size];
+            fill_controlled_data(&mut data, 10, 1);
             let uri = format!("s3://{}/{}", bucket, key);
             
             // Upload the data
@@ -218,7 +219,8 @@ async fn profile_synthetic_workload() -> Result<()> {
         for &size in &sizes {
             let data_profiler = profile_section(&format!("generate_{}MB", size / (1024 * 1024)))?;
             
-            let data = generate_controlled_data(size, 10, 1);
+            let mut data = vec![0u8; size];
+            fill_controlled_data(&mut data, 10, 1);
             println!("   📊 Generated {} MB of test data", data.len() / (1024 * 1024));
             
             // Optionally save individual flamegraph

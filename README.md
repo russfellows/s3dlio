@@ -1,9 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-178%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-178%2F178-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.37-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-480%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-480%2F480-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.38-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -13,9 +13,90 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 ## 📦 Installation
 
+### Quick Install (Python)
+
 ```bash
 pip install s3dlio
 ```
+
+### Building from Source (Rust)
+
+#### System Dependencies
+
+s3dlio requires several system libraries. Install them before building:
+
+**Ubuntu/Debian:**
+```bash
+# Quick install - run our helper script
+./scripts/install-system-deps.sh
+
+# Or manually:
+sudo apt-get install -y \
+    build-essential pkg-config libssl-dev \
+    libhdf5-dev libhwloc-dev cmake
+```
+
+**RHEL/CentOS/Fedora/Rocky/AlmaLinux:**
+```bash
+# Quick install
+./scripts/install-system-deps.sh
+
+# Or manually:
+sudo dnf install -y \
+    gcc gcc-c++ make pkg-config openssl-devel \
+    hdf5-devel hwloc-devel cmake
+```
+
+**macOS:**
+```bash
+# Quick install
+./scripts/install-system-deps.sh
+
+# Or manually:
+brew install pkg-config openssl@3 hdf5 hwloc cmake
+
+# Set environment variables (add to ~/.zshrc or ~/.bash_profile):
+export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$PKG_CONFIG_PATH"
+export OPENSSL_DIR="$(brew --prefix openssl@3)"
+```
+
+**Arch Linux:**
+```bash
+# Quick install
+./scripts/install-system-deps.sh
+
+# Or manually:
+sudo pacman -S base-devel pkg-config openssl hdf5 hwloc cmake
+```
+
+#### Install Rust (if not already installed)
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+#### Build s3dlio
+
+```bash
+# Clone the repository
+git clone https://github.com/russfellows/s3dlio.git
+cd s3dlio
+
+# Build with all features
+cargo build --release --all-features
+
+# Or build with default features (recommended)
+cargo build --release
+
+# Run tests
+cargo test
+
+# Build Python bindings (optional)
+./build_pyo3.sh
+```
+
+**Note:** The `hwloc` library is optional but recommended for NUMA support on multi-socket systems. s3dlio will build without it but won't have NUMA topology detection.
 
 ## ✨ Key Features
 

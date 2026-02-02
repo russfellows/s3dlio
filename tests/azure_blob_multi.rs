@@ -47,6 +47,7 @@ async fn mk_client() -> Result<AzureBlob> {
 
 
 #[tokio::test]
+#[ignore = "requires Azure credentials (AZURE_BLOB_CONTAINER, AZURE_BLOB_ACCOUNT)"]
 async fn multi_blob_roundtrip_and_cleanup() -> Result<()> {
     // Graceful skip if not configured
     if env::var("AZURE_BLOB_CONTAINER").is_err() ||

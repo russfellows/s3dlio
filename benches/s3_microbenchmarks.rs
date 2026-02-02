@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use s3dlio::{data_gen::generate_controlled_data, s3_utils::*};
-use std::env;
+use s3dlio::data_gen::fill_controlled_data;
+use s3dlio::s3_utils::parse_s3_uri;
 
 /// Benchmark data splitting and buffer management for multipart uploads
 fn bench_multipart_splits(c: &mut Criterion) {
@@ -36,6 +36,8 @@ fn bench_multipart_splits(c: &mut Criterion) {
 }
 
 /// Benchmark data generation performance (baseline for comparison)
+/// 
+/// Uses fill_controlled_data() for optimal performance with the global Rayon pool.
 fn bench_data_generation(c: &mut Criterion) {
     let mut group = c.benchmark_group("data_generation");
     
@@ -47,13 +49,13 @@ fn bench_data_generation(c: &mut Criterion) {
             format!("generate_{}MB", size >> 20),
             &size,
             |b, &size| {
+                // Pre-allocate buffer OUTSIDE iteration
+                let mut buffer = vec![0u8; size];
+                
                 b.iter(|| {
-                    let data = generate_controlled_data(
-                        size,
-                        10, // dedup_factor
-                        1   // compress_factor
-                    );
-                    criterion::black_box(data);
+                    // Fill in-place using global Rayon pool
+                    fill_controlled_data(&mut buffer, 1, 1);
+                    criterion::black_box(&buffer);
                 });
             },
         );

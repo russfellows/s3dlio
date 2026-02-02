@@ -56,6 +56,7 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 #[tokio::test]
+#[ignore = "requires Azure credentials (AZURE_BLOB_CONTAINER, AZURE_BLOB_ACCOUNT)"]
 async fn put_get_list_stat_delete_smoke() -> Result<()> {
     // Skip with a friendly note if not configured
     if env::var("AZURE_BLOB_CONTAINER").is_err()
@@ -100,6 +101,7 @@ async fn put_get_list_stat_delete_smoke() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires Azure credentials (AZURE_BLOB_CONTAINER, AZURE_BLOB_ACCOUNT)"]
 async fn multipart_stream_upload_roundtrip() -> Result<()> {
     // Skip if not configured
     if env::var("AZURE_BLOB_CONTAINER").is_err()
@@ -162,6 +164,7 @@ async fn multipart_stream_upload_roundtrip() -> Result<()> {
 
 /// NEW: validate the ObjectStore factory with both `az://...` and full HTTPS forms.
 #[tokio::test]
+#[ignore = "requires Azure credentials (AZURE_BLOB_CONTAINER, AZURE_BLOB_ACCOUNT)"]
 async fn factory_roundtrip_smoke() -> Result<()> {
     // Skip if not configured
     if env::var("AZURE_BLOB_CONTAINER").is_err()

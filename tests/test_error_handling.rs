@@ -7,7 +7,8 @@
 // NOTE: Some tests are slow (memory pressure, rapid creation). Run with --ignored.
 #![allow(deprecated)]
 
-use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
+use s3dlio::data_gen::DataGenerator;
+use s3dlio::data_gen_alt;
 use std::thread;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration};
@@ -17,11 +18,11 @@ fn test_zero_size_handling() {
     println!("=== Zero Size Handling ===");
     
     // Test zero size generation
-    let data = generate_controlled_data(0, 4, 2);
+    let data = data_gen_alt::generate_controlled_data_alt(0, 4, 2, None).to_vec();
     println!("Zero size single-pass result: {} bytes", data.len());
     
     // Test streaming with zero size
-    let generator = DataGenerator::new();
+    let generator = DataGenerator::new(None);
     let mut obj_gen = generator.begin_object(0, 4, 2);
     let mut total_bytes = 0;
     let mut chunk_count = 0;
@@ -57,7 +58,7 @@ fn test_extreme_parameters() {
         let start = Instant::now();
         
         // Test single-pass (but limit to reasonable time)
-        let data = generate_controlled_data(size, dedup, compress);
+        let data = data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec();
         let generation_time = start.elapsed();
         
         println!("  {} generated {} bytes in {:.2}ms", 
@@ -94,7 +95,7 @@ fn test_memory_pressure() {
             let start = Instant::now();
             
             // Generate large buffer using streaming to control memory usage
-            let generator = DataGenerator::new();
+            let generator = DataGenerator::new(None);
             let mut obj_gen = generator.begin_object(buffer_size, 4, 2);
             let mut total_bytes = 0;
             let mut max_chunk_size = 0;
@@ -153,7 +154,7 @@ fn test_rapid_generator_creation() {
     let mut total_bytes = 0;
     
     for i in 0..num_generators {
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut obj_gen = generator.begin_object(small_size, 2, 2);
         
         while let Some(chunk) = obj_gen.fill_chunk(8192) {
@@ -196,7 +197,7 @@ fn test_chunk_size_variations() {
         object_size + 1, // Larger than object
     ];
     
-    let generator = DataGenerator::new();
+    let generator = DataGenerator::new(None);
     
     for &chunk_size in &chunk_sizes {
         println!("Testing chunk size: {} bytes", chunk_size);
@@ -253,7 +254,7 @@ fn test_streaming_consistency_across_restarts() {
     let chunk_size = 128 * 1024; // 128KB chunks
     
     // Generate in one continuous stream
-    let generator1 = DataGenerator::new();
+    let generator1 = DataGenerator::new(None);
     let mut obj_gen1 = generator1.begin_object(total_size, 4, 2);
     let mut continuous_data = Vec::new();
     
@@ -279,7 +280,7 @@ fn test_streaming_consistency_across_restarts() {
              continuous_data.len());
     
     // Test with different generators (should produce different data)
-    let generator3 = DataGenerator::new();
+    let generator3 = DataGenerator::new(None);
     let mut obj_gen3 = generator3.begin_object(total_size, 4, 2);
     let mut different_data = Vec::new();
     
@@ -292,4 +293,66 @@ fn test_streaming_consistency_across_restarts() {
     
     println!("Different generator produced different data as expected");
     println!("✅ Streaming consistency verified");
+}
+
+#[test]
+fn test_reproducible_generation_with_seed() {
+    println!("\n=== Reproducible Generation with Explicit Seed ===");
+    
+    let seed = 0x123456789ABCDEF0u64;
+    let total_size = 1024 * 1024; // 1MB
+    let chunk_size = 64 * 1024; // 64KB chunks
+    
+    // First generator with explicit seed
+    let generator1 = DataGenerator::new(Some(seed));
+    let mut obj_gen1 = generator1.begin_object(total_size, 4, 2);
+    let mut data1 = Vec::new();
+    
+    while let Some(chunk) = obj_gen1.fill_chunk(chunk_size) {
+        data1.extend(chunk);
+    }
+    
+    println!("Generated {} bytes with seed {:#018X}", data1.len(), seed);
+    
+    // Second generator with same seed (should produce identical data)
+    let generator2 = DataGenerator::new(Some(seed));
+    let mut obj_gen2 = generator2.begin_object(total_size, 4, 2);
+    let mut data2 = Vec::new();
+    
+    while let Some(chunk) = obj_gen2.fill_chunk(chunk_size) {
+        data2.extend(chunk);
+    }
+    
+    // Verify identical output
+    assert_eq!(data1.len(), data2.len(), "Size mismatch for same seed");
+    assert_eq!(data1, data2, "Data mismatch for same seed - not reproducible!");
+    
+    println!("Second generator with same seed produced identical {} bytes", data2.len());
+    
+    // Third generator with different seed (should produce different data)
+    let different_seed = seed + 1;
+    let generator3 = DataGenerator::new(Some(different_seed));
+    let mut obj_gen3 = generator3.begin_object(total_size, 4, 2);
+    let mut data3 = Vec::new();
+    
+    while let Some(chunk) = obj_gen3.fill_chunk(chunk_size) {
+        data3.extend(chunk);
+    }
+    
+    assert_ne!(data1, data3, "Different seeds produced identical data (unexpected)");
+    
+    println!("Different seed {:#018X} produced different data as expected", different_seed);
+    
+    // Verify multiple begin_object calls with same generator instance also work
+    let mut obj_gen1_again = generator1.begin_object(total_size, 4, 2);
+    let mut data1_again = Vec::new();
+    
+    while let Some(chunk) = obj_gen1_again.fill_chunk(chunk_size) {
+        data1_again.extend(chunk);
+    }
+    
+    assert_eq!(data1, data1_again, 
+               "Same generator instance produced different data on second begin_object call");
+    
+    println!("✅ Reproducible generation with explicit seed verified");
 }

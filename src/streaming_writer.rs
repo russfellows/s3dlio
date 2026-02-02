@@ -50,7 +50,7 @@ impl StreamingDataWriter {
         options: WriterOptions,
     ) -> Result<Self> {
         let writer = store.create_writer(uri, options).await?;
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let object_gen = generator.begin_object(size, dedup, compress);
         
         Ok(Self {

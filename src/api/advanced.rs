@@ -95,10 +95,9 @@ pub use crate::s3_utils::get_object_concurrent_range;
 pub use crate::profiling::*;
 
 // Data generation utilities
-/// Generate test data with controlled characteristics (new algorithm - high randomness)
-#[allow(deprecated)]
-pub use crate::data_gen::generate_controlled_data;
-
-/// Generate test data with pseudo-random method (old algorithm - high performance)
-#[allow(deprecated)]
-pub use crate::data_gen::generate_controlled_data_prand;
+// DEPRECATED FUNCTIONS REMOVED - Use fill_controlled_data or data_gen_alt instead
+// Old exports commented out to prevent accidental usage:
+// pub use crate::data_gen::generate_controlled_data;  // REMOVED
+// pub use crate::data_gen::generate_controlled_data_prand;  // REMOVED
+pub use crate::data_gen::fill_controlled_data;
+pub use crate::data_gen_alt::generate_controlled_data_alt;

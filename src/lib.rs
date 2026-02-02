@@ -98,11 +98,12 @@ pub mod adaptive_config;  // Optional adaptive tuning for performance
 mod multipart;
 
 // ===== Legacy Re-exports for Backward Compatibility =====
-// These maintain compatibility with existing code but may be deprecated
-#[allow(deprecated)]
-pub use data_gen::generate_controlled_data;
-#[allow(deprecated)]
-pub use data_gen::generate_controlled_data_prand;  // DEPRECATED: Use fill_controlled_data instead
+// DEPRECATED FUNCTIONS REMOVED - Use fill_controlled_data() or data_gen_alt instead
+// Old exports commented out to prevent accidental usage:
+// #[allow(deprecated)]
+// pub use data_gen::generate_controlled_data;  // REMOVED: Use fill_controlled_data instead
+// #[allow(deprecated)]
+// pub use data_gen::generate_controlled_data_prand;  // REMOVED: Use fill_controlled_data instead
 pub use data_gen::fill_controlled_data;  // Fill-in-place (respects Rayon pool context)
 
 // ===== Re-exports expected by tests/test_dataloader.rs at the crate root =====

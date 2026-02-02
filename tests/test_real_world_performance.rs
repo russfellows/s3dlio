@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use std::time::Instant;
-use s3dlio::data_gen::{generate_controlled_data, DataGenerator};
+use s3dlio::data_gen::DataGenerator;
+use s3dlio::data_gen_alt;
 use anyhow::Result;
 
 /// Real-world performance benchmark for typical s3dlio usage patterns
@@ -70,8 +71,8 @@ async fn benchmark_real_world_scenario(size: usize, dedup: usize, compress: usiz
     
     // Warmup
     for _ in 0..WARMUP_ITERATIONS {
-        let _data = generate_controlled_data(size, dedup, compress);
-        let generator = DataGenerator::new();
+        let _data = data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec();
+        let generator = DataGenerator::new(None);
         let mut object_gen = generator.begin_object(size, dedup, compress);
         let _remaining = object_gen.fill_remaining();
     }
@@ -80,7 +81,7 @@ async fn benchmark_real_world_scenario(size: usize, dedup: usize, compress: usiz
     let mut single_pass_times = Vec::new();
     for _ in 0..ITERATIONS {
         let start = Instant::now();
-        let _data = generate_controlled_data(size, dedup, compress);
+        let _data = data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec();
         single_pass_times.push(start.elapsed());
     }
     
@@ -88,7 +89,7 @@ async fn benchmark_real_world_scenario(size: usize, dedup: usize, compress: usiz
     let mut streaming_times = Vec::new();
     for _ in 0..ITERATIONS {
         let start = Instant::now();
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut object_gen = generator.begin_object(size, dedup, compress);
         
         let chunk_size = 256 * 1024; // Optimal chunk size from previous tests
@@ -218,7 +219,7 @@ async fn test_multiple_8mb_objects_with_dedup_compress() -> Result<()> {
     
     for i in 0..NUM_OBJECTS {
         let obj_start = Instant::now();
-        let data = generate_controlled_data(OBJECT_SIZE, DEDUP_FACTOR, COMPRESS_FACTOR);
+        let data = data_gen_alt::generate_controlled_data_alt(OBJECT_SIZE, DEDUP_FACTOR, COMPRESS_FACTOR, None).to_vec();
         let obj_time = obj_start.elapsed();
         single_pass_objects.push(data.len());
         
@@ -236,7 +237,7 @@ async fn test_multiple_8mb_objects_with_dedup_compress() -> Result<()> {
     
     for i in 0..NUM_OBJECTS {
         let obj_start = Instant::now();
-        let generator = DataGenerator::new();
+        let generator = DataGenerator::new(None);
         let mut object_gen = generator.begin_object(OBJECT_SIZE, DEDUP_FACTOR, COMPRESS_FACTOR);
         
         let mut total_generated = 0;

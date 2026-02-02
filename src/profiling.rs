@@ -28,7 +28,7 @@ static PROFILING_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic:
 #[cfg(feature = "profiling")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 #[cfg(feature = "profiling")]
-use tracing::{warn, debug};
+use tracing::{info, warn, debug};
 
 #[cfg(not(feature = "profiling"))]
 use tracing::{warn, debug};
