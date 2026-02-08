@@ -725,12 +725,24 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyBytes>) -> PyResu
     })
 }
 
-/// Async version of put_bytes()
+/// Async version of put_bytes() - accepts BytesView (zero-copy via Arc clone) or PyBytes (copied)
 #[pyfunction]
-fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyBytes>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
-    // We need to copy the data for the async future since PyBytes can't be sent across threads
-    let data_owned = Bytes::copy_from_slice(data.as_bytes());
+    
+    // Try to extract BytesView first (zero-copy via Arc clone)
+    let data_owned = if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
+        // Zero-copy: Clone the Arc-based Bytes (cheap pointer increment, no data copy)
+        bytes_view.bytes.clone()
+    } else if let Ok(py_bytes) = data.cast::<PyBytes>() {
+        // Fallback: Copy data from PyBytes
+        // We need to copy because PyBytes can't be sent across threads
+        Bytes::copy_from_slice(py_bytes.as_bytes())
+    } else {
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "data must be BytesView or bytes"
+        ));
+    };
     
     future_into_py(py, async move {
         let logger = global_logger();
