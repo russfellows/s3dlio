@@ -10,6 +10,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3::ffi;
+use pyo3::buffer::PyBuffer;
 use bytes::Bytes;
 
 use tokio::task;
@@ -1164,29 +1165,87 @@ pub struct PyObjectWriter {
 
 #[pymethods]
 impl PyObjectWriter {
-    /// Write a chunk of bytes to the stream
-    fn write_chunk(&mut self, data: &Bound<'_, PyBytes>) -> PyResult<()> {
+    /// Write a chunk of bytes to the stream (ZERO-COPY via buffer protocol)
+    /// 
+    /// Accepts any Python object supporting the buffer protocol:
+    /// - bytes, bytearray, memoryview
+    /// - NumPy arrays, PyTorch tensors
+    /// - Any object with __buffer__ method
+    /// 
+    /// This method avoids copying data from Python to Rust by using PyBuffer
+    /// to get a direct view of Python's memory during the synchronous write.
+    fn write_chunk(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let writer = self.inner.as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
         
-        let bytes = data.as_bytes().to_vec();
-
-        pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-            writer.write_chunk(&bytes).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to write chunk: {}", e)))
-        })
+        // Try buffer protocol first (zero-copy path)
+        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
+            // Get readonly slice - no copy!
+            let slice = unsafe {
+                // SAFETY: We hold the buffer for the entire duration of block_on,
+                // so the memory remains valid. The GIL is held during block_on.
+                std::slice::from_raw_parts(
+                    buffer.buf_ptr() as *const u8,
+                    buffer.len_bytes()
+                )
+            };
+            
+            // Synchronous write while buffer is alive
+            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                writer.write_chunk(slice).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to write chunk: {}", e)))
+            });
+        }
+        
+        // Fallback for PyBytes (shouldn't happen, but safe)
+        if let Ok(bytes) = data.cast::<PyBytes>() {
+            let slice = bytes.as_bytes();
+            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                writer.write_chunk(slice).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to write chunk: {}", e)))
+            });
+        }
+        
+        Err(PyRuntimeError::new_err(
+            "write_chunk requires bytes-like object (bytes, bytearray, memoryview, numpy array, etc.)"
+        ))
     }
     
-    fn write_owned_bytes(&mut self, data: &Bound<'_, PyBytes>) -> PyResult<()> {
+    /// Write owned bytes (converts buffer protocol object to owned Vec for async)
+    /// 
+    /// This method copies data but takes ownership, useful when the caller
+    /// doesn't need the buffer anymore. For true zero-copy, use write_chunk().
+    fn write_owned_bytes(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let writer = self.inner.as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
         
-        let bytes = data.as_bytes().to_vec();
+        // Try buffer protocol
+        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
+            let len = buffer.len_bytes();
+            let mut vec = Vec::<u8>::with_capacity(len);
+            unsafe { vec.set_len(len); }
+            
+            buffer.copy_to_slice(data.py(), &mut vec[..])
+                .map_err(|e| PyRuntimeError::new_err(format!("Buffer copy failed: {}", e)))?;
+            
+            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                writer.write_owned_bytes(vec).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e)))
+            });
+        }
         
-        pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-            writer.write_owned_bytes(bytes).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e)))
-        })
+        // Fallback for PyBytes
+        if let Ok(bytes) = data.cast::<PyBytes>() {
+            let vec = bytes.as_bytes().to_vec();
+            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                writer.write_owned_bytes(vec).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e)))
+            });
+        }
+        
+        Err(PyRuntimeError::new_err(
+            "write_owned_bytes requires bytes-like object"
+        ))
     }
     
     /// Finalize the writer and complete the upload
