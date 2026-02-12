@@ -8,41 +8,40 @@
 //! This module provides TRUE zero-copy data generation for Python by implementing
 //! the buffer protocol. Python code can use memoryview() for zero-copy access.
 
-use bytes::Bytes;
 use pyo3::buffer::PyBuffer;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::data_gen_alt::{
-    default_data_gen_threads, generate_controlled_data_alt, total_cpus,
+    default_data_gen_threads, total_cpus, DataBuffer, DataGenerator,
 };
 
 // =============================================================================
 // Zero-Copy Buffer Support
 // =============================================================================
 
-/// A Python-visible wrapper around bytes::Bytes that exposes buffer protocol.
+/// A Python-visible wrapper around DataBuffer (UMA or NUMA) that exposes buffer protocol.
 /// This allows Python code to get a memoryview without copying data.
 ///
-/// Implements the Python buffer protocol via __getbuffer__ and __releasebuffer__
-/// so that `memoryview(data)` works directly with zero-copy access.
+/// ZERO-COPY: Python accesses the NUMA-allocated memory directly via raw pointer!
+/// This matches dgen-rs implementation for maximum performance.
 #[pyclass(name = "BytesView")]
 pub struct PyBytesView {
-    /// The underlying Bytes (reference-counted, cheap to clone)
-    bytes: Bytes,
+    /// The underlying DataBuffer (Vec for UMA, hwlocality Bytes for NUMA)
+    buffer: DataBuffer,
 }
 
 #[pymethods]
 impl PyBytesView {
     /// Get the length of the data
     fn __len__(&self) -> usize {
-        self.bytes.len()
+        self.buffer.len()
     }
 
     /// Support bytes() conversion - returns a copy
     fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.bytes)
+        PyBytes::new(py, self.buffer.as_slice())
     }
 
     /// Implement Python buffer protocol for zero-copy access.
@@ -61,12 +60,14 @@ impl PyBytesView {
             ));
         }
 
-        let bytes = &slf.bytes;
+        let buffer = &slf.buffer;
+        let len = buffer.len();
+        let ptr = buffer.as_ptr();
 
-        // Fill in the Py_buffer struct
+        // Fill in the Py_buffer struct with DataBuffer's raw pointer
         unsafe {
-            (*view).buf = bytes.as_ptr() as *mut std::os::raw::c_void;
-            (*view).len = bytes.len() as isize;
+            (*view).buf = ptr as *mut std::os::raw::c_void;
+            (*view).len = len as isize;
             (*view).readonly = 1;
             (*view).itemsize = 1;
 
@@ -97,7 +98,8 @@ impl PyBytesView {
             (*view).internal = std::ptr::null_mut();
 
             // CRITICAL: Store a reference to the PyBytesView object
-            // This prevents the Bytes data from being deallocated while the buffer is in use
+            // This prevents the DataBuffer (Vec or NUMA Bytes) from being deallocated
+            // while the Python memoryview is in use
             // Note: Cast is intentionally explicit for PyO3 FFI compatibility across versions
             #[allow(clippy::unnecessary_cast)]
             {
@@ -110,10 +112,10 @@ impl PyBytesView {
     }
 
     /// Release the buffer - called when the memoryview is garbage collected.
-    /// We don't need to do anything here since the Bytes is reference-counted.
+    /// Python decrefs view.obj which will eventually drop the PyBytesView and DataBuffer
     unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
         // Nothing to do - the Py_DECREF on view.obj will be handled by Python
-        // and will eventually drop the PyBytesView (and thus the Bytes) when refcount hits 0
+        // and will eventually drop the PyBytesView (and thus the DataBuffer) when refcount hits 0
     }
 }
 
@@ -154,13 +156,25 @@ fn generate_data(
     compress: usize,
 ) -> PyResult<Py<PyBytesView>> {
     // Generate data WITHOUT holding GIL (allows parallel Python threads)
-    let data = py.detach(|| generate_controlled_data_alt(size, dedup, compress, None));
-
-    // Convert Vec<u8> to Bytes (cheap, just wraps the Vec's heap allocation)
-    let bytes = Bytes::from(data);
+    let buffer = py.detach(|| {
+        use crate::data_gen_alt::{GeneratorConfig, generate_data as gen_data, NumaMode};
+        
+        let config = GeneratorConfig {
+            size,
+            dedup_factor: dedup,
+            compress_factor: compress,
+            numa_mode: NumaMode::Auto,
+            max_threads: Some(default_data_gen_threads()),
+            numa_node: None,
+            block_size: None,
+            seed: None,
+        };
+        
+        gen_data(config)  // Returns DataBuffer directly - NO copies!
+    });
 
     // Return BytesView - Python can use memoryview() for TRUE zero-copy access
-    Py::new(py, PyBytesView { bytes })
+    Py::new(py, PyBytesView { buffer })
 }
 
 /// Generate random data with custom thread count (ZERO-COPY)
@@ -194,8 +208,8 @@ fn generate_data_with_threads(
     let num_threads = threads.unwrap_or_else(default_data_gen_threads);
 
     // Generate with custom thread count, WITHOUT holding GIL
-    let data = py.detach(|| {
-        use crate::data_gen_alt::{GeneratorConfig, generate_data_with_config, NumaMode};
+    let buffer = py.detach(|| {
+        use crate::data_gen_alt::{GeneratorConfig, generate_data, NumaMode};
         
         let config = GeneratorConfig {
             size,
@@ -208,12 +222,11 @@ fn generate_data_with_threads(
             seed: None,
         };
         
-        generate_data_with_config(config)
+        generate_data(config)  // Returns DataBuffer directly - NO 16GB copy to bytes::Bytes!
     });
 
-    // Convert to Bytes and return BytesView for zero-copy access
-    let bytes = Bytes::from(data);
-    Py::new(py, PyBytesView { bytes })
+    // Return BytesView for zero-copy access (no conversion needed!)
+    Py::new(py, PyBytesView { buffer })
 }
 
 /// Generate data directly into existing Python buffer (ZERO-COPY WRITE)
@@ -269,9 +282,9 @@ fn generate_into_buffer(
     let size = buf.len_bytes();
     let num_threads = threads.unwrap_or_else(default_data_gen_threads);
 
-    // Generate data
-    let data = py.detach(|| {
-        use crate::data_gen_alt::{GeneratorConfig, generate_data_with_config, NumaMode};
+    // Generate data directly into DataBuffer (NO intermediate bytes::Bytes conversion!)
+    let data_buffer = py.detach(|| {
+        use crate::data_gen_alt::{GeneratorConfig, generate_data, NumaMode};
         
         let config = GeneratorConfig {
             size,
@@ -284,13 +297,13 @@ fn generate_into_buffer(
             seed: None,
         };
         
-        generate_data_with_config(config)
+        generate_data(config)  // Returns DataBuffer directly - NO 16GB copy to bytes::Bytes!
     });
 
-    // Write into buffer (zero-copy write)
+    // Write into buffer (single copy only - can't avoid this since user provided the buffer)
     unsafe {
         let dst_ptr = buf.buf_ptr() as *mut u8;
-        std::ptr::copy_nonoverlapping(data.as_ptr(), dst_ptr, size);
+        std::ptr::copy_nonoverlapping(data_buffer.as_ptr(), dst_ptr, size);
     }
 
     Ok(size)
@@ -335,12 +348,144 @@ fn py_total_cpus() -> usize {
 }
 
 // =============================================================================
+// Streaming Generator API
+// =============================================================================
+
+/// Streaming data generator for efficient chunk-by-chunk generation
+///
+/// This class allows you to generate large amounts of data incrementally,
+/// reusing the same generator state for optimal performance. Perfect for
+/// benchmarking and testing scenarios where you need to fill buffers repeatedly.
+///
+/// # Example
+/// ```python
+/// import s3dlio
+///
+/// # Create generator for 16 GB
+/// gen = s3dlio.Generator(size=16 * 1024**3, dedup=1, compress=1)
+///
+/// # Generate in chunks
+/// buf = bytearray(100 * 1024**2)  # 100 MB buffer
+/// total = 0
+///
+/// while not gen.is_complete():
+///     nbytes = gen.fill_chunk(buf)
+///     if nbytes == 0:
+///         break
+///     total += nbytes
+///     # Use buf[: nbytes]...
+///
+/// print(f"Generated {total} bytes")
+/// ```
+#[pyclass(name = "Generator")]
+struct PyGenerator {
+    inner: DataGenerator,
+    chunk_size: usize,
+}
+
+#[pymethods]
+impl PyGenerator {
+    /// Create new streaming generator
+    ///
+    /// # Arguments
+    /// * `size` - Total bytes to generate
+    /// * `dedup` - Deduplication factor (1 = no dedup, 2 = 2:1 ratio, etc.)
+    /// * `compress` - Compression factor (1 = incompressible, 2 = 2:1 ratio, etc.)
+    /// * `threads` - Maximum threads to use (None = use default)
+    /// * `chunk_size` - Recommended chunk size for fill_chunk() (default: 32 MB)
+    /// * `seed` - Random seed for reproducible data (None = non-deterministic)
+    #[new]
+    #[pyo3(signature = (size, dedup=1, compress=1, threads=None, chunk_size=None, seed=None))]
+    fn new(
+        size: usize,
+        dedup: usize,
+        compress: usize,
+        threads: Option<usize>,
+        chunk_size: Option<usize>,
+        seed: Option<u64>,
+    ) -> PyResult<Self> {
+        use crate::data_gen_alt::{GeneratorConfig, NumaMode};
+        
+        let config = GeneratorConfig {
+            size,
+            dedup_factor: dedup,
+            compress_factor: compress,
+            numa_mode: NumaMode::Auto,
+            max_threads: threads,
+            numa_node: None,
+            block_size: None,
+            seed,
+        };
+
+        let chunk_size = chunk_size.unwrap_or_else(DataGenerator::recommended_chunk_size);
+
+        Ok(Self {
+            inner: DataGenerator::new(config),
+            chunk_size,
+        })
+    }
+
+    /// Get recommended chunk size for optimal performance
+    #[getter]
+    fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Fill the next chunk of data (ZERO-COPY WRITE)
+    ///
+    /// # Arguments
+    /// * `buffer` - Pre-allocated buffer to fill
+    ///
+    /// # Returns
+    /// Number of bytes written (0 when complete)
+    fn fill_chunk(&mut self, py: Python<'_>, buffer: Py<PyAny>) -> PyResult<usize> {
+        let buf: PyBuffer<u8> = PyBuffer::get(buffer.bind(py))?;
+
+        if buf.readonly() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Buffer must be writable",
+            ));
+        }
+
+        if !buf.is_c_contiguous() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Buffer must be C-contiguous",
+            ));
+        }
+
+        let size = buf.len_bytes();
+
+        // Generate DIRECTLY into Python buffer without holding GIL
+        let written = py.detach(|| {
+            unsafe {
+                let dst_ptr = buf.buf_ptr() as *mut u8;
+                let dst_slice = std::slice::from_raw_parts_mut(dst_ptr, size);
+                self.inner.fill_chunk(dst_slice)
+            }
+        });
+
+        Ok(written)
+    }
+
+    /// Check if generation is complete
+    fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+
+    /// Reset generator to start
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
+// =============================================================================
 // Module Registration
 // =============================================================================
 
 pub fn register_datagen_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Register BytesView class
+    // Register classes
     m.add_class::<PyBytesView>()?;
+    m.add_class::<PyGenerator>()?;
     
     // Register data generation functions
     m.add_function(wrap_pyfunction!(generate_data, m)?)?;

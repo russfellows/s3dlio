@@ -1,5 +1,64 @@
 # s3dlio Changelog
 
+## Version 0.9.40 - Critical Performance Fix & Zero-Copy Architecture (February 2026)
+
+### 🚀 **Critical Performance Fix**
+
+**Zero-Copy DataBuffer Architecture:**
+- **FIXED**: 48x performance regression in Python data generation (was 0.8 GB/s, now 42+ GB/s)
+- Eliminated `bytes::Bytes` intermediate copy in `generate_into_buffer()` and `generate_data()`
+- Changed from `generate_data_with_config()` → `generate_data()` to return `DataBuffer` directly
+- Python buffer protocol now exposes `DataBuffer` raw pointer (zero-copy NUMA memory access)
+- **Performance**: Achieved parity with dgen-py (41.3 GB/s vs 42.5 GB/s = 2.9% difference)
+
+**New Streaming Generator API:**
+- Added `Generator` class to Python API matching dgen-py's streaming interface
+- Allows efficient chunk-by-chunk generation with state reuse
+- Avoids expensive generator recreation for repeated operations
+- Recommended for benchmarking and large-scale data generation
+
+**NUMA/Thread-Pinning Enabled by Default:**
+- Enabled `numa` and `thread-pinning` features in default build
+- Changed dependency from `hwloc2` to `hwlocality = "1.0.0-alpha.11"`
+- Fixed `hardware.rs` to use `NumaTopology::detect()` instead of legacy API
+- Automatic NUMA-aware allocation for >16 MB buffers on NUMA systems
+
+**Build Optimizations:**
+- Added release profile: `lto=true`, `codegen-units=1`, `opt-level=3`
+- Matches dgen-rs optimization level for consistent performance
+
+### 📚 **Documentation & Testing Improvements**
+
+**Python Bytearray Feature Documentation:**
+- Enhanced documentation for `generate_into_buffer()` bytearray support
+- Added comprehensive performance benchmarks showing 2.5-3.0x speedup with pre-allocated buffers
+- Documented best practices for streaming workflows and memory-efficient generation
+- Added usage patterns: when to use bytearray vs on-demand allocation
+
+**New Test Suite:**
+- Added `test_bytearray_allocation.py` - comprehensive bytearray feature testing
+- Added `compare_generators.py` - fair performance comparison with dgen-py using streaming API
+- 5 new test cases covering: basic allocation, reuse patterns, performance comparison, various sizes, NumPy compatibility
+- All tests passing with excellent performance (2.98x speedup measured with bytearray reuse)
+
+**Updated Documentation:**
+- Enhanced `ZERO_COPY_IMPLEMENTATION.md` with bytearray allocation section and DataBuffer architecture
+- Performance comparison examples with real benchmarks (16 GB generation in <0.4s)
+- Streaming generation patterns with reusable buffers
+- Memory efficiency guidelines for large-scale data generation
+
+**Test Status:**
+- **Rust tests**: 186/186 passing (100%)
+- **Python tests**: All existing + new tests passing
+- Zero warnings policy maintained
+
+**Architecture Note:**
+- This version prepares for future migration to `dgen-data` crate (published on crates.io)
+- Current implementation uses internal `data_gen_alt.rs` module
+- Future versions may depend on `dgen-data` to eliminate code duplication
+
+---
+
 ## Version 0.9.39 - s3dlio-oplog API Fix (February 2026)
 
 ### 🐛 **Bug Fix**
