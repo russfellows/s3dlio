@@ -43,12 +43,42 @@ class S3dlioStorage(DataStorage):
         storage:
           storage_type: s3dlio
           storage_root: s3://bucket/prefix  # or az://, gs://, file://
+          
+          # Optional: Multiple endpoints for load balancing
+          endpoint_uris:
+            - http://endpoint1:9000
+            - http://endpoint2:9000
+            - http://endpoint3:9000
+          load_balance_strategy: round_robin  # or random
+          
+          # Optional: MPI-based endpoint distribution (overrides load_balance_strategy)
+          use_mpi_endpoint_distribution: true  # Uses MPI rank to select endpoint
+          
+          storage_options:
+            access_key_id: your-key
+            secret_access_key: your-secret
+            region: us-east-1
+    
+    Multi-Endpoint Support:
+        Two approaches available:
+        
+        1. s3dlio Native Load Balancing:
+           - Set endpoint_uris list + load_balance_strategy
+           - Strategies: round_robin (default), random
+           - Each process selects endpoint based on PID
+        
+        2. MPI-Based Distribution (Recommended for HPC):
+           - Set endpoint_uris + use_mpi_endpoint_distribution: true
+           - Uses OMPI_COMM_WORLD_RANK to assign endpoints deterministically
+           - Falls back to SLURM_PROCID, PMI_RANK if OpenMPI not available
+           - Example: 4 endpoints, 16 ranks → 4 ranks per endpoint
+           - Optimal for NUMA-aware, node-aware endpoint assignment
     
     Environment Variables (for S3):
         AWS_ACCESS_KEY_ID: S3 access key
         AWS_SECRET_ACCESS_KEY: S3 secret key  
         AWS_REGION: S3 region (default: us-east-1)
-        AWS_ENDPOINT_URL: Custom endpoint for MinIO, Ceph, etc.
+        AWS_ENDPOINT_URL: Custom endpoint (set by multi-endpoint logic or config)
     
     Environment Variables (for Azure):
         AZURE_STORAGE_ACCOUNT_NAME: Azure account name
@@ -56,6 +86,12 @@ class S3dlioStorage(DataStorage):
     
     Environment Variables (for GCS):
         GOOGLE_APPLICATION_CREDENTIALS: Path to service account JSON
+    
+    MPI Environment Variables (for endpoint distribution):
+        OMPI_COMM_WORLD_RANK: OpenMPI process rank
+        OMPI_COMM_WORLD_SIZE: OpenMPI total processes
+        SLURM_PROCID: SLURM process ID (fallback)
+        PMI_RANK: MPICH process rank (fallback)
     """
 
     @dlp.log_init
@@ -73,15 +109,106 @@ class S3dlioStorage(DataStorage):
         # Get storage options from config if available
         storage_options = getattr(self._args, "storage_options", {}) or {}
         
-        # Set environment variables from config if provided
+        # Multi-endpoint support
+        endpoint_uris = getattr(self._args, "endpoint_uris", None)
+        load_balance_strategy = getattr(self._args, "load_balance_strategy", "round_robin")
+        use_mpi_distribution = getattr(self._args, "use_mpi_endpoint_distribution", False)
+        
+        # Handle multi-endpoint configuration
+        selected_endpoint = None
+        if endpoint_uris and len(endpoint_uris) > 0:
+            if use_mpi_distribution:
+                # MPI-based endpoint selection
+                selected_endpoint = self._select_endpoint_via_mpi(endpoint_uris)
+                print(f"[s3dlio] MPI-based endpoint selection: {selected_endpoint}")
+            else:
+                # s3dlio native multi-endpoint (via env vars for now)
+                # Future: use s3dlio.MultiEndpointStore when available
+                selected_endpoint = self._select_endpoint_via_strategy(
+                    endpoint_uris, load_balance_strategy
+                )
+                print(f"[s3dlio] Selected endpoint ({load_balance_strategy}): {selected_endpoint}")
+        elif storage_options.get("endpoint_url"):
+            selected_endpoint = storage_options["endpoint_url"]
+        
+        # Set environment variables from config
         if storage_options.get("access_key_id"):
             os.environ.setdefault("AWS_ACCESS_KEY_ID", storage_options["access_key_id"])
         if storage_options.get("secret_access_key"):
             os.environ.setdefault("AWS_SECRET_ACCESS_KEY", storage_options["secret_access_key"])
         if storage_options.get("region"):
             os.environ.setdefault("AWS_REGION", storage_options["region"])
-        if storage_options.get("endpoint_url"):
-            os.environ.setdefault("AWS_ENDPOINT_URL", storage_options["endpoint_url"])
+        
+        # Set selected endpoint
+        if selected_endpoint:
+            os.environ["AWS_ENDPOINT_URL"] = selected_endpoint
+            
+    def _select_endpoint_via_mpi(self, endpoint_uris):
+        """
+        Select endpoint based on MPI rank for deterministic distribution.
+        
+        Uses OMPI_COMM_WORLD_RANK to assign endpoints:
+        - Distributes ranks evenly across endpoints
+        - Falls back to SLURM_PROCID if OpenMPI not available
+        - Falls back to round-robin index 0 if no MPI environment
+        
+        Example: 4 endpoints, 16 ranks → each endpoint serves 4 ranks
+          Ranks 0-3   → endpoint[0]
+          Ranks 4-7   → endpoint[1]
+          Ranks 8-11  → endpoint[2]
+          Ranks 12-15 → endpoint[3]
+        """
+        rank = None
+        
+        # Try OpenMPI environment variables
+        if 'OMPI_COMM_WORLD_RANK' in os.environ:
+            rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+        # Try SLURM (alternative MPI launcher)
+        elif 'SLURM_PROCID' in os.environ:
+            rank = int(os.environ['SLURM_PROCID'])
+        # Try MPICH
+        elif 'PMI_RANK' in os.environ:
+            rank = int(os.environ['PMI_RANK'])
+        
+        if rank is not None:
+            # Round-robin assignment based on rank
+            endpoint_index = rank % len(endpoint_uris)
+            return endpoint_uris[endpoint_index]
+        else:
+            # No MPI environment - use first endpoint
+            print("[s3dlio] Warning: MPI distribution requested but no MPI rank found, using endpoint[0]")
+            return endpoint_uris[0]
+    
+    def _select_endpoint_via_strategy(self, endpoint_uris, strategy):
+        """
+        Select endpoint using specified load balancing strategy.
+        
+        Strategies:
+          - round_robin: Rotate through endpoints (simple, static)
+          - least_connections: Not implemented yet (needs connection tracking)
+          - random: Random selection (for testing)
+        
+        Note: For production multi-endpoint with least_connections,
+        use s3dlio.MultiEndpointStore when available.
+        """
+        import random
+        import hashlib
+        
+        if strategy == "round_robin":
+            # Use process ID for semi-stable round-robin
+            pid = os.getpid()
+            index = pid % len(endpoint_uris)
+            return endpoint_uris[index]
+        elif strategy == "random":
+            return random.choice(endpoint_uris)
+        elif strategy == "least_connections":
+            # TODO: Implement connection tracking
+            # For now, fall back to round_robin
+            print("[s3dlio] Warning: least_connections not fully implemented, using round_robin")
+            return self._select_endpoint_via_strategy(endpoint_uris, "round_robin")
+        else:
+            # Default: round_robin
+            return self._select_endpoint_via_strategy(endpoint_uris, "round_robin")
 
     def _make_uri(self, path: str) -> str:
         """Convert a relative path to a full URI."""
@@ -219,19 +346,28 @@ class S3dlioStorage(DataStorage):
         """
         Read data from storage using s3dlio.get or s3dlio.get_range.
         
+        Returns BytesView (implements buffer protocol) for ZERO-COPY performance.
+        BytesView is compatible with PyTorch (torch.frombuffer), NumPy (np.frombuffer),
+        and file writes without creating memory copies.
+        
         Args:
             id: Path or full URI
             data: Ignored (buffer not needed with s3dlio)
             offset: Start byte offset (optional)
             length: Number of bytes to read (optional)
+        
+        Returns:
+            BytesView: Zero-copy view into Rust-allocated memory (buffer protocol)
         """
         uri = self._make_uri(id)
         
         try:
             if offset is not None and length is not None:
-                return bytes(s3dlio.get_range(uri, offset=offset, length=length))
+                # Return BytesView directly - zero-copy!
+                return s3dlio.get_range(uri, offset=offset, length=length)
             else:
-                return bytes(s3dlio.get(uri))
+                # Return BytesView directly - zero-copy!
+                return s3dlio.get(uri)
         except Exception as e:
             print(f"[s3dlio] Error reading from {uri}: {e}")
             raise

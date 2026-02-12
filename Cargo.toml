@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.39"
+version = "0.9.40"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -132,7 +132,7 @@ reqwest = { version = "0.12", features = ["rustls-tls", "http2", "hickory-dns"],
 nix = { version = "0.29", features = ["fs"], optional = true }  # For O_DIRECT and positioned I/O
 
 # --- NUMA topology detection and thread pinning (optional) ------------------
-hwloc2 = { version = "2.2", optional = true }           # NUMA topology detection
+hwlocality = { version = "1.0.0-alpha.11", optional = true }  # NUMA topology detection (matches dgen-rs)
 core_affinity = { version = "0.8", optional = true }    # Thread pinning to CPU cores
 
 # --- Profiling (optional, enabled via "profiling" feature) ---------------
@@ -150,7 +150,7 @@ criterion     = { version = "0.5", features = ["html_reports"] }
 
 [features]
 #default = []
-default = ["s3", "native-backends", "gcs-community"]
+default = ["s3", "native-backends", "gcs-community", "numa", "thread-pinning"]
 s3 = []
 native-backends = []                    # Current AWS/Azure implementations
 gcs-community = ["dep:gcloud-storage"]  # Community-maintained GCS client (default)
@@ -158,7 +158,7 @@ gcs-official = ["dep:google-cloud-storage", "dep:google-cloud-gax"]  # Official 
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
 enhanced-http = ["dep:reqwest"]      # Enhanced HTTP client with HTTP/2 support
 direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
-numa = ["dep:hwloc2"]                # NUMA topology detection
+numa = ["dep:hwlocality"]  # NUMA topology detection (matches dgen-rs)
 thread-pinning = ["dep:core_affinity"]  # CPU core affinity for thread pinning
 profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always available
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
@@ -181,3 +181,7 @@ harness = false
 name = "simple_test"
 harness = false
 
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

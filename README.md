@@ -1,9 +1,9 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-480%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-480%2F480-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.39-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Tests](https://img.shields.io/badge/tests-186%20passing-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-186%2F186-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.40-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -103,20 +103,21 @@ cargo test
 - **5+ GB/s Performance**: High-throughput S3 reads, 2.5+ GB/s writes
 - **Zero-Copy Architecture**: `bytes::Bytes` throughout for minimal memory overhead
 - **Multi-Protocol**: S3, Azure Blob, GCS, file://, direct:// (O_DIRECT)
-- **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3)
+- **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
 - **Multi-Endpoint Load Balancing**: RoundRobin/LeastConnections across storage endpoints
 - **AI/ML Ready**: PyTorch DataLoader integration, TFRecord/NPZ format support
 - **High-Speed Data Generation**: 50+ GB/s test data with configurable compression/dedup
 
 ## 🌟 Latest Release
 
-**v0.9.37** (January 2026) - Test suite modernization, zero build warnings.
+**v0.9.40** (February 2026) - Python bytearray documentation & testing improvements.
 
 **Recent highlights:**
+- **v0.9.40** - Enhanced Python bytearray documentation with performance benchmarks (2.5-3x speedup)
+- **v0.9.37** - Test suite modernization, zero build warnings
 - **v0.9.36** - **BREAKING**: `ObjectStore::put()` now takes `Bytes` instead of `&[u8]` for true zero-copy
 - **v0.9.35** - Hardware detection module, 50+ GB/s data generation
 - **v0.9.30** - Zero-copy refactor, PyO3 0.27 migration
-- **v0.9.27** - First PyPI release, DLIO Benchmark integration
 
 📖 **[Complete Changelog](docs/Changelog.md)** - Full version history, migration guides, API details
 

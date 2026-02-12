@@ -219,23 +219,19 @@ pub fn is_numa_available() -> bool {
 /// ```
 #[cfg(feature = "numa")]
 pub fn detect_numa_topology() -> Option<crate::numa::NumaTopology> {
-    use hwlocality::Topology;
-    
-    match Topology::new() {
-        Ok(topo) => {
-            let nodes = crate::numa::get_numa_nodes(&topo);
-            if nodes.is_empty() {
-                tracing::debug!("NUMA topology available but no nodes found");
-                None
-            } else {
-                Some(crate::numa::NumaTopology {
-                    num_nodes: nodes.len(),
-                    nodes,
-                })
-            }
+    match crate::numa::NumaTopology::detect() {
+        Ok(topology) => {
+            tracing::debug!(
+                "NUMA topology detected: {} nodes, {} physical cores, {} logical CPUs, UMA={}",
+                topology.num_nodes,
+                topology.physical_cores,
+                topology.logical_cpus,
+                topology.is_uma
+            );
+            Some(topology)
         }
         Err(e) => {
-            tracing::debug!("NUMA topology not available: {}", e);
+            tracing::debug!("NUMA topology detection failed: {}", e);
             None
         }
     }

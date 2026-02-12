@@ -243,8 +243,11 @@ pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> V
 ///
 /// # Example
 /// ```rust
-/// // 100MB incompressible data using fast pseudo-random method
-/// let data = generate_controlled_data_prand(100 * 1024 * 1024, 1, 1);
+/// use s3dlio::fill_controlled_data;
+/// 
+/// // 100MB incompressible data using fast fill-in-place
+/// let mut data = vec![0u8; 100 * 1024 * 1024];
+/// fill_controlled_data(&mut data, 1, 1);
 /// ```
 ///
 // ============================================================================
@@ -580,7 +583,7 @@ impl DataGenerator {
     /// # Examples
     /// 
     /// ```rust
-    /// use s3dlio::DataGenerator;
+    /// use s3dlio::data_gen::DataGenerator;
     /// 
     /// // Default: use system entropy (unique data per instance)
     /// let gen1 = DataGenerator::new(None);

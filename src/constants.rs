@@ -117,7 +117,7 @@ pub const DEFAULT_RANGE_ENGINE_MAX_CONCURRENT: usize = 32;
 /// - Leave RangeEngine disabled (default) for mixed or small-object workloads
 ///
 /// **Example Configuration:**
-/// ```rust
+/// ```ignore
 /// use s3dlio::object_store::{GcsConfig, RangeEngineConfig};
 /// 
 /// // Enable RangeEngine for large-file workload

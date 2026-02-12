@@ -13,20 +13,26 @@
 //!
 //! ## Simple usage with round-robin:
 //! ```no_run
+//! # use anyhow::Result;
 //! use s3dlio::multi_endpoint::{MultiEndpointStore, LoadBalanceStrategy};
 //!
+//! # fn main() -> Result<()> {
 //! let uris = vec![
 //!     "s3://endpoint1:9000/bucket/".to_string(),
 //!     "s3://endpoint2:9000/bucket/".to_string(),
 //!     "s3://endpoint3:9000/bucket/".to_string(),
 //! ];
 //! let store = MultiEndpointStore::new(uris, LoadBalanceStrategy::RoundRobin, None)?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Advanced usage with per-endpoint thread configuration:
 //! ```no_run
+//! # use anyhow::Result;
 //! use s3dlio::multi_endpoint::{MultiEndpointStore, MultiEndpointStoreConfig, EndpointConfig, LoadBalanceStrategy};
 //!
+//! # fn main() -> Result<()> {
 //! let config = MultiEndpointStoreConfig {
 //!     endpoints: vec![
 //!         EndpointConfig {
@@ -44,6 +50,8 @@
 //!     default_thread_count: Some(16),  // Fallback for endpoints without explicit config
 //! };
 //! let store = MultiEndpointStore::from_config(config)?;
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::object_store::{ObjectStore, store_for_uri, ObjectMetadata};
