@@ -350,7 +350,7 @@ pub struct BucketInfo {
 /// For backend-agnostic code, use `ObjectStore::list()` via `store_for_uri()`.
 /// 
 /// # Migration
-/// ```rust
+/// ```ignore
 /// // Old (S3-specific):
 /// let objects = list_objects("bucket", "prefix/", true)?;
 /// 

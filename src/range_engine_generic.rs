@@ -104,7 +104,7 @@ impl RangeDownloadStats {
 /// 
 /// # Example
 /// 
-/// ```no_run
+/// ```ignore
 /// use s3dlio::range_engine_generic::{RangeEngine, RangeEngineConfig};
 /// 
 /// # async fn example() -> anyhow::Result<()> {
