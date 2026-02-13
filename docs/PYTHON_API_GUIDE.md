@@ -1,21 +1,26 @@
 # s3dlio Python API Guide
 
-**Version:** 0.9.25  
-**Last Updated:** December 9, 2025
+**Version:** 0.9.50  
+**Last Updated:** February 13, 2026
 
 ## Table of Contents
 
 1. [Installation](#installation)
 2. [Quick Start](#quick-start)
-3. [Core Storage Operations](#core-storage-operations)
-4. [Multi-Backend Support](#multi-backend-support)
-5. [Multi-Endpoint Load Balancing](#multi-endpoint-load-balancing)
-6. [Streaming API](#streaming-api)
-7. [AI/ML Integration](#aiml-integration)
-8. [Checkpoint System](#checkpoint-system)
-9. [Advanced Features](#advanced-features)
-10. [Performance Optimization](#performance-optimization)
-11. [API Reference](#api-reference)
+3. [Architecture](#architecture)
+4. [Core Storage Operations](#core-storage-operations)
+5. [Zero-Copy Data Flow](#zero-copy-data-flow)
+6. [Batch Operations](#batch-operations)
+7. [Multi-Backend Support](#multi-backend-support)
+8. [Multi-Endpoint Load Balancing](#multi-endpoint-load-balancing)
+9. [Streaming API](#streaming-api)
+10. [AI/ML Integration](#aiml-integration)
+11. [s3torchconnector Compatibility](#s3torchconnector-compatibility)
+12. [Checkpoint System](#checkpoint-system)
+13. [Performance & Threading](#performance--threading)
+14. [Advanced Features](#advanced-features)
+15. [API Reference](#api-reference)
+16. [Migration Guide](#migration-guide)
 
 ---
 
@@ -33,9 +38,15 @@ cd s3dlio
 python -c "import s3dlio; print(s3dlio.__version__)"
 ```
 
+### From PyPI
+
+```bash
+pip install s3dlio
+```
+
 ### Requirements
 
-- Python 3.8+
+- Python 3.12+
 - Rust 1.90+ (for building from source)
 - Optional: PyTorch, JAX, or TensorFlow for ML integration
 
@@ -43,188 +54,309 @@ python -c "import s3dlio; print(s3dlio.__version__)"
 
 ## Quick Start
 
-### Basic Operations
-
 ```python
 import s3dlio
 
 # Initialize logging (optional)
 s3dlio.init_logging("info")  # Options: trace, debug, info, warn, error
 
-# Put data to storage
-s3dlio.put("s3://my-bucket/data.bin", b"Hello, World!")
-s3dlio.put("file:///tmp/local.bin", b"Local data")
-s3dlio.put("gs://my-bucket/cloud.bin", b"GCS data")
-s3dlio.put("az://account/container/blob.bin", b"Azure data")
+# Put data to storage — works with S3, Azure, GCS, local filesystem
+s3dlio.put_bytes("s3://my-bucket/data.bin", b"Hello, World!")
+s3dlio.put_bytes("file:///tmp/local.bin", b"Local data")
 
-# Get data from storage
+# Get data — returns BytesView (zero-copy from Rust memory)
 data = s3dlio.get("s3://my-bucket/data.bin")
-print(data)  # b'Hello, World!'
+print(len(data))       # 13
+print(bytes(data))     # b'Hello, World!'
 
-# List objects
+# Range request — server-side, only fetches needed bytes
+chunk = s3dlio.get_range("s3://my-bucket/data.bin", offset=0, length=5)
+
+# List objects — returns full URIs
 objects = s3dlio.list("s3://my-bucket/prefix/")
-for uri in objects:
-    print(uri)
 
-# Get metadata
+# Metadata
 metadata = s3dlio.stat("s3://my-bucket/data.bin")
 print(f"Size: {metadata['size']} bytes")
-print(f"Last modified: {metadata['last_modified']}")
 
-# Delete objects
-s3dlio.delete("s3://my-bucket/data.bin")
+# Check existence
+if s3dlio.exists("s3://my-bucket/data.bin"):
+    s3dlio.delete("s3://my-bucket/data.bin")
+```
+
+**Supported URI Schemes:**
+
+| Scheme | Example | Description |
+|--------|---------|-------------|
+| `s3://` | `s3://bucket/key` | Amazon S3, MinIO, Ceph, VAST |
+| `gs://` | `gs://bucket/key` | Google Cloud Storage |
+| `az://` | `az://account/container/key` | Azure Blob Storage |
+| `file://` | `file:///path/to/file` | Local filesystem |
+| `direct://` | `direct:///path/to/file` | Direct I/O (O_DIRECT) |
+
+---
+
+## Architecture
+
+### Runtime Model (v0.9.50)
+
+s3dlio uses an **io_uring-style submit pattern** for all Python API calls:
+
+```
+Python Thread → spawn(async work) → channel.recv() → result
+```
+
+1. **SUBMIT**: The calling thread spawns the async future onto a dedicated global Tokio runtime
+2. **PROCESS**: Runtime worker threads handle the async I/O
+3. **COMPLETE**: Result flows back through `std::sync::mpsc` channel
+
+**This design is fully thread-safe.** You can call any s3dlio function from:
+- Python `ThreadPoolExecutor` (16, 64, 128+ threads)
+- PyTorch `DataLoader` worker processes
+- Any plain OS thread
+
+The calling thread blocks on channel recv (NOT on `block_on`), so there are **no Tokio runtime conflicts**.
+
+### Global Client Cache
+
+s3dlio maintains a process-global `DashMap<StoreKey, Arc<dyn ObjectStore>>` cache:
+
+- **Key**: `(scheme, endpoint, region)` — NOT bucket-specific
+- **Hit rate**: >99% in typical workloads (<100ns lookup)
+- **Thread-safe**: Lock-free concurrent read/write (DashMap sharded locking)
+- **Automatic**: No manual client passing — first call creates, all subsequent calls reuse
+
+```python
+# These all reuse the SAME underlying Rust ObjectStore client:
+s3dlio.put_bytes("s3://bucket-a/key1", data1)  # Creates client
+s3dlio.put_bytes("s3://bucket-b/key2", data2)  # Reuses client (same endpoint)
+s3dlio.get("s3://bucket-c/key3")               # Reuses client
+```
+
+### Configuration
+
+```bash
+# Control Tokio worker thread count (default: num_cpus)
+export S3DLIO_WORKER_THREADS=16
 ```
 
 ---
 
 ## Core Storage Operations
 
-### put() - Upload Data
-
-Upload bytes to any supported storage backend:
+### put_bytes() — Upload Data
 
 ```python
-# Basic upload
-s3dlio.put("s3://bucket/key", b"data")
+# Upload bytes to any backend
+s3dlio.put_bytes("s3://bucket/key", b"data")
 
 # Upload from file
 with open("local_file.bin", "rb") as f:
-    data = f.read()
-    s3dlio.put("s3://bucket/key", data)
+    s3dlio.put_bytes("s3://bucket/key", f.read())
 
-# Async version (returns coroutine)
-await s3dlio.put_async("s3://bucket/key", b"data")
+# Async version (for use with asyncio)
+await s3dlio.put_bytes_async("s3://bucket/key", b"data")
 ```
 
-**Supported URIs:**
-- `s3://bucket/key` - Amazon S3
-- `gs://bucket/key` - Google Cloud Storage
-- `az://account/container/key` - Azure Blob Storage
-- `file:///path/to/file` - Local filesystem
-- `direct:///path/to/file` - Direct I/O (O_DIRECT)
+**Data path**: `Python bytes` → `Bytes::copy_from_slice` (one unavoidable copy from Python heap) → `Bytes` (Arc-counted, zero-copy through upload pipeline).
 
-### get() - Download Data
-
-Download bytes from storage:
+### get() — Download Data
 
 ```python
-# Basic download
+# Returns BytesView — zero-copy wrapper around Rust Bytes
 data = s3dlio.get("s3://bucket/key")
 
-# Download with range request
-data = s3dlio.get_range("s3://bucket/key", offset=1024, length=4096)
-
-# Async download
-data = await s3dlio.get_many_async(["s3://bucket/key1", "s3://bucket/key2"])
+# BytesView supports Python buffer protocol:
+mv = memoryview(data)                          # Zero-copy memoryview
+arr = numpy.frombuffer(data, dtype=np.uint8)   # Zero-copy NumPy array
+raw = bytes(data)                              # Creates a copy (only if needed)
+print(len(data))                               # Size in bytes
 ```
 
-### list() - List Objects
-
-List objects under a prefix:
+### get_range() — Server-Side Range Request
 
 ```python
-# List all objects
-objects = s3dlio.list("s3://bucket/prefix/")
+# Fetch only bytes 1024-5119 from the server (saves bandwidth)
+chunk = s3dlio.get_range("s3://bucket/key", offset=1024, length=4096)
 
-# Returns list of full URIs
-for uri in objects:
-    print(uri)  # s3://bucket/prefix/file1.dat, ...
-
-# List local files
-files = s3dlio.list("file:///data/directory/")
+# Fetch from offset to end of object
+tail = s3dlio.get_range("s3://bucket/key", offset=1024)
 ```
 
-### stat() - Get Metadata
-
-Get object metadata without downloading:
+### list() — List Objects
 
 ```python
-# Single object
-metadata = s3dlio.stat("s3://bucket/key")
-print(metadata['size'])           # Bytes
-print(metadata['last_modified'])  # Timestamp
-print(metadata['etag'])          # ETag/hash
+# List all objects under prefix (returns full URIs)
+uris = s3dlio.list("s3://bucket/prefix/")
+# ['s3://bucket/prefix/file1.dat', 's3://bucket/prefix/file2.dat', ...]
 
-# Multiple objects (async)
-stats = await s3dlio.stat_many_async([
-    "s3://bucket/key1",
-    "s3://bucket/key2"
-])
+# Recursive listing
+uris = s3dlio.list("s3://bucket/prefix/", recursive=True)
+
+# With glob pattern filter
+uris = s3dlio.list("s3://bucket/prefix/", pattern="*.npz")
 ```
 
-### exists() - Check Object Existence
-
-Check if an object exists without downloading it:
+### stat() — Get Metadata
 
 ```python
-# Check single object
+meta = s3dlio.stat("s3://bucket/key")
+print(meta['size'])           # int: object size in bytes
+print(meta['last_modified'])  # str: timestamp
+print(meta['etag'])           # str: ETag/hash
+
+# Async version
+meta = await s3dlio.stat_async("s3://bucket/key")
+
+# Batch stat (async)
+metas = await s3dlio.stat_many_async(["s3://bucket/a", "s3://bucket/b"])
+```
+
+### exists() — Check Existence
+
+```python
 if s3dlio.exists("s3://bucket/key"):
-    print("Object exists")
-    
-# Check before operation
-if not s3dlio.exists("s3://bucket/config.json"):
-    s3dlio.put("s3://bucket/config.json", b'{}')
+    print("Found")
 
-# Async version (returns coroutine)
-exists = await s3dlio.exists_async("s3://bucket/key")
+# Async version
+found = await s3dlio.exists_async("s3://bucket/key")
 ```
 
-**Note:** `exists()` uses `stat()` internally, so it's efficient for single checks.
-For bulk existence checks, consider using `stat_many_async()`.
-
-### delete() - Remove Objects
-
-Delete objects from storage:
+### delete() — Remove Object
 
 ```python
-# Single object
 s3dlio.delete("s3://bucket/key")
+```
 
-# Multiple objects (use list comprehension)
-objects = s3dlio.list("s3://bucket/prefix/")
-for uri in objects:
-    s3dlio.delete(uri)
+### mkdir() — Create Directory / Prefix
+
+```python
+s3dlio.mkdir("file:///data/output/subdir")
+await s3dlio.mkdir_async("s3://bucket/prefix/")
+```
+
+---
+
+## Zero-Copy Data Flow
+
+s3dlio's `get()` returns `BytesView`, a Python object backed by Rust `Bytes` (Arc-counted reference). **No data is copied** when passing through the Rust runtime:
+
+```
+Rust async I/O → Bytes (Arc) → channel → BytesView (Python buffer protocol)
+```
+
+### Using BytesView
+
+```python
+data = s3dlio.get("s3://bucket/model_weights.bin")
+
+# 1. Zero-copy memoryview (fastest — no allocation)
+mv = memoryview(data)
+
+# 2. Zero-copy NumPy array
+import numpy as np
+weights = np.frombuffer(data, dtype=np.float32)
+
+# 3. Zero-copy PyTorch tensor
+import torch
+tensor = torch.frombuffer(data, dtype=torch.float32)
+
+# 4. Convert to bytes (creates copy — only when needed)
+raw = bytes(data)
+```
+
+### Performance Impact
+
+| Operation | Copies | Notes |
+|-----------|--------|-------|
+| `s3dlio.get()` | 0 | Returns BytesView (Rust Bytes Arc) |
+| `memoryview(data)` | 0 | Buffer protocol, no allocation |
+| `np.frombuffer(data)` | 0 | Shares Rust memory |
+| `torch.frombuffer(data)` | 0 | Shares Rust memory |
+| `bytes(data)` | 1 | Explicit copy to Python heap |
+| `s3dlio.put_bytes(uri, pydata)` | 1 | Unavoidable Python→Rust copy |
+
+---
+
+## Batch Operations
+
+### put_many() — Batch Upload (v0.9.50+)
+
+Upload multiple objects in a single call with parallel execution:
+
+```python
+# List of (uri, data) tuples
+items = [
+    ("s3://bucket/file1.bin", b"data1"),
+    ("s3://bucket/file2.bin", b"data2"),
+    ("s3://bucket/file3.bin", b"data3"),
+]
+s3dlio.put_many(items)
+
+# Async version
+await s3dlio.put_many_async(items)
+```
+
+### get_many() — Batch Download
+
+```python
+uris = ["s3://bucket/file1", "s3://bucket/file2", "s3://bucket/file3"]
+results = s3dlio.get_many(uris, workers=64)
+
+# Async version
+results = await s3dlio.get_many_async(uris)
+```
+
+### upload() / download() — Bulk File Transfer
+
+```python
+# Upload entire directory
+s3dlio.upload(
+    src_uri="file:///data/files/",
+    dest_uri="s3://bucket/uploads/",
+)
+
+# Download prefix to local directory
+s3dlio.download(
+    src_uri="s3://bucket/downloads/",
+    dest_dir="/data/output/"
+)
+```
+
+### mp_get() — Multi-Process GET
+
+For maximum throughput with very large datasets:
+
+```python
+result = s3dlio.mp_get(
+    uri="s3://bucket/dataset/",
+    procs=8,           # 8 worker processes
+    jobs=128,          # 128 concurrent ops per process
+    num=10000,         # 10,000 objects
+    template="data_{}.bin"
+)
+print(f"Throughput: {result['throughput_mb_s']} MB/s")
 ```
 
 ---
 
 ## Multi-Backend Support
 
-### Supported Backends
-
-s3dlio provides **unified API** across all storage backends:
-
-```python
-# Amazon S3 / MinIO
-s3dlio.put("s3://bucket/data.bin", data)
-
-# Google Cloud Storage
-s3dlio.put("gs://bucket/data.bin", data)
-
-# Azure Blob Storage  
-s3dlio.put("az://account/container/data.bin", data)
-
-# Local Filesystem
-s3dlio.put("file:///tmp/data.bin", data)
-
-# Direct I/O (O_DIRECT)
-s3dlio.put("direct:///nvme/data.bin", data)
-```
-
 ### Authentication
 
-**Amazon S3:**
+**Amazon S3 / S3-Compatible:**
 ```python
 import os
 os.environ['AWS_ACCESS_KEY_ID'] = 'your_key'
 os.environ['AWS_SECRET_ACCESS_KEY'] = 'your_secret'
 os.environ['AWS_REGION'] = 'us-east-1'
+os.environ['AWS_ENDPOINT_URL'] = 'http://minio:9000'  # Optional: MinIO, Ceph, VAST
 ```
 
 **Google Cloud Storage:**
 ```bash
-# Use gcloud CLI
 gcloud auth application-default login
+# Or: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/creds.json
 ```
 
 **Azure Blob Storage:**
@@ -232,510 +364,128 @@ gcloud auth application-default login
 import os
 os.environ['AZURE_STORAGE_ACCOUNT'] = 'myaccount'
 os.environ['AZURE_STORAGE_KEY'] = 'mykey'
-```
-
-### Custom Endpoints (S3-Compatible, Emulators, Proxies)
-
-s3dlio supports custom endpoints for all three cloud backends, enabling use with:
-- **S3-compatible systems**: MinIO, Ceph, VAST
-- **Local emulators**: Azurite (Azure), fake-gcs-server (GCS)
-- **Multi-protocol proxies**
-
-**Amazon S3 / S3-Compatible:**
-```python
-import os
-# Path-style addressing is automatic when endpoint is set
-os.environ['AWS_ENDPOINT_URL'] = 'http://localhost:9000'  # MinIO
-os.environ['AWS_ACCESS_KEY_ID'] = 'minioadmin'
-os.environ['AWS_SECRET_ACCESS_KEY'] = 'minioadmin'
-
-data = s3dlio.get("s3://mybucket/mykey")
-```
-
-**Azure Blob (Azurite/Custom):**
-```python
-import os
+# Optional custom endpoint:
 os.environ['AZURE_STORAGE_ENDPOINT'] = 'http://127.0.0.1:10000'  # Azurite
-os.environ['AZURE_STORAGE_ACCOUNT'] = 'devstoreaccount1'
-os.environ['AZURE_STORAGE_KEY'] = 'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=='
-
-data = s3dlio.get("az://devstoreaccount1/container/blob")
 ```
 
-**Google Cloud Storage (fake-gcs-server/Custom):**
-```python
-import os
-os.environ['GCS_ENDPOINT_URL'] = 'http://localhost:4443'  # fake-gcs-server
-# OR use the standard GCS emulator convention:
-os.environ['STORAGE_EMULATOR_HOST'] = 'localhost:4443'
-
-data = s3dlio.get("gs://testbucket/testkey")
-```
-
-| Backend | Environment Variable | Alternative |
-|---------|---------------------|-------------|
-| S3 | `AWS_ENDPOINT_URL` | - |
+| Backend | Endpoint Variable | Alternative |
+|---------|------------------|-------------|
+| S3 | `AWS_ENDPOINT_URL` | — |
 | Azure | `AZURE_STORAGE_ENDPOINT` | `AZURE_BLOB_ENDPOINT_URL` |
 | GCS | `GCS_ENDPOINT_URL` | `STORAGE_EMULATOR_HOST` |
 
-### Backend-Specific Features
+### S3 Bucket Management
 
 ```python
-# S3 bucket management
 s3dlio.create_bucket("my-bucket")
 s3dlio.delete_bucket("my-bucket")
-
-# Multi-process GET for maximum throughput
-result = s3dlio.mp_get(
-    uri="s3://bucket/prefix/",
-    procs=4,        # Number of worker processes
-    jobs=64,        # Concurrent operations per process
-    num=1000,       # Number of objects
-    template="obj_{}.dat"
-)
-print(f"Throughput: {result['throughput_mb_s']} MB/s")
 ```
 
 ---
 
 ## Multi-Endpoint Load Balancing
 
-### Overview
-
-Multi-endpoint storage (v0.9.14+) enables **parallel operations across multiple storage locations** with automatic load balancing. Use this for:
-- **Distributed storage**: Multiple S3 buckets/regions/endpoints
-- **High throughput**: Aggregate bandwidth across endpoints  
-- **Load distribution**: Balance requests across storage systems
-- **Fault tolerance**: Continue operating if endpoints fail
-
-### Creating Multi-Endpoint Stores
-
-#### From URI List
-
-```python
-import s3dlio
-
-# Create store from explicit list of URIs
-store = s3dlio.create_multi_endpoint_store(
-    uris=[
-        "s3://us-east-1-bucket",
-        "s3://us-west-2-bucket", 
-        "s3://eu-west-1-bucket"
-    ],
-    strategy="round_robin"  # or "least_connections"
-)
-```
-
-#### From URI Template
-
-Use `{start...end}` syntax for range expansion:
-
-```python
-# Expands to endpoint1, endpoint2, ..., endpoint10
-store = s3dlio.create_multi_endpoint_store_from_template(
-    uri_template="s3://my-bucket-{1...10}",
-    strategy="round_robin"
-)
-
-# Multiple ranges with zero-padding
-store = s3dlio.create_multi_endpoint_store_from_template(
-    uri_template="s3://region-{1...3}/shard-{01...99}",
-    strategy="least_connections"
-)
-```
-
-#### From File
-
-Load URIs from a text file (one per line):
-
-```python
-# endpoints.txt:
-# s3://bucket-1
-# s3://bucket-2
-# s3://bucket-3
-
-store = s3dlio.create_multi_endpoint_store_from_file(
-    file_path="/path/to/endpoints.txt",
-    strategy="round_robin"
-)
-```
-
-### Load Balancing Strategies
-
-#### Round-Robin (Default)
-
-Distributes requests evenly across all endpoints in rotation:
-
-```python
-store = s3dlio.create_multi_endpoint_store(
-    uris=["s3://endpoint1", "s3://endpoint2", "s3://endpoint3"],
-    strategy="round_robin"
-)
-
-# Requests distributed: endpoint1 → endpoint2 → endpoint3 → endpoint1 → ...
-```
-
-**Best for:**
-- Uniform workloads where all endpoints have similar performance
-- Simple load distribution without overhead
-- Predictable request patterns
-
-#### Least-Connections
-
-Routes requests to the endpoint with fewest active operations:
-
-```python
-store = s3dlio.create_multi_endpoint_store(
-    uris=["s3://endpoint1", "s3://endpoint2"],
-    strategy="least_connections"
-)
-
-# Requests routed to endpoint with lowest active_requests count
-```
-
-**Best for:**
-- Variable request latencies
-- Heterogeneous endpoint performance
-- Adaptive load balancing under varying conditions
-
-### Async Operations
-
-All multi-endpoint operations are **async** and must be awaited:
+Create stores that distribute operations across multiple endpoints (v0.9.14+):
 
 ```python
 import asyncio
 import s3dlio
 
 async def main():
-    store = s3dlio.create_multi_endpoint_store(
-        uris=["s3://bucket-1", "s3://bucket-2"],
-        strategy="round_robin"
-    )
-    
-    # Put operation (async)
-    await store.put("s3://bucket-1/data.bin", b"Hello, World!")
-    
-    # Get operation (async)
-    result = await store.get("s3://bucket-1/data.bin")
-    print(bytes(result))  # Convert BytesView to bytes
-    
-    # List operation (async)
-    objects = await store.list("s3://bucket-1/prefix/", recursive=True)
-    for obj in objects:
-        print(f"URI: {obj['uri']}, Size: {obj['size']}")
-    
-    # Delete operation (async)
-    await store.delete("s3://bucket-1/data.bin")
-
-# Run async code
-asyncio.run(main())
-```
-
-### Zero-Copy Data Access
-
-Multi-endpoint stores return `BytesView` for zero-copy memory access:
-
-```python
-import asyncio
-import numpy as np
-
-async def process_data():
-    store = s3dlio.create_multi_endpoint_store(
-        uris=["s3://bucket-1", "s3://bucket-2"],
-        strategy="round_robin"
-    )
-    
-    # Get data (returns BytesView)
-    view = await store.get("s3://bucket-1/array.bin")
-    
-    # Zero-copy access via memoryview
-    mv = view.memoryview()
-    
-    # Use with NumPy (zero-copy)
-    array = np.frombuffer(mv, dtype=np.float32)
-    print(f"Array shape: {array.shape}")
-    
-    # Convert to bytes if needed (copies data)
-    data = bytes(view)
-
-asyncio.run(process_data())
-```
-
-### Range Requests
-
-```python
-async def get_ranges():
-    store = s3dlio.create_multi_endpoint_store(
-        uris=["s3://bucket-1", "s3://bucket-2"],
-        strategy="least_connections"
-    )
-    
-    # Get bytes 1000-1999 (offset=1000, length=1000)
-    view = await store.get_range(
-        "s3://bucket-1/large_file.bin",
-        offset=1000,
-        length=1000
-    )
-    
-    data = bytes(view)  # 1000 bytes
-    print(f"Retrieved {len(data)} bytes")
-
-asyncio.run(get_ranges())
-```
-
-### Statistics and Monitoring
-
-Track per-endpoint and total statistics:
-
-```python
-import asyncio
-
-async def monitor_stats():
+    # From explicit URI list
     store = s3dlio.create_multi_endpoint_store(
         uris=["s3://bucket-1", "s3://bucket-2", "s3://bucket-3"],
-        strategy="round_robin"
+        strategy="round_robin"  # or "least_connections"
     )
     
-    # Perform operations
-    for i in range(100):
-        await store.put(f"s3://bucket-{(i % 3) + 1}/file{i}.bin", b"data")
-    
-    # Get per-endpoint statistics
-    endpoint_stats = store.get_endpoint_stats()
-    for stat in endpoint_stats:
-        print(f"Endpoint: {stat['uri']}")
-        print(f"  Total requests: {stat['total_requests']}")
-        print(f"  Bytes read: {stat['bytes_read']}")
-        print(f"  Bytes written: {stat['bytes_written']}")
-        print(f"  Active requests: {stat['active_requests']}")
-        print(f"  Errors: {stat['error_count']}")
-    
-    # Get total aggregated statistics
-    total_stats = store.get_total_stats()
-    print(f"\nTotal Statistics:")
-    print(f"  Total requests: {total_stats['total_requests']}")
-    print(f"  Total bytes read: {total_stats['bytes_read']}")
-    print(f"  Total bytes written: {total_stats['bytes_written']}")
-    print(f"  Active requests: {total_stats['active_requests']}")
-    print(f"  Total errors: {total_stats['error_count']}")
-
-asyncio.run(monitor_stats())
-```
-
-### Store Properties
-
-Query store configuration:
-
-```python
-store = s3dlio.create_multi_endpoint_store(
-    uris=["s3://bucket-1", "s3://bucket-2"],
-    strategy="least_connections"
-)
-
-# Get number of endpoints
-count = store.endpoint_count()
-print(f"Endpoints: {count}")
-
-# Get current strategy
-strategy = store.strategy()
-print(f"Strategy: {strategy}")  # "least_connections"
-```
-
-### Complete Example
-
-```python
-import asyncio
-import s3dlio
-
-async def distributed_upload():
-    """Upload 1000 files across 10 S3 buckets"""
-    
-    # Create multi-endpoint store with template expansion
+    # From template (expands {1...10})
     store = s3dlio.create_multi_endpoint_store_from_template(
         uri_template="s3://my-bucket-{1...10}",
         strategy="round_robin"
     )
     
-    print(f"Created store with {store.endpoint_count()} endpoints")
-    print(f"Using strategy: {store.strategy()}")
-    
-    # Upload files in parallel
-    tasks = []
-    for i in range(1000):
-        bucket_num = (i % 10) + 1
-        uri = f"s3://my-bucket-{bucket_num}/file{i:04d}.dat"
-        data = f"File {i} data".encode()
-        tasks.append(store.put(uri, data))
-    
-    # Wait for all uploads
-    await asyncio.gather(*tasks)
-    
-    # Check statistics
-    total_stats = store.get_total_stats()
-    print(f"\nUploaded {total_stats['total_requests']} files")
-    print(f"Total bytes written: {total_stats['bytes_written']:,}")
-    print(f"Errors: {total_stats['error_count']}")
-    
-    # List all objects from first bucket
-    objects = await store.list("s3://my-bucket-1/", recursive=False)
-    print(f"\nBucket 1 contains {len(objects)} objects")
-
-# Run
-asyncio.run(distributed_upload())
-```
-
-### Testing with pytest-asyncio
-
-```python
-import pytest
-import s3dlio
-
-@pytest.mark.asyncio
-async def test_multi_endpoint_operations():
-    """Test multi-endpoint store with pytest"""
-    store = s3dlio.create_multi_endpoint_store(
-        uris=["file:///tmp/endpoint1", "file:///tmp/endpoint2"],
-        strategy="round_robin"
+    # From file (one URI per line)
+    store = s3dlio.create_multi_endpoint_store_from_file(
+        file_path="/path/to/endpoints.txt",
+        strategy="least_connections"
     )
     
-    # Test put/get
-    test_data = b"test data"
-    await store.put("file:///tmp/endpoint1/test.bin", test_data)
+    # All operations are async
+    await store.put("s3://bucket-1/data.bin", b"Hello")
+    view = await store.get("s3://bucket-1/data.bin")      # BytesView
+    view = await store.get_range("s3://bucket-1/x", 0, 1024)
+    objects = await store.list("s3://bucket-1/", recursive=True)
+    await store.delete("s3://bucket-1/data.bin")
     
-    result = await store.get("file:///tmp/endpoint1/test.bin")
-    assert bytes(result) == test_data
-    
-    # Test statistics
-    stats = store.get_total_stats()
-    assert stats['total_requests'] >= 2  # put + get
+    # Statistics
+    print(store.endpoint_count())
+    print(store.strategy())
+    print(store.get_total_stats())
+    print(store.get_endpoint_stats())
+
+asyncio.run(main())
 ```
 
-### Best Practices
-
-1. **Use templates for many endpoints**: `{1...100}` is cleaner than listing 100 URIs
-2. **Choose strategy based on workload**: 
-   - Round-robin for uniform access patterns
-   - Least-connections for variable latencies
-3. **Monitor statistics**: Check error counts and per-endpoint load
-4. **Handle BytesView properly**: Call `.memoryview()` for zero-copy or `bytes()` to convert
-5. **Use asyncio.gather() for parallel operations**: Maximize throughput with concurrent requests
-6. **Test with pytest-asyncio**: Use `@pytest.mark.asyncio` decorator for async tests
-
-### Performance Tips
-
-- **Parallel uploads/downloads**: Use `asyncio.gather()` with 100+ concurrent operations
-- **Round-robin for speed**: Lowest overhead when endpoints have similar performance  
-- **Least-connections for mixed latency**: Adapts to slow endpoints automatically
-- **Zero-copy with NumPy/PyTorch**: Use `.memoryview()` to avoid copying large arrays
-- **Monitor endpoint health**: Check `error_count` in statistics to detect failing endpoints
-
-For more details, see [Multi-Endpoint Storage Guide](MULTI_ENDPOINT_GUIDE.md).
+**Strategies:**
+- `"round_robin"` — Even distribution, lowest overhead
+- `"least_connections"` — Routes to endpoint with fewest active requests
 
 ---
 
 ## Streaming API
 
-### Streaming Writers
-
 For large uploads with compression and chunking:
 
 ```python
-# Create writer for S3
-writer = s3dlio.create_s3_writer(
-    "s3://bucket/large_file.bin.zst",
-    options=s3dlio.PyWriterOptions()
-)
-
-# Write data in chunks
-writer.write(chunk1)
-writer.write(chunk2)
-writer.write(chunk3)
-
-# Finalize and get stats
-stats = writer.finalize()
-print(f"Wrote {stats['bytes_written']} bytes")
-print(f"Compressed size: {stats['compressed_size']}")
-```
-
-### Writer Options
-
-```python
 options = s3dlio.PyWriterOptions()
-options.compression = "zstd"  # Options: none, zstd, gzip, lz4
-options.compression_level = 3  # 1-22 for zstd
-options.chunk_size = 4194304  # 4 MiB chunks
+options.compression = "zstd"       # none, zstd, gzip, lz4
+options.compression_level = 3      # 1-22 for zstd
+options.chunk_size = 4 * 1024 * 1024  # 4 MiB chunks
 
 # Backend-specific writers
-s3_writer = s3dlio.create_s3_writer(uri, options)
-azure_writer = s3dlio.create_azure_writer(uri, options)
-fs_writer = s3dlio.create_filesystem_writer(uri, options)
-direct_writer = s3dlio.create_direct_filesystem_writer(uri, options)
-```
+writer = s3dlio.create_s3_writer("s3://bucket/file.bin.zst", options)
+writer = s3dlio.create_azure_writer("az://acct/ctr/file.bin.zst", options)
+writer = s3dlio.create_filesystem_writer("file:///path/file.bin", options)
+writer = s3dlio.create_direct_filesystem_writer("direct:///path/file.bin", options)
 
-### Zero-Copy Access
-
-Use `BytesView` for zero-copy memory access:
-
-```python
-# Get data as BytesView (zero-copy)
-view = s3dlio.get("s3://bucket/key")  # Returns BytesView
-
-# Access as memoryview (zero-copy)
-memview = view.memoryview()
-
-# Convert to bytes (copy)
-data = bytes(view)
+# Write in chunks, then finalize
+writer.write(chunk1)
+writer.write(chunk2)
+stats = writer.finalize()
+print(f"Wrote {stats['bytes_written']} bytes")
 ```
 
 ---
 
 ## AI/ML Integration
 
-### PyTorch Datasets
+### PyTorch Datasets (Native)
 
 ```python
-from s3dlio import S3MapDataset, S3IterableDataset
-
-# Map-style dataset (random access)
-dataset = S3MapDataset(
-    uri="s3://bucket/training-data/",
-    pattern="*.npz",        # Filter pattern
-    transform=my_transform   # Optional transform function
-)
-
-# Iterable dataset (streaming)
-dataset = S3IterableDataset(
-    uri="s3://bucket/training-data/",
-    pattern="*.npz",
-    shuffle=True,
-    num_workers=4
-)
-
-# Use with DataLoader
+from s3dlio import ObjectStoreMapDataset, ObjectStoreIterableDataset
 from torch.utils.data import DataLoader
-loader = DataLoader(dataset, batch_size=32)
 
+# Map-style (random access)
+dataset = ObjectStoreMapDataset(uri="s3://bucket/train/", pattern="*.npz")
+item = dataset[0]  # Fetch by index
+
+# Iterable (streaming)
+dataset = ObjectStoreIterableDataset(uri="s3://bucket/train/", shuffle=True)
+
+# With DataLoader
+loader = DataLoader(dataset, batch_size=32, num_workers=4)
 for batch in loader:
-    # Train your model
-    pass
+    pass  # Train
 ```
 
 ### JAX Integration
 
 ```python
-from s3dlio import S3JaxIterable
+from s3dlio import JaxIterable
 
-# Create JAX-compatible iterable
-jax_iter = S3JaxIterable(
-    uri="gs://bucket/training-data/",
-    pattern="*.npz",
-    batch_size=32
-)
-
-# Iterate over batches
+jax_iter = JaxIterable(uri="gs://bucket/train/", batch_size=32)
 for batch in jax_iter:
-    # JAX training code
-    pass
+    pass  # JAX training
 ```
 
 ### TensorFlow Integration
@@ -743,205 +493,197 @@ for batch in jax_iter:
 ```python
 from s3dlio import make_tf_dataset
 
-# Create TF Dataset
-ds = make_tf_dataset(
-    uri="s3://bucket/training-data/",
-    pattern="*.tfrecord",
-    batch_size=32,
-    shuffle=True
-)
-
-# Use in training
+ds = make_tf_dataset(uri="s3://bucket/train/", batch_size=32, shuffle=True)
 for batch in ds:
-    # TensorFlow training code
-    pass
+    pass  # TF training
 ```
 
-#### TFRecord Index Generation (v0.9.17+)
+---
 
-**NEW**: Generate TFRecord files with accompanying index files for TensorFlow Data Service compatibility.
+## s3torchconnector Compatibility
 
-**Rust API:**
-```rust
-use s3dlio::data_formats::{build_tfrecord_with_index, TfRecordWithIndex};
-
-// Generate synthetic data
-let raw_data = s3dlio::generate_controlled_data(102400, 1, 1);
-
-// Create TFRecord with index in single pass
-let result = build_tfrecord_with_index(
-    100,    // num_records
-    1024,   // record_size_bytes
-    &raw_data
-)?;
-
-// result.data: Bytes containing TFRecord file
-// result.index: Bytes containing index file
-
-// Write both files to storage
-use s3dlio::object_store::store_for_uri;
-let store = store_for_uri("s3://bucket/tfrecords/")?;
-
-// Write TFRecord data
-store.put("train_00000.tfrecord", &result.data).await?;
-
-// Write index file (16 bytes per record)
-store.put("train_00000.tfrecord.index", &result.index).await?;
-```
-
-**Index Format:**
-- **16 bytes per record**: Little-endian format
-  - 8 bytes: Record offset in TFRecord file (u64)
-  - 8 bytes: Record length in bytes (u64)
-- **TensorFlow compatible**: Standard format for TensorFlow Data Service
-- **Zero overhead**: Generated during TFRecord creation (single pass)
-
-**Python Index Parsing:**
-```python
-import struct
-import s3dlio
-
-# Fetch index from S3
-index_bytes = s3dlio.get("s3://bucket/train_00000.tfrecord.index")
-
-# Parse index (16 bytes per record)
-num_records = len(index_bytes) // 16
-records_info = []
-
-for i in range(num_records):
-    # Unpack little-endian u64 offset and u64 length
-    offset, length = struct.unpack('<QQ', index_bytes[i*16:(i+1)*16])
-    records_info.append((offset, length))
-    print(f"Record {i}: offset={offset}, length={length}")
-
-# Use index for random access
-import tensorflow as tf
-
-def indexed_read(tfrecord_uri, index_info, record_idx):
-    """Read specific record using index."""
-    offset, length = index_info[record_idx]
-    
-    # Fetch specific byte range from S3
-    tfrecord_bytes = s3dlio.get_range(
-        tfrecord_uri, 
-        offset, 
-        offset + length
-    )
-    
-    # Parse TFRecord
-    return tf.train.Example.FromString(tfrecord_bytes)
-```
-
-**TensorFlow Data Service Integration:**
-```python
-import tensorflow as tf
-
-# TensorFlow Data Service can use index files for efficient sharding
-data_service_config = tf.data.experimental.service.DispatcherConfig(
-    work_dir="/tmp/dispatcher_work"
-)
-
-# Dataset with index-aware sharding
-dataset = tf.data.Dataset.list_files("s3://bucket/*.tfrecord")
-dataset = dataset.interleave(
-    lambda x: tf.data.TFRecordDataset(x),
-    num_parallel_calls=tf.data.AUTOTUNE
-)
-
-# Data Service automatically uses .index files if present
-dataset = dataset.apply(
-    tf.data.experimental.service.distribute(
-        processing_mode="distributed_epoch",
-        service="grpc://localhost:5000"
-    )
-)
-```
-
-**Use Cases:**
-- **Distributed training**: Efficient dataset sharding across workers
-- **Random access**: Seek to specific records without scanning
-- **Large-scale datasets**: Minimize I/O for distributed TensorFlow training
-- **Data Service**: Enable TensorFlow Data Service optimizations
-- **Cloud storage**: Works with S3, GCS, Azure Blob for remote datasets
-
-**Performance Benefits:**
-- **No scanning overhead**: Direct access to any record via offset
-- **Worker coordination**: Data Service uses indices for optimal shard distribution
-- **Bandwidth efficiency**: Fetch only required byte ranges from cloud storage
-- **Single-pass generation**: Index computed during TFRecord creation (no extra cost)
-
-### Generic Data Loaders
+s3dlio provides a **drop-in replacement** for AWS `s3torchconnector`. Change one import line:
 
 ```python
-# Universal dataset (works with any backend)
-dataset = s3dlio.create_dataset("gs://bucket/data/")
+# Before (s3torchconnector):
+from s3torchconnector import S3IterableDataset, S3MapDataset, S3Checkpoint
 
-# Async data loader
-loader = s3dlio.create_async_loader(
-    uri="s3://bucket/data/",
-    options=s3dlio.PyLoaderOptions()
+# After (s3dlio — zero code changes needed):
+from s3dlio.compat.s3torchconnector import S3IterableDataset, S3MapDataset, S3Checkpoint
+```
+
+### S3IterableDataset
+
+```python
+from s3dlio.compat.s3torchconnector import S3IterableDataset
+from torch.utils.data import DataLoader
+
+dataset = S3IterableDataset.from_prefix("s3://bucket/train/", region="us-east-1")
+
+for item in dataset:
+    print(item.bucket, item.key)
+    data = item.read()  # Returns BytesView (zero-copy)
+    # Use with torch.frombuffer(data, dtype=torch.uint8)
+```
+
+### S3MapDataset
+
+```python
+from s3dlio.compat.s3torchconnector import S3MapDataset
+
+dataset = S3MapDataset.from_prefix("s3://bucket/train/", region="us-east-1")
+item = dataset[0]       # Random access
+item = dataset[-1]      # Negative indexing supported
+print(len(dataset))     # Number of objects
+```
+
+### S3Checkpoint
+
+```python
+from s3dlio.compat.s3torchconnector import S3Checkpoint
+import torch
+
+checkpoint = S3Checkpoint(region="us-east-1")
+
+# Save — torch.save() writes to in-memory buffer, then uploads via put_bytes()
+with checkpoint.writer("s3://bucket/model.pt") as writer:
+    torch.save(model.state_dict(), writer)
+
+# Load — downloads to BytesView, wrapped in seekable BufferedReader
+with checkpoint.reader("s3://bucket/model.pt") as reader:
+    state_dict = torch.load(reader, weights_only=True)
+```
+
+### S3Client (Low-Level)
+
+```python
+from s3dlio.compat.s3torchconnector import S3Client, S3ClientConfig
+
+client = S3Client(
+    region="us-east-1",
+    endpoint="http://minio:9000",
+    s3client_config=S3ClientConfig(force_path_style=True)
 )
 
-# Iterate asynchronously
-async for batch in loader:
-    process(batch)
+# Upload
+writer = client.put_object("my-bucket", "key.bin")
+writer.write(b"data")
+writer.close()
+
+# Download (full object)
+reader = client.get_object("my-bucket", "key.bin")
+data = reader.read()  # BytesView (zero-copy)
+
+# Download (range — server-side, saves bandwidth)
+reader = client.get_object("my-bucket", "key.bin", start=0, end=1023)
+chunk = reader.read()  # 1024 bytes
+
+# List
+for result in client.list_objects("my-bucket", "prefix/"):
+    for info in result.object_info:
+        print(info.key)
 ```
+
+### Advantages over s3torchconnector
+
+| Feature | s3torchconnector | s3dlio compat |
+|---------|------------------|---------------|
+| S3 | Yes | Yes |
+| Azure / GCS / Local | No | Yes |
+| Zero-copy reads | No | Yes (BytesView) |
+| Server-side range requests | No | Yes (get_range) |
+| Global client cache | No | Yes (DashMap) |
+| Multi-endpoint load balancing | No | Yes |
+
+For complete migration instructions, see [S3TORCHCONNECTOR_MIGRATION.md](S3TORCHCONNECTOR_MIGRATION.md).
 
 ---
 
 ## Checkpoint System
 
-### Save Checkpoints
+### Save / Load
 
 ```python
 # Save checkpoint to any backend
-checkpoint_data = {
-    "epoch": 10,
-    "model_state": model.state_dict(),
-    "optimizer_state": optimizer.state_dict()
-}
-
 s3dlio.save_checkpoint(
-    uri="s3://bucket/checkpoints/ckpt_epoch_10.bin",
-    data=checkpoint_data,
+    uri="s3://bucket/checkpoints/epoch_10.bin",
+    data={"epoch": 10, "model": model.state_dict()},
     compress=True
 )
-```
 
-### Load Checkpoints
-
-```python
 # Load checkpoint
-checkpoint = s3dlio.load_checkpoint("s3://bucket/checkpoints/ckpt_epoch_10.bin")
+ckpt = s3dlio.load_checkpoint("s3://bucket/checkpoints/epoch_10.bin")
 
 # Load with validation
-checkpoint = s3dlio.load_checkpoint_with_validation(
-    uri="s3://bucket/checkpoints/ckpt_epoch_10.bin",
-    expected_keys=["epoch", "model_state", "optimizer_state"]
+ckpt = s3dlio.load_checkpoint_with_validation(
+    uri="s3://bucket/checkpoints/epoch_10.bin",
+    expected_keys=["epoch", "model"]
 )
-
-model.load_state_dict(checkpoint["model_state"])
-optimizer.load_state_dict(checkpoint["optimizer_state"])
+model.load_state_dict(ckpt["model"])
 ```
 
 ### Distributed Checkpointing
 
 ```python
-# Save distributed shards (multi-rank)
+# Each rank saves its shard
 s3dlio.save_distributed_shard(
-    uri=f"s3://bucket/checkpoints/shard_{rank}.bin",
+    uri=f"s3://bucket/ckpt/shard_{rank}.bin",
     shard_data=local_state,
     rank=rank,
     world_size=world_size
 )
 
-# Finalize checkpoint (rank 0 only)
+# Rank 0 finalizes
 if rank == 0:
     s3dlio.finalize_distributed_checkpoint(
-        base_uri="s3://bucket/checkpoints/",
+        base_uri="s3://bucket/ckpt/",
         world_size=world_size
     )
 ```
+
+---
+
+## Performance & Threading
+
+### Thread Safety (v0.9.50)
+
+All s3dlio functions are **fully thread-safe**. Use `ThreadPoolExecutor` freely:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def upload_one(i):
+    s3dlio.put_bytes(f"s3://bucket/obj_{i}.bin", data)
+
+# 16 threads uploading concurrently — no runtime conflicts
+with ThreadPoolExecutor(max_workers=16) as pool:
+    list(pool.map(upload_one, range(1000)))
+```
+
+**Fixed in v0.9.50:**
+- v0.9.27: Per-call `Runtime::new()` caused "dispatch failure" after ~40 objects
+- v0.9.40: `GLOBAL_RUNTIME.block_on()` caused "Cannot start a runtime from within a runtime"
+- v0.9.50: io_uring-style submit pattern — works from ANY thread context
+
+### Pre-Stat Size Caching
+
+```python
+uris = s3dlio.list("s3://bucket/dataset/")
+s3dlio.get_many_stats(uris, concurrency=100)
+
+# Subsequent gets use cached sizes (2.5x faster)
+for uri in uris:
+    data = s3dlio.get(uri)
+```
+
+### Performance Tips
+
+1. **Use `put_many()` for batch uploads** — single round-trip, parallel execution
+2. **Use `get_range()` instead of `get()` + slicing** — server-side range saves bandwidth
+3. **Use `memoryview(data)` not `bytes(data)`** — avoid unnecessary copies
+4. **Pre-stat with `get_many_stats()`** — eliminates per-get stat overhead
+5. **Use `ThreadPoolExecutor`** — s3dlio handles concurrency internally via global runtime
+6. **Set `S3DLIO_WORKER_THREADS`** — tune Tokio worker count for your workload
 
 ---
 
@@ -950,215 +692,43 @@ if rank == 0:
 ### NPZ Files
 
 ```python
-# Read NumPy .npz files directly
-arrays = s3dlio.read_npz("s3://bucket/data.npz")
-print(arrays.keys())  # ['arr_0', 'arr_1', ...]
+# Read NumPy .npz files directly from any backend
+data = s3dlio.get("s3://bucket/data.npz")
+import numpy as np, io
+arrays = np.load(io.BytesIO(bytes(data)))
 ```
-
-#### Multi-Array NPZ Creation (v0.9.17+)
-
-**NEW**: Create NPZ archives with multiple named arrays for PyTorch/JAX-style datasets.
-
-**Rust API:**
-```rust
-use s3dlio::data_formats::npz::build_multi_npz;
-use ndarray::ArrayD;
-
-// Create arrays
-let data = ArrayD::zeros(vec![100, 224, 224, 3]);     // Images
-let labels = ArrayD::ones(vec![100]);                  // Labels
-let metadata = ArrayD::from_elem(vec![100, 5], 1.0);   // Metadata
-
-// Package into multi-array NPZ
-let arrays = vec![
-    ("data", &data),
-    ("labels", &labels),
-    ("metadata", &metadata),
-];
-
-let npz_bytes = build_multi_npz(arrays)?;
-
-// Write to storage
-use s3dlio::object_store::store_for_uri;
-let store = store_for_uri("s3://bucket/")?;
-store.put("dataset.npz", &npz_bytes).await?;
-```
-
-**Python Loading:**
-```python
-import numpy as np
-import s3dlio
-
-# Load from cloud storage
-data_bytes = s3dlio.get("s3://bucket/dataset.npz")
-
-# Save locally and load with NumPy
-with open("dataset.npz", "wb") as f:
-    f.write(data_bytes)
-
-data = np.load("dataset.npz")
-print(data.files)  # ['data', 'labels', 'metadata']
-
-images = data['data']      # Shape: (100, 224, 224, 3)
-labels = data['labels']    # Shape: (100,)
-metadata = data['metadata'] # Shape: (100, 5)
-```
-
-**PyTorch DataLoader:**
-```python
-import torch
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-import s3dlio
-import io
-
-class S3NPZDataset(Dataset):
-    def __init__(self, s3_uris):
-        """Dataset loading NPZ files from S3.
-        
-        Args:
-            s3_uris: List of S3 URIs to NPZ files
-        """
-        self.uris = s3_uris
-    
-    def __len__(self):
-        return len(self.uris)
-    
-    def __getitem__(self, idx):
-        # Fetch from S3
-        npz_bytes = s3dlio.get(self.uris[idx])
-        
-        # Load into memory
-        with io.BytesIO(npz_bytes) as f:
-            data = np.load(f)
-            return {
-                'data': torch.from_numpy(data['data']),
-                'labels': torch.from_numpy(data['labels']),
-                'metadata': torch.from_numpy(data['metadata'])
-            }
-
-# Use with DataLoader
-uris = [f"s3://bucket/train_{i:06d}.npz" for i in range(1000)]
-dataset = S3NPZDataset(uris)
-loader = DataLoader(dataset, batch_size=32, num_workers=4)
-
-for batch in loader:
-    images = batch['data']    # Tensor: (32, 224, 224, 3)
-    labels = batch['labels']  # Tensor: (32,)
-    # Train your model
-```
-
-**Key Features:**
-- **Zero-copy design**: Efficient memory handling with `Bytes`
-- **Standard format**: 100% compatible with NumPy's `np.load()`
-- **Named arrays**: Organize data, labels, and metadata logically
-- **Cloud-native**: Works seamlessly with S3, GCS, Azure Blob
-- **Framework agnostic**: Use with PyTorch, JAX, TensorFlow, or pure NumPy
-
-**Use Cases:**
-- **Image classification**: Store images + labels + augmentation metadata
-- **Scientific ML**: Store simulation results + parameters + timestamps
-- **NLP datasets**: Store embeddings + labels + text metadata
-- **Distributed training**: Each worker loads different NPZ shards
 
 ### TFRecord Index
 
 ```python
-# Create TFRecord index for NVIDIA DALI
 s3dlio.create_tfrecord_index(
     input_path="s3://bucket/dataset.tfrecord",
     output_path="file:///tmp/dataset.idx"
 )
-
-# Read index entries
-entries = s3dlio.get_tfrecord_index_entries("/tmp/dataset.idx")
-for entry in entries:
-    print(f"Offset: {entry['offset']}, Size: {entry['size']}")
 ```
 
 ### Operation Logging
 
 ```python
-# Enable operation logging
 s3dlio.init_op_log("file:///tmp/operations.log")
-
-# Perform operations (automatically logged)
-s3dlio.put("s3://bucket/key", data)
-s3dlio.get("s3://bucket/key")
-
-# Finalize log
+# ... operations are automatically logged ...
 s3dlio.finalize_op_log()
-
-# Check if logging is active
-if s3dlio.is_op_log_active():
-    print("Logging enabled")
 ```
 
-### Batch Operations
+### Python Convenience Helpers
 
 ```python
-# Upload multiple files
-s3dlio.upload(
-    local_dir="/data/files/",
-    remote_uri="s3://bucket/uploads/",
-    pattern="*.dat"
-)
+# list_keys — returns relative keys (not full URIs)
+keys = s3dlio.list_keys("s3://bucket/prefix/")  # ['file1.bin', 'file2.bin']
 
-# Download multiple files
-s3dlio.download(
-    remote_uri="s3://bucket/downloads/",
-    local_dir="/data/output/",
-    pattern="*.dat"
-)
+# list_full_uris — returns full URIs (alias for list())
+uris = s3dlio.list_full_uris("s3://bucket/prefix/")
 
-# Get multiple objects async
-uris = ["s3://bucket/file1", "s3://bucket/file2", "s3://bucket/file3"]
-results = await s3dlio.get_many_async(uris)
-```
+# get_object — same as get()
+data = s3dlio.get_object("s3://bucket/key")
 
----
-
-## Performance Optimization
-
-### Pre-Stat Size Caching (v0.9.10+)
-
-For benchmarking workloads, pre-stat objects to eliminate stat overhead:
-
-```python
-# Pre-stat all objects once
-uris = s3dlio.list("s3://bucket/dataset/")
-s3dlio.get_many_stats(uris, concurrency=100)
-
-# Subsequent gets skip stat operations (2.5x faster)
-for uri in uris:
-    data = s3dlio.get(uri)  # Uses cached size
-```
-
-### Parallel Downloads
-
-```python
-# Download many objects in parallel
-uris = [f"s3://bucket/obj_{i}.dat" for i in range(1000)]
-results = s3dlio.get_many(uris, workers=64)
-```
-
-### Multi-Process GET
-
-For maximum throughput with very large datasets:
-
-```python
-result = s3dlio.mp_get(
-    uri="s3://bucket/dataset/",
-    procs=8,           # Use 8 processes
-    jobs=128,          # 128 concurrent operations per process
-    num=10000,         # Download 10,000 objects
-    template="data_{}.bin"
-)
-
-print(f"Total: {result['total_bytes']} bytes")
-print(f"Time: {result['duration_seconds']}s")
-print(f"Throughput: {result['throughput_mb_s']} MB/s")
-print(f"Operations/sec: {result['ops_per_sec']}")
+# stat_object — same as stat()
+meta = s3dlio.stat_object("s3://bucket/key")
 ```
 
 ---
@@ -1167,174 +737,140 @@ print(f"Operations/sec: {result['ops_per_sec']}")
 
 ### Core Functions
 
-| Function | Description | Backends |
-|----------|-------------|----------|
-| `put(uri, data)` | Upload bytes | All |
-| `put_async(uri, data)` | Async upload | All |
-| `get(uri)` | Download bytes | All |
-| `get_range(uri, offset, length)` | Range request | All |
-| `list(uri)` | List objects | All |
-| `stat(uri)` | Get metadata | All |
-| `stat_async(uri)` | Async metadata | All |
-| `delete(uri)` | Delete object | All |
-| `upload(local, remote)` | Bulk upload | All |
-| `download(remote, local)` | Bulk download | All |
+| Function | Description | Returns |
+|----------|-------------|---------|
+| `put_bytes(uri, data)` | Upload bytes | None |
+| `put_bytes_async(uri, data)` | Async upload | Coroutine |
+| `put_many(items)` | Batch upload `[(uri, data), ...]` | None |
+| `put_many_async(items)` | Async batch upload | Coroutine |
+| `get(uri)` | Download object | BytesView |
+| `get_range(uri, offset, length=None)` | Server-side range request | BytesView |
+| `get_many(uris, workers)` | Parallel download | List[BytesView] |
+| `get_many_async(uris)` | Async parallel download | Coroutine |
+| `list(uri, recursive=False, pattern=None)` | List objects | List[str] |
+| `stat(uri)` | Get metadata | dict |
+| `stat_async(uri)` | Async metadata | Coroutine |
+| `stat_many_async(uris)` | Batch metadata | Coroutine |
+| `exists(uri)` | Check existence | bool |
+| `exists_async(uri)` | Async existence check | Coroutine |
+| `delete(uri)` | Delete object | None |
+| `mkdir(uri)` | Create directory/prefix | None |
+| `mkdir_async(uri)` | Async mkdir | Coroutine |
+| `upload(src_uri, dest_uri)` | Bulk upload files | None |
+| `download(src_uri, dest_dir)` | Bulk download files | None |
+| `mp_get(uri, procs, jobs, num, template)` | Multi-process GET | dict |
+| `create_bucket(name)` | Create S3 bucket | None |
+| `delete_bucket(name)` | Delete S3 bucket | None |
 
-### Multi-Endpoint API (v0.9.14+)
+### BytesView
+
+| Property/Method | Description | Zero-Copy |
+|----------------|-------------|-----------|
+| `len(view)` | Size in bytes | Yes |
+| `memoryview(view)` | Python memoryview | Yes |
+| `bytes(view)` | Convert to bytes | No (copy) |
+| `np.frombuffer(view)` | NumPy array | Yes |
+| `torch.frombuffer(view)` | PyTorch tensor | Yes |
+
+### Multi-Endpoint API
 
 | Function | Description |
 |----------|-------------|
-| `create_multi_endpoint_store(uris, strategy)` | Create store from URI list |
-| `create_multi_endpoint_store_from_template(uri_template, strategy)` | Create store from template with range expansion |
-| `create_multi_endpoint_store_from_file(file_path, strategy)` | Create store from file containing URIs |
+| `create_multi_endpoint_store(uris, strategy)` | Create from URI list |
+| `create_multi_endpoint_store_from_template(template, strategy)` | Create from template |
+| `create_multi_endpoint_store_from_file(path, strategy)` | Create from file |
 
 **MultiEndpointStore Methods** (all async):
 
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `put(uri, data)` | Upload bytes | Coroutine[None] |
-| `get(uri)` | Download bytes | Coroutine[BytesView] |
-| `get_range(uri, offset, length)` | Range request | Coroutine[BytesView] |
-| `list(uri, recursive)` | List objects | Coroutine[List[Dict]] |
-| `delete(uri)` | Delete object | Coroutine[None] |
-| `get_endpoint_stats()` | Per-endpoint statistics | List[Dict] |
-| `get_total_stats()` | Aggregated statistics | Dict |
-| `endpoint_count()` | Number of endpoints | int |
-| `strategy()` | Current load balancing strategy | str |
+| Method | Returns |
+|--------|---------|
+| `put(uri, data)` | Coroutine[None] |
+| `get(uri)` | Coroutine[BytesView] |
+| `get_range(uri, offset, length)` | Coroutine[BytesView] |
+| `list(uri, recursive)` | Coroutine[List[Dict]] |
+| `delete(uri)` | Coroutine[None] |
+| `get_endpoint_stats()` | List[Dict] |
+| `get_total_stats()` | Dict |
+| `endpoint_count()` | int |
+| `strategy()` | str |
 
-**Load Balancing Strategies:**
-- `"round_robin"` - Distribute requests evenly in rotation
-- `"least_connections"` - Route to endpoint with fewest active requests
+### Streaming Writers
 
-### Streaming API
+| Function | Description |
+|----------|-------------|
+| `create_s3_writer(uri, opts)` | S3 streaming writer |
+| `create_azure_writer(uri, opts)` | Azure streaming writer |
+| `create_filesystem_writer(uri, opts)` | Local filesystem writer |
+| `create_direct_filesystem_writer(uri, opts)` | Direct I/O writer |
 
-| Class/Function | Description |
-|----------------|-------------|
-| `PyWriterOptions` | Writer configuration |
-| `PyObjectWriter` | Streaming writer |
-| `create_s3_writer(uri, opts)` | Create S3 writer |
-| `create_azure_writer(uri, opts)` | Create Azure writer |
-| `create_filesystem_writer(uri, opts)` | Create filesystem writer |
-| `create_direct_filesystem_writer(uri, opts)` | Create Direct I/O writer |
+### s3torchconnector Compat Classes
+
+| Class | Description |
+|-------|-------------|
+| `S3IterableDataset.from_prefix(uri, region)` | Streaming dataset |
+| `S3MapDataset.from_prefix(uri, region)` | Random access dataset |
+| `S3Checkpoint(region)` | Checkpoint save/load |
+| `S3Client(region, endpoint, config)` | Low-level client |
+| `S3ClientConfig(force_path_style, max_attempts)` | Client configuration |
+| `S3Item` | Item with `.bucket`, `.key`, `.read()` |
 
 ### AI/ML Integration
 
-| Class/Function | Description | Framework |
-|----------------|-------------|-----------|
-| `S3MapDataset` | Random access dataset | PyTorch |
-| `S3IterableDataset` | Streaming dataset | PyTorch |
-| `S3JaxIterable` | JAX-compatible iterable | JAX |
-| `make_tf_dataset(uri)` | TensorFlow dataset | TensorFlow |
-| `create_dataset(uri)` | Generic dataset | Any |
-| `create_async_loader(uri)` | Async data loader | Any |
+| Class/Function | Framework |
+|----------------|-----------|
+| `ObjectStoreMapDataset(uri, pattern)` | PyTorch |
+| `ObjectStoreIterableDataset(uri, shuffle)` | PyTorch |
+| `JaxIterable(uri, batch_size)` | JAX |
+| `make_tf_dataset(uri, batch_size)` | TensorFlow |
 
 ### Checkpoint System
 
 | Function | Description |
 |----------|-------------|
-| `save_checkpoint(uri, data)` | Save checkpoint |
+| `save_checkpoint(uri, data, compress)` | Save checkpoint |
 | `load_checkpoint(uri)` | Load checkpoint |
-| `load_checkpoint_with_validation(uri, keys)` | Load with validation |
-| `save_distributed_shard(uri, data, rank)` | Save distributed shard |
-| `finalize_distributed_checkpoint(uri, world_size)` | Finalize distributed checkpoint |
+| `load_checkpoint_with_validation(uri, expected_keys)` | Load with validation |
+| `save_distributed_shard(uri, data, rank, world_size)` | Save distributed shard |
+| `finalize_distributed_checkpoint(base_uri, world_size)` | Finalize distributed checkpoint |
 
-### Logging & Debugging
+### Logging
 
 | Function | Description |
 |----------|-------------|
-| `init_logging(level)` | Initialize logging (trace/debug/info/warn/error) |
-| `init_op_log(path)` | Enable operation logging |
-| `finalize_op_log()` | Finalize operation log |
-| `is_op_log_active()` | Check if logging enabled |
+| `init_logging(level)` | Set log level: trace, debug, info, warn, error |
+| `init_op_log(path)` | Enable operation logging to file |
+| `finalize_op_log()` | Flush and close operation log |
+| `is_op_log_active()` | Check if operation logging is active |
 
 ---
 
-## Common Patterns
+## Migration Guide
 
-### Training Loop with Checkpoints
+### From v0.9.40
 
-```python
-import s3dlio
+v0.9.50 is a **non-breaking** upgrade. The only change is the internal runtime architecture:
 
-# Load dataset
-dataset = s3dlio.create_dataset("s3://bucket/training-data/")
+| v0.9.40 | v0.9.50 |
+|---------|---------|
+| `GLOBAL_RUNTIME.block_on()` | io_uring submit via `run_on_global_rt()` |
+| Panics in multi-threaded Python | Fully thread-safe from any context |
+| No `put_many()` | `put_many()` and `put_many_async()` added |
 
-# Training loop
-for epoch in range(num_epochs):
-    for batch in dataset:
-        # Training step
-        loss = train_step(model, batch)
-    
-    # Save checkpoint every 5 epochs
-    if epoch % 5 == 0:
-        s3dlio.save_checkpoint(
-            f"s3://bucket/checkpoints/epoch_{epoch}.bin",
-            {
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "loss": loss
-            }
-        )
-```
+### From v0.8.x
 
-### Distributed Data Loading
+| Removed (v0.8.x) | Replacement (v0.9.x+) |
+|------------------|----------------------|
+| `list_objects(bucket, prefix)` | `list(uri)` |
+| `get_object(bucket, key)` | `get(uri)` or `get_range(uri, offset, length)` |
 
-```python
-from torch.utils.data import DataLoader
-from s3dlio import S3IterableDataset
+### From s3torchconnector
 
-# Each rank loads different shard
-dataset = S3IterableDataset(
-    uri=f"s3://bucket/shard_{rank}/",
-    shuffle=True
-)
-
-loader = DataLoader(
-    dataset,
-    batch_size=32,
-    num_workers=4
-)
-
-for batch in loader:
-    # Distributed training
-    pass
-```
+See [s3torchconnector Migration Guide](S3TORCHCONNECTOR_MIGRATION.md).
 
 ---
 
-## Migration from v0.8.x
-
-### Removed Functions (v0.9.30+)
-
-The following S3-specific functions have been **removed** in favor of universal alternatives:
-
-| Removed (v0.8.x) | Replacement (v0.9.x+) | Notes |
-|------------------|----------------------|-------|
-| `list_objects(bucket, prefix)` | `list(uri)` | Returns full URIs, works with all backends |
-| `get_object(bucket, key, offset, length)` | `get(uri)` or `get_range(uri, offset, length)` | Works with all backends |
-
-### Why?
-
-s3dlio treats all storage protocols equally. The removed functions were S3-specific, which contradicted the library's design principle of protocol-agnostic storage access.
-
----
-
-## Examples
-
-See `python/tests/` directory for comprehensive examples:
-- `test_comprehensive_api.py` - All storage operations
-- `bench_s3-torch_v8.py` - Performance benchmarking
-- `test_checkpoint_framework_integration.py` - Checkpoint examples
-- `pytorch_smoke.py` - PyTorch integration
-- `jax_smoke.py` - JAX integration
-- `tf_smoke.py` - TensorFlow integration
-
----
-
-## Support & Contributing
+## Support
 
 - **GitHub**: https://github.com/russfellows/s3dlio
 - **Issues**: https://github.com/russfellows/s3dlio/issues
-- **Documentation**: https://github.com/russfellows/s3dlio/tree/main/docs
-
-**License:** AGPL-3.0
+- **License**: Apache-2.0
