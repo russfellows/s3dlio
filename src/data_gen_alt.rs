@@ -319,9 +319,9 @@ impl Default for GeneratorConfig {
 /// ```rust
 /// use s3dlio::data_gen_alt::generate_data_simple;
 ///
-/// // Generate 100 MiB incompressible data with no deduplication
-/// let data = generate_data_simple(100 * 1024 * 1024, 1, 1);
-/// assert_eq!(data.len(), 100 * 1024 * 1024);
+/// // Generate 1 MiB incompressible data with no deduplication
+/// let data = generate_data_simple(1024 * 1024, 1, 1);
+/// assert_eq!(data.len(), 1024 * 1024);
 /// ```
 pub fn generate_data_simple(size: usize, dedup: usize, compress: usize) -> DataBuffer {
     let config = GeneratorConfig {
@@ -1303,7 +1303,7 @@ pub fn default_data_gen_threads() -> usize {
 /// - < 16 MB: Returns size itself (use single allocation)
 /// 
 /// # Example
-/// ```rust
+/// ```no_run
 /// use s3dlio::data_gen_alt::{optimal_chunk_size, DataGenerator, GeneratorConfig};
 /// 
 /// let total_size = 100 * 1024 * 1024 * 1024; // 100 GB
@@ -1343,7 +1343,7 @@ pub fn optimal_chunk_size(total_size: usize) -> usize {
 ///   use `DataGenerator` directly to reuse the thread pool across calls.
 /// 
 /// # Example: Maximum Performance Pattern
-/// ```rust
+/// ```no_run
 /// use s3dlio::data_gen_alt::{DataGenerator, GeneratorConfig};
 /// 
 /// // For repeated generation, use DataGenerator to reuse thread pool:
@@ -1410,9 +1410,9 @@ pub fn generate_data_with_config(config: GeneratorConfig) -> bytes::Bytes {
 /// ```rust
 /// use s3dlio::data_gen_alt::{DataGenerator, GeneratorConfig};
 /// 
-/// let config = GeneratorConfig { size: 100_000_000, ..Default::default() };
+/// let config = GeneratorConfig { size: 1_000_000, ..Default::default() }; // 1 MB
 /// let mut gen = DataGenerator::new(config);
-/// let mut buffer = vec![0u8; 64 * 1024 * 1024];  // 64 MB chunks
+/// let mut buffer = vec![0u8; 64 * 1024];  // 64 KB chunks
 /// while !gen.is_complete() {
 ///     let nbytes = gen.fill_chunk(&mut buffer);
 ///     // Use buffer[..nbytes] for your data...

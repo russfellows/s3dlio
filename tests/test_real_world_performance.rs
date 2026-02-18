@@ -9,8 +9,12 @@ use anyhow::Result;
 /// Real-world performance benchmark for typical s3dlio usage patterns
 /// Tests 1MB-100MB objects with common dedup/compression rates (1:1 and 2:1)
 /// Memory constraint: Up to 1GB available, so memory efficiency below 100MB is not a concern
+/// 
+/// NOTE: This is a comprehensive benchmark that takes ~80 seconds to complete.
+/// Run explicitly with: cargo test -- --ignored
 
 #[tokio::test]
+#[ignore] // Long-running benchmark (~80s) - run with: cargo test -- --ignored
 async fn test_real_world_performance_benchmark() -> Result<()> {
     println!("\n=== REAL-WORLD PERFORMANCE BENCHMARK ===");
     println!("Testing typical s3dlio usage: 1MB-100MB objects with common dedup/compression rates");

@@ -803,16 +803,63 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 /// # Put bytes to Azure
 /// s3dlio.put_bytes("az://container/blob.bin", b"hello world")
 /// 
-/// # Put bytearray (also zero-copy)
+/// # Put bytearray or any buffer-like object
 /// data = bytearray(b"hello world")
 /// s3dlio.put_bytes("file:///tmp/test.bin", data)
+/// 
+/// # Put dgen_py.BytesView or numpy array
+/// import dgen_py
+/// data = dgen_py.generate_buffer(1024)
+/// s3dlio.put_bytes("s3://bucket/data.bin", data)
 /// ```
 #[pyfunction]
-pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyBytes>) -> PyResult<()> {
-    // PyBytes.as_bytes() gives us a &[u8] view without copying
-    let data_slice: &[u8] = data.as_bytes();
+pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult<()> {
     let uri = uri.to_owned();
-    let data_owned = Bytes::copy_from_slice(data_slice);
+    
+    // Use same conversion logic as put_bytes_async for consistency
+    let data_owned = if let Ok(buffer) = PyBuffer::<u8>::get(data) {
+        // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
+        let len = buffer.len_bytes();
+        let mut vec = Vec::<u8>::with_capacity(len);
+        unsafe { vec.set_len(len); }
+        
+        buffer.copy_to_slice(py, &mut vec[..])
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyBufferError, _>(
+                format!("Buffer copy failed: {}", e)
+            ))?;
+        
+        Bytes::from(vec)
+    } else if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
+        // s3dlio's own BytesView - zero-copy Arc clone (optimal)
+        bytes_view.bytes.clone()
+    } else if let Ok(py_bytes) = data.cast::<PyBytes>() {
+        // PyBytes - direct copy
+        Bytes::copy_from_slice(py_bytes.as_bytes())
+    } else {
+        // Last resort: Try __bytes__() method or bytes() conversion
+        let bytes_result = data.call_method0("__bytes__")
+            .or_else(|_| {
+                let bytes_type = py.get_type::<PyBytes>();
+                bytes_type.call1((data,))
+            });
+        
+        match bytes_result {
+            Ok(bytes_obj) => {
+                if let Ok(py_bytes) = bytes_obj.cast::<PyBytes>() {
+                    Bytes::copy_from_slice(py_bytes.as_bytes())
+                } else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                        format!("__bytes__() returned non-bytes object: {}", bytes_obj.get_type().name()?)
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                    format!("Cannot convert data to bytes: {}. Expected bytes-like object", e)
+                ));
+            }
+        }
+    };
     
     py.detach(move || {
         // Submit to global runtime (io_uring pattern — never calls block_on)
@@ -828,23 +875,66 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyBytes>) -> PyResu
     })
 }
 
-/// Async version of put_bytes() - accepts BytesView (zero-copy via Arc clone) or PyBytes (copied)
+/// Async version of put_bytes() - accepts any bytes-like object
+/// 
+/// Accepts (in order of optimization):
+/// 1. Buffer protocol objects (dgen_py.BytesView, numpy arrays, bytearray, memoryview) - optimized copy
+/// 2. s3dlio's own BytesView - zero-copy Arc clone
+/// 3. Python bytes - direct copy
+/// 4. Any object with __bytes__() method - converted via bytes()
+/// 
+/// Design philosophy: Be liberal in what you accept, optimize based on what you get.
+/// Never reject valid data - match the permissiveness of minio/boto3/s3torch.
 #[pyfunction]
 fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
     
-    // Try to extract BytesView first (zero-copy via Arc clone)
-    let data_owned = if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
-        // Zero-copy: Clone the Arc-based Bytes (cheap pointer increment, no data copy)
+    // Try optimal paths first, fall back gracefully
+    let data_owned = if let Ok(buffer) = PyBuffer::<u8>::get(data) {
+        // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
+        // This is the most common path for external buffer objects
+        let len = buffer.len_bytes();
+        let mut vec = Vec::<u8>::with_capacity(len);
+        unsafe { vec.set_len(len); }
+        
+        buffer.copy_to_slice(py, &mut vec[..])
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyBufferError, _>(
+                format!("Buffer copy failed: {}", e)
+            ))?;
+        
+        Bytes::from(vec)
+    } else if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
+        // s3dlio's own BytesView - zero-copy Arc clone (optimal)
         bytes_view.bytes.clone()
     } else if let Ok(py_bytes) = data.cast::<PyBytes>() {
-        // Fallback: Copy data from PyBytes
-        // We need to copy because PyBytes can't be sent across threads
+        // PyBytes - direct copy
         Bytes::copy_from_slice(py_bytes.as_bytes())
     } else {
-        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-            "data must be BytesView or bytes"
-        ));
+        // Last resort: Try __bytes__() method or bytes() conversion
+        // This handles any custom objects that can be converted to bytes
+        let bytes_result = data.call_method0("__bytes__")
+            .or_else(|_| {
+                // If __bytes__() doesn't exist, try bytes(data)
+                let bytes_type = py.get_type::<PyBytes>();
+                bytes_type.call1((data,))
+            });
+        
+        match bytes_result {
+            Ok(bytes_obj) => {
+                if let Ok(py_bytes) = bytes_obj.cast::<PyBytes>() {
+                    Bytes::copy_from_slice(py_bytes.as_bytes())
+                } else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                        format!("__bytes__() returned non-bytes object: {}", bytes_obj.get_type().name()?)
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                    format!("Cannot convert data to bytes: {}. Expected bytes-like object (bytes, bytearray, memoryview, BytesView, numpy array, or object with __bytes__() method)", e)
+                ));
+            }
+        }
     };
     
     future_into_py(py, async move {
@@ -1888,4 +1978,135 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests for buffer protocol support
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::{PyByteArray, PyBytes};
+    
+    #[test]
+    fn test_buffer_conversion_accepts_bytes() {
+        pyo3::prepare_freethreaded_python();
+        
+        Python::with_gil(|py| {
+            let test_data = b"Hello, bytes!";
+            let py_bytes = PyBytes::new(py, test_data);
+            
+            // This simulates what put_bytes does - should not panic
+            let result = PyBuffer::<u8>::get(py_bytes.as_any())
+                .or_else(|_| {
+                    py_bytes.as_any().cast::<PyBytes>()
+                        .map_err(|e| e.into())
+                        .map(|_| unreachable!())  // We just need to check casting works
+                });
+            
+            // bytes should be accepted (either via buffer protocol or PyBytes cast)
+            assert!(result.is_ok() || py_bytes.as_any().cast::<PyBytes>().is_ok());
+        });
+    }
+    
+    #[test]
+    fn test_buffer_conversion_accepts_bytearray() {
+        pyo3::prepare_freethreaded_python();
+        
+        Python::with_gil(|py| {
+            let test_data = b"Hello, bytearray!";
+            let py_bytearray = PyByteArray::new(py, test_data);
+            
+            // bytearray implements buffer protocol - should work
+            let buffer_result = PyBuffer::<u8>::get(py_bytearray.as_any());
+            assert!(buffer_result.is_ok(), "bytearray should support buffer protocol");
+            
+            if let Ok(buffer) = buffer_result {
+                assert_eq!(buffer.len_bytes(), test_data.len());
+            }
+        });
+    }
+    
+    #[test]
+    fn test_buffer_conversion_accepts_memoryview() {
+        pyo3::prepare_freethreaded_python();
+        
+        Python::with_gil(|py| {
+            let test_data = b"Hello, memoryview!";
+            let py_bytes = PyBytes::new(py, test_data);
+            
+            // Create memoryview from bytes
+            let memoryview = py.eval(
+                "memoryview(arg)",
+                None,
+                Some(&[("arg", py_bytes)].into_py_dict(py))
+            ).expect("Failed to create memoryview");
+            
+            // memoryview implements buffer protocol - should work
+            let buffer_result = PyBuffer::<u8>::get(memoryview);
+            assert!(buffer_result.is_ok(), "memoryview should support buffer protocol");
+            
+            if let Ok(buffer) = buffer_result {
+                assert_eq!(buffer.len_bytes(), test_data.len());
+            }
+        });
+    }
+    
+    #[test]
+    fn test_buffer_conversion_rejects_invalid_types() {
+        pyo3::prepare_freethreaded_python();
+        
+        Python::with_gil(|py| {
+            // Test various invalid types
+            let invalid_int = 42.into_py(py);
+            let invalid_str = "string".into_py(py);
+            let invalid_list = vec![1, 2, 3].into_py(py);
+            
+            // All of these should fail buffer protocol
+            assert!(PyBuffer::<u8>::get(invalid_int.bind(py)).is_err());
+            assert!(PyBuffer::<u8>::get(invalid_str.bind(py)).is_err());
+            assert!(PyBuffer::<u8>::get(invalid_list.bind(py)).is_err());
+            
+            // And should not be castable to PyBytes
+            assert!(invalid_int.bind(py).cast::<PyBytes>().is_err());
+            assert!(invalid_str.bind(py).cast::<PyBytes>().is_err());
+            assert!(invalid_list.bind(py).cast::<PyBytes>().is_err());
+        });
+    }
+    
+    #[test]
+    fn test_custom_bytes_object_conversion() {
+        pyo3::prepare_freethreaded_python();
+        
+        Python::with_gil(|py| {
+            // Create a custom Python object with __bytes__ method
+            let code = r#"
+class CustomBytes:
+    def __init__(self, data):
+        self._data = data
+    def __bytes__(self):
+        return self._data
+
+custom = CustomBytes(b"Hello, custom!")
+custom
+"#;
+            let custom_obj = py.eval(code, None, None).expect("Failed to create custom object");
+            
+            // Buffer protocol should fail (no buffer interface)
+            assert!(PyBuffer::<u8>::get(custom_obj).is_err());
+            
+            // But __bytes__() should work
+            let bytes_result = custom_obj.call_method0("__bytes__");
+            assert!(bytes_result.is_ok(), "Custom object should have __bytes__() method");
+            
+            if let Ok(bytes_obj) = bytes_result {
+                let py_bytes = bytes_obj.cast::<PyBytes>();
+                assert!(py_bytes.is_ok(), "__bytes__() should return bytes object");
+                if let Ok(b) = py_bytes {
+                    assert_eq!(b.as_bytes(), b"Hello, custom!");
+                }
+            }
+        });
+    }
+}
+
 

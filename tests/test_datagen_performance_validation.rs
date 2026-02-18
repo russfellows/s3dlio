@@ -16,18 +16,27 @@ use std::time::Instant;
 use s3dlio::data_gen_alt::{DataGenerator, GeneratorConfig, NumaMode, generate_data_simple};
 use s3dlio::constants::DGEN_BLOCK_SIZE;
 
-/// Minimum acceptable throughput in GB/s
-/// dgen-rs achieves 47 GB/s on this system with 100 GB generation
-const MIN_THROUGHPUT_GBS: f64 = 35.0;
+// Conditional compilation for debug vs release builds
+// Debug builds are much slower, so we reduce test size and expectations
+#[cfg(not(debug_assertions))]
+const MIN_THROUGHPUT_GBS: f64 = 35.0; // Release: 35 GB/s (dgen-rs achieves 47 GB/s)
+#[cfg(not(debug_assertions))]
+const TEST_SIZE: usize = 100 * 1024 * 1024 * 1024; // Release: 100 GB
+#[cfg(not(debug_assertions))]
+const WARMUP_SIZE: usize = 1024 * 1024 * 1024; // Release: 1 GB warmup
+
+#[cfg(debug_assertions)]
+const MIN_THROUGHPUT_GBS: f64 = 0.5; // Debug: 500 MB/s (much slower without optimizations)
+#[cfg(debug_assertions)]
+const TEST_SIZE: usize = 16 * 1024 * 1024 * 1024; // Debug: 16 GB
+#[cfg(debug_assertions)]
+const WARMUP_SIZE: usize = 256 * 1024 * 1024; // Debug: 256 MB warmup
 
 /// Full performance test matching dgen-rs methodology
-/// Generates 100 GB with 32 MB chunks after 1 GB warmup
-/// 
-/// NOTE: This test takes ~2-3 seconds but is the definitive performance validation
+/// Release: Generates 100 GB with 32 MB chunks after 1 GB warmup (~2-3 seconds)
+/// Debug: Generates 16 GB with 32 MB chunks after 256 MB warmup (slower without optimization)
 #[test]
 fn test_datagen_streaming_throughput_100gb() {
-    const WARMUP_SIZE: usize = 1024 * 1024 * 1024; // 1 GB warmup
-    const TEST_SIZE: usize = 100 * 1024 * 1024 * 1024; // 100 GB
     const CHUNK_SIZE: usize = 32 * 1024 * 1024; // 32 MB (optimal for L3 cache)
     
     println!("\n=== s3dlio Data Generation Performance (dgen-rs methodology) ===");
