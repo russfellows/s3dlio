@@ -64,10 +64,77 @@ Complete rewrite of `python/s3dlio/compat/s3torchconnector.py` for zero-copy per
 
 **New class: `_BytesViewIO(io.RawIOBase)`** — Zero-copy seekable file-like wrapper around BytesView. `readinto()` uses `memoryview` for zero-copy slice into caller's buffer. Used by `S3Checkpoint.reader()` so `torch.load()` can read directly from Rust memory.
 
+### � **Range Download Optimization (Opt-In)**
+
+Parallel range downloads for large S3 objects, achieving **76% performance improvement** for 148 MB objects:
+
+**New Environment Variables:**
+- `S3DLIO_ENABLE_RANGE_OPTIMIZATION` — Opt-in flag (default: disabled to avoid HEAD overhead on small objects)
+- `S3DLIO_RANGE_THRESHOLD_MB` — Minimum object size to trigger parallel download (default: 64 MB)
+
+**Performance (Measured with 16x 148 MB objects on MinIO):**
+
+| Threshold | Time | Throughput | Speedup |
+|-----------|------|------------|---------|
+| Disabled (baseline) | 5.52s | 429 MB/s (0.42 GB/s) | 1.00x |
+| 8 MB | 3.50s | 676 MB/s (0.66 GB/s) | **1.58x** (58% faster) |
+| 16 MB | 3.27s | 725 MB/s (0.71 GB/s) | **1.69x** (69% faster) |
+| 32 MB | 3.23s | 732 MB/s (0.71 GB/s) | **1.71x** (71% faster) |
+| **64 MB (default)** | **3.14s** | **755 MB/s (0.74 GB/s)** | **1.76x** (76% faster) 🏆 |
+| 128 MB | 3.22s | 735 MB/s (0.72 GB/s) | **1.71x** (71% faster) |
+
+**Key Findings:**
+- 64 MB threshold (default) is optimal for 148 MB objects
+- Sweet spot: 16-64 MB thresholds provide 69-76% faster downloads
+- Even aggressive 8 MB threshold shows 58% improvement
+- HEAD overhead (~10-20ms) is well amortized by parallel download
+- **Fixes issue** where s3dlio was 25% slower than s3torchconnector for 148 MB objects — now 61-76% faster
+
+**Implementation:**
+- `S3ObjectStore::get()` now uses `get_object_uri_optimized_async()` when enabled
+- S3 backend now matches Azure/GCS parallel range download capability
+- Conservative opt-in design: disabled by default to avoid HEAD overhead on small objects
+
+**Python Usage:**
+```python
+import os
+os.environ['S3DLIO_ENABLE_RANGE_OPTIMIZATION'] = '1'
+os.environ['S3DLIO_RANGE_THRESHOLD_MB'] = '64'  # Objects ≥ 64 MB use parallel ranges
+
+import s3dlio
+data = s3dlio.get("s3://bucket/checkpoint-148mb.bin")  # 76% faster!
+```
+
+**Files Changed:**
+- `src/s3_utils.rs` — Updated threshold default from 4 MB to 64 MB, added enable check
+- `src/object_store.rs` — Wired S3ObjectStore::get() to use optimized path when enabled
+
+### ⚡ **Multipart Upload Performance Improvements**
+
+Zero-copy chunking and non-blocking spawn for streaming multipart uploads:
+
+**Optimizations:**
+- **Zero-copy chunking**: Use `Bytes::slice()` instead of `Vec::to_vec()` for part extraction
+- **Non-blocking spawn**: Use `spawn_on_global_rt()` instead of `run_on_global_rt()` — eliminates double-spawn overhead
+- **New `spawn_part_bytes()` method**: Direct Bytes handling without Vec<u8> conversion
+- **No more Python thread blocking**: Upload tasks spawn immediately and return JoinHandle
+
+**Performance Impact:**
+- Eliminates one full data copy per multipart chunk (16-64 MB chunks)
+- Removes blocking wait during task spawn (was: channel send/recv overhead)
+- Python thread now submits upload and continues immediately
+
+**Files Changed:**
+- `src/multipart.rs` — Zero-copy Bytes::slice() in write_owned() and write_owned_blocking(), new spawn_part_bytes()
+- `src/s3_client.rs` — Added spawn_on_global_rt() helper function
+
 ### 📚 **Documentation**
 
 - Rewrote `docs/PYTHON_API_GUIDE.md` — complete API reference for v0.9.50
 - Updated `docs/S3TORCHCONNECTOR_MIGRATION.md` — reflects zero-copy compat layer
+- Updated `docs/api/Environment_Variables.md` — Full threshold comparison table with actual benchmark data
+- Updated `docs/performance/MultiPart_README.md` — Large object download section with performance results
+- **New**: `docs/performance/RANGE_OPTIMIZATION_IMPLEMENTATION.md` — Complete implementation summary
 
 ### 🏗️ **Architecture**
 

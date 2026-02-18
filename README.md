@@ -109,10 +109,10 @@ cargo test
 
 ## 🌟 Latest Release
 
-**v0.9.50** (February 2026) - Enhanced Python runtime with improved async safety and s3pytorch compatibility.
+**v0.9.50** (February 2026) - Python runtime fixes, s3torchconnector compat, range download optimization, multipart upload improvements.
 
 **Recent highlights:**
-- **v0.9.50** - Python runtime enhancements, improved s3pytorch compatibility, all 526 tests passing
+- **v0.9.50** - Python multi-threaded runtime fix (io_uring-style submit), s3torchconnector zero-copy rewrite, S3 range download optimization (76% faster for large objects), multipart upload zero-copy chunking, all 526 tests passing
 - **v0.9.40** - Enhanced Python bytearray documentation with performance benchmarks (2.5-3x speedup)
 - **v0.9.37** - Test suite modernization, zero build warnings
 - **v0.9.36** - **BREAKING**: `ObjectStore::put()` now takes `Bytes` instead of `&[u8]` for true zero-copy
