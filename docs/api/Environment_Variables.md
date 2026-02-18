@@ -21,10 +21,52 @@ This document provides a comprehensive reference for all environment variables s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `S3DLIO_ENABLE_RANGE_OPTIMIZATION` | `false` | Enable parallel range downloads for large S3 objects (opt-in to avoid HEAD overhead) |
+| `S3DLIO_RANGE_THRESHOLD_MB` | `64` | Minimum object size (MB) to trigger range GET optimization (only when enabled) |
 | `S3DLIO_RANGE_CONCURRENCY` | Auto-tuned | Number of concurrent range requests for large objects |
-| `S3DLIO_RANGE_THRESHOLD_MB` | `32` | Minimum object size (MB) to trigger range GET optimization |
-| `S3DLIO_CHUNK_SIZE` | Auto-calculated | Chunk size for range requests |
+| `S3DLIO_CHUNK_SIZE` | Auto-calculated | Chunk size for range requests (default: 1-8 MB based on object size) |
 | `S3DLIO_CONCURRENT_THRESHOLD` | Auto-tuned | Threshold for enabling concurrent operations |
+
+### Range Optimization Details
+
+**Why disabled by default?**
+- Requires HEAD request to determine object size (adds ~10-20ms latency)
+- Small objects (< 64 MB) faster with single GET request
+- Best for workloads with large, known-size objects (> 100 MB)
+
+**When to enable:**
+```bash
+# Enable for large object workloads (> 100 MB objects)
+export S3DLIO_ENABLE_RANGE_OPTIMIZATION=1
+export S3DLIO_RANGE_THRESHOLD_MB=64  # Conservative default
+
+# For very large objects (> 500 MB), use aggressive settings
+export S3DLIO_ENABLE_RANGE_OPTIMIZATION=1
+export S3DLIO_RANGE_THRESHOLD_MB=128
+export S3DLIO_RANGE_CONCURRENCY=32
+export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
+```
+
+**Performance impact (measured with 148 MB objects):**
+- Objects < threshold: Single GET request (fast path, no HEAD)
+- Objects ≥ threshold: HEAD + parallel range GETs (58-76% faster for large objects)
+
+**Actual benchmark results (16x 148 MB objects, MinIO):**
+
+| Threshold | Time | Throughput | Speedup |
+|-----------|------|------------|---------|
+| Disabled (baseline) | 5.52s | 429 MB/s (0.42 GB/s) | 1.00x |
+| 8 MB | 3.50s | 676 MB/s (0.66 GB/s) | 1.58x (58% faster) |
+| 16 MB | 3.27s | 725 MB/s (0.71 GB/s) | 1.69x (69% faster) |
+| 32 MB | 3.23s | 732 MB/s (0.71 GB/s) | 1.71x (71% faster) |
+| **64 MB (default)** | **3.14s** | **755 MB/s (0.74 GB/s)** | **1.76x (76% faster)** 🏆 |
+| 128 MB | 3.22s | 735 MB/s (0.72 GB/s) | 1.71x (71% faster) |
+
+**Key findings:**
+- **64 MB threshold (default) is optimal** for 148 MB objects
+- 16-64 MB range provides excellent performance (69-76% faster)
+- Even aggressive 8 MB threshold shows 58% improvement
+- HEAD overhead (~10-20ms) is well amortized by parallel download
 
 ## S3 Operation Logging
 
@@ -116,7 +158,7 @@ export S3DLIO_RANGE_CONCURRENCY=64
 export S3DLIO_RT_THREADS=8
 export S3DLIO_MAX_HTTP_CONNECTIONS=50
 export S3DLIO_RANGE_CONCURRENCY=8
-export S3DLIO_RANGE_THRESHOLD_MB=64
+export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0  # Disable range optimization
 
 ./target/release/s3-cli get s3://bucket/files/
 ```
@@ -143,16 +185,18 @@ export S3DLIO_RT_THREADS=8
 ## Performance Tuning Guidelines
 
 ### For Large Objects (>100MB)
+- **Enable range optimization**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=1`
+- Set `S3DLIO_RANGE_THRESHOLD_MB=64` (or higher for very large objects)
 - Increase `S3DLIO_RANGE_CONCURRENCY` to 32-64
 - Use `S3DLIO_USE_OPTIMIZED_HTTP=true`
 - Set `S3DLIO_MAX_HTTP_CONNECTIONS=400`
 - Consider `S3DLIO_RT_THREADS=32` on high-core systems
 
 ### For Many Small Objects
+- **Disable range optimization**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` (default)
 - Use `S3DLIO_USE_OPTIMIZED_HTTP=true` 
 - Set `S3DLIO_MAX_HTTP_CONNECTIONS=200-400`
 - Increase `S3DLIO_RT_THREADS` for better parallelism
-- Set `S3DLIO_RANGE_THRESHOLD_MB=64` to avoid unnecessary range requests
 
 ### For Bandwidth-Limited Networks
 - Reduce `S3DLIO_RANGE_CONCURRENCY` to 8-16

@@ -684,6 +684,61 @@ for uri in uris:
 4. **Pre-stat with `get_many_stats()`** — eliminates per-get stat overhead
 5. **Use `ThreadPoolExecutor`** — s3dlio handles concurrency internally via global runtime
 6. **Set `S3DLIO_WORKER_THREADS`** — tune Tokio worker count for your workload
+7. **Enable range optimization for large objects** — see below
+
+### Large Object Download Optimization
+
+For workloads with large S3 objects (> 100 MB), enable parallel range downloads:
+
+```python
+import os
+os.environ['S3DLIO_ENABLE_RANGE_OPTIMIZATION'] = '1'
+os.environ['S3DLIO_RANGE_THRESHOLD_MB'] = '64'  # Objects ≥ 64 MB use parallel ranges
+
+import s3dlio
+
+# Large objects automatically use parallel range downloads
+data = s3dlio.get("s3://bucket/large-checkpoint.bin")  # 148 MB → 25-50% faster
+```
+
+**How it works:**
+- **Disabled by default** to avoid HEAD request overhead on small objects
+- When enabled, objects ≥ threshold are downloaded using parallel range requests
+- HEAD request determines size, then concurrent GET ranges fetch chunks in parallel
+- Best for: ML checkpoints, large datasets, multi-GB files
+- Not recommended for: Many small objects, latency-sensitive workloads
+
+**Tuning parameters:**
+```python
+import os
+
+# Conservative (recommended for mixed workloads)
+os.environ['S3DLIO_ENABLE_RANGE_OPTIMIZATION'] = '1'
+os.environ['S3DLIO_RANGE_THRESHOLD_MB'] = '64'  # Default
+
+# Aggressive (for very large objects > 500 MB)
+os.environ['S3DLIO_ENABLE_RANGE_OPTIMIZATION'] = '1'
+os.environ['S3DLIO_RANGE_THRESHOLD_MB'] = '128'
+os.environ['S3DLIO_RANGE_CONCURRENCY'] = '32'  # More parallel requests
+os.environ['S3DLIO_CHUNK_SIZE'] = '16777216'  # 16 MB chunks
+```
+
+**Actual benchmark results (16x 148 MB objects, MinIO):**
+
+| Threshold | Time | Throughput | Speedup |
+|-----------|------|------------|---------|
+| Disabled (baseline) | 5.52s | 429 MB/s (0.42 GB/s) | 1.00x |
+| 8 MB | 3.50s | 676 MB/s (0.66 GB/s) | **1.58x** (58% faster) |
+| 16 MB | 3.27s | 725 MB/s (0.71 GB/s) | **1.69x** (69% faster) |
+| 32 MB | 3.23s | 732 MB/s (0.71 GB/s) | **1.71x** (71% faster) |
+| **64 MB (default)** | **3.14s** | **755 MB/s (0.74 GB/s)** | **1.76x (76% faster)** 🏆 |
+| 128 MB | 3.22s | 735 MB/s (0.72 GB/s) | **1.71x** (71% faster) |
+
+**Summary:**
+- **64 MB threshold (default) is optimal**, achieving 76% improvement
+- 16-64 MB range all perform excellently (69-76% faster)
+- Even aggressive 8 MB threshold delivers 58% improvement with minimal downside
+- HEAD overhead: ~10-20ms (well amortized over parallel download)
 
 ---
 

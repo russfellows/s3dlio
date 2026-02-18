@@ -1121,7 +1121,7 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
     let range_threshold = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(4) * 1024 * 1024; // Default 4MB threshold
+        .unwrap_or(64) * 1024 * 1024; // Default 64MB threshold
     
     // Get object size first to decide strategy
     let client = aws_s3_client_async().await?;
