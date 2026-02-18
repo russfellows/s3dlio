@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::primitives::ByteStream;
+use bytes::Bytes;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -20,7 +21,7 @@ use tokio::task::JoinSet;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
+use crate::s3_client::{aws_s3_client_async, run_on_global_rt, spawn_on_global_rt};
 use crate::s3_utils::parse_s3_uri;
 
 #[cfg(feature = "profiling")]
@@ -233,16 +234,22 @@ impl MultipartUploadSink {
     /// Zero-copy within Rust: accept an owned Vec from Python and stream without another copy,
     /// what about run_on_global_rt() ?
     pub fn write_owned_blocking(&mut self, data: Vec<u8>) -> Result<()> {
+        let data_len = data.len() as u64;
+        
         if self.buf.is_empty() && data.len() >= self.cfg.part_size {
+            // Fast path: Convert Vec to Bytes (zero-copy ownership transfer),
+            // then use Bytes::slice() for zero-copy part extraction
+            let bytes = Bytes::from(data);
             let mut offset = 0usize;
-            while data.len() - offset >= self.cfg.part_size {
+            while bytes.len() - offset >= self.cfg.part_size {
                 let end = offset + self.cfg.part_size;
-                let chunk = data[offset..end].to_vec(); // own each part buffer
+                let chunk = bytes.slice(offset..end);  // Zero-copy slice!
                 offset = end;
-                self.spawn_part(chunk)?;
+                self.spawn_part_bytes(chunk)?;
             }
-            if offset < data.len() {
-                self.buf.extend_from_slice(&data[offset..]);
+            if offset < bytes.len() {
+                // Remainder goes into buffer (this still requires a copy, but it's small)
+                self.buf.extend_from_slice(&bytes[offset..]);
             }
         } else {
             self.buf.extend_from_slice(&data);
@@ -252,29 +259,29 @@ impl MultipartUploadSink {
             }
         }
     
-        self.total_bytes += data.len() as u64;
+        self.total_bytes += data_len;
         Ok(())
     }
 
 
     /// Async version of `write_owned_blocking`.
     pub async fn write_owned(&mut self, data: Vec<u8>) -> Result<()> {
-        self.total_bytes += data.len() as u64;
+        let data_len = data.len() as u64;
 
         if self.buf.is_empty() && data.len() >= self.cfg.part_size {
-            // Fast path: slice full-sized parts out of `data` without extra copies.
+            // Fast path: Convert Vec to Bytes (zero-copy ownership transfer),
+            // then use Bytes::slice() for zero-copy part extraction
+            let bytes = Bytes::from(data);
             let mut offset = 0usize;
-            while data.len() - offset >= self.cfg.part_size {
+            while bytes.len() - offset >= self.cfg.part_size {
                 let end = offset + self.cfg.part_size;
-                // Move out chunks by allocating a new Vec and copying the slice.
-                // (No extra Python->Rust copy; the only copy is within Rust when chunking `data`.)
-                let chunk = data[offset..end].to_vec();
+                let chunk = bytes.slice(offset..end);  // Zero-copy slice!
                 offset = end;
-                self.spawn_part(chunk)?;
+                self.spawn_part_bytes(chunk)?;
             }
-            if offset < data.len() {
-                // Move the tail into internal buffer.
-                self.buf.extend_from_slice(&data[offset..]);
+            if offset < bytes.len() {
+                // Remainder goes into buffer (this still requires a copy, but it's small)
+                self.buf.extend_from_slice(&bytes[offset..]);
             }
         } else {
             // Merge into internal buffer; will spawn parts as it crosses thresholds.
@@ -284,6 +291,8 @@ impl MultipartUploadSink {
                 self.spawn_part(chunk)?;
             }
         }
+        
+        self.total_bytes += data_len;
         Ok(())
     }
 
@@ -428,41 +437,75 @@ impl MultipartUploadSink {
         let upload_id = self.upload_id.clone();
         let semaphore = self.sem.clone();
     
-        // Spawn the task *on the global Tokio runtime* and capture the JoinHandle.
-        let handle: JoinHandle<Result<(i32, String)>> = run_on_global_rt(async move {
-            // Spawn a child task on the same runtime; return its JoinHandle
-            let h = tokio::spawn(async move {
-                // Concurrency permit
-                let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
-    
-                let body = ByteStream::from(bytes);
-                let resp = client
-                    .upload_part()
-                    .bucket(bucket)
-                    .key(key)
-                    .upload_id(upload_id)
-                    .part_number(part_number)
-                    .body(body)
-                    .send()
-                    .await
-                    .context("UploadPart failed")?;
-    
-                let etag = resp.e_tag().unwrap_or_default().to_string();
-                if etag.is_empty() {
-                    bail!("UploadPart returned empty ETag");
-                }
-                Ok::<(i32, String), anyhow::Error>((part_number, etag))
-            });
-            Ok::<_, anyhow::Error>(h)
-        })?;
+        // Spawn directly on global runtime without blocking (no double-spawn overhead).
+        // This is a major performance improvement: instead of blocking the Python thread
+        // to spawn a task that spawns another task, we now spawn once and return immediately.
+        let handle: JoinHandle<Result<(i32, String)>> = spawn_on_global_rt(async move {
+            // Concurrency permit
+            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+
+            let body = ByteStream::from(bytes);
+            let resp = client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(body)
+                .send()
+                .await
+                .context("UploadPart failed")?;
+
+            let etag = resp.e_tag().unwrap_or_default().to_string();
+            if etag.is_empty() {
+                bail!("UploadPart returned empty ETag");
+            }
+            Ok::<(i32, String), anyhow::Error>((part_number, etag))
+        });
     
         // Store handle to await later in finish_blocking()
         self.tasks.push(handle);
         Ok(())
     }
     
+    /// Spawn a part upload using Bytes (zero-copy from Python buffer).
+    /// This avoids the Vec<u8> conversion overhead when we already have Bytes.
+    fn spawn_part_bytes(&mut self, bytes: Bytes) -> Result<()> {
+        let part_number = self.next_part_number;
+        self.next_part_number += 1;
     
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key.clone();
+        let upload_id = self.upload_id.clone();
+        let semaphore = self.sem.clone();
+    
+        // Spawn directly on global runtime without blocking
+        let handle: JoinHandle<Result<(i32, String)>> = spawn_on_global_rt(async move {
+            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+
+            let body = ByteStream::from(bytes);  // ByteStream::from(Bytes) is cheap
+            let resp = client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(body)
+                .send()
+                .await
+                .context("UploadPart failed")?;
+
+            let etag = resp.e_tag().unwrap_or_default().to_string();
+            if etag.is_empty() {
+                bail!("UploadPart returned empty ETag");
+            }
+            Ok::<(i32, String), anyhow::Error>((part_number, etag))
+        });
+    
+        self.tasks.push(handle);
+        Ok(())
+    }
+
+
 }
-    
-    
-    

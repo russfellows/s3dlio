@@ -1,5 +1,158 @@
 # s3dlio Changelog
 
+## Version 0.9.50 - Critical Python Runtime Fix & s3torchconnector Compat (February 2026)
+
+### 🚨 **CRITICAL: Python Multi-Threaded Runtime Fix**
+
+**Fixed two catastrophic bugs** that prevented s3dlio from being used in multi-threaded Python applications:
+
+| Bug | Version | Symptom | Root Cause |
+|-----|---------|---------|------------|
+| Runtime Churn | v0.9.27 | `RuntimeError: dispatch failure` after ~40 objects | Every API call created a new Tokio runtime (320 calls = 256+ OS threads) |
+| Nested Runtime | v0.9.40 | `PanicException: Cannot start a runtime from within a runtime` | `GLOBAL_RUNTIME.block_on()` panics when called from Tokio-managed threads |
+
+**Solution — io_uring-style Submit Pattern:**
+
+Replaced all `block_on()` calls with a spawn+channel pattern that works from ANY thread context:
+
+```
+Python Thread → handle.spawn(async work) → mpsc::channel.recv() → result
+```
+
+- The calling thread blocks on `channel.recv()` (NOT `block_on()`), so there are no Tokio runtime conflicts
+- A single global Tokio runtime (created once via `once_cell::Lazy`) handles all async I/O
+- `submit_io<F, T>()` wrapper converts `anyhow::Result<T>` → `PyResult<T>` for clean error propagation
+- Zero-copy: `Bytes` (Arc-based) moves through the channel — no data copied
+
+**Files Changed:**
+- `src/python_api/python_core_api.rs` — Removed `GLOBAL_RUNTIME`, added `submit_io()`, updated 12 functions
+- `src/python_api/python_aiml_api.rs` — Updated 2 functions to use `run_on_global_rt()`
+
+**Test Result:** 16 threads × 200 objects × 3 rounds — ALL OPERATIONS PASSED (ThreadPoolExecutor)
+
+### ✨ **New: `put_many()` Batch Upload**
+
+Upload multiple objects in a single call with parallel execution:
+
+```python
+items = [
+    ("s3://bucket/file1.bin", b"data1"),
+    ("s3://bucket/file2.bin", b"data2"),
+    ("s3://bucket/file3.bin", b"data3"),
+]
+s3dlio.put_many(items)
+
+# Async version
+await s3dlio.put_many_async(items)
+```
+
+### 🔧 **s3torchconnector Compatibility Layer Rewrite**
+
+Complete rewrite of `python/s3dlio/compat/s3torchconnector.py` for zero-copy performance:
+
+| Component | Before (Broken) | After (v0.9.50) |
+|-----------|-----------------|------------------|
+| `S3Client.get_object` (range) | Downloaded entire object + `bytes()` copy | Uses `get_range()` — server-side range, returns BytesView zero-copy |
+| `S3Client.put_object` | `list[bytes]` + `b''.join()` (two copies) | Accumulates in BytesIO, single `put_bytes()` call |
+| `S3Checkpoint.writer` | `self.buffer.read()` (copy) | `getbuffer()` memoryview — no copy |
+| `S3Checkpoint.reader` | `io.BytesIO(bytes(data))` (two copies) | New `_BytesViewIO(io.RawIOBase)` wrapping BytesView via memoryview, wrapped in `io.BufferedReader` |
+| `S3IterableDataset.__iter__` | Lost URIs (placeholder base_uri) | Pre-lists via `list()`, iterates with full URIs |
+| `S3MapDataset` | Depended on `ObjectStoreMapDataset._keys` private attr | Uses `list()` + `get()` directly |
+| `S3Client.list_objects` | Called non-existent `list_prefix` | Uses `list(uri, recursive=True)` |
+| Module imports | Per-class `from .. import _pymod` | Single module-level `from .. import _pymod as _core` |
+| `S3Item.close()` | No-op | Sets `_data = None` to release Rust Bytes Arc reference early |
+
+**New class: `_BytesViewIO(io.RawIOBase)`** — Zero-copy seekable file-like wrapper around BytesView. `readinto()` uses `memoryview` for zero-copy slice into caller's buffer. Used by `S3Checkpoint.reader()` so `torch.load()` can read directly from Rust memory.
+
+### � **Range Download Optimization (Opt-In)**
+
+Parallel range downloads for large S3 objects, achieving **76% performance improvement** for 148 MB objects:
+
+**New Environment Variables:**
+- `S3DLIO_ENABLE_RANGE_OPTIMIZATION` — Opt-in flag (default: disabled to avoid HEAD overhead on small objects)
+- `S3DLIO_RANGE_THRESHOLD_MB` — Minimum object size to trigger parallel download (default: 64 MB)
+
+**Performance (Measured with 16x 148 MB objects on MinIO):**
+
+| Threshold | Time | Throughput | Speedup |
+|-----------|------|------------|---------|
+| Disabled (baseline) | 5.52s | 429 MB/s (0.42 GB/s) | 1.00x |
+| 8 MB | 3.50s | 676 MB/s (0.66 GB/s) | **1.58x** (58% faster) |
+| 16 MB | 3.27s | 725 MB/s (0.71 GB/s) | **1.69x** (69% faster) |
+| 32 MB | 3.23s | 732 MB/s (0.71 GB/s) | **1.71x** (71% faster) |
+| **64 MB (default)** | **3.14s** | **755 MB/s (0.74 GB/s)** | **1.76x** (76% faster) 🏆 |
+| 128 MB | 3.22s | 735 MB/s (0.72 GB/s) | **1.71x** (71% faster) |
+
+**Key Findings:**
+- 64 MB threshold (default) is optimal for 148 MB objects
+- Sweet spot: 16-64 MB thresholds provide 69-76% faster downloads
+- Even aggressive 8 MB threshold shows 58% improvement
+- HEAD overhead (~10-20ms) is well amortized by parallel download
+- **Fixes issue** where s3dlio was 25% slower than s3torchconnector for 148 MB objects — now 61-76% faster
+
+**Implementation:**
+- `S3ObjectStore::get()` now uses `get_object_uri_optimized_async()` when enabled
+- S3 backend now matches Azure/GCS parallel range download capability
+- Conservative opt-in design: disabled by default to avoid HEAD overhead on small objects
+
+**Python Usage:**
+```python
+import os
+os.environ['S3DLIO_ENABLE_RANGE_OPTIMIZATION'] = '1'
+os.environ['S3DLIO_RANGE_THRESHOLD_MB'] = '64'  # Objects ≥ 64 MB use parallel ranges
+
+import s3dlio
+data = s3dlio.get("s3://bucket/checkpoint-148mb.bin")  # 76% faster!
+```
+
+**Files Changed:**
+- `src/s3_utils.rs` — Updated threshold default from 4 MB to 64 MB, added enable check
+- `src/object_store.rs` — Wired S3ObjectStore::get() to use optimized path when enabled
+
+### ⚡ **Multipart Upload Performance Improvements**
+
+Zero-copy chunking and non-blocking spawn for streaming multipart uploads:
+
+**Optimizations:**
+- **Zero-copy chunking**: Use `Bytes::slice()` instead of `Vec::to_vec()` for part extraction
+- **Non-blocking spawn**: Use `spawn_on_global_rt()` instead of `run_on_global_rt()` — eliminates double-spawn overhead
+- **New `spawn_part_bytes()` method**: Direct Bytes handling without Vec<u8> conversion
+- **No more Python thread blocking**: Upload tasks spawn immediately and return JoinHandle
+
+**Performance Impact:**
+- Eliminates one full data copy per multipart chunk (16-64 MB chunks)
+- Removes blocking wait during task spawn (was: channel send/recv overhead)
+- Python thread now submits upload and continues immediately
+
+**Files Changed:**
+- `src/multipart.rs` — Zero-copy Bytes::slice() in write_owned() and write_owned_blocking(), new spawn_part_bytes()
+- `src/s3_client.rs` — Added spawn_on_global_rt() helper function
+
+### 📚 **Documentation**
+
+- Rewrote `docs/PYTHON_API_GUIDE.md` — complete API reference for v0.9.50
+- Updated `docs/S3TORCHCONNECTOR_MIGRATION.md` — reflects zero-copy compat layer
+- Updated `docs/api/Environment_Variables.md` — Full threshold comparison table with actual benchmark data
+- Updated `docs/performance/MultiPart_README.md` — Large object download section with performance results
+- **New**: `docs/performance/RANGE_OPTIMIZATION_IMPLEMENTATION.md` — Complete implementation summary
+
+### 🏗️ **Architecture**
+
+**Global Client Cache (DashMap):**
+- `StoreKey(scheme, endpoint, region) → Arc<dyn ObjectStore>`
+- >99% cache hit rate, <100ns lookup (DashMap sharded locking)
+- Process-global and automatic — no manual client passing required
+- Superior to MinIO's `urllib3.PoolManager(maxsize=10)` per-instance pattern
+
+**Zero-Copy Data Flow:**
+```
+Rust async I/O → Bytes (Arc) → mpsc channel → PyBytesView (buffer protocol)
+                                                    ↓
+                    memoryview / np.frombuffer / torch.frombuffer (zero-copy)
+```
+
+---
+
 ## Version 0.9.40 - Critical Performance Fix & Zero-Copy Architecture (February 2026)
 
 ### 🚀 **Critical Performance Fix**

@@ -1,9 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Tests](https://img.shields.io/badge/tests-186%20passing-brightgreen)](docs/Changelog.md)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-186%2F186-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.40-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-526%2F526-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.50-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -110,9 +109,10 @@ cargo test
 
 ## 🌟 Latest Release
 
-**v0.9.40** (February 2026) - Python bytearray documentation & testing improvements.
+**v0.9.50** (February 2026) - Python runtime fixes, s3torchconnector compat, range download optimization, multipart upload improvements.
 
 **Recent highlights:**
+- **v0.9.50** - Python multi-threaded runtime fix (io_uring-style submit), s3torchconnector zero-copy rewrite, S3 range download optimization (76% faster for large objects), multipart upload zero-copy chunking, all 526 tests passing
 - **v0.9.40** - Enhanced Python bytearray documentation with performance benchmarks (2.5-3x speedup)
 - **v0.9.37** - Test suite modernization, zero build warnings
 - **v0.9.36** - **BREAKING**: `ObjectStore::put()` now takes `Bytes` instead of `&[u8]` for true zero-copy

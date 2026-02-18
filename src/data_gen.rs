@@ -245,8 +245,8 @@ pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> V
 /// ```rust
 /// use s3dlio::fill_controlled_data;
 /// 
-/// // 100MB incompressible data using fast fill-in-place
-/// let mut data = vec![0u8; 100 * 1024 * 1024];
+/// // 1 MB incompressible data using fast fill-in-place
+/// let mut data = vec![0u8; 1024 * 1024];
 /// fill_controlled_data(&mut data, 1, 1);
 /// ```
 ///
@@ -277,8 +277,8 @@ pub fn generate_controlled_data_prand(size: usize, dedup: usize, compress: usize
 ///
 /// # Example
 /// ```rust
-/// // Fill 4 MB buffer with incompressible random data
-/// let mut buf = vec![0u8; 4 * 1024 * 1024];
+/// // Fill 1 MB buffer with incompressible random data
+/// let mut buf = vec![0u8; 1024 * 1024];
 /// s3dlio::fill_controlled_data(&mut buf, 1, 1);
 /// ```
 pub fn fill_controlled_data(buf: &mut [u8], dedup: usize, compress: usize) {

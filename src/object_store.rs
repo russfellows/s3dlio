@@ -29,6 +29,7 @@ use crate::s3_utils::{
     list_objects as s3_list_objects,
     list_objects_stream as s3_list_objects_stream,
     get_object_uri_async as s3_get_object_uri_async,
+    get_object_uri_optimized_async as s3_get_object_uri_optimized_async,
     get_object_range_uri_async as s3_get_object_range_uri_async,
     stat_object_uri_async as s3_stat_object_uri_async,
     delete_objects as s3_delete_objects,
@@ -974,7 +975,19 @@ impl S3ObjectStore {
 impl ObjectStore for S3ObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
-        s3_get_object_uri_async(uri).await
+        
+        // Check if range optimization is enabled via environment variable
+        // This allows opt-in to parallel range downloads for large objects
+        let use_optimized = std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on" | "enable" | "enabled"))
+            .unwrap_or(false);
+        
+        if use_optimized {
+            s3_get_object_uri_optimized_async(uri).await
+        } else {
+            s3_get_object_uri_async(uri).await
+        }
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {

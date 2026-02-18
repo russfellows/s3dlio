@@ -26,6 +26,7 @@ This document explains how to use the **streaming, concurrent multipart upload (
   * [Aborting an MPU](#aborting-an-mpu)
   * [Content type / metadata](#content-type--metadata)
   * [Throughput tuning](#throughput-tuning)
+* [Large Object Downloads](#large-object-downloads)
 * [Operational guidance](#operational-guidance)
 * [FAQ](#faq)
 
@@ -196,7 +197,88 @@ You can set `content_type` on creation. Future versions may expose additional he
 * Ensure your client and endpoint are on the same high‑bandwidth network; enable jumbo frames as appropriate.
 
 ---
+## Large Object Downloads
 
+While this document focuses on **multipart uploads**, s3dlio also supports **parallel range downloads** for large objects.
+
+### Overview
+
+For large S3 objects (> 64 MB), s3dlio can automatically split the download into concurrent range requests, significantly improving throughput by hiding network latency.
+
+**Default behavior:**
+- Disabled by default to avoid HEAD request overhead on small objects
+- Must be explicitly enabled via environment variable
+
+**When to enable:**
+- Large ML checkpoints (> 100 MB)
+- Video files, large datasets, archives
+- Workloads where objects are consistently large
+
+**When to keep disabled:**
+- Many small objects (< 64 MB)
+- Latency-sensitive workloads
+- Mixed object sizes
+
+### Python Example
+
+```python
+import os
+# Enable parallel range downloads for large objects
+os.environ['S3DLIO_ENABLE_RANGE_OPTIMIZATION'] = '1'
+os.environ['S3DLIO_RANGE_THRESHOLD_MB'] = '64'  # Objects ≥ 64 MB use parallel ranges
+
+import s3dlio
+
+# Large checkpoint automatically uses parallel download
+data = s3dlio.get("s3://bucket/checkpoint-148mb.bin")  # 25-50% faster than single GET
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_ENABLE_RANGE_OPTIMIZATION` | `0` (disabled) | Enable parallel range downloads |
+| `S3DLIO_RANGE_THRESHOLD_MB` | `64` | Minimum size to trigger parallel download |
+| `S3DLIO_RANGE_CONCURRENCY` | Auto (8-32) | Number of parallel range requests |
+| `S3DLIO_CHUNK_SIZE` | Auto (1-8 MB) | Size of each range chunk |
+
+### Performance Example
+
+**Actual benchmark results (16x 148 MB objects, MinIO):**
+
+| Threshold | Time | Throughput | Speedup |
+|-----------|------|------------|---------|
+| Disabled (baseline) | 5.52s | 429 MB/s (0.42 GB/s) | 1.00x |
+| 8 MB | 3.50s | 676 MB/s (0.66 GB/s) | **1.58x** (58% faster) |
+| 16 MB | 3.27s | 725 MB/s (0.71 GB/s) | **1.69x** (69% faster) |
+| 32 MB | 3.23s | 732 MB/s (0.71 GB/s) | **1.71x** (71% faster) |
+| **64 MB (default)** | **3.14s** | **755 MB/s (0.74 GB/s)** | **1.76x (76% faster)** 🏆 |
+| 128 MB | 3.22s | 735 MB/s (0.72 GB/s) | **1.71x** (71% faster) |
+
+**Key findings:**
+- **64 MB threshold (default) is optimal**, achieving 76% improvement over single GET
+- Sweet spot: 16-64 MB thresholds provide 69-76% faster downloads
+- Even aggressive 8 MB threshold shows 58% improvement
+- 128 MB threshold still performs well (71% faster) but slightly suboptimal when object size is just above threshold
+- HEAD overhead: ~10-20ms (well amortized over parallel download)
+
+**Conservative tuning:**
+```bash
+export S3DLIO_ENABLE_RANGE_OPTIMIZATION=1
+export S3DLIO_RANGE_THRESHOLD_MB=64
+```
+
+**Aggressive tuning (for very large objects > 500 MB):**
+```bash
+export S3DLIO_ENABLE_RANGE_OPTIMIZATION=1
+export S3DLIO_RANGE_THRESHOLD_MB=128
+export S3DLIO_RANGE_CONCURRENCY=32
+export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
+```
+
+**See also:** [Environment Variables Reference](../api/Environment_Variables.md)
+
+---
 ## Operational guidance
 
 * **Don’t reuse** the memoryview returned by `reserve()` after `commit()`.

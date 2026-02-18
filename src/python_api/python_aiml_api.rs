@@ -37,6 +37,9 @@ use crate::api::dataset_for_uri_with_options;
 #[cfg(feature = "extension-module")]
 use crate::checkpoint::{CheckpointStore, CheckpointConfig, Strategy, CheckpointInfo};
 
+// Import io_uring-style submit from s3_client (never calls block_on)
+use crate::s3_client::run_on_global_rt;
+
 // Helper function to convert errors
 fn py_err<E: std::fmt::Display>(e: E) -> PyErr { PyRuntimeError::new_err(e.to_string()) }
 
@@ -1342,15 +1345,17 @@ pub fn load_checkpoint_with_validation(
     validate_integrity: bool,
 ) -> PyResult<Py<PyAny>> {
     let store = store_for_uri(uri).map_err(py_err)?;
+    let uri_owned = uri.to_owned();
 
     py.detach(|| {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
+        // Submit to global runtime (io_uring pattern — never calls block_on)
+        run_on_global_rt(async move {
             if validate_integrity {
                 // load_checkpoint_with_validation returns Vec<u8> for backward compatibility
-                store.load_checkpoint_with_validation(uri, None).await
+                store.load_checkpoint_with_validation(&uri_owned, None).await
             } else {
                 // get returns Bytes, convert to Vec<u8>
-                store.get(uri).await.map(|b| b.to_vec())
+                store.get(&uri_owned).await.map(|b| b.to_vec())
             }
         })
     }).map_err(py_err)

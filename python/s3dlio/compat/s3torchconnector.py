@@ -15,6 +15,14 @@ Key differences from native s3dlio classes:
 - Returns item objects with .bucket, .key, .read() methods (not raw tensors)
 - Supports S3, Azure, GCS, local filesystems (s3torchconnector only supports S3)
 - Higher performance (Rust backend vs Python/C++)
+- ZERO-COPY: get() returns BytesView backed by Rust Bytes (Arc-counted, no memcpy)
+- Global client cache: DashMap<StoreKey, Arc<dyn ObjectStore>> auto-reuses connections
+
+Performance architecture (analogous to MinIO Python SDK but faster):
+- MinIO: urllib3.PoolManager(maxsize=10) per Minio() instance, synchronous
+- s3dlio: Global DashMap client cache, async Tokio runtime, io_uring-style submit
+- Both: Thread-safe client objects. s3dlio is superior because the cache is
+  process-global and automatic — no manual client passing required.
 
 Environment variables (same as s3torchconnector):
     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY - S3 credentials
@@ -26,6 +34,7 @@ Environment variables (same as s3torchconnector):
 
 from __future__ import annotations
 
+import io
 import os
 import warnings
 from typing import Any, Iterator, Optional
@@ -35,6 +44,81 @@ import torch
 from torch.utils.data import IterableDataset, Dataset
 
 from ..torch import ObjectStoreIterableDataset, ObjectStoreMapDataset
+
+# Import s3dlio native module once at module level (not per-class)
+from .. import _pymod as _core
+
+
+class _BytesViewIO(io.RawIOBase):
+    """
+    Zero-copy file-like wrapper around s3dlio BytesView.
+    
+    Implements io.RawIOBase so that torch.load(), pickle.load(), etc.
+    can read directly from Rust-owned memory without any copy.
+    
+    The underlying BytesView implements the Python buffer protocol,
+    backed by Rust Bytes (Arc-counted). This wrapper adds seekable
+    file-like semantics on top.
+    """
+    
+    __slots__ = ("_view", "_pos", "_len")
+    
+    def __init__(self, bytes_view):
+        """
+        Args:
+            bytes_view: s3dlio BytesView object (implements buffer protocol)
+        """
+        super().__init__()
+        self._view = bytes_view
+        self._pos = 0
+        self._len = len(bytes_view)
+    
+    def readable(self) -> bool:
+        return True
+    
+    def seekable(self) -> bool:
+        return True
+    
+    def writable(self) -> bool:
+        return False
+    
+    def readinto(self, b):
+        """Read up to len(b) bytes into b. Zero-copy via memoryview slicing."""
+        if self._pos >= self._len:
+            return 0
+        remaining = self._len - self._pos
+        n = min(len(b), remaining)
+        # Use memoryview for zero-copy slice into the caller's buffer
+        mv = memoryview(self._view)
+        b[:n] = mv[self._pos:self._pos + n]
+        self._pos += n
+        return n
+    
+    def read(self, size=-1):
+        """Read up to size bytes. Returns bytes (one copy from Rust buffer)."""
+        if self._pos >= self._len:
+            return b""
+        if size < 0:
+            size = self._len - self._pos
+        remaining = self._len - self._pos
+        n = min(size, remaining)
+        mv = memoryview(self._view)
+        result = bytes(mv[self._pos:self._pos + n])
+        self._pos += n
+        return result
+    
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            self._pos = offset
+        elif whence == io.SEEK_CUR:
+            self._pos += offset
+        elif whence == io.SEEK_END:
+            self._pos = self._len + offset
+        self._pos = max(0, min(self._pos, self._len))
+        return self._pos
+    
+    def tell(self) -> int:
+        return self._pos
 
 
 class S3Item:
@@ -46,17 +130,18 @@ class S3Item:
         key (str): Object key (relative path)
     
     Methods:
-        read() -> bytes: Read the entire object payload
+        read() -> BytesView: Read the entire object payload (ZERO-COPY)
+        read_bytes() -> bytes: Read as Python bytes (creates copy)
         close(): Close the reader (no-op for compatibility)
     """
     
     __slots__ = ("_uri", "_bucket", "_key", "_data", "_closed")
     
-    def __init__(self, uri: str, data: bytes):
+    def __init__(self, uri: str, data):
         """
         Args:
             uri: Full URI (e.g., "s3://bucket/path/key")
-            data: Object payload bytes
+            data: Object payload — BytesView (zero-copy) or bytes
         """
         self._uri = uri
         self._data = data
@@ -71,22 +156,16 @@ class S3Item:
         scheme = parsed.scheme or "s3"
         
         if scheme == "s3":
-            # s3://bucket/path/to/key
             bucket = parsed.netloc
             key = parsed.path.lstrip("/")
         elif scheme == "az":
-            # az://account/container/path/to/key
-            # netloc is account, first path segment is container
             parts = parsed.path.lstrip("/").split("/", 1)
             bucket = f"{parsed.netloc}/{parts[0]}" if len(parts) > 0 else parsed.netloc
             key = parts[1] if len(parts) > 1 else ""
         elif scheme == "gs":
-            # gs://bucket/path/to/key
             bucket = parsed.netloc
             key = parsed.path.lstrip("/")
         elif scheme in ("file", "direct"):
-            # file:///path/to/file or direct:///path/to/file
-            # Use the directory as "bucket" and filename as "key"
             full_path = parsed.path
             if "/" in full_path:
                 bucket = os.path.dirname(full_path)
@@ -95,7 +174,6 @@ class S3Item:
                 bucket = "/"
                 key = full_path
         else:
-            # Fallback for unknown schemes
             bucket = parsed.netloc or "unknown"
             key = parsed.path.lstrip("/")
         
@@ -154,8 +232,9 @@ class S3Item:
         return self.read()
     
     def close(self) -> None:
-        """Close the reader (no-op for compatibility)."""
+        """Close the reader (releases reference to BytesView data)."""
         self._closed = True
+        self._data = None  # Allow GC to reclaim Rust Bytes
     
     def __enter__(self) -> "S3Item":
         return self
@@ -165,10 +244,13 @@ class S3Item:
     
     def __len__(self) -> int:
         """Return size of object in bytes."""
+        if self._data is None:
+            return 0
         return len(self._data)
     
     def __repr__(self) -> str:
-        return f"S3Item(bucket='{self.bucket}', key='{self.key}', size={len(self._data)})"
+        size = len(self._data) if self._data is not None else 0
+        return f"S3Item(bucket='{self.bucket}', key='{self.key}', size={size})"
 
 
 class S3IterableDataset(IterableDataset):
@@ -178,8 +260,9 @@ class S3IterableDataset(IterableDataset):
     Key features:
     - API-compatible with s3torchconnector for easy migration
     - Multi-protocol support (S3, Azure, GCS, file://, direct://)
-    - Higher performance (Rust backend)
+    - Higher performance (Rust backend with global client cache)
     - Multi-endpoint load balancing (via AWS_ENDPOINT_URL=url1,url2,...)
+    - ZERO-COPY: Items contain BytesView backed by Rust memory
     
     Usage:
         >>> from s3dlio.compat.s3torchconnector import S3IterableDataset
@@ -212,20 +295,14 @@ class S3IterableDataset(IterableDataset):
             os.environ.setdefault("AWS_REGION", region)
         
         # Extract s3dlio-compatible loader options
-        # Map s3torchconnector params to s3dlio params where needed
         self._loader_opts = self._convert_loader_kwargs(loader_kwargs)
         
-        # Create underlying s3dlio dataset (returns bytes via return_type="bytes")
-        self._dataset = ObjectStoreIterableDataset.from_prefix(
-            uri,
-            enable_sharding=enable_sharding,
-            return_type="bytes",  # Get raw bytes, wrap in S3Item
-            **self._loader_opts
-        )
+        # Pre-list object keys so we can reconstruct full URIs during iteration
+        # This uses the global client cache (DashMap) — fast after first call
+        self._keys = _core.list(uri, recursive=True)
     
     def _convert_loader_kwargs(self, kwargs):
         """Convert s3torchconnector kwargs to s3dlio format."""
-        # s3dlio supports most options directly
         opts = {}
         
         # Direct mappings
@@ -235,7 +312,6 @@ class S3IterableDataset(IterableDataset):
         
         # Reader configuration (s3torchconnector uses reader_constructor, s3dlio uses reader_mode)
         if "reader_constructor" in kwargs:
-            # This is advanced - for now just use sequential
             warnings.warn("reader_constructor not directly supported - using default reader_mode")
         
         return opts
@@ -278,29 +354,28 @@ class S3IterableDataset(IterableDataset):
         return cls(prefix, region=region, **kwargs)
     
     def __iter__(self) -> Iterator[S3Item]:
-        """Iterate over objects, yielding S3Item instances."""
-        # Get the base URI for reconstructing full URIs
-        base_uri = self._uri.rstrip("/")
-        
-        # Iterate over underlying dataset (yields bytes)
-        for data in self._dataset:
-            # Need to reconstruct the URI - s3dlio doesn't preserve it in iterable mode
-            # For now, create a placeholder URI (this is a limitation we should fix upstream)
-            # In practice, users iterate without needing the exact URI
-            item_uri = base_uri  # Fallback - exact key unknown in streaming mode
-            
-            yield S3Item(item_uri, data)
+        """Iterate over objects, yielding S3Item instances with full URIs."""
+        for uri in self._keys:
+            # Fetch each object — returns BytesView (zero-copy from Rust)
+            # Uses global client cache, so only first call creates the store
+            data = _core.get(uri)
+            yield S3Item(uri, data)
+    
+    def __len__(self) -> int:
+        """Return number of objects in the dataset."""
+        return len(self._keys)
 
 
 class S3MapDataset(Dataset):
     """
     Drop-in replacement for s3torchconnector.S3MapDataset using s3dlio.
     
-   Key features:
+    Key features:
     - API-compatible with s3torchconnector for easy migration
     - Multi-protocol support (S3, Azure, GCS, file://, direct://)
     - Random access by index
-    - Higher performance (Rust backend)
+    - Higher performance (Rust backend with global client cache)
+    - ZERO-COPY: Items contain BytesView backed by Rust memory
     
     Usage:
         >>> from s3dlio.compat.s3torchconnector import S3MapDataset
@@ -328,22 +403,9 @@ class S3MapDataset(Dataset):
         if region:
             os.environ.setdefault("AWS_REGION", region)
         
-        # Create underlying s3dlio map dataset (returns bytes)
-        self._dataset = ObjectStoreMapDataset.from_prefix(
-            uri,
-            return_type="bytes",  # Get raw bytes, wrap in S3Item
-            **kwargs
-        )
-        
-        # Pre-compute full URIs for each key
-        parsed = urlparse(uri)
-        scheme = parsed.scheme or "s3"
-        base = uri.rstrip("/")
-        
-        self._full_uris = []
-        for key in self._dataset._keys:
-            full_uri = f"{base}/{key}"
-            self._full_uris.append(full_uri)
+        # List all object URIs upfront for random access
+        # Uses global client cache — fast after first call
+        self._full_uris = _core.list(uri, recursive=True)
     
     @classmethod
     def from_prefix(
@@ -372,20 +434,19 @@ class S3MapDataset(Dataset):
     
     def __len__(self) -> int:
         """Return number of objects in the dataset."""
-        return len(self._dataset)
+        return len(self._full_uris)
     
     def __getitem__(self, index: int) -> S3Item:
-        """Get item by index, returning S3Item instance."""
-        if index < 0 or index >= len(self):
-            raise IndexError(f"Index {index} out of range for dataset of size {len(self)}")
+        """Get item by index, returning S3Item instance with zero-copy data."""
+        if index < 0:
+            index += len(self._full_uris)
+        if index < 0 or index >= len(self._full_uris):
+            raise IndexError(f"Index {index} out of range for dataset of size {len(self._full_uris)}")
         
-        # Get data from underlying dataset
-        data = self._dataset[index]
-        
-        # Get the full URI for this item
-        item_uri = self._full_uris[index]
-        
-        return S3Item(item_uri, data)
+        uri = self._full_uris[index]
+        # Fetch via Rust — returns BytesView (zero-copy)
+        data = _core.get(uri)
+        return S3Item(uri, data)
 
 
 class S3Checkpoint:
@@ -398,6 +459,7 @@ class S3Checkpoint:
     - API-compatible with s3torchconnector
     - Multi-protocol support (S3, Azure, GCS, file://)
     - Works with torch.save() and torch.load()
+    - Reader uses zero-copy BytesView wrapper for efficient load
     
     Usage:
         >>> from s3dlio.compat.s3torchconnector import S3Checkpoint
@@ -426,21 +488,20 @@ class S3Checkpoint:
         """
         Context manager for writing checkpoint to storage.
         
+        torch.save() serializes into an in-memory buffer, then on __exit__
+        the entire payload is uploaded via put_bytes() (one copy from Python
+        heap to Rust Bytes, then zero-copy through the upload pipeline).
+        
         Args:
             uri: Full URI to checkpoint (e.g., "s3://bucket/checkpoint.pt")
         
         Returns:
-            File-like writer object compatible with torch.save()
+            Context manager yielding a file-like writer for torch.save()
         
         Example:
             >>> with checkpoint.writer("s3://bucket/model.ckpt") as writer:
             ...     torch.save(model.state_dict(), writer)
         """
-        import io
-        import tempfile
-        from .. import _pymod
-        
-        # Create a temporary buffer to collect checkpoint data
         class _S3Writer:
             def __init__(self, uri):
                 self.uri = uri
@@ -449,17 +510,28 @@ class S3Checkpoint:
             def write(self, data):
                 return self.buffer.write(data)
             
+            def tell(self):
+                return self.buffer.tell()
+            
+            def seek(self, offset, whence=io.SEEK_SET):
+                return self.buffer.seek(offset, whence)
+            
             def close(self):
-                # Upload buffer to storage on close
-                self.buffer.seek(0)
-                _pymod.put_bytes(self.uri, self.buffer.read())
+                # getbuffer() returns a memoryview — no copy
+                # put_bytes does Bytes::copy_from_slice once (unavoidable Python→Rust)
+                mv = self.buffer.getbuffer()
+                _core.put_bytes(self.uri, bytes(mv))
+                mv.release()
+                self.buffer.close()
             
             def __enter__(self):
-                return self.buffer  # torch.save() needs file-like object
+                return self  # Return self — torch.save needs write()+tell()
             
             def __exit__(self, exc_type, exc, tb):
                 if exc_type is None:  # Only upload if no exception
                     self.close()
+                else:
+                    self.buffer.close()
         
         return _S3Writer(uri)
     
@@ -467,34 +539,38 @@ class S3Checkpoint:
         """
         Context manager for reading checkpoint from storage.
         
+        Downloads the object via get() which returns a BytesView (Rust Bytes,
+        zero-copy). Wraps it in _BytesViewIO for seekable file-like access
+        that torch.load() requires.
+        
         Args:
             uri: Full URI to checkpoint (e.g., "s3://bucket/checkpoint.pt")
         
         Returns:
-            File-like reader object compatible with torch.load()
+            Context manager yielding a seekable file-like reader for torch.load()
         
         Example:
             >>> with checkpoint.reader("s3://bucket/model.ckpt") as reader:
-            ...     state_dict = torch.load(reader)
+            ...     state_dict = torch.load(reader, weights_only=True)
         """
-        import io
-        from .. import _pymod
-        
-        # Download checkpoint data
         class _S3Reader:
             def __init__(self, uri):
                 self.uri = uri
-                self.buffer = None
+                self._view = None
+                self._reader = None
             
             def __enter__(self):
-                # Download on enter
-                data = _pymod.get(self.uri)
-                self.buffer = io.BytesIO(bytes(data))
-                return self.buffer
+                # Download — returns BytesView (zero-copy from Rust)
+                self._view = _core.get(self.uri)
+                # Wrap in buffered reader for seekable file-like interface
+                # _BytesViewIO.readinto() uses memoryview (zero-copy slice)
+                self._reader = io.BufferedReader(_BytesViewIO(self._view))
+                return self._reader
             
             def __exit__(self, exc_type, exc, tb):
-                if self.buffer:
-                    self.buffer.close()
+                if self._reader:
+                    self._reader.close()
+                self._view = None  # Release Rust Bytes reference
         
         return _S3Reader(uri)
 
@@ -519,6 +595,10 @@ class S3Client:
     This provides compatibility for DLIO's s3_torch_storage.py which uses
     the low-level S3Client interface instead of the high-level Dataset classes.
     
+    Uses s3dlio's global client cache (DashMap) — all S3Client instances
+    sharing the same endpoint automatically reuse the same Rust ObjectStore,
+    similar to MinIO's PoolManager but process-global and lock-free.
+    
     Args:
         region (str): AWS region
         endpoint (str): Custom endpoint URL (for MinIO, Ceph, etc.)
@@ -529,14 +609,20 @@ class S3Client:
         self.region = region or os.environ.get("AWS_REGION", "us-east-1")
         self.endpoint = endpoint or os.environ.get("AWS_ENDPOINT_URL")
         self.config = s3client_config or S3ClientConfig()
-        
-        # Import s3dlio for backend operations
-        from .. import _pymod
-        self._pymod = _pymod
+    
+    def _make_uri(self, bucket, key):
+        """Build full s3:// URI from bucket and key."""
+        if key.startswith("s3://") or key.startswith("az://") or key.startswith("gs://") or key.startswith("file://"):
+            return key
+        return f"s3://{bucket}/{key.lstrip('/')}"
     
     def put_object(self, bucket, key):
         """
         Create a writer for uploading object data.
+        
+        The writer accumulates data in a BytesIO buffer, then uploads
+        via put_bytes() on close() (one unavoidable Python→Rust copy,
+        then zero-copy through the upload pipeline).
         
         Args:
             bucket (str): Bucket name
@@ -545,79 +631,70 @@ class S3Client:
         Returns:
             Writer object with write() and close() methods
         """
-        # Parse key if it's a full URI
-        if key.startswith("s3://"):
-            uri = key
-        else:
-            uri = f"s3://{bucket}/{key.lstrip('/')}"
+        uri = self._make_uri(bucket, key)
         
         class _S3Writer:
-            def __init__(self, uri, pymod):
+            def __init__(self, uri):
                 self.uri = uri
-                self._pymod = pymod
-                self.buffer = []
+                self.buffer = io.BytesIO()
             
             def write(self, data):
                 """Accumulate data to write"""
-                if isinstance(data, bytes):
-                    self.buffer.append(data)
-                else:
-                    self.buffer.append(bytes(data))
+                return self.buffer.write(data)
             
             def close(self):
-                """Upload accumulated data"""
-                if self.buffer:
-                    payload = b''.join(self.buffer)
-                    self._pymod.put(self.uri, payload)
-                    self.buffer = []
+                """Upload accumulated data via put_bytes (one copy Python→Rust)"""
+                if self.buffer.tell() > 0:
+                    self.buffer.seek(0)
+                    payload = self.buffer.read()
+                    _core.put_bytes(self.uri, payload)
+                self.buffer.close()
         
-        return _S3Writer(uri, self._pymod)
+        return _S3Writer(uri)
     
     def get_object(self, bucket, key, start=None, end=None):
         """
         Create a reader for downloading object data.
         
+        ZERO-COPY: Uses get_range() for range requests (server-side range,
+        no wasted bandwidth) and get() for full objects. Both return
+        BytesView backed by Rust Bytes.
+        
         Args:
             bucket (str): Bucket name  
             key (str): Object key (can be full s3:// URI)
             start (int, optional): Range start byte
-            end (int, optional): Range end byte (inclusive)
+            end (int, optional): Range end byte (inclusive, s3torchconnector convention)
         
         Returns:
-            Reader object with read() method
+            Reader object with read() method returning BytesView (zero-copy)
         """
-        # Parse key if it's a full URI
-        if key.startswith("s3://"):
-            uri = key
-        else:
-            uri = f"s3://{bucket}/{key.lstrip('/')}"
+        uri = self._make_uri(bucket, key)
         
         class _S3Reader:
-            def __init__(self, uri, pymod, start, end):
+            def __init__(self, uri, start, end):
                 self.uri = uri
-                self._pymod = pymod
                 self.start = start
                 self.end = end
                 self._data = None
             
             def read(self):
-                """Read object data (with optional range) - ZERO-COPY"""
+                """Read object data — ZERO-COPY via BytesView."""
                 if self._data is None:
-                    # Get full object (returns BytesView - zero-copy!)
-                    data = self._pymod.get(self.uri)
-                    
-                    # Apply range if specified
                     if self.start is not None and self.end is not None:
+                        # Server-side range request — only fetches the needed bytes
                         # end is inclusive in s3torchconnector API
-                        # Slicing BytesView creates a new BytesView (zero-copy)
-                        self._data = bytes(data[self.start:self.end + 1])
+                        length = self.end - self.start + 1
+                        self._data = _core.get_range(self.uri, self.start, length)
+                    elif self.start is not None:
+                        # Start offset, read to end
+                        self._data = _core.get_range(self.uri, self.start)
                     else:
-                        # ✅ ZERO-COPY: Keep BytesView (don't convert to bytes!)
-                        self._data = data
-                
+                        # Full object — returns BytesView (zero-copy from Rust)
+                        self._data = _core.get(self.uri)
                 return self._data
         
-        return _S3Reader(uri, self._pymod, start, end)
+        return _S3Reader(uri, start, end)
     
     def list_objects(self, bucket, prefix=""):
         """
@@ -630,36 +707,29 @@ class S3Client:
         Yields:
             ListObjectResult with object_info list
         """
-        # Parse prefix if it's a full URI
-        if prefix.startswith("s3://"):
+        if prefix.startswith("s3://") or prefix.startswith("az://") or prefix.startswith("gs://") or prefix.startswith("file://"):
             uri = prefix.rstrip('/') + '/'
         else:
             uri = f"s3://{bucket}/{prefix.lstrip('/')}"
         
-        # List objects using s3dlio
-        from .. import list_prefix
-        
         class ObjectInfo:
             """Object metadata"""
+            __slots__ = ("key",)
             def __init__(self, key):
                 self.key = key
         
         class ListObjectResult:
             """Result from list_objects"""
+            __slots__ = ("object_info",)
             def __init__(self, object_infos):
                 self.object_info = object_infos
         
         try:
-            # List all objects with this prefix
-            objects = list_prefix(uri)
-            
-            # Convert to ObjectInfo objects
+            # Use the native list function (uses global client cache)
+            objects = _core.list(uri, recursive=True)
             object_infos = [ObjectInfo(obj) for obj in objects]
-            
-            # Yield as a single result (s3torchconnector returns iterator of results)
             yield ListObjectResult(object_infos)
-        except Exception as e:
-            # Return empty result on error
+        except Exception:
             yield ListObjectResult([])
 
 

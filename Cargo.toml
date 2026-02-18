@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.40"
+version = "0.9.50"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -111,6 +111,7 @@ glob        = "^0.3"
 hdrhistogram = "^7.5"    # High Dynamic Range histograms for detailed analysis
 metrics     = "^0.23"    # Metrics collection framework with histogram support
 parking_lot = "^0.12"    # High-performance RwLock for metrics
+dashmap     = "^6.1"     # Lock-free concurrent HashMap for Python client caching
 
 async-trait  = "^0.1"
 futures-core = "^0.3"

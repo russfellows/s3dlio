@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 use std::sync::Arc;
@@ -397,18 +397,18 @@ impl AzureBlob {
     // Container helpers (optional)
     // ----------------------------------------------------------------------
 
+    /// Container creation not supported in newer Azure SDK versions.
+    /// Use Azure CLI, portal, or SDK v0.7 for container management.
     #[allow(dead_code)]
     pub async fn create_container_if_missing(&self) -> Result<()> {
-        let c = self.container_client()?;
-        let _ = c.create_container(None).await?;
-        Ok(())
+        bail!("Container creation not supported in Azure SDK v0.8+. Use Azure CLI: az storage container create")
     }
 
+    /// Container deletion not supported in newer Azure SDK versions.
+    /// Use Azure CLI, portal, or SDK v0.7 for container management.
     #[allow(dead_code)]
     pub async fn delete_container(&self) -> Result<()> {
-        let c = self.container_client()?;
-        let _ = c.delete_container(None).await?;
-        Ok(())
+        bail!("Container deletion not supported in Azure SDK v0.8+. Use Azure CLI: az storage container delete")
     }
 
 }

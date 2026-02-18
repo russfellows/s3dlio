@@ -122,6 +122,20 @@ where
 }
 
 
+/// Spawn a task on the global runtime without blocking (non-blocking spawn).
+/// Returns a JoinHandle immediately that can be awaited later.
+///
+/// This is more efficient than `run_on_global_rt` when you just want to
+/// kick off async work and poll it later, avoiding the channel overhead.
+pub fn spawn_on_global_rt<F, T>(fut: F) -> tokio::task::JoinHandle<T>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    global_rt_handle().spawn(fut)
+}
+
+
 
 // -----------------------------------------------------------------------------
 // TLS helper, for CA bundle
