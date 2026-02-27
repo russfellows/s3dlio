@@ -439,6 +439,62 @@ pub fn resolve_azure_account_url(account: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Service-level helpers
+// ---------------------------------------------------------------------------
+
+/// List all containers in an Azure Blob Storage account.
+///
+/// Returns `Vec<(container_name, Option<last_modified_string>)>`.
+///
+/// Credentials follow the same chain as [`AzureBlob::with_default_credential`]:
+/// environment variables, managed identity, developer tools, etc.
+pub async fn list_account_containers(
+    account: &str,
+) -> Result<Vec<(String, Option<String>)>> {
+
+    let account_url = resolve_azure_account_url(account);
+
+    let credential = AZURE_CREDENTIAL
+        .get_or_try_init(|| async {
+            let cred = DeveloperToolsCredential::new(None)?;
+            let cred: Arc<dyn azure_core::credentials::TokenCredential> = cred;
+            Ok::<_, anyhow::Error>(cred)
+        })
+        .await?;
+
+    let service_client = BlobServiceClient::new(
+        &account_url,
+        Some(Arc::clone(credential)),
+        Some(BlobServiceClientOptions::default()),
+    )
+    .map_err(|e| anyhow!(e))?;
+
+    let mut containers: Vec<(String, Option<String>)> = Vec::new();
+    let mut pager = service_client
+        .list_containers(None)
+        .map_err(|e| anyhow!("Azure list_containers failed: {}", e))?
+        .into_pages();
+
+    while let Some(page) = pager.next().await {
+        let current_page = page
+            .map_err(|e| anyhow!("Azure list_containers page error: {}", e))?
+            .into_model()
+            .map_err(|e| anyhow!("Azure container model deserialisation: {}", e))?;
+
+        for item in current_page.container_items {
+            let name = item.name.unwrap_or_default();
+            let date = item
+                .properties
+                .and_then(|p| p.last_modified)
+                .map(|t| t.to_string());
+            containers.push((name, date));
+        }
+    }
+
+    Ok(containers)
+}
+
 // ============================================================================
 // Unit Tests
 // ============================================================================

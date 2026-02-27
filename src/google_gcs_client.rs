@@ -10,7 +10,7 @@ use google_cloud_storage::model_ext::ReadRange;
 use google_cloud_gax::paginator::ItemPaginator;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 // Global cached GCS clients - initialized once and reused across all operations
 static GCS_STORAGE: OnceCell<Arc<Storage>> = OnceCell::const_new();
@@ -29,14 +29,24 @@ pub struct GcsObjectMetadata {
 }
 
 /// High-level GCS client using official Google google-cloud-storage crate.
-/// 
+///
 /// Authentication follows the standard ADC chain:
 /// 1. GOOGLE_APPLICATION_CREDENTIALS environment variable (service account JSON)
 /// 2. GCE/GKE metadata server (automatic for Google Cloud workloads)
 /// 3. gcloud CLI credentials (~/.config/gcloud/application_default_credentials.json)
+///
+/// # RAPID Storage
+///
+/// Set the environment variable `S3DLIO_GCS_RAPID=true` (or `1`, `yes`) to
+/// enable appendable-object writes for GCS RAPID / Hyperdisk ML buckets.
+/// Without this flag, writes to RAPID buckets fail with:
+/// *"This bucket requires appendable objects."*
 pub struct GcsClient {
-    storage: Arc<Storage>,  // For read/write operations
-    control: Arc<StorageControl>,  // For metadata/list/delete operations
+    storage: Arc<Storage>,      // For read/write operations
+    control: Arc<StorageControl>, // For metadata/list/delete operations
+    /// True when writing to a GCS RAPID (Hyperdisk ML) bucket.
+    /// Set via S3DLIO_GCS_RAPID=true|1|yes environment variable.
+    pub rapid_mode: bool,
 }
 
 impl GcsClient {
@@ -76,10 +86,25 @@ impl GcsClient {
             })
             .await?;
         
+        // RAPID mode: set appendable=true on every write for RAPID/Hyperdisk ML buckets.
+        let rapid_mode = read_rapid_mode();
+        if rapid_mode {
+            info!("GCS RAPID mode enabled (appendable writes)");
+        } else {
+            debug!("GCS RAPID mode: disabled (S3DLIO_GCS_RAPID not set or not 'true|1|yes')");
+        }
+
         Ok(Self {
             storage: Arc::clone(storage),
             control: Arc::clone(control),
+            rapid_mode,
         })
+    }
+
+    /// Access the [`StorageControl`] client for bucket management operations
+    /// (list, create, delete buckets).
+    pub fn control_ref(&self) -> &StorageControl {
+        &self.control
     }
 
     /// Get entire object as bytes.
@@ -87,7 +112,7 @@ impl GcsClient {
         debug!("GCS GET (official): bucket={}, object={}", bucket, object);
         
         // Format bucket name as required by official client
-        let bucket_name = format!("projects/_/buckets/{}", bucket);
+        let bucket_name = format_bucket_name(bucket);
         
         let mut response = self.storage
             .read_object(&bucket_name, object)
@@ -97,13 +122,16 @@ impl GcsClient {
         
         // Collect all chunks into a single buffer
         let mut data = Vec::new();
+        let mut chunk_count: u32 = 0;
         while let Some(chunk) = response.next().await.transpose()
             .map_err(|e| anyhow!("GCS GET stream error for gs://{}/{}: {}", bucket, object, e))? 
         {
+            chunk_count += 1;
+            trace!("GCS GET chunk #{}: {} bytes", chunk_count, chunk.len());
             data.extend_from_slice(&chunk);
         }
         
-        debug!("GCS GET success: {} bytes", data.len());
+        debug!("GCS GET success: {} bytes in {} chunk(s)", data.len(), chunk_count);
         Ok(Bytes::from(data))
     }
 
@@ -120,13 +148,17 @@ impl GcsClient {
             bucket, object, offset, length
         );
 
-        let bucket_name = format!("projects/_/buckets/{}", bucket);
+        let bucket_name = format_bucket_name(bucket);
         
         // Use ReadRange to specify byte range
         let read_range = match length {
             Some(len) => ReadRange::segment(offset, len),
             None => ReadRange::offset(offset),
         };
+        trace!(
+            "GCS GET RANGE: resource={}, offset={}, length={:?}",
+            bucket_name, offset, length
+        );
 
         let mut response = self.storage
             .read_object(&bucket_name, object)
@@ -137,13 +169,16 @@ impl GcsClient {
 
         // Collect all chunks
         let mut data = Vec::new();
+        let mut chunk_count: u32 = 0;
         while let Some(chunk) = response.next().await.transpose()
             .map_err(|e| anyhow!("GCS GET RANGE stream error for gs://{}/{}: {}", bucket, object, e))? 
         {
+            chunk_count += 1;
+            trace!("GCS GET RANGE chunk #{}: {} bytes", chunk_count, chunk.len());
             data.extend_from_slice(&chunk);
         }
 
-        debug!("GCS GET RANGE success: {} bytes", data.len());
+        debug!("GCS GET RANGE success: {} bytes in {} chunk(s)", data.len(), chunk_count);
         Ok(Bytes::from(data))
     }
 
@@ -156,13 +191,20 @@ impl GcsClient {
             data.len()
         );
 
-        let bucket_name = format!("projects/_/buckets/{}", bucket);
+        let bucket_name = format_bucket_name(bucket);
+        trace!("GCS PUT: resource={}, rapid_mode={}", bucket_name, self.rapid_mode);
 
         // Convert slice to Bytes for upload
         let bytes = Bytes::copy_from_slice(data);
 
-        self.storage
-            .write_object(&bucket_name, object, bytes)
+        let write = self.storage.write_object(&bucket_name, object, bytes);
+        let write = if self.rapid_mode {
+            debug!("GCS PUT: RAPID mode — setting appendable=true for {}", bucket_name);
+            write.set_appendable(true)
+        } else {
+            write
+        };
+        write
             .send_unbuffered()
             .await
             .map_err(|e| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))?;
@@ -176,7 +218,7 @@ impl GcsClient {
         debug!("GCS DELETE (official): bucket={}, object={}", bucket, object);
 
         // StorageControl requires projects/_/buckets/{bucket} format
-        let bucket_name = format!("projects/_/buckets/{}", bucket);
+        let bucket_name = format_bucket_name(bucket);
 
         self.control
             .delete_object()
@@ -195,7 +237,7 @@ impl GcsClient {
         debug!("GCS GET METADATA (official): bucket={}, object={}", bucket, object);
 
         // StorageControl requires projects/_/buckets/{bucket} format
-        let bucket_name = format!("projects/_/buckets/{}", bucket);
+        let bucket_name = format_bucket_name(bucket);
 
         let obj = self.control
             .get_object()
@@ -251,7 +293,7 @@ impl GcsClient {
         );
 
         // StorageControl requires projects/_/buckets/{bucket} format
-        let bucket_name = format!("projects/_/buckets/{}", bucket);
+        let bucket_name = format_bucket_name(bucket);
 
         let mut builder = self.control
             .list_objects()
@@ -279,10 +321,19 @@ impl GcsClient {
                 let page = result.map_err(|e| anyhow!("GCS LIST error for gs://{}: {}", bucket, e))?;
                 
                 // Collect object names (files)
-                results.extend(page.objects.into_iter().map(|obj| obj.name));
+                results.extend(
+                    page.objects
+                        .into_iter()
+                        .map(|obj| obj.name)
+                        .inspect(|name| trace!("GCS LIST: object={}", name)),
+                );
                 
                 // Collect prefixes (subdirectories) - these end with "/"
-                results.extend(page.prefixes);
+                results.extend(
+                    page.prefixes
+                        .into_iter()
+                        .inspect(|prefix| trace!("GCS LIST: prefix={}", prefix)),
+                );
             }
         } else {
             // For recursive, by_item() is more efficient (no need for prefixes)
@@ -291,6 +342,7 @@ impl GcsClient {
             while let Some(object) = objects_iter.next().await.transpose()
                 .map_err(|e| anyhow!("GCS LIST error for gs://{}: {}", bucket, e))? 
             {
+                trace!("GCS LIST recursive: object={}", object.name);
                 results.push(object.name.clone());
             }
         }
@@ -303,7 +355,7 @@ impl GcsClient {
     pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         debug!("GCS DELETE BUCKET (official): bucket={}", bucket);
 
-        let bucket_name = format!("projects/_/buckets/{}", bucket);
+        let bucket_name = format_bucket_name(bucket);
 
         self.control
             .delete_bucket()
@@ -364,6 +416,32 @@ impl GcsClient {
 }
 
 
+// ---------------------------------------------------------------------------
+// Free-standing helpers (pub(crate) so unit tests can exercise them directly)
+// ---------------------------------------------------------------------------
+
+/// Read the `S3DLIO_GCS_RAPID` environment variable and return `true` when it
+/// is set to `true`, `1`, or `yes` (case-insensitive).  Returns `false` for
+/// any other value or when the variable is absent.
+///
+/// The variable can be set in the shell **or** loaded from a `.env` file via
+/// the [`dotenvy`] crate before the binary initializes its GCS client.
+pub(crate) fn read_rapid_mode() -> bool {
+    std::env::var("S3DLIO_GCS_RAPID")
+        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Format a plain bucket name into the resource path required by the
+/// official google-cloud-storage gRPC API.
+///
+/// ```text
+/// "my-bucket"  →  "projects/_/buckets/my-bucket"
+/// ```
+pub(crate) fn format_bucket_name(bucket: &str) -> String {
+    format!("projects/_/buckets/{}", bucket)
+}
+
 /// Parse a GCS URI (gs://bucket/path/to/object) into (bucket, object_path).
 /// 
 /// Bucket-only URIs are also supported (for prefix listings):
@@ -391,5 +469,290 @@ pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
     }
 
     Ok((bucket, object_path))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    /// Serialize all tests that mutate environment variables.  Without this
+    /// guard two tests running in parallel could observe each other's
+    /// `set_var` / `remove_var` calls and produce non-deterministic results.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // ------------------------------------------------------------------
+    // parse_gcs_uri
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_gcs_uri_standard() {
+        let (bucket, obj) = parse_gcs_uri("gs://my-bucket/path/to/object.bin").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(obj, "path/to/object.bin");
+    }
+
+    #[test]
+    fn test_parse_gcs_uri_gcs_scheme() {
+        let (bucket, obj) = parse_gcs_uri("gcs://my-bucket/data/file.npz").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(obj, "data/file.npz");
+    }
+
+    #[test]
+    fn test_parse_gcs_uri_bucket_only_with_slash() {
+        let (bucket, obj) = parse_gcs_uri("gs://my-bucket/").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(obj, "");
+    }
+
+    #[test]
+    fn test_parse_gcs_uri_bucket_only_no_slash() {
+        let (bucket, obj) = parse_gcs_uri("gs://my-bucket").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(obj, "");
+    }
+
+    #[test]
+    fn test_parse_gcs_uri_nested_path() {
+        let (bucket, obj) =
+            parse_gcs_uri("gs://rapids-test-bucket/checkpoints/epoch-10/model.bin").unwrap();
+        assert_eq!(bucket, "rapids-test-bucket");
+        assert_eq!(obj, "checkpoints/epoch-10/model.bin");
+    }
+
+    #[test]
+    fn test_parse_gcs_uri_wrong_scheme() {
+        assert!(parse_gcs_uri("s3://bucket/obj").is_err());
+        assert!(parse_gcs_uri("az://container/blob").is_err());
+        assert!(parse_gcs_uri("bucket/obj").is_err());
+    }
+
+    #[test]
+    fn test_parse_gcs_uri_empty_bucket() {
+        assert!(parse_gcs_uri("gs:///some-object").is_err());
+        assert!(parse_gcs_uri("gs://").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // format_bucket_name
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_format_bucket_name_standard() {
+        assert_eq!(
+            format_bucket_name("my-bucket"),
+            "projects/_/buckets/my-bucket"
+        );
+    }
+
+    #[test]
+    fn test_format_bucket_name_rapid_bucket() {
+        assert_eq!(
+            format_bucket_name("rapid-hyperdisk-ml-bucket"),
+            "projects/_/buckets/rapid-hyperdisk-ml-bucket"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // read_rapid_mode — env var parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_rapid_mode_unset_is_false() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        assert!(!read_rapid_mode(), "absent var should default to false");
+    }
+
+    #[test]
+    fn test_rapid_mode_true_lowercase() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_RAPID", "true");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        assert!(r);
+    }
+
+    #[test]
+    fn test_rapid_mode_true_uppercase() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_RAPID", "TRUE");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        assert!(r, "TRUE should enable RAPID mode (case-insensitive)");
+    }
+
+    #[test]
+    fn test_rapid_mode_one() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_RAPID", "1");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        assert!(r, "\"1\" should enable RAPID mode");
+    }
+
+    #[test]
+    fn test_rapid_mode_yes_lowercase() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_RAPID", "yes");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        assert!(r);
+    }
+
+    #[test]
+    fn test_rapid_mode_yes_uppercase() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_RAPID", "YES");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        assert!(r, "YES should enable RAPID mode (case-insensitive)");
+    }
+
+    #[test]
+    fn test_rapid_mode_false_string() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_RAPID", "false");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        assert!(!r, "\"false\" should NOT enable RAPID mode");
+    }
+
+    #[test]
+    fn test_rapid_mode_zero() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_RAPID", "0");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        assert!(!r, "\"0\" should NOT enable RAPID mode");
+    }
+
+    #[test]
+    fn test_rapid_mode_unrecognised_value() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_RAPID", "maybe");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        assert!(!r, "unrecognised value should NOT enable RAPID mode");
+    }
+
+    // ------------------------------------------------------------------
+    // dotenvy — load vars from a .env file
+    // ------------------------------------------------------------------
+
+    /// Verify that a `.env` file containing `S3DLIO_GCS_RAPID=true` causes
+    /// `read_rapid_mode()` to return `true` after the file is loaded via
+    /// `dotenvy::from_path()`.
+    #[test]
+    fn test_dotenvy_rapid_mode_enabled_from_dotenv() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "S3DLIO_GCS_RAPID=true\n").unwrap();
+
+        assert!(!read_rapid_mode(), "should be off before loading .env");
+
+        dotenvy::from_path(&env_path).expect("dotenvy::from_path should succeed");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+
+        assert!(r, "RAPID mode should be on after loading .env with S3DLIO_GCS_RAPID=true");
+    }
+
+    /// `S3DLIO_GCS_RAPID=false` in a `.env` file should leave RAPID mode off.
+    #[test]
+    fn test_dotenvy_rapid_mode_disabled_in_dotenv() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "S3DLIO_GCS_RAPID=false\n").unwrap();
+
+        dotenvy::from_path(&env_path).expect("dotenvy::from_path should succeed");
+        let r = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+
+        assert!(!r, "RAPID mode should remain off when .env sets it to false");
+    }
+
+    /// `GOOGLE_APPLICATION_CREDENTIALS` loaded from a `.env` file should
+    /// appear in the process environment exactly as written.
+    #[test]
+    fn test_dotenvy_credentials_path_from_dotenv() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+
+        let fake_creds = "/workspace/secrets/gcp-sa.json";
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, format!("GOOGLE_APPLICATION_CREDENTIALS={}\n", fake_creds))
+            .unwrap();
+
+        dotenvy::from_path(&env_path).expect("dotenvy::from_path should succeed");
+        let loaded = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").unwrap_or_default();
+        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+
+        assert_eq!(loaded, fake_creds);
+    }
+
+    /// A single `.env` file can set both `S3DLIO_GCS_RAPID` and
+    /// `GOOGLE_APPLICATION_CREDENTIALS` at the same time.
+    #[test]
+    fn test_dotenvy_multiple_vars_from_dotenv() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env");
+        std::fs::write(
+            &env_path,
+            "S3DLIO_GCS_RAPID=1\nGOOGLE_APPLICATION_CREDENTIALS=/tmp/creds.json\n",
+        )
+        .unwrap();
+
+        dotenvy::from_path(&env_path).expect("dotenvy::from_path should succeed");
+        let rapid = read_rapid_mode();
+        let creds = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").unwrap_or_default();
+
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+
+        assert!(rapid, "RAPID mode should be enabled via .env");
+        assert_eq!(creds, "/tmp/creds.json", "credentials path should be loaded from .env");
+    }
+
+    /// An environment variable already set in the shell takes precedence over
+    /// the same variable in a `.env` file — this is standard dotenvy behaviour.
+    #[test]
+    fn test_dotenvy_shell_env_takes_precedence_over_dotenv() {
+        let _g = ENV_MUTEX.lock().unwrap();
+
+        // Pre-set the var (simulates `export S3DLIO_GCS_RAPID=false` in the shell)
+        std::env::set_var("S3DLIO_GCS_RAPID", "false");
+
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env");
+        // .env tries to set it to true, but dotenvy must not override existing vars
+        std::fs::write(&env_path, "S3DLIO_GCS_RAPID=true\n").unwrap();
+
+        dotenvy::from_path(&env_path).ok(); // ok() - may warn but must not panic
+
+        let raw = std::env::var("S3DLIO_GCS_RAPID").unwrap();
+        let rapid = read_rapid_mode();
+        std::env::remove_var("S3DLIO_GCS_RAPID");
+
+        assert_eq!(raw, "false", "shell env var must not be overridden by .env");
+        assert!(!rapid, "read_rapid_mode() must respect the shell-set value");
+    }
 }
 

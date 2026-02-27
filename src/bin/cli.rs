@@ -40,7 +40,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use s3dlio::{
     parse_s3_uri,
     DEFAULT_OBJECT_SIZE, ObjectType,
-    list_buckets,
+    list_containers, ContainerInfo,
     object_store::store_for_uri_with_logger,
     mp,
     config::{DataGenMode, Config},
@@ -91,8 +91,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
 
-    /// List all S3 buckets in the account.
-    ListBuckets,
+    /// List all top-level containers (buckets, containers, or directories)
+    /// for the specified storage backend.
+    ///
+    /// Pass a URI or scheme to select the backend:
+    ///   s3://               AWS S3 or S3-compatible (default, uses AWS_ENDPOINT_URL)
+    ///   gs://               Google Cloud Storage (needs GOOGLE_CLOUD_PROJECT)
+    ///   az://accountname    Azure Blob Storage containers for that account
+    ///   file:///path        Local filesystem directories under /path
+    ListBuckets {
+        /// Backend URI or scheme.  Examples:
+        ///   s3://  gs://  gcs://  az://mystorageaccount  file:///mnt/data
+        #[arg(default_value = "s3://")]
+        uri: String,
+    },
 
     /// Create a new S3 bucket.
     CreateBucket {
@@ -299,25 +311,26 @@ enum Command {
 // Command implementations
 // -----------------------------------------------------------------------------
 
-/// List all S3 buckets in the account.
-async fn list_buckets_cmd() -> Result<()> {
-    safe_println!("Listing all S3 buckets...");
-    
-    let buckets = list_buckets()?;
-    
-    if buckets.is_empty() {
-        safe_println!("No buckets found in this S3 account.");
+/// List top-level containers for the given backend URI (bucket/container/directory).
+async fn list_buckets_cmd(uri: &str) -> Result<()> {
+    safe_println!("Listing containers for '{}'...", uri);
+
+    let containers: Vec<ContainerInfo> = list_containers(uri)?;
+
+    if containers.is_empty() {
+        safe_println!("No containers found.");
         return Ok(());
     }
-    
-    safe_println!("\nFound {} bucket(s):", buckets.len());
-    safe_println!("{:<30} {}", "Bucket Name", "Creation Date");
-    safe_println!("{}", "-".repeat(60));
-    
-    for bucket in buckets {
-        safe_println!("{:<30} {}", bucket.name, bucket.creation_date);
+
+    safe_println!("\nFound {} container(s):", containers.len());
+    safe_println!("{:<40} {:<30} {}", "Name", "URI", "Creation Date");
+    safe_println!("{}", "-".repeat(90));
+
+    for c in containers {
+        let date = c.creation_date.as_deref().unwrap_or("-");
+        safe_println!("{:<40} {:<30} {}", c.name, c.uri, date);
     }
-    
+
     Ok(())
 }
 
@@ -377,10 +390,14 @@ async fn main() -> Result<()> {
     }
 
     match cli.cmd {
-        // List all buckets command (S3-specific)
-        Command::ListBuckets => {
-            check_aws_credentials()?;
-            list_buckets_cmd().await?;
+        // List containers: multi-backend (s3://, gs://, az://, file://, direct://)
+        Command::ListBuckets { uri } => {
+            // S3 scheme requires AWS credentials up-front; other backends
+            // discover their own credentials lazily.
+            if uri.is_empty() || uri.starts_with("s3://") {
+                check_aws_credentials()?;
+            }
+            list_buckets_cmd(&uri).await?;
         },
 
         // New, create-bucket command (S3-specific)

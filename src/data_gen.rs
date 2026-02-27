@@ -8,7 +8,9 @@ use rayon::prelude::*;
 use tracing::{info, debug};
 
 use crate::constants::{BLK_SIZE, HALF_BLK, MOD_SIZE, A_BASE_BLOCK, BASE_BLOCK};
-use crate::data_formats::{build_npz, build_hdf5, build_tfrecord, build_raw};
+use crate::data_formats::{build_npz, build_tfrecord, build_raw};
+#[cfg(feature = "hdf5")]
+use crate::data_formats::build_hdf5;
 use crate::config::Config;
 use crate::config::ObjectType;
 
@@ -70,7 +72,21 @@ pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
     // New, uses type
     let object = match cfg.object_type {
         ObjectType::Npz      => build_npz(cfg.elements, cfg.element_size, &data)?,
+        #[cfg(feature = "hdf5")]
         ObjectType::Hdf5     => build_hdf5(cfg.elements, cfg.element_size, &data)?,
+        #[cfg(not(feature = "hdf5"))]
+        ObjectType::Hdf5     => anyhow::bail!(
+            "HDF5 format is not available in this build.\n\
+             If you installed via pip, rebuild from source with the hdf5 extra:\n\
+             \n\
+             pip install --no-binary s3dlio \\\'s3dlio[hdf5]\\' \\
+             --config-settings cargo-extra-args=\"--features hdf5,extension-module\"\n\
+             \n\
+             This also requires libhdf5 to be installed on your system:\n\
+             Ubuntu/Debian: sudo apt-get install libhdf5-dev\n\
+             RHEL/Fedora:   sudo dnf install hdf5-devel\n\
+             macOS:         brew install hdf5"
+        ),
         ObjectType::TfRecord => build_tfrecord(cfg.elements, cfg.element_size, &data)?,
         ObjectType::Raw      => build_raw(&data)?,
     };

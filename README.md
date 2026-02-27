@@ -22,17 +22,24 @@ pip install s3dlio
 
 #### System Dependencies
 
-s3dlio requires several system libraries. Install them before building:
+s3dlio requires some system libraries to build. **Only OpenSSL and pkg-config are required by default.** HDF5 and hwloc are optional and improve functionality but are not needed for the core library:
 
 **Ubuntu/Debian:**
 ```bash
 # Quick install - run our helper script
 ./scripts/install-system-deps.sh
 
-# Or manually:
-sudo apt-get install -y \
-    build-essential pkg-config libssl-dev \
-    libhdf5-dev libhwloc-dev cmake
+# Or manually (required only):
+sudo apt-get install -y build-essential pkg-config libssl-dev
+
+# Optional - for NUMA topology support (--features numa):
+sudo apt-get install -y libhwloc-dev
+
+# Optional - for HDF5 data format support (--features hdf5):
+sudo apt-get install -y libhdf5-dev
+
+# All optional libraries at once:
+sudo apt-get install -y libhdf5-dev libhwloc-dev cmake
 ```
 
 **RHEL/CentOS/Fedora/Rocky/AlmaLinux:**
@@ -40,10 +47,17 @@ sudo apt-get install -y \
 # Quick install
 ./scripts/install-system-deps.sh
 
-# Or manually:
-sudo dnf install -y \
-    gcc gcc-c++ make pkg-config openssl-devel \
-    hdf5-devel hwloc-devel cmake
+# Or manually (required only):
+sudo dnf install -y gcc gcc-c++ make pkg-config openssl-devel
+
+# Optional - for NUMA topology support:
+sudo dnf install -y hwloc-devel
+
+# Optional - for HDF5 data format support:
+sudo dnf install -y hdf5-devel
+
+# All optional libraries at once:
+sudo dnf install -y hdf5-devel hwloc-devel cmake
 ```
 
 **macOS:**
@@ -51,8 +65,11 @@ sudo dnf install -y \
 # Quick install
 ./scripts/install-system-deps.sh
 
-# Or manually:
-brew install pkg-config openssl@3 hdf5 hwloc cmake
+# Or manually (required only):
+brew install pkg-config openssl@3
+
+# Optional - for NUMA/HDF5 support:
+brew install hdf5 hwloc cmake
 
 # Set environment variables (add to ~/.zshrc or ~/.bash_profile):
 export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$PKG_CONFIG_PATH"
@@ -64,8 +81,22 @@ export OPENSSL_DIR="$(brew --prefix openssl@3)"
 # Quick install
 ./scripts/install-system-deps.sh
 
-# Or manually:
-sudo pacman -S base-devel pkg-config openssl hdf5 hwloc cmake
+# Or manually (required only):
+sudo pacman -S base-devel pkg-config openssl
+
+# Optional - for NUMA/HDF5 support:
+sudo pacman -S hdf5 hwloc cmake
+```
+
+**WSL (Windows Subsystem for Linux) / Minimal Environments:**
+
+If you are building on WSL or any environment where `libhdf5` or `libhwloc` may not be available, s3dlio builds without them by default. No extra libraries are required:
+```bash
+# Just the basics - works on WSL, Docker, CI, and minimal installs:
+sudo apt-get install -y build-essential pkg-config libssl-dev
+cargo build --release
+# or via pip (no system HDF5/hwloc needed):
+pip install s3dlio
 ```
 
 #### Install Rust (if not already installed)
@@ -82,11 +113,17 @@ source $HOME/.cargo/env
 git clone https://github.com/russfellows/s3dlio.git
 cd s3dlio
 
-# Build with all features
-cargo build --release --all-features
-
-# Or build with default features (recommended)
+# Build with default features (no HDF5 or NUMA required)
 cargo build --release
+
+# Build with NUMA topology support (requires libhwloc-dev)
+cargo build --release --features numa
+
+# Build with HDF5 data format support (requires libhdf5-dev)
+cargo build --release --features hdf5
+
+# Build with all optional features
+cargo build --release --features numa,hdf5
 
 # Run tests
 cargo test
@@ -95,7 +132,9 @@ cargo test
 ./build_pyo3.sh
 ```
 
-**Note:** The `hwloc` library is optional but recommended for NUMA support on multi-socket systems. s3dlio will build without it but won't have NUMA topology detection.
+**Note:** NUMA support (`--features numa`) improves multi-socket performance but requires the `hwloc2` C library. HDF5 support (`--features hdf5`) enables HDF5 data format generation but requires `libhdf5`. Both are optional and s3dlio is fully functional without them.
+
+**Platform support:** s3dlio builds natively on Linux (x86\_64, aarch64), macOS (x86\_64 and Apple Silicon arm64), and WSL. Making `numa` and `hdf5` optional was the key change for broad platform support — all remaining dependencies are pure Rust or use platform-independent system libraries (OpenSSL). To cross-compile Python wheels for Linux ARM64 from an x86\_64 host, see `build_pyo3.sh` for instructions using the `--zig` linker. For macOS universal2 (fat binary covering both architectures), see the commented section in `build_pyo3.sh`.
 
 ## ✨ Key Features
 
@@ -443,7 +482,9 @@ See [S3DLIO OpLog Implementation](docs/S3DLIO_OPLOG_IMPLEMENTATION_SUMMARY.md) f
 - **Rust**: [Install Rust toolchain](https://www.rust-lang.org/tools/install)
 - **Python 3.12+**: For Python library development
 - **UV** (recommended): [Install UV](https://docs.astral.sh/uv/getting-started/installation/)
-- **HDF5**: Required for HDF5 support (`libhdf5-dev` on Ubuntu, `brew install hdf5` on macOS)
+- **OpenSSL**: Required (`libssl-dev` on Ubuntu)
+- **HDF5** *(optional)*: Only needed with `--features hdf5` (`libhdf5-dev` on Ubuntu, `brew install hdf5` on macOS)
+- **hwloc** *(optional)*: Only needed with `--features numa` (`libhwloc-dev` on Ubuntu)
 
 ### Build Steps
 ```bash

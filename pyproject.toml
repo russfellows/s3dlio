@@ -1,6 +1,6 @@
 [project]
 name = "s3dlio"
-version = "0.9.50"
+version = "0.9.60"
 description = "High-performance Object Storage Library for Pytorch, Jax and Tensorflow: Object support inlcudes S3, Azure, GCS, and file system operations for AI/ML"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,6 +21,26 @@ torch = ["torch>=2.0.0"]
 jax = ["jax>=0.4.0", "jaxlib>=0.4.0"]
 tensorflow = ["tensorflow>=2.16.0"]
 all = ["torch>=2.0.0", "jax>=0.4.0", "jaxlib>=0.4.0", "tensorflow>=2.16.0"]
+
+# ── Optional Rust-feature extras ─────────────────────────────────────────────
+# NOTE: Pre-built wheels from PyPI do NOT include these features.
+# To install with these features you must build from source (see README).
+# The Python dependencies below are listed for clarity; the Rust features are
+# enabled by setting the MATURIN_PEP517_ARGS environment variable.
+#
+# Quick how-to (requires libhdf5-dev / libhwloc-dev system packages):
+#   pip install "s3dlio[hdf5]"  --no-binary s3dlio \
+#       --config-settings "cargo-extra-args=--features hdf5,extension-module"
+#
+#   pip install "s3dlio[numa,hdf5]" --no-binary s3dlio \
+#       --config-settings "cargo-extra-args=--features numa,hdf5,extension-module"
+#
+# Or via environment variable:
+#   MATURIN_PEP517_ARGS="--features numa,hdf5,extension-module" \
+#       pip install "s3dlio[numa,hdf5]" --no-binary s3dlio
+hdf5 = ["h5py>=3.0.0"]  # HDF5 read support; native HDF5 gen needs --features hdf5 (libhdf5-dev)
+numa = []               # NUMA topology; needs --features numa (libhwloc-dev)
+
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

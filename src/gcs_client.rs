@@ -100,6 +100,14 @@ impl GcsClient {
         })
     }
 
+    /// Access the inner [`gcloud_storage::client::Client`] directly.
+    ///
+    /// Primarily used by `list_containers` to call `list_buckets` on the
+    /// `StorageClient` that `Client` derefs to.
+    pub fn inner_client(&self) -> &Client {
+        &self.client
+    }
+
     /// Get entire object as bytes.
     pub async fn get_object(&self, bucket: &str, object: &str) -> Result<Bytes> {
         debug!("GCS GET: bucket={}, object={}", bucket, object);

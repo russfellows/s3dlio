@@ -8,9 +8,10 @@ use std::convert::TryInto;
 use std::io::Cursor;
 use zip::ZipArchive;
 
-use s3dlio::data_formats::{
-    build_raw, build_npz, build_hdf5, tfrecord::TfRecordWithIndex,
-};
+use s3dlio::data_formats::{build_raw, build_npz, tfrecord::TfRecordWithIndex};
+
+#[cfg(feature = "hdf5")]
+use s3dlio::data_formats::build_hdf5;
 
 use s3dlio::data_formats::tfrecord::build_tfrecord_with_index;
 
@@ -57,6 +58,7 @@ fn npz_roundtrip_and_content() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "hdf5")]
 #[test]
 fn hdf5_signature_and_dataset() -> anyhow::Result<()> {
     let elements = 10;

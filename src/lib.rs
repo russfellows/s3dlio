@@ -90,6 +90,9 @@ pub mod gcs_client;  // Community-maintained gcloud-storage implementation
 #[cfg(feature = "gcs-official")]
 pub mod google_gcs_client;  // Official Google google-cloud-storage implementation
 
+pub mod list_containers;    // Backend-agnostic bucket/container listing (s3://, gs://, az://, file://)
+pub use list_containers::{list_containers, ContainerInfo};
+
 pub mod concurrency;
 #[cfg(feature = "enhanced-http")]
 pub mod http;
