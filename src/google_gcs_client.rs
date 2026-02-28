@@ -35,6 +35,12 @@ pub struct GcsObjectMetadata {
 /// 2. GCE/GKE metadata server (automatic for Google Cloud workloads)
 /// 3. gcloud CLI credentials (~/.config/gcloud/application_default_credentials.json)
 ///
+/// # gRPC Transport
+///
+/// All reads and writes use gRPC (`BidiReadObject` / `BidiWriteObject`) which
+/// is faster than the JSON API and works universally for both standard and
+/// RAPID/zonal (Hyperdisk ML) buckets.
+///
 /// # RAPID Storage
 ///
 /// Set the environment variable `S3DLIO_GCS_RAPID=true` (or `1`, `yes`) to
@@ -87,11 +93,12 @@ impl GcsClient {
             .await?;
         
         // RAPID mode: set appendable=true on every write for RAPID/Hyperdisk ML buckets.
+        // All reads/writes use gRPC regardless of RAPID mode.
         let rapid_mode = read_rapid_mode();
         if rapid_mode {
-            info!("GCS RAPID mode enabled (appendable writes)");
+            info!("GCS RAPID mode enabled (gRPC + appendable writes)");
         } else {
-            debug!("GCS RAPID mode: disabled (S3DLIO_GCS_RAPID not set or not 'true|1|yes')");
+            debug!("GCS mode: standard (gRPC reads/writes, S3DLIO_GCS_RAPID not set)");
         }
 
         Ok(Self {
@@ -108,53 +115,14 @@ impl GcsClient {
     }
 
     /// Get entire object as bytes.
+    ///
+    /// Always uses gRPC BidiReadObject (`open_object`) which works for both
+    /// standard and RAPID/zonal GCS buckets.  This avoids the JSON API path
+    /// (`read_object`) which is rejected by zonal buckets with HTTP 400.
     pub async fn get_object(&self, bucket: &str, object: &str) -> Result<Bytes> {
-        debug!("GCS GET (official): bucket={}, object={}", bucket, object);
-        
-        // Format bucket name as required by official client
+        debug!("GCS GET (gRPC): bucket={}, object={}", bucket, object);
         let bucket_name = format_bucket_name(bucket);
-
-        if self.rapid_mode {
-            // RAPID/zonal buckets require gRPC — use open_object (BidiReadObject)
-            debug!("GCS GET: RAPID mode — using gRPC BidiReadObject for {}/{}", bucket_name, object);
-            return self.get_object_via_grpc(&bucket_name, bucket, object, ReadRange::all()).await;
-        }
-        
-        let result = self.storage
-            .read_object(&bucket_name, object)
-            .send()
-            .await;
-
-        match result {
-            Ok(mut response) => {
-                // Collect all chunks into a single buffer
-                let mut data = Vec::new();
-                let mut chunk_count: u32 = 0;
-                while let Some(chunk) = response.next().await.transpose()
-                    .map_err(|e| anyhow!("GCS GET stream error for gs://{}/{}: {}", bucket, object, e))? 
-                {
-                    chunk_count += 1;
-                    trace!("GCS GET chunk #{}: {} bytes", chunk_count, chunk.len());
-                    data.extend_from_slice(&chunk);
-                }
-                
-                debug!("GCS GET success: {} bytes in {} chunk(s)", data.len(), chunk_count);
-                Ok(Bytes::from(data))
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                // Auto-detect RAPID/zonal: if JSON API is rejected, retry via gRPC
-                if !self.rapid_mode && (msg.contains("only support gRPC") || msg.contains("requires appendable")) {
-                    info!(
-                        "GCS GET: bucket '{}' requires gRPC API (RAPID bucket) — retrying with BidiReadObject",
-                        bucket
-                    );
-                    self.get_object_via_grpc(&bucket_name, bucket, object, ReadRange::all()).await
-                } else {
-                    Err(anyhow!("GCS GET failed for gs://{}/{}: {}", bucket, object, e))
-                }
-            }
-        }
+        self.get_object_via_grpc(&bucket_name, bucket, object, ReadRange::all()).await
     }
 
     /// Internal: read an object (or range) via gRPC BidiReadObject (open_object).
@@ -186,6 +154,9 @@ impl GcsClient {
     }
 
     /// Get a byte range from an object.
+    ///
+    /// Always uses gRPC BidiReadObject (`open_object`) which works for both
+    /// standard and RAPID/zonal GCS buckets.
     pub async fn get_object_range(
         &self,
         bucket: &str,
@@ -194,132 +165,50 @@ impl GcsClient {
         length: Option<u64>,
     ) -> Result<Bytes> {
         debug!(
-            "GCS GET RANGE (official): bucket={}, object={}, offset={}, length={:?}",
+            "GCS GET RANGE (gRPC): bucket={}, object={}, offset={}, length={:?}",
             bucket, object, offset, length
         );
 
         let bucket_name = format_bucket_name(bucket);
-        
+
         // Use ReadRange to specify byte range
         let read_range = match length {
             Some(len) => ReadRange::segment(offset, len),
             None => ReadRange::offset(offset),
         };
 
-        if self.rapid_mode {
-            // RAPID/zonal buckets require gRPC — use open_object (BidiReadObject)
-            debug!(
-                "GCS GET RANGE: RAPID mode — using gRPC BidiReadObject for {}/{} (offset={}, length={:?})",
-                bucket_name, object, offset, length
-            );
-            return self.get_object_via_grpc(&bucket_name, bucket, object, read_range).await;
-        }
-
-        trace!(
-            "GCS GET RANGE: resource={}, offset={}, length={:?}",
-            bucket_name, offset, length
-        );
-
-        let result = self.storage
-            .read_object(&bucket_name, object)
-            .set_read_range(read_range.clone())
-            .send()
-            .await;
-
-        match result {
-            Ok(mut response) => {
-                // Collect all chunks
-                let mut data = Vec::new();
-                let mut chunk_count: u32 = 0;
-                while let Some(chunk) = response.next().await.transpose()
-                    .map_err(|e| anyhow!("GCS GET RANGE stream error for gs://{}/{}: {}", bucket, object, e))? 
-                {
-                    chunk_count += 1;
-                    trace!("GCS GET RANGE chunk #{}: {} bytes", chunk_count, chunk.len());
-                    data.extend_from_slice(&chunk);
-                }
-
-                debug!("GCS GET RANGE success: {} bytes in {} chunk(s)", data.len(), chunk_count);
-                Ok(Bytes::from(data))
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                // Auto-detect RAPID/zonal: if JSON API is rejected, retry via gRPC
-                if !self.rapid_mode && (msg.contains("only support gRPC") || msg.contains("requires appendable")) {
-                    info!(
-                        "GCS GET RANGE: bucket '{}' requires gRPC API (RAPID bucket) — retrying with BidiReadObject",
-                        bucket
-                    );
-                    self.get_object_via_grpc(&bucket_name, bucket, object, read_range).await
-                } else {
-                    Err(anyhow!("GCS GET RANGE failed for gs://{}/{}: {}", bucket, object, e))
-                }
-            }
-        }
+        self.get_object_via_grpc(&bucket_name, bucket, object, read_range).await
     }
 
     /// Upload an object.
+    ///
+    /// Always uses gRPC BidiWriteObject (`send_grpc`) which works for both
+    /// standard and RAPID/zonal GCS buckets.  When RAPID mode is enabled
+    /// (`S3DLIO_GCS_RAPID=true`), sets `appendable=true` on the write spec.
     pub async fn put_object(&self, bucket: &str, object: &str, data: &[u8]) -> Result<()> {
         debug!(
-            "GCS PUT (official): bucket={}, object={}, size={}",
-            bucket,
-            object,
-            data.len()
+            "GCS PUT (gRPC): bucket={}, object={}, size={}, rapid={}",
+            bucket, object, data.len(), self.rapid_mode
         );
 
         let bucket_name = format_bucket_name(bucket);
-        trace!("GCS PUT: resource={}, rapid_mode={}", bucket_name, self.rapid_mode);
 
         // Convert slice to Bytes for upload
         let bytes = Bytes::copy_from_slice(data);
 
-        // First attempt: use gRPC BidiWriteObject for RAPID/zonal buckets,
-        // otherwise use JSON API single-shot upload.
-        let result = {
-            let write = self.storage.write_object(&bucket_name, object, bytes.clone());
-            if self.rapid_mode {
-                // RAPID (zonal) buckets require appendable=true. The gRPC
-                // BidiWriteObject path sends WriteObjectSpec.appendable=true
-                // natively, with chunked data and per-chunk CRC32C.
-                debug!("GCS PUT: RAPID mode — using gRPC BidiWriteObject with appendable=true for {}", bucket_name);
-                debug!("GCS PUT: payload_size={} bytes", data.len());
-                write.set_appendable(true).send_grpc().await
-            } else {
-                // Non-RAPID: force single-shot JSON API upload to avoid any
-                // accidental resumable path that zonal buckets would reject.
-                trace!("GCS PUT: standard mode — forcing single-shot upload for {}", bucket_name);
-                write.with_resumable_upload_threshold(usize::MAX).send_unbuffered().await
-            }
-        };
-
-        match result {
-            Ok(_) => {
-                debug!("GCS PUT success");
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                // Auto-detect RAPID/zonal buckets: if the bucket requires appendable objects
-                // (i.e. it is a RAPID bucket) but RAPID mode was not set via env var, retry
-                // automatically with gRPC BidiWriteObject + appendable=true.
-                if !self.rapid_mode && msg.contains("requires appendable objects") {
-                    info!(
-                        "GCS PUT: bucket '{}' requires appendable writes (RAPID bucket) — retrying with gRPC BidiWriteObject",
-                        bucket
-                    );
-                    self.storage
-                        .write_object(&bucket_name, object, bytes)
-                        .set_appendable(true)
-                        .send_grpc()
-                        .await
-                        .map_err(|e2| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e2))?;
-                    debug!("GCS PUT success (auto-detected RAPID bucket, gRPC)");
-                    Ok(())
-                } else {
-                    Err(anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))
-                }
-            }
+        let mut write = self.storage.write_object(&bucket_name, object, bytes);
+        if self.rapid_mode {
+            // RAPID (zonal) buckets require appendable=true on every write.
+            write = write.set_appendable(true);
         }
+
+        write
+            .send_grpc()
+            .await
+            .map_err(|e| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))?;
+
+        debug!("GCS PUT success");
+        Ok(())
     }
 
     /// Delete an object.
