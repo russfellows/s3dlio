@@ -113,25 +113,75 @@ impl GcsClient {
         
         // Format bucket name as required by official client
         let bucket_name = format_bucket_name(bucket);
-        
-        let mut response = self.storage
-            .read_object(&bucket_name, object)
-            .send()
-            .await
-            .map_err(|e| anyhow!("GCS GET failed for gs://{}/{}: {}", bucket, object, e))?;
-        
-        // Collect all chunks into a single buffer
-        let mut data = Vec::new();
-        let mut chunk_count: u32 = 0;
-        while let Some(chunk) = response.next().await.transpose()
-            .map_err(|e| anyhow!("GCS GET stream error for gs://{}/{}: {}", bucket, object, e))? 
-        {
-            chunk_count += 1;
-            trace!("GCS GET chunk #{}: {} bytes", chunk_count, chunk.len());
-            data.extend_from_slice(&chunk);
+
+        if self.rapid_mode {
+            // RAPID/zonal buckets require gRPC — use open_object (BidiReadObject)
+            debug!("GCS GET: RAPID mode — using gRPC BidiReadObject for {}/{}", bucket_name, object);
+            return self.get_object_via_grpc(&bucket_name, bucket, object, ReadRange::all()).await;
         }
         
-        debug!("GCS GET success: {} bytes in {} chunk(s)", data.len(), chunk_count);
+        let result = self.storage
+            .read_object(&bucket_name, object)
+            .send()
+            .await;
+
+        match result {
+            Ok(mut response) => {
+                // Collect all chunks into a single buffer
+                let mut data = Vec::new();
+                let mut chunk_count: u32 = 0;
+                while let Some(chunk) = response.next().await.transpose()
+                    .map_err(|e| anyhow!("GCS GET stream error for gs://{}/{}: {}", bucket, object, e))? 
+                {
+                    chunk_count += 1;
+                    trace!("GCS GET chunk #{}: {} bytes", chunk_count, chunk.len());
+                    data.extend_from_slice(&chunk);
+                }
+                
+                debug!("GCS GET success: {} bytes in {} chunk(s)", data.len(), chunk_count);
+                Ok(Bytes::from(data))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Auto-detect RAPID/zonal: if JSON API is rejected, retry via gRPC
+                if !self.rapid_mode && (msg.contains("only support gRPC") || msg.contains("requires appendable")) {
+                    info!(
+                        "GCS GET: bucket '{}' requires gRPC API (RAPID bucket) — retrying with BidiReadObject",
+                        bucket
+                    );
+                    self.get_object_via_grpc(&bucket_name, bucket, object, ReadRange::all()).await
+                } else {
+                    Err(anyhow!("GCS GET failed for gs://{}/{}: {}", bucket, object, e))
+                }
+            }
+        }
+    }
+
+    /// Internal: read an object (or range) via gRPC BidiReadObject (open_object).
+    async fn get_object_via_grpc(
+        &self,
+        bucket_name: &str,
+        bucket: &str,
+        object: &str,
+        range: ReadRange,
+    ) -> Result<Bytes> {
+        let (_descriptor, mut reader) = self.storage
+            .open_object(bucket_name, object)
+            .send_and_read(range)
+            .await
+            .map_err(|e| anyhow!("GCS GET (gRPC) failed for gs://{}/{}: {}", bucket, object, e))?;
+
+        let mut data = Vec::new();
+        let mut chunk_count: u32 = 0;
+        while let Some(chunk) = reader.next().await.transpose()
+            .map_err(|e| anyhow!("GCS GET (gRPC) stream error for gs://{}/{}: {}", bucket, object, e))?
+        {
+            chunk_count += 1;
+            trace!("GCS GET (gRPC) chunk #{}: {} bytes", chunk_count, chunk.len());
+            data.extend_from_slice(&chunk);
+        }
+
+        debug!("GCS GET (gRPC) success: {} bytes in {} chunk(s)", data.len(), chunk_count);
         Ok(Bytes::from(data))
     }
 
@@ -155,31 +205,57 @@ impl GcsClient {
             Some(len) => ReadRange::segment(offset, len),
             None => ReadRange::offset(offset),
         };
+
+        if self.rapid_mode {
+            // RAPID/zonal buckets require gRPC — use open_object (BidiReadObject)
+            debug!(
+                "GCS GET RANGE: RAPID mode — using gRPC BidiReadObject for {}/{} (offset={}, length={:?})",
+                bucket_name, object, offset, length
+            );
+            return self.get_object_via_grpc(&bucket_name, bucket, object, read_range).await;
+        }
+
         trace!(
             "GCS GET RANGE: resource={}, offset={}, length={:?}",
             bucket_name, offset, length
         );
 
-        let mut response = self.storage
+        let result = self.storage
             .read_object(&bucket_name, object)
-            .set_read_range(read_range)
+            .set_read_range(read_range.clone())
             .send()
-            .await
-            .map_err(|e| anyhow!("GCS GET RANGE failed for gs://{}/{}: {}", bucket, object, e))?;
+            .await;
 
-        // Collect all chunks
-        let mut data = Vec::new();
-        let mut chunk_count: u32 = 0;
-        while let Some(chunk) = response.next().await.transpose()
-            .map_err(|e| anyhow!("GCS GET RANGE stream error for gs://{}/{}: {}", bucket, object, e))? 
-        {
-            chunk_count += 1;
-            trace!("GCS GET RANGE chunk #{}: {} bytes", chunk_count, chunk.len());
-            data.extend_from_slice(&chunk);
+        match result {
+            Ok(mut response) => {
+                // Collect all chunks
+                let mut data = Vec::new();
+                let mut chunk_count: u32 = 0;
+                while let Some(chunk) = response.next().await.transpose()
+                    .map_err(|e| anyhow!("GCS GET RANGE stream error for gs://{}/{}: {}", bucket, object, e))? 
+                {
+                    chunk_count += 1;
+                    trace!("GCS GET RANGE chunk #{}: {} bytes", chunk_count, chunk.len());
+                    data.extend_from_slice(&chunk);
+                }
+
+                debug!("GCS GET RANGE success: {} bytes in {} chunk(s)", data.len(), chunk_count);
+                Ok(Bytes::from(data))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Auto-detect RAPID/zonal: if JSON API is rejected, retry via gRPC
+                if !self.rapid_mode && (msg.contains("only support gRPC") || msg.contains("requires appendable")) {
+                    info!(
+                        "GCS GET RANGE: bucket '{}' requires gRPC API (RAPID bucket) — retrying with BidiReadObject",
+                        bucket
+                    );
+                    self.get_object_via_grpc(&bucket_name, bucket, object, read_range).await
+                } else {
+                    Err(anyhow!("GCS GET RANGE failed for gs://{}/{}: {}", bucket, object, e))
+                }
+            }
         }
-
-        debug!("GCS GET RANGE success: {} bytes in {} chunk(s)", data.len(), chunk_count);
-        Ok(Bytes::from(data))
     }
 
     /// Upload an object.
@@ -312,6 +388,8 @@ impl GcsClient {
     ) -> Result<Vec<String>> {
         // Normalize prefix for non-recursive listings
         // GCS requires trailing "/" for delimiter behavior to work correctly
+        // when listing virtual directories.
+        let original_prefix = prefix.map(|p| p.to_string());
         let normalized_prefix = prefix.map(|p| {
             if !recursive && !p.is_empty() && !p.ends_with('/') {
                 format!("{}/", p)
@@ -328,12 +406,44 @@ impl GcsClient {
         // StorageControl requires projects/_/buckets/{bucket} format
         let bucket_name = format_bucket_name(bucket);
 
+        let results = self
+            .list_objects_with_prefix(&bucket_name, bucket, normalized_prefix.as_deref(), recursive)
+            .await?;
+
+        // If 0 results with normalized prefix (trailing '/') and the original
+        // prefix didn't have a trailing slash, retry without it — the prefix
+        // might be an exact object name, not a directory.
+        if results.is_empty() && !recursive {
+            if let Some(orig) = original_prefix.as_deref() {
+                if !orig.is_empty() && !orig.ends_with('/') {
+                    debug!(
+                        "GCS LIST: 0 results with normalized_prefix={:?}, retrying with exact prefix={:?}",
+                        normalized_prefix, orig
+                    );
+                    return self
+                        .list_objects_with_prefix(&bucket_name, bucket, Some(orig), recursive)
+                        .await;
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Internal: execute a paginated LIST with specified prefix and options.
+    async fn list_objects_with_prefix(
+        &self,
+        bucket_name: &str,
+        bucket: &str,
+        prefix: Option<&str>,
+        recursive: bool,
+    ) -> Result<Vec<String>> {
         let mut builder = self.control
             .list_objects()
-            .set_parent(bucket_name);
+            .set_parent(bucket_name.to_string());
 
-        if let Some(p) = normalized_prefix.as_ref() {
-            builder = builder.set_prefix(p.clone());
+        if let Some(p) = prefix {
+            builder = builder.set_prefix(p.to_string());
         }
 
         // Set delimiter for non-recursive listings

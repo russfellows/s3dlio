@@ -167,6 +167,11 @@ impl super::stub::Storage for Storage {
         // Determine chunk size
         let chunk_size = grpc_write_chunk_size();
         let total_len = data.len();
+        let num_chunks_est = if total_len == 0 { 1 } else { (total_len + chunk_size - 1) / chunk_size };
+        tracing::trace!(
+            "BidiWriteObject: total_size={} bytes, chunk_size={} bytes ({:.1} MiB), estimated_chunks={}, appendable={:?}, object_crc32c={:#010x}",
+            total_len, chunk_size, chunk_size as f64 / (1024.0 * 1024.0), num_chunks_est, req.spec.appendable, object_crc32c
+        );
 
         // Build x-goog-request-params routing header
         let x_goog_request_params = format!("bucket={bucket_name}");
@@ -233,10 +238,15 @@ impl super::stub::Storage for Storage {
                 )),
             };
 
+            tracing::trace!(
+                "BidiWriteObject: chunk {}/{} offset={} len={} crc32c={:#010x} first={} last={}",
+                msg_index + 1, num_chunks_est, offset, end - offset, chunk_crc, is_first, is_last
+            );
             tx.send(request).await.map_err(Error::io)?;
             offset = end;
             msg_index += 1;
         }
+        tracing::trace!("BidiWriteObject: sent {} chunk(s), starting gRPC stream", msg_index);
         // Drop sender so the server sees end-of-stream after all messages
         drop(tx);
 
