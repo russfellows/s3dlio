@@ -197,26 +197,23 @@ impl GcsClient {
         // Convert slice to Bytes for upload
         let bytes = Bytes::copy_from_slice(data);
 
-        // First attempt: use RAPID/appendable mode if explicitly configured, otherwise
-        // force single-shot (avoids "Zonal buckets do not support resumable upload").
+        // First attempt: use gRPC BidiWriteObject for RAPID/zonal buckets,
+        // otherwise use JSON API single-shot upload.
         let result = {
             let write = self.storage.write_object(&bucket_name, object, bytes.clone());
-            let write = if self.rapid_mode {
-                // RAPID (zonal) buckets require appendable=true AND a Simple upload
-                // (uploadType=media). Both resumable and multipart uploads are
-                // rejected by zonal buckets. Force threshold=MAX so ALL sizes
-                // use single-shot, and set_appendable(true) triggers the Simple
-                // upload path (uploadType=media) in the vendor library.
-                debug!("GCS PUT: RAPID mode — appendable=true + forcing single-shot for {}", bucket_name);
-                debug!("GCS PUT: payload_size={}, threshold=usize::MAX → will use uploadType=media", data.len());
-                write.set_appendable(true).with_resumable_upload_threshold(usize::MAX)
+            if self.rapid_mode {
+                // RAPID (zonal) buckets require appendable=true. The gRPC
+                // BidiWriteObject path sends WriteObjectSpec.appendable=true
+                // natively, with chunked data and per-chunk CRC32C.
+                debug!("GCS PUT: RAPID mode — using gRPC BidiWriteObject with appendable=true for {}", bucket_name);
+                debug!("GCS PUT: payload_size={} bytes", data.len());
+                write.set_appendable(true).send_grpc().await
             } else {
-                // Non-RAPID: also force single-shot to avoid any accidental resumable
-                // path that zonal buckets would reject.
+                // Non-RAPID: force single-shot JSON API upload to avoid any
+                // accidental resumable path that zonal buckets would reject.
                 trace!("GCS PUT: standard mode — forcing single-shot upload for {}", bucket_name);
-                write.with_resumable_upload_threshold(usize::MAX)
-            };
-            write.send_unbuffered().await
+                write.with_resumable_upload_threshold(usize::MAX).send_unbuffered().await
+            }
         };
 
         match result {
@@ -228,20 +225,19 @@ impl GcsClient {
                 let msg = e.to_string();
                 // Auto-detect RAPID/zonal buckets: if the bucket requires appendable objects
                 // (i.e. it is a RAPID bucket) but RAPID mode was not set via env var, retry
-                // automatically with set_appendable(true).
+                // automatically with gRPC BidiWriteObject + appendable=true.
                 if !self.rapid_mode && msg.contains("requires appendable objects") {
                     info!(
-                        "GCS PUT: bucket '{}' requires appendable writes (RAPID bucket) — retrying with appendable=true + single-shot",
+                        "GCS PUT: bucket '{}' requires appendable writes (RAPID bucket) — retrying with gRPC BidiWriteObject",
                         bucket
                     );
                     self.storage
                         .write_object(&bucket_name, object, bytes)
                         .set_appendable(true)
-                        .with_resumable_upload_threshold(usize::MAX)
-                        .send_unbuffered()
+                        .send_grpc()
                         .await
                         .map_err(|e2| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e2))?;
-                    debug!("GCS PUT success (auto-detected RAPID bucket)");
+                    debug!("GCS PUT success (auto-detected RAPID bucket, gRPC)");
                     Ok(())
                 } else {
                     Err(anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))

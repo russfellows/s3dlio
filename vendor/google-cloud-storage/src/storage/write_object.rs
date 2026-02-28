@@ -1006,6 +1006,48 @@ where
             .await
     }
 
+    /// Upload via gRPC BidiWriteObject, for RAPID/zonal buckets.
+    ///
+    /// Collects the full payload into a contiguous `Bytes` buffer, then calls
+    /// `write_object_grpc` which streams the data in 2 MiB chunks over
+    /// gRPC with per-chunk CRC32C and whole-object checksums.
+    ///
+    /// # Example
+    /// ```
+    /// # use google_cloud_storage::client::Storage;
+    /// # async fn sample(client: &Storage) -> anyhow::Result<()> {
+    /// let response = client
+    ///     .write_object("projects/_/buckets/my-bucket", "my-object", "hello world")
+    ///     .set_appendable(true)
+    ///     .send_grpc()
+    ///     .await?;
+    /// println!("response details={response:?}");
+    /// # Ok(()) }
+    /// ```
+    pub async fn send_grpc(mut self) -> Result<Object> {
+        // Collect the entire payload into a single Bytes buffer
+        let mut chunks: Vec<bytes::Bytes> = Vec::new();
+        while let Some(result) = self.payload.next().await {
+            let chunk = result.map_err(|e| {
+                crate::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
+            chunks.push(chunk);
+        }
+        let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut buf = bytes::BytesMut::with_capacity(total_len);
+        for chunk in chunks {
+            buf.extend_from_slice(&chunk);
+        }
+        let data = buf.freeze();
+
+        self.stub
+            .write_object_grpc(data, self.request, self.options)
+            .await
+    }
+
     /// Precompute the payload checksums before uploading the data.
     ///
     /// If the checksums are known when the upload starts, the client library
