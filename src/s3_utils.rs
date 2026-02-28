@@ -1199,11 +1199,12 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
         bail!("Cannot GET: no key specified");
     }
     
-    // Use environment variable to control range optimization threshold
+    // Use environment variable to control range optimization threshold.
+    // Default is 32 MB (v0.9.60+); override with S3DLIO_RANGE_THRESHOLD_MB=<megabytes>.
     let range_threshold = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(64) * 1024 * 1024; // Default 64MB threshold
+        .unwrap_or(32) * 1024 * 1024; // Default 32 MB threshold
     
     // Get object size first to decide strategy
     let client = aws_s3_client_async().await?;

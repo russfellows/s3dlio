@@ -13,13 +13,15 @@ serving large model weights to inference accelerators.
 
 RAPID buckets impose two hard constraints that differ from ordinary GCS buckets:
 
-1. **All writes must set `appendable=true`** in the gRPC `WriteObjectSpec`.
-   Omitting this flag causes every PUT to fail immediately with:
+1. **All writes must set `appendable=true`** as an HTTP query parameter and must use
+   a **single-shot** (non-resumable) upload. Resumable uploads (`uploadType=resumable`)
+   are explicitly rejected by zonal buckets. Omitting `appendable=true` causes:
    > `This bucket requires appendable objects. Make sure you use the appendable=true query parameter.`
 
-2. **The JSON API does not work with RAPID objects.** Only the gRPC transport (HTTP/2)
-   can read or write these objects. Any client using the JSON API will get
-   `HTTP 400 Bad Request` on reads.
+2. **Reads require the gRPC transport (HTTP/2).** The official `google-cloud-storage`
+   crate (v1.8.0+) uses JSON/REST for writes and gRPC for reads, so both paths are
+   handled correctly by the `gcs-official` backend. The `gcs-community` backend
+   (pure JSON API) cannot read RAPID objects.
 
 This means only the `gcs-official` backend (which uses the official Google gRPC SDK)
 is capable of working with RAPID buckets. The `gcs-community` backend (JSON API) is
@@ -224,7 +226,7 @@ Error: GCS PUT failed for gs://<bucket>/<object>:
 ```
 
 **Fix:** Set `S3DLIO_GCS_RAPID=true` before running. This tells s3dlio to include
-`appendable=true` in every write request spec.
+`appendable=true` as an HTTP query parameter on every single-shot write request.
 
 ### GET returns `HTTP 400 Bad Request`
 
@@ -275,10 +277,21 @@ cat "$GOOGLE_APPLICATION_CREDENTIALS" | python3 -c "import sys,json; d=json.load
 ## Technical Details
 
 s3dlio vendored `google-cloud-storage` v1.8.0 and added a `set_appendable()` method
-to the `WriteObject` request builder. The upstream SDK's model already supports the
-`appendable` field in `WriteObjectSpec`, but the high-level builder did not expose
-it. A PR has been filed upstream; once merged s3dlio will switch back to the
-unmodified upstream crate.
+to the `WriteObject` request builder. The SDK's `WriteObjectSpec` model struct already
+has an `appendable` field, but the high-level builder did not expose it, and the
+`apply_preconditions()` function that translates spec fields into HTTP query parameters
+did not emit `appendable=true`. Both gaps are patched in the vendor copy.
+
+**Write transport:** The official `google-cloud-storage` crate uses the **JSON/REST API**
+for all writes (both single-shot `uploadType=multipart` and resumable). gRPC is used
+only for reads (`read_object`, `open_object`). The `appendable=true` flag is therefore
+sent as an HTTP query parameter, not in a gRPC message.
+
+**Upload type for RAPID:** RAPID (zonal) buckets reject resumable uploads entirely.
+s3dlio forces `uploadType=multipart` (single-shot) for all writes — both in explicit
+RAPID mode (`S3DLIO_GCS_RAPID=true`) and in standard mode — to avoid the resumable
+rejection. The `appendable=true` query parameter is added via `apply_preconditions()`
+which is called for both upload paths.
 
 The vendor patch is in [`vendor/google-cloud-storage/`](../vendor/google-cloud-storage/)
 and is wired via `[patch.crates-io]` in `Cargo.toml` — no changes to user-visible

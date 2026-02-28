@@ -1,5 +1,28 @@
 # s3dlio Changelog
 
+## Version 0.9.60 - GCS RAPID Storage, List Buckets Multi-Protocol & Range Optimization Defaults (February 2026)
+
+### Range GET Optimization Defaults Changed
+- `S3DLIO_ENABLE_RANGE_OPTIMIZATION` is now **enabled by default**; set to `0` to disable
+- Default threshold changed from 64 MB → **32 MB** (`S3DLIO_RANGE_THRESHOLD_MB`)
+- Setting the variable to `1` is still accepted (no-op, already enabled)
+
+### GCS RAPID Storage Support (Issue #122)
+- Vendored `google-cloud-storage` fork with `set_appendable()` on `WriteObject` builder
+- New env var `S3DLIO_GCS_RAPID=true|1|yes` enables appendable writes for RAPID
+- `.env` file support via `dotenvy` for persistent configuration
+
+### List Buckets Multi-Protocol (Issue #121)
+- Fixed hardcoded `us-east-1` for custom S3 endpoints in `list_buckets()`
+- New `list_containers(uri)` function dispatches across S3, Azure, GCS, and local fs
+- CLI `list-buckets` command now accepts optional URI argument for non-S3 backends
+
+### Other
+- Comprehensive `trace!`/`debug!` instrumentation across GCS, Azure, S3 list paths
+- Doc-test fence annotations updated; `doctest-threads = 1` to prevent memory thrash
+
+---
+
 ## Version 0.9.50 - Critical Python Runtime Fix & s3torchconnector Compat (February 2026)
 
 ### 🚨 **CRITICAL: Python Multi-Threaded Runtime Fix**

@@ -39,9 +39,15 @@ where
             .await
             .map_err(Error::deser)?;
         let threshold = self.options.resumable_upload_threshold() as u64;
+        eprintln!(
+            "[RAPID DEBUG] send_unbuffered: hint.upper()={:?}, threshold={}, appendable={:?}",
+            hint.upper(), threshold, self.spec.appendable
+        );
         if hint.upper().is_none_or(|max| max >= threshold) {
+            eprintln!("[RAPID DEBUG] send_unbuffered: → RESUMABLE upload path");
             self.send_unbuffered_resumable(hint).await
         } else {
+            eprintln!("[RAPID DEBUG] send_unbuffered: → SINGLE-SHOT upload path");
             self.send_unbuffered_single_shot(hint).await
         }
     }
@@ -130,6 +136,29 @@ where
     async fn single_shot_attempt(&self, hint: SizeHint) -> Result<Object> {
         let builder = self.single_shot_builder(hint).await?;
         let response = builder.send().await.map_err(map_send_error)?;
+
+        // RAPID DEBUG: capture the actual HTTP response details
+        let status = response.status();
+        let url = response.url().to_string();
+        eprintln!(
+            "[RAPID DEBUG] single_shot_attempt: HTTP {} url={}",
+            status, url
+        );
+
+        if !status.is_success() && self.spec.appendable == Some(true) {
+            // For RAPID uploads: capture full error details before they're consumed
+            let headers = format!("{:?}", response.headers());
+            let body = response.text().await.unwrap_or_default();
+            eprintln!(
+                "[RAPID DEBUG] RAPID upload FAILED:\n  status: {}\n  url: {}\n  response_headers: {}\n  body: {}",
+                status, url, headers, body
+            );
+            return Err(Error::binding(format!(
+                "RAPID upload failed: HTTP {} at {} — {}",
+                status, url, body
+            )));
+        }
+
         let object = super::handle_object_response(response).await?;
         self.validate_response_object(object).await
     }
@@ -142,6 +171,18 @@ where
             ))
         })?;
         let object = &self.resource().name;
+
+        // For appendable/RAPID objects, use multipart upload with "appendable"
+        // injected into the JSON metadata body. GCS RAPID (zonal) buckets
+        // require appendable=true both as a query parameter AND in the object
+        // metadata. The gcloud CLI (via apitools) does this automatically by
+        // using uploadType=multipart with metadata containing appendable:true.
+        if self.spec.appendable == Some(true) {
+            eprintln!("[RAPID DEBUG] single_shot_builder: appendable=true → using uploadType=multipart with appendable in JSON metadata");
+            return self.rapid_multipart_builder(bucket_id, object, hint).await;
+        }
+
+        eprintln!("[RAPID DEBUG] single_shot_builder: using uploadType=multipart (standard)");
         let builder = self
             .inner
             .client
@@ -158,6 +199,74 @@ where
         let builder = self.inner.apply_auth_headers(builder).await?;
 
         let metadata = multipart::Part::text(v1::insert_body(self.resource()).to_string())
+            .mime_str("application/json; charset=UTF-8")
+            .map_err(Error::ser)?;
+        self.payload
+            .lock()
+            .await
+            .seek(0)
+            .await
+            .map_err(Error::ser)?;
+        let payload = self.payload_to_body().await?;
+        let form = multipart::Form::new().part("metadata", metadata);
+        let form = if let Some(exact) = hint.exact() {
+            form.part("media", multipart::Part::stream_with_length(payload, exact))
+        } else {
+            form.part("media", multipart::Part::stream(payload))
+        };
+
+        let builder = builder.header(
+            "content-type",
+            format!("multipart/related; boundary={}", form.boundary()),
+        );
+        Ok(builder.body(Body::wrap_stream(form.into_stream())))
+    }
+
+    /// Build a multipart upload request for RAPID/appendable objects.
+    ///
+    /// This is like the standard multipart upload, but injects `"appendable": true`
+    /// into the JSON metadata body. GCS RAPID (zonal) buckets require this flag
+    /// in the metadata to create appendable objects. The flag is also sent as a
+    /// query parameter via `apply_preconditions()` for belt-and-suspenders safety.
+    ///
+    /// This matches the behavior of `gcloud storage cp` for RAPID buckets, where
+    /// `apitools` sends the appendable flag in both the metadata and query params.
+    async fn rapid_multipart_builder(
+        &self,
+        bucket_id: &str,
+        object: &str,
+        hint: SizeHint,
+    ) -> Result<RequestBuilder> {
+        let builder = self
+            .inner
+            .client
+            .builder(Method::POST, format!("/upload/storage/v1/b/{bucket_id}/o"))
+            .query(&[("uploadType", "multipart")])
+            .query(&[("name", object)])
+            .header(
+                "x-goog-api-client",
+                HeaderValue::from_static(&X_GOOG_API_CLIENT_HEADER),
+            );
+
+        // apply_preconditions adds appendable=true as query param + any generation-match params
+        let builder = self.apply_preconditions(builder);
+        let builder = apply_customer_supplied_encryption_headers(builder, &self.params);
+        let builder = self.inner.apply_auth_headers(builder).await?;
+
+        // Build the JSON metadata body with "appendable": true injected.
+        // Start from the standard insert_body and add the appendable field.
+        let mut metadata_json = v1::insert_body(self.resource());
+        if let serde_json::Value::Object(ref mut map) = metadata_json {
+            map.insert("appendable".to_string(), serde_json::Value::Bool(true));
+        }
+        let metadata_str = metadata_json.to_string();
+
+        eprintln!(
+            "[RAPID DEBUG] rapid_multipart_builder: POST /upload/storage/v1/b/{}/o?uploadType=multipart&name={}&appendable=true  metadata={}",
+            bucket_id, object, metadata_str,
+        );
+
+        let metadata = multipart::Part::text(metadata_str)
             .mime_str("application/json; charset=UTF-8")
             .map_err(Error::ser)?;
         self.payload

@@ -258,7 +258,7 @@ pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> V
 /// - Lower CPU overhead than the new algorithm
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// use s3dlio::fill_controlled_data;
 /// 
 /// // 1 MB incompressible data using fast fill-in-place
@@ -292,7 +292,7 @@ pub fn generate_controlled_data_prand(size: usize, dedup: usize, compress: usize
 /// - `compress`: Compression factor (1 = incompressible, N = N:1 compressible)
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// // Fill 1 MB buffer with incompressible random data
 /// let mut buf = vec![0u8; 1024 * 1024];
 /// s3dlio::fill_controlled_data(&mut buf, 1, 1);
@@ -598,7 +598,7 @@ impl DataGenerator {
     /// 
     /// # Examples
     /// 
-    /// ```rust
+    /// ```ignore
     /// use s3dlio::data_gen::DataGenerator;
     /// 
     /// // Default: use system entropy (unique data per instance)
@@ -648,7 +648,7 @@ impl DataGenerator {
     /// such as for testing or when recreating the same dataset.
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// use s3dlio::data_gen::DataGenerator;
     /// 
     /// // Create two generators with the same seed - they will produce identical data

@@ -142,7 +142,7 @@ impl<S> PerformUpload<S> {
             .iter()
             .fold(builder, |b, v| b.query(&[("ifMetagenerationNotMatch", v)]));
 
-        [
+        let builder = [
             ("kmsKeyName", self.resource().kms_key.as_str()),
             ("predefinedAcl", self.spec.predefined_acl.as_str()),
         ]
@@ -150,7 +150,14 @@ impl<S> PerformUpload<S> {
         .fold(
             builder,
             |b, (k, v)| if v.is_empty() { b } else { b.query(&[(k, v)]) },
-        )
+        );
+
+        // Required for RAPID (zonal) buckets — must be sent as a query parameter.
+        eprintln!("[RAPID DEBUG] apply_preconditions: spec.appendable={:?}", self.spec.appendable);
+        match self.spec.appendable {
+            Some(true) => builder.query(&[("appendable", "true")]),
+            _ => builder,
+        }
     }
 }
 

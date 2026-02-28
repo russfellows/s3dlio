@@ -892,12 +892,15 @@ impl FileSystemObjectStore {
 /// v0.9.10: Added size_cache_ttl for pre-stat optimization
 #[derive(Debug, Clone)]
 pub struct S3Config {
-    /// Enable RangeEngine for concurrent range downloads
-    /// Default: false (v0.9.6+) - must opt-in to avoid stat overhead on every GET
+    /// Enable RangeEngine for concurrent range downloads (struct config field)
+    /// 
+    /// Default: false — set to true for large-file workloads.
+    /// Note: S3 also has a separate env-var optimization path (`S3DLIO_ENABLE_RANGE_OPTIMIZATION`)
+    /// that is enabled by default (v0.9.60+) and does not require this field to be set.
     pub enable_range_engine: bool,
     
     /// RangeEngine configuration
-    /// Network-optimized defaults: 16 MiB threshold, 32 concurrent ranges, 64 MiB chunks
+    /// Network-optimized defaults: 32 MiB threshold (v0.9.60+), 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
     
     /// Time-to-live for cached object sizes
@@ -909,11 +912,11 @@ pub struct S3Config {
 impl Default for S3Config {
     fn default() -> Self {
         Self {
-            enable_range_engine: false,  // Disabled by default due to stat overhead (v0.9.6+)
+            enable_range_engine: false,  // Struct field off by default; S3 env-var optimization (S3DLIO_ENABLE_RANGE_OPTIMIZATION) is on by default (v0.9.60+)
             range_engine: RangeEngineConfig {
                 chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
                 max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
-                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 16 MiB threshold
+                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 32 MiB threshold (v0.9.60+)
                 range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
             },
             size_cache_ttl_secs: 60,  // 60 second TTL for size cache
@@ -976,12 +979,13 @@ impl ObjectStore for S3ObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         
-        // Check if range optimization is enabled via environment variable
-        // This allows opt-in to parallel range downloads for large objects
+        // Range optimization is ENABLED by default (v0.9.60+).
+        // Set S3DLIO_ENABLE_RANGE_OPTIMIZATION=0 (or false/no/off/disable) to disable.
+        // Setting it to 1/true/yes/on/enable is accepted but has no effect (already on).
         let use_optimized = std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
             .ok()
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on" | "enable" | "enabled"))
-            .unwrap_or(false);
+            .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off" | "disable" | "disabled"))
+            .unwrap_or(true);  // Default: enabled
         
         if use_optimized {
             s3_get_object_uri_optimized_async(uri).await
@@ -1423,16 +1427,17 @@ fn az_props_to_meta(p: &AzureBlobProperties) -> ObjectMetadata {
 /// Configuration for Azure Blob Storage backend with RangeEngine support
 /// 
 /// Azure benefits significantly from concurrent range downloads due to network latency.
-/// However, RangeEngine is **disabled by default** (v0.9.6+) to avoid stat overhead.
-/// Enable explicitly for large-file workloads where the benefit outweighs HEAD request cost.
+/// RangeEngine is **disabled by default** — enable explicitly for large-file workloads
+/// where the benefit outweighs the HEAD request cost. Unlike S3, there is no
+/// env-var default for Azure; this config field must be set explicitly.
 #[derive(Debug, Clone)]
 pub struct AzureConfig {
     /// Enable RangeEngine for concurrent range downloads
-    /// Default: false (v0.9.6+) - must opt-in to avoid stat overhead on every GET
+    /// Default: false — must be set explicitly for large-file workloads
     pub enable_range_engine: bool,
     
     /// RangeEngine configuration
-    /// Network-optimized defaults: 16 MiB threshold, 32 concurrent ranges, 64 MiB chunks
+    /// Network-optimized defaults: 32 MiB threshold (v0.9.60+), 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
     
     /// Time-to-live for cached object sizes
@@ -1446,11 +1451,11 @@ pub struct AzureConfig {
 impl Default for AzureConfig {
     fn default() -> Self {
         Self {
-            enable_range_engine: false,  // Disabled by default due to stat overhead (v0.9.6+)
+            enable_range_engine: false,  // Disabled by default; must be set explicitly for Azure large-file workloads
             range_engine: RangeEngineConfig {
                 chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
                 max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
-                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 16 MiB threshold
+                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 32 MiB threshold (v0.9.60+)
                 range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
             },
             size_cache_ttl_secs: 60,  // 60 second TTL for size cache
@@ -1989,18 +1994,19 @@ fn gcs_meta_to_object_meta(meta: &GcsObjectMetadata) -> ObjectMetadata {
 /// Configuration for Google Cloud Storage backend
 /// 
 /// Supports RangeEngine for concurrent range downloads on network storage.
-/// However, RangeEngine is **disabled by default** (v0.9.6+) to avoid stat overhead.
-/// Enable explicitly for large-file workloads where the benefit outweighs HEAD request cost.
+/// RangeEngine is **disabled by default** — enable explicitly for large-file workloads
+/// where the benefit outweighs the HEAD request cost. Unlike S3, there is no
+/// env-var default for GCS; this config field must be set explicitly.
 /// 
 /// v0.9.10: Added size_cache_ttl_secs for pre-stat optimization
 #[derive(Clone, Debug)]
 pub struct GcsConfig {
-    /// Enable RangeEngine for concurrent range downloads
-    /// Default: false (v0.9.6+) - must opt-in to avoid stat overhead on every GET
+    /// Enable RangeEngine for concurrent range downloads (per-store config)
+    /// Default: false — must be set explicitly for GCS large-file workloads
     pub enable_range_engine: bool,
     
     /// RangeEngine configuration
-    /// Network-optimized defaults: 16 MiB threshold, 32 concurrent ranges, 64 MiB chunks
+    /// Network-optimized defaults: 32 MiB threshold (v0.9.60+), 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
     
     /// Time-to-live for cached object sizes
@@ -2012,11 +2018,11 @@ pub struct GcsConfig {
 impl Default for GcsConfig {
     fn default() -> Self {
         Self {
-            enable_range_engine: false,  // Disabled by default due to stat overhead (v0.9.6+)
+            enable_range_engine: false,  // Disabled by default; must be set explicitly for GCS large-file workloads
             range_engine: RangeEngineConfig {
                 chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
                 max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
-                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 16 MiB threshold
+                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 32 MiB threshold (v0.9.60+)
                 range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
             },
             size_cache_ttl_secs: 60,  // 60 second TTL for size cache
@@ -2631,11 +2637,12 @@ pub fn high_performance_store_for_uri_with_logger(uri: &str, logger: Option<crat
 /// This factory enables high-performance concurrent downloads for cloud storage (S3, Azure, GCS)
 /// by enabling RangeEngine with network-optimized settings. Use this when:
 /// - Testing within the cloud provider's network (low latency, high bandwidth)
-/// - Working with large objects (> 16 MiB) where parallelism improves throughput
+/// - Working with large objects (> 32 MiB) where parallelism improves throughput
 /// - Network conditions support concurrent connections (> 10 Gbps, < 3 ms latency)
 /// 
-/// RangeEngine is disabled by default to avoid stat() overhead on small files.
-/// This factory explicitly enables it for high-performance scenarios.
+/// Note: For S3, range optimization is also available via `S3DLIO_ENABLE_RANGE_OPTIMIZATION`
+/// (enabled by default, v0.9.60+) without needing this factory.
+/// This factory explicitly enables the struct-based RangeEngine for all backends.
 /// 
 /// # Arguments
 /// * `uri` - Storage URI (e.g., "s3://bucket/", "az://container/", "gs://bucket/")
@@ -2647,7 +2654,7 @@ pub fn high_performance_store_for_uri_with_logger(uri: &str, logger: Option<crat
 /// - Expected improvement: 30-60% for large objects
 /// 
 /// **Remote/low-bandwidth**: < 1 Gbps, > 30 ms latency
-/// - Use standard `store_for_uri()` (RangeEngine disabled by default)
+/// - Use standard `store_for_uri()` (struct RangeEngine disabled by default)
 /// - Avoids stat() overhead that may not be worth parallelism cost
 /// 
 /// # Example

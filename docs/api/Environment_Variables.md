@@ -21,28 +21,29 @@ This document provides a comprehensive reference for all environment variables s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3DLIO_ENABLE_RANGE_OPTIMIZATION` | `false` | Enable parallel range downloads for large S3 objects (opt-in to avoid HEAD overhead) |
-| `S3DLIO_RANGE_THRESHOLD_MB` | `64` | Minimum object size (MB) to trigger range GET optimization (only when enabled) |
+| `S3DLIO_ENABLE_RANGE_OPTIMIZATION` | `true` (v0.9.60+) | Parallel range downloads for large S3 objects. Set to `0` to disable (e.g., for small-object or memory-constrained workloads) |
+| `S3DLIO_RANGE_THRESHOLD_MB` | `32` (v0.9.60+) | Minimum object size (MB) to trigger range GET optimization |
 | `S3DLIO_RANGE_CONCURRENCY` | Auto-tuned | Number of concurrent range requests for large objects |
 | `S3DLIO_CHUNK_SIZE` | Auto-calculated | Chunk size for range requests (default: 1-8 MB based on object size) |
 | `S3DLIO_CONCURRENT_THRESHOLD` | Auto-tuned | Threshold for enabling concurrent operations |
 
 ### Range Optimization Details
 
-**Why disabled by default?**
-- Requires HEAD request to determine object size (adds ~10-20ms latency)
-- Small objects (< 64 MB) faster with single GET request
-- Best for workloads with large, known-size objects (> 100 MB)
+**Enabled by default (v0.9.60+)**
+- Range optimization is on by default; requires a HEAD request to determine object size (~10-20ms overhead)
+- Objects below the threshold use a single GET request (no HEAD)
+- Default threshold is 32 MB — covers most AI/ML dataset file sizes
 
-**When to enable:**
+**When to disable** (small-object or memory-constrained workloads):
 ```bash
-# Enable for large object workloads (> 100 MB objects)
-export S3DLIO_ENABLE_RANGE_OPTIMIZATION=1
-export S3DLIO_RANGE_THRESHOLD_MB=64  # Conservative default
+# Disable range optimization (e.g., many small objects < 32 MB)
+export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0
 
-# For very large objects (> 500 MB), use aggressive settings
-export S3DLIO_ENABLE_RANGE_OPTIMIZATION=1
-export S3DLIO_RANGE_THRESHOLD_MB=128
+# Raise the threshold instead of disabling entirely
+export S3DLIO_RANGE_THRESHOLD_MB=128  # Only for very large objects
+
+# For very large objects, aggressive parallel settings
+export S3DLIO_RANGE_THRESHOLD_MB=32
 export S3DLIO_RANGE_CONCURRENCY=32
 export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
 ```
@@ -59,11 +60,11 @@ export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
 | 8 MB | 3.50s | 676 MB/s (0.66 GB/s) | 1.58x (58% faster) |
 | 16 MB | 3.27s | 725 MB/s (0.71 GB/s) | 1.69x (69% faster) |
 | 32 MB | 3.23s | 732 MB/s (0.71 GB/s) | 1.71x (71% faster) |
-| **64 MB (default)** | **3.14s** | **755 MB/s (0.74 GB/s)** | **1.76x (76% faster)** 🏆 |
+| 64 MB | 3.14s | 755 MB/s (0.74 GB/s) | 1.76x (76% faster) 🏆 |
 | 128 MB | 3.22s | 735 MB/s (0.72 GB/s) | 1.71x (71% faster) |
 
 **Key findings:**
-- **64 MB threshold (default) is optimal** for 148 MB objects
+- **32 MB default threshold** is a good balance for typical AI/ML objects (covers most dataset files)
 - 16-64 MB range provides excellent performance (69-76% faster)
 - Even aggressive 8 MB threshold shows 58% improvement
 - HEAD overhead (~10-20ms) is well amortized by parallel download
@@ -158,7 +159,7 @@ export S3DLIO_RANGE_CONCURRENCY=64
 export S3DLIO_RT_THREADS=8
 export S3DLIO_MAX_HTTP_CONNECTIONS=50
 export S3DLIO_RANGE_CONCURRENCY=8
-export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0  # Disable range optimization
+export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0  # Disable range optimization (on by default since v0.9.60)
 
 ./target/release/s3-cli get s3://bucket/files/
 ```
@@ -185,15 +186,15 @@ export S3DLIO_RT_THREADS=8
 ## Performance Tuning Guidelines
 
 ### For Large Objects (>100MB)
-- **Enable range optimization**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=1`
-- Set `S3DLIO_RANGE_THRESHOLD_MB=64` (or higher for very large objects)
+- Range optimization is **enabled by default** (v0.9.60+); no action needed
+- Lower `S3DLIO_RANGE_THRESHOLD_MB` if needed (default is 32 MB)
 - Increase `S3DLIO_RANGE_CONCURRENCY` to 32-64
 - Use `S3DLIO_USE_OPTIMIZED_HTTP=true`
 - Set `S3DLIO_MAX_HTTP_CONNECTIONS=400`
 - Consider `S3DLIO_RT_THREADS=32` on high-core systems
 
 ### For Many Small Objects
-- **Disable range optimization**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` (default)
+- **Disable range optimization**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` (enabled by default since v0.9.60)
 - Use `S3DLIO_USE_OPTIMIZED_HTTP=true` 
 - Set `S3DLIO_MAX_HTTP_CONNECTIONS=200-400`
 - Increase `S3DLIO_RT_THREADS` for better parallelism
@@ -210,6 +211,7 @@ export S3DLIO_RT_THREADS=8
 
 ## Version History
 
+- **v0.9.60**: Range optimization enabled by default; default threshold changed 64 MB → 32 MB; set `=0` to disable
 - **v0.7.5**: Added HTTP client optimization variables
 - **v0.7.4**: Added runtime threading control
 - **v0.7.0+**: Range GET optimization variables

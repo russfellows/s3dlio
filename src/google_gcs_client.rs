@@ -197,20 +197,57 @@ impl GcsClient {
         // Convert slice to Bytes for upload
         let bytes = Bytes::copy_from_slice(data);
 
-        let write = self.storage.write_object(&bucket_name, object, bytes);
-        let write = if self.rapid_mode {
-            debug!("GCS PUT: RAPID mode — setting appendable=true for {}", bucket_name);
-            write.set_appendable(true)
-        } else {
-            write
+        // First attempt: use RAPID/appendable mode if explicitly configured, otherwise
+        // force single-shot (avoids "Zonal buckets do not support resumable upload").
+        let result = {
+            let write = self.storage.write_object(&bucket_name, object, bytes.clone());
+            let write = if self.rapid_mode {
+                // RAPID (zonal) buckets require appendable=true AND a Simple upload
+                // (uploadType=media). Both resumable and multipart uploads are
+                // rejected by zonal buckets. Force threshold=MAX so ALL sizes
+                // use single-shot, and set_appendable(true) triggers the Simple
+                // upload path (uploadType=media) in the vendor library.
+                debug!("GCS PUT: RAPID mode — appendable=true + forcing single-shot for {}", bucket_name);
+                debug!("GCS PUT: payload_size={}, threshold=usize::MAX → will use uploadType=media", data.len());
+                write.set_appendable(true).with_resumable_upload_threshold(usize::MAX)
+            } else {
+                // Non-RAPID: also force single-shot to avoid any accidental resumable
+                // path that zonal buckets would reject.
+                trace!("GCS PUT: standard mode — forcing single-shot upload for {}", bucket_name);
+                write.with_resumable_upload_threshold(usize::MAX)
+            };
+            write.send_unbuffered().await
         };
-        write
-            .send_unbuffered()
-            .await
-            .map_err(|e| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))?;
 
-        debug!("GCS PUT success");
-        Ok(())
+        match result {
+            Ok(_) => {
+                debug!("GCS PUT success");
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Auto-detect RAPID/zonal buckets: if the bucket requires appendable objects
+                // (i.e. it is a RAPID bucket) but RAPID mode was not set via env var, retry
+                // automatically with set_appendable(true).
+                if !self.rapid_mode && msg.contains("requires appendable objects") {
+                    info!(
+                        "GCS PUT: bucket '{}' requires appendable writes (RAPID bucket) — retrying with appendable=true + single-shot",
+                        bucket
+                    );
+                    self.storage
+                        .write_object(&bucket_name, object, bytes)
+                        .set_appendable(true)
+                        .with_resumable_upload_threshold(usize::MAX)
+                        .send_unbuffered()
+                        .await
+                        .map_err(|e2| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e2))?;
+                    debug!("GCS PUT success (auto-detected RAPID bucket)");
+                    Ok(())
+                } else {
+                    Err(anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))
+                }
+            }
+        }
     }
 
     /// Delete an object.

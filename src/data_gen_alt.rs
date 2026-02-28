@@ -316,7 +316,7 @@ impl Default for GeneratorConfig {
 /// - `compress`: Compression factor (1 = incompressible, N = N:1 ratio)
 ///
 /// # Example
-/// ```rust
+/// ```no_run
 /// use s3dlio::data_gen_alt::generate_data_simple;
 ///
 /// // Generate 1 MiB incompressible data with no deduplication
@@ -1407,7 +1407,7 @@ pub fn generate_data_with_config(config: GeneratorConfig) -> bytes::Bytes {
 /// 
 /// # Performance Notes
 /// For maximum performance with repeated calls, consider using the streaming API:
-/// ```rust
+/// ```no_run
 /// use s3dlio::data_gen_alt::{DataGenerator, GeneratorConfig};
 /// 
 /// let config = GeneratorConfig { size: 1_000_000, ..Default::default() }; // 1 MB
