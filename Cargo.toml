@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.50"
+version = "0.9.60"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -25,10 +25,9 @@ name = "s3-cli"
 path = "src/bin/cli.rs"
 
 [dependencies]
-# AWS SDK - pinned to latest (2025-12-03 testing for -v hang issue)
-# AWS SDK - restored to latest after confirming tracing hang exists in 1.104 too
-aws-config         = "=1.8.11"
-aws-sdk-s3         = "=1.116.0"
+# AWS SDK - pinned to latest stable (update by running: cargo search aws-config)
+aws-config         = "=1.8.14"
+aws-sdk-s3         = "=1.124.0"
 
 # Azure SDK crates (keep minor versions flexible; they evolve together)
 azure_core = { version = "0" }          # Response/Body, paging, errors
@@ -36,11 +35,11 @@ azure_identity = { version = "0" }      # DefaultAzureCredential
 azure_storage_blob = { version = "0" }   # Blob/Container/BlockBlob clients
 
 # Google Cloud Storage SDK - Two implementations available via feature flags:
-# - gcs-community: Community-maintained gcloud-storage (default, stable)
-# - gcs-official: Official Google google-cloud-storage (experimental)
-gcloud-storage = { version = "^1.1", optional = true }       # Community GCS client with ADC support
-google-cloud-storage = { version = "^1.1", optional = true } # Official Google GCS client
-google-cloud-gax = { version = "^1.1", optional = true }     # Google Cloud GAX library (needed for ItemPaginator trait)
+# - gcs-official: Official Google gRPC client (default, supports RAPID/Hyperdisk ML)
+# - gcs-community: Community JSON-API client (fallback, no RAPID support)
+gcloud-storage = { version = "^1.2", optional = true }       # Community GCS client with ADC support
+google-cloud-storage = { version = "^1.8", optional = true } # Official Google GCS client
+google-cloud-gax = { version = "^1.7", optional = true }     # Google Cloud GAX library (needed for ItemPaginator trait)
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat
@@ -86,10 +85,11 @@ zip         = { version = "^2.1", default-features = false }
 # System-level I/O support
 libc        = "^0.2"
 
-# Not certain which hdf5 gives best set of features
-#hdf5 = { package = "hdf5-metno", version = "0.10.1" }
-hdf5-metno = "^0.10"
-hdf5-metno-sys = "^0.10"
+# HDF5 support (optional - requires libhdf5 system library, not available on all platforms)
+# Enable with: cargo build --features hdf5
+# Note: Not included in defaults to allow building on WSL/minimal environments
+hdf5-metno = { version = "^0.12", optional = true }
+hdf5-metno-sys = { version = "^0.11", optional = true }
 
 # -------- Python bindings ----------
 pyo3           = { version = "^0.27", features = ["extension-module"], optional = true }
@@ -123,14 +123,14 @@ tokio-sync   = "^0.1.8"
 base64 = "0.22.1"
 
 # --- Arrow backend (optional, enabled via "arrow-backend" feature) -------
-object_store = { version = "0.12", default-features = false, features = ["aws", "azure", "http", "gcp"], optional = true }
+object_store = { version = "0.13", default-features = false, features = ["aws", "azure", "http", "gcp"], optional = true }
 url = { version = "2.5", optional = true }
 
 # --- Enhanced HTTP client with HTTP/2 support --------------------------------
 reqwest = { version = "0.12", features = ["rustls-tls", "http2", "hickory-dns"], optional = true }
 
 # --- High-performance memory and file I/O ------------------------------------
-nix = { version = "0.29", features = ["fs"], optional = true }  # For O_DIRECT and positioned I/O
+nix = { version = "0.31", features = ["fs"], optional = true }  # For O_DIRECT and positioned I/O
 
 # --- NUMA topology detection and thread pinning (optional) ------------------
 hwlocality = { version = "1.0.0-alpha.11", optional = true }  # NUMA topology detection (matches dgen-rs)
@@ -139,7 +139,7 @@ core_affinity = { version = "0.8", optional = true }    # Thread pinning to CPU 
 # --- Profiling (optional, enabled via "profiling" feature) ---------------
 # tracing and tracing-subscriber are now main dependencies above
 console-subscriber = { version = "0.4", optional = true }
-pprof             = { version = "0.13", features = ["flamegraph"], optional = true }
+pprof             = { version = "0.15", features = ["flamegraph"], optional = true }
 
 
 [dev-dependencies]
@@ -151,16 +151,21 @@ criterion     = { version = "0.5", features = ["html_reports"] }
 
 [features]
 #default = []
-default = ["s3", "native-backends", "gcs-community", "numa", "thread-pinning"]
+# Note: 'numa' and 'hdf5' are intentionally excluded from defaults.
+# - 'numa' requires the hwloc2 C library (not available on WSL/minimal systems)
+# - 'hdf5' requires libhdf5 (not available on WSL/minimal systems)
+# Enable these manually: cargo build --features numa,hdf5
+default = ["s3", "native-backends", "gcs-official", "thread-pinning"]
 s3 = []
 native-backends = []                    # Current AWS/Azure implementations
-gcs-community = ["dep:gcloud-storage"]  # Community-maintained GCS client (default)
-gcs-official = ["dep:google-cloud-storage", "dep:google-cloud-gax"]  # Official Google GCS client (experimental)
+gcs-community = ["dep:gcloud-storage"]  # Community-maintained GCS client (JSON API, no RAPID support)
+gcs-official = ["dep:google-cloud-storage", "dep:google-cloud-gax"]  # Official Google GCS client (gRPC, RAPID support)
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
 enhanced-http = ["dep:reqwest"]      # Enhanced HTTP client with HTTP/2 support
 direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
-numa = ["dep:hwlocality"]  # NUMA topology detection (matches dgen-rs)
-thread-pinning = ["dep:core_affinity"]  # CPU core affinity for thread pinning
+numa = ["dep:hwlocality"]  # NUMA topology detection - requires hwloc2 C library (optional, not in defaults)
+thread-pinning = ["dep:core_affinity"]  # CPU core affinity for thread pinning (pure Rust, safe for all platforms)
+hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys"]  # HDF5 data format support - requires libhdf5 (optional, not in defaults)
 profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always available
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
 experimental-http-client = []        # Enable custom hyper_builder optimizations (requires patched aws-smithy-http-client)
@@ -186,3 +191,34 @@ harness = false
 lto = true
 codegen-units = 1
 opt-level = 3
+
+# Vendored fork of google-cloud-storage with set_appendable() added to WriteObject
+# builder for GCS RAPID (Hyperdisk ML) bucket support.
+# Pending upstream PR: https://github.com/googleapis/google-cloud-rust
+# ---------------------------------------------------------------------------
+# Vendored patch — google-cloud-storage does not yet expose set_appendable()
+# on its WriteObject builder.  We vendor a minimal fork that adds the method.
+#
+# IMPORTANT FOR WHEEL / PIP BUILDERS
+# ==================================
+# The `vendor/google-cloud-storage/` directory MUST be committed to git so
+# that:
+#   1. Anyone who clones the repo can run `cargo build` / `maturin build`.
+#   2. Maturin includes the directory in the sdist it publishes to PyPI,
+#      allowing `pip install s3dlio --no-binary s3dlio` to work.
+#
+# If you see this error after cloning:
+#   error: failed to get `google-cloud-storage` ...
+#   ... directory does not exist: .../vendor/google-cloud-storage
+# run:  git submodule update --init  (or check out via git LFS if enabled)
+#
+# MIGRATION PATH
+# ==============
+# Once https://github.com/googleapis/google-cloud-rust adds set_appendable()
+# upstream, remove this section entirely and delete the vendor/ directory.
+# Alternatively, point to a git-fork to avoid committing vendor source:
+#   google-cloud-storage = { git = "https://github.com/<fork>/google-cloud-rust",
+#                             rev  = "<commit-hash>" }
+# ---------------------------------------------------------------------------
+[patch.crates-io]
+google-cloud-storage = { path = "vendor/google-cloud-storage" }

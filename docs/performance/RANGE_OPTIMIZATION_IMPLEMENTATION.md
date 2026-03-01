@@ -94,12 +94,12 @@ async fn get(&self, uri: &str) -> Result<Bytes> {
 ### New Variable
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3DLIO_ENABLE_RANGE_OPTIMIZATION` | `0` (disabled) | Enable parallel range downloads (opt-in to avoid HEAD overhead) |
+| `S3DLIO_ENABLE_RANGE_OPTIMIZATION` | `1` (enabled, v0.9.60+) | Set to `0` to disable parallel range downloads |
 
 ### Updated Variable
 | Variable | Old Default | New Default | Description |
 |----------|-------------|-------------|-------------|
-| `S3DLIO_RANGE_THRESHOLD_MB` | 4 MB | **64 MB** | Minimum object size to trigger parallel downloads (conservative to avoid HEAD overhead) |
+| `S3DLIO_RANGE_THRESHOLD_MB` | 4 MB | **32 MB** (v0.9.60+) | Minimum object size to trigger parallel downloads |
 
 ### Existing Variables (now documented)
 - `S3DLIO_RANGE_CONCURRENCY`: Number of parallel requests (auto-tuned 8-32)

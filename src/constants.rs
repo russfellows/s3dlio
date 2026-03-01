@@ -97,39 +97,42 @@ pub const DEFAULT_RANGE_ENGINE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 /// Controls parallelism for concurrent range downloads
 pub const DEFAULT_RANGE_ENGINE_MAX_CONCURRENT: usize = 32;
 
-/// Universal default minimum object size to trigger RangeEngine (16 MiB)
+/// Universal default minimum object size to trigger RangeEngine (now 32 MiB, v0.9.60+)
 /// 
 /// This threshold applies to all storage backends (S3, Azure, GCS, file://, direct://)
-/// when RangeEngine is explicitly enabled. **RangeEngine is disabled by default as of v0.9.6.**
+/// when RangeEngine is enabled.
 ///
-/// **Why 16 MiB?**
-/// - Avoids range splitting for typical objects (configs, logs, small files)
-/// - Only engages RangeEngine for moderately large files (media, datasets, archives)
-/// - When enabled, balances performance vs overhead for large-file workloads
+/// **S3 inline optimization** (`S3DLIO_ENABLE_RANGE_OPTIMIZATION`, enabled by default in v0.9.60):
+/// Uses this 32 MiB threshold unless overridden by `S3DLIO_RANGE_THRESHOLD_MB`.
+/// Set `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` to disable.
+///
+/// **Per-store RangeEngine** (`enable_range_engine` config field):
+/// Still `false` by default on all backends — must be explicitly enabled via config.
+/// This avoids the HEAD stat overhead for workloads with small or mixed objects.
 /// 
-/// **Performance Impact (when RangeEngine is enabled):**
-/// - Objects < 16 MiB: Single GET request (fast path, no range splitting)
-/// - Objects >= 16 MiB: HEAD + concurrent range GETs (RangeEngine path)
+/// **Performance Impact (when RangeEngine is active):**
+/// - Objects < 32 MiB: Single GET request (fast path, no range splitting)
+/// - Objects >= 32 MiB: HEAD + concurrent range GETs (RangeEngine path)
 /// 
 /// **When to Override:**
-/// - Set higher (e.g., 64 MiB) if most objects are large but still want to avoid HEAD overhead
-/// - Set lower (e.g., 4 MiB) for dedicated large-file workloads on high-latency networks
-/// - Leave RangeEngine disabled (default) for mixed or small-object workloads
+/// - Set `S3DLIO_RANGE_THRESHOLD_MB` to change S3 inline optimization threshold
+/// - Set higher (e.g., 64 MiB) to avoid HEAD overhead for large-object workloads
+/// - Set lower (e.g., 4 MiB) for dedicated large-file high-latency networks
 ///
-/// **Example Configuration:**
+/// **Example Configuration (per-store RangeEngine):**
 /// ```ignore
 /// use s3dlio::object_store::{GcsConfig, RangeEngineConfig};
 /// 
 /// // Enable RangeEngine for large-file workload
 /// let config = GcsConfig {
-///     enable_range_engine: true,  // Must explicitly enable (disabled by default)
+///     enable_range_engine: true,  // Must explicitly enable for per-store RangeEngine
 ///     range_engine: RangeEngineConfig {
-///         min_split_size: 16 * 1024 * 1024,  // 16 MiB threshold (default)
+///         min_split_size: 32 * 1024 * 1024,  // 32 MiB threshold
 ///         ..Default::default()
 ///     },
 /// };
 /// ```
-pub const DEFAULT_RANGE_ENGINE_THRESHOLD: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_RANGE_ENGINE_THRESHOLD: u64 = 32 * 1024 * 1024;
 
 /// Legacy alias for S3 backend (now uses universal threshold)
 /// Kept for backward compatibility, but DEFAULT_RANGE_ENGINE_THRESHOLD is preferred

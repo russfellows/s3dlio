@@ -1,0 +1,4 @@
+[test]
+# Run doc-tests one at a time to avoid parallel memory/CPU pressure.
+# Unit tests (--lib) and integration tests are unaffected by this setting.
+doctest-threads = 1

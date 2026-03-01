@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub enum ObjectType {
     Npz,
     TfRecord,
+    /// HDF5 format. Requires building with `--features hdf5` and libhdf5 installed.
+    /// Standard PyPI wheels do not include this feature.
     Hdf5,
     Raw,
 }

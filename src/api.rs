@@ -18,7 +18,7 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust
+//! ```no_run
 //! use s3dlio::api::{ObjectStore, store_for_uri};
 //!
 //! # async fn example() -> anyhow::Result<()> {

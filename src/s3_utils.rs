@@ -270,47 +270,129 @@ pub fn delete_bucket(bucket: &str) -> Result<()> {
 // -----------------------------------------------------------------------------
 // S3 List buckets
 // -----------------------------------------------------------------------------
-/// List all S3 buckets in the account.
-/// Returns a vector of bucket names with their creation dates.
-/// 
-/// NOTE: ListBuckets is a global S3 operation that MUST use us-east-1 region,
-/// regardless of the configured default region. This function creates a special
-/// client with us-east-1 to avoid "AuthorizationHeaderMalformed" errors.
+
+/// Resolved S3 client parameters for a list-buckets request.
+///
+/// Separated from env-var reading so the resolution logic can be unit-tested
+/// without touching the process environment.
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct ListBucketsParams {
+    /// Effective AWS region to use for the request.
+    pub region: String,
+    /// Whether to use path-style (`https://host/bucket`) vs virtual-host
+    /// style (`https://bucket.host`) addressing.
+    pub use_path_style: bool,
+    /// Custom endpoint URL (when `AWS_ENDPOINT_URL` is set).
+    pub endpoint_url: Option<String>,
+}
+
+/// Resolve S3 client parameters for `list_buckets` from environment-variable
+/// values that have already been read by the caller.
+///
+/// **Rules**
+///
+/// - If `endpoint_url_env` is `Some` and non-empty (a custom / non-AWS
+///   endpoint is configured), `region` is taken from `region_env` and the
+///   endpoint is forwarded to the SDK.  This is required because third-party
+///   S3-compatible services (GCS, MinIO, Vast Data, …) need the caller's
+///   region and reject a hard-coded `us-east-1`.
+/// - If `endpoint_url_env` is `None` or empty (genuine AWS S3), the region is
+///   always forced to `us-east-1`.  AWS's global `ListBuckets` operation must
+///   target `us-east-1` or the SDK returns
+///   `AuthorizationHeaderMalformed / region is wrong`.
+/// - `use_path_style` is `true` when `addressing_style_env` equals `"path"`
+///   (case-insensitive), matching the behaviour of `AWS_S3_ADDRESSING_STYLE`.
+///
+/// All three arguments mirror the corresponding environment variables:
+/// `AWS_ENDPOINT_URL`, `AWS_REGION` (or `AWS_DEFAULT_REGION`), and
+/// `AWS_S3_ADDRESSING_STYLE`.
+pub(crate) fn resolve_list_buckets_params(
+    endpoint_url_env: Option<&str>,
+    region_env: Option<&str>,
+    addressing_style_env: Option<&str>,
+) -> ListBucketsParams {
+    let endpoint_url = endpoint_url_env
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let region = if endpoint_url.is_some() {
+        // Non-AWS endpoint: honour the caller's region; fall back to us-east-1
+        // only if the user did not set any region variable at all.
+        region_env.unwrap_or("us-east-1").to_string()
+    } else {
+        // Genuine AWS S3: GlobalListBuckets must use us-east-1 regardless of
+        // what AWS_REGION says.
+        "us-east-1".to_string()
+    };
+
+    let use_path_style = addressing_style_env
+        .map(|v| v.to_lowercase() == "path")
+        .unwrap_or(false);
+
+    debug!(
+        "list_buckets params: {} → region={:?}, path_style={}",
+        if endpoint_url.is_some() { "custom endpoint" } else { "native AWS (us-east-1)" },
+        region,
+        use_path_style,
+    );
+    ListBucketsParams { region, use_path_style, endpoint_url }
+}
+
+/// List all S3 buckets visible to the current credentials.
+///
+/// **Region behaviour**
+///
+/// - Genuine AWS S3: always uses `us-east-1` (required for the global
+///   `ListBuckets` operation).
+/// - Custom endpoint (`AWS_ENDPOINT_URL` is set, e.g. GCS, MinIO, Vast):
+///   uses `AWS_REGION` / `AWS_DEFAULT_REGION` from the environment.  Set
+///   `AWS_S3_ADDRESSING_STYLE=path` when your endpoint requires path-style
+///   addressing (GCS and most self-hosted services do).
 pub fn list_buckets() -> Result<Vec<BucketInfo>> {
     run_on_global_rt(async move {
-        // ListBuckets is a GLOBAL operation and MUST use us-east-1
-        // Create a special client with forced us-east-1 region
         use aws_sdk_s3::config::Region;
-        use aws_config::meta::region::RegionProviderChain;
         use aws_config::timeout::TimeoutConfig;
         use std::time::Duration;
         use tracing::debug;
-        
+
         dotenvy::dotenv().ok();
-        
-        // Force us-east-1 for global ListBuckets operation
-        let region = RegionProviderChain::first_try(Some(Region::new("us-east-1")));
-        
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12())
-            .region(region);
-            
-        // Respect endpoint URL if set (for MinIO, etc.)
-        if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
-            if !endpoint.is_empty() {
-                loader = loader.endpoint_url(endpoint);
-            }
-        }
-        
-        // Use same timeout config as main client
+
+        // Read env vars once and resolve config through the pure helper so the
+        // logic stays testable without mutating the process environment.
+        let params = resolve_list_buckets_params(
+            std::env::var("AWS_ENDPOINT_URL").ok().as_deref(),
+            std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .ok()
+                .as_deref(),
+            std::env::var("AWS_S3_ADDRESSING_STYLE").ok().as_deref(),
+        );
+
+        debug!(
+            "ListBuckets params: region={}, path_style={}, endpoint={:?}",
+            params.region, params.use_path_style, params.endpoint_url
+        );
+
         let timeout_config = TimeoutConfig::builder()
             .connect_timeout(Duration::from_secs(5))
             .operation_timeout(Duration::from_secs(120))
             .build();
-            
-        let cfg = loader.timeout_config(timeout_config).load().await;
-        let client = aws_sdk_s3::Client::new(&cfg);
-        
-        debug!("ListBuckets using forced us-east-1 region (global operation requirement)");
+
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12())
+            .region(Region::new(params.region))
+            .timeout_config(timeout_config);
+
+        if let Some(endpoint) = params.endpoint_url {
+            loader = loader.endpoint_url(endpoint);
+        }
+
+        let sdk_cfg = loader.load().await;
+
+        let s3_cfg = aws_sdk_s3::config::Builder::from(&sdk_cfg)
+            .force_path_style(params.use_path_style)
+            .build();
+
+        let client = aws_sdk_s3::Client::from_conf(s3_cfg);
         
         let response = client
             .list_buckets()
@@ -331,7 +413,7 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
                 creation_date,
             });
         }
-        
+        debug!("list_buckets: {} bucket(s) returned", buckets.len());
         Ok(buckets)
     })
 }
@@ -1117,11 +1199,12 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
         bail!("Cannot GET: no key specified");
     }
     
-    // Use environment variable to control range optimization threshold
+    // Use environment variable to control range optimization threshold.
+    // Default is 32 MB (v0.9.60+); override with S3DLIO_RANGE_THRESHOLD_MB=<megabytes>.
     let range_threshold = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(64) * 1024 * 1024; // Default 64MB threshold
+        .unwrap_or(32) * 1024 * 1024; // Default 32 MB threshold
     
     // Get object size first to decide strategy
     let client = aws_s3_client_async().await?;
@@ -1302,6 +1385,100 @@ pub(crate) fn put_objects_parallel_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------------
+    // resolve_list_buckets_params
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_list_buckets_aws_no_endpoint_forces_us_east_1() {
+        // No custom endpoint → genuine AWS → always us-east-1
+        let p = resolve_list_buckets_params(None, Some("eu-west-1"), None);
+        assert_eq!(p.region, "us-east-1",
+            "genuine AWS must always use us-east-1 for global ListBuckets");
+        assert!(!p.use_path_style);
+        assert_eq!(p.endpoint_url, None);
+    }
+
+    #[test]
+    fn test_list_buckets_empty_endpoint_treated_as_no_endpoint() {
+        // An empty string for AWS_ENDPOINT_URL is treated as "not set"
+        let p = resolve_list_buckets_params(Some(""), Some("us-central1"), Some("path"));
+        assert_eq!(p.region, "us-east-1",
+            "empty endpoint must still force us-east-1 (genuine AWS path)");
+        assert_eq!(p.endpoint_url, None);
+    }
+
+    #[test]
+    fn test_list_buckets_gcs_endpoint_uses_env_region() {
+        // GCS S3-compat endpoint + explicit region
+        let p = resolve_list_buckets_params(
+            Some("https://storage.googleapis.com"),
+            Some("us-central1"),
+            Some("path"),
+        );
+        assert_eq!(p.region, "us-central1",
+            "custom endpoint must use the caller's region, not us-east-1");
+        assert!(p.use_path_style, "path addressing style must be respected");
+        assert_eq!(p.endpoint_url, Some("https://storage.googleapis.com".to_string()));
+    }
+
+    #[test]
+    fn test_list_buckets_custom_endpoint_no_region_falls_back() {
+        // Custom endpoint but no region env var → fallback to us-east-1
+        let p = resolve_list_buckets_params(
+            Some("http://minio.local:9000"),
+            None,
+            None,
+        );
+        assert_eq!(p.region, "us-east-1",
+            "should fall back to us-east-1 when no region is set even for custom endpoints");
+        assert!(!p.use_path_style);
+        assert_eq!(p.endpoint_url, Some("http://minio.local:9000".to_string()));
+    }
+
+    #[test]
+    fn test_list_buckets_minio_path_style() {
+        // MinIO with path style
+        let p = resolve_list_buckets_params(
+            Some("http://192.168.1.10:9000"),
+            Some("us-east-1"),
+            Some("path"),
+        );
+        assert_eq!(p.region, "us-east-1");
+        assert!(p.use_path_style);
+        assert_eq!(p.endpoint_url, Some("http://192.168.1.10:9000".to_string()));
+    }
+
+    #[test]
+    fn test_list_buckets_path_style_case_insensitive() {
+        // AWS_S3_ADDRESSING_STYLE is compared case-insensitively
+        let p_lower = resolve_list_buckets_params(Some("http://host:9000"), None, Some("path"));
+        let p_upper = resolve_list_buckets_params(Some("http://host:9000"), None, Some("PATH"));
+        let p_mixed = resolve_list_buckets_params(Some("http://host:9000"), None, Some("Path"));
+        let p_virt  = resolve_list_buckets_params(Some("http://host:9000"), None, Some("virtual"));
+        assert!(p_lower.use_path_style, "'path' should enable path style");
+        assert!(p_upper.use_path_style, "'PATH' should enable path style");
+        assert!(p_mixed.use_path_style, "'Path' should enable path style");
+        assert!(!p_virt.use_path_style, "'virtual' should not enable path style");
+    }
+
+    #[test]
+    fn test_list_buckets_vast_data_endpoint() {
+        // Vast Data S3-compatible endpoint with its typical region name
+        let p = resolve_list_buckets_params(
+            Some("https://vast-s3.corp.example.com"),
+            Some("vast-region-1"),
+            Some("path"),
+        );
+        assert_eq!(p.region, "vast-region-1");
+        assert!(p.use_path_style);
+        assert!(p.endpoint_url.is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_s3_uri
+    // -------------------------------------------------------------------------
 
     #[test]
     fn test_parse_s3_uri_standard_format() {

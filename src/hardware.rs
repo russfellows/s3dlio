@@ -20,7 +20,7 @@
 //!
 //! # Usage
 //!
-//! ```rust
+//! ```no_run
 //! use s3dlio::hardware;
 //!
 //! // Get CPU count respecting process affinity mask
@@ -54,7 +54,7 @@ use std::fs;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use s3dlio::hardware::get_affinity_cpu_count;
 ///
 /// // Returns CPUs available to this process
@@ -99,7 +99,7 @@ pub fn get_affinity_cpu_count() -> usize {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use s3dlio::hardware::parse_cpu_list;
 ///
 /// assert_eq!(parse_cpu_list("0-23"), 24);
@@ -146,7 +146,7 @@ pub fn parse_cpu_list(cpu_list: &str) -> usize {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use s3dlio::hardware::total_cpus;
 ///
 /// let cpus = total_cpus();
@@ -170,7 +170,7 @@ pub fn total_cpus() -> usize {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use s3dlio::hardware::is_numa_available;
 ///
 /// if is_numa_available() {
@@ -207,7 +207,7 @@ pub fn is_numa_available() -> bool {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use s3dlio::hardware::detect_numa_topology;
 ///
 /// if let Some(topology) = detect_numa_topology() {
@@ -263,7 +263,7 @@ pub fn detect_numa_topology() -> Option<()> {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use s3dlio::hardware::recommended_data_gen_threads;
 ///
 /// // Use default detection

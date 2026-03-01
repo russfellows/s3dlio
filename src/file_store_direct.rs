@@ -1019,7 +1019,15 @@ impl ConfigurableFileSystemObjectStore {
         let mut file = options.open(path).await?;
         
         file.seek(std::io::SeekFrom::Start(aligned_offset)).await?;
-        let bytes_read = file.read(aligned.as_mut_slice()).await?;
+        // Loop until we've filled the aligned buffer or reached EOF.
+        // A single read() call may return far fewer bytes than requested,
+        // especially for large ranges (O_DIRECT imposes per-call limits).
+        let mut bytes_read = 0;
+        while bytes_read < aligned_length {
+            let n = file.read(&mut aligned.as_mut_slice()[bytes_read..aligned_length]).await?;
+            if n == 0 { break; } // EOF
+            bytes_read += n;
+        }
         
         // Extract the requested subrange (single small copy vs entire buffer copy)
         let start = offset_adjustment.min(bytes_read);

@@ -1,5 +1,58 @@
 # s3dlio Changelog
 
+## Version 0.9.60 - GCS gRPC Transport, RAPID Storage & Multi-Protocol List Buckets (February 2026)
+
+### GCS gRPC Transport (All Operations)
+- **All GCS reads** now use gRPC `BidiReadObject` via `open_object()` — replaces JSON/REST `read_object()`
+- **All GCS writes** now use gRPC `BidiWriteObject` via `send_grpc()` — replaces JSON/REST multipart uploads
+- Chunked writes with 2 MiB default chunk size (`S3DLIO_GRPC_WRITE_CHUNK_SIZE` to override)
+- Per-chunk CRC32C checksums via `ChecksummedData` + whole-object CRC32C on final message
+- TRACE-level logging for gRPC write chunk size, count, offsets, and CRC32C values
+- See [docs/GCS-gRPC-Transport.md](GCS-gRPC-Transport.md) for full architecture details
+
+### GCS RAPID / Hyperdisk ML Storage Support
+- Vendored `google-cloud-storage` v1.8.0 fork with gRPC write support:
+  - `stub.rs`: `write_object_grpc()` trait method
+  - `transport.rs`: Full `BidiWriteObject` implementation (~200 lines)
+  - `write_object.rs`: `send_grpc()` + `set_appendable()` builder methods
+  - `perform_upload.rs`: `appendable=true` query parameter for legacy JSON path
+- New env var `S3DLIO_GCS_RAPID=true|1|yes` enables `appendable=true` on writes
+- `.env` file support via `dotenvy` for persistent configuration
+- gRPC reads work with RAPID/zonal buckets automatically (no special flag needed)
+
+### GCS Concurrent Batch Deletes
+- `delete_objects()` now dispatches up to **64 concurrent** gRPC delete requests
+- Uses `FuturesUnordered` + `Semaphore` for bounded parallelism
+- ~35x speedup for batch deletes (859 objects: ~69s → ~2s)
+- Errors collected and reported after all requests complete (no early abort)
+
+### GCS List Prefix Normalization Fix
+- Fixed bug where `list_objects()` appended `/` to exact object names (e.g. `object.dat/`)
+- Now retries without trailing slash when normalized prefix returns empty results
+- Extracted reusable `list_objects_with_prefix()` paginated helper
+
+### List Buckets Multi-Protocol (Issue #121)
+- Fixed hardcoded `us-east-1` for custom S3 endpoints in `list_buckets()`
+- New `list_containers(uri)` function dispatches across S3, Azure, GCS, and local fs
+- CLI `list-buckets` command now accepts optional URI argument for non-S3 backends
+
+### Range GET Optimization Defaults Changed
+- `S3DLIO_ENABLE_RANGE_OPTIMIZATION` is now **enabled by default**; set to `0` to disable
+- Default threshold changed from 64 MB → **32 MB** (`S3DLIO_RANGE_THRESHOLD_MB`)
+- Setting the variable to `1` is still accepted (no-op, already enabled)
+
+### Build & Dependencies
+- `gcs-official` (gRPC) is now the default GCS backend; `gcs-community` demoted
+- `hdf5` and `numa` (hwloc) are now **optional** Cargo features — removes `libhdf5-dev` and `libhwloc-dev` as build dependencies
+- Vendor fork wired via `[patch.crates-io]` in `Cargo.toml`
+
+### Other
+- Comprehensive `trace!`/`debug!` instrumentation across GCS, Azure, S3 list paths
+- Doc-test fence annotations updated; `doctest-threads = 1` to prevent memory thrash
+- Consolidated 4 GCS design docs into single [docs/GCS-gRPC-Transport.md](GCS-gRPC-Transport.md)
+
+---
+
 ## Version 0.9.50 - Critical Python Runtime Fix & s3torchconnector Compat (February 2026)
 
 ### 🚨 **CRITICAL: Python Multi-Threaded Runtime Fix**
