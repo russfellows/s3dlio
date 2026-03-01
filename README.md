@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-526%2F526-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.50-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.60-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -138,7 +138,7 @@ cargo test
 
 ## ✨ Key Features
 
-- **5+ GB/s Performance**: High-throughput S3 reads, 2.5+ GB/s writes
+- **High Performance**: High-throughput multi GB/s reads and writes on platforms with sufficient network and storage capabilities
 - **Zero-Copy Architecture**: `bytes::Bytes` throughout for minimal memory overhead
 - **Multi-Protocol**: S3, Azure Blob, GCS, file://, direct:// (O_DIRECT)
 - **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
@@ -148,14 +148,14 @@ cargo test
 
 ## 🌟 Latest Release
 
-**v0.9.50** (February 2026) - Python runtime fixes, s3torchconnector compat, range download optimization, multipart upload improvements.
+**v0.9.60** (February 2026) - GCS gRPC transport, RAPID/Hyperdisk ML support, concurrent deletes, multi-protocol list-buckets.
 
 **Recent highlights:**
-- **v0.9.50** - Python multi-threaded runtime fix (io_uring-style submit), s3torchconnector zero-copy rewrite, S3 range download optimization (76% faster for large objects), multipart upload zero-copy chunking, all 526 tests passing
+- **v0.9.60** - All GCS operations now use gRPC (BidiReadObject/BidiWriteObject) instead of JSON API; GCS RAPID/Hyperdisk ML zonal bucket support via `S3DLIO_GCS_RAPID`; 64-way concurrent batch deletes; byte-range optimization enabled by default at 32 MB threshold; NUMA and HDF5 now optional features
+- **v0.9.50** - Python multi-threaded runtime fix (io_uring-style submit), s3torchconnector zero-copy rewrite, S3 range download optimization (76% faster for large objects), multipart upload zero-copy chunking
 - **v0.9.40** - Enhanced Python bytearray documentation with performance benchmarks (2.5-3x speedup)
 - **v0.9.37** - Test suite modernization, zero build warnings
 - **v0.9.36** - **BREAKING**: `ObjectStore::put()` now takes `Bytes` instead of `&[u8]` for true zero-copy
-- **v0.9.35** - Hardware detection module, 50+ GB/s data generation
 - **v0.9.30** - Zero-copy refactor, PyO3 0.27 migration
 
 📖 **[Complete Changelog](docs/Changelog.md)** - Full version history, migration guides, API details
