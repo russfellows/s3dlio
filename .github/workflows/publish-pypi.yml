@@ -21,11 +21,6 @@ jobs:
         with:
           python-version: '3.12'
       
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libhdf5-dev
-      
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -34,7 +29,7 @@ jobs:
           sccache: 'true'
           manylinux: auto
           before-script-linux: |
-            yum install -y hdf5-devel || apt-get install -y libhdf5-dev || true
+            yum install -y openssl-devel perl-IPC-Cmd pkg-config || apt-get install -y libssl-dev pkg-config || true
       
       - name: Upload wheels
         uses: actions/upload-artifact@v4
