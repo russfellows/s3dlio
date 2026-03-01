@@ -417,18 +417,62 @@ impl GcsClient {
         Ok(())
     }
 
-    /// Delete multiple objects (batch delete).
+    /// Delete multiple objects concurrently (batch delete).
+    ///
+    /// GCS does not have a native batch-delete API like S3's `DeleteObjects`,
+    /// so each object is deleted with an individual gRPC call.  To avoid
+    /// sequential round-trip latency (~80ms each), requests are dispatched
+    /// concurrently with a semaphore.
     pub async fn delete_objects(&self, bucket: &str, objects: Vec<String>) -> Result<()> {
-        debug!("GCS DELETE OBJECTS (official): bucket={}, count={}", bucket, objects.len());
+        if objects.is_empty() { return Ok(()); }
 
-        // Note: google-cloud-storage doesn't have a native batch delete API,
-        // so we delete objects one by one
-        for object in &objects {
-            if let Err(e) = self.delete_object(bucket, object).await {
-                tracing::warn!("Failed to delete gs://{}/{}: {}", bucket, object, e);
+        const MAX_CONCURRENT_DELETES: usize = 64;
+
+        debug!(
+            "GCS DELETE OBJECTS (concurrent): bucket={}, count={}, concurrency={}",
+            bucket, objects.len(), MAX_CONCURRENT_DELETES
+        );
+
+        let bucket_name = format_bucket_name(bucket);
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DELETES));
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut futs = futures_util::stream::FuturesUnordered::new();
+
+        for object in objects {
+            let sem = sem.clone();
+            let control = Arc::clone(&self.control);
+            let bname = bucket_name.clone();
+            let bucket_str = bucket.to_string();
+            let failed = failed.clone();
+
+            futs.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let result = control
+                    .delete_object()
+                    .set_bucket(bname)
+                    .set_object(object.clone())
+                    .send()
+                    .await;
+
+                if let Err(e) = result {
+                    tracing::warn!("Failed to delete gs://{}/{}: {}", bucket_str, object, e);
+                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // Drain all futures
+        while let Some(result) = futures_util::StreamExt::next(&mut futs).await {
+            if let Err(e) = result {
+                tracing::warn!("Delete task panicked: {}", e);
             }
         }
 
+        let fail_count = failed.load(std::sync::atomic::Ordering::Relaxed);
+        if fail_count > 0 {
+            tracing::warn!("GCS DELETE OBJECTS: {} deletions failed", fail_count);
+        }
         debug!("GCS DELETE OBJECTS complete");
         Ok(())
     }
