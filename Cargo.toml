@@ -130,12 +130,6 @@ url = { version = "2.5", optional = true }
 # --- Enhanced HTTP client with HTTP/2 support --------------------------------
 reqwest = { version = "0.12", features = ["rustls-tls", "http2", "hickory-dns"], optional = true }
 
-# --- OpenSSL (vendored) ------------------------------------------------------
-# Statically compile OpenSSL so manylinux wheel builds never need a system
-# openssl-devel package. Required because transitive deps (Azure SDK → reqwest
-# → native-tls) pull in openssl-sys regardless of our own TLS stack choice.
-openssl = { version = "0.10", features = ["vendored"] }
-
 # --- High-performance memory and file I/O ------------------------------------
 nix = { version = "0.31", features = ["fs"], optional = true }  # For O_DIRECT and positioned I/O
 
