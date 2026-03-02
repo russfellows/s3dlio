@@ -6,14 +6,12 @@
 #[allow(dead_code)]
 mod common;
 
-#[cfg(feature = "gcs-official")]
 use anyhow::{Context, Result};
-#[cfg(feature = "gcs-official")]
 use common::{get_test_config, print_test_header, print_test_result};
 
-#[cfg(feature = "gcs-official")]
 mod gcs_official_tests {
     use super::*;
+    use bytes::Bytes;
     use s3dlio::google_gcs_client::{GcsClient, parse_gcs_uri};
     use once_cell::sync::Lazy;
     use tokio::sync::OnceCell;
@@ -98,7 +96,7 @@ mod gcs_official_tests {
         let test_data = b"Hello from s3dlio GCS backend test";
         
         println!("Uploading object: gs://{}/{}", config.bucket, test_key);
-        client.put_object(&config.bucket, &test_key, test_data).await?;
+        client.put_object(&config.bucket, &test_key, Bytes::from_static(test_data)).await?;
         println!("✓ PUT successful: {} bytes", test_data.len());
 
         println!("Downloading object: gs://{}/{}", config.bucket, test_key);
@@ -127,7 +125,7 @@ mod gcs_official_tests {
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         
         println!("Uploading object: gs://{}/{}", config.bucket, test_key);
-        client.put_object(&config.bucket, &test_key, test_data).await?;
+        client.put_object(&config.bucket, &test_key, Bytes::from_static(test_data)).await?;
         println!("✓ PUT successful: {} bytes", test_data.len());
 
         // Test partial read
@@ -163,7 +161,7 @@ mod gcs_official_tests {
         let test_data = b"Metadata test object content";
         
         println!("Uploading object: gs://{}/{}", config.bucket, test_key);
-        client.put_object(&config.bucket, &test_key, test_data).await?;
+        client.put_object(&config.bucket, &test_key, Bytes::from_static(test_data)).await?;
         println!("✓ PUT successful");
 
         println!("Fetching object metadata...");
@@ -206,7 +204,7 @@ mod gcs_official_tests {
         ];
         
         for key in &test_keys {
-            client.put_object(&config.bucket, key, b"test data").await?;
+            client.put_object(&config.bucket, key, Bytes::from_static(b"test data")).await?;
         }
         println!("✓ Test objects uploaded");
 
@@ -264,7 +262,7 @@ mod gcs_official_tests {
         let test_key = format!("{}/test-delete-single.txt", config.test_prefix);
         
         println!("Uploading object: gs://{}/{}", config.bucket, test_key);
-        client.put_object(&config.bucket, &test_key, b"Delete me").await?;
+        client.put_object(&config.bucket, &test_key, Bytes::from_static(b"Delete me")).await?;
         println!("✓ PUT successful");
 
         // Verify it exists
@@ -299,7 +297,7 @@ mod gcs_official_tests {
         let mut test_keys = Vec::new();
         for i in 0..25 {
             let key = format!("{}/file{}.txt", test_prefix, i);
-            client.put_object(&config.bucket, &key, format!("test data {}", i).as_bytes()).await?;
+            client.put_object(&config.bucket, &key, Bytes::from(format!("test data {}", i))).await?;
             test_keys.push(key);
         }
         println!("✓ {} objects uploaded", test_keys.len());
@@ -342,7 +340,7 @@ mod gcs_official_tests {
         
         // Use multipart upload with 256 KB chunks
         let chunk_size = 256 * 1024;
-        client.put_object_multipart(&config.bucket, &test_key, &test_data, chunk_size).await?;
+        client.put_object_multipart(&config.bucket, &test_key, Bytes::from(test_data.clone()), chunk_size).await?;
         println!("✓ Multipart PUT successful");
 
         // Verify size

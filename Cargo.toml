@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.60"
+version = "0.9.65"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -34,12 +34,13 @@ azure_core = { version = "0" }          # Response/Body, paging, errors
 azure_identity = { version = "0" }      # DefaultAzureCredential
 azure_storage_blob = { version = "0" }   # Blob/Container/BlockBlob clients
 
-# Google Cloud Storage SDK - Two implementations available via feature flags:
-# - gcs-official: Official Google gRPC client (default, supports RAPID/Hyperdisk ML)
-# - gcs-community: Community JSON-API client (fallback, no RAPID support)
-gcloud-storage = { version = "^1.2", optional = true }       # Community GCS client with ADC support
-google-cloud-storage = { version = "^1.8", optional = true } # Official Google GCS client
-google-cloud-gax = { version = "^1.7", optional = true }     # Google Cloud GAX library (needed for ItemPaginator trait)
+# Google Cloud Storage SDK
+# The official Google gRPC client (google-cloud-storage) is always compiled.
+# 'gcs-community' is an optional legacy alternative (JSON-API, no RAPID support).
+gcloud-storage = { version = "^1.2", optional = true }  # Community GCS client (opt-in only)
+google-cloud-storage = { version = "^1.8" }             # Official Google GCS client (always on)
+google-cloud-gax = { version = "^1.7" }                 # Google Cloud GAX (always on)
+google-cloud-gax-internal = { version = "0.7.9", features = ["_internal-grpc-client"] }  # Direct dep: exposes gcs_constants
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat
@@ -155,11 +156,10 @@ criterion     = { version = "0.5", features = ["html_reports"] }
 # - 'numa' requires the hwloc2 C library (not available on WSL/minimal systems)
 # - 'hdf5' requires libhdf5 (not available on WSL/minimal systems)
 # Enable these manually: cargo build --features numa,hdf5
-default = ["s3", "native-backends", "gcs-official", "thread-pinning"]
+default = ["s3", "native-backends", "thread-pinning"]
 s3 = []
 native-backends = []                    # Current AWS/Azure implementations
-gcs-community = ["dep:gcloud-storage"]  # Community-maintained GCS client (JSON API, no RAPID support)
-gcs-official = ["dep:google-cloud-storage", "dep:google-cloud-gax"]  # Official Google GCS client (gRPC, RAPID support)
+gcs-community = ["dep:gcloud-storage"]  # Legacy community GCS client (JSON API, no RAPID support; conflicts with default)
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
 enhanced-http = ["dep:reqwest"]      # Enhanced HTTP client with HTTP/2 support
 direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
@@ -222,3 +222,6 @@ opt-level = 3
 # ---------------------------------------------------------------------------
 [patch.crates-io]
 google-cloud-storage = { path = "vendor/google-cloud-storage" }
+# s3dlio patch: configure HTTP/2 flow-control windows for high-throughput GCS gRPC
+# (see vendor/google-cloud-gax-internal/src/grpc.rs — make_endpoint function)
+google-cloud-gax-internal = { path = "vendor/google-cloud-gax-internal" }

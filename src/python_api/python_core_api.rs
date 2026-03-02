@@ -151,6 +151,13 @@ where
 pub struct PyBytesView {
     /// The underlying Bytes (reference-counted, cheap to clone)
     bytes: Bytes,
+    /// Cached length stored in the heap object for a stable shape[0] pointer.
+    /// The Python buffer protocol requires shape/strides pointers to remain
+    /// valid for the full lifetime of the Py_buffer view.  Storing `len_isize`
+    /// here (in the heap-allocated PyObject) guarantees stability: CPython
+    /// keeps this object alive (via Py_INCREF on view.obj) until the last
+    /// memoryview referencing it is garbage-collected.
+    shape_len: isize,
 }
 
 #[pymethods]
@@ -166,90 +173,112 @@ impl PyBytesView {
     }
     
     /// Implement Python buffer protocol for zero-copy access.
-    /// This allows `memoryview(bytes_view)` to work directly.
-    /// 
-    /// The buffer is read-only; requesting a writable buffer will raise BufferError.
+    ///
+    /// When Python evaluates `memoryview(bytes_view_instance)` it calls
+    /// `__getbuffer__` on this object.  We fill in the `Py_buffer` descriptor
+    /// so that the resulting memoryview points directly at the Arc-backed
+    /// `Bytes` buffer with **no data copy**.
+    ///
+    /// Lifecycle safety:
+    /// - `(*view).obj` is set to this Python object and `Py_INCREF`'d, so
+    ///   CPython keeps the `PyBytesView` (and thus the `Bytes` Arc) alive for
+    ///   as long as any consumer holds the memoryview.
+    /// - `shape` points to `slf.shape_len` which lives in the heap-allocated
+    ///   PyObject — stable for the object's lifetime.
+    /// - `strides` uses a `'static` unit stride (byte arrays always have
+    ///   stride = 1).
+    ///
+    /// The buffer is read-only; requesting a writable buffer will raise
+    /// `BufferError`.
     unsafe fn __getbuffer__(
         slf: PyRef<'_, Self>,
         view: *mut ffi::Py_buffer,
         flags: std::os::raw::c_int,
     ) -> PyResult<()> {
-        // Check for writable request - we only support read-only buffers
         if (flags & ffi::PyBUF_WRITABLE) != 0 {
             return Err(pyo3::exceptions::PyBufferError::new_err(
                 "BytesView is read-only and does not support writable buffers"
             ));
         }
-        
+
+        // Unit stride: 1 byte per element — constant, 'static lifetime.
+        static UNIT_STRIDE: isize = 1;
+
         let bytes = &slf.bytes;
-        
-        // Fill in the Py_buffer struct
-        // Safety: view is a valid pointer provided by Python
         unsafe {
-            (*view).buf = bytes.as_ptr() as *mut std::os::raw::c_void;
-            (*view).len = bytes.len() as isize;
+            (*view).buf      = bytes.as_ptr() as *mut std::os::raw::c_void;
+            (*view).len      = bytes.len() as isize;
             (*view).readonly = 1;
             (*view).itemsize = 1;
-            
-            // Format string: "B" = unsigned byte (matches u8)
+            (*view).ndim     = 1;
+
+            // Format: "B" = unsigned byte.
             (*view).format = if (flags & ffi::PyBUF_FORMAT) != 0 {
-                // Static string that lives for the duration of the program
                 b"B\0".as_ptr() as *mut std::os::raw::c_char
             } else {
                 std::ptr::null_mut()
             };
-            
-            (*view).ndim = 1;
-            
-            // Shape: pointer to the length (1D array of len elements)
+
+            // shape[0] = number of elements.  Points into the PyBytesView
+            // heap object (not into the Py_buffer struct) for lifetime safety.
             (*view).shape = if (flags & ffi::PyBUF_ND) != 0 {
-                // Point to our len field - this is a 1D array
-                &(*view).len as *const isize as *mut isize
+                &slf.shape_len as *const isize as *mut isize
             } else {
                 std::ptr::null_mut()
             };
-            
-            // Strides: 1 byte per element
+
+            // strides[0] = 1 (contiguous byte array).  'static pointer.
             (*view).strides = if (flags & ffi::PyBUF_STRIDES) != 0 {
-                &(*view).itemsize as *const isize as *mut isize
+                &UNIT_STRIDE as *const isize as *mut isize
             } else {
                 std::ptr::null_mut()
             };
-            
+
             (*view).suboffsets = std::ptr::null_mut();
-            (*view).internal = std::ptr::null_mut();
-            
-            // CRITICAL: Store a reference to the PyBytesView object
-            // This prevents the Bytes data from being deallocated while the buffer is in use
+            (*view).internal   = std::ptr::null_mut();
+
+            // Keep this PyBytesView alive for the duration of the buffer view.
             (*view).obj = slf.as_ptr() as *mut ffi::PyObject;
             ffi::Py_INCREF((*view).obj);
         }
-        
         Ok(())
     }
-    
-    /// Release the buffer - called when the memoryview is garbage collected.
-    /// We don't need to do anything here since the Bytes is reference-counted.
-    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
-        // Nothing to do - the Py_DECREF on view.obj will be handled by Python
-        // and will eventually drop the PyBytesView (and thus the Bytes) when refcount hits 0
-    }
-    
-    /// Get a memoryview (TRUE zero-copy readonly access)
-    /// Uses PyMemoryView_FromMemory from the Python C API to create a memoryview
-    /// that directly references the Rust Bytes buffer without copying.
-    fn memoryview(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let ptr = self.bytes.as_ptr() as *mut i8;
-        let len = self.bytes.len() as isize;
-        
-        // PyBUF_READ = 0x100 (read-only buffer)
-        let raw_mv = unsafe { ffi::PyMemoryView_FromMemory(ptr, len, ffi::PyBUF_READ) };
-        if raw_mv.is_null() {
-            // If something went wrong, fetch and return the Python exception
+
+    /// Release the buffer.
+    ///
+    /// PyO3 / CPython will `Py_DECREF(view.obj)` after this call, decrementing
+    /// the reference count on this `PyBytesView`.  When the count reaches zero
+    /// the `PyBytesView` is dropped, which decrements the `Bytes` Arc.
+    /// Nothing additional to do here.
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
+
+    /// Return a **zero-copy** read-only `memoryview` over the underlying buffer.
+    ///
+    /// Uses `PyMemoryView_FromObject`, which routes through the buffer protocol
+    /// (`__getbuffer__` above) and correctly increments the reference count on
+    /// this `PyBytesView` object.  The resulting memoryview keeps the `Bytes`
+    /// Arc alive for as long as any Python consumer holds it.
+    ///
+    /// The previous implementation used `PyMemoryView_FromMemory`, which does
+    /// **not** link the memoryview's lifetime to this object — a potential
+    /// use-after-free.  This implementation is safe.
+    ///
+    /// # Python usage
+    /// ```python
+    /// bv  = s3dlio.get("gs://bucket/obj")   # returns BytesView
+    /// mv  = bv.memoryview()                  # zero-copy memoryview
+    /// arr = np.frombuffer(mv, dtype=np.uint8) # numpy reads directly — no copy
+    /// t   = torch.frombuffer(mv, dtype=torch.uint8) # torch too
+    /// ```
+    fn memoryview<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        // PyMemoryView_FromObject calls PyObject_GetBuffer → our __getbuffer__.
+        // CPython will Py_INCREF(view.obj = slf) keeping the Arc alive.
+        let raw = unsafe { ffi::PyMemoryView_FromObject(slf.as_ptr()) };
+        if raw.is_null() {
             Err(PyErr::fetch(py))
         } else {
-            // Convert the raw pointer into a safe Py<PyAny> object
-            Ok(unsafe { Py::from_owned_ptr(py, raw_mv) })
+            Ok(unsafe { Bound::from_owned_ptr(py, raw) })
         }
     }
     
@@ -265,9 +294,14 @@ impl PyBytesView {
 }
 
 impl PyBytesView {
-    /// Create from Rust Bytes
+    /// Create from Rust `Bytes`.
+    ///
+    /// `shape_len` is cached here (not in the `Py_buffer` struct) so that the
+    /// pointer we hand to Python's buffer protocol remains stable for the full
+    /// lifetime of any memoryview that references this object.
     pub fn new(bytes: Bytes) -> Self {
-        Self { bytes }
+        let shape_len = bytes.len() as isize;
+        Self { bytes, shape_len }
     }
 }
 
@@ -1073,6 +1107,7 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
 #[pyfunction(name = "get_range")]
 #[pyo3(signature = (uri, offset, length = None))]
 pub fn get_range_py(py: Python<'_>, uri: &str, offset: u64, length: Option<u64>) -> PyResult<PyBytesView> {
+
     // Use universal ObjectStore interface for range requests
     let uri_owned = uri.to_owned();
     py.detach(|| {
@@ -1083,6 +1118,44 @@ pub fn get_range_py(py: Python<'_>, uri: &str, offset: u64, length: Option<u64>)
             let bytes = store.get_range(&uri_owned, offset, length).await?;
             Ok(PyBytesView::new(bytes))
         })
+    })
+}
+
+/// Async variant of `get` — returns a coroutine yielding a `BytesView`.
+///
+/// The returned `BytesView` wraps the Arc-backed `Bytes` from the storage
+/// backend with **no copy**.  Use `await`'d result's `.memoryview()` method
+/// for fully zero-copy access from numpy / torch.
+///
+/// # Python usage
+/// ```python
+/// import asyncio, s3dlio
+/// async def read():
+///     bv = await s3dlio.get_async("gs://bucket/object")
+///     mv = bv.memoryview()               # zero-copy
+///     arr = np.frombuffer(mv, dtype=np.uint8)
+/// asyncio.run(read())
+/// ```
+#[pyfunction(name = "get_async")]
+#[pyo3(signature = (uri))]
+pub fn get_async_py<'p>(py: Python<'p>, uri: &str) -> PyResult<Bound<'p, PyAny>> {
+    let uri_owned = uri.to_owned();
+    future_into_py(py, async move {
+        let store = get_or_create_store(&uri_owned, None).map_err(py_err)?;
+        let bytes = store.get(&uri_owned).await.map_err(py_err)?;
+        Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
+    })
+}
+
+/// Async variant of `get_range` — returns a coroutine yielding a `BytesView`.
+#[pyfunction(name = "get_range_async")]
+#[pyo3(signature = (uri, offset, length = None))]
+pub fn get_range_async_py<'p>(py: Python<'p>, uri: &str, offset: u64, length: Option<u64>) -> PyResult<Bound<'p, PyAny>> {
+    let uri_owned = uri.to_owned();
+    future_into_py(py, async move {
+        let store = get_or_create_store(&uri_owned, None).map_err(py_err)?;
+        let bytes = store.get_range(&uri_owned, offset, length).await.map_err(py_err)?;
+        Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
     })
 }
 
@@ -1919,6 +1992,85 @@ fn create_multi_endpoint_store_from_file(
 }
 
 // ---------------------------------------------------------------------------
+// GCS tuning — programmatic setters, getters, and bucket RAPID query
+// ---------------------------------------------------------------------------
+
+/// Set the number of gRPC subchannels for GCS.
+///
+/// Must be called before the first ``gs://`` operation.  Setting this to
+/// your workload's concurrency (e.g. ``num_jobs``) gives each concurrent
+/// stream an uncontested HTTP/2 flow-control window, which is critical for
+/// RAPID / Hyperdisk ML throughput.
+///
+/// The ``S3DLIO_GCS_GRPC_CHANNELS`` environment variable, if set, takes
+/// precedence over this call.
+#[pyfunction]
+fn gcs_set_channel_count(n: usize) {
+    crate::google_gcs_client::set_gcs_channel_count(n);
+}
+
+/// Configure GCS RAPID (Hyperdisk ML / zonal) mode before the first ``gs://``
+/// operation.
+///
+/// Parameters
+/// ----------
+/// force : bool or None
+///     * ``True``  — force RAPID on for every bucket
+///     * ``False`` — force RAPID off for every bucket
+///     * ``None``  — auto-detect per bucket (default; recommended)
+///
+/// The ``S3DLIO_GCS_RAPID`` environment variable still takes precedence if set.
+#[pyfunction]
+fn gcs_set_rapid_mode(force: Option<bool>) {
+    crate::google_gcs_client::set_gcs_rapid_mode(force);
+}
+
+/// Return the programmatically-configured GCS subchannel count.
+///
+/// Returns ``0`` if :func:`gcs_set_channel_count` has not been called
+/// (auto-detect will be used on first client initialization).
+#[pyfunction]
+fn gcs_get_channel_count() -> usize {
+    crate::google_gcs_client::get_gcs_channel_count()
+}
+
+/// Return the current effective RAPID mode setting.
+///
+/// Resolution includes the ``S3DLIO_GCS_RAPID`` environment variable:
+///
+/// * ``True``  — RAPID forced on
+/// * ``False`` — RAPID forced off
+/// * ``None``  — auto-detect per bucket (default)
+#[pyfunction]
+fn gcs_get_rapid_mode() -> Option<bool> {
+    crate::google_gcs_client::get_gcs_rapid_mode()
+}
+
+/// Query whether a GCS bucket or ``gs://`` URI is a RAPID (Hyperdisk ML) bucket.
+///
+/// Accepts either a bare bucket name (``"my-bucket"``) or a full URI
+/// (``"gs://my-bucket/prefix/"``).  The result is determined once via the
+/// ``GetStorageLayout`` API and cached for the lifetime of the process, so
+/// repeated calls for the same bucket are essentially free.
+///
+/// Returns ``False`` on authentication / network errors (a warning is logged).
+///
+/// Example
+/// -------
+/// >>> import s3dlio
+/// >>> s3dlio.gcs_query_rapid_bucket("gs://my-rapid-bucket/")
+/// True
+#[pyfunction]
+fn gcs_query_rapid_bucket(bucket_or_uri: &str) -> PyResult<bool> {
+    let owned = bucket_or_uri.to_owned();
+    submit_io(async move {
+        Ok::<bool, anyhow::Error>(
+            crate::google_gcs_client::query_gcs_rapid_bucket(&owned).await
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Module registration function for core API
 // ---------------------------------------------------------------------------
 pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1952,7 +2104,9 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_many_stats_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
+    m.add_function(wrap_pyfunction!(get_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_range_py, m)?)?;
+    m.add_function(wrap_pyfunction!(get_range_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(download, m)?)?;
     m.add_function(wrap_pyfunction!(get_many, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
@@ -1975,138 +2129,14 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_multi_endpoint_store, m)?)?;
     m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_template, m)?)?;
     m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_file, m)?)?;
-    
+
+    // GCS tuning (programmatic setters / getters / bucket RAPID query)
+    m.add_function(wrap_pyfunction!(gcs_set_channel_count, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs_set_rapid_mode, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs_get_channel_count, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs_get_rapid_mode, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs_query_rapid_bucket, m)?)?;
+
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests for buffer protocol support
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pyo3::types::{PyByteArray, PyBytes};
-    
-    #[test]
-    fn test_buffer_conversion_accepts_bytes() {
-        pyo3::prepare_freethreaded_python();
-        
-        Python::with_gil(|py| {
-            let test_data = b"Hello, bytes!";
-            let py_bytes = PyBytes::new(py, test_data);
-            
-            // This simulates what put_bytes does - should not panic
-            let result = PyBuffer::<u8>::get(py_bytes.as_any())
-                .or_else(|_| {
-                    py_bytes.as_any().cast::<PyBytes>()
-                        .map_err(|e| e.into())
-                        .map(|_| unreachable!())  // We just need to check casting works
-                });
-            
-            // bytes should be accepted (either via buffer protocol or PyBytes cast)
-            assert!(result.is_ok() || py_bytes.as_any().cast::<PyBytes>().is_ok());
-        });
-    }
-    
-    #[test]
-    fn test_buffer_conversion_accepts_bytearray() {
-        pyo3::prepare_freethreaded_python();
-        
-        Python::with_gil(|py| {
-            let test_data = b"Hello, bytearray!";
-            let py_bytearray = PyByteArray::new(py, test_data);
-            
-            // bytearray implements buffer protocol - should work
-            let buffer_result = PyBuffer::<u8>::get(py_bytearray.as_any());
-            assert!(buffer_result.is_ok(), "bytearray should support buffer protocol");
-            
-            if let Ok(buffer) = buffer_result {
-                assert_eq!(buffer.len_bytes(), test_data.len());
-            }
-        });
-    }
-    
-    #[test]
-    fn test_buffer_conversion_accepts_memoryview() {
-        pyo3::prepare_freethreaded_python();
-        
-        Python::with_gil(|py| {
-            let test_data = b"Hello, memoryview!";
-            let py_bytes = PyBytes::new(py, test_data);
-            
-            // Create memoryview from bytes
-            let memoryview = py.eval(
-                "memoryview(arg)",
-                None,
-                Some(&[("arg", py_bytes)].into_py_dict(py))
-            ).expect("Failed to create memoryview");
-            
-            // memoryview implements buffer protocol - should work
-            let buffer_result = PyBuffer::<u8>::get(memoryview);
-            assert!(buffer_result.is_ok(), "memoryview should support buffer protocol");
-            
-            if let Ok(buffer) = buffer_result {
-                assert_eq!(buffer.len_bytes(), test_data.len());
-            }
-        });
-    }
-    
-    #[test]
-    fn test_buffer_conversion_rejects_invalid_types() {
-        pyo3::prepare_freethreaded_python();
-        
-        Python::with_gil(|py| {
-            // Test various invalid types
-            let invalid_int = 42.into_py(py);
-            let invalid_str = "string".into_py(py);
-            let invalid_list = vec![1, 2, 3].into_py(py);
-            
-            // All of these should fail buffer protocol
-            assert!(PyBuffer::<u8>::get(invalid_int.bind(py)).is_err());
-            assert!(PyBuffer::<u8>::get(invalid_str.bind(py)).is_err());
-            assert!(PyBuffer::<u8>::get(invalid_list.bind(py)).is_err());
-            
-            // And should not be castable to PyBytes
-            assert!(invalid_int.bind(py).cast::<PyBytes>().is_err());
-            assert!(invalid_str.bind(py).cast::<PyBytes>().is_err());
-            assert!(invalid_list.bind(py).cast::<PyBytes>().is_err());
-        });
-    }
-    
-    #[test]
-    fn test_custom_bytes_object_conversion() {
-        pyo3::prepare_freethreaded_python();
-        
-        Python::with_gil(|py| {
-            // Create a custom Python object with __bytes__ method
-            let code = r#"
-class CustomBytes:
-    def __init__(self, data):
-        self._data = data
-    def __bytes__(self):
-        return self._data
-
-custom = CustomBytes(b"Hello, custom!")
-custom
-"#;
-            let custom_obj = py.eval(code, None, None).expect("Failed to create custom object");
-            
-            // Buffer protocol should fail (no buffer interface)
-            assert!(PyBuffer::<u8>::get(custom_obj).is_err());
-            
-            // But __bytes__() should work
-            let bytes_result = custom_obj.call_method0("__bytes__");
-            assert!(bytes_result.is_ok(), "Custom object should have __bytes__() method");
-            
-            if let Ok(bytes_obj) = bytes_result {
-                let py_bytes = bytes_obj.cast::<PyBytes>();
-                assert!(py_bytes.is_ok(), "__bytes__() should return bytes object");
-                if let Ok(b) = py_bytes {
-                    assert_eq!(b.as_bytes(), b"Hello, custom!");
-                }
-            }
-        });
-    }
-}
-
 

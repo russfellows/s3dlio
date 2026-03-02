@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
+use bytes::Bytes;
 use std::env;
 
 // Import GcsClient - will use whichever backend is feature-gated
@@ -58,7 +59,7 @@ async fn test_gcs_put_get_object() -> Result<()> {
     
     // PUT object
     println!("Uploading object: gs://{}/{}", bucket, object_key);
-    client.put_object(&bucket, &object_key, test_data).await?;
+    client.put_object(&bucket, &object_key, Bytes::from_static(test_data)).await?;
     println!("✓ PUT successful: {} bytes", test_data.len());
     
     // GET object
@@ -95,7 +96,7 @@ async fn test_gcs_get_object_range() -> Result<()> {
     
     // Upload test object
     println!("Uploading object: gs://{}/{}", bucket, object_key);
-    client.put_object(&bucket, &object_key, test_data).await?;
+    client.put_object(&bucket, &object_key, Bytes::from_static(test_data)).await?;
     println!("✓ PUT successful: {} bytes", test_data.len());
     
     // Test range read: bytes 10-19 (should be "ABCDEFGHIJ")
@@ -143,7 +144,7 @@ async fn test_gcs_stat_object() -> Result<()> {
     let test_data = b"Test data for metadata check";
     
     println!("Uploading object: gs://{}/{}", bucket, object_key);
-    client.put_object(&bucket, &object_key, test_data).await?;
+    client.put_object(&bucket, &object_key, Bytes::from_static(test_data)).await?;
     println!("✓ PUT successful");
     
     // Get object metadata
@@ -191,7 +192,7 @@ async fn test_gcs_list_objects() -> Result<()> {
     println!("Uploading {} test objects...", test_objects.len());
     for obj in &test_objects {
         let data = format!("Test data for {}", obj);
-        client.put_object(&bucket, obj, data.as_bytes()).await?;
+        client.put_object(&bucket, obj, Bytes::from(data)).await?;
     }
     println!("✓ Test objects uploaded");
     
@@ -252,7 +253,7 @@ async fn test_gcs_delete_single_object() -> Result<()> {
     let test_data = b"This object will be deleted";
     
     println!("Uploading object: gs://{}/{}", bucket, object_key);
-    client.put_object(&bucket, &object_key, test_data).await?;
+    client.put_object(&bucket, &object_key, Bytes::from_static(test_data)).await?;
     println!("✓ PUT successful");
     
     // Verify object exists
@@ -291,7 +292,7 @@ async fn test_gcs_delete_multiple_objects() -> Result<()> {
     for i in 0..num_objects {
         let key = format!("{}file-{:03}.txt", test_prefix, i);
         let data = format!("Test data for object {}", i);
-        client.put_object(&bucket, &key, data.as_bytes()).await?;
+        client.put_object(&bucket, &key, Bytes::from(data)).await?;
         test_objects.push(key);
     }
     println!("✓ {} objects uploaded", num_objects);
@@ -333,7 +334,7 @@ async fn test_gcs_multipart_upload() -> Result<()> {
     
     // Use multipart upload with 256 KB chunks
     let chunk_size = 256 * 1024;
-    client.put_object_multipart(&bucket, &object_key, &test_data, chunk_size).await?;
+    client.put_object_multipart(&bucket, &object_key, Bytes::from(test_data.clone()), chunk_size).await?;
     println!("✓ Multipart PUT successful");
     
     // Verify object metadata

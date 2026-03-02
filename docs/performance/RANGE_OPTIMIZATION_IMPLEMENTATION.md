@@ -1,12 +1,80 @@
-# Range Download Optimization Implementation Summary
+# Range Download Optimization — S3 Backend
+
+> **⚠️ S3 BACKEND ONLY**
+> This document describes parallel range download optimization for the **S3 (`s3://`) backend only**.
+> GCS and Azure use entirely different transport architectures for large-object reads and each
+> has its own tuning approach. See [§Backend-Specific Read Architectures](#backend-specific-read-architectures)
+> for a full comparison, and the linked docs for GCS and Azure tuning.
 
 **Date:** February 17, 2026  
-**Version:** s3dlio v0.9.50 (pending release)  
-**Branch:** optimize/multipart-upload-performance
+**Version:** s3dlio v0.9.50  
+**Applies to:** S3 / S3-compatible endpoints (`s3://`, MinIO, etc.)
 
 ## Overview
 
 Implemented configurable parallel range downloads for large S3 objects, addressing the 25% performance gap observed when downloading 148 MB objects compared to s3torchconnector.
+
+---
+
+## Backend-Specific Read Architectures
+
+Parallel range reading is **not a universal knob** — each backend in s3dlio uses a fundamentally
+different transport layer for object reads. The correct tuning approach differs accordingly:
+
+### S3 (`s3://`) — This Document
+
+The S3 backend uses the AWS SDK's `GetObject` HTTP call. The SDK does not automatically issue
+parallel byte-range requests for large objects. s3dlio's `RangeEngine` splits large objects into
+chunks and fires multiple concurrent `GetObject(Range: bytes=X-Y)` requests, then reassembles the
+buffer. This requires a `HEAD` (or `GetObjectAttributes`) call first to learn the object size.
+
+**Tuning env vars:** `S3DLIO_ENABLE_RANGE_OPTIMIZATION`, `S3DLIO_RANGE_THRESHOLD_MB`,
+`S3DLIO_RANGE_CONCURRENCY`, `S3DLIO_CHUNK_SIZE` — all documented in this file.
+
+### GCS (`gs://`) — Separate Architecture
+
+GCS uses gRPC `BidiReadObject` streaming, not HTTP range requests. Google's gRPC transport
+streams the object in chunks over a single bidirectional connection; there is no concept of
+firing independent range sub-requests in parallel. Performance on GCS is governed by:
+
+- **HTTP/2 flow-control window size** (default 65 KB, patched to 128 MiB)
+- **Number of gRPC subchannels** (auto-tuned to `max(64, --jobs)` in v0.9.60+)
+- **gRPC write chunk size** (capped below the 4 MiB server message limit)
+
+Setting `S3DLIO_ENABLE_RANGE_OPTIMIZATION=1` has **no effect on GCS reads**. GCS throughput
+tuning is covered in [docs/Fix-GCS_v2.md](../Fix-GCS_v2.md) and
+[docs/GCS-gRPC-Transport.md](../GCS-gRPC-Transport.md).
+
+### Azure Blob Storage (`az://`) — Separate Architecture
+
+The Azure backend uses the `azure-storage-blobs` Rust SDK, which issues standard HTTP
+`GET` (or `GET` with `Range:` header) calls. The SDK handles connection pooling internally.
+Range parallelism for Azure is controlled differently from S3 — the `RangeEngine` code path
+exists for Azure but operates over the Azure SDK's own HTTP client rather than AWS SDK calls.
+
+Key Azure tuning considerations:
+- Block blob reads are served from Azure's CDN/edge; latency is typically lower than S3
+- Parallel range requests can be enabled but offer less benefit for same-region reads
+- Azure's equivalent of `ENABLE_RANGE_OPTIMIZATION` is `S3DLIO_AZURE_RANGE_OPTIMIZATION`
+  (see `docs/api/Environment_Variables.md` for current status)
+- External reference: [Azure Blob Storage performance and scalability checklist](https://learn.microsoft.com/en-us/azure/storage/blobs/storage-performance-checklist)
+
+### File (`file://`) — Local Filesystem
+
+Local filesystem reads use `read()` syscalls. Splitting a file into parallel ranges incurs
+`seek()` overhead and competes for the same physical I/O path. The `RangeEngine` for the
+file backend is intentionally disabled by default — a single sequential read is faster.
+
+### Summary
+
+| Backend | Read transport | Parallel range opt | Where to tune |
+|---------|---------------|-------------------|---------------|
+| S3 / S3-compat | AWS SDK HTTP `GetObject` | ✅ `S3DLIO_ENABLE_RANGE_OPTIMIZATION` | This document |
+| GCS RAPID | gRPC `BidiReadObject` stream | ✖ N/A (streaming, not range-based) | [Fix-GCS_v2.md](../Fix-GCS_v2.md) |
+| Azure Blob | Azure SDK HTTP GET | ⚠️ Separate flag | `Environment_Variables.md` |
+| File | `read()` syscalls | ✖ Disabled (seek overhead) | N/A |
+
+---
 
 ## Problem Statement
 
@@ -15,9 +83,10 @@ Implemented configurable parallel range downloads for large S3 objects, addressi
 - 148 MB objects: s3torchconnector 25% faster (likely using parallel ranges)
 
 **Root Cause:**
-- S3ObjectStore used simple `get_object_uri_async()` (single sequential download)
-- Azure and GCS backends already had RangeEngine support
-- Existing `get_object_uri_optimized_async()` function existed but wasn't wired to Python API
+- `S3ObjectStore` used simple `get_object_uri_async()` (single sequential download)
+- GCS and Azure backends use fundamentally different transport layers (see §Backend-Specific
+  Read Architectures above) — the comparison here is specifically S3 vs s3torchconnector
+- Existing `get_object_uri_optimized_async()` function existed but wasn't wired to the Python API
 
 ## Implementation Details
 

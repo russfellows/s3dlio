@@ -66,7 +66,7 @@ use std::time::Duration;
 #[cfg(feature = "gcs-community")]
 use crate::gcs_client::{GcsClient, GcsObjectMetadata, parse_gcs_uri};
 
-#[cfg(feature = "gcs-official")]
+#[cfg(not(feature = "gcs-community"))]
 use crate::google_gcs_client::{GcsClient, GcsObjectMetadata, parse_gcs_uri};
 
 /// Provider-neutral object metadata. For now this aliases S3's metadata.
@@ -2176,16 +2176,16 @@ impl ObjectStore for GcsObjectStore {
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let client = Self::get_client().await?;
-        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
-        client.put_object(&bucket, &object, data.as_ref()).await
+        // Pass Bytes directly — put_object now takes Bytes, zero-copy end-to-end.
+        client.put_object(&bucket, &object, data).await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let chunk_size = part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE);
         let client = Self::get_client().await?;
-        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
-        client.put_object_multipart(&bucket, &object, data.as_ref(), chunk_size).await
+        // Pass Bytes directly — put_object_multipart now takes Bytes, zero-copy end-to-end.
+        client.put_object_multipart(&bucket, &object, data, chunk_size).await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
@@ -2433,11 +2433,13 @@ impl ObjectWriter for GcsBufferedWriter {
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
         let client = GcsClient::new().await?;
         
-        // Use multipart for large objects, simple put for small ones
+        // Use multipart for large objects, simple put for small ones.
+        // `Bytes::from(Vec<u8>)` transfers ownership without copying — zero-cost.
+        // `std::mem::take` moves the buffer out so the encoder can be dropped too.
         if self.buffer.len() > crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE {
-            client.put_object_multipart(&bucket, &object, &self.buffer, crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE).await
+            client.put_object_multipart(&bucket, &object, Bytes::from(std::mem::take(&mut self.buffer)), crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE).await
         } else {
-            client.put_object(&bucket, &object, &self.buffer).await
+            client.put_object(&bucket, &object, Bytes::from(std::mem::take(&mut self.buffer))).await
         }
     }
     
