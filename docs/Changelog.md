@@ -1,5 +1,63 @@
 # s3dlio Changelog
 
+## Version 0.9.65 - GCS PUT/Performance Fixes: Chunk Size, Constants, Zero-Copy (March 2026)
+
+### GCS PUT RESOURCE_EXHAUSTED Fix
+- Fixed `RESOURCE_EXHAUSTED: SERVER: Received message larger than max` errors on all GCS PUT operations
+- Root cause: `DEFAULT_GRPC_WRITE_CHUNK_SIZE` was 16 MiB; GCS server's limit is **4 MiB per serialised protobuf message** (not just data payload)
+- Protobuf framing overhead (~89 bytes per message) means the data payload must be smaller than the server ceiling
+- New constant hierarchy in `vendor/google-cloud-gax-internal/src/gcs_constants.rs`:
+  - `GCS_SERVER_MAX_MESSAGE_SIZE = 4 MiB` — raw server ceiling
+  - `MAX_GRPC_WRITE_CHUNK_SIZE = GCS_SERVER_MAX_MESSAGE_SIZE - 64 KiB` — max safe data payload (63 × 64 KiB)
+  - `DEFAULT_GRPC_WRITE_CHUNK_SIZE = 2 MiB` — conservative default (32 × 64 KiB), well below ceiling
+- All values are 64 KiB-aligned; env-var override `S3DLIO_GRPC_WRITE_CHUNK_SIZE` silently clamped to `MAX_GRPC_WRITE_CHUNK_SIZE`
+- Measured upload performance: **3.83 GB/s** for 1,000 × 32 MiB objects on RAPID bucket (32 jobs)
+
+### GCS Constants Centralisation
+- **NEW**: `vendor/google-cloud-gax-internal/src/gcs_constants.rs` — single source of truth for all GCS/gRPC protocol constants
+- **NEW**: `src/gcs_constants.rs` — application-layer re-exports + channel floor, concurrent delete limit, env-var names
+- All magic numbers removed from `transport.rs`, `grpc.rs`, `google_gcs_client.rs`
+- `google-cloud-gax-internal` added as direct dependency in `Cargo.toml` (needed for re-exports)
+
+### gcs-official Feature Flag Removed
+- `google-cloud-storage` and `google-cloud-gax` are now always-on unconditional dependencies
+- All `#[cfg(feature = "gcs-official")]` guards removed across 6 source files
+- Projects depending on s3dlio no longer need `features = ["gcs-official"]`
+
+### Zero-Copy Write Pipeline
+- `put_object` and `put_object_multipart` now take `Bytes` directly — eliminates the `Bytes::copy_from_slice` on every write
+- Bounded channel (capacity 8) + `tokio::spawn` producer: CRC32C now runs concurrently with gRPC network I/O
+- Read path: `BytesMut::with_capacity(size_hint)` pre-allocated from `ObjectDescriptor` — zero reallocations
+
+### RAPID Auto-Detection
+- `RapidMode` enum (`Auto` | `ForceOn` | `ForceOff`) with per-bucket cache
+- `get_storage_layout()` auto-detects RAPID on first access; no manual configuration required
+- `S3DLIO_GCS_RAPID=auto|true|false` controls override behaviour
+
+### Subchannel Auto-Tune
+- `set_gcs_channel_count(n)` pre-init hook wired to `--jobs N` in CLI
+- Three-tier priority: env var > API call > `max(64, cpu_count)` floor
+- HTTP/2 window patched to 128 MiB (env `S3DLIO_GRPC_INITIAL_WINDOW_MIB`)
+
+### New Zero-Copy Unit Tests (10 tests)
+- `test_bytesmut_freeze_is_zero_copy`
+- `test_bytes_clone_is_zero_copy`
+- `test_bytes_slice_is_zero_copy`
+- `test_bytes_from_vec_preserves_pointer`
+- `test_buffered_writer_finalise_path_is_zero_copy`
+- `test_grpc_read_accumulation_no_realloc`
+- `test_http_read_freeze_returns_bytes_not_vec`
+- `test_write_producer_chunk_slices_are_zero_copy`
+- `test_producer_task_data_clone_is_arc_increment`
+- `test_put_object_caller_bytes_conversion_is_zero_copy`
+
+### Documentation
+- `docs/GCS-gRPC_Fixes.md` — comprehensive combined doc covering all 6 root-cause issues, all fixes, constants architecture, zero-copy data flow, performance results (3.83 GB/s), env-var reference, files-changed table
+- `docs/Fix-GCS_v0-9-65.md` removed (absorbed into `GCS-gRPC_Fixes.md`)
+- `docs/performance/RANGE_OPTIMIZATION_IMPLEMENTATION.md` — clarified as S3-only; added §Backend-Specific Read Architectures comparing S3/GCS/Azure/File transport layers
+
+---
+
 ## Version 0.9.60 - GCS gRPC Transport, RAPID Storage & Multi-Protocol List Buckets (February 2026)
 
 ### GCS gRPC Transport (All Operations)

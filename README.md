@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-526%2F526-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.60-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-536%2F536-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.65-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -148,9 +148,10 @@ cargo test
 
 ## 🌟 Latest Release
 
-**v0.9.60** (February 2026) - GCS gRPC transport, RAPID/Hyperdisk ML support, concurrent deletes, multi-protocol list-buckets.
+**v0.9.65** (March 2026) - GCS PUT fix (RESOURCE_EXHAUSTED), constants centralisation, zero-copy write pipeline, RAPID auto-detection. Measured **3.83 GB/s** upload on RAPID bucket.
 
 **Recent highlights:**
+- **v0.9.65** - Fixed GCS PUT RESOURCE_EXHAUSTED (chunk size exceeded server 4 MiB protobuf message limit); centralised all GCS/gRPC constants; zero-copy `put_object(Bytes)`; RAPID auto-detection; subchannel auto-tune via `--jobs`; 10 new zero-copy unit tests
 - **v0.9.60** - All GCS operations now use gRPC (BidiReadObject/BidiWriteObject) instead of JSON API; GCS RAPID/Hyperdisk ML zonal bucket support via `S3DLIO_GCS_RAPID`; 64-way concurrent batch deletes; byte-range optimization enabled by default at 32 MB threshold; NUMA and HDF5 now optional features
 - **v0.9.50** - Python multi-threaded runtime fix (io_uring-style submit), s3torchconnector zero-copy rewrite, S3 range download optimization (76% faster for large objects), multipart upload zero-copy chunking
 - **v0.9.40** - Enhanced Python bytearray documentation with performance benchmarks (2.5-3x speedup)

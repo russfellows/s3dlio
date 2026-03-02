@@ -2275,8 +2275,6 @@ dependencies = [
 [[package]]
 name = "google-cloud-gax-internal"
 version = "0.7.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "598e5ffec2c1c9b43e83847b2badc0f128a03e541b75f1ecd8acf0a2605c40cf"
 dependencies = [
  "bytes",
  "futures 0.3.31",
@@ -5067,7 +5065,7 @@ checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
 name = "s3dlio"
-version = "0.9.60"
+version = "0.9.65"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -5096,6 +5094,7 @@ dependencies = [
  "gcloud-storage",
  "glob",
  "google-cloud-gax",
+ "google-cloud-gax-internal",
  "google-cloud-storage",
  "hdf5-metno",
  "hdf5-metno-sys",
@@ -5147,7 +5146,7 @@ dependencies = [
 
 [[package]]
 name = "s3dlio-oplog"
-version = "0.9.60"
+version = "0.9.65"
 dependencies = [
  "anyhow",
  "async-trait",

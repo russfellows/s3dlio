@@ -143,7 +143,7 @@ fn list_gcs_containers() -> Result<Vec<ContainerInfo>> {
     run_on_global_rt(async move { list_gcs_async(&project).await })
 }
 
-#[cfg(all(feature = "gcs-community", not(feature = "gcs-official")))]
+#[cfg(feature = "gcs-community")]
 async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     use gcloud_storage::http::buckets::list::ListBucketsRequest;
 
@@ -191,7 +191,7 @@ async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     Ok(containers)
 }
 
-#[cfg(feature = "gcs-official")]
+#[cfg(not(feature = "gcs-community"))]
 async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     use google_cloud_gax::paginator::ItemPaginator;
 
@@ -224,10 +224,7 @@ async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     Ok(containers)
 }
 
-#[cfg(not(any(feature = "gcs-community", feature = "gcs-official")))]
-async fn list_gcs_async(_project: &str) -> Result<Vec<ContainerInfo>> {
-    bail!("GCS support is not compiled in. Enable 'gcs-community' or 'gcs-official' feature.");
-}
+
 
 // ---------------------------------------------------------------------------
 // Azure Blob Storage

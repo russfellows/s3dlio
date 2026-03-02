@@ -26,20 +26,24 @@ use crate::{
     storage::bidi::connector::Connector, storage::bidi::transport::ObjectDescriptorTransport,
 };
 use std::sync::Arc;
+use gaxi::gcs_constants::{DEFAULT_GRPC_WRITE_CHUNK_SIZE, ENV_GRPC_WRITE_CHUNK_SIZE, MAX_GRPC_WRITE_CHUNK_SIZE};
 
-/// Default gRPC write chunk size: 2 MiB.
-/// This aligns with GCS server expectations for BidiWriteObject.
-/// Can be overridden via the `S3DLIO_GRPC_WRITE_CHUNK_SIZE` environment variable
-/// (value in bytes).
-pub const DEFAULT_GRPC_WRITE_CHUNK_SIZE: usize = 2 * 1024 * 1024;
-
-/// Returns the configured gRPC write chunk size.
-/// Checks `S3DLIO_GRPC_WRITE_CHUNK_SIZE` env var, falls back to DEFAULT_GRPC_WRITE_CHUNK_SIZE.
+/// Returns the effective gRPC write chunk size.
+///
+/// Priority:
+///   1. `S3DLIO_GRPC_WRITE_CHUNK_SIZE` env var (bytes) — silently clamped to
+///      [`MAX_GRPC_WRITE_CHUNK_SIZE`] if the provided value exceeds the server limit.
+///   2. [`DEFAULT_GRPC_WRITE_CHUNK_SIZE`] (= [`MAX_GRPC_WRITE_CHUNK_SIZE`] = 4 MiB).
+///
+/// Both constants are defined in
+/// `vendor/google-cloud-gax-internal/src/gcs_constants.rs` — the single
+/// source of truth for all GCS/gRPC tuning values.
 fn grpc_write_chunk_size() -> usize {
-    std::env::var("S3DLIO_GRPC_WRITE_CHUNK_SIZE")
+    let requested = std::env::var(ENV_GRPC_WRITE_CHUNK_SIZE)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_GRPC_WRITE_CHUNK_SIZE)
+        .unwrap_or(DEFAULT_GRPC_WRITE_CHUNK_SIZE);
+    requested.min(MAX_GRPC_WRITE_CHUNK_SIZE)
 }
 
 /// An implementation of [`stub::Storage`][crate::storage::stub::Storage] that
@@ -189,68 +193,84 @@ impl super::stub::Storage for Storage {
             "/google.storage.v2.Storage/BidiWriteObject",
         );
 
-        // Create the channel for sending requests
-        // Buffer enough for all chunks + 1 to avoid blocking
-        let num_chunks = (total_len + chunk_size - 1) / chunk_size;
-        let channel_size = std::cmp::max(num_chunks + 1, 2);
+        // Use a small bounded channel so the producer and the gRPC network
+        // sender run concurrently.  The previous approach used an unbounded
+        // channel (sized to hold ALL chunks), which serialised CRC computation
+        // and gRPC stream setup: all N chunks were queued before the first byte
+        // was sent on the wire.  With a capacity of 8 chunks the producer
+        // stays at most 8 chunks ahead of the network consumer, keeping both
+        // the CPU (CRC) and the network (gRPC) busy simultaneously.
+        // For a single-chunk object the channel never blocks, so there is no
+        // overhead when total_len <= chunk_size.
+        const PRODUCER_CHANNEL_CAPACITY: usize = 8;
         let (tx, rx) =
-            tokio::sync::mpsc::channel::<BidiWriteObjectRequest>(channel_size);
+            tokio::sync::mpsc::channel::<BidiWriteObjectRequest>(PRODUCER_CHANNEL_CAPACITY);
 
-        // Build and send all messages
-        let mut offset: usize = 0;
-        let mut msg_index: usize = 0;
+        // Spawn the producer as a separate task so it runs concurrently with
+        // the gRPC sender below.  `data` is `bytes::Bytes` (Arc-backed), so
+        // the clone is effectively free.
+        let producer_task = {
+            let data = data.clone();
+            let proto_spec = proto_spec.clone();
+            tokio::spawn(async move {
+                let mut offset: usize = 0;
+                let mut msg_index: usize = 0;
+                while offset < total_len || (total_len == 0 && msg_index == 0) {
+                    let end = std::cmp::min(offset + chunk_size, total_len);
+                    // `data.slice()` is zero-copy: it increments the Arc refcount.
+                    let chunk = data.slice(offset..end);
+                    let chunk_crc = crc32c::crc32c(&chunk);
+                    let is_first = msg_index == 0;
+                    let is_last = end >= total_len;
 
-        while offset < total_len || (total_len == 0 && msg_index == 0) {
-            let end = std::cmp::min(offset + chunk_size, total_len);
-            let chunk = data.slice(offset..end);
-            let chunk_crc = crc32c::crc32c(&chunk);
-            let is_first = msg_index == 0;
-            let is_last = end >= total_len;
+                    let request = BidiWriteObjectRequest {
+                        write_offset: offset as i64,
+                        object_checksums: if is_last {
+                            Some(ObjectChecksums {
+                                crc32c: Some(object_crc32c),
+                                md5_hash: bytes::Bytes::new(),
+                            })
+                        } else {
+                            None
+                        },
+                        state_lookup: false,
+                        flush: is_last,
+                        finish_write: is_last,
+                        common_object_request_params: None,
+                        first_message: if is_first {
+                            Some(
+                                bidi_write_object_request::FirstMessage::WriteObjectSpec(
+                                    proto_spec.clone(),
+                                ),
+                            )
+                        } else {
+                            None
+                        },
+                        data: Some(bidi_write_object_request::Data::ChecksummedData(
+                            ChecksummedData {
+                                content: chunk,
+                                crc32c: Some(chunk_crc),
+                            },
+                        )),
+                    };
 
-            let request = BidiWriteObjectRequest {
-                write_offset: offset as i64,
-                object_checksums: if is_last {
-                    Some(ObjectChecksums {
-                        crc32c: Some(object_crc32c),
-                        md5_hash: bytes::Bytes::new(),
-                    })
-                } else {
-                    None
-                },
-                state_lookup: false,
-                flush: is_last,
-                finish_write: is_last,
-                common_object_request_params: None,
-                first_message: if is_first {
-                    Some(
-                        bidi_write_object_request::FirstMessage::WriteObjectSpec(
-                            proto_spec.clone(),
-                        ),
-                    )
-                } else {
-                    None
-                },
-                data: Some(bidi_write_object_request::Data::ChecksummedData(
-                    ChecksummedData {
-                        content: chunk,
-                        crc32c: Some(chunk_crc),
-                    },
-                )),
-            };
+                    tracing::trace!(
+                        "BidiWriteObject: chunk {}/{} offset={} len={} crc32c={:#010x} first={} last={}",
+                        msg_index + 1, num_chunks_est, offset, end - offset, chunk_crc, is_first, is_last
+                    );
+                    if tx.send(request).await.is_err() {
+                        // Stream was dropped (e.g. gRPC error); abort producer.
+                        break;
+                    }
+                    offset = end;
+                    msg_index += 1;
+                }
+                tracing::trace!("BidiWriteObject producer: sent {} chunk(s)", msg_index);
+                // Dropping `tx` signals end-of-stream to the ReceiverStream.
+            })
+        };
 
-            tracing::trace!(
-                "BidiWriteObject: chunk {}/{} offset={} len={} crc32c={:#010x} first={} last={}",
-                msg_index + 1, num_chunks_est, offset, end - offset, chunk_crc, is_first, is_last
-            );
-            tx.send(request).await.map_err(Error::io)?;
-            offset = end;
-            msg_index += 1;
-        }
-        tracing::trace!("BidiWriteObject: sent {} chunk(s), starting gRPC stream", msg_index);
-        // Drop sender so the server sees end-of-stream after all messages
-        drop(tx);
-
-        // Start the bidi stream
+        // Start the bidi stream immediately — concurrently with the producer.
         let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let response: std::result::Result<
             gaxi::grpc::tonic::Result<gaxi::grpc::tonic::Response<Streaming<BidiWriteObjectResponse>>>,
@@ -267,6 +287,12 @@ impl super::stub::Storage for Storage {
                 &x_goog_request_params,
             )
             .await;
+
+        // `request_stream` (which held `rx`) was consumed by `bidi_stream_with_status`.
+        // With `rx` dropped the producer task's next `tx.send()` returns `Err` and
+        // the loop exits.  Abort + await ensures no task leak even on error paths.
+        producer_task.abort();
+        let _ = producer_task.await; // JoinError on abort is expected — ignore
 
         let tonic_result = response?;
         let tonic_response = tonic_result.map_err(|status| {

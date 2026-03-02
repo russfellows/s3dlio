@@ -466,6 +466,9 @@ async fn main() -> Result<()> {
     
     
         Command::Upload { files, dest, jobs, create_bucket } => {
+            // Pre-tune GCS subchannels to match upload concurrency.
+            s3dlio::set_gcs_channel_count(jobs);
+
             // Check AWS credentials only for S3 destinations
             if requires_aws_credentials(&dest) {
                 check_aws_credentials()?;
@@ -552,6 +555,9 @@ async fn main() -> Result<()> {
         }
     
         Command::Download { src, dest_dir, jobs, recursive } => {
+            // Pre-tune GCS subchannels to match download concurrency.
+            s3dlio::set_gcs_channel_count(jobs);
+
             // Check AWS credentials only for S3 sources
             if requires_aws_credentials(&src) {
                 check_aws_credentials()?;
@@ -818,7 +824,12 @@ async fn stat_cmd(uri: &str) -> Result<()> {
 async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool, offset: Option<u64>, length: Option<u64>) -> Result<()> {
     // Determine concurrency level (prefer concurrent over jobs for mp compatibility)
     let concurrency = concurrent.unwrap_or(jobs);
-    
+
+    // Pre-tune GCS subchannels to match concurrency before the first GCS client init.
+    // The GCS client is a process-wide singleton (OnceCell); this must be called
+    // before any GCS store is created.  S3DLIO_GCS_GRPC_CHANNELS env var overrides.
+    s3dlio::set_gcs_channel_count(concurrency);
+
     // Validate range request parameters
     if (offset.is_some() || length.is_some()) && (keylist.is_some() || recursive) {
         bail!("Range requests (--offset/--length) are only supported for single-object GET, not with --keylist or --recursive");
@@ -1343,6 +1354,9 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
 /// Put command supports 1 or more objects, also takes our ObjectType
 #[allow(clippy::too_many_arguments)]
 async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize, data_gen_mode: DataGenMode, chunk_size: usize) -> Result<()> {
+    // Pre-tune GCS subchannels to match upload concurrency before the first GCS op.
+    s3dlio::set_gcs_channel_count(jobs);
+
     // Ensure prefix ends with '/' for consistent URI generation
     let mut prefix = uri_prefix.to_string();
     if !prefix.ends_with('/') {

@@ -9,12 +9,11 @@ compile_error!("Enable only one of: native-backends or arrow-backend");
 #[cfg(not(any(feature = "native-backends", feature = "arrow-backend")))]
 compile_error!("Must enable either 'native-backends' or 'arrow-backend' feature");
 
-// GCS backend selection - choose one implementation
-#[cfg(all(feature = "gcs-community", feature = "gcs-official"))]
-compile_error!("Enable only one of: gcs-community or gcs-official");
-
-#[cfg(not(any(feature = "gcs-community", feature = "gcs-official")))]
-compile_error!("Must enable either 'gcs-community' or 'gcs-official' feature for GCS support");
+// The 'gcs-community' feature is a legacy opt-in alternative (JSON API, no RAPID).
+// The official Google gRPC client is always compiled — do not enable gcs-community
+// alongside it as both define the same GcsClient symbol.
+#[cfg(feature = "gcs-community")]
+compile_error!("'gcs-community' conflicts with the built-in Google GCS client. Remove 'gcs-community' from your feature list.");
 
 // ===== Core Public API =====
 // This is the main stable API that external users should use
@@ -87,8 +86,25 @@ pub mod numa;
 #[cfg(feature = "gcs-community")]
 pub mod gcs_client;  // Community-maintained gcloud-storage implementation
 
-#[cfg(feature = "gcs-official")]
-pub mod google_gcs_client;  // Official Google google-cloud-storage implementation
+pub mod gcs_constants;      // Single source of truth for all GCS/gRPC tuning constants
+pub mod google_gcs_client;  // Official Google google-cloud-storage implementation (always compiled)
+
+/// Pre-configure the number of gRPC subchannels (TCP connections) the GCS client
+/// will open.  Call this once, before any GCS operation, to auto-tune throughput
+/// to your concurrency level.  Matching channels to concurrent jobs ensures each
+/// active stream has an uncontested HTTP/2 flow-control window.
+///
+/// **Call pattern**: invoke this at startup, before constructing any `ObjectStore`
+/// or calling any `get`/`put` function.  The GCS client is a process-wide singleton;
+/// this setting is only observed on first initialization.
+///
+/// Priority inside the GCS client:
+///   1. `S3DLIO_GCS_GRPC_CHANNELS` env var  (always wins)
+///   2. The value set here
+///   3. `max(64, cpu_count)` auto fallback
+pub fn set_gcs_channel_count(n: usize) {
+    google_gcs_client::set_gcs_channel_count(n);
+}
 
 pub mod list_containers;    // Backend-agnostic bucket/container listing (s3://, gs://, az://, file://)
 pub use list_containers::{list_containers, ContainerInfo};

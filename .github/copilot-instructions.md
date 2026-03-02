@@ -37,6 +37,33 @@ cargo build --no-default-features --features arrow-backend
 
 ### Build Quality Standards
 
+**CRITICAL: Build Timing — NEVER Interrupt a Release Build**
+
+`cargo build --release` takes **~10 minutes** on this machine. This is normal and expected.
+
+- **NEVER** interrupt a running `cargo build --release` with Ctrl-C or by starting a new command
+- **NEVER** grow impatient and kill the build partway through
+- **NEVER** assume the build is hung just because it is quiet — Rust release builds are silent during compilation
+- After starting a release build, **wait the full ~10 minutes** for it to complete before doing anything else
+- If you need a faster feedback loop, use a **debug build** instead: `cargo build` (no `--release`)
+  - Debug builds finish in ~1-2 minutes and catch all errors and warnings
+  - Only use `--release` when you need the final optimized binary for testing
+
+**Build command cheat-sheet**:
+```bash
+# Fast iteration / error checking (~1-2 min)
+cargo build
+
+# Final binary for performance testing (~10 min, DO NOT INTERRUPT)
+cargo build --release
+
+# Check for errors without producing binary (fastest, ~30 sec)
+cargo check
+
+# Lint
+cargo clippy
+```
+
 **CRITICAL: Zero Warnings Policy**
 - ALL builds MUST be warning-free before commits
 - Never use quick fixes like `_` prefix to silence unused variable warnings
@@ -92,13 +119,74 @@ cargo clippy --all-targets --all-features
 - **Factory pattern**: `store_for_uri()` creates appropriate backend for any URI scheme
 
 ### Python Integration (PyO3/Maturin)
-- **Module structure**: `python/s3dlio/` wraps compiled Rust extension `_pymod`
-- **Build process**: `./build_pyo3.sh` → `./install_pyo3_wheel.sh`
-- **Critical testing rule**: Always test installed package, never development `python/` directory
 
-**CRITICAL: Virtual Environment Check**
-- **ALWAYS verify virtual environment is active** before any build/install commands
-- Check for `(s3dlio)` prefix in terminal prompt
+#### Package Manager: `uv` — NOT `pip`
+**This project uses `uv` exclusively. NEVER run `pip install` directly.**
+
+| ❌ WRONG | ✅ CORRECT |
+|----------|-----------|
+| `pip install numpy` | `uv pip install numpy` |
+| `pip install -r requirements.txt` | `uv pip install -r requirements.txt` |
+| `pip install ./dist/s3dlio*.whl` | `uv pip install ./dist/s3dlio*.whl --force-reinstall` |
+
+`uv` is a fast Python package manager that works inside the project's `.venv`. Always prefix package operations with `uv pip`.
+
+#### Virtual Environment Setup (one-time per shell session)
+```bash
+# Activate the project venv — do this ONCE per shell session
+cd /home/eval/Documents/Code/s3dlio
+source .venv/bin/activate
+# Prompt should now show: (s3dlio) eval@...
+```
+
+- **Terminal interrupts (Ctrl-C) exit the venv** — re-run `source .venv/bin/activate` after any interrupt
+- **Always verify** `(s3dlio)` prefix in the terminal prompt before running Python or build commands
+- Do NOT create a new venv — the existing `.venv/` is managed by `uv`
+
+#### Full Python Build and Install Workflow
+Only needed after Rust code changes. If wheels are already built (`.whl` files exist in `dist/`), skip to step 3.
+
+```bash
+# Step 1: Activate venv (once per shell session)
+source .venv/bin/activate
+
+# Step 2: Build Python wheel from Rust source
+./build_pyo3.sh
+# Produces: target/wheels/s3dlio-<version>-cp<pyver>-<platform>.whl
+
+# Step 3: Install the wheel into the venv  (adjust filename to match what was built)
+uv pip install target/wheels/s3dlio-*.whl --force-reinstall
+# If the glob doesn't expand (uv doesn't expand globs), use the explicit name:
+#   ls target/wheels/   ← find the exact filename
+#   uv pip install target/wheels/s3dlio-0.9.60-cp312-cp312-manylinux_2_39_x86_64.whl --force-reinstall
+
+# Step 4: Verify the install
+python -c "import s3dlio; print('s3dlio imported OK')"
+```
+
+**IMPORTANT**: `./build_pyo3.sh` must be re-run every time Rust source changes. The installed `.whl` does NOT auto-update from source.
+
+#### Module Structure
+- **`python/s3dlio/`** — Python wrapper package (pure Python layer)
+- **`_pymod`** — compiled Rust extension (produced by maturin, embedded in wheel)
+- **Testing rule**: Always `import s3dlio` from the *installed* package, never `sys.path.insert(0, "python/")` or the raw `python/` directory
+
+#### Running Python Tests
+```bash
+source .venv/bin/activate
+# After installing the wheel:
+python tests/test_zero_copy.py          # s3dlio-specific tests
+python -m pytest tests/ -v              # full test suite (if pytest installed)
+uv pip install pytest                   # install pytest if missing
+```
+
+#### Installing Additional Python Packages
+```bash
+uv pip install numpy          # add numpy
+uv pip install torch          # add PyTorch
+uv pip install pytest         # add pytest
+uv pip list                   # show installed packages
+```
 
 ### Data Generation Algorithm Migration (November 2025)
 
@@ -169,9 +257,6 @@ The following functions in `src/data_gen.rs` are **COMMENTED OUT** and marked fo
 4. Remove duplicate code from dl-driver
 
 **GitHub Issue**: See future enhancement tracking issue (to be filed)
-- If not active, run: `source .venv/bin/activate`
-- Terminal interrupts (Ctrl-C) may exit the virtual environment
-- Re-activate before continuing work
 
 ## Key Development Patterns
 
