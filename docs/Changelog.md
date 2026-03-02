@@ -56,6 +56,14 @@
 - `docs/Fix-GCS_v0-9-65.md` removed (absorbed into `GCS-gRPC_Fixes.md`)
 - `docs/performance/RANGE_OPTIMIZATION_IMPLEMENTATION.md` — clarified as S3-only; added §Backend-Specific Read Architectures comparing S3/GCS/Azure/File transport layers
 
+### GCS API Completion (read-back, query, Python bindings)
+- **NEW**: `s3dlio::get_gcs_channel_count() -> usize` — read back the programmatically-configured subchannel count (`0` = not set, auto-detect will apply)
+- **NEW**: `s3dlio::get_gcs_rapid_mode() -> Option<bool>` — read back the current effective RAPID mode, resolving env var + programmatic override (`None` = auto-detect)
+- **NEW**: `s3dlio::query_gcs_rapid_bucket(bucket_or_uri) -> bool` (async) — query whether a bucket or `gs://` URI is RAPID (Hyperdisk ML); result cached per bucket for process lifetime, deduplicated under concurrent access
+- **NEW** Python API: `gcs_set_channel_count`, `gcs_set_rapid_mode`, `gcs_get_channel_count`, `gcs_get_rapid_mode`, `gcs_query_rapid_bucket` — full GCS tuning control from Python without requiring environment variables
+- `docs/GCS-API-Configuration.md` — complete reference for all 5 public GCS API functions, constants, env vars, and Python usage
+- `.github/copilot-instructions.md` — added Prime Directive and Secondary Directive
+
 ---
 
 ## Version 0.9.60 - GCS gRPC Transport, RAPID Storage & Multi-Protocol List Buckets (February 2026)

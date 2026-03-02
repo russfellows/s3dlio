@@ -1,5 +1,15 @@
 # s3dlio AI Coding Agent Instructions
 
+---
+
+## 🚨 Prime Directive
+
+**Prime Directive**: If told to investigate something, I will ONLY investigate, and then report and possibly document my findings. I will NEVER assume to proceed to making ANY code changes, unless SPECIFICALLY asked to do so.
+
+**Secondary Directive**: Whenever given a task, first check that I am not violating my Prime Directive before proceeding.
+
+---
+
 ## Project Overview
 s3dlio is a high-performance, multi-protocol storage library built in Rust with Python bindings, designed for AI/ML workloads. It provides universal copy operations across S3, Azure, local file systems, and DirectIO with near line-speed performance.
 

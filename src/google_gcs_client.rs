@@ -10,7 +10,7 @@ use google_cloud_storage::model_ext::ReadRange;
 use google_cloud_gax::paginator::ItemPaginator;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use tokio::sync::OnceCell;
 use tracing::{debug, info, trace, warn};
 use crate::gcs_constants::{
@@ -44,6 +44,70 @@ static DESIRED_GCS_CHANNELS: AtomicUsize = AtomicUsize::new(0);
 /// `S3DLIO_GCS_GRPC_CHANNELS` env var takes precedence over this value.
 pub fn set_gcs_channel_count(n: usize) {
     DESIRED_GCS_CHANNELS.store(n, Ordering::Relaxed);
+}
+
+/// Read back the programmatic GCS subchannel count set via [`set_gcs_channel_count`].
+///
+/// Returns `0` if [`set_gcs_channel_count`] has not been called — the client will
+/// auto-detect from `max(GCS_MIN_CHANNELS, cpu_count)` on first initialization.
+/// The `S3DLIO_GCS_GRPC_CHANNELS` env var is NOT checked here; it is applied
+/// inside `GcsClient::new()` and takes precedence over this value.
+pub fn get_gcs_channel_count() -> usize {
+    DESIRED_GCS_CHANNELS.load(Ordering::Relaxed)
+}
+
+/// Programmatic override for RAPID mode, parallel to [`set_gcs_channel_count`].
+///
+/// Stored values:
+///   0 = Unset — defer to `S3DLIO_GCS_RAPID` env var (default: Auto)
+///   1 = ForceOn
+///   2 = ForceOff
+///
+/// Must be set before the `GCS_STORAGE` OnceCell is first initialized.
+static DESIRED_GCS_RAPID: AtomicU8 = AtomicU8::new(0);
+
+/// Pre-configure RAPID (Hyperdisk ML / zonal GCS) mode before the first GCS
+/// operation.
+///
+/// - `Some(true)`  — force RAPID on for all buckets (gRPC + appendable writes)
+/// - `Some(false)` — force RAPID off for all buckets (standard HTTP reads)
+/// - `None`        — auto-detect per bucket (default; no override)
+///
+/// Priority inside the GCS client:
+///   1. `S3DLIO_GCS_RAPID` env var  (always wins)
+///   2. The value set here            (`Some(true)` / `Some(false)`)
+///   3. Auto-detect per bucket        (`None` / default)
+///
+/// Has no effect if called after the GCS client has already been initialized.
+pub fn set_gcs_rapid_mode(force: Option<bool>) {
+    let v = match force {
+        None        => 0u8,
+        Some(true)  => 1u8,
+        Some(false) => 2u8,
+    };
+    DESIRED_GCS_RAPID.store(v, Ordering::Relaxed);
+}
+
+/// Read back the current effective RAPID mode as an `Option<bool>`.
+///
+/// Resolution order (same as GCS client initialization):
+///   1. `S3DLIO_GCS_RAPID` env var  →  `Some(true)` / `Some(false)`
+///   2. Value previously set by [`set_gcs_rapid_mode`]
+///   3. Unset / auto-detect          →  `None`
+///
+/// Returns:
+///   - `Some(true)`  — RAPID forced on  (gRPC BidiRead/Write + appendable)
+///   - `Some(false)` — RAPID forced off (standard HTTP reads)
+///   - `None`        — auto-detect per bucket (default)
+///
+/// Mirrors the `force` argument of [`set_gcs_rapid_mode`], making it easy to
+/// log the effective setting at the start of a workload.
+pub fn get_gcs_rapid_mode() -> Option<bool> {
+    match read_rapid_mode() {
+        RapidMode::ForceOn  => Some(true),
+        RapidMode::ForceOff => Some(false),
+        RapidMode::Auto     => None,
+    }
 }
 
 /// Per-bucket cache of whether a bucket is RAPID (zonal/Hyperdisk ML).
@@ -734,9 +798,9 @@ impl GcsClient {
 /// The variable can be set in the shell **or** loaded from a `.env` file via
 /// the [`dotenvy`] crate before the binary initializes its GCS client.
 pub(crate) fn read_rapid_mode() -> RapidMode {
-    match std::env::var("S3DLIO_GCS_RAPID") {
-        Err(_) => RapidMode::Auto,
-        Ok(v) => match v.to_lowercase().as_str() {
+    // Priority 1: env var (explicit user override, always wins)
+    if let Ok(v) = std::env::var("S3DLIO_GCS_RAPID") {
+        return match v.to_lowercase().as_str() {
             "true" | "1" | "yes" => RapidMode::ForceOn,
             "false" | "0" | "no" => RapidMode::ForceOff,
             "auto" | "" => RapidMode::Auto,
@@ -747,7 +811,13 @@ pub(crate) fn read_rapid_mode() -> RapidMode {
                 );
                 RapidMode::Auto
             }
-        },
+        };
+    }
+    // Priority 2: programmatic override via set_gcs_rapid_mode()
+    match DESIRED_GCS_RAPID.load(Ordering::Relaxed) {
+        1 => RapidMode::ForceOn,
+        2 => RapidMode::ForceOff,
+        _ => RapidMode::Auto, // 0 = unset → auto-detect
     }
 }
 
@@ -788,6 +858,36 @@ pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
     }
 
     Ok((bucket, object_path))
+}
+
+/// Query whether a GCS bucket or `gs://` URI refers to a RAPID (Hyperdisk ML / zonal) bucket.
+///
+/// Accepts either a bare bucket name (`"my-bucket"`) or a full GCS URI
+/// (`"gs://my-bucket/some/prefix/"`).  The bucket layout is determined once via
+/// the `GetStorageLayout` RPC and cached for the process lifetime — the same
+/// cache used internally by every `get_object` / `put_object` call — so
+/// repeated calls for the same bucket are essentially free.
+///
+/// Concurrency-safe: simultaneous calls for the same bucket are deduplicated
+/// via `BUCKET_RAPID_CACHE` — only one `GetStorageLayout` RPC is issued.
+///
+/// Returns `false` on authentication or network errors (a warning is logged).
+pub async fn query_gcs_rapid_bucket(bucket_or_uri: &str) -> bool {
+    let bucket = if bucket_or_uri.starts_with("gs://") || bucket_or_uri.starts_with("gcs://") {
+        match parse_gcs_uri(bucket_or_uri) {
+            Ok((b, _)) => b,
+            Err(_) => bucket_or_uri.to_string(),
+        }
+    } else {
+        bucket_or_uri.to_string()
+    };
+    match GcsClient::new().await {
+        Ok(client) => client.is_rapid_bucket(&bucket).await,
+        Err(e) => {
+            warn!("query_gcs_rapid_bucket('{}'): failed to init GCS client: {}", bucket, e);
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

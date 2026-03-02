@@ -106,6 +106,46 @@ pub fn set_gcs_channel_count(n: usize) {
     google_gcs_client::set_gcs_channel_count(n);
 }
 
+/// Pre-configure RAPID (Hyperdisk ML / zonal GCS) mode before the first GCS
+/// operation.  Must be called before any `gs://` I/O.
+///
+/// - `Some(true)`  — force RAPID on for all buckets
+/// - `Some(false)` — force RAPID off for all buckets
+/// - `None`        — auto-detect per bucket (default)
+///
+/// `S3DLIO_GCS_RAPID` env var still takes precedence if set.
+pub fn set_gcs_rapid_mode(force: Option<bool>) {
+    google_gcs_client::set_gcs_rapid_mode(force);
+}
+
+/// Read back the programmatic GCS subchannel count.
+///
+/// Returns `0` if [`set_gcs_channel_count`] has not been called
+/// (`S3DLIO_GCS_GRPC_CHANNELS` env var or auto-detect will be used on first
+/// client initialization).
+pub fn get_gcs_channel_count() -> usize {
+    google_gcs_client::get_gcs_channel_count()
+}
+
+/// Read back the current effective GCS RAPID mode setting.
+///
+/// Resolution includes the `S3DLIO_GCS_RAPID` env var (highest priority):
+/// - `Some(true)`  — RAPID forced on
+/// - `Some(false)` — RAPID forced off
+/// - `None`        — auto-detect per bucket (default)
+pub fn get_gcs_rapid_mode() -> Option<bool> {
+    google_gcs_client::get_gcs_rapid_mode()
+}
+
+/// Query whether a GCS bucket or `gs://` URI is a RAPID (Hyperdisk ML / zonal) bucket.
+///
+/// The result is cached for the process lifetime.  Accepts either a plain
+/// bucket name or a full `gs://bucket/prefix/` URI.
+/// Returns `false` on authentication/network errors (logs a warning).
+pub async fn query_gcs_rapid_bucket(bucket_or_uri: &str) -> bool {
+    google_gcs_client::query_gcs_rapid_bucket(bucket_or_uri).await
+}
+
 pub mod list_containers;    // Backend-agnostic bucket/container listing (s3://, gs://, az://, file://)
 pub use list_containers::{list_containers, ContainerInfo};
 

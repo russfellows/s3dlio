@@ -1992,6 +1992,85 @@ fn create_multi_endpoint_store_from_file(
 }
 
 // ---------------------------------------------------------------------------
+// GCS tuning — programmatic setters, getters, and bucket RAPID query
+// ---------------------------------------------------------------------------
+
+/// Set the number of gRPC subchannels for GCS.
+///
+/// Must be called before the first ``gs://`` operation.  Setting this to
+/// your workload's concurrency (e.g. ``num_jobs``) gives each concurrent
+/// stream an uncontested HTTP/2 flow-control window, which is critical for
+/// RAPID / Hyperdisk ML throughput.
+///
+/// The ``S3DLIO_GCS_GRPC_CHANNELS`` environment variable, if set, takes
+/// precedence over this call.
+#[pyfunction]
+fn gcs_set_channel_count(n: usize) {
+    crate::google_gcs_client::set_gcs_channel_count(n);
+}
+
+/// Configure GCS RAPID (Hyperdisk ML / zonal) mode before the first ``gs://``
+/// operation.
+///
+/// Parameters
+/// ----------
+/// force : bool or None
+///     * ``True``  — force RAPID on for every bucket
+///     * ``False`` — force RAPID off for every bucket
+///     * ``None``  — auto-detect per bucket (default; recommended)
+///
+/// The ``S3DLIO_GCS_RAPID`` environment variable still takes precedence if set.
+#[pyfunction]
+fn gcs_set_rapid_mode(force: Option<bool>) {
+    crate::google_gcs_client::set_gcs_rapid_mode(force);
+}
+
+/// Return the programmatically-configured GCS subchannel count.
+///
+/// Returns ``0`` if :func:`gcs_set_channel_count` has not been called
+/// (auto-detect will be used on first client initialization).
+#[pyfunction]
+fn gcs_get_channel_count() -> usize {
+    crate::google_gcs_client::get_gcs_channel_count()
+}
+
+/// Return the current effective RAPID mode setting.
+///
+/// Resolution includes the ``S3DLIO_GCS_RAPID`` environment variable:
+///
+/// * ``True``  — RAPID forced on
+/// * ``False`` — RAPID forced off
+/// * ``None``  — auto-detect per bucket (default)
+#[pyfunction]
+fn gcs_get_rapid_mode() -> Option<bool> {
+    crate::google_gcs_client::get_gcs_rapid_mode()
+}
+
+/// Query whether a GCS bucket or ``gs://`` URI is a RAPID (Hyperdisk ML) bucket.
+///
+/// Accepts either a bare bucket name (``"my-bucket"``) or a full URI
+/// (``"gs://my-bucket/prefix/"``).  The result is determined once via the
+/// ``GetStorageLayout`` API and cached for the lifetime of the process, so
+/// repeated calls for the same bucket are essentially free.
+///
+/// Returns ``False`` on authentication / network errors (a warning is logged).
+///
+/// Example
+/// -------
+/// >>> import s3dlio
+/// >>> s3dlio.gcs_query_rapid_bucket("gs://my-rapid-bucket/")
+/// True
+#[pyfunction]
+fn gcs_query_rapid_bucket(bucket_or_uri: &str) -> PyResult<bool> {
+    let owned = bucket_or_uri.to_owned();
+    submit_io(async move {
+        Ok::<bool, anyhow::Error>(
+            crate::google_gcs_client::query_gcs_rapid_bucket(&owned).await
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Module registration function for core API
 // ---------------------------------------------------------------------------
 pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2050,7 +2129,14 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_multi_endpoint_store, m)?)?;
     m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_template, m)?)?;
     m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_file, m)?)?;
-    
+
+    // GCS tuning (programmatic setters / getters / bucket RAPID query)
+    m.add_function(wrap_pyfunction!(gcs_set_channel_count, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs_set_rapid_mode, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs_get_channel_count, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs_get_rapid_mode, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs_query_rapid_bucket, m)?)?;
+
     Ok(())
 }
 
