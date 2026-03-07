@@ -30,17 +30,17 @@ aws-config         = "=1.8.14"
 aws-sdk-s3         = "=1.124.0"
 
 # Azure SDK crates (keep minor versions flexible; they evolve together)
-azure_core = { version = "0" }          # Response/Body, paging, errors
-azure_identity = { version = "0" }      # DefaultAzureCredential
-azure_storage_blob = { version = "0" }   # Blob/Container/BlockBlob clients
+azure_core = { version = "=0.31.0" }          # Response/Body, paging, errors
+azure_identity = { version = "=0.31.0" }      # DefaultAzureCredential
+azure_storage_blob = { version = "=0.8.0" }   # Blob/Container/BlockBlob clients
 
 # Google Cloud Storage SDK
 # The official Google gRPC client (google-cloud-storage) is always compiled.
 # 'gcs-community' is an optional legacy alternative (JSON-API, no RAPID support).
 gcloud-storage = { version = "^1.2", optional = true }  # Community GCS client (opt-in only)
-google-cloud-storage = { version = "^1.8" }             # Official Google GCS client (always on)
-google-cloud-gax = { version = "^1.7" }                 # Google Cloud GAX (always on)
-google-cloud-gax-internal = { version = "0.7.9", features = ["_internal-grpc-client"] }  # Direct dep: exposes gcs_constants
+google-cloud-storage = { path = "../google-cloud-rust/src/storage" }             # Official Google GCS client (always on)
+google-cloud-gax = { path = "../google-cloud-rust/src/gax" }                     # Google Cloud GAX (always on)
+google-cloud-gax-internal = { path = "../google-cloud-rust/src/gax-internal", features = ["_internal-grpc-client"] }  # Direct dep: exposes gcs_constants
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat
@@ -192,36 +192,13 @@ lto = true
 codegen-units = 1
 opt-level = 3
 
-# Vendored fork of google-cloud-storage with set_appendable() added to WriteObject
-# builder for GCS RAPID (Hyperdisk ML) bucket support.
-# Pending upstream PR: https://github.com/googleapis/google-cloud-rust
-# ---------------------------------------------------------------------------
-# Vendored patch — google-cloud-storage does not yet expose set_appendable()
-# on its WriteObject builder.  We vendor a minimal fork that adds the method.
+# GCS fork dependency note
+# =========================
+# google-cloud-storage and google-cloud-gax-internal are sourced from
+# https://github.com/russfellows/google-cloud-rust (branch: s3dlio-patches)
+# which adds GCS RAPID BidiWriteObject support and HTTP/2 window tuning.
+# The direct path/git deps here propagate correctly to all downstream consumers
+# (unlike [patch.crates-io] which is silently ignored by downstream Cargo workspaces).
 #
-# IMPORTANT FOR WHEEL / PIP BUILDERS
-# ==================================
-# The `vendor/google-cloud-storage/` directory MUST be committed to git so
-# that:
-#   1. Anyone who clones the repo can run `cargo build` / `maturin build`.
-#   2. Maturin includes the directory in the sdist it publishes to PyPI,
-#      allowing `pip install s3dlio --no-binary s3dlio` to work.
-#
-# If you see this error after cloning:
-#   error: failed to get `google-cloud-storage` ...
-#   ... directory does not exist: .../vendor/google-cloud-storage
-# run:  git submodule update --init  (or check out via git LFS if enabled)
-#
-# MIGRATION PATH
-# ==============
-# Once https://github.com/googleapis/google-cloud-rust adds set_appendable()
-# upstream, remove this section entirely and delete the vendor/ directory.
-# Alternatively, point to a git-fork to avoid committing vendor source:
-#   google-cloud-storage = { git = "https://github.com/<fork>/google-cloud-rust",
-#                             rev  = "<commit-hash>" }
-# ---------------------------------------------------------------------------
-[patch.crates-io]
-google-cloud-storage = { path = "vendor/google-cloud-storage" }
-# s3dlio patch: configure HTTP/2 flow-control windows for high-throughput GCS gRPC
-# (see vendor/google-cloud-gax-internal/src/grpc.rs — make_endpoint function)
-google-cloud-gax-internal = { path = "vendor/google-cloud-gax-internal" }
+# Development: path = "../google-cloud-rust/src/..."
+# Released:    git  = "https://github.com/russfellows/google-cloud-rust", rev = "<hash>"
