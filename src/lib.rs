@@ -9,11 +9,8 @@ compile_error!("Enable only one of: native-backends or arrow-backend");
 #[cfg(not(any(feature = "native-backends", feature = "arrow-backend")))]
 compile_error!("Must enable either 'native-backends' or 'arrow-backend' feature");
 
-// The 'gcs-community' feature is a legacy opt-in alternative (JSON API, no RAPID).
-// The official Google gRPC client is always compiled — do not enable gcs-community
-// alongside it as both define the same GcsClient symbol.
-#[cfg(feature = "gcs-community")]
-compile_error!("'gcs-community' conflicts with the built-in Google GCS client. Remove 'gcs-community' from your feature list.");
+// The 'gcs-community' feature is a legacy opt-in alternative (JSON API, no RAPID)
+// selected under the shared `backend-gcs` backend gate.
 
 // ===== Core Public API =====
 // This is the main stable API that external users should use
@@ -76,6 +73,7 @@ pub mod tfrecord_index;
 pub mod object_store_logger;  // Op-log support for all backends
 pub mod data_loader;
 pub mod checkpoint;
+#[cfg(feature = "backend-azure")]
 pub mod azure_client;
 
 // NUMA topology detection (optional, feature-gated)
@@ -86,8 +84,10 @@ pub mod numa;
 #[cfg(feature = "gcs-community")]
 pub mod gcs_client;  // Community-maintained gcloud-storage implementation
 
+#[cfg(feature = "backend-gcs")]
 pub mod gcs_constants;      // Single source of truth for all GCS/gRPC tuning constants
-pub mod google_gcs_client;  // Official Google google-cloud-storage implementation (always compiled)
+#[cfg(feature = "backend-gcs")]
+pub mod google_gcs_client;  // Official Google google-cloud-storage implementation
 
 /// Pre-configure the number of gRPC subchannels (TCP connections) the GCS client
 /// will open.  Call this once, before any GCS operation, to auto-tune throughput
@@ -103,7 +103,12 @@ pub mod google_gcs_client;  // Official Google google-cloud-storage implementati
 ///   2. The value set here
 ///   3. `max(64, cpu_count)` auto fallback
 pub fn set_gcs_channel_count(n: usize) {
+    #[cfg(feature = "backend-gcs")]
     google_gcs_client::set_gcs_channel_count(n);
+    #[cfg(not(feature = "backend-gcs"))]
+    {
+        let _ = n;
+    }
 }
 
 /// Pre-configure RAPID (Hyperdisk ML / zonal GCS) mode before the first GCS
@@ -115,7 +120,12 @@ pub fn set_gcs_channel_count(n: usize) {
 ///
 /// `S3DLIO_GCS_RAPID` env var still takes precedence if set.
 pub fn set_gcs_rapid_mode(force: Option<bool>) {
+    #[cfg(feature = "backend-gcs")]
     google_gcs_client::set_gcs_rapid_mode(force);
+    #[cfg(not(feature = "backend-gcs"))]
+    {
+        let _ = force;
+    }
 }
 
 /// Read back the programmatic GCS subchannel count.
@@ -124,7 +134,14 @@ pub fn set_gcs_rapid_mode(force: Option<bool>) {
 /// (`S3DLIO_GCS_GRPC_CHANNELS` env var or auto-detect will be used on first
 /// client initialization).
 pub fn get_gcs_channel_count() -> usize {
-    google_gcs_client::get_gcs_channel_count()
+    #[cfg(feature = "backend-gcs")]
+    {
+        return google_gcs_client::get_gcs_channel_count();
+    }
+    #[cfg(not(feature = "backend-gcs"))]
+    {
+        return 0;
+    }
 }
 
 /// Read back the current effective GCS RAPID mode setting.
@@ -134,7 +151,14 @@ pub fn get_gcs_channel_count() -> usize {
 /// - `Some(false)` — RAPID forced off
 /// - `None`        — auto-detect per bucket (default)
 pub fn get_gcs_rapid_mode() -> Option<bool> {
-    google_gcs_client::get_gcs_rapid_mode()
+    #[cfg(feature = "backend-gcs")]
+    {
+        return google_gcs_client::get_gcs_rapid_mode();
+    }
+    #[cfg(not(feature = "backend-gcs"))]
+    {
+        return None;
+    }
 }
 
 /// Query whether a GCS bucket or `gs://` URI is a RAPID (Hyperdisk ML / zonal) bucket.
@@ -143,7 +167,15 @@ pub fn get_gcs_rapid_mode() -> Option<bool> {
 /// bucket name or a full `gs://bucket/prefix/` URI.
 /// Returns `false` on authentication/network errors (logs a warning).
 pub async fn query_gcs_rapid_bucket(bucket_or_uri: &str) -> bool {
-    google_gcs_client::query_gcs_rapid_bucket(bucket_or_uri).await
+    #[cfg(feature = "backend-gcs")]
+    {
+        return google_gcs_client::query_gcs_rapid_bucket(bucket_or_uri).await;
+    }
+    #[cfg(not(feature = "backend-gcs"))]
+    {
+        let _ = bucket_or_uri;
+        return false;
+    }
 }
 
 pub mod list_containers;    // Backend-agnostic bucket/container listing (s3://, gs://, az://, file://)
@@ -192,6 +224,9 @@ pub use object_store::{
     store_for_uri_with_high_performance_cloud,
     generic_upload_files,
     generic_download_objects,
+    generic_upload_files_with_summary,
+    generic_download_objects_with_summary,
+    TransferSummary,
 };
 
 // Arrow backend specific exports

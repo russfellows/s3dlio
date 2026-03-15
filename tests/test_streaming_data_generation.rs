@@ -247,6 +247,11 @@ fn test_different_generators_produce_different_data() {
 #[test]
 fn test_streaming_performance() {
     use std::time::Instant;
+
+    if cfg!(debug_assertions) {
+        println!("Skipping streaming performance threshold in non-optimized build (debug assertions enabled)");
+        return;
+    }
     
     let size = 1024 * 1024; // 1MB
     let chunk_size = 64 * 1024; // 64KB chunks

@@ -9,10 +9,19 @@ use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
 use google_cloud_gax::paginator::ItemPaginator;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use tokio::sync::OnceCell;
 use tracing::{debug, info, trace, warn};
+use crate::constants::{
+    BYTES_PER_GIB, DEFAULT_GCS_READ_PROGRESS_INTERVAL_SECS,
+    DEFAULT_GCS_READ_TIMEOUT_MAX_SECS, DEFAULT_GCS_READ_TIMEOUT_MIN_SECS,
+    DEFAULT_GCS_READ_TIMEOUT_SECS_PER_GIB, ENV_GCS_BIDI_ATTEMPT_TIMEOUT_SECS,
+    ENV_GCS_READ_CHUNK_TIMEOUT_SECS, ENV_GCS_READ_PROGRESS_INTERVAL_SECS,
+    ENV_GCS_READ_TIMEOUT_MAX_SECS, ENV_GCS_READ_TIMEOUT_MIN_SECS,
+    ENV_GCS_READ_TIMEOUT_SECS_PER_GIB,
+};
 use crate::gcs_constants::{
     DEFAULT_WINDOW_MIB, ENV_GCS_GRPC_CHANNELS, ENV_GRPC_INITIAL_WINDOW_MIB,
     GCS_MAX_CONCURRENT_DELETES, GCS_MIN_CHANNELS,
@@ -21,6 +30,9 @@ use crate::gcs_constants::{
 // Global cached GCS clients - initialized once and reused across all operations
 static GCS_STORAGE: OnceCell<Arc<Storage>> = OnceCell::const_new();
 static GCS_CONTROL: OnceCell<Arc<StorageControl>> = OnceCell::const_new();
+static EFFECTIVE_GCS_RAPID_MODE: std::sync::OnceLock<RapidMode> = std::sync::OnceLock::new();
+const GCS_FULL_READ_REPAIR_MAX_ATTEMPTS: usize = 4;
+const GCS_FULL_READ_RETRY_MAX_ATTEMPTS: usize = 3;
 
 /// Desired gRPC subchannel count, set by the caller before the first GCS operation.
 ///
@@ -174,6 +186,7 @@ pub(crate) enum RapidMode {
 /// | unset / `auto`               | auto-detect via storage layout     |
 /// | `true` / `1` / `yes`         | force RAPID on all buckets         |
 /// | `false` / `0` / `no`         | force standard mode on all buckets |
+#[derive(Clone)]
 pub struct GcsClient {
     storage: Arc<Storage>,
     control: Arc<StorageControl>,
@@ -274,12 +287,15 @@ impl GcsClient {
             })
             .await?;
         
-        let rapid_mode = read_rapid_mode();
-        match rapid_mode {
-            RapidMode::ForceOn  => info!("GCS RAPID mode: forced ON (gRPC + appendable writes)"),
-            RapidMode::ForceOff => info!("GCS RAPID mode: forced OFF (standard HTTP reads)"),
-            RapidMode::Auto     => debug!("GCS RAPID mode: auto-detect per bucket"),
-        }
+        let rapid_mode = *EFFECTIVE_GCS_RAPID_MODE.get_or_init(|| {
+            let mode = read_rapid_mode();
+            match mode {
+                RapidMode::ForceOn  => info!("GCS RAPID mode: forced ON (gRPC + appendable writes)"),
+                RapidMode::ForceOff => info!("GCS RAPID mode: forced OFF (standard HTTP reads)"),
+                RapidMode::Auto     => debug!("GCS RAPID mode: auto-detect per bucket"),
+            }
+            mode
+        });
 
         Ok(Self {
             storage: Arc::clone(storage),
@@ -371,31 +387,216 @@ impl GcsClient {
         object: &str,
         range: ReadRange,
     ) -> Result<Bytes> {
-        let (descriptor, mut reader) = self.storage
+        let requested_range = range.clone();
+        let (expected_size, mut data, mut chunk_count) = if requested_range == ReadRange::all() {
+            let mut attempt = 0usize;
+            loop {
+                attempt += 1;
+                match self
+                    .get_object_via_grpc_once(bucket_name, bucket, object, range.clone())
+                    .await
+                {
+                    Ok(result) => break result,
+                    Err(e)
+                        if attempt < GCS_FULL_READ_RETRY_MAX_ATTEMPTS
+                            && is_retryable_gcs_read_error(&e.to_string()) =>
+                    {
+                        info!(
+                            "GCS GET (gRPC) full-read attempt {}/{} failed for gs://{}/{}; retrying quickly: {}",
+                            attempt,
+                            GCS_FULL_READ_RETRY_MAX_ATTEMPTS,
+                            bucket,
+                            object,
+                            e
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        } else {
+            self.get_object_via_grpc_once(bucket_name, bucket, object, range)
+                .await?
+        };
+
+        if requested_range == ReadRange::all() {
+            if should_repair_incomplete_full_read(&requested_range, expected_size, data.len()) {
+                let mut repair_attempts = 0usize;
+
+                while data.len() < expected_size && repair_attempts < GCS_FULL_READ_REPAIR_MAX_ATTEMPTS {
+                    let offset = data.len() as u64;
+                    let remaining = (expected_size - data.len()) as u64;
+                    repair_attempts += 1;
+
+                    debug!(
+                        "GCS GET (gRPC) detected truncated full read for gs://{}/{} (got {} < expected {}), repairing tail offset={} len={} (attempt {}/{})",
+                        bucket,
+                        object,
+                        data.len(),
+                        expected_size,
+                        offset,
+                        remaining,
+                        repair_attempts,
+                        GCS_FULL_READ_REPAIR_MAX_ATTEMPTS
+                    );
+
+                    let (_, tail, tail_chunks) = self
+                        .get_object_via_grpc_once(
+                            bucket_name,
+                            bucket,
+                            object,
+                            ReadRange::segment(offset, remaining),
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow!(
+                                "GCS GET (gRPC) tail repair failed for gs://{}/{} at offset {} (remaining {}): {}",
+                                bucket,
+                                object,
+                                offset,
+                                remaining,
+                                e
+                            )
+                        })?;
+
+                    if tail.is_empty() {
+                        break;
+                    }
+
+                    data.put_slice(tail.as_ref());
+                    chunk_count += tail_chunks;
+                }
+            }
+
+            if data.len() != expected_size {
+                return Err(anyhow!(
+                    "GCS GET (gRPC) incomplete full read for gs://{}/{}: got {} bytes, expected {} bytes",
+                    bucket,
+                    object,
+                    data.len(),
+                    expected_size
+                ));
+            }
+        }
+
+        debug!("GCS GET (gRPC) success: {} bytes in {} chunk(s)", data.len(), chunk_count);
+        Ok(data.freeze())
+    }
+
+    async fn get_object_via_grpc_once(
+        &self,
+        bucket_name: &str,
+        bucket: &str,
+        object: &str,
+        range: ReadRange,
+    ) -> Result<(usize, BytesMut, u32)> {
+        let requested_range = range.clone();
+        let attempt_timeout = gcs_bidi_attempt_timeout();
+        let (descriptor, mut reader) = match self
+            .storage
             .open_object(bucket_name, object)
+            .with_attempt_timeout(attempt_timeout)
             .send_and_read(range)
             .await
-            .map_err(|e| anyhow!("GCS GET (gRPC) failed for gs://{}/{}: {}", bucket, object, e))?;
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let error_text = e.to_string();
+                if should_treat_out_of_range_as_empty_full_read(&error_text, &requested_range) {
+                    match self.get_object_metadata(bucket, object).await {
+                        Ok(metadata) if metadata.size == 0 => {
+                            debug!(
+                                "GCS GET (gRPC) empty-object fallback: treating OUT_OF_RANGE as empty for gs://{}/{}",
+                                bucket, object
+                            );
+                            return Ok((0, BytesMut::new(), 0));
+                        }
+                        Ok(metadata) => {
+                            trace!(
+                                "GCS GET (gRPC) OUT_OF_RANGE not treated as empty: metadata.size={} for gs://{}/{}",
+                                metadata.size,
+                                bucket,
+                                object
+                            );
+                        }
+                        Err(meta_err) => {
+                            trace!(
+                                "GCS GET (gRPC) OUT_OF_RANGE metadata check failed for gs://{}/{}: {}",
+                                bucket,
+                                object,
+                                meta_err
+                            );
+                        }
+                    }
+                }
 
-        // Pre-allocate using the object size from the descriptor to avoid
-        // repeated reallocations as chunks stream in.  For a range read the
-        // object size is the full size, so this may slightly over-allocate,
-        // but that is far cheaper than multiple realloc+memcpy cycles.
-        // BytesMut::freeze() is zero-copy — it transitions the buffer to an
-        // immutable Arc-backed Bytes without any data movement.
+                return Err(anyhow!(
+                    "GCS GET (gRPC) failed for gs://{}/{}: {}",
+                    bucket,
+                    object,
+                    e
+                ));
+            }
+        };
+
         let size_hint = descriptor.object().size as usize;
         let mut data = BytesMut::with_capacity(size_hint);
+        let chunk_timeout = gcs_read_chunk_timeout(size_hint as u64);
+        let progress_interval = gcs_read_chunk_progress_interval();
         let mut chunk_count: u32 = 0;
-        while let Some(chunk) = reader.next().await.transpose()
-            .map_err(|e| anyhow!("GCS GET (gRPC) stream error for gs://{}/{}: {}", bucket, object, e))?
+        while let Some(chunk) = {
+            let next_chunk = if let Some(timeout) = chunk_timeout {
+                let wait_started = Instant::now();
+                loop {
+                    let waited = wait_started.elapsed();
+                    if waited >= timeout {
+                        return Err(anyhow!(
+                            "GCS GET (gRPC) timeout for gs://{}/{} after {} chunk(s), {} byte(s), chunk-timeout={}s",
+                            bucket,
+                            object,
+                            chunk_count,
+                            data.len(),
+                            timeout.as_secs()
+                        ));
+                    }
+
+                    let remaining = timeout.saturating_sub(waited);
+                    let step = if remaining < progress_interval {
+                        remaining
+                    } else {
+                        progress_interval
+                    };
+
+                    match tokio::time::timeout(step, reader.next()).await {
+                        Ok(next) => break next,
+                        Err(_) => {
+                            let now_waited = wait_started.elapsed().as_secs();
+                            info!(
+                                "GCS GET (gRPC) waiting for next chunk for gs://{}/{} (waited={}s, chunk-timeout={}s, received_chunks={}, received_bytes={})",
+                                bucket,
+                                object,
+                                now_waited,
+                                timeout.as_secs(),
+                                chunk_count,
+                                data.len()
+                            );
+                        }
+                    }
+                }
+            } else {
+                reader.next().await
+            };
+            next_chunk
+        }
+        .transpose()
+        .map_err(|e| anyhow!("GCS GET (gRPC) stream error for gs://{}/{}: {}", bucket, object, e))?
         {
             chunk_count += 1;
             trace!("GCS GET (gRPC) chunk #{}: {} bytes", chunk_count, chunk.len());
             data.put_slice(&chunk);
         }
 
-        debug!("GCS GET (gRPC) success: {} bytes in {} chunk(s)", data.len(), chunk_count);
-        Ok(data.freeze())
+        Ok((size_hint, data, chunk_count))
     }
 
     /// Internal: read an object (or optional range) via standard HTTP (`read_object`).
@@ -831,6 +1032,94 @@ pub(crate) fn format_bucket_name(bucket: &str) -> String {
     format!("projects/_/buckets/{}", bucket)
 }
 
+fn is_gcs_out_of_range_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("out_of_range")
+        || normalized.contains("outside the valid object range")
+}
+
+fn should_treat_out_of_range_as_empty_full_read(message: &str, requested_range: &ReadRange) -> bool {
+    is_gcs_out_of_range_error(message) && *requested_range == ReadRange::all()
+}
+
+fn should_repair_incomplete_full_read(
+    requested_range: &ReadRange,
+    expected_size: usize,
+    actual_size: usize,
+) -> bool {
+    *requested_range == ReadRange::all() && actual_size < expected_size
+}
+
+fn is_retryable_gcs_read_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("timeout")
+        || normalized.contains("unavailable")
+        || normalized.contains("cancel")
+        || normalized.contains("resource_exhausted")
+}
+
+fn gcs_read_chunk_timeout(expected_size_bytes: u64) -> Option<Duration> {
+    let timeout_secs = std::env::var(ENV_GCS_READ_CHUNK_TIMEOUT_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| gcs_scaled_timeout_secs(expected_size_bytes));
+
+    if timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(timeout_secs))
+    }
+}
+
+fn gcs_bidi_attempt_timeout() -> Duration {
+    let timeout_secs = std::env::var(ENV_GCS_BIDI_ATTEMPT_TIMEOUT_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| gcs_scaled_timeout_secs(0));
+
+    Duration::from_secs(timeout_secs)
+}
+
+fn gcs_read_chunk_progress_interval() -> Duration {
+    let interval_secs = std::env::var(ENV_GCS_READ_PROGRESS_INTERVAL_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_GCS_READ_PROGRESS_INTERVAL_SECS);
+
+    Duration::from_secs(interval_secs)
+}
+
+fn gcs_scaled_timeout_secs(expected_size_bytes: u64) -> u64 {
+    let per_gib = std::env::var(ENV_GCS_READ_TIMEOUT_SECS_PER_GIB)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_GCS_READ_TIMEOUT_SECS_PER_GIB);
+
+    let min_secs = std::env::var(ENV_GCS_READ_TIMEOUT_MIN_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_GCS_READ_TIMEOUT_MIN_SECS);
+
+    let max_secs = std::env::var(ENV_GCS_READ_TIMEOUT_MAX_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_GCS_READ_TIMEOUT_MAX_SECS);
+
+    let scaled = if expected_size_bytes == 0 {
+        0
+    } else {
+        expected_size_bytes
+            .saturating_mul(per_gib)
+            .div_ceil(BYTES_PER_GIB)
+    };
+    scaled.clamp(min_secs, max_secs)
+}
+
 /// Parse a GCS URI (gs://bucket/path/to/object) into (bucket, object_path).
 /// 
 /// Bucket-only URIs are also supported (for prefix listings):
@@ -1181,6 +1470,116 @@ mod tests {
 
         assert_eq!(raw, "false", "shell env var must not be overridden by .env");
         assert_eq!(rapid, RapidMode::ForceOff, "read_rapid_mode() must respect the shell-set value");
+    }
+
+    #[test]
+    fn test_is_gcs_out_of_range_error_matches_known_patterns() {
+        assert!(is_gcs_out_of_range_error("OUT_OF_RANGE"));
+        assert!(is_gcs_out_of_range_error(
+            "The provided read ranges are outside the valid object range"
+        ));
+        assert!(is_gcs_out_of_range_error(
+            "the service reports an error with code OUT_OF_RANGE described as: The provided read ranges are outside the valid object range."
+        ));
+        assert!(!is_gcs_out_of_range_error("RESOURCE_EXHAUSTED"));
+    }
+
+    #[test]
+    fn test_should_treat_out_of_range_as_empty_full_read_only_for_full_reads() {
+        let msg = "OUT_OF_RANGE: The provided read ranges are outside the valid object range.";
+        assert!(should_treat_out_of_range_as_empty_full_read(msg, &ReadRange::all()));
+        assert!(!should_treat_out_of_range_as_empty_full_read(msg, &ReadRange::segment(0, 1)));
+        assert!(!should_treat_out_of_range_as_empty_full_read("INTERNAL", &ReadRange::all()));
+    }
+
+    #[test]
+    fn test_should_repair_incomplete_full_read() {
+        assert!(should_repair_incomplete_full_read(&ReadRange::all(), 8 * 1024 * 1024, 3_162_112));
+        assert!(!should_repair_incomplete_full_read(&ReadRange::all(), 8 * 1024 * 1024, 8 * 1024 * 1024));
+        assert!(!should_repair_incomplete_full_read(&ReadRange::segment(0, 1024), 1024, 512));
+    }
+
+    #[test]
+    fn test_is_retryable_gcs_read_error() {
+        assert!(is_retryable_gcs_read_error("timeout for gs://bucket/object"));
+        assert!(is_retryable_gcs_read_error("UNAVAILABLE: upstream reset"));
+        assert!(is_retryable_gcs_read_error("CANCELLED by peer"));
+        assert!(!is_retryable_gcs_read_error("PERMISSION_DENIED"));
+    }
+
+    #[test]
+    fn test_gcs_read_chunk_timeout_default() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("S3DLIO_GCS_READ_CHUNK_TIMEOUT_SECS");
+        assert_eq!(gcs_read_chunk_timeout(8 * 1024 * 1024), Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn test_gcs_read_chunk_timeout_disabled_when_zero() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_READ_CHUNK_TIMEOUT_SECS", "0");
+        let timeout = gcs_read_chunk_timeout(8 * 1024 * 1024);
+        std::env::remove_var("S3DLIO_GCS_READ_CHUNK_TIMEOUT_SECS");
+        assert_eq!(timeout, None);
+    }
+
+    #[test]
+    fn test_gcs_read_chunk_timeout_from_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_READ_CHUNK_TIMEOUT_SECS", "7");
+        let timeout = gcs_read_chunk_timeout(8 * 1024 * 1024);
+        std::env::remove_var("S3DLIO_GCS_READ_CHUNK_TIMEOUT_SECS");
+        assert_eq!(timeout, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn test_gcs_scaled_timeout_secs_uses_min_for_small_objects() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("S3DLIO_GCS_READ_TIMEOUT_SECS_PER_GIB");
+        std::env::remove_var("S3DLIO_GCS_READ_TIMEOUT_MIN_SECS");
+        std::env::remove_var("S3DLIO_GCS_READ_TIMEOUT_MAX_SECS");
+        assert_eq!(gcs_scaled_timeout_secs(8 * 1024 * 1024), 12);
+    }
+
+    #[test]
+    fn test_gcs_scaled_timeout_secs_scales_by_object_size() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("S3DLIO_GCS_READ_TIMEOUT_SECS_PER_GIB");
+        std::env::remove_var("S3DLIO_GCS_READ_TIMEOUT_MIN_SECS");
+        std::env::remove_var("S3DLIO_GCS_READ_TIMEOUT_MAX_SECS");
+        assert_eq!(gcs_scaled_timeout_secs(3 * 1024 * 1024 * 1024), 135);
+    }
+
+    #[test]
+    fn test_gcs_read_chunk_progress_interval_default() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("S3DLIO_GCS_READ_PROGRESS_INTERVAL_SECS");
+        assert_eq!(gcs_read_chunk_progress_interval(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_gcs_read_chunk_progress_interval_from_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_READ_PROGRESS_INTERVAL_SECS", "2");
+        let interval = gcs_read_chunk_progress_interval();
+        std::env::remove_var("S3DLIO_GCS_READ_PROGRESS_INTERVAL_SECS");
+        assert_eq!(interval, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_gcs_bidi_attempt_timeout_default() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("S3DLIO_GCS_BIDI_ATTEMPT_TIMEOUT_SECS");
+        assert_eq!(gcs_bidi_attempt_timeout(), Duration::from_secs(12));
+    }
+
+    #[test]
+    fn test_gcs_bidi_attempt_timeout_from_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("S3DLIO_GCS_BIDI_ATTEMPT_TIMEOUT_SECS", "4");
+        let timeout = gcs_bidi_attempt_timeout();
+        std::env::remove_var("S3DLIO_GCS_BIDI_ATTEMPT_TIMEOUT_SECS");
+        assert_eq!(timeout, Duration::from_secs(4));
     }
 }
 

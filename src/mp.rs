@@ -68,8 +68,17 @@ impl Default for MpGetConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerSummary {
     pub worker_id: usize,
-    pub objects: u64,
-    pub bytes: u64,
+    pub attempted: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub bytes: Option<u64>,
+}
+
+/// Indicates whether byte totals are based on observed metrics or unavailable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BytesSource {
+    Observed,
+    Unknown,
 }
 
 /// Overall run summary with aggregated statistics
@@ -80,36 +89,40 @@ pub struct RunSummary {
     pub elapsed_seconds: f64,
     pub procs: usize,
     pub concurrent_per_proc: usize,
-    pub total_objects: u64,
-    pub total_bytes: u64,
+    pub attempted: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub total_bytes: Option<u64>,
+    pub bytes_source: BytesSource,
     pub per_worker: Vec<WorkerSummary>,
 }
 
 impl RunSummary {
     /// Calculate total throughput in MB/s
-    pub fn throughput_mbps(&self) -> f64 {
-        if self.elapsed_seconds > 0.0 {
-            (self.total_bytes as f64 / (1024.0 * 1024.0)) / self.elapsed_seconds
-        } else {
-            0.0
-        }
+    pub fn throughput_mbps(&self) -> Option<f64> {
+        self.total_bytes.and_then(|bytes| {
+            if self.elapsed_seconds > 0.0 {
+                Some((bytes as f64 / (1024.0 * 1024.0)) / self.elapsed_seconds)
+            } else {
+                None
+            }
+        })
     }
 
     /// Calculate operations per second
     pub fn ops_per_second(&self) -> f64 {
         if self.elapsed_seconds > 0.0 {
-            self.total_objects as f64 / self.elapsed_seconds
+            self.succeeded as f64 / self.elapsed_seconds
         } else {
             0.0
         }
     }
 
     /// Calculate average object size in bytes
-    pub fn avg_object_size(&self) -> f64 {
-        if self.total_objects > 0 {
-            self.total_bytes as f64 / self.total_objects as f64
-        } else {
-            0.0
+    pub fn avg_object_size(&self) -> Option<f64> {
+        match (self.total_bytes, self.succeeded) {
+            (Some(bytes), succeeded) if succeeded > 0 => Some(bytes as f64 / succeeded as f64),
+            _ => None,
         }
     }
 }
@@ -150,6 +163,7 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
     };
 
     // Spawn worker processes
+    let mut stderr_files: Vec<Option<PathBuf>> = vec![None; cfg.procs];
     let mut children = Vec::with_capacity(cfg.procs);
     for (i, shard_file) in shard_files.iter().enumerate() {
         let mut cmd = Command::new(&cfg.worker_cmd);
@@ -210,7 +224,11 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
         if cfg.passthrough_io {
             cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         } else {
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            let stderr_path = run_dir_path.join(format!("worker_{}.stderr.log", i));
+            let stderr_file = File::create(&stderr_path)
+                .with_context(|| format!("Failed to create stderr file: {:?}", stderr_path))?;
+            cmd.stdout(Stdio::null()).stderr(Stdio::from(stderr_file));
+            stderr_files[i] = Some(stderr_path);
         }
 
         // Spawn the worker
@@ -222,17 +240,41 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
 
     // Wait for all workers to complete
     let mut summaries = Vec::with_capacity(cfg.procs);
+    let mut worker_failures: Vec<String> = Vec::new();
     for (worker_id, mut child) in children {
         let status = child.wait()
             .with_context(|| format!("Failed to wait for worker {}", worker_id))?;
-        
-        if !status.success() {
-            eprintln!("Worker {} exited with non-zero status: {:?}", worker_id, status);
-        }
 
         // Parse worker results
         let shard_size = shards.get(worker_id).map(|s| s.len()).unwrap_or(0) as u64;
-        let summary = summarize_worker(worker_id, oplog_files.get(worker_id).and_then(|o| o.as_ref()), shard_size)
+        let stderr_path = stderr_files.get(worker_id).and_then(|p| p.as_ref());
+        if !status.success() {
+            let first_stderr = stderr_path
+                .map(|p| read_first_non_empty_line(p.as_path()))
+                .flatten()
+                .unwrap_or_else(|| "(no stderr output captured)".to_string());
+            let status_code = status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "terminated by signal".to_string());
+
+            worker_failures.push(format!(
+                "worker={} status={} stderr={} stderr_path={}",
+                worker_id,
+                status_code,
+                first_stderr,
+                stderr_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(passthrough)".to_string())
+            ));
+        }
+
+        let summary = summarize_worker(
+            worker_id,
+            oplog_files.get(worker_id).and_then(|o| o.as_ref()),
+            shard_size,
+            status.success(),
+        )
             .with_context(|| format!("Failed to summarize worker {}", worker_id))?;
         
         summaries.push(summary);
@@ -241,8 +283,34 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
     let elapsed = start.elapsed().as_secs_f64();
     let finished_at = chrono::Utc::now().to_rfc3339();
 
-    let total_objects: u64 = summaries.iter().map(|s| s.objects).sum();
-    let total_bytes: u64 = summaries.iter().map(|s| s.bytes).sum();
+    let attempted: u64 = summaries.iter().map(|s| s.attempted).sum();
+    let succeeded: u64 = summaries.iter().map(|s| s.succeeded).sum();
+    let failed: u64 = summaries.iter().map(|s| s.failed).sum();
+
+    let all_bytes_observed = summaries.iter().all(|s| s.bytes.is_some());
+    let (total_bytes, bytes_source) = if all_bytes_observed {
+        (
+            Some(summaries.iter().filter_map(|s| s.bytes).sum::<u64>()),
+            BytesSource::Observed,
+        )
+    } else {
+        (None, BytesSource::Unknown)
+    };
+
+    if !worker_failures.is_empty() {
+        eprintln!("\n=== Multi-Process GET Result (invalid) ===");
+        eprintln!(
+            "attempted={}, succeeded={}, failed={}, bytes_source={:?}",
+            attempted, succeeded, failed, bytes_source
+        );
+        eprintln!("Worker failures:");
+        for detail in &worker_failures {
+            eprintln!("  - {}", detail);
+        }
+        anyhow::bail!(
+            "mp-get failed: one or more workers exited non-zero; metrics are invalid due to worker failures, throughput omitted"
+        );
+    }
 
     Ok(RunSummary {
         started_at,
@@ -250,8 +318,11 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
         elapsed_seconds: elapsed,
         procs: cfg.procs,
         concurrent_per_proc: cfg.concurrent_per_proc,
-        total_objects,
+        attempted,
+        succeeded,
+        failed,
         total_bytes,
+        bytes_source,
         per_worker: summaries,
     })
 }
@@ -401,30 +472,46 @@ fn shard_keys(keys: &[String], procs: usize) -> Vec<Vec<String>> {
     shards
 }
 
-fn summarize_worker(worker_id: usize, oplog_path: Option<&PathBuf>, shard_size: u64) -> Result<WorkerSummary> {
+fn summarize_worker(
+    worker_id: usize,
+    oplog_path: Option<&PathBuf>,
+    shard_size: u64,
+    worker_succeeded: bool,
+) -> Result<WorkerSummary> {
     if let Some(path) = oplog_path {
         if path.exists() {
-            return parse_oplog(worker_id, path);
+            let (observed_objects, observed_bytes) = parse_oplog(path)?;
+            let succeeded = observed_objects.min(shard_size);
+            let failed = shard_size.saturating_sub(succeeded);
+            return Ok(WorkerSummary {
+                worker_id,
+                attempted: shard_size,
+                succeeded,
+                failed,
+                bytes: observed_bytes,
+            });
         }
     }
-    
-    // If no oplog available, assume all objects in shard were processed successfully
-    // For benchmarking, estimate bytes based on typical object size (1MB per object is common)
-    let estimated_bytes = shard_size * 1_048_576; // Assume 1MB per object for benchmarking
+
+    let succeeded = if worker_succeeded { shard_size } else { 0 };
+    let failed = shard_size.saturating_sub(succeeded);
     Ok(WorkerSummary {
         worker_id,
-        objects: shard_size,
-        bytes: estimated_bytes,
+        attempted: shard_size,
+        succeeded,
+        failed,
+        bytes: None,
     })
 }
 
-fn parse_oplog(worker_id: usize, path: &Path) -> Result<WorkerSummary> {
+fn parse_oplog(path: &Path) -> Result<(u64, Option<u64>)> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open oplog: {:?}", path))?;
     let reader = BufReader::new(file);
     
     let mut objects = 0u64;
     let mut bytes = 0u64;
+    let mut saw_bytes = false;
     
     for line in reader.lines() {
         let line = line.context("Failed to read oplog line")?;
@@ -432,16 +519,26 @@ fn parse_oplog(worker_id: usize, path: &Path) -> Result<WorkerSummary> {
             // Extract bytes if present
             if let Some(size) = value.get("bytes").and_then(|v| v.as_u64()) {
                 bytes += size;
+                saw_bytes = true;
             }
             objects += 1;
         }
     }
-    
-    Ok(WorkerSummary {
-        worker_id,
-        objects,
-        bytes,
-    })
+
+    Ok((objects, if saw_bytes { Some(bytes) } else { None }))
+}
+
+fn read_first_non_empty_line(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
 }
 
 // Simple hash function for sharding keys
@@ -507,13 +604,16 @@ mod tests {
             elapsed_seconds: 60.0,
             procs: 4,
             concurrent_per_proc: 64,
-            total_objects: 1000,
-            total_bytes: 1024 * 1024 * 100, // 100 MB
+            attempted: 1000,
+            succeeded: 1000,
+            failed: 0,
+            total_bytes: Some(1024 * 1024 * 100), // 100 MB
+            bytes_source: BytesSource::Observed,
             per_worker: vec![],
         };
 
         // Test throughput calculation
-        let throughput = summary.throughput_mbps();
+        let throughput = summary.throughput_mbps().unwrap();
         assert!((throughput - (100.0 / 60.0)).abs() < 0.01);
 
         // Test ops per second
@@ -521,7 +621,7 @@ mod tests {
         assert!((ops_per_sec - (1000.0 / 60.0)).abs() < 0.01);
 
         // Test average object size
-        let avg_size = summary.avg_object_size();
+        let avg_size = summary.avg_object_size().unwrap();
         // 100 MiB / 1000 objects = 104857.6 bytes per object
         assert_eq!(avg_size, 104857.6);
     }

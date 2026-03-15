@@ -30,17 +30,17 @@ aws-config         = "=1.8.14"
 aws-sdk-s3         = "=1.124.0"
 
 # Azure SDK crates (keep minor versions flexible; they evolve together)
-azure_core = { version = "=0.31.0" }          # Response/Body, paging, errors
-azure_identity = { version = "=0.31.0" }      # DefaultAzureCredential
-azure_storage_blob = { version = "=0.8.0" }   # Blob/Container/BlockBlob clients
+azure_core = { version = "=0.31.0", optional = true }          # Response/Body, paging, errors
+azure_identity = { version = "=0.31.0", optional = true }      # DefaultAzureCredential
+azure_storage_blob = { version = "=0.8.0", optional = true }   # Blob/Container/BlockBlob clients
 
 # Google Cloud Storage SDK
-# The official Google gRPC client (google-cloud-storage) is always compiled.
+# 'backend-gcs' enables official gRPC GCS support (google-cloud-rust).
 # 'gcs-community' is an optional legacy alternative (JSON-API, no RAPID support).
 gcloud-storage = { version = "^1.2", optional = true }  # Community GCS client (opt-in only)
-google-cloud-storage = { path = "../google-cloud-rust/src/storage" }             # Official Google GCS client (always on)
-google-cloud-gax = { path = "../google-cloud-rust/src/gax" }                     # Google Cloud GAX (always on)
-google-cloud-gax-internal = { path = "../google-cloud-rust/src/gax-internal", features = ["_internal-grpc-client"] }  # Direct dep: exposes gcs_constants
+google-cloud-storage = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1", optional = true }             # Official Google GCS client
+google-cloud-gax = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1", optional = true }                     # Google Cloud GAX
+google-cloud-gax-internal = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1", features = ["_internal-grpc-client"], optional = true }  # Direct dep: exposes gcs_constants
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat
@@ -156,10 +156,14 @@ criterion     = { version = "0.5", features = ["html_reports"] }
 # - 'numa' requires the hwloc2 C library (not available on WSL/minimal systems)
 # - 'hdf5' requires libhdf5 (not available on WSL/minimal systems)
 # Enable these manually: cargo build --features numa,hdf5
-default = ["s3", "native-backends", "thread-pinning"]
+default = ["s3", "native-backends", "thread-pinning", "backend-aws"]
 s3 = []
 native-backends = []                    # Current AWS/Azure implementations
-gcs-community = ["dep:gcloud-storage"]  # Legacy community GCS client (JSON API, no RAPID support; conflicts with default)
+backend-aws = []
+backend-azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_blob"]
+backend-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-gax-internal"]
+full-backends = ["backend-aws", "backend-azure", "backend-gcs"]
+gcs-community = ["backend-gcs", "dep:gcloud-storage"]  # Legacy community GCS client (JSON API, no RAPID support; conflicts with official GCS client)
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
 enhanced-http = ["dep:reqwest"]      # Enhanced HTTP client with HTTP/2 support
 direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
@@ -201,4 +205,4 @@ opt-level = 3
 # (unlike [patch.crates-io] which is silently ignored by downstream Cargo workspaces).
 #
 # Development: path = "../google-cloud-rust/src/..."
-# Released:    git  = "https://github.com/russfellows/google-cloud-rust", rev = "<hash>"
+# Released:    git  = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1"

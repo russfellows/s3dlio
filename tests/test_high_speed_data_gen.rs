@@ -21,6 +21,12 @@ const TEST_SIZE_BYTES: usize = 1024 * 1024 * 1024; // 1 GB test for speed
 /// This test runs quickly (< 2 seconds) and validates basic performance
 #[test]
 fn test_data_gen_sanity_check() {
+    if cfg!(debug_assertions) {
+        println!("\n=== Data Generation Sanity Check (Skipped) ===");
+        println!("Skipping performance threshold in non-optimized build (debug assertions enabled)");
+        return;
+    }
+
     println!("\n=== Data Generation Sanity Check ===");
     
     // Generate 64 MB - should complete in < 100ms on a modern system

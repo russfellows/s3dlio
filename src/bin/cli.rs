@@ -47,7 +47,10 @@ use s3dlio::{
     data_gen::generate_object,
 };
 
-use s3dlio::{generic_upload_files, generic_download_objects};
+use s3dlio::{
+    generic_download_objects_with_summary,
+    generic_upload_files_with_summary,
+};
 use s3dlio::{init_op_logger, finalize_op_logger, global_logger};
 use s3dlio::progress::{S3ProgressTracker, ProgressCallback};
 
@@ -171,7 +174,7 @@ enum Command {
     },
     /// Multi-process GET for maximum throughput (warp-level performance).
     MpGet {
-        /// S3 URI prefix for objects to download (e.g. s3://bucket/prefix/)
+        /// Storage URI prefix for objects to download (e.g. s3://bucket/prefix/, gs://bucket/prefix/)
         uri: String,
         
         /// Number of worker processes to spawn
@@ -185,10 +188,6 @@ enum Command {
         /// Number of objects to download (for testing/benchmarking)
         #[arg(short = 'n', long = "num", default_value_t = 1000)]
         num: usize,
-        
-        /// Object size in bytes (for generated object names)
-        #[arg(short = 's', long = "size", default_value_t = 1048576)]
-        size: usize,
         
         /// Template for object names (use {} for number placeholder)
         #[arg(short = 't', long = "template", default_value = "object_{}.dat")]
@@ -223,8 +222,8 @@ enum Command {
         #[arg( short = 'o', long = "object-type", value_enum, ignore_case = true, default_value_t = ObjectType::Raw)] // Without value_parser [] values are case insensitive
         object_type: ObjectType,
 
-        /// Object size in bytes (default 20 MB).
-        #[arg(short = 's', long = "size", default_value_t = DEFAULT_OBJECT_SIZE)]
+        /// Object size in bytes or human units (examples: 8388608, 8MB, 8MiB, 8m, 8M, 8g, 8GiB).
+        #[arg(short = 's', long = "size", default_value_t = DEFAULT_OBJECT_SIZE, value_parser = parse_human_size)]
         size: usize,
 
         /// Template for names. Use '{}' for replacement, first '{}' is object number, 2nd is total count.
@@ -269,6 +268,27 @@ enum Command {
         /// Download recursively
         #[clap(short, long)] 
         recursive: bool,     
+    },
+
+    /// Copy between local paths and storage URIs.
+    ///
+    /// Direction is inferred automatically:
+    /// - local -> URI  : upload
+    /// - URI   -> local: download
+    Cp {
+        /// Source local path or storage URI
+        src: String,
+        /// Destination local path or storage URI
+        dest: String,
+        /// Maximum parallel operations
+        #[arg(short = 'j', long = "jobs", default_value_t = 32)]
+        jobs: usize,
+        /// Recursive mode for URI-prefix downloads
+        #[clap(short, long)]
+        recursive: bool,
+        /// Create destination bucket/container when uploading (if supported)
+        #[arg(short = 'c', long = "create-bucket")]
+        create_bucket: bool,
     },
 
     /// List objects using generic storage URI (supports s3://, az://, gs://, file://, direct://)
@@ -348,6 +368,60 @@ fn requires_aws_credentials(uri: &str) -> bool {
     // Only S3 URIs require AWS credentials
     // Other schemes (gs://, az://, file://, direct://) use their own auth methods
     uri.starts_with("s3://")
+}
+
+fn is_storage_uri(path_or_uri: &str) -> bool {
+    path_or_uri.starts_with("s3://")
+        || path_or_uri.starts_with("gs://")
+        || path_or_uri.starts_with("gcs://")
+        || path_or_uri.starts_with("az://")
+        || path_or_uri.starts_with("azure://")
+        || path_or_uri.starts_with("file://")
+        || path_or_uri.starts_with("direct://")
+}
+
+fn parse_human_size(input: &str) -> std::result::Result<usize, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("size cannot be empty".to_string());
+    }
+
+    let numeric_len = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+
+    if numeric_len == 0 {
+        return Err(format!("invalid size '{}': must start with digits", input));
+    }
+
+    let (value_str, suffix_str) = trimmed.split_at(numeric_len);
+    let value: u128 = value_str
+        .parse()
+        .map_err(|_| format!("invalid size '{}': invalid number", input))?;
+
+    let suffix = suffix_str.trim().to_ascii_lowercase();
+    let multiplier: u128 = match suffix.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "ki" | "kib" => 1_024,
+        "mi" | "mib" => 1_048_576,
+        "gi" | "gib" => 1_073_741_824,
+        _ => {
+            return Err(format!(
+                "invalid size '{}': unsupported suffix '{}'. Supported: k, m, g, kb, mb, gb, ki, mi, gi, kib, mib, gib",
+                input, suffix_str
+            ))
+        }
+    };
+
+    let bytes = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("invalid size '{}': value is too large", input))?;
+
+    usize::try_from(bytes).map_err(|_| format!("invalid size '{}': value exceeds platform size", input))
 }
 
 /// Main CLI function
@@ -448,12 +522,12 @@ async fn main() -> Result<()> {
         }
         
         // Multi-process GET for maximum throughput
-        Command::MpGet { uri, procs, jobs, num, size, template, interval } => {
+        Command::MpGet { uri, procs, jobs, num, template, interval } => {
             // Check AWS credentials for S3 URIs
             if requires_aws_credentials(&uri) {
                 check_aws_credentials()?;
             }
-            mp_get_cmd(&uri, procs, jobs, num, size, &template, interval)?
+            mp_get_cmd(&uri, procs, jobs, num, &template, interval)?
         }
     
         Command::Delete { uri, jobs, recursive, pattern } => {
@@ -545,13 +619,27 @@ async fn main() -> Result<()> {
             }
 
             let t0 = Instant::now();
-            let result = generic_upload_files(&dest, &files, jobs, Some(progress_callback)).await;
+            let summary = generic_upload_files_with_summary(&dest, &files, jobs, Some(progress_callback)).await?;
             let elapsed = t0.elapsed();
 
             // Finish progress bar
             progress_tracker.finish("Upload", total_bytes, elapsed);
-            
-            result?
+
+            safe_println!(
+                "UPLOAD summary: attempted={}, succeeded={}, failed={}",
+                summary.attempted,
+                summary.succeeded,
+                summary.failed
+            );
+
+            if summary.failed > 0 {
+                bail!(
+                    "UPLOAD completed with failures: attempted={}, succeeded={}, failed={}",
+                    summary.attempted,
+                    summary.succeeded,
+                    summary.failed
+                );
+            }
         }
     
         Command::Download { src, dest_dir, jobs, recursive } => {
@@ -576,15 +664,120 @@ async fn main() -> Result<()> {
             let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), keys.len() as u64));
 
             let t0 = Instant::now();
-            let result = generic_download_objects(&src, &dest_dir, jobs, recursive, Some(progress_callback.clone())).await;
+            let summary = generic_download_objects_with_summary(&src, &dest_dir, jobs, recursive, Some(progress_callback.clone())).await?;
             let elapsed = t0.elapsed();
 
             // Get final byte count from progress callback and update the progress bar total
             let total_bytes = progress_callback.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
             progress_callback.update_total_bytes(total_bytes);
             progress_tracker.finish("Download", total_bytes, elapsed);
-            
-            result?
+
+            safe_println!(
+                "DOWNLOAD summary: attempted={}, succeeded={}, failed={}",
+                summary.attempted,
+                summary.succeeded,
+                summary.failed
+            );
+
+            if summary.failed > 0 {
+                bail!(
+                    "DOWNLOAD completed with failures: attempted={}, succeeded={}, failed={}",
+                    summary.attempted,
+                    summary.succeeded,
+                    summary.failed
+                );
+            }
+        }
+
+        Command::Cp { src, dest, jobs, recursive, create_bucket } => {
+            let src_is_uri = is_storage_uri(&src);
+            let dest_is_uri = is_storage_uri(&dest);
+
+            match (src_is_uri, dest_is_uri) {
+                (false, true) => {
+                    if requires_aws_credentials(&dest) {
+                        check_aws_credentials()?;
+                    }
+
+                    if create_bucket {
+                        let logger = global_logger();
+                        if let Ok(store) = store_for_uri_with_logger(&dest, logger) {
+                            if dest.starts_with("s3://") {
+                                if let Ok((bucket, _)) = parse_s3_uri(&dest) {
+                                    if let Err(e) = store.create_container(&bucket).await {
+                                        warn!("Failed to create bucket {}: {}", bucket, e);
+                                    }
+                                }
+                            } else if dest.starts_with("az://") || dest.starts_with("azure://") {
+                                let parts: Vec<&str> = dest.trim_start_matches("az://").trim_start_matches("azure://").split('/').collect();
+                                if let Some(container) = parts.first() {
+                                    if let Err(e) = store.create_container(container).await {
+                                        warn!("Failed to create container {}: {}", container, e);
+                                    }
+                                }
+                            } else if dest.starts_with("gs://") || dest.starts_with("gcs://") {
+                                let parts: Vec<&str> = dest.trim_start_matches("gs://").trim_start_matches("gcs://").split('/').collect();
+                                if let Some(bucket) = parts.first() {
+                                    if let Err(e) = store.create_container(bucket).await {
+                                        warn!("Failed to create GCS bucket {}: {}", bucket, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let files = vec![PathBuf::from(&src)];
+                    let summary = generic_upload_files_with_summary(&dest, &files, jobs, None).await?;
+                    safe_println!(
+                        "CP summary (upload): attempted={}, succeeded={}, failed={}",
+                        summary.attempted,
+                        summary.succeeded,
+                        summary.failed
+                    );
+                    if summary.failed > 0 {
+                        bail!(
+                            "cp (upload) completed with failures: attempted={}, succeeded={}, failed={}",
+                            summary.attempted,
+                            summary.succeeded,
+                            summary.failed
+                        );
+                    }
+                }
+                (true, false) => {
+                    if requires_aws_credentials(&src) {
+                        check_aws_credentials()?;
+                    }
+
+                    let summary = generic_download_objects_with_summary(
+                        &src,
+                        Path::new(&dest),
+                        jobs,
+                        recursive,
+                        None,
+                    )
+                    .await?;
+                    safe_println!(
+                        "CP summary (download): attempted={}, succeeded={}, failed={}",
+                        summary.attempted,
+                        summary.succeeded,
+                        summary.failed
+                    );
+                    if summary.failed > 0 {
+                        bail!(
+                            "cp (download) completed with failures: attempted={}, succeeded={}, failed={}",
+                            summary.attempted,
+                            summary.succeeded,
+                            summary.failed
+                        );
+                    }
+                }
+                (true, true) => {
+                    bail!("cp with URI->URI is not supported yet; use get/put, upload/download, or backend-native copy");
+                }
+                (false, false) => {
+                    bail!("cp expects one local path and one storage URI");
+                }
+            }
         }
     
         Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size } => {
@@ -864,6 +1057,8 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
         let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let mut futs = futures_util::stream::FuturesUnordered::new();
         let mut total_bytes = 0u64;
+        let mut success_count = 0u64;
+        let mut failure_count = 0u64;
         
         for uri in &uris {
             let sem = sem.clone();
@@ -885,9 +1080,21 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
         }
         
         while let Some(result) = futs.next().await {
-            let (uri, byte_count) = result??;
-            total_bytes += byte_count;
-            info!("Downloaded {} bytes from {}", byte_count, uri);
+            match result {
+                Ok(Ok((uri, byte_count))) => {
+                    total_bytes += byte_count;
+                    success_count += 1;
+                    info!("Downloaded {} bytes from {}", byte_count, uri);
+                }
+                Ok(Err(e)) => {
+                    failure_count += 1;
+                    warn!("GET failed: {}", e);
+                }
+                Err(e) => {
+                    failure_count += 1;
+                    warn!("GET task join failed: {}", e);
+                }
+            }
         }
         
         let dt = t0.elapsed();
@@ -900,6 +1107,21 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
         let throughput_mb_s = (total_bytes as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64();
         println!("Benchmarked {} objects: {} bytes in {:.3}s ({:.2} MB/s)", 
                  uris.len(), total_bytes, dt.as_secs_f64(), throughput_mb_s);
+        safe_println!(
+            "GET summary: attempted={}, succeeded={}, failed={}",
+            uris.len(),
+            success_count,
+            failure_count
+        );
+
+        if failure_count > 0 {
+            bail!(
+                "GET completed with failures: attempted={}, succeeded={}, failed={}",
+                uris.len(),
+                success_count,
+                failure_count
+            );
+        }
         
         return Ok(());
     }
@@ -960,6 +1182,8 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
     let sem = Arc::new(tokio::sync::Semaphore::new(jobs));
     let mut futs = futures_util::stream::FuturesUnordered::new();
     let mut total_bytes = 0u64;
+    let mut success_count = 0u64;
+    let mut failure_count = 0u64;
     
     for uri in &keys {
         let sem = sem.clone();
@@ -981,9 +1205,21 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
     }
     
     while let Some(result) = futs.next().await {
-        let (uri, byte_count) = result??;
-        total_bytes += byte_count;
-        info!("Downloaded {} bytes from {}", byte_count, uri);
+        match result {
+            Ok(Ok((uri, byte_count))) => {
+                total_bytes += byte_count;
+                success_count += 1;
+                info!("Downloaded {} bytes from {}", byte_count, uri);
+            }
+            Ok(Err(e)) => {
+                failure_count += 1;
+                warn!("GET failed: {}", e);
+            }
+            Err(e) => {
+                failure_count += 1;
+                warn!("GET task join failed: {}", e);
+            }
+        }
     }
     
     let dt = t0.elapsed();
@@ -992,15 +1228,42 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
     progress_callback.update_total_bytes(total_bytes);
     progress_tracker.finish("Download", total_bytes, dt);
 
+    safe_println!(
+        "GET summary: attempted={}, succeeded={}, failed={}",
+        keys.len(),
+        success_count,
+        failure_count
+    );
+
+    if failure_count > 0 {
+        bail!(
+            "GET completed with failures: attempted={}, succeeded={}, failed={}",
+            keys.len(),
+            success_count,
+            failure_count
+        );
+    }
+
     Ok(())
 }
 
-/// Multi-process GET command for maximum throughput
-fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, template: &str, _interval: f64) -> Result<()> {
-    let (bucket, key_prefix) = parse_s3_uri(uri)?;
+/// Multi-process GET command for maximum throughput.
+///
+/// FUTURE TODO: Properly implement mp-get as a true prefix downloader that first
+/// lists real objects from the backend (matching `get` semantics), then shards the
+/// discovered keys across workers. The current implementation still synthesizes keys
+/// from `num + template`.
+fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, template: &str, _interval: f64) -> Result<()> {
+    let mut prefix = uri.to_string();
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+
+    eprintln!("Warning: mp-get currently uses template-generated keys (num+template), not prefix listing.");
     
     println!("Multi-process GET starting with {} processes, {} jobs per process", procs, jobs);
-    println!("Target: {} objects from s3://{}/{}", num, bucket, key_prefix);
+    println!("Target: {} objects from {}", num, prefix);
+    println!("Warning: mp-get currently generates keys from --template/--num (it does not list prefix objects)");
     
     // Generate object keys based on template and number
     let mut keys = Vec::new();
@@ -1010,7 +1273,7 @@ fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, te
         } else {
             format!("{}{}", template, i)
         };
-        keys.push(format!("s3://{}/{}{}", bucket, key_prefix, key));
+        keys.push(format!("{}{}", prefix, key));
     }
     
     // Create temporary keylist file
@@ -1041,22 +1304,42 @@ fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, _size: usize, te
     let result = mp::run_get_shards(&config)?;
     
     // Print summary
-    println!("\n=== Multi-Process GET Summary ===");
-    println!("Total operations: {}", result.total_objects);
-    println!("Total bytes: {}", result.total_bytes);
+    println!("\n=== Multi-Process GET Result (validated) ===");
+    println!(
+        "attempted={}, succeeded={}, failed={}",
+        result.attempted, result.succeeded, result.failed
+    );
     println!("Duration: {:.2}s", result.elapsed_seconds);
-    println!("Throughput: {:.2} MB/s", result.throughput_mbps());
+    println!("Bytes source: {:?}", result.bytes_source);
+    match result.total_bytes {
+        Some(total_bytes) => {
+            println!("Total bytes: {}", total_bytes);
+            if let Some(throughput) = result.throughput_mbps() {
+                println!("Throughput: {:.2} MB/s", throughput);
+            } else {
+                println!("Throughput: unavailable");
+            }
+            if let Some(avg_size) = result.avg_object_size() {
+                println!("Average object size: {:.2} bytes", avg_size);
+            }
+        }
+        None => {
+            println!("Total bytes: unknown");
+            println!("Throughput: omitted (byte totals unavailable)");
+        }
+    }
     println!("Operations/sec: {:.2}", result.ops_per_second());
     
     println!("\nPer-worker performance:");
     for worker in &result.per_worker {
-        let worker_throughput = if result.elapsed_seconds > 0.0 {
-            (worker.bytes as f64 / (1024.0 * 1024.0)) / result.elapsed_seconds
-        } else {
-            0.0
-        };
-        println!("  Worker {}: {} ops, {} bytes, {:.2} MB/s", 
-                 worker.worker_id, worker.objects, worker.bytes, worker_throughput);
+        let bytes_str = worker
+            .bytes
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!(
+            "  Worker {}: attempted={}, succeeded={}, failed={}, bytes={}",
+            worker.worker_id, worker.attempted, worker.succeeded, worker.failed, bytes_str
+        );
     }
     
     Ok(())
@@ -1420,10 +1703,24 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
     }
     
     let mut total_uploaded_bytes = 0u64;
+    let mut success_count = 0u64;
+    let mut failure_count = 0u64;
     while let Some(result) = futs.next().await {
-        let (uri, byte_count) = result??;
-        total_uploaded_bytes += byte_count;
-        info!("Uploaded {} bytes to {}", byte_count, uri);
+        match result {
+            Ok(Ok((uri, byte_count))) => {
+                total_uploaded_bytes += byte_count;
+                success_count += 1;
+                info!("Uploaded {} bytes to {}", byte_count, uri);
+            }
+            Ok(Err(e)) => {
+                failure_count += 1;
+                warn!("PUT failed: {}", e);
+            }
+            Err(e) => {
+                failure_count += 1;
+                warn!("PUT task join failed: {}", e);
+            }
+        }
     }
     
     let elapsed = t0.elapsed();
@@ -1431,7 +1728,51 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
     // Update final progress and finish
     progress_callback.update_total_bytes(total_uploaded_bytes);
     progress_tracker.finish("Upload", total_uploaded_bytes, elapsed);
+
+    safe_println!(
+        "PUT summary: attempted={}, succeeded={}, failed={}",
+        num,
+        success_count,
+        failure_count
+    );
+
+    if failure_count > 0 {
+        bail!(
+            "PUT completed with failures: attempted={}, succeeded={}, failed={}",
+            num,
+            success_count,
+            failure_count
+        );
+    }
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_human_size;
+
+    #[test]
+    fn parse_human_size_accepts_bytes_and_suffixes() {
+        assert_eq!(parse_human_size("8").unwrap(), 8);
+        assert_eq!(parse_human_size("8b").unwrap(), 8);
+        assert_eq!(parse_human_size("8K").unwrap(), 8_000);
+        assert_eq!(parse_human_size("8m").unwrap(), 8_000_000);
+        assert_eq!(parse_human_size("8MB").unwrap(), 8_000_000);
+        assert_eq!(parse_human_size("8mb").unwrap(), 8_000_000);
+        assert_eq!(parse_human_size("8G").unwrap(), 8_000_000_000);
+        assert_eq!(parse_human_size("8MiB").unwrap(), 8 * 1_048_576);
+        assert_eq!(parse_human_size("8mib").unwrap(), 8 * 1_048_576);
+        assert_eq!(parse_human_size("8Gi").unwrap(), 8 * 1_073_741_824);
+        assert_eq!(parse_human_size("8KiB").unwrap(), 8 * 1_024);
+    }
+
+    #[test]
+    fn parse_human_size_rejects_invalid_values() {
+        assert!(parse_human_size("").is_err());
+        assert!(parse_human_size("mb").is_err());
+        assert!(parse_human_size("8XB").is_err());
+        assert!(parse_human_size("8.5MB").is_err());
+    }
 }
 

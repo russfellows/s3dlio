@@ -260,6 +260,49 @@ pub const ENV_AZURE_STORAGE_ENDPOINT: &str = "AZURE_STORAGE_ENDPOINT";
 /// Example: AZURE_BLOB_ENDPOINT_URL=http://localhost:10000
 pub const ENV_AZURE_BLOB_ENDPOINT_URL: &str = "AZURE_BLOB_ENDPOINT_URL";
 
+// =============================================================================
+// GCS gRPC Read Timeout / Progress Constants
+// =============================================================================
+
+/// Number of bytes in one GiB, used for size-scaled timeout calculations.
+pub const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
+
+/// Environment variable to force a fixed per-chunk read timeout (seconds).
+///
+/// - `0` disables chunk timeout entirely.
+/// - unset uses size-scaled defaults.
+pub const ENV_GCS_READ_CHUNK_TIMEOUT_SECS: &str = "S3DLIO_GCS_READ_CHUNK_TIMEOUT_SECS";
+
+/// Environment variable to force a fixed per-attempt bidi connect timeout (seconds).
+///
+/// - `0` is ignored (falls back to scaled defaults).
+/// - unset uses size-scaled defaults.
+pub const ENV_GCS_BIDI_ATTEMPT_TIMEOUT_SECS: &str = "S3DLIO_GCS_BIDI_ATTEMPT_TIMEOUT_SECS";
+
+/// Environment variable controlling INFO progress cadence while waiting for chunks.
+pub const ENV_GCS_READ_PROGRESS_INTERVAL_SECS: &str = "S3DLIO_GCS_READ_PROGRESS_INTERVAL_SECS";
+
+/// Environment variable for timeout slope (seconds per GiB).
+pub const ENV_GCS_READ_TIMEOUT_SECS_PER_GIB: &str = "S3DLIO_GCS_READ_TIMEOUT_SECS_PER_GIB";
+
+/// Environment variable for minimum timeout floor (seconds).
+pub const ENV_GCS_READ_TIMEOUT_MIN_SECS: &str = "S3DLIO_GCS_READ_TIMEOUT_MIN_SECS";
+
+/// Environment variable for maximum timeout cap (seconds).
+pub const ENV_GCS_READ_TIMEOUT_MAX_SECS: &str = "S3DLIO_GCS_READ_TIMEOUT_MAX_SECS";
+
+/// Default timeout slope: each GiB contributes this many seconds.
+pub const DEFAULT_GCS_READ_TIMEOUT_SECS_PER_GIB: u64 = 45;
+
+/// Minimum timeout floor (seconds).
+pub const DEFAULT_GCS_READ_TIMEOUT_MIN_SECS: u64 = 12;
+
+/// Maximum timeout cap (seconds).
+pub const DEFAULT_GCS_READ_TIMEOUT_MAX_SECS: u64 = 300;
+
+/// Default INFO progress interval while chunk waits are in progress.
+pub const DEFAULT_GCS_READ_PROGRESS_INTERVAL_SECS: u64 = 5;
+
 /// Primary environment variable for custom GCS endpoint
 /// Example: GCS_ENDPOINT_URL=http://localhost:4443
 pub const ENV_GCS_ENDPOINT_URL: &str = "GCS_ENDPOINT_URL";
