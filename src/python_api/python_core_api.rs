@@ -36,8 +36,10 @@ use crate::s3_client::run_on_global_rt;
 // Phase 2 streaming functionality imports
 use crate::object_store::{
     ObjectStore, ObjectWriter, WriterOptions, CompressionConfig,
-    S3ObjectStore, AzureObjectStore
+    S3ObjectStore
 };
+#[cfg(feature = "backend-azure")]
+use crate::object_store::AzureObjectStore;
 use crate::file_store::FileSystemObjectStore;
 use crate::file_store_direct::ConfigurableFileSystemObjectStore;
 
@@ -410,23 +412,38 @@ pub fn mp_get(
         
         // Build Python dictionary result
         let dict = PyDict::new(py);
-        dict.set_item("total_objects", result.total_objects)?;
+        // New schema
+        dict.set_item("attempted", result.attempted)?;
+        dict.set_item("succeeded", result.succeeded)?;
+        dict.set_item("failed", result.failed)?;
         dict.set_item("total_bytes", result.total_bytes)?;
+        dict.set_item("bytes_source", format!("{:?}", result.bytes_source))?;
         dict.set_item("duration_seconds", result.elapsed_seconds)?;
         dict.set_item("throughput_mb_s", result.throughput_mbps())?;
         dict.set_item("ops_per_sec", result.ops_per_second())?;
+
+        // Backward compatibility key: historically this represented successful
+        // operations in mp_get summaries.
+        dict.set_item("total_objects", result.succeeded)?;
         
         // Add per-worker stats
         let workers = PyList::empty(py);
         for worker in &result.per_worker {
             let worker_dict = PyDict::new(py);
             worker_dict.set_item("worker_id", worker.worker_id)?;
-            worker_dict.set_item("objects", worker.objects)?;
+            worker_dict.set_item("attempted", worker.attempted)?;
+            worker_dict.set_item("succeeded", worker.succeeded)?;
+            worker_dict.set_item("failed", worker.failed)?;
             worker_dict.set_item("bytes", worker.bytes)?;
+            // Backward compatibility key
+            worker_dict.set_item("objects", worker.succeeded)?;
+
             let worker_throughput = if result.elapsed_seconds > 0.0 {
-                (worker.bytes as f64 / (1024.0 * 1024.0)) / result.elapsed_seconds
+                worker
+                    .bytes
+                    .map(|bytes| (bytes as f64 / (1024.0 * 1024.0)) / result.elapsed_seconds)
             } else {
-                0.0
+                None
             };
             worker_dict.set_item("throughput_mb_s", worker_throughput)?;
             workers.append(worker_dict)?;
@@ -1710,6 +1727,7 @@ pub fn create_s3_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOp
 
 /// Create a streaming writer for Azure Blob Storage
 #[pyfunction]
+#[cfg(feature = "backend-azure")]
 pub fn create_azure_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
     let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
     
@@ -1722,6 +1740,15 @@ pub fn create_azure_writer(py: Python<'_>, uri: String, options: Option<&PyWrite
             Ok(PyObjectWriter { inner: Some(writer), finalized_stats: None })
         })
     })
+}
+
+/// Create a streaming writer for Azure Blob Storage
+#[pyfunction]
+#[cfg(not(feature = "backend-azure"))]
+pub fn create_azure_writer(_py: Python<'_>, _uri: String, _options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
+    Err(PyRuntimeError::new_err(
+        "Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'."
+    ))
 }
 
 /// Create a streaming writer for filesystem
@@ -2005,9 +2032,14 @@ fn create_multi_endpoint_store_from_file(
 /// The ``S3DLIO_GCS_GRPC_CHANNELS`` environment variable, if set, takes
 /// precedence over this call.
 #[pyfunction]
+#[cfg(feature = "backend-gcs")]
 fn gcs_set_channel_count(n: usize) {
     crate::google_gcs_client::set_gcs_channel_count(n);
 }
+
+#[pyfunction]
+#[cfg(not(feature = "backend-gcs"))]
+fn gcs_set_channel_count(_n: usize) {}
 
 /// Configure GCS RAPID (Hyperdisk ML / zonal) mode before the first ``gs://``
 /// operation.
@@ -2021,17 +2053,29 @@ fn gcs_set_channel_count(n: usize) {
 ///
 /// The ``S3DLIO_GCS_RAPID`` environment variable still takes precedence if set.
 #[pyfunction]
+#[cfg(feature = "backend-gcs")]
 fn gcs_set_rapid_mode(force: Option<bool>) {
     crate::google_gcs_client::set_gcs_rapid_mode(force);
 }
+
+#[pyfunction]
+#[cfg(not(feature = "backend-gcs"))]
+fn gcs_set_rapid_mode(_force: Option<bool>) {}
 
 /// Return the programmatically-configured GCS subchannel count.
 ///
 /// Returns ``0`` if :func:`gcs_set_channel_count` has not been called
 /// (auto-detect will be used on first client initialization).
 #[pyfunction]
+#[cfg(feature = "backend-gcs")]
 fn gcs_get_channel_count() -> usize {
     crate::google_gcs_client::get_gcs_channel_count()
+}
+
+#[pyfunction]
+#[cfg(not(feature = "backend-gcs"))]
+fn gcs_get_channel_count() -> usize {
+    0
 }
 
 /// Return the current effective RAPID mode setting.
@@ -2042,8 +2086,15 @@ fn gcs_get_channel_count() -> usize {
 /// * ``False`` — RAPID forced off
 /// * ``None``  — auto-detect per bucket (default)
 #[pyfunction]
+#[cfg(feature = "backend-gcs")]
 fn gcs_get_rapid_mode() -> Option<bool> {
     crate::google_gcs_client::get_gcs_rapid_mode()
+}
+
+#[pyfunction]
+#[cfg(not(feature = "backend-gcs"))]
+fn gcs_get_rapid_mode() -> Option<bool> {
+    None
 }
 
 /// Query whether a GCS bucket or ``gs://`` URI is a RAPID (Hyperdisk ML) bucket.
@@ -2061,6 +2112,7 @@ fn gcs_get_rapid_mode() -> Option<bool> {
 /// >>> s3dlio.gcs_query_rapid_bucket("gs://my-rapid-bucket/")
 /// True
 #[pyfunction]
+#[cfg(feature = "backend-gcs")]
 fn gcs_query_rapid_bucket(bucket_or_uri: &str) -> PyResult<bool> {
     let owned = bucket_or_uri.to_owned();
     submit_io(async move {
@@ -2068,6 +2120,12 @@ fn gcs_query_rapid_bucket(bucket_or_uri: &str) -> PyResult<bool> {
             crate::google_gcs_client::query_gcs_rapid_bucket(&owned).await
         )
     })
+}
+
+#[pyfunction]
+#[cfg(not(feature = "backend-gcs"))]
+fn gcs_query_rapid_bucket(_bucket_or_uri: &str) -> PyResult<bool> {
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------

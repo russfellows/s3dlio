@@ -33,10 +33,47 @@
 //! ```
 
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "backend-gcs")]
+use std::sync::Arc;
+#[cfg(feature = "backend-gcs")]
+use tokio::sync::OnceCell;
 use tracing::{debug, trace};
 
+#[cfg(any(feature = "backend-gcs", feature = "backend-azure"))]
 use crate::s3_client::run_on_global_rt;
 use crate::s3_utils::{list_buckets, BucketInfo};
+
+#[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
+static GCS_COMMUNITY_LIST_CLIENT: OnceCell<Arc<crate::gcs_client::GcsClient>> = OnceCell::const_new();
+
+#[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
+async fn get_list_gcs_community_client() -> Result<Arc<crate::gcs_client::GcsClient>> {
+    let client = GCS_COMMUNITY_LIST_CLIENT
+        .get_or_try_init(|| async {
+            let gcs = crate::gcs_client::GcsClient::new()
+                .await
+                .context("Failed to initialise GCS community client")?;
+            Ok::<Arc<crate::gcs_client::GcsClient>, anyhow::Error>(Arc::new(gcs))
+        })
+        .await?;
+    Ok(Arc::clone(client))
+}
+
+#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+static GCS_OFFICIAL_LIST_CLIENT: OnceCell<Arc<crate::google_gcs_client::GcsClient>> = OnceCell::const_new();
+
+#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
+async fn get_list_gcs_official_client() -> Result<Arc<crate::google_gcs_client::GcsClient>> {
+    let client = GCS_OFFICIAL_LIST_CLIENT
+        .get_or_try_init(|| async {
+            let gcs = crate::google_gcs_client::GcsClient::new()
+                .await
+                .context("Failed to initialise GCS official client")?;
+            Ok::<Arc<crate::google_gcs_client::GcsClient>, anyhow::Error>(Arc::new(gcs))
+        })
+        .await?;
+    Ok(Arc::clone(client))
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -129,6 +166,7 @@ fn list_s3_containers() -> Result<Vec<ContainerInfo>> {
 // Google Cloud Storage
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "backend-gcs")]
 fn list_gcs_containers() -> Result<Vec<ContainerInfo>> {
     dotenvy::dotenv().ok();
     let project = std::env::var("GOOGLE_CLOUD_PROJECT")
@@ -143,14 +181,17 @@ fn list_gcs_containers() -> Result<Vec<ContainerInfo>> {
     run_on_global_rt(async move { list_gcs_async(&project).await })
 }
 
-#[cfg(feature = "gcs-community")]
+#[cfg(not(feature = "backend-gcs"))]
+fn list_gcs_containers() -> Result<Vec<ContainerInfo>> {
+    bail!("GCS backend is not enabled in this build. Rebuild with feature 'backend-gcs' or 'full-backends'.")
+}
+
+#[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
 async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     use gcloud_storage::http::buckets::list::ListBucketsRequest;
 
     debug!("GCS LIST BUCKETS (community): project={}", project);
-    let gcs = crate::gcs_client::GcsClient::new()
-        .await
-        .context("Failed to initialise GCS community client")?;
+    let gcs = get_list_gcs_community_client().await?;
 
     let mut containers = Vec::new();
     let mut page_token: Option<String> = None;
@@ -191,14 +232,12 @@ async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     Ok(containers)
 }
 
-#[cfg(not(feature = "gcs-community"))]
+#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
 async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
     use google_cloud_gax::paginator::ItemPaginator;
 
     debug!("GCS LIST BUCKETS (official/gRPC): project={}", project);
-    let gcs = crate::google_gcs_client::GcsClient::new()
-        .await
-        .context("Failed to initialise GCS official client")?;
+    let gcs = get_list_gcs_official_client().await?;
 
     let parent = format!("projects/{}", project);
     let mut containers = Vec::new();
@@ -230,6 +269,7 @@ async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
 // Azure Blob Storage
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "backend-azure")]
 fn list_azure_containers(uri: &str) -> Result<Vec<ContainerInfo>> {
     let account = uri
         .strip_prefix("az://")
@@ -244,6 +284,12 @@ fn list_azure_containers(uri: &str) -> Result<Vec<ContainerInfo>> {
     run_on_global_rt(async move { list_azure_async(&account).await })
 }
 
+#[cfg(not(feature = "backend-azure"))]
+fn list_azure_containers(_uri: &str) -> Result<Vec<ContainerInfo>> {
+    bail!("Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'.")
+}
+
+#[cfg(feature = "backend-azure")]
 async fn list_azure_async(account: &str) -> Result<Vec<ContainerInfo>> {
     debug!("Azure LIST CONTAINERS: account={}", account);
     let pairs = crate::azure_client::list_account_containers(account)
@@ -356,21 +402,37 @@ mod tests {
         std::env::remove_var("GCLOUD_PROJECT");
         std::env::remove_var("GCS_PROJECT");
         let err = list_containers("gs://").unwrap_err();
-        assert!(
-            err.to_string().contains("project ID"),
-            "should ask for project ID, got: {}",
-            err
-        );
+        if cfg!(feature = "backend-gcs") {
+            assert!(
+                err.to_string().contains("project ID"),
+                "should ask for project ID, got: {}",
+                err
+            );
+        } else {
+            assert!(
+                err.to_string().contains("GCS backend is not enabled"),
+                "should explain backend-gcs feature requirement, got: {}",
+                err
+            );
+        }
     }
 
     #[test]
     fn test_list_containers_azure_no_account() {
         let err = list_containers("az://").unwrap_err();
-        assert!(
-            err.to_string().contains("account name"),
-            "should ask for account name, got: {}",
-            err
-        );
+        if cfg!(feature = "backend-azure") {
+            assert!(
+                err.to_string().contains("account name"),
+                "should ask for account name, got: {}",
+                err
+            );
+        } else {
+            assert!(
+                err.to_string().contains("Azure backend is not enabled"),
+                "should explain backend-azure feature requirement, got: {}",
+                err
+            );
+        }
     }
 
     #[test]

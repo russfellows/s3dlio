@@ -9,10 +9,14 @@ use async_trait::async_trait;
 use crc32fast::Hasher;
 use std::io::Write;
 use std::collections::HashMap;
-use tracing::{debug, warn, info, trace};
+use tracing::{debug, warn, info};
+#[cfg(feature = "backend-gcs")]
+use tracing::trace;
 use regex::Regex;
 use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
+#[cfg(feature = "backend-gcs")]
+use tokio::sync::OnceCell;
 
 // Helper function for integrity validation
 fn compute_checksum(data: &[u8]) -> String {
@@ -51,9 +55,13 @@ use crate::file_store_direct::ConfigurableFileSystemObjectStore;
 
 // --- Azure ---------------------------------------------------
 use bytes::Bytes;
+#[cfg(feature = "backend-azure")]
 use futures::stream;
+#[cfg(feature = "backend-azure")]
 use crate::azure_client::{AzureBlob, AzureBlobProperties};
-use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
+#[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
+use crate::range_engine_generic::RangeEngine;
+use crate::range_engine_generic::RangeEngineConfig;
 use crate::constants::{
     DEFAULT_RANGE_ENGINE_CHUNK_SIZE,
     DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,
@@ -63,11 +71,22 @@ use crate::constants::{
 use std::time::Duration;
 
 // --- GCS - Feature-gated backend selection -------------------
-#[cfg(feature = "gcs-community")]
+#[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
 use crate::gcs_client::{GcsClient, GcsObjectMetadata, parse_gcs_uri};
 
-#[cfg(not(feature = "gcs-community"))]
+#[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
 use crate::google_gcs_client::{GcsClient, GcsObjectMetadata, parse_gcs_uri};
+
+#[cfg(feature = "backend-gcs")]
+static GLOBAL_GCS_CLIENT: OnceCell<GcsClient> = OnceCell::const_new();
+
+#[cfg(feature = "backend-gcs")]
+async fn get_global_gcs_client() -> Result<GcsClient> {
+    let client = GLOBAL_GCS_CLIENT
+        .get_or_try_init(|| async { GcsClient::new().await })
+        .await?;
+    Ok(client.clone())
+}
 
 /// Provider-neutral object metadata. For now this aliases S3's metadata.
 pub type ObjectMetadata = S3ObjectStat;
@@ -1365,6 +1384,7 @@ impl ObjectWriter for S3BufferedWriter {
 // ============================================================================
 // Azure adapter
 // ============================================================================
+#[cfg(feature = "backend-azure")]
 fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     // Supports:
     // - az://{account}/{container}/{key...}
@@ -1395,6 +1415,7 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     bail!("not a recognized Azure URI: {}", uri)
 }
 
+#[cfg(feature = "backend-azure")]
 fn az_uri(account: &str, container: &str, key: &str) -> String {
     if key.is_empty() {
         format!("az://{}/{}", account, container)
@@ -1403,6 +1424,7 @@ fn az_uri(account: &str, container: &str, key: &str) -> String {
     }
 }
 
+#[cfg(feature = "backend-azure")]
 fn az_props_to_meta(p: &AzureBlobProperties) -> ObjectMetadata {
     ObjectMetadata {
         size: p.content_length,
@@ -1430,6 +1452,7 @@ fn az_props_to_meta(p: &AzureBlobProperties) -> ObjectMetadata {
 /// RangeEngine is **disabled by default** — enable explicitly for large-file workloads
 /// where the benefit outweighs the HEAD request cost. Unlike S3, there is no
 /// env-var default for Azure; this config field must be set explicitly.
+#[cfg(feature = "backend-azure")]
 #[derive(Debug, Clone)]
 pub struct AzureConfig {
     /// Enable RangeEngine for concurrent range downloads
@@ -1448,6 +1471,7 @@ pub struct AzureConfig {
     pub size_cache_ttl_secs: u64,
 }
 
+#[cfg(feature = "backend-azure")]
 impl Default for AzureConfig {
     fn default() -> Self {
         Self {
@@ -1464,6 +1488,7 @@ impl Default for AzureConfig {
 }
 
 
+#[cfg(feature = "backend-azure")]
 #[derive(Clone)]
 pub struct AzureObjectStore {
     config: AzureConfig,
@@ -1471,12 +1496,14 @@ pub struct AzureObjectStore {
 }
 
 
+#[cfg(feature = "backend-azure")]
 impl Default for AzureObjectStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "backend-azure")]
 impl AzureObjectStore {
     pub fn new() -> Self {
         let config = AzureConfig::default();
@@ -1571,6 +1598,7 @@ impl AzureObjectStore {
 
 
 #[async_trait]
+#[cfg(feature = "backend-azure")]
 impl ObjectStore for AzureObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
@@ -1827,6 +1855,7 @@ impl ObjectStore for AzureObjectStore {
 }
 
 /// Buffered writer for Azure that collects chunks and uses multipart upload
+#[cfg(feature = "backend-azure")]
 pub struct AzureBufferedWriter {
     uri: String,
     buffer: Vec<u8>,
@@ -1839,6 +1868,7 @@ pub struct AzureBufferedWriter {
 }
 
 
+#[cfg(feature = "backend-azure")]
 impl AzureBufferedWriter {
     pub fn new(uri: String) -> Self {
         Self::new_with_compression(uri, CompressionConfig::None)
@@ -1867,6 +1897,7 @@ impl AzureBufferedWriter {
 
 
 #[async_trait]
+#[cfg(feature = "backend-azure")]
 impl ObjectWriter for AzureBufferedWriter {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
         if self.finalized {
@@ -1957,6 +1988,7 @@ impl ObjectWriter for AzureBufferedWriter {
 // ============================================================================
 
 /// Helper function to create GCS URI from bucket and key
+#[cfg(feature = "backend-gcs")]
 fn gcs_uri(bucket: &str, key: &str) -> String {
     if key.is_empty() {
         format!("gs://{}", bucket)
@@ -1966,6 +1998,7 @@ fn gcs_uri(bucket: &str, key: &str) -> String {
 }
 
 /// Convert GCS object metadata to provider-neutral ObjectMetadata
+#[cfg(feature = "backend-gcs")]
 fn gcs_meta_to_object_meta(meta: &GcsObjectMetadata) -> ObjectMetadata {
     ObjectMetadata {
         size: meta.size,
@@ -1999,6 +2032,7 @@ fn gcs_meta_to_object_meta(meta: &GcsObjectMetadata) -> ObjectMetadata {
 /// env-var default for GCS; this config field must be set explicitly.
 /// 
 /// v0.9.10: Added size_cache_ttl_secs for pre-stat optimization
+#[cfg(feature = "backend-gcs")]
 #[derive(Clone, Debug)]
 pub struct GcsConfig {
     /// Enable RangeEngine for concurrent range downloads (per-store config)
@@ -2015,6 +2049,7 @@ pub struct GcsConfig {
     pub size_cache_ttl_secs: u64,
 }
 
+#[cfg(feature = "backend-gcs")]
 impl Default for GcsConfig {
     fn default() -> Self {
         Self {
@@ -2034,18 +2069,22 @@ impl Default for GcsConfig {
 // GCS ObjectStore Implementation
 // ────────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "backend-gcs")]
 #[derive(Clone)]
 pub struct GcsObjectStore {
     config: GcsConfig,
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
+    client: Arc<OnceCell<GcsClient>>,
 }
 
+#[cfg(feature = "backend-gcs")]
 impl Default for GcsObjectStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "backend-gcs")]
 impl GcsObjectStore {
     pub fn new() -> Self {
         let config = GcsConfig::default();
@@ -2053,6 +2092,7 @@ impl GcsObjectStore {
         Self {
             config,
             size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            client: Arc::new(OnceCell::const_new()),
         }
     }
     
@@ -2061,6 +2101,7 @@ impl GcsObjectStore {
         Self {
             config,
             size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            client: Arc::new(OnceCell::const_new()),
         }
     }
     
@@ -2085,8 +2126,12 @@ impl GcsObjectStore {
         Ok(metadata.size)
     }
 
-    async fn get_client() -> Result<GcsClient> {
-        GcsClient::new().await
+    async fn get_client(&self) -> Result<GcsClient> {
+        let client = self
+            .client
+            .get_or_try_init(|| async { GcsClient::new().await })
+            .await?;
+        Ok(client.clone())
     }
     
     /// Download using RangeEngine for concurrent range requests
@@ -2131,10 +2176,11 @@ impl GcsObjectStore {
 }
 
 #[async_trait]
+#[cfg(feature = "backend-gcs")]
 impl ObjectStore for GcsObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         let (bucket, object) = parse_gcs_uri(uri)?;
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         
         // Check if RangeEngine is enabled and object is large enough
         if !self.config.enable_range_engine {
@@ -2169,13 +2215,13 @@ impl ObjectStore for GcsObjectStore {
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let (bucket, object) = parse_gcs_uri(uri)?;
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         client.get_object_range(&bucket, &object, offset, length).await
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         // Pass Bytes directly — put_object now takes Bytes, zero-copy end-to-end.
         client.put_object(&bucket, &object, data).await
     }
@@ -2183,7 +2229,7 @@ impl ObjectStore for GcsObjectStore {
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let chunk_size = part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE);
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         // Pass Bytes directly — put_object_multipart now takes Bytes, zero-copy end-to-end.
         client.put_object_multipart(&bucket, &object, data, chunk_size).await
     }
@@ -2192,7 +2238,7 @@ impl ObjectStore for GcsObjectStore {
         // parse_gcs_uri now handles bucket-only URIs (gs://bucket/ → ("bucket", ""))
         let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)?;
 
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.as_str()) };
         let keys = client.list_objects(&bucket, prefix, recursive).await?;
 
@@ -2215,7 +2261,7 @@ impl ObjectStore for GcsObjectStore {
                 }
             };
 
-            let client = match Self::get_client().await {
+            let client = match self.get_client().await {
                 Ok(c) => c,
                 Err(e) => {
                     yield Err(e);
@@ -2238,14 +2284,14 @@ impl ObjectStore for GcsObjectStore {
 
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         let (bucket, object) = parse_gcs_uri(uri)?;
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         let meta = client.stat_object(&bucket, &object).await?;
         Ok(gcs_meta_to_object_meta(&meta))
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         client.delete_object(&bucket, &object).await
     }
 
@@ -2258,7 +2304,7 @@ impl ObjectStore for GcsObjectStore {
             .filter_map(|uri| parse_gcs_uri(uri).ok().map(|(_, obj)| obj))
             .collect();
         
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         client.delete_objects(&bucket, objects).await
     }
 
@@ -2275,7 +2321,7 @@ impl ObjectStore for GcsObjectStore {
                 bail!("Invalid GCS URI for delete_prefix operation: {}", uri_prefix)
             })?;
 
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         
         // Use streaming list to avoid loading millions of keys into memory
         // List all objects (returns Vec, not a stream)
@@ -2293,13 +2339,13 @@ impl ObjectStore for GcsObjectStore {
 
     async fn create_container(&self, name: &str) -> Result<()> {
         // For GCS, the "container" is a bucket
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         client.create_bucket(name, None).await
     }
 
     async fn delete_container(&self, name: &str) -> Result<()> {
         // For GCS, the "container" is a bucket
-        let client = Self::get_client().await?;
+        let client = self.get_client().await?;
         client.delete_bucket(name).await
     }
 
@@ -2347,6 +2393,7 @@ impl ObjectStore for GcsObjectStore {
 }
 
 /// Buffered writer for GCS that collects chunks and uses multipart upload
+#[cfg(feature = "backend-gcs")]
 pub struct GcsBufferedWriter {
     uri: String,
     buffer: Vec<u8>,
@@ -2358,6 +2405,7 @@ pub struct GcsBufferedWriter {
     compressed_bytes: u64,
 }
 
+#[cfg(feature = "backend-gcs")]
 impl GcsBufferedWriter {
     pub fn new(uri: String) -> Self {
         Self::new_with_compression(uri, CompressionConfig::None)
@@ -2385,6 +2433,7 @@ impl GcsBufferedWriter {
 }
 
 #[async_trait]
+#[cfg(feature = "backend-gcs")]
 impl ObjectWriter for GcsBufferedWriter {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
         if self.finalized {
@@ -2431,7 +2480,7 @@ impl ObjectWriter for GcsBufferedWriter {
         
         // Parse URI and upload via GCS client
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
-        let client = GcsClient::new().await?;
+        let client = get_global_gcs_client().await?;
         
         // Use multipart for large objects, simple put for small ones.
         // `Bytes::from(Vec<u8>)` transfers ownership without copying — zero-cost.
@@ -2520,8 +2569,26 @@ pub fn store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Log
         Scheme::File  => FileSystemObjectStore::boxed(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3    => S3ObjectStore::boxed(),
-        Scheme::Azure => AzureObjectStore::boxed(),
-        Scheme::Gcs   => GcsObjectStore::boxed(),
+        Scheme::Azure => {
+            #[cfg(feature = "backend-azure")]
+            {
+                AzureObjectStore::boxed()
+            }
+            #[cfg(not(feature = "backend-azure"))]
+            {
+                bail!("Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'.")
+            }
+        }
+        Scheme::Gcs   => {
+            #[cfg(feature = "backend-gcs")]
+            {
+                GcsObjectStore::boxed()
+            }
+            #[cfg(not(feature = "backend-gcs"))]
+            {
+                bail!("GCS backend is not enabled in this build. Rebuild with feature 'backend-gcs' or 'full-backends'.")
+            }
+        }
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     
@@ -2567,8 +2634,26 @@ pub fn store_for_uri_with_config_and_logger(
             bail!("Cannot use DirectFileSystemConfig with file:// URI - use FileSystemConfig instead")
         }
         (Scheme::S3, _) => S3ObjectStore::boxed(),
-        (Scheme::Azure, _) => AzureObjectStore::boxed(),
-        (Scheme::Gcs, _) => GcsObjectStore::boxed(),
+        (Scheme::Azure, _) => {
+            #[cfg(feature = "backend-azure")]
+            {
+                AzureObjectStore::boxed()
+            }
+            #[cfg(not(feature = "backend-azure"))]
+            {
+                bail!("Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'.")
+            }
+        }
+        (Scheme::Gcs, _) => {
+            #[cfg(feature = "backend-gcs")]
+            {
+                GcsObjectStore::boxed()
+            }
+            #[cfg(not(feature = "backend-gcs"))]
+            {
+                bail!("GCS backend is not enabled in this build. Rebuild with feature 'backend-gcs' or 'full-backends'.")
+            }
+        }
         (Scheme::Unknown, _) => bail!("Unable to infer backend from URI: {uri}"),
     };
     
@@ -2594,8 +2679,26 @@ pub fn direct_io_store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_l
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => S3ObjectStore::boxed(),
-        Scheme::Azure => AzureObjectStore::boxed(),
-        Scheme::Gcs => GcsObjectStore::boxed(),
+        Scheme::Azure => {
+            #[cfg(feature = "backend-azure")]
+            {
+                AzureObjectStore::boxed()
+            }
+            #[cfg(not(feature = "backend-azure"))]
+            {
+                bail!("Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'.")
+            }
+        }
+        Scheme::Gcs => {
+            #[cfg(feature = "backend-gcs")]
+            {
+                GcsObjectStore::boxed()
+            }
+            #[cfg(not(feature = "backend-gcs"))]
+            {
+                bail!("GCS backend is not enabled in this build. Rebuild with feature 'backend-gcs' or 'full-backends'.")
+            }
+        }
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     
@@ -2621,8 +2724,26 @@ pub fn high_performance_store_for_uri_with_logger(uri: &str, logger: Option<crat
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => S3ObjectStore::boxed(),
-        Scheme::Azure => AzureObjectStore::boxed(),
-        Scheme::Gcs => GcsObjectStore::boxed(),
+        Scheme::Azure => {
+            #[cfg(feature = "backend-azure")]
+            {
+                AzureObjectStore::boxed()
+            }
+            #[cfg(not(feature = "backend-azure"))]
+            {
+                bail!("Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'.")
+            }
+        }
+        Scheme::Gcs => {
+            #[cfg(feature = "backend-gcs")]
+            {
+                GcsObjectStore::boxed()
+            }
+            #[cfg(not(feature = "backend-gcs"))]
+            {
+                bail!("GCS backend is not enabled in this build. Rebuild with feature 'backend-gcs' or 'full-backends'.")
+            }
+        }
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
     
@@ -2693,18 +2814,32 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
             Box::new(S3ObjectStore::with_config(config))
         },
         Scheme::Azure => {
-            let config = AzureConfig {
-                enable_range_engine: true,  // Enable for high-performance
-                ..Default::default()
-            };
-            Box::new(AzureObjectStore::with_config(config))
+            #[cfg(feature = "backend-azure")]
+            {
+                let config = AzureConfig {
+                    enable_range_engine: true,  // Enable for high-performance
+                    ..Default::default()
+                };
+                Box::new(AzureObjectStore::with_config(config))
+            }
+            #[cfg(not(feature = "backend-azure"))]
+            {
+                bail!("Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'.")
+            }
         },
         Scheme::Gcs => {
-            let config = GcsConfig {
-                enable_range_engine: true,  // Enable for high-performance
-                ..Default::default()
-            };
-            Box::new(GcsObjectStore::with_config(config))
+            #[cfg(feature = "backend-gcs")]
+            {
+                let config = GcsConfig {
+                    enable_range_engine: true,  // Enable for high-performance
+                    ..Default::default()
+                };
+                Box::new(GcsObjectStore::with_config(config))
+            }
+            #[cfg(not(feature = "backend-gcs"))]
+            {
+                bail!("GCS backend is not enabled in this build. Rebuild with feature 'backend-gcs' or 'full-backends'.")
+            }
         },
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
@@ -2729,6 +2864,14 @@ use tokio::sync::Semaphore;
 use glob;
 use crate::progress::ProgressCallback;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferSummary {
+    pub attempted: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub bytes_transferred: u64,
+}
+
 /// Generic upload function that works with any ObjectStore backend
 /// and supports progress tracking. Supports glob patterns (*,?) and regex patterns.
 pub async fn generic_upload_files<P: AsRef<Path>>(
@@ -2737,6 +2880,25 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
     max_in_flight: usize,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
+    let summary = generic_upload_files_with_summary(dest_prefix, patterns, max_in_flight, progress_callback).await?;
+    if summary.failed > 0 {
+        bail!(
+            "Upload completed with failures: attempted={}, succeeded={}, failed={}",
+            summary.attempted,
+            summary.succeeded,
+            summary.failed
+        );
+    }
+    Ok(())
+}
+
+/// Generic upload function with detailed transfer summary.
+pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
+    dest_prefix: &str,
+    patterns: &[P],
+    max_in_flight: usize,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<TransferSummary> {
     // Expand patterns (globs, regex, and single paths)
     let mut paths = Vec::new();
     for pat in patterns {
@@ -2874,13 +3036,33 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
         }));
     }
 
+    let mut summary = TransferSummary {
+        attempted: paths.len() as u64,
+        ..Default::default()
+    };
+
     // Wait for all uploads to complete
     while let Some(join_res) = futs.next().await {
-        join_res??;
+        match join_res {
+            Ok(Ok(())) => {
+                summary.succeeded += 1;
+            }
+            Ok(Err(e)) => {
+                summary.failed += 1;
+                warn!("Upload task failed: {}", e);
+            }
+            Err(e) => {
+                summary.failed += 1;
+                warn!("Upload task join failed: {}", e);
+            }
+        }
     }
 
     info!("Finished upload of {} file(s) to {}", paths.len(), dest_prefix);
-    Ok(())
+    if let Some(progress) = &progress_callback {
+        summary.bytes_transferred = progress.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(summary)
 }
 
 /// Generic download function that works with any ObjectStore backend
@@ -2892,6 +3074,33 @@ pub async fn generic_download_objects(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
+    let summary = generic_download_objects_with_summary(
+        src_uri,
+        dest_dir,
+        max_in_flight,
+        recursive,
+        progress_callback,
+    )
+    .await?;
+    if summary.failed > 0 {
+        bail!(
+            "Download completed with failures: attempted={}, succeeded={}, failed={}",
+            summary.attempted,
+            summary.succeeded,
+            summary.failed
+        );
+    }
+    Ok(())
+}
+
+/// Generic download function with detailed transfer summary.
+pub async fn generic_download_objects_with_summary(
+    src_uri: &str,
+    dest_dir: &Path,
+    max_in_flight: usize,
+    recursive: bool,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<TransferSummary> {
     let store = store_for_uri_with_logger(src_uri, global_logger())?;
 
     // List objects to download
@@ -2956,12 +3165,32 @@ pub async fn generic_download_objects(
         }));
     }
 
+    let mut summary = TransferSummary {
+        attempted: keys.iter().filter(|k| !k.ends_with('/')).count() as u64,
+        ..Default::default()
+    };
+
     // Wait for all downloads to complete
     while let Some(join_res) = futs.next().await {
-        join_res??;
+        match join_res {
+            Ok(Ok(())) => {
+                summary.succeeded += 1;
+            }
+            Ok(Err(e)) => {
+                summary.failed += 1;
+                warn!("Download task failed: {}", e);
+            }
+            Err(e) => {
+                summary.failed += 1;
+                warn!("Download task join failed: {}", e);
+            }
+        }
     }
 
     info!("Finished download of {} object(s) to {:?}", keys.len(), dest_dir);
-    Ok(())
+    if let Some(progress) = &progress_callback {
+        summary.bytes_transferred = progress.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(summary)
 }
 

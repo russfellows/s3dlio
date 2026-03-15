@@ -1,5 +1,90 @@
 # s3dlio Changelog
 
+## Version 0.9.70 - Backend-Profiled Builds, GCS Hot-Path Reuse, and RAPID Runtime Improvements (March 2026)
+
+### Why this release was needed
+- We needed to separate "default" packaging behavior from "all backends enabled" behavior.
+- The Python wheel path needed a predictable profile model for maintainers and users.
+- GCS hot code paths were creating lightweight wrappers frequently, adding avoidable overhead and log noise.
+- RAPID mode logs were emitted too often under high concurrency, making real diagnostics harder.
+- Runtime tuning around GCS channel count needed clearer wiring from CLI concurrency settings.
+
+### Build and packaging model changes
+- Added explicit backend profile behavior for Python wheel builds.
+- Default Python build profile now targets a smaller S3-focused wheel.
+- Full cloud backend build remains available via full-backends feature selection.
+- `build_pyo3.sh` now accepts profile arguments from CLI instead of relying on environment-only control.
+- Added named-flag CLI support in `build_pyo3.sh`:
+    - `--profile full`
+    - `--profile default`
+    - `-p full`
+    - `-p default`
+- Positional profile form is still supported:
+    - `./build_pyo3.sh`
+    - `./build_pyo3.sh full`
+    - `./build_pyo3.sh default`
+- Added robust argument validation and help output in `build_pyo3.sh`.
+- Updated `pyproject.toml` guidance/comments to align with current build/install workflows.
+
+### Cargo feature and dependency updates
+- Refined optional backend dependency usage for clearer backend selection boundaries.
+- Preserved full backend behavior through `full-backends` feature.
+- Updated lockfile to reflect new dependency graph resulting from feature-path updates.
+
+### GCS performance and hot-path optimizations
+- Confirmed expensive GCS transport/auth clients remain globally reused via async once-initialization.
+- Added wrapper-level reuse in operational paths to avoid repeated `GcsClient::new()` wrapper churn.
+- Added per-store lazy GCS wrapper caching in object-store path.
+- Added global wrapper reuse for additional GCS paths that execute outside per-store reuse scope.
+- Extended reuse into write finalize path so per-object write completion avoids unnecessary wrapper construction.
+- Extended reuse into GCS container-list path to reduce repeated wrapper initialization in repeated listing workflows.
+
+### RAPID mode behavior improvements
+- Cached effective RAPID mode once per process lifecycle.
+- Reduced RAPID mode log emission to one initialization-time message rather than per wrapper construction.
+- Kept per-bucket RAPID auto-detection behavior and cache strategy intact.
+- Preserved explicit override behavior from environment and API configuration.
+
+### CLI/runtime tuning improvements
+- Added/strengthened pre-tuning of GCS subchannel count before first GCS client initialization.
+- Propagated concurrency intent from CLI options into GCS setup earlier in command flow.
+- Added/updated constants for GCS read timeout/progress environment control.
+
+### Documentation updates
+- Updated README to explain:
+    - default vs full backend build behavior,
+    - explicit full-backend CLI build command,
+    - Python build profile usage for `build_pyo3.sh`,
+    - source-build commands for full backend Python installs.
+- Updated backend options guidance to reflect current feature model.
+- Added investigation docs for GCS bidi read behavior and debugging findings.
+- Consolidated GCS debug document roles:
+    - one document as deep technical analysis,
+    - one as concise incident/debug summary with references.
+
+### Tests and verification
+- Updated tests impacted by new backend-feature defaults.
+- Made list-container backend expectation tests feature-aware.
+- Validation performed during this release cycle:
+    - `cargo check`
+    - `cargo check --features backend-gcs`
+    - `cargo check --features full-backends`
+    - `cargo test --lib`
+
+### User-visible outcomes
+- Cleaner default Python install footprint.
+- Straightforward path to full cloud backend builds when required.
+- Reduced GCS runtime overhead in hot operational paths.
+- Significantly reduced RAPID log spam under concurrency.
+- Better maintainability through explicit build profiles and clearer docs.
+
+### Notes for maintainers
+- Keep `build_pyo3.sh` profile UX stable (`default|slim|full`, `--profile|-p`).
+- Keep README and changelog examples aligned with actual Cargo features.
+- Treat GCS debug docs as a paired set:
+    - technical root-cause deep dive,
+    - concise debugging summary and triage notes.
+
 ## Version 0.9.65 - GCS PUT/Performance Fixes: Chunk Size, Constants, Zero-Copy (March 2026)
 
 ### GCS PUT RESOURCE_EXHAUSTED Fix

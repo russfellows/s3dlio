@@ -163,7 +163,8 @@ async fn test_end_to_end_upload_speed_comparison() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test] 
+#[tokio::test]
+#[ignore = "Long-running benchmark; run explicitly with -- --ignored when needed"]
 async fn test_memory_pressure_vs_speed_tradeoff() -> Result<()> {
     println!("\n=== MEMORY PRESSURE vs SPEED TRADE-OFF ===");
     println!("Testing scenarios where streaming might be preferred despite speed penalty");

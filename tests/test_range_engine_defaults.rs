@@ -102,26 +102,27 @@ mod range_engine_defaults {
     }
 
     #[test]
-    fn test_default_threshold_is_16mib() {
-        const EXPECTED: u64 = 16 * 1024 * 1024;
+    fn test_default_threshold_matches_expected_constant() {
+        const EXPECTED: u64 = 32 * 1024 * 1024;
         assert_eq!(DEFAULT_RANGE_ENGINE_THRESHOLD, EXPECTED);
-        println!("✅ DEFAULT_RANGE_ENGINE_THRESHOLD is 16 MiB");
+        println!("✅ DEFAULT_RANGE_ENGINE_THRESHOLD is 32 MiB");
     }
 
     #[test]
-    fn test_all_configs_use_16mib_threshold() {
+    fn test_all_configs_use_default_threshold() {
         let azure = AzureConfig::default();
         let gcs = GcsConfig::default();
         let file = FileSystemConfig::default();
         let directio = DirectIOConfig::default();
-        
-        const EXPECTED: u64 = 16 * 1024 * 1024;
-        
-        assert_eq!(azure.range_engine.min_split_size, EXPECTED);
-        assert_eq!(gcs.range_engine.min_split_size, EXPECTED);
-        assert_eq!(file.range_engine.min_split_size, EXPECTED);
-        assert_eq!(directio.range_engine.min_split_size, EXPECTED);
-        
-        println!("✅ All configs use 16 MiB threshold");
+
+        assert_eq!(azure.range_engine.min_split_size, DEFAULT_RANGE_ENGINE_THRESHOLD);
+        assert_eq!(gcs.range_engine.min_split_size, DEFAULT_RANGE_ENGINE_THRESHOLD);
+        assert_eq!(file.range_engine.min_split_size, DEFAULT_RANGE_ENGINE_THRESHOLD);
+        assert_eq!(directio.range_engine.min_split_size, DEFAULT_RANGE_ENGINE_THRESHOLD);
+
+        println!(
+            "✅ All configs use default threshold ({} MiB)",
+            DEFAULT_RANGE_ENGINE_THRESHOLD / (1024 * 1024)
+        );
     }
 }

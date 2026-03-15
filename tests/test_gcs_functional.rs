@@ -3,16 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+#![cfg(feature = "gcs-community")]
+
 use anyhow::Result;
 use bytes::Bytes;
 use std::env;
 
 // Import GcsClient - will use whichever backend is feature-gated
-#[cfg(feature = "gcs-community")]
 use s3dlio::gcs_client::{GcsClient, parse_gcs_uri};
-
-#[cfg(feature = "gcs-official")]
-use s3dlio::google_gcs_client::{GcsClient, parse_gcs_uri};
 
 /// Test bucket name from environment variable
 fn get_test_bucket() -> Result<String> {
@@ -409,10 +407,7 @@ mod integration_tests {
         println!("\n");
         println!("╔══════════════════════════════════════════════════════════════╗");
         println!("║  Comprehensive GCS Functional Test Suite                    ║");
-        #[cfg(feature = "gcs-community")]
         println!("║  Backend: gcs-community (gcloud-storage)                     ║");
-        #[cfg(feature = "gcs-official")]
-        println!("║  Backend: gcs-official (google-cloud-storage)                ║");
         println!("╚══════════════════════════════════════════════════════════════╝");
         println!();
         

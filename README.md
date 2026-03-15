@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-536%2F536-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.65-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.70-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -15,8 +15,31 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 ### Quick Install (Python)
 
 ```bash
+# If using uv package manager + uv virtual environment:
+uv pip install s3dlio
+
+# If using pip without uv:
 pip install s3dlio
 ```
+
+### Python Backend Profiles (PyPI vs Full Build)
+
+- If using `uv` package manager + `uv` virtual environment: `uv pip install s3dlio`.
+- If using standard `pip` without `uv`: `pip install s3dlio`.
+- The default published wheel is now S3-focused (Azure Blob and GCS are excluded).
+- If you want full backends (S3 + Azure Blob + GCS), build from source with:
+
+```bash
+# uv workflow:
+uv pip install s3dlio --no-binary s3dlio --config-settings "cargo-extra-args=--features extension-module,full-backends"
+
+# pip-only workflow:
+pip install s3dlio --no-binary s3dlio --config-settings "cargo-extra-args=--features extension-module,full-backends"
+```
+
+You can still add a separate package name (for example `s3dlio-full`) later if you want a dedicated prebuilt full wheel distribution.
+
+> Maintainer note: for PyPI uploads, publish the default (`./build_pyo3.sh`) wheel unless intentionally releasing a separate distribution. `full-backends` is currently source-build only via the command above.
 
 ### Building from Source (Rust)
 
@@ -95,7 +118,10 @@ If you are building on WSL or any environment where `libhdf5` or `libhwloc` may 
 # Just the basics - works on WSL, Docker, CI, and minimal installs:
 sudo apt-get install -y build-essential pkg-config libssl-dev
 cargo build --release
-# or via pip (no system HDF5/hwloc needed):
+# install Python package (no system HDF5/hwloc needed):
+# uv workflow:
+uv pip install s3dlio
+# pip-only workflow:
 pip install s3dlio
 ```
 
@@ -116,6 +142,12 @@ cd s3dlio
 # Build with default features (no HDF5 or NUMA required)
 cargo build --release
 
+# Build s3-cli with all cloud backends enabled (AWS + Azure + GCS)
+cargo build --release --bin s3-cli --features full-backends
+
+# Build s3-cli with GCS enabled only (plus default backends)
+cargo build --release --bin s3-cli --features backend-gcs
+
 # Build with NUMA topology support (requires libhwloc-dev)
 cargo build --release --features numa
 
@@ -130,7 +162,37 @@ cargo test
 
 # Build Python bindings (optional)
 ./build_pyo3.sh
+
+# Build Python bindings with full backends (S3 + Azure + GCS)
+./build_pyo3.sh full
+
+# Named profile form is also supported:
+./build_pyo3.sh --profile full
+./build_pyo3.sh --profile default
+
+# Show profile/help usage
+./build_pyo3.sh --help
 ```
+
+### Build Profile Quick Reference
+
+Rust backend feature profiles:
+
+- Default build (`cargo build --release`): S3-focused default backend set.
+- GCS-enabled build (`--features backend-gcs`): enables GCS in addition to default set.
+- Full cloud build (`--features full-backends`): enables AWS + Azure + GCS.
+
+Python wheel build profiles via `build_pyo3.sh`:
+
+- `default` or `slim`: AWS + file/direct; excludes Azure and GCS.
+- `full`: AWS + Azure + GCS + file/direct.
+- Positional and named forms are equivalent:
+    - `./build_pyo3.sh full`
+    - `./build_pyo3.sh -p full`
+    - `./build_pyo3.sh --profile full`
+
+Optional extra Rust features for wheel builds can still be passed with `EXTRA_FEATURES`.
+Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 **Note:** NUMA support (`--features numa`) improves multi-socket performance but requires the `hwloc2` C library. HDF5 support (`--features hdf5`) enables HDF5 data format generation but requires `libhdf5`. Both are optional and s3dlio is fully functional without them.
 
@@ -148,10 +210,11 @@ cargo test
 
 ## 🌟 Latest Release
 
-**v0.9.65** (March 2026) - GCS PUT fix (RESOURCE_EXHAUSTED), constants centralisation, zero-copy write pipeline, RAPID auto-detection. Measured **3.83 GB/s** upload on RAPID bucket.
+**v0.9.70** (March 2026) - Python wheel backend profiles: default PyPI wheel is S3-focused; full backends available via source build using `full-backends`.
 
 **Recent highlights:**
 - **v0.9.65** - Fixed GCS PUT RESOURCE_EXHAUSTED (chunk size exceeded server 4 MiB protobuf message limit); centralised all GCS/gRPC constants; zero-copy `put_object(Bytes)`; RAPID auto-detection; subchannel auto-tune via `--jobs`; 10 new zero-copy unit tests
+- **v0.9.70** - Added Python wheel backend profiles (`default` and `full`), `build_pyo3.sh` profile CLI options (`full` / `default` / `--profile`), and documentation for full-backend source builds
 - **v0.9.60** - All GCS operations now use gRPC (BidiReadObject/BidiWriteObject) instead of JSON API; GCS RAPID/Hyperdisk ML zonal bucket support via `S3DLIO_GCS_RAPID`; 64-way concurrent batch deletes; byte-range optimization enabled by default at 32 MB threshold; NUMA and HDF5 now optional features
 - **v0.9.50** - Python multi-threaded runtime fix (io_uring-style submit), s3torchconnector zero-copy rewrite, S3 range download optimization (76% faster for large objects), multipart upload zero-copy chunking
 - **v0.9.40** - Enhanced Python bytearray documentation with performance benchmarks (2.5-3x speedup)
@@ -252,37 +315,30 @@ cargo build --no-default-features --features arrow-backend
 - Useful for comparison testing and development
 - Not recommended for production use
 
-### GCS Backend Options (v0.9.7+)
+### GCS Backend Options (Current)
 
-s3dlio supports **two mutually exclusive GCS backend implementations** that can be selected at compile time. **Community backend (`gcs-community`) is the default and recommended** for production use:
+GCS is now **optional** at build time.
+
+- Default build (`cargo build --release`) does **not** include GCS.
+- To include GCS, enable `backend-gcs` (or `full-backends`).
+- When enabled, s3dlio uses the **official Google crates** (`google-cloud-storage` + gax) from a patched fork maintained for s3dlio.
 
 ```bash
-# Default: Community backend (RECOMMENDED for production)
+# Default build (S3-focused; no GCS)
 cargo build --release
-# or explicitly:
-cargo build --release --features gcs-community
 
-# Experimental: Official Google backend (for testing only)
-cargo build --release --no-default-features --features native-backends,s3,gcs-official
+# Enable GCS explicitly
+cargo build --release --features backend-gcs
+
+# Enable all cloud backends (AWS + Azure + GCS)
+cargo build --release --features full-backends
 ```
 
-**Why gcs-community is default:**
-- ✅ Production-ready and stable (10/10 tests pass consistently)
-- ✅ Uses community-maintained `gcloud-storage` v1.1 crate
-- ✅ Full ADC (Application Default Credentials) support
-- ✅ All operations work reliably: GET, PUT, DELETE, LIST, STAT, range reads
+**Patched official GCS fork used by s3dlio:**
+- Repository: https://github.com/russfellows/google-cloud-rust
+- Integration in this repo is pinned in [Cargo.toml](Cargo.toml) (currently via release tag from that fork).
 
-**About gcs-official:**
-- ⚠️ **Experimental only** - Known transport flakes in test suites
-- Uses official Google `google-cloud-storage` v1.1 crate
-- Individual operations work correctly (100% pass when tested alone)
-- Full test suite experiences intermittent "transport error" failures (7/10 tests fail)
-- **Root cause**: Upstream HTTP/2 connection pool flake in google-cloud-rust library
-  - **Bug Report**: https://github.com/googleapis/google-cloud-rust/issues/3574
-  - **Related Issue**: https://github.com/googleapis/google-cloud-rust/issues/3412
-- Not recommended for production until upstream issue is resolved
-
-**For more details:** See [GCS Backend Selection Guide](docs/GCS-BACKEND-SELECTION.md)
+**Legacy note:** `gcs-community` remains as a legacy opt-in path, but the primary supported path is the official Google crates from the patched `russfellows/google-cloud-rust` fork.
 
 ## Quick Start
 
@@ -293,13 +349,24 @@ cargo build --release --no-default-features --features native-backends,s3,gcs-of
 git clone https://github.com/russfellows/s3dlio.git
 cd s3dlio
 cargo build --release
+
+# Full cloud backend CLI build:
+cargo build --release --bin s3-cli --features full-backends
 ```
 
 **Python Library:**
 ```bash
+# uv workflow:
+uv pip install s3dlio
+
+# pip-only workflow:
 pip install s3dlio
+
 # or build from source:
 ./build_pyo3.sh && ./install_pyo3_wheel.sh
+
+# build from source with full cloud backends:
+./build_pyo3.sh --profile full && ./install_pyo3_wheel.sh
 ```
 
 ### Documentation
@@ -556,6 +623,7 @@ podman build -t s3dlio .
 
 - **[sai3-bench](https://github.com/russfellows/sai3-bench)** - Multi-protocol I/O benchmarking suite built on s3dlio
 - **[polarWarp](https://github.com/russfellows/polarWarp)** - Op-log analysis tool for parsing and visualizing s3dlio operation logs
+- **[google-cloud-rust (s3dlio patched fork)](https://github.com/russfellows/google-cloud-rust)** - Official Google Cloud Rust client fork used by s3dlio for patched GCS support
 
 ## License
 
