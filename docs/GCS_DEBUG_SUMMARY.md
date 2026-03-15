@@ -1,5 +1,9 @@
 # GCS gRPC Debugging Summary
 
+> Consolidation note (v0.9.70): this file is the short operational summary.
+> The deep-dive technical analysis now lives in [GCS_BIDI_HANG_ANALYSIS.md](GCS_BIDI_HANG_ANALYSIS.md).
+> Keep detailed call-stack and worker-lifecycle reasoning in the analysis doc to avoid duplication.
+
 ## 1. The Original Issue & Resolution
 * **The Problem:** We originally observed a persistent hang/deadlock after a few seconds of concurrent gRPC reads against GCS using `s3dlio`. Trace logs indicated HTTP/2 flow control window starvation.
 * **The Cause:** A custom patch in `google-cloud-rust`'s `grpc.rs` was allocating a massive 128 MiB `initial_stream_window_size`. This exhausted connection-level window limits instantly under high concurrency.
@@ -32,3 +36,10 @@ Since the explicit `ReadRange` protobuf boundaries being generated are identical
 1. We need to verify if other files failing with `OUT_OF_RANGE` are also 0 bytes, confirming the 0-byte file edge case.
 2. Run a trace or debug print directly inside the new `connector.rs` (where `BidiReadObjectRequest` is built) to see the exact `read_offset` and `read_length` the new worker actually passes over the wire.
 3. Look at `worker_new.rs` to see what it does when it encounters a file with 0 explicit bytes returned in `BidiReadObjectResponse` (does it try to request more?).
+
+---
+
+## 6. Related Documentation
+
+- Deep technical analysis: [GCS_BIDI_HANG_ANALYSIS.md](GCS_BIDI_HANG_ANALYSIS.md)
+- Release notes context: [Changelog.md](Changelog.md)

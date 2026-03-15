@@ -1,5 +1,8 @@
 # GCS BidiReadObject Hang Analysis
 
+> Consolidation note (v0.9.70): this is the deep-dive technical source of truth.
+> For triage-oriented incident notes and quick status, use [GCS_DEBUG_SUMMARY.md](GCS_DEBUG_SUMMARY.md).
+
 **Date**: March 14, 2026  
 **Symptom**: `sai3-bench` GCS GET on RAPID bucket hangs permanently near end of large runs  
 **Root**: `google-cloud-storage` crate upgrade: vendored v1.8 → fork at v1.9 (`russfellows/google-cloud-rust`, branch `s3dlio-patches`)  

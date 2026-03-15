@@ -142,6 +142,12 @@ cd s3dlio
 # Build with default features (no HDF5 or NUMA required)
 cargo build --release
 
+# Build s3-cli with all cloud backends enabled (AWS + Azure + GCS)
+cargo build --release --bin s3-cli --features full-backends
+
+# Build s3-cli with GCS enabled only (plus default backends)
+cargo build --release --bin s3-cli --features backend-gcs
+
 # Build with NUMA topology support (requires libhwloc-dev)
 cargo build --release --features numa
 
@@ -159,7 +165,34 @@ cargo test
 
 # Build Python bindings with full backends (S3 + Azure + GCS)
 ./build_pyo3.sh full
+
+# Named profile form is also supported:
+./build_pyo3.sh --profile full
+./build_pyo3.sh --profile default
+
+# Show profile/help usage
+./build_pyo3.sh --help
 ```
+
+### Build Profile Quick Reference
+
+Rust backend feature profiles:
+
+- Default build (`cargo build --release`): S3-focused default backend set.
+- GCS-enabled build (`--features backend-gcs`): enables GCS in addition to default set.
+- Full cloud build (`--features full-backends`): enables AWS + Azure + GCS.
+
+Python wheel build profiles via `build_pyo3.sh`:
+
+- `default` or `slim`: AWS + file/direct; excludes Azure and GCS.
+- `full`: AWS + Azure + GCS + file/direct.
+- Positional and named forms are equivalent:
+    - `./build_pyo3.sh full`
+    - `./build_pyo3.sh -p full`
+    - `./build_pyo3.sh --profile full`
+
+Optional extra Rust features for wheel builds can still be passed with `EXTRA_FEATURES`.
+Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 **Note:** NUMA support (`--features numa`) improves multi-socket performance but requires the `hwloc2` C library. HDF5 support (`--features hdf5`) enables HDF5 data format generation but requires `libhdf5`. Both are optional and s3dlio is fully functional without them.
 
@@ -316,6 +349,9 @@ cargo build --release --features full-backends
 git clone https://github.com/russfellows/s3dlio.git
 cd s3dlio
 cargo build --release
+
+# Full cloud backend CLI build:
+cargo build --release --bin s3-cli --features full-backends
 ```
 
 **Python Library:**
@@ -328,6 +364,9 @@ pip install s3dlio
 
 # or build from source:
 ./build_pyo3.sh && ./install_pyo3_wheel.sh
+
+# build from source with full cloud backends:
+./build_pyo3.sh --profile full && ./install_pyo3_wheel.sh
 ```
 
 ### Documentation
