@@ -579,9 +579,9 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
 /// Returns a stream of keys (without the s3:// prefix) for memory efficiency.
 /// Callers can format URIs as needed: format!("s3://{}/{}", bucket, key)
 ///
-/// **NOTE**: Due to AWS SDK bug [aws-sdk-rust#1388](https://github.com/awslabs/aws-sdk-rust/issues/1388),
-/// tracing macros (debug!, info!, etc.) inside the spawned task cause hangs.
-/// Keep tracing calls OUTSIDE the tokio::spawn block.
+/// **History**: Prior to v0.9.75, tracing macros inside the spawned task caused hangs
+/// when RUST_LOG was set, due to h2/hyper debug output flooding. This is now fixed by
+/// `crate_log_caps()` which pins problematic crates to warn level.
 pub async fn list_objects_stream(
     bucket: String,
     path: String,
@@ -598,10 +598,6 @@ pub async fn list_objects_stream(
     
     // Spawn task to paginate and send results
     tokio::spawn(async move {
-        // NOTE: 2025-12-03 - tracing debug!() calls INSIDE this tokio::spawn cause hangs
-        // when verbose mode is enabled. Root cause unknown - possibly interaction between
-        // tracing subscriber and AWS SDK async code. Keep tracing macros outside spawn.
-        
         // Determine the S3 prefix and regex pattern from the input path
         let (prefix, pattern) = match path.rfind('/') {
             Some(index) => {
@@ -635,9 +631,13 @@ pub async fn list_objects_stream(
         let mut cont: Option<String> = None;
         let delimiter = if effective_recursive { None } else { Some("/") };
 
-        // NOTE: 2025-12-03 - tracing debug!() causes hangs in spawned async tasks when verbose mode enabled
-        // Root cause: Unknown interaction between tracing subscriber and AWS SDK async code
-        // Workaround: Keep tracing macros commented out in this spawned task context
+        debug!(
+            "list_objects_stream spawn: prefix='{}', pattern='{}', recursive={}, delimiter={:?}",
+            prefix, final_pattern, effective_recursive, delimiter
+        );
+
+        let mut page_count: u32 = 0;
+        let mut total_keys: u64 = 0;
 
         // Paginate through results
         loop {
@@ -649,6 +649,7 @@ pub async fn list_objects_stream(
 
             if let Some(token) = &cont {
                 req_builder = req_builder.continuation_token(token);
+                debug!("  page {}: continuation_token={:?}", page_count + 1, cont);
             }
 
             let resp = match req_builder.send().await {
@@ -658,6 +659,12 @@ pub async fn list_objects_stream(
                     return;
                 }
             };
+
+            page_count += 1;
+            debug!(
+                "  page {}: {} contents, {} common prefixes",
+                page_count, resp.contents().len(), resp.common_prefixes().len()
+            );
 
             // Stream matching objects from this page
             for obj in resp.contents() {
@@ -706,8 +713,11 @@ pub async fn list_objects_stream(
             if let Some(next) = resp.next_continuation_token() {
                 cont = Some(next.to_string());
             } else {
+                debug!("  list_objects_stream done: {} pages, {} total keys streamed", page_count, total_keys);
                 break;
             }
+
+            total_keys += resp.contents().len() as u64;
         }
     });
     
@@ -729,6 +739,7 @@ pub async fn list_objects_stream(
 pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() { bail!("Cannot GET range: no key specified"); }
+    debug!("get_object_range: uri='{}', offset={}, length={:?}", uri, offset, length);
     let client = aws_s3_client_async().await?;
     let mut range = format!("bytes={}-", offset);
     if let Some(len) = length {
@@ -746,7 +757,9 @@ pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u
         .context("get_object(range) failed")?;
     let body = resp.body.collect().await.context("collect range body")?;
     // Zero-copy: return Bytes directly
-    Ok(body.into_bytes())
+    let bytes = body.into_bytes();
+    debug!("get_object_range: uri='{}', returned {} bytes", uri, bytes.len());
+    Ok(bytes)
 }
 
 /// Read `length` bytes starting at `offset` from `s3://bucket/key`.
@@ -1009,8 +1022,8 @@ pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
     let _ = build_ops_async().await?.stat_object(bucket, key_clean).await;
 
     debug!(
-        "stat_object → bucket='{}', key='{}', key_clean='{}'",
-        bucket, key, key_clean
+        "stat_object: bucket='{}', key='{}'",
+        bucket, key_clean
     );
 
     let client = aws_s3_client_async().await?;
@@ -1046,6 +1059,7 @@ pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
 ///
 /// Async HEAD by full URI (non-blocking; safe inside Tokio)
 pub async fn stat_object_uri_async(uri: &str) -> Result<ObjectStat> {
+    debug!("stat_object_uri_async: uri='{}'", uri);
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() { bail!("Cannot HEAD: no key specified"); }
     stat_object(&bucket, &key).await
@@ -1110,8 +1124,7 @@ pub async fn get_object(bucket: &str, key: &str) -> Result<Bytes> {
     // delegate to S3Ops (which records the GET) and propagate errors
     let data = build_ops_async().await?.get_object(bucket, key).await?;
     
-    // Emit an info‑level message
-    info!("S3 GET s3://{}/{}", bucket, key);
+    debug!("S3 GET s3://{}/{} ({} bytes)", bucket, key, data.len());
     Ok(data)
 }
 
@@ -1239,6 +1252,7 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
 
 /// Public async get object call
 pub async fn get_object_uri_async(uri: &str) -> Result<Bytes> {
+    debug!("get_object_uri_async: uri='{}'", uri);
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
@@ -1285,11 +1299,9 @@ pub fn put_objects_with_random_data_and_type_with_progress(
 /// 
 /// Accepts `Bytes` for zero-copy efficiency (no .to_vec() call).
 pub async fn put_object_async(bucket: &str, key: &str, data: Bytes) -> Result<()> {
+    debug!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
     // delegate to S3Ops (which records the PUT) - data moved, no copy
     build_ops_async().await?.put_object(bucket, key, data).await?;
-    
-    // Emit an info‑level message 
-    info!("S3 PUT s3://{}/{} (Bytes)", bucket, key);
     Ok(())
 }
 
@@ -1297,6 +1309,7 @@ pub async fn put_object_async(bucket: &str, key: &str, data: Bytes) -> Result<()
 /// 
 /// Accepts `Bytes` for zero-copy efficiency.
 pub async fn put_object_uri_async(uri: &str, data: Bytes) -> Result<()> {
+    debug!("put_object_uri_async: uri='{}', {} bytes", uri, data.len());
     let (bucket, key) = parse_s3_uri(uri)?;
     put_object_async(&bucket, &key, data).await
 }
@@ -1309,6 +1322,7 @@ pub async fn put_object_multipart_uri_async(
     data: Bytes,
     part_size: Option<usize>,
 ) -> Result<()> {
+    debug!("put_object_multipart_uri_async: uri='{}', {} bytes, part_size={:?}", uri, data.len(), part_size);
     use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
     let cfg = MultipartUploadConfig {
         part_size: part_size.unwrap_or(16 * 1024 * 1024), // 16 MiB default

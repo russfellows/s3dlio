@@ -17,31 +17,35 @@ async fn test_complete_object_store_parity() -> Result<()> {
     assert_eq!(infer_scheme("https://account.blob.core.windows.net/container/key"), Scheme::Azure);
     println!("✅ All URI schemes recognized correctly");
     
-    // Test all backends can be instantiated
+    // Test always-available backends can be instantiated
     let file_store = store_for_uri("file:///tmp/test")?;
     let s3_store = store_for_uri("s3://test-bucket/test")?;
-    let azure_store = store_for_uri("az://account/container/test")?;
-    
-    // Test Azure backend is always available (ungated in v0.6.3)
-    let azure_result = store_for_uri("az://account/container/test");
-    assert!(azure_result.is_ok()); // Should succeed - Azure is now always available
-    
-    println!("✅ All backends instantiate through unified factory");
-    
-    // Verify all backends implement the same trait
-    // This compiles only if all backends have identical ObjectStore implementations
+    println!("✅ File and S3 backends instantiate through unified factory");
+
+    // Azure backend is only available with the backend-azure feature.
+    // Without it, store_for_uri returns a descriptive error — verify that.
+    #[cfg(feature = "backend-azure")]
+    let azure_store = {
+        let store = store_for_uri("az://account/container/test")?;
+        println!("✅ Azure backend instantiates through unified factory");
+        store
+    };
+    #[cfg(not(feature = "backend-azure"))]
+    {
+        let azure_result = store_for_uri("az://account/container/test");
+        assert!(azure_result.is_err(), "Azure backend should be unavailable without the backend-azure feature");
+        println!("✅ Azure backend correctly unavailable without backend-azure feature");
+    }
+
+    // Verify always-available backends implement the same trait
     let _: &dyn s3dlio::object_store::ObjectStore = &*file_store;
     let _: &dyn s3dlio::object_store::ObjectStore = &*s3_store;
+    #[cfg(feature = "backend-azure")]
     let _: &dyn s3dlio::object_store::ObjectStore = &*azure_store;
+
+    println!("✅ All compiled backends implement identical ObjectStore trait");
     
-    println!("✅ All three backends (File, S3, Azure) implement identical ObjectStore trait");
-    
-    println!("🎉 COMPLETE PARITY ACHIEVED:");
-    println!("   - Unified ObjectStore trait with identical API surface");
-    println!("   - Consistent URI schemes: file://, s3://, az://");
-    println!("   - Automatic backend selection via store_for_uri()");
-    println!("   - All operations: get, get_range, put, put_multipart, list, stat, delete, etc.");
-    println!("   - Storage backend is now transparent to AI/ML applications");
+    println!("🎉 BACKEND PARITY: unified factory, consistent URI schemes, identical trait surface");
     
     Ok(())
 }

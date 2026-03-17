@@ -28,7 +28,7 @@ use std::io::{self, Write, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use tempfile::NamedTempFile;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -53,6 +53,35 @@ use s3dlio::{
 };
 use s3dlio::{init_op_logger, finalize_op_logger, global_logger};
 use s3dlio::progress::{S3ProgressTracker, ProgressCallback};
+
+/// Returns per-crate log-level caps that prevent deadlocks.
+///
+/// h2, hyper, tonic, and the AWS SDK crates deadlock when debug/trace
+/// logging is active inside `tokio::spawn` blocks.  These directives are
+/// applied on top of whatever `RUST_LOG` says, so `RUST_LOG=debug` still
+/// works for *our* code while keeping the problematic crates at `warn`.
+fn crate_log_caps() -> Vec<tracing_subscriber::filter::Directive> {
+    [
+        "h2=warn",
+        "hyper=warn",
+        "hyper_util=warn",
+        "tonic=warn",
+        "tower=warn",
+        "reqwest=warn",
+        "aws_config=warn",
+        "aws_runtime=warn",
+        "aws_sdk_s3=warn",
+        "aws_smithy_runtime=warn",
+        "aws_smithy_runtime_api=warn",
+        "aws_smithy_http=warn",
+        "aws_credential_types=warn",
+        "aws_sigv4=warn",
+        "tracing=warn",
+    ]
+    .iter()
+    .filter_map(|s| s.parse().ok())
+    .collect()
+}
 
 /// Macro to safely print with broken pipe handling
 macro_rules! safe_println {
@@ -109,16 +138,20 @@ enum Command {
         uri: String,
     },
 
-    /// Create a new S3 bucket.
+    /// Create a bucket/container/directory for any supported backend (s3://, gs://, az://, file://, direct://).
+    #[clap(name = "create-bucket")]
     CreateBucket {
-        /// The name of the bucket to create (e.g., my-new-bucket)
-        bucket_name: String,
+        /// Storage URI of the bucket/container to create
+        /// (e.g. s3://my-bucket, gs://my-bucket, az://account/container, file:///mnt/data)
+        uri: String,
     },
 
-    /// Delete an S3 bucket. The bucket must be empty.
+    /// Delete a bucket/container/directory for any supported backend. The bucket must be empty.
+    #[clap(name = "delete-bucket")]
     DeleteBucket {
-        /// The name of the bucket to delete (e.g., my-old-bucket)
-        bucket_name: String,
+        /// Storage URI of the bucket/container to delete
+        /// (e.g. s3://my-bucket, gs://my-bucket, az://account/container, file:///mnt/data)
+        uri: String,
     },
 
     /// Stat object, show size & last modify date of a single object 
@@ -127,6 +160,7 @@ enum Command {
         uri: String,
     },
     /// Delete one object or every object that matches the prefix.
+    #[clap(visible_alias = "rm")]
     Delete {
         /// S3 URI (single key or prefix ending with `/`).
         uri: String,
@@ -291,10 +325,8 @@ enum Command {
         create_bucket: bool,
     },
 
-    /// List objects using generic storage URI (supports s3://, az://, gs://, file://, direct://)
-    /// Example: s3dlio ls s3://bucket/prefix/ -r
-    /// Example: s3dlio ls gs://bucket/prefix/ -r
-    #[clap(name = "ls", visible_alias = "list")]
+    /// List objects at a storage URI (s3://, az://, gs://, file://, direct://)
+    #[clap(name = "list", visible_alias = "ls")]
     GenericList {
         /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, gs://bucket/prefix/, file:///path/)
         uri: String,
@@ -313,9 +345,7 @@ enum Command {
         count_only: bool,
     },
 
-    /// Generate NVIDIA DALI-compatible index file for TFRecord files
-    /// Format: "{offset} {size}\n" (space-separated ASCII text)
-    /// Example: s3dlio tfrecord-index train.tfrecord train.tfrecord.idx
+    /// Generate NVIDIA DALI-compatible index file for a TFRecord file
     #[clap(name = "tfrecord-index")]
     TfrecordIndex {
         /// Path to TFRecord file (input)
@@ -368,6 +398,60 @@ fn requires_aws_credentials(uri: &str) -> bool {
     // Only S3 URIs require AWS credentials
     // Other schemes (gs://, az://, file://, direct://) use their own auth methods
     uri.starts_with("s3://")
+}
+
+/// Extract the container/bucket/path component expected by each backend's
+/// `create_container` / `delete_container` from a full storage URI.
+///
+/// Scheme → extracted name:
+///   s3://bucket[/prefix]              → "bucket"
+///   gs://bucket[/prefix]              → "bucket"
+///   gcs://bucket[/prefix]             → "bucket"
+///   az://account/container[/prefix]   → "account/container"
+///   azure://account/container[/…]     → "account/container"
+///   file:///path[/…]                  → "/path[/…]"
+///   direct:///path[/…]                → "/path[/…]"
+fn extract_container_name(uri: &str) -> Result<String> {
+    if let Some(rest) = uri.strip_prefix("s3://") {
+        let bucket = rest.split('/').next().unwrap_or("").trim_end_matches('/');
+        if bucket.is_empty() {
+            bail!("No bucket name found in S3 URI: {}", uri);
+        }
+        Ok(bucket.to_string())
+    } else if let Some(rest) = uri.strip_prefix("gs://")
+        .or_else(|| uri.strip_prefix("gcs://"))
+    {
+        let bucket = rest.split('/').next().unwrap_or("").trim_end_matches('/');
+        if bucket.is_empty() {
+            bail!("No bucket name found in GCS URI: {}", uri);
+        }
+        Ok(bucket.to_string())
+    } else if let Some(rest) = uri.strip_prefix("az://")
+        .or_else(|| uri.strip_prefix("azure://"))
+    {
+        // Azure expects "account/container"
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        let account = parts.first().copied().unwrap_or("");
+        let container = parts.get(1).copied().unwrap_or("").trim_end_matches('/');
+        if account.is_empty() || container.is_empty() {
+            bail!("Azure URI must be az://account/container; got: {}", uri);
+        }
+        Ok(format!("{}/{}", account, container))
+    } else if let Some(rest) = uri.strip_prefix("file://") {
+        let path = rest.trim_end_matches('/');
+        if path.is_empty() {
+            bail!("No path found in file URI: {}", uri);
+        }
+        Ok(path.to_string())
+    } else if let Some(rest) = uri.strip_prefix("direct://") {
+        let path = rest.trim_end_matches('/');
+        if path.is_empty() {
+            bail!("No path found in direct URI: {}", uri);
+        }
+        Ok(path.to_string())
+    } else {
+        bail!("Unsupported URI scheme for create/delete-bucket: {}", uri);
+    }
 }
 
 fn is_storage_uri(path_or_uri: &str) -> bool {
@@ -434,18 +518,26 @@ async fn main() -> Result<()> {
 
     // Initialize tracing with env filter (compatible with dl-driver/s3-bench)
     // NOTE: 2025-12-03 - Debug-level logging for ALL crates causes hangs during AWS SDK operations.
-    // Root cause: Unknown interaction between tracing subscriber and AWS SDK async code inside tokio::spawn.
-    // Workaround: Only enable verbose logging for our s3dlio crate, keep everything else at warn.
+    // Root cause: h2, hyper, and AWS SDK crates deadlock when debug/trace logging is active
+    // inside tokio::spawn blocks (tracing subscriber contention with async I/O).
+    // Fix: Always cap known-problematic crates at warn, regardless of RUST_LOG setting.
     // Bug filed: https://github.com/awslabs/aws-sdk-rust/issues/1388
+    // See also: https://github.com/russfellows/s3dlio/issues/105
     let safe_filter = match cli.verbose {
         0 => "warn".to_string(),
         1 => "warn,s3dlio=info".to_string(),   // -v: our code at info, deps at warn
         _ => "warn,s3dlio=debug".to_string(),  // -vv: our code at debug, deps at warn
     };
     
+    // Start from RUST_LOG if present, otherwise use our safe default.
+    // Then forcibly cap problematic crates at warn to prevent deadlocks,
+    // even if RUST_LOG=debug or RUST_LOG=trace was set globally.
+    let base_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&safe_filter));
+    let filter = crate_log_caps().into_iter().fold(base_filter, |f, d| f.add_directive(d));
+
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&safe_filter)))
+        .with_env_filter(filter)
         .with_target(false)
         .init();
     
@@ -474,32 +566,28 @@ async fn main() -> Result<()> {
             list_buckets_cmd(&uri).await?;
         },
 
-        // New, create-bucket command (S3-specific)
-        Command::CreateBucket { bucket_name } => {
-            check_aws_credentials()?;
-            // Reliably clean the input to get a valid bucket name by
-            // stripping the protocol prefix and any trailing slashes.
-            let final_bucket_name = bucket_name
-                .strip_prefix("s3://")
-                .unwrap_or(&bucket_name)
-                .trim_end_matches('/');
-
-            info!("Attempting to create bucket: {}...", final_bucket_name);
-            s3dlio::s3_utils::create_bucket(final_bucket_name)?;
-            safe_println!("Successfully created or verified bucket '{}'.", final_bucket_name);
+        Command::CreateBucket { uri } => {
+            if requires_aws_credentials(&uri) {
+                check_aws_credentials()?;
+            }
+            let name = extract_container_name(&uri)?;
+            let logger = global_logger();
+            let store = store_for_uri_with_logger(&uri, logger)?;
+            info!("Attempting to create bucket/container: {}...", uri);
+            store.create_container(&name).await?;
+            safe_println!("Successfully created or verified '{}'.", uri);
         },
 
-        Command::DeleteBucket { bucket_name } => {
-            check_aws_credentials()?;
-            // Reliably clean the input to get a valid bucket name
-            let final_bucket_name = bucket_name
-                .strip_prefix("s3://")
-                .unwrap_or(&bucket_name)
-                .trim_end_matches('/');
-
-            info!("Attempting to delete bucket: {}...", final_bucket_name);
-            s3dlio::s3_utils::delete_bucket(final_bucket_name)?;
-            safe_println!("Successfully deleted bucket '{}'.", final_bucket_name);
+        Command::DeleteBucket { uri } => {
+            if requires_aws_credentials(&uri) {
+                check_aws_credentials()?;
+            }
+            let name = extract_container_name(&uri)?;
+            let logger = global_logger();
+            let store = store_for_uri_with_logger(&uri, logger)?;
+            info!("Attempting to delete bucket/container: {}...", uri);
+            store.delete_container(&name).await?;
+            safe_println!("Successfully deleted '{}'.", uri);
         }
     
         Command::Stat { uri } => {
@@ -832,6 +920,8 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
     use regex::Regex;
     use futures::stream::StreamExt;
     
+    debug!("generic_list_cmd: uri='{}', recursive={}, pattern={:?}, count_only={}", uri, recursive, pattern, count_only);
+    
     // Helper to format numbers with commas
     fn format_with_commas(n: f64) -> String {
         let s = format!("{:.0}", n);
@@ -963,9 +1053,11 @@ fn tfrecord_index_cmd(tfrecord_path: &PathBuf, index_path: Option<&Path>) -> Res
 
 /// Stat command: provide info on a single object (universal, works with all backends)
 async fn stat_cmd(uri: &str) -> Result<()> {
+    debug!("stat_cmd: uri='{}'", uri);
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger)?;
     let os = store.stat(uri).await?;
+    debug!("stat_cmd: uri='{}', size={}", uri, os.size);
     
     // Always show core fields
     safe_println!("URI             : {}", uri);
@@ -1750,7 +1842,115 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
 
 #[cfg(test)]
 mod tests {
-    use super::parse_human_size;
+    use super::{extract_container_name, parse_human_size};
+
+    // ------------------------------------------------------------------
+    // extract_container_name — no network access, pure string parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn extract_s3_simple_bucket() {
+        assert_eq!(extract_container_name("s3://my-bucket").unwrap(), "my-bucket");
+    }
+
+    #[test]
+    fn extract_s3_bucket_with_prefix() {
+        // Only the bucket portion should be returned
+        assert_eq!(extract_container_name("s3://my-bucket/some/prefix/").unwrap(), "my-bucket");
+    }
+
+    #[test]
+    fn extract_s3_trailing_slash_only() {
+        // "s3://" alone has no bucket — should error
+        assert!(extract_container_name("s3://").is_err());
+    }
+
+    #[test]
+    fn extract_gcs_gs_prefix() {
+        assert_eq!(extract_container_name("gs://my-gcs-bucket").unwrap(), "my-gcs-bucket");
+    }
+
+    #[test]
+    fn extract_gcs_gcs_prefix() {
+        assert_eq!(extract_container_name("gcs://my-gcs-bucket/prefix/").unwrap(), "my-gcs-bucket");
+    }
+
+    #[test]
+    fn extract_gcs_missing_bucket() {
+        assert!(extract_container_name("gs://").is_err());
+    }
+
+    #[test]
+    fn extract_azure_account_and_container() {
+        assert_eq!(
+            extract_container_name("az://myaccount/mycontainer").unwrap(),
+            "myaccount/mycontainer"
+        );
+    }
+
+    #[test]
+    fn extract_azure_with_prefix() {
+        // Prefix beyond account/container is ignored; only account/container returned
+        assert_eq!(
+            extract_container_name("az://myaccount/mycontainer/some/prefix/").unwrap(),
+            "myaccount/mycontainer"
+        );
+    }
+
+    #[test]
+    fn extract_azure_missing_container() {
+        assert!(extract_container_name("az://myaccount").is_err());
+        assert!(extract_container_name("az://myaccount/").is_err());
+    }
+
+    #[test]
+    fn extract_azure_missing_account() {
+        assert!(extract_container_name("az://").is_err());
+    }
+
+    #[test]
+    fn extract_azure_prefix_variant() {
+        assert_eq!(
+            extract_container_name("azure://acc/cont").unwrap(),
+            "acc/cont"
+        );
+    }
+
+    #[test]
+    fn extract_file_absolute_path() {
+        assert_eq!(extract_container_name("file:///mnt/data").unwrap(), "/mnt/data");
+    }
+
+    #[test]
+    fn extract_file_nested_path() {
+        assert_eq!(extract_container_name("file:///mnt/data/subdir/").unwrap(), "/mnt/data/subdir");
+    }
+
+    #[test]
+    fn extract_file_empty_path() {
+        assert!(extract_container_name("file://").is_err());
+    }
+
+    #[test]
+    fn extract_direct_path() {
+        assert_eq!(extract_container_name("direct:///nvme/data").unwrap(), "/nvme/data");
+    }
+
+    #[test]
+    fn extract_direct_trailing_slash_stripped() {
+        assert_eq!(extract_container_name("direct:///nvme/data/").unwrap(), "/nvme/data");
+    }
+
+    #[test]
+    fn extract_unknown_scheme_errors() {
+        assert!(extract_container_name("ftp://some-host/bucket").is_err());
+        assert!(extract_container_name("http://example.com/bucket").is_err());
+        assert!(extract_container_name("just-a-name").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // parse_human_size — existing tests
+    // ------------------------------------------------------------------
 
     #[test]
     fn parse_human_size_accepts_bytes_and_suffixes() {

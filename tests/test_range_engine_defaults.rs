@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-azure", feature = "backend-gcs"))]
 mod range_engine_defaults {
     use s3dlio::object_store::{AzureConfig, GcsConfig};
     use s3dlio::file_store::FileSystemConfig;

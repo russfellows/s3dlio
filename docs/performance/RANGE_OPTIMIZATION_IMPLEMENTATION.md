@@ -42,8 +42,7 @@ firing independent range sub-requests in parallel. Performance on GCS is governe
 - **gRPC write chunk size** (capped below the 4 MiB server message limit)
 
 Setting `S3DLIO_ENABLE_RANGE_OPTIMIZATION=1` has **no effect on GCS reads**. GCS throughput
-tuning is covered in [docs/Fix-GCS_v2.md](../Fix-GCS_v2.md) and
-[docs/GCS-gRPC-Transport.md](../GCS-gRPC-Transport.md).
+tuning is covered in [docs/supplemental/GCS-Backend.md](../supplemental/GCS-Backend.md).
 
 ### Azure Blob Storage (`az://`) — Separate Architecture
 
@@ -70,7 +69,7 @@ file backend is intentionally disabled by default — a single sequential read i
 | Backend | Read transport | Parallel range opt | Where to tune |
 |---------|---------------|-------------------|---------------|
 | S3 / S3-compat | AWS SDK HTTP `GetObject` | ✅ `S3DLIO_ENABLE_RANGE_OPTIMIZATION` | This document |
-| GCS RAPID | gRPC `BidiReadObject` stream | ✖ N/A (streaming, not range-based) | [Fix-GCS_v2.md](../Fix-GCS_v2.md) |
+| GCS RAPID | gRPC `BidiReadObject` stream | ✖ N/A (streaming, not range-based) | [GCS-Backend.md](../supplemental/GCS-Backend.md) |
 | Azure Blob | Azure SDK HTTP GET | ⚠️ Separate flag | `Environment_Variables.md` |
 | File | `read()` syscalls | ✖ Disabled (seek overhead) | N/A |
 

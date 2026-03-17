@@ -1117,6 +1117,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("ConfigurableFileSystemObjectStore::get uri='{}'", uri);
         
         if !path.exists() {
             bail!("File not found: {}", path.display());
@@ -1142,6 +1143,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("ConfigurableFileSystemObjectStore::get_range uri='{}', offset={}, length={:?}", uri, offset, length);
         
         if !path.exists() {
             bail!("File not found: {}", path.display());
@@ -1157,6 +1159,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("ConfigurableFileSystemObjectStore::put uri='{}', {} bytes", uri, data.len());
         
         // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
         self.write_file_direct(&path, data.as_ref()).await
@@ -1164,6 +1167,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
+        debug!("ConfigurableFileSystemObjectStore::put_multipart uri='{}', {} bytes, part_size={:?}", uri, data.len(), part_size);
         
         if !self.config.direct_io {
             // Fallback to regular put for non-direct I/O
@@ -1201,6 +1205,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         if !Self::is_valid_file_uri(uri_prefix) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let base_path = Self::uri_to_path(uri_prefix)?;
+        debug!("ConfigurableFileSystemObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
         let mut results = Vec::new();
         
         if !base_path.exists() {
@@ -1253,6 +1258,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("ConfigurableFileSystemObjectStore::stat uri='{}'", uri);
         
         if !path.exists() {
             bail!("File not found: {}", path.display());
@@ -1268,6 +1274,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     async fn delete(&self, uri: &str) -> Result<()> {
         if !Self::is_valid_file_uri(uri) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("ConfigurableFileSystemObjectStore::delete uri='{}'", uri);
         
         if !path.exists() {
             // Already deleted, consider it success
@@ -1286,6 +1293,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
         // FileSystemObjectStore: delete files concurrently
         use futures::stream::{self, StreamExt};
+        debug!("ConfigurableFileSystemObjectStore::delete_batch {} URIs", uris.len());
         
         let max_concurrency = (uris.len() / 10).clamp(10, 100);
         let uris_owned: Vec<String> = uris.to_vec();
@@ -1305,6 +1313,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         if !Self::is_valid_file_uri(uri_prefix) { bail!("FileSystemObjectStore expected file:// or direct:// URI"); }
         let base_path = Self::uri_to_path(uri_prefix)?;
+        debug!("ConfigurableFileSystemObjectStore::delete_prefix prefix='{}'", uri_prefix);
         
         if !base_path.exists() {
             return Ok(()); // Nothing to delete

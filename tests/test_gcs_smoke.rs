@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+// Only compile when the GCS backend is included.
+#![cfg(feature = "backend-gcs")]
+
 use anyhow::Result;
 use bytes::Bytes;
 use s3dlio::object_store::{GcsObjectStore, ObjectStore};

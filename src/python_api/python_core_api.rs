@@ -473,8 +473,11 @@ pub fn init_logging(level: &str) -> PyResult<()> {
         .with_target(false)
         .try_init();
     
-    // Initialize tracing-log bridge to capture log crate messages
-    tracing_log::LogTracer::init().ok();
+    // NOTE: tracing_log::LogTracer::init() intentionally omitted here.
+    // The log→tracing bridge causes deadlocks during async OnceCell
+    // initialization when debug/trace logging is active (AWS SDK uses
+    // the `log` crate internally, and the bridge re-enters tracing).
+    // See: https://github.com/russfellows/s3dlio/issues/105
     
     Ok(())
 }
