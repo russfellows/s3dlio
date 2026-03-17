@@ -1,7 +1,10 @@
-// Azure backend tests - now always enabled
+// Azure backend tests - requires backend-azure feature
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
+// Only compile when the Azure backend is included.
+#![cfg(feature = "backend-azure")]
 
 use anyhow::{Context, Result};
 use bytes::Bytes;

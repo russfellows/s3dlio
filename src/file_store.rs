@@ -419,6 +419,7 @@ impl ObjectStore for FileSystemObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("FileSystemObjectStore::get uri='{}'", uri);
         
         if !path.exists() {
             bail!("File not found: {}", path.display());
@@ -456,6 +457,7 @@ impl ObjectStore for FileSystemObjectStore {
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("FileSystemObjectStore::get_range uri='{}', offset={}, length={:?}", uri, offset, length);
         
         if !path.exists() {
             bail!("File not found: {}", path.display());
@@ -509,6 +511,7 @@ impl ObjectStore for FileSystemObjectStore {
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("FileSystemObjectStore::put uri='{}', {} bytes", uri, data.len());
         
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
@@ -522,6 +525,7 @@ impl ObjectStore for FileSystemObjectStore {
 
     async fn put_multipart(&self, uri: &str, data: Bytes, _part_size: Option<usize>) -> Result<()> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
+        debug!("FileSystemObjectStore::put_multipart uri='{}', {} bytes", uri, data.len());
         // For filesystem, multipart is the same as regular put
         // In a more sophisticated implementation, we could write in chunks
         self.put(uri, data).await
@@ -530,6 +534,7 @@ impl ObjectStore for FileSystemObjectStore {
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         if !uri_prefix.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let base_path = Self::uri_to_path(uri_prefix)?;
+        debug!("FileSystemObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
         let mut results = Vec::new();
         
         if !base_path.exists() {
@@ -582,6 +587,7 @@ impl ObjectStore for FileSystemObjectStore {
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("FileSystemObjectStore::stat uri='{}'", uri);
         
         if !path.exists() {
             bail!("File not found: {}", path.display());
@@ -597,6 +603,7 @@ impl ObjectStore for FileSystemObjectStore {
     async fn delete(&self, uri: &str) -> Result<()> {
         if !uri.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let path = Self::uri_to_path(uri)?;
+        debug!("FileSystemObjectStore::delete uri='{}'", uri);
         
         if !path.exists() {
             // Already deleted, consider it success
@@ -615,6 +622,7 @@ impl ObjectStore for FileSystemObjectStore {
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
         // FileSystemObjectStore: delete files concurrently
         use futures::stream::{self, StreamExt};
+        debug!("FileSystemObjectStore::delete_batch {} URIs", uris.len());
         
         let max_concurrency = (uris.len() / 10).clamp(10, 100);
         let uris_owned: Vec<String> = uris.to_vec();
@@ -634,6 +642,7 @@ impl ObjectStore for FileSystemObjectStore {
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         if !uri_prefix.starts_with("file://") { bail!("FileSystemObjectStore expected file:// URI"); }
         let base_path = Self::uri_to_path(uri_prefix)?;
+        debug!("FileSystemObjectStore::delete_prefix prefix='{}'", uri_prefix);
         
         if !base_path.exists() {
             return Ok(()); // Nothing to delete

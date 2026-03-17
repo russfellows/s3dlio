@@ -23,6 +23,7 @@ use azure_storage_blob::models::{
     BlockBlobClientStageBlockOptions, BlockBlobClientUploadOptions, BlockList, BlockListType,
     BlockLookupList,
 };
+use tracing::debug;
 
 // Global credential cache to avoid repeated authentication
 static AZURE_CREDENTIAL: OnceCell<Arc<dyn TokenCredential>> = OnceCell::const_new();
@@ -161,6 +162,7 @@ impl AzureBlob {
 
     /// Simple upload (single request). For large bodies prefer multipart helpers below.
     pub async fn put(&self, key: &str, body: Bytes, overwrite: bool) -> Result<()> {
+        debug!("AzureBlob::put container='{}', key='{}', size={}, overwrite={}", self.container, key, body.len(), overwrite);
         let blob = self.blob_client(key)?;
         // Convert Bytes -> Body -> RequestContent<Bytes, NoFormat>
         let content_len = body.len() as u64;
@@ -173,6 +175,7 @@ impl AzureBlob {
 
     /// Range GET. If `end` is None → open-ended range.
     pub async fn get_range(&self, key: &str, start: u64, end: Option<u64>) -> Result<Bytes> {
+        debug!("AzureBlob::get_range container='{}', key='{}', start={}, end={:?}", self.container, key, start, end);
         let blob = self.blob_client(key)?;
         let mut opts = BlobClientDownloadOptions::default();
         let range = match end {
@@ -182,30 +185,36 @@ impl AzureBlob {
         opts.range = Some(range);
         let resp = blob.download(Some(opts)).await?;
         let body = resp.into_body().collect().await?;
+        debug!("AzureBlob::get_range success: key='{}', {} bytes", key, body.len());
         Ok(body)
     }
 
     /// Full GET (single buffer).
     pub async fn get(&self, key: &str) -> Result<Bytes> {
+        debug!("AzureBlob::get container='{}', key='{}'", self.container, key);
         let blob = self.blob_client(key)?;
         let resp = blob.download(Some(BlobClientDownloadOptions::default())).await?;
         let body = resp.into_body().collect().await?;
+        debug!("AzureBlob::get success: key='{}', {} bytes", key, body.len());
         Ok(body)
     }
 
     /// Stat: read size, etag, last-modified from typed response headers.
     pub async fn stat(&self, key: &str) -> Result<AzureBlobProperties> {
+        debug!("AzureBlob::stat container='{}', key='{}'", self.container, key);
         let blob = self.blob_client(key)?;
         let resp = blob.get_properties(Some(BlobClientGetPropertiesOptions::default())).await?;
         let content_length = resp.content_length()?.unwrap_or(0);
         let etag = resp.etag()?.map(|e| e.to_string());
         let last_modified = resp.last_modified()?.map(|dt| dt.to_string());
+        debug!("AzureBlob::stat success: key='{}', content_length={}", key, content_length);
         Ok(AzureBlobProperties { content_length, etag, last_modified })
     }
 
     /// Flat list with optional prefix.
     /// In SDK 0.7+, the Pager yields BlobItemInternal directly (not Response pages).
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        debug!("AzureBlob::list container='{}', prefix={:?}", self.container, prefix);
         let container = self.container_client()?;
         let mut opts = BlobContainerClientListBlobFlatSegmentOptions::default();
         if let Some(p) = prefix {
@@ -222,6 +231,7 @@ impl AzureBlob {
                 out.push(name);
             }
         }
+        debug!("AzureBlob::list success: {} objects", out.len());
         Ok(out)
     }
 
@@ -273,6 +283,7 @@ impl AzureBlob {
     // src/azure_client.rs  (inside impl AzureBlob)
     /// Delete multiple blobs (simple loop; batch is possible later).
     pub async fn delete_objects(&self, blobs: &[String]) -> anyhow::Result<()> {
+        debug!("AzureBlob::delete_objects container='{}', count={}", self.container, blobs.len());
         let container = self.container_client()?;
         for name in blobs {
             let b = container.blob_client(name);
@@ -288,6 +299,7 @@ impl AzureBlob {
 
     /// Stage a block (non-committal). `block_id` is raw bytes; SDK base64-encodes on wire.
     pub async fn stage_block(&self, key: &str, block_id: &[u8], chunk: Bytes) -> Result<()> {
+        debug!("AzureBlob::stage_block container='{}', key='{}', chunk_size={}", self.container, key, chunk.len());
         let bb = self.block_blob_client(key)?;
         let content_len = chunk.len() as u64;
         let body: RequestContent<Bytes, NoFormat> = Body::from(chunk).into();
@@ -299,6 +311,7 @@ impl AzureBlob {
 
     /// Commit previously staged block IDs (order matters).
     pub async fn commit_block_list(&self, key: &str, committed_block_ids: Vec<Vec<u8>>) -> Result<()> {
+        debug!("AzureBlob::commit_block_list container='{}', key='{}', blocks={}", self.container, key, committed_block_ids.len());
         let bb = self.block_blob_client(key)?;
         let lookup = BlockLookupList {
             committed: None,
@@ -314,6 +327,7 @@ impl AzureBlob {
 
     /// Return committed block IDs (raw bytes that correspond to your passed IDs).
     pub async fn get_block_list_committed(&self, key: &str) -> Result<Vec<Vec<u8>>> {
+        debug!("AzureBlob::get_block_list_committed container='{}', key='{}'", self.container, key);
         let bb = self.block_blob_client(key)?;
         let resp = bb.get_block_list(BlockListType::Committed, None).await?;
         // In 0.7.0, Response::into_model() deserializes directly (not async)
@@ -347,6 +361,7 @@ impl AzureBlob {
     where
         S: Stream<Item = Bytes> + Unpin + Send + 'static,
     {
+        debug!("AzureBlob::upload_multipart_stream container='{}', key='{}', part_size={}, max_in_flight={}", self.container, key, part_size, max_in_flight);
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut next_idx: u64 = 0;
         let mut committed_ids: Vec<Vec<u8>> = Vec::new();

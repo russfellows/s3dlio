@@ -102,6 +102,7 @@ async fn test_s3_compression_via_store() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "backend-azure")]
 #[tokio::test]
 async fn test_azure_compression_via_store() -> Result<()> {
     let azure_uri = "az://testaccount/testcontainer/test_azure_compression.dat";

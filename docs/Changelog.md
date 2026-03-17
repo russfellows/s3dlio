@@ -1,5 +1,61 @@
 # s3dlio Changelog
 
+## Version 0.9.75 - GCS RAPID/Zonal Support, Debug Logging, RUST_LOG Hang Fix (March 2026)
+
+### GCS RAPID / zonal bucket support
+- Stat: use BidiReadObject for authoritative size metadata on RAPID buckets (StorageControl returns stale size=0).
+- Get: handle OUT_OF_RANGE errors on RAPID zonal buckets by bypassing stale-metadata fallback path.
+- Put: leverage `google-cloud-rust` fork with BidiWriteObject two-phase finalize to avoid PUT truncation.
+- Auto-detect RAPID mode per bucket via `S3DLIO_GCS_RAPID` env var (`true` / `false` / `auto`); cached once per process.
+- Pinned `google-cloud-rust` fork at `release-20260212-rf-gcsrapid-20260317.1` for PUT truncation fix.
+
+### RUST_LOG=debug hang fix (issue #105)
+- Added `crate_log_caps()` in `src/bin/cli.rs` that applies `warn`-level `EnvFilter` directives for noisy async crates (`h2`, `hyper`, `hyper_util`, `hyper_rustls`, `tonic`, `tower`, `reqwest`, `rustls`, `aws_config`, `aws_sdk_s3`, `aws_smithy_runtime`, `aws_smithy_http`).
+- Prevents debug-level tracing from triggering async deadlocks inside HTTP/gRPC stacks.
+- User code remains at the level requested by `RUST_LOG`; only the third-party crates are capped.
+
+### Debug logging restored across all five backends
+- `S3ObjectStore` + `s3_utils.rs`: entry/exit debug logging on all operations (get, get_range, put, put_multipart, list, stat, delete, delete_batch, delete_prefix).
+- `AzureObjectStore` + `azure_client.rs`: consistent debug logging on all 12 Blob Storage methods.
+- `GcsObjectStore` in `object_store.rs`: entry debug logging (inner `google_gcs_client.rs` already had 35+ statements).
+- `FileSystemObjectStore` (`file_store.rs`): debug logging on all POSIX-path operations.
+- `ConfigurableFileSystemObjectStore` (`file_store_direct.rs`): debug logging on all O_DIRECT operations.
+- `MultiEndpointStore` and `LoggedObjectStore` intentionally not modified (delegate/TSV paths avoid duplication).
+
+### CLI improvements
+- `delete` command gains `rm` as a visible alias (`s3-cli rm ...`).
+- Command naming corrected: `list` is now the primary name, `ls` is the alias (was reversed). Help output now reads `list ... [aliases: ls]`.
+- Shortened `list` and `tfrecord-index` one-line help strings to prevent wrapping in terminal help output.
+- `create-bucket` and `delete-bucket` commands made fully generic: now accept any URI scheme (`s3://`, `gs://`, `az://`, `file://`, `direct://`) instead of bare bucket names. Auth check is URI-scheme-aware (only S3 checks AWS credentials). Uses `store_for_uri_with_logger()` dispatch, consistent with all other commands.
+- `extract_container_name(uri)` helper: pure string parser extracting the backend-appropriate container identifier from any URI scheme.
+- Command help ordering: bucket commands (`create-bucket`, `delete-bucket`, `list-buckets`) listed first, remaining commands sorted alphabetically.
+- 17 unit tests added for `extract_container_name()` covering all five backends and error cases (19/19 `cargo test --bin s3-cli` passing).
+- `crate_log_caps()` pins noisy async crates (`h2`, `hyper`, `tonic`, `tower`, `reqwest`, etc.) to `warn` level, preventing `RUST_LOG=debug` from triggering async deadlocks in gRPC/HTTP stacks.
+
+### Python binding fix
+- Removed `LogTracer::init()` call from `python_core_api.rs` that conflicted with Python's own logging initialization.
+
+### Issue #125 confirmed resolved
+- Default build (`cargo build`) excludes optional Azure/GCS backends; `--features full-backends` enables all five.
+
+### Integration test hygiene
+- Fixed 11 integration test files that referenced feature-gated Azure/GCS structs without being feature-gated themselves. All files now carry the correct `#![cfg(feature = "backend-azure")]` or `#![cfg(feature = "backend-gcs")]` crate-level attribute.
+- `tests/test_backend_parity.rs`: corrected stale assertion `assert!(azure_result.is_ok())` — wrapped Azure instantiation in `#[cfg(feature = "backend-azure")]` / `#[cfg(not(...))]` blocks; default builds now correctly verify that Azure returns an error when the feature is absent.
+- `tests/test_compression_all_backends.rs` and `tests/test_object_store_integration.rs`: individual Azure/GCS tests gated with `#[cfg(feature = "backend-azure")]` to prevent spurious failures in default builds.
+- `cargo test` (default features) returns zero failures across all test suites.
+
+### GCS documentation consolidated
+- Removed 5 GCS docs that documented in-progress investigation and now-resolved issues: `GCS-API-Configuration.md`, `GCS_BIDI_HANG_ANALYSIS.md`, `GCS_DEBUG_SUMMARY.md`, `GCS-gRPC_Fixes.md`, `GCS-gRPC-Transport.md`.
+- Replaced with single authoritative reference: `docs/supplemental/GCS-Backend.md` — current architecture, RAPID two-phase finalize, HTTP/2 window tuning, google-cloud-rust fork commit history, API reference, performance results.
+
+### Verification
+- `cargo check --features full-backends` — zero warnings ✅
+- `cargo build --release --features full-backends` — success ✅
+- `cargo test` (default features) — zero failures ✅
+- Manual GCS RAPID cluster test: 1000-object delete via `s3-cli -vv rm -r gs://…` — debug logging visible, `rm` alias functional ✅
+
+---
+
 ## Version 0.9.70 - Backend-Profiled Builds, GCS Hot-Path Reuse, and RAPID Runtime Improvements (March 2026)
 
 ### Why this release was needed
@@ -137,8 +193,7 @@
 - `test_put_object_caller_bytes_conversion_is_zero_copy`
 
 ### Documentation
-- `docs/GCS-gRPC_Fixes.md` — comprehensive combined doc covering all 6 root-cause issues, all fixes, constants architecture, zero-copy data flow, performance results (3.83 GB/s), env-var reference, files-changed table
-- `docs/Fix-GCS_v0-9-65.md` removed (absorbed into `GCS-gRPC_Fixes.md`)
+- `docs/supplemental/GCS-Backend.md` — comprehensive combined doc covering all 6 root-cause issues, all fixes, constants architecture, zero-copy data flow, performance results (3.83 GB/s), env-var reference, files-changed table (formerly `GCS-gRPC_Fixes.md`)
 - `docs/performance/RANGE_OPTIMIZATION_IMPLEMENTATION.md` — clarified as S3-only; added §Backend-Specific Read Architectures comparing S3/GCS/Azure/File transport layers
 
 ### GCS API Completion (read-back, query, Python bindings)
@@ -146,7 +201,7 @@
 - **NEW**: `s3dlio::get_gcs_rapid_mode() -> Option<bool>` — read back the current effective RAPID mode, resolving env var + programmatic override (`None` = auto-detect)
 - **NEW**: `s3dlio::query_gcs_rapid_bucket(bucket_or_uri) -> bool` (async) — query whether a bucket or `gs://` URI is RAPID (Hyperdisk ML); result cached per bucket for process lifetime, deduplicated under concurrent access
 - **NEW** Python API: `gcs_set_channel_count`, `gcs_set_rapid_mode`, `gcs_get_channel_count`, `gcs_get_rapid_mode`, `gcs_query_rapid_bucket` — full GCS tuning control from Python without requiring environment variables
-- `docs/GCS-API-Configuration.md` — complete reference for all 5 public GCS API functions, constants, env vars, and Python usage
+- `docs/supplemental/GCS-Backend.md` — complete reference for all 5 public GCS API functions, constants, env vars, and Python usage (see §Runtime Configuration)
 - `.github/copilot-instructions.md` — added Prime Directive and Secondary Directive
 
 ---
@@ -159,7 +214,7 @@
 - Chunked writes with 2 MiB default chunk size (`S3DLIO_GRPC_WRITE_CHUNK_SIZE` to override)
 - Per-chunk CRC32C checksums via `ChecksummedData` + whole-object CRC32C on final message
 - TRACE-level logging for gRPC write chunk size, count, offsets, and CRC32C values
-- See [docs/GCS-gRPC-Transport.md](GCS-gRPC-Transport.md) for full architecture details
+- See [docs/supplemental/GCS-Backend.md](supplemental/GCS-Backend.md) for full architecture details
 
 ### GCS RAPID / Hyperdisk ML Storage Support
 - Vendored `google-cloud-storage` v1.8.0 fork with gRPC write support:
@@ -200,7 +255,7 @@
 ### Other
 - Comprehensive `trace!`/`debug!` instrumentation across GCS, Azure, S3 list paths
 - Doc-test fence annotations updated; `doctest-threads = 1` to prevent memory thrash
-- Consolidated 4 GCS design docs into single [docs/GCS-gRPC-Transport.md](GCS-gRPC-Transport.md)
+- Consolidated 4 GCS design docs into single `docs/GCS-gRPC-Transport.md` (subsequently merged into `docs/supplemental/GCS-Backend.md` in v0.9.75)
 
 ---
 

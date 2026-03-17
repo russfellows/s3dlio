@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+// This test file requires the Azure backend feature. Exclude it from default builds.
+#![cfg(feature = "backend-azure")]
+
 use anyhow::Result;
 use bytes::Bytes;
 use s3dlio::api::store_for_uri;

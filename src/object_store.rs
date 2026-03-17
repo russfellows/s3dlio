@@ -724,6 +724,8 @@ where
         (total / 10).min(1000)  // Large batches: 10% capped at 1000
     };
 
+    debug!("delete_objects_concurrent: {} objects, concurrency={}", total, max_concurrency);
+
     let completed = Arc::new(AtomicUsize::new(0));
     let last_reported = Arc::new(AtomicUsize::new(0));
     
@@ -775,6 +777,8 @@ where
         let final_count = completed.load(Ordering::Relaxed);
         callback(final_count);
     }
+
+    debug!("delete_objects_concurrent: completed {} deletions", total);
 
     Ok(())
 }
@@ -997,6 +1001,7 @@ impl S3ObjectStore {
 impl ObjectStore for S3ObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        debug!("S3ObjectStore::get uri='{}'", uri);
         
         // Range optimization is ENABLED by default (v0.9.60+).
         // Set S3DLIO_ENABLE_RANGE_OPTIMIZATION=0 (or false/no/off/disable) to disable.
@@ -1015,22 +1020,27 @@ impl ObjectStore for S3ObjectStore {
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        debug!("S3ObjectStore::get_range uri='{}', offset={}, length={:?}", uri, offset, length);
         s3_get_object_range_uri_async(uri, offset, length).await
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        debug!("S3ObjectStore::put uri='{}', {} bytes", uri, data.len());
         s3_put_object_uri_async(uri, data).await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        debug!("S3ObjectStore::put_multipart uri='{}', {} bytes, part_size={:?}", uri, data.len(), part_size);
         s3_put_object_multipart_uri_async(uri, data, part_size).await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
+        debug!("S3ObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
         let (bucket, key_prefix) = parse_s3_uri(uri_prefix)?;
         let keys = s3_list_objects(&bucket, &key_prefix, recursive)?;
+        debug!("S3ObjectStore::list result: {} keys", keys.len());
         Ok(keys.into_iter().map(|k| format!("s3://{}/{}", bucket, k)).collect())
     }
 
@@ -1067,17 +1077,20 @@ impl ObjectStore for S3ObjectStore {
 
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        debug!("S3ObjectStore::stat uri='{}'", uri);
         s3_stat_object_uri_async(uri).await
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        debug!("S3ObjectStore::delete uri='{}'", uri);
         let (bucket, key) = parse_s3_uri(uri)?;
         s3_delete_objects(&bucket, &[key])
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
         if uris.is_empty() { return Ok(()); }
+        debug!("S3ObjectStore::delete_batch {} URIs", uris.len());
         
         // Extract bucket and keys from URIs
         let (bucket, _) = parse_s3_uri(&uris[0])?;
@@ -1091,6 +1104,7 @@ impl ObjectStore for S3ObjectStore {
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         use futures::stream::StreamExt;
+        debug!("S3ObjectStore::delete_prefix prefix='{}'", uri_prefix);
         
         let (bucket, mut key_prefix) = parse_s3_uri(uri_prefix)?;
         if !key_prefix.is_empty() && !key_prefix.ends_with('/') { 
@@ -1631,6 +1645,7 @@ impl ObjectStore for AzureObjectStore {
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
+        debug!("AzureObjectStore::get_range uri='{}', offset={}, length={:?}", uri, offset, length);
         let end = length.map(|len| offset + len - 1);
         let b = cli.get_range(&key, offset, end).await?; // Bytes - return directly for zero-copy
         Ok(b)
@@ -1638,12 +1653,14 @@ impl ObjectStore for AzureObjectStore {
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
+        debug!("AzureObjectStore::put uri='{}', {} bytes", uri, data.len());
         // Bytes→Bytes is zero-copy (reference counted buffer)
         cli.put(&key, data, true).await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
+        debug!("AzureObjectStore::put_multipart uri='{}', {} bytes, part_size={:?}", uri, data.len(), part_size);
         let part = part_size.unwrap_or(crate::constants::DEFAULT_AZURE_MULTIPART_PART_SIZE);
         let max_in_flight = std::env::var("AZURE_MAX_INFLIGHT")
             .ok()
@@ -1665,6 +1682,7 @@ impl ObjectStore for AzureObjectStore {
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         let (cli, account, container, key_prefix) = Self::client_for_prefix(uri_prefix)?;
+        debug!("AzureObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
         // Azure's flat list is already recursive (prefix-constrained).
         let prefix = if recursive {
             Some(key_prefix.as_str())
@@ -1696,6 +1714,7 @@ impl ObjectStore for AzureObjectStore {
         recursive: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
         Box::pin(async_stream::stream! {
+            debug!("AzureObjectStore::list_stream prefix='{}', recursive={}", uri_prefix, recursive);
             let (cli, account, container, key_prefix) = match Self::client_for_prefix(uri_prefix) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1737,16 +1756,19 @@ impl ObjectStore for AzureObjectStore {
 
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
+        debug!("AzureObjectStore::stat uri='{}'", uri);
         let p = cli.stat(&key).await?;
         Ok(az_props_to_meta(&p))
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
+        debug!("AzureObjectStore::delete uri='{}'", uri);
         cli.delete_objects(&[key]).await}
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
         if uris.is_empty() { return Ok(()); }
+        debug!("AzureObjectStore::delete_batch {} URIs", uris.len());
         
         // Azure Blob batch delete: already supports batching
         let (cli, _acct, _cont, _) = Self::client_for_uri(&uris[0])?;
@@ -1760,6 +1782,7 @@ impl ObjectStore for AzureObjectStore {
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         use futures::stream::StreamExt;
+        debug!("AzureObjectStore::delete_prefix prefix='{}'", uri_prefix);
         
         let (cli, _acct, _cont, key_prefix) = Self::client_for_prefix(uri_prefix)?;
         
@@ -2215,20 +2238,22 @@ impl ObjectStore for GcsObjectStore {
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let (bucket, object) = parse_gcs_uri(uri)?;
+        debug!("GcsObjectStore::get_range uri='{}', offset={}, length={:?}", uri, offset, length);
         let client = self.get_client().await?;
         client.get_object_range(&bucket, &object, offset, length).await
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
+        debug!("GcsObjectStore::put uri='{}', {} bytes", uri, data.len());
         let client = self.get_client().await?;
-        // Pass Bytes directly — put_object now takes Bytes, zero-copy end-to-end.
         client.put_object(&bucket, &object, data).await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let chunk_size = part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE);
+        debug!("GcsObjectStore::put_multipart uri='{}', {} bytes, chunk_size={}", uri, data.len(), chunk_size);
         let client = self.get_client().await?;
         // Pass Bytes directly — put_object_multipart now takes Bytes, zero-copy end-to-end.
         client.put_object_multipart(&bucket, &object, data, chunk_size).await
@@ -2237,6 +2262,7 @@ impl ObjectStore for GcsObjectStore {
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         // parse_gcs_uri now handles bucket-only URIs (gs://bucket/ → ("bucket", ""))
         let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)?;
+        debug!("GcsObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
 
         let client = self.get_client().await?;
         let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.as_str()) };
@@ -2284,6 +2310,7 @@ impl ObjectStore for GcsObjectStore {
 
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         let (bucket, object) = parse_gcs_uri(uri)?;
+        debug!("GcsObjectStore::stat uri='{}'", uri);
         let client = self.get_client().await?;
         let meta = client.stat_object(&bucket, &object).await?;
         Ok(gcs_meta_to_object_meta(&meta))
@@ -2291,12 +2318,14 @@ impl ObjectStore for GcsObjectStore {
 
     async fn delete(&self, uri: &str) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
+        debug!("GcsObjectStore::delete uri='{}'", uri);
         let client = self.get_client().await?;
         client.delete_object(&bucket, &object).await
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
         if uris.is_empty() { return Ok(()); }
+        debug!("GcsObjectStore::delete_batch {} URIs", uris.len());
         
         // GCS batch delete: extract bucket and objects
         let (bucket, _) = parse_gcs_uri(&uris[0])?;
@@ -2309,6 +2338,7 @@ impl ObjectStore for GcsObjectStore {
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
+        debug!("GcsObjectStore::delete_prefix prefix='{}'", uri_prefix);
         let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)
             .or_else(|_| {
                 // Handle bucket-only URIs
