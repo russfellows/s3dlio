@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.70"
+version = "0.9.75"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -38,9 +38,13 @@ azure_storage_blob = { version = "=0.8.0", optional = true }   # Blob/Container/
 # 'backend-gcs' enables official gRPC GCS support (google-cloud-rust).
 # 'gcs-community' is an optional legacy alternative (JSON-API, no RAPID support).
 gcloud-storage = { version = "^1.2", optional = true }  # Community GCS client (opt-in only)
-google-cloud-storage = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1", optional = true }             # Official Google GCS client
-google-cloud-gax = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1", optional = true }                     # Google Cloud GAX
-google-cloud-gax-internal = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1", features = ["_internal-grpc-client"], optional = true }  # Direct dep: exposes gcs_constants
+# TEMPORARY: local path for development — switch back to git tag before release
+google-cloud-storage = { path = "../google-cloud-rust/src/storage", optional = true }             # Official Google GCS client
+google-cloud-gax = { path = "../google-cloud-rust/src/gax", optional = true }                     # Google Cloud GAX
+google-cloud-gax-internal = { path = "../google-cloud-rust/src/gax-internal", features = ["_internal-grpc-client"], optional = true }  # Direct dep: exposes gcs_constants
+# Released: google-cloud-storage = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1", optional = true }
+# Released: google-cloud-gax = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1", optional = true }
+# Released: google-cloud-gax-internal = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260314.1", features = ["_internal-grpc-client"], optional = true }
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat

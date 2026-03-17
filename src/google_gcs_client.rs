@@ -503,6 +503,22 @@ impl GcsClient {
             Err(e) => {
                 let error_text = e.to_string();
                 if should_treat_out_of_range_as_empty_full_read(&error_text, &requested_range) {
+                    // OUT_OF_RANGE on a full read may indicate a genuinely
+                    // empty object.  Check metadata to confirm.
+                    // HOWEVER: on RAPID/zonal buckets, GetObject metadata can
+                    // return stale size=0 for recently written objects (per GCS
+                    // team).  Do NOT trust the empty-object fallback there.
+                    let is_rapid = self.is_rapid_bucket(bucket).await;
+                    if is_rapid {
+                        info!(
+                            "GCS GET (gRPC) OUT_OF_RANGE on RAPID bucket gs://{}/{} — NOT falling back to stale metadata; retrying directly",
+                            bucket, object
+                        );
+                        return Err(anyhow!(
+                            "GCS GET (gRPC) OUT_OF_RANGE for RAPID object gs://{}/{}: {}",
+                            bucket, object, e
+                        ));
+                    }
                     match self.get_object_metadata(bucket, object).await {
                         Ok(metadata) if metadata.size == 0 => {
                             debug!(
@@ -674,12 +690,15 @@ impl GcsClient {
     ///
     /// Always uses gRPC BidiWriteObject (`send_grpc()`) which works for both
     /// standard and RAPID/zonal GCS buckets.  When the target bucket is RAPID
-    /// (auto-detected or forced via `S3DLIO_GCS_RAPID`), sets `appendable=true`.
+    /// (auto-detected or forced via `S3DLIO_GCS_RAPID`), sets `appendable=true`
+    /// as required by zonal storage.  The transport layer omits `object_size`
+    /// for appendable writes so the server can finalize correctly.
     pub async fn put_object(&self, bucket: &str, object: &str, data: Bytes) -> Result<()> {
         let is_rapid = self.is_rapid_bucket(bucket).await;
+        let data_len = data.len();
         debug!(
             "GCS PUT (gRPC): bucket={}, object={}, size={}, rapid={}",
-            bucket, object, data.len(), is_rapid
+            bucket, object, data_len, is_rapid
         );
 
         let bucket_name = format_bucket_name(bucket);
@@ -691,12 +710,15 @@ impl GcsClient {
             write = write.set_appendable(true);
         }
 
-        write
+        let obj = write
             .send_grpc()
             .await
             .map_err(|e| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))?;
 
-        debug!("GCS PUT success");
+        debug!(
+            "GCS PUT success: gs://{}/{} size={} (server reported size={})",
+            bucket, object, data_len, obj.size
+        );
         Ok(())
     }
 
@@ -749,9 +771,44 @@ impl GcsClient {
         Ok(metadata)
     }
 
-    /// Alias for get_object_metadata (for compatibility with gcs_client.rs).
+    /// Get object metadata.
+    ///
+    /// On RAPID/zonal buckets, `StorageControl.get_object()` may return stale
+    /// `size=0` for recently written objects (confirmed by GCS team).  We work
+    /// around this by using `BidiReadObject` (`open_object`) which returns
+    /// authoritative metadata in the response descriptor.
     pub async fn stat_object(&self, bucket: &str, object: &str) -> Result<GcsObjectMetadata> {
+        if self.is_rapid_bucket(bucket).await {
+            return self.stat_object_via_bidi_read(bucket, object).await;
+        }
         self.get_object_metadata(bucket, object).await
+    }
+
+    /// RAPID-safe stat using BidiReadObject descriptor for authoritative metadata.
+    async fn stat_object_via_bidi_read(&self, bucket: &str, object: &str) -> Result<GcsObjectMetadata> {
+        debug!("GCS STAT (BidiRead) for RAPID bucket: gs://{}/{}", bucket, object);
+        let bucket_name = format_bucket_name(bucket);
+        let attempt_timeout = gcs_bidi_attempt_timeout();
+
+        // Request just 1 byte — we only need the descriptor metadata.
+        let (descriptor, _reader) = self
+            .storage
+            .open_object(&bucket_name, object)
+            .with_attempt_timeout(attempt_timeout)
+            .send_and_read(ReadRange::segment(0, 1))
+            .await
+            .map_err(|e| anyhow!("GCS STAT (BidiRead) failed for gs://{}/{}: {}", bucket, object, e))?;
+
+        let obj = descriptor.object();
+        let metadata = GcsObjectMetadata {
+            size: obj.size as u64,
+            etag: Some(obj.etag.clone()),
+            updated: obj.update_time.map(|t| format!("{:?}", t)),
+            key: object.to_string(),
+        };
+
+        debug!("GCS STAT (BidiRead) success: {} bytes for gs://{}/{}", metadata.size, bucket, object);
+        Ok(metadata)
     }
 
     /// List objects in a bucket with optional prefix.
