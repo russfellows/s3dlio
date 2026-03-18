@@ -1,5 +1,9 @@
 # s3dlio Changelog
 
+## Version 0.9.76 - Version fix for PyPI publish (March 2026)
+
+- Corrected `pyproject.toml` version from `0.9.70` to `0.9.75` (was accidentally not bumped before the v0.9.75 release tag was created, causing the PyPI workflow to upload `0.9.70` wheels). No functional code changes from v0.9.75.
+
 ## Version 0.9.75 - GCS RAPID/Zonal Support, Debug Logging, RUST_LOG Hang Fix (March 2026)
 
 ### GCS RAPID / zonal bucket support

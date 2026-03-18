@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.75"
+version = "0.9.76"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -210,3 +210,4 @@ opt-level = 3
 #
 # Development: path = "../google-cloud-rust/src/..."
 # Released:    git  = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260317.1"
+gh run watch 23221419265
