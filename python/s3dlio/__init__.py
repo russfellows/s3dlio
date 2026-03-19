@@ -149,33 +149,25 @@ def stat_object(uri: str) -> dict:
 
 # ------------------------------------------------------------------
 # Deprecated helpers - kept for backward compatibility
+# TODO: Remove all functions in this section entirely.
 # ------------------------------------------------------------------
-def list_keys_from_s3(uri: str) -> List[str]:
-    """
-    DEPRECATED: Use list_keys() instead - it supports all URI schemes.
-    
-    Return object keys (strings) under the given URI prefix.
-    """
-    _warnings.warn(
-        "list_keys_from_s3() is deprecated. Use list_keys() instead - it supports all URI schemes.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    return list_keys(uri)
+
+# TODO: Remove list_keys_from_s3 — use list_keys() instead.
+# def list_keys_from_s3(uri: str) -> List[str]:
+#     _warnings.warn(
+#         "list_keys_from_s3() is deprecated. Use list_keys() instead.",
+#         DeprecationWarning, stacklevel=2
+#     )
+#     return list_keys(uri)
 
 
-def list_uris(uri: str) -> List[str]:
-    """
-    DEPRECATED: Use list_full_uris() instead - it supports all URI schemes.
-    
-    Return fully-qualified URIs under the given prefix.
-    """
-    _warnings.warn(
-        "list_uris() is deprecated. Use list_full_uris() instead - it supports all URI schemes.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    return list_full_uris(uri)
+# TODO: Remove list_uris — use list_full_uris() instead.
+# def list_uris(uri: str) -> List[str]:
+#     _warnings.warn(
+#         "list_uris() is deprecated. Use list_full_uris() instead.",
+#         DeprecationWarning, stacklevel=2
+#     )
+#     return list_full_uris(uri)
 
 
 def get_by_key(bucket: str, key: str) -> bytes:

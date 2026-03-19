@@ -30,15 +30,14 @@ use crate::s3_utils::{
     // Reuse existing S3 helpers
     ObjectStat as S3ObjectStat,
     parse_s3_uri,
-    list_objects as s3_list_objects,
     list_objects_stream as s3_list_objects_stream,
     get_object_uri_async as s3_get_object_uri_async,
     get_object_uri_optimized_async as s3_get_object_uri_optimized_async,
     get_object_range_uri_async as s3_get_object_range_uri_async,
     stat_object_uri_async as s3_stat_object_uri_async,
-    delete_objects as s3_delete_objects,
-    create_bucket as s3_create_bucket,
-    delete_bucket as s3_delete_bucket,
+    delete_objects_async as s3_delete_objects_async,
+    create_bucket_async as s3_create_bucket_async,
+    delete_bucket_async as s3_delete_bucket_async,
     // NEW: PUT operations via ObjectStore
     put_object_uri_async as s3_put_object_uri_async,
     put_object_multipart_uri_async as s3_put_object_multipart_uri_async,
@@ -1039,9 +1038,18 @@ impl ObjectStore for S3ObjectStore {
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         debug!("S3ObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
         let (bucket, key_prefix) = parse_s3_uri(uri_prefix)?;
-        let keys = s3_list_objects(&bucket, &key_prefix, recursive)?;
+        // Use the async streaming version to avoid nested run_on_global_rt deadlock.
+        // s3_list_objects (sync) cannot be called from inside the global runtime.
+        let mut stream = s3_list_objects_stream(bucket.clone(), key_prefix, recursive).await?;
+        let mut keys = Vec::new();
+        use futures::StreamExt;
+        while let Some(result) = stream.next().await {
+            let key = result?;
+            keys.push(format!("s3://{}/{}", bucket, key));
+        }
+        keys.sort();
         debug!("S3ObjectStore::list result: {} keys", keys.len());
-        Ok(keys.into_iter().map(|k| format!("s3://{}/{}", bucket, k)).collect())
+        Ok(keys)
     }
 
     fn list_stream<'a>(
@@ -1085,7 +1093,7 @@ impl ObjectStore for S3ObjectStore {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         debug!("S3ObjectStore::delete uri='{}'", uri);
         let (bucket, key) = parse_s3_uri(uri)?;
-        s3_delete_objects(&bucket, &[key])
+        s3_delete_objects_async(&bucket, &[key]).await
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
@@ -1099,7 +1107,7 @@ impl ObjectStore for S3ObjectStore {
             .collect();
         
         // Use S3 batch delete API (1000 objects per request)
-        s3_delete_objects(&bucket, &keys)
+        s3_delete_objects_async(&bucket, &keys).await
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -1123,7 +1131,7 @@ impl ObjectStore for S3ObjectStore {
                     
                     // Delete in batches of 1000 (S3 DeleteObjects API limit)
                     if batch.len() >= 1000 {
-                        s3_delete_objects(&bucket, &batch)?;
+                        s3_delete_objects_async(&bucket, &batch).await?;
                         total_deleted += batch.len();
                         batch.clear();
                     }
@@ -1134,7 +1142,7 @@ impl ObjectStore for S3ObjectStore {
         
         // Delete final partial batch if any
         if !batch.is_empty() {
-            s3_delete_objects(&bucket, &batch)?;
+            s3_delete_objects_async(&bucket, &batch).await?;
             total_deleted += batch.len();
         }
         
@@ -1143,11 +1151,11 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
-        s3_create_bucket(name)
+        s3_create_bucket_async(name).await
     }
 
     async fn delete_container(&self, name: &str) -> Result<()> {
-        s3_delete_bucket(name)
+        s3_delete_bucket_async(name).await
     }
 
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {

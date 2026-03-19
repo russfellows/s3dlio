@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-580%2F580-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.76-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.80-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -210,9 +210,10 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.76** (March 2026) - GCS RAPID/zonal bucket support, `RUST_LOG=debug` hang fix, debug logging across all 5 backends, `rm` alias for delete, `list`/`ls` command-name correction, Python LogTracer fix.
+**v0.9.80** (March 2026) - Critical fix: Python `list()` / `list_keys()` hung indefinitely on non-AWS endpoints; tracing deadlock inside `tokio::spawn` eliminated by refactoring `list_objects_stream` to an inline `async_stream::stream!`; all S3 bucket/delete operations now use async-safe helpers.
 
 **Recent highlights:**
+- **v0.9.80** - Python list hang fix (IMDSv2 legacy call removed); tracing deadlock fix (`tokio::spawn` → inline stream); async S3 delete/bucket helpers; deprecated Python APIs cleaned up
 - **v0.9.76** - GCS RAPID/zonal support (stat/get/put); `RUST_LOG=debug` hang fix (issue #105); debug logging on all five ObjectStore backends; `rm` alias; `list` as primary command name; Python LogTracer conflict fixed
 - **v0.9.70** - Added Python wheel backend profiles (`default` and `full`), `build_pyo3.sh` profile CLI options (`full` / `default` / `--profile`), and documentation for full-backend source builds
 - **v0.9.65** - Fixed GCS PUT RESOURCE_EXHAUSTED (chunk size exceeded server 4 MiB protobuf message limit); centralised all GCS/gRPC constants; zero-copy `put_object(Bytes)`; RAPID auto-detection; subchannel auto-tune via `--jobs`; 10 new zero-copy unit tests
