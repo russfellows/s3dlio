@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-580%2F580-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.76-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.80-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -210,9 +210,10 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.76** (March 2026) - GCS RAPID/zonal bucket support, `RUST_LOG=debug` hang fix, debug logging across all 5 backends, `rm` alias for delete, `list`/`ls` command-name correction, Python LogTracer fix.
+**v0.9.80** (March 2026) - Critical fix: Python `list()` / `list_keys()` hung indefinitely on non-AWS endpoints; tracing deadlock inside `tokio::spawn` eliminated by refactoring `list_objects_stream` to an inline `async_stream::stream!`; all S3 bucket/delete operations now use async-safe helpers.
 
 **Recent highlights:**
+- **v0.9.80** - Python list hang fix (IMDSv2 legacy call removed); tracing deadlock fix (`tokio::spawn` → inline stream); async S3 delete/bucket helpers; deprecated Python APIs cleaned up
 - **v0.9.76** - GCS RAPID/zonal support (stat/get/put); `RUST_LOG=debug` hang fix (issue #105); debug logging on all five ObjectStore backends; `rm` alias; `list` as primary command name; Python LogTracer conflict fixed
 - **v0.9.70** - Added Python wheel backend profiles (`default` and `full`), `build_pyo3.sh` profile CLI options (`full` / `default` / `--profile`), and documentation for full-backend source builds
 - **v0.9.65** - Fixed GCS PUT RESOURCE_EXHAUSTED (chunk size exceeded server 4 MiB protobuf message limit); centralised all GCS/gRPC constants; zero-copy `put_object(Bytes)`; RAPID auto-detection; subchannel auto-tune via `--jobs`; 10 new zero-copy unit tests
@@ -231,18 +232,6 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 For detailed release notes and migration guides, see the [Complete Changelog](docs/Changelog.md).
 
-**Recent versions:**
-- **v0.9.10** (19, October 2024) - Pre-stat size cache for benchmarking (2.5x faster multi-object downloads)
-- **v0.9.9** (18, October 2025) - Buffer pool optimization for DirectIO (15-20% throughput improvement)
-- **v0.9.8** (17, October 2025) - Dual GCS backend options, configurable page cache hints
-- **v0.9.6** (10, October 2025) - RangeEngine disabled by default (performance fix)
-- **v0.9.5** (9, October 2025) - Adaptive concurrency for deletes (10-70x faster)
-- **v0.9.3** (8, October 2025) - RangeEngine for Azure & GCS
-- **v0.9.2** (8, October 2025) - Graceful shutdown & configuration hierarchy
-- **v0.9.1** (8, October 2025) - Zero-copy Python API with BytesView
-- **v0.9.0** (7, October 2025) - bytes::Bytes migration (BREAKING)
-- **v0.8.x** (2024-2025) - Production features (universal commands, OpLog, TFRecord indexing)
-
 ---
 
 ## Storage Backend Support
@@ -259,21 +248,17 @@ s3dlio provides unified storage operations across all backends with consistent U
 ### RangeEngine Performance Features (v0.9.3+, Updated v0.9.6)
 Concurrent range downloads hide network latency by parallelizing HTTP range requests.
 
-**⚠️ IMPORTANT (v0.9.6+):** RangeEngine is **disabled by default** across all backends due to stat overhead causing up to 50% slowdown on typical workloads. Must be explicitly enabled for large-file operations.
-
 **Backends with RangeEngine Support:**
 - ✅ **Azure Blob Storage**: 30-50% faster for large files (must enable explicitly)
 - ✅ **Google Cloud Storage**: 30-50% faster for large files (must enable explicitly)
 - ✅ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
 - ✅ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
-- 🔄 **S3**: Coming soon
+- 🔄 **S3**: Implemented by default in version 0.9.70 and later.   
 
 **Default Configuration (v0.9.6+):**
 - **Status**: Disabled by default (was: enabled in v0.9.5)
 - **Reason**: Extra HEAD request on every GET causes 50% slowdown for typical workloads
-- **Threshold**: 16MB when enabled
-- **Chunk size**: 64MB default
-- **Max concurrent**: 32 ranges (network) or 16 ranges (local)
+- **Threshold**: 32MB Default threshold for automatic range GET enablement (can be tuned with `S3DLIO_RANGE_THRESHOLD`) 
 
 **How to Enable for Large-File Workloads:**
 ```rust
@@ -287,7 +272,7 @@ let store = AzureObjectStore::with_config(config);
 ```
 
 **When to Enable:**
-- ✅ Large-file workloads (average size >= 64 MiB)
+- ✅ Large-file workloads (average size >= 32 MiB)
 - ✅ High-bandwidth, high-latency networks
 - ❌ Mixed or small-object workloads
 - ❌ Local file systems

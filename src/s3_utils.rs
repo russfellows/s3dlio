@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 //use aws_sdk_s3::primitives::ByteStream;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
+use std::pin::Pin;
 #[cfg(feature = "extension-module")]
 use pyo3::{FromPyObject, PyAny};
 use std::sync::Arc;
@@ -467,8 +468,9 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
         let re = Regex::new(final_pattern)
             .with_context(|| format!("Invalid regex pattern: '{}'", final_pattern))?;
 
-        // This logging operation can be adapted or removed, but here's how to keep it:
-        let _ = build_ops_async().await?.list_objects(&bucket, prefix).await;
+        // NOTE: Legacy S3Ops logging call removed here (was: `let _ = build_ops_async()...`)
+        // It caused all Python list() calls to hang on non-AWS endpoints (IMDSv2 timeout).
+        // See docs/bugs/PYTHON_LIST_HANG_BUG_REPORT.md for full root cause analysis.
 
         let client = aws_s3_client_async().await?;
         let mut keys = Vec::new();
@@ -579,83 +581,61 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
 /// Returns a stream of keys (without the s3:// prefix) for memory efficiency.
 /// Callers can format URIs as needed: format!("s3://{}/{}", bucket, key)
 ///
-/// **History**: Prior to v0.9.75, tracing macros inside the spawned task caused hangs
-/// when RUST_LOG was set, due to h2/hyper debug output flooding. This is now fixed by
-/// `crate_log_caps()` which pins problematic crates to warn level.
+/// **Implementation note**: Uses an inline `async_stream::stream!` (no `tokio::spawn`)
+/// so all S3 and tracing calls run on the caller's task. This avoids the tracing-subscriber
+/// deadlock that occurred when debug/trace logging was active inside a spawned task.
 pub async fn list_objects_stream(
     bucket: String,
     path: String,
     recursive: bool,
-) -> Result<impl Stream<Item = Result<String>> + Send> {
-    use tokio_stream::wrappers::ReceiverStream;
-    use tokio::sync::mpsc;
-    
-    // This debug! call is OUTSIDE tokio::spawn - should work fine
+) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
     debug!("list_objects_stream called: bucket='{}', path='{}', recursive={}", bucket, path, recursive);
-    
-    // Channel for streaming results (buffer 1000 objects per page)
-    let (tx, rx) = mpsc::channel(1000);
-    
-    // Spawn task to paginate and send results
-    tokio::spawn(async move {
-        // Determine the S3 prefix and regex pattern from the input path
-        let (prefix, pattern) = match path.rfind('/') {
-            Some(index) => {
-                let (p, pat) = path.split_at(index + 1);
-                (p, pat)
-            }
-            None => ("", path.as_str()),
-        };
 
-        let final_pattern = if pattern.is_empty() { ".*" } else { pattern };
-        let effective_recursive = recursive;
+    // Determine the S3 prefix and regex pattern from the input path.
+    // Do this eagerly (before returning the stream) so callers get parse errors immediately.
+    let (prefix_str, pattern_str) = match path.rfind('/') {
+        Some(index) => {
+            let (p, pat) = path.split_at(index + 1);
+            (p.to_string(), pat.to_string())
+        }
+        None => (String::new(), path.clone()),
+    };
+    let final_pattern = if pattern_str.is_empty() { ".*".to_string() } else { pattern_str };
+    let re = Regex::new(&final_pattern)
+        .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
 
-        // Compile the regex
-        let re = match Regex::new(final_pattern) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.send(Err(anyhow::anyhow!("Invalid regex pattern '{}': {}", final_pattern, e))).await;
-                return;
-            }
-        };
+    let delimiter = if recursive { None } else { Some("/".to_string()) };
 
-        // Build client
-        let client = match aws_s3_client_async().await {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-        };
+    debug!(
+        "list_objects_stream: prefix='{}', pattern='{}', recursive={}, delimiter={:?}",
+        prefix_str, final_pattern, recursive, delimiter
+    );
 
+    // Build the client eagerly too — any credential errors surface before the stream starts.
+    let client = aws_s3_client_async().await?;
+
+    // Return an inline pinned stream: no tokio::spawn, runs entirely on the caller's task.
+    // This avoids tracing-subscriber deadlocks when RUST_LOG=debug/trace is set.
+    Ok(Box::pin(async_stream::stream! {
         let mut cont: Option<String> = None;
-        let delimiter = if effective_recursive { None } else { Some("/") };
-
-        debug!(
-            "list_objects_stream spawn: prefix='{}', pattern='{}', recursive={}, delimiter={:?}",
-            prefix, final_pattern, effective_recursive, delimiter
-        );
-
         let mut page_count: u32 = 0;
         let mut total_keys: u64 = 0;
 
-        // Paginate through results
         loop {
-            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix);
+            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix_str.as_str());
 
-            if let Some(d) = delimiter {
-                req_builder = req_builder.delimiter(d);
+            if let Some(ref d) = delimiter {
+                req_builder = req_builder.delimiter(d.as_str());
             }
 
-            if let Some(token) = &cont {
-                req_builder = req_builder.continuation_token(token);
-                debug!("  page {}: continuation_token={:?}", page_count + 1, cont);
+            if let Some(ref token) = cont {
+                req_builder = req_builder.continuation_token(token.as_str());
             }
 
             let resp = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(anyhow::anyhow!("list_objects_v2 failed: {}", e))).await;
+                    yield Err(anyhow::anyhow!("list_objects_v2 failed: {}", e));
                     return;
                 }
             };
@@ -666,41 +646,42 @@ pub async fn list_objects_stream(
                 page_count, resp.contents().len(), resp.common_prefixes().len()
             );
 
-            // Stream matching objects from this page
+            // Yield matching objects from this page.
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
-                    if let Some(basename) = key.strip_prefix(prefix) {
-                        if re.is_match(basename)
-                            && tx.send(Ok(key.to_string())).await.is_err() {
-                                // Receiver dropped, stop streaming
-                                return;
-                            }
+                    if let Some(basename) = key.strip_prefix(prefix_str.as_str()) {
+                        if re.is_match(basename) {
+                            yield Ok(key.to_string());
+                        }
                     }
                 }
             }
 
-            // Handle common prefixes (non-recursive mode)
-            if !effective_recursive {
+            // Handle common prefixes (non-recursive mode only).
+            if !recursive {
                 for common_prefix in resp.common_prefixes() {
                     if let Some(prefix_key) = common_prefix.prefix() {
-                        if let Some(basename) = prefix_key.strip_prefix(prefix) {
+                        if let Some(basename) = prefix_key.strip_prefix(prefix_str.as_str()) {
                             if basename.len() == 1 && basename == "/" {
-                                // Recursive call for "/" prefix
                                 let recursive_req = client
                                     .list_objects_v2()
                                     .bucket(&bucket)
                                     .prefix(prefix_key);
-
-                                if let Ok(recursive_resp) = recursive_req.send().await {
-                                    for obj in recursive_resp.contents() {
-                                        if let Some(key) = obj.key() {
-                                            if let Some(obj_basename) = key.strip_prefix(prefix) {
-                                                if re.is_match(obj_basename)
-                                                    && tx.send(Ok(key.to_string())).await.is_err() {
-                                                        return;
+                                match recursive_req.send().await {
+                                    Ok(recursive_resp) => {
+                                        for obj in recursive_resp.contents() {
+                                            if let Some(key) = obj.key() {
+                                                if let Some(obj_basename) = key.strip_prefix(prefix_str.as_str()) {
+                                                    if re.is_match(obj_basename) {
+                                                        yield Ok(key.to_string());
                                                     }
+                                                }
                                             }
                                         }
+                                    }
+                                    Err(e) => {
+                                        yield Err(anyhow::anyhow!("recursive list_objects_v2 failed: {}", e));
+                                        return;
                                     }
                                 }
                             }
@@ -709,19 +690,16 @@ pub async fn list_objects_stream(
                 }
             }
 
-            // Check for next page
+            total_keys += resp.contents().len() as u64;
+
             if let Some(next) = resp.next_continuation_token() {
                 cont = Some(next.to_string());
             } else {
                 debug!("  list_objects_stream done: {} pages, {} total keys streamed", page_count, total_keys);
                 break;
             }
-
-            total_keys += resp.contents().len() as u64;
         }
-    });
-    
-    Ok(ReceiverStream::new(rx))
+    }))
 }
 
 
@@ -1017,9 +995,9 @@ pub fn get_object_concurrent_range(
 /// Perform HEAD-object and return all common metadata (async).
 pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
 
-    // optional: log the HEAD via S3Ops (does not return the metadata)
+    // NOTE: Legacy S3Ops logging call removed here (was: `let _ = build_ops_async()...`)
+    // Could hang on non-AWS endpoints. See docs/bugs/PYTHON_LIST_HANG_BUG_REPORT.md
     let key_clean = key.trim_start_matches('/');
-    let _ = build_ops_async().await?.stat_object(bucket, key_clean).await;
 
     debug!(
         "stat_object: bucket='{}', key='{}'",
@@ -1113,6 +1091,58 @@ pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
     })
 }
 
+/// Async version of delete_objects — safe to call from within an async context
+/// (e.g., inside submit_io or S3ObjectStore trait methods).
+pub async fn delete_objects_async(bucket: &str, keys: &[String]) -> Result<()> {
+    let client = aws_s3_client_async().await?;
+    for chunk in keys.chunks(1000) {
+        let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk
+            .iter()
+            .filter_map(|k| {
+                aws_sdk_s3::types::ObjectIdentifier::builder()
+                    .key(k)
+                    .build()
+                    .ok()
+            })
+            .collect();
+        let delete = aws_sdk_s3::types::Delete::builder()
+            .set_objects(Some(objects))
+            .build()
+            .context("Failed to build Delete request")?;
+        client
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .send()
+            .await
+            .with_context(|| format!("delete_objects_async failed for bucket '{}'", bucket))?;
+    }
+    Ok(())
+}
+
+/// Async version of delete_bucket — safe to call from within an async context.
+pub async fn delete_bucket_async(bucket: &str) -> Result<()> {
+    let client = aws_s3_client_async().await?;
+    client
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .with_context(|| format!("delete_bucket failed for '{}'", bucket))?;
+    Ok(())
+}
+
+/// Async version of create_bucket — safe to call from within an async context.
+pub async fn create_bucket_async(bucket: &str) -> Result<()> {
+    let client = aws_s3_client_async().await?;
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .with_context(|| format!("create_bucket failed for '{}'", bucket))?;
+    Ok(())
+}
 
 
 // -----------------------------------------------------------------------------

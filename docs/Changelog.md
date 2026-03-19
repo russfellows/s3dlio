@@ -1,5 +1,46 @@
 # s3dlio Changelog
 
+## Version 0.9.80 - Python List Hang Fix, Tracing Deadlock Fix, Async S3 Operations (March 2026)
+
+### Bug fix: Python list() hung indefinitely on non-AWS endpoints (HIGH severity)
+- Removed legacy `let _ = build_ops_async().await?...` calls from `list_objects()`
+  and `stat_object()` in `src/s3_utils.rs`. These were leftover debug artifacts
+  from an earlier `S3Ops` implementation whose results were discarded. On non-AWS
+  endpoints (MinIO, on-prem S3), the AWS SDK's IMDSv2 credential probe
+  (`http://169.254.169.254/…`) never times out, causing all Python `list()`,
+  `list_keys()`, `list_full_uris()`, and `list_uris()` calls to hang indefinitely
+  with no Ctrl-C recovery. Bug closed by this release.
+
+### Bug fix: Tracing deadlock inside `tokio::spawn` with AWS SDK S3 operations
+- Refactored `list_objects_stream` in `src/s3_utils.rs` from `tokio::spawn` +
+  `mpsc::channel` + `ReceiverStream` to an inline `async_stream::stream!` macro
+  (no spawned task). When `RUST_LOG=debug` or `trace` was set, the previous
+  `tokio::spawn`-based implementation could deadlock due to tracing-subscriber
+  lock contention between the spawned task's tracing events and the AWS SDK's
+  internal tracing. The inline stream runs entirely on the caller's task,
+  eliminating this class of deadlock. Bug closed by this release; also filed upstream as aws-sdk-rust#1388.
+
+### S3ObjectStore: replace sync helpers with async variants
+- `S3ObjectStore::list()` now drives `s3_list_objects_stream` (async, inline)
+  instead of calling the sync `s3_list_objects()` from inside the global runtime
+  (which would deadlock via nested `run_on_global_rt`).
+- Added `delete_objects_async()`, `create_bucket_async()`, `delete_bucket_async()`
+  to `src/s3_utils.rs` — safe to call from within async contexts.
+- `S3ObjectStore::delete()`, `delete_batch()`, `delete_prefix()`,
+  `create_container()`, and `delete_container()` all updated to use the new async
+  variants.
+
+### Python API cleanup
+- Removed stale deprecated helpers (`list_keys_from_s3`, `list_uris`) from
+  `python/s3dlio/__init__.py`; marked remaining deprecated section with TODO.
+
+### Verification
+- `cargo check` — zero warnings ✅
+- All list, stat, delete operations confirmed working against MinIO ✅
+- `RUST_LOG=debug` no longer causes hangs ✅
+
+---
+
 ## Version 0.9.76 - Version fix for PyPI publish (March 2026)
 
 - Corrected `pyproject.toml` version from `0.9.70` to `0.9.75` (was accidentally not bumped before the v0.9.75 release tag was created, causing the PyPI workflow to upload `0.9.70` wheels). No functional code changes from v0.9.75.
