@@ -232,18 +232,6 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 For detailed release notes and migration guides, see the [Complete Changelog](docs/Changelog.md).
 
-**Recent versions:**
-- **v0.9.10** (19, October 2024) - Pre-stat size cache for benchmarking (2.5x faster multi-object downloads)
-- **v0.9.9** (18, October 2025) - Buffer pool optimization for DirectIO (15-20% throughput improvement)
-- **v0.9.8** (17, October 2025) - Dual GCS backend options, configurable page cache hints
-- **v0.9.6** (10, October 2025) - RangeEngine disabled by default (performance fix)
-- **v0.9.5** (9, October 2025) - Adaptive concurrency for deletes (10-70x faster)
-- **v0.9.3** (8, October 2025) - RangeEngine for Azure & GCS
-- **v0.9.2** (8, October 2025) - Graceful shutdown & configuration hierarchy
-- **v0.9.1** (8, October 2025) - Zero-copy Python API with BytesView
-- **v0.9.0** (7, October 2025) - bytes::Bytes migration (BREAKING)
-- **v0.8.x** (2024-2025) - Production features (universal commands, OpLog, TFRecord indexing)
-
 ---
 
 ## Storage Backend Support
@@ -260,21 +248,17 @@ s3dlio provides unified storage operations across all backends with consistent U
 ### RangeEngine Performance Features (v0.9.3+, Updated v0.9.6)
 Concurrent range downloads hide network latency by parallelizing HTTP range requests.
 
-**⚠️ IMPORTANT (v0.9.6+):** RangeEngine is **disabled by default** across all backends due to stat overhead causing up to 50% slowdown on typical workloads. Must be explicitly enabled for large-file operations.
-
 **Backends with RangeEngine Support:**
 - ✅ **Azure Blob Storage**: 30-50% faster for large files (must enable explicitly)
 - ✅ **Google Cloud Storage**: 30-50% faster for large files (must enable explicitly)
 - ✅ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
 - ✅ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
-- 🔄 **S3**: Coming soon
+- 🔄 **S3**: Implemented by default in version 0.9.70 and later.   
 
 **Default Configuration (v0.9.6+):**
 - **Status**: Disabled by default (was: enabled in v0.9.5)
 - **Reason**: Extra HEAD request on every GET causes 50% slowdown for typical workloads
-- **Threshold**: 16MB when enabled
-- **Chunk size**: 64MB default
-- **Max concurrent**: 32 ranges (network) or 16 ranges (local)
+- **Threshold**: 32MB Default threshold for automatic range GET enablement (can be tuned with `S3DLIO_RANGE_THRESHOLD`) 
 
 **How to Enable for Large-File Workloads:**
 ```rust
@@ -288,7 +272,7 @@ let store = AzureObjectStore::with_config(config);
 ```
 
 **When to Enable:**
-- ✅ Large-file workloads (average size >= 64 MiB)
+- ✅ Large-file workloads (average size >= 32 MiB)
 - ✅ High-bandwidth, high-latency networks
 - ❌ Mixed or small-object workloads
 - ❌ Local file systems
