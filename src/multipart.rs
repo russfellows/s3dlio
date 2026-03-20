@@ -9,14 +9,10 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 
 use crate::constants::{DEFAULT_S3_MULTIPART_PART_SIZE, MIN_S3_MULTIPART_PART_SIZE, DEFAULT_MULTIPART_BUFFER_CAPACITY};
-/*
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
-use tokio::task::JoinSet;
-*/
 
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -328,13 +324,15 @@ impl MultipartUploadSink {
         // Move the JoinHandles out so the future owns them (no borrow of self).
         let tasks = std::mem::take(&mut self.tasks);
     
-        // Await all part tasks on the global runtime
+        // Await all part tasks concurrently on the global runtime.
+        // With backpressure in spawn_part/spawn_part_bytes, at most max_in_flight
+        // tasks are still running here; joining concurrently is correct and fast.
         let results: Vec<(i32, String)> = run_on_global_rt(async move {
-            let mut out = Vec::with_capacity(tasks.len());
-            for h in tasks {
-                // First await the join handle, then unwrap the inner Result
-                let res = h.await.context("part task join failed")??;
-                out.push(res);
+            let joined = futures::future::join_all(tasks).await;
+            let mut out = Vec::with_capacity(joined.len());
+            for res in joined {
+                let (pn, etag) = res.context("part task join failed")??;
+                out.push((pn, etag));
             }
             Ok::<_, anyhow::Error>(out)
         })?;
@@ -436,13 +434,24 @@ impl MultipartUploadSink {
         let key = self.key.clone();
         let upload_id = self.upload_id.clone();
         let semaphore = self.sem.clone();
+
+        // Acquire the permit BEFORE spawning the task (backpressure).
+        // This blocks the Python thread when max_in_flight uploads are already
+        // in progress, preventing unbounded task accumulation in memory.
+        // At most max_in_flight * part_size bytes are held in Rust task memory
+        // at any given time — mirrors minio's _throttle() pattern.
+        let permit: OwnedSemaphorePermit = run_on_global_rt(async move {
+            Ok::<_, anyhow::Error>(
+                semaphore.acquire_owned().await
+                    .map_err(|_| anyhow::anyhow!("semaphore closed"))?
+            )
+        })?;
     
-        // Spawn directly on global runtime without blocking (no double-spawn overhead).
-        // This is a major performance improvement: instead of blocking the Python thread
-        // to spawn a task that spawns another task, we now spawn once and return immediately.
+        // Spawn directly on global runtime — permit already acquired, so the task
+        // starts uploading immediately without waiting for the semaphore.
         let handle: JoinHandle<Result<(i32, String)>> = spawn_on_global_rt(async move {
-            // Concurrency permit
-            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+            // Hold permit for duration of upload; drop releases the slot.
+            let _permit = permit;
 
             let body = ByteStream::from(bytes);
             let resp = client
@@ -479,10 +488,18 @@ impl MultipartUploadSink {
         let key = self.key.clone();
         let upload_id = self.upload_id.clone();
         let semaphore = self.sem.clone();
+
+        // Acquire permit BEFORE spawning (backpressure — same as spawn_part).
+        let permit: OwnedSemaphorePermit = run_on_global_rt(async move {
+            Ok::<_, anyhow::Error>(
+                semaphore.acquire_owned().await
+                    .map_err(|_| anyhow::anyhow!("semaphore closed"))?
+            )
+        })?;
     
         // Spawn directly on global runtime without blocking
         let handle: JoinHandle<Result<(i32, String)>> = spawn_on_global_rt(async move {
-            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+            let _permit = permit;  // Already acquired; drop releases the slot.
 
             let body = ByteStream::from(bytes);  // ByteStream::from(Bytes) is cheap
             let resp = client

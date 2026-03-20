@@ -1,5 +1,55 @@
 # s3dlio Changelog
 
+## Version 0.9.82 - Multipart Upload Backpressure Fix, DLIO Multipart Integration (March 2026)
+
+### Bug fix: Multipart upload semaphore acquired before spawn (backpressure)
+- `spawn_part()` and `spawn_part_bytes()` in `src/multipart.rs` previously
+  acquired the concurrency semaphore *inside* the spawned task, meaning all
+  parts were immediately spawned with no bound on concurrent memory usage.
+  The semaphore is now acquired on the caller thread (via `run_on_global_rt`)
+  **before** `spawn_on_global_rt`, providing true backpressure: at most
+  `max_in_flight` tasks are ever live, capping peak memory at
+  `max_in_flight × part_size` bytes. This mirrors the `_throttle()` pattern
+  used by minio's Python client.
+
+### Performance: concurrent part-joining in `finish()`
+- `MultipartUploadSink::finish()` previously joined upload tasks sequentially
+  (`for h in tasks { h.await }`). Changed to `futures::future::join_all(tasks)`
+  so all remaining in-flight parts are awaited concurrently — reduces tail
+  latency on the final flush when parts finish out of order.
+- `OwnedSemaphorePermit` import moved from commented-out block to active use.
+
+### DLIO integration: automatic multipart upload for large objects
+- `S3dlioStorage.put_data()` in
+  `python/s3dlio/integrations/dlio/s3dlio_storage.py` now automatically selects
+  upload strategy based on object size:
+  - **< 32 MiB**: single `put_bytes()` call — lowest overhead for small objects.
+  - **≥ 32 MiB**: `MultipartUploadWriter` with 32 MiB parts and up to 8
+    concurrent in-flight parts — avoids the S3 5 GiB single-PUT limit and
+    achieves higher throughput on large checkpoints.
+- Threshold constants (`_MULTIPART_THRESHOLD`, `_MULTIPART_PART_SIZE`,
+  `_MULTIPART_MAX_IN_FLIGHT`) defined at module level and aligned with
+  `src/constants.rs` defaults.
+
+### Build fix: vendored OpenSSL for manylinux wheel compatibility
+- Added `openssl = { version = "0.10", features = ["vendored"] }` as a direct
+  dependency. The Azure SDK (`typespec_client_core`) transitively enables
+  `native-tls` on `reqwest`, which pulls `openssl-sys` and requires system OpenSSL
+  headers. Manylinux containers do not reliably have these installed. The vendored
+  feature compiles OpenSSL from source (statically linked) so no system package is
+  ever required — in any container, any OS, any CI environment.
+- Set `default-features = false` on our own `reqwest` dependency (defense in
+  depth — ensures s3dlio's own HTTP paths never introduce `native-tls`).
+- CI `before-script-linux` already installs `openssl-devel`/`libssl-dev` as a
+  fallback; the vendored fix makes this redundant but harmless.
+
+### Verification
+- `cargo build --release --features full-backends,direct-io,enhanced-http` — zero warnings ✅
+- `./build_pyo3.sh` — Python 3.12 and 3.13 wheels built successfully ✅
+- `cargo check --features full-backends,direct-io,enhanced-http` — zero warnings ✅
+
+---
+
 ## Version 0.9.80 - Python List Hang Fix, Tracing Deadlock Fix, Async S3 Operations (March 2026)
 
 ### Bug fix: Python list() hung indefinitely on non-AWS endpoints (HIGH severity)
