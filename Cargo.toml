@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.80"
+version = "0.9.82"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -28,6 +28,13 @@ path = "src/bin/cli.rs"
 # AWS SDK - pinned to latest stable (update by running: cargo search aws-config)
 aws-config         = "=1.8.14"
 aws-sdk-s3         = "=1.124.0"
+
+# PERMANENT FIX: The Azure SDK (typespec_client_core) pulls reqwest with native-tls,
+# which transitively requires openssl-sys and a system OpenSSL installation.
+# We cannot control the Azure SDK's reqwest feature flags from outside its crate.
+# Forcing the vendored feature here causes openssl-sys to compile OpenSSL from source
+# (statically linked) — no system OpenSSL package ever required in any environment.
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Azure SDK crates (keep minor versions flexible; they evolve together)
 azure_core = { version = "=0.31.0", optional = true }          # Response/Body, paging, errors
@@ -132,7 +139,8 @@ object_store = { version = "0.13", default-features = false, features = ["aws", 
 url = { version = "2.5", optional = true }
 
 # --- Enhanced HTTP client with HTTP/2 support --------------------------------
-reqwest = { version = "0.12", features = ["rustls-tls", "http2", "hickory-dns"], optional = true }
+# default-features = false ensures we don't pull in native-tls via reqwest ourselves.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "hickory-dns"], optional = true }
 
 # --- High-performance memory and file I/O ------------------------------------
 nix = { version = "0.31", features = ["fs"], optional = true }  # For O_DIRECT and positioned I/O
