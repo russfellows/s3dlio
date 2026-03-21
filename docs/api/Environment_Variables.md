@@ -89,7 +89,7 @@ Standard AWS environment variables are also supported:
 | `AWS_SESSION_TOKEN` | AWS session token (for temporary credentials) |
 | `AWS_REGION` | AWS region (e.g., `us-east-1`) |
 | `AWS_ENDPOINT_URL` | Custom S3 endpoint URL (for MinIO or other S3-compatible storage) |
-| `AWS_CA_BUNDLE_PATH` | Path to custom CA certificate bundle |
+| `AWS_CA_BUNDLE` | Path to custom CA certificate bundle (standard AWS SDK name) |
 
 ## Azure Blob Storage Configuration
 

@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-580%2F580-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.82-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.84-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,7 +10,7 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.82** — Multipart upload backpressure fix (semaphore acquired before spawn) and concurrent part-joining via `join_all`; DLIO integration now automatically uses multipart upload for objects ≥ 32 MiB.
+> **v0.9.84** — HEAD elimination via process-global ObjectSizeCache; OnceLock env-var caching on hot path; fix `S3DLIO_ENABLE_RANGE_OPTIMIZATION` no-op on `get_many()` path; lock-free range chunk assembly; rename `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE`; replace `eprintln!` with structured tracing.
 
 ## 📦 Installation
 

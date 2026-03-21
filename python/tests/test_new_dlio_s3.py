@@ -62,7 +62,7 @@ def sync_tests():
 
 
 async def async_tests():
-    # turn on info‑level logs (shows the AWS_CA_BUNDLE_PATH message)
+    # turn on info‑level logs (shows the AWS_CA_BUNDLE message)
     #s3.init_logging("info")
 
     print("=== Async LIST ===")
@@ -103,7 +103,7 @@ async def async_tests():
 
 def main():
 
-    # turn on info‑level logs (shows the AWS S3 info messages, including AWS_CA_BUNDLE_PATH loading)
+    # turn on info‑level logs (shows the AWS S3 info messages, including AWS_CA_BUNDLE loading)
     #s3.init_logging("info")
     # turn on debug‑level logs (shows AWS S3 SDK info + debug messages)
     #s3.init_logging("debug")
