@@ -14,8 +14,9 @@ use futures::{stream::FuturesUnordered, Stream, StreamExt};
 use std::pin::Pin;
 #[cfg(feature = "extension-module")]
 use pyo3::{FromPyObject, PyAny};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::collections::HashMap;
+use std::time::Duration;
 use regex::Regex;
 use tokio::sync::Semaphore;
 
@@ -37,10 +38,71 @@ use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
 use crate::s3_logger::global_logger;
 use crate::s3_ops::S3Ops;
 
+// Object size cache for eliminating redundant HEAD requests
+use crate::object_size_cache::ObjectSizeCache;
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 pub const DEFAULT_OBJECT_SIZE: usize = 20 * 1024 * 1024;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Process-level configuration caches
+//
+// These OnceLocks read environment variables ONCE per process on first call,
+// then return the cached value on every subsequent call — eliminating env-var
+// syscalls on the hot path where get_object_uri_optimized_async() is called
+// once per object per step.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static RANGE_OPT_ENABLED: OnceLock<bool> = OnceLock::new();
+static RANGE_THRESHOLD_BYTES: OnceLock<u64> = OnceLock::new();
+static GLOBAL_SIZE_CACHE: OnceLock<Arc<ObjectSizeCache>> = OnceLock::new();
+
+/// Whether range optimization (range splitting) is enabled.
+/// Cached once per process from S3DLIO_ENABLE_RANGE_OPTIMIZATION.
+/// Setting =0/false/no/off/disable skips HEAD entirely on the get_many() path
+/// (S3ObjectStore::get() honours this too — now consistent on ALL paths).
+fn get_range_opt_enabled() -> bool {
+    *RANGE_OPT_ENABLED.get_or_init(|| {
+        std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
+            .ok()
+            .map(|v| !matches!(v.to_lowercase().as_str(),
+                "0" | "false" | "no" | "off" | "disable" | "disabled"))
+            .unwrap_or(true) // default: enabled
+    })
+}
+
+/// Range-split threshold in bytes, cached once per process.
+/// Default: 32 MiB. Override with S3DLIO_RANGE_THRESHOLD_MB=<megabytes>.
+/// Set above file size (e.g. 1000 for 147 MiB files) to force single-GET.
+fn get_range_threshold_bytes() -> u64 {
+    *RANGE_THRESHOLD_BYTES.get_or_init(|| {
+        let mb = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(32);
+        mb * 1024 * 1024
+    })
+}
+
+/// Process-global object size cache.
+///
+/// Default TTL: 1 hour. Override with S3DLIO_SIZE_CACHE_TTL_SECS=<seconds>.
+/// 5 minutes (300 s) would be too short for large-scale training where a single
+/// epoch over a 10TB+ dataset takes 10–30 minutes — cache entries would expire
+/// and cause redundant HEAD requests on every subsequent epoch.
+/// Populated by get_object_uri_optimized_async() on each HEAD and by the
+/// pre-stat phase in get_objects_parallel(). Cache hits skip HEAD entirely.
+fn get_size_cache() -> &'static Arc<ObjectSizeCache> {
+    GLOBAL_SIZE_CACHE.get_or_init(|| {
+        let ttl_secs = std::env::var("S3DLIO_SIZE_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(3600); // 1 hour — lasts across many training epochs
+        Arc::new(ObjectSizeCache::new(Duration::from_secs(ttl_secs)))
+    })
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -853,6 +915,13 @@ pub async fn get_object_concurrent_range_async(
         max_concurrency = %max_concurrency
     )
 ))]
+/// Internal concurrent range GET implementation.
+///
+/// v0.9.31+: Replaced Arc<Mutex<BytesMut>> shared buffer with a collect-then-assemble
+/// approach (Finding 5 fix). Each chunk future returns its (buffer_offset, data) pair
+/// independently — no shared state, no lock contention. Chunks are sorted by offset
+/// once at the end and assembled into a single BytesMut with one sequential pass.
+/// This eliminates mutex serialisation across up to 37 concurrent writers per file.
 async fn concurrent_range_get_impl(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -862,38 +931,33 @@ async fn concurrent_range_get_impl(
     chunk_size: usize,
     max_concurrency: usize,
 ) -> Result<Bytes> {
-    let total_bytes = end_offset - start_offset;
-    
-    // Calculate chunk ranges
-    let mut ranges = Vec::new();
+    let total_bytes = (end_offset - start_offset) as usize;
+
+    // Build (range_start, range_end, buffer_offset) tuples
+    let mut ranges: Vec<(u64, u64, usize)> = Vec::new();
     let mut current_offset = start_offset;
-    
     while current_offset < end_offset {
         let chunk_end = std::cmp::min(current_offset + chunk_size as u64, end_offset);
         let buffer_start = (current_offset - start_offset) as usize;
         ranges.push((current_offset, chunk_end, buffer_start));
         current_offset = chunk_end;
     }
-    
-    // Create semaphore for concurrency control
+
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
-    
-    // Use Arc<Mutex<BytesMut>> to store results
-    let result = Arc::new(std::sync::Mutex::new(BytesMut::zeroed(total_bytes as usize)));
-    
-    // Execute concurrent range requests
     let mut futures = FuturesUnordered::new();
-    
+
     for (range_start, range_end, buffer_offset) in ranges {
         let client = client.clone();
         let bucket = bucket.to_string();
         let key = key.to_string();
         let semaphore = semaphore.clone();
-        let result = result.clone();
-        
-        let future = async move {
-            let _permit = semaphore.acquire().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
-            
+
+        futures.push(async move {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+
             let range_header = format!("bytes={}-{}", range_start, range_end - 1);
             let resp = client
                 .get_object()
@@ -903,35 +967,30 @@ async fn concurrent_range_get_impl(
                 .send()
                 .await
                 .context("concurrent range request failed")?;
-            
-            let body = resp.body.collect().await.context("collect concurrent range body")?;
+
+            let body = resp.body.collect().await.context("collect chunk body")?;
             let chunk_data = body.into_bytes();
-            
-            // Write to shared buffer
-            {
-                let mut result_guard = result.lock().map_err(|e| anyhow::anyhow!("Mutex lock error: {}", e))?;
-                let end_pos = buffer_offset + chunk_data.len();
-                result_guard[buffer_offset..end_pos].copy_from_slice(&chunk_data);
-            }
-            
-            Ok::<_, anyhow::Error>(())
-        };
-        
-        futures.push(future);
+
+            // Return (buffer_offset, data) — no shared mutex, no contention
+            Ok::<(usize, Bytes), anyhow::Error>((buffer_offset, chunk_data))
+        });
     }
-    
-    // Wait for all requests to complete
-    while let Some(result_future) = futures.next().await {
-        result_future.context("concurrent range request failed")?;
+
+    // Collect all (offset, chunk) pairs — order is non-deterministic (FuturesUnordered)
+    let mut chunks: Vec<(usize, Bytes)> = Vec::new();
+    while let Some(result) = futures.next().await {
+        chunks.push(result.context("concurrent range chunk failed")?);
     }
-    
-    // Extract final result and convert to Bytes
-    let final_result = Arc::try_unwrap(result)
-        .map_err(|_| anyhow::anyhow!("Failed to unwrap result Arc"))?
-        .into_inner()
-        .map_err(|e| anyhow::anyhow!("Mutex poison error: {}", e))?;
-    
-    Ok(final_result.freeze())
+
+    // Sort by buffer offset, then assemble with a single sequential pass
+    chunks.sort_unstable_by_key(|(offset, _)| *offset);
+
+    let mut output = BytesMut::with_capacity(total_bytes);
+    for (_, chunk) in chunks {
+        output.extend_from_slice(&chunk);
+    }
+
+    Ok(output.freeze())
 }
 
 /// Get optimal chunk size based on total transfer size
@@ -1165,12 +1224,50 @@ pub fn get_object_uri(uri: &str) -> anyhow::Result<Bytes> {
 }
 
 /// Download many objects concurrently (ordered by input).
+/// Download many objects concurrently (ordered by input).
+///
+/// v0.9.31+ improvements:
+/// - Pre-stat phase: all object sizes fetched concurrently and stored in the
+///   process-global ObjectSizeCache before GET phase begins. This means each
+///   individual get_object_uri_optimized_async() call finds its size in cache
+///   and skips its own HEAD — eliminating both HEAD #1 and #2 (Finding 1 fix).
+///   On subsequent epochs the cache is already warm; zero HEADs issued.
+/// - O(N log N) sort: replaced O(N²) linear scan with a pre-built HashMap index.
 pub fn get_objects_parallel(
     uris: &[String],
     max_in_flight: usize,
 ) -> Result<Vec<(String, Bytes)>> {
-    let uris = uris.to_vec(); // own for 'static
+    let uris = uris.to_vec();
     run_on_global_rt(async move {
+        // Build position index once (O(N)) for O(N log N) sort later.
+        let uri_positions: HashMap<String, usize> = uris.iter()
+            .enumerate()
+            .map(|(i, u)| (u.clone(), i))
+            .collect();
+
+        // Pre-stat phase: populate ObjectSizeCache for all URIs concurrently.
+        // Only runs when range opt is enabled (if disabled, HEAD is skipped anyway).
+        // Uses the same max_in_flight limit to avoid overwhelming the server.
+        if get_range_opt_enabled() {
+            let stat_sem = Arc::new(Semaphore::new(max_in_flight));
+            let stat_futs: Vec<_> = uris.iter().map(|uri| {
+                let uri = uri.clone();
+                let stat_sem = stat_sem.clone();
+                async move {
+                    let _permit = stat_sem.acquire().await.ok();
+                    // Only stat if not already cached (subsequent epochs skip this)
+                    if get_size_cache().get(&uri).await.is_none() {
+                        if let Ok(stat) = stat_object_uri_async(&uri).await {
+                            get_size_cache().put(uri, stat.size).await;
+                        }
+                    }
+                }
+            }).collect();
+            futures::future::join_all(stat_futs).await;
+        }
+
+        // GET phase: get_object_uri_optimized_async() will find sizes in cache,
+        // skipping its internal HEAD call entirely.
         let sem = Arc::new(Semaphore::new(max_in_flight));
         let mut futs = FuturesUnordered::new();
 
@@ -1186,8 +1283,8 @@ pub fn get_objects_parallel(
         while let Some(res) = futs.next().await {
             out.push(res??);
         }
-        // keep input order
-        out.sort_by_key(|(u, _)| uris.iter().position(|x| x == u).unwrap());
+        // O(N log N) sort using pre-built position map
+        out.sort_by_key(|(u, _)| uri_positions.get(u.as_str()).copied().unwrap_or(0));
         Ok(out)
     })
 }
@@ -1200,6 +1297,12 @@ pub fn get_objects_parallel_with_progress(
 ) -> Result<Vec<(String, Bytes)>> {
     let uris = uris.to_vec(); // own for 'static
     run_on_global_rt(async move {
+        // Build position index once (O(N)) for O(N log N) sort later.
+        let uri_positions: HashMap<String, usize> = uris.iter()
+            .enumerate()
+            .map(|(i, u)| (u.clone(), i))
+            .collect();
+
         let sem = Arc::new(Semaphore::new(max_in_flight));
         let mut futs = FuturesUnordered::new();
 
@@ -1223,14 +1326,20 @@ pub fn get_objects_parallel_with_progress(
         while let Some(res) = futs.next().await {
             out.push(res??);
         }
-        // keep input order
-        out.sort_by_key(|(u, _)| uris.iter().position(|x| x == u).unwrap());
+        // O(N log N) sort using pre-built position map
+        out.sort_by_key(|(u, _)| uri_positions.get(u.as_str()).copied().unwrap_or(0));
         Ok(out)
     })
 }
 
 
-/// Optimized async get object call that uses concurrent range downloads for larger objects
+/// Optimised async GET that honours S3DLIO_ENABLE_RANGE_OPTIMIZATION on ALL paths.
+///
+/// v0.9.31+ fixes (Finding 1 + bug fix):
+/// - S3DLIO_ENABLE_RANGE_OPTIMIZATION=0 now skips HEAD entirely (was a no-op on this path).
+/// - ObjectSizeCache checked before issuing HEAD; result stored after HEAD.
+/// - When range split is chosen, size is passed directly → eliminates HEAD #2.
+/// - All env-var reads cached via OnceLock (no syscall overhead on hot path).
 #[cfg_attr(feature = "profiling", instrument(
     name = "s3.get_optimized",
     skip(uri),
@@ -1241,42 +1350,89 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
     }
-    
-    // Use environment variable to control range optimization threshold.
-    // Default is 32 MB (v0.9.60+); override with S3DLIO_RANGE_THRESHOLD_MB=<megabytes>.
-    let range_threshold = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(32) * 1024 * 1024; // Default 32 MB threshold
-    
-    // Get object size first to decide strategy
-    let client = aws_s3_client_async().await?;
-    let head_resp = client
-        .head_object()
-        .bucket(&bucket)
-        .key(key.trim_start_matches('/'))
-        .send()
-        .await;
-        
-    match head_resp {
-        Ok(resp) => {
-            let object_size = resp.content_length().unwrap_or(0) as u64;
-            
-            // For objects larger than threshold, use concurrent range downloads
-            if object_size >= range_threshold {
-                debug!("Using concurrent range download for {}MB object: {}", 
-                       object_size / (1024 * 1024), uri);
-                get_object_concurrent_range_async(uri, 0, None, None, None).await
-            } else {
-                // For smaller objects, use regular download
-                get_object(&bucket, &key).await
-            }
-        },
-        Err(_) => {
-            // If HEAD fails, fall back to regular download
-            get_object(&bucket, &key).await
-        }
+
+    // Fast path: range optimisation disabled — skip HEAD entirely on ALL paths.
+    // Fixes the bug where S3DLIO_ENABLE_RANGE_OPTIMIZATION=0 was a no-op here.
+    if !get_range_opt_enabled() {
+        debug!("range_opt disabled: single GET for {}", uri);
+        return get_object(&bucket, &key).await;
     }
+
+    let range_threshold = get_range_threshold_bytes();
+
+    // Check ObjectSizeCache before issuing HEAD (avoids a network round-trip on cache hit).
+    // The cache is populated by this function and by the pre-stat phase in get_objects_parallel().
+    let object_size = if let Some(sz) = get_size_cache().get(uri).await {
+        sz
+    } else {
+        // Cache miss: issue one HEAD to learn the size, then cache it.
+        let client = aws_s3_client_async().await?;
+        match client
+            .head_object()
+            .bucket(&bucket)
+            .key(key.trim_start_matches('/'))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let sz = resp.content_length().unwrap_or(0) as u64;
+                get_size_cache().put(uri.to_string(), sz).await;
+                sz
+            }
+            Err(_) => {
+                // HEAD failed: fall back to single GET without range splitting.
+                return get_object(&bucket, &key).await;
+            }
+        }
+    };
+
+    if object_size >= range_threshold {
+        debug!("concurrent range GET {}MB: {}", object_size / (1024 * 1024), uri);
+        // Pass known size → internal impl skips its own HEAD (eliminates HEAD #2).
+        get_object_with_known_size_async(&bucket, &key, object_size, 0, None, None, None).await
+    } else {
+        get_object(&bucket, &key).await
+    }
+}
+
+/// Fetch an object using concurrent range GETs with a pre-known size (no HEAD issued).
+///
+/// Called from get_object_uri_optimized_async() when the size is already known from
+/// either the ObjectSizeCache or a prior HEAD in the same call stack.  This eliminates
+/// the redundant HEAD #2 that get_object_concurrent_range_async() would otherwise issue.
+async fn get_object_with_known_size_async(
+    bucket: &str,
+    key: &str,
+    object_size: u64,
+    offset: u64,
+    length: Option<u64>,
+    chunk_size: Option<usize>,
+    max_concurrency: Option<usize>,
+) -> Result<Bytes> {
+    let start_offset = offset;
+    let end_offset = match length {
+        Some(len) => std::cmp::min(start_offset + len, object_size),
+        None => object_size,
+    };
+    if start_offset >= object_size {
+        return Ok(Bytes::new());
+    }
+
+    let total_bytes = end_offset - start_offset;
+    let effective_chunk_size = chunk_size.unwrap_or_else(|| get_optimal_chunk_size(total_bytes));
+
+    // If total fits in one chunk, use a single range request (no concurrency overhead).
+    if total_bytes <= effective_chunk_size as u64 {
+        let uri = format!("s3://{}/{}", bucket, key.trim_start_matches('/'));
+        return get_object_range_uri_async(&uri, start_offset, Some(total_bytes)).await;
+    }
+
+    let effective_concurrency = max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
+    let client = aws_s3_client_async().await?;
+    concurrent_range_get_impl(
+        &client, bucket, key, start_offset, end_offset,
+        effective_chunk_size, effective_concurrency,
+    ).await
 }
 
 

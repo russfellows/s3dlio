@@ -5078,7 +5078,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3dlio"
-version = "0.9.82"
+version = "0.9.84"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -5159,7 +5159,7 @@ dependencies = [
 
 [[package]]
 name = "s3dlio-oplog"
-version = "0.9.82"
+version = "0.9.84"
 dependencies = [
  "anyhow",
  "async-trait",

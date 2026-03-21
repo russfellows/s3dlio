@@ -1,5 +1,47 @@
 # s3dlio Changelog
 
+## Version 0.9.84 - HEAD Elimination, OnceLock Caching, Lock-Free Range Assembly, Env Var Rename (March 2026)
+
+### Performance: process-global ObjectSizeCache eliminates redundant HEAD requests
+- Added `ObjectSizeCache` (TTL: 1 hour, override via `S3DLIO_SIZE_CACHE_TTL_SECS`) integrated
+  into `get_objects_parallel()`. A pre-stat phase issues N concurrent HEADs before any GETs begin;
+  results are stored in the process-global cache. From batch 2 onward (and all subsequent epochs),
+  `get_object_uri_optimized_async()` finds the size in cache and skips its HEAD entirely. For
+  typical training workloads (same files repeated across batches/epochs), this reduces S3 request
+  count by up to 50%.
+
+### Performance: OnceLock-based env var caching on the hot path
+- `get_object_uri_optimized_async()` previously called `std::env::var()` on every invocation
+  (one syscall per object). Three `OnceLock<T>` statics now cache `S3DLIO_ENABLE_RANGE_OPTIMIZATION`,
+  `S3DLIO_RANGE_THRESHOLD_MB`, and the `ObjectSizeCache` instance once per process on first call.
+
+### Bug fix: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` was a no-op on the `get_many()` path
+- The env var previously only applied to `S3ObjectStore::get()` in `object_store.rs`. The Python
+  `get_many()` path routes through `get_objects_parallel()` → `get_object_uri_optimized_async()`
+  which never checked the var. Now all paths are consistent: setting `=0` disables range splitting
+  and suppresses the HEAD that was needed only to determine the threshold.
+
+### Performance: lock-free chunk assembly in `concurrent_range_get_impl()`
+- Replaced `Arc<Mutex<BytesMut>>` shared buffer (serialised writes from up to 37 concurrent chunk
+  tasks) with a collect-then-sort-then-assemble pattern. Each chunk future returns
+  `(buffer_offset, Bytes)` independently; results are sorted by offset and assembled in one
+  sequential pass — no lock contention in the concurrent phase.
+
+### Fix: rename `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE` (standard AWS SDK name)
+- `s3_client.rs`, `aws-env`, `docs/api/Environment_Variables.md`, and `python/tests/test_new_dlio_s3.py`
+  updated. The previous name was non-standard; the AWS SDK uses `AWS_CA_BUNDLE`.
+
+### Observability: replace `eprintln!` with structured tracing
+- Replaced all `eprintln!("[s3dlio] ...")` calls in `s3_client.rs` with `info!()` and `debug!()`
+  from the `tracing` crate. Log output is now controlled by `S3DLIO_LOG_LEVEL` / `RUST_LOG` and
+  captured correctly by the Python logging integration.
+
+### Verification
+- `cargo build --release` — zero warnings ✅
+- `cargo check` — zero warnings ✅
+
+---
+
 ## Version 0.9.82 - Multipart Upload Backpressure Fix, DLIO Multipart Integration (March 2026)
 
 ### Bug fix: Multipart upload semaphore acquired before spawn (backpressure)

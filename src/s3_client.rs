@@ -21,7 +21,7 @@ use tokio::sync::{oneshot, OnceCell};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use std::path::Path;
 use std::sync::mpsc;
-use tracing::debug; // For logging
+use tracing::{debug, info}; // For logging
 
 
 // -----------------------------------------------------------------------------
@@ -258,9 +258,7 @@ fn create_optimized_http_client() -> Result<SharedHttpClient> {
             }
         });
     
-    // NOTE: info!() removed 2025-12-03 - causes hangs in async context with tracing
-    // info!("Experimental optimized HTTP client created with {} max connections per host", max_connections);
-    eprintln!("[s3dlio] Experimental HTTP client: {} max connections/host", max_connections);
+    info!("Experimental HTTP client: {} max connections/host, idle timeout: {:?}", max_connections, idle_timeout);
     Ok(http_client)
 }
 
@@ -301,17 +299,14 @@ pub async fn aws_s3_client_async() -> Result<Client> {
             {
                 bail!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
             }
+            info!("Initializing S3 client");
 
-            // Create HTTP client with optimized settings
-            // NOTE: debug!() commented out 2025-12-03 - causes hangs in async context with tracing
-            // debug!("Building HTTP client with optimization settings: max_connections={}, idle_timeout={}ms", 
-            //        get_max_http_connections(), get_http_idle_timeout().as_millis());
-
-            let http_client = match env::var("AWS_CA_BUNDLE_PATH") {
+            // Build HTTP client
+            let http_client = match env::var("AWS_CA_BUNDLE") {
                 Ok(ca_bundle_path) if !ca_bundle_path.is_empty() => {
                     // User has specified custom CA bundle via environment
                     // This is a standard AWS SDK feature that must work in all builds
-                    eprintln!("[s3dlio] Loading CA bundle from: {}", ca_bundle_path);
+                    info!("AWS_CA_BUNDLE set — loading CA bundle from: {}", ca_bundle_path);
                     let tls_context = tls_context_from_pem(&ca_bundle_path)?;
                     
                     // Build HTTPS client with custom CA using standard AWS SDK API
@@ -321,11 +316,11 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                         .build_https())
                 },
                 _ => {
+                    info!("AWS_CA_BUNDLE not set — using system default TLS trust store");
                     // Check if optimized HTTP client is enabled via environment variable
                     match env::var("S3DLIO_USE_OPTIMIZED_HTTP").unwrap_or_default().to_lowercase().as_str() {
                         "true" | "1" | "yes" | "on" | "enable" => {
-                            // Use our optimized HTTP client with connection pooling (opt-in)
-                            eprintln!("[s3dlio] HTTP optimization enabled: Enhanced connection pooling");
+                            info!("S3DLIO_USE_OPTIMIZED_HTTP enabled — using enhanced connection pooling");
                             Some(create_optimized_http_client()?)
                         },
                         _ => {
@@ -337,6 +332,7 @@ pub async fn aws_s3_client_async() -> Result<Client> {
             };
 
             // Region & optional endpoint
+            debug!("AWS_REGION env: {}", env::var("AWS_REGION").as_deref().unwrap_or("<not set — using provider chain>"));
             let region =
                 RegionProviderChain::first_try(env::var("AWS_REGION").ok().map(Region::new))
                     .or_default_provider()
@@ -346,14 +342,17 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                 aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12()).region(region);
             if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL") {
                 if !endpoint.is_empty() {
+                    info!("Custom S3 endpoint: {}", endpoint);
                     loader = loader.endpoint_url(endpoint);
                 }
             }
 
             // Load config fully async with optimized timeout configuration
+            let op_timeout = get_operation_timeout();
+            debug!("Timeouts — connect: 5s, operation: {:?}", op_timeout);
             let timeout_config = TimeoutConfig::builder()
                 .connect_timeout(Duration::from_secs(5))  // Quick connection timeout
-                .operation_timeout(get_operation_timeout()) // Configurable for large transfers
+                .operation_timeout(op_timeout)             // Configurable for large transfers
                 .build();
 
             let mut config_builder = loader.timeout_config(timeout_config);
@@ -375,6 +374,8 @@ pub async fn aws_s3_client_async() -> Result<Client> {
             let s3_config = aws_sdk_s3::config::Builder::from(&cfg)
                 .force_path_style(true)
                 .build();
+            info!("S3 client ready (path-style: forced, endpoint: {})",
+                env::var("AWS_ENDPOINT_URL").ok().as_deref().unwrap_or("AWS default"));
             Ok::<_, anyhow::Error>(Client::from_conf(s3_config))
         })
         .await?;
