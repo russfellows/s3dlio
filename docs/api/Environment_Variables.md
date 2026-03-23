@@ -4,6 +4,12 @@ This document provides a comprehensive reference for all environment variables s
 
 ## HTTP Client & Performance Optimization
 
+### Redirect Following (for AIStore and other S3-compatible services that use 3xx redirects)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_FOLLOW_REDIRECTS` | `0` | Enable 3xx redirect following (`1`, `true`, `yes`, `on`, or `enable`). Required for NVIDIA AIStore (HTTP 307 routing). Disabled by default because the AWS SDK intentionally does not follow cross-host redirects. |
+| `S3DLIO_REDIRECT_MAX` | `5` | Maximum redirect hops to follow per request. Set to a lower value to detect redirect loops sooner. |
+
 ### HTTP Client Control
 | Variable | Default | Description |
 |----------|---------|-------------|

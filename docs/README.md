@@ -17,6 +17,7 @@ These are the main user-facing guides:
 | **[PYTHON_API_GUIDE.md](PYTHON_API_GUIDE.md)** | Python API reference and examples |
 | **[Changelog.md](Changelog.md)** | Complete release history (v0.7.0 → v0.9.86) |
 | **[AIStore_307_Redirect_Proposal.md](AIStore_307_Redirect_Proposal.md)** | Design rationale for HTTP 307 redirect support (NVIDIA AIStore) |
+| **[AIStore_Redirect_Status_v0.9.86.md](AIStore_Redirect_Status_v0.9.86.md)** | AIStore compatibility assessment: protocol validation from source, known limitations, open test items |
 | **[security/HTTPS_Redirect_Security_Issues.md](security/HTTPS_Redirect_Security_Issues.md)** | Redirect security analysis: scheme downgrade (fixed) and cert pinning (pending) |
 
 ---
@@ -30,6 +31,7 @@ docs/
 ├── PYTHON_API_GUIDE.md          ← Python API guide
 ├── Changelog.md                 ← Release history
 ├── AIStore_307_Redirect_Proposal.md  ← NVIDIA AIStore redirect design
+├── AIStore_Redirect_Status_v0.9.86.md ← AIStore compatibility status (v0.9.86)
 │
 ├── security/                    ← Security analyses
 │   └── HTTPS_Redirect_Security_Issues.md
@@ -88,6 +90,7 @@ docs/
 | Generate test data with NUMA optimization | [supplemental/DATA-GENERATION-GUIDE.md](supplemental/DATA-GENERATION-GUIDE.md) |
 | See what's new | [Changelog.md](Changelog.md) |
 | Use s3dlio with NVIDIA AIStore | [AIStore_307_Redirect_Proposal.md](AIStore_307_Redirect_Proposal.md) |
+| Check AIStore compatibility status | [AIStore_Redirect_Status_v0.9.86.md](AIStore_Redirect_Status_v0.9.86.md) |
 | Review redirect security status | [security/HTTPS_Redirect_Security_Issues.md](security/HTTPS_Redirect_Security_Issues.md) |
 | Configure s3dlio | [supplemental/CONFIGURATION-HIERARCHY.md](supplemental/CONFIGURATION-HIERARCHY.md) |
 | Use environment variables | [api/Environment_Variables.md](api/Environment_Variables.md) |

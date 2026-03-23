@@ -6,7 +6,7 @@
 - Added `RedirectFollowingHttpClient` / `RedirectFollowingConnector` in `src/redirect_client.rs`.
   When the environment variable `S3DLIO_FOLLOW_REDIRECTS=1` is set, the S3 client wraps the
   default AWS SDK HTTP client with a connector that transparently follows 3xx redirects up to
-  a configurable maximum (default: 3, override via `S3DLIO_MAX_REDIRECTS`).
+  a configurable maximum (default: 5, override via `S3DLIO_REDIRECT_MAX`).
 - The primary motivation is **NVIDIA AIStore**, which routes S3 GET/PUT/DELETE requests from a
   stateless proxy node to the specific storage target via HTTP 307 Temporary Redirect. The AWS
   SDK's default HTTP client intentionally does not follow cross-host redirects; this connector
