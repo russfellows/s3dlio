@@ -53,6 +53,7 @@ use pyo3::prelude::*;
 
 // Internal modules - these may change in future versions
 pub mod s3_client;
+pub(crate) mod redirect_client;  // HTTP 307 redirect following (for AIStore compatibility)
 pub mod s3_copy;
 pub mod s3_utils;
 pub mod s3_logger;

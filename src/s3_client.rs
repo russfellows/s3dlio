@@ -331,6 +331,24 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                 }
             };
 
+            // Optionally wrap with redirect following for AIStore compatibility.
+            // AIStore proxy nodes return HTTP 307 → Location: http://target-node/...
+            // which the AWS SDK's default HTTP client does not follow cross-host.
+            // Enable via: S3DLIO_FOLLOW_REDIRECTS=1  (also: true/yes/on/enable)
+            let follow_redirects_env = env::var("S3DLIO_FOLLOW_REDIRECTS").unwrap_or_default();
+            let http_client = if matches!(
+                follow_redirects_env.to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enable"
+            ) {
+                info!("S3DLIO_FOLLOW_REDIRECTS enabled — following 307/302/308 redirects (AIStore support)");
+                // If no custom http_client was built above, create the default one now
+                // so we have a concrete client to wrap.
+                let base = http_client.unwrap_or_else(|| HttpClientBuilder::new().build_http());
+                Some(crate::redirect_client::make_redirecting_client(base))
+            } else {
+                http_client
+            };
+
             // Region & optional endpoint
             debug!("AWS_REGION env: {}", env::var("AWS_REGION").as_deref().unwrap_or("<not set — using provider chain>"));
             let region =

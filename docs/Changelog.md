@@ -1,5 +1,58 @@
 # s3dlio Changelog
 
+## Version 0.9.86 - Redirect Follower / Tacit AIStore Support, Redirect Security (March 2026)
+
+### Feature: HTTP 3xx redirect-following connector (`S3DLIO_FOLLOW_REDIRECTS`)
+- Added `RedirectFollowingHttpClient` / `RedirectFollowingConnector` in `src/redirect_client.rs`.
+  When the environment variable `S3DLIO_FOLLOW_REDIRECTS=1` is set, the S3 client wraps the
+  default AWS SDK HTTP client with a connector that transparently follows 3xx redirects up to
+  a configurable maximum (default: 3, override via `S3DLIO_MAX_REDIRECTS`).
+- The primary motivation is **NVIDIA AIStore**, which routes S3 GET/PUT/DELETE requests from a
+  stateless proxy node to the specific storage target via HTTP 307 Temporary Redirect. The AWS
+  SDK's default HTTP client intentionally does not follow cross-host redirects; this connector
+  closes that gap. See [`docs/AIStore_307_Redirect_Proposal.md`](AIStore_307_Redirect_Proposal.md)
+  for full design rationale and the rejected alternative approaches.
+
+  > **⚠️ Note:** AIStore compatibility is *tacit* support — s3dlio has not been tested directly
+  > against NVIDIA AIStore at this time. The redirect mechanism conforms to the protocol as
+  > described in AIStore's documentation, but end-to-end validation is pending.
+
+### Feature: Redirect security — scheme downgrade prevention (ACTIVE)
+- HTTPS → HTTP redirects are now **refused** with a `ConnectorError`. Following an HTTPS-to-HTTP
+  redirect would transmit the S3 `Authorization` header (HMAC-SHA256 signature + credentials) in
+  plaintext, enabling credential capture and replay attacks.
+- This protection is unconditional when `S3DLIO_FOLLOW_REDIRECTS=1` is active.
+
+### Security gap: Certificate pinning across redirect chain (NOT YET IMPLEMENTED)
+- A `CertVerifyStore` structure is in place and the redirect-chain cert-comparison policy is
+  implemented and fully unit-tested — but the store is currently empty in production because there
+  is no point at which the TLS handshake's peer certificate is recorded into it.
+- Implementing this requires a pre-flight TLS probe using `tokio_rustls` to extract the peer
+  certificate before each redirect hop. The AWS Smithy SDK's built-in TLS connector chain does not
+  expose a public injection point for a custom `rustls::client::danger::ServerCertVerifier`, and
+  all internal paths (`create_rustls_client_config`, `wrap_connector`) are `pub(crate)`.
+- The planned approach (pre-flight probe via `aws-smithy-runtime-api`'s public `HttpConnector`
+  trait) requires no SDK fork and is fully documented. See
+  [`docs/security/HTTPS_Redirect_Security_Issues.md`](security/HTTPS_Redirect_Security_Issues.md)
+  §7 for the complete API investigation, dead-end analysis, viable implementation path, and
+  future PR checklist.
+- **Risk:** MEDIUM. WebPKI validation (hostname + CA chain) continues to run on every hop.
+  The scheme downgrade risk (HIGH) is now blocked. Cert pinning adds defense in depth for
+  environments with non-standard CA configurations.
+
+### Tests: 21 new unit tests for redirect behavior
+- All redirect tests live in `src/redirect_client.rs` under `#[cfg(test)]`.
+- Coverage includes: basic 302/307 redirect following; cross-host `Authorization` stripping
+  (RFC 9110 §11.6.2); max-redirect loop termination; scheme downgrade refusal (HTTPS → HTTP);
+  cert pinning match/mismatch; RFC-correct handling of 301/302 POST→GET conversion; 303 See Other;
+  and the scheme-downgrade regression test that confirmed the production gap and its fix.
+
+### Verification
+- `cargo build --release` — zero warnings ✅
+- `cargo test` — all tests pass ✅
+
+---
+
 ## Version 0.9.84 - HEAD Elimination, OnceLock Caching, Lock-Free Range Assembly, Env Var Rename (March 2026)
 
 ### Performance: process-global ObjectSizeCache eliminates redundant HEAD requests

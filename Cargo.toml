@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.84"
+version = "0.9.86"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -153,6 +153,9 @@ tokio-sync   = "^0.1.8"
 futures-util  = "^0.3"
 async-trait   = "^0.1"   # needed by the mock datasets
 criterion     = { version = "0.5", features = ["html_reports"] }
+# RFC conformance tests for redirect_client
+http          = "0.2"           # needed to construct HttpRequest with non-GET methods (e.g., POST for 303 test)
+aws-smithy-types = "^1"        # needed for SdkBody::empty() in test fixtures
 
 [features]
 #default = []

@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-580%2F580-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.84-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-507%2F507-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.86-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,7 +10,7 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.84** — HEAD elimination via process-global ObjectSizeCache; OnceLock env-var caching on hot path; fix `S3DLIO_ENABLE_RANGE_OPTIMIZATION` no-op on `get_many()` path; lock-free range chunk assembly; rename `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE`; replace `eprintln!` with structured tracing.
+> **v0.9.86** — Redirect-following connector (`S3DLIO_FOLLOW_REDIRECTS=1`) for tacit NVIDIA AIStore support via S3; scheme-downgrade (HTTPS→HTTP) prevention active; 21 new redirect unit tests. Note: direct AIStore end-to-end testing has not been performed; cert-pinning security is pending (see [docs/security/HTTPS_Redirect_Security_Issues.md](docs/security/HTTPS_Redirect_Security_Issues.md)).
 
 ## 📦 Installation
 
@@ -212,19 +212,12 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.80** (March 2026) - Critical fix: Python `list()` / `list_keys()` hung indefinitely on non-AWS endpoints; tracing deadlock inside `tokio::spawn` eliminated by refactoring `list_objects_stream` to an inline `async_stream::stream!`; all S3 bucket/delete operations now use async-safe helpers.
+**v0.9.86** (March 2026) - Redirect-following connector for tacit NVIDIA AIStore S3 support (`S3DLIO_FOLLOW_REDIRECTS=1`); HTTPS→HTTP scheme-downgrade protection active; 21 new redirect unit tests. Note: tested against the AIStore protocol spec but not against a live AIStore cluster. Certificate pinning is pending (see [security doc](docs/security/HTTPS_Redirect_Security_Issues.md)).
 
 **Recent highlights:**
+- **v0.9.86** - Redirect follower for NVIDIA AIStore (S3 path); HTTPS→HTTP downgrade prevention; 21 new redirect tests; redirect security analysis documented
+- **v0.9.84** - HEAD elimination (ObjectSizeCache); OnceLock env-var caching; lock-free range assembly; `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE`; structured tracing
 - **v0.9.80** - Python list hang fix (IMDSv2 legacy call removed); tracing deadlock fix (`tokio::spawn` → inline stream); async S3 delete/bucket helpers; deprecated Python APIs cleaned up
-- **v0.9.76** - GCS RAPID/zonal support (stat/get/put); `RUST_LOG=debug` hang fix (issue #105); debug logging on all five ObjectStore backends; `rm` alias; `list` as primary command name; Python LogTracer conflict fixed
-- **v0.9.70** - Added Python wheel backend profiles (`default` and `full`), `build_pyo3.sh` profile CLI options (`full` / `default` / `--profile`), and documentation for full-backend source builds
-- **v0.9.65** - Fixed GCS PUT RESOURCE_EXHAUSTED (chunk size exceeded server 4 MiB protobuf message limit); centralised all GCS/gRPC constants; zero-copy `put_object(Bytes)`; RAPID auto-detection; subchannel auto-tune via `--jobs`; 10 new zero-copy unit tests
-- **v0.9.60** - All GCS operations now use gRPC (BidiReadObject/BidiWriteObject) instead of JSON API; GCS RAPID/Hyperdisk ML zonal bucket support via `S3DLIO_GCS_RAPID`; 64-way concurrent batch deletes; byte-range optimization enabled by default at 32 MB threshold; NUMA and HDF5 now optional features
-- **v0.9.50** - Python multi-threaded runtime fix (io_uring-style submit), s3torchconnector zero-copy rewrite, S3 range download optimization (76% faster for large objects), multipart upload zero-copy chunking
-- **v0.9.40** - Enhanced Python bytearray documentation with performance benchmarks (2.5-3x speedup)
-- **v0.9.37** - Test suite modernization, zero build warnings
-- **v0.9.36** - **BREAKING**: `ObjectStore::put()` now takes `Bytes` instead of `&[u8]` for true zero-copy
-- **v0.9.30** - Zero-copy refactor, PyO3 0.27 migration
 
 📖 **[Complete Changelog](docs/Changelog.md)** - Full version history, migration guides, API details
 
