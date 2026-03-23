@@ -1,6 +1,6 @@
 # s3dlio Documentation
 
-> **Version**: v0.9.37 (January 2026)  
+> **Version**: v0.9.86 (March 2026)  
 > **Status**: Production-Ready (All 5 Backends Active)
 
 Welcome to s3dlio documentation! This README provides an overview of the documentation structure.
@@ -15,7 +15,10 @@ These are the main user-facing guides:
 |----------|-------------|
 | **[CLI_GUIDE.md](CLI_GUIDE.md)** | Command-line interface reference (`s3-cli`) |
 | **[PYTHON_API_GUIDE.md](PYTHON_API_GUIDE.md)** | Python API reference and examples |
-| **[Changelog.md](Changelog.md)** | Complete release history (v0.7.0 → v0.9.24) |
+| **[Changelog.md](Changelog.md)** | Complete release history (v0.7.0 → v0.9.86) |
+| **[AIStore_307_Redirect_Proposal.md](AIStore_307_Redirect_Proposal.md)** | Design rationale for HTTP 307 redirect support (NVIDIA AIStore) |
+| **[AIStore_Redirect_Status_v0.9.86.md](AIStore_Redirect_Status_v0.9.86.md)** | AIStore compatibility assessment: protocol validation from source, known limitations, open test items |
+| **[security/HTTPS_Redirect_Security_Issues.md](security/HTTPS_Redirect_Security_Issues.md)** | Redirect security analysis: scheme downgrade (fixed) and cert pinning (pending) |
 
 ---
 
@@ -27,6 +30,11 @@ docs/
 ├── CLI_GUIDE.md                 ← s3-cli command reference
 ├── PYTHON_API_GUIDE.md          ← Python API guide
 ├── Changelog.md                 ← Release history
+├── AIStore_307_Redirect_Proposal.md  ← NVIDIA AIStore redirect design
+├── AIStore_Redirect_Status_v0.9.86.md ← AIStore compatibility status (v0.9.86)
+│
+├── security/                    ← Security analyses
+│   └── HTTPS_Redirect_Security_Issues.md
 │
 ├── api/                         ← API reference
 │   └── Environment_Variables.md
@@ -81,6 +89,9 @@ docs/
 | Use the Python API | [PYTHON_API_GUIDE.md](PYTHON_API_GUIDE.md) |
 | Generate test data with NUMA optimization | [supplemental/DATA-GENERATION-GUIDE.md](supplemental/DATA-GENERATION-GUIDE.md) |
 | See what's new | [Changelog.md](Changelog.md) |
+| Use s3dlio with NVIDIA AIStore | [AIStore_307_Redirect_Proposal.md](AIStore_307_Redirect_Proposal.md) |
+| Check AIStore compatibility status | [AIStore_Redirect_Status_v0.9.86.md](AIStore_Redirect_Status_v0.9.86.md) |
+| Review redirect security status | [security/HTTPS_Redirect_Security_Issues.md](security/HTTPS_Redirect_Security_Issues.md) |
 | Configure s3dlio | [supplemental/CONFIGURATION-HIERARCHY.md](supplemental/CONFIGURATION-HIERARCHY.md) |
 | Use environment variables | [api/Environment_Variables.md](api/Environment_Variables.md) |
 | Work with operation logs | [supplemental/OPLOG-GUIDE.md](supplemental/OPLOG-GUIDE.md) |
@@ -103,6 +114,12 @@ All backends are production-ready with the same universal API:
 | **Google Cloud Storage** | `gs://` | Google Cloud Storage |
 | **Local Filesystem** | `file://` | Standard POSIX filesystem I/O |
 | **DirectIO** | `direct://` | O_DIRECT bypass for NVMe/SSD |
+
+> **NVIDIA AIStore (tacit support):** s3dlio can follow the HTTP 307 redirects that AIStore uses
+> for internal load balancing. Set `S3DLIO_FOLLOW_REDIRECTS=1` to enable. Direct end-to-end
+> testing against AIStore has not been performed. Scheme-downgrade protection (HTTPS → HTTP) is
+> active; cert pinning is pending (see
+> [security/HTTPS_Redirect_Security_Issues.md](security/HTTPS_Redirect_Security_Issues.md)).
 
 **See:** [testing/BACKEND-TESTING.md](testing/BACKEND-TESTING.md) for backend-specific testing
 

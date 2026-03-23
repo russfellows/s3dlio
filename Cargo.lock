@@ -5078,7 +5078,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3dlio"
-version = "0.9.84"
+version = "0.9.86"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -5087,6 +5087,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "azure_core",
  "azure_identity",
  "azure_storage_blob",
@@ -5112,6 +5113,7 @@ dependencies = [
  "hdf5-metno",
  "hdf5-metno-sys",
  "hdrhistogram",
+ "http 0.2.12",
  "humantime",
  "hwlocality",
  "hyper 1.8.1",
@@ -5159,7 +5161,7 @@ dependencies = [
 
 [[package]]
 name = "s3dlio-oplog"
-version = "0.9.84"
+version = "0.9.86"
 dependencies = [
  "anyhow",
  "async-trait",
