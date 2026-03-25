@@ -42,9 +42,9 @@ gcloud-storage = { version = "^1.2", optional = true }  # Community GCS client (
 # google-cloud-storage = { path = "../google-cloud-rust/src/storage", optional = true }
 # google-cloud-gax = { path = "../google-cloud-rust/src/gax", optional = true }
 # google-cloud-gax-internal = { path = "../google-cloud-rust/src/gax-internal", features = ["_internal-grpc-client"], optional = true }
-google-cloud-storage = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260317.1", optional = true }
-google-cloud-gax = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260317.1", optional = true }
-google-cloud-gax-internal = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260317.1", features = ["_internal-grpc-client"], optional = true }
+google-cloud-storage = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.1", optional = true }
+google-cloud-gax = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.1", optional = true }
+google-cloud-gax-internal = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.1", features = ["_internal-grpc-client"], optional = true }
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat
@@ -212,4 +212,4 @@ opt-level = 3
 # (unlike [patch.crates-io] which is silently ignored by downstream Cargo workspaces).
 #
 # Development: path = "../google-cloud-rust/src/..."
-# Released:    git  = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260317.1"
+# Released:    git  = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.1"

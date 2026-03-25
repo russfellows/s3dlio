@@ -1258,7 +1258,20 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
     // Use universal ObjectStore to list objects (works with all backends)
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri_str, logger)?;
-    let keys = store.list(uri_str, recursive).await?;
+
+    // When the URI is a directory prefix (ends with '/'), list recursively even if the
+    // user did not pass -r.  A directory URI with recursive=false returns only the
+    // immediate virtual sub-prefixes (entries ending in '/'), which are not real objects
+    // and cannot be GET-ted; the user always wants the leaf objects inside the prefix.
+    let do_recursive = recursive || uri_str.ends_with('/');
+
+    // Filter out virtual directory entries (keys ending with '/').  Object-storage
+    // backends (GCS, S3, Azure) surface these as "common prefixes" in non-recursive
+    // listings; they have no data and will fail with NOT_FOUND if GET-ted.
+    let keys: Vec<String> = store.list(uri_str, do_recursive).await?
+        .into_iter()
+        .filter(|k| !k.ends_with('/'))
+        .collect();
 
     if keys.is_empty() {
         bail!("No objects match pattern '{}'", uri_str);
