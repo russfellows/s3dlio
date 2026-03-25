@@ -1265,57 +1265,160 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
     // and cannot be GET-ted; the user always wants the leaf objects inside the prefix.
     let do_recursive = recursive || uri_str.ends_with('/');
 
-    // Filter out virtual directory entries (keys ending with '/').  Object-storage
-    // backends (GCS, S3, Azure) surface these as "common prefixes" in non-recursive
-    // listings; they have no data and will fail with NOT_FOUND if GET-ted.
-    let keys: Vec<String> = store.list(uri_str, do_recursive).await?
-        .into_iter()
-        .filter(|k| !k.ends_with('/'))
-        .collect();
+    // === Shared real-time progress state ===
+    // These atomics are updated by spawned download tasks so the background
+    // progress updater always sees current counts without any locking on the
+    // hot path.
+    let keys_listed  = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let keys_done    = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_done   = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    if keys.is_empty() {
+    // Rolling rate window for obj/s computation — see CLI_RATE_WINDOW_SECS in constants.rs.
+    // Sampled every 500 ms by the background task.
+    let rate_window: Arc<std::sync::Mutex<std::collections::VecDeque<(Instant, u64)>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+    // Bytes-based progress bar — same visual style as the old S3ProgressTracker.
+    // We start with length=0 and update it each tick using the estimated total bytes
+    // (avg_bytes_per_object × remaining_objects + bytes_already_done), so indicatif
+    // can compute {bytes_per_sec} and {eta} natively from real byte throughput.
+    let pb = ProgressBar::new(0);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "GET: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
+                 {bytes}/{total_bytes} ({bytes_per_sec}, ETA: {eta}) | {msg}"
+            )
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let t0 = Instant::now();
+
+    // Background task: updates the progress bar every 500 ms.
+    //
+    // - pb.set_position(bytes) drives all indicatif-computed fields: {bytes},
+    //   {bytes_per_sec}, and {eta}.
+    // - pb.set_length(estimated_total) gives indicatif a moving-but-converging
+    //   estimate of total bytes so the bar fill and ETA are meaningful from the
+    //   start, before listing completes.
+    // - {msg} carries object count and the rolling obj/s rate (window = CLI_RATE_WINDOW_SECS).
+    let pb_bg      = pb.clone();
+    let listed_bg  = Arc::clone(&keys_listed);
+    let done_bg    = Arc::clone(&keys_done);
+    let bytes_bg   = Arc::clone(&bytes_done);
+    let window_bg  = Arc::clone(&rate_window);
+    let updater = tokio::spawn(async move {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            let listed    = listed_bg.load(Relaxed);
+            let completed = done_bg.load(Relaxed);
+            let bytes     = bytes_bg.load(Relaxed);
+
+            // Drive the bytes bar so indicatif tracks real byte throughput.
+            pb_bg.set_position(bytes);
+
+            // Estimate total bytes = bytes so far + avg_bytes/obj × remaining objects.
+            // This keeps the bar fill and ETA reasonable even while listing is still
+            // ongoing.  Once listing finishes the estimate converges to reality.
+            if completed > 0 {
+                let avg_bytes_per_obj = bytes / completed;
+                let remaining = listed.saturating_sub(completed);
+                let estimated_total = bytes + remaining * avg_bytes_per_obj;
+                pb_bg.set_length(estimated_total);
+            }
+
+            // Rolling obj/s rate — window length from CLI_RATE_WINDOW_SECS in constants.rs.
+            let now = Instant::now();
+            let rate_obj_s = {
+                let mut win = window_bg.lock().unwrap();
+                win.push_back((now, completed));
+                // Evict samples outside the rolling window.
+                while win.front()
+                    .map(|(t, _)| now.duration_since(*t) > std::time::Duration::from_secs(s3dlio::constants::CLI_RATE_WINDOW_SECS))
+                    .unwrap_or(false)
+                {
+                    win.pop_front();
+                }
+                if win.len() >= 2 {
+                    let (oldest_t, oldest_c) = *win.front().unwrap();
+                    let span_s = now.duration_since(oldest_t).as_secs_f64();
+                    if span_s > 0.1 {
+                        completed.saturating_sub(oldest_c) as f64 / span_s
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            };
+
+            pb_bg.set_message(format!(
+                "{}/{} objects | {:.1} obj/s ({}s avg)",
+                completed, listed, rate_obj_s, s3dlio::constants::CLI_RATE_WINDOW_SECS,
+            ));
+        }
+    });
+
+    // === Semaphore-bounded streaming pipeline ===
+    //
+    // The semaphore permit is acquired in the main task *before* spawning each
+    // tokio task.  This keeps the live-task count pinned to exactly `concurrency`
+    // regardless of how many objects exist in the prefix.  While the main task is
+    // suspended on `acquire_owned()`, the already-running tasks release permits as
+    // they finish — no deadlock is possible.
+    //
+    // Keys arrive from the listing stream one-by-one, so BidiReadObject streams open
+    // progressively instead of all simultaneously — reducing thundering-herd pressure
+    // on GCS RAPID read-ahead buffers.
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut futs = futures_util::stream::FuturesUnordered::new();
+    let mut stream = store.list_stream(uri_str, do_recursive);
+    let mut failure_count = 0u64;
+
+    // Phase 1: consume the listing stream, spawning one bounded download per key.
+    while let Some(result) = stream.next().await {
+        let key = result.with_context(|| format!("list error for '{}'", uri_str))?;
+        if key.ends_with('/') {
+            continue; // skip virtual directory entries (common prefixes)
+        }
+        keys_listed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Block here until a concurrency slot is available, then spawn immediately.
+        let permit     = Arc::clone(&sem).acquire_owned().await.expect("semaphore closed");
+        let logger     = global_logger();
+        let done_task  = Arc::clone(&keys_done);
+        let bytes_task = Arc::clone(&bytes_done);
+
+        futs.push(tokio::spawn(async move {
+            let _permit = permit; // released when this block exits
+            let store = store_for_uri_with_logger(&key, logger)?;
+            let data = store.get(&key).await?;
+            let byte_count = data.len() as u64;
+            // Update shared progress atomics on success so the background task
+            // sees live counts without waiting for Phase 2.
+            done_task .fetch_add(1,          std::sync::atomic::Ordering::Relaxed);
+            bytes_task.fetch_add(byte_count, std::sync::atomic::Ordering::Relaxed);
+            Ok::<u64, anyhow::Error>(byte_count)
+        }));
+    }
+
+    let keys_seen = keys_listed.load(std::sync::atomic::Ordering::Relaxed);
+    if keys_seen == 0 {
+        updater.abort();
+        pb.finish_and_clear();
         bail!("No objects match pattern '{}'", uri_str);
     }
 
-    // Create progress tracker
-    let progress_tracker = Arc::new(S3ProgressTracker::new("GET", keys.len() as u64, 0));
-    let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), keys.len() as u64));
-
-    let t0 = Instant::now();
-    
-    // Use universal ObjectStore interface for parallel downloads
-    let sem = Arc::new(tokio::sync::Semaphore::new(jobs));
-    let mut futs = futures_util::stream::FuturesUnordered::new();
-    let mut total_bytes = 0u64;
-    let mut success_count = 0u64;
-    let mut failure_count = 0u64;
-    
-    for uri in &keys {
-        let sem = sem.clone();
-        let progress = progress_callback.clone();
-        let uri = uri.clone();
-        let logger = global_logger();
-        
-        futs.push(tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.unwrap();
-            let store = store_for_uri_with_logger(&uri, logger)?;
-            let data = store.get(&uri).await?;
-            let byte_count = data.len() as u64;
-            
-            // Update progress
-            progress.object_completed(byte_count);
-            
-            Ok::<(String, u64), anyhow::Error>((uri, byte_count))
-        }));
-    }
-    
+    // Phase 2: drain all in-flight downloads and collect errors.
+    // Byte/object counts are already tracked via atomics; this loop only gathers failures.
     while let Some(result) = futs.next().await {
         match result {
-            Ok(Ok((uri, byte_count))) => {
-                total_bytes += byte_count;
-                success_count += 1;
-                info!("Downloaded {} bytes from {}", byte_count, uri);
-            }
+            Ok(Ok(_)) => {} // atomics already updated inside the task
             Ok(Err(e)) => {
                 failure_count += 1;
                 warn!("GET failed: {}", e);
@@ -1326,26 +1429,32 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
             }
         }
     }
-    
-    let dt = t0.elapsed();
 
-    // Update final progress and finish
-    progress_callback.update_total_bytes(total_bytes);
-    progress_tracker.finish("Download", total_bytes, dt);
+    // Stop the background updater and display final summary on the progress bar.
+    updater.abort();
+    let dt            = t0.elapsed();
+    let total_bytes   = bytes_done.load(std::sync::atomic::Ordering::Relaxed);
+    let success_count = keys_done.load(std::sync::atomic::Ordering::Relaxed);
+    // Land the bar at exactly 100 % so the fill is complete.
+    // indicatif already renders {bytes}/{total_bytes} and {bytes_per_sec} from the
+    // bar template, so {msg} only carries what indicatif cannot: obj count and obj/s.
+    pb.set_length(total_bytes);
+    pb.set_position(total_bytes);
+    let avg_obj_s = success_count as f64 / dt.as_secs_f64();
+    pb.finish_with_message(format!(
+        "{}/{} objects | {:.1} obj/s avg",
+        success_count, keys_seen, avg_obj_s,
+    ));
 
     safe_println!(
         "GET summary: attempted={}, succeeded={}, failed={}",
-        keys.len(),
-        success_count,
-        failure_count
+        keys_seen, success_count, failure_count,
     );
 
     if failure_count > 0 {
         bail!(
             "GET completed with failures: attempted={}, succeeded={}, failed={}",
-            keys.len(),
-            success_count,
-            failure_count
+            keys_seen, success_count, failure_count,
         );
     }
 

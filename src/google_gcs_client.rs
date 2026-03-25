@@ -5,10 +5,12 @@
 
 use anyhow::{anyhow, bail, Result};
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::Stream;
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
 use google_cloud_gax::paginator::ItemPaginator;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -863,6 +865,92 @@ impl GcsClient {
         }
 
         Ok(results)
+    }
+
+    /// Stream objects from a bucket with optional prefix, yielding keys as they
+    /// arrive from the GCS paginator — without buffering the full result set.
+    ///
+    /// For recursive listings this uses `by_item()` which yields one object per
+    /// paginator item; downloads can begin as soon as the first key is received,
+    /// up to ~7 seconds earlier than the blocking `list_objects` alternative.
+    ///
+    /// For non-recursive listings it falls back to `by_page()` so that virtual
+    /// directory prefixes (entries ending with `/`) are included.
+    pub fn list_objects_stream<'a>(
+        &'a self,
+        bucket: &'a str,
+        prefix: Option<&'a str>,
+        recursive: bool,
+    ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+        use google_cloud_gax::paginator::Paginator;
+
+        let bucket_name_owned = format_bucket_name(bucket);
+        // Normalise the prefix exactly as list_objects does.
+        let normalized_prefix: Option<String> = prefix.map(|p| {
+            if !recursive && !p.is_empty() && !p.ends_with('/') {
+                format!("{}/", p)
+            } else {
+                p.to_string()
+            }
+        });
+
+        Box::pin(async_stream::stream! {
+            let mut builder = self.control
+                .list_objects()
+                .set_parent(bucket_name_owned.clone());
+
+            if let Some(ref p) = normalized_prefix {
+                builder = builder.set_prefix(p.clone());
+            }
+            if !recursive {
+                builder = builder.set_delimiter("/".to_string());
+            }
+
+            if recursive {
+                // by_item() yields one Object per call — true streaming, no intermediate Vec.
+                let mut iter = builder.by_item();
+                let mut count = 0u64;
+                while let Some(result) = iter.next().await {
+                    match result {
+                        Ok(obj) => {
+                            count += 1;
+                            trace!("GCS LIST stream recursive: object={}", obj.name);
+                            yield Ok(obj.name);
+                        }
+                        Err(e) => {
+                            yield Err(anyhow!("GCS LIST stream error for gs://{}: {}", bucket, e));
+                            return;
+                        }
+                    }
+                }
+                debug!("GCS LIST stream complete: {} objects", count);
+            } else {
+                // by_page() is needed for non-recursive so we can emit prefix entries.
+                let mut pages_iter = builder.by_page();
+                let mut count = 0u64;
+                while let Some(result) = pages_iter.next().await {
+                    match result {
+                        Ok(page) => {
+                            for obj in page.objects {
+                                count += 1;
+                                trace!("GCS LIST stream: object={}", obj.name);
+                                yield Ok(obj.name);
+                            }
+                            for pfx in page.prefixes {
+                                count += 1;
+                                trace!("GCS LIST stream: prefix={}", pfx);
+                                yield Ok(pfx);
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(anyhow!("GCS LIST stream error for gs://{}: {}", bucket, e));
+                            return;
+                        }
+                    }
+                }
+                debug!("GCS LIST stream complete: {} entries", count);
+            }
+        })
     }
 
     /// Internal: execute a paginated LIST with specified prefix and options.

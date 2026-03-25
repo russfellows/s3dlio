@@ -162,6 +162,28 @@ pub const DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD: u64 = DEFAULT_RANGE_ENGINE_TH
 /// Default range request timeout (30 seconds)
 pub const DEFAULT_RANGE_TIMEOUT_SECS: u64 = 30;
 
+// =============================================================================
+// CLI Progress Display Constants
+// =============================================================================
+
+/// Rolling-window duration (seconds) used to compute the current obj/s rate in
+/// the `s3-cli get` progress bar (URI-prefix mode).
+///
+/// Every 500 ms the background updater records a (timestamp, completed_count)
+/// sample.  Samples older than this window are evicted; the rate is calculated
+/// as Δcompleted / Δtime across the oldest surviving sample, giving a responsive
+/// but stable "current rate" display.
+///
+/// **Why 5 s?**
+/// - Short enough to track real acceleration / deceleration (e.g. GCS RAPID
+///   warming up over the first few seconds).
+/// - Long enough to smooth out single-object jitter without lag.
+///
+/// **Note on PUT (put_many_cmd):** the PUT progress bar drives indicatif's
+/// built-in {bytes_per_sec} field, which uses indicatif's own internal
+/// exponential moving average — this constant does not apply there.
+pub const CLI_RATE_WINDOW_SECS: u64 = 5;
+
 /// Page size bounds for validation
 pub const MIN_PAGE_SIZE: usize = 512;
 pub const MAX_PAGE_SIZE: usize = 64 * 1024;

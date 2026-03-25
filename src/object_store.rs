@@ -2286,32 +2286,26 @@ impl ObjectStore for GcsObjectStore {
         recursive: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
         Box::pin(async_stream::stream! {
-            // parse_gcs_uri now handles bucket-only URIs (gs://bucket/ → ("bucket", ""))
             let (bucket, key_prefix) = match parse_gcs_uri(uri_prefix) {
                 Ok((b, k)) => (b, k),
-                Err(e) => {
-                    yield Err(e);
-                    return;
-                }
+                Err(e) => { yield Err(e); return; }
             };
 
             let client = match self.get_client().await {
                 Ok(c) => c,
-                Err(e) => {
-                    yield Err(e);
-                    return;
-                }
+                Err(e) => { yield Err(e); return; }
             };
 
-            // List all objects (returns Vec, not a stream)
+            // Route through the true streaming lister — yields keys as GCS pages
+            // arrive, so downloads begin in parallel with the listing rather than
+            // waiting for all 50 K+ entries to be collected first.
             let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.as_str()) };
-            match client.list_objects(&bucket, prefix, recursive).await {
-                Ok(keys) => {
-                    for key in keys {
-                        yield Ok(gcs_uri(&bucket, &key));
-                    }
+            let mut stream = client.list_objects_stream(&bucket, prefix, recursive);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(key) => yield Ok(gcs_uri(&bucket, &key)),
+                    Err(e) => { yield Err(e); return; }
                 }
-                Err(e) => yield Err(e),
             }
         })
     }
