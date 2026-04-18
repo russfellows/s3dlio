@@ -169,11 +169,11 @@ pub struct LoaderOptions {
     pub collate_buffer_size: usize,
     /// Page cache behavior hint for file I/O operations
     pub page_cache_mode: PageCacheMode,
-    
+
     // ── New in v0.9.0 (adaptive tuning) ─────────────────────────────────────
     /// Optional adaptive configuration for auto-tuning (default: None/disabled)
     pub adaptive: Option<crate::adaptive_config::AdaptiveConfig>,
-    
+
     // ── New in v0.9.2 (cancellation support) ────────────────────────────────
     /// Optional cancellation token for graceful shutdown of async operations
     /// When set, all prefetch loops and async workers will cooperatively cancel
@@ -218,10 +218,10 @@ impl Default for LoaderOptions {
             enable_transforms: false,
             collate_buffer_size: 1024, // 1KB default buffer
             page_cache_mode: PageCacheMode::default(),
-            
+
             // new defaults (v0.9.0 - adaptive tuning)
             adaptive: None, // Disabled by default - users opt-in
-            
+
             // new defaults (v0.9.2 - cancellation support)
             cancellation_token: None, // No cancellation by default
         }
@@ -317,13 +317,16 @@ impl LoaderOptions {
     /// Use async pool loading with default configuration
     pub fn async_pool_loading(mut self) -> Self {
         self.loading_mode = LoadingMode::AsyncPool(
-            crate::data_loader::async_pool_dataloader::PoolConfig::default()
+            crate::data_loader::async_pool_dataloader::PoolConfig::default(),
         );
         self
     }
 
     /// Use async pool loading with custom configuration
-    pub fn async_pool_loading_with_config(mut self, config: crate::data_loader::async_pool_dataloader::PoolConfig) -> Self {
+    pub fn async_pool_loading_with_config(
+        mut self,
+        config: crate::data_loader::async_pool_dataloader::PoolConfig,
+    ) -> Self {
         self.loading_mode = LoadingMode::AsyncPool(config);
         self
     }
@@ -481,47 +484,47 @@ impl LoaderOptions {
         self.page_cache_mode = mode;
         self
     }
-    
+
     // ── New in v0.9.0: adaptive tuning builder helpers ──────────────────────
-    
+
     /// Enable adaptive tuning with default configuration
-    /// 
+    ///
     /// When enabled, part_size and num_workers will be auto-tuned based on
     /// workload characteristics. Explicit settings always override adaptive.
     pub fn with_adaptive(mut self) -> Self {
         self.adaptive = Some(crate::adaptive_config::AdaptiveConfig::enabled());
         self
     }
-    
+
     /// Set custom adaptive configuration
     pub fn with_adaptive_config(mut self, config: crate::adaptive_config::AdaptiveConfig) -> Self {
         self.adaptive = Some(config);
         self
     }
-    
+
     // ── New in v0.9.2: cancellation support builder helpers ─────────────────
-    
+
     /// Set cancellation token for graceful shutdown
-    /// 
+    ///
     /// When set, all async operations (prefetch loops, pool workers) will
     /// cooperatively check for cancellation and exit cleanly.
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```no_run
     /// use s3dlio::data_loader::*;
     /// use tokio_util::sync::CancellationToken;
-    /// 
+    ///
     /// # async fn example() -> anyhow::Result<()> {
     /// let cancel_token = CancellationToken::new();
-    /// 
+    ///
     /// // Setup Ctrl-C handler
     /// let token_clone = cancel_token.clone();
     /// tokio::spawn(async move {
     ///     tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl-C");
     ///     token_clone.cancel();
     /// });
-    /// 
+    ///
     /// let opts = LoaderOptions::default()
     ///     .with_batch_size(32)
     ///     .with_cancellation_token(cancel_token);
@@ -532,19 +535,19 @@ impl LoaderOptions {
         self.cancellation_token = Some(token);
         self
     }
-    
+
     /// Remove cancellation token (disable cancellation)
     pub fn without_cancellation(mut self) -> Self {
         self.cancellation_token = None;
         self
     }
-    
+
     /// Compute effective part size considering adaptive tuning
-    /// 
+    ///
     /// CRITICAL: Explicit part_size always overrides adaptive behavior
     pub fn effective_part_size(&self, file_size: Option<usize>) -> usize {
         use crate::adaptive_config::AdaptiveParams;
-        
+
         if let Some(ref adaptive_cfg) = self.adaptive {
             let params = AdaptiveParams::new(adaptive_cfg.clone());
             // If part_size was explicitly set, it's used; otherwise adaptive computes it
@@ -554,17 +557,24 @@ impl LoaderOptions {
             self.part_size
         }
     }
-    
+
     /// Compute effective concurrency considering adaptive tuning
-    /// 
+    ///
     /// CRITICAL: Explicit num_workers always overrides adaptive behavior
-    pub fn effective_concurrency(&self, workload: Option<crate::adaptive_config::WorkloadType>) -> usize {
+    pub fn effective_concurrency(
+        &self,
+        workload: Option<crate::adaptive_config::WorkloadType>,
+    ) -> usize {
         use crate::adaptive_config::AdaptiveParams;
-        
+
         if let Some(ref adaptive_cfg) = self.adaptive {
             let params = AdaptiveParams::new(adaptive_cfg.clone());
             // If num_workers was explicitly set (non-zero), use it; otherwise adaptive computes
-            let explicit = if self.num_workers > 0 { Some(self.num_workers) } else { None };
+            let explicit = if self.num_workers > 0 {
+                Some(self.num_workers)
+            } else {
+                None
+            };
             params.compute_concurrency(workload, explicit)
         } else {
             // No adaptive: use explicit num_workers (0 means auto = CPU count)
@@ -578,4 +588,3 @@ impl LoaderOptions {
         }
     }
 }
-

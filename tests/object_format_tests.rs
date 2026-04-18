@@ -8,7 +8,7 @@ use std::convert::TryInto;
 use std::io::Cursor;
 use zip::ZipArchive;
 
-use s3dlio::data_formats::{build_raw, build_npz, tfrecord::TfRecordWithIndex};
+use s3dlio::data_formats::{build_npz, build_raw, tfrecord::TfRecordWithIndex};
 
 #[cfg(feature = "hdf5")]
 use s3dlio::data_formats::build_hdf5;
@@ -63,11 +63,13 @@ fn npz_roundtrip_and_content() -> anyhow::Result<()> {
 fn hdf5_signature_and_dataset() -> anyhow::Result<()> {
     let elements = 10;
     let element_size = 2;
-    let data: Vec<u8> = (0..elements*element_size).map(|i| (i % 256) as u8).collect();
+    let data: Vec<u8> = (0..elements * element_size)
+        .map(|i| (i % 256) as u8)
+        .collect();
 
     let h5_bytes = build_hdf5(elements, element_size, &data)?;
     // HDF5 signature
-    const HDF5_SIG: &[u8;8] = b"\x89HDF\r\n\x1A\n";
+    const HDF5_SIG: &[u8; 8] = b"\x89HDF\r\n\x1A\n";
     assert!(h5_bytes.len() > 8, "HDF5 image too small");
     assert_eq!(&h5_bytes[..8], HDF5_SIG, "Invalid HDF5 signature");
 
@@ -90,8 +92,10 @@ fn tfrecord_index_and_stream_consistency() -> anyhow::Result<()> {
         data.push((i % 256) as u8);
     }
 
-    let TfRecordWithIndex { data: tf_bytes, index: idx_bytes } =
-        build_tfrecord_with_index(records, rec_size, &data)?;
+    let TfRecordWithIndex {
+        data: tf_bytes,
+        index: idx_bytes,
+    } = build_tfrecord_with_index(records, rec_size, &data)?;
 
     // Index should be exactly 16 bytes per record (u64 offset + u64 length)
     assert_eq!(idx_bytes.len(), records * 16);
@@ -109,7 +113,7 @@ fn tfrecord_index_and_stream_consistency() -> anyhow::Result<()> {
     let total: u64 = (0..records)
         .map(|i| {
             let start = i * 16;
-            u64::from_le_bytes(idx_bytes[start+8..start+16].try_into().unwrap())
+            u64::from_le_bytes(idx_bytes[start + 8..start + 16].try_into().unwrap())
         })
         .sum();
     assert_eq!(
@@ -120,4 +124,3 @@ fn tfrecord_index_and_stream_consistency() -> anyhow::Result<()> {
 
     Ok(())
 }
-

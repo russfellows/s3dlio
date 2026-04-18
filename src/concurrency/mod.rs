@@ -6,6 +6,6 @@
 pub mod scheduler;
 
 pub use scheduler::{
-    AdaptiveScheduler, ConcurrencyMode, SchedulerPermit, S3PerformanceProfile,
-    Throughput, TransferDirection, calculate_optimal_part_size,
+    calculate_optimal_part_size, AdaptiveScheduler, ConcurrencyMode, S3PerformanceProfile,
+    SchedulerPermit, Throughput, TransferDirection,
 };

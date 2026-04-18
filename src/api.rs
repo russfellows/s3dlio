@@ -66,7 +66,7 @@ pub use crate::file_store_direct::FileSystemConfig as DirectFileSystemConfig;
 pub use crate::data_loader::options::PageCacheMode;
 
 /// Unified storage configuration for all backends
-/// 
+///
 /// Use this enum to configure backend-specific options when creating stores
 /// with `store_for_uri_with_config()`. This allows you to pass the correct
 /// configuration type for each storage backend (file://, direct://, etc.)
@@ -79,18 +79,18 @@ pub enum StorageConfig {
 }
 
 /// URI scheme detection
-pub use crate::object_store::{Scheme, infer_scheme};
+pub use crate::object_store::{infer_scheme, Scheme};
 
 // Op-log (trace logging) support
 /// Initialize operation logging to a file
-pub use crate::s3_logger::{init_op_logger, finalize_op_logger, global_logger, Logger};
+pub use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger, Logger};
 
 /// Set clock offset for distributed op-log synchronization (issue #100)
-pub use crate::s3_logger::{set_clock_offset, get_clock_offset};
+pub use crate::s3_logger::{get_clock_offset, set_clock_offset};
 
 /// Set client ID for operation logging (v0.9.22)
 /// All operations logged after this call will use the specified client_id value
-pub use crate::s3_logger::{set_client_id, get_client_id};
+pub use crate::s3_logger::{get_client_id, set_client_id};
 
 /// Wrapper that adds logging to any ObjectStore
 pub use crate::object_store_logger::LoggedObjectStore;
@@ -143,7 +143,7 @@ pub use crate::data_loader::dataset::Dataset;
 pub use crate::data_loader::options::LoaderOptions;
 
 /// Data loading modes and reader configurations
-pub use crate::data_loader::options::{ReaderMode, LoadingMode};
+pub use crate::data_loader::options::{LoadingMode, ReaderMode};
 
 // Checkpoint system for state management
 /// Checkpoint store for saving/loading state
@@ -205,9 +205,12 @@ pub fn dataset_for_uri(uri: &str) -> Result<Box<dyn Dataset<Item = bytes::Bytes>
 
 /// Create a dataset from a URI with custom options
 /// Returns a Dataset that produces Bytes (zero-copy)
-pub fn dataset_for_uri_with_options(uri: &str, opts: &LoaderOptions) -> Result<Box<dyn Dataset<Item = bytes::Bytes>>> {
+pub fn dataset_for_uri_with_options(
+    uri: &str,
+    opts: &LoaderOptions,
+) -> Result<Box<dyn Dataset<Item = bytes::Bytes>>> {
     use crate::object_store::infer_scheme;
-    
+
     match infer_scheme(uri) {
         crate::object_store::Scheme::S3 => {
             let dataset = S3BytesDataset::from_prefix_with_opts(uri, opts)
@@ -249,13 +252,18 @@ pub const API_VERSION: &str = "0.9.21";
 /// Uses semantic versioning: major.minor.patch
 /// Compatible if: same major version AND same minor version (patch can differ)
 pub fn is_compatible_version(required: &str) -> bool {
-    let current_parts: Vec<u32> = API_VERSION.split('.').map(|s| s.parse().unwrap_or(0)).collect();
-    let required_parts: Vec<u32> = required.split('.').map(|s| s.parse().unwrap_or(0)).collect();
-    
+    let current_parts: Vec<u32> = API_VERSION
+        .split('.')
+        .map(|s| s.parse().unwrap_or(0))
+        .collect();
+    let required_parts: Vec<u32> = required
+        .split('.')
+        .map(|s| s.parse().unwrap_or(0))
+        .collect();
+
     if current_parts.len() >= 2 && required_parts.len() >= 2 {
         // Major and minor versions must match exactly
-        current_parts[0] == required_parts[0] && 
-        current_parts[1] == required_parts[1]
+        current_parts[0] == required_parts[0] && current_parts[1] == required_parts[1]
     } else {
         false
     }

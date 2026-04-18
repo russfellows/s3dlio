@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-//! CLI supporting `list`, `get`, `delete`, `put`, and `putmany`.
+//! CLI supporting `list`, `get`, `delete`, `put`, and related commands.
 //!
 //! Examples:
 //! ```bash
@@ -24,35 +24,28 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
-use std::io::{self, Write, ErrorKind};
-use std::path::{Path, PathBuf};
-use std::time::Instant;
-use std::sync::Arc;
-use tracing::{debug, info, warn};
-use tracing_subscriber::EnvFilter;
-use tempfile::NamedTempFile;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-
-
+use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::{debug, info, warn};
+use tracing_subscriber::EnvFilter;
 
 // Import shared functions from the crate.
 use s3dlio::{
-    parse_s3_uri,
-    DEFAULT_OBJECT_SIZE, ObjectType,
-    list_containers, ContainerInfo,
-    object_store::store_for_uri_with_logger,
-    mp,
-    config::{DataGenMode, Config},
+    config::{Config, DataGenMode},
     data_gen::generate_object,
+    list_containers,
+    multi_endpoint::{LoadBalanceStrategy, MultiEndpointStore},
+    object_store::{store_for_uri_with_logger, ObjectStore},
+    parse_s3_uri, ContainerInfo, ObjectType, DEFAULT_OBJECT_SIZE,
 };
 
-use s3dlio::{
-    generic_download_objects_with_summary,
-    generic_upload_files_with_summary,
-};
-use s3dlio::{init_op_logger, finalize_op_logger, global_logger};
-use s3dlio::progress::{S3ProgressTracker, ProgressCallback};
+use s3dlio::progress::{ProgressCallback, S3ProgressTracker};
+use s3dlio::{finalize_op_logger, global_logger, init_op_logger};
+use s3dlio::{generic_download_objects_with_summary, generic_upload_files_with_summary};
 
 /// Returns per-crate log-level caps that prevent deadlocks.
 ///
@@ -97,15 +90,14 @@ macro_rules! safe_println {
     };
 }
 
-
 // -- Commands
 
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Cli {
     /// Turn on verbose (info‑level) logging New, counts the number of v's
-    #[arg(short = 'v', 
-        long, 
+    #[arg(short = 'v',
+        long,
         action = ArgAction::Count,
         help = "Increase log verbosity: -v = Info, -vv = Debug",
     )]
@@ -119,10 +111,8 @@ struct Cli {
     cmd: Command,
 }
 
-
 #[derive(Subcommand)]
 enum Command {
-
     /// List all top-level containers (buckets, containers, or directories)
     /// for the specified storage backend.
     ///
@@ -154,7 +144,7 @@ enum Command {
         uri: String,
     },
 
-    /// Stat object, show size & last modify date of a single object 
+    /// Stat object, show size & last modify date of a single object
     Stat {
         /// Full S3 URI (e.g. s3://bucket/prefix/key)
         uri: String,
@@ -168,11 +158,11 @@ enum Command {
         /// Batch size (number of parallel delete calls).
         #[arg(short = 'j', long = "jobs", default_value_t = 1000)]
         jobs: usize,
-        
+
         /// Perform the operation recursively.
         #[clap(short, long)]
         recursive: bool,
-        
+
         /// Optional regex pattern to filter objects to delete (applied client-side, works with all backends).
         #[clap(short, long)]
         pattern: Option<String>,
@@ -181,55 +171,36 @@ enum Command {
     Get {
         /// S3 URI – can be a full key or a prefix ending with `/`.
         uri: Option<String>,
-        
+
         /// Maximum concurrent GET requests.
         #[arg(short = 'j', long = "jobs", default_value_t = 64)]
         jobs: usize,
-        
+
         /// Alternative: maximum concurrent GET requests (for mp compatibility).
         #[arg(long = "concurrent")]
         concurrent: Option<usize>,
-        
+
         /// File containing list of S3 URIs to download (one per line).
         #[arg(long = "keylist")]
         keylist: Option<PathBuf>,
-        
+
         /// Perform the operation recursively.
         #[clap(short, long)]
         recursive: bool,
-        
+
         /// Byte offset for range request (optional, for single-object GET only)
         #[arg(long = "offset")]
         offset: Option<u64>,
-        
+
         /// Number of bytes to read for range request (optional, if not specified reads to end)
         #[arg(long = "length")]
         length: Option<u64>,
-    },
-    /// Multi-process GET for maximum throughput (warp-level performance).
-    MpGet {
-        /// Storage URI prefix for objects to download (e.g. s3://bucket/prefix/, gs://bucket/prefix/)
-        uri: String,
-        
-        /// Number of worker processes to spawn
-        #[arg(short = 'p', long = "procs", default_value_t = 4)]
-        procs: usize,
-        
-        /// Concurrent operations per worker process
-        #[arg(short = 'j', long = "jobs", default_value_t = 64)]
-        jobs: usize,
-        
-        /// Number of objects to download (for testing/benchmarking)
-        #[arg(short = 'n', long = "num", default_value_t = 1000)]
-        num: usize,
-        
-        /// Template for object names (use {} for number placeholder)
-        #[arg(short = 't', long = "template", default_value = "object_{}.dat")]
-        template: String,
-        
-        /// Progress reporting interval in seconds
-        #[arg(short = 'i', long = "interval", default_value_t = 1.0)]
-        interval: f64,
+
+        /// Comma-separated S3 endpoints (host:port) for multi-endpoint GET.
+        /// Round-robin load balancing across all endpoints. Requires an s3:// URI.
+        /// Example: --endpoints=10.9.0.17:9000,10.9.0.18:9000
+        #[arg(long = "endpoints", value_name = "HOST:PORT[,HOST:PORT...]")]
+        endpoints: Option<String>,
     },
     /// Upload one or more objects concurrently, uses ObjectType format filled with random data.
     Put {
@@ -243,7 +214,7 @@ enum Command {
         /// Deduplication factor (integer ≥1). 1 => fully unique.
         #[arg(short = 'd', long = "dedup", default_value_t = 1)]
         dedup_f: usize,
-       
+
         /// Maximum concurrent uploads (jobs), but is modified to be min(jobs, num).
         #[arg(short = 'j', long = "jobs", default_value_t = 32)]
         jobs: usize,
@@ -252,8 +223,9 @@ enum Command {
         #[arg(short = 'n', long = "num", default_value_t = 1)]
         num: usize,
 
-        /// Specify Type of object to generate: 
-        #[arg( short = 'o', long = "object-type", value_enum, ignore_case = true, default_value_t = ObjectType::Raw)] // Without value_parser [] values are case insensitive
+        /// Specify Type of object to generate:
+        #[arg( short = 'o', long = "object-type", value_enum, ignore_case = true, default_value_t = ObjectType::Raw)]
+        // Without value_parser [] values are case insensitive
         object_type: ObjectType,
 
         /// Object size in bytes or human units (examples: 8388608, 8MB, 8MiB, 8m, 8M, 8g, 8GiB).
@@ -275,6 +247,12 @@ enum Command {
         /// Chunk size for streaming generation mode (bytes)
         #[arg(long = "chunk-size", default_value_t = 256 * 1024)]
         chunk_size: usize,
+
+        /// Comma-separated S3 endpoints (host:port) for multi-endpoint PUT.
+        /// Round-robin load balancing across all endpoints. Requires an s3:// URI.
+        /// Example: --endpoints=10.9.0.17:9000,10.9.0.18:9000
+        #[arg(long = "endpoints", value_name = "HOST:PORT[,HOST:PORT...]")]
+        endpoints: Option<String>,
     },
     /// Upload local files to any storage backend (S3, Azure, GCS, file://, direct://), supports glob and regex patterns
     Upload {
@@ -300,8 +278,8 @@ enum Command {
         #[arg(short = 'j', long = "jobs", default_value_t = 64)]
         jobs: usize,
         /// Download recursively
-        #[clap(short, long)] 
-        recursive: bool,     
+        #[clap(short, long)]
+        recursive: bool,
     },
 
     /// Copy between local paths and storage URIs.
@@ -339,7 +317,7 @@ enum Command {
         /// Example: '.*\.txt$' to match only .txt files
         #[clap(short, long)]
         pattern: Option<String>,
-        
+
         /// Count objects only (don't print URIs) - faster for large result sets
         #[clap(short, long)]
         count_only: bool,
@@ -384,10 +362,11 @@ async fn list_buckets_cmd(uri: &str) -> Result<()> {
     Ok(())
 }
 
-
 /// Check if AWS credentials are available for S3 operations
 fn check_aws_credentials() -> Result<()> {
-    if std::env::var("AWS_ACCESS_KEY_ID").is_err() || std::env::var("AWS_SECRET_ACCESS_KEY").is_err() {
+    if std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        || std::env::var("AWS_SECRET_ACCESS_KEY").is_err()
+    {
         bail!("Missing required AWS environment variables. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and optionally AWS_REGION) either in your environment or in a .env file.");
     }
     Ok(())
@@ -418,7 +397,8 @@ fn extract_container_name(uri: &str) -> Result<String> {
             bail!("No bucket name found in S3 URI: {}", uri);
         }
         Ok(bucket.to_string())
-    } else if let Some(rest) = uri.strip_prefix("gs://")
+    } else if let Some(rest) = uri
+        .strip_prefix("gs://")
         .or_else(|| uri.strip_prefix("gcs://"))
     {
         let bucket = rest.split('/').next().unwrap_or("").trim_end_matches('/');
@@ -426,7 +406,8 @@ fn extract_container_name(uri: &str) -> Result<String> {
             bail!("No bucket name found in GCS URI: {}", uri);
         }
         Ok(bucket.to_string())
-    } else if let Some(rest) = uri.strip_prefix("az://")
+    } else if let Some(rest) = uri
+        .strip_prefix("az://")
         .or_else(|| uri.strip_prefix("azure://"))
     {
         // Azure expects "account/container"
@@ -470,10 +451,7 @@ fn parse_human_size(input: &str) -> std::result::Result<usize, String> {
         return Err("size cannot be empty".to_string());
     }
 
-    let numeric_len = trimmed
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .count();
+    let numeric_len = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
 
     if numeric_len == 0 {
         return Err(format!("invalid size '{}': must start with digits", input));
@@ -505,7 +483,8 @@ fn parse_human_size(input: &str) -> std::result::Result<usize, String> {
         .checked_mul(multiplier)
         .ok_or_else(|| format!("invalid size '{}': value is too large", input))?;
 
-    usize::try_from(bytes).map_err(|_| format!("invalid size '{}': value exceeds platform size", input))
+    usize::try_from(bytes)
+        .map_err(|_| format!("invalid size '{}': value exceeds platform size", input))
 }
 
 /// Main CLI function
@@ -525,28 +504,29 @@ async fn main() -> Result<()> {
     // See also: https://github.com/russfellows/s3dlio/issues/105
     let safe_filter = match cli.verbose {
         0 => "warn".to_string(),
-        1 => "warn,s3dlio=info".to_string(),   // -v: our code at info, deps at warn
-        _ => "warn,s3dlio=debug".to_string(),  // -vv: our code at debug, deps at warn
+        1 => "warn,s3dlio=info".to_string(), // -v: our code at info, deps at warn
+        _ => "warn,s3dlio=debug".to_string(), // -vv: our code at debug, deps at warn
     };
-    
+
     // Start from RUST_LOG if present, otherwise use our safe default.
     // Then forcibly cap problematic crates at warn to prevent deadlocks,
     // even if RUST_LOG=debug or RUST_LOG=trace was set globally.
-    let base_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&safe_filter));
-    let filter = crate_log_caps().into_iter().fold(base_filter, |f, d| f.add_directive(d));
+    let base_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&safe_filter));
+    let filter = crate_log_caps()
+        .into_iter()
+        .fold(base_filter, |f, d| f.add_directive(d));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .init();
-    
+
     // NOTE: tracing_log::LogTracer disabled 2025-12-03
     // This bridge from log->tracing causes deadlocks when AWS SDK logs from within
     // async OnceCell initialization. The AWS SDK uses the `log` crate internally.
     // Symptom: s3-cli hangs with -v or -vv flags.
     // tracing_log::LogTracer::init().ok();
-
 
     // If set, start the op‑logger *before* the first S3 call
     if let Some(ref path) = cli.op_log {
@@ -564,7 +544,7 @@ async fn main() -> Result<()> {
                 check_aws_credentials()?;
             }
             list_buckets_cmd(&uri).await?;
-        },
+        }
 
         Command::CreateBucket { uri } => {
             if requires_aws_credentials(&uri) {
@@ -576,7 +556,7 @@ async fn main() -> Result<()> {
             info!("Attempting to create bucket/container: {}...", uri);
             store.create_container(&name).await?;
             safe_println!("Successfully created or verified '{}'.", uri);
-        },
+        }
 
         Command::DeleteBucket { uri } => {
             if requires_aws_credentials(&uri) {
@@ -589,45 +569,64 @@ async fn main() -> Result<()> {
             store.delete_container(&name).await?;
             safe_println!("Successfully deleted '{}'.", uri);
         }
-    
+
         Command::Stat { uri } => {
             // Only check AWS credentials if using S3
             if requires_aws_credentials(&uri) {
                 check_aws_credentials()?;
             }
             stat_cmd(&uri).await?
-        },
-    
+        }
+
         // New, with regex and recursion
-        Command::Get { uri, jobs, concurrent, keylist, recursive, offset, length } => {
+        Command::Get {
+            uri,
+            jobs,
+            concurrent,
+            keylist,
+            recursive,
+            offset,
+            length,
+            endpoints,
+        } => {
             // Only check AWS credentials if URI is S3
             if let Some(uri_str) = &uri {
                 if requires_aws_credentials(uri_str) {
                     check_aws_credentials()?;
                 }
             }
-            get_cmd(uri.as_deref(), jobs, concurrent, keylist.as_deref(), recursive, offset, length).await?
+            get_cmd(
+                uri.as_deref(),
+                jobs,
+                concurrent,
+                keylist.as_deref(),
+                recursive,
+                offset,
+                length,
+                endpoints.as_deref(),
+            )
+            .await?
         }
-        
-        // Multi-process GET for maximum throughput
-        Command::MpGet { uri, procs, jobs, num, template, interval } => {
-            // Check AWS credentials for S3 URIs
-            if requires_aws_credentials(&uri) {
-                check_aws_credentials()?;
-            }
-            mp_get_cmd(&uri, procs, jobs, num, &template, interval)?
-        }
-    
-        Command::Delete { uri, jobs, recursive, pattern } => {
+
+        Command::Delete {
+            uri,
+            jobs,
+            recursive,
+            pattern,
+        } => {
             // Check AWS credentials for S3 URIs
             if requires_aws_credentials(&uri) {
                 check_aws_credentials()?;
             }
             delete_cmd(&uri, jobs, recursive, pattern.as_deref()).await?
-        },
-    
-    
-        Command::Upload { files, dest, jobs, create_bucket } => {
+        }
+
+        Command::Upload {
+            files,
+            dest,
+            jobs,
+            create_bucket,
+        } => {
             // Pre-tune GCS subchannels to match upload concurrency.
             s3dlio::set_gcs_channel_count(jobs);
 
@@ -638,7 +637,7 @@ async fn main() -> Result<()> {
             // Calculate total size of files to upload for progress tracking
             let mut total_bytes = 0u64;
             let mut file_count = 0;
-            
+
             for pattern in &files {
                 let s = pattern.to_string_lossy();
                 if s.contains('*') || s.contains('?') {
@@ -671,8 +670,10 @@ async fn main() -> Result<()> {
             }
 
             // Create progress tracker
-            let progress_tracker = Arc::new(S3ProgressTracker::new("UPLOAD", file_count, total_bytes));
-            let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), file_count));
+            let progress_tracker =
+                Arc::new(S3ProgressTracker::new("UPLOAD", file_count, total_bytes));
+            let progress_callback =
+                Arc::new(ProgressCallback::new(progress_tracker.clone(), file_count));
 
             // Handle bucket creation for backends that support it
             if create_bucket {
@@ -687,7 +688,11 @@ async fn main() -> Result<()> {
                         }
                     } else if dest.starts_with("az://") || dest.starts_with("azure://") {
                         // For Azure, extract container name
-                        let parts: Vec<&str> = dest.trim_start_matches("az://").trim_start_matches("azure://").split('/').collect();
+                        let parts: Vec<&str> = dest
+                            .trim_start_matches("az://")
+                            .trim_start_matches("azure://")
+                            .split('/')
+                            .collect();
                         if let Some(container) = parts.first() {
                             if let Err(e) = store.create_container(container).await {
                                 warn!("Failed to create container {}: {}", container, e);
@@ -695,7 +700,11 @@ async fn main() -> Result<()> {
                         }
                     } else if dest.starts_with("gs://") || dest.starts_with("gcs://") {
                         // For GCS, extract bucket name
-                        let parts: Vec<&str> = dest.trim_start_matches("gs://").trim_start_matches("gcs://").split('/').collect();
+                        let parts: Vec<&str> = dest
+                            .trim_start_matches("gs://")
+                            .trim_start_matches("gcs://")
+                            .split('/')
+                            .collect();
                         if let Some(bucket) = parts.first() {
                             if let Err(e) = store.create_container(bucket).await {
                                 warn!("Failed to create GCS bucket {}: {}", bucket, e);
@@ -707,7 +716,9 @@ async fn main() -> Result<()> {
             }
 
             let t0 = Instant::now();
-            let summary = generic_upload_files_with_summary(&dest, &files, jobs, Some(progress_callback)).await?;
+            let summary =
+                generic_upload_files_with_summary(&dest, &files, jobs, Some(progress_callback))
+                    .await?;
             let elapsed = t0.elapsed();
 
             // Finish progress bar
@@ -729,8 +740,13 @@ async fn main() -> Result<()> {
                 );
             }
         }
-    
-        Command::Download { src, dest_dir, jobs, recursive } => {
+
+        Command::Download {
+            src,
+            dest_dir,
+            jobs,
+            recursive,
+        } => {
             // Pre-tune GCS subchannels to match download concurrency.
             s3dlio::set_gcs_channel_count(jobs);
 
@@ -742,21 +758,34 @@ async fn main() -> Result<()> {
             let logger = global_logger();
             let store = store_for_uri_with_logger(&src, logger)?;
             let keys = store.list(&src, recursive).await?;
-            
+
             if keys.is_empty() {
                 bail!("No objects matched for download");
             }
 
             // Create progress tracker with unknown total bytes initially
-            let progress_tracker = Arc::new(S3ProgressTracker::new("DOWNLOAD", keys.len() as u64, 0));
-            let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), keys.len() as u64));
+            let progress_tracker =
+                Arc::new(S3ProgressTracker::new("DOWNLOAD", keys.len() as u64, 0));
+            let progress_callback = Arc::new(ProgressCallback::new(
+                progress_tracker.clone(),
+                keys.len() as u64,
+            ));
 
             let t0 = Instant::now();
-            let summary = generic_download_objects_with_summary(&src, &dest_dir, jobs, recursive, Some(progress_callback.clone())).await?;
+            let summary = generic_download_objects_with_summary(
+                &src,
+                &dest_dir,
+                jobs,
+                recursive,
+                Some(progress_callback.clone()),
+            )
+            .await?;
             let elapsed = t0.elapsed();
 
             // Get final byte count from progress callback and update the progress bar total
-            let total_bytes = progress_callback.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
+            let total_bytes = progress_callback
+                .bytes_transferred
+                .load(std::sync::atomic::Ordering::Relaxed);
             progress_callback.update_total_bytes(total_bytes);
             progress_tracker.finish("Download", total_bytes, elapsed);
 
@@ -777,7 +806,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Cp { src, dest, jobs, recursive, create_bucket } => {
+        Command::Cp {
+            src,
+            dest,
+            jobs,
+            recursive,
+            create_bucket,
+        } => {
             let src_is_uri = is_storage_uri(&src);
             let dest_is_uri = is_storage_uri(&dest);
 
@@ -797,14 +832,22 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             } else if dest.starts_with("az://") || dest.starts_with("azure://") {
-                                let parts: Vec<&str> = dest.trim_start_matches("az://").trim_start_matches("azure://").split('/').collect();
+                                let parts: Vec<&str> = dest
+                                    .trim_start_matches("az://")
+                                    .trim_start_matches("azure://")
+                                    .split('/')
+                                    .collect();
                                 if let Some(container) = parts.first() {
                                     if let Err(e) = store.create_container(container).await {
                                         warn!("Failed to create container {}: {}", container, e);
                                     }
                                 }
                             } else if dest.starts_with("gs://") || dest.starts_with("gcs://") {
-                                let parts: Vec<&str> = dest.trim_start_matches("gs://").trim_start_matches("gcs://").split('/').collect();
+                                let parts: Vec<&str> = dest
+                                    .trim_start_matches("gs://")
+                                    .trim_start_matches("gcs://")
+                                    .split('/')
+                                    .collect();
                                 if let Some(bucket) = parts.first() {
                                     if let Err(e) = store.create_container(bucket).await {
                                         warn!("Failed to create GCS bucket {}: {}", bucket, e);
@@ -815,7 +858,8 @@ async fn main() -> Result<()> {
                     }
 
                     let files = vec![PathBuf::from(&src)];
-                    let summary = generic_upload_files_with_summary(&dest, &files, jobs, None).await?;
+                    let summary =
+                        generic_upload_files_with_summary(&dest, &files, jobs, None).await?;
                     safe_println!(
                         "CP summary (upload): attempted={}, succeeded={}, failed={}",
                         summary.attempted,
@@ -867,12 +911,25 @@ async fn main() -> Result<()> {
                 }
             }
         }
-    
-        Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size } => {
+
+        Command::Put {
+            uri_prefix,
+            create_bucket_flag,
+            num,
+            template,
+            jobs,
+            size,
+            object_type,
+            dedup_f,
+            compress_f,
+            data_gen_mode,
+            chunk_size,
+            endpoints,
+        } => {
             // Check AWS credentials only for S3 operations
             if requires_aws_credentials(&uri_prefix) {
                 check_aws_credentials()?;
-                
+
                 // Handle S3-specific bucket creation
                 if create_bucket_flag {
                     let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
@@ -881,12 +938,29 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-    
-            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size).await?
 
+            put_many_cmd(
+                &uri_prefix,
+                num,
+                &template,
+                jobs,
+                size,
+                object_type,
+                dedup_f,
+                compress_f,
+                data_gen_mode,
+                chunk_size,
+                endpoints.as_deref(),
+            )
+            .await?
         }
 
-        Command::GenericList { uri, recursive, pattern, count_only } => {
+        Command::GenericList {
+            uri,
+            recursive,
+            pattern,
+            count_only,
+        } => {
             // Check AWS credentials only for S3 URIs
             if requires_aws_credentials(&uri) {
                 check_aws_credentials()?;
@@ -894,7 +968,10 @@ async fn main() -> Result<()> {
             generic_list_cmd(&uri, recursive, pattern.as_deref(), count_only).await?
         }
 
-        Command::TfrecordIndex { tfrecord_path, index_path } => {
+        Command::TfrecordIndex {
+            tfrecord_path,
+            index_path,
+        } => {
             // Check AWS credentials only for S3 paths
             let tfrecord_str = tfrecord_path.to_string_lossy();
             if requires_aws_credentials(&tfrecord_str) {
@@ -902,10 +979,9 @@ async fn main() -> Result<()> {
             }
             tfrecord_index_cmd(&tfrecord_path, index_path.as_deref())?
         }
-
     } // End of match cli.cmd
 
-    // If set, finalize the op‑logger 
+    // If set, finalize the op‑logger
     if cli.op_log.is_some() {
         finalize_op_logger();
     }
@@ -916,12 +992,20 @@ async fn main() -> Result<()> {
 /// Generic list command that works with any storage backend
 /// Supports optional client-side regex filtering
 /// Uses streaming for memory efficiency and visible progress
-async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, count_only: bool) -> Result<()> {
-    use regex::Regex;
+async fn generic_list_cmd(
+    uri: &str,
+    recursive: bool,
+    pattern: Option<&str>,
+    count_only: bool,
+) -> Result<()> {
     use futures::stream::StreamExt;
-    
-    debug!("generic_list_cmd: uri='{}', recursive={}, pattern={:?}, count_only={}", uri, recursive, pattern, count_only);
-    
+    use regex::Regex;
+
+    debug!(
+        "generic_list_cmd: uri='{}', recursive={}, pattern={:?}, count_only={}",
+        uri, recursive, pattern, count_only
+    );
+
     // Helper to format numbers with commas
     fn format_with_commas(n: f64) -> String {
         let s = format!("{:.0}", n);
@@ -934,21 +1018,20 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
         }
         result.chars().rev().collect()
     }
-    
+
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger)?;
-    
+
     // Compile regex pattern if provided
-    let re = pattern.map(|pat| {
-        Regex::new(pat)
-            .with_context(|| format!("Invalid regex pattern: '{}'", pat))
-    }).transpose()?;
+    let re = pattern
+        .map(|pat| Regex::new(pat).with_context(|| format!("Invalid regex pattern: '{}'", pat)))
+        .transpose()?;
 
     let mut stream = store.list_stream(uri, recursive);
     let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    
+
     // Create progress bar for count-only mode with background update task
     let start = std::time::Instant::now();
     let progress_handle = if count_only {
@@ -956,11 +1039,11 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] {msg}")
-                .unwrap()
+                .unwrap(),
         );
         pb.set_message("Listing objects...");
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
-        
+
         // Spawn background task to update progress every second
         let count_clone = count.clone();
         let pb_clone = pb.clone();
@@ -971,9 +1054,16 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
                 interval.tick().await;
                 let current_count = count_clone.load(std::sync::atomic::Ordering::Relaxed);
                 let elapsed = start.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 { current_count as f64 / elapsed } else { 0.0 };
-                pb_clone.set_message(format!("{} objects ({} obj/s)", 
-                    format_with_commas(current_count as f64), format_with_commas(rate)));
+                let rate = if elapsed > 0.0 {
+                    current_count as f64 / elapsed
+                } else {
+                    0.0
+                };
+                pb_clone.set_message(format!(
+                    "{} objects ({} obj/s)",
+                    format_with_commas(current_count as f64),
+                    format_with_commas(rate)
+                ));
             }
         });
         Some((pb, handle))
@@ -983,16 +1073,16 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
 
     while let Some(result) = stream.next().await {
         let key = result?;
-        
+
         // Apply client-side regex filtering if pattern provided
         if let Some(ref regex) = re {
             if !regex.is_match(&key) {
                 continue;
             }
         }
-        
+
         count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
+
         // Print URI unless --count-only
         if !count_only {
             if let Err(e) = writeln!(out, "{}", key) {
@@ -1013,7 +1103,13 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
     }
     let elapsed = start.elapsed().as_secs_f64();
     let rate = final_count as f64 / elapsed;
-    writeln!(out, "Total objects: {} ({:.3}s, rate: {} objects/s)", final_count, elapsed, format_with_commas(rate))?;
+    writeln!(
+        out,
+        "Total objects: {} ({:.3}s, rate: {} objects/s)",
+        final_count,
+        elapsed,
+        format_with_commas(rate)
+    )?;
     Ok(())
 }
 
@@ -1021,13 +1117,14 @@ async fn generic_list_cmd(uri: &str, recursive: bool, pattern: Option<&str>, cou
 /// Creates NVIDIA DALI-compatible index files for TFRecord files
 fn tfrecord_index_cmd(tfrecord_path: &PathBuf, index_path: Option<&Path>) -> Result<()> {
     use s3dlio::tfrecord_index::write_index_for_tfrecord_file;
-    
+
     // Determine output path: use provided or default to input + ".idx"
     let output_path = match index_path {
         Some(p) => p.to_path_buf(),
         None => {
             let mut p = tfrecord_path.clone();
-            let current_name = p.file_name()
+            let current_name = p
+                .file_name()
                 .context("Invalid TFRecord path")?
                 .to_string_lossy()
                 .to_string();
@@ -1035,19 +1132,23 @@ fn tfrecord_index_cmd(tfrecord_path: &PathBuf, index_path: Option<&Path>) -> Res
             p
         }
     };
-    
+
     info!("Indexing TFRecord file: {}", tfrecord_path.display());
     info!("Output index file: {}", output_path.display());
-    
+
     let start = Instant::now();
     let num_records = write_index_for_tfrecord_file(tfrecord_path, &output_path)
         .map_err(|e| anyhow::anyhow!("Failed to create index: {}", e))?;
     let elapsed = start.elapsed();
-    
-    safe_println!("Successfully indexed {} records in {:.2?}", num_records, elapsed);
+
+    safe_println!(
+        "Successfully indexed {} records in {:.2?}",
+        num_records,
+        elapsed
+    );
     safe_println!("Index file: {}", output_path.display());
     safe_println!("Format: NVIDIA DALI compatible (text, space-separated)");
-    
+
     Ok(())
 }
 
@@ -1058,11 +1159,11 @@ async fn stat_cmd(uri: &str) -> Result<()> {
     let store = store_for_uri_with_logger(uri, logger)?;
     let os = store.stat(uri).await?;
     debug!("stat_cmd: uri='{}', size={}", uri, os.size);
-    
+
     // Always show core fields
     safe_println!("URI             : {}", uri);
     safe_println!("Size            : {}", os.size);
-    
+
     // Only show optional fields if they have values
     if let Some(ref lm) = os.last_modified {
         safe_println!("LastModified    : {}", lm);
@@ -1094,11 +1195,11 @@ async fn stat_cmd(uri: &str) -> Result<()> {
     if let Some(ref kmsid) = os.ssekms_key_id {
         safe_println!("SSE-KMS Key ID  : {}", kmsid);
     }
-    
+
     // Show user metadata if present
     if !os.metadata.is_empty() {
         safe_println!("User Metadata:");
-        for (k,v) in os.metadata {
+        for (k, v) in os.metadata {
             safe_println!("  {} = {}", k, v);
         }
     }
@@ -1106,7 +1207,17 @@ async fn stat_cmd(uri: &str) -> Result<()> {
 }
 
 /// Get command: downloads objects matching a key, prefix, or pattern.
-async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool, offset: Option<u64>, length: Option<u64>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn get_cmd(
+    uri: Option<&str>,
+    jobs: usize,
+    concurrent: Option<usize>,
+    keylist: Option<&std::path::Path>,
+    recursive: bool,
+    offset: Option<u64>,
+    length: Option<u64>,
+    endpoints: Option<&str>,
+) -> Result<()> {
     // Determine concurrency level (prefer concurrent over jobs for mp compatibility)
     let concurrency = concurrent.unwrap_or(jobs);
 
@@ -1119,58 +1230,103 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
     if (offset.is_some() || length.is_some()) && (keylist.is_some() || recursive) {
         bail!("Range requests (--offset/--length) are only supported for single-object GET, not with --keylist or --recursive");
     }
-    
+
     // Handle keylist mode vs URI mode
     if let Some(keylist_path) = keylist {
         // Read URIs from keylist file
         let keylist_content = std::fs::read_to_string(keylist_path)
             .with_context(|| format!("Failed to read keylist file: {:?}", keylist_path))?;
-        
-        let uris: Vec<String> = keylist_content
+
+        let mut uris: Vec<String> = keylist_content
             .lines()
             .map(|line| line.trim())
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .map(|line| line.to_string())
             .collect();
-            
+
         if uris.is_empty() {
             bail!("No URIs found in keylist file: {:?}", keylist_path);
         }
-        
-        println!("Processing {} URIs from keylist with concurrency {}", uris.len(), concurrency);
-        
+
+        // When --endpoints is given, build a shared MultiEndpointStore.
+        // Rewrite all keylist URIs to use the first endpoint as the base;
+        // the store will round-robin them across all endpoints on each get().
+        let multi_store: Option<Arc<MultiEndpointStore>> = if let Some(endpoints_str) = endpoints {
+            let first_endpoint = endpoints_str
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if first_endpoint.is_empty() {
+                bail!("--endpoints requires at least one host:port");
+            }
+            // Rewrite each URI: s3://bucket/path → s3://first_endpoint:port/bucket/path
+            uris = uris
+                .iter()
+                .map(|u| {
+                    let path = u.strip_prefix("s3://").ok_or_else(|| {
+                        anyhow::anyhow!("--endpoints requires s3:// URIs in keylist, got: {}", u)
+                    })?;
+                    Ok(format!("s3://{}/{}", first_endpoint, path))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Build endpoint roots: s3://host1:port/, s3://host2:port/, ...
+            let endpoint_uris = build_s3_host_root_uris(endpoints_str)?;
+            let store =
+                MultiEndpointStore::new(endpoint_uris, LoadBalanceStrategy::RoundRobin, None)
+                    .context("Failed to create multi-endpoint store")?;
+            Some(Arc::new(store))
+        } else {
+            None
+        };
+
+        println!(
+            "Processing {} URIs from keylist with concurrency {}",
+            uris.len(),
+            concurrency
+        );
+
         // Create progress tracker for keylist mode
         let progress_tracker = Arc::new(S3ProgressTracker::new("GET", uris.len() as u64, 0));
-        let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), uris.len() as u64));
-        
+        let progress_callback = Arc::new(ProgressCallback::new(
+            progress_tracker.clone(),
+            uris.len() as u64,
+        ));
+
         let t0 = Instant::now();
-        
+
         // Use universal ObjectStore interface for parallel downloads
         let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let mut futs = futures_util::stream::FuturesUnordered::new();
         let mut total_bytes = 0u64;
         let mut success_count = 0u64;
         let mut failure_count = 0u64;
-        
+
         for uri in &uris {
             let sem = sem.clone();
             let progress = progress_callback.clone();
             let uri = uri.clone();
             let logger = global_logger();
-            
+            let multi = multi_store.clone();
+
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                let store = store_for_uri_with_logger(&uri, logger)?;
-                let data = store.get(&uri).await?;
+                let data = if let Some(store) = multi {
+                    store.get(&uri).await?
+                } else {
+                    let store = store_for_uri_with_logger(&uri, logger)?;
+                    store.get(&uri).await?
+                };
                 let byte_count = data.len() as u64;
-                
+
                 // Update progress
                 progress.object_completed(byte_count);
-                
+
                 Ok::<(String, u64), anyhow::Error>((uri, byte_count))
             }));
         }
-        
+
         while let Some(result) = futs.next().await {
             match result {
                 Ok(Ok((uri, byte_count))) => {
@@ -1188,17 +1344,22 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
                 }
             }
         }
-        
+
         let dt = t0.elapsed();
-        
+
         // Update final progress
         progress_callback.update_total_bytes(total_bytes);
         progress_tracker.finish("Download", total_bytes, dt);
-        
+
         // Report benchmark results (data is immediately discarded for benchmarking)
         let throughput_mb_s = (total_bytes as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64();
-        println!("Benchmarked {} objects: {} bytes in {:.3}s ({:.2} MB/s)", 
-                 uris.len(), total_bytes, dt.as_secs_f64(), throughput_mb_s);
+        println!(
+            "Benchmarked {} objects: {} bytes in {:.3}s ({:.2} MB/s)",
+            uris.len(),
+            total_bytes,
+            dt.as_secs_f64(),
+            throughput_mb_s
+        );
         safe_println!(
             "GET summary: attempted={}, succeeded={}, failed={}",
             uris.len(),
@@ -1214,13 +1375,14 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
                 failure_count
             );
         }
-        
+
         return Ok(());
     }
-    
+
     // Original URI-based mode - use universal ObjectStore interface
-    let uri_str = uri.ok_or_else(|| anyhow::anyhow!("Either --uri or --keylist must be provided"))?;
-    
+    let uri_str =
+        uri.ok_or_else(|| anyhow::anyhow!("Either --uri or --keylist must be provided"))?;
+
     // Only check AWS credentials if using S3 backend
     if requires_aws_credentials(uri_str) {
         check_aws_credentials()?;
@@ -1232,77 +1394,235 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
         if recursive {
             bail!("Range requests (--offset/--length) cannot be combined with --recursive");
         }
-        
+
         let logger = global_logger();
         let store = store_for_uri_with_logger(uri_str, logger)?;
-        
+
         let t0 = Instant::now();
         let data = store.get_range(uri_str, offset_val, length).await?;
         let dt = t0.elapsed();
-        
+
         let byte_count = data.len() as u64;
         let throughput_mb_s = (byte_count as f64 / (1024.0 * 1024.0)) / dt.as_secs_f64();
-        
+
         let range_desc = if let Some(len) = length {
             format!("bytes {}-{}", offset_val, offset_val + len - 1)
         } else {
             format!("bytes {}-EOF", offset_val)
         };
-        
-        println!("Range GET {}: {} bytes in {:.3}s ({:.2} MB/s)", 
-                 range_desc, byte_count, dt.as_secs_f64(), throughput_mb_s);
-        
+
+        println!(
+            "Range GET {}: {} bytes in {:.3}s ({:.2} MB/s)",
+            range_desc,
+            byte_count,
+            dt.as_secs_f64(),
+            throughput_mb_s
+        );
+
         return Ok(());
     }
 
-    // Use universal ObjectStore to list objects (works with all backends)
+    // Use universal ObjectStore to list objects (works with all backends).
+    // When --endpoints is given, list from the first endpoint then distribute GETs
+    // across all endpoints via a shared MultiEndpointStore.
     let logger = global_logger();
+    let multi_store: Option<Arc<MultiEndpointStore>> = if let Some(endpoints_str) = endpoints {
+        if !uri_str.starts_with("s3://") {
+            bail!("--endpoints requires an s3:// URI");
+        }
+        // Extract the bucket/prefix path from the URI and build per-endpoint URIs.
+        let path = uri_str.strip_prefix("s3://").unwrap_or(uri_str);
+        let path = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/", path)
+        };
+        let endpoint_uris = build_s3_endpoint_uris(endpoints_str, &format!("s3://{}", path))?;
+        let store = MultiEndpointStore::new(endpoint_uris, LoadBalanceStrategy::RoundRobin, None)
+            .context("Failed to create multi-endpoint store")?;
+        Some(Arc::new(store))
+    } else {
+        None
+    };
     let store = store_for_uri_with_logger(uri_str, logger)?;
-    let keys = store.list(uri_str, recursive).await?;
 
-    if keys.is_empty() {
+    // When the URI is a directory prefix (ends with '/'), list recursively even if the
+    // user did not pass -r.  A directory URI with recursive=false returns only the
+    // immediate virtual sub-prefixes (entries ending in '/'), which are not real objects
+    // and cannot be GET-ted; the user always wants the leaf objects inside the prefix.
+    let do_recursive = recursive || uri_str.ends_with('/');
+
+    // === Shared real-time progress state ===
+    // These atomics are updated by spawned download tasks so the background
+    // progress updater always sees current counts without any locking on the
+    // hot path.
+    let keys_listed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let keys_done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Rolling rate window for obj/s computation — see CLI_RATE_WINDOW_SECS in constants.rs.
+    // Sampled every 500 ms by the background task.
+    let rate_window: Arc<std::sync::Mutex<std::collections::VecDeque<(Instant, u64)>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+    // Bytes-based progress bar — same visual style as the old S3ProgressTracker.
+    // We start with length=0 and update it each tick using the estimated total bytes
+    // (avg_bytes_per_object × remaining_objects + bytes_already_done), so indicatif
+    // can compute {bytes_per_sec} and {eta} natively from real byte throughput.
+    let pb = ProgressBar::new(0);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "GET: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
+                 {bytes}/{total_bytes} ({bytes_per_sec}, ETA: {eta}) | {msg}",
+            )
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let t0 = Instant::now();
+
+    // Background task: updates the progress bar every 500 ms.
+    //
+    // - pb.set_position(bytes) drives all indicatif-computed fields: {bytes},
+    //   {bytes_per_sec}, and {eta}.
+    // - pb.set_length(estimated_total) gives indicatif a moving-but-converging
+    //   estimate of total bytes so the bar fill and ETA are meaningful from the
+    //   start, before listing completes.
+    // - {msg} carries object count and the rolling obj/s rate (window = CLI_RATE_WINDOW_SECS).
+    let pb_bg = pb.clone();
+    let listed_bg = Arc::clone(&keys_listed);
+    let done_bg = Arc::clone(&keys_done);
+    let bytes_bg = Arc::clone(&bytes_done);
+    let window_bg = Arc::clone(&rate_window);
+    let updater = tokio::spawn(async move {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            let listed = listed_bg.load(Relaxed);
+            let completed = done_bg.load(Relaxed);
+            let bytes = bytes_bg.load(Relaxed);
+
+            // Drive the bytes bar so indicatif tracks real byte throughput.
+            pb_bg.set_position(bytes);
+
+            // Estimate total bytes = bytes so far + avg_bytes/obj × remaining objects.
+            // This keeps the bar fill and ETA reasonable even while listing is still
+            // ongoing.  Once listing finishes the estimate converges to reality.
+            if completed > 0 {
+                let avg_bytes_per_obj = bytes / completed;
+                let remaining = listed.saturating_sub(completed);
+                let estimated_total = bytes + remaining * avg_bytes_per_obj;
+                pb_bg.set_length(estimated_total);
+            }
+
+            // Rolling obj/s rate — window length from CLI_RATE_WINDOW_SECS in constants.rs.
+            let now = Instant::now();
+            let rate_obj_s = {
+                let mut win = window_bg.lock().unwrap();
+                win.push_back((now, completed));
+                // Evict samples outside the rolling window.
+                while win
+                    .front()
+                    .map(|(t, _)| {
+                        now.duration_since(*t)
+                            > std::time::Duration::from_secs(
+                                s3dlio::constants::CLI_RATE_WINDOW_SECS,
+                            )
+                    })
+                    .unwrap_or(false)
+                {
+                    win.pop_front();
+                }
+                if win.len() >= 2 {
+                    let (oldest_t, oldest_c) = *win.front().unwrap();
+                    let span_s = now.duration_since(oldest_t).as_secs_f64();
+                    if span_s > 0.1 {
+                        completed.saturating_sub(oldest_c) as f64 / span_s
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            };
+
+            pb_bg.set_message(format!(
+                "{}/{} objects | {:.1} obj/s ({}s avg)",
+                completed,
+                listed,
+                rate_obj_s,
+                s3dlio::constants::CLI_RATE_WINDOW_SECS,
+            ));
+        }
+    });
+
+    // === Semaphore-bounded streaming pipeline ===
+    //
+    // The semaphore permit is acquired in the main task *before* spawning each
+    // tokio task.  This keeps the live-task count pinned to exactly `concurrency`
+    // regardless of how many objects exist in the prefix.  While the main task is
+    // suspended on `acquire_owned()`, the already-running tasks release permits as
+    // they finish — no deadlock is possible.
+    //
+    // Keys arrive from the listing stream one-by-one, so BidiReadObject streams open
+    // progressively instead of all simultaneously — reducing thundering-herd pressure
+    // on GCS RAPID read-ahead buffers.
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut futs = futures_util::stream::FuturesUnordered::new();
+    let mut stream = store.list_stream(uri_str, do_recursive);
+    let mut failure_count = 0u64;
+
+    // Phase 1: consume the listing stream, spawning one bounded download per key.
+    while let Some(result) = stream.next().await {
+        let key = result.with_context(|| format!("list error for '{}'", uri_str))?;
+        if key.ends_with('/') {
+            continue; // skip virtual directory entries (common prefixes)
+        }
+        keys_listed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Block here until a concurrency slot is available, then spawn immediately.
+        let permit = Arc::clone(&sem)
+            .acquire_owned()
+            .await
+            .expect("semaphore closed");
+        let logger = global_logger();
+        let done_task = Arc::clone(&keys_done);
+        let bytes_task = Arc::clone(&bytes_done);
+        let multi = multi_store.clone();
+
+        futs.push(tokio::spawn(async move {
+            let _permit = permit; // released when this block exits
+            let data = if let Some(store) = multi {
+                store.get(&key).await?
+            } else {
+                let store = store_for_uri_with_logger(&key, logger)?;
+                store.get(&key).await?
+            };
+            let byte_count = data.len() as u64;
+            // Update shared progress atomics on success so the background task
+            // sees live counts without waiting for Phase 2.
+            done_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            bytes_task.fetch_add(byte_count, std::sync::atomic::Ordering::Relaxed);
+            Ok::<u64, anyhow::Error>(byte_count)
+        }));
+    }
+
+    let keys_seen = keys_listed.load(std::sync::atomic::Ordering::Relaxed);
+    if keys_seen == 0 {
+        updater.abort();
+        pb.finish_and_clear();
         bail!("No objects match pattern '{}'", uri_str);
     }
 
-    // Create progress tracker
-    let progress_tracker = Arc::new(S3ProgressTracker::new("GET", keys.len() as u64, 0));
-    let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), keys.len() as u64));
-
-    let t0 = Instant::now();
-    
-    // Use universal ObjectStore interface for parallel downloads
-    let sem = Arc::new(tokio::sync::Semaphore::new(jobs));
-    let mut futs = futures_util::stream::FuturesUnordered::new();
-    let mut total_bytes = 0u64;
-    let mut success_count = 0u64;
-    let mut failure_count = 0u64;
-    
-    for uri in &keys {
-        let sem = sem.clone();
-        let progress = progress_callback.clone();
-        let uri = uri.clone();
-        let logger = global_logger();
-        
-        futs.push(tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.unwrap();
-            let store = store_for_uri_with_logger(&uri, logger)?;
-            let data = store.get(&uri).await?;
-            let byte_count = data.len() as u64;
-            
-            // Update progress
-            progress.object_completed(byte_count);
-            
-            Ok::<(String, u64), anyhow::Error>((uri, byte_count))
-        }));
-    }
-    
+    // Phase 2: drain all in-flight downloads and collect errors.
+    // Byte/object counts are already tracked via atomics; this loop only gathers failures.
     while let Some(result) = futs.next().await {
         match result {
-            Ok(Ok((uri, byte_count))) => {
-                total_bytes += byte_count;
-                success_count += 1;
-                info!("Downloaded {} bytes from {}", byte_count, uri);
-            }
+            Ok(Ok(_)) => {} // atomics already updated inside the task
             Ok(Err(e)) => {
                 failure_count += 1;
                 warn!("GET failed: {}", e);
@@ -1313,161 +1633,103 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
             }
         }
     }
-    
-    let dt = t0.elapsed();
 
-    // Update final progress and finish
-    progress_callback.update_total_bytes(total_bytes);
-    progress_tracker.finish("Download", total_bytes, dt);
+    // Stop the background updater and display final summary on the progress bar.
+    updater.abort();
+    let dt = t0.elapsed();
+    let total_bytes = bytes_done.load(std::sync::atomic::Ordering::Relaxed);
+    let success_count = keys_done.load(std::sync::atomic::Ordering::Relaxed);
+    // Land the bar at exactly 100 % so the fill is complete.
+    // indicatif already renders {bytes}/{total_bytes} and {bytes_per_sec} from the
+    // bar template, so {msg} only carries what indicatif cannot: obj count and obj/s.
+    pb.set_length(total_bytes);
+    pb.set_position(total_bytes);
+    let avg_obj_s = success_count as f64 / dt.as_secs_f64();
+    pb.finish_with_message(format!(
+        "{}/{} objects | {:.1} obj/s avg",
+        success_count, keys_seen, avg_obj_s,
+    ));
 
     safe_println!(
         "GET summary: attempted={}, succeeded={}, failed={}",
-        keys.len(),
+        keys_seen,
         success_count,
-        failure_count
+        failure_count,
     );
 
     if failure_count > 0 {
         bail!(
             "GET completed with failures: attempted={}, succeeded={}, failed={}",
-            keys.len(),
+            keys_seen,
             success_count,
-            failure_count
+            failure_count,
         );
     }
 
     Ok(())
 }
 
-/// Multi-process GET command for maximum throughput.
-///
-/// FUTURE TODO: Properly implement mp-get as a true prefix downloader that first
-/// lists real objects from the backend (matching `get` semantics), then shards the
-/// discovered keys across workers. The current implementation still synthesizes keys
-/// from `num + template`.
-fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, template: &str, _interval: f64) -> Result<()> {
-    let mut prefix = uri.to_string();
-    if !prefix.ends_with('/') {
-        prefix.push('/');
-    }
-
-    eprintln!("Warning: mp-get currently uses template-generated keys (num+template), not prefix listing.");
-    
-    println!("Multi-process GET starting with {} processes, {} jobs per process", procs, jobs);
-    println!("Target: {} objects from {}", num, prefix);
-    println!("Warning: mp-get currently generates keys from --template/--num (it does not list prefix objects)");
-    
-    // Generate object keys based on template and number
-    let mut keys = Vec::new();
-    for i in 0..num {
-        let key = if template.contains("{}") {
-            template.replace("{}", &i.to_string())
-        } else {
-            format!("{}{}", template, i)
-        };
-        keys.push(format!("{}{}", prefix, key));
-    }
-    
-    // Create temporary keylist file
-    let keylist_file = NamedTempFile::new()?;
-    let keylist_path = keylist_file.path().to_path_buf();
-    
-    // Write keys to file
-    {
-        let mut file = std::fs::File::create(&keylist_path)?;
-        for key in &keys {
-            writeln!(file, "{}", key)?;
-        }
-    }
-    
-    // Get the current executable path for worker processes
-    let current_exe = std::env::current_exe()?;
-    
-    // Configure multi-process GET (without oplog for now - will add proper zstd support later) 
-    let config = mp::MpGetConfigBuilder::new()
-        .procs(procs)
-        .concurrent_per_proc(jobs)
-        .keylist(keylist_path)
-        .worker_cmd(current_exe.to_string_lossy().to_string())
-        .passthrough_io(false)  // Disable debug output for clean results
-        .build();
-    
-    // Run the multi-process operation
-    let result = mp::run_get_shards(&config)?;
-    
-    // Print summary
-    println!("\n=== Multi-Process GET Result (validated) ===");
-    println!(
-        "attempted={}, succeeded={}, failed={}",
-        result.attempted, result.succeeded, result.failed
-    );
-    println!("Duration: {:.2}s", result.elapsed_seconds);
-    println!("Bytes source: {:?}", result.bytes_source);
-    match result.total_bytes {
-        Some(total_bytes) => {
-            println!("Total bytes: {}", total_bytes);
-            if let Some(throughput) = result.throughput_mbps() {
-                println!("Throughput: {:.2} MB/s", throughput);
-            } else {
-                println!("Throughput: unavailable");
-            }
-            if let Some(avg_size) = result.avg_object_size() {
-                println!("Average object size: {:.2} bytes", avg_size);
-            }
-        }
-        None => {
-            println!("Total bytes: unknown");
-            println!("Throughput: omitted (byte totals unavailable)");
-        }
-    }
-    println!("Operations/sec: {:.2}", result.ops_per_second());
-    
-    println!("\nPer-worker performance:");
-    for worker in &result.per_worker {
-        let bytes_str = worker
-            .bytes
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        println!(
-            "  Worker {}: attempted={}, succeeded={}, failed={}, bytes={}",
-            worker.worker_id, worker.attempted, worker.succeeded, worker.failed, bytes_str
-        );
-    }
-    
-    Ok(())
-}
+// NOTE: mp-get CLI command removed.
+//
+// The process-spawn approach had worse real-world performance than a single
+// `get -j N` invocation. Each worker process pays full cold-start costs
+// (Tokio runtime init, AWS SDK init, HTTP connection pool build-up), whereas
+// a single async process amortizes all of that once and handles thousands of
+// concurrent tasks with negligible overhead.
+//
+// The `mp` module and Python `mp_get()` binding are retained unchanged.
+// If multi-process GET is worth revisiting, consider:
+//   - Pre-warming worker processes and reusing them across runs
+//   - NUMA-local process pinning for very large NUMA server configs
+//   - Measuring Tokio reactor saturation at >1024 concurrent tasks
+//   - Always wiring op_log_dir so byte throughput is properly reported
+//   - Listing real prefix objects instead of synthesizing keys from a template
+//
+// For now: `s3dlio get s3://bucket/prefix/ -j 256 -r` is the recommended path.
 
 /// Delete command: deletes objects matching a key, prefix, or pattern.
 async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&str>) -> Result<()> {
-    use s3dlio::object_store::store_for_uri_with_logger;
-    use regex::Regex;
     use indicatif::{ProgressBar, ProgressStyle};
+    use regex::Regex;
+    use s3dlio::object_store::store_for_uri_with_logger;
     use std::sync::Arc;
-    
+
     // Use generic object store to delete objects (works with all backends)
     let logger = global_logger();
     let store = Arc::new(store_for_uri_with_logger(uri, logger)?);
-    
+
     // If recursive or URI ends with '/', delete prefix; otherwise check if it's a pattern
     if recursive || uri.ends_with('/') {
         if let Some(pat) = pattern {
             // Delete with regex filter
             let mut keys = store.list(uri, recursive).await?;
-            let re = Regex::new(pat)
-                .with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
+            let re =
+                Regex::new(pat).with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
             keys.retain(|k| re.is_match(k));
-            
+
             if keys.is_empty() {
                 eprintln!("No objects match pattern '{}' under prefix '{}'", pat, uri);
                 return Ok(());
             }
-            
+
             let total = keys.len();
-            info!("Deleting {} objects matching pattern '{}' under prefix '{}'", total, pat, uri);
-            eprintln!("Found {} objects matching pattern '{}' (using adaptive concurrency: ~{})", 
-                     total, pat, 
-                     if total < 10 { 1 } else if total < 100 { 10 } else { (total / 10).min(1000) });
-            
+            info!(
+                "Deleting {} objects matching pattern '{}' under prefix '{}'",
+                total, pat, uri
+            );
+            eprintln!(
+                "Found {} objects matching pattern '{}' (using adaptive concurrency: ~{})",
+                total,
+                pat,
+                if total < 10 {
+                    1
+                } else if total < 100 {
+                    10
+                } else {
+                    (total / 10).min(1000)
+                }
+            );
+
             // Create progress bar for deletion
             let pb = ProgressBar::new(total as u64);
             pb.set_style(
@@ -1476,52 +1738,58 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                     .unwrap()
                     .progress_chars("█▉▊▋▌▍▎▏  ")
             );
-            
+
             // Clone progress bar for the callback
             let pb_clone = pb.clone();
-            
+
             // Use batch delete (backends optimize internally - S3 uses DeleteObjects API)
             for chunk in keys.chunks(1000) {
                 store.delete_batch(chunk).await?;
                 pb_clone.inc(chunk.len() as u64);
             }
-            
+
             pb.finish_with_message(format!("Deleted {} objects matching pattern", total));
-            eprintln!("\nSuccessfully deleted {} objects matching pattern '{}'", total, pat);
+            eprintln!(
+                "\nSuccessfully deleted {} objects matching pattern '{}'",
+                total, pat
+            );
         } else {
             // Delete entire prefix without filter - use streaming pipeline with progress bar
-            info!("Starting streaming list+delete pipeline for prefix: {}", uri);
-            
+            info!(
+                "Starting streaming list+delete pipeline for prefix: {}",
+                uri
+            );
+
             // Create indeterminate progress bar (we don't know total count yet)
             let pb = ProgressBar::new_spinner();
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template("Deleting: {spinner:.green} [{elapsed_precise}] {msg}")
-                    .unwrap()
+                    .unwrap(),
             );
             pb.enable_steady_tick(std::time::Duration::from_millis(100));
             pb.set_message("Starting pipeline...");
-            
+
             // Channel for passing batches from lister to deleter (buffer 10 batches)
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(10);
-            
+
             // Spawn lister task - streams results and batches them
             let store_list = store.clone();
             let uri_list = uri.to_string();
             let pb_list = pb.clone();
             let lister = tokio::spawn(async move {
                 use futures::stream::StreamExt;
-                
+
                 let mut stream = store_list.list_stream(&uri_list, recursive);
                 let mut batch = Vec::with_capacity(1000);
                 let mut total_listed = 0u64;
-                
+
                 while let Some(result) = stream.next().await {
                     match result {
                         Ok(key) => {
                             batch.push(key);
                             total_listed += 1;
-                            
+
                             // Send batch when it reaches 1000 objects
                             if batch.len() >= 1000 {
                                 if tx.send(batch.clone()).await.is_err() {
@@ -1529,10 +1797,13 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                                     break;
                                 }
                                 batch.clear();
-                                
+
                                 // Update progress bar with nice formatting
                                 if total_listed.is_multiple_of(1000) {
-                                    pb_list.set_message(format!("Listed: {} | Deleting in background...", total_listed));
+                                    pb_list.set_message(format!(
+                                        "Listed: {} | Deleting in background...",
+                                        total_listed
+                                    ));
                                 }
                             }
                         }
@@ -1542,26 +1813,26 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                         }
                     }
                 }
-                
+
                 // Send final partial batch if any
                 if !batch.is_empty() {
                     let _ = tx.send(batch).await;
                 }
-                
+
                 total_listed
             });
-            
+
             // Deleter task - receives batches and deletes them IN PARALLEL
             let store_delete = store.clone();
             let pb_delete = pb.clone();
             let deleter = tokio::spawn(async move {
                 use futures::stream::{FuturesUnordered, StreamExt};
-                
+
                 let mut total_deleted = 0u64;
                 let delete_start = std::time::Instant::now();
                 let max_concurrent_deletes = 10; // Allow 10 concurrent DeleteObjects requests
                 let mut active_deletes = FuturesUnordered::new();
-                
+
                 loop {
                     // Try to receive batches while we have room for more concurrent deletes
                     while active_deletes.len() < max_concurrent_deletes {
@@ -1569,7 +1840,7 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                             Ok(batch) => {
                                 let store_clone = store_delete.clone();
                                 let batch_size = batch.len();
-                                
+
                                 // Spawn delete as a future
                                 active_deletes.push(tokio::spawn(async move {
                                     store_clone.delete_batch(&batch).await.map(|_| batch_size)
@@ -1585,19 +1856,21 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                             }
                         }
                     }
-                    
+
                     // Wait for at least one delete to complete if we have any active
                     if !active_deletes.is_empty() {
                         match active_deletes.next().await {
                             Some(Ok(Ok(batch_size))) => {
                                 total_deleted += batch_size as u64;
-                                
+
                                 // Update progress bar with rate information
                                 let elapsed = delete_start.elapsed().as_secs_f64().max(0.001);
                                 let rate = (total_deleted as f64 / elapsed) as u64;
                                 pb_delete.set_message(format!(
                                     "Deleted: {} ({}/s, {} concurrent)",
-                                    total_deleted, rate, active_deletes.len() + 1
+                                    total_deleted,
+                                    rate,
+                                    active_deletes.len() + 1
                                 ));
                             }
                             Some(Ok(Err(e))) => {
@@ -1629,7 +1902,7 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                         }
                     }
                 }
-                
+
                 // Wait for any remaining deletes to complete
                 while let Some(result) = active_deletes.next().await {
                     match result {
@@ -1637,7 +1910,8 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                             total_deleted += batch_size as u64;
                             let elapsed = delete_start.elapsed().as_secs_f64().max(0.001);
                             let rate = (total_deleted as f64 / elapsed) as u64;
-                            pb_delete.set_message(format!("Deleted: {} ({}/s)", total_deleted, rate));
+                            pb_delete
+                                .set_message(format!("Deleted: {} ({}/s)", total_deleted, rate));
                         }
                         Ok(Err(e)) => {
                             pb_delete.finish_with_message(format!("Delete error: {}", e));
@@ -1649,34 +1923,34 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                         }
                     }
                 }
-                
+
                 Ok::<u64, anyhow::Error>(total_deleted)
             });
-            
+
             // Wait for both tasks to complete
             let total_listed = lister.await?;
             let total_deleted = deleter.await??;
-            
+
             if total_listed == 0 {
                 pb.finish_with_message("No objects found");
                 eprintln!("No objects found under prefix: {}", uri);
                 return Ok(());
             }
-            
+
             pb.finish_with_message(format!("✓ Deleted {} objects", total_deleted));
             eprintln!("Successfully deleted all objects under prefix: {}", uri);
         }
     } else {
         // First, try to list objects with this URI as a prefix to see if it matches multiple objects
         let mut keys = store.list(uri, false).await?;
-        
+
         // Apply regex filter if provided
         if let Some(pat) = pattern {
-            let re = Regex::new(pat)
-                .with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
+            let re =
+                Regex::new(pat).with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
             keys.retain(|k| re.is_match(k));
         }
-        
+
         if keys.is_empty() {
             // No objects found with this prefix, try as exact object name
             info!("Deleting single object: {}", uri);
@@ -1692,11 +1966,14 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
             let total_count = keys.len();
             info!("Deleting {} objects matching prefix: {}", total_count, uri);
             if let Some(pat) = pattern {
-                eprintln!("Found {} objects matching prefix '{}' and pattern '{}'", total_count, uri, pat);
+                eprintln!(
+                    "Found {} objects matching prefix '{}' and pattern '{}'",
+                    total_count, uri, pat
+                );
             } else {
                 eprintln!("Found {} objects matching prefix '{}'", total_count, uri);
             }
-            
+
             // Create progress bar for deletion
             let pb = ProgressBar::new(total_count as u64);
             pb.set_style(
@@ -1705,30 +1982,87 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
                     .unwrap()
                     .progress_chars("█▉▊▋▌▍▎▏  ")
             );
-            
+
             for key in &keys {
                 store.delete(key).await?;
                 info!("Deleted: {}", key);
                 pb.inc(1);
             }
-            
+
             pb.finish_with_message(format!("Completed deletion of {} objects", total_count));
             if let Some(pat) = pattern {
-                eprintln!("\nSuccessfully deleted {} objects matching pattern '{}'", total_count, pat);
+                eprintln!(
+                    "\nSuccessfully deleted {} objects matching pattern '{}'",
+                    total_count, pat
+                );
             } else {
                 eprintln!("\nSuccessfully deleted {} objects", total_count);
             }
         }
     }
-    
+
     Ok(())
 }
 
+/// Build per-endpoint S3 URIs from a comma-separated endpoint list and a base S3 URI.
+///
+/// For example, `endpoints = "10.9.0.17:9000,10.9.0.18:9000"` and
+/// `base_uri = "s3://mybucket/bench/"` produces:
+/// `["s3://10.9.0.17:9000/mybucket/bench/", "s3://10.9.0.18:9000/mybucket/bench/"]`
+///
+/// The base URI must start with `s3://`.
+fn build_s3_endpoint_uris(endpoints: &str, base_uri: &str) -> Result<Vec<String>> {
+    let path = base_uri
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow::anyhow!("--endpoints requires an s3:// URI, got: {}", base_uri))?;
+    let path = if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/", path)
+    };
+    let uris: Vec<String> = endpoints
+        .split(',')
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .map(|h| format!("s3://{}/{}", h, path))
+        .collect();
+    if uris.is_empty() {
+        bail!("--endpoints requires at least one host:port value");
+    }
+    Ok(uris)
+}
 
+/// Build bare per-endpoint root URIs (`s3://host:port/`) from a comma-separated endpoint list.
+///
+/// Used for keylist mode where object paths are preserved and only the endpoint is replaced.
+fn build_s3_host_root_uris(endpoints: &str) -> Result<Vec<String>> {
+    let uris: Vec<String> = endpoints
+        .split(',')
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .map(|h| format!("s3://{}/", h))
+        .collect();
+    if uris.is_empty() {
+        bail!("--endpoints requires at least one host:port value");
+    }
+    Ok(uris)
+}
 
 /// Put command supports 1 or more objects, also takes our ObjectType
 #[allow(clippy::too_many_arguments)]
-async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize, data_gen_mode: DataGenMode, chunk_size: usize) -> Result<()> {
+async fn put_many_cmd(
+    uri_prefix: &str,
+    num: usize,
+    template: &str,
+    jobs: usize,
+    size: usize,
+    object_type: s3dlio::ObjectType,
+    dedup_f: usize,
+    compress_f: usize,
+    data_gen_mode: DataGenMode,
+    chunk_size: usize,
+    endpoints: Option<&str>,
+) -> Result<()> {
     // Pre-tune GCS subchannels to match upload concurrency before the first GCS op.
     s3dlio::set_gcs_channel_count(jobs);
 
@@ -1737,16 +2071,31 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
     if !prefix.ends_with('/') {
         prefix.push('/');
     }
-    
-    // Generate the full list of URIs.
+
+    // When --endpoints is given, construct per-endpoint URIs and build a MultiEndpointStore.
+    // Object URIs are generated using the first endpoint as the base; the store rewrites
+    // each URI to the selected (round-robin) endpoint on every put() call.
+    let multi_store: Option<Arc<MultiEndpointStore>> = if let Some(endpoints_str) = endpoints {
+        let endpoint_uris = build_s3_endpoint_uris(endpoints_str, &prefix)?;
+        let store = MultiEndpointStore::new(endpoint_uris, LoadBalanceStrategy::RoundRobin, None)
+            .context("Failed to create multi-endpoint store")?;
+        // Use the first endpoint's URI as the base for generating object URIs.
+        prefix = store.get_endpoint_configs()[0].0.clone();
+        Some(Arc::new(store))
+    } else {
+        None
+    };
+
+    // Generate the full list of URIs (always using `prefix` which may now be endpoint-specific).
     let mut uris = Vec::with_capacity(num);
 
     // Now replace brackets with values
     for i in 0..num {
         // replace first {} with the index, second {} with the total count
-        let object_name = template
-            .replacen("{}", &i.to_string(), 1)
-            .replacen("{}", &num.to_string(), 1);
+        let object_name =
+            template
+                .replacen("{}", &i.to_string(), 1)
+                .replacen("{}", &num.to_string(), 1);
         let full_uri = format!("{}{}", prefix, object_name);
         uris.push(full_uri);
     }
@@ -1754,46 +2103,58 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
     // Find the lesser of the number of jobs or number of objects
     let effective_jobs = std::cmp::min(jobs, num);
     let total_bytes = num * size;
-    
+
     // Create progress bar for upload operation
-    let progress_tracker = Arc::new(S3ProgressTracker::new("PUT", num as u64, total_bytes as u64));
+    let progress_tracker = Arc::new(S3ProgressTracker::new(
+        "PUT",
+        num as u64,
+        total_bytes as u64,
+    ));
     let progress_callback = Arc::new(ProgressCallback::new(progress_tracker.clone(), num as u64));
-    progress_tracker.progress_bar.set_message(format!("Preparing to upload {} objects...", num));
+    progress_tracker
+        .progress_bar
+        .set_message(format!("Preparing to upload {} objects...", num));
 
     let t0 = Instant::now();
-    
+
     // Generate test data
     let config = Config::new_with_defaults(object_type, 1, size, dedup_f, compress_f)
         .with_data_gen_mode(data_gen_mode)
         .with_chunk_size(chunk_size);
     let data = generate_object(&config)?;
-    
+
     // Use universal ObjectStore interface for parallel uploads
     let sem = Arc::new(tokio::sync::Semaphore::new(effective_jobs));
     let mut futs = FuturesUnordered::new();
     let logger = global_logger();
-    
+
     for uri in &uris {
         let sem = sem.clone();
         let progress = progress_callback.clone();
         let uri = uri.clone();
         let data = data.clone();
         let logger = logger.clone();
-        
+        let multi = multi_store.clone();
+
         futs.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let store = store_for_uri_with_logger(&uri, logger)?;
             let byte_count = data.len() as u64;
-            // Bytes passed directly (zero-copy, reference counted)
-            store.put(&uri, data).await?;
-            
+            if let Some(store) = multi {
+                // Multi-endpoint: store routes round-robin and rewrites the URI.
+                store.put(&uri, data).await?;
+            } else {
+                let store = store_for_uri_with_logger(&uri, logger)?;
+                // Bytes passed directly (zero-copy, reference counted)
+                store.put(&uri, data).await?;
+            }
+
             // Update progress
             progress.object_completed(byte_count);
-            
+
             Ok::<(String, u64), anyhow::Error>((uri, byte_count))
         }));
     }
-    
+
     let mut total_uploaded_bytes = 0u64;
     let mut success_count = 0u64;
     let mut failure_count = 0u64;
@@ -1814,18 +2175,22 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
             }
         }
     }
-    
+
     let elapsed = t0.elapsed();
 
     // Update final progress and finish
     progress_callback.update_total_bytes(total_uploaded_bytes);
     progress_tracker.finish("Upload", total_uploaded_bytes, elapsed);
 
+    let proto_tag = s3dlio::reqwest_client::observed_http_version_str()
+        .map(|v| format!(", protocol={v}"))
+        .unwrap_or_default();
     safe_println!(
-        "PUT summary: attempted={}, succeeded={}, failed={}",
+        "PUT summary: attempted={}, succeeded={}, failed={}{}",
         num,
         success_count,
-        failure_count
+        failure_count,
+        proto_tag
     );
 
     if failure_count > 0 {
@@ -1836,13 +2201,17 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
             failure_count
         );
     }
-    
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_container_name, parse_human_size};
+    use super::{
+        build_s3_endpoint_uris, build_s3_host_root_uris, extract_container_name, parse_human_size,
+        Cli, Command,
+    };
+    use clap::Parser;
 
     // ------------------------------------------------------------------
     // extract_container_name — no network access, pure string parsing
@@ -1850,13 +2219,19 @@ mod tests {
 
     #[test]
     fn extract_s3_simple_bucket() {
-        assert_eq!(extract_container_name("s3://my-bucket").unwrap(), "my-bucket");
+        assert_eq!(
+            extract_container_name("s3://my-bucket").unwrap(),
+            "my-bucket"
+        );
     }
 
     #[test]
     fn extract_s3_bucket_with_prefix() {
         // Only the bucket portion should be returned
-        assert_eq!(extract_container_name("s3://my-bucket/some/prefix/").unwrap(), "my-bucket");
+        assert_eq!(
+            extract_container_name("s3://my-bucket/some/prefix/").unwrap(),
+            "my-bucket"
+        );
     }
 
     #[test]
@@ -1867,12 +2242,18 @@ mod tests {
 
     #[test]
     fn extract_gcs_gs_prefix() {
-        assert_eq!(extract_container_name("gs://my-gcs-bucket").unwrap(), "my-gcs-bucket");
+        assert_eq!(
+            extract_container_name("gs://my-gcs-bucket").unwrap(),
+            "my-gcs-bucket"
+        );
     }
 
     #[test]
     fn extract_gcs_gcs_prefix() {
-        assert_eq!(extract_container_name("gcs://my-gcs-bucket/prefix/").unwrap(), "my-gcs-bucket");
+        assert_eq!(
+            extract_container_name("gcs://my-gcs-bucket/prefix/").unwrap(),
+            "my-gcs-bucket"
+        );
     }
 
     #[test]
@@ -1918,12 +2299,18 @@ mod tests {
 
     #[test]
     fn extract_file_absolute_path() {
-        assert_eq!(extract_container_name("file:///mnt/data").unwrap(), "/mnt/data");
+        assert_eq!(
+            extract_container_name("file:///mnt/data").unwrap(),
+            "/mnt/data"
+        );
     }
 
     #[test]
     fn extract_file_nested_path() {
-        assert_eq!(extract_container_name("file:///mnt/data/subdir/").unwrap(), "/mnt/data/subdir");
+        assert_eq!(
+            extract_container_name("file:///mnt/data/subdir/").unwrap(),
+            "/mnt/data/subdir"
+        );
     }
 
     #[test]
@@ -1933,12 +2320,18 @@ mod tests {
 
     #[test]
     fn extract_direct_path() {
-        assert_eq!(extract_container_name("direct:///nvme/data").unwrap(), "/nvme/data");
+        assert_eq!(
+            extract_container_name("direct:///nvme/data").unwrap(),
+            "/nvme/data"
+        );
     }
 
     #[test]
     fn extract_direct_trailing_slash_stripped() {
-        assert_eq!(extract_container_name("direct:///nvme/data/").unwrap(), "/nvme/data");
+        assert_eq!(
+            extract_container_name("direct:///nvme/data/").unwrap(),
+            "/nvme/data"
+        );
     }
 
     #[test]
@@ -1974,5 +2367,114 @@ mod tests {
         assert!(parse_human_size("8XB").is_err());
         assert!(parse_human_size("8.5MB").is_err());
     }
-}
 
+    // ------------------------------------------------------------------
+    // --endpoints helper functions — pure string logic, no network access
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_s3_endpoint_uris_two_endpoints() {
+        let uris = build_s3_endpoint_uris("10.9.0.17:9000,10.9.0.18:9000", "s3://mybucket/bench/")
+            .unwrap();
+        assert_eq!(uris.len(), 2);
+        assert_eq!(uris[0], "s3://10.9.0.17:9000/mybucket/bench/");
+        assert_eq!(uris[1], "s3://10.9.0.18:9000/mybucket/bench/");
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_adds_trailing_slash() {
+        // base URI without trailing slash should still produce correct endpoint URIs
+        let uris = build_s3_endpoint_uris("10.9.0.17:9000", "s3://mybucket/prefix").unwrap();
+        assert_eq!(uris[0], "s3://10.9.0.17:9000/mybucket/prefix/");
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_ignores_whitespace_and_empty_entries() {
+        let uris =
+            build_s3_endpoint_uris(" 10.9.0.17:9000 , , 10.9.0.18:9000 ", "s3://bucket/").unwrap();
+        // Empty entry between commas and surrounding whitespace should be stripped
+        assert_eq!(uris.len(), 2);
+        assert_eq!(uris[0], "s3://10.9.0.17:9000/bucket/");
+        assert_eq!(uris[1], "s3://10.9.0.18:9000/bucket/");
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_rejects_non_s3_uri() {
+        assert!(build_s3_endpoint_uris("host:9000", "az://myaccount/mycontainer/").is_err());
+        assert!(build_s3_endpoint_uris("host:9000", "file:///mnt/data/").is_err());
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_rejects_empty_list() {
+        assert!(build_s3_endpoint_uris("  ,  ", "s3://bucket/").is_err());
+    }
+
+    #[test]
+    fn build_s3_host_root_uris_two_endpoints() {
+        let uris = build_s3_host_root_uris("10.9.0.17:9000,10.9.0.18:9000").unwrap();
+        assert_eq!(uris.len(), 2);
+        assert_eq!(uris[0], "s3://10.9.0.17:9000/");
+        assert_eq!(uris[1], "s3://10.9.0.18:9000/");
+    }
+
+    // ------------------------------------------------------------------
+    // --endpoints CLI argument parsing — verifies clap wiring end-to-end
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cli_put_endpoints_parsed_into_struct() {
+        let cli = Cli::try_parse_from([
+            "s3-cli",
+            "put",
+            "--endpoints=10.9.0.17:9000,10.9.0.18:9000",
+            "s3://mybucket/bench/",
+        ])
+        .expect("should parse successfully");
+
+        if let Command::Put { endpoints, .. } = cli.cmd {
+            assert_eq!(
+                endpoints.as_deref(),
+                Some("10.9.0.17:9000,10.9.0.18:9000"),
+                "--endpoints value should be passed through verbatim"
+            );
+        } else {
+            panic!("expected Command::Put");
+        }
+    }
+
+    #[test]
+    fn cli_get_endpoints_parsed_into_struct() {
+        let cli = Cli::try_parse_from([
+            "s3-cli",
+            "get",
+            "--endpoints=10.9.0.17:9000,10.9.0.18:9000",
+            "s3://mybucket/bench/",
+        ])
+        .expect("should parse successfully");
+
+        if let Command::Get { endpoints, .. } = cli.cmd {
+            assert_eq!(
+                endpoints.as_deref(),
+                Some("10.9.0.17:9000,10.9.0.18:9000"),
+                "--endpoints value should be passed through verbatim"
+            );
+        } else {
+            panic!("expected Command::Get");
+        }
+    }
+
+    #[test]
+    fn cli_put_endpoints_absent_when_not_provided() {
+        let cli = Cli::try_parse_from(["s3-cli", "put", "s3://mybucket/bench/"])
+            .expect("should parse successfully");
+
+        if let Command::Put { endpoints, .. } = cli.cmd {
+            assert!(
+                endpoints.is_none(),
+                "--endpoints should be None when not provided"
+            );
+        } else {
+            panic!("expected Command::Put");
+        }
+    }
+}

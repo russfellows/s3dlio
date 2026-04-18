@@ -8,15 +8,13 @@ use aws_sdk_s3::primitives::ByteStream;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use glob::glob;
-use tracing::{info, debug, warn, error};
+use tracing::{debug, error, info, warn};
 //use regex::Regex;
-use std::{fs, path::{Path}, sync::Arc};
+use std::{fs, path::Path, sync::Arc};
 use tokio::{fs as async_fs, sync::Semaphore};
 
-use crate::s3_utils::{
-    parse_s3_uri, create_bucket, list_objects, get_object, put_object_async,
-};
 use crate::progress::ProgressCallback;
+use crate::s3_utils::{create_bucket, get_object, list_objects, parse_s3_uri, put_object_async};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Functions that leverage existing s3_utils code
@@ -26,7 +24,7 @@ use crate::progress::ProgressCallback;
 /// Upload local files (supports globs) into `s3://bucket/prefix/…`,
 /// streaming each file off disk with up to `max_in_flight` tasks.
 /// If `do_create_bucket` is true, we attempt to create the bucket first.
-pub async fn upload_files<P: AsRef<Path>>(  
+pub async fn upload_files<P: AsRef<Path>>(
     dest_prefix: &str,
     patterns: &[P],
     max_in_flight: usize,
@@ -75,8 +73,7 @@ pub async fn upload_files<P: AsRef<Path>>(
     // DEBUG: details of create_bucket and requested jobs
     debug!(
         "upload_files debug: create_bucket={}, requested_jobs={}",
-        do_create_bucket,
-        max_in_flight
+        do_create_bucket, max_in_flight
     );
 
     let sem = Arc::new(Semaphore::new(effective_jobs));
@@ -87,7 +84,8 @@ pub async fn upload_files<P: AsRef<Path>>(
             let sem = sem.clone();
             let bucket = bucket.clone();
             let progress = progress_callback.clone();
-            let fname = path.file_name()
+            let fname = path
+                .file_name()
                 .ok_or_else(|| anyhow::anyhow!("Bad path {:?}", path))?
                 .to_string_lossy();
             let key = format!("{}{}", key_prefix, fname);
@@ -101,12 +99,12 @@ pub async fn upload_files<P: AsRef<Path>>(
                 let body = ByteStream::from_path(&path).await?;
                 put_object_async(&bucket, &key, body.collect().await?.into_bytes()).await?;
                 debug!("finished upload of {:?} → s3://{}/{}", path, bucket, key);
-                
+
                 // Update progress if callback provided
                 if let Some(ref progress) = progress {
                     progress.object_completed(file_size);
                 }
-                
+
                 Ok::<(), anyhow::Error>(())
             }));
         }
@@ -128,7 +126,6 @@ pub async fn upload_files<P: AsRef<Path>>(
     }
     result
 }
-
 
 /// Download one key, every key under a prefix, or glob/regex-match objects into `dest_dir/`,
 /// creating files with their original basenames, up to `max_in_flight` at once.
@@ -207,13 +204,16 @@ pub async fn download_objects(
                     .ok_or_else(|| anyhow::anyhow!("Bad key: {}", k))?;
                 let out_path = out_dir.join(fname);
                 async_fs::write(&out_path, &bytes).await?;
-                debug!("finished download of s3://{}/{} → {:?}", bucket, k, out_path);
-                
+                debug!(
+                    "finished download of s3://{}/{} → {:?}",
+                    bucket, k, out_path
+                );
+
                 // Update progress if callback provided
                 if let Some(ref progress) = progress {
                     progress.object_completed(byte_count);
                 }
-                
+
                 Ok::<(), anyhow::Error>(())
             }));
         }
@@ -235,5 +235,3 @@ pub async fn download_objects(
     }
     result
 }
-
-

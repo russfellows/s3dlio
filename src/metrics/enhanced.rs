@@ -2,20 +2,20 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 //! Enhanced performance metrics with HDR histogram support
-//! 
+//!
 //! This module provides comprehensive performance monitoring for AI/ML workloads
 //! using HDR (High Dynamic Range) histograms for precise tail latency analysis.
-//! 
+//!
 //! Key Features:
 //! - HDR histograms for detailed performance analysis with precise percentiles
 //! - Mergeable metrics for distributed training scenarios  
 //! - Adaptive performance optimization based on real-time metrics
 //! - AI/ML workload-specific performance tracking with low overhead
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use hdrhistogram::Histogram;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Configuration for HDR histogram collection
 #[derive(Debug, Clone)]
@@ -72,64 +72,71 @@ impl PerformanceHistogram {
     pub fn new(name: String, config: HistogramConfig) -> Result<Self> {
         let hdr = Histogram::new_with_bounds(1, config.max_value, config.significant_digits)
             .map_err(|e| anyhow::anyhow!("Failed to create HDR histogram: {}", e))?;
-        
+
         Ok(Self { hdr, name })
     }
-    
+
     /// Record a value in microseconds
     pub fn record(&mut self, value_us: u64) -> Result<()> {
-        self.hdr.record(value_us)
-            .map_err(|e| anyhow::anyhow!("Failed to record value in histogram {}: {}", self.name, e))?;
+        self.hdr.record(value_us).map_err(|e| {
+            anyhow::anyhow!("Failed to record value in histogram {}: {}", self.name, e)
+        })?;
         Ok(())
     }
-    
+
     /// Get percentile value in microseconds
     pub fn percentile(&self, percentile: f64) -> u64 {
         self.hdr.value_at_percentile(percentile)
     }
-    
+
     /// Get mean value in microseconds
     pub fn mean(&self) -> f64 {
         self.hdr.mean()
     }
-    
+
     /// Get total count of samples
     pub fn len(&self) -> u64 {
         self.hdr.len()
     }
-    
+
     /// Check if histogram is empty
     pub fn is_empty(&self) -> bool {
         self.hdr.is_empty()
     }
-    
+
     /// Get standard deviation
     pub fn stdev(&self) -> f64 {
         self.hdr.stdev()
     }
-    
+
     /// Get minimum recorded value
     pub fn min(&self) -> u64 {
         self.hdr.min()
     }
-    
+
     /// Get maximum recorded value
     pub fn max(&self) -> u64 {
         self.hdr.max()
     }
-    
+
     /// Merge another histogram into this one (for distributed aggregation)
     pub fn merge(&mut self, other: &PerformanceHistogram) -> Result<()> {
-        self.hdr.add(&other.hdr)
-            .map_err(|e| anyhow::anyhow!("Failed to merge histogram {} with {}: {}", self.name, other.name, e))?;
+        self.hdr.add(&other.hdr).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to merge histogram {} with {}: {}",
+                self.name,
+                other.name,
+                e
+            )
+        })?;
         Ok(())
     }
-    
+
     /// Reset histogram (clear all recorded values)
     pub fn reset(&mut self) {
         self.hdr.reset();
     }
-    
+
     /// Export histogram data for external analysis or persistence
     pub fn export_summary(&self) -> HistogramSummary {
         HistogramSummary {
@@ -197,40 +204,54 @@ impl EnhancedMetricsCollector {
             error_counts: HashMap::new(),
         }
     }
-    
+
     /// Record operation metrics
-    pub fn record_operation(&mut self, operation: &str, latency_us: u64, request_size: u64, response_size: u64) -> Result<()> {
+    pub fn record_operation(
+        &mut self,
+        operation: &str,
+        latency_us: u64,
+        request_size: u64,
+        response_size: u64,
+    ) -> Result<()> {
         // Apply sampling if configured
-        if self.config.sampling_rate < 1.0
-            && rand::random::<f64>() > self.config.sampling_rate {
-                return Ok(());
-            }
-        
+        if self.config.sampling_rate < 1.0 && rand::random::<f64>() > self.config.sampling_rate {
+            return Ok(());
+        }
+
         // Ensure histograms exist for this operation
         if !self.latency_histograms.contains_key(operation) {
             self.latency_histograms.insert(
-                operation.to_string(), 
-                PerformanceHistogram::new(format!("{}_latency", operation), self.config.histogram_config.clone())?
+                operation.to_string(),
+                PerformanceHistogram::new(
+                    format!("{}_latency", operation),
+                    self.config.histogram_config.clone(),
+                )?,
             );
         }
         if !self.throughput_histograms.contains_key(operation) {
             self.throughput_histograms.insert(
-                operation.to_string(), 
-                PerformanceHistogram::new(format!("{}_throughput", operation), self.config.histogram_config.clone())?
+                operation.to_string(),
+                PerformanceHistogram::new(
+                    format!("{}_throughput", operation),
+                    self.config.histogram_config.clone(),
+                )?,
             );
         }
         if !self.request_size_histograms.contains_key(operation) {
             self.request_size_histograms.insert(
-                operation.to_string(), 
-                PerformanceHistogram::new(format!("{}_request_size", operation), self.config.histogram_config.clone())?
+                operation.to_string(),
+                PerformanceHistogram::new(
+                    format!("{}_request_size", operation),
+                    self.config.histogram_config.clone(),
+                )?,
             );
         }
-        
+
         // Record latency
         if let Some(histogram) = self.latency_histograms.get_mut(operation) {
             histogram.record(latency_us)?;
         }
-        
+
         // Calculate and record throughput (bytes per second)
         if latency_us > 0 {
             let throughput_bps = (response_size * 1_000_000) / latency_us; // Convert to bytes per second
@@ -238,26 +259,26 @@ impl EnhancedMetricsCollector {
                 histogram.record(throughput_bps)?;
             }
         }
-        
+
         // Record request size
         if let Some(histogram) = self.request_size_histograms.get_mut(operation) {
             histogram.record(request_size)?;
         }
-        
+
         // Update counters
         self.operation_counts
             .entry(operation.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
-            
+
         self.bytes_transferred
             .entry(operation.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(request_size + response_size, Ordering::Relaxed);
-        
+
         Ok(())
     }
-    
+
     /// Record an error for an operation
     pub fn record_error(&mut self, operation: &str) {
         self.error_counts
@@ -265,73 +286,82 @@ impl EnhancedMetricsCollector {
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Get latency summary for an operation
     pub fn get_latency_summary(&self, operation: &str) -> Option<HistogramSummary> {
-        self.latency_histograms.get(operation).map(|h| h.export_summary())
+        self.latency_histograms
+            .get(operation)
+            .map(|h| h.export_summary())
     }
-    
+
     /// Get throughput summary for an operation
     pub fn get_throughput_summary(&self, operation: &str) -> Option<HistogramSummary> {
-        self.throughput_histograms.get(operation).map(|h| h.export_summary())
+        self.throughput_histograms
+            .get(operation)
+            .map(|h| h.export_summary())
     }
-    
+
     /// Get request size summary for an operation
     pub fn get_request_size_summary(&self, operation: &str) -> Option<HistogramSummary> {
-        self.request_size_histograms.get(operation).map(|h| h.export_summary())
+        self.request_size_histograms
+            .get(operation)
+            .map(|h| h.export_summary())
     }
-    
+
     /// Get operation count
     pub fn get_operation_count(&self, operation: &str) -> u64 {
-        self.operation_counts.get(operation)
+        self.operation_counts
+            .get(operation)
             .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
-    
+
     /// Get total bytes transferred for an operation
     pub fn get_bytes_transferred(&self, operation: &str) -> u64 {
-        self.bytes_transferred.get(operation)
+        self.bytes_transferred
+            .get(operation)
             .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
-    
+
     /// Get error count for an operation
     pub fn get_error_count(&self, operation: &str) -> u64 {
-        self.error_counts.get(operation)
+        self.error_counts
+            .get(operation)
             .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
-    
+
     /// Get error rate for an operation (errors / total operations)
     pub fn get_error_rate(&self, operation: &str) -> f64 {
         let total = self.get_operation_count(operation);
         let errors = self.get_error_count(operation);
-        
+
         if total > 0 {
             errors as f64 / total as f64
         } else {
             0.0
         }
     }
-    
+
     /// Get all tracked operations
     pub fn get_operations(&self) -> Vec<String> {
         let mut operations: std::collections::HashSet<String> = std::collections::HashSet::new();
-        
+
         for key in self.latency_histograms.keys() {
             operations.insert(key.clone());
         }
         for key in self.operation_counts.keys() {
             operations.insert(key.clone());
         }
-        
+
         operations.into_iter().collect()
     }
-    
+
     /// Generate comprehensive performance report
     pub fn generate_report(&self) -> PerformanceReport {
         let mut operations = HashMap::new();
-        
+
         for operation in self.get_operations() {
             let op_report = OperationReport {
                 name: operation.clone(),
@@ -345,10 +375,10 @@ impl EnhancedMetricsCollector {
             };
             operations.insert(operation, op_report);
         }
-        
+
         PerformanceReport { operations }
     }
-    
+
     /// Reset all metrics
     pub fn reset(&mut self) {
         for histogram in self.latency_histograms.values_mut() {
@@ -360,7 +390,7 @@ impl EnhancedMetricsCollector {
         for histogram in self.request_size_histograms.values_mut() {
             histogram.reset();
         }
-        
+
         for counter in self.operation_counts.values() {
             counter.store(0, Ordering::Relaxed);
         }
@@ -396,26 +426,33 @@ impl PerformanceReport {
     /// Print a human-readable performance report
     pub fn print_summary(&self) {
         println!("\n=== Performance Report ===");
-        
+
         for (operation, report) in &self.operations {
             println!("\nOperation: {}", operation);
             println!("  Operations: {}", report.operation_count);
-            println!("  Bytes Transferred: {} MB", report.bytes_transferred / (1024 * 1024));
+            println!(
+                "  Bytes Transferred: {} MB",
+                report.bytes_transferred / (1024 * 1024)
+            );
             println!("  Error Rate: {:.2}%", report.error_rate * 100.0);
-            
+
             if let Some(latency) = &report.latency {
                 println!("  Latency (μs):");
-                println!("    Mean: {:.2}, P50: {}, P95: {}, P99: {}, P99.9: {}", 
-                    latency.mean, latency.p50, latency.p95, latency.p99, latency.p999);
+                println!(
+                    "    Mean: {:.2}, P50: {}, P95: {}, P99: {}, P99.9: {}",
+                    latency.mean, latency.p50, latency.p95, latency.p99, latency.p999
+                );
             }
-            
+
             if let Some(throughput) = &report.throughput {
                 println!("  Throughput (bytes/s):");
-                println!("    Mean: {:.2}, P50: {}, P95: {}, P99: {}", 
-                    throughput.mean, throughput.p50, throughput.p95, throughput.p99);
+                println!(
+                    "    Mean: {:.2}, P50: {}, P95: {}, P99: {}",
+                    throughput.mean, throughput.p50, throughput.p95, throughput.p99
+                );
             }
         }
-        
+
         println!("\n=========================\n");
     }
 }
@@ -431,7 +468,12 @@ pub fn init_global_metrics(config: MetricsConfig) {
 }
 
 /// Record operation using global metrics collector
-pub fn record_operation(operation: &str, latency_us: u64, request_size: u64, response_size: u64) -> Result<()> {
+pub fn record_operation(
+    operation: &str,
+    latency_us: u64,
+    request_size: u64,
+    response_size: u64,
+) -> Result<()> {
     if let Some(metrics) = GLOBAL_METRICS.get() {
         let mut collector = metrics.lock().unwrap();
         collector.record_operation(operation, latency_us, request_size, response_size)
@@ -484,29 +526,29 @@ impl MetricsConfig {
             batch_size: 100,
         }
     }
-    
+
     /// Configuration optimized for inference workloads  
     pub fn inference_optimized() -> Self {
         Self {
             histogram_config: HistogramConfig {
                 significant_digits: 4, // Higher precision for inference latency
-                max_value: 1_000_000, // 1 second max for inference
+                max_value: 1_000_000,  // 1 second max for inference
             },
             per_operation_tracking: true,
             sampling_rate: 1.0,
             batch_size: 1000,
         }
     }
-    
+
     /// Configuration for high-frequency operations with sampling
     pub fn high_frequency() -> Self {
         Self {
             histogram_config: HistogramConfig {
                 significant_digits: 2, // Lower precision for speed
-                max_value: 100_000, // 100ms max
+                max_value: 100_000,    // 100ms max
             },
             per_operation_tracking: false, // Aggregate only
-            sampling_rate: 0.1, // Sample 10% for performance
+            sampling_rate: 0.1,            // Sample 10% for performance
             batch_size: 10000,
         }
     }

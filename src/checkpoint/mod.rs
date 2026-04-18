@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+pub mod latest;
 pub mod manifest;
 pub mod paths;
-pub mod writer;
 pub mod reader;
-pub mod latest;
+pub mod writer;
 
+use crate::object_store::{store_for_uri, ObjectStore};
 use anyhow::Result;
 use bytes::Bytes;
-use crate::object_store::{store_for_uri, ObjectStore};
+pub use latest::Latest;
 pub use manifest::{Manifest, ShardMeta};
 pub use paths::{KeyLayout, Strategy};
-pub use writer::Writer;
 pub use reader::Reader;
-pub use latest::Latest;
+pub use writer::Writer;
 
 /// Configuration for checkpoint operations
 #[derive(Debug, Clone)]
@@ -80,7 +80,7 @@ impl CheckpointConfig {
         Self {
             strategy: Strategy::RoundRobin,
             multipart_threshold: 64 * 1024 * 1024, // 64MB for cloud
-            part_size: Some(8 * 1024 * 1024), // 8MB parts
+            part_size: Some(8 * 1024 * 1024),      // 8MB parts
             enable_validation: true,
             concurrent_uploads: true,
             compression: None,
@@ -104,7 +104,7 @@ impl CheckpointConfig {
         Self {
             strategy: Strategy::Binary,
             multipart_threshold: 32 * 1024 * 1024, // 32MB
-            part_size: Some(16 * 1024 * 1024), // 16MB parts
+            part_size: Some(16 * 1024 * 1024),     // 16MB parts
             enable_validation: false,
             concurrent_uploads: true,
             compression: None,
@@ -146,11 +146,11 @@ impl CheckpointStore {
             .with_strategy(self.config.strategy)
             .with_multipart_threshold(self.config.multipart_threshold)
             .with_part_size(self.config.part_size.unwrap_or(8 * 1024 * 1024));
-        
+
         if let Some(compression) = &self.config.compression {
             writer = writer.with_compression(*compression);
         }
-        
+
         writer
     }
 
@@ -169,7 +169,9 @@ impl CheckpointStore {
         user_meta: Option<serde_json::Value>,
     ) -> Result<String> {
         let writer = self.writer(1, 0);
-        writer.save_checkpoint(step, epoch, framework, data, user_meta).await
+        writer
+            .save_checkpoint(step, epoch, framework, data, user_meta)
+            .await
     }
 
     /// Convenience method to load the latest checkpoint
@@ -192,7 +194,7 @@ impl CheckpointStore {
     pub async fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>> {
         let reader = self.reader();
         let checkpoints = reader.list_checkpoints().await?;
-        
+
         let mut infos = Vec::new();
         for (step, timestamp, status) in checkpoints {
             if let Some(manifest) = reader.find_manifest_by_step(step).await? {
@@ -207,7 +209,7 @@ impl CheckpointStore {
                 });
             }
         }
-        
+
         Ok(infos)
     }
 
@@ -282,7 +284,7 @@ impl CheckpointStore {
         } else {
             CheckpointConfig::local_optimized()
         };
-        
+
         Self::open_with_config(uri, config)
     }
 
@@ -301,9 +303,9 @@ mod tests {
     async fn test_checkpoint_store_basic() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let uri = format!("file://{}", temp_dir.path().display());
-        
+
         let store = CheckpointStore::open(&uri)?;
-        
+
         // Health check
         store.health_check().await?;
 
@@ -334,7 +336,7 @@ mod tests {
         // Test different configurations
         let _store1 = CheckpointStore::open_auto_config(&uri)?;
         let _store2 = CheckpointStore::open_high_performance(&uri)?;
-        
+
         let custom_config = CheckpointConfig::new()
             .with_strategy(Strategy::Binary)
             .with_validation(false);
@@ -347,7 +349,7 @@ mod tests {
     async fn test_distributed_workflow() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let uri = format!("file://{}", temp_dir.path().display());
-        
+
         let store = CheckpointStore::open(&uri)?;
 
         // Simulate distributed training with 2 ranks
@@ -355,22 +357,24 @@ mod tests {
         let writer_1 = store.writer(2, 1);
 
         // Each rank saves its shard
-        let (layout, shard_0) = writer_0.save_distributed_shard(
-            200, 20, "torch", b"rank 0 model state"
-        ).await?;
+        let (layout, shard_0) = writer_0
+            .save_distributed_shard(200, 20, "torch", b"rank 0 model state")
+            .await?;
 
-        let (_, shard_1) = writer_1.save_distributed_shard(
-            200, 20, "torch", b"rank 1 model state"
-        ).await?;
+        let (_, shard_1) = writer_1
+            .save_distributed_shard(200, 20, "torch", b"rank 1 model state")
+            .await?;
 
         // Rank 0 finalizes the checkpoint
-        let manifest_key = writer_0.finalize_distributed_checkpoint(
-            &layout,
-            "torch",
-            20,
-            vec![shard_0, shard_1],
-            Some(serde_json::json!({"model": "gpt", "layers": 24})),
-        ).await?;
+        let manifest_key = writer_0
+            .finalize_distributed_checkpoint(
+                &layout,
+                "torch",
+                20,
+                vec![shard_0, shard_1],
+                Some(serde_json::json!({"model": "gpt", "layers": 24})),
+            )
+            .await?;
 
         assert!(manifest_key.contains("manifests/ckpt-200-"));
 

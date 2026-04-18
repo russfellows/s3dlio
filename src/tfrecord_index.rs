@@ -8,8 +8,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// TFRecord format constants
-const TFRECORD_LENGTH_SIZE: usize = 8;  // u64 little-endian
-const TFRECORD_CRC_SIZE: usize = 4;     // u32 CRC checksum
+const TFRECORD_LENGTH_SIZE: usize = 8; // u64 little-endian
+const TFRECORD_CRC_SIZE: usize = 4; // u32 CRC checksum
 
 /// Index entry representing one TFRecord
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,8 +128,8 @@ pub fn read_index_file<P: AsRef<Path>>(index_path: P) -> Result<Vec<TfRecordInde
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let file = File::open(index_path.as_ref())
-        .map_err(|e| format!("Failed to open index file: {}", e))?;
+    let file =
+        File::open(index_path.as_ref()).map_err(|e| format!("Failed to open index file: {}", e))?;
 
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
@@ -405,8 +405,12 @@ mod tests {
         // Verify space-separated format (DALI compatible)
         for line in lines {
             let parts: Vec<&str> = line.split(' ').collect();
-            assert_eq!(parts.len(), 2, "Each line should have exactly 2 space-separated values");
-            
+            assert_eq!(
+                parts.len(),
+                2,
+                "Each line should have exactly 2 space-separated values"
+            );
+
             // Verify both parts are valid u64 numbers
             parts[0].parse::<u64>().expect("Offset should be valid u64");
             parts[1].parse::<u64>().expect("Size should be valid u64");

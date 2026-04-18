@@ -6,13 +6,13 @@
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use gcloud_storage::client::{Client, ClientConfig};
+use gcloud_storage::http::buckets::delete::DeleteBucketRequest;
+use gcloud_storage::http::buckets::insert::InsertBucketRequest;
+use gcloud_storage::http::objects::delete::DeleteObjectRequest;
 use gcloud_storage::http::objects::download::Range;
 use gcloud_storage::http::objects::get::GetObjectRequest;
-use gcloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
-use gcloud_storage::http::objects::delete::DeleteObjectRequest;
 use gcloud_storage::http::objects::list::ListObjectsRequest;
-use gcloud_storage::http::buckets::insert::InsertBucketRequest;
-use gcloud_storage::http::buckets::delete::DeleteBucketRequest;
+use gcloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tracing::{debug, info};
@@ -31,7 +31,7 @@ pub struct GcsObjectMetadata {
 }
 
 /// High-level GCS client using Application Default Credentials (ADC).
-/// 
+///
 /// Authentication follows the standard ADC chain:
 /// 1. GOOGLE_APPLICATION_CREDENTIALS environment variable (service account JSON)
 /// 2. GCE/GKE metadata server (automatic for Google Cloud workloads)
@@ -43,16 +43,16 @@ pub struct GcsClient {
 impl GcsClient {
     /// Create a new GCS client using Application Default Credentials.
     /// This now uses a cached global client for efficiency - authentication only happens once.
-    /// 
+    ///
     /// The credentials are automatically discovered from:
     /// - GOOGLE_APPLICATION_CREDENTIALS env var (loaded by dotenvy)
     /// - Metadata server (if running on GCP)
     /// - gcloud CLI credentials
-    /// 
+    ///
     /// Supports custom endpoints via environment variables for local emulators and proxies:
     /// - `GCS_ENDPOINT_URL`: Full endpoint URL (e.g., http://localhost:4443)
     /// - `STORAGE_EMULATOR_HOST`: GCS emulator convention (host:port, http:// prepended if missing)
-    /// 
+    ///
     /// When a custom endpoint is set, anonymous authentication is used (typical for emulators).
     pub async fn new() -> Result<Self> {
         let client = GCS_CLIENT
@@ -70,7 +70,7 @@ impl GcsClient {
                                 }
                             })
                     });
-                
+
                 let config = if let Some(endpoint) = custom_endpoint {
                     info!("Using custom GCS endpoint: {}", endpoint);
                     // Local emulators typically don't need auth
@@ -87,14 +87,14 @@ impl GcsClient {
                         .await
                         .map_err(|e| anyhow!("Failed to initialize GCS authentication: {}", e))?
                 };
-                
+
                 let client = Client::new(config);
-                
+
                 info!("GCS client initialized successfully (cached for reuse)");
                 Ok::<Arc<Client>, anyhow::Error>(Arc::new(client))
             })
             .await?;
-        
+
         Ok(Self {
             client: Arc::clone(client),
         })
@@ -111,17 +111,20 @@ impl GcsClient {
     /// Get entire object as bytes.
     pub async fn get_object(&self, bucket: &str, object: &str) -> Result<Bytes> {
         debug!("GCS GET: bucket={}, object={}", bucket, object);
-        
-        let data = self.client.download_object(
-            &GetObjectRequest {
-                bucket: bucket.to_string(),
-                object: object.to_string(),
-                ..Default::default()
-            },
-            &Range::default(),
-        ).await
-        .map_err(|e| anyhow!("GCS GET failed for gs://{}/{}: {}", bucket, object, e))?;
-        
+
+        let data = self
+            .client
+            .download_object(
+                &GetObjectRequest {
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    ..Default::default()
+                },
+                &Range::default(),
+            )
+            .await
+            .map_err(|e| anyhow!("GCS GET failed for gs://{}/{}: {}", bucket, object, e))?;
+
         debug!("GCS GET success: {} bytes", data.len());
         // Convert Vec<u8> to Bytes (cheap, just wraps in Arc)
         Ok(Bytes::from(data))
@@ -145,15 +148,18 @@ impl GcsClient {
             None => Range(Some(offset), None),
         };
 
-        let data = self.client.download_object(
-            &GetObjectRequest {
-                bucket: bucket.to_string(),
-                object: object.to_string(),
-                ..Default::default()
-            },
-            &range,
-        ).await
-        .map_err(|e| anyhow!("GCS GET RANGE failed for gs://{}/{}: {}", bucket, object, e))?;
+        let data = self
+            .client
+            .download_object(
+                &GetObjectRequest {
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    ..Default::default()
+                },
+                &range,
+            )
+            .await
+            .map_err(|e| anyhow!("GCS GET RANGE failed for gs://{}/{}: {}", bucket, object, e))?;
 
         debug!("GCS GET RANGE success: {} bytes", data.len());
         // Convert Vec<u8> to Bytes (cheap, just wraps in Arc)
@@ -162,19 +168,26 @@ impl GcsClient {
 
     /// Upload object with simple upload (for small objects).
     pub async fn put_object(&self, bucket: &str, object: &str, data: &[u8]) -> Result<()> {
-        debug!("GCS PUT: bucket={}, object={}, size={}", bucket, object, data.len());
+        debug!(
+            "GCS PUT: bucket={}, object={}, size={}",
+            bucket,
+            object,
+            data.len()
+        );
 
         let upload_type = UploadType::Simple(Media::new(object.to_string()));
-        
-        self.client.upload_object(
-            &UploadObjectRequest {
-                bucket: bucket.to_string(),
-                ..Default::default()
-            },
-            data.to_vec(),
-            &upload_type,
-        ).await
-        .map_err(|e| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))?;
+
+        self.client
+            .upload_object(
+                &UploadObjectRequest {
+                    bucket: bucket.to_string(),
+                    ..Default::default()
+                },
+                data.to_vec(),
+                &upload_type,
+            )
+            .await
+            .map_err(|e| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))?;
 
         debug!("GCS PUT success: {} bytes", data.len());
         Ok(())
@@ -190,21 +203,32 @@ impl GcsClient {
     ) -> Result<()> {
         debug!(
             "GCS PUT MULTIPART: bucket={}, object={}, size={}",
-            bucket, object, data.len()
+            bucket,
+            object,
+            data.len()
         );
 
         // For now, use simple upload - will implement resumable upload in GcsObjectWriter
         let upload_type = UploadType::Simple(Media::new(object.to_string()));
-        
-        self.client.upload_object(
-            &UploadObjectRequest {
-                bucket: bucket.to_string(),
-                ..Default::default()
-            },
-            data.to_vec(),
-            &upload_type,
-        ).await
-        .map_err(|e| anyhow!("GCS PUT MULTIPART failed for gs://{}/{}: {}", bucket, object, e))?;
+
+        self.client
+            .upload_object(
+                &UploadObjectRequest {
+                    bucket: bucket.to_string(),
+                    ..Default::default()
+                },
+                data.to_vec(),
+                &upload_type,
+            )
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "GCS PUT MULTIPART failed for gs://{}/{}: {}",
+                    bucket,
+                    object,
+                    e
+                )
+            })?;
 
         debug!("GCS PUT MULTIPART success: {} bytes", data.len());
         Ok(())
@@ -214,14 +238,15 @@ impl GcsClient {
     pub async fn stat_object(&self, bucket: &str, object: &str) -> Result<GcsObjectMetadata> {
         debug!("GCS STAT: bucket={}, object={}", bucket, object);
 
-        let obj = self.client.get_object(
-            &GetObjectRequest {
+        let obj = self
+            .client
+            .get_object(&GetObjectRequest {
                 bucket: bucket.to_string(),
                 object: object.to_string(),
                 ..Default::default()
-            },
-        ).await
-        .map_err(|e| anyhow!("GCS STAT failed for gs://{}/{}: {}", bucket, object, e))?;
+            })
+            .await
+            .map_err(|e| anyhow!("GCS STAT failed for gs://{}/{}: {}", bucket, object, e))?;
 
         let result = GcsObjectMetadata {
             size: obj.size as u64,
@@ -238,14 +263,14 @@ impl GcsClient {
     pub async fn delete_object(&self, bucket: &str, object: &str) -> Result<()> {
         debug!("GCS DELETE: bucket={}, object={}", bucket, object);
 
-        self.client.delete_object(
-            &DeleteObjectRequest {
+        self.client
+            .delete_object(&DeleteObjectRequest {
                 bucket: bucket.to_string(),
                 object: object.to_string(),
                 ..Default::default()
-            },
-        ).await
-        .map_err(|e| anyhow!("GCS DELETE failed for gs://{}/{}: {}", bucket, object, e))?;
+            })
+            .await
+            .map_err(|e| anyhow!("GCS DELETE failed for gs://{}/{}: {}", bucket, object, e))?;
 
         debug!("GCS DELETE success");
         Ok(())
@@ -253,7 +278,11 @@ impl GcsClient {
 
     /// Delete multiple objects (batch deletion with concurrency).
     pub async fn delete_objects(&self, bucket: &str, objects: Vec<String>) -> Result<()> {
-        debug!("GCS DELETE BATCH: bucket={}, count={}", bucket, objects.len());
+        debug!(
+            "GCS DELETE BATCH: bucket={}, count={}",
+            bucket,
+            objects.len()
+        );
 
         use futures::stream::{self, StreamExt};
 
@@ -265,13 +294,14 @@ impl GcsClient {
                 let bucket = bucket.clone();
                 let client = client.clone();
                 async move {
-                    client.delete_object(&DeleteObjectRequest {
-                        bucket: bucket.clone(),
-                        object: object.clone(),
-                        ..Default::default()
-                    })
-                    .await
-                    .map_err(|e| anyhow!("Delete failed for {}: {}", object, e))
+                    client
+                        .delete_object(&DeleteObjectRequest {
+                            bucket: bucket.clone(),
+                            object: object.clone(),
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|e| anyhow!("Delete failed for {}: {}", object, e))
                 }
             })
             .buffer_unordered(16) // Concurrent deletions
@@ -281,7 +311,11 @@ impl GcsClient {
         // Check for any errors
         let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
         if !errors.is_empty() {
-            bail!("GCS batch delete had {} failures: {:?}", errors.len(), errors);
+            bail!(
+                "GCS batch delete had {} failures: {:?}",
+                errors.len(),
+                errors
+            );
         }
 
         debug!("GCS DELETE BATCH success");
@@ -290,17 +324,17 @@ impl GcsClient {
 
     /// List objects with optional prefix filtering.
     /// List objects in a GCS bucket with optional prefix filtering.
-    /// 
+    ///
     /// **Pagination**: This method automatically handles GCS pagination to retrieve
     /// all matching objects, not just the first 1000. GCS returns a maximum of 1000
     /// objects per API call by default. This implementation uses the `next_page_token`
     /// from each response to fetch subsequent pages until all objects are retrieved.
-    /// 
+    ///
     /// # Arguments
     /// * `bucket` - The GCS bucket name
     /// * `prefix` - Optional prefix filter for object names
     /// * `recursive` - If false, uses delimiter "/" for directory-like listing
-    /// 
+    ///
     /// # Returns
     /// Complete list of all matching object names (not URIs)
     pub async fn list_objects(
@@ -344,19 +378,20 @@ impl GcsClient {
             debug!(
                 "GCS LIST page request: normalized_prefix={:?}, page_token={:?}",
                 normalized_prefix,
-                page_token.as_ref().map(|t| format!("{}...", &t[..t.len().min(20)]))
+                page_token
+                    .as_ref()
+                    .map(|t| format!("{}...", &t[..t.len().min(20)]))
             );
 
-            let response = self.client.list_objects(&request)
+            let response = self
+                .client
+                .list_objects(&request)
                 .await
                 .map_err(|e| anyhow!("GCS LIST failed for bucket {}: {}", bucket, e))?;
 
             // Collect files at this level (from items[])
             if let Some(items) = response.items {
-                let item_names: Vec<String> = items
-                    .into_iter()
-                    .map(|obj| obj.name)
-                    .collect();
+                let item_names: Vec<String> = items.into_iter().map(|obj| obj.name).collect();
                 debug!("GCS LIST page received: {} objects", item_names.len());
                 results.extend(item_names);
             }
@@ -365,7 +400,10 @@ impl GcsClient {
             // These represent "folders" and always end with "/"
             if !recursive {
                 if let Some(prefixes) = response.prefixes {
-                    debug!("GCS LIST page received: {} prefixes (subdirectories)", prefixes.len());
+                    debug!(
+                        "GCS LIST page received: {} prefixes (subdirectories)",
+                        prefixes.len()
+                    );
                     results.extend(prefixes);
                 }
             }
@@ -380,18 +418,21 @@ impl GcsClient {
             }
         }
 
-        debug!("GCS LIST success: {} total results (files + prefixes)", results.len());
+        debug!(
+            "GCS LIST success: {} total results (files + prefixes)",
+            results.len()
+        );
         Ok(results)
     }
 
     /// List objects in a GCS bucket as a stream, yielding results page by page.
     /// This is more memory-efficient for large listings and enables progress updates.
-    /// 
+    ///
     /// # Arguments
     /// * `bucket` - The GCS bucket name
     /// * `prefix` - Optional prefix filter for object names
     /// * `recursive` - If false, uses delimiter "/" for directory-like listing
-    /// 
+    ///
     /// # Returns
     /// A stream of object names (not URIs)
     pub fn list_objects_stream<'a>(
@@ -477,7 +518,8 @@ impl GcsClient {
 
         // Note: InsertBucketRequest requires project parameter which needs to be configured
         // Location should be set via bucket metadata, not directly on the request
-        self.client.insert_bucket(&request)
+        self.client
+            .insert_bucket(&request)
             .await
             .map_err(|e| anyhow!("GCS CREATE BUCKET failed for {}: {}", bucket, e))?;
 
@@ -489,13 +531,13 @@ impl GcsClient {
     pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         debug!("GCS DELETE BUCKET: bucket={}", bucket);
 
-        self.client.delete_bucket(
-            &DeleteBucketRequest {
+        self.client
+            .delete_bucket(&DeleteBucketRequest {
                 bucket: bucket.to_string(),
                 ..Default::default()
-            },
-        ).await
-        .map_err(|e| anyhow!("GCS DELETE BUCKET failed for {}: {}", bucket, e))?;
+            })
+            .await
+            .map_err(|e| anyhow!("GCS DELETE BUCKET failed for {}: {}", bucket, e))?;
 
         debug!("GCS DELETE BUCKET success");
         Ok(())
@@ -524,7 +566,7 @@ impl GcsClient {
 /// let (bucket, object) = parse_gcs_uri("gcs://my-bucket/path/to/file.txt").unwrap();
 /// assert_eq!(bucket, "my-bucket");
 /// assert_eq!(object, "path/to/file.txt");
-/// 
+///
 /// // Bucket-only URIs are also supported (for prefix listings)
 /// let (bucket, object) = parse_gcs_uri("gs://my-bucket/").unwrap();
 /// assert_eq!(bucket, "my-bucket");
@@ -559,16 +601,18 @@ pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
 // ============================================================================
 
 /// Resolves the GCS storage endpoint based on environment variables.
-/// 
+///
 /// Returns a custom endpoint URL if `GCS_ENDPOINT_URL` or `STORAGE_EMULATOR_HOST`
 /// is set, otherwise returns `None` (indicating default GCS endpoint should be used).
-/// 
+///
 /// This is extracted as a pure function for testability.
 pub fn resolve_gcs_endpoint() -> Option<String> {
-    std::env::var(crate::constants::ENV_GCS_ENDPOINT_URL).ok()
+    std::env::var(crate::constants::ENV_GCS_ENDPOINT_URL)
+        .ok()
         .or_else(|| {
             // GCS emulator convention: STORAGE_EMULATOR_HOST=host:port
-            std::env::var(crate::constants::ENV_STORAGE_EMULATOR_HOST).ok()
+            std::env::var(crate::constants::ENV_STORAGE_EMULATOR_HOST)
+                .ok()
                 .map(|host| {
                     if host.starts_with("http://") || host.starts_with("https://") {
                         host
@@ -587,7 +631,7 @@ pub fn resolve_gcs_endpoint() -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    
+
     // Mutex to serialize tests that modify environment variables
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -623,7 +667,10 @@ mod tests {
     fn test_parse_gcs_uri_invalid_prefix() {
         let result = parse_gcs_uri("s3://bucket/file.txt");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("expected gs:// or gcs:// prefix"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected gs:// or gcs:// prefix"));
     }
 
     #[test]
@@ -638,7 +685,10 @@ mod tests {
     fn test_parse_gcs_uri_empty_bucket() {
         let result = parse_gcs_uri("gs:///path/to/file.txt");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty bucket name"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("empty bucket name"));
     }
 
     // ========================================================================
@@ -648,11 +698,11 @@ mod tests {
     #[test]
     fn test_resolve_gcs_endpoint_default() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Clear any existing endpoint env vars
         std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
         std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
-        
+
         let endpoint = resolve_gcs_endpoint();
         assert!(endpoint.is_none(), "Expected None when no env vars set");
     }
@@ -660,14 +710,17 @@ mod tests {
     #[test]
     fn test_resolve_gcs_endpoint_with_primary_env_var() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Set primary env var
-        std::env::set_var(crate::constants::ENV_GCS_ENDPOINT_URL, "http://localhost:4443");
+        std::env::set_var(
+            crate::constants::ENV_GCS_ENDPOINT_URL,
+            "http://localhost:4443",
+        );
         std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
-        
+
         let endpoint = resolve_gcs_endpoint();
         assert_eq!(endpoint, Some("http://localhost:4443".to_string()));
-        
+
         // Cleanup
         std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
     }
@@ -675,14 +728,17 @@ mod tests {
     #[test]
     fn test_resolve_gcs_endpoint_with_emulator_host_no_scheme() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Set STORAGE_EMULATOR_HOST without http:// prefix (common convention)
         std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
-        std::env::set_var(crate::constants::ENV_STORAGE_EMULATOR_HOST, "localhost:4443");
-        
+        std::env::set_var(
+            crate::constants::ENV_STORAGE_EMULATOR_HOST,
+            "localhost:4443",
+        );
+
         let endpoint = resolve_gcs_endpoint();
         assert_eq!(endpoint, Some("http://localhost:4443".to_string()));
-        
+
         // Cleanup
         std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
     }
@@ -690,14 +746,17 @@ mod tests {
     #[test]
     fn test_resolve_gcs_endpoint_with_emulator_host_with_scheme() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Set STORAGE_EMULATOR_HOST with http:// prefix
         std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
-        std::env::set_var(crate::constants::ENV_STORAGE_EMULATOR_HOST, "http://127.0.0.1:9002");
-        
+        std::env::set_var(
+            crate::constants::ENV_STORAGE_EMULATOR_HOST,
+            "http://127.0.0.1:9002",
+        );
+
         let endpoint = resolve_gcs_endpoint();
         assert_eq!(endpoint, Some("http://127.0.0.1:9002".to_string()));
-        
+
         // Cleanup
         std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
     }
@@ -705,14 +764,17 @@ mod tests {
     #[test]
     fn test_resolve_gcs_endpoint_with_https_scheme() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Set STORAGE_EMULATOR_HOST with https:// prefix
         std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
-        std::env::set_var(crate::constants::ENV_STORAGE_EMULATOR_HOST, "https://secure-emulator:4443");
-        
+        std::env::set_var(
+            crate::constants::ENV_STORAGE_EMULATOR_HOST,
+            "https://secure-emulator:4443",
+        );
+
         let endpoint = resolve_gcs_endpoint();
         assert_eq!(endpoint, Some("https://secure-emulator:4443".to_string()));
-        
+
         // Cleanup
         std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);
     }
@@ -720,14 +782,17 @@ mod tests {
     #[test]
     fn test_resolve_gcs_endpoint_primary_takes_precedence() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Set both env vars - primary should take precedence
-        std::env::set_var(crate::constants::ENV_GCS_ENDPOINT_URL, "http://primary:4443");
+        std::env::set_var(
+            crate::constants::ENV_GCS_ENDPOINT_URL,
+            "http://primary:4443",
+        );
         std::env::set_var(crate::constants::ENV_STORAGE_EMULATOR_HOST, "emulator:9999");
-        
+
         let endpoint = resolve_gcs_endpoint();
         assert_eq!(endpoint, Some("http://primary:4443".to_string()));
-        
+
         // Cleanup
         std::env::remove_var(crate::constants::ENV_GCS_ENDPOINT_URL);
         std::env::remove_var(crate::constants::ENV_STORAGE_EMULATOR_HOST);

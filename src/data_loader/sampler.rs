@@ -9,15 +9,17 @@
 //!  * `SequentialSampler` – yields 0..end in order.
 //!  * `ShuffleSampler`    – yields 0..len in a deterministic shuffled order.
 
-use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 
 /// Trait for index producers.
 pub trait Sampler {
     /// Return the next index to fetch, or `None` when exhausted.
     fn next_index(&mut self) -> Option<usize>;
     /// (Optional) remaining items hint.
-    fn remaining(&self) -> Option<usize> { None }
+    fn remaining(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Yields `0, 1, 2, …, end-1` once.
@@ -100,7 +102,7 @@ mod tests {
     fn sequential_yields_all_in_order() {
         let mut s = SequentialSampler::new(5);
         let got: Vec<_> = std::iter::from_fn(|| s.next_index()).collect();
-        assert_eq!(got, vec![0,1,2,3,4]);
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
         assert_eq!(s.remaining(), Some(0));
     }
 
@@ -110,7 +112,7 @@ mod tests {
         let mut b = ShuffleSampler::new(10, 42);
         let av: Vec<_> = std::iter::from_fn(|| a.next_index()).collect();
         let bv: Vec<_> = std::iter::from_fn(|| b.next_index()).collect();
-        assert_eq!(av, bv);           // same seed -> same order
+        assert_eq!(av, bv); // same seed -> same order
         assert_ne!(av, (0..10).collect::<Vec<_>>()); // not the identity
     }
 }

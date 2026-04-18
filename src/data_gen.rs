@@ -5,21 +5,19 @@
 
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
-use crate::constants::{BLK_SIZE, HALF_BLK, MOD_SIZE, A_BASE_BLOCK, BASE_BLOCK};
-use crate::data_formats::{build_npz, build_tfrecord, build_raw};
-#[cfg(feature = "hdf5")]
-use crate::data_formats::build_hdf5;
 use crate::config::Config;
 use crate::config::ObjectType;
+use crate::constants::{A_BASE_BLOCK, BASE_BLOCK, BLK_SIZE, HALF_BLK, MOD_SIZE};
+#[cfg(feature = "hdf5")]
+use crate::data_formats::build_hdf5;
+use crate::data_formats::{build_npz, build_raw, build_tfrecord};
 
 // -----------------------------------------------------------------------------
 // Generate a buffer of random bytes.
 // -----------------------------------------------------------------------------
 // Data generation constants moved to src/constants.rs
-
-
 
 // -------------------------------------------------------------
 // Public API to generate a specific object type, of a given size
@@ -27,32 +25,42 @@ use crate::config::ObjectType;
 /// A function to build objects in the correct format
 pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
     use crate::config::DataGenMode;
-    
+
     let total_bytes = cfg.elements * cfg.element_size;
     info!(
         "Generating object: type={:?}, elements={}, element_size={} bytes, total_bytes={}, algorithm={:?}, mode={:?}",
         cfg.object_type, cfg.elements, cfg.element_size, total_bytes, cfg.data_gen_algorithm, cfg.data_gen_mode
     );
-    
+
     let data = if cfg.use_controlled {
         // Choose mode (streaming vs single-pass)
         match cfg.data_gen_mode {
             DataGenMode::Streaming => {
-                debug!("Using streaming controlled data: dedup={}, compress={}, chunk_size={}", 
-                    cfg.dedup_factor, cfg.compress_factor, cfg.chunk_size);
-                generate_controlled_data_streaming(total_bytes, cfg.dedup_factor, cfg.compress_factor, cfg.chunk_size)
-            },
+                debug!(
+                    "Using streaming controlled data: dedup={}, compress={}, chunk_size={}",
+                    cfg.dedup_factor, cfg.compress_factor, cfg.chunk_size
+                );
+                generate_controlled_data_streaming(
+                    total_bytes,
+                    cfg.dedup_factor,
+                    cfg.compress_factor,
+                    cfg.chunk_size,
+                )
+            }
             DataGenMode::SinglePass => {
-                debug!("Using single-pass controlled data: dedup={}, compress={}", 
-                    cfg.dedup_factor, cfg.compress_factor);
+                debug!(
+                    "Using single-pass controlled data: dedup={}, compress={}",
+                    cfg.dedup_factor, cfg.compress_factor
+                );
                 // Use data_gen_alt for single-pass generation
                 crate::data_gen_alt::generate_controlled_data_alt(
-                    total_bytes, 
-                    cfg.dedup_factor, 
-                    cfg.compress_factor, 
-                    None
-                ).to_vec()
-            },
+                    total_bytes,
+                    cfg.dedup_factor,
+                    cfg.compress_factor,
+                    None,
+                )
+                .to_vec()
+            }
         }
     } else {
         debug!("Using generic random data");
@@ -71,11 +79,11 @@ pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
 
     // New, uses type
     let object = match cfg.object_type {
-        ObjectType::Npz      => build_npz(cfg.elements, cfg.element_size, &data)?,
+        ObjectType::Npz => build_npz(cfg.elements, cfg.element_size, &data)?,
         #[cfg(feature = "hdf5")]
-        ObjectType::Hdf5     => build_hdf5(cfg.elements, cfg.element_size, &data)?,
+        ObjectType::Hdf5 => build_hdf5(cfg.elements, cfg.element_size, &data)?,
         #[cfg(not(feature = "hdf5"))]
-        ObjectType::Hdf5     => anyhow::bail!(
+        ObjectType::Hdf5 => anyhow::bail!(
             "HDF5 format is not available in this build.\n\
              If you installed via pip, rebuild from source with the hdf5 extra:\n\
              \n\
@@ -88,7 +96,7 @@ pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
              macOS:         brew install hdf5"
         ),
         ObjectType::TfRecord => build_tfrecord(cfg.elements, cfg.element_size, &data)?,
-        ObjectType::Raw      => build_raw(&data)?,
+        ObjectType::Raw => build_raw(&data)?,
     };
 
     debug!("Generated paylod: {} bytes", object.len());
@@ -102,22 +110,22 @@ pub fn generate_object(cfg: &Config) -> anyhow::Result<bytes::Bytes> {
 pub fn generate_npz(size: usize) -> Vec<u8> {
     //generate_random_data(size)
     generate_controlled_data(size, 1, 1)
-} 
+}
 
 pub fn generate_tfrecord(size: usize) -> Vec<u8> {
     //generate_random_data(size)
     generate_controlled_data(size, 1, 1)
-} 
+}
 
 pub fn generate_hdf5(size: usize) -> Vec<u8> {
     //generate_random_data(size)
     generate_controlled_data(size, 1, 1)
-} 
+}
 
 pub fn generate_raw_data(size: usize) -> Vec<u8> {
     //generate_random_data(size)
     generate_controlled_data(size, 1, 1)
-} 
+}
 *
 */
 
@@ -129,12 +137,7 @@ pub fn generate_raw_data(size: usize) -> Vec<u8> {
 ///
 /// This ensures each BLK_SIZE-byte block is unique while avoiding the need to generate a whole new
 /// random buffer on every call.
-pub fn generate_random_data(mut size: usize) -> Vec<u8> {
-    // Enforce a minimum size of BLK_SIZE bytes.
-    if size < BLK_SIZE {
-        size = BLK_SIZE;
-    }
-
+pub fn generate_random_data(size: usize) -> Vec<u8> {
     // Allocate the buffer.
     let mut data = vec![0u8; size];
 
@@ -152,13 +155,17 @@ pub fn generate_random_data(mut size: usize) -> Vec<u8> {
 
         // Modify the first MOD_SIZE bytes (or the full block if it's smaller).
         if block_size > 0 {
-            let first_len = if block_size >= MOD_SIZE { MOD_SIZE } else { block_size };
-            rng.fill(&mut data[offset .. offset + first_len]);
+            let first_len = if block_size >= MOD_SIZE {
+                MOD_SIZE
+            } else {
+                block_size
+            };
+            rng.fill(&mut data[offset..offset + first_len]);
         }
 
         // Modify the last MOD_SIZE bytes only if the block is larger than 128 bytes.
         if block_size > HALF_BLK {
-            rng.fill(&mut data[block_end - MOD_SIZE .. block_end]);
+            rng.fill(&mut data[block_end - MOD_SIZE..block_end]);
         }
 
         offset += BLK_SIZE;
@@ -166,7 +173,6 @@ pub fn generate_random_data(mut size: usize) -> Vec<u8> {
 
     data
 }
-
 
 /// Generates a buffer of `size` bytes with controlled deduplication and compressibility.
 ///
@@ -193,21 +199,26 @@ pub fn generate_random_data(mut size: usize) -> Vec<u8> {
 ///
 /// Generate controlled data using streaming approach for optimal performance.
 /// Based on benchmarks showing streaming is faster for most workload sizes.
-pub fn generate_controlled_data_streaming(size: usize, dedup: usize, compress: usize, chunk_size: usize) -> Vec<u8> {
+pub fn generate_controlled_data_streaming(
+    size: usize,
+    dedup: usize,
+    compress: usize,
+    chunk_size: usize,
+) -> Vec<u8> {
     let generator = DataGenerator::new(None);
     let mut object_gen = generator.begin_object(size, dedup, compress);
-    
+
     let mut result = Vec::with_capacity(size);
-    
+
     while !object_gen.is_complete() {
         let remaining = object_gen.total_size() - object_gen.position();
         let current_chunk_size = remaining.min(chunk_size);
-        
+
         if let Some(chunk) = object_gen.fill_chunk(current_chunk_size) {
             result.extend_from_slice(&chunk);
         }
     }
-    
+
     result
 }
 
@@ -260,7 +271,7 @@ pub fn generate_controlled_data(size: usize, dedup: usize, compress: usize) -> V
 /// # Example
 /// ```ignore
 /// use s3dlio::fill_controlled_data;
-/// 
+///
 /// // 1 MB incompressible data using fast fill-in-place
 /// let mut data = vec![0u8; 1024 * 1024];
 /// fill_controlled_data(&mut data, 1, 1);
@@ -278,7 +289,7 @@ pub fn generate_controlled_data_prand(size: usize, dedup: usize, compress: usize
 }
 */
 /// Fill a buffer in-place with controlled random data (dedup/compress).
-/// 
+///
 /// **CRITICAL**: This uses the global Rayon pool, which means it respects any
 /// `rayon::ThreadPool::install()` context. Use this when you need to control
 /// which thread pool does the parallel work.
@@ -349,33 +360,35 @@ pub fn fill_controlled_data(buf: &mut [u8], dedup: usize, compress: usize) {
         .as_nanos() as u64;
 
     // FILL IN PLACE using global Rayon pool (respects install() context!)
-    buf.par_chunks_mut(block_size).enumerate().for_each(|(i, chunk)| {
-        let unique_block_idx = i % unique_blocks;
-        let seed = (unique_block_idx as u64).wrapping_add(call_entropy);
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+    buf.par_chunks_mut(block_size)
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let unique_block_idx = i % unique_blocks;
+            let seed = (unique_block_idx as u64).wrapping_add(call_entropy);
+            let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
 
-        // Copy from base block
-        let src = &*A_BASE_BLOCK;
-        let len = chunk.len();
-        chunk.copy_from_slice(&src[..len]);
+            // Copy from base block
+            let src = &*A_BASE_BLOCK;
+            let len = chunk.len();
+            chunk.copy_from_slice(&src[..len]);
 
-        // Apply zero-prefix for compression
-        let const_len = const_lens[unique_block_idx].min(len);
-        chunk[..const_len].fill(0);
+            // Apply zero-prefix for compression
+            let const_len = const_lens[unique_block_idx].min(len);
+            chunk[..const_len].fill(0);
 
-        // Inject uniqueness
-        let region_start = const_len;
-        let region_len = len - region_start;
-        let modify_len = region_len.min(MOD_SIZE);
+            // Inject uniqueness
+            let region_start = const_len;
+            let region_len = len - region_start;
+            let modify_len = region_len.min(MOD_SIZE);
 
-        if modify_len > 0 {
-            rng.fill(&mut chunk[region_start..region_start + modify_len]);
-            let second_offset = HALF_BLK.max(region_start);
-            if second_offset + modify_len <= len {
-                rng.fill(&mut chunk[second_offset..second_offset + modify_len]);
+            if modify_len > 0 {
+                rng.fill(&mut chunk[region_start..region_start + modify_len]);
+                let second_offset = HALF_BLK.max(region_start);
+                if second_offset + modify_len <= len {
+                    rng.fill(&mut chunk[second_offset..second_offset + modify_len]);
+                }
             }
-        }
-    });
+        });
 }
 
 // ============================================================================
@@ -468,7 +481,7 @@ fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: us
         if modify_len > 0 {
             // First region: at start of random region
             rng.fill(&mut chunk[region_start..region_start + modify_len]);
-            
+
             // Second region: at HALF_BLK offset if it fits
             let second_offset = HALF_BLK.max(region_start);
             if second_offset + modify_len <= len {
@@ -483,9 +496,12 @@ fn generate_controlled_data_original(mut size: usize, dedup: usize, compress: us
 }
 */  // End of commented-out generate_controlled_data_original
 
-
 /// Two-pass version (original implementation) - kept for testing parity
-pub fn generate_controlled_data_two_pass(mut size: usize, dedup: usize, compress: usize) -> Vec<u8> {
+pub fn generate_controlled_data_two_pass(
+    mut size: usize,
+    dedup: usize,
+    compress: usize,
+) -> Vec<u8> {
     // Enforce a minimum size of BLK_SIZE bytes.
     if size < BLK_SIZE {
         size = BLK_SIZE;
@@ -578,34 +594,34 @@ pub fn generate_controlled_data_two_pass(mut size: usize, dedup: usize, compress
 // =============================================================================
 
 /// Object-scoped data generator that maintains consistent block indexing across streaming chunks.
-/// 
-/// This enables streaming data generation while preserving exact deduplication and compression 
+///
+/// This enables streaming data generation while preserving exact deduplication and compression
 /// semantics. Each object maintains a global block index that ensures identical dedup/compress
 /// ratios regardless of how the data is chunked during streaming.
 pub struct DataGenerator {
-    /// Instance-specific entropy generated at creation time to differentiate between different 
+    /// Instance-specific entropy generated at creation time to differentiate between different
     /// DataGenerator instances while maintaining deterministic behavior for the same instance
     instance_entropy: u64,
 }
 
 impl DataGenerator {
     /// Create a new DataGenerator.
-    /// 
+    ///
     /// # Parameters
     /// - `seed`: Optional seed for reproducible data generation. If `None`, uses system entropy
     ///   to generate unique data on each invocation. If `Some(seed)`, all generators with the
     ///   same seed will produce identical data patterns.
-    /// 
+    ///
     /// # Examples
-    /// 
+    ///
     /// ```ignore
     /// use s3dlio::data_gen::DataGenerator;
-    /// 
+    ///
     /// // Default: use system entropy (unique data per instance)
     /// let gen1 = DataGenerator::new(None);
     /// let gen2 = DataGenerator::new(None);
     /// // gen1 and gen2 will produce different data
-    /// 
+    ///
     /// // Reproducible: use explicit seed
     /// let gen3 = DataGenerator::new(Some(42));
     /// let gen4 = DataGenerator::new(Some(42));
@@ -616,61 +632,64 @@ impl DataGenerator {
             Some(s) => s,
             None => {
                 // Generate instance-specific entropy at creation time
-                use std::time::{SystemTime, UNIX_EPOCH};
                 use std::cell::Cell;
+                use std::time::{SystemTime, UNIX_EPOCH};
                 thread_local! {
                     static ENTROPY_COUNTER: Cell<u64> = const { Cell::new(0) };
                 }
-                
+
                 let base_entropy = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64;
-                    
+
                 let counter = ENTROPY_COUNTER.with(|c| {
                     let val = c.get();
                     c.set(val.wrapping_add(1));
                     val
                 });
-                
+
                 base_entropy.wrapping_add(counter)
             }
         };
-            
+
         Self { instance_entropy }
     }
-    
+
     /// Create a new DataGenerator with an explicit seed for reproducible data generation.
-    /// 
+    ///
     /// **Deprecated**: Use `DataGenerator::new(Some(seed))` instead.
-    /// 
+    ///
     /// This is useful when you need deterministic data generation across different runs,
     /// such as for testing or when recreating the same dataset.
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// use s3dlio::data_gen::DataGenerator;
-    /// 
+    ///
     /// // Create two generators with the same seed - they will produce identical data
     /// let gen1 = DataGenerator::new_with_seed(42);
     /// let gen2 = DataGenerator::new_with_seed(42);
-    /// 
+    ///
     /// let obj1 = gen1.begin_object(1024 * 1024, 1, 1);
     /// let obj2 = gen2.begin_object(1024 * 1024, 1, 1);
     /// // obj1 and obj2 will generate identical bytes
     /// ```
     pub fn new_with_seed(seed: u64) -> Self {
-        Self { instance_entropy: seed }
-    }    /// Begin generating a new object with the specified parameters.
-    /// 
+        Self {
+            instance_entropy: seed,
+        }
+    }
+    /// Begin generating a new object with the specified parameters.
+    ///
     /// REDIRECTED TO NEW ALGORITHM: Creates ObjectGenAlt for improved compression control.
     /// This provides truly incompressible data when compress=1 (fixes cross-block compression bug)
-    /// 
+    ///
     /// # Parameters
     /// - `size`: Total size of the object in bytes
     /// - `dedup`: Deduplication factor (0 treated as 1)
     /// - `compress`: Compression factor for controllable compressibility
-    /// 
+    ///
     /// # Returns
     /// An ObjectGen instance for streaming generation of the object
     pub fn begin_object(&self, size: usize, dedup: usize, compress: usize) -> ObjectGen {
@@ -686,7 +705,7 @@ impl Default for DataGenerator {
 }
 
 /// Per-object generator that maintains state for streaming generation of a single object.
-/// 
+///
 /// REDIRECTED TO NEW ALGORITHM: This now wraps ObjectGenAlt for improved compression control.
 /// The public API remains unchanged for backward compatibility.
 pub struct ObjectGen {
@@ -698,7 +717,12 @@ impl ObjectGen {
     /// Create a new ObjectGen using the new algorithm (ObjectGenAlt)
     fn from_alt(total_size: usize, dedup: usize, compress: usize, call_entropy: u64) -> Self {
         Self {
-            alt_gen: crate::data_gen_alt::ObjectGenAlt::new_with_seed(total_size, dedup, compress, call_entropy),
+            alt_gen: crate::data_gen_alt::ObjectGenAlt::new_with_seed(
+                total_size,
+                dedup,
+                compress,
+                call_entropy,
+            ),
         }
     }
 
@@ -709,9 +733,9 @@ impl ObjectGen {
         if total_size < BLK_SIZE {
             total_size = BLK_SIZE;
         }
-        
+
         let total_blocks = (total_size + BLK_SIZE - 1) / BLK_SIZE;
-        
+
         // Calculate deduplication (identical to generate_controlled_data)
         let dedup_factor = if dedup == 0 { 1 } else { dedup };
         let unique_blocks = if dedup_factor > 1 {
@@ -719,7 +743,7 @@ impl ObjectGen {
         } else {
             total_blocks
         };
-        
+
         // Calculate compression parameters (identical to generate_controlled_data)
         let (f_num, f_den) = if compress > 1 {
             (compress - 1, compress)
@@ -728,7 +752,7 @@ impl ObjectGen {
         };
         let floor_len = (f_num * BLK_SIZE) / f_den;
         let rem = (f_num * BLK_SIZE) % f_den;
-        
+
         // Precompute integer error distribution (identical to generate_controlled_data)
         let mut const_lens = Vec::with_capacity(unique_blocks);
         let mut err_acc = 0;
@@ -741,7 +765,7 @@ impl ObjectGen {
                 const_lens.push(floor_len);
             }
         }
-        
+
         Self {
             total_size,
             unique_blocks,
@@ -751,30 +775,30 @@ impl ObjectGen {
         }
     }
     */
-    
+
     /// Fill a chunk with generated data starting at the current position.
-    /// 
+    ///
     /// REDIRECTED: Delegates to ObjectGenAlt for improved compression control
-    /// 
+    ///
     /// # Parameters
     /// - `chunk_size`: Size of the chunk to generate
-    /// 
+    ///
     /// # Returns
     /// A Vec<u8> with generated data, or None if all data has been generated
-    /// 
+    ///
     /// # Panics
     /// Panics if chunk_size is 0
     pub fn fill_chunk(&mut self, chunk_size: usize) -> Option<Vec<u8>> {
         assert!(chunk_size > 0, "Chunk size must be greater than 0");
-        
+
         // Allocate buffer and delegate to ObjectGenAlt
         let mut buf = vec![0u8; chunk_size];
         let written = self.alt_gen.fill_chunk(&mut buf);
-        
+
         if written == 0 {
             return None;
         }
-        
+
         buf.truncate(written);
         Some(buf)
     }
@@ -785,7 +809,7 @@ impl ObjectGen {
         if remaining == 0 {
             return Vec::new();
         }
-        
+
         self.fill_chunk(remaining).unwrap_or_default()
     }
 
@@ -813,85 +837,85 @@ impl ObjectGen {
     #[allow(dead_code)]
     fn fill_chunk_original(&mut self, chunk_size: usize) -> Option<Vec<u8>> {
         assert!(chunk_size > 0, "Chunk size must be greater than 0");
-        
+
         // Check if we've reached the end of the object
         if self.current_pos >= self.total_size {
             return None;
         }
-        
+
         // Determine actual chunk size (may be smaller at end of object)
         let remaining = self.total_size - self.current_pos;
         let actual_chunk_size = chunk_size.min(remaining);
-        
+
         // Create buffer for the chunk
         let mut chunk_data = vec![0u8; actual_chunk_size];
-        
+
         // Find which blocks intersect with this chunk
         let start_block = self.current_pos / BLK_SIZE;
         let end_pos = self.current_pos + actual_chunk_size;
         let end_block = (end_pos + BLK_SIZE - 1) / BLK_SIZE;
-        
+
         // Generate data block by block to match single-pass logic exactly
         for block_idx in start_block..end_block {
             let block_start_global = block_idx * BLK_SIZE;
             let block_end_global = (block_start_global + BLK_SIZE).min(self.total_size);
-            
+
             // Find intersection with current chunk
             let chunk_start_in_block = self.current_pos.max(block_start_global);
             let chunk_end_in_block = end_pos.min(block_end_global);
-            
+
             if chunk_start_in_block < chunk_end_in_block {
                 // Generate full block using EXACT same logic as single-pass
                 let unique_block_idx = block_idx % self.unique_blocks;
                 let seed = (unique_block_idx as u64).wrapping_add(self.call_entropy);
                 let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-                
+
                 // 1) Start with base block data
                 let block_size = block_end_global - block_start_global;
                 let mut block_data = A_BASE_BLOCK[..block_size].to_vec();
-                
+
                 // 2) Apply compression (zero prefix) - identical to single-pass
                 let const_len = self.const_lens[unique_block_idx].min(block_size);
                 block_data[..const_len].fill(0);
-                
+
                 // 3) Apply uniqueness modifications - IDENTICAL to single-pass
                 let region_start = const_len;
                 let region_len = block_size - region_start;
                 let modify_len = region_len.min(MOD_SIZE);
-                
+
                 if modify_len > 0 {
                     // First region: at start of random region - EXACT same as single-pass
                     rng.fill(&mut block_data[region_start..region_start + modify_len]);
-                    
+
                     // Second region: at HALF_BLK offset if it fits - EXACT same as single-pass
                     let second_offset = HALF_BLK.max(region_start);
                     if second_offset + modify_len <= block_size {
                         rng.fill(&mut block_data[second_offset..second_offset + modify_len]);
                     }
                 }
-                
+
                 // Copy intersection to chunk
                 let chunk_offset_start = chunk_start_in_block - self.current_pos;
                 let chunk_offset_end = chunk_end_in_block - self.current_pos;
                 let block_offset_start = chunk_start_in_block - block_start_global;
                 let block_offset_end = chunk_end_in_block - block_start_global;
-                
+
                 chunk_data[chunk_offset_start..chunk_offset_end]
                     .copy_from_slice(&block_data[block_offset_start..block_offset_end]);
             }
         }
-        
+
         // Update position for next chunk
         self.current_pos += actual_chunk_size;
-        
+
         Some(chunk_data)
     }
-    
+
     /// Fill all remaining chunks and collect into a single buffer.
-    /// 
+    ///
     /// This is a convenience method that generates all remaining data at once.
     /// Equivalent to calling fill_chunk repeatedly with a large chunk size.
-    /// 
+    ///
     /// # Returns
     /// All remaining data as a single Vec<u8>, or empty Vec if no data remains
     pub fn fill_remaining(&mut self) -> Vec<u8> {
@@ -899,33 +923,30 @@ impl ObjectGen {
         if remaining == 0 {
             return Vec::new();
         }
-        
+
         self.fill_chunk(remaining).unwrap_or_default()
     }
-    
+
     /// Get the current position in the object (bytes generated so far).
     pub fn position(&self) -> usize {
         self.current_pos
     }
-    
+
     /// Get the total size of the object being generated.
     pub fn total_size(&self) -> usize {
         self.total_size
     }
-    
+
     /// Check if all data has been generated.
     pub fn is_complete(&self) -> bool {
         self.current_pos >= self.total_size
     }
-    
+
     /// Reset the generator to the beginning of the object.
-    /// 
+    ///
     /// This allows re-generating the same object data, useful for retries or testing.
     pub fn reset(&mut self) {
         self.current_pos = 0;
     }
     */
 }
-
-
-

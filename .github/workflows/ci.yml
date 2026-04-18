@@ -26,7 +26,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.91'
+          toolchain: stable
       
       - name: Build (Rust)
         run: cargo build --release
@@ -65,4 +65,7 @@ jobs:
         run: cargo fmt --all -- --check
       
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # --all-features omitted: native-backends and arrow-backend are mutually
+        # exclusive (compile_error! guards this); defaults include native-backends.
+        # Tests/benches are compiled and validated by the Test job above.
+        run: cargo clippy --lib --bins --examples -- -D warnings

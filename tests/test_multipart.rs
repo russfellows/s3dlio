@@ -3,15 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use s3dlio::{MultipartUploadConfig, MultipartUploadSink};
 use s3dlio::s3_client::{aws_s3_client_async, run_on_global_rt};
+use s3dlio::{MultipartUploadConfig, MultipartUploadSink};
 
 fn unique(prefix: &str) -> String {
     let pid = std::process::id();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     format!("s3dlio-{}-{}-{}", prefix, pid, now)
 }
 
@@ -26,14 +29,22 @@ fn multipart_upload_basic() -> Result<()> {
         let bucket = bucket.clone();
         async move {
             let client = aws_s3_client_async().await?;
-            client.create_bucket().bucket(&bucket).send().await
+            client
+                .create_bucket()
+                .bucket(&bucket)
+                .send()
+                .await
                 .context("create_bucket")?;
             Ok::<(), anyhow::Error>(())
         }
     })?;
 
     // Upload ~65 MiB in 8 MiB writes
-    let cfg = MultipartUploadConfig { part_size: 32 * 1024 * 1024, max_in_flight: 8, ..Default::default() };
+    let cfg = MultipartUploadConfig {
+        part_size: 32 * 1024 * 1024,
+        max_in_flight: 8,
+        ..Default::default()
+    };
     let mut sink = MultipartUploadSink::new(&bucket, key, cfg)?;
 
     let total = (64 * 1024 * 1024) + (3 * 1024 * 1024);
@@ -59,10 +70,25 @@ fn multipart_upload_basic() -> Result<()> {
         let key = key.to_string();
         async move {
             let client = aws_s3_client_async().await?;
-            let head = client.head_object().bucket(&bucket).key(&key).send().await?;
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await?;
             let size = head.content_length().unwrap_or_default();
-            ensure!(size == total as i64, "HEAD size mismatch: {} vs {}", size, total);
-            let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+            ensure!(
+                size == total as i64,
+                "HEAD size mismatch: {} vs {}",
+                size,
+                total
+            );
+            let _ = client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await;
             let _ = client.delete_bucket().bucket(&bucket).send().await;
             Ok::<(), anyhow::Error>(())
         }
@@ -82,18 +108,26 @@ fn multipart_upload_abort() -> Result<()> {
         let bucket = bucket.clone();
         async move {
             let client = aws_s3_client_async().await?;
-            client.create_bucket().bucket(&bucket).send().await
+            client
+                .create_bucket()
+                .bucket(&bucket)
+                .send()
+                .await
                 .context("create_bucket")?;
             Ok::<(), anyhow::Error>(())
         }
     })?;
 
     // Start upload and then abort
-    let cfg = MultipartUploadConfig { part_size: 16 * 1024 * 1024, max_in_flight: 4, ..Default::default() };
+    let cfg = MultipartUploadConfig {
+        part_size: 16 * 1024 * 1024,
+        max_in_flight: 4,
+        ..Default::default()
+    };
     let mut sink = MultipartUploadSink::new(&bucket, key, cfg)?;
     sink.write_blocking(&vec![0xCD; 5 * 1024 * 1024])?;
-    sink.flush_blocking()?;     // force a part upload to start
-    sink.abort_blocking()?;     // abort the MPU
+    sink.flush_blocking()?; // force a part upload to start
+    sink.abort_blocking()?; // abort the MPU
 
     // Object should not exist
     run_on_global_rt({
@@ -110,4 +144,3 @@ fn multipart_upload_abort() -> Result<()> {
 
     Ok(())
 }
-

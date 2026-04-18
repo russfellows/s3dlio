@@ -382,6 +382,16 @@ s3-cli --op-log sorted.tsv.zst ls -r s3://bucket/
 | `GCS_ENDPOINT_URL` | Custom endpoint |
 | `STORAGE_EMULATOR_HOST` | GCS emulator endpoint |
 
+### HTTP/2 Configuration
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_H2C` | *(not set)* | HTTP/2 cleartext mode for `http://` endpoints. Not set = auto-probe h2c on first connection, fall back to HTTP/1.1 if rejected. `1` (or `true`, `yes`, `on`, `enable`) = force h2c, no fallback. `0` (or `false`, `no`, `off`, `disable`) = always HTTP/1.1, skip probe. Has **no effect** on `https://` endpoints — those negotiate HTTP/2 automatically via TLS ALPN. |
+| `S3DLIO_POOL_MAX_IDLE_PER_HOST` | `32` | Maximum idle connections per host in the reqwest connection pool. |
+| `S3DLIO_POOL_IDLE_TIMEOUT_SECS` | `90` | Idle connection timeout in seconds before a pooled connection is closed. |
+| `S3DLIO_H2_ADAPTIVE_WINDOW` | `1` (enabled) | HTTP/2 flow-control window mode (active when `S3DLIO_H2C=1`). `1` = adaptive BDP estimator: hyper sends H2 PING frames, measures RTT, computes `BDP = throughput × RTT`, and auto-issues `WINDOW_UPDATE` to eliminate stalls. **Completely overrides the two static variables below when enabled.** `0` = static windows. |
+| `S3DLIO_H2_STREAM_WINDOW_MB` | `4` | Per-stream H2 flow-control window in MiB (static mode only). Controls how much response data the server may send on one stream before we must issue `WINDOW_UPDATE`. H2 spec default is 64 KB — too small for storage I/O. Ignored when `S3DLIO_H2_ADAPTIVE_WINDOW=1`. Max 256 MiB. |
+| `S3DLIO_H2_CONN_WINDOW_MB` | `4×stream` | Connection-level H2 flow-control window in MiB (static mode only). Aggregate receive budget across all concurrent streams on one TCP connection. Must be ≥ stream window or the connection becomes the bottleneck. Defaults to 4× `S3DLIO_H2_STREAM_WINDOW_MB`. Ignored when adaptive. Max 256 MiB. |
+
 ### Logging
 | Variable | Description |
 |----------|-------------|
@@ -406,6 +416,14 @@ s3-cli download s3://bucket/data/ ./local/
 
 # With custom endpoint (MinIO)
 AWS_ENDPOINT_URL=http://localhost:9000 s3-cli ls s3://bucket/
+
+# With custom endpoint over plain HTTP, forcing HTTP/2 cleartext (h2c)
+# Use this for storage systems that require HTTP/2 on their http:// API endpoint
+AWS_ENDPOINT_URL=http://storage-host:9000 S3DLIO_H2C=1 s3-cli stat s3://bucket/object
+
+# With custom endpoint using TLS — HTTP/2 is negotiated automatically via ALPN
+# (no S3DLIO_H2C needed for https:// endpoints)
+AWS_ENDPOINT_URL=https://storage-host:9000 AWS_CA_BUNDLE=/path/to/ca.crt s3-cli stat s3://bucket/object
 ```
 
 ### Azure Blob

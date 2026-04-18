@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.86"
+version = "0.9.90"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -26,8 +26,8 @@ path = "src/bin/cli.rs"
 
 [dependencies]
 # AWS SDK - pinned to latest stable (update by running: cargo search aws-config)
-aws-config         = "=1.8.14"
-aws-sdk-s3         = "=1.124.0"
+aws-config         = "=1.8.15"
+aws-sdk-s3         = "=1.129.0"
 
 # Azure SDK crates (keep minor versions flexible; they evolve together)
 azure_core = { version = "=0.31.0", optional = true }          # Response/Body, paging, errors
@@ -42,9 +42,9 @@ gcloud-storage = { version = "^1.2", optional = true }  # Community GCS client (
 # google-cloud-storage = { path = "../google-cloud-rust/src/storage", optional = true }
 # google-cloud-gax = { path = "../google-cloud-rust/src/gax", optional = true }
 # google-cloud-gax-internal = { path = "../google-cloud-rust/src/gax-internal", features = ["_internal-grpc-client"], optional = true }
-google-cloud-storage = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260317.1", optional = true }
-google-cloud-gax = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260317.1", optional = true }
-google-cloud-gax-internal = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260317.1", features = ["_internal-grpc-client"], optional = true }
+google-cloud-storage = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2", optional = true }
+google-cloud-gax = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2", optional = true }
+google-cloud-gax-internal = { git = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2", features = ["_internal-grpc-client"], optional = true }
 
 # Logging (tracing ecosystem for compatibility with dl-driver/s3-bench)
 tracing = { version = "^0.1", features = ["log"] }  # Main tracing API with log compat
@@ -57,13 +57,12 @@ tokio-stream = { version = "^0.1", features = ["sync"] }
 tokio-util = "^0.7"  # For CancellationToken and other utilities
 async-stream = "^0.3"  # For stream! macro in list_stream implementations
 # HTTP stack
-hyper   = { version = "^1", features = ["client"] }
-hyper-util = { version = "^0.1", features = ["client-legacy", "tokio"] }
-hyper-rustls = "^0.27"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+http    = "^1"             # Re-exported by reqwest, but needed as direct dep for response building
+http-body-util  = "^0.1"   # BodyExt::collect() for SdkBody async collection
+aws-smithy-types = "^1"   # SdkBody type used by reqwest_client.rs bridge
 aws-smithy-http-client = { version = "^1", features = ["rustls-aws-lc"] }
 aws-smithy-runtime-api = "^1"                         # ← Added for HTTP client types
-rustls  = { version = "^0.23" }					# ← matches hyper‑rustls 0.27
-webpki-roots = "^0.26"
 
 # --- util / CLI / etc. ----------------------------------------------------
 once_cell   = "^1.19"
@@ -127,12 +126,15 @@ humantime    = "^2.2"
 tokio-sync   = "^0.1.8"
 base64 = "0.22.1"
 
+# TLS certificate probing for redirect-chain cert pinning (issue #126)
+rustls              = { version = "0.23", features = ["aws-lc-rs"] }
+tokio-rustls        = "0.26"
+rustls-native-certs = "0.8"
+
 # --- Arrow backend (optional, enabled via "arrow-backend" feature) -------
 object_store = { version = "0.13", default-features = false, features = ["aws", "azure", "http", "gcp"], optional = true }
 url = { version = "2.5", optional = true }
 
-# --- Enhanced HTTP client with HTTP/2 support --------------------------------
-reqwest = { version = "0.12", features = ["rustls-tls", "http2", "hickory-dns"], optional = true }
 
 # --- High-performance memory and file I/O ------------------------------------
 nix = { version = "0.31", features = ["fs"], optional = true }  # For O_DIRECT and positioned I/O
@@ -153,9 +155,13 @@ tokio-sync   = "^0.1.8"
 futures-util  = "^0.3"
 async-trait   = "^0.1"   # needed by the mock datasets
 criterion     = { version = "0.5", features = ["html_reports"] }
-# RFC conformance tests for redirect_client
-http          = "0.2"           # needed to construct HttpRequest with non-GET methods (e.g., POST for 303 test)
+# RFC conformance tests for redirect_client (uses http 1.x — same version as production dep)
 aws-smithy-types = "^1"        # needed for SdkBody::empty() in test fixtures
+
+# tls_test_server example: minimal TLS+HTTP/2 server for ALPN verification
+rcgen        = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+hyper        = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util   = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 
 [features]
 #default = []
@@ -172,14 +178,14 @@ backend-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-c
 full-backends = ["backend-aws", "backend-azure", "backend-gcs"]
 gcs-community = ["backend-gcs", "dep:gcloud-storage"]  # Legacy community GCS client (JSON API, no RAPID support; conflicts with official GCS client)
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
-enhanced-http = ["dep:reqwest"]      # Enhanced HTTP client with HTTP/2 support
+h2c = []                             # Enable HTTP/2 cleartext (h2c) transport for high-throughput PUT workloads
 direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
 numa = ["dep:hwlocality"]  # NUMA topology detection - requires hwloc2 C library (optional, not in defaults)
 thread-pinning = ["dep:core_affinity"]  # CPU core affinity for thread pinning (pure Rust, safe for all platforms)
 hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys"]  # HDF5 data format support - requires libhdf5 (optional, not in defaults)
 profiling = ["dep:console-subscriber", "dep:pprof"]  # tracing deps now always available
 extension-module = ["dep:pyo3", "dep:pyo3-async-runtimes"]     # suppresses the cfg warning when building the wheel
-experimental-http-client = []        # Enable custom hyper_builder optimizations (requires patched aws-smithy-http-client)
+
 test-npy-09 = []                     # Test ndarray-npy 0.9 API compatibility (temporary for testing)
 
 [[bench]]
@@ -212,4 +218,4 @@ opt-level = 3
 # (unlike [patch.crates-io] which is silently ignored by downstream Cargo workspaces).
 #
 # Development: path = "../google-cloud-rust/src/..."
-# Released:    git  = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260317.1"
+# Released:    git  = "https://github.com/russfellows/google-cloud-rust.git", tag = "release-20260212-rf-gcsrapid-20260324.2"

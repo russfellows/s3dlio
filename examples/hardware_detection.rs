@@ -17,7 +17,7 @@ fn main() {
     // Check if NUMA is available
     if hardware::is_numa_available() {
         println!("NUMA system detected");
-        
+
         #[cfg(feature = "numa")]
         if let Some(topology) = hardware::detect_numa_topology() {
             println!("NUMA nodes: {}", topology.num_nodes);

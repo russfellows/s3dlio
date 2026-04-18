@@ -66,15 +66,30 @@ mod tests {
     #[test]
     fn test_translate_uri_different_backends() {
         // File to S3
-        let result = translate_uri("file:///tmp/data/obj.dat", "file:///tmp/", "s3://bucket/prefix").unwrap();
+        let result = translate_uri(
+            "file:///tmp/data/obj.dat",
+            "file:///tmp/",
+            "s3://bucket/prefix",
+        )
+        .unwrap();
         assert_eq!(result, "s3://bucket/prefix/data/obj.dat");
 
         // S3 to Azure
-        let result = translate_uri("s3://source/data/obj.dat", "s3://source/", "az://account/container").unwrap();
+        let result = translate_uri(
+            "s3://source/data/obj.dat",
+            "s3://source/",
+            "az://account/container",
+        )
+        .unwrap();
         assert_eq!(result, "az://account/container/data/obj.dat");
 
         // Azure to Direct I/O
-        let result = translate_uri("az://account/container/data/obj.dat", "az://account/container/", "direct:///nvme/cache").unwrap();
+        let result = translate_uri(
+            "az://account/container/data/obj.dat",
+            "az://account/container/",
+            "direct:///nvme/cache",
+        )
+        .unwrap();
         assert_eq!(result, "direct:///nvme/cache/data/obj.dat");
     }
 }

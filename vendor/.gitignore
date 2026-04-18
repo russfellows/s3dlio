@@ -1,5 +1,0 @@
-# Build artifacts produced when cargo operates inside the vendored crate.
-# These must NEVER be committed — only source files belong here.
-target/
-*.rlib
-*.rmeta

@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use bytes::Bytes;
-use crate::data_loader::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, ReaderMode};
+use crate::data_loader::{Dataset, DatasetError};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
@@ -43,17 +43,20 @@ impl FileSystemBytesDataset {
     /// Parse file:// URI to local path
     fn parse_file_uri(uri: &str) -> Result<PathBuf, DatasetError> {
         if !uri.starts_with("file://") {
-            return Err(DatasetError::from(format!("Expected file:// scheme, got: {}", uri)));
+            return Err(DatasetError::from(format!(
+                "Expected file:// scheme, got: {}",
+                uri
+            )));
         }
-        
+
         // Remove "file://" prefix (7 characters)
         let path_str = &uri[7..];
-        
+
         // Handle empty path
         if path_str.is_empty() {
             return Err(DatasetError::from("Empty path in file URI"));
         }
-        
+
         let path = PathBuf::from(path_str);
         Ok(path)
     }
@@ -63,7 +66,10 @@ impl FileSystemBytesDataset {
     /// If path is a directory, recursively collects all files
     fn collect_files(path: &Path) -> Result<Vec<PathBuf>, DatasetError> {
         if !path.exists() {
-            return Err(DatasetError::from(format!("Path does not exist: {}", path.display())));
+            return Err(DatasetError::from(format!(
+                "Path does not exist: {}",
+                path.display()
+            )));
         }
 
         if path.is_file() {
@@ -77,17 +83,22 @@ impl FileSystemBytesDataset {
             return Ok(files);
         }
 
-        Err(DatasetError::from(format!("Path is neither file nor directory: {}", path.display())))
+        Err(DatasetError::from(format!(
+            "Path is neither file nor directory: {}",
+            path.display()
+        )))
     }
 
     /// Recursively collect files from a directory
     fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), DatasetError> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| DatasetError::from(format!("Failed to read directory {}: {}", dir.display(), e)))?;
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            DatasetError::from(format!("Failed to read directory {}: {}", dir.display(), e))
+        })?;
 
         for entry in entries {
-            let entry = entry
-                .map_err(|e| DatasetError::from(format!("Failed to read directory entry: {}", e)))?;
+            let entry = entry.map_err(|e| {
+                DatasetError::from(format!("Failed to read directory entry: {}", e))
+            })?;
             let path = entry.path();
 
             if path.is_file() {
@@ -102,18 +113,22 @@ impl FileSystemBytesDataset {
 
     /// Get the file path for a given index
     fn get_file_path(&self, index: usize) -> Result<&PathBuf, DatasetError> {
-        self.files.get(index)
-            .ok_or_else(|| DatasetError::from(format!("Index {} out of bounds (dataset has {} files)", index, self.files.len())))
+        self.files.get(index).ok_or_else(|| {
+            DatasetError::from(format!(
+                "Index {} out of bounds (dataset has {} files)",
+                index,
+                self.files.len()
+            ))
+        })
     }
 
     /// Read entire file contents - returns Bytes for zero-copy
     async fn read_file(&self, path: &Path) -> Result<Bytes, DatasetError> {
-        let data = tokio::fs::read(path).await
-            .map_err(|e| DatasetError::from(format!("Failed to read file {}: {}", path.display(), e)))?;
+        let data = tokio::fs::read(path).await.map_err(|e| {
+            DatasetError::from(format!("Failed to read file {}: {}", path.display(), e))
+        })?;
         Ok(Bytes::from(data))
     }
-
-
 }
 
 #[async_trait]
@@ -126,15 +141,18 @@ impl Dataset for FileSystemBytesDataset {
 
     fn keys(&self) -> Option<Vec<String>> {
         // Return file paths as strings (just the filename, not full path)
-        Some(self.files.iter()
-            .filter_map(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect())
+        Some(
+            self.files
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect(),
+        )
     }
 
     async fn get(&self, index: usize) -> Result<Self::Item, DatasetError> {
         let path = self.get_file_path(index)?;
-        
+
         match self.reader_mode {
             ReaderMode::Sequential => {
                 // Read entire file
@@ -147,8 +165,6 @@ impl Dataset for FileSystemBytesDataset {
             }
         }
     }
-
-
 }
 
 #[cfg(test)]
@@ -162,7 +178,7 @@ mod tests {
         // Use temporary directory for test
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
-        
+
         // Create test file
         fs::write(&file_path, b"Hello, World!").unwrap();
 
@@ -172,7 +188,7 @@ mod tests {
         assert_eq!(dataset.len(), Some(1));
         let data = dataset.get(0).await.unwrap();
         assert_eq!(&data[..], b"Hello, World!");
-        
+
         // TempDir automatically cleans up when dropped
     }
 
@@ -182,7 +198,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file1 = temp_dir.path().join("file1.txt");
         let file2 = temp_dir.path().join("file2.txt");
-        
+
         // Create test files
         fs::write(&file1, b"File 1 content").unwrap();
         fs::write(&file2, b"File 2 content").unwrap();
@@ -191,16 +207,16 @@ mod tests {
         let dataset = FileSystemBytesDataset::from_uri(&uri).unwrap();
 
         assert_eq!(dataset.len(), Some(2));
-        
+
         // Files should be sorted
         let data1 = dataset.get(0).await.unwrap();
         let data2 = dataset.get(1).await.unwrap();
-        
+
         // Note: exact order depends on filesystem but should be consistent
         assert!(&data1[..] == b"File 1 content" || &data1[..] == b"File 2 content");
         assert!(&data2[..] == b"File 1 content" || &data2[..] == b"File 2 content");
         assert_ne!(data1, data2);
-        
+
         // TempDir automatically cleans up when dropped
     }
 }

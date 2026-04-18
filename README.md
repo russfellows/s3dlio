@@ -1,16 +1,22 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-507%2F507-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.86-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-559-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.90-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
-[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.86** — Redirect-following connector (`S3DLIO_FOLLOW_REDIRECTS=1`) for tacit NVIDIA AIStore support via S3; scheme-downgrade (HTTPS→HTTP) prevention active; 21 new redirect unit tests. Note: direct AIStore end-to-end testing has not been performed; cert-pinning security is pending (see [docs/security/HTTPS_Redirect_Security_Issues.md](docs/security/HTTPS_Redirect_Security_Issues.md)).
+> **v0.9.90 — Full NVIDIA AIStore support, HTTP/2, and 5 issues closed.**
+>
+> **NVIDIA AIStore (redirects + security):** s3dlio now has complete, security-hardened support for NVIDIA AIStore. AIStore routes S3 clients through a proxy that issues HTTP 307 redirects to the target storage node. `RedirectFollowingConnector` (opt-in via `S3DLIO_FOLLOW_REDIRECTS=1`) follows these redirects while enforcing four security policies: standard TLS WebPKI verification, cross-host `Authorization` header stripping (RFC 9110), HTTPS→HTTP scheme-downgrade prevention, and certificate pinning across the redirect chain via a pre-flight TLS probe using `RecordingVerifier`. Two production security gaps that were present since the initial redirect implementation are now closed. All four redirect scenarios are validated with end-to-end tests against real OS-assigned loopback ports. See [docs/AIStore_redirect_implementation_v0.9.90.md](docs/AIStore_redirect_implementation_v0.9.90.md) for the full implementation reference.
+>
+> **HTTP/2:** s3dlio now speaks HTTP/2 natively — full HTTP/2 over TLS via ALPN negotiation on `https://` endpoints, and cleartext h2c (HTTP/2 prior-knowledge) on `http://` endpoints for storage systems that support it. Set `S3DLIO_H2C=1` to force h2c, `S3DLIO_H2C=0` to force HTTP/1.1, or leave it unset for automatic detection. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+>
+> **Also in this release:** GCS delete errors now propagate correctly instead of being silently swallowed (#135); small object PUT size rounding fixed (#136); `list_containers()` exposed to the Python API (#133). Closes issues #126, #133, #134, #135, #136.
 
 ## 📦 Installation
 
@@ -205,6 +211,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 - **High Performance**: High-throughput multi GB/s reads and writes on platforms with sufficient network and storage capabilities
 - **Zero-Copy Architecture**: `bytes::Bytes` throughout for minimal memory overhead
 - **Multi-Protocol**: S3, Azure Blob, GCS, file://, direct:// (O_DIRECT)
+- **HTTP/2 Support (NEW)**: s3dlio now speaks HTTP/2. On `https://` endpoints, HTTP/2 is negotiated automatically via TLS ALPN — no configuration needed. On `http://` endpoints, cleartext h2c (HTTP/2 prior-knowledge) is available for storage systems that support it. Control via `S3DLIO_H2C`: `=1` forces h2c, `=0` forces HTTP/1.1, unset = auto. HTTP/2 multiplexing enables far higher request rates on supporting servers. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 - **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
 - **Multi-Endpoint Load Balancing**: RoundRobin/LeastConnections across storage endpoints
 - **AI/ML Ready**: PyTorch DataLoader integration, TFRecord/NPZ format support
@@ -212,9 +219,10 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.86** (March 2026) - Redirect-following connector for tacit NVIDIA AIStore S3 support (`S3DLIO_FOLLOW_REDIRECTS=1`); HTTPS→HTTP scheme-downgrade protection active; 21 new redirect unit tests. Note: tested against the AIStore protocol spec but not against a live AIStore cluster. Certificate pinning is pending (see [security doc](docs/security/HTTPS_Redirect_Security_Issues.md)).
+**v0.9.90** (April 2026) — **HTTP/2 support lands in s3dlio.** Both TLS (`https://`, via ALPN) and cleartext h2c (`http://`, prior-knowledge) are now fully supported. `S3DLIO_H2C` controls the mode; auto-detection works out of the box. Includes a built-in TLS test server (`examples/tls_test_server`) for local HTTP/2 verification, startup logging of the active HTTP version mode, and 10 new routing unit tests. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 
 **Recent highlights:**
+- **v0.9.90** - Full NVIDIA AIStore support (`S3DLIO_FOLLOW_REDIRECTS=1`) with all TLS security policies; HTTP/2 (TLS ALPN + h2c); 5 issues closed (#126, #133, #134, #135, #136); 559 tests passing
 - **v0.9.86** - Redirect follower for NVIDIA AIStore (S3 path); HTTPS→HTTP downgrade prevention; 21 new redirect tests; redirect security analysis documented
 - **v0.9.84** - HEAD elimination (ObjectSizeCache); OnceLock env-var caching; lock-free range assembly; `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE`; structured tracing
 - **v0.9.80** - Python list hang fix (IMDSv2 legacy call removed); tracing deadlock fix (`tokio::spawn` → inline stream); async S3 delete/bucket helpers; deprecated Python APIs cleaned up
@@ -234,26 +242,30 @@ For detailed release notes and migration guides, see the [Complete Changelog](do
 ### Universal Backend Architecture
 s3dlio provides unified storage operations across all backends with consistent URI patterns:
 
-- **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations (5+ GB/s reads, 2.5+ GB/s writes)
+- **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations (5+ GB/s reads, 2.5+ GB/s writes) with built-in concurrent range GETs (on by default)
 - **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with **RangeEngine** (30-50% faster for large blobs)
 - **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - Production ready with **RangeEngine** and full ObjectStore integration
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations with **RangeEngine** support
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance with **RangeEngine**
 
-### RangeEngine Performance Features (v0.9.3+, Updated v0.9.6)
+### Concurrent Range GET Performance Features (v0.9.3+, Updated v0.9.60)
 Concurrent range downloads hide network latency by parallelizing HTTP range requests.
 
-**Backends with RangeEngine Support:**
-- ✅ **Azure Blob Storage**: 30-50% faster for large files (must enable explicitly)
-- ✅ **Google Cloud Storage**: 30-50% faster for large files (must enable explicitly)
-- ✅ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
-- ✅ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
-- 🔄 **S3**: Implemented by default in version 0.9.70 and later.   
+**All backends support concurrent range GETs — but via two different mechanisms:**
 
-**Default Configuration (v0.9.6+):**
-- **Status**: Disabled by default (was: enabled in v0.9.5)
-- **Reason**: Extra HEAD request on every GET causes 50% slowdown for typical workloads
-- **Threshold**: 32MB Default threshold for automatic range GET enablement (can be tuned with `S3DLIO_RANGE_THRESHOLD`) 
+**Mechanism 1 — S3 built-in (on by default, v0.9.60+)**
+- ✅ **Amazon S3**: Concurrent range splitting enabled by default via `S3DLIO_ENABLE_RANGE_OPTIMIZATION` (default: on). Uses `get_object_concurrent_range_async()` — fires parallel `GetObject(Range: bytes=N-M)` requests via the AWS SDK with lock-free chunk assembly. Controlled by `S3DLIO_RANGE_THRESHOLD_MB` (default: 32 MiB) and `S3DLIO_RANGE_CONCURRENCY` (default: auto-scaled). Disable with `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0`.
+
+**Mechanism 2 — RangeEngine (per-store config flag, must enable explicitly)**
+- ✅ **Azure Blob Storage**: 30-50% faster for large files (`enable_range_engine: true` in `AzureConfig`)
+- ✅ **Google Cloud Storage**: 30-50% faster for large files (`enable_range_engine: true` in `GcsConfig`)
+- ⚠️ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
+- ⚠️ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
+
+**RangeEngine config flag defaults (v0.9.6+):**
+- **Status**: `enable_range_engine: false` by default in all per-store config structs
+- **Reason**: Extra HEAD request on every GET causes ~50% slowdown for small-object workloads
+- **Threshold**: 32 MiB default (tunable per-store via `RangeEngineConfig::min_split_size`)
 
 **How to Enable for Large-File Workloads:**
 ```rust
@@ -486,7 +498,7 @@ s3dlio delivers world-class performance across all operations:
 | **Streaming Mode** | 2.6-3.5x faster | For 1-8MB objects vs single-pass |
 
 ### Optimization Features
-- **HTTP/2 Support**: Modern multiplexing for enhanced throughput (with Apache Arrow backend only)
+- **HTTP/2 Support (NEW)**: HTTP/2 multiplexing for dramatically higher request-rate workloads. Negotiated automatically via TLS ALPN on `https://`; cleartext h2c on `http://` via `S3DLIO_H2C=1` or auto-probe.
 - **Intelligent Defaults**: Streaming mode automatically selected based on benchmarks
 - **Multi-Process Architecture**: Massive parallelism for maximum performance
 - **Zero-Copy Streaming**: Memory-efficient operations for large datasets
@@ -505,13 +517,14 @@ loaded_data = store.load('model_state')
 ### Environment Variables
 s3dlio supports comprehensive configuration through environment variables:
 
-- **HTTP Client Optimization**: `S3DLIO_USE_OPTIMIZED_HTTP=true` - Enhanced connection pooling
-- **Runtime Scaling**: `S3DLIO_RT_THREADS=32` - Tokio worker threads  
-- **Connection Pool**: `S3DLIO_MAX_HTTP_CONNECTIONS=400` - Max connections per host
-- **Range GET**: `S3DLIO_RANGE_CONCURRENCY=64` - Large object optimization
+- **NVIDIA AIStore**: `S3DLIO_FOLLOW_REDIRECTS=1` - Enable HTTP 307 redirect following for AIStore (opt-in, disabled by default); `S3DLIO_REDIRECT_MAX=5` - Maximum redirect hops per request
+- **HTTP/2 mode**: `S3DLIO_H2C=1` - Force h2c (HTTP/2 cleartext) on http:// endpoints; `S3DLIO_H2C=0` - Force HTTP/1.1; unset = auto-probe (default)
+- **Runtime Scaling**: `S3DLIO_RT_THREADS=32` - Tokio worker threads
+- **Connection Pool**: `S3DLIO_POOL_MAX_IDLE_PER_HOST=32` - Max idle connections per host (default: 32)
+- **S3 Range GET**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` - Disable concurrent range splitting (enabled by default); `S3DLIO_RANGE_THRESHOLD_MB=64` - Size threshold in MiB (default: 32); `S3DLIO_RANGE_CONCURRENCY=64` - Max concurrent range requests
 - **Operation Logging**: `S3DLIO_OPLOG_LEVEL=2` - S3 operation tracking
 
-📖 [Environment Variables Reference](docs/api/Environment_Variables.md)
+📖 [Environment Variables Reference](docs/Environment_Variables.md)
 
 ### Operation Logging (Op-Log)
 Universal operation trace logging across all backends with zstd-compressed TSV format, warp-replay compatible.

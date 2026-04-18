@@ -16,7 +16,6 @@ use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-
 use std::time::SystemTime;
 
 /// A wrapper around the S3 client to provide logged, high-level operations.
@@ -37,12 +36,7 @@ struct LogContext {
 
 impl S3Ops {
     /// Creates a new S3 operations handler.
-    pub fn new(
-        client: Client,
-        logger: Option<Logger>,
-        client_id: &str,
-        endpoint: &str,
-    ) -> Self {
+    pub fn new(client: Client, logger: Option<Logger>, client_id: &str, endpoint: &str) -> Self {
         Self {
             client,
             logger,
@@ -93,7 +87,13 @@ impl S3Ops {
             start_time: SystemTime::now(),
         };
 
-        let result = self.client.get_object().bucket(bucket).key(key).send().await;
+        let result = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
         let first_byte_time = SystemTime::now();
 
         match result {
@@ -105,14 +105,20 @@ impl S3Ops {
                 Ok(body)
             }
             Err(e) => {
-                self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None); 
+                self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None);
                 Err(e.into())
             }
         }
     }
 
     /// GET (Download) a range of bytes from an object.
-    pub async fn get_object_range(&self, bucket: &str, key: &str, start: u64, end: u64) -> Result<Bytes> {
+    pub async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Bytes> {
         let ctx = LogContext {
             operation: "GET_RANGE",
             key: format!("{}[{}-{}]", key, start, end),
@@ -121,7 +127,8 @@ impl S3Ops {
         };
 
         let range = format!("bytes={}-{}", start, end);
-        let result = self.client
+        let result = self
+            .client
             .get_object()
             .bucket(bucket)
             .key(key)
@@ -139,14 +146,14 @@ impl S3Ops {
                 Ok(body)
             }
             Err(e) => {
-                self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None); 
+                self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None);
                 Err(e.into())
             }
         }
     }
 
     /// PUT (Upload) an object.
-    /// 
+    ///
     /// Accepts `Bytes` for zero-copy conversion to AWS SDK ByteStream.
     pub async fn put_object(&self, bucket: &str, key: &str, data: Bytes) -> Result<()> {
         let ctx = LogContext {
@@ -156,7 +163,7 @@ impl S3Ops {
             start_time: SystemTime::now(),
         };
         let bytes = data.len() as u64;
-        let body = data.into();  // Bytes → ByteStream is zero-copy (refcount bump)
+        let body = data.into(); // Bytes → ByteStream is zero-copy (refcount bump)
 
         let result = self
             .client
@@ -179,7 +186,13 @@ impl S3Ops {
             start_time: SystemTime::now(),
         };
 
-        let result = self.client.head_object().bucket(bucket).key(key).send().await;
+        let result = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
         self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
         Ok(result.map(|_| ())?)
     }
@@ -214,11 +227,14 @@ impl S3Ops {
             start_time: SystemTime::now(),
         };
 
-
         // FIX: Collect into a Result to handle potential build errors.
         let objects_to_delete: Result<Vec<_>, _> = keys
             .into_iter()
-            .map(|k| aws_sdk_s3::types::ObjectIdentifier::builder().key(k).build())
+            .map(|k| {
+                aws_sdk_s3::types::ObjectIdentifier::builder()
+                    .key(k)
+                    .build()
+            })
             .collect();
 
         let delete_req = Delete::builder()
@@ -235,9 +251,7 @@ impl S3Ops {
 
         self.log_op(ctx, &result, 0, None);
         Ok(result.map(|_| ())?)
-
     }
-
 
     /// LIST objects with a given prefix.
     pub async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<usize> {

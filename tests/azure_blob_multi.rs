@@ -8,10 +8,10 @@
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use rand::{rng, Rng};
 use rand::distr::Alphanumeric;
-use std::env;
+use rand::{rng, Rng};
 use s3dlio::azure_client::AzureBlob;
+use std::env;
 
 fn req_env(key: &str) -> Result<String> {
     env::var(key).with_context(|| format!("Missing required env var {}", key))
@@ -41,22 +41,25 @@ async fn mk_client() -> Result<AzureBlob> {
             anyhow::ensure!(acc_from_url == acct,
                 "AZURE_BLOB_ACCOUNT_URL points to '{acc_from_url}', but AZURE_BLOB_ACCOUNT is '{acct}'");
         }
-        Ok(AzureBlob::with_default_credential_from_url(&url, &container)?)
+        Ok(AzureBlob::with_default_credential_from_url(
+            &url, &container,
+        )?)
     } else {
         let acct = req_env("AZURE_BLOB_ACCOUNT")?;
         Ok(AzureBlob::with_default_credential(&acct, &container)?)
     }
 }
 
-
 #[tokio::test]
 #[ignore = "requires Azure credentials (AZURE_BLOB_CONTAINER, AZURE_BLOB_ACCOUNT)"]
 async fn multi_blob_roundtrip_and_cleanup() -> Result<()> {
     // Graceful skip if not configured
-    if env::var("AZURE_BLOB_CONTAINER").is_err() ||
-        (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
+    if env::var("AZURE_BLOB_CONTAINER").is_err()
+        || (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
     {
-        eprintln!("SKIP: set AZURE_BLOB_CONTAINER and (AZURE_BLOB_ACCOUNT or AZURE_BLOB_ACCOUNT_URL)");
+        eprintln!(
+            "SKIP: set AZURE_BLOB_CONTAINER and (AZURE_BLOB_ACCOUNT or AZURE_BLOB_ACCOUNT_URL)"
+        );
         return Ok(());
     }
 
@@ -70,7 +73,9 @@ async fn multi_blob_roundtrip_and_cleanup() -> Result<()> {
         let key = format!("{}/blob-{:02}.bin", &prefix, i);
         let size = (i + 1) * 64 * 1024; // 64KiB, 128KiB, ...
         let mut data = vec![0u8; size];
-        for (idx, b) in data.iter_mut().enumerate() { *b = ((idx + i) % 251) as u8; }
+        for (idx, b) in data.iter_mut().enumerate() {
+            *b = ((idx + i) % 251) as u8;
+        }
         client.put(&key, Bytes::from(data), true).await?;
         keys.push(key);
     }
@@ -100,4 +105,3 @@ async fn multi_blob_roundtrip_and_cleanup() -> Result<()> {
 
     Ok(())
 }
-

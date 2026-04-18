@@ -5,7 +5,7 @@
 //!
 //! Provides robust parsing of operation logs in JSONL and TSV formats,
 //! with automatic compression detection and header-driven column mapping.
-//! 
+//!
 //! The streaming reader (OpLogStreamReader) processes large op-logs with constant memory usage
 //! by using background decompression and 1MB chunk buffering.
 
@@ -38,30 +38,34 @@ impl OpLogFormat {
     /// Detect format from file path extension
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_str = path.as_ref().to_string_lossy();
-        
+
         if path_str.ends_with(".jsonl") || path_str.ends_with(".jsonl.zst") {
             Ok(OpLogFormat::Jsonl)
         } else if path_str.ends_with(".tsv") 
             || path_str.ends_with(".tsv.zst")
             || path_str.ends_with(".csv")  // .csv files are often TSV in practice (e.g., Warp)
-            || path_str.ends_with(".csv.zst") {
+            || path_str.ends_with(".csv.zst")
+        {
             Ok(OpLogFormat::Tsv)
         } else {
-            anyhow::bail!("Unsupported file format: {}. Supported: .jsonl[.zst], .tsv[.zst], .csv[.zst]", path_str)
+            anyhow::bail!(
+                "Unsupported file format: {}. Supported: .jsonl[.zst], .tsv[.zst], .csv[.zst]",
+                path_str
+            )
         }
     }
 }
 
 /// Streaming op-log reader with background decompression and constant memory usage
-/// 
+///
 /// This reader processes op-log files in 1MB chunks using a background thread for decompression,
 /// providing constant memory usage regardless of file size. Entries are streamed via an iterator
 /// rather than loaded all at once.
-/// 
+///
 /// # Example
 /// ```no_run
 /// use s3dlio_oplog::OpLogStreamReader;
-/// 
+///
 /// let stream = OpLogStreamReader::from_file("large_oplog.tsv.zst")?;
 /// for entry in stream {
 ///     let entry = entry?;
@@ -76,7 +80,7 @@ pub struct OpLogStreamReader {
 
 impl OpLogStreamReader {
     /// Create a streaming reader from a file path
-    /// 
+    ///
     /// This spawns a background thread for decompression and parsing.
     /// Environment variables:
     /// - S3DLIO_OPLOG_READ_BUF: Channel buffer size (default: 1024 entries)
@@ -86,8 +90,10 @@ impl OpLogStreamReader {
         let format = OpLogFormat::from_path(&path_buf)?;
         let is_compressed = path_buf.extension().map_or(false, |ext| ext == "zst");
 
-        info!("Opening streaming op-log reader for {:?} (format: {:?}, compressed: {})", 
-              path_buf, format, is_compressed);
+        info!(
+            "Opening streaming op-log reader for {:?} (format: {:?}, compressed: {})",
+            path_buf, format, is_compressed
+        );
 
         // Get tunable parameters from environment
         let channel_cap = std::env::var(ENV_OPLOG_READ_BUF)
@@ -100,19 +106,18 @@ impl OpLogStreamReader {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_OPLOG_CHUNK_SIZE);
 
-        debug!("Streaming reader config: channel_cap={}, chunk_size={}", channel_cap, chunk_size);
+        debug!(
+            "Streaming reader config: channel_cap={}, chunk_size={}",
+            channel_cap, chunk_size
+        );
 
         let (sender, receiver) = sync_channel(channel_cap);
 
         // Spawn background thread for decompression and parsing
         let handle = thread::spawn(move || {
-            if let Err(e) = Self::parse_in_background(
-                path_buf,
-                format,
-                is_compressed,
-                chunk_size,
-                sender,
-            ) {
+            if let Err(e) =
+                Self::parse_in_background(path_buf, format, is_compressed, chunk_size, sender)
+            {
                 warn!("Background parsing error: {}", e);
             }
         });
@@ -157,7 +162,11 @@ impl OpLogStreamReader {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
-                    let err = Err(anyhow::anyhow!("Failed to read line {}: {}", line_num + 1, e));
+                    let err = Err(anyhow::anyhow!(
+                        "Failed to read line {}: {}",
+                        line_num + 1,
+                        e
+                    ));
                     if sender.send(err).is_err() {
                         break; // Receiver dropped
                     }
@@ -184,10 +193,7 @@ impl OpLogStreamReader {
     }
 
     /// Stream TSV format line-by-line
-    fn stream_tsv(
-        reader: Box<dyn BufRead>,
-        sender: SyncSender<Result<OpLogEntry>>,
-    ) -> Result<()> {
+    fn stream_tsv(reader: Box<dyn BufRead>, sender: SyncSender<Result<OpLogEntry>>) -> Result<()> {
         let mut lines = reader.lines();
 
         // Read and parse header
@@ -202,7 +208,11 @@ impl OpLogStreamReader {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
-                    let err = Err(anyhow::anyhow!("Failed to read line {}: {}", line_num + 2, e));
+                    let err = Err(anyhow::anyhow!(
+                        "Failed to read line {}: {}",
+                        line_num + 2,
+                        e
+                    ));
                     if sender.send(err).is_err() {
                         break;
                     }
@@ -236,7 +246,7 @@ impl Iterator for OpLogStreamReader {
 }
 
 /// Reader for op-log files with automatic format and compression detection
-/// 
+///
 /// This is a convenience wrapper that loads all entries into memory.
 /// For large files, consider using OpLogStreamReader for constant memory usage.
 pub struct OpLogReader {
@@ -245,11 +255,14 @@ pub struct OpLogReader {
 
 impl OpLogReader {
     /// Load op-log from file with automatic format and compression detection
-    /// 
+    ///
     /// Note: This loads all entries into memory. For large files, use OpLogStreamReader instead.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_ref = path.as_ref();
-        info!("Loading op-log from {:?} (loading all entries into memory)", path_ref);
+        info!(
+            "Loading op-log from {:?} (loading all entries into memory)",
+            path_ref
+        );
 
         // Use streaming reader internally and collect all entries
         let stream = OpLogStreamReader::from_file(path_ref)?;
@@ -291,19 +304,20 @@ impl OpLogReader {
 /// Parse a JSON value into an OpLogEntry
 fn parse_json_entry(json: &serde_json::Value, line_num: usize) -> Result<OpLogEntry> {
     let get_str = |key: &str| -> Option<String> {
-        json.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        json.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     };
 
-    let get_u64 = |key: &str| -> Option<u64> {
-        json.get(key).and_then(|v| v.as_u64())
-    };
+    let get_u64 = |key: &str| -> Option<u64> { json.get(key).and_then(|v| v.as_u64()) };
 
     // Parse operation type (handle both "operation" and "op" field names)
     let op_str = get_str("operation")
         .or_else(|| get_str("op"))
         .ok_or_else(|| anyhow::anyhow!("Missing 'operation' or 'op' field"))?;
-    
-    let op = op_str.parse::<OpType>()
+
+    let op = op_str
+        .parse::<OpType>()
         .with_context(|| format!("Invalid operation type: {}", op_str))?;
 
     // Parse other fields with sensible defaults
@@ -336,7 +350,7 @@ fn parse_json_entry(json: &serde_json::Value, line_num: usize) -> Result<OpLogEn
 /// Create column name to index mapping (case-insensitive, handles variations)
 fn create_column_mapping(headers: &[&str]) -> Result<HashMap<String, usize>> {
     let mut mapping = HashMap::new();
-    
+
     for (idx, &header) in headers.iter().enumerate() {
         mapping.insert(header.to_lowercase(), idx);
     }
@@ -356,16 +370,18 @@ fn parse_tsv_entry(
     line_num: usize,
 ) -> Result<OpLogEntry> {
     let get_field = |name: &str| -> Option<&str> {
-        col_mapping.get(name).and_then(|&idx| fields.get(idx)).copied()
+        col_mapping
+            .get(name)
+            .and_then(|&idx| fields.get(idx))
+            .copied()
     };
 
     let get_u64 = |name: &str| -> Result<Option<u64>> {
         match get_field(name) {
-            Some(s) if !s.is_empty() => {
-                s.parse::<u64>()
-                    .with_context(|| format!("Invalid {} value: {}", name, s))
-                    .map(Some)
-            }
+            Some(s) if !s.is_empty() => s
+                .parse::<u64>()
+                .with_context(|| format!("Invalid {} value: {}", name, s))
+                .map(Some),
             _ => Ok(None),
         }
     };
@@ -374,8 +390,9 @@ fn parse_tsv_entry(
     let op_str = get_field("operation")
         .or_else(|| get_field("op"))
         .ok_or_else(|| anyhow::anyhow!("Missing 'operation' or 'op' field"))?;
-    
-    let op = op_str.parse::<OpType>()
+
+    let op = op_str
+        .parse::<OpType>()
         .with_context(|| format!("Invalid operation type: {}", op_str))?;
 
     // Parse other fields
@@ -384,7 +401,9 @@ fn parse_tsv_entry(
     let endpoint = get_field("endpoint").unwrap_or("").to_string();
     let file = get_field("file").unwrap_or("").to_string();
     let duration_ns = get_u64("duration_ns")?;
-    let error = get_field("error").filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let error = get_field("error")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
     // Parse timestamp
     let start = get_field("start")
@@ -413,12 +432,30 @@ mod tests {
 
     #[test]
     fn test_format_detection() {
-        assert_eq!(OpLogFormat::from_path("test.jsonl").unwrap(), OpLogFormat::Jsonl);
-        assert_eq!(OpLogFormat::from_path("test.jsonl.zst").unwrap(), OpLogFormat::Jsonl);
-        assert_eq!(OpLogFormat::from_path("test.tsv").unwrap(), OpLogFormat::Tsv);
-        assert_eq!(OpLogFormat::from_path("test.tsv.zst").unwrap(), OpLogFormat::Tsv);
-        assert_eq!(OpLogFormat::from_path("test.csv").unwrap(), OpLogFormat::Tsv);
-        assert_eq!(OpLogFormat::from_path("test.csv.zst").unwrap(), OpLogFormat::Tsv);
+        assert_eq!(
+            OpLogFormat::from_path("test.jsonl").unwrap(),
+            OpLogFormat::Jsonl
+        );
+        assert_eq!(
+            OpLogFormat::from_path("test.jsonl.zst").unwrap(),
+            OpLogFormat::Jsonl
+        );
+        assert_eq!(
+            OpLogFormat::from_path("test.tsv").unwrap(),
+            OpLogFormat::Tsv
+        );
+        assert_eq!(
+            OpLogFormat::from_path("test.tsv.zst").unwrap(),
+            OpLogFormat::Tsv
+        );
+        assert_eq!(
+            OpLogFormat::from_path("test.csv").unwrap(),
+            OpLogFormat::Tsv
+        );
+        assert_eq!(
+            OpLogFormat::from_path("test.csv.zst").unwrap(),
+            OpLogFormat::Tsv
+        );
         assert!(OpLogFormat::from_path("test.txt").is_err());
     }
 
@@ -431,7 +468,7 @@ mod tests {
 
         let reader = OpLogReader::from_file(file.path()).unwrap();
         assert_eq!(reader.len(), 2);
-        
+
         let entries = reader.entries();
         assert_eq!(entries[0].op, OpType::GET);
         assert_eq!(entries[0].bytes, 1024);
@@ -449,7 +486,7 @@ mod tests {
 
         let reader = OpLogReader::from_file(file.path()).unwrap();
         assert_eq!(reader.len(), 2);
-        
+
         let entries = reader.entries();
         assert_eq!(entries[0].op, OpType::GET);
         assert_eq!(entries[0].bytes, 1024);
@@ -487,7 +524,7 @@ mod tests {
 
         let stream = OpLogStreamReader::from_file(file.path()).unwrap();
         let entries: Vec<_> = stream.map(|r| r.unwrap()).collect();
-        
+
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].op, OpType::GET);
         assert_eq!(entries[0].bytes, 1024);
@@ -505,7 +542,7 @@ mod tests {
 
         let stream = OpLogStreamReader::from_file(file.path()).unwrap();
         let entries: Vec<_> = stream.map(|r| r.unwrap()).collect();
-        
+
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].op, OpType::GET);
         assert_eq!(entries[1].op, OpType::PUT);
@@ -521,7 +558,7 @@ mod tests {
 
         let stream = OpLogStreamReader::from_file(file.path()).unwrap();
         let results: Vec<_> = stream.collect();
-        
+
         assert_eq!(results.len(), 3);
         assert!(results[0].is_ok());
         assert!(results[1].is_err()); // Error for invalid JSON
@@ -531,7 +568,7 @@ mod tests {
     #[test]
     fn test_streaming_compressed() {
         use std::io::Write;
-        
+
         let mut file = NamedTempFile::with_suffix(".jsonl.zst").unwrap();
         let mut encoder = zstd::stream::Encoder::new(file.as_file_mut(), 1).unwrap();
         writeln!(encoder, r#"{{"operation": "GET", "file": "test.dat", "bytes": 1024, "start": "2025-01-01T00:00:00Z"}}"#).unwrap();
@@ -541,7 +578,7 @@ mod tests {
 
         let stream = OpLogStreamReader::from_file(file.path()).unwrap();
         let entries: Vec<_> = stream.map(|r| r.unwrap()).collect();
-        
+
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].op, OpType::GET);
         assert_eq!(entries[1].op, OpType::PUT);
@@ -552,13 +589,19 @@ mod tests {
         let mut file = NamedTempFile::with_suffix(".tsv").unwrap();
         writeln!(file, "op\tfile\tbytes\tstart").unwrap();
         for i in 0..100 {
-            writeln!(file, "GET\ttest{}.dat\t{}\t2025-01-01T00:00:00Z", i, i * 1000).unwrap();
+            writeln!(
+                file,
+                "GET\ttest{}.dat\t{}\t2025-01-01T00:00:00Z",
+                i,
+                i * 1000
+            )
+            .unwrap();
         }
         file.flush().unwrap();
 
         let stream = OpLogStreamReader::from_file(file.path()).unwrap();
         let entries: Vec<_> = stream.take(10).map(|r| r.unwrap()).collect();
-        
+
         assert_eq!(entries.len(), 10);
         assert_eq!(entries[0].bytes, 0);
         assert_eq!(entries[9].bytes, 9000);
@@ -575,10 +618,9 @@ mod tests {
 
         let reader = OpLogReader::from_file(file.path()).unwrap();
         assert_eq!(reader.len(), 2);
-        
+
         let stream = OpLogStreamReader::from_file(file.path()).unwrap();
         let stream_count = stream.count();
         assert_eq!(stream_count, 2);
     }
 }
-

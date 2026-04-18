@@ -23,7 +23,7 @@ use hwlocality::{
 };
 
 /// ZERO-COPY buffer abstraction for UMA and NUMA allocations
-/// 
+///
 /// CRITICAL: This type NEVER copies data - it holds the actual memory and provides
 /// mutable slices for zero-copy operations. Python bindings access this memory
 /// directly via raw pointers.
@@ -47,31 +47,23 @@ impl DataBuffer {
             DataBuffer::Numa((_, bytes, _)) => {
                 // SAFETY: We've allocated this buffer and will initialize it
                 unsafe {
-                    std::slice::from_raw_parts_mut(
-                        bytes.as_mut_ptr() as *mut u8,
-                        bytes.len()
-                    )
+                    std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut u8, bytes.len())
                 }
             }
         }
     }
-    
+
     /// Get immutable slice view (zero-copy)
     pub fn as_slice(&self) -> &[u8] {
         match self {
             DataBuffer::Uma(vec) => vec.as_slice(),
             DataBuffer::Numa((_, bytes, size)) => {
                 // SAFETY: Buffer has been fully initialized
-                unsafe {
-                    std::slice::from_raw_parts(
-                        bytes.as_ptr() as *const u8,
-                        *size
-                    )
-                }
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u8, *size) }
             }
         }
     }
-    
+
     /// Get raw pointer for zero-copy Python access
     pub fn as_ptr(&self) -> *const u8 {
         match self {
@@ -79,7 +71,7 @@ impl DataBuffer {
             DataBuffer::Numa((_, bytes, _)) => bytes.as_ptr() as *const u8,
         }
     }
-    
+
     /// Get mutable raw pointer for zero-copy Python access
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
@@ -87,7 +79,7 @@ impl DataBuffer {
             DataBuffer::Numa((_, bytes, _)) => bytes.as_mut_ptr() as *mut u8,
         }
     }
-    
+
     /// Get length (actual data size, not allocated size)
     pub fn len(&self) -> usize {
         match self {
@@ -100,7 +92,7 @@ impl DataBuffer {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    
+
     /// Truncate to requested size (modifies metadata only, NO COPY)
     pub fn truncate(&mut self, size: usize) {
         match self {
@@ -110,9 +102,9 @@ impl DataBuffer {
             }
         }
     }
-    
+
     /// Convert to bytes::Bytes for Python API (ZERO-COPY for UMA, minimal copy for NUMA)
-    /// 
+    ///
     /// For UMA: Uses Bytes::from(Vec<u8>) which is cheap (just wraps the allocation)
     /// For NUMA: Must copy to bytes::Bytes since hwlocality::Bytes can't be converted directly
     ///          Alternative: Keep as DataBuffer and implement Python buffer protocol directly
@@ -122,12 +114,8 @@ impl DataBuffer {
             DataBuffer::Numa((_, hwloc_bytes, size)) => {
                 // Convert NUMA-allocated memory to bytes::Bytes
                 // Unfortunately this requires a copy since bytes::Bytes needs owned data
-                let slice = unsafe {
-                    std::slice::from_raw_parts(
-                        hwloc_bytes.as_ptr() as *const u8,
-                        size
-                    )
-                };
+                let slice =
+                    unsafe { std::slice::from_raw_parts(hwloc_bytes.as_ptr() as *const u8, size) };
                 bytes::Bytes::copy_from_slice(slice)
             }
         }
@@ -146,41 +134,41 @@ impl DataBuffer {
             DataBuffer::Uma(vec) => vec.as_mut_slice(),
         }
     }
-    
+
     pub fn as_slice(&self) -> &[u8] {
         match self {
             DataBuffer::Uma(vec) => vec.as_slice(),
         }
     }
-    
+
     pub fn as_ptr(&self) -> *const u8 {
         match self {
             DataBuffer::Uma(vec) => vec.as_ptr(),
         }
     }
-    
+
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
             DataBuffer::Uma(vec) => vec.as_mut_ptr(),
         }
     }
-    
+
     pub fn len(&self) -> usize {
         match self {
             DataBuffer::Uma(vec) => vec.len(),
         }
     }
-    
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    
+
     pub fn truncate(&mut self, size: usize) {
         match self {
             DataBuffer::Uma(vec) => vec.truncate(size),
         }
     }
-    
+
     /// Convert to bytes::Bytes (ZERO-COPY for UMA via Bytes::from(Vec<u8>))
     pub fn into_bytes(self) -> bytes::Bytes {
         match self {
@@ -200,39 +188,45 @@ fn allocate_numa_buffer(
     node_id: usize,
 ) -> Result<(Topology, hwlocality::memory::binding::Bytes<'static>, usize), String> {
     use hwlocality::object::types::ObjectType;
-    
+
     // Create topology
-    let topology = Topology::new()
-        .map_err(|e| format!("Failed to create hwloc topology: {}", e))?;
-    
+    let topology =
+        Topology::new().map_err(|e| format!("Failed to create hwloc topology: {}", e))?;
+
     // Find NUMA node
-    let numa_nodes: Vec<_> = topology
-        .objects_with_type(ObjectType::NUMANode)
-        .collect();
-    
+    let numa_nodes: Vec<_> = topology.objects_with_type(ObjectType::NUMANode).collect();
+
     if numa_nodes.is_empty() {
         return Err("No NUMA nodes found in topology".to_string());
     }
-    
+
     // Get the NUMA node by OS index
     let node = numa_nodes
         .iter()
         .find(|n| n.os_index() == Some(node_id))
-        .ok_or_else(|| format!("NUMA node {} not found (available: {:?})", 
-                               node_id,
-                               numa_nodes.iter().filter_map(|n| n.os_index()).collect::<Vec<_>>()))?;
-    
+        .ok_or_else(|| {
+            format!(
+                "NUMA node {} not found (available: {:?})",
+                node_id,
+                numa_nodes
+                    .iter()
+                    .filter_map(|n| n.os_index())
+                    .collect::<Vec<_>>()
+            )
+        })?;
+
     // Get nodeset for this NUMA node
-    let nodeset = node.nodeset()
+    let nodeset = node
+        .nodeset()
         .ok_or_else(|| format!("NUMA node {} has no nodeset", node_id))?;
-    
+
     tracing::debug!(
         "Allocating {} bytes on NUMA node {} with nodeset {:?}",
         size,
         node_id,
         nodeset
     );
-    
+
     // Allocate memory bound to this NUMA node
     // Using ASSUME_SINGLE_THREAD flag for maximum portability
     let bytes = topology
@@ -243,7 +237,7 @@ fn allocate_numa_buffer(
             MemoryBindingFlags::ASSUME_SINGLE_THREAD,
         )
         .map_err(|e| format!("Failed to allocate NUMA memory: {}", e))?;
-    
+
     // SAFETY: We need to extend the lifetime to 'static because we're storing
     // both Topology and Bytes together, and Bytes' lifetime is tied to Topology.
     // This is safe because we keep Topology alive as long as Bytes exists.
@@ -253,7 +247,7 @@ fn allocate_numa_buffer(
             hwlocality::memory::binding::Bytes<'static>,
         >(bytes)
     };
-    
+
     Ok((topology, bytes_static, size))
 }
 
@@ -358,10 +352,11 @@ pub fn generate_data_simple(size: usize, dedup: usize, compress: usize) -> DataB
 /// Python accesses this memory directly via buffer protocol - ZERO COPY!
 pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
     // Validate and get effective block size (default 1 MiB, max 32 MiB)
-    let block_size = config.block_size
-        .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024))  // 1 MiB min, 32 MiB max
+    let block_size = config
+        .block_size
+        .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024)) // 1 MiB min, 32 MiB max
         .unwrap_or(DGEN_BLOCK_SIZE);
-    
+
     tracing::info!(
         "Starting data generation: size={}, dedup={}, compress={}, block_size={}",
         config.size,
@@ -372,7 +367,11 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
 
     // FIXED: Allow zero-size generation without enforcing block_size minimum
     let size = config.size;
-    let nblocks = if size == 0 { 0 } else { size.div_ceil(block_size) };
+    let nblocks = if size == 0 {
+        0
+    } else {
+        size.div_ceil(block_size)
+    };
 
     let dedup_factor = config.dedup_factor.max(1);
     let unique_blocks = if dedup_factor > 1 {
@@ -439,7 +438,7 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
         nblocks * block_size
     };
     tracing::debug!("Allocating {} bytes ({} blocks)", total_size, nblocks);
-    
+
     // CRITICAL: UMA fast path - always use Vec<u8> when numa_node is None
     // This preserves 43-50 GB/s performance on UMA systems
     #[cfg(feature = "numa")]
@@ -447,7 +446,11 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
         tracing::info!("Attempting NUMA allocation on node {}", node_id);
         match allocate_numa_buffer(total_size, node_id) {
             Ok(buffer) => {
-                tracing::info!("Successfully allocated {} bytes on NUMA node {}", total_size, node_id);
+                tracing::info!(
+                    "Successfully allocated {} bytes on NUMA node {}",
+                    total_size,
+                    node_id
+                );
                 DataBuffer::Numa(buffer)
             }
             Err(e) => {
@@ -458,7 +461,7 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
     } else {
         DataBuffer::Uma(vec![0u8; total_size])
     };
-    
+
     #[cfg(not(feature = "numa"))]
     let mut data_buffer = DataBuffer::Uma(vec![0u8; total_size]);
 
@@ -472,10 +475,8 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
 
     // Use public hardware API for thread count recommendation
     // This respects NUMA, CPU affinity, and provides sensible defaults
-    let num_threads = crate::hardware::recommended_data_gen_threads(
-        config.numa_node,
-        config.max_threads
-    );
+    let num_threads =
+        crate::hardware::recommended_data_gen_threads(config.numa_node, config.max_threads);
 
     tracing::info!("Using {} threads for parallel generation", num_threads);
 
@@ -525,7 +526,11 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
                 );
 
                 // Build CPU affinity mapping (wrap in Arc for sharing across threads)
-                let cpu_map = std::sync::Arc::new(build_cpu_affinity_map(topology, num_threads, config.numa_node));
+                let cpu_map = std::sync::Arc::new(build_cpu_affinity_map(
+                    topology,
+                    num_threads,
+                    config.numa_node,
+                ));
 
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(num_threads)
@@ -614,14 +619,20 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
                 // Use unique_block_idx for RNG seeding to ensure duplicate blocks are identical
                 // block_idx (i) is NOT used for RNG - only for round-robin assignment
                 tracing::trace!("Filling block {} (unique block {})", i, ub);
-                fill_block(chunk, ub, copy_lens[ub].min(chunk.len()), ub as u64, call_entropy);
+                fill_block(
+                    chunk,
+                    ub,
+                    copy_lens[ub].min(chunk.len()),
+                    ub as u64,
+                    call_entropy,
+                );
             });
     });
 
     tracing::debug!("Parallel generation complete, truncating to {} bytes", size);
     // Truncate to requested size (metadata only, NO COPY!)
     data_buffer.truncate(size);
-    
+
     // Return DataBuffer directly - Python accesses via raw pointer (ZERO COPY!)
     data_buffer
 }
@@ -629,23 +640,23 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
 /// Fill a single block with controlled compression
 ///
 /// # Algorithm (OPTIMIZED January 2026)
-/// 
+///
 /// **NEW METHOD (Current)**: Zero-fill for compression
 /// 1. Fill incompressible portion with Xoshiro256++ keystream (high-entropy random data)
 /// 2. Fill compressible portion with zeros (memset - extremely fast)
-/// 
+///
 /// **OLD METHOD (Before Jan 2026)**: Back-reference approach
 /// - Filled entire block with RNG data
 /// - Created back-references using copy_within() in 64-256 byte chunks
 /// - SLOW: Required 2x memory traffic (write all, then copy 50% for 2:1 compression)
 /// - Example: 1 MB block @ 2:1 ratio = 1 MB RNG write + 512 KB of copy_within operations
-/// 
-/// **WHY CHANGED**: 
+///
+/// **WHY CHANGED**:
 /// - Testing showed significant slowdown with compression enabled (1-4 GB/s vs 15 GB/s)
 /// - Back-references created small, inefficient memory copies
 /// - Zero-fill approach matches DLIO benchmark methodology
 /// - Much faster: memset is highly optimized (often CPU instruction or libc fast path)
-/// 
+///
 /// **PERFORMANCE COMPARISON**:
 /// - Incompressible (copy_len=0): ~15 GB/s per core (both methods identical)
 /// - 2:1 compression (copy_len=50%): OLD ~2-4 GB/s, NEW ~10-12 GB/s (estimated)
@@ -662,7 +673,13 @@ pub fn generate_data(config: GeneratorConfig) -> DataBuffer {
 /// - `unique_block_idx`: Index into the pool of unique blocks (determines RNG seed for dedup)
 /// - `copy_len`: Target bytes to make compressible (filled with zeros)
 /// - `seed_base`: Base seed for this generation session
-fn fill_block(out: &mut [u8], unique_block_idx: usize, copy_len: usize, unique_block_sequence: u64, seed_base: u64) {
+fn fill_block(
+    out: &mut [u8],
+    unique_block_idx: usize,
+    copy_len: usize,
+    unique_block_sequence: u64,
+    seed_base: u64,
+) {
     tracing::trace!(
         "fill_block: idx={}, seq={}, copy_len={}, out_len={}",
         unique_block_idx,
@@ -686,31 +703,37 @@ fn fill_block(out: &mut [u8], unique_block_idx: usize, copy_len: usize, unique_b
 
     if copy_len == 0 {
         // No compression: fill entire block with high-entropy random data
-        tracing::trace!("Filling {} bytes with RNG keystream (incompressible)", out.len());
+        tracing::trace!(
+            "Filling {} bytes with RNG keystream (incompressible)",
+            out.len()
+        );
         rng.fill_bytes(out);
     } else {
         // With compression: split between random and zeros
         let incompressible_len = out.len().saturating_sub(copy_len);
-        
+
         tracing::trace!(
             "Filling block: {} bytes random (incompressible) + {} bytes zeros (compressible)",
             incompressible_len,
             copy_len
         );
-        
+
         // Step 1: Fill incompressible portion with high-entropy keystream
         if incompressible_len > 0 {
             rng.fill_bytes(&mut out[..incompressible_len]);
         }
-        
+
         // Step 2: Fill compressible portion with zeros (memset - super fast!)
         // This is typically optimized to a CPU instruction or fast libc call
         if copy_len > 0 && incompressible_len < out.len() {
             out[incompressible_len..].fill(0);
         }
     }
-    
-    tracing::trace!("fill_block complete: {} compressible bytes (zeros)", copy_len);
+
+    tracing::trace!(
+        "fill_block complete: {} compressible bytes (zeros)",
+        copy_len
+    );
 }
 
 /// Generate per-call entropy from time + urandom
@@ -766,7 +789,7 @@ fn build_cpu_affinity_map(
             for thread_id in 0..num_threads {
                 let core_idx = thread_id % target_node.cpus.len();
                 let core_id = target_node.cpus[core_idx];
-                
+
                 tracing::trace!(
                     "Thread {} -> NUMA node {} core {}",
                     thread_id,
@@ -790,7 +813,8 @@ fn build_cpu_affinity_map(
         while thread_id < num_threads {
             if let Some(node) = topology.nodes.get(node_idx % topology.nodes.len()) {
                 // Assign threads to cores within this NUMA node
-                let cores_per_thread = (node.cpus.len() as f64 / num_threads as f64).ceil() as usize;
+                let cores_per_thread =
+                    (node.cpus.len() as f64 / num_threads as f64).ceil() as usize;
                 let cores_per_thread = cores_per_thread.max(1);
 
                 let start_cpu = (thread_id * cores_per_thread) % node.cpus.len();
@@ -849,9 +873,9 @@ pub struct DataGenerator {
     unique_blocks: usize,
     copy_lens: Vec<usize>,
     call_entropy: u64,
-    block_sequence: u64,  // Sequential counter for RNG derivation (ensures determinism)
+    block_sequence: u64, // Sequential counter for RNG derivation (ensures determinism)
     max_threads: usize,  // Thread count for parallel generation
-    thread_pool: Option<rayon::ThreadPool>,  // Reused thread pool (created once)
+    thread_pool: Option<rayon::ThreadPool>, // Reused thread pool (created once)
     block_size: usize,   // Internal parallelization block size (4-32 MB)
 }
 
@@ -859,10 +883,11 @@ impl DataGenerator {
     /// Create new streaming generator
     pub fn new(config: GeneratorConfig) -> Self {
         // Validate and get effective block size (default 1 MiB, max 32 MiB)
-        let block_size = config.block_size
-            .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024))  // 1 MiB min, 32 MiB max
+        let block_size = config
+            .block_size
+            .map(|bs| bs.clamp(1024 * 1024, 32 * 1024 * 1024)) // 1 MiB min, 32 MiB max
             .unwrap_or(DGEN_BLOCK_SIZE);
-        
+
         tracing::info!(
             "Creating DataGenerator: size={}, dedup={}, compress={}, block_size={}",
             config.size,
@@ -873,7 +898,11 @@ impl DataGenerator {
 
         // FIXED: Allow zero-size generation without enforcing block_size minimum
         let total_size = config.size;
-        let nblocks = if total_size == 0 { 0 } else { total_size.div_ceil(block_size) };
+        let nblocks = if total_size == 0 {
+            0
+        } else {
+            total_size.div_ceil(block_size)
+        };
 
         let dedup_factor = config.dedup_factor.max(1);
         let unique_blocks = if dedup_factor > 1 {
@@ -918,7 +947,7 @@ impl DataGenerator {
         let call_entropy = config.seed.unwrap_or_else(generate_call_entropy);
 
         let max_threads = config.max_threads.unwrap_or_else(num_cpus::get);
-        
+
         // Create thread pool ONCE for reuse (major performance optimization)
         let thread_pool = if max_threads > 1 {
             match rayon::ThreadPoolBuilder::new()
@@ -953,18 +982,18 @@ impl DataGenerator {
             unique_blocks,
             copy_lens,
             call_entropy,
-            block_sequence: 0,  // Start from 0 for deterministic generation
+            block_sequence: 0, // Start from 0 for deterministic generation
             max_threads,
             thread_pool,
             block_size,
         }
     }
-    
+
     /// Set or reset the random seed for subsequent data generation
-    /// 
+    ///
     /// This allows changing the data pattern mid-stream while maintaining generation position.
     /// The new seed takes effect on the next `fill_chunk()` call.
-    /// 
+    ///
     /// # Arguments
     /// * `seed` - New seed value, or None to use time+urandom entropy (non-deterministic)
     pub fn set_seed(&mut self, seed: Option<u64>) {
@@ -973,7 +1002,11 @@ impl DataGenerator {
         self.block_sequence = 0;
         tracing::debug!(
             "Seed reset: {} (entropy={}) - block_sequence reset to 0",
-            if seed.is_some() { "deterministic" } else { "non-deterministic" },
+            if seed.is_some() {
+                "deterministic"
+            } else {
+                "non-deterministic"
+            },
             self.call_entropy
         );
     }
@@ -981,7 +1014,7 @@ impl DataGenerator {
     /// Fill the next chunk of data
     ///
     /// Returns the number of bytes written. When this returns 0, generation is complete.
-    /// 
+    ///
     /// **Performance**: When buffer contains multiple blocks (>=8 MB), generation is parallelized
     /// using rayon. Small buffers (<8 MB) use sequential generation to avoid threading overhead.
     pub fn fill_chunk(&mut self, buf: &mut [u8]) -> usize {
@@ -1011,7 +1044,7 @@ impl DataGenerator {
         // Use parallel generation for large buffers (>=2 blocks), sequential for small
         // This avoids rayon overhead for tiny chunks
         const PARALLEL_THRESHOLD: usize = 2;
-        
+
         if num_blocks >= PARALLEL_THRESHOLD && self.max_threads > 1 {
             // PARALLEL PATH: Generate all blocks in parallel
             self.fill_chunk_parallel(chunk, start_block, start_offset, num_blocks)
@@ -1048,14 +1081,14 @@ impl DataGenerator {
             } else {
                 self.block_size
             };
-            
+
             // Generate block of the actual size needed
             let mut block_buf = vec![0u8; actual_block_size];
             fill_block(
                 &mut block_buf,
                 ub,
                 self.copy_lens[ub].min(actual_block_size),
-                block_idx as u64,  // Use block_idx for deterministic output regardless of chunk size
+                block_idx as u64, // Use block_idx for deterministic output regardless of chunk size
                 self.call_entropy,
             );
 
@@ -1068,14 +1101,14 @@ impl DataGenerator {
 
         let to_write = offset;
         self.current_pos += to_write;
-        
+
         tracing::debug!(
             "fill_chunk_sequential: generated {} blocks ({} MiB) for {} byte chunk",
             num_blocks,
             num_blocks * 4,
             to_write
         );
-        
+
         to_write
     }
 
@@ -1102,7 +1135,7 @@ impl DataGenerator {
         let copy_lens = &self.copy_lens;
         let unique_blocks = self.unique_blocks;
         let block_size = self.block_size;
-        
+
         // CRITICAL: For small objects (<1 MiB), use actual object size as block size
         // to ensure compression works correctly (zeros are at END of block)
         let total_size = self.total_size;
@@ -1115,7 +1148,7 @@ impl DataGenerator {
 
         // DETERMINISTIC GENERATION: Always generate full blocks then copy needed portion
         // This ensures identical output regardless of chunk size (critical for streaming determinism)
-        // 
+        //
         // Note: We cannot use zero-copy for partial blocks because fill_block() uses
         // out.len() to determine the random/zero split. Different buffer sizes would
         // produce different data, breaking determinism.
@@ -1126,35 +1159,48 @@ impl DataGenerator {
                 .for_each(|(i, block_chunk)| {
                     let block_idx = start_block + i;
                     let ub = block_idx % unique_blocks;
-                    
+
                     // Determine if this is a partial block (first with offset, or last not full)
                     let block_offset = if i == 0 { start_offset } else { 0 };
                     let is_partial = block_offset > 0 || block_chunk.len() < block_size;
-                    
+
                     if is_partial {
                         // Generate full block into temp, copy needed portion
                         // This ensures deterministic output regardless of chunk boundaries
                         let mut temp = vec![0u8; actual_block_size];
-                        fill_block(&mut temp, ub, copy_lens[ub].min(actual_block_size), block_idx as u64, call_entropy);
+                        fill_block(
+                            &mut temp,
+                            ub,
+                            copy_lens[ub].min(actual_block_size),
+                            block_idx as u64,
+                            call_entropy,
+                        );
                         let copy_len = (actual_block_size - block_offset).min(block_chunk.len());
-                        block_chunk[..copy_len].copy_from_slice(&temp[block_offset..block_offset + copy_len]);
+                        block_chunk[..copy_len]
+                            .copy_from_slice(&temp[block_offset..block_offset + copy_len]);
                     } else {
                         // Full block: generate directly into output buffer (ZERO-COPY!)
-                        fill_block(block_chunk, ub, copy_lens[ub].min(actual_block_size), block_idx as u64, call_entropy);
+                        fill_block(
+                            block_chunk,
+                            ub,
+                            copy_lens[ub].min(actual_block_size),
+                            block_idx as u64,
+                            call_entropy,
+                        );
                     }
                 });
         });
 
         let to_write = chunk.len();
         self.current_pos += to_write;
-        
+
         tracing::debug!(
             "fill_chunk_parallel: ZERO-COPY generated {} blocks ({} MiB) for {} byte chunk",
             num_blocks,
             num_blocks * 4,
             to_write
         );
-        
+
         to_write
     }
 
@@ -1179,17 +1225,250 @@ impl DataGenerator {
     }
 
     /// Get recommended chunk size for optimal performance
-    /// 
+    ///
     /// Returns 32 MB, which provides the best balance between:
     /// - Parallelism: 8 blocks × 4 MB = good distribution across cores
     /// - Cache locality: Fits well in L3 cache
     /// - Memory overhead: Reasonable buffer size
-    /// 
+    ///
     /// Based on empirical testing showing 32 MB is ~16% faster than 64 MB
     /// and significantly better than smaller or larger sizes.
     pub fn recommended_chunk_size() -> usize {
-        32 * 1024 * 1024  // 32 MB
+        32 * 1024 * 1024 // 32 MB
     }
+}
+
+// ============================================================================
+// s3dlio compatibility wrappers
+// ============================================================================
+
+/// Get total number of CPUs in the system
+pub fn total_cpus() -> usize {
+    num_cpus::get()
+}
+
+/// Get default number of threads for data generation (100% of CPUs)
+pub fn default_data_gen_threads() -> usize {
+    num_cpus::get()
+}
+
+/// Get optimal chunk size for streaming data generation
+///
+/// Returns the best chunk size based on total data size for maximum throughput:
+/// - >= 64 MB: Returns 64 MB (50+ GB/s)
+/// - >= 32 MB: Returns 32 MB
+/// - >= 16 MB: Returns 16 MB
+/// - < 16 MB: Returns size itself (use single allocation)
+///
+/// # Example
+/// ```no_run
+/// use s3dlio::data_gen_alt::{optimal_chunk_size, DataGenerator, GeneratorConfig};
+///
+/// let total_size = 100 * 1024 * 1024 * 1024; // 100 GB
+/// let chunk_size = optimal_chunk_size(total_size); // Returns 64 MB
+///
+/// let config = GeneratorConfig { size: total_size, ..Default::default() };
+/// let mut gen = DataGenerator::new(config);
+/// let mut buffer = vec![0u8; chunk_size];
+/// while !gen.is_complete() {
+///     let nbytes = gen.fill_chunk(&mut buffer);
+///     // Process buffer[..nbytes]...
+/// }
+/// ```
+pub fn optimal_chunk_size(total_size: usize) -> usize {
+    if total_size >= 64 * 1024 * 1024 {
+        64 * 1024 * 1024 // 64 MB - optimal (50+ GB/s)
+    } else if total_size >= 32 * 1024 * 1024 {
+        32 * 1024 * 1024 // 32 MB
+    } else if total_size >= 16 * 1024 * 1024 {
+        16 * 1024 * 1024 // 16 MB
+    } else {
+        total_size // Small enough for single allocation
+    }
+}
+
+/// Generate data with GeneratorConfig (returns bytes::Bytes for ZERO-COPY)
+///
+/// OPTIMIZED: Uses streaming API with optimal chunk sizes for best performance.
+/// - >= 64 MB: Uses 64 MB chunks (50+ GB/s throughput)
+/// - >= 32 MB: Uses 32 MB chunks
+/// - >= 16 MB: Uses 16 MB chunks
+/// - < 16 MB: Single allocation (small enough not to matter)
+///
+/// # Performance Notes
+/// - **Single call**: Optimized internally with streaming API and optimal chunking
+/// - **Multiple calls**: Thread pool created per call. For maximum performance,
+///   use `DataGenerator` directly to reuse the thread pool across calls.
+///
+/// # Example: Maximum Performance Pattern
+/// ```no_run
+/// use s3dlio::data_gen_alt::{DataGenerator, GeneratorConfig};
+///
+/// // For repeated generation, use DataGenerator to reuse thread pool:
+/// let config = GeneratorConfig { size: 1_000_000_000, ..Default::default() };
+/// let mut gen = DataGenerator::new(config);
+/// let mut buffer = vec![0u8; 64 * 1024 * 1024];  // 64 MB
+///
+/// while !gen.is_complete() {
+///     let nbytes = gen.fill_chunk(&mut buffer);
+///     // Use buffer[..nbytes]... achieves 50+ GB/s
+/// }
+/// ```
+pub fn generate_data_with_config(config: GeneratorConfig) -> bytes::Bytes {
+    let size = config.size;
+
+    // For small sizes, use single allocation (no overhead worth optimizing)
+    if size < 16 * 1024 * 1024 {
+        let buffer = generate_data(config);
+        return buffer.into_bytes();
+    }
+
+    // For larger sizes, use streaming API with optimal chunk size
+    let chunk_size = if size >= 64 * 1024 * 1024 {
+        64 * 1024 * 1024 // 64 MB - optimal performance (50+ GB/s)
+    } else if size >= 32 * 1024 * 1024 {
+        32 * 1024 * 1024 // 32 MB
+    } else {
+        16 * 1024 * 1024 // 16 MB
+    };
+
+    // Use streaming API (creates thread pool ONCE, reuses across chunks)
+    let mut generator = DataGenerator::new(config);
+    let mut result = Vec::with_capacity(size);
+    let mut chunk = vec![0u8; chunk_size];
+
+    while !generator.is_complete() {
+        let nbytes = generator.fill_chunk(&mut chunk);
+        if nbytes == 0 {
+            break;
+        }
+        result.extend_from_slice(&chunk[..nbytes]);
+    }
+
+    // Zero-copy conversion to bytes::Bytes
+    bytes::Bytes::from(result)
+}
+
+/// Generate controlled data (simplified API for s3dlio)
+///
+/// OPTIMIZED: Automatically uses optimal chunk sizes for best performance.
+/// - >= 64 MB: Uses 64 MB chunks (50+ GB/s throughput)
+/// - >= 32 MB: Uses 32 MB chunks
+/// - >= 16 MB: Uses 16 MB chunks
+/// - < 16 MB: Single allocation
+///
+/// # Parameters
+/// - `size`: Total size in bytes
+/// - `dedup`: Deduplication factor (1 = no dedup, N = N:1 ratio)
+/// - `compress`: Compression factor (1 = incompressible, N = N:1 ratio)
+/// - `seed`: Optional RNG seed for reproducibility (None = random)
+///
+/// # Performance Notes
+/// For maximum performance with repeated calls, consider using the streaming API:
+/// ```no_run
+/// use s3dlio::data_gen_alt::{DataGenerator, GeneratorConfig};
+///
+/// let config = GeneratorConfig { size: 1_000_000, ..Default::default() }; // 1 MB
+/// let mut gen = DataGenerator::new(config);
+/// let mut buffer = vec![0u8; 64 * 1024];  // 64 KB chunks
+/// while !gen.is_complete() {
+///     let nbytes = gen.fill_chunk(&mut buffer);
+///     // Use buffer[..nbytes] for your data...
+/// }
+/// ```
+pub fn generate_controlled_data_alt(
+    size: usize,
+    dedup: usize,
+    compress: usize,
+    seed: Option<u64>,
+) -> bytes::Bytes {
+    let config = GeneratorConfig {
+        size,
+        dedup_factor: dedup,
+        compress_factor: compress,
+        seed,
+        ..Default::default()
+    };
+    generate_data_with_config(config)
+}
+
+/// Streaming data generator (s3dlio compatibility)
+pub struct ObjectGenAlt {
+    generator: DataGenerator,
+}
+
+impl ObjectGenAlt {
+    /// Create new streaming generator
+    pub fn new(size: usize, dedup: usize, compress: usize) -> Self {
+        let config = GeneratorConfig {
+            size,
+            dedup_factor: dedup,
+            compress_factor: compress,
+            ..Default::default()
+        };
+        Self {
+            generator: DataGenerator::new(config),
+        }
+    }
+
+    /// Create new streaming generator with explicit seed for deterministic output
+    ///
+    /// When using the same seed, multiple generators will produce identical data
+    /// regardless of chunk size used in fill_chunk() calls.
+    pub fn new_with_seed(size: usize, dedup: usize, compress: usize, seed: u64) -> Self {
+        let config = GeneratorConfig {
+            size,
+            dedup_factor: dedup,
+            compress_factor: compress,
+            seed: Some(seed),
+            ..Default::default()
+        };
+        Self {
+            generator: DataGenerator::new(config),
+        }
+    }
+
+    /// Set or reset the random seed for subsequent data generation
+    ///
+    /// This allows changing the data pattern mid-stream. The new seed takes effect
+    /// on the next fill_chunk() call and resets the internal block sequence counter.
+    pub fn set_seed(&mut self, seed: Option<u64>) {
+        self.generator.set_seed(seed);
+    }
+
+    /// Fill chunk with data (returns number of bytes written)
+    pub fn fill_chunk(&mut self, buffer: &mut [u8]) -> usize {
+        self.generator.fill_chunk(buffer)
+    }
+
+    /// Check if generation is complete
+    pub fn is_complete(&self) -> bool {
+        self.generator.is_complete()
+    }
+
+    /// Get total size
+    pub fn total_size(&self) -> usize {
+        self.generator.total_size()
+    }
+
+    /// Get current position
+    pub fn position(&self) -> usize {
+        self.generator.position()
+    }
+
+    /// Reset generator to start
+    pub fn reset(&mut self) {
+        self.generator.reset()
+    }
+}
+
+/// Generate controlled data with streaming API
+pub fn generate_controlled_data_streaming_alt(
+    size: usize,
+    dedup: usize,
+    compress: usize,
+) -> ObjectGenAlt {
+    ObjectGenAlt::new(size, dedup, compress)
 }
 
 #[cfg(test)]
@@ -1207,7 +1486,11 @@ mod tests {
     fn test_generate_minimal() {
         init_tracing();
         let data = generate_data_simple(100, 1, 1);
-        assert_eq!(data.len(), 100, "Should generate exactly 100 bytes, not rounded up to block_size");
+        assert_eq!(
+            data.len(),
+            100,
+            "Should generate exactly 100 bytes, not rounded up to block_size"
+        );
     }
 
     #[test]
@@ -1278,237 +1561,4 @@ mod tests {
         assert_eq!(result.len(), config.size);
         assert!(gen.is_complete());
     }
-}
-
-// ============================================================================
-// s3dlio compatibility wrappers
-// ============================================================================
-
-/// Get total number of CPUs in the system
-pub fn total_cpus() -> usize {
-    num_cpus::get()
-}
-
-/// Get default number of threads for data generation (100% of CPUs)
-pub fn default_data_gen_threads() -> usize {
-    num_cpus::get()
-}
-
-/// Get optimal chunk size for streaming data generation
-/// 
-/// Returns the best chunk size based on total data size for maximum throughput:
-/// - >= 64 MB: Returns 64 MB (50+ GB/s)
-/// - >= 32 MB: Returns 32 MB
-/// - >= 16 MB: Returns 16 MB
-/// - < 16 MB: Returns size itself (use single allocation)
-/// 
-/// # Example
-/// ```no_run
-/// use s3dlio::data_gen_alt::{optimal_chunk_size, DataGenerator, GeneratorConfig};
-/// 
-/// let total_size = 100 * 1024 * 1024 * 1024; // 100 GB
-/// let chunk_size = optimal_chunk_size(total_size); // Returns 64 MB
-/// 
-/// let config = GeneratorConfig { size: total_size, ..Default::default() };
-/// let mut gen = DataGenerator::new(config);
-/// let mut buffer = vec![0u8; chunk_size];
-/// while !gen.is_complete() {
-///     let nbytes = gen.fill_chunk(&mut buffer);
-///     // Process buffer[..nbytes]...
-/// }
-/// ```
-pub fn optimal_chunk_size(total_size: usize) -> usize {
-    if total_size >= 64 * 1024 * 1024 {
-        64 * 1024 * 1024  // 64 MB - optimal (50+ GB/s)
-    } else if total_size >= 32 * 1024 * 1024 {
-        32 * 1024 * 1024  // 32 MB
-    } else if total_size >= 16 * 1024 * 1024 {
-        16 * 1024 * 1024  // 16 MB
-    } else {
-        total_size  // Small enough for single allocation
-    }
-}
-
-/// Generate data with GeneratorConfig (returns bytes::Bytes for ZERO-COPY)
-/// 
-/// OPTIMIZED: Uses streaming API with optimal chunk sizes for best performance.
-/// - >= 64 MB: Uses 64 MB chunks (50+ GB/s throughput)
-/// - >= 32 MB: Uses 32 MB chunks
-/// - >= 16 MB: Uses 16 MB chunks
-/// - < 16 MB: Single allocation (small enough not to matter)
-/// 
-/// # Performance Notes
-/// - **Single call**: Optimized internally with streaming API and optimal chunking
-/// - **Multiple calls**: Thread pool created per call. For maximum performance,
-///   use `DataGenerator` directly to reuse the thread pool across calls.
-/// 
-/// # Example: Maximum Performance Pattern
-/// ```no_run
-/// use s3dlio::data_gen_alt::{DataGenerator, GeneratorConfig};
-/// 
-/// // For repeated generation, use DataGenerator to reuse thread pool:
-/// let config = GeneratorConfig { size: 1_000_000_000, ..Default::default() };
-/// let mut gen = DataGenerator::new(config);
-/// let mut buffer = vec![0u8; 64 * 1024 * 1024];  // 64 MB
-/// 
-/// while !gen.is_complete() {
-///     let nbytes = gen.fill_chunk(&mut buffer);
-///     // Use buffer[..nbytes]... achieves 50+ GB/s
-/// }
-/// ```
-pub fn generate_data_with_config(config: GeneratorConfig) -> bytes::Bytes {
-    let size = config.size;
-    
-    // For small sizes, use single allocation (no overhead worth optimizing)
-    if size < 16 * 1024 * 1024 {
-        let buffer = generate_data(config);
-        return buffer.into_bytes();
-    }
-    
-    // For larger sizes, use streaming API with optimal chunk size
-    let chunk_size = if size >= 64 * 1024 * 1024 {
-        64 * 1024 * 1024  // 64 MB - optimal performance (50+ GB/s)
-    } else if size >= 32 * 1024 * 1024 {
-        32 * 1024 * 1024  // 32 MB
-    } else {
-        16 * 1024 * 1024  // 16 MB
-    };
-    
-    // Use streaming API (creates thread pool ONCE, reuses across chunks)
-    let mut generator = DataGenerator::new(config);
-    let mut result = Vec::with_capacity(size);
-    let mut chunk = vec![0u8; chunk_size];
-    
-    while !generator.is_complete() {
-        let nbytes = generator.fill_chunk(&mut chunk);
-        if nbytes == 0 {
-            break;
-        }
-        result.extend_from_slice(&chunk[..nbytes]);
-    }
-    
-    // Zero-copy conversion to bytes::Bytes
-    bytes::Bytes::from(result)
-}
-
-/// Generate controlled data (simplified API for s3dlio)
-/// 
-/// OPTIMIZED: Automatically uses optimal chunk sizes for best performance.
-/// - >= 64 MB: Uses 64 MB chunks (50+ GB/s throughput)
-/// - >= 32 MB: Uses 32 MB chunks
-/// - >= 16 MB: Uses 16 MB chunks
-/// - < 16 MB: Single allocation
-/// 
-/// # Parameters
-/// - `size`: Total size in bytes
-/// - `dedup`: Deduplication factor (1 = no dedup, N = N:1 ratio)
-/// - `compress`: Compression factor (1 = incompressible, N = N:1 ratio)
-/// - `seed`: Optional RNG seed for reproducibility (None = random)
-/// 
-/// # Performance Notes
-/// For maximum performance with repeated calls, consider using the streaming API:
-/// ```no_run
-/// use s3dlio::data_gen_alt::{DataGenerator, GeneratorConfig};
-/// 
-/// let config = GeneratorConfig { size: 1_000_000, ..Default::default() }; // 1 MB
-/// let mut gen = DataGenerator::new(config);
-/// let mut buffer = vec![0u8; 64 * 1024];  // 64 KB chunks
-/// while !gen.is_complete() {
-///     let nbytes = gen.fill_chunk(&mut buffer);
-///     // Use buffer[..nbytes] for your data...
-/// }
-/// ```
-pub fn generate_controlled_data_alt(
-    size: usize,
-    dedup: usize,
-    compress: usize,
-    seed: Option<u64>,
-) -> bytes::Bytes {
-    let config = GeneratorConfig {
-        size,
-        dedup_factor: dedup,
-        compress_factor: compress,
-        seed,
-        ..Default::default()
-    };
-    generate_data_with_config(config)
-}
-
-/// Streaming data generator (s3dlio compatibility)
-pub struct ObjectGenAlt {
-    generator: DataGenerator,
-}
-
-impl ObjectGenAlt {
-    /// Create new streaming generator
-    pub fn new(size: usize, dedup: usize, compress: usize) -> Self {
-        let config = GeneratorConfig {
-            size,
-            dedup_factor: dedup,
-            compress_factor: compress,
-            ..Default::default()
-        };
-        Self {
-            generator: DataGenerator::new(config),
-        }
-    }
-    
-    /// Create new streaming generator with explicit seed for deterministic output
-    /// 
-    /// When using the same seed, multiple generators will produce identical data
-    /// regardless of chunk size used in fill_chunk() calls.
-    pub fn new_with_seed(size: usize, dedup: usize, compress: usize, seed: u64) -> Self {
-        let config = GeneratorConfig {
-            size,
-            dedup_factor: dedup,
-            compress_factor: compress,
-            seed: Some(seed),
-            ..Default::default()
-        };
-        Self {
-            generator: DataGenerator::new(config),
-        }
-    }
-    
-    /// Set or reset the random seed for subsequent data generation
-    /// 
-    /// This allows changing the data pattern mid-stream. The new seed takes effect
-    /// on the next fill_chunk() call and resets the internal block sequence counter.
-    pub fn set_seed(&mut self, seed: Option<u64>) {
-        self.generator.set_seed(seed);
-    }
-
-    /// Fill chunk with data (returns number of bytes written)
-    pub fn fill_chunk(&mut self, buffer: &mut [u8]) -> usize {
-        self.generator.fill_chunk(buffer)
-    }
-
-    /// Check if generation is complete
-    pub fn is_complete(&self) -> bool {
-        self.generator.is_complete()
-    }
-
-    /// Get total size
-    pub fn total_size(&self) -> usize {
-        self.generator.total_size()
-    }
-
-    /// Get current position
-    pub fn position(&self) -> usize {
-        self.generator.position()
-    }
-
-    /// Reset generator to start
-    pub fn reset(&mut self) {
-        self.generator.reset()
-    }
-}
-
-/// Generate controlled data with streaming API
-pub fn generate_controlled_data_streaming_alt(
-    size: usize,
-    dedup: usize,
-    compress: usize,
-) -> ObjectGenAlt {
-    ObjectGenAlt::new(size, dedup, compress)
 }

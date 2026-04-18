@@ -8,9 +8,9 @@ use crate::data_loader::options::{LoaderOptions, LoadingMode};
 use crate::data_loader::sampler::{Sampler, SequentialSampler, ShuffleSampler};
 
 use futures_util::StreamExt;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use std::sync::Arc;
 
 /// High-level iterator that yields batches from a `Dataset`.
 pub struct DataLoader<D: Dataset> {
@@ -25,7 +25,7 @@ impl<D: Dataset> DataLoader<D> {
 
     /// Produce an async stream of `Result<Vec<Item>>` batches.
     /// Returned type is a concrete `ReceiverStream`, which is `Unpin` and `Sized`.
-    /// 
+    ///
     /// Supports graceful cancellation via `LoaderOptions::cancellation_token`.
     /// When cancelled, prefetch loops exit cleanly without producing new batches.
     pub fn stream(self) -> ReceiverStream<Result<Vec<D::Item>, DatasetError>> {
@@ -63,15 +63,16 @@ impl<D: Dataset> DataLoader<D> {
                     // Check cancellation before fetching
                     if let Some(ref token) = cancel_token_idx {
                         if token.is_cancelled() {
-                            break;  // Clean exit
+                            break; // Clean exit
                         }
                     }
-                    
+
                     match ds_idx.get(idx).await {
                         Ok(item) => {
                             buf.push(item);
                             if buf.len() == batch
-                                && tx_idx.send(Ok(std::mem::take(&mut buf))).await.is_err() {
+                                && tx_idx.send(Ok(std::mem::take(&mut buf))).await.is_err()
+                            {
                                 break;
                             }
                         }
@@ -89,13 +90,21 @@ impl<D: Dataset> DataLoader<D> {
             // -------- Iterable-style: drain underlying stream, form batches --------
             // NEW (Stage 0): optional sharding across distributed ranks + DataLoader workers
             let shard_world = self.opts.shard_world_size.max(1);
-            let worker_n    = self.opts.num_workers_pytorch.max(1);
-            let shard_mod   = shard_world * worker_n;
+            let worker_n = self.opts.num_workers_pytorch.max(1);
+            let shard_mod = shard_world * worker_n;
 
             // Clamp shard indices to valid ranges to be defensive
-            let rank       = if shard_world > 0 { self.opts.shard_rank.min(shard_world - 1) } else { 0 };
-            let worker_id  = if worker_n > 0 { self.opts.worker_id.min(worker_n - 1) } else { 0 };
-            let shard_id   = rank * worker_n + worker_id;
+            let rank = if shard_world > 0 {
+                self.opts.shard_rank.min(shard_world - 1)
+            } else {
+                0
+            };
+            let worker_id = if worker_n > 0 {
+                self.opts.worker_id.min(worker_n - 1)
+            } else {
+                0
+            };
+            let shard_id = rank * worker_n + worker_id;
 
             let tx_it = tx.clone();
             let cancel_token_it = cancel_token.clone();
@@ -106,21 +115,28 @@ impl<D: Dataset> DataLoader<D> {
                     // Check cancellation before processing
                     if let Some(ref token) = cancel_token_it {
                         if token.is_cancelled() {
-                            break;  // Clean exit
+                            break; // Clean exit
                         }
                     }
-                    
+
                     match next {
                         Ok(item) => {
                             // Keep item if this shard "owns" position i in round-robin
-                            let take = if shard_mod <= 1 { true } else { (i % shard_mod) == shard_id };
+                            let take = if shard_mod <= 1 {
+                                true
+                            } else {
+                                (i % shard_mod) == shard_id
+                            };
                             i = i.wrapping_add(1);
 
-                            if !take { continue; }
+                            if !take {
+                                continue;
+                            }
 
                             buf.push(item);
                             if buf.len() == batch
-                                && tx_it.send(Ok(std::mem::take(&mut buf))).await.is_err() {
+                                && tx_it.send(Ok(std::mem::take(&mut buf))).await.is_err()
+                            {
                                 break;
                             }
                         }
@@ -146,15 +162,16 @@ impl<D: Dataset> DataLoader<D> {
                     // Check cancellation before probing
                     if let Some(ref token) = cancel_token_un {
                         if token.is_cancelled() {
-                            break;  // Clean exit
+                            break; // Clean exit
                         }
                     }
-                    
+
                     match ds_un.get(idx).await {
                         Ok(item) => {
                             buf.push(item);
                             if buf.len() == batch
-                                && tx_un.send(Ok(std::mem::take(&mut buf))).await.is_err() {
+                                && tx_un.send(Ok(std::mem::take(&mut buf))).await.is_err()
+                            {
                                 break;
                             }
                             idx += 1;
@@ -178,4 +195,3 @@ impl<D: Dataset> DataLoader<D> {
         ReceiverStream::new(rx)
     }
 }
-

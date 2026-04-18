@@ -6,8 +6,8 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 // Use the new data_gen_alt API directly - NO deprecated functions
-use s3dlio::data_gen_alt::generate_data_simple;
 use s3dlio::constants::DGEN_BLOCK_SIZE;
+use s3dlio::data_gen_alt::generate_data_simple;
 
 #[cfg(test)]
 mod tests {
@@ -22,42 +22,50 @@ mod tests {
     /// which broke compression for small objects. Now generates exact size requested.
     #[test]
     fn test_min_size_enforcement() {
-        let size = 1024;  // Request less than DGEN_BLOCK_SIZE
+        let size = 1024; // Request less than DGEN_BLOCK_SIZE
         let dedup = 1;
         let compress = 1;
 
         let data = generate_data_simple(size, dedup, compress);
 
         // Verify we get exactly the requested size (FIX: no longer enforces 1 MiB minimum)
-        assert_eq!(data.len(), size, 
-            "Should get exact requested size. Requested {} bytes and got {}", 
-            size, data.len());
+        assert_eq!(
+            data.len(),
+            size,
+            "Should get exact requested size. Requested {} bytes and got {}",
+            size,
+            data.len()
+        );
     }
 
-    /// Check if one file gets created with random data 
+    /// Check if one file gets created with random data
     /// We need to check manually, so just create the file and examine offline
     #[test]
     fn test_write_random_data_to_file() {
-        let size = 8 * DGEN_BLOCK_SIZE;  // 8 MiB
+        let size = 8 * DGEN_BLOCK_SIZE; // 8 MiB
         let dedup = 3;
         let compress = 2;
         let output_dir = "/tmp";
 
         let data = generate_data_simple(size, dedup, compress);
-    
-        let filename = format!("{output_dir}/random_data_{}.bin", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+
+        let filename = format!(
+            "{output_dir}/random_data_{}.bin",
+            chrono::Local::now().format("%Y%m%d_%H%M%S")
+        );
         std::fs::create_dir_all(output_dir).expect("Failed to create test directory");
-    
+
         let mut file = std::fs::File::create(&filename).expect("Failed to create file");
-        file.write_all(data.as_slice()).expect("Failed to write data");
-    
+        file.write_all(data.as_slice())
+            .expect("Failed to write data");
+
         println!("Generated file: {}", filename);
     }
 
     /// Check if multiple files seem to have different data (unique per call)
     #[test]
     fn test_create_multiple_files() {
-        let size = 4 * DGEN_BLOCK_SIZE;  // 4 MiB
+        let size = 4 * DGEN_BLOCK_SIZE; // 4 MiB
         let dedup = 3;
         let compress = 2;
         let output_dir = "/tmp";
@@ -74,10 +82,10 @@ mod tests {
     /// With 64 blocks and dedup=2, we should have exactly 32 unique block patterns
     #[test]
     fn test_data_dedup_compress1() {
-        let num_blocks_to_generate = 64;  // 64 MiB total
+        let num_blocks_to_generate = 64; // 64 MiB total
         let size = num_blocks_to_generate * DGEN_BLOCK_SIZE;
         let dedup = 2;
-        let compress = 1;  // No compression
+        let compress = 1; // No compression
 
         let data = generate_data_simple(size, dedup, compress);
         let data_slice = data.as_slice();
@@ -108,7 +116,11 @@ mod tests {
         let expected_compress_ratio = (compress as f64 - 1.0) / compress as f64;
 
         eprintln!("Num blocks: {} ({} MiB)", num_blocks, num_blocks);
-        eprintln!("Unique blocks: {} (expected {})", unique_blocks.len(), num_blocks / dedup);
+        eprintln!(
+            "Unique blocks: {} (expected {})",
+            unique_blocks.len(),
+            num_blocks / dedup
+        );
         eprintln!("Calculated Dedup Ratio: {:.4}", dedup_ratio);
         eprintln!("Expected Dedup Ratio: {:.4}", expected_dedup_ratio);
         eprintln!("Calculated Compression Ratio: {:.4}", compression_ratio);
@@ -118,13 +130,18 @@ mod tests {
         assert!(
             (dedup_ratio - expected_dedup_ratio).abs() < TOLERANCE,
             "Dedup ratio check failed: got {:.4}, expected {:.4} (diff {:.4}, tolerance {:.4})",
-            dedup_ratio, expected_dedup_ratio, (dedup_ratio - expected_dedup_ratio).abs(), TOLERANCE
+            dedup_ratio,
+            expected_dedup_ratio,
+            (dedup_ratio - expected_dedup_ratio).abs(),
+            TOLERANCE
         );
 
         assert!(
             (compression_ratio - expected_compress_ratio).abs() < TOLERANCE,
             "Compression ratio check failed: got {:.4}, expected {:.4} (diff {:.4})",
-            compression_ratio, expected_compress_ratio, (compression_ratio - expected_compress_ratio).abs()
+            compression_ratio,
+            expected_compress_ratio,
+            (compression_ratio - expected_compress_ratio).abs()
         );
 
         println!("✅ Test Passed!");
@@ -134,7 +151,7 @@ mod tests {
     /// Verify dedup=3 (33% unique) and compress=2 (50% zeros)
     #[test]
     fn test_data_dedup_compress2() {
-        let num_blocks_to_generate = 66;  // 66 MiB (divisible by 3)
+        let num_blocks_to_generate = 66; // 66 MiB (divisible by 3)
         let size = num_blocks_to_generate * DGEN_BLOCK_SIZE;
         let dedup = 3;
         let compress = 2;
@@ -165,7 +182,11 @@ mod tests {
         let expected_compress_ratio = (compress as f64 - 1.0) / compress as f64;
 
         eprintln!("Num blocks: {} ({} MiB)", num_blocks, num_blocks);
-        eprintln!("Unique blocks: {} (expected {})", unique_blocks.len(), num_blocks / dedup);
+        eprintln!(
+            "Unique blocks: {} (expected {})",
+            unique_blocks.len(),
+            num_blocks / dedup
+        );
         eprintln!("Calculated Dedup Ratio: {:.4}", dedup_ratio);
         eprintln!("Expected Dedup Ratio: {:.4}", expected_dedup_ratio);
         eprintln!("Calculated Compression Ratio: {:.4}", compression_ratio);
@@ -175,13 +196,18 @@ mod tests {
         assert!(
             (dedup_ratio - expected_dedup_ratio).abs() < TOLERANCE,
             "Dedup ratio check failed: got {:.4}, expected {:.4} (diff {:.4}, tolerance {:.4})",
-            dedup_ratio, expected_dedup_ratio, (dedup_ratio - expected_dedup_ratio).abs(), TOLERANCE
+            dedup_ratio,
+            expected_dedup_ratio,
+            (dedup_ratio - expected_dedup_ratio).abs(),
+            TOLERANCE
         );
 
         assert!(
             (compression_ratio - expected_compress_ratio).abs() < TOLERANCE,
             "Compression ratio check failed: got {:.4}, expected {:.4} (diff {:.4})",
-            compression_ratio, expected_compress_ratio, (compression_ratio - expected_compress_ratio).abs()
+            compression_ratio,
+            expected_compress_ratio,
+            (compression_ratio - expected_compress_ratio).abs()
         );
 
         println!("✅ Test Passed!");

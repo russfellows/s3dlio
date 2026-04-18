@@ -14,14 +14,14 @@ use azure_core::http::{Body, NoFormat, RequestContent, XmlFormat};
 use azure_identity::DeveloperToolsCredential;
 
 use azure_storage_blob::clients::{
-    BlobClient, BlobClientOptions, BlobContainerClient, BlobContainerClientOptions, BlobServiceClient,
-    BlobServiceClientOptions, BlockBlobClient,
+    BlobClient, BlobClientOptions, BlobContainerClient, BlobContainerClientOptions,
+    BlobServiceClient, BlobServiceClientOptions, BlockBlobClient,
 };
 use azure_storage_blob::models::{
-    BlobClientDownloadOptions, BlobClientGetPropertiesOptions, BlobClientGetPropertiesResultHeaders,
-    BlobContainerClientListBlobFlatSegmentOptions, BlockBlobClientCommitBlockListOptions,
-    BlockBlobClientStageBlockOptions, BlockBlobClientUploadOptions, BlockList, BlockListType,
-    BlockLookupList,
+    BlobClientDownloadOptions, BlobClientGetPropertiesOptions,
+    BlobClientGetPropertiesResultHeaders, BlobContainerClientListBlobFlatSegmentOptions,
+    BlockBlobClientCommitBlockListOptions, BlockBlobClientStageBlockOptions,
+    BlockBlobClientUploadOptions, BlockList, BlockListType, BlockLookupList,
 };
 use tracing::debug;
 
@@ -56,11 +56,11 @@ impl AzureBlob {
     }
 
     /// Build with Entra ID (AAD) default chain (env, managed identity, etc).
-    /// 
+    ///
     /// Supports custom endpoints via environment variables for local emulators and proxies:
     /// - `AZURE_STORAGE_ENDPOINT`: Primary endpoint URL (e.g., http://localhost:10000)
     /// - `AZURE_BLOB_ENDPOINT_URL`: Alternative endpoint URL
-    /// 
+    ///
     /// When a custom endpoint is set, the account name is appended to form the full URL.
     /// Example: AZURE_STORAGE_ENDPOINT=http://localhost:10000 + account="devstoreaccount1"
     ///          → http://localhost:10000/devstoreaccount1
@@ -78,25 +78,27 @@ impl AzureBlob {
             tracing::info!("Using custom Azure endpoint: {}", account_url);
             return Self::with_default_credential_from_url(&account_url, container);
         }
-        
+
         // Default: public Azure endpoint
         let account_url = Self::account_url_from_account(account);
-        
+
         // Get or initialize the global credential (only authenticates once per process)
         let credential = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                AZURE_CREDENTIAL.get_or_try_init(|| async {
-                    let credential_arc = DeveloperToolsCredential::new(None)?;
-                    let credential: Arc<dyn TokenCredential> = credential_arc;
-                    Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
-                }).await
+                AZURE_CREDENTIAL
+                    .get_or_try_init(|| async {
+                        let credential_arc = DeveloperToolsCredential::new(None)?;
+                        let credential: Arc<dyn TokenCredential> = credential_arc;
+                        Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
+                    })
+                    .await
             })
         })?;
-        
-        Ok(Self { 
-            account_url, 
-            container: container.to_string(), 
-            credential: Arc::clone(credential) 
+
+        Ok(Self {
+            account_url,
+            container: container.to_string(),
+            credential: Arc::clone(credential),
         })
     }
 
@@ -105,18 +107,20 @@ impl AzureBlob {
         // Get or initialize the global credential (only authenticates once per process)
         let credential = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                AZURE_CREDENTIAL.get_or_try_init(|| async {
-                    let credential_arc = DeveloperToolsCredential::new(None)?;
-                    let credential: Arc<dyn TokenCredential> = credential_arc;
-                    Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
-                }).await
+                AZURE_CREDENTIAL
+                    .get_or_try_init(|| async {
+                        let credential_arc = DeveloperToolsCredential::new(None)?;
+                        let credential: Arc<dyn TokenCredential> = credential_arc;
+                        Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
+                    })
+                    .await
             })
         })?;
-        
-        Ok(Self { 
-            account_url: account_url.to_string(), 
-            container: container.to_string(), 
-            credential: Arc::clone(credential) 
+
+        Ok(Self {
+            account_url: account_url.to_string(),
+            container: container.to_string(),
+            credential: Arc::clone(credential),
         })
     }
 
@@ -162,20 +166,34 @@ impl AzureBlob {
 
     /// Simple upload (single request). For large bodies prefer multipart helpers below.
     pub async fn put(&self, key: &str, body: Bytes, overwrite: bool) -> Result<()> {
-        debug!("AzureBlob::put container='{}', key='{}', size={}, overwrite={}", self.container, key, body.len(), overwrite);
+        debug!(
+            "AzureBlob::put container='{}', key='{}', size={}, overwrite={}",
+            self.container,
+            key,
+            body.len(),
+            overwrite
+        );
         let blob = self.blob_client(key)?;
         // Convert Bytes -> Body -> RequestContent<Bytes, NoFormat>
         let content_len = body.len() as u64;
         let data: RequestContent<Bytes, NoFormat> = Body::from(body).into();
         let _resp = blob
-            .upload(data, overwrite, content_len, Some(BlockBlobClientUploadOptions::default()))
+            .upload(
+                data,
+                overwrite,
+                content_len,
+                Some(BlockBlobClientUploadOptions::default()),
+            )
             .await?;
         Ok(())
     }
 
     /// Range GET. If `end` is None → open-ended range.
     pub async fn get_range(&self, key: &str, start: u64, end: Option<u64>) -> Result<Bytes> {
-        debug!("AzureBlob::get_range container='{}', key='{}', start={}, end={:?}", self.container, key, start, end);
+        debug!(
+            "AzureBlob::get_range container='{}', key='{}', start={}, end={:?}",
+            self.container, key, start, end
+        );
         let blob = self.blob_client(key)?;
         let mut opts = BlobClientDownloadOptions::default();
         let range = match end {
@@ -185,40 +203,70 @@ impl AzureBlob {
         opts.range = Some(range);
         let resp = blob.download(Some(opts)).await?;
         let body = resp.into_body().collect().await?;
-        debug!("AzureBlob::get_range success: key='{}', {} bytes", key, body.len());
+        debug!(
+            "AzureBlob::get_range success: key='{}', {} bytes",
+            key,
+            body.len()
+        );
         Ok(body)
     }
 
     /// Full GET (single buffer).
     pub async fn get(&self, key: &str) -> Result<Bytes> {
-        debug!("AzureBlob::get container='{}', key='{}'", self.container, key);
+        debug!(
+            "AzureBlob::get container='{}', key='{}'",
+            self.container, key
+        );
         let blob = self.blob_client(key)?;
-        let resp = blob.download(Some(BlobClientDownloadOptions::default())).await?;
+        let resp = blob
+            .download(Some(BlobClientDownloadOptions::default()))
+            .await?;
         let body = resp.into_body().collect().await?;
-        debug!("AzureBlob::get success: key='{}', {} bytes", key, body.len());
+        debug!(
+            "AzureBlob::get success: key='{}', {} bytes",
+            key,
+            body.len()
+        );
         Ok(body)
     }
 
     /// Stat: read size, etag, last-modified from typed response headers.
     pub async fn stat(&self, key: &str) -> Result<AzureBlobProperties> {
-        debug!("AzureBlob::stat container='{}', key='{}'", self.container, key);
+        debug!(
+            "AzureBlob::stat container='{}', key='{}'",
+            self.container, key
+        );
         let blob = self.blob_client(key)?;
-        let resp = blob.get_properties(Some(BlobClientGetPropertiesOptions::default())).await?;
+        let resp = blob
+            .get_properties(Some(BlobClientGetPropertiesOptions::default()))
+            .await?;
         let content_length = resp.content_length()?.unwrap_or(0);
         let etag = resp.etag()?.map(|e| e.to_string());
         let last_modified = resp.last_modified()?.map(|dt| dt.to_string());
-        debug!("AzureBlob::stat success: key='{}', content_length={}", key, content_length);
-        Ok(AzureBlobProperties { content_length, etag, last_modified })
+        debug!(
+            "AzureBlob::stat success: key='{}', content_length={}",
+            key, content_length
+        );
+        Ok(AzureBlobProperties {
+            content_length,
+            etag,
+            last_modified,
+        })
     }
 
     /// Flat list with optional prefix.
     /// In SDK 0.7+, the Pager yields BlobItemInternal directly (not Response pages).
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
-        debug!("AzureBlob::list container='{}', prefix={:?}", self.container, prefix);
+        debug!(
+            "AzureBlob::list container='{}', prefix={:?}",
+            self.container, prefix
+        );
         let container = self.container_client()?;
         let mut opts = BlobContainerClientListBlobFlatSegmentOptions::default();
         if let Some(p) = prefix {
-            if !p.is_empty() { opts.prefix = Some(p.to_string()); }
+            if !p.is_empty() {
+                opts.prefix = Some(p.to_string());
+            }
         }
         let mut pager = container.list_blobs(Some(opts))?;
         let mut out = Vec::new();
@@ -249,12 +297,12 @@ impl AzureBlob {
                     return;
                 }
             };
-            
+
             let mut opts = BlobContainerClientListBlobFlatSegmentOptions::default();
             if let Some(p) = prefix {
                 if !p.is_empty() { opts.prefix = Some(p.to_string()); }
             }
-            
+
             let mut pager = match container.list_blobs(Some(opts)) {
                 Ok(p) => p,
                 Err(e) => {
@@ -272,7 +320,7 @@ impl AzureBlob {
                         return;
                     }
                 };
-                
+
                 if let Some(name) = item.name.and_then(|bn| bn.content) {
                     yield Ok(name);
                 }
@@ -283,7 +331,11 @@ impl AzureBlob {
     // src/azure_client.rs  (inside impl AzureBlob)
     /// Delete multiple blobs (simple loop; batch is possible later).
     pub async fn delete_objects(&self, blobs: &[String]) -> anyhow::Result<()> {
-        debug!("AzureBlob::delete_objects container='{}', count={}", self.container, blobs.len());
+        debug!(
+            "AzureBlob::delete_objects container='{}', count={}",
+            self.container,
+            blobs.len()
+        );
         let container = self.container_client()?;
         for name in blobs {
             let b = container.blob_client(name);
@@ -292,26 +344,44 @@ impl AzureBlob {
         Ok(())
     }
 
-
     // ----------------------------------------------------------------------
     // Multipart (block blob) helpers
     // ----------------------------------------------------------------------
 
     /// Stage a block (non-committal). `block_id` is raw bytes; SDK base64-encodes on wire.
     pub async fn stage_block(&self, key: &str, block_id: &[u8], chunk: Bytes) -> Result<()> {
-        debug!("AzureBlob::stage_block container='{}', key='{}', chunk_size={}", self.container, key, chunk.len());
+        debug!(
+            "AzureBlob::stage_block container='{}', key='{}', chunk_size={}",
+            self.container,
+            key,
+            chunk.len()
+        );
         let bb = self.block_blob_client(key)?;
         let content_len = chunk.len() as u64;
         let body: RequestContent<Bytes, NoFormat> = Body::from(chunk).into();
         let _resp = bb
-            .stage_block(block_id, content_len, body, Some(BlockBlobClientStageBlockOptions::default()))
+            .stage_block(
+                block_id,
+                content_len,
+                body,
+                Some(BlockBlobClientStageBlockOptions::default()),
+            )
             .await?;
         Ok(())
     }
 
     /// Commit previously staged block IDs (order matters).
-    pub async fn commit_block_list(&self, key: &str, committed_block_ids: Vec<Vec<u8>>) -> Result<()> {
-        debug!("AzureBlob::commit_block_list container='{}', key='{}', blocks={}", self.container, key, committed_block_ids.len());
+    pub async fn commit_block_list(
+        &self,
+        key: &str,
+        committed_block_ids: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        debug!(
+            "AzureBlob::commit_block_list container='{}', key='{}', blocks={}",
+            self.container,
+            key,
+            committed_block_ids.len()
+        );
         let bb = self.block_blob_client(key)?;
         let lookup = BlockLookupList {
             committed: None,
@@ -327,7 +397,10 @@ impl AzureBlob {
 
     /// Return committed block IDs (raw bytes that correspond to your passed IDs).
     pub async fn get_block_list_committed(&self, key: &str) -> Result<Vec<Vec<u8>>> {
-        debug!("AzureBlob::get_block_list_committed container='{}', key='{}'", self.container, key);
+        debug!(
+            "AzureBlob::get_block_list_committed container='{}', key='{}'",
+            self.container, key
+        );
         let bb = self.block_blob_client(key)?;
         let resp = bb.get_block_list(BlockListType::Committed, None).await?;
         // In 0.7.0, Response::into_model() deserializes directly (not async)
@@ -367,7 +440,6 @@ impl AzureBlob {
         let mut committed_ids: Vec<Vec<u8>> = Vec::new();
 
         while let Some(chunk) = stream.next().await {
-
             // Fixed-width raw bytes (SDK will base64 on the wire)
             let id_str = format!("{:016x}-{:08x}", next_idx, part_size as u32);
             let id_bytes = id_str.as_bytes().to_vec();
@@ -425,7 +497,6 @@ impl AzureBlob {
     pub async fn delete_container(&self) -> Result<()> {
         bail!("Container deletion not supported in Azure SDK v0.8+. Use Azure CLI: az storage container delete")
     }
-
 }
 
 // ============================================================================
@@ -433,10 +504,10 @@ impl AzureBlob {
 // ============================================================================
 
 /// Constructs the Azure account URL based on environment variables.
-/// 
+///
 /// Returns the custom endpoint URL if `AZURE_STORAGE_ENDPOINT` or `AZURE_BLOB_ENDPOINT_URL`
 /// is set, otherwise returns the standard Azure Blob endpoint.
-/// 
+///
 /// This is extracted as a pure function for testability.
 pub fn resolve_azure_account_url(account: &str) -> String {
     if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
@@ -464,10 +535,7 @@ pub fn resolve_azure_account_url(account: &str) -> String {
 ///
 /// Credentials follow the same chain as [`AzureBlob::with_default_credential`]:
 /// environment variables, managed identity, developer tools, etc.
-pub async fn list_account_containers(
-    account: &str,
-) -> Result<Vec<(String, Option<String>)>> {
-
+pub async fn list_account_containers(account: &str) -> Result<Vec<(String, Option<String>)>> {
     let account_url = resolve_azure_account_url(account);
 
     let credential = AZURE_CREDENTIAL
@@ -518,7 +586,7 @@ pub async fn list_account_containers(
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    
+
     // Mutex to serialize tests that modify environment variables
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -537,11 +605,11 @@ mod tests {
     #[test]
     fn test_resolve_azure_account_url_default() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Clear any existing endpoint env vars
         std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
-        
+
         let url = resolve_azure_account_url("mystorageaccount");
         assert_eq!(url, "https://mystorageaccount.blob.core.windows.net");
     }
@@ -549,14 +617,17 @@ mod tests {
     #[test]
     fn test_resolve_azure_account_url_with_primary_env_var() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Set primary env var
-        std::env::set_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT, "http://localhost:10000");
+        std::env::set_var(
+            crate::constants::ENV_AZURE_STORAGE_ENDPOINT,
+            "http://localhost:10000",
+        );
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
-        
+
         let url = resolve_azure_account_url("devstoreaccount1");
         assert_eq!(url, "http://localhost:10000/devstoreaccount1");
-        
+
         // Cleanup
         std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
     }
@@ -564,14 +635,17 @@ mod tests {
     #[test]
     fn test_resolve_azure_account_url_with_alternative_env_var() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Set alternative env var (primary not set)
         std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
-        std::env::set_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL, "http://127.0.0.1:9001");
-        
+        std::env::set_var(
+            crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL,
+            "http://127.0.0.1:9001",
+        );
+
         let url = resolve_azure_account_url("testaccount");
         assert_eq!(url, "http://127.0.0.1:9001/testaccount");
-        
+
         // Cleanup
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
     }
@@ -579,14 +653,17 @@ mod tests {
     #[test]
     fn test_resolve_azure_account_url_with_trailing_slash() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Set env var with trailing slash
-        std::env::set_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT, "http://localhost:10000/");
+        std::env::set_var(
+            crate::constants::ENV_AZURE_STORAGE_ENDPOINT,
+            "http://localhost:10000/",
+        );
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
-        
+
         let url = resolve_azure_account_url("devstoreaccount1");
         assert_eq!(url, "http://localhost:10000/devstoreaccount1");
-        
+
         // Cleanup
         std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
     }
@@ -594,14 +671,20 @@ mod tests {
     #[test]
     fn test_resolve_azure_account_url_primary_takes_precedence() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        
+
         // Set both env vars - primary should take precedence
-        std::env::set_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT, "http://primary:10000");
-        std::env::set_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL, "http://alternative:9001");
-        
+        std::env::set_var(
+            crate::constants::ENV_AZURE_STORAGE_ENDPOINT,
+            "http://primary:10000",
+        );
+        std::env::set_var(
+            crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL,
+            "http://alternative:9001",
+        );
+
         let url = resolve_azure_account_url("testaccount");
         assert_eq!(url, "http://primary:10000/testaccount");
-        
+
         // Cleanup
         std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);

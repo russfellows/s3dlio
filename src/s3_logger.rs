@@ -8,14 +8,17 @@
 //! Creates a zstd-compressed, tab-separated log file with a format
 //! identical to the 'warp-replay' tool.
 
+use once_cell::sync::OnceCell;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::time::{SystemTime, Duration};
-use std::thread;
-use std::sync::{Arc, Mutex, mpsc::{sync_channel, channel, SyncSender, Receiver}};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{
+    mpsc::{channel, sync_channel, Receiver, SyncSender},
+    Arc, Mutex,
+};
+use std::thread;
+use std::time::{Duration, SystemTime};
 use tracing::info;
-use once_cell::sync::OnceCell;
 use zstd::stream::write::Encoder;
 
 // Global variables
@@ -47,22 +50,22 @@ pub fn global_logger() -> Option<Logger> {
 }
 
 /// Set clock offset for the global logger (convenience function).
-/// 
+///
 /// # Parameters
 /// - `offset_nanos`: Nanoseconds to subtract from local timestamps for distributed sync
-/// 
+///
 /// # Returns
 /// - `Ok(())` if logger is initialized and offset was set
 /// - `Err` if logger is not initialized
-/// 
+///
 /// # Example
 /// ```ignore
 /// // Initialize logger
 /// s3dlio::init_op_logger("operations.log.zst")?;
-/// 
+///
 /// // Calculate clock offset during agent sync
 /// let offset = (local_time - controller_time).as_nanos() as i64;
-/// 
+///
 /// // Set offset for all future log entries
 /// s3dlio::set_clock_offset(offset)?;
 /// ```
@@ -73,7 +76,7 @@ pub fn set_clock_offset(offset_nanos: i64) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Logger not initialized - call init_op_logger() first"
+            "Logger not initialized - call init_op_logger() first",
         ))
     }
 }
@@ -85,45 +88,43 @@ pub fn get_clock_offset() -> std::io::Result<i64> {
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Logger not initialized"
+            "Logger not initialized",
         ))
     }
 }
 
 /// Set the global client ID for operation logging.
-/// 
+///
 /// All operations logged after this call will use the specified client_id value.
 /// This is useful for identifying which client/agent generated which operations
 /// in distributed systems or multi-client scenarios.
-/// 
+///
 /// # Parameters
 /// - `client_id`: String identifier for this client (e.g., "agent-1", "worker-3")
-/// 
+///
 /// # Example
 /// ```ignore
 /// // Initialize logger
 /// s3dlio::init_op_logger("operations.log.zst")?;
-/// 
+///
 /// // Set client ID for all subsequent operations
 /// s3dlio::set_client_id("agent-1")?;
 /// ```
 pub fn set_client_id(client_id: &str) -> std::io::Result<()> {
     // Initialize global client_id storage if not already done
     let _ = GLOBAL_CLIENT_ID.get_or_init(|| Mutex::new(String::new()));
-    
+
     if let Some(global_id) = GLOBAL_CLIENT_ID.get() {
         if let Ok(mut id) = global_id.lock() {
             *id = client_id.to_string();
             Ok(())
         } else {
-            Err(std::io::Error::other(
-                "Failed to acquire client_id lock"
-            ))
+            Err(std::io::Error::other("Failed to acquire client_id lock"))
         }
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Failed to initialize client_id storage"
+            "Failed to initialize client_id storage",
         ))
     }
 }
@@ -193,19 +194,27 @@ impl LogEntry {
         } else {
             Duration::from_nanos((-clock_offset_nanos) as u64)
         };
-        
+
         let corrected_start = if clock_offset_nanos >= 0 {
-            self.start_time.checked_sub(offset_duration).unwrap_or(self.start_time)
+            self.start_time
+                .checked_sub(offset_duration)
+                .unwrap_or(self.start_time)
         } else {
-            self.start_time.checked_add(offset_duration).unwrap_or(self.start_time)
+            self.start_time
+                .checked_add(offset_duration)
+                .unwrap_or(self.start_time)
         };
-        
+
         let corrected_end = if clock_offset_nanos >= 0 {
-            self.end_time.checked_sub(offset_duration).unwrap_or(self.end_time)
+            self.end_time
+                .checked_sub(offset_duration)
+                .unwrap_or(self.end_time)
         } else {
-            self.end_time.checked_add(offset_duration).unwrap_or(self.end_time)
+            self.end_time
+                .checked_add(offset_duration)
+                .unwrap_or(self.end_time)
         };
-        
+
         let corrected_first_byte = self.first_byte_time.and_then(|t| {
             if clock_offset_nanos >= 0 {
                 t.checked_sub(offset_duration)
@@ -213,7 +222,7 @@ impl LogEntry {
                 t.checked_add(offset_duration)
             }
         });
-        
+
         let duration_ns = corrected_end
             .duration_since(corrected_start)
             .unwrap_or_default()
@@ -226,9 +235,19 @@ impl LogEntry {
         let error_str = self.error.as_deref().unwrap_or_default();
         format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            self.idx, self.thread_id, self.operation, self.client_id, self.num_objects,
-            self.bytes, self.endpoint, self.file, error_str, start_ts, first_byte_ts,
-            end_ts, duration_ns
+            self.idx,
+            self.thread_id,
+            self.operation,
+            self.client_id,
+            self.num_objects,
+            self.bytes,
+            self.endpoint,
+            self.file,
+            error_str,
+            start_ts,
+            first_byte_ts,
+            end_ts,
+            duration_ns
         )
     }
 }
@@ -238,7 +257,7 @@ impl LogEntry {
 pub struct Logger {
     sender: SyncSender<LogEntry>,
     done_rx: Mutex<Option<Receiver<()>>>,
-    clock_offset_nanos: Arc<AtomicI64>,  // Nanoseconds to adjust timestamps for distributed sync
+    clock_offset_nanos: Arc<AtomicI64>, // Nanoseconds to adjust timestamps for distributed sync
 }
 
 impl Clone for Logger {
@@ -255,28 +274,34 @@ impl Clone for Logger {
 impl Logger {
     /// Creates a new logger and spawns the background thread to handle writing.
     pub fn new(log_file_path: &str) -> std::io::Result<Self> {
-        // 
-        // Check to see if the LOSSLESS env variable is set 
+        //
+        // Check to see if the LOSSLESS env variable is set
         let _ = LOSSLESS.set(
             std::env::var("S3DLIO_OPLOG_LOSSLESS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
+                .unwrap_or(false),
         );
 
-/*
- * Instead of a Bounded channel with set size, check ENV variables to optionally use different
- * sizes
- *
-        // Bounded channel for log entries (drop on overflow in `log()` via try_send).
-        let (sender, receiver): (SyncSender<LogEntry>, Receiver<LogEntry>) = sync_channel(256);
-*/
+        /*
+         * Instead of a Bounded channel with set size, check ENV variables to optionally use different
+         * sizes
+         *
+                // Bounded channel for log entries (drop on overflow in `log()` via try_send).
+                let (sender, receiver): (SyncSender<LogEntry>, Receiver<LogEntry>) = sync_channel(256);
+        */
         // Tunable buffer sizes via (env) variables:
-        let cap: usize = std::env::var("S3DLIO_OPLOG_BUF").ok()
-            .and_then(|s| s.parse().ok()).unwrap_or(256);
-        let wbuf: usize = std::env::var("S3DLIO_OPLOG_WBUFCAP").ok()
-            .and_then(|s| s.parse().ok()).unwrap_or(256 * 1024);
-        let level: i32 = std::env::var("S3DLIO_OPLOG_LEVEL").ok()
-            .and_then(|s| s.parse().ok()).unwrap_or(1); // bias to fast
+        let cap: usize = std::env::var("S3DLIO_OPLOG_BUF")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256);
+        let wbuf: usize = std::env::var("S3DLIO_OPLOG_WBUFCAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256 * 1024);
+        let level: i32 = std::env::var("S3DLIO_OPLOG_LEVEL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1); // bias to fast
 
         // Bounded channel for log entries (drop on overflow in `log()` via try_send).
         let (sender, receiver): (SyncSender<LogEntry>, Receiver<LogEntry>) = sync_channel(cap);
@@ -289,7 +314,7 @@ impl Logger {
 
         // Old, we didn't set a buffer capacity
         //let writer = BufWriter::new(file);
-        let writer = BufWriter::with_capacity(wbuf, file); 
+        let writer = BufWriter::with_capacity(wbuf, file);
 
         let mut encoder = Encoder::new(writer, level)?.auto_finish();
 
@@ -318,40 +343,41 @@ impl Logger {
             let _ = done_tx.send(());
         });
 
-        Ok(Logger { 
-            sender, 
+        Ok(Logger {
+            sender,
             done_rx: Mutex::new(Some(done_rx)),
             clock_offset_nanos: clock_offset,
         })
     }
 
     /// Set the clock offset for timestamp correction in distributed systems.
-    /// 
+    ///
     /// # Parameters
     /// - `offset_nanos`: Nanoseconds to subtract from local timestamps
     ///   - Positive: local clock is ahead of reference (subtract to correct)
     ///   - Negative: local clock is behind reference (add to correct)
     ///   - Zero: no correction needed
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// // Agent calculates offset during synchronization
     /// let clock_offset_nanos = (local_time - controller_time).as_nanos() as i64;
-    /// 
+    ///
     /// // Set offset for all future log entries
     /// logger.set_clock_offset(clock_offset_nanos);
     /// ```
     pub fn set_clock_offset(&self, offset_nanos: i64) {
-        self.clock_offset_nanos.store(offset_nanos, Ordering::Relaxed);
+        self.clock_offset_nanos
+            .store(offset_nanos, Ordering::Relaxed);
     }
-    
+
     /// Get the current clock offset value.
     pub fn get_clock_offset(&self) -> i64 {
         self.clock_offset_nanos.load(Ordering::Relaxed)
     }
 
     /// Submit a log entry. Use try_send to avoid blocking; drop if channel is full.
-    /// if our LOSSLESS env is set, then we do block instead of dropping 
+    /// if our LOSSLESS env is set, then we do block instead of dropping
     pub fn log(&self, entry: LogEntry) {
         if *LOSSLESS.get().unwrap_or(&false) {
             // Blocking: guarantees no drops (may stall if writer can’t keep up).
@@ -364,4 +390,3 @@ impl Logger {
         }
     }
 }
-

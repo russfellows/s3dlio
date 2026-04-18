@@ -1,5 +1,183 @@
 # s3dlio Changelog
 
+## Version 0.9.90 - AIStore Full Support, TLS Security Fixes, HTTP/2, 5 Issues Closed (April 2026)
+
+### Feature: Full NVIDIA AIStore support — redirects + complete TLS security (closes #126)
+
+This release promotes AIStore support from "tacit" to **fully implemented and security-hardened**.
+`RedirectFollowingConnector` now enforces all four redirect security policies when
+`S3DLIO_FOLLOW_REDIRECTS=1`:
+
+1. **Cross-host `Authorization` header stripping** (RFC 9110 §11.6.2) — always active
+2. **Standard TLS cert chain + hostname verification** (rustls WebPKI) — always active
+3. **HTTPS→HTTP scheme downgrade prevention** — was dead code (`cert_store: None`) since
+   `make_redirecting_client()` never attached the store; now active via
+   `cert_store: Some(CertVerifyStore::new())`
+4. **Certificate pinning across redirect chain** — implemented via `RecordingVerifier`
+   (a `rustls::client::danger::ServerCertVerifier` that delegates to WebPKI first and records
+   the leaf cert DER only on success) + pre-flight TLS probe via `tokio-rustls`. This is the only
+   viable approach given that the AWS Rust SDK's internal TLS chain is entirely `pub(crate)`-gated.
+
+**Root cause of the security gaps:** both TLS policy gates in `follow_redirects()` are guarded by
+`if let Some(ref store) = cert_store`. With `cert_store: None`, neither gate was ever entered —
+all TLS security logic was unreachable in production. Unit tests bypassed `make_redirecting_client()`
+entirely, so they passed while production was unprotected.
+
+**New direct dependencies** (were already transitive via `aws-smithy-http-client`):
+- `rustls = { version = "0.23", features = ["aws-lc-rs"] }`
+- `tokio-rustls = "0.26"`
+- `rustls-native-certs = "0.8"` (loads platform root CAs for production probes)
+
+**End-to-end test coverage — all 4 redirect scenarios validated with real OS-assigned ports:**
+
+| # | Origin | Redirect target | Result | Test |
+|---|---|---|---|---|
+| 1 | `https://` (real TLS server) | `http://` (real TCP port) | ❌ Refused — scheme downgrade | `end_to_end_https_to_http_redirect_refused_real_servers` |
+| 2 | `https://` cert A | `https://` cert B ≠ A | ❌ Refused — cert mismatch | `end_to_end_https_cert_mismatch_refused_real_servers` |
+| 3 | `https://` cert A | `https://` cert A (shared) | ✅ 200 OK — cert match | `end_to_end_https_same_cert_redirect_passes_real_servers` |
+| 4 | `http://` | `http://` | ✅ 200 OK — no TLS checks | `end_to_end_http_to_http_redirect_passes_real_servers` |
+
+Total redirect tests: **27** (13 RFC 9110 conformance, 4 TLS policy unit, 2 TLS probe integration,
+4 end-to-end). See [`docs/AIStore_redirect_implementation_v0.9.90.md`](AIStore_redirect_implementation_v0.9.90.md)
+for the full implementation reference including the AWS SDK API dead-end investigation.
+
+### Bug fix: GCS delete errors silently swallowed — exit code always 0 (closes #135)
+- `GcsClient::delete_objects()` logged `warn!()` for individual delete failures but returned
+  `Ok(())`, causing `s3-cli rm` to report "Successfully deleted all objects" even when objects
+  were not deleted. A subsequent `ls` would reveal the surviving objects.
+- Fix: `anyhow::bail!()` with a descriptive message including `fail_count / total` and the bucket
+  name. Errors now propagate correctly to the CLI caller and produce a non-zero exit code.
+
+### Bug fix: `s3-cli put` silently rounds up objects < 4 KiB to 4096 bytes (closes #136)
+- Small object generation clamped the payload to a 4096-byte minimum in the random data path.
+  A request for a 1 KiB object silently produced a 4 KiB PUT. Fixed in the Python API layer.
+
+### Feature: expose `list_containers()` / `list_buckets()` to Python API (closes #133)
+- `list_containers(uri)` was implemented in `src/list_containers.rs` but never registered in the
+  Python API. Now exported as `list_containers_py()` in `src/python_api/python_core_api.rs`.
+- Returns a `list[dict]` with keys `"name"`, `"uri"`, `"creation_date"` for every container found.
+- Works for all backends: `s3://`, `az://`, `gs://`, `file://`, `direct://`.
+
+### Bug documented: multipart upload blocks Python writer thread (closes #134)
+- `MultipartUploadSink::spawn_part_bytes()` acquires the concurrency semaphore via
+  `run_on_global_rt(sem.acquire_owned())` — a blocking wait on the calling (Python writer) thread.
+  This causes a ~3× throughput regression vs non-blocking clients (AWS CRT) for the same object
+  and endpoint. The root cause, measured impact, proposed fix (coordinator task + bounded channel),
+  and memory profile comparison are documented in issue #134.
+- This release adds `MultipartUploadConfig` validation tests; the coordinator-task fix is
+  scheduled for a follow-on PR.
+
+---
+
+## Version 0.9.90 - HTTP/2 & h2c Support, ForceH2c Routing Fix, TLS Test Server (April 2026)
+
+### Code cleanup: removed dead-code modules `sharded_client` and `range_engine` (April 2026)
+- Deleted `src/sharded_client.rs` — a never-completed stub that proposed splitting HTTP traffic
+  across multiple `aws_sdk_s3::Client` instances to reduce per-client contention.  The premise
+  is wrong for reqwest 0.13 + HTTP/2 (the connection pool is already concurrent); the
+  implementation's core `get_range()` returned `Bytes::new()` (empty placeholder) and was never
+  wired into any call site.  Removed `pub mod sharded_client` from `lib.rs`.
+- Deleted `src/range_engine.rs` — an S3-specific range-GET engine that depended on
+  `sharded_client`.  Also a stub with placeholder implementations; zero callers outside itself.
+  Removed `pub mod range_engine` from `lib.rs`.
+- The **production** range engine, `src/range_engine_generic.rs`, is unchanged and continues to
+  be used by `file_store.rs`, `file_store_direct.rs`, and `object_store.rs` (Azure/GCS backends).
+  A rationalization comment was added to `range_engine_generic.rs` explaining the history and
+  noting that S3ObjectStore does not yet use this engine (future work item).
+- Build is clean with zero warnings after removal.
+
+### Documentation: `store_for_uri()` async limitation (April 2026)
+- Added an in-code comment block above `store_for_uri()` in `object_store.rs` documenting:
+  - Why the function is intentionally synchronous (all current backends construct without I/O).
+  - The known limitation: callers passing `s3://host:port/bucket/` directly to `store_for_uri()`
+    always get the global singleton client — NOT a per-endpoint isolated client — because
+    `S3ObjectStore::for_endpoint()` is async and cannot be called from a sync context.
+  - How `MultiEndpointStore::from_config()` works around this via `run_on_global_rt()`.
+  - What a future `store_for_uri_async()` would look like if per-endpoint isolation is ever
+    needed outside `MultiEndpointStore`.
+
+### Future work items (range engine)
+- `S3ObjectStore` does not yet use `range_engine_generic` for large-object downloads.  S3 range
+  GETs are handled natively by the AWS SDK streaming path.  Adding an opt-in
+  `enable_range_engine` flag to an `S3Config` struct (mirroring `AzureConfig`/`GcsConfig`)
+  would be the natural next step if S3 workloads would benefit from explicit range splitting.
+
+### Feature: HTTP/2 and h2c (cleartext HTTP/2) support via `S3DLIO_H2C`
+- Added `S3DLIO_H2C` environment variable to control the HTTP version used by the S3 client:
+  - `S3DLIO_H2C=1` — force h2c (HTTP/2 prior-knowledge) on `http://` endpoints; on `https://`
+    endpoints, ALPN negotiation proceeds normally (server selects HTTP/2 or HTTP/1.1).
+  - `S3DLIO_H2C=0` — force HTTP/1.1 on all endpoints.
+  - Unset (default `Auto`) — probes h2c once on the first `http://` connection; falls back to
+    HTTP/1.1 if the server rejects the HTTP/2 preface. On `https://`, ALPN handles version
+    negotiation transparently with no extra probe.
+- Implemented in `src/reqwest_client.rs` as `H2cMode` enum with `build_smithy_http_client()`.
+  Two reqwest clients are built at startup (`http1_client` and `h2c_client`); the correct one is
+  selected per-request based on scheme and current probe state via `select_client()`.
+- CA bundle (`AWS_CA_BUNDLE`) is supported independently of the HTTP version mode.
+
+### Bug fix: `ForceH2c` on HTTPS caused "broken pipe"
+- Root cause: `H2cMode::ForceH2c` unconditionally routed all requests (including `https://`) to
+  the h2c client, which sends an HTTP/2 prior-knowledge preface without TLS. TLS servers reject
+  this with a broken-pipe error.
+- Fix: `ForceH2c` now only routes `http://` requests to the h2c client. `https://` requests fall
+  through to the standard TLS client so ALPN negotiation selects the protocol.
+- Routing logic extracted into a pure `pub(crate) fn select_client(mode, is_plain_http,
+  auto_state) -> ClientChoice` for testability.
+
+### Feature: Startup INFO logging for HTTP version mode and CA bundle
+- `build_smithy_http_client()` logs the resolved `H2cMode` at `INFO` on every client creation so
+  operators can confirm which mode is active without needing a packet capture.
+- `s3_client.rs` logs both the "CA bundle loaded from <path>" and "CA bundle not set — using
+  system default TLS trust store" cases, eliminating a previous silent no-op for the not-set path.
+- First response HTTP version (HTTP/2 or HTTP/1.1) is logged once via `PROTOCOL_LOGGED` atomic.
+
+### New: `examples/tls_test_server` — local TLS+HTTP/2 test server for ALPN verification
+- Added `examples/tls_test_server.rs`: a minimal HTTPS server that generates a self-signed
+  certificate at runtime (via `rcgen`) for `127.0.0.1`/`localhost`, installs `aws_lc_rs` as the
+  rustls crypto provider, advertises ALPN `["h2", "http/1.1"]`, and serves both HTTP/1.1 and
+  HTTP/2 via `hyper_util`'s `AutoBuilder`.
+- The server writes its certificate to `/tmp/tls_test_server.crt` for use by curl or `s3-cli`.
+- Logs `ALPN negotiated = "h2"` (or `"http/1.1"`) and the HTTP version of every request.
+- Verified end-to-end: `s3-cli stat` and `s3-cli put` against this server both log
+  `HTTP protocol (first response): HTTP/2.0` and `protocol=HTTP/2` in PUT summary.
+- Start it with: `cargo run --example tls_test_server`
+- Test with: `AWS_CA_BUNDLE=/tmp/tls_test_server.crt AWS_ENDPOINT_URL=https://127.0.0.1:9443`
+- See [`docs/HTTP2_ALPN_INVESTIGATION.md`](HTTP2_ALPN_INVESTIGATION.md) for full usage and
+  expected output.
+- New dev-dependencies added to `Cargo.toml`: `rcgen 0.13`, `rustls 0.23 (aws-lc-rs)`,
+  `tokio-rustls 0.26`, `hyper 1 (server)`, `hyper-util 0.1 (server-auto)`.
+
+### Tests: 10 new unit tests for HTTP version routing logic
+- `test_select_client_force_h2c_plain_http` — ForceH2c + http:// → h2c client
+- `test_select_client_force_h2c_tls` — ForceH2c + https:// → http1 client (the bug case)
+- `test_select_client_force_http1_plain_http` — ForceHttp1 + http:// → http1 client
+- `test_select_client_force_http1_tls` — ForceHttp1 + https:// → http1 client
+- `test_select_client_auto_plain_http_first_connection` — Auto + http:// + Unknown → h2c probe
+- `test_select_client_auto_plain_http_probe_succeeded` — Auto + http:// + H2C_AUTO_OK → h2c
+- `test_select_client_auto_plain_http_probe_failed` — Auto + http:// + H2C_AUTO_FAILED → http1
+- `test_select_client_auto_tls_unknown` — Auto + https:// → http1 (ALPN, any state)
+- `test_select_client_auto_tls_ok` — Auto + https:// → http1 (ALPN)
+- `test_select_client_auto_tls_failed` — Auto + https:// → http1 (ALPN, state irrelevant)
+- All tests live in `src/reqwest_client.rs` under `#[cfg(test)]`.
+
+### Documentation: HTTP2_ALPN_INVESTIGATION.md
+- Created `docs/HTTP2_ALPN_INVESTIGATION.md`: documents the full ALPN investigation (MinIO
+  always selects `http/1.1` in ALPN — its server does not accept h2), the routing logic table,
+  the `tls_test_server` usage guide with expected curl and `s3-cli` output, and an index of the
+  new unit tests. This doc is the canonical reference for HTTP version behavior in s3dlio.
+- Updated `docs/CLI_GUIDE.md`: added `S3DLIO_H2C` to the environment variables table with
+  cleartext and TLS usage examples.
+- Updated `docs/api/Environment_Variables.md`: replaced stale HTTP client variables with current
+  `S3DLIO_H2C` and connection pool settings, with cleartext and TLS configuration examples.
+
+### Verification
+- `cargo build --bin s3-cli` — zero warnings ✅
+- `cargo test` — 225 unit tests + 38 doc tests = 263 passing, 0 failed ✅
+- `s3-cli stat` against `tls_test_server` → `HTTP protocol (first response): HTTP/2.0` ✅
+- `s3-cli put` against `tls_test_server` → `PUT summary: ... protocol=HTTP/2` ✅
+
+---
+
 ## Version 0.9.86 - Redirect Follower / Tacit AIStore Support, Redirect Security (March 2026)
 
 ### Feature: HTTP 3xx redirect-following connector (`S3DLIO_FOLLOW_REDIRECTS`)

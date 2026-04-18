@@ -13,9 +13,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::data_gen_alt::{
-    default_data_gen_threads, total_cpus, DataBuffer, DataGenerator,
-};
+use crate::data_gen_alt::{default_data_gen_threads, total_cpus, DataBuffer, DataGenerator};
 
 // =============================================================================
 // Zero-Copy Buffer Support
@@ -139,7 +137,7 @@ impl PyBytesView {
 ///
 /// # Generate 1 MiB incompressible data (uses default 50% of CPUs)
 /// data = s3dlio.generate_data(1024 * 1024)
-/// 
+///
 /// # Use memoryview for ZERO-COPY access
 /// view = memoryview(data)
 /// print(f"Generated {len(view)} bytes, zero copies!")
@@ -157,8 +155,8 @@ fn generate_data(
 ) -> PyResult<Py<PyBytesView>> {
     // Generate data WITHOUT holding GIL (allows parallel Python threads)
     let buffer = py.detach(|| {
-        use crate::data_gen_alt::{GeneratorConfig, generate_data as gen_data, NumaMode};
-        
+        use crate::data_gen_alt::{generate_data as gen_data, GeneratorConfig, NumaMode};
+
         let config = GeneratorConfig {
             size,
             dedup_factor: dedup,
@@ -169,8 +167,8 @@ fn generate_data(
             block_size: None,
             seed: None,
         };
-        
-        gen_data(config)  // Returns DataBuffer directly - NO copies!
+
+        gen_data(config) // Returns DataBuffer directly - NO copies!
     });
 
     // Return BytesView - Python can use memoryview() for TRUE zero-copy access
@@ -209,8 +207,8 @@ fn generate_data_with_threads(
 
     // Generate with custom thread count, WITHOUT holding GIL
     let buffer = py.detach(|| {
-        use crate::data_gen_alt::{GeneratorConfig, generate_data, NumaMode};
-        
+        use crate::data_gen_alt::{generate_data, GeneratorConfig, NumaMode};
+
         let config = GeneratorConfig {
             size,
             dedup_factor: dedup,
@@ -221,8 +219,8 @@ fn generate_data_with_threads(
             block_size: None,
             seed: None,
         };
-        
-        generate_data(config)  // Returns DataBuffer directly - NO 16GB copy to bytes::Bytes!
+
+        generate_data(config) // Returns DataBuffer directly - NO 16GB copy to bytes::Bytes!
     });
 
     // Return BytesView for zero-copy access (no conversion needed!)
@@ -284,8 +282,8 @@ fn generate_into_buffer(
 
     // Generate data directly into DataBuffer (NO intermediate bytes::Bytes conversion!)
     let data_buffer = py.detach(|| {
-        use crate::data_gen_alt::{GeneratorConfig, generate_data, NumaMode};
-        
+        use crate::data_gen_alt::{generate_data, GeneratorConfig, NumaMode};
+
         let config = GeneratorConfig {
             size,
             dedup_factor: dedup,
@@ -296,8 +294,8 @@ fn generate_into_buffer(
             block_size: None,
             seed: None,
         };
-        
-        generate_data(config)  // Returns DataBuffer directly - NO 16GB copy to bytes::Bytes!
+
+        generate_data(config) // Returns DataBuffer directly - NO 16GB copy to bytes::Bytes!
     });
 
     // Write into buffer (single copy only - can't avoid this since user provided the buffer)
@@ -405,7 +403,7 @@ impl PyGenerator {
         seed: Option<u64>,
     ) -> PyResult<Self> {
         use crate::data_gen_alt::{GeneratorConfig, NumaMode};
-        
+
         let config = GeneratorConfig {
             size,
             dedup_factor: dedup,
@@ -456,12 +454,10 @@ impl PyGenerator {
         let size = buf.len_bytes();
 
         // Generate DIRECTLY into Python buffer without holding GIL
-        let written = py.detach(|| {
-            unsafe {
-                let dst_ptr = buf.buf_ptr() as *mut u8;
-                let dst_slice = std::slice::from_raw_parts_mut(dst_ptr, size);
-                self.inner.fill_chunk(dst_slice)
-            }
+        let written = py.detach(|| unsafe {
+            let dst_ptr = buf.buf_ptr() as *mut u8;
+            let dst_slice = std::slice::from_raw_parts_mut(dst_ptr, size);
+            self.inner.fill_chunk(dst_slice)
         });
 
         Ok(written)
@@ -486,15 +482,15 @@ pub fn register_datagen_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register classes
     m.add_class::<PyBytesView>()?;
     m.add_class::<PyGenerator>()?;
-    
+
     // Register data generation functions
     m.add_function(wrap_pyfunction!(generate_data, m)?)?;
     m.add_function(wrap_pyfunction!(generate_data_with_threads, m)?)?;
     m.add_function(wrap_pyfunction!(generate_into_buffer, m)?)?;
-    
+
     // Register utility functions
     m.add_function(wrap_pyfunction!(py_default_data_gen_threads, m)?)?;
     m.add_function(wrap_pyfunction!(py_total_cpus, m)?)?;
-    
+
     Ok(())
 }

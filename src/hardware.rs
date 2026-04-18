@@ -80,7 +80,7 @@ pub fn get_affinity_cpu_count() -> usize {
             }
         }
     }
-    
+
     // Fallback to system CPU count
     num_cpus::get()
 }
@@ -114,13 +114,13 @@ pub fn get_affinity_cpu_count() -> usize {
 #[cfg(target_os = "linux")]
 pub fn parse_cpu_list(cpu_list: &str) -> usize {
     let mut count = 0;
-    
+
     for part in cpu_list.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        
+
         if let Some((start, end)) = part.split_once('-') {
             // Range format: "0-23"
             if let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) {
@@ -133,7 +133,7 @@ pub fn parse_cpu_list(cpu_list: &str) -> usize {
             }
         }
     }
-    
+
     count
 }
 
@@ -187,7 +187,7 @@ pub fn is_numa_available() -> bool {
             return topology.num_nodes > 1;
         }
     }
-    
+
     false
 }
 
@@ -295,7 +295,10 @@ pub fn recommended_data_gen_threads(numa_node: Option<usize>, max_threads: Optio
 }
 
 #[cfg(not(feature = "numa"))]
-pub fn recommended_data_gen_threads(_numa_node: Option<usize>, max_threads: Option<usize>) -> usize {
+pub fn recommended_data_gen_threads(
+    _numa_node: Option<usize>,
+    max_threads: Option<usize>,
+) -> usize {
     // Without NUMA feature, ignore numa_node parameter
     max_threads.unwrap_or_else(get_affinity_cpu_count)
 }
