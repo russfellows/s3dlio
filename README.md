@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-507%2F507-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.86-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-263%2F263-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.90-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,7 +10,7 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.86** — Redirect-following connector (`S3DLIO_FOLLOW_REDIRECTS=1`) for tacit NVIDIA AIStore support via S3; scheme-downgrade (HTTPS→HTTP) prevention active; 21 new redirect unit tests. Note: direct AIStore end-to-end testing has not been performed; cert-pinning security is pending (see [docs/security/HTTPS_Redirect_Security_Issues.md](docs/security/HTTPS_Redirect_Security_Issues.md)).
+> **v0.9.90** — HTTP/2 and h2c (cleartext HTTP/2 prior-knowledge) support via `S3DLIO_H2C`; ForceH2c routing bug fixed (HTTPS endpoints no longer incorrectly routed to h2c client); startup INFO logging for HTTP version mode and CA bundle; 10 new routing unit tests; `examples/tls_test_server` for local ALPN verification. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 
 ## 📦 Installation
 
@@ -205,6 +205,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 - **High Performance**: High-throughput multi GB/s reads and writes on platforms with sufficient network and storage capabilities
 - **Zero-Copy Architecture**: `bytes::Bytes` throughout for minimal memory overhead
 - **Multi-Protocol**: S3, Azure Blob, GCS, file://, direct:// (O_DIRECT)
+- **HTTP/2 & h2c Support**: Full HTTP/2 over TLS (via ALPN) and cleartext h2c (prior-knowledge) for S3-compatible storage systems that support it. Controlled by `S3DLIO_H2C`: `=1` forces h2c on plain-HTTP endpoints, `=0` forces HTTP/1.1, and unset enables auto-detection (h2c probe on `http://`, ALPN negotiation on `https://`). See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 - **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
 - **Multi-Endpoint Load Balancing**: RoundRobin/LeastConnections across storage endpoints
 - **AI/ML Ready**: PyTorch DataLoader integration, TFRecord/NPZ format support
@@ -212,9 +213,10 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.86** (March 2026) - Redirect-following connector for tacit NVIDIA AIStore S3 support (`S3DLIO_FOLLOW_REDIRECTS=1`); HTTPS→HTTP scheme-downgrade protection active; 21 new redirect unit tests. Note: tested against the AIStore protocol spec but not against a live AIStore cluster. Certificate pinning is pending (see [security doc](docs/security/HTTPS_Redirect_Security_Issues.md)).
+**v0.9.90** (April 2026) - HTTP/2 and h2c support (`S3DLIO_H2C`); ForceH2c routing bug fix (HTTPS no longer sent as h2c prior-knowledge); startup logging for HTTP version mode and CA bundle; 10 new routing unit tests; `tls_test_server` example for ALPN verification. ALPN investigation documented in [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 
 **Recent highlights:**
+- **v0.9.90** - HTTP/2 & h2c support via `S3DLIO_H2C`; ForceH2c routing fix; TLS ALPN test server; 263 tests passing
 - **v0.9.86** - Redirect follower for NVIDIA AIStore (S3 path); HTTPS→HTTP downgrade prevention; 21 new redirect tests; redirect security analysis documented
 - **v0.9.84** - HEAD elimination (ObjectSizeCache); OnceLock env-var caching; lock-free range assembly; `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE`; structured tracing
 - **v0.9.80** - Python list hang fix (IMDSv2 legacy call removed); tracing deadlock fix (`tokio::spawn` → inline stream); async S3 delete/bucket helpers; deprecated Python APIs cleaned up
@@ -486,7 +488,7 @@ s3dlio delivers world-class performance across all operations:
 | **Streaming Mode** | 2.6-3.5x faster | For 1-8MB objects vs single-pass |
 
 ### Optimization Features
-- **HTTP/2 Support**: Modern multiplexing for enhanced throughput (with Apache Arrow backend only)
+- **HTTP/2 Support**: Full HTTP/2 over TLS (ALPN) and cleartext h2c via `S3DLIO_H2C`. Auto-detection probes h2c on `http://` and uses ALPN on `https://`.
 - **Intelligent Defaults**: Streaming mode automatically selected based on benchmarks
 - **Multi-Process Architecture**: Massive parallelism for maximum performance
 - **Zero-Copy Streaming**: Memory-efficient operations for large datasets

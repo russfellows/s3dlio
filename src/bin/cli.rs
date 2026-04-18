@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-//! CLI supporting `list`, `get`, `delete`, `put`, and `putmany`.
+//! CLI supporting `list`, `get`, `delete`, `put`, and related commands.
 //!
 //! Examples:
 //! ```bash
@@ -30,7 +30,6 @@ use std::time::Instant;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-use tempfile::NamedTempFile;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -41,8 +40,8 @@ use s3dlio::{
     parse_s3_uri,
     DEFAULT_OBJECT_SIZE, ObjectType,
     list_containers, ContainerInfo,
-    object_store::store_for_uri_with_logger,
-    mp,
+    object_store::{store_for_uri_with_logger, ObjectStore},
+    multi_endpoint::{MultiEndpointStore, LoadBalanceStrategy},
     config::{DataGenMode, Config},
     data_gen::generate_object,
 };
@@ -205,31 +204,12 @@ enum Command {
         /// Number of bytes to read for range request (optional, if not specified reads to end)
         #[arg(long = "length")]
         length: Option<u64>,
-    },
-    /// Multi-process GET for maximum throughput (warp-level performance).
-    MpGet {
-        /// Storage URI prefix for objects to download (e.g. s3://bucket/prefix/, gs://bucket/prefix/)
-        uri: String,
-        
-        /// Number of worker processes to spawn
-        #[arg(short = 'p', long = "procs", default_value_t = 4)]
-        procs: usize,
-        
-        /// Concurrent operations per worker process
-        #[arg(short = 'j', long = "jobs", default_value_t = 64)]
-        jobs: usize,
-        
-        /// Number of objects to download (for testing/benchmarking)
-        #[arg(short = 'n', long = "num", default_value_t = 1000)]
-        num: usize,
-        
-        /// Template for object names (use {} for number placeholder)
-        #[arg(short = 't', long = "template", default_value = "object_{}.dat")]
-        template: String,
-        
-        /// Progress reporting interval in seconds
-        #[arg(short = 'i', long = "interval", default_value_t = 1.0)]
-        interval: f64,
+
+        /// Comma-separated S3 endpoints (host:port) for multi-endpoint GET.
+        /// Round-robin load balancing across all endpoints. Requires an s3:// URI.
+        /// Example: --endpoints=10.9.0.17:9000,10.9.0.18:9000
+        #[arg(long = "endpoints", value_name = "HOST:PORT[,HOST:PORT...]")]
+        endpoints: Option<String>,
     },
     /// Upload one or more objects concurrently, uses ObjectType format filled with random data.
     Put {
@@ -275,6 +255,12 @@ enum Command {
         /// Chunk size for streaming generation mode (bytes)
         #[arg(long = "chunk-size", default_value_t = 256 * 1024)]
         chunk_size: usize,
+
+        /// Comma-separated S3 endpoints (host:port) for multi-endpoint PUT.
+        /// Round-robin load balancing across all endpoints. Requires an s3:// URI.
+        /// Example: --endpoints=10.9.0.17:9000,10.9.0.18:9000
+        #[arg(long = "endpoints", value_name = "HOST:PORT[,HOST:PORT...]")]
+        endpoints: Option<String>,
     },
     /// Upload local files to any storage backend (S3, Azure, GCS, file://, direct://), supports glob and regex patterns
     Upload {
@@ -599,25 +585,16 @@ async fn main() -> Result<()> {
         },
     
         // New, with regex and recursion
-        Command::Get { uri, jobs, concurrent, keylist, recursive, offset, length } => {
+        Command::Get { uri, jobs, concurrent, keylist, recursive, offset, length, endpoints } => {
             // Only check AWS credentials if URI is S3
             if let Some(uri_str) = &uri {
                 if requires_aws_credentials(uri_str) {
                     check_aws_credentials()?;
                 }
             }
-            get_cmd(uri.as_deref(), jobs, concurrent, keylist.as_deref(), recursive, offset, length).await?
+            get_cmd(uri.as_deref(), jobs, concurrent, keylist.as_deref(), recursive, offset, length, endpoints.as_deref()).await?
         }
         
-        // Multi-process GET for maximum throughput
-        Command::MpGet { uri, procs, jobs, num, template, interval } => {
-            // Check AWS credentials for S3 URIs
-            if requires_aws_credentials(&uri) {
-                check_aws_credentials()?;
-            }
-            mp_get_cmd(&uri, procs, jobs, num, &template, interval)?
-        }
-    
         Command::Delete { uri, jobs, recursive, pattern } => {
             // Check AWS credentials for S3 URIs
             if requires_aws_credentials(&uri) {
@@ -868,7 +845,7 @@ async fn main() -> Result<()> {
             }
         }
     
-        Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size } => {
+        Command::Put { uri_prefix, create_bucket_flag, num, template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size, endpoints } => {
             // Check AWS credentials only for S3 operations
             if requires_aws_credentials(&uri_prefix) {
                 check_aws_credentials()?;
@@ -882,7 +859,7 @@ async fn main() -> Result<()> {
                 }
             }
     
-            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size).await?
+            put_many_cmd(&uri_prefix, num, &template, jobs, size, object_type, dedup_f, compress_f, data_gen_mode, chunk_size, endpoints.as_deref()).await?
 
         }
 
@@ -1106,7 +1083,7 @@ async fn stat_cmd(uri: &str) -> Result<()> {
 }
 
 /// Get command: downloads objects matching a key, prefix, or pattern.
-async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool, offset: Option<u64>, length: Option<u64>) -> Result<()> {
+async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool, offset: Option<u64>, length: Option<u64>, endpoints: Option<&str>) -> Result<()> {
     // Determine concurrency level (prefer concurrent over jobs for mp compatibility)
     let concurrency = concurrent.unwrap_or(jobs);
 
@@ -1126,7 +1103,7 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
         let keylist_content = std::fs::read_to_string(keylist_path)
             .with_context(|| format!("Failed to read keylist file: {:?}", keylist_path))?;
         
-        let uris: Vec<String> = keylist_content
+        let mut uris: Vec<String> = keylist_content
             .lines()
             .map(|line| line.trim())
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -1136,6 +1113,29 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
         if uris.is_empty() {
             bail!("No URIs found in keylist file: {:?}", keylist_path);
         }
+
+        // When --endpoints is given, build a shared MultiEndpointStore.
+        // Rewrite all keylist URIs to use the first endpoint as the base;
+        // the store will round-robin them across all endpoints on each get().
+        let multi_store: Option<Arc<MultiEndpointStore>> = if let Some(endpoints_str) = endpoints {
+            let first_endpoint = endpoints_str.split(',').next().unwrap_or("").trim().to_string();
+            if first_endpoint.is_empty() {
+                bail!("--endpoints requires at least one host:port");
+            }
+            // Rewrite each URI: s3://bucket/path → s3://first_endpoint:port/bucket/path
+            uris = uris.iter().map(|u| {
+                let path = u.strip_prefix("s3://")
+                    .ok_or_else(|| anyhow::anyhow!("--endpoints requires s3:// URIs in keylist, got: {}", u))?;
+                Ok(format!("s3://{}/{}", first_endpoint, path))
+            }).collect::<Result<Vec<_>>>()?;
+            // Build endpoint roots: s3://host1:port/, s3://host2:port/, ...
+            let endpoint_uris = build_s3_host_root_uris(endpoints_str)?;
+            let store = MultiEndpointStore::new(endpoint_uris, LoadBalanceStrategy::RoundRobin, None)
+                .context("Failed to create multi-endpoint store")?;
+            Some(Arc::new(store))
+        } else {
+            None
+        };
         
         println!("Processing {} URIs from keylist with concurrency {}", uris.len(), concurrency);
         
@@ -1157,11 +1157,16 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
             let progress = progress_callback.clone();
             let uri = uri.clone();
             let logger = global_logger();
+            let multi = multi_store.clone();
             
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                let store = store_for_uri_with_logger(&uri, logger)?;
-                let data = store.get(&uri).await?;
+                let data = if let Some(store) = multi {
+                    store.get(&uri).await?
+                } else {
+                    let store = store_for_uri_with_logger(&uri, logger)?;
+                    store.get(&uri).await?
+                };
                 let byte_count = data.len() as u64;
                 
                 // Update progress
@@ -1255,8 +1260,24 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
         return Ok(());
     }
 
-    // Use universal ObjectStore to list objects (works with all backends)
+    // Use universal ObjectStore to list objects (works with all backends).
+    // When --endpoints is given, list from the first endpoint then distribute GETs
+    // across all endpoints via a shared MultiEndpointStore.
     let logger = global_logger();
+    let multi_store: Option<Arc<MultiEndpointStore>> = if let Some(endpoints_str) = endpoints {
+        if !uri_str.starts_with("s3://") {
+            bail!("--endpoints requires an s3:// URI");
+        }
+        // Extract the bucket/prefix path from the URI and build per-endpoint URIs.
+        let path = uri_str.strip_prefix("s3://").unwrap_or(uri_str);
+        let path = if path.ends_with('/') { path.to_string() } else { format!("{}/", path) };
+        let endpoint_uris = build_s3_endpoint_uris(endpoints_str, &format!("s3://{}", path))?;
+        let store = MultiEndpointStore::new(endpoint_uris, LoadBalanceStrategy::RoundRobin, None)
+            .context("Failed to create multi-endpoint store")?;
+        Some(Arc::new(store))
+    } else {
+        None
+    };
     let store = store_for_uri_with_logger(uri_str, logger)?;
 
     // When the URI is a directory prefix (ends with '/'), list recursively even if the
@@ -1393,11 +1414,16 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
         let logger     = global_logger();
         let done_task  = Arc::clone(&keys_done);
         let bytes_task = Arc::clone(&bytes_done);
+        let multi      = multi_store.clone();
 
         futs.push(tokio::spawn(async move {
             let _permit = permit; // released when this block exits
-            let store = store_for_uri_with_logger(&key, logger)?;
-            let data = store.get(&key).await?;
+            let data = if let Some(store) = multi {
+                store.get(&key).await?
+            } else {
+                let store = store_for_uri_with_logger(&key, logger)?;
+                store.get(&key).await?
+            };
             let byte_count = data.len() as u64;
             // Update shared progress atomics on success so the background task
             // sees live counts without waiting for Phase 2.
@@ -1461,103 +1487,23 @@ async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keyl
     Ok(())
 }
 
-/// Multi-process GET command for maximum throughput.
-///
-/// FUTURE TODO: Properly implement mp-get as a true prefix downloader that first
-/// lists real objects from the backend (matching `get` semantics), then shards the
-/// discovered keys across workers. The current implementation still synthesizes keys
-/// from `num + template`.
-fn mp_get_cmd(uri: &str, procs: usize, jobs: usize, num: usize, template: &str, _interval: f64) -> Result<()> {
-    let mut prefix = uri.to_string();
-    if !prefix.ends_with('/') {
-        prefix.push('/');
-    }
-
-    eprintln!("Warning: mp-get currently uses template-generated keys (num+template), not prefix listing.");
-    
-    println!("Multi-process GET starting with {} processes, {} jobs per process", procs, jobs);
-    println!("Target: {} objects from {}", num, prefix);
-    println!("Warning: mp-get currently generates keys from --template/--num (it does not list prefix objects)");
-    
-    // Generate object keys based on template and number
-    let mut keys = Vec::new();
-    for i in 0..num {
-        let key = if template.contains("{}") {
-            template.replace("{}", &i.to_string())
-        } else {
-            format!("{}{}", template, i)
-        };
-        keys.push(format!("{}{}", prefix, key));
-    }
-    
-    // Create temporary keylist file
-    let keylist_file = NamedTempFile::new()?;
-    let keylist_path = keylist_file.path().to_path_buf();
-    
-    // Write keys to file
-    {
-        let mut file = std::fs::File::create(&keylist_path)?;
-        for key in &keys {
-            writeln!(file, "{}", key)?;
-        }
-    }
-    
-    // Get the current executable path for worker processes
-    let current_exe = std::env::current_exe()?;
-    
-    // Configure multi-process GET (without oplog for now - will add proper zstd support later) 
-    let config = mp::MpGetConfigBuilder::new()
-        .procs(procs)
-        .concurrent_per_proc(jobs)
-        .keylist(keylist_path)
-        .worker_cmd(current_exe.to_string_lossy().to_string())
-        .passthrough_io(false)  // Disable debug output for clean results
-        .build();
-    
-    // Run the multi-process operation
-    let result = mp::run_get_shards(&config)?;
-    
-    // Print summary
-    println!("\n=== Multi-Process GET Result (validated) ===");
-    println!(
-        "attempted={}, succeeded={}, failed={}",
-        result.attempted, result.succeeded, result.failed
-    );
-    println!("Duration: {:.2}s", result.elapsed_seconds);
-    println!("Bytes source: {:?}", result.bytes_source);
-    match result.total_bytes {
-        Some(total_bytes) => {
-            println!("Total bytes: {}", total_bytes);
-            if let Some(throughput) = result.throughput_mbps() {
-                println!("Throughput: {:.2} MB/s", throughput);
-            } else {
-                println!("Throughput: unavailable");
-            }
-            if let Some(avg_size) = result.avg_object_size() {
-                println!("Average object size: {:.2} bytes", avg_size);
-            }
-        }
-        None => {
-            println!("Total bytes: unknown");
-            println!("Throughput: omitted (byte totals unavailable)");
-        }
-    }
-    println!("Operations/sec: {:.2}", result.ops_per_second());
-    
-    println!("\nPer-worker performance:");
-    for worker in &result.per_worker {
-        let bytes_str = worker
-            .bytes
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        println!(
-            "  Worker {}: attempted={}, succeeded={}, failed={}, bytes={}",
-            worker.worker_id, worker.attempted, worker.succeeded, worker.failed, bytes_str
-        );
-    }
-    
-    Ok(())
-}
+// NOTE: mp-get CLI command removed.
+//
+// The process-spawn approach had worse real-world performance than a single
+// `get -j N` invocation. Each worker process pays full cold-start costs
+// (Tokio runtime init, AWS SDK init, HTTP connection pool build-up), whereas
+// a single async process amortizes all of that once and handles thousands of
+// concurrent tasks with negligible overhead.
+//
+// The `mp` module and Python `mp_get()` binding are retained unchanged.
+// If multi-process GET is worth revisiting, consider:
+//   - Pre-warming worker processes and reusing them across runs
+//   - NUMA-local process pinning for very large NUMA server configs
+//   - Measuring Tokio reactor saturation at >1024 concurrent tasks
+//   - Always wiring op_log_dir so byte throughput is properly reported
+//   - Listing real prefix objects instead of synthesizing keys from a template
+//
+// For now: `s3dlio get s3://bucket/prefix/ -j 256 -r` is the recommended path.
 
 /// Delete command: deletes objects matching a key, prefix, or pattern.
 async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&str>) -> Result<()> {
@@ -1848,9 +1794,53 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
 
 
 
+/// Build per-endpoint S3 URIs from a comma-separated endpoint list and a base S3 URI.
+///
+/// For example, `endpoints = "10.9.0.17:9000,10.9.0.18:9000"` and
+/// `base_uri = "s3://mybucket/bench/"` produces:
+/// `["s3://10.9.0.17:9000/mybucket/bench/", "s3://10.9.0.18:9000/mybucket/bench/"]`
+///
+/// The base URI must start with `s3://`.
+fn build_s3_endpoint_uris(endpoints: &str, base_uri: &str) -> Result<Vec<String>> {
+    let path = base_uri
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow::anyhow!("--endpoints requires an s3:// URI, got: {}", base_uri))?;
+    let path = if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/", path)
+    };
+    let uris: Vec<String> = endpoints
+        .split(',')
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .map(|h| format!("s3://{}/{}", h, path))
+        .collect();
+    if uris.is_empty() {
+        bail!("--endpoints requires at least one host:port value");
+    }
+    Ok(uris)
+}
+
+/// Build bare per-endpoint root URIs (`s3://host:port/`) from a comma-separated endpoint list.
+///
+/// Used for keylist mode where object paths are preserved and only the endpoint is replaced.
+fn build_s3_host_root_uris(endpoints: &str) -> Result<Vec<String>> {
+    let uris: Vec<String> = endpoints
+        .split(',')
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .map(|h| format!("s3://{}/", h))
+        .collect();
+    if uris.is_empty() {
+        bail!("--endpoints requires at least one host:port value");
+    }
+    Ok(uris)
+}
+
 /// Put command supports 1 or more objects, also takes our ObjectType
 #[allow(clippy::too_many_arguments)]
-async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize, data_gen_mode: DataGenMode, chunk_size: usize) -> Result<()> {
+async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize, size: usize, object_type: s3dlio::ObjectType, dedup_f: usize, compress_f: usize, data_gen_mode: DataGenMode, chunk_size: usize, endpoints: Option<&str>) -> Result<()> {
     // Pre-tune GCS subchannels to match upload concurrency before the first GCS op.
     s3dlio::set_gcs_channel_count(jobs);
 
@@ -1859,8 +1849,22 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
     if !prefix.ends_with('/') {
         prefix.push('/');
     }
-    
-    // Generate the full list of URIs.
+
+    // When --endpoints is given, construct per-endpoint URIs and build a MultiEndpointStore.
+    // Object URIs are generated using the first endpoint as the base; the store rewrites
+    // each URI to the selected (round-robin) endpoint on every put() call.
+    let multi_store: Option<Arc<MultiEndpointStore>> = if let Some(endpoints_str) = endpoints {
+        let endpoint_uris = build_s3_endpoint_uris(endpoints_str, &prefix)?;
+        let store = MultiEndpointStore::new(endpoint_uris, LoadBalanceStrategy::RoundRobin, None)
+            .context("Failed to create multi-endpoint store")?;
+        // Use the first endpoint's URI as the base for generating object URIs.
+        prefix = store.get_endpoint_configs()[0].0.clone();
+        Some(Arc::new(store))
+    } else {
+        None
+    };
+
+    // Generate the full list of URIs (always using `prefix` which may now be endpoint-specific).
     let mut uris = Vec::with_capacity(num);
 
     // Now replace brackets with values
@@ -1901,13 +1905,19 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
         let uri = uri.clone();
         let data = data.clone();
         let logger = logger.clone();
-        
+        let multi = multi_store.clone();
+
         futs.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let store = store_for_uri_with_logger(&uri, logger)?;
             let byte_count = data.len() as u64;
-            // Bytes passed directly (zero-copy, reference counted)
-            store.put(&uri, data).await?;
+            if let Some(store) = multi {
+                // Multi-endpoint: store routes round-robin and rewrites the URI.
+                store.put(&uri, data).await?;
+            } else {
+                let store = store_for_uri_with_logger(&uri, logger)?;
+                // Bytes passed directly (zero-copy, reference counted)
+                store.put(&uri, data).await?;
+            }
             
             // Update progress
             progress.object_completed(byte_count);
@@ -1943,11 +1953,15 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
     progress_callback.update_total_bytes(total_uploaded_bytes);
     progress_tracker.finish("Upload", total_uploaded_bytes, elapsed);
 
+    let proto_tag = s3dlio::reqwest_client::observed_http_version_str()
+        .map(|v| format!(", protocol={v}"))
+        .unwrap_or_default();
     safe_println!(
-        "PUT summary: attempted={}, succeeded={}, failed={}",
+        "PUT summary: attempted={}, succeeded={}, failed={}{}",
         num,
         success_count,
-        failure_count
+        failure_count,
+        proto_tag
     );
 
     if failure_count > 0 {
@@ -1964,7 +1978,8 @@ async fn put_many_cmd(uri_prefix: &str, num: usize, template: &str, jobs: usize,
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_container_name, parse_human_size};
+    use super::{extract_container_name, parse_human_size, build_s3_endpoint_uris, build_s3_host_root_uris, Cli, Command};
+    use clap::Parser;
 
     // ------------------------------------------------------------------
     // extract_container_name — no network access, pure string parsing
@@ -2095,6 +2110,121 @@ mod tests {
         assert!(parse_human_size("mb").is_err());
         assert!(parse_human_size("8XB").is_err());
         assert!(parse_human_size("8.5MB").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // --endpoints helper functions — pure string logic, no network access
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_s3_endpoint_uris_two_endpoints() {
+        let uris = build_s3_endpoint_uris(
+            "10.9.0.17:9000,10.9.0.18:9000",
+            "s3://mybucket/bench/",
+        )
+        .unwrap();
+        assert_eq!(uris.len(), 2);
+        assert_eq!(uris[0], "s3://10.9.0.17:9000/mybucket/bench/");
+        assert_eq!(uris[1], "s3://10.9.0.18:9000/mybucket/bench/");
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_adds_trailing_slash() {
+        // base URI without trailing slash should still produce correct endpoint URIs
+        let uris = build_s3_endpoint_uris(
+            "10.9.0.17:9000",
+            "s3://mybucket/prefix",
+        )
+        .unwrap();
+        assert_eq!(uris[0], "s3://10.9.0.17:9000/mybucket/prefix/");
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_ignores_whitespace_and_empty_entries() {
+        let uris = build_s3_endpoint_uris(
+            " 10.9.0.17:9000 , , 10.9.0.18:9000 ",
+            "s3://bucket/",
+        )
+        .unwrap();
+        // Empty entry between commas and surrounding whitespace should be stripped
+        assert_eq!(uris.len(), 2);
+        assert_eq!(uris[0], "s3://10.9.0.17:9000/bucket/");
+        assert_eq!(uris[1], "s3://10.9.0.18:9000/bucket/");
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_rejects_non_s3_uri() {
+        assert!(build_s3_endpoint_uris("host:9000", "az://myaccount/mycontainer/").is_err());
+        assert!(build_s3_endpoint_uris("host:9000", "file:///mnt/data/").is_err());
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_rejects_empty_list() {
+        assert!(build_s3_endpoint_uris("  ,  ", "s3://bucket/").is_err());
+    }
+
+    #[test]
+    fn build_s3_host_root_uris_two_endpoints() {
+        let uris = build_s3_host_root_uris("10.9.0.17:9000,10.9.0.18:9000").unwrap();
+        assert_eq!(uris.len(), 2);
+        assert_eq!(uris[0], "s3://10.9.0.17:9000/");
+        assert_eq!(uris[1], "s3://10.9.0.18:9000/");
+    }
+
+    // ------------------------------------------------------------------
+    // --endpoints CLI argument parsing — verifies clap wiring end-to-end
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cli_put_endpoints_parsed_into_struct() {
+        let cli = Cli::try_parse_from([
+            "s3-cli", "put",
+            "--endpoints=10.9.0.17:9000,10.9.0.18:9000",
+            "s3://mybucket/bench/",
+        ])
+        .expect("should parse successfully");
+
+        if let Command::Put { endpoints, .. } = cli.cmd {
+            assert_eq!(
+                endpoints.as_deref(),
+                Some("10.9.0.17:9000,10.9.0.18:9000"),
+                "--endpoints value should be passed through verbatim"
+            );
+        } else {
+            panic!("expected Command::Put");
+        }
+    }
+
+    #[test]
+    fn cli_get_endpoints_parsed_into_struct() {
+        let cli = Cli::try_parse_from([
+            "s3-cli", "get",
+            "--endpoints=10.9.0.17:9000,10.9.0.18:9000",
+            "s3://mybucket/bench/",
+        ])
+        .expect("should parse successfully");
+
+        if let Command::Get { endpoints, .. } = cli.cmd {
+            assert_eq!(
+                endpoints.as_deref(),
+                Some("10.9.0.17:9000,10.9.0.18:9000"),
+                "--endpoints value should be passed through verbatim"
+            );
+        } else {
+            panic!("expected Command::Get");
+        }
+    }
+
+    #[test]
+    fn cli_put_endpoints_absent_when_not_provided() {
+        let cli = Cli::try_parse_from(["s3-cli", "put", "s3://mybucket/bench/"])
+            .expect("should parse successfully");
+
+        if let Command::Put { endpoints, .. } = cli.cmd {
+            assert!(endpoints.is_none(), "--endpoints should be None when not provided");
+        } else {
+            panic!("expected Command::Put");
+        }
     }
 }
 

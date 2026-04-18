@@ -153,6 +153,13 @@ criterion     = { version = "0.5", features = ["html_reports"] }
 # RFC conformance tests for redirect_client (uses http 1.x — same version as production dep)
 aws-smithy-types = "^1"        # needed for SdkBody::empty() in test fixtures
 
+# tls_test_server example: minimal TLS+HTTP/2 server for ALPN verification
+rcgen        = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rustls       = { version = "0.23", features = ["aws-lc-rs"] }
+tokio-rustls = "0.26"
+hyper        = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util   = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+
 [features]
 #default = []
 # Note: 'numa' and 'hdf5' are intentionally excluded from defaults.

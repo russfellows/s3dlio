@@ -16,6 +16,7 @@ These are the main user-facing guides:
 | **[CLI_GUIDE.md](CLI_GUIDE.md)** | Command-line interface reference (`s3-cli`) |
 | **[PYTHON_API_GUIDE.md](PYTHON_API_GUIDE.md)** | Python API reference and examples |
 | **[Changelog.md](Changelog.md)** | Complete release history (v0.7.0 → v0.9.86) |
+| **[HTTP2_ALPN_INVESTIGATION.md](HTTP2_ALPN_INVESTIGATION.md)** | HTTP/2 support: modes, routing logic, ALPN findings, and the `tls_test_server` test harness |
 | **[AIStore_307_Redirect_Proposal.md](AIStore_307_Redirect_Proposal.md)** | Design rationale for HTTP 307 redirect support (NVIDIA AIStore) |
 | **[AIStore_Redirect_Status_v0.9.86.md](AIStore_Redirect_Status_v0.9.86.md)** | AIStore compatibility assessment: protocol validation from source, known limitations, open test items |
 | **[security/HTTPS_Redirect_Security_Issues.md](security/HTTPS_Redirect_Security_Issues.md)** | Redirect security analysis: scheme downgrade (fixed) and cert pinning (pending) |
@@ -87,6 +88,7 @@ docs/
 |------|----------|
 | Use the CLI (`s3-cli`) | [CLI_GUIDE.md](CLI_GUIDE.md) |
 | Use the Python API | [PYTHON_API_GUIDE.md](PYTHON_API_GUIDE.md) |
+| Configure HTTP/2 (h2c, ALPN, TLS) | [HTTP2_ALPN_INVESTIGATION.md](HTTP2_ALPN_INVESTIGATION.md) |
 | Generate test data with NUMA optimization | [supplemental/DATA-GENERATION-GUIDE.md](supplemental/DATA-GENERATION-GUIDE.md) |
 | See what's new | [Changelog.md](Changelog.md) |
 | Use s3dlio with NVIDIA AIStore | [AIStore_307_Redirect_Proposal.md](AIStore_307_Redirect_Proposal.md) |

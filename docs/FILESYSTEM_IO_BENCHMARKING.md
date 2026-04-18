@@ -48,7 +48,7 @@ S3DLIO_BENCH_DIR=/tmp cargo bench --bench filesystem_io_benchmark
 #### Network Storage (NFS)
 ```bash
 # Higher latency, good bandwidth
-S3DLIO_BENCH_DIR=/mnt/vast1 cargo bench --bench filesystem_io_benchmark
+S3DLIO_BENCH_DIR=/mnt/nfs1 cargo bench --bench filesystem_io_benchmark
 ```
 
 #### Home Directory
@@ -137,7 +137,7 @@ Based on loki-node3 testing (32-core system):
 |----------------|-------------|------------|----------|
 | NVMe direct (`/mnt/scratch`) | 6-7 GB/s | 12+ GB/s | Production, large files |
 | tmpfs (`/tmp`) | 2-3 GB/s | 9-10 GB/s | Testing, temp files |
-| NFS (`/mnt/vast1`) | 1-1.5 GB/s | 1-1.5 GB/s | Shared storage, moderate I/O |
+| NFS (`/mnt/nfs1`) | 1-1.5 GB/s | 1-1.5 GB/s | Shared storage, moderate I/O |
 
 ### Performance Patterns to Look For
 
@@ -180,7 +180,7 @@ S3DLIO_BENCH_DIR=/mnt/scratch cargo bench --bench filesystem_io_benchmark > resu
 S3DLIO_BENCH_DIR=/tmp cargo bench --bench filesystem_io_benchmark > results_tmpfs.txt
 
 # NFS
-S3DLIO_BENCH_DIR=/mnt/vast1 cargo bench --bench filesystem_io_benchmark > results_nfs.txt
+S3DLIO_BENCH_DIR=/mnt/nfs1 cargo bench --bench filesystem_io_benchmark > results_nfs.txt
 
 # Compare
 grep "time:" results_*.txt | sort

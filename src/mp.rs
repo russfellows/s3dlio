@@ -2,6 +2,16 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+//
+// NOTE: The `mp-get` CLI command was removed from src/bin/cli.rs because
+// spawning N worker processes had worse performance than a single `get -j N`
+// command.  Each child process pays full cold-start overhead (Tokio runtime,
+// AWS SDK, HTTP connection pool), eliminating the hoped-for parallelism gain.
+//
+// This module is retained because the Python `mp_get()` binding in
+// python_api/python_core_api.rs still uses it.  If multi-process GET is
+// worth revisiting for the CLI in the future, see the comment block above the
+// removed mp_get_cmd in src/bin/cli.rs for a list of things to address first.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

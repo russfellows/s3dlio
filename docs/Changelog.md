@@ -1,5 +1,83 @@
 # s3dlio Changelog
 
+## Version 0.9.90 - HTTP/2 & h2c Support, ForceH2c Routing Fix, TLS Test Server (April 2026)
+
+### Feature: HTTP/2 and h2c (cleartext HTTP/2) support via `S3DLIO_H2C`
+- Added `S3DLIO_H2C` environment variable to control the HTTP version used by the S3 client:
+  - `S3DLIO_H2C=1` — force h2c (HTTP/2 prior-knowledge) on `http://` endpoints; on `https://`
+    endpoints, ALPN negotiation proceeds normally (server selects HTTP/2 or HTTP/1.1).
+  - `S3DLIO_H2C=0` — force HTTP/1.1 on all endpoints.
+  - Unset (default `Auto`) — probes h2c once on the first `http://` connection; falls back to
+    HTTP/1.1 if the server rejects the HTTP/2 preface. On `https://`, ALPN handles version
+    negotiation transparently with no extra probe.
+- Implemented in `src/reqwest_client.rs` as `H2cMode` enum with `build_smithy_http_client()`.
+  Two reqwest clients are built at startup (`http1_client` and `h2c_client`); the correct one is
+  selected per-request based on scheme and current probe state via `select_client()`.
+- CA bundle (`AWS_CA_BUNDLE`) is supported independently of the HTTP version mode.
+
+### Bug fix: `ForceH2c` on HTTPS caused "broken pipe"
+- Root cause: `H2cMode::ForceH2c` unconditionally routed all requests (including `https://`) to
+  the h2c client, which sends an HTTP/2 prior-knowledge preface without TLS. TLS servers reject
+  this with a broken-pipe error.
+- Fix: `ForceH2c` now only routes `http://` requests to the h2c client. `https://` requests fall
+  through to the standard TLS client so ALPN negotiation selects the protocol.
+- Routing logic extracted into a pure `pub(crate) fn select_client(mode, is_plain_http,
+  auto_state) -> ClientChoice` for testability.
+
+### Feature: Startup INFO logging for HTTP version mode and CA bundle
+- `build_smithy_http_client()` logs the resolved `H2cMode` at `INFO` on every client creation so
+  operators can confirm which mode is active without needing a packet capture.
+- `s3_client.rs` logs both the "CA bundle loaded from <path>" and "CA bundle not set — using
+  system default TLS trust store" cases, eliminating a previous silent no-op for the not-set path.
+- First response HTTP version (HTTP/2 or HTTP/1.1) is logged once via `PROTOCOL_LOGGED` atomic.
+
+### New: `examples/tls_test_server` — local TLS+HTTP/2 test server for ALPN verification
+- Added `examples/tls_test_server.rs`: a minimal HTTPS server that generates a self-signed
+  certificate at runtime (via `rcgen`) for `127.0.0.1`/`localhost`, installs `aws_lc_rs` as the
+  rustls crypto provider, advertises ALPN `["h2", "http/1.1"]`, and serves both HTTP/1.1 and
+  HTTP/2 via `hyper_util`'s `AutoBuilder`.
+- The server writes its certificate to `/tmp/tls_test_server.crt` for use by curl or `s3-cli`.
+- Logs `ALPN negotiated = "h2"` (or `"http/1.1"`) and the HTTP version of every request.
+- Verified end-to-end: `s3-cli stat` and `s3-cli put` against this server both log
+  `HTTP protocol (first response): HTTP/2.0` and `protocol=HTTP/2` in PUT summary.
+- Start it with: `cargo run --example tls_test_server`
+- Test with: `AWS_CA_BUNDLE=/tmp/tls_test_server.crt AWS_ENDPOINT_URL=https://127.0.0.1:9443`
+- See [`docs/HTTP2_ALPN_INVESTIGATION.md`](HTTP2_ALPN_INVESTIGATION.md) for full usage and
+  expected output.
+- New dev-dependencies added to `Cargo.toml`: `rcgen 0.13`, `rustls 0.23 (aws-lc-rs)`,
+  `tokio-rustls 0.26`, `hyper 1 (server)`, `hyper-util 0.1 (server-auto)`.
+
+### Tests: 10 new unit tests for HTTP version routing logic
+- `test_select_client_force_h2c_plain_http` — ForceH2c + http:// → h2c client
+- `test_select_client_force_h2c_tls` — ForceH2c + https:// → http1 client (the bug case)
+- `test_select_client_force_http1_plain_http` — ForceHttp1 + http:// → http1 client
+- `test_select_client_force_http1_tls` — ForceHttp1 + https:// → http1 client
+- `test_select_client_auto_plain_http_first_connection` — Auto + http:// + Unknown → h2c probe
+- `test_select_client_auto_plain_http_probe_succeeded` — Auto + http:// + H2C_AUTO_OK → h2c
+- `test_select_client_auto_plain_http_probe_failed` — Auto + http:// + H2C_AUTO_FAILED → http1
+- `test_select_client_auto_tls_unknown` — Auto + https:// → http1 (ALPN, any state)
+- `test_select_client_auto_tls_ok` — Auto + https:// → http1 (ALPN)
+- `test_select_client_auto_tls_failed` — Auto + https:// → http1 (ALPN, state irrelevant)
+- All tests live in `src/reqwest_client.rs` under `#[cfg(test)]`.
+
+### Documentation: HTTP2_ALPN_INVESTIGATION.md
+- Created `docs/HTTP2_ALPN_INVESTIGATION.md`: documents the full ALPN investigation (MinIO
+  always selects `http/1.1` in ALPN — its server does not accept h2), the routing logic table,
+  the `tls_test_server` usage guide with expected curl and `s3-cli` output, and an index of the
+  new unit tests. This doc is the canonical reference for HTTP version behavior in s3dlio.
+- Updated `docs/CLI_GUIDE.md`: added `S3DLIO_H2C` to the environment variables table with
+  cleartext and TLS usage examples.
+- Updated `docs/api/Environment_Variables.md`: replaced stale HTTP client variables with current
+  `S3DLIO_H2C` and connection pool settings, with cleartext and TLS configuration examples.
+
+### Verification
+- `cargo build --bin s3-cli` — zero warnings ✅
+- `cargo test` — 225 unit tests + 38 doc tests = 263 passing, 0 failed ✅
+- `s3-cli stat` against `tls_test_server` → `HTTP protocol (first response): HTTP/2.0` ✅
+- `s3-cli put` against `tls_test_server` → `PUT summary: ... protocol=HTTP/2` ✅
+
+---
+
 ## Version 0.9.86 - Redirect Follower / Tacit AIStore Support, Redirect Security (March 2026)
 
 ### Feature: HTTP 3xx redirect-following connector (`S3DLIO_FOLLOW_REDIRECTS`)

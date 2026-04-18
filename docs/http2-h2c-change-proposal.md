@@ -2,11 +2,11 @@
 
 **Date**: April 17, 2026  
 **Target**: s3dlio + sai3-bench  
-**Goal**: Sustain 70,000 PUT ops/s per client × 4 clients = 280,000 PUT/s total across 16 VAST S3 endpoints
+**Goal**: Sustain 70,000 PUT ops/s per client × 4 clients = 280,000 PUT/s total across 16 S3 endpoints
 
 ## Infrastructure
 
-- 4 client nodes × 2×100Gb NICs → switch → 4 VAST CINs × 4 network connections = **16 unique S3 endpoints**
+- 4 client nodes × 2×100Gb NICs → switch → 4 storage nodes × 4 network connections = **16 unique S3 endpoints**
 
 ---
 

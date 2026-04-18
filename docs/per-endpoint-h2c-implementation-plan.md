@@ -2,7 +2,7 @@
 
 **Date**: April 17, 2026  
 **Target**: s3dlio v0.9.87 → sai3-bench  
-**Goal**: 4 clients × 70,000 PUT/s × 1 KiB = 280,000 PUT/s across 16 VAST S3 endpoints  
+**Goal**: 4 clients × 70,000 PUT/s × 1 KiB = 280,000 PUT/s across 16 S3 endpoints  
 **Prerequisite**: Read `docs/http2-h2c-change-proposal.md` for full architectural analysis
 
 ---
@@ -646,7 +646,7 @@ sai3-bench uses `MultiEndpointStore` via YAML config. Once s3dlio is fixed, sai3
 ### 10.2 Example YAML Config for 16 Endpoints
 
 ```yaml
-# 4 VAST CINs × 4 connections each = 16 endpoints
+# 4 storage nodes × 4 connections each = 16 endpoints
 multi_endpoint:
   strategy: round_robin
   endpoints:

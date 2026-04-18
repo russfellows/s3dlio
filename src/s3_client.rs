@@ -7,17 +7,15 @@
 //! Owns a single global multi-thread Tokio runtime and the global S3 client.
 //!
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::{config::Region, Client};
-use aws_smithy_http_client::{tls, Builder as HttpClientBuilder};
-use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
-use std::{env, fs, thread, time::Duration};
+
+use std::{env, thread, time::Duration};
 use tokio::runtime::{Builder as TokioBuilder, Handle};
 use tokio::sync::{oneshot, OnceCell};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
-use std::path::Path;
 use std::sync::mpsc;
 use tracing::{debug, info}; // For logging
 
@@ -135,27 +133,6 @@ where
 
 
 
-// -----------------------------------------------------------------------------
-// TLS helper, for CA bundle
-// -----------------------------------------------------------------------------
-
-/// Create a TLS context using a CA bundle file
-fn tls_context_from_pem(filename: impl AsRef<Path>) -> Result<tls::TlsContext> {
-    // Read the file, but wrap any IO error
-    let pem_contents = fs::read(&filename)
-        .with_context(|| format!("Failed to read CA bundle file: {}", filename.as_ref().display()))?;
-
-    // Build a trust store containing exactly that PEM
-    let trust_store = tls::TrustStore::empty()
-        .with_pem_certificate(pem_contents.as_slice());
-
-    // Build the TlsContext, bubbling up any builder error
-    tls::TlsContext::builder()
-        .with_trust_store(trust_store)
-        .build()
-        .with_context(|| format!("Failed to build TLS context from PEM {}", filename.as_ref().display()))
-}
-
 
 // -----------------------------------------------------------------------------
 // HTTP Client Configuration
@@ -202,30 +179,17 @@ pub async fn aws_s3_client_async() -> Result<Client> {
             }
             info!("Initializing S3 client");
 
-            // Build HTTP client
-            let http_client = match env::var("AWS_CA_BUNDLE") {
-                Ok(ca_bundle_path) if !ca_bundle_path.is_empty() => {
-                    // User has specified custom CA bundle via environment
-                    // This is a standard AWS SDK feature that must work in all builds
-                    info!("AWS_CA_BUNDLE set — loading CA bundle from: {}", ca_bundle_path);
-                    let tls_context = tls_context_from_pem(&ca_bundle_path)?;
-                    
-                    // Build HTTPS client with custom CA using standard AWS SDK API
-                    Some(aws_smithy_http_client::Builder::new()
-                        .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
-                        .tls_context(tls_context)
-                        .build_https())
-                },
-                _ => {
-                    info!("AWS_CA_BUNDLE not set — using reqwest-based transport");
-                    // Use reqwest-based client for all transports (supports h2c via S3DLIO_H2C)
-                    let reqwest_client = crate::reqwest_client::build_reqwest_http_client();
-                    let http_client = SharedHttpClient::new(
-                        crate::reqwest_client::ReqwestHttpClient::new(reqwest_client)
-                    );
-                    Some(http_client)
-                }
-            };
+            // Build HTTP client — always use the reqwest-based transport so that
+            // HTTP version detection, h2c support, and connection pool tuning are
+            // available regardless of whether a custom CA bundle is configured.
+            let ca_val  = env::var("AWS_CA_BUNDLE").ok();
+            let ca_path = ca_val.as_deref().filter(|s| !s.is_empty());
+            if let Some(path) = ca_path {
+                info!("AWS_CA_BUNDLE set — loading CA bundle from: {}", path);
+            } else {
+                info!("AWS_CA_BUNDLE not set — using system default TLS trust store");
+            }
+            let http_client = crate::reqwest_client::build_smithy_http_client(ca_path)?;
 
             // Optionally wrap with redirect following for AIStore compatibility.
             // AIStore proxy nodes return HTTP 307 → Location: http://target-node/...
@@ -237,10 +201,7 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                 "1" | "true" | "yes" | "on" | "enable"
             ) {
                 info!("S3DLIO_FOLLOW_REDIRECTS enabled — following 307/302/308 redirects (AIStore support)");
-                // If no custom http_client was built above, create the default one now
-                // so we have a concrete client to wrap.
-                let base = http_client.unwrap_or_else(|| HttpClientBuilder::new().build_http());
-                Some(crate::redirect_client::make_redirecting_client(base))
+                crate::redirect_client::make_redirecting_client(http_client)
             } else {
                 http_client
             };
@@ -272,9 +233,7 @@ pub async fn aws_s3_client_async() -> Result<Client> {
             let mut config_builder = loader.timeout_config(timeout_config);
             
             // Conditionally set HTTP client only if we have one
-            if let Some(client) = http_client {
-                config_builder = config_builder.http_client(client);
-            }
+            config_builder = config_builder.http_client(http_client);
             
             let cfg = config_builder.load().await;
 
@@ -331,23 +290,15 @@ pub async fn create_s3_client_for_endpoint(
         .or_default_provider()
         .or_else(Region::new(DEFAULT_REGION));
 
-    // Build HTTP client: use provided one, or create a new reqwest/CA-bundle client
+    // Build HTTP client: use provided one, or create a new reqwest client.
+    // Always use the reqwest-based transport so HTTP version detection and
+    // h2c support are available. Load the CA bundle into reqwest when set.
     let http_client = match http_client {
         Some(c) => c,
         None => {
-            match env::var("AWS_CA_BUNDLE") {
-                Ok(ca_bundle_path) if !ca_bundle_path.is_empty() => {
-                    let tls_context = tls_context_from_pem(&ca_bundle_path)?;
-                    aws_smithy_http_client::Builder::new()
-                        .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
-                        .tls_context(tls_context)
-                        .build_https()
-                }
-                _ => {
-                    let reqwest_client = crate::reqwest_client::build_reqwest_http_client();
-                    SharedHttpClient::new(crate::reqwest_client::ReqwestHttpClient::new(reqwest_client))
-                }
-            }
+            let ca = env::var("AWS_CA_BUNDLE").ok();
+            let ca_path = ca.as_deref().filter(|s| !s.is_empty());
+            crate::reqwest_client::build_smithy_http_client(ca_path)?
         }
     };
 
