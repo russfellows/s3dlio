@@ -10,7 +10,7 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.90** — HTTP/2 and h2c (cleartext HTTP/2 prior-knowledge) support via `S3DLIO_H2C`; ForceH2c routing bug fixed (HTTPS endpoints no longer incorrectly routed to h2c client); startup INFO logging for HTTP version mode and CA bundle; 10 new routing unit tests; `examples/tls_test_server` for local ALPN verification. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+> **v0.9.90 — HTTP/2 is here.** s3dlio now speaks HTTP/2 natively: full HTTP/2 over TLS via ALPN negotiation on `https://` endpoints, and cleartext h2c (HTTP/2 prior-knowledge) on `http://` endpoints for storage systems that support it. Set `S3DLIO_H2C=1` to force h2c, `S3DLIO_H2C=0` to force HTTP/1.1, or leave it unset for automatic detection. This is the foundation for dramatically higher request-rate workloads with multiplexed connections. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 
 ## 📦 Installation
 
@@ -205,7 +205,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 - **High Performance**: High-throughput multi GB/s reads and writes on platforms with sufficient network and storage capabilities
 - **Zero-Copy Architecture**: `bytes::Bytes` throughout for minimal memory overhead
 - **Multi-Protocol**: S3, Azure Blob, GCS, file://, direct:// (O_DIRECT)
-- **HTTP/2 & h2c Support**: Full HTTP/2 over TLS (via ALPN) and cleartext h2c (prior-knowledge) for S3-compatible storage systems that support it. Controlled by `S3DLIO_H2C`: `=1` forces h2c on plain-HTTP endpoints, `=0` forces HTTP/1.1, and unset enables auto-detection (h2c probe on `http://`, ALPN negotiation on `https://`). See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+- **HTTP/2 Support (NEW)**: s3dlio now speaks HTTP/2. On `https://` endpoints, HTTP/2 is negotiated automatically via TLS ALPN — no configuration needed. On `http://` endpoints, cleartext h2c (HTTP/2 prior-knowledge) is available for storage systems that support it. Control via `S3DLIO_H2C`: `=1` forces h2c, `=0` forces HTTP/1.1, unset = auto. HTTP/2 multiplexing enables far higher request rates on supporting servers. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 - **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
 - **Multi-Endpoint Load Balancing**: RoundRobin/LeastConnections across storage endpoints
 - **AI/ML Ready**: PyTorch DataLoader integration, TFRecord/NPZ format support
@@ -213,10 +213,10 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.90** (April 2026) - HTTP/2 and h2c support (`S3DLIO_H2C`); ForceH2c routing bug fix (HTTPS no longer sent as h2c prior-knowledge); startup logging for HTTP version mode and CA bundle; 10 new routing unit tests; `tls_test_server` example for ALPN verification. ALPN investigation documented in [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+**v0.9.90** (April 2026) — **HTTP/2 support lands in s3dlio.** Both TLS (`https://`, via ALPN) and cleartext h2c (`http://`, prior-knowledge) are now fully supported. `S3DLIO_H2C` controls the mode; auto-detection works out of the box. Includes a built-in TLS test server (`examples/tls_test_server`) for local HTTP/2 verification, startup logging of the active HTTP version mode, and 10 new routing unit tests. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 
 **Recent highlights:**
-- **v0.9.90** - HTTP/2 & h2c support via `S3DLIO_H2C`; ForceH2c routing fix; TLS ALPN test server; 263 tests passing
+- **v0.9.90** - First-ever HTTP/2 support: TLS ALPN on `https://`, h2c prior-knowledge on `http://`; `S3DLIO_H2C` env var; 540 tests passing
 - **v0.9.86** - Redirect follower for NVIDIA AIStore (S3 path); HTTPS→HTTP downgrade prevention; 21 new redirect tests; redirect security analysis documented
 - **v0.9.84** - HEAD elimination (ObjectSizeCache); OnceLock env-var caching; lock-free range assembly; `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE`; structured tracing
 - **v0.9.80** - Python list hang fix (IMDSv2 legacy call removed); tracing deadlock fix (`tokio::spawn` → inline stream); async S3 delete/bucket helpers; deprecated Python APIs cleaned up
@@ -488,7 +488,7 @@ s3dlio delivers world-class performance across all operations:
 | **Streaming Mode** | 2.6-3.5x faster | For 1-8MB objects vs single-pass |
 
 ### Optimization Features
-- **HTTP/2 Support**: Full HTTP/2 over TLS (ALPN) and cleartext h2c via `S3DLIO_H2C`. Auto-detection probes h2c on `http://` and uses ALPN on `https://`.
+- **HTTP/2 Support (NEW)**: HTTP/2 multiplexing for dramatically higher request-rate workloads. Negotiated automatically via TLS ALPN on `https://`; cleartext h2c on `http://` via `S3DLIO_H2C=1` or auto-probe.
 - **Intelligent Defaults**: Streaming mode automatically selected based on benchmarks
 - **Multi-Process Architecture**: Massive parallelism for maximum performance
 - **Zero-Copy Streaming**: Memory-efficient operations for large datasets
