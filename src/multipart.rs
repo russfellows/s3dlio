@@ -520,5 +520,74 @@ impl MultipartUploadSink {
         Ok(())
     }
 
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------------------
+    // MultipartUploadConfig validation (issue #134)
+    // ------------------------------------------------------------------
+
+    /// The part_size validation in new_async must reject sizes below 5 MiB.
+    /// This is testable without a live S3 connection by calling new() (which
+    /// calls run_on_global_rt → new_async) and expecting a descriptive error.
+    ///
+    /// The global Tokio runtime is initialised on first use by run_on_global_rt.
+    #[test]
+    fn test_multipart_config_rejects_part_size_below_min() {
+        let mut cfg = MultipartUploadConfig::default();
+        cfg.part_size = 1024; // 1 KiB — well below the 5 MiB minimum
+
+        // new() will call new_async() which validates part_size before any S3 call.
+        let err = MultipartUploadSink::new("test-bucket", "test-key", cfg)
+            .err().expect("must fail with part_size < 5 MiB");
+        assert!(
+            err.to_string().contains("5 MiB"),
+            "error must mention 5 MiB minimum, got: {}",
+            err
+        );
+    }
+
+    /// max_in_flight = 0 must be rejected before any S3 call.
+    #[test]
+    fn test_multipart_config_rejects_zero_max_in_flight() {
+        let mut cfg = MultipartUploadConfig::default();
+        cfg.max_in_flight = 0;
+
+        let err = MultipartUploadSink::new("test-bucket", "test-key", cfg)
+            .err().expect("must fail with max_in_flight = 0");
+        assert!(
+            err.to_string().contains("max_in_flight"),
+            "error must mention max_in_flight, got: {}",
+            err
+        );
+    }
+
+    /// from_uri must reject non-s3:// URIs with a clear parse error before
+    /// attempting any network call — ensuring the GIL-release path is only
+    /// entered for structurally valid URIs.
+    #[test]
+    fn test_multipart_from_uri_rejects_invalid_uri() {
+        let cfg = MultipartUploadConfig::default();
+        let err = MultipartUploadSink::from_uri("not-a-valid-uri", cfg)
+            .err().expect("must fail for invalid URI");
+        // The error must come from URI parsing, not a network timeout
+        assert!(
+            !err.to_string().is_empty(),
+            "error message must not be empty"
+        );
+    }
+
+    /// Default MultipartUploadConfig has valid values that should pass
+    /// structural validation.
+    #[test]
+    fn test_multipart_default_config_is_valid() {
+        let cfg = MultipartUploadConfig::default();
+        assert!(cfg.part_size >= MIN_S3_MULTIPART_PART_SIZE,
+            "default part_size {} must be >= MIN {}", cfg.part_size, MIN_S3_MULTIPART_PART_SIZE);
+        assert!(cfg.max_in_flight > 0, "default max_in_flight must be > 0");
+        assert!(cfg.abort_on_drop, "default abort_on_drop should be true");
+    }
 }

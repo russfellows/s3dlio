@@ -126,6 +126,11 @@ humantime    = "^2.2"
 tokio-sync   = "^0.1.8"
 base64 = "0.22.1"
 
+# TLS certificate probing for redirect-chain cert pinning (issue #126)
+rustls              = { version = "0.23", features = ["aws-lc-rs"] }
+tokio-rustls        = "0.26"
+rustls-native-certs = "0.8"
+
 # --- Arrow backend (optional, enabled via "arrow-backend" feature) -------
 object_store = { version = "0.13", default-features = false, features = ["aws", "azure", "http", "gcp"], optional = true }
 url = { version = "2.5", optional = true }
@@ -155,8 +160,6 @@ aws-smithy-types = "^1"        # needed for SdkBody::empty() in test fixtures
 
 # tls_test_server example: minimal TLS+HTTP/2 server for ALPN verification
 rcgen        = { version = "0.13", default-features = false, features = ["pem", "ring"] }
-rustls       = { version = "0.23", features = ["aws-lc-rs"] }
-tokio-rustls = "0.26"
 hyper        = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util   = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 

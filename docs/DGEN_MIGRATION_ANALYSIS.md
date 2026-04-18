@@ -135,6 +135,33 @@ of the `use` statements in `python_datagen_api.rs` only.
 
 ---
 
+## Issue #136 Status (4 KB Minimum Bug)
+
+**Confirmed fixed** as of commit `0b73492` ("fix(data-gen): Critical compression bug fixes for
+small objects (<1 MiB)", 2026-01-31). The old `BLK_SIZE` minimum enforcement was only in
+`generate_controlled_data_original()`, which is now commented out / deprecated. The `_alt`
+algorithm (and its `data_gen_alt.rs` equivalent) never had the minimum.
+
+Verified April 18, 2026 by running `examples/test_size_136.rs` across all code paths
+(use_controlled=false, use_controlled=true dedup, use_controlled=true compress):
+
+```
+requested=1    actual=1    MATCH=true
+requested=10   actual=10   MATCH=true
+requested=100  actual=100  MATCH=true
+requested=512  actual=512  MATCH=true
+requested=1024 actual=1024 MATCH=true
+requested=2048 actual=2048 MATCH=true
+requested=3000 actual=3000 MATCH=true
+requested=4096 actual=4096 MATCH=true
+```
+
+The issue predates v0.9.37 and does not need to be fixed in the current branch.
+Note: NPZ and TFRecord formats intentionally produce slightly larger output than the raw payload
+due to format framing headers — that is expected behavior, not a bug.
+
+---
+
 ## How sai3-bench Already Does This (Reference)
 
 `sai3-bench/src/data_gen_pool.rs` is the template:

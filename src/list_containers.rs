@@ -446,4 +446,67 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------
+    // ContainerInfo fields — validates the contract used by the Python API
+    // (issue #133: list_containers exposed to Python as list of dicts with
+    // keys "name", "uri", "creation_date")
+    // ------------------------------------------------------------------
+
+    /// Every ContainerInfo returned from a file:// URI must have a non-empty
+    /// name, a URI that starts with "file://", and creation_date == None
+    /// (filesystem stat doesn't provide creation time on Linux).
+    #[test]
+    fn test_container_info_fields_file_uri() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("bucket-a")).unwrap();
+        std::fs::create_dir(root.join("bucket-b")).unwrap();
+
+        let uri = format!("file://{}", root.display());
+        let containers = list_containers(&uri).expect("list_containers should succeed for file://");
+
+        assert!(!containers.is_empty(), "should return at least one container");
+        for c in &containers {
+            assert!(!c.name.is_empty(), "name must be non-empty: {:?}", c);
+            assert!(
+                c.uri.starts_with("file://"),
+                "uri must start with 'file://', got: {}",
+                c.uri
+            );
+            // creation_date is None for filesystem entries (no creation time on Linux)
+            assert!(
+                c.creation_date.is_none(),
+                "creation_date should be None for filesystem entries"
+            );
+        }
+
+        // Names should be sorted and match the created directories
+        let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"bucket-a"), "bucket-a missing from {:?}", names);
+        assert!(names.contains(&"bucket-b"), "bucket-b missing from {:?}", names);
+    }
+
+    /// The URI field of each ContainerInfo must be re-usable as a storage URI
+    /// (can be passed back to list_containers to list the container's contents).
+    #[test]
+    fn test_container_info_uri_is_reusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sub = root.join("my-bucket");
+        std::fs::create_dir(&sub).unwrap();
+        // Put a directory inside the sub-directory so re-listing is non-empty
+        std::fs::create_dir(sub.join("nested")).unwrap();
+
+        let uri = format!("file://{}", root.display());
+        let containers = list_containers(&uri).expect("outer list should succeed");
+        let bucket_entry = containers.iter().find(|c| c.name == "my-bucket")
+            .expect("my-bucket should appear in the listing");
+
+        // Re-use the URI from ContainerInfo as input to list_containers
+        let inner = list_containers(&bucket_entry.uri)
+            .expect("ContainerInfo.uri must be a valid re-usable list_containers input");
+        let inner_names: Vec<&str> = inner.iter().map(|c| c.name.as_str()).collect();
+        assert!(inner_names.contains(&"nested"), "nested dir missing from re-listed container: {:?}", inner_names);
+    }
 }

@@ -32,6 +32,7 @@ use crate::{generic_upload_files, generic_download_objects};
 use crate::s3_logger::{finalize_op_logger, init_op_logger, global_logger};
 use crate::object_store::{store_for_uri_with_logger, store_for_uri};
 use crate::s3_client::run_on_global_rt;
+use crate::list_containers::list_containers as list_containers_rs;
 
 // Phase 2 streaming functionality imports
 use crate::object_store::{
@@ -2134,6 +2135,43 @@ fn gcs_query_rapid_bucket(_bucket_or_uri: &str) -> PyResult<bool> {
 // ---------------------------------------------------------------------------
 // Module registration function for core API
 // ---------------------------------------------------------------------------
+
+/// List top-level containers (buckets, containers, or directories) for the
+/// storage backend identified by `uri`.
+///
+/// Args:
+///     uri: Storage URI identifying the backend.  Examples:
+///          ``"s3://"`` — all S3 buckets visible to current credentials
+///          ``"gs://"`` — all GCS buckets in GOOGLE_CLOUD_PROJECT
+///          ``"az://mystorageaccount"`` — all containers for that account
+///          ``"file:///path/to/dir"`` — top-level sub-directories
+///
+/// Returns:
+///     list[dict]: Each element has keys ``name``, ``uri``, and
+///     ``creation_date`` (a string or ``None``).
+///
+/// Raises:
+///     RuntimeError: On any storage or credentials error.
+#[pyfunction]
+#[pyo3(text_signature = "(uri, /)")]
+pub fn list_containers(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
+    let uri_owned = uri.to_string();
+    let containers = py.detach(move || list_containers_rs(&uri_owned).map_err(py_err))?;
+
+    let result = PyList::empty(py);
+    for c in containers {
+        let d = PyDict::new(py);
+        d.set_item("name", &c.name)?;
+        d.set_item("uri", &c.uri)?;
+        match c.creation_date {
+            Some(ref date) => d.set_item("creation_date", date)?,
+            None => d.set_item("creation_date", py.None())?,
+        }
+        result.append(d)?;
+    }
+    result.into_py_any(py)
+}
+
 pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Logging
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
@@ -2144,9 +2182,10 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // URI parsing utilities
     m.add_function(wrap_pyfunction!(parse_s3_uri_full, m)?)?;
     
-    // Bucket management (S3-specific but kept for convenience)
+    // Bucket / container management
     m.add_function(wrap_pyfunction!(create_bucket, m)?)?;
     m.add_function(wrap_pyfunction!(delete_bucket, m)?)?;
+    m.add_function(wrap_pyfunction!(list_containers, m)?)?;
     
     // Universal storage operations (preferred)
     m.add_function(wrap_pyfunction!(put, m)?)?;

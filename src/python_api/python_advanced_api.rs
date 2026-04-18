@@ -49,6 +49,7 @@ impl PyMultipartUploadWriter {
     #[new]
     #[pyo3(signature = (bucket, key, part_size=None, max_in_flight=None, content_type=None, abort_on_drop=None))]
     fn new(
+        py: Python<'_>,
         bucket: &str,
         key: &str,
         part_size: Option<usize>,
@@ -62,7 +63,10 @@ impl PyMultipartUploadWriter {
         if let Some(ct) = content_type { cfg.content_type = Some(ct); }
         if let Some(aod) = abort_on_drop { cfg.abort_on_drop = aod; }
 
-        let inner = MultipartUploadSink::new(bucket, key, cfg)
+        // Release the GIL for the blocking CreateMultipartUpload S3 call.
+        let bucket_s = bucket.to_string();
+        let key_s = key.to_string();
+        let inner = py.detach(move || MultipartUploadSink::new(&bucket_s, &key_s, cfg))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Multipart init failed: {e}")))?;
         Ok(Self { inner: Some(inner), pending_buf: None })
     }
@@ -75,6 +79,7 @@ impl PyMultipartUploadWriter {
     #[staticmethod]
     #[pyo3(signature = (uri, part_size=None, max_in_flight=None, content_type=None, abort_on_drop=None))]
     fn from_uri(
+        py: Python<'_>,
         uri: &str,
         part_size: Option<usize>,
         max_in_flight: Option<usize>,
@@ -87,7 +92,9 @@ impl PyMultipartUploadWriter {
         if let Some(ct) = content_type { cfg.content_type = Some(ct); }
         if let Some(aod) = abort_on_drop { cfg.abort_on_drop = aod; }
 
-        let inner = MultipartUploadSink::from_uri(uri, cfg)
+        // Release the GIL for the blocking CreateMultipartUpload S3 call.
+        let uri_s = uri.to_string();
+        let inner = py.detach(move || MultipartUploadSink::from_uri(&uri_s, cfg))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Multipart init failed: {e}")))?;
         Ok(Self { inner: Some(inner), pending_buf: None })
     }
