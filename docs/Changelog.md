@@ -1,5 +1,74 @@
 # s3dlio Changelog
 
+## Version 0.9.90 - AIStore Full Support, TLS Security Fixes, HTTP/2, 5 Issues Closed (April 2026)
+
+### Feature: Full NVIDIA AIStore support — redirects + complete TLS security (closes #126)
+
+This release promotes AIStore support from "tacit" to **fully implemented and security-hardened**.
+`RedirectFollowingConnector` now enforces all four redirect security policies when
+`S3DLIO_FOLLOW_REDIRECTS=1`:
+
+1. **Cross-host `Authorization` header stripping** (RFC 9110 §11.6.2) — always active
+2. **Standard TLS cert chain + hostname verification** (rustls WebPKI) — always active
+3. **HTTPS→HTTP scheme downgrade prevention** — was dead code (`cert_store: None`) since
+   `make_redirecting_client()` never attached the store; now active via
+   `cert_store: Some(CertVerifyStore::new())`
+4. **Certificate pinning across redirect chain** — implemented via `RecordingVerifier`
+   (a `rustls::client::danger::ServerCertVerifier` that delegates to WebPKI first and records
+   the leaf cert DER only on success) + pre-flight TLS probe via `tokio-rustls`. This is the only
+   viable approach given that the AWS Rust SDK's internal TLS chain is entirely `pub(crate)`-gated.
+
+**Root cause of the security gaps:** both TLS policy gates in `follow_redirects()` are guarded by
+`if let Some(ref store) = cert_store`. With `cert_store: None`, neither gate was ever entered —
+all TLS security logic was unreachable in production. Unit tests bypassed `make_redirecting_client()`
+entirely, so they passed while production was unprotected.
+
+**New direct dependencies** (were already transitive via `aws-smithy-http-client`):
+- `rustls = { version = "0.23", features = ["aws-lc-rs"] }`
+- `tokio-rustls = "0.26"`
+- `rustls-native-certs = "0.8"` (loads platform root CAs for production probes)
+
+**End-to-end test coverage — all 4 redirect scenarios validated with real OS-assigned ports:**
+
+| # | Origin | Redirect target | Result | Test |
+|---|---|---|---|---|
+| 1 | `https://` (real TLS server) | `http://` (real TCP port) | ❌ Refused — scheme downgrade | `end_to_end_https_to_http_redirect_refused_real_servers` |
+| 2 | `https://` cert A | `https://` cert B ≠ A | ❌ Refused — cert mismatch | `end_to_end_https_cert_mismatch_refused_real_servers` |
+| 3 | `https://` cert A | `https://` cert A (shared) | ✅ 200 OK — cert match | `end_to_end_https_same_cert_redirect_passes_real_servers` |
+| 4 | `http://` | `http://` | ✅ 200 OK — no TLS checks | `end_to_end_http_to_http_redirect_passes_real_servers` |
+
+Total redirect tests: **27** (13 RFC 9110 conformance, 4 TLS policy unit, 2 TLS probe integration,
+4 end-to-end). See [`docs/AIStore_redirect_implementation_v0.9.90.md`](AIStore_redirect_implementation_v0.9.90.md)
+for the full implementation reference including the AWS SDK API dead-end investigation.
+
+### Bug fix: GCS delete errors silently swallowed — exit code always 0 (closes #135)
+- `GcsClient::delete_objects()` logged `warn!()` for individual delete failures but returned
+  `Ok(())`, causing `s3-cli rm` to report "Successfully deleted all objects" even when objects
+  were not deleted. A subsequent `ls` would reveal the surviving objects.
+- Fix: `anyhow::bail!()` with a descriptive message including `fail_count / total` and the bucket
+  name. Errors now propagate correctly to the CLI caller and produce a non-zero exit code.
+
+### Bug fix: `s3-cli put` silently rounds up objects < 4 KiB to 4096 bytes (closes #136)
+- Small object generation clamped the payload to a 4096-byte minimum in the random data path.
+  A request for a 1 KiB object silently produced a 4 KiB PUT. Fixed in the Python API layer.
+
+### Feature: expose `list_containers()` / `list_buckets()` to Python API (closes #133)
+- `list_containers(uri)` was implemented in `src/list_containers.rs` but never registered in the
+  Python API. Now exported as `list_containers_py()` in `src/python_api/python_core_api.rs`.
+- Returns a `list[dict]` with keys `"name"`, `"uri"`, `"creation_date"` for every container found.
+- Works for all backends: `s3://`, `az://`, `gs://`, `file://`, `direct://`.
+
+### Bug documented: multipart upload blocks Python writer thread (closes #134)
+- `MultipartUploadSink::spawn_part_bytes()` acquires the concurrency semaphore via
+  `run_on_global_rt(sem.acquire_owned())` — a blocking wait on the calling (Python writer) thread.
+  This causes a ~3× throughput regression vs non-blocking clients (AWS CRT) for the same object
+  and endpoint. The root cause, measured impact, proposed fix (coordinator task + bounded channel),
+  and memory profile comparison are documented in issue #134.
+- This release adds `MultipartUploadConfig` validation tests; the coordinator-task fix is
+  scheduled for a follow-on PR.
+
+---
+
 ## Version 0.9.90 - HTTP/2 & h2c Support, ForceH2c Routing Fix, TLS Test Server (April 2026)
 
 ### Code cleanup: removed dead-code modules `sharded_client` and `range_engine` (April 2026)

@@ -406,7 +406,7 @@ The subsequent `set_uri()` call with a relative path may also fail. AIStore alwa
 | `src/s3_client.rs` | Wires in redirect wrapper when `S3DLIO_FOLLOW_REDIRECTS=1` |
 | `src/lib.rs` | `pub(crate) mod redirect_client` |
 | `examples/tls_test_server.rs` | Interactive HTTPS+h2 test server (rcgen cert, ALPN) |
-| `docs/api/Environment_Variables.md` | `S3DLIO_FOLLOW_REDIRECTS` and `S3DLIO_REDIRECT_MAX` documented |
+| `docs/Environment_Variables.md` | `S3DLIO_FOLLOW_REDIRECTS` and `S3DLIO_REDIRECT_MAX` documented |
 
 ---
 

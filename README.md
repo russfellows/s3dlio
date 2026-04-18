@@ -1,16 +1,22 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-540%2F263-brightgreen)](docs/Changelog.md)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-559-brightgreen)](docs/Changelog.md)
 [![Version](https://img.shields.io/badge/version-0.9.90-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
-[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.90 — HTTP/2 is here.** s3dlio now speaks HTTP/2 natively: full HTTP/2 over TLS via ALPN negotiation on `https://` endpoints, and cleartext h2c (HTTP/2 prior-knowledge) on `http://` endpoints for storage systems that support it. Set `S3DLIO_H2C=1` to force h2c, `S3DLIO_H2C=0` to force HTTP/1.1, or leave it unset for automatic detection. This is the foundation for dramatically higher request-rate workloads with multiplexed connections. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+> **v0.9.90 — Full NVIDIA AIStore support, HTTP/2, and 5 issues closed.**
+>
+> **NVIDIA AIStore (redirects + security):** s3dlio now has complete, security-hardened support for NVIDIA AIStore. AIStore routes S3 clients through a proxy that issues HTTP 307 redirects to the target storage node. `RedirectFollowingConnector` (opt-in via `S3DLIO_FOLLOW_REDIRECTS=1`) follows these redirects while enforcing four security policies: standard TLS WebPKI verification, cross-host `Authorization` header stripping (RFC 9110), HTTPS→HTTP scheme-downgrade prevention, and certificate pinning across the redirect chain via a pre-flight TLS probe using `RecordingVerifier`. Two production security gaps that were present since the initial redirect implementation are now closed. All four redirect scenarios are validated with end-to-end tests against real OS-assigned loopback ports. See [docs/AIStore_redirect_implementation_v0.9.90.md](docs/AIStore_redirect_implementation_v0.9.90.md) for the full implementation reference.
+>
+> **HTTP/2:** s3dlio now speaks HTTP/2 natively — full HTTP/2 over TLS via ALPN negotiation on `https://` endpoints, and cleartext h2c (HTTP/2 prior-knowledge) on `http://` endpoints for storage systems that support it. Set `S3DLIO_H2C=1` to force h2c, `S3DLIO_H2C=0` to force HTTP/1.1, or leave it unset for automatic detection. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+>
+> **Also in this release:** GCS delete errors now propagate correctly instead of being silently swallowed (#135); small object PUT size rounding fixed (#136); `list_containers()` exposed to the Python API (#133). Closes issues #126, #133, #134, #135, #136.
 
 ## 📦 Installation
 
@@ -216,7 +222,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 **v0.9.90** (April 2026) — **HTTP/2 support lands in s3dlio.** Both TLS (`https://`, via ALPN) and cleartext h2c (`http://`, prior-knowledge) are now fully supported. `S3DLIO_H2C` controls the mode; auto-detection works out of the box. Includes a built-in TLS test server (`examples/tls_test_server`) for local HTTP/2 verification, startup logging of the active HTTP version mode, and 10 new routing unit tests. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 
 **Recent highlights:**
-- **v0.9.90** - First-ever HTTP/2 support: TLS ALPN on `https://`, h2c prior-knowledge on `http://`; `S3DLIO_H2C` env var; 540 tests passing
+- **v0.9.90** - Full NVIDIA AIStore support (`S3DLIO_FOLLOW_REDIRECTS=1`) with all TLS security policies; HTTP/2 (TLS ALPN + h2c); 5 issues closed (#126, #133, #134, #135, #136); 559 tests passing
 - **v0.9.86** - Redirect follower for NVIDIA AIStore (S3 path); HTTPS→HTTP downgrade prevention; 21 new redirect tests; redirect security analysis documented
 - **v0.9.84** - HEAD elimination (ObjectSizeCache); OnceLock env-var caching; lock-free range assembly; `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE`; structured tracing
 - **v0.9.80** - Python list hang fix (IMDSv2 legacy call removed); tracing deadlock fix (`tokio::spawn` → inline stream); async S3 delete/bucket helpers; deprecated Python APIs cleaned up
@@ -511,13 +517,14 @@ loaded_data = store.load('model_state')
 ### Environment Variables
 s3dlio supports comprehensive configuration through environment variables:
 
+- **NVIDIA AIStore**: `S3DLIO_FOLLOW_REDIRECTS=1` - Enable HTTP 307 redirect following for AIStore (opt-in, disabled by default); `S3DLIO_REDIRECT_MAX=5` - Maximum redirect hops per request
 - **HTTP/2 mode**: `S3DLIO_H2C=1` - Force h2c (HTTP/2 cleartext) on http:// endpoints; `S3DLIO_H2C=0` - Force HTTP/1.1; unset = auto-probe (default)
 - **Runtime Scaling**: `S3DLIO_RT_THREADS=32` - Tokio worker threads
 - **Connection Pool**: `S3DLIO_POOL_MAX_IDLE_PER_HOST=32` - Max idle connections per host (default: 32)
 - **S3 Range GET**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` - Disable concurrent range splitting (enabled by default); `S3DLIO_RANGE_THRESHOLD_MB=64` - Size threshold in MiB (default: 32); `S3DLIO_RANGE_CONCURRENCY=64` - Max concurrent range requests
 - **Operation Logging**: `S3DLIO_OPLOG_LEVEL=2` - S3 operation tracking
 
-📖 [Environment Variables Reference](docs/api/Environment_Variables.md)
+📖 [Environment Variables Reference](docs/Environment_Variables.md)
 
 ### Operation Logging (Op-Log)
 Universal operation trace logging across all backends with zstd-compressed TSV format, warp-replay compatible.

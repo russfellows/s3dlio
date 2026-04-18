@@ -276,7 +276,7 @@ export S3DLIO_RANGE_CONCURRENCY=32
 export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
 ```
 
-**See also:** [Environment Variables Reference](../api/Environment_Variables.md)
+**See also:** [Environment Variables Reference](../Environment_Variables.md)
 
 ---
 ## Operational guidance

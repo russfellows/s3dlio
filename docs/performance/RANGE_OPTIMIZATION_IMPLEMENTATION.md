@@ -55,7 +55,7 @@ Key Azure tuning considerations:
 - Block blob reads are served from Azure's CDN/edge; latency is typically lower than S3
 - Parallel range requests can be enabled but offer less benefit for same-region reads
 - Azure's equivalent of `ENABLE_RANGE_OPTIMIZATION` is `S3DLIO_AZURE_RANGE_OPTIMIZATION`
-  (see `docs/api/Environment_Variables.md` for current status)
+  (see `docs/Environment_Variables.md` for current status)
 - External reference: [Azure Blob Storage performance and scalability checklist](https://learn.microsoft.com/en-us/azure/storage/blobs/storage-performance-checklist)
 
 ### File (`file://`) — Local Filesystem
@@ -137,7 +137,7 @@ async fn get(&self, uri: &str) -> Result<Bytes> {
 
 ### Documentation Updates
 
-#### 1. docs/api/Environment_Variables.md
+#### 1. docs/Environment_Variables.md
 - Updated "Range GET Optimization" section
 - Added `S3DLIO_ENABLE_RANGE_OPTIMIZATION` variable documentation
 - Changed default threshold from 32 MB → 64 MB
@@ -372,7 +372,7 @@ This work complements the multipart **upload** optimization completed earlier:
    - Use optimized path in S3ObjectStore
 
 ### Documentation (3 files)
-1. `docs/api/Environment_Variables.md`
+1. `docs/Environment_Variables.md`
    - Updated Range GET Optimization section
    - Added new variable documentation
    - Updated tuning guidelines

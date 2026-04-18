@@ -1083,6 +1083,7 @@ async fn stat_cmd(uri: &str) -> Result<()> {
 }
 
 /// Get command: downloads objects matching a key, prefix, or pattern.
+#[allow(clippy::too_many_arguments)]
 async fn get_cmd(uri: Option<&str>, jobs: usize, concurrent: Option<usize>, keylist: Option<&std::path::Path>, recursive: bool, offset: Option<u64>, length: Option<u64>, endpoints: Option<&str>) -> Result<()> {
     // Determine concurrency level (prefer concurrent over jobs for mp compatibility)
     let concurrency = concurrent.unwrap_or(jobs);

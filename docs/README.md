@@ -95,7 +95,7 @@ docs/
 | Check AIStore compatibility status | [AIStore_Redirect_Status_v0.9.86.md](AIStore_Redirect_Status_v0.9.86.md) |
 | Review redirect security status | [security/HTTPS_Redirect_Security_Issues.md](security/HTTPS_Redirect_Security_Issues.md) |
 | Configure s3dlio | [supplemental/CONFIGURATION-HIERARCHY.md](supplemental/CONFIGURATION-HIERARCHY.md) |
-| Use environment variables | [api/Environment_Variables.md](api/Environment_Variables.md) |
+| Use environment variables | [Environment_Variables.md](Environment_Variables.md) |
 | Work with operation logs | [supplemental/OPLOG-GUIDE.md](supplemental/OPLOG-GUIDE.md) |
 | Use multi-endpoint load balancing | [supplemental/MULTI_ENDPOINT_GUIDE.md](supplemental/MULTI_ENDPOINT_GUIDE.md) |
 | Use zero-copy APIs | [supplemental/ZERO-COPY-API-REFERENCE.md](supplemental/ZERO-COPY-API-REFERENCE.md) |
