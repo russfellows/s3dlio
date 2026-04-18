@@ -69,7 +69,7 @@ pub use crate::checkpoint::writer::Writer as CheckpointWriter;
 pub use crate::checkpoint::reader::Reader as CheckpointReader;
 
 /// Checkpoint path strategies
-pub use crate::checkpoint::paths::{Strategy as CheckpointStrategy, KeyLayout};
+pub use crate::checkpoint::paths::{KeyLayout, Strategy as CheckpointStrategy};
 
 /// Checkpoint manifest management
 pub use crate::checkpoint::manifest::{Manifest, ShardMeta};

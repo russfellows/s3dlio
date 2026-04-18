@@ -8,24 +8,25 @@ use s3dlio::s3_utils::parse_s3_uri;
 /// Benchmark data splitting and buffer management for multipart uploads
 fn bench_multipart_splits(c: &mut Criterion) {
     let mut group = c.benchmark_group("multipart_buffer_ops");
-    
+
     // Test different part sizes that are commonly used
-    for part_size in [4 << 20, 8 << 20, 16 << 20, 64 << 20] {  // 4MB, 8MB, 16MB, 64MB
+    for part_size in [4 << 20, 8 << 20, 16 << 20, 64 << 20] {
+        // 4MB, 8MB, 16MB, 64MB
         group.throughput(Throughput::Bytes(part_size as u64 * 2)); // 2 parts worth
-        
+
         group.bench_with_input(
-            format!("split_to_{}MB", part_size >> 20), 
-            &part_size, 
+            format!("split_to_{}MB", part_size >> 20),
+            &part_size,
             |b, &part_size| {
                 b.iter(|| {
                     // Simulate realistic buffer operations for multipart upload
                     let mut buffer = bytes::BytesMut::with_capacity(part_size * 2);
                     buffer.resize(part_size * 2, 42u8);
-                    
+
                     // Split off first part (zero-copy operation)
                     let first_part = buffer.split_to(part_size).freeze();
                     criterion::black_box(first_part);
-                    
+
                     // Remaining data (simulates leftover in buffer)
                     criterion::black_box(buffer);
                 });
@@ -36,34 +37,31 @@ fn bench_multipart_splits(c: &mut Criterion) {
 }
 
 /// Benchmark data generation performance (baseline for comparison)
-/// 
+///
 /// Uses fill_controlled_data() for optimal performance with the global Rayon pool.
 /// This avoids the overhead of creating/destroying dedicated thread pools per iteration.
 fn bench_data_generation(c: &mut Criterion) {
     let mut group = c.benchmark_group("data_generation");
-    
+
     // Test different data sizes
-    for size in [1 << 20, 4 << 20, 16 << 20] {  // 1MB, 4MB, 16MB
+    for size in [1 << 20, 4 << 20, 16 << 20] {
+        // 1MB, 4MB, 16MB
         group.throughput(Throughput::Bytes(size as u64));
-        
-        group.bench_with_input(
-            format!("generate_{}MB", size >> 20),
-            &size,
-            |b, &size| {
-                // Pre-allocate buffer OUTSIDE iteration to avoid repeated allocations
-                let mut buffer = vec![0u8; size];
-                
-                b.iter(|| {
-                    // Fill in-place using global Rayon pool (86-163 GB/s capability)
-                    fill_controlled_data(
-                        &mut buffer,
-                        1, // dedup_factor (1 = no dedup)
-                        1  // compress_factor (1 = incompressible)
-                    );
-                    criterion::black_box(&buffer);
-                });
-            },
-        );
+
+        group.bench_with_input(format!("generate_{}MB", size >> 20), &size, |b, &size| {
+            // Pre-allocate buffer OUTSIDE iteration to avoid repeated allocations
+            let mut buffer = vec![0u8; size];
+
+            b.iter(|| {
+                // Fill in-place using global Rayon pool (86-163 GB/s capability)
+                fill_controlled_data(
+                    &mut buffer,
+                    1, // dedup_factor (1 = no dedup)
+                    1, // compress_factor (1 = incompressible)
+                );
+                criterion::black_box(&buffer);
+            });
+        });
     }
     group.finish();
 }
@@ -71,37 +69,30 @@ fn bench_data_generation(c: &mut Criterion) {
 /// Benchmark vector operations commonly used in S3 operations
 fn bench_vector_ops(c: &mut Criterion) {
     let mut group = c.benchmark_group("vector_operations");
-    
-    for size in [1 << 20, 4 << 20, 16 << 20] {  // 1MB, 4MB, 16MB
+
+    for size in [1 << 20, 4 << 20, 16 << 20] {
+        // 1MB, 4MB, 16MB
         group.throughput(Throughput::Bytes(size as u64));
-        
+
         // Benchmark Vec::with_capacity + extend_from_slice (common pattern)
-        group.bench_with_input(
-            format!("vec_extend_{}MB", size >> 20),
-            &size,
-            |b, &size| {
-                let source_data = vec![42u8; size];
-                b.iter(|| {
-                    let mut target = Vec::with_capacity(size);
-                    target.extend_from_slice(&source_data);
-                    criterion::black_box(target);
-                });
-            },
-        );
-        
+        group.bench_with_input(format!("vec_extend_{}MB", size >> 20), &size, |b, &size| {
+            let source_data = vec![42u8; size];
+            b.iter(|| {
+                let mut target = Vec::with_capacity(size);
+                target.extend_from_slice(&source_data);
+                criterion::black_box(target);
+            });
+        });
+
         // Benchmark pre-allocated buffer copy (optimal pattern)
-        group.bench_with_input(
-            format!("vec_copy_{}MB", size >> 20),
-            &size,
-            |b, &size| {
-                let source_data = vec![42u8; size];
-                b.iter(|| {
-                    let mut target = vec![0u8; size];
-                    target.copy_from_slice(&source_data);
-                    criterion::black_box(target);
-                });
-            },
-        );
+        group.bench_with_input(format!("vec_copy_{}MB", size >> 20), &size, |b, &size| {
+            let source_data = vec![42u8; size];
+            b.iter(|| {
+                let mut target = vec![0u8; size];
+                target.copy_from_slice(&source_data);
+                criterion::black_box(target);
+            });
+        });
     }
     group.finish();
 }
@@ -109,13 +100,13 @@ fn bench_vector_ops(c: &mut Criterion) {
 /// Benchmark URI parsing (happens on every S3 operation)
 fn bench_uri_parsing(c: &mut Criterion) {
     let mut group = c.benchmark_group("uri_parsing");
-    
+
     let test_uris = vec![
         "s3://my-bucket/key",
         "s3://my-bucket/path/to/nested/key",
         "s3://my-bucket/very/deeply/nested/path/with/many/segments/file.dat",
     ];
-    
+
     for uri in &test_uris {
         group.bench_with_input(
             format!("parse_uri_{}_segments", uri.matches('/').count()),
@@ -132,7 +123,7 @@ fn bench_uri_parsing(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches, 
+    benches,
     bench_multipart_splits,
     bench_data_generation,
     bench_vector_ops,

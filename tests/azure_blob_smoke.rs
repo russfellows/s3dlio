@@ -10,11 +10,11 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use crc32fast::Hasher as Crc32;
 use futures::stream;
-use rand::{Rng, rng};
 use rand::distr::Alphanumeric;
-use std::env;
+use rand::{rng, Rng};
 use s3dlio::azure_client::AzureBlob; // direct client tests
-use s3dlio::object_store::store_for_uri; // NEW: factory-based smoke
+use s3dlio::object_store::store_for_uri;
+use std::env; // NEW: factory-based smoke
 
 fn req_env(key: &str) -> Result<String> {
     env::var(key).with_context(|| format!("Missing required env var {}", key))
@@ -34,7 +34,6 @@ fn random_key(prefix: &str) -> String {
     format!("{prefix}-{suffix}")
 }
 
-
 async fn mk_client() -> Result<AzureBlob> {
     let container = req_env("AZURE_BLOB_CONTAINER")?;
     if let Some(url) = opt_env("AZURE_BLOB_ACCOUNT_URL") {
@@ -45,7 +44,9 @@ async fn mk_client() -> Result<AzureBlob> {
             anyhow::ensure!(acc_from_url == acct,
                 "AZURE_BLOB_ACCOUNT_URL points to '{acc_from_url}', but AZURE_BLOB_ACCOUNT is '{acct}'");
         }
-        Ok(AzureBlob::with_default_credential_from_url(&url, &container)?)
+        Ok(AzureBlob::with_default_credential_from_url(
+            &url, &container,
+        )?)
     } else {
         let acct = req_env("AZURE_BLOB_ACCOUNT")?;
         Ok(AzureBlob::with_default_credential(&acct, &container)?)
@@ -90,7 +91,10 @@ async fn put_get_list_stat_delete_smoke() -> Result<()> {
     // list (by prefix)
     let pref = key.split('-').next().unwrap().to_string(); // "s3dlio"
     let listed = client.list(Some(&pref)).await?;
-    assert!(listed.iter().any(|k| k == &key), "key not found in list() results for prefix {pref}");
+    assert!(
+        listed.iter().any(|k| k == &key),
+        "key not found in list() results for prefix {pref}"
+    );
 
     // range get (middle slice)
     let start = 6u64;
@@ -151,7 +155,7 @@ async fn multipart_stream_upload_roundtrip() -> Result<()> {
     let ranges = [
         (0u64, Some(1023u64)),
         (3_900_000u64, Some(4_100_000u64)), // crosses a part boundary
-        ((total_len as u64) - 4096, None),   // tail open-ended
+        ((total_len as u64) - 4096, None),  // tail open-ended
     ];
     for (start, end) in ranges {
         let slice = client.get_range(&key, start, end).await?;
@@ -195,7 +199,12 @@ async fn factory_roundtrip_smoke() -> Result<()> {
 
     // 2) full https form
     let key2 = random_key("s3dlio-factory-https");
-    let uri2 = format!("{}/{}/{}", base_https.trim_end_matches('/'), container, key2);
+    let uri2 = format!(
+        "{}/{}/{}",
+        base_https.trim_end_matches('/'),
+        container,
+        key2
+    );
     let store2 = store_for_uri(&uri2)?;
     store2.put(&uri2, payload.clone()).await?;
     let got2 = store2.get(&uri2).await?;
@@ -204,4 +213,3 @@ async fn factory_roundtrip_smoke() -> Result<()> {
 
     Ok(())
 }
-

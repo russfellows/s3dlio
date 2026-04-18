@@ -12,26 +12,23 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::{config::Region, Client};
 
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
+use std::sync::mpsc;
 use std::{env, thread, time::Duration};
 use tokio::runtime::{Builder as TokioBuilder, Handle};
 use tokio::sync::{oneshot, OnceCell};
-use aws_smithy_runtime_api::client::http::SharedHttpClient;
-use std::sync::mpsc;
 use tracing::{debug, info}; // For logging
-
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-pub const DEFAULT_REGION: &str     = "us-east-1";
-
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 // -----------------------------------------------------------------------------
 // Global runtime + S3 client (lazy, thread-safe)
 // -----------------------------------------------------------------------------
 static RT_HANDLE: once_cell::sync::OnceCell<Handle> = once_cell::sync::OnceCell::new();
 static CLIENT: OnceCell<Client> = OnceCell::const_new();
-
 
 // Create (once) a background multi-thread Tokio runtime and return its Handle.
 fn global_rt_handle() -> &'static Handle {
@@ -43,7 +40,7 @@ fn global_rt_handle() -> &'static Handle {
                 // Intelligent thread count with environment override
                 let threads = get_runtime_threads();
                 debug!("Creating Tokio runtime with {} worker threads", threads);
-                
+
                 let rt = TokioBuilder::new_multi_thread()
                     .enable_io()
                     .enable_time()
@@ -75,7 +72,6 @@ fn get_runtime_threads() -> usize {
             std::cmp::min(default_threads, 32)
         })
 }
-
 
 /// Run an async `fut` on the global runtime and block the **current** thread
 /// until it completes. Handles both runtime and non-runtime contexts.
@@ -117,7 +113,6 @@ where
     }
 }
 
-
 /// Spawn a task on the global runtime without blocking (non-blocking spawn).
 /// Returns a JoinHandle immediately that can be awaited later.
 ///
@@ -130,9 +125,6 @@ where
 {
     global_rt_handle().spawn(fut)
 }
-
-
-
 
 // -----------------------------------------------------------------------------
 // HTTP Client Configuration
@@ -148,10 +140,9 @@ fn get_operation_timeout() -> Duration {
             // For fast storage: ~1 second per 8MB object should be plenty
             // 5000 objects * 1 second = 83 minutes max (very conservative)
             // Use more aggressive timeout for better resource management
-            Duration::from_secs(120)  // 2 minutes per operation - much faster
+            Duration::from_secs(120) // 2 minutes per operation - much faster
         })
 }
-
 
 // -----------------------------------------------------------------------------
 // Client factory (built on the global runtime)
@@ -231,10 +222,10 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                 .build();
 
             let mut config_builder = loader.timeout_config(timeout_config);
-            
+
             // Conditionally set HTTP client only if we have one
             config_builder = config_builder.http_client(http_client);
-            
+
             let cfg = config_builder.load().await;
 
             // =========================================================================
@@ -331,6 +322,9 @@ pub async fn create_s3_client_for_endpoint(
         .force_path_style(true)
         .build();
 
-    info!("Per-endpoint S3 client ready (path-style: forced, endpoint: {})", endpoint_url);
+    info!(
+        "Per-endpoint S3 client ready (path-style: forced, endpoint: {})",
+        endpoint_url
+    );
     Ok(Client::from_conf(s3_config))
 }

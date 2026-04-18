@@ -3,16 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use anyhow::{Context, Result, bail};
-use aws_sdk_s3::Client;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use anyhow::{bail, Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::Client;
 use bytes::Bytes;
 
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::constants::{DEFAULT_S3_MULTIPART_PART_SIZE, MIN_S3_MULTIPART_PART_SIZE, DEFAULT_MULTIPART_BUFFER_CAPACITY};
+use crate::constants::{
+    DEFAULT_MULTIPART_BUFFER_CAPACITY, DEFAULT_S3_MULTIPART_PART_SIZE, MIN_S3_MULTIPART_PART_SIZE,
+};
 
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -56,7 +58,6 @@ pub struct MultipartCompleteInfo {
     pub completed_at: SystemTime,
 }
 
-
 /// Streaming sink for multipart upload.
 pub struct MultipartUploadSink {
     client: Client,
@@ -90,7 +91,8 @@ impl Drop for MultipartUploadSink {
         let key = self.key.clone();
         let upload_id = self.upload_id.clone();
         let _ = run_on_global_rt(async move {
-            let _ = client.abort_multipart_upload()
+            let _ = client
+                .abort_multipart_upload()
                 .bucket(bucket)
                 .key(key)
                 .upload_id(upload_id)
@@ -123,11 +125,9 @@ impl MultipartUploadSink {
         if cfg.max_in_flight == 0 {
             bail!("max_in_flight must be >= 1");
         }
-    
+
         let client = aws_s3_client_async().await?;
-        let mut req = client.create_multipart_upload()
-            .bucket(bucket)
-            .key(key);
+        let mut req = client.create_multipart_upload().bucket(bucket).key(key);
         if let Some(ct) = &cfg.content_type {
             req = req.content_type(ct);
         }
@@ -136,10 +136,10 @@ impl MultipartUploadSink {
         if upload_id.is_empty() {
             bail!("CreateMultipartUpload returned empty upload_id");
         }
-    
+
         // Build semaphore BEFORE moving cfg into the struct.
         let sem = Arc::new(Semaphore::new(cfg.max_in_flight));
-    
+
         Ok(Self {
             client,
             bucket: bucket.to_string(),
@@ -186,7 +186,6 @@ impl MultipartUploadSink {
         Ok(())
     }
 
-
     /// Async write: buffers and schedules part uploads as needed.
     #[cfg_attr(feature = "profiling", instrument(
         name = "mpu.write",
@@ -231,7 +230,7 @@ impl MultipartUploadSink {
     /// what about run_on_global_rt() ?
     pub fn write_owned_blocking(&mut self, data: Vec<u8>) -> Result<()> {
         let data_len = data.len() as u64;
-        
+
         if self.buf.is_empty() && data.len() >= self.cfg.part_size {
             // Fast path: Convert Vec to Bytes (zero-copy ownership transfer),
             // then use Bytes::slice() for zero-copy part extraction
@@ -239,7 +238,7 @@ impl MultipartUploadSink {
             let mut offset = 0usize;
             while bytes.len() - offset >= self.cfg.part_size {
                 let end = offset + self.cfg.part_size;
-                let chunk = bytes.slice(offset..end);  // Zero-copy slice!
+                let chunk = bytes.slice(offset..end); // Zero-copy slice!
                 offset = end;
                 self.spawn_part_bytes(chunk)?;
             }
@@ -254,11 +253,10 @@ impl MultipartUploadSink {
                 self.spawn_part(chunk)?;
             }
         }
-    
+
         self.total_bytes += data_len;
         Ok(())
     }
-
 
     /// Async version of `write_owned_blocking`.
     pub async fn write_owned(&mut self, data: Vec<u8>) -> Result<()> {
@@ -271,7 +269,7 @@ impl MultipartUploadSink {
             let mut offset = 0usize;
             while bytes.len() - offset >= self.cfg.part_size {
                 let end = offset + self.cfg.part_size;
-                let chunk = bytes.slice(offset..end);  // Zero-copy slice!
+                let chunk = bytes.slice(offset..end); // Zero-copy slice!
                 offset = end;
                 self.spawn_part_bytes(chunk)?;
             }
@@ -287,7 +285,7 @@ impl MultipartUploadSink {
                 self.spawn_part(chunk)?;
             }
         }
-        
+
         self.total_bytes += data_len;
         Ok(())
     }
@@ -301,7 +299,6 @@ impl MultipartUploadSink {
         Ok(())
     }
 
-
     pub async fn flush(&mut self) -> Result<()> {
         if !self.buf.is_empty() {
             let chunk = std::mem::take(&mut self.buf);
@@ -309,7 +306,6 @@ impl MultipartUploadSink {
         }
         Ok(())
     }
-
 
     pub fn finish_blocking(&mut self) -> Result<MultipartCompleteInfo> {
         if self.finished {
@@ -320,10 +316,10 @@ impl MultipartUploadSink {
             let chunk = std::mem::take(&mut self.buf);
             self.spawn_part(chunk)?;
         }
-    
+
         // Move the JoinHandles out so the future owns them (no borrow of self).
         let tasks = std::mem::take(&mut self.tasks);
-    
+
         // Await all part tasks concurrently on the global runtime.
         // With backpressure in spawn_part/spawn_part_bytes, at most max_in_flight
         // tasks are still running here; joining concurrently is correct and fast.
@@ -336,13 +332,13 @@ impl MultipartUploadSink {
             }
             Ok::<_, anyhow::Error>(out)
         })?;
-    
+
         // Record completed parts
         {
             let mut guard = self.completed.lock().unwrap();
             guard.extend(results);
         }
-    
+
         // Build CompletedMultipartUpload
         let mut parts = self.completed.lock().unwrap().clone();
         parts.sort_by_key(|(pn, _)| *pn);
@@ -355,17 +351,17 @@ impl MultipartUploadSink {
                     .build()
             })
             .collect();
-    
+
         let cmu = CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
             .build();
-    
+
         // Clone small fields; call CompleteMultipartUpload on the runtime.
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.key.clone();
         let upload_id = self.upload_id.clone();
-    
+
         let resp = run_on_global_rt(async move {
             client
                 .complete_multipart_upload()
@@ -377,9 +373,9 @@ impl MultipartUploadSink {
                 .await
                 .context("CompleteMultipartUpload failed")
         })?;
-    
+
         self.finished = true;
-    
+
         Ok(MultipartCompleteInfo {
             e_tag: resp.e_tag.map(|s| s.to_string()),
             total_bytes: self.total_bytes,
@@ -389,11 +385,10 @@ impl MultipartUploadSink {
         })
     }
 
-
     pub fn abort_blocking(&mut self) -> Result<()> {
         // Move JoinHandles out so the future owns them
         let tasks = std::mem::take(&mut self.tasks);
-    
+
         // Best-effort: join and ignore results
         let _ = run_on_global_rt(async move {
             for h in tasks {
@@ -401,13 +396,13 @@ impl MultipartUploadSink {
             }
             Ok::<_, anyhow::Error>(())
         });
-    
+
         // Abort MPU
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.key.clone();
         let upload_id = self.upload_id.clone();
-    
+
         let _ = run_on_global_rt(async move {
             let _ = client
                 .abort_multipart_upload()
@@ -418,17 +413,15 @@ impl MultipartUploadSink {
                 .await;
             Ok::<_, anyhow::Error>(())
         });
-    
+
         self.finished = true;
         Ok(())
     }
 
-
-
     fn spawn_part(&mut self, bytes: Vec<u8>) -> Result<()> {
         let part_number = self.next_part_number;
         self.next_part_number += 1;
-    
+
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.key.clone();
@@ -441,10 +434,12 @@ impl MultipartUploadSink {
         // At most max_in_flight * part_size bytes are held in Rust task memory
         // at any given time — mirrors minio's _throttle() pattern.
         let permit: OwnedSemaphorePermit = run_on_global_rt(async move {
-            semaphore.acquire_owned().await
+            semaphore
+                .acquire_owned()
+                .await
                 .map_err(|_| anyhow::anyhow!("semaphore closed"))
         })?;
-    
+
         // Spawn directly on global runtime — permit already acquired, so the task
         // starts uploading immediately without waiting for the semaphore.
         let handle: JoinHandle<Result<(i32, String)>> = spawn_on_global_rt(async move {
@@ -469,18 +464,18 @@ impl MultipartUploadSink {
             }
             Ok::<(i32, String), anyhow::Error>((part_number, etag))
         });
-    
+
         // Store handle to await later in finish_blocking()
         self.tasks.push(handle);
         Ok(())
     }
-    
+
     /// Spawn a part upload using Bytes (zero-copy from Python buffer).
     /// This avoids the Vec<u8> conversion overhead when we already have Bytes.
     fn spawn_part_bytes(&mut self, bytes: Bytes) -> Result<()> {
         let part_number = self.next_part_number;
         self.next_part_number += 1;
-    
+
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.key.clone();
@@ -489,15 +484,17 @@ impl MultipartUploadSink {
 
         // Acquire permit BEFORE spawning (backpressure — same as spawn_part).
         let permit: OwnedSemaphorePermit = run_on_global_rt(async move {
-            semaphore.acquire_owned().await
+            semaphore
+                .acquire_owned()
+                .await
                 .map_err(|_| anyhow::anyhow!("semaphore closed"))
         })?;
-    
+
         // Spawn directly on global runtime without blocking
         let handle: JoinHandle<Result<(i32, String)>> = spawn_on_global_rt(async move {
-            let _permit = permit;  // Already acquired; drop releases the slot.
+            let _permit = permit; // Already acquired; drop releases the slot.
 
-            let body = ByteStream::from(bytes);  // ByteStream::from(Bytes) is cheap
+            let body = ByteStream::from(bytes); // ByteStream::from(Bytes) is cheap
             let resp = client
                 .upload_part()
                 .bucket(bucket)
@@ -515,11 +512,10 @@ impl MultipartUploadSink {
             }
             Ok::<(i32, String), anyhow::Error>((part_number, etag))
         });
-    
+
         self.tasks.push(handle);
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -537,12 +533,15 @@ mod tests {
     /// The global Tokio runtime is initialised on first use by run_on_global_rt.
     #[test]
     fn test_multipart_config_rejects_part_size_below_min() {
-        let mut cfg = MultipartUploadConfig::default();
-        cfg.part_size = 1024; // 1 KiB — well below the 5 MiB minimum
+        let cfg = MultipartUploadConfig {
+            part_size: 1024, // 1 KiB — well below the 5 MiB minimum
+            ..Default::default()
+        };
 
         // new() will call new_async() which validates part_size before any S3 call.
         let err = MultipartUploadSink::new("test-bucket", "test-key", cfg)
-            .err().expect("must fail with part_size < 5 MiB");
+            .err()
+            .expect("must fail with part_size < 5 MiB");
         assert!(
             err.to_string().contains("5 MiB"),
             "error must mention 5 MiB minimum, got: {}",
@@ -553,11 +552,14 @@ mod tests {
     /// max_in_flight = 0 must be rejected before any S3 call.
     #[test]
     fn test_multipart_config_rejects_zero_max_in_flight() {
-        let mut cfg = MultipartUploadConfig::default();
-        cfg.max_in_flight = 0;
+        let cfg = MultipartUploadConfig {
+            max_in_flight: 0,
+            ..Default::default()
+        };
 
         let err = MultipartUploadSink::new("test-bucket", "test-key", cfg)
-            .err().expect("must fail with max_in_flight = 0");
+            .err()
+            .expect("must fail with max_in_flight = 0");
         assert!(
             err.to_string().contains("max_in_flight"),
             "error must mention max_in_flight, got: {}",
@@ -572,7 +574,8 @@ mod tests {
     fn test_multipart_from_uri_rejects_invalid_uri() {
         let cfg = MultipartUploadConfig::default();
         let err = MultipartUploadSink::from_uri("not-a-valid-uri", cfg)
-            .err().expect("must fail for invalid URI");
+            .err()
+            .expect("must fail for invalid URI");
         // The error must come from URI parsing, not a network timeout
         assert!(
             !err.to_string().is_empty(),
@@ -585,8 +588,12 @@ mod tests {
     #[test]
     fn test_multipart_default_config_is_valid() {
         let cfg = MultipartUploadConfig::default();
-        assert!(cfg.part_size >= MIN_S3_MULTIPART_PART_SIZE,
-            "default part_size {} must be >= MIN {}", cfg.part_size, MIN_S3_MULTIPART_PART_SIZE);
+        assert!(
+            cfg.part_size >= MIN_S3_MULTIPART_PART_SIZE,
+            "default part_size {} must be >= MIN {}",
+            cfg.part_size,
+            MIN_S3_MULTIPART_PART_SIZE
+        );
         assert!(cfg.max_in_flight > 0, "default max_in_flight must be > 0");
         assert!(cfg.abort_on_drop, "default abort_on_drop should be true");
     }

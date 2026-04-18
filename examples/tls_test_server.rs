@@ -43,10 +43,10 @@ use tokio_rustls::TlsAcceptor;
 /// Logs the HTTP version so we can confirm h2 was negotiated.
 async fn handle(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     let version = match req.version() {
-        hyper::Version::HTTP_2  => "HTTP/2",
+        hyper::Version::HTTP_2 => "HTTP/2",
         hyper::Version::HTTP_11 => "HTTP/1.1",
         hyper::Version::HTTP_10 => "HTTP/1.0",
-        _                       => "HTTP/?",
+        _ => "HTTP/?",
     };
     eprintln!("[server] {} {} {version}", req.method(), req.uri().path());
 
@@ -103,8 +103,7 @@ async fn main() -> anyhow::Result<()> {
     // Build rustls ServerConfig with ALPN ["h2", "http/1.1"].
     // -------------------------------------------------------------------------
     let cert_der: CertificateDer<'static> = cert.der().clone();
-    let key_der: PrivateKeyDer<'static> =
-        PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
+    let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
 
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()

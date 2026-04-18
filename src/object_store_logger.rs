@@ -9,16 +9,16 @@
 //! to any ObjectStore implementation without modifying the underlying implementations.
 //! Enables trace logging for file://, s3://, az://, and direct:// backends.
 
-use std::sync::Arc;
-use std::time::SystemTime;
+use anyhow::Result;
+use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use async_trait::async_trait;
-use anyhow::Result;
-use bytes::Bytes;
+use std::sync::Arc;
+use std::time::SystemTime;
 
-use crate::object_store::{ObjectStore, ObjectMetadata, ObjectWriter, WriterOptions};
-use crate::s3_logger::{Logger, LogEntry};
+use crate::object_store::{ObjectMetadata, ObjectStore, ObjectWriter, WriterOptions};
+use crate::s3_logger::{LogEntry, Logger};
 
 /// Extract the scheme and container/bucket from a URI for endpoint logging.
 /// Examples:
@@ -29,21 +29,21 @@ use crate::s3_logger::{Logger, LogEntry};
 fn extract_endpoint(uri: &str) -> String {
     if let Some(scheme_end) = uri.find("://") {
         let after_scheme = scheme_end + 3;
-        
+
         // For file:// and direct://, just return the scheme
         if uri.starts_with("file://") || uri.starts_with("direct://") {
             return uri[..after_scheme].to_string();
         }
-        
+
         // For s3:// and az://, include the bucket/container name
         if let Some(path_start) = uri[after_scheme..].find('/') {
             return uri[..after_scheme + path_start].to_string();
         }
-        
+
         // If no path separator, return entire URI
         return uri.to_string();
     }
-    
+
     // Fallback for malformed URIs
     "unknown".to_string()
 }
@@ -58,7 +58,7 @@ fn strip_uri_scheme(uri: &str) -> String {
     if let Some(scheme_end) = uri.find("://") {
         return uri[scheme_end + 3..].to_string();
     }
-    
+
     // If no scheme found, return as-is
     uri.to_string()
 }
@@ -72,7 +72,7 @@ fn get_thread_id() -> usize {
 }
 
 /// Wrapper that adds operation logging to any ObjectStore implementation.
-/// 
+///
 /// This decorator intercepts all ObjectStore method calls, logs them via the
 /// provided Logger, and then delegates to the inner store. No changes are
 /// needed to existing ObjectStore implementations.
@@ -172,7 +172,7 @@ impl LoggedObjectStore {
             first_byte_time, // Now accepts actual timestamp or None
             end_time,
         };
-        
+
         self.logger.log(entry);
     }
 }
@@ -188,12 +188,12 @@ impl ObjectStore for LoggedObjectStore {
         // the same as end time since file I/O is typically synchronous.
         let first_byte = SystemTime::now();
         let end = first_byte; // For simple get(), first_byte ≈ end
-        
+
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         self.log_operation("GET", uri, bytes, 1, start, Some(first_byte), end, error);
-        
+
         result
     }
 
@@ -202,12 +202,21 @@ impl ObjectStore for LoggedObjectStore {
         let result = self.inner.get_range(uri, offset, length).await;
         let first_byte = SystemTime::now();
         let end = first_byte; // Range requests also return complete data
-        
+
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
-        
-        self.log_operation("GET_RANGE", uri, bytes, 1, start, Some(first_byte), end, error);
-        
+
+        self.log_operation(
+            "GET_RANGE",
+            uri,
+            bytes,
+            1,
+            start,
+            Some(first_byte),
+            end,
+            error,
+        );
+
         result
     }
 
@@ -217,13 +226,13 @@ impl ObjectStore for LoggedObjectStore {
         // Bytes is zero-copy (reference counted, can be cloned cheaply)
         let result = self.inner.put(uri, data).await;
         let end = SystemTime::now();
-        
+
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // For PUT, first_byte represents when upload begins (start time)
         // Future: Could track when first chunk ACK received for better accuracy
         self.log_operation("PUT", uri, bytes, 1, start, Some(start), end, error);
-        
+
         result
     }
 
@@ -233,13 +242,13 @@ impl ObjectStore for LoggedObjectStore {
         // Bytes is zero-copy (reference counted, can be cloned cheaply)
         let result = self.inner.put_multipart(uri, data, part_size).await;
         let end = SystemTime::now();
-        
+
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // Still log as PUT (multipart is implementation detail)
         // For multipart, first_byte = start (upload begins immediately)
         self.log_operation("PUT", uri, bytes, 1, start, Some(start), end, error);
-        
+
         result
     }
 
@@ -247,13 +256,13 @@ impl ObjectStore for LoggedObjectStore {
         let start = SystemTime::now();
         let result = self.inner.list(uri_prefix, recursive).await;
         let end = SystemTime::now();
-        
+
         let num_objects = result.as_ref().map(|v| v.len() as u32).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // LIST is metadata-only operation, first_byte not applicable
         self.log_operation("LIST", uri_prefix, 0, num_objects, start, None, end, error);
-        
+
         result
     }
 
@@ -263,17 +272,17 @@ impl ObjectStore for LoggedObjectStore {
         recursive: bool,
     ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<String>> + Send + 'a>> {
         use futures::stream::StreamExt;
-        
+
         let start_time = SystemTime::now();
         let mut inner_stream = self.inner.list_stream(uri_prefix, recursive);
         let uri_str = uri_prefix.to_string();
         let logger = self.logger.clone();
-        
+
         // Wrap stream to count objects and log when complete
         Box::pin(async_stream::stream! {
             let mut count = 0u32;
             let mut stream_error: Option<String> = None;
-            
+
             while let Some(result) = inner_stream.next().await {
                 match &result {
                     Ok(_) => {
@@ -287,7 +296,7 @@ impl ObjectStore for LoggedObjectStore {
                     }
                 }
             }
-            
+
             // Log the complete operation
             let end_time = SystemTime::now();
             let entry = LogEntry {
@@ -304,7 +313,7 @@ impl ObjectStore for LoggedObjectStore {
                 first_byte_time: None,
                 end_time,
             };
-            
+
             logger.log(entry);
         })
     }
@@ -313,13 +322,13 @@ impl ObjectStore for LoggedObjectStore {
         let start = SystemTime::now();
         let result = self.inner.stat(uri).await;
         let end = SystemTime::now();
-        
+
         let bytes = result.as_ref().map(|m| m.size).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // STAT/HEAD is metadata-only, first_byte not applicable
         self.log_operation("HEAD", uri, bytes, 1, start, None, end, error);
-        
+
         result
     }
 
@@ -327,12 +336,12 @@ impl ObjectStore for LoggedObjectStore {
         let start = SystemTime::now();
         let result = self.inner.delete(uri).await;
         let end = SystemTime::now();
-        
+
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // DELETE is metadata-only operation, no data transfer
         self.log_operation("DELETE", uri, 0, 1, start, None, end, error);
-        
+
         result
     }
 
@@ -340,13 +349,22 @@ impl ObjectStore for LoggedObjectStore {
         let start = SystemTime::now();
         let result = self.inner.delete_batch(uris).await;
         let end = SystemTime::now();
-        
+
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // Log batch delete with object count (metadata-only, no first_byte)
         let uri_str = if uris.is_empty() { "(empty)" } else { &uris[0] };
-        self.log_operation("DELETE_BATCH", uri_str, 0, uris.len() as u32, start, None, end, error);
-        
+        self.log_operation(
+            "DELETE_BATCH",
+            uri_str,
+            0,
+            uris.len() as u32,
+            start,
+            None,
+            end,
+            error,
+        );
+
         result
     }
 
@@ -354,12 +372,12 @@ impl ObjectStore for LoggedObjectStore {
         let start = SystemTime::now();
         let result = self.inner.delete_prefix(uri_prefix).await;
         let end = SystemTime::now();
-        
+
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // Don't know exact count, use 0 to indicate prefix operation (no first_byte)
         self.log_operation("DELETE_PREFIX", uri_prefix, 0, 0, start, None, end, error);
-        
+
         result
     }
 
@@ -367,12 +385,12 @@ impl ObjectStore for LoggedObjectStore {
         let start = SystemTime::now();
         let result = self.inner.create_container(name).await;
         let end = SystemTime::now();
-        
+
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // CREATE_CONTAINER is metadata-only operation
         self.log_operation("CREATE_CONTAINER", name, 0, 1, start, None, end, error);
-        
+
         result
     }
 
@@ -380,12 +398,12 @@ impl ObjectStore for LoggedObjectStore {
         let start = SystemTime::now();
         let result = self.inner.delete_container(name).await;
         let end = SystemTime::now();
-        
+
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // DELETE_CONTAINER is metadata-only operation
         self.log_operation("DELETE_CONTAINER", name, 0, 1, start, None, end, error);
-        
+
         result
     }
 
@@ -393,27 +411,31 @@ impl ObjectStore for LoggedObjectStore {
         let start = SystemTime::now();
         let result = self.inner.exists(uri).await;
         let end = SystemTime::now();
-        
+
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // Log as HEAD operation (existence check, metadata-only)
         self.log_operation("HEAD", uri, 0, 1, start, None, end, error);
-        
+
         result
     }
 
-    async fn get_with_validation(&self, uri: &str, expected_checksum: Option<&str>) -> Result<Bytes> {
+    async fn get_with_validation(
+        &self,
+        uri: &str,
+        expected_checksum: Option<&str>,
+    ) -> Result<Bytes> {
         let start = SystemTime::now();
         let result = self.inner.get_with_validation(uri, expected_checksum).await;
         let first_byte = SystemTime::now();
         let end = first_byte;
-        
+
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // Log as GET with validation (capture first_byte like regular GET)
         self.log_operation("GET", uri, bytes, 1, start, Some(first_byte), end, error);
-        
+
         result
     }
 
@@ -425,15 +447,27 @@ impl ObjectStore for LoggedObjectStore {
         expected_checksum: Option<&str>,
     ) -> Result<Bytes> {
         let start = SystemTime::now();
-        let result = self.inner.get_range_with_validation(uri, offset, length, expected_checksum).await;
+        let result = self
+            .inner
+            .get_range_with_validation(uri, offset, length, expected_checksum)
+            .await;
         let first_byte = SystemTime::now();
         let end = first_byte;
-        
+
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
-        
-        self.log_operation("GET_RANGE", uri, bytes, 1, start, Some(first_byte), end, error);
-        
+
+        self.log_operation(
+            "GET_RANGE",
+            uri,
+            bytes,
+            1,
+            start,
+            Some(first_byte),
+            end,
+            error,
+        );
+
         result
     }
 
@@ -443,20 +477,36 @@ impl ObjectStore for LoggedObjectStore {
         expected_checksum: Option<&str>,
     ) -> Result<Vec<u8>> {
         let start = SystemTime::now();
-        let result = self.inner.load_checkpoint_with_validation(checkpoint_uri, expected_checksum).await;
+        let result = self
+            .inner
+            .load_checkpoint_with_validation(checkpoint_uri, expected_checksum)
+            .await;
         let first_byte = SystemTime::now();
         let end = first_byte;
-        
+
         let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
         let error = result.as_ref().err().map(|e| e.to_string());
-        
+
         // Checkpoint load is a GET operation
-        self.log_operation("GET", checkpoint_uri, bytes, 1, start, Some(first_byte), end, error);
-        
+        self.log_operation(
+            "GET",
+            checkpoint_uri,
+            bytes,
+            1,
+            start,
+            Some(first_byte),
+            end,
+            error,
+        );
+
         result
     }
 
-    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+    async fn create_writer(
+        &self,
+        uri: &str,
+        options: WriterOptions,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // Note: We log the final write, not the writer creation
         // The writer itself will handle logging when finalized
         self.inner.create_writer(uri, options).await
@@ -467,9 +517,15 @@ impl ObjectStore for LoggedObjectStore {
         self.inner.get_writer(uri).await
     }
 
-    async fn get_writer_with_compression(&self, uri: &str, compression: crate::object_store::CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+    async fn get_writer_with_compression(
+        &self,
+        uri: &str,
+        compression: crate::object_store::CompressionConfig,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // Delegate to inner store - writer operations logged at write time
-        self.inner.get_writer_with_compression(uri, compression).await
+        self.inner
+            .get_writer_with_compression(uri, compression)
+            .await
     }
 }
 
@@ -479,22 +535,37 @@ mod tests {
 
     #[test]
     fn test_extract_endpoint() {
-        assert_eq!(extract_endpoint("s3://my-bucket/path/to/key"), "s3://my-bucket");
+        assert_eq!(
+            extract_endpoint("s3://my-bucket/path/to/key"),
+            "s3://my-bucket"
+        );
         assert_eq!(extract_endpoint("s3://bucket"), "s3://bucket");
         assert_eq!(extract_endpoint("file:///tmp/test.txt"), "file://");
         assert_eq!(extract_endpoint("file:///path/to/file"), "file://");
-        assert_eq!(extract_endpoint("az://container/blob/path"), "az://container");
+        assert_eq!(
+            extract_endpoint("az://container/blob/path"),
+            "az://container"
+        );
         assert_eq!(extract_endpoint("direct:///mnt/storage/file"), "direct://");
         assert_eq!(extract_endpoint("malformed"), "unknown");
     }
 
     #[test]
     fn test_strip_uri_scheme() {
-        assert_eq!(strip_uri_scheme("s3://bucket/path/to/key.txt"), "bucket/path/to/key.txt");
+        assert_eq!(
+            strip_uri_scheme("s3://bucket/path/to/key.txt"),
+            "bucket/path/to/key.txt"
+        );
         assert_eq!(strip_uri_scheme("file:///tmp/test.txt"), "/tmp/test.txt");
         assert_eq!(strip_uri_scheme("file:///path/to/file"), "/path/to/file");
-        assert_eq!(strip_uri_scheme("az://container/blob/path"), "container/blob/path");
-        assert_eq!(strip_uri_scheme("direct:///mnt/storage/file.dat"), "/mnt/storage/file.dat");
+        assert_eq!(
+            strip_uri_scheme("az://container/blob/path"),
+            "container/blob/path"
+        );
+        assert_eq!(
+            strip_uri_scheme("direct:///mnt/storage/file.dat"),
+            "/mnt/storage/file.dat"
+        );
         assert_eq!(strip_uri_scheme("no-scheme-path"), "no-scheme-path");
     }
 

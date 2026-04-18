@@ -14,7 +14,7 @@ fn test_high_compress_validation() {
     println!("Compressed: {} bytes", compressed5.len());
     println!("Ratio: {:.4}", ratio5);
     assert!(ratio5 >= 1.2, "compress=5 should give at least 1.2:1 ratio");
-    
+
     // Test compress=6 (should give ~6:1 compression)
     println!("\n=== Testing compress=6 (target 6:1) ===");
     let data6 = generate_controlled_data_alt(4 * 1024 * 1024, 1, 6, None);
@@ -24,10 +24,14 @@ fn test_high_compress_validation() {
     println!("Compressed: {} bytes", compressed6.len());
     println!("Ratio: {:.4}", ratio6);
     assert!(ratio6 >= 1.2, "compress=6 should give at least 1.2:1 ratio");
-    
+
     // Test dedup=6 (should give 6 unique blocks out of many)
     println!("\n=== Testing dedup=6 (target 6:1) ===");
     let data_dedup = generate_controlled_data_alt(16 * 65536, 6, 1, None); // 16 blocks
-    println!("Total size: {} bytes ({} blocks)", data_dedup.len(), data_dedup.len() / 65536);
+    println!(
+        "Total size: {} bytes ({} blocks)",
+        data_dedup.len(),
+        data_dedup.len() / 65536
+    );
     println!("Expected unique blocks: ~3 (16 blocks / dedup=6 ≈ 2.67 → 3)");
 }

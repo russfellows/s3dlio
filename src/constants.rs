@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use std::sync::Arc;
 use once_cell::sync::Lazy;
 use rand::RngCore;
+use std::sync::Arc;
 
 /// Default page size fallback when system detection fails (4096 bytes)
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
@@ -98,7 +98,7 @@ pub const DEFAULT_RANGE_ENGINE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 pub const DEFAULT_RANGE_ENGINE_MAX_CONCURRENT: usize = 32;
 
 /// Universal default minimum object size to trigger RangeEngine (now 32 MiB, v0.9.60+)
-/// 
+///
 /// This threshold applies to all storage backends (S3, Azure, GCS, file://, direct://)
 /// when RangeEngine is enabled.
 ///
@@ -109,11 +109,11 @@ pub const DEFAULT_RANGE_ENGINE_MAX_CONCURRENT: usize = 32;
 /// **Per-store RangeEngine** (`enable_range_engine` config field):
 /// Still `false` by default on all backends — must be explicitly enabled via config.
 /// This avoids the HEAD stat overhead for workloads with small or mixed objects.
-/// 
+///
 /// **Performance Impact (when RangeEngine is active):**
 /// - Objects < 32 MiB: Single GET request (fast path, no range splitting)
 /// - Objects >= 32 MiB: HEAD + concurrent range GETs (RangeEngine path)
-/// 
+///
 /// **When to Override:**
 /// - Set `S3DLIO_RANGE_THRESHOLD_MB` to change S3 inline optimization threshold
 /// - Set higher (e.g., 64 MiB) to avoid HEAD overhead for large-object workloads
@@ -122,7 +122,7 @@ pub const DEFAULT_RANGE_ENGINE_MAX_CONCURRENT: usize = 32;
 /// **Example Configuration (per-store RangeEngine):**
 /// ```ignore
 /// use s3dlio::object_store::{GcsConfig, RangeEngineConfig};
-/// 
+///
 /// // Enable RangeEngine for large-file workload
 /// let config = GcsConfig {
 ///     enable_range_engine: true,  // Must explicitly enable for per-store RangeEngine
@@ -230,14 +230,14 @@ pub const BLK_SIZE: usize = 4096;
 pub const HALF_BLK: usize = BLK_SIZE / 2;
 
 /// Data generation block size for OPTIMIZED data_gen_alt.rs algorithm (1 MiB)
-/// 
+///
 /// **PERFORMANCE OPTIMIZATION (backported from dgen-rs v0.1.5)**:
 /// Optimal L3 cache utilization provides ~3x performance improvement:
 /// - Better parallelization across cores  
 /// - Reduced thread pool overhead
 /// - Optimal for modern CPUs (Emerald Rapid, Sapphire Rapids)
 /// - 34% performance boost vs 64 KB blocks
-/// 
+///
 /// **Benchmarks (dgen-rs v0.1.5)**:
 /// - UMA systems: 10.80 GB/s per core (C4-16, 8 cores)
 /// - Aggregate: 86-163 GB/s on single-socket systems
@@ -246,7 +246,7 @@ pub const HALF_BLK: usize = BLK_SIZE / 2;
 /// Data generation block size (1 MiB) - used by data_gen_alt for controlled
 /// deduplication and compression patterns. Named specifically to avoid
 /// confusion with other block size concepts (filesystem, storage, etc.).
-pub const DGEN_BLOCK_SIZE: usize = 1024 * 1024;  // 1 MiB
+pub const DGEN_BLOCK_SIZE: usize = 1024 * 1024; // 1 MiB
 
 /// Modification region size for randomization (32 bytes)
 /// This determines the size of regions that get randomized within blocks
@@ -439,7 +439,7 @@ impl Default for H2WindowConfig {
         Self {
             adaptive: true,
             stream_window_mb: DEFAULT_H2_STREAM_WINDOW_MB,
-            conn_window_mb:   DEFAULT_H2_CONN_WINDOW_MB,
+            conn_window_mb: DEFAULT_H2_CONN_WINDOW_MB,
         }
     }
 }
@@ -477,70 +477,27 @@ impl H2WindowConfig {
             .map(|v| v.min(H2_WINDOW_MB_HARD_CAP))
             .unwrap_or(stream_mb.saturating_mul(4).min(H2_WINDOW_MB_HARD_CAP));
 
-        Self { adaptive, stream_window_mb: stream_mb, conn_window_mb: conn_mb }
+        Self {
+            adaptive,
+            stream_window_mb: stream_mb,
+            conn_window_mb: conn_mb,
+        }
     }
 
     /// Convert the stream window to bytes for use in the reqwest builder.
     #[inline]
     pub fn stream_window_bytes(&self) -> u32 {
-        self.stream_window_mb.saturating_mul(1024 * 1024).min(H2_MAX_WINDOW_BYTES)
+        self.stream_window_mb
+            .saturating_mul(1024 * 1024)
+            .min(H2_MAX_WINDOW_BYTES)
     }
 
     /// Convert the connection window to bytes for use in the reqwest builder.
     #[inline]
     pub fn conn_window_bytes(&self) -> u32 {
-        self.conn_window_mb.saturating_mul(1024 * 1024).min(H2_MAX_WINDOW_BYTES)
-    }
-}
-
-#[cfg(test)]
-mod h2_window_tests {
-    use super::*;
-
-    #[test]
-    fn test_h2_window_config_default() {
-        let cfg = H2WindowConfig::default();
-        assert!(cfg.adaptive, "default should be adaptive ON");
-        assert_eq!(cfg.stream_window_mb, DEFAULT_H2_STREAM_WINDOW_MB);
-        assert_eq!(cfg.conn_window_mb, DEFAULT_H2_CONN_WINDOW_MB);
-        assert_eq!(cfg.conn_window_mb, cfg.stream_window_mb * 4,
-            "default conn window should be 4x stream window");
-    }
-
-    #[test]
-    fn test_h2_window_config_stream_to_bytes() {
-        let cfg = H2WindowConfig { adaptive: false, stream_window_mb: 4, conn_window_mb: 16 };
-        assert_eq!(cfg.stream_window_bytes(), 4 * 1024 * 1024);
-        assert_eq!(cfg.conn_window_bytes(),  16 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_h2_window_config_hard_cap_enforced() {
-        // 300 MiB exceeds H2_WINDOW_MB_HARD_CAP (256)
-        let cfg = H2WindowConfig { adaptive: false, stream_window_mb: 300, conn_window_mb: 300 };
-        // bytes() doesn't clamp to hard cap — the cap is enforced in from_env parsing.
-        // Verify the hard cap constant itself is sane.
-        assert!(H2_WINDOW_MB_HARD_CAP <= 2047,
-            "hard cap must be below the HTTP/2 spec max of ~2 GiB");
-        assert!(H2_MAX_WINDOW_BYTES == 0x7FFF_FFFF);
-        // bytes() uses saturating_mul + min(H2_MAX_WINDOW_BYTES)
-        assert!(cfg.stream_window_bytes() <= H2_MAX_WINDOW_BYTES);
-    }
-
-    #[test]
-    fn test_h2_window_conn_defaults_to_4x_stream() {
-        // When conn is unset, from_env() sets it to 4× stream.
-        // We test the struct math directly.
-        let stream = 8u32;
-        let conn   = stream.saturating_mul(4).min(H2_WINDOW_MB_HARD_CAP);
-        assert_eq!(conn, 32);
-    }
-
-    #[test]
-    fn test_h2_window_adaptive_default_true() {
-        // Simulate "unset" — H2WindowConfig::default() should give adaptive=true.
-        let cfg = H2WindowConfig::default();
-        assert!(cfg.adaptive);
+        self.conn_window_mb
+            .saturating_mul(1024 * 1024)
+            .min(H2_MAX_WINDOW_BYTES)
     }
 }
 
@@ -625,3 +582,69 @@ pub static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
     rng.fill_bytes(&mut block[..]);
     block
 });
+
+#[cfg(test)]
+mod h2_window_tests {
+    use super::*;
+
+    #[test]
+    fn test_h2_window_config_default() {
+        let cfg = H2WindowConfig::default();
+        assert!(cfg.adaptive, "default should be adaptive ON");
+        assert_eq!(cfg.stream_window_mb, DEFAULT_H2_STREAM_WINDOW_MB);
+        assert_eq!(cfg.conn_window_mb, DEFAULT_H2_CONN_WINDOW_MB);
+        assert_eq!(
+            cfg.conn_window_mb,
+            cfg.stream_window_mb * 4,
+            "default conn window should be 4x stream window"
+        );
+    }
+
+    #[test]
+    fn test_h2_window_config_stream_to_bytes() {
+        let cfg = H2WindowConfig {
+            adaptive: false,
+            stream_window_mb: 4,
+            conn_window_mb: 16,
+        };
+        assert_eq!(cfg.stream_window_bytes(), 4 * 1024 * 1024);
+        assert_eq!(cfg.conn_window_bytes(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_h2_window_config_hard_cap_enforced() {
+        // 300 MiB exceeds H2_WINDOW_MB_HARD_CAP (256)
+        let cfg = H2WindowConfig {
+            adaptive: false,
+            stream_window_mb: 300,
+            conn_window_mb: 300,
+        };
+        // bytes() doesn't clamp to hard cap — the cap is enforced in from_env parsing.
+        // Verify the hard cap constant itself is sane.
+        const {
+            assert!(
+                H2_WINDOW_MB_HARD_CAP <= 2047,
+                "hard cap must be below the HTTP/2 spec max of ~2 GiB"
+            );
+            assert!(H2_MAX_WINDOW_BYTES == 0x7FFF_FFFF);
+        }
+        // bytes() uses saturating_mul + min(H2_MAX_WINDOW_BYTES)
+        assert!(cfg.stream_window_bytes() <= H2_MAX_WINDOW_BYTES);
+    }
+
+    #[test]
+    fn test_h2_window_conn_defaults_to_4x_stream() {
+        // When conn is unset, from_env() sets it to 4× stream.
+        // We test the struct math directly.
+        let stream = 8u32;
+        let conn = stream.saturating_mul(4).min(H2_WINDOW_MB_HARD_CAP);
+        assert_eq!(conn, 32);
+    }
+
+    #[test]
+    fn test_h2_window_adaptive_default_true() {
+        // Simulate "unset" — H2WindowConfig::default() should give adaptive=true.
+        let cfg = H2WindowConfig::default();
+        assert!(cfg.adaptive);
+    }
+}

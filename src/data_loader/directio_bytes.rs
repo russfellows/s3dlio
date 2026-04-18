@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use bytes::Bytes;
-use crate::data_loader::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, ReaderMode};
+use crate::data_loader::{Dataset, DatasetError};
 use crate::object_store::store_for_uri;
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
@@ -42,16 +42,19 @@ impl DirectIOBytesDataset {
     /// Parse direct:// URI to local path
     fn parse_direct_uri(uri: &str) -> Result<PathBuf, DatasetError> {
         if !uri.starts_with("direct://") {
-            return Err(DatasetError::from(format!("Expected direct:// scheme, got: {}", uri)));
+            return Err(DatasetError::from(format!(
+                "Expected direct:// scheme, got: {}",
+                uri
+            )));
         }
-        
+
         // Remove "direct://" prefix (9 characters)
         let path_str = &uri[9..];
-        
+
         if path_str.is_empty() {
             return Err(DatasetError::from("Empty path in direct:// URI"));
         }
-        
+
         Ok(PathBuf::from(path_str))
     }
 
@@ -66,22 +69,28 @@ impl DirectIOBytesDataset {
             let mut files = Vec::new();
             Self::collect_files_recursive(path, &mut files)?;
             files.sort(); // Ensure deterministic ordering
-            Ok(files.into_iter()
+            Ok(files
+                .into_iter()
                 .map(|p| format!("direct://{}", p.to_string_lossy()))
                 .collect())
         } else {
-            Err(DatasetError::from(format!("Path does not exist or is not accessible: {}", path.display())))
+            Err(DatasetError::from(format!(
+                "Path does not exist or is not accessible: {}",
+                path.display()
+            )))
         }
     }
 
     /// Recursively collect files from a directory
     fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), DatasetError> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| DatasetError::from(format!("Failed to read directory {}: {}", dir.display(), e)))?;
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            DatasetError::from(format!("Failed to read directory {}: {}", dir.display(), e))
+        })?;
 
         for entry in entries {
-            let entry = entry
-                .map_err(|e| DatasetError::from(format!("Failed to read directory entry: {}", e)))?;
+            let entry = entry.map_err(|e| {
+                DatasetError::from(format!("Failed to read directory entry: {}", e))
+            })?;
             let path = entry.path();
 
             if path.is_file() {
@@ -96,18 +105,27 @@ impl DirectIOBytesDataset {
 
     /// Get the file URI for a given index
     fn get_file_uri(&self, index: usize) -> Result<&String, DatasetError> {
-        self.files.get(index)
-            .ok_or_else(|| DatasetError::from(format!("Index {} out of bounds (dataset has {} files)", index, self.files.len())))
+        self.files.get(index).ok_or_else(|| {
+            DatasetError::from(format!(
+                "Index {} out of bounds (dataset has {} files)",
+                index,
+                self.files.len()
+            ))
+        })
     }
 
     /// Read entire file contents using Direct I/O object store - returns Bytes for zero-copy
     async fn read_file(&self, uri: &str) -> Result<Bytes, DatasetError> {
         let store = store_for_uri(uri)
             .map_err(|e| DatasetError::from(format!("Failed to create Direct I/O store: {}", e)))?;
-        
+
         // Return Bytes directly - zero-copy!
-        store.get(uri).await
-            .map_err(|e| DatasetError::from(format!("Failed to read file with Direct I/O {}: {}", uri, e)))
+        store.get(uri).await.map_err(|e| {
+            DatasetError::from(format!(
+                "Failed to read file with Direct I/O {}: {}",
+                uri, e
+            ))
+        })
     }
 }
 
@@ -121,19 +139,22 @@ impl Dataset for DirectIOBytesDataset {
 
     fn keys(&self) -> Option<Vec<String>> {
         // Return just the filenames, stripping the direct:// prefix and path
-        Some(self.files.iter()
-            .filter_map(|uri| {
-                // Strip "direct://" prefix and get just the filename
-                uri.strip_prefix("direct://")
-                    .and_then(|p| Path::new(p).file_name())
-                    .map(|s| s.to_string_lossy().into_owned())
-            })
-            .collect())
+        Some(
+            self.files
+                .iter()
+                .filter_map(|uri| {
+                    // Strip "direct://" prefix and get just the filename
+                    uri.strip_prefix("direct://")
+                        .and_then(|p| Path::new(p).file_name())
+                        .map(|s| s.to_string_lossy().into_owned())
+                })
+                .collect(),
+        )
     }
 
     async fn get(&self, index: usize) -> Result<Self::Item, DatasetError> {
         let uri = self.get_file_uri(index)?;
-        
+
         match self.reader_mode {
             ReaderMode::Sequential => {
                 // Read entire file using Direct I/O
@@ -164,7 +185,7 @@ mod tests {
         let dataset = DirectIOBytesDataset::from_uri(&uri).unwrap();
 
         assert_eq!(dataset.len(), Some(1));
-        
+
         let content = dataset.get(0).await.unwrap();
         assert_eq!(&content[..], b"test content");
     }
@@ -172,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn test_directory_direct_io() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let file1 = temp_dir.path().join("file1.txt");
         let file2 = temp_dir.path().join("file2.txt");
         fs::write(&file1, b"content 1").unwrap();
@@ -182,11 +203,11 @@ mod tests {
         let dataset = DirectIOBytesDataset::from_uri(&uri).unwrap();
 
         assert_eq!(dataset.len(), Some(2));
-        
+
         // Read both files (order may vary due to filesystem)
         let content1 = dataset.get(0).await.unwrap();
         let content2 = dataset.get(1).await.unwrap();
-        
+
         let contents: Vec<&[u8]> = vec![&content1[..], &content2[..]];
         assert!(contents.contains(&b"content 1".as_slice()));
         assert!(contents.contains(&b"content 2".as_slice()));

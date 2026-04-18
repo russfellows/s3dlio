@@ -7,16 +7,16 @@ use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use crc32fast::Hasher;
-use std::io::Write;
-use std::collections::HashMap;
-use tracing::{debug, warn, info};
-#[cfg(feature = "backend-gcs")]
-use tracing::trace;
-use regex::Regex;
 use futures::stream::{Stream, StreamExt};
+use regex::Regex;
+use std::collections::HashMap;
+use std::io::Write;
 use std::pin::Pin;
 #[cfg(feature = "backend-gcs")]
 use tokio::sync::OnceCell;
+#[cfg(feature = "backend-gcs")]
+use tracing::trace;
+use tracing::{debug, info, warn};
 
 // Helper function for integrity validation
 fn compute_checksum(data: &[u8]) -> String {
@@ -27,20 +27,20 @@ fn compute_checksum(data: &[u8]) -> String {
 
 // --- S3 ----------------------------------------------------------------------
 use crate::s3_utils::{
-    // Reuse existing S3 helpers
-    ObjectStat as S3ObjectStat,
-    parse_s3_uri,
-    list_objects_stream as s3_list_objects_stream,
-    get_object_uri_async as s3_get_object_uri_async,
-    get_object_uri_optimized_async as s3_get_object_uri_optimized_async,
-    get_object_range_uri_async as s3_get_object_range_uri_async,
-    stat_object_uri_async as s3_stat_object_uri_async,
-    delete_objects_async as s3_delete_objects_async,
     create_bucket_async as s3_create_bucket_async,
     delete_bucket_async as s3_delete_bucket_async,
+    delete_objects_async as s3_delete_objects_async,
+    get_object_range_uri_async as s3_get_object_range_uri_async,
+    get_object_uri_async as s3_get_object_uri_async,
+    get_object_uri_optimized_async as s3_get_object_uri_optimized_async,
+    list_objects_stream as s3_list_objects_stream,
+    parse_s3_uri,
+    put_object_multipart_uri_async as s3_put_object_multipart_uri_async,
     // NEW: PUT operations via ObjectStore
     put_object_uri_async as s3_put_object_uri_async,
-    put_object_multipart_uri_async as s3_put_object_multipart_uri_async,
+    stat_object_uri_async as s3_stat_object_uri_async,
+    // Reuse existing S3 helpers
+    ObjectStat as S3ObjectStat,
 };
 
 use crate::s3_logger::global_logger;
@@ -51,30 +51,27 @@ use crate::file_store::FileSystemObjectStore;
 // Expose enhanced FS adapter with O_DIRECT support
 use crate::file_store_direct::ConfigurableFileSystemObjectStore;
 
-
 // --- Azure ---------------------------------------------------
-use bytes::Bytes;
-#[cfg(feature = "backend-azure")]
-use futures::stream;
 #[cfg(feature = "backend-azure")]
 use crate::azure_client::{AzureBlob, AzureBlobProperties};
+use crate::constants::{
+    DEFAULT_RANGE_ENGINE_CHUNK_SIZE, DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,
+    DEFAULT_RANGE_ENGINE_THRESHOLD, DEFAULT_RANGE_TIMEOUT_SECS,
+};
 #[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
 use crate::range_engine_generic::RangeEngine;
 use crate::range_engine_generic::RangeEngineConfig;
-use crate::constants::{
-    DEFAULT_RANGE_ENGINE_CHUNK_SIZE,
-    DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,
-    DEFAULT_RANGE_ENGINE_THRESHOLD,
-    DEFAULT_RANGE_TIMEOUT_SECS,
-};
+use bytes::Bytes;
+#[cfg(feature = "backend-azure")]
+use futures::stream;
 use std::time::Duration;
 
 // --- GCS - Feature-gated backend selection -------------------
 #[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
-use crate::gcs_client::{GcsClient, GcsObjectMetadata, parse_gcs_uri};
+use crate::gcs_client::{parse_gcs_uri, GcsClient, GcsObjectMetadata};
 
 #[cfg(all(feature = "backend-gcs", not(feature = "gcs-community")))]
-use crate::google_gcs_client::{GcsClient, GcsObjectMetadata, parse_gcs_uri};
+use crate::google_gcs_client::{parse_gcs_uri, GcsClient, GcsObjectMetadata};
 
 #[cfg(feature = "backend-gcs")]
 static GLOBAL_GCS_CLIENT: OnceCell<GcsClient> = OnceCell::const_new();
@@ -104,26 +101,28 @@ fn get_concurrent_threshold() -> u64 {
 }
 
 /// Compression configuration for ObjectWriter implementations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionConfig {
     #[default]
     None,
-    Zstd { level: i32 },
+    Zstd {
+        level: i32,
+    },
 }
-
 
 impl CompressionConfig {
     /// Create Zstd compression with default level (3)
     pub fn zstd_default() -> Self {
         CompressionConfig::Zstd { level: 3 }
     }
-    
+
     /// Create Zstd compression with custom level (1-22)
     pub fn zstd_level(level: i32) -> Self {
-        CompressionConfig::Zstd { level: level.clamp(1, 22) }
+        CompressionConfig::Zstd {
+            level: level.clamp(1, 22),
+        }
     }
-    
+
     /// Get the file extension for this compression format
     pub fn extension(&self) -> &'static str {
         match self {
@@ -131,13 +130,12 @@ impl CompressionConfig {
             CompressionConfig::Zstd { .. } => ".zst",
         }
     }
-    
+
     /// Check if compression is enabled
     pub fn is_enabled(&self) -> bool {
         !matches!(self, CompressionConfig::None)
     }
 }
-
 
 /// Configuration options for creating object writers
 #[derive(Debug, Clone, Default)]
@@ -157,59 +155,60 @@ impl WriterOptions {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Set compression configuration
     pub fn with_compression(mut self, compression: CompressionConfig) -> Self {
         self.compression = Some(compression);
         self
     }
-    
+
     /// Set buffer size hint
     pub fn with_buffer_size(mut self, size: usize) -> Self {
         self.buffer_size = Some(size);
         self
     }
-    
+
     /// Set maximum part size for multipart uploads
     pub fn with_part_size(mut self, size: usize) -> Self {
         self.part_size = Some(size);
         self
     }
-    
+
     /// Enable adaptive tuning with default configuration
     pub fn with_adaptive(mut self) -> Self {
         self.adaptive = Some(crate::adaptive_config::AdaptiveConfig::enabled());
         self
     }
-    
+
     /// Set custom adaptive configuration
     pub fn with_adaptive_config(mut self, config: crate::adaptive_config::AdaptiveConfig) -> Self {
         self.adaptive = Some(config);
         self
     }
-    
+
     /// Compute effective part size considering adaptive tuning
-    /// 
+    ///
     /// If part_size is explicitly set, it is always used.
     /// Otherwise, if adaptive is enabled, it computes the optimal part size.
     /// Falls back to default if neither is set.
     pub fn effective_part_size(&self, file_size: Option<usize>) -> usize {
         use crate::adaptive_config::AdaptiveParams;
-        
+
         // If adaptive config is provided, use it to compute effective part size
         if let Some(ref adaptive_cfg) = self.adaptive {
             let params = AdaptiveParams::new(adaptive_cfg.clone());
             params.compute_part_size(file_size, self.part_size)
         } else {
             // No adaptive config: use explicit part_size or default
-            self.part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE)
+            self.part_size
+                .unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE)
         }
     }
-    
+
     /// Compute effective buffer size considering adaptive tuning
     pub fn effective_buffer_size(&self, operation_type: &str) -> usize {
         use crate::adaptive_config::AdaptiveParams;
-        
+
         // If adaptive config is provided, use it to compute effective buffer size
         if let Some(ref adaptive_cfg) = self.adaptive {
             let params = AdaptiveParams::new(adaptive_cfg.clone());
@@ -231,7 +230,7 @@ pub enum Scheme {
     Unknown,
 }
 /// Object properties for metadata update operations (v0.10.0+)
-/// 
+///
 /// Used with `update_properties()` to modify object metadata without re-uploading data.
 /// Only non-None fields will be updated. For cloud backends, this typically requires
 /// copying the object with new metadata.
@@ -239,22 +238,22 @@ pub enum Scheme {
 pub struct ObjectProperties {
     /// MIME content type (e.g., "application/json", "text/plain")
     pub content_type: Option<String>,
-    
+
     /// HTTP Cache-Control header (e.g., "max-age=3600, public")
     pub cache_control: Option<String>,
-    
+
     /// Content encoding (e.g., "gzip", "br")
     pub content_encoding: Option<String>,
-    
+
     /// Content language (e.g., "en-US", "fr-FR")
     pub content_language: Option<String>,
-    
+
     /// Content disposition (e.g., "attachment; filename=data.json")
     pub content_disposition: Option<String>,
-    
+
     /// HTTP Expires header (RFC 2822 date format)
     pub expires: Option<String>,
-    
+
     /// Storage class/tier for cost optimization
     /// - S3: "STANDARD", "INTELLIGENT_TIERING", "GLACIER", "DEEP_ARCHIVE"
     /// - GCS: "STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"
@@ -262,38 +261,44 @@ pub struct ObjectProperties {
     pub storage_class: Option<String>,
 }
 
-
 /// Best-effort scheme inference from a URI.
 pub fn infer_scheme(uri: &str) -> Scheme {
-    if uri.starts_with("file://") { Scheme::File }
-    else if uri.starts_with("direct://") { Scheme::Direct }
-    else if uri.starts_with("s3://") { Scheme::S3 }
-    else if uri.starts_with("az://") || uri.contains(".blob.core.windows.net/") { Scheme::Azure }
-    else if uri.starts_with("gs://") || uri.starts_with("gcs://") { Scheme::Gcs }
-    else { Scheme::Unknown }
+    if uri.starts_with("file://") {
+        Scheme::File
+    } else if uri.starts_with("direct://") {
+        Scheme::Direct
+    } else if uri.starts_with("s3://") {
+        Scheme::S3
+    } else if uri.starts_with("az://") || uri.contains(".blob.core.windows.net/") {
+        Scheme::Azure
+    } else if uri.starts_with("gs://") || uri.starts_with("gcs://") {
+        Scheme::Gcs
+    } else {
+        Scheme::Unknown
+    }
 }
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Get entire object into memory.
-    /// 
+    ///
     /// Returns `Bytes` for zero-copy efficiency. The S3/Azure SDKs return data as `Bytes`,
     /// allowing us to avoid unnecessary allocations. Use `.as_ref()` to get &[u8] or
     /// `.to_vec()` only when ownership is required.
     async fn get(&self, uri: &str) -> Result<Bytes>;
 
     /// Get a byte-range. If `length` is None, read from `offset` to end.
-    /// 
+    ///
     /// Returns `Bytes` for zero-copy efficiency.
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes>;
 
     /// Put full object (single-shot).
-    /// 
+    ///
     /// Accepts `Bytes` for zero-copy efficiency (no memcpy when converting to SDK types).
     async fn put(&self, uri: &str, data: Bytes) -> Result<()>;
 
     /// Put via multipart semantics (or an equivalent high-throughput path).
-    /// 
+    ///
     /// Accepts `Bytes` for zero-copy efficiency.
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()>;
 
@@ -332,63 +337,82 @@ pub trait ObjectStore: Send + Sync {
     async fn exists(&self, uri: &str) -> Result<bool> {
         Ok(self.stat(uri).await.is_ok())
     }
-    
+
     /// Get object with integrity validation.
     /// Returns the data and validates it against the expected checksum if provided.
-    async fn get_with_validation(&self, uri: &str, expected_checksum: Option<&str>) -> Result<Bytes> {
+    async fn get_with_validation(
+        &self,
+        uri: &str,
+        expected_checksum: Option<&str>,
+    ) -> Result<Bytes> {
         let data = self.get(uri).await?;
-        
+
         if let Some(expected) = expected_checksum {
             let actual = compute_checksum(&data);
             if actual != expected {
-                bail!("Integrity validation failed for {}: expected {}, got {}", uri, expected, actual);
+                bail!(
+                    "Integrity validation failed for {}: expected {}, got {}",
+                    uri,
+                    expected,
+                    actual
+                );
             }
         }
-        
+
         Ok(data)
     }
-    
+
     /// Get byte range with integrity validation.
     /// For partial reads, validates against the partial data checksum if provided.
     async fn get_range_with_validation(
-        &self, 
-        uri: &str, 
-        offset: u64, 
+        &self,
+        uri: &str,
+        offset: u64,
         length: Option<u64>,
-        expected_checksum: Option<&str>
+        expected_checksum: Option<&str>,
     ) -> Result<Bytes> {
         let data = self.get_range(uri, offset, length).await?;
-        
+
         if let Some(expected) = expected_checksum {
             let actual = compute_checksum(&data);
             if actual != expected {
-                bail!("Integrity validation failed for range {}[{}:{}]: expected {}, got {}", 
-                      uri, offset, offset + data.len() as u64, expected, actual);
+                bail!(
+                    "Integrity validation failed for range {}[{}:{}]: expected {}, got {}",
+                    uri,
+                    offset,
+                    offset + data.len() as u64,
+                    expected,
+                    actual
+                );
             }
         }
-        
+
         Ok(data)
     }
-    
+
     /// Load and validate checkpoint data with integrity checking.
     /// This method is specifically designed for checkpoint loading scenarios.
     async fn load_checkpoint_with_validation(
-        &self, 
-        checkpoint_uri: &str, 
-        expected_checksum: Option<&str>
+        &self,
+        checkpoint_uri: &str,
+        expected_checksum: Option<&str>,
     ) -> Result<Vec<u8>> {
         // Get checkpoint data
         let data = self.get(checkpoint_uri).await?;
-        
+
         // Validate integrity if checksum provided
         if let Some(expected) = expected_checksum {
             let actual = compute_checksum(&data);
             if actual != expected {
-                bail!("Checkpoint integrity validation failed for {}: expected checksum {}, got {}", 
-                      checkpoint_uri, expected, actual);
+                bail!(
+                    "Checkpoint integrity validation failed for {}: expected checksum {}, got {}",
+                    checkpoint_uri,
+                    expected,
+                    actual
+                );
             }
         }
-        
+
         // Convert Bytes to Vec<u8> for backward compatibility
         Ok(data.to_vec())
     }
@@ -414,7 +438,11 @@ pub trait ObjectStore: Send + Sync {
 
     /// Get a streaming writer with compression support for zero-copy operations.
     /// This enables writing large objects with compression without buffering the entire content in memory.
-    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+    async fn get_writer_with_compression(
+        &self,
+        uri: &str,
+        compression: CompressionConfig,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // Default implementation: use get_writer (no compression)
         if compression.is_enabled() {
             bail!("Compression not supported by this ObjectStore implementation");
@@ -424,7 +452,11 @@ pub trait ObjectStore: Send + Sync {
 
     /// Create a new streaming writer with specified options.
     /// This is the unified interface for creating writers with configurable options.
-    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+    async fn create_writer(
+        &self,
+        uri: &str,
+        options: WriterOptions,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // Default implementation: use get_writer_with_compression if compression is specified
         if let Some(compression) = options.compression {
             self.get_writer_with_compression(uri, compression).await
@@ -446,12 +478,12 @@ pub trait ObjectStore: Send + Sync {
     /// High-performance optimized range GET operation.
     /// Uses concurrent range requests for large transfers to maximize throughput.
     async fn get_range_optimized(
-        &self, 
-        uri: &str, 
-        offset: u64, 
+        &self,
+        uri: &str,
+        offset: u64,
         length: Option<u64>,
         _chunk_size: Option<usize>,
-        _max_concurrency: Option<usize>
+        _max_concurrency: Option<usize>,
     ) -> Result<Bytes> {
         // Default implementation: delegate to regular get_range()
         // S3ObjectStore will override this with concurrent range logic
@@ -459,45 +491,45 @@ pub trait ObjectStore: Send + Sync {
     }
 
     /// Pre-stat multiple objects concurrently to populate size cache (v0.9.10+)
-    /// 
+    ///
     /// This is a performance optimization for workloads where object URIs are known
     /// upfront (e.g., benchmark tools like sai3-bench, batch processing pipelines).
     /// By pre-statting objects concurrently, we eliminate per-object stat latency
     /// during the download phase.
-    /// 
+    ///
     /// # Performance Impact
-    /// 
+    ///
     /// For 1000 object benchmark workload:
     /// - Without pre-stat: 1000 × 20ms stat = 20 seconds overhead (61% of total time)
     /// - With pre-stat: Pre-stat in 200ms (100 concurrent), then zero per-object overhead
     /// - Result: 2.5x faster (32.8s → 13.0s), 2.5x higher throughput (1.95 GB/s → 4.92 GB/s)
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `uris` - List of object URIs to stat
     /// * `max_concurrent` - Maximum concurrent stat operations (recommended: 100)
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// Map of URI → size for successfully statted objects. Failed stats are logged
     /// and omitted from the result (graceful degradation).
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```no_run
     /// use s3dlio::object_store::ObjectStore;
-    /// 
+    ///
     /// # async fn example(store: &dyn ObjectStore) -> anyhow::Result<()> {
     /// let uris = vec![
     ///     "s3://bucket/object1.dat".to_string(),
     ///     "s3://bucket/object2.dat".to_string(),
     ///     // ... 1000 more objects
     /// ];
-    /// 
+    ///
     /// // Pre-stat all objects concurrently
     /// let size_map = store.pre_stat_objects(&uris, 100).await?;
     /// println!("Pre-statted {} objects", size_map.len());
-    /// 
+    ///
     /// // Now downloads can use cached sizes (if backend supports it)
     /// for uri in &uris {
     ///     let data = store.get(uri).await?;
@@ -506,9 +538,9 @@ pub trait ObjectStore: Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// # Backward Compatibility
-    /// 
+    ///
     /// This method has a default implementation that stats objects CONCURRENTLY
     /// using the provided max_concurrent limit. No need to override unless you
     /// want custom behavior.
@@ -518,12 +550,16 @@ pub trait ObjectStore: Send + Sync {
         max_concurrent: usize,
     ) -> Result<std::collections::HashMap<String, u64>> {
         use futures::stream::{self, StreamExt};
-        
-        tracing::debug!("Pre-statting {} objects (concurrent, max={})", uris.len(), max_concurrent);
-        
+
+        tracing::debug!(
+            "Pre-statting {} objects (concurrent, max={})",
+            uris.len(),
+            max_concurrent
+        );
+
         // Clone URIs to avoid lifetime issues in async closures
         let uri_vec: Vec<String> = uris.to_vec();
-        
+
         // Use futures::stream to stat objects concurrently
         let results: Vec<Option<(String, u64)>> = stream::iter(uri_vec)
             .map(|uri| async move {
@@ -541,51 +577,49 @@ pub trait ObjectStore: Send + Sync {
             .buffer_unordered(max_concurrent)
             .collect()
             .await;
-        
+
         // Collect successful results
-        let size_map: std::collections::HashMap<String, u64> = results
-            .into_iter()
-            .flatten()
-            .collect();
-        
+        let size_map: std::collections::HashMap<String, u64> =
+            results.into_iter().flatten().collect();
+
         tracing::info!(
             "Pre-statted {}/{} objects successfully (concurrent)",
             size_map.len(),
             uris.len()
         );
-        
+
         Ok(size_map)
     }
 
     /// Pre-stat objects and populate internal size cache (v0.9.10+)
-    /// 
+    ///
     /// This is a higher-level convenience method that pre-stats objects AND caches
     /// the results internally. After calling this, subsequent `get()` calls will
     /// use cached sizes and skip the per-object stat operation.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `uris` - List of object URIs to stat
     /// * `max_concurrent` - Maximum concurrent stat operations (recommended: 100)
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// Count of successfully cached entries
-    /// 
+    ///
     /// # Example (sai3-bench usage pattern)
-    /// 
+    ///
     /// ```no_run
     /// use s3dlio::object_store::ObjectStore;
     /// use std::time::Instant;
-    /// 
+    ///
     /// # async fn example(store: &dyn ObjectStore) -> anyhow::Result<()> {
     /// let object_uris: Vec<String> = vec![/* 1000 objects */];
-    /// 
+    ///
     /// // PHASE 1: Pre-stat all objects (runs once at start)
     /// let start = Instant::now();
     /// let cached = store.pre_stat_and_cache(&object_uris, 100).await?;
     /// println!("Pre-statted {} objects in {:?}", cached, start.elapsed());
-    /// 
+    ///
     /// // PHASE 2: Download with zero stat overhead
     /// for uri in &object_uris {
     ///     let data = store.get(uri).await?;  // Uses cached size!
@@ -594,32 +628,28 @@ pub trait ObjectStore: Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// # Backward Compatibility
-    /// 
+    ///
     /// Default implementation calls `pre_stat_objects()` but doesn't cache results
     /// (returns the count but doesn't enable size cache benefits). Backends with
     /// size cache support will override this method.
-    async fn pre_stat_and_cache(
-        &self,
-        uris: &[String],
-        max_concurrent: usize,
-    ) -> Result<usize> {
+    async fn pre_stat_and_cache(&self, uris: &[String], max_concurrent: usize) -> Result<usize> {
         // Default: just pre-stat without caching (backward compatible no-op)
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
         Ok(size_map.len())
     }
-    
+
     // =========================================================================
     // Metadata Operations (v0.10.0+)
     // =========================================================================
-    
+
     /// Create a directory (POSIX) or prefix marker (cloud).
-    /// 
+    ///
     /// **Backend behavior**:
     /// - `file://`, `direct://`: Creates actual directory with `create_dir_all()`
     /// - `s3://`, `gs://`, `az://`: Creates empty marker object (e.g., `.keep`)
-    /// 
+    ///
     /// # Arguments
     /// * `uri` - Full URI including scheme (e.g., "file:///tmp/dir", "s3://bucket/prefix/")
     async fn mkdir(&self, uri: &str) -> Result<()> {
@@ -628,11 +658,11 @@ pub trait ObjectStore: Send + Sync {
     }
 
     /// Remove a directory (POSIX) or delete all objects under prefix (cloud).
-    /// 
+    ///
     /// **Backend behavior**:
     /// - `file://`, `direct://`: Removes directory (must be empty unless `recursive=true`)
     /// - `s3://`, `gs://`, `az://`: Deletes all objects under prefix
-    /// 
+    ///
     /// # Arguments
     /// * `uri` - Full URI including scheme
     /// * `recursive` - If true, delete recursively; if false, fail if not empty
@@ -642,7 +672,7 @@ pub trait ObjectStore: Send + Sync {
     }
 
     /// Update custom object metadata (cloud-specific, x-amz-meta-*, x-goog-meta-*, x-ms-meta-*).
-    /// 
+    ///
     /// **Note**: For cloud backends, this typically requires copying the object with new metadata.
     /// For file backends, this is not applicable.
     async fn update_metadata(&self, uri: &str, metadata: &HashMap<String, String>) -> Result<()> {
@@ -651,42 +681,40 @@ pub trait ObjectStore: Send + Sync {
     }
 
     /// Update object properties (content-type, cache-control, storage class, etc).
-    /// 
+    ///
     /// **Note**: For cloud backends, changing properties requires copying the object.
     /// For file backends, limited support.
     async fn update_properties(&self, uri: &str, properties: &ObjectProperties) -> Result<()> {
         let _ = (uri, properties);
         bail!("update_properties not supported for this backend")
     }
-
-
 }
 
 /// Concurrent deletion helper for efficient batch deletions across all backends.
-/// 
+///
 /// This function deletes multiple objects concurrently through the ObjectStore trait,
 /// providing significant performance improvements over sequential deletion while
 /// maintaining universal backend compatibility.
-/// 
+///
 /// # Adaptive Concurrency
 /// - For small batches (< 10 objects): Sequential deletion (concurrency = 1)
 /// - For medium batches: 10% of total objects (with min 10, max 1000)
 /// - For large batches (10,000+ objects): Caps at 1000 concurrent operations
-/// 
+///
 /// # Progress Updates
 /// - Batched updates (every 50 operations) to minimize overhead
 /// - Allows 98% reduction in progress bar overhead vs per-object updates
 /// - Final update ensures accurate completion count
-/// 
+///
 /// # Arguments
 /// * `store` - Any ObjectStore implementation (S3, Azure, GCS, file, direct)
 /// * `keys` - Slice of object URIs to delete
 /// * `progress_callback` - Optional callback for progress updates (called every 50 deletions)
-/// 
+///
 /// # Returns
 /// * `Ok(())` - All objects deleted successfully
 /// * `Err(_)` - First error encountered (other deletions may still be in progress)
-/// 
+///
 /// # Example
 /// ```ignore
 /// let keys = vec!["s3://bucket/obj1", "s3://bucket/obj2"];
@@ -707,30 +735,33 @@ where
     use std::sync::Arc;
 
     let total = keys.len();
-    
+
     if total == 0 {
         return Ok(());
     }
 
     // Adaptive concurrency: 10% of total objects with reasonable min/max bounds
     let max_concurrency = if total < 10 {
-        1  // Very small batches: sequential
+        1 // Very small batches: sequential
     } else if total < 100 {
-        10  // Small batches: minimum 10 concurrent
+        10 // Small batches: minimum 10 concurrent
     } else if total < 10_000 {
-        (total / 10).clamp(10, 100)  // Medium batches: 10% with max 100
+        (total / 10).clamp(10, 100) // Medium batches: 10% with max 100
     } else {
-        (total / 10).min(1000)  // Large batches: 10% capped at 1000
+        (total / 10).min(1000) // Large batches: 10% capped at 1000
     };
 
-    debug!("delete_objects_concurrent: {} objects, concurrency={}", total, max_concurrency);
+    debug!(
+        "delete_objects_concurrent: {} objects, concurrency={}",
+        total, max_concurrency
+    );
 
     let completed = Arc::new(AtomicUsize::new(0));
     let last_reported = Arc::new(AtomicUsize::new(0));
-    
+
     // Wrap callback in Arc for sharing across async tasks
     let callback_arc = progress_callback.map(Arc::new);
-    
+
     // Progress reporting frequency: every 50 deletions or at completion
     let report_interval = 50;
 
@@ -741,23 +772,26 @@ where
             let completed = Arc::clone(&completed);
             let last_reported = Arc::clone(&last_reported);
             let callback = callback_arc.clone();
-            
+
             async move {
                 // Delete the object
                 store.delete(&key).await?;
-                
+
                 // Update counter
                 let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                
+
                 // Report progress in batches or on completion
                 if let Some(ref cb) = callback {
                     let last = last_reported.load(Ordering::Relaxed);
                     if (count - last >= report_interval || count == total || idx == keys.len() - 1)
-                        && last_reported.compare_exchange(last, count, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                            cb(count);
-                        }
+                        && last_reported
+                            .compare_exchange(last, count, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        cb(count);
+                    }
                 }
-                
+
                 Ok::<_, anyhow::Error>(())
             }
         })
@@ -765,7 +799,7 @@ where
 
     // Execute all deletions and collect results
     let results: Vec<Result<()>> = deletions.collect().await;
-    
+
     // Check for errors
     for result in results {
         result?;
@@ -796,29 +830,29 @@ pub trait ObjectWriter: Send + Sync {
         // Default implementation: convert to slice and call write_chunk
         self.write_chunk(&data).await
     }
-    
+
     /// Finalize the object upload. Must be called to complete the write.
     /// After calling finalize(), the writer should not be used again.
     async fn finalize(self: Box<Self>) -> Result<()>;
-    
+
     /// Get the total number of uncompressed bytes written so far.
     fn bytes_written(&self) -> u64;
-    
+
     /// Get the total number of compressed bytes (if compression is enabled).
     /// Returns the same as bytes_written() if compression is disabled.
     fn compressed_bytes(&self) -> u64 {
         self.bytes_written() // Default: no compression
     }
-    
+
     /// Get the computed checksum for the uncompressed data written so far.
     /// Returns None if no checksum has been computed yet.
     fn checksum(&self) -> Option<String>;
-    
+
     /// Get compression configuration for this writer.
     fn compression(&self) -> CompressionConfig {
         CompressionConfig::None // Default: no compression
     }
-    
+
     /// Get compression ratio (compressed_size / uncompressed_size).
     /// Returns 1.0 if compression is disabled.
     fn compression_ratio(&self) -> f64 {
@@ -828,7 +862,7 @@ pub trait ObjectWriter: Send + Sync {
             self.compressed_bytes() as f64 / self.bytes_written() as f64
         }
     }
-    
+
     /// Cancel the upload and clean up any partial data.
     /// This is called automatically if the writer is dropped without finalize().
     async fn cancel(self: Box<Self>) -> Result<()> {
@@ -871,23 +905,25 @@ impl<'a> ObjectWriter for BufferedObjectWriter<'a> {
         self.bytes_written += chunk.len() as u64;
         Ok(())
     }
-    
+
     async fn finalize(mut self: Box<Self>) -> Result<()> {
         if self.finalized {
             return Ok(());
         }
         self.finalized = true;
-        self.store.put(&self.uri, Bytes::from(std::mem::take(&mut self.buffer))).await
+        self.store
+            .put(&self.uri, Bytes::from(std::mem::take(&mut self.buffer)))
+            .await
     }
-    
+
     fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
-    
+
     fn checksum(&self) -> Option<String> {
         Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
-    
+
     async fn cancel(mut self: Box<Self>) -> Result<()> {
         self.finalized = true;
         self.buffer.clear();
@@ -910,21 +946,21 @@ impl FileSystemObjectStore {
 // ============================================================================
 
 /// Configuration for S3ObjectStore
-/// 
+///
 /// v0.9.10: Added size_cache_ttl for pre-stat optimization
 #[derive(Debug, Clone)]
 pub struct S3Config {
     /// Enable RangeEngine for concurrent range downloads (struct config field)
-    /// 
+    ///
     /// Default: false — set to true for large-file workloads.
     /// Note: S3 also has a separate env-var optimization path (`S3DLIO_ENABLE_RANGE_OPTIMIZATION`)
     /// that is enabled by default (v0.9.60+) and does not require this field to be set.
     pub enable_range_engine: bool,
-    
+
     /// RangeEngine configuration
     /// Network-optimized defaults: 32 MiB threshold (v0.9.60+), 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
-    
+
     /// Time-to-live for cached object sizes
     /// Default: 60 seconds
     /// Set to 0 to disable caching
@@ -934,14 +970,14 @@ pub struct S3Config {
 impl Default for S3Config {
     fn default() -> Self {
         Self {
-            enable_range_engine: false,  // Struct field off by default; S3 env-var optimization (S3DLIO_ENABLE_RANGE_OPTIMIZATION) is on by default (v0.9.60+)
+            enable_range_engine: false, // Struct field off by default; S3 env-var optimization (S3DLIO_ENABLE_RANGE_OPTIMIZATION) is on by default (v0.9.60+)
             range_engine: RangeEngineConfig {
-                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
-                max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
-                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 32 MiB threshold (v0.9.60+)
-                range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
+                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE, // 64 MiB chunks
+                max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT, // 32 parallel
+                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD, // 32 MiB threshold (v0.9.60+)
+                range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS), // 30s
             },
-            size_cache_ttl_secs: 60,  // 60 second TTL for size cache
+            size_cache_ttl_secs: 60, // 60 second TTL for size cache
         }
     }
 }
@@ -971,16 +1007,20 @@ impl S3ObjectStore {
         let config = S3Config::default();
         let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
-            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(
+                cache_ttl,
+            )),
             client: None,
             endpoint_url: None,
         }
     }
-    
+
     pub fn with_config(config: S3Config) -> Self {
         let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
-            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(
+                cache_ttl,
+            )),
             client: None,
             endpoint_url: None,
         }
@@ -1001,7 +1041,9 @@ impl S3ObjectStore {
         let config = S3Config::default();
         let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Ok(Self {
-            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(
+                cache_ttl,
+            )),
             client: Some(std::sync::Arc::new(client)),
             endpoint_url: Some(endpoint_url.to_string()),
         })
@@ -1014,12 +1056,14 @@ impl S3ObjectStore {
     pub fn endpoint_url(&self) -> Option<&str> {
         self.endpoint_url.as_deref()
     }
-    
+
     #[inline]
-    pub fn boxed() -> Box<dyn ObjectStore> { Box::new(Self::new()) }
-    
+    pub fn boxed() -> Box<dyn ObjectStore> {
+        Box::new(Self::new())
+    }
+
     /// Get object size, checking cache first
-    /// 
+    ///
     /// v0.9.10: Added to optimize get_optimized() and get_range_optimized()
     /// by eliminating redundant stat() calls.
     async fn get_object_size(&self, uri: &str) -> Result<u64> {
@@ -1027,7 +1071,7 @@ impl S3ObjectStore {
         if let Some(cached_size) = self.size_cache.get(uri).await {
             return Ok(cached_size);
         }
-        
+
         // Cache miss - perform stat and cache result
         let metadata = self.stat(uri).await?;
         self.size_cache.put(uri.to_string(), metadata.size).await;
@@ -1049,18 +1093,35 @@ impl S3ObjectStore {
             }
             None => (String::new(), key_prefix.to_string()),
         };
-        let final_pattern = if pattern_str.is_empty() { ".*".to_string() } else { pattern_str };
+        let final_pattern = if pattern_str.is_empty() {
+            ".*".to_string()
+        } else {
+            pattern_str
+        };
         let re = Regex::new(&final_pattern)
             .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
-        let delimiter = if recursive { None } else { Some("/".to_string()) };
+        let delimiter = if recursive {
+            None
+        } else {
+            Some("/".to_string())
+        };
 
         let mut keys = Vec::new();
         let mut cont: Option<String> = None;
         loop {
-            let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix_str.as_str());
-            if let Some(ref d) = delimiter { req = req.delimiter(d.as_str()); }
-            if let Some(ref t) = cont { req = req.continuation_token(t.as_str()); }
-            let resp = req.send().await
+            let mut req = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix_str.as_str());
+            if let Some(ref d) = delimiter {
+                req = req.delimiter(d.as_str());
+            }
+            if let Some(ref t) = cont {
+                req = req.continuation_token(t.as_str());
+            }
+            let resp = req
+                .send()
+                .await
                 .with_context(|| format!("list_objects_v2 failed for bucket '{}'", bucket))?;
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
@@ -1083,18 +1144,24 @@ impl S3ObjectStore {
 #[async_trait]
 impl ObjectStore for S3ObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
-        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
         debug!("S3ObjectStore::get uri='{}'", uri);
 
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
-            let resp = client.get_object()
+            let resp = client
+                .get_object()
                 .bucket(&bucket)
                 .key(&key)
                 .send()
                 .await
                 .with_context(|| format!("S3 GET failed for '{}'", uri))?;
-            let data = resp.body.collect().await
+            let data = resp
+                .body
+                .collect()
+                .await
                 .context("Failed to read S3 GET response body")?;
             return Ok(data.into_bytes());
         }
@@ -1104,9 +1171,14 @@ impl ObjectStore for S3ObjectStore {
         // Setting it to 1/true/yes/on/enable is accepted but has no effect (already on).
         let use_optimized = std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
             .ok()
-            .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off" | "disable" | "disabled"))
-            .unwrap_or(true);  // Default: enabled
-        
+            .map(|v| {
+                !matches!(
+                    v.to_lowercase().as_str(),
+                    "0" | "false" | "no" | "off" | "disable" | "disabled"
+                )
+            })
+            .unwrap_or(true); // Default: enabled
+
         if use_optimized {
             s3_get_object_uri_optimized_async(uri).await
         } else {
@@ -1115,8 +1187,13 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
-        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
-        debug!("S3ObjectStore::get_range uri='{}', offset={}, length={:?}", uri, offset, length);
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        debug!(
+            "S3ObjectStore::get_range uri='{}', offset={}, length={:?}",
+            uri, offset, length
+        );
 
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
@@ -1124,14 +1201,18 @@ impl ObjectStore for S3ObjectStore {
                 Some(len) => format!("bytes={}-{}", offset, offset + len - 1),
                 None => format!("bytes={}-", offset),
             };
-            let resp = client.get_object()
+            let resp = client
+                .get_object()
                 .bucket(&bucket)
                 .key(&key)
                 .range(range_header)
                 .send()
                 .await
                 .with_context(|| format!("S3 range GET failed for '{}'", uri))?;
-            let data = resp.body.collect().await
+            let data = resp
+                .body
+                .collect()
+                .await
                 .context("Failed to read S3 range GET response body")?;
             return Ok(data.into_bytes());
         }
@@ -1140,12 +1221,15 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
-        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
         debug!("S3ObjectStore::put uri='{}', {} bytes", uri, data.len());
 
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
-            client.put_object()
+            client
+                .put_object()
                 .bucket(&bucket)
                 .key(&key)
                 .body(data.into())
@@ -1159,13 +1243,23 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
-        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
-        debug!("S3ObjectStore::put_multipart uri='{}', {} bytes, part_size={:?}", uri, data.len(), part_size);
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        debug!(
+            "S3ObjectStore::put_multipart uri='{}', {} bytes, part_size={:?}",
+            uri,
+            data.len(),
+            part_size
+        );
         s3_put_object_multipart_uri_async(uri, data, part_size).await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
-        debug!("S3ObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
+        debug!(
+            "S3ObjectStore::list prefix='{}', recursive={}",
+            uri_prefix, recursive
+        );
         let (bucket, key_prefix) = parse_s3_uri(uri_prefix)?;
 
         if let Some(client) = &self.client {
@@ -1209,7 +1303,7 @@ impl ObjectStore for S3ObjectStore {
                 }
                 return;
             }
-            
+
             let mut stream = match s3_list_objects_stream(bucket.clone(), key_prefix, recursive).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -1217,7 +1311,7 @@ impl ObjectStore for S3ObjectStore {
                     return;
                 }
             };
-            
+
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(key) => yield Ok(format!("s3://{}/{}", bucket, key)),
@@ -1228,13 +1322,16 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
-        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
         debug!("S3ObjectStore::stat uri='{}'", uri);
 
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
             let key_clean = key.trim_start_matches('/');
-            let resp = client.head_object()
+            let resp = client
+                .head_object()
                 .bucket(&bucket)
                 .key(key_clean)
                 .send()
@@ -1251,7 +1348,9 @@ impl ObjectStore for S3ObjectStore {
                 content_disposition: resp.content_disposition().map(|s| s.to_string()),
                 expires: resp.expires_string().map(|s| s.to_string()),
                 storage_class: resp.storage_class().map(|s| s.as_str().to_string()),
-                server_side_encryption: resp.server_side_encryption().map(|s| s.as_str().to_string()),
+                server_side_encryption: resp
+                    .server_side_encryption()
+                    .map(|s| s.as_str().to_string()),
                 ssekms_key_id: resp.ssekms_key_id().map(|s| s.to_string()),
                 sse_customer_algorithm: resp.sse_customer_algorithm().map(|s| s.to_string()),
                 version_id: resp.version_id().map(|s| s.to_string()),
@@ -1264,12 +1363,15 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
-        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
         debug!("S3ObjectStore::delete uri='{}'", uri);
 
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
-            client.delete_object()
+            client
+                .delete_object()
                 .bucket(&bucket)
                 .key(&key)
                 .send()
@@ -1283,25 +1385,35 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
-        if uris.is_empty() { return Ok(()); }
+        if uris.is_empty() {
+            return Ok(());
+        }
         debug!("S3ObjectStore::delete_batch {} URIs", uris.len());
-        
+
         // Extract bucket and keys from URIs
         let (bucket, _) = parse_s3_uri(&uris[0])?;
-        let keys: Vec<String> = uris.iter()
+        let keys: Vec<String> = uris
+            .iter()
             .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, key)| key))
             .collect();
 
         if let Some(client) = &self.client {
             for chunk in keys.chunks(1000) {
-                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk.iter()
-                    .filter_map(|k| aws_sdk_s3::types::ObjectIdentifier::builder().key(k).build().ok())
+                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk
+                    .iter()
+                    .filter_map(|k| {
+                        aws_sdk_s3::types::ObjectIdentifier::builder()
+                            .key(k)
+                            .build()
+                            .ok()
+                    })
                     .collect();
                 let delete = aws_sdk_s3::types::Delete::builder()
                     .set_objects(Some(objects))
                     .build()
                     .context("Failed to build Delete request")?;
-                client.delete_objects()
+                client
+                    .delete_objects()
                     .bucket(&bucket)
                     .delete(delete)
                     .send()
@@ -1318,27 +1430,37 @@ impl ObjectStore for S3ObjectStore {
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         use futures::stream::StreamExt;
         debug!("S3ObjectStore::delete_prefix prefix='{}'", uri_prefix);
-        
+
         let (bucket, mut key_prefix) = parse_s3_uri(uri_prefix)?;
-        if !key_prefix.is_empty() && !key_prefix.ends_with('/') { 
-            key_prefix.push('/'); 
+        if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
+            key_prefix.push('/');
         }
 
         if let Some(client) = &self.client {
             let keys = Self::list_with_client(client, &bucket, &key_prefix, true).await?;
-            let just_keys: Vec<String> = keys.iter()
+            let just_keys: Vec<String> = keys
+                .iter()
                 .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, k)| k))
                 .collect();
             for chunk in just_keys.chunks(1000) {
-                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk.iter()
-                    .filter_map(|k| aws_sdk_s3::types::ObjectIdentifier::builder().key(k).build().ok())
+                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk
+                    .iter()
+                    .filter_map(|k| {
+                        aws_sdk_s3::types::ObjectIdentifier::builder()
+                            .key(k)
+                            .build()
+                            .ok()
+                    })
                     .collect();
-                if objects.is_empty() { continue; }
+                if objects.is_empty() {
+                    continue;
+                }
                 let delete = aws_sdk_s3::types::Delete::builder()
                     .set_objects(Some(objects))
                     .build()
                     .context("Failed to build Delete request")?;
-                client.delete_objects()
+                client
+                    .delete_objects()
                     .bucket(&bucket)
                     .delete(delete)
                     .send()
@@ -1347,17 +1469,17 @@ impl ObjectStore for S3ObjectStore {
             }
             return Ok(());
         }
-        
+
         // Use streaming list to avoid loading millions of keys into memory
         let mut stream = s3_list_objects_stream(bucket.clone(), key_prefix, true).await?;
         let mut batch = Vec::with_capacity(1000);
         let mut total_deleted = 0;
-        
+
         while let Some(result) = stream.next().await {
             match result {
                 Ok(key) => {
                     batch.push(key);
-                    
+
                     // Delete in batches of 1000 (S3 DeleteObjects API limit)
                     if batch.len() >= 1000 {
                         s3_delete_objects_async(&bucket, &batch).await?;
@@ -1368,13 +1490,13 @@ impl ObjectStore for S3ObjectStore {
                 Err(e) => return Err(e),
             }
         }
-        
+
         // Delete final partial batch if any
         if !batch.is_empty() {
             s3_delete_objects_async(&bucket, &batch).await?;
             total_deleted += batch.len();
         }
-        
+
         debug!("S3 delete_prefix deleted {} objects total", total_deleted);
         Ok(())
     }
@@ -1392,31 +1514,50 @@ impl ObjectStore for S3ObjectStore {
         Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
     }
 
-    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+    async fn get_writer_with_compression(
+        &self,
+        uri: &str,
+        compression: CompressionConfig,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // For S3, use buffered writer with compression support
-        Ok(Box::new(S3BufferedWriter::new_with_compression(uri.to_string(), compression)))
+        Ok(Box::new(S3BufferedWriter::new_with_compression(
+            uri.to_string(),
+            compression,
+        )))
     }
 
-    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+    async fn create_writer(
+        &self,
+        uri: &str,
+        options: WriterOptions,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // For S3, use buffered writer that collects chunks then uses put_multipart
         if let Some(compression) = options.compression {
-            Ok(Box::new(S3BufferedWriter::new_with_compression(uri.to_string(), compression)))
+            Ok(Box::new(S3BufferedWriter::new_with_compression(
+                uri.to_string(),
+                compression,
+            )))
         } else {
             Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
         }
     }
 
     async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
-        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
-        
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+
         // Get object size from cache or stat (v0.9.10: cache optimization)
         let object_size = self.get_object_size(uri).await?;
-        
+
         // Use threshold-based decision for optimization
         let threshold = get_concurrent_threshold();
-        
+
         if object_size >= threshold {
-            debug!("Using concurrent range GET for large object: {} bytes", object_size);
+            debug!(
+                "Using concurrent range GET for large object: {} bytes",
+                object_size
+            );
             // Use concurrent range GET for large objects
             crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await
         } else {
@@ -1427,15 +1568,17 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn get_range_optimized(
-        &self, 
-        uri: &str, 
-        offset: u64, 
+        &self,
+        uri: &str,
+        offset: u64,
         length: Option<u64>,
         chunk_size: Option<usize>,
-        max_concurrency: Option<usize>
+        max_concurrency: Option<usize>,
     ) -> Result<Bytes> {
-        if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
-        
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+
         let transfer_size = match length {
             Some(len) => len,
             None => {
@@ -1444,47 +1587,60 @@ impl ObjectStore for S3ObjectStore {
                 object_size.saturating_sub(offset)
             }
         };
-        
+
         // Use threshold-based decision for optimization
         let threshold = get_concurrent_threshold();
-        
+
         if transfer_size >= threshold {
-            debug!("Using concurrent range GET for large transfer: {} bytes", transfer_size);
+            debug!(
+                "Using concurrent range GET for large transfer: {} bytes",
+                transfer_size
+            );
             // Use concurrent range GET for large transfers
-            crate::s3_utils::get_object_concurrent_range_async(uri, offset, length, chunk_size, max_concurrency).await
+            crate::s3_utils::get_object_concurrent_range_async(
+                uri,
+                offset,
+                length,
+                chunk_size,
+                max_concurrency,
+            )
+            .await
         } else {
-            debug!("Using standard range GET for small transfer: {} bytes", transfer_size);
+            debug!(
+                "Using standard range GET for small transfer: {} bytes",
+                transfer_size
+            );
             // Use standard range GET for small transfers
             self.get_range(uri, offset, length).await
         }
     }
-    
+
     /// Pre-stat objects and populate the size cache
-    /// 
+    ///
     /// v0.9.10: Override default implementation to populate internal size cache.
     /// This enables subsequent get_optimized() calls to skip redundant stat operations.
-    /// 
+    ///
     /// # Performance Impact
-    /// 
+    ///
     /// For workloads that download many objects (e.g., benchmarking 1000+ objects):
     /// - Eliminates per-object stat latency (typically 10-50ms each)
     /// - Trades one-time concurrent pre-stat (e.g., 200ms for 1000 objects @ 100 concurrent)
     ///   for N × stat_latency savings (e.g., 1000 × 20ms = 20 seconds)
     /// - Expected speedup: 2-3x for large object sets
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```rust,no_run
     /// use s3dlio::api::store_for_uri;
-    /// 
+    ///
     /// # async fn example() -> anyhow::Result<()> {
     /// let store = store_for_uri("s3://my-bucket/prefix/")?;
     /// let objects: Vec<String> = vec![/* 1000 s3:// URIs */];
-    /// 
+    ///
     /// // Pre-stat phase (once at start)
     /// let cached = store.pre_stat_and_cache(&objects, 100).await?;
     /// println!("Cached {} object sizes", cached);
-    /// 
+    ///
     /// // Download phase (benefits from cached sizes)
     /// for uri in &objects {
     ///     let data = store.get(&uri).await?;  // No stat overhead!
@@ -1492,19 +1648,15 @@ impl ObjectStore for S3ObjectStore {
     /// # Ok(())
     /// # }
     /// ```
-    async fn pre_stat_and_cache(
-        &self,
-        uris: &[String],
-        max_concurrent: usize,
-    ) -> Result<usize> {
+    async fn pre_stat_and_cache(&self, uris: &[String], max_concurrent: usize) -> Result<usize> {
         // Use default concurrent pre_stat_objects implementation
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
-        
+
         // Populate size cache with results
         for (uri, size) in size_map.iter() {
             self.size_cache.put(uri.clone(), *size).await;
         }
-        
+
         Ok(size_map.len())
     }
 }
@@ -1525,15 +1677,13 @@ impl S3BufferedWriter {
     pub fn new(uri: String) -> Self {
         Self::new_with_compression(uri, CompressionConfig::None)
     }
-    
+
     pub fn new_with_compression(uri: String, compression: CompressionConfig) -> Self {
         let compressor = match &compression {
             CompressionConfig::None => None,
-            CompressionConfig::Zstd { level } => {
-                zstd::Encoder::new(Vec::new(), *level).ok()
-            }
+            CompressionConfig::Zstd { level } => zstd::Encoder::new(Vec::new(), *level).ok(),
         };
-        
+
         Self {
             uri,
             buffer: Vec::new(),
@@ -1553,10 +1703,10 @@ impl ObjectWriter for S3BufferedWriter {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
-        
+
         self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
-        
+
         // Handle compression
         if let Some(ref mut compressor) = self.compressor {
             // Compress the chunk and add to buffer
@@ -1567,47 +1717,51 @@ impl ObjectWriter for S3BufferedWriter {
             // No compression - direct to buffer
             self.buffer.extend_from_slice(chunk);
         }
-        
+
         Ok(())
     }
-    
+
     async fn finalize(mut self: Box<Self>) -> Result<()> {
         if self.finalized {
             return Ok(());
         }
         self.finalized = true;
-        
+
         // Finalize compression if enabled
         if let Some(compressor) = self.compressor.take() {
             let compressed_data = compressor.finish()?;
             self.buffer = compressed_data;
         }
-        
+
         self.compressed_bytes = self.buffer.len() as u64;
-        
+
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
-        if self.compression.is_enabled()
-            && !final_uri.ends_with(self.compression.extension()) {
-                final_uri.push_str(self.compression.extension());
-            }
-        
+        if self.compression.is_enabled() && !final_uri.ends_with(self.compression.extension()) {
+            final_uri.push_str(self.compression.extension());
+        }
+
         // Use S3 multipart upload for the buffered data
-        s3_put_object_multipart_uri_async(&final_uri, Bytes::from(std::mem::take(&mut self.buffer)), None).await
+        s3_put_object_multipart_uri_async(
+            &final_uri,
+            Bytes::from(std::mem::take(&mut self.buffer)),
+            None,
+        )
+        .await
     }
-    
+
     fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
-    
+
     fn checksum(&self) -> Option<String> {
         Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
-    
+
     fn compression(&self) -> CompressionConfig {
         self.compression
     }
-    
+
     fn compression_ratio(&self) -> f64 {
         if self.bytes_written == 0 || !self.compression.is_enabled() {
             1.0
@@ -1621,7 +1775,7 @@ impl ObjectWriter for S3BufferedWriter {
             current_compressed_size as f64 / self.bytes_written as f64
         }
     }
-    
+
     async fn cancel(mut self: Box<Self>) -> Result<()> {
         self.finalized = true;
         self.buffer.clear();
@@ -1642,8 +1796,12 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     // - https://{account}.blob.core.windows.net/{container}/{key...}
     if let Some(rest) = uri.strip_prefix("az://") {
         let mut it = rest.splitn(3, '/');
-        let account = it.next().ok_or_else(|| anyhow!("missing account in az:// URI"))?;
-        let container = it.next().ok_or_else(|| anyhow!("missing container in az:// URI"))?;
+        let account = it
+            .next()
+            .ok_or_else(|| anyhow!("missing account in az:// URI"))?;
+        let container = it
+            .next()
+            .ok_or_else(|| anyhow!("missing container in az:// URI"))?;
         let key = it.next().unwrap_or("").to_string();
         return Ok((account.to_string(), container.to_string(), key));
     }
@@ -1652,13 +1810,20 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     if uri.contains(".blob.core.windows.net/") {
         // crude parse: "https://{account}.blob.core.windows.net/{container}/{key...}"
         // find "https://" then account up to first '.'
-        let after_scheme = uri.strip_prefix("https://").ok_or_else(|| anyhow!("expected https:// for Azure URL"))?;
+        let after_scheme = uri
+            .strip_prefix("https://")
+            .ok_or_else(|| anyhow!("expected https:// for Azure URL"))?;
         let mut host_and_path = after_scheme.splitn(2, '/');
         let host = host_and_path.next().unwrap_or("");
         let path = host_and_path.next().unwrap_or("");
-        let account = host.split('.').next().ok_or_else(|| anyhow!("bad Azure host"))?;
+        let account = host
+            .split('.')
+            .next()
+            .ok_or_else(|| anyhow!("bad Azure host"))?;
         let mut segs = path.split('/').filter(|s| !s.is_empty());
-        let container = segs.next().ok_or_else(|| anyhow!("missing container in URL path"))?;
+        let container = segs
+            .next()
+            .ok_or_else(|| anyhow!("missing container in URL path"))?;
         let key = segs.collect::<Vec<_>>().join("/");
         return Ok((account.to_string(), container.to_string(), key));
     }
@@ -1698,7 +1863,7 @@ fn az_props_to_meta(p: &AzureBlobProperties) -> ObjectMetadata {
 }
 
 /// Configuration for Azure Blob Storage backend with RangeEngine support
-/// 
+///
 /// Azure benefits significantly from concurrent range downloads due to network latency.
 /// RangeEngine is **disabled by default** — enable explicitly for large-file workloads
 /// where the benefit outweighs the HEAD request cost. Unlike S3, there is no
@@ -1709,15 +1874,15 @@ pub struct AzureConfig {
     /// Enable RangeEngine for concurrent range downloads
     /// Default: false — must be set explicitly for large-file workloads
     pub enable_range_engine: bool,
-    
+
     /// RangeEngine configuration
     /// Network-optimized defaults: 32 MiB threshold (v0.9.60+), 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
-    
+
     /// Time-to-live for cached object sizes
     /// Default: 60 seconds
     /// Set to 0 to disable caching
-    /// 
+    ///
     /// v0.9.10: Added for pre-stat optimization
     pub size_cache_ttl_secs: u64,
 }
@@ -1726,18 +1891,17 @@ pub struct AzureConfig {
 impl Default for AzureConfig {
     fn default() -> Self {
         Self {
-            enable_range_engine: false,  // Disabled by default; must be set explicitly for Azure large-file workloads
+            enable_range_engine: false, // Disabled by default; must be set explicitly for Azure large-file workloads
             range_engine: RangeEngineConfig {
-                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
-                max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
-                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 32 MiB threshold (v0.9.60+)
-                range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
+                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE, // 64 MiB chunks
+                max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT, // 32 parallel
+                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD, // 32 MiB threshold (v0.9.60+)
+                range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS), // 30s
             },
-            size_cache_ttl_secs: 60,  // 60 second TTL for size cache
+            size_cache_ttl_secs: 60, // 60 second TTL for size cache
         }
     }
 }
-
 
 #[cfg(feature = "backend-azure")]
 #[derive(Clone)]
@@ -1745,7 +1909,6 @@ pub struct AzureObjectStore {
     config: AzureConfig,
     size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
 }
-
 
 #[cfg(feature = "backend-azure")]
 impl Default for AzureObjectStore {
@@ -1764,7 +1927,7 @@ impl AzureObjectStore {
             size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
         }
     }
-    
+
     pub fn with_config(config: AzureConfig) -> Self {
         let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
@@ -1772,14 +1935,14 @@ impl AzureObjectStore {
             size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
         }
     }
-    
+
     #[inline]
     pub fn boxed() -> Box<dyn ObjectStore> {
         Box::new(Self::new())
     }
-    
+
     /// Get object size, checking cache first
-    /// 
+    ///
     /// v0.9.10: Added to optimize get() and get_with_range_engine()
     /// by eliminating redundant stat() calls.
     async fn get_object_size(&self, uri: &str) -> Result<u64> {
@@ -1787,7 +1950,7 @@ impl AzureObjectStore {
         if let Some(cached_size) = self.size_cache.get(uri).await {
             return Ok(cached_size);
         }
-        
+
         // Cache miss - perform stat and cache result
         let metadata = self.stat(uri).await?;
         self.size_cache.put(uri.to_string(), metadata.size).await;
@@ -1805,36 +1968,34 @@ impl AzureObjectStore {
     fn client_for_prefix(uri_prefix: &str) -> Result<(AzureBlob, String, String, String)> {
         Self::client_for_uri(uri_prefix)
     }
-    
+
     /// Download using RangeEngine for concurrent range requests
-    /// 
+    ///
     /// This method uses the generic RangeEngine to split large Azure blobs into
     /// concurrent range requests, significantly improving throughput by hiding
     /// network latency.
-    /// 
+    ///
     /// # Performance
-    /// 
+    ///
     /// Expected improvements for large blobs (> 4MB):
     /// - Medium blobs (4-64MB): 20-40% faster
     /// - Large blobs (> 64MB): 30-50% faster
     /// - Huge blobs (> 1GB): 40-60% faster
     async fn get_with_range_engine(&self, uri: &str, object_size: u64) -> Result<Bytes> {
         let engine = RangeEngine::new(self.config.range_engine.clone());
-        
+
         // Create closure that captures uri for get_range calls
         let uri_owned = uri.to_string();
         let self_clone = self.clone();
-        
+
         let get_range_fn = move |offset: u64, length: u64| {
             let uri = uri_owned.clone();
             let store = self_clone.clone();
-            async move {
-                store.get_range(&uri, offset, Some(length)).await
-            }
+            async move { store.get_range(&uri, offset, Some(length)).await }
         };
-        
+
         let (bytes, stats) = engine.download(object_size, get_range_fn, None).await?;
-        
+
         info!(
             "RangeEngine (Azure) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
             stats.bytes_downloaded,
@@ -1842,47 +2003,46 @@ impl AzureObjectStore {
             stats.throughput_mbps(),
             stats.throughput_gbps()
         );
-        
+
         Ok(bytes)
     }
 }
-
 
 #[async_trait]
 #[cfg(feature = "backend-azure")]
 impl ObjectStore for AzureObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
-        
+
         // Get blob size from cache or stat (v0.9.10: cache optimization)
         let object_size = self.get_object_size(uri).await?;
-        
+
         // Use RangeEngine for large blobs if enabled
-        if self.config.enable_range_engine && object_size >= self.config.range_engine.min_split_size {
+        if self.config.enable_range_engine && object_size >= self.config.range_engine.min_split_size
+        {
             debug!(
                 "Azure blob size {} >= threshold {}, using RangeEngine for {}",
-                object_size,
-                self.config.range_engine.min_split_size,
-                uri
+                object_size, self.config.range_engine.min_split_size, uri
             );
             return self.get_with_range_engine(uri, object_size).await;
         }
-        
+
         // Simple sequential download for small blobs
         debug!(
             "Azure blob size {} < threshold {}, using simple download for {}",
-            object_size,
-            self.config.range_engine.min_split_size,
-            uri
+            object_size, self.config.range_engine.min_split_size, uri
         );
-        
+
         let b = cli.get(&key).await?; // Bytes - return directly for zero-copy
         Ok(b)
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
-        debug!("AzureObjectStore::get_range uri='{}', offset={}, length={:?}", uri, offset, length);
+        debug!(
+            "AzureObjectStore::get_range uri='{}', offset={}, length={:?}",
+            uri, offset, length
+        );
         let end = length.map(|len| offset + len - 1);
         let b = cli.get_range(&key, offset, end).await?; // Bytes - return directly for zero-copy
         Ok(b)
@@ -1897,7 +2057,12 @@ impl ObjectStore for AzureObjectStore {
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
-        debug!("AzureObjectStore::put_multipart uri='{}', {} bytes, part_size={:?}", uri, data.len(), part_size);
+        debug!(
+            "AzureObjectStore::put_multipart uri='{}', {} bytes, part_size={:?}",
+            uri,
+            data.len(),
+            part_size
+        );
         let part = part_size.unwrap_or(crate::constants::DEFAULT_AZURE_MULTIPART_PART_SIZE);
         let max_in_flight = std::env::var("AZURE_MAX_INFLIGHT")
             .ok()
@@ -1909,17 +2074,21 @@ impl ObjectStore for AzureObjectStore {
             .step_by(part)
             .map(|offset| {
                 let end = (offset + part).min(data.len());
-                data.slice(offset..end)  // Zero-copy slice (shares same Arc)
+                data.slice(offset..end) // Zero-copy slice (shares same Arc)
             })
             .collect::<Vec<_>>();
         let stream = stream::iter(chunks);
 
-        cli.upload_multipart_stream(&key, stream, part, max_in_flight).await
+        cli.upload_multipart_stream(&key, stream, part, max_in_flight)
+            .await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         let (cli, account, container, key_prefix) = Self::client_for_prefix(uri_prefix)?;
-        debug!("AzureObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
+        debug!(
+            "AzureObjectStore::list prefix='{}', recursive={}",
+            uri_prefix, recursive
+        );
         // Azure's flat list is already recursive (prefix-constrained).
         let prefix = if recursive {
             Some(key_prefix.as_str())
@@ -1931,7 +2100,11 @@ impl ObjectStore for AzureObjectStore {
 
         let mut keys = cli.list(prefix).await?;
         if !recursive && !key_prefix.is_empty() {
-            let base = if key_prefix.ends_with('/') { key_prefix.clone() } else { format!("{}/", key_prefix) };
+            let base = if key_prefix.ends_with('/') {
+                key_prefix.clone()
+            } else {
+                format!("{}/", key_prefix)
+            };
             keys.retain(|k| {
                 if let Some(rest) = k.strip_prefix(&base) {
                     !rest.contains('/')
@@ -1942,7 +2115,10 @@ impl ObjectStore for AzureObjectStore {
             });
         }
 
-        Ok(keys.into_iter().map(|k| az_uri(&account, &container, &k)).collect())
+        Ok(keys
+            .into_iter()
+            .map(|k| az_uri(&account, &container, &k))
+            .collect())
     }
 
     fn list_stream<'a>(
@@ -1961,15 +2137,15 @@ impl ObjectStore for AzureObjectStore {
             };
 
             let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.as_str()) };
-            let base = if !key_prefix.is_empty() && !key_prefix.ends_with('/') { 
-                format!("{}/", key_prefix) 
-            } else { 
-                key_prefix.clone() 
+            let base = if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
+                format!("{}/", key_prefix)
+            } else {
+                key_prefix.clone()
             };
 
             // Use streaming list to get blobs page by page
             let mut stream = cli.list_stream(prefix);
-            
+
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(key) => {
@@ -2001,38 +2177,41 @@ impl ObjectStore for AzureObjectStore {
     async fn delete(&self, uri: &str) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         debug!("AzureObjectStore::delete uri='{}'", uri);
-        cli.delete_objects(&[key]).await}
+        cli.delete_objects(&[key]).await
+    }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
-        if uris.is_empty() { return Ok(()); }
+        if uris.is_empty() {
+            return Ok(());
+        }
         debug!("AzureObjectStore::delete_batch {} URIs", uris.len());
-        
+
         // Azure Blob batch delete: already supports batching
         let (cli, _acct, _cont, _) = Self::client_for_uri(&uris[0])?;
-        let keys: Vec<String> = uris.iter()
-            .filter_map(|uri| {
-                Self::client_for_uri(uri).ok().map(|(_, _, _, key)| key)
-            })
+        let keys: Vec<String> = uris
+            .iter()
+            .filter_map(|uri| Self::client_for_uri(uri).ok().map(|(_, _, _, key)| key))
             .collect();
-        
-        cli.delete_objects(&keys).await}
+
+        cli.delete_objects(&keys).await
+    }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         use futures::stream::StreamExt;
         debug!("AzureObjectStore::delete_prefix prefix='{}'", uri_prefix);
-        
+
         let (cli, _acct, _cont, key_prefix) = Self::client_for_prefix(uri_prefix)?;
-        
+
         // Use streaming list to avoid loading millions of keys into memory
         let mut stream = cli.list_stream(Some(&key_prefix));
         let mut batch = Vec::with_capacity(1000);
         let mut total_deleted = 0;
-        
+
         while let Some(result) = stream.next().await {
             match result {
                 Ok(key) => {
                     batch.push(key);
-                    
+
                     // Delete in batches of 1000 to avoid memory bloat
                     if batch.len() >= 1000 {
                         cli.delete_objects(&batch).await?;
@@ -2043,22 +2222,29 @@ impl ObjectStore for AzureObjectStore {
                 Err(e) => return Err(e),
             }
         }
-        
+
         // Delete final partial batch if any
         if !batch.is_empty() {
             cli.delete_objects(&batch).await?;
             total_deleted += batch.len();
         }
-        
-        debug!("Azure delete_prefix deleted {} objects total", total_deleted);
+
+        debug!(
+            "Azure delete_prefix deleted {} objects total",
+            total_deleted
+        );
         Ok(())
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
         // interpret "name" as "{account}/{container}"
         let mut it = name.splitn(2, '/');
-        let account = it.next().ok_or_else(|| anyhow!("expected \"account/container\""))?;
-        let container = it.next().ok_or_else(|| anyhow!("expected \"account/container\""))?;
+        let account = it
+            .next()
+            .ok_or_else(|| anyhow!("expected \"account/container\""))?;
+        let container = it
+            .next()
+            .ok_or_else(|| anyhow!("expected \"account/container\""))?;
         let cli = AzureBlob::with_default_credential(account, container)?;
         // best-effort create
         let _ = cli.create_container_if_missing().await?;
@@ -2067,8 +2253,12 @@ impl ObjectStore for AzureObjectStore {
 
     async fn delete_container(&self, name: &str) -> Result<()> {
         let mut it = name.splitn(2, '/');
-        let account = it.next().ok_or_else(|| anyhow!("expected \"account/container\""))?;
-        let container = it.next().ok_or_else(|| anyhow!("expected \"account/container\""))?;
+        let account = it
+            .next()
+            .ok_or_else(|| anyhow!("expected \"account/container\""))?;
+        let container = it
+            .next()
+            .ok_or_else(|| anyhow!("expected \"account/container\""))?;
         let cli = AzureBlob::with_default_credential(account, container)?;
         let _ = cli.delete_container().await?;
         Ok(())
@@ -2079,37 +2269,47 @@ impl ObjectStore for AzureObjectStore {
         Ok(Box::new(AzureBufferedWriter::new(uri.to_string())))
     }
 
-    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+    async fn get_writer_with_compression(
+        &self,
+        uri: &str,
+        compression: CompressionConfig,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // For Azure, use buffered writer with compression support
-        Ok(Box::new(AzureBufferedWriter::new_with_compression(uri.to_string(), compression)))
+        Ok(Box::new(AzureBufferedWriter::new_with_compression(
+            uri.to_string(),
+            compression,
+        )))
     }
 
-    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+    async fn create_writer(
+        &self,
+        uri: &str,
+        options: WriterOptions,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // For Azure, use buffered writer that collects chunks then uses put_multipart
         if let Some(compression) = options.compression {
-            Ok(Box::new(AzureBufferedWriter::new_with_compression(uri.to_string(), compression)))
+            Ok(Box::new(AzureBufferedWriter::new_with_compression(
+                uri.to_string(),
+                compression,
+            )))
         } else {
             Ok(Box::new(AzureBufferedWriter::new(uri.to_string())))
         }
     }
-    
+
     /// Pre-stat objects and populate the size cache
-    /// 
+    ///
     /// v0.9.10: Override default implementation to populate internal size cache.
     /// This enables subsequent get() calls to skip redundant stat operations.
-    async fn pre_stat_and_cache(
-        &self,
-        uris: &[String],
-        max_concurrent: usize,
-    ) -> Result<usize> {
+    async fn pre_stat_and_cache(&self, uris: &[String], max_concurrent: usize) -> Result<usize> {
         // Use default concurrent pre_stat_objects implementation
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
-        
+
         // Populate size cache with results
         for (uri, size) in size_map.iter() {
             self.size_cache.put(uri.clone(), *size).await;
         }
-        
+
         Ok(size_map.len())
     }
 }
@@ -2127,21 +2327,18 @@ pub struct AzureBufferedWriter {
     compressed_bytes: u64,
 }
 
-
 #[cfg(feature = "backend-azure")]
 impl AzureBufferedWriter {
     pub fn new(uri: String) -> Self {
         Self::new_with_compression(uri, CompressionConfig::None)
     }
-    
+
     pub fn new_with_compression(uri: String, compression: CompressionConfig) -> Self {
         let compressor = match &compression {
             CompressionConfig::None => None,
-            CompressionConfig::Zstd { level } => {
-                zstd::Encoder::new(Vec::new(), *level).ok()
-            }
+            CompressionConfig::Zstd { level } => zstd::Encoder::new(Vec::new(), *level).ok(),
         };
-        
+
         Self {
             uri,
             buffer: Vec::new(),
@@ -2155,7 +2352,6 @@ impl AzureBufferedWriter {
     }
 }
 
-
 #[async_trait]
 #[cfg(feature = "backend-azure")]
 impl ObjectWriter for AzureBufferedWriter {
@@ -2163,10 +2359,10 @@ impl ObjectWriter for AzureBufferedWriter {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
-        
+
         self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
-        
+
         // Handle compression
         if let Some(ref mut compressor) = self.compressor {
             // Compress the chunk and add to buffer
@@ -2177,48 +2373,50 @@ impl ObjectWriter for AzureBufferedWriter {
             // No compression - direct to buffer
             self.buffer.extend_from_slice(chunk);
         }
-        
+
         Ok(())
     }
-    
+
     async fn finalize(mut self: Box<Self>) -> Result<()> {
         if self.finalized {
             return Ok(());
         }
         self.finalized = true;
-        
+
         // Finalize compression if enabled
         if let Some(compressor) = self.compressor.take() {
             let compressed_data = compressor.finish()?;
             self.buffer = compressed_data;
         }
-        
+
         self.compressed_bytes = self.buffer.len() as u64;
-        
+
         // Append compression extension if needed
         let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
-        let final_key = if self.compression.is_enabled() && !key.ends_with(self.compression.extension()) {
-            format!("{}{}", key, self.compression.extension())
-        } else {
-            key
-        };
-        
+        let final_key =
+            if self.compression.is_enabled() && !key.ends_with(self.compression.extension()) {
+                format!("{}{}", key, self.compression.extension())
+            } else {
+                key
+            };
+
         // Use Azure multipart upload for the buffered data
-        cli.put(&final_key, Bytes::from(self.buffer.clone()), true).await
+        cli.put(&final_key, Bytes::from(self.buffer.clone()), true)
+            .await
     }
-    
+
     fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
-    
+
     fn checksum(&self) -> Option<String> {
         Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
-    
+
     fn compression(&self) -> CompressionConfig {
         self.compression
     }
-    
+
     fn compression_ratio(&self) -> f64 {
         if self.bytes_written == 0 || !self.compression.is_enabled() {
             1.0
@@ -2232,7 +2430,7 @@ impl ObjectWriter for AzureBufferedWriter {
             current_compressed_size as f64 / self.bytes_written as f64
         }
     }
-    
+
     async fn cancel(mut self: Box<Self>) -> Result<()> {
         self.finalized = true;
         self.buffer.clear();
@@ -2285,12 +2483,12 @@ fn gcs_meta_to_object_meta(meta: &GcsObjectMetadata) -> ObjectMetadata {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Configuration for Google Cloud Storage backend
-/// 
+///
 /// Supports RangeEngine for concurrent range downloads on network storage.
 /// RangeEngine is **disabled by default** — enable explicitly for large-file workloads
 /// where the benefit outweighs the HEAD request cost. Unlike S3, there is no
 /// env-var default for GCS; this config field must be set explicitly.
-/// 
+///
 /// v0.9.10: Added size_cache_ttl_secs for pre-stat optimization
 #[cfg(feature = "backend-gcs")]
 #[derive(Clone, Debug)]
@@ -2298,11 +2496,11 @@ pub struct GcsConfig {
     /// Enable RangeEngine for concurrent range downloads (per-store config)
     /// Default: false — must be set explicitly for GCS large-file workloads
     pub enable_range_engine: bool,
-    
+
     /// RangeEngine configuration
     /// Network-optimized defaults: 32 MiB threshold (v0.9.60+), 32 concurrent ranges, 64 MiB chunks
     pub range_engine: RangeEngineConfig,
-    
+
     /// Time-to-live for cached object sizes
     /// Default: 60 seconds
     /// Set to 0 to disable caching
@@ -2313,14 +2511,14 @@ pub struct GcsConfig {
 impl Default for GcsConfig {
     fn default() -> Self {
         Self {
-            enable_range_engine: false,  // Disabled by default; must be set explicitly for GCS large-file workloads
+            enable_range_engine: false, // Disabled by default; must be set explicitly for GCS large-file workloads
             range_engine: RangeEngineConfig {
-                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE,  // 64 MiB chunks
-                max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,  // 32 parallel
-                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD,  // 32 MiB threshold (v0.9.60+)
-                range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS),  // 30s
+                chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE, // 64 MiB chunks
+                max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT, // 32 parallel
+                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD, // 32 MiB threshold (v0.9.60+)
+                range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS), // 30s
             },
-            size_cache_ttl_secs: 60,  // 60 second TTL for size cache
+            size_cache_ttl_secs: 60, // 60 second TTL for size cache
         }
     }
 }
@@ -2355,7 +2553,7 @@ impl GcsObjectStore {
             client: Arc::new(OnceCell::const_new()),
         }
     }
-    
+
     pub fn with_config(config: GcsConfig) -> Self {
         let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
@@ -2364,14 +2562,14 @@ impl GcsObjectStore {
             client: Arc::new(OnceCell::const_new()),
         }
     }
-    
+
     #[inline]
     pub fn boxed() -> Box<dyn ObjectStore> {
         Box::new(Self::new())
     }
-    
+
     /// Get object size, checking cache first
-    /// 
+    ///
     /// v0.9.10: Added to optimize get() and get_with_range_engine()
     /// by eliminating redundant stat() calls.
     async fn get_object_size(&self, uri: &str) -> Result<u64> {
@@ -2379,7 +2577,7 @@ impl GcsObjectStore {
         if let Some(cached_size) = self.size_cache.get(uri).await {
             return Ok(cached_size);
         }
-        
+
         // Cache miss - perform stat and cache result
         let metadata = self.stat(uri).await?;
         self.size_cache.put(uri.to_string(), metadata.size).await;
@@ -2393,36 +2591,34 @@ impl GcsObjectStore {
             .await?;
         Ok(client.clone())
     }
-    
+
     /// Download using RangeEngine for concurrent range requests
-    /// 
+    ///
     /// This method uses the generic RangeEngine to split large GCS objects into
     /// concurrent range requests, significantly improving throughput by hiding
     /// network latency.
-    /// 
+    ///
     /// # Performance
-    /// 
+    ///
     /// Expected improvements for large objects (> 4MB):
     /// - Medium objects (4-64MB): 20-40% faster
     /// - Large objects (> 64MB): 30-50% faster
     /// - Huge objects (> 1GB): 40-60% faster
     async fn get_with_range_engine(&self, uri: &str, object_size: u64) -> Result<Bytes> {
         let engine = RangeEngine::new(self.config.range_engine.clone());
-        
+
         // Create closure that captures uri for get_range calls
         let uri_owned = uri.to_string();
         let self_clone = self.clone();
-        
+
         let get_range_fn = move |offset: u64, length: u64| {
             let uri = uri_owned.clone();
             let store = self_clone.clone();
-            async move {
-                store.get_range(&uri, offset, Some(length)).await
-            }
+            async move { store.get_range(&uri, offset, Some(length)).await }
         };
-        
+
         let (bytes, stats) = engine.download(object_size, get_range_fn, None).await?;
-        
+
         info!(
             "RangeEngine (GCS) downloaded {} bytes in {} ranges: {:.2} MB/s ({:.2} Gbps)",
             stats.bytes_downloaded,
@@ -2430,7 +2626,7 @@ impl GcsObjectStore {
             stats.throughput_mbps(),
             stats.throughput_gbps()
         );
-        
+
         Ok(bytes)
     }
 }
@@ -2441,43 +2637,44 @@ impl ObjectStore for GcsObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let client = self.get_client().await?;
-        
+
         // Check if RangeEngine is enabled and object is large enough
         if !self.config.enable_range_engine {
             trace!("RangeEngine disabled for GCS, using simple download");
             return client.get_object(&bucket, &object).await;
         }
-        
+
         // Get object size from cache or stat (v0.9.10: cache optimization)
         let object_size = self.get_object_size(uri).await?;
-        
+
         // Use RangeEngine for large objects (default 4MB+)
         if object_size >= self.config.range_engine.min_split_size {
             debug!(
                 "GCS object size {} >= threshold {}, using RangeEngine for {}",
-                object_size,
-                self.config.range_engine.min_split_size,
-                uri
+                object_size, self.config.range_engine.min_split_size, uri
             );
             return self.get_with_range_engine(uri, object_size).await;
         }
-        
+
         // Simple sequential download for small objects
         debug!(
             "GCS object size {} < threshold {}, using simple download for {}",
-            object_size,
-            self.config.range_engine.min_split_size,
-            uri
+            object_size, self.config.range_engine.min_split_size, uri
         );
-        
+
         client.get_object(&bucket, &object).await
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let (bucket, object) = parse_gcs_uri(uri)?;
-        debug!("GcsObjectStore::get_range uri='{}', offset={}, length={:?}", uri, offset, length);
+        debug!(
+            "GcsObjectStore::get_range uri='{}', offset={}, length={:?}",
+            uri, offset, length
+        );
         let client = self.get_client().await?;
-        client.get_object_range(&bucket, &object, offset, length).await
+        client
+            .get_object_range(&bucket, &object, offset, length)
+            .await
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
@@ -2490,19 +2687,33 @@ impl ObjectStore for GcsObjectStore {
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         let chunk_size = part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE);
-        debug!("GcsObjectStore::put_multipart uri='{}', {} bytes, chunk_size={}", uri, data.len(), chunk_size);
+        debug!(
+            "GcsObjectStore::put_multipart uri='{}', {} bytes, chunk_size={}",
+            uri,
+            data.len(),
+            chunk_size
+        );
         let client = self.get_client().await?;
         // Pass Bytes directly — put_object_multipart now takes Bytes, zero-copy end-to-end.
-        client.put_object_multipart(&bucket, &object, data, chunk_size).await
+        client
+            .put_object_multipart(&bucket, &object, data, chunk_size)
+            .await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         // parse_gcs_uri now handles bucket-only URIs (gs://bucket/ → ("bucket", ""))
         let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)?;
-        debug!("GcsObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
+        debug!(
+            "GcsObjectStore::list prefix='{}', recursive={}",
+            uri_prefix, recursive
+        );
 
         let client = self.get_client().await?;
-        let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.as_str()) };
+        let prefix = if key_prefix.is_empty() {
+            None
+        } else {
+            Some(key_prefix.as_str())
+        };
         let keys = client.list_objects(&bucket, prefix, recursive).await?;
 
         // Convert keys to full URIs
@@ -2555,45 +2766,55 @@ impl ObjectStore for GcsObjectStore {
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
-        if uris.is_empty() { return Ok(()); }
+        if uris.is_empty() {
+            return Ok(());
+        }
         debug!("GcsObjectStore::delete_batch {} URIs", uris.len());
-        
+
         // GCS batch delete: extract bucket and objects
         let (bucket, _) = parse_gcs_uri(&uris[0])?;
-        let objects: Vec<String> = uris.iter()
+        let objects: Vec<String> = uris
+            .iter()
             .filter_map(|uri| parse_gcs_uri(uri).ok().map(|(_, obj)| obj))
             .collect();
-        
+
         let client = self.get_client().await?;
         client.delete_objects(&bucket, objects).await
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         debug!("GcsObjectStore::delete_prefix prefix='{}'", uri_prefix);
-        let (bucket, key_prefix) = parse_gcs_uri(uri_prefix)
-            .or_else(|_| {
-                // Handle bucket-only URIs
-                if let Some(rest) = uri_prefix.strip_prefix("gs://").or_else(|| uri_prefix.strip_prefix("gcs://")) {
-                    let bucket = rest.trim_end_matches('/').to_string();
-                    if !bucket.is_empty() {
-                        return Ok((bucket, String::new()));
-                    }
+        let (bucket, key_prefix) = parse_gcs_uri(uri_prefix).or_else(|_| {
+            // Handle bucket-only URIs
+            if let Some(rest) = uri_prefix
+                .strip_prefix("gs://")
+                .or_else(|| uri_prefix.strip_prefix("gcs://"))
+            {
+                let bucket = rest.trim_end_matches('/').to_string();
+                if !bucket.is_empty() {
+                    return Ok((bucket, String::new()));
                 }
-                bail!("Invalid GCS URI for delete_prefix operation: {}", uri_prefix)
-            })?;
+            }
+            bail!(
+                "Invalid GCS URI for delete_prefix operation: {}",
+                uri_prefix
+            )
+        })?;
 
         let client = self.get_client().await?;
-        
+
         // Use streaming list to avoid loading millions of keys into memory
         // List all objects (returns Vec, not a stream)
-        let keys = client.list_objects(&bucket, Some(&key_prefix), true).await?;
+        let keys = client
+            .list_objects(&bucket, Some(&key_prefix), true)
+            .await?;
         let total_deleted = keys.len();
-        
+
         // Delete in batches of 1000 to avoid overloading the API
         for chunk in keys.chunks(1000) {
             client.delete_objects(&bucket, chunk.to_vec()).await?;
         }
-        
+
         debug!("GCS delete_prefix deleted {} objects total", total_deleted);
         Ok(())
     }
@@ -2615,40 +2836,50 @@ impl ObjectStore for GcsObjectStore {
         Ok(Box::new(GcsBufferedWriter::new(uri.to_string())))
     }
 
-    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn ObjectWriter>> {
+    async fn get_writer_with_compression(
+        &self,
+        uri: &str,
+        compression: CompressionConfig,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // For GCS, use buffered writer with compression support
-        Ok(Box::new(GcsBufferedWriter::new_with_compression(uri.to_string(), compression)))
+        Ok(Box::new(GcsBufferedWriter::new_with_compression(
+            uri.to_string(),
+            compression,
+        )))
     }
 
-    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn ObjectWriter>> {
+    async fn create_writer(
+        &self,
+        uri: &str,
+        options: WriterOptions,
+    ) -> Result<Box<dyn ObjectWriter>> {
         // For GCS, use buffered writer
         if let Some(compression) = options.compression {
-            Ok(Box::new(GcsBufferedWriter::new_with_compression(uri.to_string(), compression)))
+            Ok(Box::new(GcsBufferedWriter::new_with_compression(
+                uri.to_string(),
+                compression,
+            )))
         } else {
             Ok(Box::new(GcsBufferedWriter::new(uri.to_string())))
         }
     }
-    
+
     /// Pre-stat objects and populate the size cache
-    /// 
+    ///
     /// v0.9.10: Override default implementation to populate internal size cache.
     /// This enables subsequent get() calls to skip redundant stat operations.
-    /// 
+    ///
     /// Critical for benchmarking workloads that download many GCS objects,
     /// eliminating per-object HEAD request latency (typically 10-50ms each).
-    async fn pre_stat_and_cache(
-        &self,
-        uris: &[String],
-        max_concurrent: usize,
-    ) -> Result<usize> {
+    async fn pre_stat_and_cache(&self, uris: &[String], max_concurrent: usize) -> Result<usize> {
         // Use default concurrent pre_stat_objects implementation
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
-        
+
         // Populate size cache with results
         for (uri, size) in size_map.iter() {
             self.size_cache.put(uri.clone(), *size).await;
         }
-        
+
         Ok(size_map.len())
     }
 }
@@ -2671,15 +2902,13 @@ impl GcsBufferedWriter {
     pub fn new(uri: String) -> Self {
         Self::new_with_compression(uri, CompressionConfig::None)
     }
-    
+
     pub fn new_with_compression(uri: String, compression: CompressionConfig) -> Self {
         let compressor = match &compression {
             CompressionConfig::None => None,
-            CompressionConfig::Zstd { level } => {
-                zstd::Encoder::new(Vec::new(), *level).ok()
-            }
+            CompressionConfig::Zstd { level } => zstd::Encoder::new(Vec::new(), *level).ok(),
         };
-        
+
         Self {
             uri,
             buffer: Vec::new(),
@@ -2700,10 +2929,10 @@ impl ObjectWriter for GcsBufferedWriter {
         if self.finalized {
             bail!("Cannot write to finalized writer");
         }
-        
+
         self.hasher.update(chunk);
         self.bytes_written += chunk.len() as u64;
-        
+
         // Handle compression
         if let Some(ref mut compressor) = self.compressor {
             // Compress the chunk and add to buffer
@@ -2714,57 +2943,69 @@ impl ObjectWriter for GcsBufferedWriter {
             // No compression - direct to buffer
             self.buffer.extend_from_slice(chunk);
         }
-        
+
         Ok(())
     }
-    
+
     async fn finalize(mut self: Box<Self>) -> Result<()> {
         if self.finalized {
             return Ok(());
         }
         self.finalized = true;
-        
+
         // Finalize compression if enabled
         if let Some(compressor) = self.compressor.take() {
             let compressed_data = compressor.finish()?;
             self.buffer = compressed_data;
         }
-        
+
         self.compressed_bytes = self.buffer.len() as u64;
-        
+
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
-        if self.compression.is_enabled()
-            && !final_uri.ends_with(self.compression.extension()) {
-                final_uri.push_str(self.compression.extension());
-            }
-        
+        if self.compression.is_enabled() && !final_uri.ends_with(self.compression.extension()) {
+            final_uri.push_str(self.compression.extension());
+        }
+
         // Parse URI and upload via GCS client
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
         let client = get_global_gcs_client().await?;
-        
+
         // Use multipart for large objects, simple put for small ones.
         // `Bytes::from(Vec<u8>)` transfers ownership without copying — zero-cost.
         // `std::mem::take` moves the buffer out so the encoder can be dropped too.
         if self.buffer.len() > crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE {
-            client.put_object_multipart(&bucket, &object, Bytes::from(std::mem::take(&mut self.buffer)), crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE).await
+            client
+                .put_object_multipart(
+                    &bucket,
+                    &object,
+                    Bytes::from(std::mem::take(&mut self.buffer)),
+                    crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE,
+                )
+                .await
         } else {
-            client.put_object(&bucket, &object, Bytes::from(std::mem::take(&mut self.buffer))).await
+            client
+                .put_object(
+                    &bucket,
+                    &object,
+                    Bytes::from(std::mem::take(&mut self.buffer)),
+                )
+                .await
         }
     }
-    
+
     fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
-    
+
     fn checksum(&self) -> Option<String> {
         Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
-    
+
     fn compression(&self) -> CompressionConfig {
         self.compression
     }
-    
+
     fn compression_ratio(&self) -> f64 {
         if self.bytes_written == 0 || !self.compression.is_enabled() {
             1.0
@@ -2778,7 +3019,7 @@ impl ObjectWriter for GcsBufferedWriter {
             current_compressed_size as f64 / self.bytes_written as f64
         }
     }
-    
+
     async fn cancel(mut self: Box<Self>) -> Result<()> {
         self.finalized = true;
         self.buffer.clear();
@@ -2848,7 +3089,7 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
 }
 
 /// Create a store for the given URI with optional operation logging.
-/// 
+///
 /// When a logger is provided, all ObjectStore operations will be traced to the op-log.
 /// This enables performance analysis and debugging for all backends (file://, s3://, az://, direct://).
 ///
@@ -2873,14 +3114,17 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
 /// # Ok(())
 /// # }
 /// ```
-pub fn store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Logger>) -> Result<Box<dyn ObjectStore>> {
+pub fn store_for_uri_with_logger(
+    uri: &str,
+    logger: Option<crate::s3_logger::Logger>,
+) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
-    
+
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
-        Scheme::File  => FileSystemObjectStore::boxed(),
+        Scheme::File => FileSystemObjectStore::boxed(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
-        Scheme::S3    => S3ObjectStore::boxed(),
+        Scheme::S3 => S3ObjectStore::boxed(),
         Scheme::Azure => {
             #[cfg(feature = "backend-azure")]
             {
@@ -2891,7 +3135,7 @@ pub fn store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Log
                 bail!("Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'.")
             }
         }
-        Scheme::Gcs   => {
+        Scheme::Gcs => {
             #[cfg(feature = "backend-gcs")]
             {
                 GcsObjectStore::boxed()
@@ -2903,7 +3147,7 @@ pub fn store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Log
         }
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
-    
+
     // Wrap with logger if provided
     if let Some(logger) = logger {
         Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
@@ -2913,37 +3157,38 @@ pub fn store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Log
 }
 
 /// Enhanced factory that supports configuration options for file I/O
-pub fn store_for_uri_with_config(uri: &str, config: Option<crate::api::StorageConfig>) -> Result<Box<dyn ObjectStore>> {
+pub fn store_for_uri_with_config(
+    uri: &str,
+    config: Option<crate::api::StorageConfig>,
+) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_config_and_logger(uri, config, None)
 }
 
 /// Enhanced factory with configuration and optional logger support
 pub fn store_for_uri_with_config_and_logger(
-    uri: &str, 
+    uri: &str,
     config: Option<crate::api::StorageConfig>,
-    logger: Option<crate::s3_logger::Logger>
+    logger: Option<crate::s3_logger::Logger>,
 ) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
-    
+
     let store: Box<dyn ObjectStore> = match (infer_scheme(uri), config) {
         (Scheme::File, Some(crate::api::StorageConfig::File(cfg))) => {
             Box::new(FileSystemObjectStore::with_config(cfg))
         }
-        (Scheme::File, None) => {
-            FileSystemObjectStore::boxed()
-        }
+        (Scheme::File, None) => FileSystemObjectStore::boxed(),
         (Scheme::Direct, Some(crate::api::StorageConfig::Direct(cfg))) => {
             ConfigurableFileSystemObjectStore::boxed(cfg)
         }
-        (Scheme::Direct, None) => {
-            ConfigurableFileSystemObjectStore::boxed_direct_io()
-        }
+        (Scheme::Direct, None) => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         (Scheme::Direct, Some(crate::api::StorageConfig::File(_))) => {
             bail!("Cannot use FileSystemConfig with direct:// URI - use DirectFileSystemConfig instead")
         }
         (Scheme::File, Some(crate::api::StorageConfig::Direct(_))) => {
-            bail!("Cannot use DirectFileSystemConfig with file:// URI - use FileSystemConfig instead")
+            bail!(
+                "Cannot use DirectFileSystemConfig with file:// URI - use FileSystemConfig instead"
+            )
         }
         (Scheme::S3, _) => S3ObjectStore::boxed(),
         (Scheme::Azure, _) => {
@@ -2968,7 +3213,7 @@ pub fn store_for_uri_with_config_and_logger(
         }
         (Scheme::Unknown, _) => bail!("Unable to infer backend from URI: {uri}"),
     };
-    
+
     // Wrap with logger if provided
     if let Some(logger) = logger {
         Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
@@ -2983,10 +3228,13 @@ pub fn direct_io_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
 }
 
 /// Factory for creating file stores with O_DIRECT and optional logger
-pub fn direct_io_store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Logger>) -> Result<Box<dyn ObjectStore>> {
+pub fn direct_io_store_for_uri_with_logger(
+    uri: &str,
+    logger: Option<crate::s3_logger::Logger>,
+) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
-    
+
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
@@ -3013,7 +3261,7 @@ pub fn direct_io_store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_l
         }
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
-    
+
     // Wrap with logger if provided
     if let Some(logger) = logger {
         Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
@@ -3028,10 +3276,13 @@ pub fn high_performance_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>>
 }
 
 /// Factory for creating high-performance stores with optional logger
-pub fn high_performance_store_for_uri_with_logger(uri: &str, logger: Option<crate::s3_logger::Logger>) -> Result<Box<dyn ObjectStore>> {
+pub fn high_performance_store_for_uri_with_logger(
+    uri: &str,
+    logger: Option<crate::s3_logger::Logger>,
+) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
-    
+
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
@@ -3058,7 +3309,7 @@ pub fn high_performance_store_for_uri_with_logger(uri: &str, logger: Option<crat
         }
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
-    
+
     // Wrap with logger if provided
     if let Some(logger) = logger {
         Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
@@ -3068,34 +3319,34 @@ pub fn high_performance_store_for_uri_with_logger(uri: &str, logger: Option<crat
 }
 
 /// Factory for creating cloud storage backends with RangeEngine enabled
-/// 
+///
 /// This factory enables high-performance concurrent downloads for cloud storage (S3, Azure, GCS)
 /// by enabling RangeEngine with network-optimized settings. Use this when:
 /// - Testing within the cloud provider's network (low latency, high bandwidth)
 /// - Working with large objects (> 32 MiB) where parallelism improves throughput
 /// - Network conditions support concurrent connections (> 10 Gbps, < 3 ms latency)
-/// 
+///
 /// Note: For S3, range optimization is also available via `S3DLIO_ENABLE_RANGE_OPTIMIZATION`
 /// (enabled by default, v0.9.60+) without needing this factory.
 /// This factory explicitly enables the struct-based RangeEngine for all backends.
-/// 
+///
 /// # Arguments
 /// * `uri` - Storage URI (e.g., "s3://bucket/", "az://container/", "gs://bucket/")
-/// 
+///
 /// # Network Scenarios
-/// 
+///
 /// **High-performance (local/in-cloud)**: > 10 Gbps, < 3 ms latency
 /// - Use this factory to enable RangeEngine
 /// - Expected improvement: 30-60% for large objects
-/// 
+///
 /// **Remote/low-bandwidth**: < 1 Gbps, > 30 ms latency
 /// - Use standard `store_for_uri()` (struct RangeEngine disabled by default)
 /// - Avoids stat() overhead that may not be worth parallelism cost
-/// 
+///
 /// # Example
 /// ```rust,no_run
 /// use s3dlio::object_store::store_for_uri_with_high_performance_cloud;
-/// 
+///
 /// # async fn example() -> anyhow::Result<()> {
 /// // High-performance mode for in-cloud testing
 /// let store = store_for_uri_with_high_performance_cloud("s3://my-bucket/")?;
@@ -3110,26 +3361,26 @@ pub fn store_for_uri_with_high_performance_cloud(uri: &str) -> Result<Box<dyn Ob
 /// Factory for creating cloud storage backends with RangeEngine enabled and optional logger
 pub fn store_for_uri_with_high_performance_cloud_and_logger(
     uri: &str,
-    logger: Option<crate::s3_logger::Logger>
+    logger: Option<crate::s3_logger::Logger>,
 ) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
-    
+
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => {
             let config = S3Config {
-                enable_range_engine: true,  // Enable for high-performance
+                enable_range_engine: true, // Enable for high-performance
                 ..Default::default()
             };
             Box::new(S3ObjectStore::with_config(config))
-        },
+        }
         Scheme::Azure => {
             #[cfg(feature = "backend-azure")]
             {
                 let config = AzureConfig {
-                    enable_range_engine: true,  // Enable for high-performance
+                    enable_range_engine: true, // Enable for high-performance
                     ..Default::default()
                 };
                 Box::new(AzureObjectStore::with_config(config))
@@ -3138,12 +3389,12 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
             {
                 bail!("Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'.")
             }
-        },
+        }
         Scheme::Gcs => {
             #[cfg(feature = "backend-gcs")]
             {
                 let config = GcsConfig {
-                    enable_range_engine: true,  // Enable for high-performance
+                    enable_range_engine: true, // Enable for high-performance
                     ..Default::default()
                 };
                 Box::new(GcsObjectStore::with_config(config))
@@ -3152,10 +3403,10 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
             {
                 bail!("GCS backend is not enabled in this build. Rebuild with feature 'backend-gcs' or 'full-backends'.")
             }
-        },
+        }
         Scheme::Unknown => bail!("Unable to infer backend from URI: {uri}"),
     };
-    
+
     // Wrap with logger if provided
     if let Some(logger) = logger {
         Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
@@ -3168,13 +3419,13 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
 // Generic Upload/Download Functions with Progress Tracking
 // ============================================================================
 
+use futures::stream::FuturesUnordered;
 use std::path::Path;
 use std::sync::Arc;
-use futures::stream::FuturesUnordered;
 // StreamExt already imported at top of file
-use tokio::sync::Semaphore;
-use glob;
 use crate::progress::ProgressCallback;
+use glob;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TransferSummary {
@@ -3192,7 +3443,9 @@ pub async fn generic_upload_files<P: AsRef<Path>>(
     max_in_flight: usize,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
-    let summary = generic_upload_files_with_summary(dest_prefix, patterns, max_in_flight, progress_callback).await?;
+    let summary =
+        generic_upload_files_with_summary(dest_prefix, patterns, max_in_flight, progress_callback)
+            .await?;
     if summary.failed > 0 {
         bail!(
             "Upload completed with failures: attempted={}, succeeded={}, failed={}",
@@ -3215,7 +3468,7 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
     let mut paths = Vec::new();
     for pat in patterns {
         let s = pat.as_ref().to_string_lossy();
-        
+
         // Handle different pattern types
         if s.contains('*') || s.contains('?') {
             // Glob pattern - use glob crate
@@ -3225,11 +3478,17 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
                         if pb.is_file() {
                             paths.push(pb);
                         }
-                    },
+                    }
                     Err(e) => warn!("Glob error for pattern {}: {}", s, e),
                 }
             }
-        } else if s.contains('^') || s.contains('$') || s.contains('[') || s.contains('(') || s.contains('\\') || s.contains('.') {
+        } else if s.contains('^')
+            || s.contains('$')
+            || s.contains('[')
+            || s.contains('(')
+            || s.contains('\\')
+            || s.contains('.')
+        {
             // Regex pattern - scan directory and apply regex
             let (dir_part, pattern_part) = match s.rfind('/') {
                 Some(index) => {
@@ -3238,31 +3497,43 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
                 }
                 None => ("./", s.as_ref()),
             };
-            
-            let pattern_part = if pattern_part.is_empty() { ".*" } else { pattern_part };
-            debug!("Trying regex pattern '{}' in directory '{}'", pattern_part, dir_part);
-            
+
+            let pattern_part = if pattern_part.is_empty() {
+                ".*"
+            } else {
+                pattern_part
+            };
+            debug!(
+                "Trying regex pattern '{}' in directory '{}'",
+                pattern_part, dir_part
+            );
+
             match Regex::new(pattern_part) {
                 Ok(re) => {
                     let dir_path = std::path::Path::new(dir_part);
                     if dir_path.is_dir() {
                         for entry in (std::fs::read_dir(dir_path)
-                            .map_err(|e| anyhow!("Cannot read directory '{}': {}", dir_part, e))?).flatten() {
-                                let path = entry.path();
-                                if path.is_file() {
-                                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                                        if re.is_match(filename) {
-                                            debug!("Regex matched file: {:?}", path);
-                                            paths.push(path);
-                                        }
+                            .map_err(|e| anyhow!("Cannot read directory '{}': {}", dir_part, e))?)
+                        .flatten()
+                        {
+                            let path = entry.path();
+                            if path.is_file() {
+                                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                                    if re.is_match(filename) {
+                                        debug!("Regex matched file: {:?}", path);
+                                        paths.push(path);
                                     }
                                 }
                             }
+                        }
                     }
-                },
+                }
                 Err(_) => {
                     // Not a valid regex, treat as literal file path
-                    debug!("Invalid regex pattern '{}', treating as literal path", pattern_part);
+                    debug!(
+                        "Invalid regex pattern '{}', treating as literal path",
+                        pattern_part
+                    );
                     let path = pat.as_ref();
                     if path.is_file() {
                         paths.push(path.to_path_buf());
@@ -3277,12 +3548,14 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
             } else if path.is_dir() {
                 // If it's a directory, add all files in it
                 for entry in (std::fs::read_dir(path)
-                    .map_err(|e| anyhow!("Cannot read directory '{:?}': {}", path, e))?).flatten() {
-                        let entry_path = entry.path();
-                        if entry_path.is_file() {
-                            paths.push(entry_path);
-                        }
+                    .map_err(|e| anyhow!("Cannot read directory '{:?}': {}", path, e))?)
+                .flatten()
+                {
+                    let entry_path = entry.path();
+                    if entry_path.is_file() {
+                        paths.push(entry_path);
                     }
+                }
             } else {
                 warn!("Path does not exist or is not accessible: {:?}", path);
             }
@@ -3313,7 +3586,8 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
         let progress = progress_callback.clone();
         let dest_base = dest_prefix.to_string();
 
-        let fname = path.file_name()
+        let fname = path
+            .file_name()
             .ok_or_else(|| anyhow!("Bad path {:?}", path))?
             .to_string_lossy();
 
@@ -3370,9 +3644,15 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
         }
     }
 
-    info!("Finished upload of {} file(s) to {}", paths.len(), dest_prefix);
+    info!(
+        "Finished upload of {} file(s) to {}",
+        paths.len(),
+        dest_prefix
+    );
     if let Some(progress) = &progress_callback {
-        summary.bytes_transferred = progress.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
+        summary.bytes_transferred = progress
+            .bytes_transferred
+            .load(std::sync::atomic::Ordering::Relaxed);
     }
     Ok(summary)
 }
@@ -3459,7 +3739,9 @@ pub async fn generic_download_objects_with_summary(
             let byte_count = bytes.len() as u64;
 
             // Extract filename from URI
-            let fname = uri.split('/').next_back()
+            let fname = uri
+                .split('/')
+                .next_back()
                 .ok_or_else(|| anyhow!("Cannot extract filename from URI: {}", uri))?;
             let out_path = out_dir.join(fname);
 
@@ -3499,9 +3781,15 @@ pub async fn generic_download_objects_with_summary(
         }
     }
 
-    info!("Finished download of {} object(s) to {:?}", keys.len(), dest_dir);
+    info!(
+        "Finished download of {} object(s) to {:?}",
+        keys.len(),
+        dest_dir
+    );
     if let Some(progress) = &progress_callback {
-        summary.bytes_transferred = progress.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
+        summary.bytes_transferred = progress
+            .bytes_transferred
+            .load(std::sync::atomic::Ordering::Relaxed);
     }
     Ok(summary)
 }
@@ -3635,4 +3923,3 @@ mod s3_object_store_tests {
         }
     }
 }
-

@@ -15,9 +15,9 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{BuildHasher, BuildHasherDefault};
-use std::collections::hash_map::DefaultHasher;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -145,26 +145,25 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
     // Read and shard the key list
     let keys = read_lines(&cfg.keylist)
         .with_context(|| format!("Failed to read keylist: {:?}", cfg.keylist))?;
-    
+
     if keys.is_empty() {
         anyhow::bail!("No keys found in keylist: {:?}", cfg.keylist);
     }
 
     let shards = shard_keys(&keys, cfg.procs);
-    
+
     // Create temporary directory for this run
     let run_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let run_dir_path = run_dir.path();
 
     // Write shard files
-    let shard_files = write_shards(run_dir_path, &shards)
-        .context("Failed to write shard files")?;
+    let shard_files = write_shards(run_dir_path, &shards).context("Failed to write shard files")?;
 
     // Setup oplog files if requested
     let oplog_files = if let Some(ref oplog_dir) = cfg.op_log_dir {
         std::fs::create_dir_all(oplog_dir)
             .with_context(|| format!("Failed to create oplog dir: {:?}", oplog_dir))?;
-        
+
         (0..cfg.procs)
             .map(|i| Some(oplog_dir.join(format!("worker_{}.jsonl", i))))
             .collect()
@@ -177,18 +176,18 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
     let mut children = Vec::with_capacity(cfg.procs);
     for (i, shard_file) in shard_files.iter().enumerate() {
         let mut cmd = Command::new(&cfg.worker_cmd);
-        
+
         // Add global arguments first (like --op-log)
         if let Some(ref oplog_file) = oplog_files[i] {
             cmd.arg("--op-log").arg(oplog_file);
         }
-        
+
         // Add subcommand and its arguments
         cmd.arg(&cfg.worker_subcmd)
-           .arg("--concurrent")
-           .arg(cfg.concurrent_per_proc.to_string())
-           .arg("--keylist")
-           .arg(shard_file);
+            .arg("--concurrent")
+            .arg(cfg.concurrent_per_proc.to_string())
+            .arg("--keylist")
+            .arg(shard_file);
 
         // Add duration if specified
         if let Some(duration) = cfg.duration_secs {
@@ -200,10 +199,16 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
 
         // Setup environment
         let mut env_vars = cfg.extra_env.clone();
-        
+
         // Pass through AWS environment variables
-        let aws_vars = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", 
-                       "AWS_ENDPOINT_URL", "AWS_PROFILE", "AWS_DEFAULT_REGION"];
+        let aws_vars = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_REGION",
+            "AWS_ENDPOINT_URL",
+            "AWS_PROFILE",
+            "AWS_DEFAULT_REGION",
+        ];
         for var in &aws_vars {
             if let Ok(value) = std::env::var(var) {
                 env_vars.push((var.to_string(), value));
@@ -217,7 +222,10 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
 
         // Set max HTTP connections
         if let Some(max_http) = cfg.max_http_connections {
-            env_vars.push(("S3DLIO_MAX_HTTP_CONNECTIONS".to_string(), max_http.to_string()));
+            env_vars.push((
+                "S3DLIO_MAX_HTTP_CONNECTIONS".to_string(),
+                max_http.to_string(),
+            ));
         }
 
         // Set optimized HTTP
@@ -242,9 +250,13 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
         }
 
         // Spawn the worker
-        let child = cmd.spawn()
-            .with_context(|| format!("Failed to spawn worker {} with command: {:?}", i, cfg.worker_cmd))?;
-        
+        let child = cmd.spawn().with_context(|| {
+            format!(
+                "Failed to spawn worker {} with command: {:?}",
+                i, cfg.worker_cmd
+            )
+        })?;
+
         children.push((i, child));
     }
 
@@ -252,7 +264,8 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
     let mut summaries = Vec::with_capacity(cfg.procs);
     let mut worker_failures: Vec<String> = Vec::new();
     for (worker_id, mut child) in children {
-        let status = child.wait()
+        let status = child
+            .wait()
             .with_context(|| format!("Failed to wait for worker {}", worker_id))?;
 
         // Parse worker results
@@ -284,8 +297,8 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
             shard_size,
             status.success(),
         )
-            .with_context(|| format!("Failed to summarize worker {}", worker_id))?;
-        
+        .with_context(|| format!("Failed to summarize worker {}", worker_id))?;
+
         summaries.push(summary);
     }
 
@@ -398,16 +411,18 @@ impl MpGetConfigBuilder {
         self
     }
 
-    pub fn forward_args<I, S>(mut self, args: I) -> Self 
+    pub fn forward_args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.config.forward_args.extend(args.into_iter().map(|s| s.into()));
+        self.config
+            .forward_args
+            .extend(args.into_iter().map(|s| s.into()));
         self
     }
 
-    pub fn env<K, V>(mut self, key: K, value: V) -> Self 
+    pub fn env<K, V>(mut self, key: K, value: V) -> Self
     where
         K: Into<String>,
         V: Into<String>,
@@ -435,10 +450,9 @@ impl Default for MpGetConfigBuilder {
 // ----------------------------- Helper Functions -----------------------------
 
 fn read_lines(path: &Path) -> Result<Vec<String>> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open file: {:?}", path))?;
+    let file = File::open(path).with_context(|| format!("Failed to open file: {:?}", path))?;
     let reader = BufReader::new(file);
-    
+
     let mut lines = Vec::new();
     for line in reader.lines() {
         let line = line.context("Failed to read line")?;
@@ -452,32 +466,31 @@ fn read_lines(path: &Path) -> Result<Vec<String>> {
 
 fn write_shards(run_dir: &Path, shards: &[Vec<String>]) -> Result<Vec<PathBuf>> {
     let mut shard_files = Vec::with_capacity(shards.len());
-    
+
     for (i, shard) in shards.iter().enumerate() {
         let shard_file = run_dir.join(format!("shard_{}.txt", i));
         let mut file = File::create(&shard_file)
             .with_context(|| format!("Failed to create shard file: {:?}", shard_file))?;
-        
+
         for key in shard {
-            writeln!(file, "{}", key)
-                .context("Failed to write key to shard file")?;
+            writeln!(file, "{}", key).context("Failed to write key to shard file")?;
         }
-        
+
         shard_files.push(shard_file);
     }
-    
+
     Ok(shard_files)
 }
 
 fn shard_keys(keys: &[String], procs: usize) -> Vec<Vec<String>> {
     let mut shards: Vec<Vec<String>> = vec![Vec::new(); procs];
-    
+
     for key in keys {
         let hash = hash64(key.as_bytes());
         let shard_index = (hash as usize) % procs;
         shards[shard_index].push(key.clone());
     }
-    
+
     shards
 }
 
@@ -514,14 +527,13 @@ fn summarize_worker(
 }
 
 fn parse_oplog(path: &Path) -> Result<(u64, Option<u64>)> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open oplog: {:?}", path))?;
+    let file = File::open(path).with_context(|| format!("Failed to open oplog: {:?}", path))?;
     let reader = BufReader::new(file);
-    
+
     let mut objects = 0u64;
     let mut bytes = 0u64;
     let mut saw_bytes = false;
-    
+
     for line in reader.lines() {
         let line = line.context("Failed to read oplog line")?;
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -552,8 +564,6 @@ fn read_first_non_empty_line(path: &Path) -> Option<String> {
 
 // Simple hash function for sharding keys
 fn hash64(data: &[u8]) -> u64 {
-    
-    
     BuildHasherDefault::<DefaultHasher>::default().hash_one(data)
 }
 
@@ -569,16 +579,16 @@ mod tests {
             "key3".to_string(),
             "key4".to_string(),
         ];
-        
+
         let shards = shard_keys(&keys, 2);
-        
+
         // Should have 2 shards
         assert_eq!(shards.len(), 2);
-        
+
         // All keys should be distributed
         let total_keys: usize = shards.iter().map(|s| s.len()).sum();
         assert_eq!(total_keys, keys.len());
-        
+
         // Sharding should be deterministic
         let shards2 = shard_keys(&keys, 2);
         assert_eq!(shards, shards2);
@@ -602,7 +612,10 @@ mod tests {
         assert!(config.optimized_http);
         assert_eq!(config.rt_threads, Some(4));
         assert_eq!(config.forward_args, vec!["s3://bucket/prefix"]);
-        assert_eq!(config.extra_env, vec![("AWS_REGION".to_string(), "us-west-2".to_string())]);
+        assert_eq!(
+            config.extra_env,
+            vec![("AWS_REGION".to_string(), "us-west-2".to_string())]
+        );
     }
 
     #[test]
@@ -639,14 +652,14 @@ mod tests {
     fn test_hash_distribution() {
         let keys: Vec<String> = (0..1000).map(|i| format!("key_{}", i)).collect();
         let shards = shard_keys(&keys, 4);
-        
+
         // Check that we have 4 shards
         assert_eq!(shards.len(), 4);
-        
+
         // Check that all keys are distributed
         let total: usize = shards.iter().map(|s| s.len()).sum();
         assert_eq!(total, 1000);
-        
+
         // Check that distribution is reasonably balanced
         // (no shard should be completely empty for 1000 keys)
         for shard in &shards {

@@ -4,10 +4,10 @@
 //!
 //! We currently implement MapDataset as an example; add FilterDataset and FlatMapDataset similarly.
 
+use crate::data_loader::dataset::DynStream;
+use crate::{Dataset, DatasetError};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use crate::{DatasetError, Dataset};
-use crate::data_loader::dataset::DynStream;
 
 /// Map – applies a function `F` to each item.
 #[derive(Debug, Clone)]

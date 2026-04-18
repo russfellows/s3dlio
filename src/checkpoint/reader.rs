@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use anyhow::Result;
-use bytes::Bytes;
-use crate::object_store::ObjectStore;
+use super::latest::{read_latest, Latest};
 use super::manifest::Manifest;
 use super::paths::KeyLayout;
-use super::latest::{Latest, read_latest};
+use crate::object_store::ObjectStore;
+use anyhow::Result;
+use bytes::Bytes;
 
 pub struct Reader<'a> {
     pub store: &'a dyn ObjectStore,
@@ -54,43 +54,44 @@ impl<'a> Reader<'a> {
     pub async fn scan_latest_complete(&self) -> Result<Option<Manifest>> {
         let prefix = format!("{}/manifests/", self.base_uri);
         let uris = self.store.list(&prefix, false).await?;
-        
+
         let mut best: Option<(u64, String, Manifest)> = None;
-        
+
         for uri in uris {
-            if !uri.ends_with(".json") { 
-                continue; 
+            if !uri.ends_with(".json") {
+                continue;
             }
-            
+
             // Try to load and parse the manifest
             let bytes = match self.store.get(&uri).await {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            
+
             let manifest = match serde_json::from_slice::<Manifest>(&bytes) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            
+
             // Only consider complete manifests
-            if manifest.status != "complete" { 
-                continue; 
+            if manifest.status != "complete" {
+                continue;
             }
-            
+
             // Check if this is better than current best
             let is_better = match &best {
                 None => true,
                 Some((prev_step, prev_ts, _)) => {
-                    (manifest.global_step, manifest.wall_time.clone()) > (*prev_step, prev_ts.clone())
+                    (manifest.global_step, manifest.wall_time.clone())
+                        > (*prev_step, prev_ts.clone())
                 }
             };
-            
+
             if is_better {
                 best = Some((manifest.global_step, manifest.wall_time.clone(), manifest));
             }
         }
-        
+
         Ok(best.map(|(_, _, manifest)| manifest))
     }
 
@@ -98,7 +99,7 @@ impl<'a> Reader<'a> {
     pub async fn read_shard(&self, shard_rel_key: &str) -> Result<Bytes> {
         let uri = format!("{}/{}", self.base_uri, shard_rel_key);
         let data = self.store.get(&uri).await?;
-        
+
         // Check if this is a compressed file and decompress if needed
         if shard_rel_key.ends_with(".zst") {
             use std::io::Read;
@@ -114,10 +115,17 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a complete shard by its relative key with integrity validation
-    pub async fn read_shard_with_validation(&self, shard_rel_key: &str, expected_checksum: Option<&str>) -> Result<Bytes> {
+    pub async fn read_shard_with_validation(
+        &self,
+        shard_rel_key: &str,
+        expected_checksum: Option<&str>,
+    ) -> Result<Bytes> {
         let uri = format!("{}/{}", self.base_uri, shard_rel_key);
-        let data = self.store.get_with_validation(&uri, expected_checksum).await?;
-        
+        let data = self
+            .store
+            .get_with_validation(&uri, expected_checksum)
+            .await?;
+
         // Check if this is a compressed file and decompress if needed
         if shard_rel_key.ends_with(".zst") {
             use std::io::Read;
@@ -134,54 +142,71 @@ impl<'a> Reader<'a> {
 
     /// Read a shard by rank from a manifest
     pub async fn read_shard_by_rank(&self, manifest: &Manifest, rank: u32) -> Result<Bytes> {
-        let shard = manifest.shards.iter()
+        let shard = manifest
+            .shards
+            .iter()
             .find(|s| s.rank == rank)
             .ok_or_else(|| anyhow::anyhow!("Shard for rank {} not found in manifest", rank))?;
-        
+
         self.read_shard(&shard.key).await
     }
 
     /// Read a shard by rank from a manifest with integrity validation
-    pub async fn read_shard_by_rank_with_validation(&self, manifest: &Manifest, rank: u32) -> Result<Bytes> {
-        let shard = manifest.shards.iter()
+    pub async fn read_shard_by_rank_with_validation(
+        &self,
+        manifest: &Manifest,
+        rank: u32,
+    ) -> Result<Bytes> {
+        let shard = manifest
+            .shards
+            .iter()
             .find(|s| s.rank == rank)
             .ok_or_else(|| anyhow::anyhow!("Shard for rank {} not found in manifest", rank))?;
-        
-        self.read_shard_with_validation(&shard.key, shard.checksum.as_deref()).await
+
+        self.read_shard_with_validation(&shard.key, shard.checksum.as_deref())
+            .await
     }
 
     /// Read all shards from a manifest
     pub async fn read_all_shards(&self, manifest: &Manifest) -> Result<Vec<(u32, Bytes)>> {
         let mut results = Vec::new();
-        
+
         for shard in &manifest.shards {
             let data = self.read_shard(&shard.key).await?;
             results.push((shard.rank, data));
         }
-        
+
         // Sort by rank for consistent ordering
         results.sort_by_key(|(rank, _)| *rank);
         Ok(results)
     }
 
     /// Read all shards from a manifest with integrity validation
-    pub async fn read_all_shards_with_validation(&self, manifest: &Manifest) -> Result<Vec<(u32, Bytes)>> {
+    pub async fn read_all_shards_with_validation(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Vec<(u32, Bytes)>> {
         let mut results = Vec::new();
-        
+
         for shard in &manifest.shards {
-            let data = self.read_shard_with_validation(&shard.key, shard.checksum.as_deref()).await?;
+            let data = self
+                .read_shard_with_validation(&shard.key, shard.checksum.as_deref())
+                .await?;
             results.push((shard.rank, data));
         }
-        
+
         // Sort by rank for consistent ordering
         results.sort_by_key(|(rank, _)| *rank);
         Ok(results)
     }
 
     /// Read all shards concurrently for better performance
-    pub async fn read_all_shards_concurrent(&self, manifest: &Manifest) -> Result<Vec<(u32, Bytes)>> {
+    pub async fn read_all_shards_concurrent(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Vec<(u32, Bytes)>> {
         use futures::future::try_join_all;
-        
+
         let futures = manifest.shards.iter().map(|shard| {
             let rank = shard.rank;
             let key = shard.key.clone();
@@ -190,26 +215,31 @@ impl<'a> Reader<'a> {
                 Ok::<(u32, Bytes), anyhow::Error>((rank, data))
             }
         });
-        
+
         let mut results = try_join_all(futures).await?;
         results.sort_by_key(|(rank, _)| *rank);
         Ok(results)
     }
 
     /// Read all shards concurrently with integrity validation
-    pub async fn read_all_shards_concurrent_with_validation(&self, manifest: &Manifest) -> Result<Vec<(u32, Bytes)>> {
+    pub async fn read_all_shards_concurrent_with_validation(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Vec<(u32, Bytes)>> {
         use futures::future::try_join_all;
-        
+
         let futures = manifest.shards.iter().map(|shard| {
             let rank = shard.rank;
             let key = shard.key.clone();
             let checksum = shard.checksum.clone();
             async move {
-                let data = self.read_shard_with_validation(&key, checksum.as_deref()).await?;
+                let data = self
+                    .read_shard_with_validation(&key, checksum.as_deref())
+                    .await?;
                 Ok::<(u32, Bytes), anyhow::Error>((rank, data))
             }
         });
-        
+
         let mut results = try_join_all(futures).await?;
         results.sort_by_key(|(rank, _)| *rank);
         Ok(results)
@@ -223,7 +253,7 @@ impl<'a> Reader<'a> {
                 return Ok(false); // Cannot validate without checksums
             }
         }
-        
+
         // Attempt to read all shards with validation
         match self.read_all_shards_with_validation(manifest).await {
             Ok(_) => Ok(true),
@@ -249,12 +279,12 @@ impl<'a> Reader<'a> {
     pub async fn find_manifest_by_step(&self, step: u64) -> Result<Option<Manifest>> {
         let prefix = format!("{}/manifests/", self.base_uri);
         let uris = self.store.list(&prefix, false).await?;
-        
+
         for uri in uris {
             if !uri.ends_with(".json") {
                 continue;
             }
-            
+
             // Extract step from filename
             if let Ok(rel_key) = self.extract_relative_key(&uri) {
                 if let Ok((manifest_step, _)) = KeyLayout::parse_manifest_key(&rel_key) {
@@ -264,7 +294,7 @@ impl<'a> Reader<'a> {
                 }
             }
         }
-        
+
         Ok(None)
     }
 
@@ -272,14 +302,14 @@ impl<'a> Reader<'a> {
     pub async fn list_checkpoints(&self) -> Result<Vec<(u64, String, String)>> {
         let prefix = format!("{}/manifests/", self.base_uri);
         let uris = self.store.list(&prefix, false).await?;
-        
+
         let mut checkpoints = Vec::new();
-        
+
         for uri in uris {
             if !uri.ends_with(".json") {
                 continue;
             }
-            
+
             if let Ok(rel_key) = self.extract_relative_key(&uri) {
                 if let Ok((step, timestamp)) = KeyLayout::parse_manifest_key(&rel_key) {
                     // Try to load manifest to get status
@@ -289,7 +319,7 @@ impl<'a> Reader<'a> {
                 }
             }
         }
-        
+
         // Sort by step
         checkpoints.sort_by_key(|(step, _, _)| *step);
         Ok(checkpoints)
@@ -303,12 +333,12 @@ impl<'a> Reader<'a> {
                 let shard_uri = format!("{}/{}", self.base_uri, shard.key);
                 let _ = self.store.delete(&shard_uri).await; // Best effort
             }
-            
+
             // Delete manifest
             let _manifest_uri = format!("{}/manifests/ckpt-{}-*.json", self.base_uri, step);
             let prefix = format!("{}/manifests/", self.base_uri);
             let uris = self.store.list(&prefix, false).await?;
-            
+
             for uri in uris {
                 if let Ok(rel_key) = self.extract_relative_key(&uri) {
                     if let Ok((manifest_step, _)) = KeyLayout::parse_manifest_key(&rel_key) {
@@ -319,7 +349,7 @@ impl<'a> Reader<'a> {
                     }
                 }
             }
-            
+
             Ok(true)
         } else {
             Ok(false)
@@ -339,12 +369,12 @@ impl<'a> Reader<'a> {
     /// Validate checkpoint integrity
     pub async fn validate_checkpoint(&self, manifest: &Manifest) -> Result<Vec<String>> {
         let mut errors = Vec::new();
-        
+
         // Validate manifest itself
         if let Err(e) = manifest.validate() {
             errors.push(format!("Manifest validation failed: {}", e));
         }
-        
+
         // Check that all shards exist and have correct sizes
         for shard in &manifest.shards {
             let shard_uri = format!("{}/{}", self.base_uri, shard.key);
@@ -352,7 +382,7 @@ impl<'a> Reader<'a> {
                 Ok(meta) => {
                     if meta.size != shard.size {
                         errors.push(format!(
-                            "Shard {} size mismatch: expected {}, got {}", 
+                            "Shard {} size mismatch: expected {}, got {}",
                             shard.rank, shard.size, meta.size
                         ));
                     }
@@ -371,7 +401,7 @@ impl<'a> Reader<'a> {
                 }
             }
         }
-        
+
         Ok(errors)
     }
 }
@@ -379,8 +409,8 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_store::store_for_uri;
     use crate::checkpoint::writer::Writer;
+    use crate::object_store::store_for_uri;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -396,7 +426,7 @@ mod tests {
 
         // Now read it back
         let reader = Reader::new(&*store, base_uri);
-        
+
         let latest = reader.get_latest().await?.unwrap();
         assert_eq!(latest.global_step, 100);
 
@@ -420,20 +450,20 @@ mod tests {
         let writer_0 = Writer::new(&*store, base_uri.clone(), 2, 0);
         let writer_1 = Writer::new(&*store, base_uri.clone(), 2, 1);
 
-        let (layout, shard_0) = writer_0.save_distributed_shard(
-            200, 20, "torch", b"rank 0 data"
-        ).await?;
-        let (_, shard_1) = writer_1.save_distributed_shard(
-            200, 20, "torch", b"rank 1 data"
-        ).await?;
+        let (layout, shard_0) = writer_0
+            .save_distributed_shard(200, 20, "torch", b"rank 0 data")
+            .await?;
+        let (_, shard_1) = writer_1
+            .save_distributed_shard(200, 20, "torch", b"rank 1 data")
+            .await?;
 
-        writer_0.finalize_distributed_checkpoint(
-            &layout, "torch", 20, vec![shard_0, shard_1], None
-        ).await?;
+        writer_0
+            .finalize_distributed_checkpoint(&layout, "torch", 20, vec![shard_0, shard_1], None)
+            .await?;
 
         // Now read it back
         let reader = Reader::new(&*store, base_uri);
-        
+
         let manifest = reader.load_latest_manifest().await?.unwrap();
         assert_eq!(manifest.world_size, 2);
 
@@ -454,14 +484,20 @@ mod tests {
         let store = store_for_uri(&base_uri)?;
 
         let writer = Writer::new(&*store, base_uri.clone(), 1, 0);
-        
+
         // Create multiple checkpoints
-        writer.save_checkpoint(100, 10, "torch", b"data1", None).await?;
-        writer.save_checkpoint(200, 20, "torch", b"data2", None).await?;
-        writer.save_checkpoint(300, 30, "torch", b"data3", None).await?;
+        writer
+            .save_checkpoint(100, 10, "torch", b"data1", None)
+            .await?;
+        writer
+            .save_checkpoint(200, 20, "torch", b"data2", None)
+            .await?;
+        writer
+            .save_checkpoint(300, 30, "torch", b"data3", None)
+            .await?;
 
         let reader = Reader::new(&*store, base_uri);
-        
+
         // List all checkpoints
         let checkpoints = reader.list_checkpoints().await?;
         assert_eq!(checkpoints.len(), 3);
@@ -487,7 +523,9 @@ mod tests {
         let store = store_for_uri(&base_uri)?;
 
         let writer = Writer::new(&*store, base_uri.clone(), 1, 0);
-        writer.save_checkpoint(100, 10, "torch", b"test data", None).await?;
+        writer
+            .save_checkpoint(100, 10, "torch", b"test data", None)
+            .await?;
 
         let reader = Reader::new(&*store, base_uri);
         let manifest = reader.load_latest_manifest().await?.unwrap();

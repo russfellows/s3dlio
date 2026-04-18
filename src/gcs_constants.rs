@@ -18,12 +18,8 @@
 /// Re-export all vendor-layer constants so callers only need
 /// `use crate::gcs_constants::*;` (or `use s3dlio::gcs_constants::*;`).
 pub use google_cloud_gax_internal::gcs_constants::{
-    GCS_SERVER_MAX_MESSAGE_SIZE,
-    DEFAULT_GRPC_WRITE_CHUNK_SIZE,
-    MAX_GRPC_WRITE_CHUNK_SIZE,
-    DEFAULT_WINDOW_MIB,
-    ENV_GRPC_INITIAL_WINDOW_MIB,
-    ENV_GRPC_WRITE_CHUNK_SIZE,
+    DEFAULT_GRPC_WRITE_CHUNK_SIZE, DEFAULT_WINDOW_MIB, ENV_GRPC_INITIAL_WINDOW_MIB,
+    ENV_GRPC_WRITE_CHUNK_SIZE, GCS_SERVER_MAX_MESSAGE_SIZE, MAX_GRPC_WRITE_CHUNK_SIZE,
 };
 
 // ── Application-layer constants ───────────────────────────────────────────────

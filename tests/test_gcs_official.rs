@@ -15,22 +15,25 @@ use common::{get_test_config, print_test_header, print_test_result};
 mod gcs_official_tests {
     use super::*;
     use bytes::Bytes;
-    use s3dlio::google_gcs_client::{GcsClient, parse_gcs_uri};
     use once_cell::sync::Lazy;
+    use s3dlio::google_gcs_client::{parse_gcs_uri, GcsClient};
     use tokio::sync::OnceCell;
 
     const BACKEND_NAME: &str = "gcs-official (google-cloud-storage)";
-    
+
     // Single global client for all tests - recommended pattern from Google docs
     // https://docs.rs/google-cloud-storage/latest/google_cloud_storage/client/struct.Storage.html
     static GLOBAL_CLIENT: Lazy<OnceCell<GcsClient>> = Lazy::new(OnceCell::new);
-    
-    async fn get_client() -> &'static GcsClient {
-        GLOBAL_CLIENT.get_or_init(|| async {
-            GcsClient::new().await.expect("Failed to initialize GCS client")
-        }).await
-    }
 
+    async fn get_client() -> &'static GcsClient {
+        GLOBAL_CLIENT
+            .get_or_init(|| async {
+                GcsClient::new()
+                    .await
+                    .expect("Failed to initialize GCS client")
+            })
+            .await
+    }
 
     #[tokio::test]
     #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
@@ -41,29 +44,43 @@ mod gcs_official_tests {
         let (bucket, key) = parse_gcs_uri("gs://my-bucket/path/to/object.txt")?;
         assert_eq!(bucket, "my-bucket");
         assert_eq!(key, "path/to/object.txt");
-        println!("✓ Parsed: gs://my-bucket/path/to/object.txt → bucket='{}', key='{}'", bucket, key);
+        println!(
+            "✓ Parsed: gs://my-bucket/path/to/object.txt → bucket='{}', key='{}'",
+            bucket, key
+        );
 
         let (bucket, key) = parse_gcs_uri("gcs://my-bucket/file.dat")?;
         assert_eq!(bucket, "my-bucket");
         assert_eq!(key, "file.dat");
-        println!("✓ Parsed: gcs://my-bucket/file.dat → bucket='{}', key='{}'", bucket, key);
+        println!(
+            "✓ Parsed: gcs://my-bucket/file.dat → bucket='{}', key='{}'",
+            bucket, key
+        );
 
         // Invalid URIs
         assert!(parse_gcs_uri("s3://wrong-scheme/key").is_err());
-        println!("✓ Correctly rejected invalid URI 's3://wrong-scheme/key': {}", 
-                 parse_gcs_uri("s3://wrong-scheme/key").unwrap_err());
+        println!(
+            "✓ Correctly rejected invalid URI 's3://wrong-scheme/key': {}",
+            parse_gcs_uri("s3://wrong-scheme/key").unwrap_err()
+        );
 
         assert!(parse_gcs_uri("http://not-gcs/key").is_err());
-        println!("✓ Correctly rejected invalid URI 'http://not-gcs/key': {}", 
-                 parse_gcs_uri("http://not-gcs/key").unwrap_err());
+        println!(
+            "✓ Correctly rejected invalid URI 'http://not-gcs/key': {}",
+            parse_gcs_uri("http://not-gcs/key").unwrap_err()
+        );
 
         assert!(parse_gcs_uri("gs://").is_err());
-        println!("✓ Correctly rejected invalid URI 'gs://': {}", 
-                 parse_gcs_uri("gs://").unwrap_err());
+        println!(
+            "✓ Correctly rejected invalid URI 'gs://': {}",
+            parse_gcs_uri("gs://").unwrap_err()
+        );
 
         assert!(parse_gcs_uri("").is_err());
-        println!("✓ Correctly rejected invalid URI '': {}", 
-                 parse_gcs_uri("").unwrap_err());
+        println!(
+            "✓ Correctly rejected invalid URI '': {}",
+            parse_gcs_uri("").unwrap_err()
+        );
 
         print_test_result(true);
         Ok(())
@@ -80,9 +97,14 @@ mod gcs_official_tests {
 
         // Test bucket access by listing
         println!("  Testing access to bucket: {}", config.bucket);
-        let objects = client.list_objects(&config.bucket, Some(""), true).await
+        let objects = client
+            .list_objects(&config.bucket, Some(""), true)
+            .await
             .context("Failed to list bucket - check permissions")?;
-        println!("✓ Successfully authenticated and accessed bucket (found {} objects)", objects.len());
+        println!(
+            "✓ Successfully authenticated and accessed bucket (found {} objects)",
+            objects.len()
+        );
 
         print_test_result(true);
         Ok(())
@@ -97,9 +119,11 @@ mod gcs_official_tests {
 
         let test_key = format!("{}/test-put-get.txt", config.test_prefix);
         let test_data = b"Hello from s3dlio GCS backend test";
-        
+
         println!("Uploading object: gs://{}/{}", config.bucket, test_key);
-        client.put_object(&config.bucket, &test_key, Bytes::from_static(test_data)).await?;
+        client
+            .put_object(&config.bucket, &test_key, Bytes::from_static(test_data))
+            .await?;
         println!("✓ PUT successful: {} bytes", test_data.len());
 
         println!("Downloading object: gs://{}/{}", config.bucket, test_key);
@@ -126,21 +150,30 @@ mod gcs_official_tests {
 
         let test_key = format!("{}/test-range-get.txt", config.test_prefix);
         let test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        
+
         println!("Uploading object: gs://{}/{}", config.bucket, test_key);
-        client.put_object(&config.bucket, &test_key, Bytes::from_static(test_data)).await?;
+        client
+            .put_object(&config.bucket, &test_key, Bytes::from_static(test_data))
+            .await?;
         println!("✓ PUT successful: {} bytes", test_data.len());
 
         // Test partial read
         println!("Testing range read: offset=10, length=10");
-        let range_data = client.get_object_range(&config.bucket, &test_key, 10, Some(10)).await?;
+        let range_data = client
+            .get_object_range(&config.bucket, &test_key, 10, Some(10))
+            .await?;
         println!("✓ Range GET successful: {} bytes", range_data.len());
         assert_eq!(range_data.as_ref(), b"ABCDEFGHIJ");
-        println!("✓ Range data verified: {:?}", std::str::from_utf8(&range_data));
+        println!(
+            "✓ Range data verified: {:?}",
+            std::str::from_utf8(&range_data)
+        );
 
         // Test tail read
         println!("Testing range read: offset=30, length=None (to end)");
-        let tail_data = client.get_object_range(&config.bucket, &test_key, 30, None).await?;
+        let tail_data = client
+            .get_object_range(&config.bucket, &test_key, 30, None)
+            .await?;
         println!("✓ Tail GET successful: {} bytes", tail_data.len());
         assert_eq!(tail_data.as_ref(), b"UVWXYZ");
         println!("✓ Tail data verified");
@@ -162,9 +195,11 @@ mod gcs_official_tests {
 
         let test_key = format!("{}/test-stat.txt", config.test_prefix);
         let test_data = b"Metadata test object content";
-        
+
         println!("Uploading object: gs://{}/{}", config.bucket, test_key);
-        client.put_object(&config.bucket, &test_key, Bytes::from_static(test_data)).await?;
+        client
+            .put_object(&config.bucket, &test_key, Bytes::from_static(test_data))
+            .await?;
         println!("✓ PUT successful");
 
         println!("Fetching object metadata...");
@@ -196,7 +231,7 @@ mod gcs_official_tests {
         let client = get_client().await;
 
         let test_prefix = format!("{}/test-list", config.test_prefix);
-        
+
         // Create test objects
         println!("Uploading 4 test objects...");
         let test_keys = vec![
@@ -205,15 +240,19 @@ mod gcs_official_tests {
             format!("{}/subdir/file3.txt", test_prefix),
             format!("{}/subdir/file4.txt", test_prefix),
         ];
-        
+
         for key in &test_keys {
-            client.put_object(&config.bucket, key, Bytes::from_static(b"test data")).await?;
+            client
+                .put_object(&config.bucket, key, Bytes::from_static(b"test data"))
+                .await?;
         }
         println!("✓ Test objects uploaded");
 
         // Test recursive listing
         println!("\nTest 1: List with prefix (recursive)");
-        let objects = client.list_objects(&config.bucket, Some(&test_prefix), true).await?;
+        let objects = client
+            .list_objects(&config.bucket, Some(&test_prefix), true)
+            .await?;
         println!("Found {} objects", objects.len());
         for obj in &objects {
             println!("  - {}", obj);
@@ -223,7 +262,9 @@ mod gcs_official_tests {
 
         // Test non-recursive listing (should get top-level files + subdirectory prefix)
         println!("\nTest 2: List with prefix (non-recursive)");
-        let objects = client.list_objects(&config.bucket, Some(&test_prefix), false).await?;
+        let objects = client
+            .list_objects(&config.bucket, Some(&test_prefix), false)
+            .await?;
         println!("Found {} objects/prefixes", objects.len());
         for obj in &objects {
             println!("  - {}", obj);
@@ -234,12 +275,16 @@ mod gcs_official_tests {
         assert!(objects.iter().any(|o| o.ends_with("file1.txt")));
         assert!(objects.iter().any(|o| o.ends_with("file2.txt")));
         // Verify we got the subdirectory prefix (ends with /)
-        assert!(objects.iter().any(|o| o.contains("subdir") && o.ends_with("/")));
+        assert!(objects
+            .iter()
+            .any(|o| o.contains("subdir") && o.ends_with("/")));
         println!("✓ Non-recursive listing verified (2 files + 1 subdirectory prefix)");
 
         // Test listing with our test prefix
         println!("\nTest 3: List with test prefix");
-        let objects = client.list_objects(&config.bucket, Some(&config.test_prefix), true).await?;
+        let objects = client
+            .list_objects(&config.bucket, Some(&config.test_prefix), true)
+            .await?;
         println!("Found {} objects with our test prefix", objects.len());
         assert!(objects.len() >= 4);
         println!("✓ Test prefix listing successful");
@@ -263,9 +308,11 @@ mod gcs_official_tests {
         let client = get_client().await;
 
         let test_key = format!("{}/test-delete-single.txt", config.test_prefix);
-        
+
         println!("Uploading object: gs://{}/{}", config.bucket, test_key);
-        client.put_object(&config.bucket, &test_key, Bytes::from_static(b"Delete me")).await?;
+        client
+            .put_object(&config.bucket, &test_key, Bytes::from_static(b"Delete me"))
+            .await?;
         println!("✓ PUT successful");
 
         // Verify it exists
@@ -294,30 +341,42 @@ mod gcs_official_tests {
         let client = get_client().await;
 
         let test_prefix = format!("{}/test-batch-delete", config.test_prefix);
-        
+
         // Create multiple test objects
         println!("Uploading 25 test objects...");
         let mut test_keys = Vec::new();
         for i in 0..25 {
             let key = format!("{}/file{}.txt", test_prefix, i);
-            client.put_object(&config.bucket, &key, Bytes::from(format!("test data {}", i))).await?;
+            client
+                .put_object(
+                    &config.bucket,
+                    &key,
+                    Bytes::from(format!("test data {}", i)),
+                )
+                .await?;
             test_keys.push(key);
         }
         println!("✓ {} objects uploaded", test_keys.len());
 
         // Verify they exist
-        let objects = client.list_objects(&config.bucket, Some(&test_prefix), true).await?;
+        let objects = client
+            .list_objects(&config.bucket, Some(&test_prefix), true)
+            .await?;
         assert_eq!(objects.len(), 25);
         println!("✓ All objects verified present");
 
         // Delete all
         println!("Deleting {} objects in batch...", test_keys.len());
-        client.delete_objects(&config.bucket, test_keys.clone()).await?;
+        client
+            .delete_objects(&config.bucket, test_keys.clone())
+            .await?;
         println!("✓ Batch DELETE successful");
 
         // Verify they're gone
         println!("Verifying objects are deleted...");
-        let objects = client.list_objects(&config.bucket, Some(&test_prefix), true).await?;
+        let objects = client
+            .list_objects(&config.bucket, Some(&test_prefix), true)
+            .await?;
         assert_eq!(objects.len(), 0, "All objects should be deleted");
         println!("✓ All objects confirmed deleted");
 
@@ -333,17 +392,28 @@ mod gcs_official_tests {
         let client = get_client().await;
 
         let test_key = format!("{}/test-multipart.bin", config.test_prefix);
-        
+
         // Create 1 MB of test data
         let data_size = 1024 * 1024; // 1 MB
         let test_data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
-        
-        println!("Uploading large object: gs://{}/{} ({} MB)", 
-                 config.bucket, test_key, data_size / (1024 * 1024));
-        
+
+        println!(
+            "Uploading large object: gs://{}/{} ({} MB)",
+            config.bucket,
+            test_key,
+            data_size / (1024 * 1024)
+        );
+
         // Use multipart upload with 256 KB chunks
         let chunk_size = 256 * 1024;
-        client.put_object_multipart(&config.bucket, &test_key, Bytes::from(test_data.clone()), chunk_size).await?;
+        client
+            .put_object_multipart(
+                &config.bucket,
+                &test_key,
+                Bytes::from(test_data.clone()),
+                chunk_size,
+            )
+            .await?;
         println!("✓ Multipart PUT successful");
 
         // Verify size
@@ -372,14 +442,14 @@ mod gcs_official_tests {
         println!("║  Comprehensive GCS Functional Test Suite                    ║");
         println!("║  Backend: {}                ║", BACKEND_NAME);
         println!("╚══════════════════════════════════════════════════════════════╝\n");
-        
+
         println!("See individual test results above");
         println!("Run with: cargo test --test test_gcs_official\n");
-        
+
         println!("\n╔══════════════════════════════════════════════════════════════╗");
         println!("║  ✓ ALL TESTS PASSED                                          ║");
         println!("╚══════════════════════════════════════════════════════════════╝\n");
-        
+
         Ok(())
     }
 }

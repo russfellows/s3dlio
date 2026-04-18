@@ -8,10 +8,10 @@
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use rand::{rng, Rng};
 use rand::distr::Alphanumeric;
-use std::{env, fs, path::Path};
+use rand::{rng, Rng};
 use s3dlio::azure_client::AzureBlob;
+use std::{env, fs, path::Path};
 
 const MANIFEST_PATH: &str = "target/azure_seq_manifest.txt";
 
@@ -43,7 +43,9 @@ async fn mk_client() -> Result<AzureBlob> {
             anyhow::ensure!(acc_from_url == acct,
                 "AZURE_BLOB_ACCOUNT_URL points to '{acc_from_url}', but AZURE_BLOB_ACCOUNT is '{acct}'");
         }
-        Ok(AzureBlob::with_default_credential_from_url(&url, &container)?)
+        Ok(AzureBlob::with_default_credential_from_url(
+            &url, &container,
+        )?)
     } else {
         let acct = req_env("AZURE_BLOB_ACCOUNT")?;
         Ok(AzureBlob::with_default_credential(&acct, &container)?)
@@ -64,8 +66,9 @@ fn write_manifest(prefix: &str, keys: &[String]) -> Result<()> {
 }
 
 fn read_manifest() -> Result<(String, Vec<String>)> {
-    let s = fs::read_to_string(MANIFEST_PATH)
-        .with_context(|| format!("missing manifest at {MANIFEST_PATH}. Run sequence_1_upload_and_list first."))?;
+    let s = fs::read_to_string(MANIFEST_PATH).with_context(|| {
+        format!("missing manifest at {MANIFEST_PATH}. Run sequence_1_upload_and_list first.")
+    })?;
     let mut prefix = String::new();
     let mut keys = Vec::new();
     for line in s.lines() {
@@ -86,10 +89,12 @@ fn read_manifest() -> Result<(String, Vec<String>)> {
 #[tokio::test]
 #[ignore = "requires Azure credentials (AZURE_BLOB_CONTAINER, AZURE_BLOB_ACCOUNT)"]
 async fn sequence_1_upload_and_list() -> Result<()> {
-    if env::var("AZURE_BLOB_CONTAINER").is_err() ||
-        (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
+    if env::var("AZURE_BLOB_CONTAINER").is_err()
+        || (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
     {
-        eprintln!("SKIP: set AZURE_BLOB_CONTAINER and (AZURE_BLOB_ACCOUNT or AZURE_BLOB_ACCOUNT_URL)");
+        eprintln!(
+            "SKIP: set AZURE_BLOB_CONTAINER and (AZURE_BLOB_ACCOUNT or AZURE_BLOB_ACCOUNT_URL)"
+        );
         return Ok(());
     }
 
@@ -97,7 +102,10 @@ async fn sequence_1_upload_and_list() -> Result<()> {
 
     let prefix = random_key("s3dlio-seq");
     let before = client.list(Some(&prefix)).await?;
-    println!("Sequence#1: initial count under prefix {prefix}: {}", before.len());
+    println!(
+        "Sequence#1: initial count under prefix {prefix}: {}",
+        before.len()
+    );
 
     // Upload 3 blobs (single-shot put)
     let mut created: Vec<String> = Vec::new();
@@ -106,14 +114,19 @@ async fn sequence_1_upload_and_list() -> Result<()> {
         // small content with a pattern
         let len = (i + 1) * 4096;
         let mut buf = vec![0u8; len];
-        for (j, b) in buf.iter_mut().enumerate() { *b = ((j + i) % 251) as u8; }
+        for (j, b) in buf.iter_mut().enumerate() {
+            *b = ((j + i) % 251) as u8;
+        }
         client.put(&key, Bytes::from(buf), true).await?;
         created.push(key);
     }
 
     // List again and print a brief diff
     let after = client.list(Some(&prefix)).await?;
-    println!("Sequence#1: after upload, count under prefix {prefix}: {}", after.len());
+    println!(
+        "Sequence#1: after upload, count under prefix {prefix}: {}",
+        after.len()
+    );
     println!("Sequence#1: created keys: {:?}", &created);
 
     // GET one blob to validate
@@ -134,10 +147,12 @@ async fn sequence_1_upload_and_list() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires Azure credentials (AZURE_BLOB_CONTAINER, AZURE_BLOB_ACCOUNT)"]
 async fn sequence_2_cleanup_and_verify() -> Result<()> {
-    if env::var("AZURE_BLOB_CONTAINER").is_err() ||
-        (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
+    if env::var("AZURE_BLOB_CONTAINER").is_err()
+        || (env::var("AZURE_BLOB_ACCOUNT").is_err() && env::var("AZURE_BLOB_ACCOUNT_URL").is_err())
     {
-        eprintln!("SKIP: set AZURE_BLOB_CONTAINER and (AZURE_BLOB_ACCOUNT or AZURE_BLOB_ACCOUNT_URL)");
+        eprintln!(
+            "SKIP: set AZURE_BLOB_CONTAINER and (AZURE_BLOB_ACCOUNT or AZURE_BLOB_ACCOUNT_URL)"
+        );
         return Ok(());
     }
 
@@ -150,16 +165,23 @@ async fn sequence_2_cleanup_and_verify() -> Result<()> {
         }
     };
 
-    println!("Sequence#2: cleaning up {} objects under prefix {}", keys.len(), prefix);
+    println!(
+        "Sequence#2: cleaning up {} objects under prefix {}",
+        keys.len(),
+        prefix
+    );
     client.delete_objects(&keys).await?;
 
     let after = client.list(Some(&prefix)).await?;
     println!("Sequence#2: remaining under {prefix}: {}", after.len());
-    assert!(after.is_empty(), "expected empty listing under {prefix}, got {:?}", after);
+    assert!(
+        after.is_empty(),
+        "expected empty listing under {prefix}, got {:?}",
+        after
+    );
 
     // Optional: remove the manifest so repeated runs fail cleanly if step 1 wasn't run
     let _ = fs::remove_file(MANIFEST_PATH);
 
     Ok(())
 }
-

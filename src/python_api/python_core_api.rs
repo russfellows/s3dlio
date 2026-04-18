@@ -3,46 +3,44 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use bytes::Bytes;
+use pyo3::buffer::PyBuffer;
+use pyo3::conversion::IntoPyObjectExt;
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods};
 use pyo3::Bound;
-use pyo3::exceptions::PyRuntimeError;
-use pyo3::conversion::IntoPyObjectExt;
 use pyo3_async_runtimes::tokio::future_into_py;
-use pyo3::ffi;
-use pyo3::buffer::PyBuffer;
-use bytes::Bytes;
 
 use tokio::task;
 
 use std::path::PathBuf;
 
-use tracing::{Level, warn};
+use tracing::{warn, Level};
 use tracing_subscriber;
 
 // Project crates
-use crate::config::{ObjectType, DataGenMode, DataGenAlgorithm, Config};
-use crate::s3_utils::{
-    get_objects_parallel,
-    parse_s3_uri, put_objects_with_random_data_and_type, DEFAULT_OBJECT_SIZE,
-    create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs,
-    stat_object_many_async,
-};
-use crate::{generic_upload_files, generic_download_objects};
-use crate::s3_logger::{finalize_op_logger, init_op_logger, global_logger};
-use crate::object_store::{store_for_uri_with_logger, store_for_uri};
-use crate::s3_client::run_on_global_rt;
+use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
 use crate::list_containers::list_containers as list_containers_rs;
+use crate::object_store::{store_for_uri, store_for_uri_with_logger};
+use crate::s3_client::run_on_global_rt;
+use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger};
+use crate::s3_utils::{
+    create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs, get_objects_parallel,
+    parse_s3_uri, put_objects_with_random_data_and_type, stat_object_many_async,
+    DEFAULT_OBJECT_SIZE,
+};
+use crate::{generic_download_objects, generic_upload_files};
 
 // Phase 2 streaming functionality imports
-use crate::object_store::{
-    ObjectStore, ObjectWriter, WriterOptions, CompressionConfig,
-    S3ObjectStore
-};
-#[cfg(feature = "backend-azure")]
-use crate::object_store::AzureObjectStore;
 use crate::file_store::FileSystemObjectStore;
 use crate::file_store_direct::ConfigurableFileSystemObjectStore;
+#[cfg(feature = "backend-azure")]
+use crate::object_store::AzureObjectStore;
+use crate::object_store::{
+    CompressionConfig, ObjectStore, ObjectWriter, S3ObjectStore, WriterOptions,
+};
 
 // ---------------------------------------------------------------------------
 // Client Caching + io_uring-style Submit for Python API
@@ -66,19 +64,19 @@ use crate::file_store_direct::ConfigurableFileSystemObjectStore;
 // data copy — just moving the pointer.
 // ---------------------------------------------------------------------------
 
-use once_cell::sync::Lazy;
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use std::sync::Arc;
 
 /// Cache key: uniquely identifies an ObjectStore configuration
-/// 
+///
 /// Note: We DON'T include bucket in the key because AWS clients work across
 /// all buckets in a region/endpoint. This maximizes cache hit rate.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct StoreKey {
-    scheme: String,      // "s3", "az", "gs", "file", "direct"
-    endpoint: String,    // AWS_ENDPOINT_URL or default
-    region: String,      // AWS_REGION or default
+    scheme: String,   // "s3", "az", "gs", "file", "direct"
+    endpoint: String, // AWS_ENDPOINT_URL or default
+    region: String,   // AWS_REGION or default
 }
 
 impl StoreKey {
@@ -86,7 +84,7 @@ impl StoreKey {
         let scheme = uri.split("://").next().unwrap_or("s3");
         let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-        
+
         StoreKey {
             scheme: scheme.to_string(),
             endpoint,
@@ -96,10 +94,10 @@ impl StoreKey {
 }
 
 /// Global cache of ObjectStore instances
-/// 
+///
 /// DashMap provides lock-free concurrent access (better than RwLock<HashMap>)
 /// for read-heavy workloads. Expected cache hit rate: >99% in typical workloads.
-/// 
+///
 /// Performance: <100ns per lookup (DashMap sharded locking)
 static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<dyn ObjectStore>>> = Lazy::new(DashMap::new);
 
@@ -107,22 +105,25 @@ static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<dyn ObjectStore>>> = Lazy::new(Da
 ///
 /// store_for_uri_with_logger() is synchronous — no runtime needed for creation.
 /// The store is cached by (scheme, endpoint, region) for >99% cache hit rate.
-fn get_or_create_store(uri: &str, logger: Option<crate::s3_logger::Logger>) -> anyhow::Result<Arc<dyn ObjectStore>> {
+fn get_or_create_store(
+    uri: &str,
+    logger: Option<crate::s3_logger::Logger>,
+) -> anyhow::Result<Arc<dyn ObjectStore>> {
     let key = StoreKey::from_uri(uri);
-    
+
     // Fast path: Store already exists (cache hit >99% in typical workloads)
     if let Some(store) = STORE_CACHE.get(&key) {
         return Ok(store.clone());
     }
-    
+
     // Slow path: Create new store — store_for_uri_with_logger is SYNC,
     // no runtime needed. The store itself is Send + Sync and will use
     // the global runtime's I/O reactor when async methods are called.
     let store_box: Box<dyn ObjectStore> = store_for_uri_with_logger(uri, logger)?;
-    
+
     let store_arc: Arc<dyn ObjectStore> = Arc::from(store_box);
     STORE_CACHE.insert(key, store_arc.clone());
-    
+
     Ok(store_arc)
 }
 
@@ -147,7 +148,7 @@ where
 
 /// A Python-visible wrapper around Rust Bytes that exposes buffer protocol
 /// This allows Python code to get a memoryview without copying data
-/// 
+///
 /// Implements the Python buffer protocol via __getbuffer__ and __releasebuffer__
 /// so that `memoryview(bytes_view)` works directly with zero-copy access.
 #[pyclass(name = "BytesView")]
@@ -169,12 +170,12 @@ impl PyBytesView {
     fn __len__(&self) -> usize {
         self.bytes.len()
     }
-    
+
     /// Support bytes() conversion - returns a copy
     fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.bytes)
     }
-    
+
     /// Implement Python buffer protocol for zero-copy access.
     ///
     /// When Python evaluates `memoryview(bytes_view_instance)` it calls
@@ -200,7 +201,7 @@ impl PyBytesView {
     ) -> PyResult<()> {
         if (flags & ffi::PyBUF_WRITABLE) != 0 {
             return Err(pyo3::exceptions::PyBufferError::new_err(
-                "BytesView is read-only and does not support writable buffers"
+                "BytesView is read-only and does not support writable buffers",
             ));
         }
 
@@ -209,11 +210,11 @@ impl PyBytesView {
 
         let bytes = &slf.bytes;
         unsafe {
-            (*view).buf      = bytes.as_ptr() as *mut std::os::raw::c_void;
-            (*view).len      = bytes.len() as isize;
+            (*view).buf = bytes.as_ptr() as *mut std::os::raw::c_void;
+            (*view).len = bytes.len() as isize;
             (*view).readonly = 1;
             (*view).itemsize = 1;
-            (*view).ndim     = 1;
+            (*view).ndim = 1;
 
             // Format: "B" = unsigned byte.
             (*view).format = if (flags & ffi::PyBUF_FORMAT) != 0 {
@@ -238,7 +239,7 @@ impl PyBytesView {
             };
 
             (*view).suboffsets = std::ptr::null_mut();
-            (*view).internal   = std::ptr::null_mut();
+            (*view).internal = std::ptr::null_mut();
 
             // Keep this PyBytesView alive for the duration of the buffer view.
             (*view).obj = slf.as_ptr() as *mut ffi::PyObject;
@@ -284,12 +285,12 @@ impl PyBytesView {
             Ok(unsafe { Bound::from_owned_ptr(py, raw) })
         }
     }
-    
+
     /// Convert to Python bytes (copy)
     fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.bytes)
     }
-    
+
     /// Python repr
     fn __repr__(&self) -> String {
         format!("BytesView({} bytes)", self.bytes.len())
@@ -313,14 +314,14 @@ pub fn py_err<E: std::fmt::Display>(error: E) -> PyErr {
 }
 
 /// Multi-process GET for maximum throughput (Python API)
-/// 
+///
 /// Args:
 ///     uri (str): S3 URI prefix (e.g., "s3://bucket/prefix/")
 ///     procs (int): Number of worker processes to spawn (default: 4)
 ///     jobs (int): Concurrent operations per worker process (default: 64)  
 ///     num (int): Number of objects to download (for benchmarking, default: 1000)
 ///     template (str): Object name template with {} placeholder (default: "object_{}.dat")
-/// 
+///
 /// Returns:
 ///     dict: Performance statistics with keys:
 ///         - total_objects (int): Total objects processed
@@ -333,21 +334,21 @@ pub fn py_err<E: std::fmt::Display>(error: E) -> PyErr {
 /// Find the s3-cli binary for use as worker processes
 fn find_s3_cli_binary() -> Result<String, anyhow::Error> {
     use std::path::Path;
-    
+
     // Try common development locations
     let candidates = vec![
         "./target/release/s3-cli",
         "./target/debug/s3-cli",
-        "../target/release/s3-cli", 
+        "../target/release/s3-cli",
         "../target/debug/s3-cli",
     ];
-    
+
     for candidate in candidates {
         if Path::new(candidate).exists() {
             return Ok(candidate.to_string());
         }
     }
-    
+
     // Try finding s3-cli in PATH
     if let Ok(output) = std::process::Command::new("which").arg("s3-cli").output() {
         if output.status.success() {
@@ -358,7 +359,7 @@ fn find_s3_cli_binary() -> Result<String, anyhow::Error> {
             }
         }
     }
-    
+
     anyhow::bail!("Could not find s3-cli binary. Please build it with 'cargo build --bin s3-cli' or ensure it's in PATH")
 }
 
@@ -371,14 +372,14 @@ pub fn mp_get(
     num: usize,
     template: &str,
 ) -> PyResult<Py<PyAny>> {
-    use crate::mp::{MpGetConfigBuilder, run_get_shards};
+    use crate::mp::{run_get_shards, MpGetConfigBuilder};
     use std::io::Write;
     use tempfile::NamedTempFile;
-    
+
     Python::attach(|py| {
         // Parse S3 URI
         let (bucket, key_prefix) = parse_s3_uri(uri).map_err(py_err)?;
-        
+
         // Generate object keys based on template and number
         let mut keys = Vec::new();
         for i in 0..num {
@@ -389,17 +390,17 @@ pub fn mp_get(
             };
             keys.push(format!("s3://{}/{}{}", bucket, key_prefix, key));
         }
-        
+
         // Create temporary keylist file
         let mut keylist_file = NamedTempFile::new().map_err(py_err)?;
         for key in &keys {
             writeln!(keylist_file, "{}", key).map_err(py_err)?;
         }
         let keylist_path = keylist_file.path().to_path_buf();
-        
+
         // Find the s3-cli binary for worker processes
         let s3_cli_path = find_s3_cli_binary().map_err(py_err)?;
-        
+
         // Configure multi-process GET
         let config = MpGetConfigBuilder::new()
             .procs(procs)
@@ -407,10 +408,10 @@ pub fn mp_get(
             .keylist(keylist_path)
             .worker_cmd(s3_cli_path)
             .build();
-        
+
         // Run the multi-process operation
         let result = run_get_shards(&config).map_err(py_err)?;
-        
+
         // Build Python dictionary result
         let dict = PyDict::new(py);
         // New schema
@@ -426,7 +427,7 @@ pub fn mp_get(
         // Backward compatibility key: historically this represented successful
         // operations in mp_get summaries.
         dict.set_item("total_objects", result.succeeded)?;
-        
+
         // Add per-worker stats
         let workers = PyList::empty(py);
         for worker in &result.per_worker {
@@ -450,7 +451,7 @@ pub fn mp_get(
             workers.append(worker_dict)?;
         }
         dict.set_item("workers", workers)?;
-        
+
         Ok(dict.into_py_any(py)?.into())
     })
 }
@@ -463,31 +464,36 @@ pub fn init_logging(level: &str) -> PyResult<()> {
     let filter = match level.to_lowercase().as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
-        "warn"  => Level::WARN,
+        "warn" => Level::WARN,
         "error" => Level::ERROR,
-        _       => Level::INFO,
+        _ => Level::INFO,
     };
-    
+
     // Initialize tracing subscriber with the specified level
     let _ = tracing_subscriber::fmt()
         .with_max_level(filter)
         .with_target(false)
         .try_init();
-    
+
     // NOTE: tracing_log::LogTracer::init() intentionally omitted here.
     // The log→tracing bridge causes deadlocks during async OnceCell
     // initialization when debug/trace logging is active (AWS SDK uses
     // the `log` crate internally, and the bridge re-enters tracing).
     // See: https://github.com/russfellows/s3dlio/issues/105
-    
+
     Ok(())
 }
 
 #[pyfunction]
-pub fn init_op_log(path: &str) -> PyResult<()> { init_op_logger(path).map_err(py_err) }
+pub fn init_op_log(path: &str) -> PyResult<()> {
+    init_op_logger(path).map_err(py_err)
+}
 
 #[pyfunction]
-pub fn finalize_op_log() -> PyResult<()> { finalize_op_logger(); Ok(()) }
+pub fn finalize_op_log() -> PyResult<()> {
+    finalize_op_logger();
+    Ok(())
+}
 
 #[pyfunction]
 pub fn is_op_log_active() -> PyResult<bool> {
@@ -499,33 +505,42 @@ pub fn is_op_log_active() -> PyResult<bool> {
 // ---------------------------------------------------------------------------
 fn build_uri_list(prefix: &str, template: &str, num: usize) -> PyResult<(String, Vec<String>)> {
     // Extract scheme and parse URI generically (works for s3://, az://, file://, etc.)
-    let scheme_end = prefix.find("://").ok_or_else(|| {
-        anyhow::anyhow!("URI must contain scheme (e.g., s3://, az://, file://)")
-    }).map_err(py_err)?;
-    
+    let scheme_end = prefix
+        .find("://")
+        .ok_or_else(|| anyhow::anyhow!("URI must contain scheme (e.g., s3://, az://, file://)"))
+        .map_err(py_err)?;
+
     let scheme = &prefix[..scheme_end + 3]; // Include "://"
     let remainder = &prefix[scheme_end + 3..];
-    
+
     // Split into bucket/container and key prefix
     let (bucket, mut key_prefix) = if let Some(slash_pos) = remainder.find('/') {
-        (remainder[..slash_pos].to_string(), remainder[slash_pos + 1..].to_string())
+        (
+            remainder[..slash_pos].to_string(),
+            remainder[slash_pos + 1..].to_string(),
+        )
     } else {
         (remainder.to_string(), String::new())
     };
-    
-    if !key_prefix.is_empty() && !key_prefix.ends_with('/') { 
-        key_prefix.push('/'); 
+
+    if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
+        key_prefix.push('/');
     }
-    
-    let uris = (0..num).map(|i| {
-        let name = template
-            .replacen("{}", &i.to_string(), 1)
-            .replacen("{}", &num.to_string(), 1);
-        format!("{}{}/{}{}", scheme, bucket, key_prefix, name)
-    }).collect();
+
+    let uris = (0..num)
+        .map(|i| {
+            let name =
+                template
+                    .replacen("{}", &i.to_string(), 1)
+                    .replacen("{}", &num.to_string(), 1);
+            format!("{}{}/{}{}", scheme, bucket, key_prefix, name)
+        })
+        .collect();
     Ok((bucket, uris))
 }
-fn str_to_obj(s: &str) -> ObjectType { ObjectType::from(s) }
+fn str_to_obj(s: &str) -> ObjectType {
+    ObjectType::from(s)
+}
 
 fn str_to_data_gen_algorithm(s: &str) -> DataGenAlgorithm {
     match s.to_lowercase().as_str() {
@@ -547,9 +562,9 @@ fn str_to_data_gen_mode(s: &str) -> DataGenMode {
 // ------------------------------------------------------------------------
 
 /// Parse S3 URI with optional endpoint support
-/// 
+///
 /// Returns a dictionary with keys: 'endpoint' (optional), 'bucket', 'key'
-/// 
+///
 /// Examples:
 ///     >>> parse_s3_uri_full("s3://mybucket/data.bin")
 ///     {'endpoint': None, 'bucket': 'mybucket', 'key': 'data.bin'}
@@ -559,22 +574,22 @@ fn str_to_data_gen_mode(s: &str) -> DataGenMode {
 #[pyfunction]
 fn parse_s3_uri_full(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
     use crate::s3_utils::parse_s3_uri_full as parse_full;
-    
+
     let components = parse_full(uri).map_err(py_err)?;
-    
+
     // Create Python dictionary
     let dict = pyo3::types::PyDict::new(py);
-    
+
     // Add endpoint (None if not present)
     if let Some(endpoint) = components.endpoint {
         dict.set_item("endpoint", endpoint)?;
     } else {
         dict.set_item("endpoint", py.None())?;
     }
-    
+
     dict.set_item("bucket", components.bucket)?;
     dict.set_item("key", components.key)?;
-    
+
     Ok(dict.into())
 }
 
@@ -589,9 +604,7 @@ pub fn create_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
         .to_string(); // Own the string to move it across the thread boundary
 
     // Release the GIL to allow other Python threads to run
-    py.detach(move || {
-        create_bucket_rs(&final_bucket_name).map_err(py_err)
-    })
+    py.detach(move || create_bucket_rs(&final_bucket_name).map_err(py_err))
 }
 
 // - delete-bucket command
@@ -605,9 +618,7 @@ pub fn delete_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
         .to_string(); // Own the string to move across the thread boundary
 
     // Release the GIL for the blocking S3 call
-    py.detach(move || {
-        delete_bucket_rs(&final_bucket_name).map_err(py_err)
-    })
+    py.detach(move || delete_bucket_rs(&final_bucket_name).map_err(py_err))
 }
 
 // ---------------------------------------------------------------------------
@@ -623,11 +634,18 @@ pub fn delete_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
 ))]
 pub fn put(
     py: Python<'_>,
-    prefix: &str, num: usize, template: Option<&str>,
-    max_in_flight: usize, size: Option<usize>,
-    should_create_bucket: bool, object_type: &str,
-    dedup_factor: usize, compress_factor: usize,
-    data_gen_algorithm: &str, data_gen_mode: &str, chunk_size: usize,
+    prefix: &str,
+    num: usize,
+    template: Option<&str>,
+    max_in_flight: usize,
+    size: Option<usize>,
+    should_create_bucket: bool,
+    object_type: &str,
+    dedup_factor: usize,
+    compress_factor: usize,
+    data_gen_algorithm: &str,
+    data_gen_mode: &str,
+    chunk_size: usize,
 ) -> PyResult<()> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let template = template.unwrap_or("object-{}");
@@ -641,9 +659,10 @@ pub fn put(
         .with_data_gen_mode(mode)
         .with_chunk_size(chunk_size);
     py.detach(|| {
-        if should_create_bucket { let _ = create_bucket_rs(&bucket); }
-        put_objects_with_random_data_and_type(&uris, sz, jobs, config)
-            .map_err(py_err)
+        if should_create_bucket {
+            let _ = create_bucket_rs(&bucket);
+        }
+        put_objects_with_random_data_and_type(&uris, sz, jobs, config).map_err(py_err)
     })
 }
 
@@ -655,13 +674,20 @@ pub fn put(
     dedup_factor = 1, compress_factor = 1,
     data_gen_algorithm = "random", data_gen_mode = "streaming", chunk_size = 262144
 ))]
-pub (crate) fn put_async_py<'p>(
+pub(crate) fn put_async_py<'p>(
     py: Python<'p>,
-    prefix: &'p str, num: usize, template: Option<&'p str>,
-    max_in_flight: usize, size: Option<usize>,
-    should_create_bucket: bool, object_type: &'p str,
-    dedup_factor: usize, compress_factor: usize,
-    data_gen_algorithm: &'p str, data_gen_mode: &'p str, chunk_size: usize,
+    prefix: &'p str,
+    num: usize,
+    template: Option<&'p str>,
+    max_in_flight: usize,
+    size: Option<usize>,
+    should_create_bucket: bool,
+    object_type: &'p str,
+    dedup_factor: usize,
+    compress_factor: usize,
+    data_gen_algorithm: &'p str,
+    data_gen_mode: &'p str,
+    chunk_size: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let template = template.unwrap_or("object-{}");
@@ -677,16 +703,16 @@ pub (crate) fn put_async_py<'p>(
 
     future_into_py(py, async move {
         task::spawn_blocking(move || {
-            if should_create_bucket { let _ = create_bucket_rs(&bucket); }
-            put_objects_with_random_data_and_type(&uris, sz, jobs, config)
-                .map_err(py_err)
+            if should_create_bucket {
+                let _ = create_bucket_rs(&bucket);
+            }
+            put_objects_with_random_data_and_type(&uris, sz, jobs, config).map_err(py_err)
         })
         .await
         .map_err(py_err)??;
         Python::attach(|py| Ok(py.None()))
     })
 }
-
 
 // --- `list` function
 #[pyfunction]
@@ -696,22 +722,19 @@ pub fn list(uri: &str, recursive: bool, pattern: Option<&str>) -> PyResult<Vec<S
     let logger = global_logger();
     let store = get_or_create_store(uri, logger).map_err(py_err)?;
     let uri_owned = uri.to_owned();
-    
+
     // Submit to global runtime (io_uring pattern — never calls block_on)
-    let mut keys = submit_io(async move {
-        store.list(&uri_owned, recursive).await
-    })?;
-    
+    let mut keys = submit_io(async move { store.list(&uri_owned, recursive).await })?;
+
     // Apply client-side regex filtering if pattern provided
     if let Some(pat) = pattern {
         use regex::Regex;
         let re = Regex::new(pat).map_err(py_err)?;
         keys.retain(|k| re.is_match(k));
     }
-    
+
     Ok(keys)
 }
-
 
 // New stat calls, almost the same ????
 //
@@ -721,12 +744,10 @@ pub fn stat(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
     let logger = global_logger();
     let store = get_or_create_store(uri, logger).map_err(py_err)?;
     let uri_owned = uri.to_owned();
-    
+
     // Submit to global runtime (io_uring pattern — never calls block_on)
-    let os = submit_io(async move {
-        store.stat(&uri_owned).await
-    })?;
-    
+    let os = submit_io(async move { store.stat(&uri_owned).await })?;
+
     let d = stat_to_pydict(py, os)?;
     Ok(d.unbind().into())
 }
@@ -736,7 +757,7 @@ fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAn
     let uri = uri.to_owned();
     let logger = global_logger();
     let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
-    
+
     future_into_py(py, async move {
         let os = store.stat(&uri).await.map_err(py_err)?;
         Python::attach(|py| {
@@ -761,11 +782,11 @@ fn stat_many_async<'py>(py: Python<'py>, uris: Vec<String>) -> PyResult<pyo3::Bo
     })
 }
 
-
 /// Helper function to map Rust to Python for stat call
-fn stat_to_pydict<'py>(py: Python<'py>, os: crate::s3_utils::ObjectStat)
-    -> PyResult<pyo3::Bound<'py, PyDict>>
-{
+fn stat_to_pydict<'py>(
+    py: Python<'py>,
+    os: crate::s3_utils::ObjectStat,
+) -> PyResult<pyo3::Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("size", os.size)?;
     d.set_item("last_modified", os.last_modified)?;
@@ -786,7 +807,6 @@ fn stat_to_pydict<'py>(py: Python<'py>, os: crate::s3_utils::ObjectStat)
     Ok(d)
 }
 
-
 // ---------------------------------------------------------------------------
 // exists() - Check if object exists (DLIO benchmark compatibility)
 // ---------------------------------------------------------------------------
@@ -805,7 +825,7 @@ pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
                 Ok(s) => s,
                 Err(_) => return Ok(false), // URI parsing error → doesn't exist
             };
-            
+
             match store.stat(&uri_owned).await {
                 Ok(_) => Ok(true),
                 Err(_) => Ok(false),
@@ -821,7 +841,7 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
     let uri = uri.to_owned();
     let logger = global_logger();
     let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
-    
+
     future_into_py(py, async move {
         match store.stat(&uri).await {
             Ok(_) => Ok(true),
@@ -830,38 +850,37 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
     })
 }
 
-
 // ---------------------------------------------------------------------------
 // put_bytes() - Zero-copy put from Python bytes to any backend
 // ---------------------------------------------------------------------------
 
 /// Put bytes data to any storage backend with zero-copy from Python.
-/// 
+///
 /// This function accepts Python bytes/bytearray and writes them to the specified
 /// URI without copying the data on the Rust side. The data is borrowed directly
 /// from Python's memory buffer.
-/// 
+///
 /// # Arguments
 /// * `uri` - Full URI including scheme (s3://, az://, gs://, file://, direct://)
 /// * `data` - Python bytes, bytearray, or any object supporting the buffer protocol
-/// 
+///
 /// # Examples
 /// ```python
 /// import s3dlio
-/// 
+///
 /// # Put bytes to S3
 /// s3dlio.put_bytes("s3://bucket/key.bin", b"hello world")
-/// 
+///
 /// # Put bytes to local file
 /// s3dlio.put_bytes("file:///tmp/test.bin", b"hello world")
-/// 
+///
 /// # Put bytes to Azure
 /// s3dlio.put_bytes("az://container/blob.bin", b"hello world")
-/// 
+///
 /// # Put bytearray or any buffer-like object
 /// data = bytearray(b"hello world")
 /// s3dlio.put_bytes("file:///tmp/test.bin", data)
-/// 
+///
 /// # Put dgen_py.BytesView or numpy array
 /// import dgen_py
 /// data = dgen_py.generate_buffer(1024)
@@ -870,19 +889,20 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 #[pyfunction]
 pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult<()> {
     let uri = uri.to_owned();
-    
+
     // Use same conversion logic as put_bytes_async for consistency
     let data_owned = if let Ok(buffer) = PyBuffer::<u8>::get(data) {
         // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
         let len = buffer.len_bytes();
         let mut vec = Vec::<u8>::with_capacity(len);
-        unsafe { vec.set_len(len); }
-        
-        buffer.copy_to_slice(py, &mut vec[..])
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyBufferError, _>(
-                format!("Buffer copy failed: {}", e)
-            ))?;
-        
+        unsafe {
+            vec.set_len(len);
+        }
+
+        buffer.copy_to_slice(py, &mut vec[..]).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!("Buffer copy failed: {}", e))
+        })?;
+
         Bytes::from(vec)
     } else if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
         // s3dlio's own BytesView - zero-copy Arc clone (optimal)
@@ -892,38 +912,39 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
         Bytes::copy_from_slice(py_bytes.as_bytes())
     } else {
         // Last resort: Try __bytes__() method or bytes() conversion
-        let bytes_result = data.call_method0("__bytes__")
-            .or_else(|_| {
-                let bytes_type = py.get_type::<PyBytes>();
-                bytes_type.call1((data,))
-            });
-        
+        let bytes_result = data.call_method0("__bytes__").or_else(|_| {
+            let bytes_type = py.get_type::<PyBytes>();
+            bytes_type.call1((data,))
+        });
+
         match bytes_result {
             Ok(bytes_obj) => {
                 if let Ok(py_bytes) = bytes_obj.cast::<PyBytes>() {
                     Bytes::copy_from_slice(py_bytes.as_bytes())
                 } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                        format!("__bytes__() returned non-bytes object: {}", bytes_obj.get_type().name()?)
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                        "__bytes__() returned non-bytes object: {}",
+                        bytes_obj.get_type().name()?
+                    )));
                 }
             }
             Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("Cannot convert data to bytes: {}. Expected bytes-like object", e)
-                ));
+                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                    "Cannot convert data to bytes: {}. Expected bytes-like object",
+                    e
+                )));
             }
         }
     };
-    
+
     py.detach(move || {
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
             let logger = global_logger();
-            
+
             // Get cached store (or create if first time)
             let store = get_or_create_store(&uri, logger)?;
-            
+
             // Execute operation using cached client — zero-copy Bytes
             store.put(&uri, data_owned).await
         })
@@ -931,32 +952,37 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
 }
 
 /// Async version of put_bytes() - accepts any bytes-like object
-/// 
+///
 /// Accepts (in order of optimization):
 /// 1. Buffer protocol objects (dgen_py.BytesView, numpy arrays, bytearray, memoryview) - optimized copy
 /// 2. s3dlio's own BytesView - zero-copy Arc clone
 /// 3. Python bytes - direct copy
 /// 4. Any object with __bytes__() method - converted via bytes()
-/// 
+///
 /// Design philosophy: Be liberal in what you accept, optimize based on what you get.
 /// Never reject valid data - match the permissiveness of minio/boto3/s3torch.
 #[pyfunction]
-fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+fn put_bytes_async<'py>(
+    py: Python<'py>,
+    uri: &str,
+    data: &Bound<'_, PyAny>,
+) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
-    
+
     // Try optimal paths first, fall back gracefully
     let data_owned = if let Ok(buffer) = PyBuffer::<u8>::get(data) {
         // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
         // This is the most common path for external buffer objects
         let len = buffer.len_bytes();
         let mut vec = Vec::<u8>::with_capacity(len);
-        unsafe { vec.set_len(len); }
-        
-        buffer.copy_to_slice(py, &mut vec[..])
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyBufferError, _>(
-                format!("Buffer copy failed: {}", e)
-            ))?;
-        
+        unsafe {
+            vec.set_len(len);
+        }
+
+        buffer.copy_to_slice(py, &mut vec[..]).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!("Buffer copy failed: {}", e))
+        })?;
+
         Bytes::from(vec)
     } else if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
         // s3dlio's own BytesView - zero-copy Arc clone (optimal)
@@ -967,21 +993,21 @@ fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyAny>) -> 
     } else {
         // Last resort: Try __bytes__() method or bytes() conversion
         // This handles any custom objects that can be converted to bytes
-        let bytes_result = data.call_method0("__bytes__")
-            .or_else(|_| {
-                // If __bytes__() doesn't exist, try bytes(data)
-                let bytes_type = py.get_type::<PyBytes>();
-                bytes_type.call1((data,))
-            });
-        
+        let bytes_result = data.call_method0("__bytes__").or_else(|_| {
+            // If __bytes__() doesn't exist, try bytes(data)
+            let bytes_type = py.get_type::<PyBytes>();
+            bytes_type.call1((data,))
+        });
+
         match bytes_result {
             Ok(bytes_obj) => {
                 if let Ok(py_bytes) = bytes_obj.cast::<PyBytes>() {
                     Bytes::copy_from_slice(py_bytes.as_bytes())
                 } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                        format!("__bytes__() returned non-bytes object: {}", bytes_obj.get_type().name()?)
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                        "__bytes__() returned non-bytes object: {}",
+                        bytes_obj.get_type().name()?
+                    )));
                 }
             }
             Err(e) => {
@@ -991,7 +1017,7 @@ fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyAny>) -> 
             }
         }
     };
-    
+
     future_into_py(py, async move {
         let logger = global_logger();
         let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
@@ -999,34 +1025,33 @@ fn put_bytes_async<'py>(py: Python<'py>, uri: &str, data: &Bound<'_, PyAny>) -> 
     })
 }
 
-
 // ---------------------------------------------------------------------------
 // mkdir() - Create directory/prefix for any backend
 // ---------------------------------------------------------------------------
 
 /// Create a directory (file://, direct://) or prefix marker (s3://, az://, gs://).
-/// 
+///
 /// # Backend Behavior
 /// - `file://`, `direct://`: Creates actual directory using create_dir_all()
 /// - `s3://`, `az://`, `gs://`: Creates empty marker object (no-op for some backends)
-/// 
+///
 /// # Arguments
 /// * `uri` - Full URI including scheme and trailing slash recommended for clarity
-/// 
+///
 /// # Examples
 /// ```python
 /// import s3dlio
-/// 
+///
 /// # Create local directory
 /// s3dlio.mkdir("file:///tmp/mydata/subdir/")
-/// 
+///
 /// # Create S3 prefix marker
 /// s3dlio.mkdir("s3://bucket/prefix/")
 /// ```
 #[pyfunction]
 pub fn mkdir(py: Python<'_>, uri: &str) -> PyResult<()> {
     let uri = uri.to_owned();
-    
+
     py.detach(move || {
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
@@ -1041,14 +1066,13 @@ pub fn mkdir(py: Python<'_>, uri: &str) -> PyResult<()> {
 #[pyfunction]
 fn mkdir_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
-    
+
     future_into_py(py, async move {
         let logger = global_logger();
         let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
         store.mkdir(&uri).await.map_err(py_err)
     })
 }
-
 
 #[pyfunction(name = "get_many_stats")]
 #[pyo3(signature = (uris, max_in_flight = 64))]
@@ -1086,7 +1110,7 @@ pub fn get_many_stats_async<'p>(
 
 #[pyfunction(name = "get_many_async")]
 #[pyo3(signature = (uris, max_in_flight = 64))]
-pub (crate) fn get_many_async_py<'p>(
+pub(crate) fn get_many_async_py<'p>(
     py: Python<'p>,
     uris: Vec<String>,
     max_in_flight: usize,
@@ -1094,14 +1118,14 @@ pub (crate) fn get_many_async_py<'p>(
     future_into_py(py, async move {
         // get_objects_parallel returns Vec<(String, Bytes)> - keep as Bytes for zero-copy
         let pairs: Vec<(String, Bytes)> = task::spawn_blocking(move || {
-            get_objects_parallel(&uris, max_in_flight)
-                .map_err(py_err)
+            get_objects_parallel(&uris, max_in_flight).map_err(py_err)
         })
         .await
         .map_err(py_err)??;
 
         Python::attach(|_py| {
-            let out = pairs.into_iter()
+            let out = pairs
+                .into_iter()
                 .map(|(u, b)| (u, PyBytesView::new(b)))
                 .collect::<Vec<_>>();
             Ok(out)
@@ -1127,8 +1151,12 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
 // --- `get_range` function (universal backend support)
 #[pyfunction(name = "get_range")]
 #[pyo3(signature = (uri, offset, length = None))]
-pub fn get_range_py(py: Python<'_>, uri: &str, offset: u64, length: Option<u64>) -> PyResult<PyBytesView> {
-
+pub fn get_range_py(
+    py: Python<'_>,
+    uri: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> PyResult<PyBytesView> {
     // Use universal ObjectStore interface for range requests
     let uri_owned = uri.to_owned();
     py.detach(|| {
@@ -1171,11 +1199,19 @@ pub fn get_async_py<'p>(py: Python<'p>, uri: &str) -> PyResult<Bound<'p, PyAny>>
 /// Async variant of `get_range` — returns a coroutine yielding a `BytesView`.
 #[pyfunction(name = "get_range_async")]
 #[pyo3(signature = (uri, offset, length = None))]
-pub fn get_range_async_py<'p>(py: Python<'p>, uri: &str, offset: u64, length: Option<u64>) -> PyResult<Bound<'p, PyAny>> {
+pub fn get_range_async_py<'p>(
+    py: Python<'p>,
+    uri: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> PyResult<Bound<'p, PyAny>> {
     let uri_owned = uri.to_owned();
     future_into_py(py, async move {
         let store = get_or_create_store(&uri_owned, None).map_err(py_err)?;
-        let bytes = store.get_range(&uri_owned, offset, length).await.map_err(py_err)?;
+        let bytes = store
+            .get_range(&uri_owned, offset, length)
+            .await
+            .map_err(py_err)?;
         Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
     })
 }
@@ -1203,7 +1239,6 @@ pub fn download(
     })
 }
 
-
 // --- `get_many` function (universal backend support)
 #[pyfunction]
 #[pyo3(signature = (uris, max_in_flight = 64))]
@@ -1213,30 +1248,31 @@ pub fn get_many(
     max_in_flight: usize,
 ) -> PyResult<Vec<(String, PyBytesView)>> {
     use crate::object_store::{infer_scheme, Scheme};
-    use tokio::sync::Semaphore;
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::sync::Arc;
-    
+    use tokio::sync::Semaphore;
+
     py.detach(|| {
         // Check all URIs are the same scheme
         let schemes: Vec<_> = uris.iter().map(|u| infer_scheme(u)).collect();
-        let first_scheme = schemes.first().ok_or_else(|| {
-            PyRuntimeError::new_err("get_many requires at least one URI")
-        })?;
-        
+        let first_scheme = schemes
+            .first()
+            .ok_or_else(|| PyRuntimeError::new_err("get_many requires at least one URI"))?;
+
         // Verify all URIs use the same scheme
         if !schemes.iter().all(|s| s == first_scheme) {
             return Err(PyRuntimeError::new_err(
-                "get_many requires all URIs to use the same backend scheme"
+                "get_many requires all URIs to use the same backend scheme",
             ));
         }
-        
+
         // Route to appropriate backend
         match first_scheme {
             Scheme::S3 => {
                 // Use existing optimized S3 implementation
                 let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
-                Ok(res.into_iter()
+                Ok(res
+                    .into_iter()
                     .map(|(u, b)| (u, PyBytesView::new(b)))
                     .collect())
             }
@@ -1247,32 +1283,35 @@ pub fn get_many(
                 let res = submit_io(async move {
                     let sem = Arc::new(Semaphore::new(max_in_flight));
                     let mut futs = FuturesUnordered::new();
-                    
+
                     for uri in uris_clone.iter().cloned() {
                         let sem = Arc::clone(&sem);
                         futs.push(tokio::spawn(async move {
                             let _permit = sem.acquire_owned().await.unwrap();
-                            let path = uri.strip_prefix("file://")
+                            let path = uri
+                                .strip_prefix("file://")
                                 .or_else(|| uri.strip_prefix("direct://"))
                                 .unwrap_or(&uri);
                             let file_bytes = tokio::fs::read(path).await?;
                             Ok::<_, std::io::Error>((uri, Bytes::from(file_bytes)))
                         }));
                     }
-                    
+
                     let mut out = Vec::new();
                     while let Some(res) = futs.next().await {
-                        let (uri, bytes) = res.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+                        let (uri, bytes) = res
+                            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
                             .map_err(|e| anyhow::anyhow!("File read error: {}", e))?;
                         out.push((uri, bytes));
                     }
-                    
+
                     // Maintain input order
                     out.sort_by_key(|(u, _)| uris_clone.iter().position(|x| x == u).unwrap());
                     Ok::<_, anyhow::Error>(out)
                 })?;
-                
-                Ok(res.into_iter()
+
+                Ok(res
+                    .into_iter()
                     .map(|(u, b)| (u, PyBytesView::new(b)))
                     .collect())
             }
@@ -1283,57 +1322,57 @@ pub fn get_many(
                 let res = submit_io(async move {
                     let sem = Arc::new(Semaphore::new(max_in_flight));
                     let mut futs = FuturesUnordered::new();
-                    
+
                     for uri in uris_clone.iter().cloned() {
                         let sem = Arc::clone(&sem);
                         futs.push(tokio::spawn(async move {
                             let _permit = sem.acquire_owned().await.unwrap();
-                            
+
                             // Use store_for_uri to get appropriate backend
                             let store = store_for_uri(&uri)?;
-                            
+
                             // Extract the key from the URI
                             let key = if let Some(idx) = uri.find("://") {
-                                if let Some(slash_idx) = uri[idx+3..].find('/') {
-                                    &uri[idx+3+slash_idx+1..]
+                                if let Some(slash_idx) = uri[idx + 3..].find('/') {
+                                    &uri[idx + 3 + slash_idx + 1..]
                                 } else {
                                     ""
                                 }
                             } else {
                                 &uri
                             };
-                            
+
                             if key.is_empty() {
                                 anyhow::bail!("Cannot GET: no key specified in URI: {}", uri);
                             }
-                            
+
                             let bytes = store.get(key).await?;
                             Ok::<_, anyhow::Error>((uri, bytes))
                         }));
                     }
-                    
+
                     let mut out = Vec::new();
                     while let Some(res) = futs.next().await {
-                        let (uri, bytes) = res.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+                        let (uri, bytes) = res
+                            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
                             .map_err(|e| anyhow::anyhow!("Get error: {}", e))?;
                         out.push((uri, bytes));
                     }
-                    
+
                     // Maintain input order
                     out.sort_by_key(|(u, _)| uris_clone.iter().position(|x| x == u).unwrap());
                     Ok::<_, anyhow::Error>(out)
                 })?;
-                
-                Ok(res.into_iter()
+
+                Ok(res
+                    .into_iter()
                     .map(|(u, b)| (u, PyBytesView::new(b)))
                     .collect())
             }
-            Scheme::Unknown => {
-                Err(PyRuntimeError::new_err(format!(
-                    "Unsupported URI scheme for get_many: {}", 
-                    uris.first().unwrap_or(&String::new())
-                )))
-            }
+            Scheme::Unknown => Err(PyRuntimeError::new_err(format!(
+                "Unsupported URI scheme for get_many: {}",
+                uris.first().unwrap_or(&String::new())
+            ))),
         }
     })
 }
@@ -1349,19 +1388,20 @@ pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
         submit_io(async move {
             let logger = global_logger();
             let store = get_or_create_store(&uri_owned, logger)?;
-            
+
             // Check if URI contains wildcards or ends with / (pattern/directory)
-            let has_pattern = uri_owned.contains('*') || uri_owned.contains('?') || uri_owned.ends_with('/');
-            
+            let has_pattern =
+                uri_owned.contains('*') || uri_owned.contains('?') || uri_owned.ends_with('/');
+
             if has_pattern || recursive {
                 // Need to list objects first, then delete them
                 let list_results = store.list(&uri_owned, recursive).await?;
-                
+
                 if list_results.is_empty() {
                     // No objects matched - this is OK
                     return Ok(());
                 }
-                
+
                 // Delete each object (list returns full URIs)
                 for obj_uri in list_results {
                     store.delete(&obj_uri).await?;
@@ -1374,7 +1414,6 @@ pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
         })
     })
 }
-
 
 #[pyfunction]
 #[pyo3(signature = (src_patterns, dest_prefix,
@@ -1393,7 +1432,7 @@ pub fn upload(
         submit_io(async move {
             // Get logger if op-log is active
             let logger = global_logger();
-            
+
             // Handle bucket creation ONLY if explicitly requested
             if create_bucket {
                 if let Ok(store) = store_for_uri_with_logger(&dest_prefix_owned, logger.clone()) {
@@ -1404,9 +1443,15 @@ pub fn upload(
                                 warn!("Failed to create bucket {}: {}", bucket, e);
                             }
                         }
-                    } else if dest_prefix_owned.starts_with("az://") || dest_prefix_owned.starts_with("azure://") {
+                    } else if dest_prefix_owned.starts_with("az://")
+                        || dest_prefix_owned.starts_with("azure://")
+                    {
                         // For Azure, extract container name
-                        let parts: Vec<&str> = dest_prefix_owned.trim_start_matches("az://").trim_start_matches("azure://").split('/').collect();
+                        let parts: Vec<&str> = dest_prefix_owned
+                            .trim_start_matches("az://")
+                            .trim_start_matches("azure://")
+                            .split('/')
+                            .collect();
                         if let Some(container) = parts.get(0) {
                             if let Err(e) = store.create_container(container).await {
                                 warn!("Failed to create container {}: {}", container, e);
@@ -1416,7 +1461,7 @@ pub fn upload(
                     // File backends don't need bucket creation, directories are created automatically
                 }
             }
-            
+
             // Use generic upload that works with all backends
             generic_upload_files(&dest_prefix_owned, &paths, max_in_flight, None).await
         })
@@ -1461,8 +1506,8 @@ pub fn put_many(
     items: Vec<(String, Vec<u8>)>,
     max_in_flight: usize,
 ) -> PyResult<()> {
-    use tokio::sync::Semaphore;
     use futures::stream::{FuturesUnordered, StreamExt};
+    use tokio::sync::Semaphore;
 
     // Convert Vec<u8> → Bytes on the Python thread (one copy per item,
     // after this everything is zero-copy via Arc)
@@ -1506,8 +1551,8 @@ pub fn put_many_async<'py>(
     items: Vec<(String, Vec<u8>)>,
     max_in_flight: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    use tokio::sync::Semaphore;
     use futures::stream::{FuturesUnordered, StreamExt};
+    use tokio::sync::Semaphore;
 
     // Convert Vec<u8> → Bytes
     let owned_items: Vec<(String, Bytes)> = items
@@ -1553,22 +1598,27 @@ impl PyWriterOptions {
             inner: WriterOptions::new(),
         }
     }
-    
+
     /// Set compression for the writer
     fn with_compression(&mut self, compression_type: &str, level: Option<i32>) -> PyResult<()> {
         let compression = match compression_type.to_lowercase().as_str() {
             "zstd" => {
                 let level = level.unwrap_or(3); // Default zstd compression level
                 CompressionConfig::Zstd { level }
-            },
+            }
             "none" => CompressionConfig::None,
-            _ => return Err(PyRuntimeError::new_err(format!("Unsupported compression type: {}", compression_type))),
+            _ => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Unsupported compression type: {}",
+                    compression_type
+                )))
+            }
         };
-        
+
         self.inner = self.inner.clone().with_compression(compression);
         Ok(())
     }
-    
+
     /// Set buffer size for the writer
     fn with_buffer_size(&mut self, size: usize) {
         self.inner = self.inner.clone().with_buffer_size(size);
@@ -1585,88 +1635,98 @@ pub struct PyObjectWriter {
 #[pymethods]
 impl PyObjectWriter {
     /// Write a chunk of bytes to the stream (ZERO-COPY via buffer protocol)
-    /// 
+    ///
     /// Accepts any Python object supporting the buffer protocol:
     /// - bytes, bytearray, memoryview
     /// - NumPy arrays, PyTorch tensors
     /// - Any object with __buffer__ method
-    /// 
+    ///
     /// This method avoids copying data from Python to Rust by using PyBuffer
     /// to get a direct view of Python's memory during the synchronous write.
     fn write_chunk(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let writer = self.inner.as_mut()
+        let writer = self
+            .inner
+            .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
-        
+
         // Try buffer protocol first (zero-copy path)
         if let Ok(buffer) = PyBuffer::<u8>::get(data) {
             // Get readonly slice - no copy!
             let slice = unsafe {
                 // SAFETY: We hold the buffer for the entire duration of block_on,
                 // so the memory remains valid. The GIL is held during block_on.
-                std::slice::from_raw_parts(
-                    buffer.buf_ptr() as *const u8,
-                    buffer.len_bytes()
-                )
+                std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
             };
-            
+
             // Synchronous write while buffer is alive
             return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer.write_chunk(slice).await
+                writer
+                    .write_chunk(slice)
+                    .await
                     .map_err(|e| PyRuntimeError::new_err(format!("Failed to write chunk: {}", e)))
             });
         }
-        
+
         // Fallback for PyBytes (shouldn't happen, but safe)
         if let Ok(bytes) = data.cast::<PyBytes>() {
             let slice = bytes.as_bytes();
             return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer.write_chunk(slice).await
+                writer
+                    .write_chunk(slice)
+                    .await
                     .map_err(|e| PyRuntimeError::new_err(format!("Failed to write chunk: {}", e)))
             });
         }
-        
+
         Err(PyRuntimeError::new_err(
             "write_chunk requires bytes-like object (bytes, bytearray, memoryview, numpy array, etc.)"
         ))
     }
-    
+
     /// Write owned bytes (converts buffer protocol object to owned Vec for async)
-    /// 
+    ///
     /// This method copies data but takes ownership, useful when the caller
     /// doesn't need the buffer anymore. For true zero-copy, use write_chunk().
     fn write_owned_bytes(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let writer = self.inner.as_mut()
+        let writer = self
+            .inner
+            .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
-        
+
         // Try buffer protocol
         if let Ok(buffer) = PyBuffer::<u8>::get(data) {
             let len = buffer.len_bytes();
             let mut vec = Vec::<u8>::with_capacity(len);
-            unsafe { vec.set_len(len); }
-            
-            buffer.copy_to_slice(data.py(), &mut vec[..])
+            unsafe {
+                vec.set_len(len);
+            }
+
+            buffer
+                .copy_to_slice(data.py(), &mut vec[..])
                 .map_err(|e| PyRuntimeError::new_err(format!("Buffer copy failed: {}", e)))?;
-            
+
             return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer.write_owned_bytes(vec).await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e)))
+                writer.write_owned_bytes(vec).await.map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e))
+                })
             });
         }
-        
+
         // Fallback for PyBytes
         if let Ok(bytes) = data.cast::<PyBytes>() {
             let vec = bytes.as_bytes().to_vec();
             return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer.write_owned_bytes(vec).await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e)))
+                writer.write_owned_bytes(vec).await.map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e))
+                })
             });
         }
-        
+
         Err(PyRuntimeError::new_err(
-            "write_owned_bytes requires bytes-like object"
+            "write_owned_bytes requires bytes-like object",
         ))
     }
-    
+
     /// Finalize the writer and complete the upload
     fn finalize(&mut self, py: Python<'_>) -> PyResult<(u64, u64)> {
         if let Some(writer) = self.inner.take() {
@@ -1676,7 +1736,8 @@ impl PyObjectWriter {
                     writer.finalize().await.map_err(py_err)?;
                     Ok::<(u64, u64), PyErr>(stats)
                 })
-            }).map(|stats| {
+            })
+            .map(|stats| {
                 self.finalized_stats = Some(stats);
                 stats
             })
@@ -1684,7 +1745,7 @@ impl PyObjectWriter {
             Err(PyRuntimeError::new_err("Writer already finalized"))
         }
     }
-    
+
     /// Get the number of bytes written so far
     fn bytes_written(&self) -> PyResult<u64> {
         if let Some((bytes_written, _)) = self.finalized_stats {
@@ -1695,12 +1756,12 @@ impl PyObjectWriter {
             Err(PyRuntimeError::new_err("Writer has been finalized"))
         }
     }
-    
+
     /// Get the checksum of the data written (if available)
     fn checksum(&self) -> Option<String> {
         self.inner.as_ref().and_then(|w| w.checksum())
     }
-    
+
     /// Get the number of compressed bytes (if compression is enabled)
     fn compressed_bytes(&self) -> PyResult<u64> {
         if let Some((_, compressed)) = self.finalized_stats {
@@ -1715,16 +1776,26 @@ impl PyObjectWriter {
 
 /// Create a streaming writer for S3
 #[pyfunction]
-pub fn create_s3_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
-    let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
-    
+pub fn create_s3_writer(
+    py: Python<'_>,
+    uri: String,
+    options: Option<&PyWriterOptions>,
+) -> PyResult<PyObjectWriter> {
+    let opts = options
+        .map(|o| o.inner.clone())
+        .unwrap_or_else(WriterOptions::new);
+
     py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
             let store = S3ObjectStore::new();
-            let writer = store.create_writer(&uri, opts).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create S3 writer: {}", e)))?;
-            
-            Ok(PyObjectWriter { inner: Some(writer), finalized_stats: None })
+            let writer = store.create_writer(&uri, opts).await.map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to create S3 writer: {}", e))
+            })?;
+
+            Ok(PyObjectWriter {
+                inner: Some(writer),
+                finalized_stats: None,
+            })
         })
     })
 }
@@ -1732,16 +1803,26 @@ pub fn create_s3_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOp
 /// Create a streaming writer for Azure Blob Storage
 #[pyfunction]
 #[cfg(feature = "backend-azure")]
-pub fn create_azure_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
-    let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
-    
+pub fn create_azure_writer(
+    py: Python<'_>,
+    uri: String,
+    options: Option<&PyWriterOptions>,
+) -> PyResult<PyObjectWriter> {
+    let opts = options
+        .map(|o| o.inner.clone())
+        .unwrap_or_else(WriterOptions::new);
+
     py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
             let store = AzureObjectStore::new();
-            let writer = store.create_writer(&uri, opts).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create Azure writer: {}", e)))?;
-            
-            Ok(PyObjectWriter { inner: Some(writer), finalized_stats: None })
+            let writer = store.create_writer(&uri, opts).await.map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to create Azure writer: {}", e))
+            })?;
+
+            Ok(PyObjectWriter {
+                inner: Some(writer),
+                finalized_stats: None,
+            })
         })
     })
 }
@@ -1749,7 +1830,11 @@ pub fn create_azure_writer(py: Python<'_>, uri: String, options: Option<&PyWrite
 /// Create a streaming writer for Azure Blob Storage
 #[pyfunction]
 #[cfg(not(feature = "backend-azure"))]
-pub fn create_azure_writer(_py: Python<'_>, _uri: String, _options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
+pub fn create_azure_writer(
+    _py: Python<'_>,
+    _uri: String,
+    _options: Option<&PyWriterOptions>,
+) -> PyResult<PyObjectWriter> {
     Err(PyRuntimeError::new_err(
         "Azure backend is not enabled in this build. Rebuild with feature 'backend-azure' or 'full-backends'."
     ))
@@ -1757,32 +1842,52 @@ pub fn create_azure_writer(_py: Python<'_>, _uri: String, _options: Option<&PyWr
 
 /// Create a streaming writer for filesystem
 #[pyfunction]
-pub fn create_filesystem_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
-    let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
-    
+pub fn create_filesystem_writer(
+    py: Python<'_>,
+    uri: String,
+    options: Option<&PyWriterOptions>,
+) -> PyResult<PyObjectWriter> {
+    let opts = options
+        .map(|o| o.inner.clone())
+        .unwrap_or_else(WriterOptions::new);
+
     py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
             let store = FileSystemObjectStore::new();
-            let writer = store.create_writer(&uri, opts).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create filesystem writer: {}", e)))?;
-            
-            Ok(PyObjectWriter { inner: Some(writer), finalized_stats: None })
+            let writer = store.create_writer(&uri, opts).await.map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to create filesystem writer: {}", e))
+            })?;
+
+            Ok(PyObjectWriter {
+                inner: Some(writer),
+                finalized_stats: None,
+            })
         })
     })
 }
 
 /// Create a streaming writer for direct I/O filesystem
 #[pyfunction]
-pub fn create_direct_filesystem_writer(py: Python<'_>, uri: String, options: Option<&PyWriterOptions>) -> PyResult<PyObjectWriter> {
-    let opts = options.map(|o| o.inner.clone()).unwrap_or_else(WriterOptions::new);
-    
+pub fn create_direct_filesystem_writer(
+    py: Python<'_>,
+    uri: String,
+    options: Option<&PyWriterOptions>,
+) -> PyResult<PyObjectWriter> {
+    let opts = options
+        .map(|o| o.inner.clone())
+        .unwrap_or_else(WriterOptions::new);
+
     py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
             let store = ConfigurableFileSystemObjectStore::new(Default::default());
-            let writer = store.create_writer(&uri, opts).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create direct filesystem writer: {}", e)))?;
-            
-            Ok(PyObjectWriter { inner: Some(writer), finalized_stats: None })
+            let writer = store.create_writer(&uri, opts).await.map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to create direct filesystem writer: {}", e))
+            })?;
+
+            Ok(PyObjectWriter {
+                inner: Some(writer),
+                finalized_stats: None,
+            })
         })
     })
 }
@@ -1791,7 +1896,7 @@ pub fn create_direct_filesystem_writer(py: Python<'_>, uri: String, options: Opt
 // Multi-Endpoint Support (v0.9.14+)
 // ---------------------------------------------------------------------------
 
-use crate::multi_endpoint::{MultiEndpointStore, LoadBalanceStrategy};
+use crate::multi_endpoint::{LoadBalanceStrategy, MultiEndpointStore};
 use crate::uri_utils;
 
 /// Python wrapper for MultiEndpointStore
@@ -1806,82 +1911,92 @@ impl PyMultiEndpointStore {
     fn get<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
-        
+
         future_into_py(py, async move {
-            let data = store.get(&uri).await
+            let data = store
+                .get(&uri)
+                .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Get failed: {}", e)))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
             Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
         })
     }
-    
+
     /// Get a byte range from an object (zero-copy via BytesView)
     fn get_range<'py>(
         &self,
         py: Python<'py>,
         uri: &str,
         offset: u64,
-        length: Option<u64>
+        length: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
-        
+
         future_into_py(py, async move {
-            let data = store.get_range(&uri, offset, length).await
+            let data = store
+                .get_range(&uri, offset, length)
+                .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Get range failed: {}", e)))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
             Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
         })
     }
-    
+
     /// Put an object to the multi-endpoint store
     fn put<'py>(&self, py: Python<'py>, uri: &str, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let data = Bytes::copy_from_slice(data);
         let store = self.store.clone();
-        
+
         future_into_py(py, async move {
-            store.put(&uri, data).await
+            store
+                .put(&uri, data)
+                .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Put failed: {}", e)))?;
             Ok(())
         })
     }
-    
+
     /// List objects under a prefix
     fn list<'py>(
         &self,
         py: Python<'py>,
         prefix: &str,
-        recursive: bool
+        recursive: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = prefix.to_string();
         let store = self.store.clone();
-        
+
         future_into_py(py, async move {
-            let objects = store.list(&prefix, recursive).await
+            let objects = store
+                .list(&prefix, recursive)
+                .await
                 .map_err(|e| PyRuntimeError::new_err(format!("List failed: {}", e)))?;
             // Return Vec<String> - PyO3 automatically converts to Python list
             Ok(objects)
         })
     }
-    
+
     /// Delete an object
     fn delete<'py>(&self, py: Python<'py>, uri: &str) -> PyResult<Bound<'py, PyAny>> {
         let uri = uri.to_string();
         let store = self.store.clone();
-        
+
         future_into_py(py, async move {
-            store.delete(&uri).await
+            store
+                .delete(&uri)
+                .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Delete failed: {}", e)))?;
             Ok(())
         })
     }
-    
+
     /// Get per-endpoint statistics
     fn get_endpoint_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let stats = self.store.get_all_stats();
         let list = PyList::empty(py);
-        
+
         for (uri, stat) in stats {
             let dict = PyDict::new(py);
             dict.set_item("uri", uri)?;
@@ -1892,29 +2007,29 @@ impl PyMultiEndpointStore {
             dict.set_item("active_requests", stat.active_requests)?;
             list.append(dict)?;
         }
-        
+
         Ok(list.into())
     }
-    
+
     /// Get total aggregated statistics across all endpoints
     fn get_total_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let total = self.store.get_total_stats();
         let dict = PyDict::new(py);
-        
+
         dict.set_item("total_requests", total.total_requests)?;
         dict.set_item("bytes_read", total.bytes_read)?;
         dict.set_item("bytes_written", total.bytes_written)?;
         dict.set_item("error_count", total.error_count)?;
         dict.set_item("active_requests", total.active_requests)?;
-        
+
         Ok(dict.into())
     }
-    
+
     /// Get the number of configured endpoints
     fn endpoint_count(&self) -> usize {
         self.store.endpoint_count()
     }
-    
+
     /// Get the load balancing strategy
     fn strategy(&self) -> String {
         match self.store.strategy() {
@@ -1944,20 +2059,26 @@ impl PyMultiEndpointStore {
 #[pyfunction]
 fn create_multi_endpoint_store(
     uris: Vec<String>,
-    strategy: Option<&str>
+    strategy: Option<&str>,
 ) -> PyResult<PyMultiEndpointStore> {
     let strategy = match strategy.unwrap_or("round_robin") {
         "round_robin" => LoadBalanceStrategy::RoundRobin,
         "least_connections" => LoadBalanceStrategy::LeastConnections,
-        s => return Err(PyRuntimeError::new_err(format!(
-            "Invalid strategy '{}'. Use 'round_robin' or 'least_connections'", s
-        ))),
+        s => {
+            return Err(PyRuntimeError::new_err(format!(
+                "Invalid strategy '{}'. Use 'round_robin' or 'least_connections'",
+                s
+            )))
+        }
     };
-    
-    let store = MultiEndpointStore::new(uris, strategy, None)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create multi-endpoint store: {}", e)))?;
-    
-    Ok(PyMultiEndpointStore { store: Arc::new(store) })
+
+    let store = MultiEndpointStore::new(uris, strategy, None).map_err(|e| {
+        PyRuntimeError::new_err(format!("Failed to create multi-endpoint store: {}", e))
+    })?;
+
+    Ok(PyMultiEndpointStore {
+        store: Arc::new(store),
+    })
 }
 
 /// Create a multi-endpoint store from a URI template with range expansion
@@ -1981,11 +2102,11 @@ fn create_multi_endpoint_store(
 #[pyfunction]
 fn create_multi_endpoint_store_from_template(
     uri_template: &str,
-    strategy: Option<&str>
+    strategy: Option<&str>,
 ) -> PyResult<PyMultiEndpointStore> {
     let uris = uri_utils::expand_uri_template(uri_template)
         .map_err(|e| PyRuntimeError::new_err(format!("Template expansion failed: {}", e)))?;
-    
+
     create_multi_endpoint_store(uris, strategy)
 }
 
@@ -2013,12 +2134,12 @@ fn create_multi_endpoint_store_from_template(
 #[pyfunction]
 fn create_multi_endpoint_store_from_file(
     file_path: &str,
-    strategy: Option<&str>
+    strategy: Option<&str>,
 ) -> PyResult<PyMultiEndpointStore> {
     let path = std::path::Path::new(file_path);
     let uris = uri_utils::load_uris_from_file(path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load URIs from file: {}", e)))?;
-    
+
     create_multi_endpoint_store(uris, strategy)
 }
 
@@ -2120,9 +2241,7 @@ fn gcs_get_rapid_mode() -> Option<bool> {
 fn gcs_query_rapid_bucket(bucket_or_uri: &str) -> PyResult<bool> {
     let owned = bucket_or_uri.to_owned();
     submit_io(async move {
-        Ok::<bool, anyhow::Error>(
-            crate::google_gcs_client::query_gcs_rapid_bucket(&owned).await
-        )
+        Ok::<bool, anyhow::Error>(crate::google_gcs_client::query_gcs_rapid_bucket(&owned).await)
     })
 }
 
@@ -2178,15 +2297,15 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(finalize_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(is_op_log_active, m)?)?;
-    
+
     // URI parsing utilities
     m.add_function(wrap_pyfunction!(parse_s3_uri_full, m)?)?;
-    
+
     // Bucket / container management
     m.add_function(wrap_pyfunction!(create_bucket, m)?)?;
     m.add_function(wrap_pyfunction!(delete_bucket, m)?)?;
     m.add_function(wrap_pyfunction!(list_containers, m)?)?;
-    
+
     // Universal storage operations (preferred)
     m.add_function(wrap_pyfunction!(put, m)?)?;
     m.add_function(wrap_pyfunction!(put_async_py, m)?)?;
@@ -2214,20 +2333,23 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put_many, m)?)?;
     m.add_function(wrap_pyfunction!(put_many_async, m)?)?;
     m.add_function(wrap_pyfunction!(mp_get, m)?)?;
-    
+
     // Phase 2 Streaming API classes and functions
     m.add_class::<PyWriterOptions>()?;
     m.add_class::<PyObjectWriter>()?;
-    m.add_class::<PyBytesView>()?;  // Zero-copy buffer wrapper
+    m.add_class::<PyBytesView>()?; // Zero-copy buffer wrapper
     m.add_function(wrap_pyfunction!(create_s3_writer, m)?)?;
     m.add_function(wrap_pyfunction!(create_azure_writer, m)?)?;
     m.add_function(wrap_pyfunction!(create_filesystem_writer, m)?)?;
     m.add_function(wrap_pyfunction!(create_direct_filesystem_writer, m)?)?;
-    
+
     // Multi-endpoint support (v0.9.14+)
     m.add_class::<PyMultiEndpointStore>()?;
     m.add_function(wrap_pyfunction!(create_multi_endpoint_store, m)?)?;
-    m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_template, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        create_multi_endpoint_store_from_template,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_file, m)?)?;
 
     // GCS tuning (programmatic setters / getters / bucket RAPID query)
@@ -2239,4 +2361,3 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     Ok(())
 }
-

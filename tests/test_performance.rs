@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use std::time::Instant;
 use s3dlio::data_gen_alt;
+use std::time::Instant;
 
-/// Measure generate_random_data() over 100 runs of 1 GiB each.
-/// Run with: `cargo test -- --ignored --nocapture perf_random`
+// Measure generate_random_data() over 100 runs of 1 GiB each.
+// Run with: `cargo test -- --ignored --nocapture perf_random`
 /*
 #[test]
 #[ignore]
@@ -47,7 +47,7 @@ fn perf_controll1() {
     println!(
         "data_gen_alt::generate_controlled_data_alt: {} × {:.1} MB (dedup={}, compress={}) → {:?}",
         runs,
-        size as f64 / (1024.0*1024.0),
+        size as f64 / (1024.0 * 1024.0),
         dedup,
         compress,
         elapsed
@@ -72,7 +72,7 @@ fn perf_controll2() {
     println!(
         "data_gen_alt::generate_controlled_data_alt: {} × {:.1} MB (dedup={}, compress={}) → {:?}",
         runs,
-        size as f64 / (1024.0*1024.0),
+        size as f64 / (1024.0 * 1024.0),
         dedup,
         compress,
         elapsed

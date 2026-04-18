@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ impl S3ProgressTracker {
     pub fn new(operation: &str, total_objects: u64, total_bytes: u64) -> Self {
         let multi = MultiProgress::new();
         let pb = multi.add(ProgressBar::new(total_bytes));
-        
+
         // Warp-style progress bar template
         pb.set_style(
             ProgressStyle::default_bar()
@@ -42,7 +42,8 @@ impl S3ProgressTracker {
     /// Update progress with bytes transferred and objects completed
     pub fn update(&self, bytes_transferred: u64, objects_completed: u64, total_objects: u64) {
         self.progress_bar.set_position(bytes_transferred);
-        self.progress_bar.set_message(format!("{}/{} objects", objects_completed, total_objects));
+        self.progress_bar
+            .set_message(format!("{}/{} objects", objects_completed, total_objects));
     }
 
     /// Update the total size of the progress bar (useful when total size is discovered during operation)
@@ -53,16 +54,14 @@ impl S3ProgressTracker {
     /// Finish the progress bar with a completion message
     pub fn finish(&self, operation: &str, total_bytes: u64, duration: Duration) {
         let throughput_mbps = (total_bytes as f64 / 1_048_576.0) / duration.as_secs_f64();
-        
-        self.progress_bar.finish_with_message(
-            format!(
-                "{} complete! {:.2} MB in {:.2}s ({:.2} MB/s)",
-                operation,
-                total_bytes as f64 / 1_048_576.0,
-                duration.as_secs_f64(),
-                throughput_mbps
-            )
-        );
+
+        self.progress_bar.finish_with_message(format!(
+            "{} complete! {:.2} MB in {:.2}s ({:.2} MB/s)",
+            operation,
+            total_bytes as f64 / 1_048_576.0,
+            duration.as_secs_f64(),
+            throughput_mbps
+        ));
     }
 
     /// Create a simple spinner for operations without known total size
@@ -72,7 +71,7 @@ impl S3ProgressTracker {
             ProgressStyle::default_spinner()
                 .template(&format!("{}: {{spinner:.green}} {{msg}}", operation))
                 .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
         );
         pb.enable_steady_tick(Duration::from_millis(100));
         pb
@@ -99,10 +98,17 @@ impl ProgressCallback {
 
     /// Call this when an object transfer completes
     pub fn object_completed(&self, bytes: u64) {
-        let completed = self.objects_completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let total_bytes = self.bytes_transferred.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed) + bytes;
-        
-        self.tracker.update(total_bytes, completed, self.total_objects);
+        let completed = self
+            .objects_completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let total_bytes = self
+            .bytes_transferred
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+            + bytes;
+
+        self.tracker
+            .update(total_bytes, completed, self.total_objects);
     }
 
     /// Update the progress bar's total size as we discover the actual total

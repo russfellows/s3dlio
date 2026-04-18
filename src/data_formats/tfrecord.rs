@@ -39,7 +39,7 @@ pub fn build_tfrecord(records: usize, record_size: usize, data: &[u8]) -> Result
 
 /// TFRecord + matching 16‑byte‑per‑record index.
 pub struct TfRecordWithIndex {
-    pub data:  Bytes,
+    pub data: Bytes,
     pub index: Bytes,
 }
 
@@ -49,14 +49,14 @@ pub fn build_tfrecord_with_index(
     record_size: usize,
     data: &[u8],
 ) -> Result<TfRecordWithIndex> {
-    let mut tf_buf   = Cursor::new(Vec::<u8>::new());
-    let mut idx_buf  = Cursor::new(Vec::<u8>::new());
+    let mut tf_buf = Cursor::new(Vec::<u8>::new());
+    let mut idx_buf = Cursor::new(Vec::<u8>::new());
 
     let mut offset: u64 = 0;
 
     for i in 0..records {
         let start = i * record_size;
-        let end   = start + record_size;
+        let end = start + record_size;
 
         // write record, capture its on‑wire length
         let written = write_raw_record(&mut tf_buf, &data[start..end])? as u64;
@@ -69,8 +69,7 @@ pub fn build_tfrecord_with_index(
     }
 
     Ok(TfRecordWithIndex {
-        data:  Bytes::from(tf_buf.into_inner()),
+        data: Bytes::from(tf_buf.into_inner()),
         index: Bytes::from(idx_buf.into_inner()),
     })
 }
-

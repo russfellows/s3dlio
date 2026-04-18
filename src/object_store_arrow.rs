@@ -13,22 +13,18 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::object_store::{
+    CompressionConfig,
+    ObjectMetadata, // alias to s3_utils::ObjectStat
     ObjectStore as S3DlioObjectStore,
     ObjectWriter as S3DlioObjectWriter,
-    ObjectMetadata,             // alias to s3_utils::ObjectStat
     WriterOptions,
-    CompressionConfig,
 };
 
-use object_store as aos;
 use aos::{
-    path::Path,
-    ObjectStore as AosObjectStore,
-    GetOptions,
-    GetRange,
+    aws::AmazonS3Builder, path::Path, GetOptions, GetRange, ObjectStore as AosObjectStore,
     PutPayload,
-    aws::AmazonS3Builder,
 };
+use object_store as aos;
 
 // ----------------------------------------------------------------------------
 // Adapter object store
@@ -39,41 +35,49 @@ use aos::{
 pub struct ArrowObjectStore;
 
 impl ArrowObjectStore {
-    pub fn new() -> Self { Self }
-    
+    pub fn new() -> Self {
+        Self
+    }
+
     #[inline]
-    pub fn boxed() -> Box<dyn S3DlioObjectStore> { Box::new(Self) }
+    pub fn boxed() -> Box<dyn S3DlioObjectStore> {
+        Box::new(Self)
+    }
 
     /// parse a full URI into (store, path) using explicit S3 configuration.
     fn parse(uri: &str) -> Result<(Arc<dyn AosObjectStore>, Path, Url)> {
         let url = Url::parse(uri).context("invalid URI")?;
-        
+
         match url.scheme() {
             "s3" => {
                 // Extract bucket and path from URL
-                let bucket = url.host_str().ok_or_else(|| anyhow::anyhow!("No bucket in S3 URL"))?;
+                let bucket = url
+                    .host_str()
+                    .ok_or_else(|| anyhow::anyhow!("No bucket in S3 URL"))?;
                 let path = Path::from(url.path().trim_start_matches('/'));
-                
+
                 // Build S3 client explicitly to control credentials
-                let mut builder = AmazonS3Builder::new()
-                    .with_bucket_name(bucket);
-                
+                let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+
                 // Use credentials from environment
                 if let (Ok(access_key), Ok(secret_key)) = (
-                    std::env::var("AWS_ACCESS_KEY_ID"), 
-                    std::env::var("AWS_SECRET_ACCESS_KEY")
+                    std::env::var("AWS_ACCESS_KEY_ID"),
+                    std::env::var("AWS_SECRET_ACCESS_KEY"),
                 ) {
-                    builder = builder.with_access_key_id(&access_key)
-                                   .with_secret_access_key(&secret_key);
+                    builder = builder
+                        .with_access_key_id(&access_key)
+                        .with_secret_access_key(&secret_key);
                 } else {
                     bail!("AWS credentials not found in environment");
                 }
-                
+
                 // Set region
-                if let Ok(region) = std::env::var("AWS_DEFAULT_REGION").or_else(|_| std::env::var("AWS_REGION")) {
+                if let Ok(region) =
+                    std::env::var("AWS_DEFAULT_REGION").or_else(|_| std::env::var("AWS_REGION"))
+                {
                     builder = builder.with_region(&region);
                 }
-                
+
                 // Set custom endpoint if provided
                 if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
                     builder = builder.with_endpoint(&endpoint);
@@ -82,13 +86,14 @@ impl ArrowObjectStore {
                         builder = builder.with_allow_http(true);
                     }
                 }
-                
+
                 let store = builder.build().context("Failed to build S3 client")?;
                 Ok((Arc::new(store), path, url))
-            },
+            }
             _ => {
                 // For non-S3 URLs, fall back to generic parse_url
-                let (store, path) = aos::parse_url(&url).context("object_store::parse_url failed")?;
+                let (store, path) =
+                    aos::parse_url(&url).context("object_store::parse_url failed")?;
                 Ok((Arc::from(store), path, url))
             }
         }
@@ -126,7 +131,9 @@ impl ArrowObjectStore {
         if !base_path.is_empty() {
             rebuilt.push_str(&base_path);
         }
-        if !rebuilt.ends_with('/') { rebuilt.push('/'); }
+        if !rebuilt.ends_with('/') {
+            rebuilt.push('/');
+        }
 
         // Append Arrow location (never starts with '/')
         rebuilt.push_str(&location.to_string());
@@ -189,7 +196,9 @@ impl S3DlioObjectStore for ArrowObjectStore {
 
     async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
         let (store, path, _url) = Self::parse(uri)?;
-        store.put(&path, PutPayload::from(Bytes::copy_from_slice(data))).await?;
+        store
+            .put(&path, PutPayload::from(Bytes::copy_from_slice(data)))
+            .await?;
         Ok(())
     }
 
@@ -237,13 +246,13 @@ impl S3DlioObjectStore for ArrowObjectStore {
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         let (store, base, _url) = Self::parse_prefix(uri_prefix)?;
-        
+
         // Simple implementation: list objects and delete them one by one
         let result = store.list_with_delimiter(Some(&base)).await?;
         for obj in result.objects {
             store.delete(&obj.location).await?;
         }
-        
+
         Ok(())
     }
 
@@ -262,11 +271,19 @@ impl S3DlioObjectStore for ArrowObjectStore {
         ArrowWriter::new(uri, CompressionConfig::None).await
     }
 
-    async fn get_writer_with_compression(&self, uri: &str, compression: CompressionConfig) -> Result<Box<dyn S3DlioObjectWriter>> {
+    async fn get_writer_with_compression(
+        &self,
+        uri: &str,
+        compression: CompressionConfig,
+    ) -> Result<Box<dyn S3DlioObjectWriter>> {
         ArrowWriter::new(uri, compression).await
     }
 
-    async fn create_writer(&self, uri: &str, options: WriterOptions) -> Result<Box<dyn S3DlioObjectWriter>> {
+    async fn create_writer(
+        &self,
+        uri: &str,
+        options: WriterOptions,
+    ) -> Result<Box<dyn S3DlioObjectWriter>> {
         let compression = options.compression.unwrap_or(CompressionConfig::None);
         ArrowWriter::new(uri, compression).await
     }
@@ -278,12 +295,12 @@ impl S3DlioObjectStore for ArrowObjectStore {
     }
 
     async fn get_range_optimized(
-        &self, 
-        uri: &str, 
-        offset: u64, 
+        &self,
+        uri: &str,
+        offset: u64,
         length: Option<u64>,
         _chunk_size: Option<usize>,
-        _max_concurrency: Option<usize>
+        _max_concurrency: Option<usize>,
     ) -> Result<Vec<u8>> {
         self.get_range(uri, offset, length).await
     }
@@ -294,7 +311,7 @@ impl S3DlioObjectStore for ArrowObjectStore {
 // ----------------------------------------------------------------------------
 
 /// Arrow-backed streaming writer.
-/// Since Arrow's BufWriter doesn't implement Sync (required by ObjectWriter), 
+/// Since Arrow's BufWriter doesn't implement Sync (required by ObjectWriter),
 /// we implement a simple buffered writer that collects all data and uses put() at finalize.
 /// - Maintains CRC32C over the **uncompressed** stream (parity with s3dlio writers).
 /// - Optional Zstd compression (matches your FileSystemWriter behavior).
@@ -321,9 +338,12 @@ struct ArrowWriter {
 }
 
 impl ArrowWriter {
-    async fn new(dest_uri: &str, compression: CompressionConfig) -> Result<Box<dyn S3DlioObjectWriter>> {
+    async fn new(
+        dest_uri: &str,
+        compression: CompressionConfig,
+    ) -> Result<Box<dyn S3DlioObjectWriter>> {
         let (store, path, _url) = ArrowObjectStore::parse(dest_uri)?;
-        
+
         // Adjust path for compression extension
         let final_path = if compression.is_enabled() {
             Path::from(format!("{}{}", path.to_string(), compression.extension()))
@@ -400,22 +420,32 @@ impl S3DlioObjectWriter for ArrowWriter {
         // Put the entire buffer to the store
         let payload = PutPayload::from(Bytes::from(self.buffer.clone()));
         self.store.put(&self.path, payload).await?;
-        
+
         Ok(())
     }
 
-    fn bytes_written(&self) -> u64 { self.bytes_written }
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
 
-    fn compressed_bytes(&self) -> u64 { self.compressed_bytes }
+    fn compressed_bytes(&self) -> u64 {
+        self.compressed_bytes
+    }
 
     fn checksum(&self) -> Option<String> {
         Some(format!("crc32c:{:08x}", self.hasher.clone().finalize()))
     }
 
-    fn compression(&self) -> CompressionConfig { self.compression }
+    fn compression(&self) -> CompressionConfig {
+        self.compression
+    }
 
     fn compression_ratio(&self) -> f64 {
-        if self.bytes_written == 0 { 1.0 } else { self.compressed_bytes as f64 / self.bytes_written as f64 }
+        if self.bytes_written == 0 {
+            1.0
+        } else {
+            self.compressed_bytes as f64 / self.bytes_written as f64
+        }
     }
 
     async fn cancel(mut self: Box<Self>) -> Result<()> {
@@ -433,23 +463,26 @@ impl S3DlioObjectWriter for ArrowWriter {
 fn setup_arrow_environment() {
     // Load environment variables from .env file (same as rest of s3dlio)
     let _ = dotenvy::dotenv();
-    
+
     // Try multiple approaches to disable EC2 metadata service
-    unsafe { 
+    unsafe {
         std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
         std::env::set_var("AWS_IMDS_DISABLED", "true");
         std::env::set_var("AWS_EC2_METADATA_SERVICE_DISABLED", "true");
     }
-    
+
     // Ensure required region is set
     if std::env::var("AWS_DEFAULT_REGION").is_err() && std::env::var("AWS_REGION").is_ok() {
         if let Ok(region) = std::env::var("AWS_REGION") {
-            unsafe { std::env::set_var("AWS_DEFAULT_REGION", region); }
+            unsafe {
+                std::env::set_var("AWS_DEFAULT_REGION", region);
+            }
         }
     }
-    
+
     // Log what we found for debugging (without exposing secrets)
-    if std::env::var("AWS_ACCESS_KEY_ID").is_ok() && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok() {
+    if std::env::var("AWS_ACCESS_KEY_ID").is_ok() && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok()
+    {
         println!("🔧 Arrow backend: Using credentials from environment");
     }
     if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
@@ -465,15 +498,15 @@ fn setup_arrow_environment() {
 pub fn store_for_uri(_uri: &str) -> Result<Box<dyn S3DlioObjectStore>> {
     // Ensure environment is set up before any Arrow operations
     setup_arrow_environment();
-    
+
     // Arrow's object_store will automatically pick up standard AWS environment variables:
     // - AWS_ACCESS_KEY_ID
-    // - AWS_SECRET_ACCESS_KEY  
+    // - AWS_SECRET_ACCESS_KEY
     // - AWS_DEFAULT_REGION
     // - AWS_ENDPOINT_URL (for custom S3 endpoints)
     // - AWS_ALLOW_HTTP (for non-HTTPS endpoints)
-    
-    // Arrow's parse_url handles scheme detection automatically, so we can 
+
+    // Arrow's parse_url handles scheme detection automatically, so we can
     // use a single ArrowObjectStore instance for all URI types
     Ok(ArrowObjectStore::boxed())
 }

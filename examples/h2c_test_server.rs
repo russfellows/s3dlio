@@ -79,10 +79,10 @@ use tokio::net::TcpListener;
 /// Logs the HTTP version and method so we can confirm h2c was negotiated.
 async fn handle(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     let version = match req.version() {
-        hyper::Version::HTTP_2  => "HTTP/2",
+        hyper::Version::HTTP_2 => "HTTP/2",
         hyper::Version::HTTP_11 => "HTTP/1.1",
         hyper::Version::HTTP_10 => "HTTP/1.0",
-        _                       => "HTTP/?",
+        _ => "HTTP/?",
     };
     eprintln!("[server] {} {} {version}", req.method(), req.uri().path());
 

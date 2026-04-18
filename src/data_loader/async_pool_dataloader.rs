@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use bytes::Bytes;
-use crate::object_store::{ObjectStore, store_for_uri};
-use crate::data_loader::dataset::{DatasetError, Dataset};
+use crate::data_loader::dataset::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, LoadingMode};
+use crate::object_store::{store_for_uri, ObjectStore};
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::stream::{StreamExt, FuturesUnordered};
+use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,7 +47,7 @@ impl MultiBackendDataset {
     pub async fn from_prefix(prefix_uri: &str) -> Result<Self> {
         let store: Arc<dyn ObjectStore> = Arc::from(store_for_uri(prefix_uri)?);
         let uris = store.list(prefix_uri, true).await?;
-        
+
         Ok(Self { uris, store })
     }
 
@@ -59,20 +59,20 @@ impl MultiBackendDataset {
                 store: Arc::from(store_for_uri("file://dummy")?), // Won't be used
             });
         }
-        
+
         // Use first URI to determine backend
         let store: Arc<dyn ObjectStore> = Arc::from(store_for_uri(&uris[0])?);
         Ok(Self { uris, store })
     }
-    
+
     pub fn len(&self) -> usize {
         self.uris.len()
     }
-    
+
     pub fn is_empty(&self) -> bool {
         self.uris.is_empty()
     }
-    
+
     /// Get URI by index
     pub fn get_uri(&self, index: usize) -> Option<&str> {
         self.uris.get(index).map(|s| s.as_str())
@@ -88,11 +88,15 @@ impl Dataset for MultiBackendDataset {
     }
 
     async fn get(&self, idx: usize) -> Result<Self::Item, DatasetError> {
-        let uri = self.uris.get(idx)
+        let uri = self
+            .uris
+            .get(idx)
             .ok_or(DatasetError::IndexOutOfRange(idx))?;
-        
+
         // Return Bytes directly - zero-copy!
-        self.store.get(uri).await
+        self.store
+            .get(uri)
+            .await
             .map_err(|e| DatasetError::from(e.to_string()))
     }
 }
@@ -108,7 +112,7 @@ pub struct AsyncPoolDataLoader {
 pub struct PoolConfig {
     /// Number of concurrent requests to maintain
     pub pool_size: usize,
-    /// Target number of read-ahead batches 
+    /// Target number of read-ahead batches
     pub readahead_batches: usize,
     /// Maximum time to wait for batch completion
     pub batch_timeout: Duration,
@@ -129,14 +133,14 @@ impl Default for PoolConfig {
 
 impl PoolConfig {
     /// Create PoolConfig with sensible scaling from LoaderOptions
-    /// 
+    ///
     /// Maps LoaderOptions fields to pool configuration:
     /// - `pool_size` = `num_workers * 16` (scale parallelism)
     /// - `readahead_batches` = `prefetch.max(2)` (minimum prefetch depth)
-    /// 
+    ///
     /// This provides a reasonable starting point for users who want to derive
     /// pool configuration from their training parameters.
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let options = LoaderOptions { num_workers: 4, prefetch: 3, ..Default::default() };
@@ -148,14 +152,13 @@ impl PoolConfig {
             pool_size: if opts.num_workers > 0 {
                 opts.num_workers * 16
             } else {
-                64  // Default when num_workers is 0 (auto)
+                64 // Default when num_workers is 0 (auto)
             },
             readahead_batches: opts.prefetch.max(2),
             ..Default::default()
         }
     }
 }
-
 
 impl AsyncPoolDataLoader {
     pub fn new(dataset: MultiBackendDataset, options: LoaderOptions) -> Self {
@@ -173,19 +176,23 @@ impl AsyncPoolDataLoader {
 
     /// Enhanced stream with async pooling and dynamic batch formation
     /// Enhanced stream with async pooling and dynamic batch formation
-    /// 
+    ///
     /// Supports graceful cancellation via `LoaderOptions::cancellation_token`.
     /// When cancelled, the pool stops submitting new requests and drains pending ones.
-    pub fn stream_with_pool(self, pool_config: PoolConfig) -> ReceiverStream<Result<Vec<Bytes>, DatasetError>> {
+    pub fn stream_with_pool(
+        self,
+        pool_config: PoolConfig,
+    ) -> ReceiverStream<Result<Vec<Bytes>, DatasetError>> {
         let batch_size = self.options.batch_size.max(1);
         let drop_last = self.options.drop_last;
         let dataset_len = self.dataset.len();
         let cancel_token = self.options.cancellation_token.clone();
-        
-        let (tx, rx) = mpsc::channel::<Result<Vec<Bytes>, DatasetError>>(pool_config.readahead_batches);
-        
+
+        let (tx, rx) =
+            mpsc::channel::<Result<Vec<Bytes>, DatasetError>>(pool_config.readahead_batches);
+
         let dataset = Arc::clone(&self.dataset);
-        
+
         tokio::spawn(async move {
             if let Err(e) = Self::run_async_pool_worker(
                 dataset,
@@ -195,11 +202,13 @@ impl AsyncPoolDataLoader {
                 pool_config,
                 dataset_len,
                 cancel_token,
-            ).await {
+            )
+            .await
+            {
                 eprintln!("AsyncPoolDataLoader error: {}", e);
             }
         });
-        
+
         ReceiverStream::new(rx)
     }
 
@@ -213,15 +222,17 @@ impl AsyncPoolDataLoader {
         dataset_len: usize,
         cancel_token: Option<CancellationToken>,
     ) -> Result<()> {
-        type RequestFuture = Pin<Box<dyn std::future::Future<Output = (usize, Result<Bytes, anyhow::Error>)> + Send>>;
-        
+        type RequestFuture = Pin<
+            Box<dyn std::future::Future<Output = (usize, Result<Bytes, anyhow::Error>)> + Send>,
+        >;
+
         let mut pending_requests: FuturesUnordered<RequestFuture> = FuturesUnordered::new();
         let mut next_index = 0;
         let mut completed_data = std::collections::HashMap::new();
         let mut current_batch = Vec::new();
         let total_items = dataset_len;
         let timeout = pool_config.batch_timeout;
-        
+
         // Start initial pool of requests
         for _ in 0..pool_config.pool_size.min(total_items) {
             // Check cancellation before submitting initial requests
@@ -230,13 +241,13 @@ impl AsyncPoolDataLoader {
                     break;
                 }
             }
-            
+
             if next_index < total_items {
                 if let Some(uri) = dataset.get_uri(next_index) {
                     let store = dataset.store.clone();
                     let uri = uri.to_string();
                     let index = next_index;
-                    
+
                     let fut: RequestFuture = Box::pin(async move {
                         let result = match tokio::time::timeout(timeout, store.get(&uri)).await {
                             Ok(Ok(data)) => Ok(data), // Return Bytes directly - zero-copy!
@@ -250,7 +261,7 @@ impl AsyncPoolDataLoader {
                 }
             }
         }
-        
+
         // Process completions and maintain pool
         while !pending_requests.is_empty() {
             // Check cancellation before processing next completion
@@ -259,12 +270,12 @@ impl AsyncPoolDataLoader {
                     break;
                 }
             }
-            
+
             if let Some((index, result)) = pending_requests.next().await {
                 match result {
                     Ok(data) => {
                         completed_data.insert(index, data);
-                        
+
                         // Add more requests to maintain pool size
                         if next_index < total_items {
                             // Check cancellation before submitting new requests
@@ -274,17 +285,25 @@ impl AsyncPoolDataLoader {
                                     continue;
                                 }
                             }
-                            
+
                             if let Some(uri) = dataset.get_uri(next_index) {
                                 let store = dataset.store.clone();
                                 let uri = uri.to_string();
                                 let req_index = next_index;
-                                
+
                                 let fut: RequestFuture = Box::pin(async move {
-                                    let result = match tokio::time::timeout(timeout, store.get(&uri)).await {
+                                    let result = match tokio::time::timeout(
+                                        timeout,
+                                        store.get(&uri),
+                                    )
+                                    .await
+                                    {
                                         Ok(Ok(data)) => Ok(data), // Return Bytes directly - zero-copy!
                                         Ok(Err(e)) => Err(anyhow::anyhow!("Store error: {}", e)),
-                                        Err(_) => Err(anyhow::anyhow!("Request timeout after {:?}", timeout)),
+                                        Err(_) => Err(anyhow::anyhow!(
+                                            "Request timeout after {:?}",
+                                            timeout
+                                        )),
                                     };
                                     (req_index, result)
                                 });
@@ -292,7 +311,7 @@ impl AsyncPoolDataLoader {
                                 next_index += 1;
                             }
                         }
-                        
+
                         // Try to form batches from completed data (out-of-order completion)
                         while current_batch.len() < batch_size && !completed_data.is_empty() {
                             // Take any available completed item (out-of-order)
@@ -303,10 +322,14 @@ impl AsyncPoolDataLoader {
                                 break;
                             }
                         }
-                        
+
                         // Send complete batch
                         if current_batch.len() == batch_size
-                            && tx.send(Ok(std::mem::take(&mut current_batch))).await.is_err() {
+                            && tx
+                                .send(Ok(std::mem::take(&mut current_batch)))
+                                .await
+                                .is_err()
+                        {
                             break; // Receiver dropped
                         }
                     }
@@ -318,10 +341,10 @@ impl AsyncPoolDataLoader {
                 }
             }
         }
-        
+
         // Send any remaining data after all requests complete
         // Process any remaining completed data into final batches
-        
+
         // First, process any remaining completed data
         while !completed_data.is_empty() {
             while current_batch.len() < batch_size && !completed_data.is_empty() {
@@ -332,19 +355,23 @@ impl AsyncPoolDataLoader {
                     break;
                 }
             }
-            
+
             // Send complete batch
             if current_batch.len() == batch_size
-                && tx.send(Ok(std::mem::take(&mut current_batch))).await.is_err() {
+                && tx
+                    .send(Ok(std::mem::take(&mut current_batch)))
+                    .await
+                    .is_err()
+            {
                 break;
             }
         }
-        
+
         // Finally, send any remaining partial batch
         if !current_batch.is_empty() && !drop_last {
             let _ = tx.send(Ok(current_batch)).await;
         }
-        
+
         Ok(())
     }
 
@@ -384,10 +411,8 @@ impl UnifiedDataLoader {
         match loading_mode {
             LoadingMode::Sequential => {
                 // Use traditional sequential loading
-                let traditional_loader = crate::data_loader::dataloader::DataLoader::new(
-                    self.dataset, 
-                    self.options
-                );
+                let traditional_loader =
+                    crate::data_loader::dataloader::DataLoader::new(self.dataset, self.options);
                 traditional_loader.stream()
             }
             LoadingMode::AsyncPool(pool_config) => {
@@ -410,9 +435,12 @@ impl LoaderOptions {
             max_inflight: self.max_inflight_parts * 2,
         }
     }
-    
+
     /// Enhanced stream with automatic pool configuration
-    pub fn enhanced_stream(self, dataset: MultiBackendDataset) -> ReceiverStream<Result<Vec<Bytes>, DatasetError>> {
+    pub fn enhanced_stream(
+        self,
+        dataset: MultiBackendDataset,
+    ) -> ReceiverStream<Result<Vec<Bytes>, DatasetError>> {
         let pool_config = self.to_pool_config();
         AsyncPoolDataLoader::new(dataset, self).stream_with_pool(pool_config)
     }

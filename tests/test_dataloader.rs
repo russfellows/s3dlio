@@ -113,9 +113,7 @@ async fn map_dataset_drop_last() {
     let ds = VecDataset {
         data: (0..100).collect(),
     };
-    let opts = LoaderOptions::default()
-        .with_batch_size(32)
-        .drop_last(true);
+    let opts = LoaderOptions::default().with_batch_size(32).drop_last(true);
     let loader = DataLoader::new(ds, opts);
 
     let batches: Vec<_> = loader
@@ -146,7 +144,6 @@ async fn iterable_dataset() {
 
     assert_eq!(collected, (0..55).collect::<Vec<_>>());
 }
-
 
 #[tokio::test]
 async fn unknown_len_dataset() {
@@ -190,7 +187,9 @@ async fn empty_dataset() {
 /// and that sequence must differ from the unshuffled order.
 #[tokio::test]
 async fn shuffle_determinism() {
-    let base: VecDataset = VecDataset { data: (0..50).collect() };
+    let base: VecDataset = VecDataset {
+        data: (0..50).collect(),
+    };
 
     // Unshuffled (seed ignored)
     let uns_opt = LoaderOptions::default()
@@ -234,17 +233,20 @@ async fn shuffle_determinism() {
 /// the default (single-threaded, no prefetch) loader.
 #[tokio::test]
 async fn parallel_prefetch_equivalence() {
-    let ds = VecDataset { data: (0..100).collect() };
+    let ds = VecDataset {
+        data: (0..100).collect(),
+    };
 
     // Default loader
-    let default_out: Vec<i32> = DataLoader::new(ds.clone(), LoaderOptions::default().with_batch_size(10))
-        .stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        //.map(Result::unwrap)
-        .flat_map(Result::unwrap)
-        .collect();
+    let default_out: Vec<i32> =
+        DataLoader::new(ds.clone(), LoaderOptions::default().with_batch_size(10))
+            .stream()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            //.map(Result::unwrap)
+            .flat_map(Result::unwrap)
+            .collect();
 
     // Parallel loader
     let parallel_opts = LoaderOptions::default()
@@ -260,5 +262,8 @@ async fn parallel_prefetch_equivalence() {
         .flat_map(Result::unwrap)
         .collect();
 
-    assert_eq!(default_out, parallel_out, "parallel loader output must match default");
+    assert_eq!(
+        default_out, parallel_out,
+        "parallel loader output must match default"
+    );
 }

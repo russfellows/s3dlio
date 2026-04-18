@@ -3,17 +3,17 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use bytes::Bytes;
+use crate::data_loader::options::{LoaderOptions, ReaderMode};
+use crate::data_loader::{Dataset, DatasetError};
 use crate::s3_utils::{
-    parse_s3_uri,
-    get_object_uri_async,
     get_object_range_uri_async, // NEW: implemented in s3_utils.rs next
+    get_object_uri_async,
     list_objects as list_objects_rs,
+    parse_s3_uri,
     stat_object_uri_async,
 };
-use crate::data_loader::{Dataset, DatasetError};
-use crate::data_loader::options::{LoaderOptions, ReaderMode};
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
 #[derive(Clone)]
@@ -33,8 +33,7 @@ impl S3BytesDataset {
 
     /// NEW: honor LoaderOptions (reader strategy + part params)
     pub fn from_prefix_with_opts(uri: &str, opts: &LoaderOptions) -> Result<Self, DatasetError> {
-        let (bucket, prefix) = parse_s3_uri(uri)
-            .map_err(|e| DatasetError::from(e.to_string()))?;
+        let (bucket, prefix) = parse_s3_uri(uri).map_err(|e| DatasetError::from(e.to_string()))?;
 
         // Recursively list keys under prefix
         let keys = list_objects_rs(&bucket, &prefix, true)
@@ -50,21 +49,27 @@ impl S3BytesDataset {
     }
 
     #[inline]
-    pub fn keys(&self) -> &Vec<String> { &self.keys }
+    pub fn keys(&self) -> &Vec<String> {
+        &self.keys
+    }
 }
 
 #[async_trait]
 impl Dataset for S3BytesDataset {
     type Item = Bytes;
 
-    fn len(&self) -> Option<usize> { Some(self.keys.len()) }
+    fn len(&self) -> Option<usize> {
+        Some(self.keys.len())
+    }
 
     fn keys(&self) -> Option<Vec<String>> {
         Some(self.keys.clone())
     }
 
     async fn get(&self, idx: usize) -> Result<Self::Item, DatasetError> {
-        let key = self.keys.get(idx)
+        let key = self
+            .keys
+            .get(idx)
             .ok_or(DatasetError::IndexOutOfRange(idx))?;
 
         let uri = format!("s3://{}/{}", self.bucket, key);
@@ -79,9 +84,13 @@ impl Dataset for S3BytesDataset {
             }
             ReaderMode::Range => {
                 // HEAD to learn size
-                let meta = stat_object_uri_async(&uri).await.map_err(DatasetError::from)?;
+                let meta = stat_object_uri_async(&uri)
+                    .await
+                    .map_err(DatasetError::from)?;
                 let size = meta.size;
-                if size == 0 { return Ok(Bytes::new()); }
+                if size == 0 {
+                    return Ok(Bytes::new());
+                }
                 let part = self.part_size.max(1) as u64;
                 let n_parts = size.div_ceil(part) as usize;
                 let max_inflight = self.max_inflight_parts.max(1);
@@ -93,9 +102,7 @@ impl Dataset for S3BytesDataset {
                         let start = (i as u64) * part;
                         let len = (size - start).min(part);
                         let uri = uri.clone();
-                        async move {
-                            get_object_range_uri_async(&uri, start, Some(len)).await
-                        }
+                        async move { get_object_range_uri_async(&uri, start, Some(len)).await }
                     })
                     .buffered(max_inflight);
 
@@ -109,5 +116,3 @@ impl Dataset for S3BytesDataset {
         }
     }
 }
-
-

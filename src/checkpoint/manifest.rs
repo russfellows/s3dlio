@@ -8,31 +8,26 @@ pub struct ShardMeta {
     pub rank: u32,
     pub key: String,
     pub size: u64,
-    pub etag: Option<String>,          // from ObjectMetadata.e_tag
-    pub checksum: Option<String>,      // e.g., "crc32c:abcd..." (optional)
+    pub etag: Option<String>,     // from ObjectMetadata.e_tag
+    pub checksum: Option<String>, // e.g., "crc32c:abcd..." (optional)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Manifest {
-    pub format_version: u32,           // start at 1
-    pub framework: String,             // "torch" | "flax" | "tf" | "generic"
+    pub format_version: u32, // start at 1
+    pub framework: String,   // "torch" | "flax" | "tf" | "generic"
     pub global_step: u64,
     pub epoch: u64,
-    pub wall_time: String,             // RFC3339
+    pub wall_time: String, // RFC3339
     pub world_size: u32,
     pub shards: Vec<ShardMeta>,
-    pub status: String,                // "complete"
+    pub status: String, // "complete"
     pub user_meta: Option<serde_json::Value>,
 }
 
 impl Manifest {
     /// Create a new manifest with default values
-    pub fn new(
-        framework: String,
-        global_step: u64,
-        epoch: u64,
-        world_size: u32,
-    ) -> Self {
+    pub fn new(framework: String, global_step: u64, epoch: u64, world_size: u32) -> Self {
         Self {
             format_version: 1,
             framework,
@@ -66,15 +61,15 @@ impl Manifest {
         if self.format_version == 0 {
             anyhow::bail!("Invalid format_version: must be >= 1");
         }
-        
+
         if self.framework.is_empty() {
             anyhow::bail!("Framework cannot be empty");
         }
-        
+
         if self.world_size == 0 {
             anyhow::bail!("World size must be > 0");
         }
-        
+
         // Check for duplicate ranks
         let mut ranks = std::collections::HashSet::new();
         for shard in &self.shards {
@@ -82,17 +77,21 @@ impl Manifest {
                 anyhow::bail!("Duplicate rank found: {}", shard.rank);
             }
         }
-        
+
         // For complete manifests, ensure we have shards for all ranks
         if self.status == "complete" {
             let expected_ranks: std::collections::HashSet<u32> = (0..self.world_size).collect();
-            let actual_ranks: std::collections::HashSet<u32> = self.shards.iter().map(|s| s.rank).collect();
+            let actual_ranks: std::collections::HashSet<u32> =
+                self.shards.iter().map(|s| s.rank).collect();
             if expected_ranks != actual_ranks {
-                anyhow::bail!("Missing shards for some ranks. Expected: {:?}, Got: {:?}", 
-                    expected_ranks, actual_ranks);
+                anyhow::bail!(
+                    "Missing shards for some ranks. Expected: {:?}, Got: {:?}",
+                    expected_ranks,
+                    actual_ranks
+                );
             }
         }
-        
+
         Ok(())
     }
 }
@@ -116,10 +115,10 @@ mod tests {
     #[test]
     fn test_manifest_validation() {
         let mut manifest = Manifest::new("torch".to_string(), 100, 5, 2);
-        
+
         // Should pass validation for incomplete manifest
         assert!(manifest.validate().is_ok());
-        
+
         // Add shards
         manifest.add_shard(ShardMeta {
             rank: 0,
@@ -135,11 +134,11 @@ mod tests {
             etag: None,
             checksum: None,
         });
-        
+
         // Mark complete and validate
         manifest.mark_complete();
         assert!(manifest.validate().is_ok());
-        
+
         // Test duplicate rank detection
         manifest.add_shard(ShardMeta {
             rank: 1,

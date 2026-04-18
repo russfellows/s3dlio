@@ -23,16 +23,16 @@ use crate::uri::translate_uri;
 pub struct ReplayConfig {
     /// Path to op-log file
     pub op_log_path: PathBuf,
-    
+
     /// Optional target URI for backend retargeting (1:1 remapping)
     pub target_uri: Option<String>,
-    
+
     /// Speed multiplier (1.0 = original speed, 2.0 = 2x faster, 0.5 = half speed)
     pub speed: f64,
-    
+
     /// Continue execution on errors instead of stopping
     pub continue_on_error: bool,
-    
+
     /// Optional operation filter (only replay specific operation types)
     pub filter_ops: Option<Vec<OpType>>,
 }
@@ -57,16 +57,16 @@ impl Default for ReplayConfig {
 pub trait OpExecutor: Send + Sync {
     /// Execute a GET operation
     async fn get(&self, uri: &str) -> Result<()>;
-    
+
     /// Execute a PUT operation
     async fn put(&self, uri: &str, bytes: usize) -> Result<()>;
-    
+
     /// Execute a DELETE operation
     async fn delete(&self, uri: &str) -> Result<()>;
-    
+
     /// Execute a LIST operation
     async fn list(&self, uri: &str) -> Result<()>;
-    
+
     /// Execute a STAT/HEAD operation
     async fn stat(&self, uri: &str) -> Result<()>;
 }
@@ -81,7 +81,9 @@ impl OpExecutor for S3dlioExecutor {
     async fn get(&self, uri: &str) -> Result<()> {
         let store = s3dlio::api::store_for_uri(uri)
             .with_context(|| format!("Failed to create store for URI: {}", uri))?;
-        let _ = store.get(uri).await
+        let _ = store
+            .get(uri)
+            .await
             .with_context(|| format!("Failed to GET {}", uri))?;
         Ok(())
     }
@@ -89,11 +91,13 @@ impl OpExecutor for S3dlioExecutor {
     async fn put(&self, uri: &str, bytes: usize) -> Result<()> {
         // Generate random data using s3dlio's new data_gen_alt (returns Bytes directly)
         let data = s3dlio::data_gen_alt::generate_controlled_data_alt(bytes, 1, 1, None);
-        
+
         let store = s3dlio::api::store_for_uri(uri)
             .with_context(|| format!("Failed to create store for URI: {}", uri))?;
         // s3dlio v0.9.36+: put() takes Bytes directly for zero-copy
-        store.put(uri, data).await
+        store
+            .put(uri, data)
+            .await
             .with_context(|| format!("Failed to PUT {} ({} bytes)", uri, bytes))?;
         Ok(())
     }
@@ -101,7 +105,9 @@ impl OpExecutor for S3dlioExecutor {
     async fn delete(&self, uri: &str) -> Result<()> {
         let store = s3dlio::api::store_for_uri(uri)
             .with_context(|| format!("Failed to create store for URI: {}", uri))?;
-        store.delete(uri).await
+        store
+            .delete(uri)
+            .await
             .with_context(|| format!("Failed to DELETE {}", uri))?;
         Ok(())
     }
@@ -109,7 +115,9 @@ impl OpExecutor for S3dlioExecutor {
     async fn list(&self, uri: &str) -> Result<()> {
         let store = s3dlio::api::store_for_uri(uri)
             .with_context(|| format!("Failed to create store for URI: {}", uri))?;
-        let _ = store.list(uri, true).await
+        let _ = store
+            .list(uri, true)
+            .await
             .with_context(|| format!("Failed to LIST {}", uri))?;
         Ok(())
     }
@@ -117,7 +125,9 @@ impl OpExecutor for S3dlioExecutor {
     async fn stat(&self, uri: &str) -> Result<()> {
         let store = s3dlio::api::store_for_uri(uri)
             .with_context(|| format!("Failed to create store for URI: {}", uri))?;
-        let _ = store.stat(uri).await
+        let _ = store
+            .stat(uri)
+            .await
             .with_context(|| format!("Failed to STAT {}", uri))?;
         Ok(())
     }
@@ -151,7 +161,10 @@ impl OpExecutor for S3dlioExecutor {
 /// replay_workload(config, executor).await.unwrap();
 /// # });
 /// ```
-pub async fn replay_workload<E: OpExecutor + 'static>(config: ReplayConfig, executor: std::sync::Arc<E>) -> Result<()> {
+pub async fn replay_workload<E: OpExecutor + 'static>(
+    config: ReplayConfig,
+    executor: std::sync::Arc<E>,
+) -> Result<()> {
     info!("Starting replay with config: {:?}", config);
 
     // Load operations from file
@@ -164,8 +177,12 @@ pub async fn replay_workload<E: OpExecutor + 'static>(config: ReplayConfig, exec
     if let Some(ref filter_ops) = config.filter_ops {
         let original_count = operations.len();
         operations.retain(|op| filter_ops.contains(&op.op));
-        info!("Filtered {} -> {} operations (filter: {:?})", 
-              original_count, operations.len(), filter_ops);
+        info!(
+            "Filtered {} -> {} operations (filter: {:?})",
+            original_count,
+            operations.len(),
+            filter_ops
+        );
     }
 
     if operations.is_empty() {
@@ -305,7 +322,10 @@ mod tests {
         }
 
         async fn put(&self, uri: &str, bytes: usize) -> Result<()> {
-            self.ops.lock().unwrap().push(format!("PUT {} ({})", uri, bytes));
+            self.ops
+                .lock()
+                .unwrap()
+                .push(format!("PUT {} ({})", uri, bytes));
             Ok(())
         }
 
@@ -329,8 +349,16 @@ mod tests {
     async fn test_replay_with_mock_executor() {
         let mut file = NamedTempFile::with_suffix(".tsv").unwrap();
         writeln!(file, "op\tfile\tendpoint\tbytes\tstart").unwrap();
-        writeln!(file, "GET\tdata/test.dat\tfile:///tmp/\t1024\t2025-01-01T00:00:00Z").unwrap();
-        writeln!(file, "PUT\tdata/test2.dat\tfile:///tmp/\t2048\t2025-01-01T00:00:01Z").unwrap();
+        writeln!(
+            file,
+            "GET\tdata/test.dat\tfile:///tmp/\t1024\t2025-01-01T00:00:00Z"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "PUT\tdata/test2.dat\tfile:///tmp/\t2048\t2025-01-01T00:00:01Z"
+        )
+        .unwrap();
         file.flush().unwrap();
 
         let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -348,9 +376,13 @@ mod tests {
 
         let executed_ops = ops.lock().unwrap();
         assert_eq!(executed_ops.len(), 2);
-        assert!(executed_ops[0].starts_with("GET s3://test-bucket/data/test.dat") || 
-                executed_ops[1].starts_with("GET s3://test-bucket/data/test.dat"));
-        assert!(executed_ops[0].starts_with("PUT s3://test-bucket/data/test2.dat") || 
-                executed_ops[1].starts_with("PUT s3://test-bucket/data/test2.dat"));
+        assert!(
+            executed_ops[0].starts_with("GET s3://test-bucket/data/test.dat")
+                || executed_ops[1].starts_with("GET s3://test-bucket/data/test.dat")
+        );
+        assert!(
+            executed_ops[0].starts_with("PUT s3://test-bucket/data/test2.dat")
+                || executed_ops[1].starts_with("PUT s3://test-bucket/data/test2.dat")
+        );
     }
 }

@@ -6,30 +6,29 @@
 //! Thread‑safe, blocking wrapper around the async AWS Rust SDK.
 //! Provides high‑level S3 operations: list, get, delete, typed PUT.
 
-
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 //use aws_sdk_s3::primitives::ByteStream;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
-use std::pin::Pin;
 #[cfg(feature = "extension-module")]
 use pyo3::{FromPyObject, PyAny};
-use std::sync::{Arc, OnceLock};
-use std::collections::HashMap;
-use std::time::Duration;
 use regex::Regex;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::sync::Semaphore;
 
+use bytes::{Bytes, BytesMut};
 #[cfg(feature = "profiling")]
 use tracing::instrument;
-use bytes::{Bytes, BytesMut};
 
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 // data generation helpers
-use crate::data_gen::{generate_object};
 use crate::config::Config;
 use crate::config::ObjectType;
+use crate::data_gen::generate_object;
 
 // S3 client creation
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
@@ -67,8 +66,12 @@ fn get_range_opt_enabled() -> bool {
     *RANGE_OPT_ENABLED.get_or_init(|| {
         std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
             .ok()
-            .map(|v| !matches!(v.to_lowercase().as_str(),
-                "0" | "false" | "no" | "off" | "disable" | "disabled"))
+            .map(|v| {
+                !matches!(
+                    v.to_lowercase().as_str(),
+                    "0" | "false" | "no" | "off" | "disable" | "disabled"
+                )
+            })
             .unwrap_or(true) // default: enabled
     })
 }
@@ -104,39 +107,38 @@ fn get_size_cache() -> &'static Arc<ObjectSizeCache> {
     })
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // helper: create an S3Ops wired to the singleton logger (if any)
 async fn build_ops_async() -> Result<S3Ops> {
     let client = aws_s3_client_async().await?;
     let logger = global_logger();
     let client_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
-    let endpoint  = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
+    let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
     Ok(S3Ops::new(client, logger, &client_id, &endpoint))
 }
 
 // -----------------------------------------------------------------------------
-// ObjectStat struct for stat operation 
+// ObjectStat struct for stat operation
 // -----------------------------------------------------------------------------
 /// Full set of common S3 metadata from a HEAD-object call.
 #[derive(Debug)]
 pub struct ObjectStat {
-    pub size:                     u64,
-    pub last_modified:            Option<String>,
-    pub e_tag:                    Option<String>,
-    pub content_type:             Option<String>,
-    pub content_language:         Option<String>,
-    pub content_encoding:         Option<String>,
-    pub cache_control:            Option<String>,
-    pub content_disposition:      Option<String>,
-    pub expires:                  Option<String>,
-    pub storage_class:            Option<String>,
-    pub server_side_encryption:   Option<String>,
-    pub ssekms_key_id:            Option<String>,
-    pub sse_customer_algorithm:   Option<String>,
-    pub version_id:               Option<String>,
-    pub replication_status:       Option<String>,
-    pub metadata:                 HashMap<String, String>,
+    pub size: u64,
+    pub last_modified: Option<String>,
+    pub e_tag: Option<String>,
+    pub content_type: Option<String>,
+    pub content_language: Option<String>,
+    pub content_encoding: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    pub expires: Option<String>,
+    pub storage_class: Option<String>,
+    pub server_side_encryption: Option<String>,
+    pub ssekms_key_id: Option<String>,
+    pub sse_customer_algorithm: Option<String>,
+    pub version_id: Option<String>,
+    pub replication_status: Option<String>,
+    pub metadata: HashMap<String, String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -146,26 +148,24 @@ pub struct ObjectStat {
 impl From<&str> for ObjectType {
     fn from(s: &str) -> Self {
         match s.to_ascii_uppercase().as_str() {
-            "NPZ"      => ObjectType::Npz,
+            "NPZ" => ObjectType::Npz,
             "TFRECORD" => ObjectType::TfRecord,
-            "HDF5"     => ObjectType::Hdf5,
-            _           => ObjectType::Raw,
+            "HDF5" => ObjectType::Hdf5,
+            _ => ObjectType::Raw,
         }
     }
 }
-
 
 // pyo3 0.27 API - FromPyObject now takes two lifetime parameters and uses Borrowed
 #[cfg(feature = "extension-module")]
 impl<'a, 'py> FromPyObject<'a, 'py> for ObjectType {
     type Error = pyo3::PyErr;
-    
+
     fn extract(ob: pyo3::Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
         let s = ob.extract::<&str>()?;
         Ok(ObjectType::from(s))
     }
 }
-
 
 // -----------------------------------------------------------------------------
 // S3 URI helpers
@@ -186,7 +186,7 @@ pub struct S3UriComponents {
 /// Parse S3 URI with optional endpoint support (Hybrid Approach - Option C)
 ///
 /// Supports two formats:
-/// 1. **Standard**: `s3://bucket/key` 
+/// 1. **Standard**: `s3://bucket/key`
 ///    - Uses AWS_ENDPOINT_URL environment variable or default AWS endpoint
 ///    - Compatible with existing code
 ///
@@ -217,29 +217,33 @@ pub struct S3UriComponents {
 /// assert_eq!(result.endpoint, Some("minio.local:9000".to_string()));
 /// ```
 pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
-    let trimmed = uri.strip_prefix("s3://").context("URI must start with s3://")?;
-    
+    let trimmed = uri
+        .strip_prefix("s3://")
+        .context("URI must start with s3://")?;
+
     // Find the first slash to split host/bucket from key
-    let slash_pos = trimmed.find('/').context("URI must contain '/' after bucket")?;
+    let slash_pos = trimmed
+        .find('/')
+        .context("URI must contain '/' after bucket")?;
     let before_slash = &trimmed[..slash_pos];
     let after_slash = &trimmed[slash_pos + 1..];
-    
+
     // Heuristic to detect if first part is an endpoint:
     // - Contains ':' (has port) → definitely endpoint
     // - Starts with digit → likely IP address → endpoint
     // - Contains multiple dots → likely IP or FQDN → endpoint
     // - Common hostnames like "minio", "ceph" → endpoint
-    let is_endpoint = before_slash.contains(':') || 
-                     before_slash.starts_with(|c: char| c.is_ascii_digit()) ||
-                     before_slash.matches('.').count() >= 2 ||
-                     before_slash.starts_with("minio") ||
-                     before_slash.starts_with("ceph") ||
-                     before_slash.contains("localhost");
-    
+    let is_endpoint = before_slash.contains(':')
+        || before_slash.starts_with(|c: char| c.is_ascii_digit())
+        || before_slash.matches('.').count() >= 2
+        || before_slash.starts_with("minio")
+        || before_slash.starts_with("ceph")
+        || before_slash.contains("localhost");
+
     if is_endpoint {
         // Format: s3://endpoint:port/bucket/key or s3://endpoint/bucket/key
         let endpoint = before_slash.to_string();
-        
+
         // Find next slash for bucket/key split
         let slash_pos2 = after_slash.find('/').unwrap_or(after_slash.len());
         let bucket = after_slash[..slash_pos2].to_string();
@@ -248,11 +252,11 @@ pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
         } else {
             String::new()
         };
-        
+
         if bucket.is_empty() {
             bail!("Bucket name cannot be empty in URI: {}", uri);
         }
-        
+
         Ok(S3UriComponents {
             endpoint: Some(endpoint),
             bucket,
@@ -262,7 +266,7 @@ pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
         // Format: s3://bucket/key (standard AWS)
         let bucket = before_slash.to_string();
         let key = after_slash.to_string();
-        
+
         Ok(S3UriComponents {
             endpoint: None,
             bucket,
@@ -273,7 +277,7 @@ pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
 
 /// Split `s3://bucket/key` → (`bucket`, `key`).
 /// `key` may be empty (prefix).
-/// 
+///
 /// **Note**: This is the legacy function for backwards compatibility.
 /// For endpoint-aware parsing, use `parse_s3_uri_full()`.
 pub fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
@@ -305,7 +309,6 @@ pub fn create_bucket(bucket: &str) -> Result<()> {
         }
     })
 }
-
 
 // -----------------------------------------------------------------------------
 // S3 Delete bucket
@@ -394,11 +397,19 @@ pub(crate) fn resolve_list_buckets_params(
 
     debug!(
         "list_buckets params: {} → region={:?}, path_style={}",
-        if endpoint_url.is_some() { "custom endpoint" } else { "native AWS (us-east-1)" },
+        if endpoint_url.is_some() {
+            "custom endpoint"
+        } else {
+            "native AWS (us-east-1)"
+        },
         region,
         use_path_style,
     );
-    ListBucketsParams { region, use_path_style, endpoint_url }
+    ListBucketsParams {
+        region,
+        use_path_style,
+        endpoint_url,
+    }
 }
 
 /// List all S3 buckets visible to the current credentials.
@@ -413,8 +424,8 @@ pub(crate) fn resolve_list_buckets_params(
 ///   addressing (GCS and most self-hosted services do).
 pub fn list_buckets() -> Result<Vec<BucketInfo>> {
     run_on_global_rt(async move {
-        use aws_sdk_s3::config::Region;
         use aws_config::timeout::TimeoutConfig;
+        use aws_sdk_s3::config::Region;
         use std::time::Duration;
         use tracing::debug;
 
@@ -456,7 +467,7 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
             .build();
 
         let client = aws_sdk_s3::Client::from_conf(s3_cfg);
-        
+
         let response = client
             .list_buckets()
             .send()
@@ -467,10 +478,11 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
         let bucket_list = response.buckets();
         for bucket in bucket_list {
             let name = bucket.name().unwrap_or("Unknown").to_string();
-            let creation_date = bucket.creation_date()
+            let creation_date = bucket
+                .creation_date()
                 .map(|dt| dt.to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
-            
+
             buckets.push(BucketInfo {
                 name,
                 creation_date,
@@ -490,15 +502,15 @@ pub struct BucketInfo {
 
 /// List keys under a path, with regex matching on the final path component.
 /// Handles S3 pagination automatically.
-/// 
+///
 /// **DEPRECATED**: This S3-specific function will be removed in v1.0.0.
 /// For backend-agnostic code, use `ObjectStore::list()` via `store_for_uri()`.
-/// 
+///
 /// # Migration
 /// ```ignore
 /// // Old (S3-specific):
 /// let objects = list_objects("bucket", "prefix/", true)?;
-/// 
+///
 /// // New (Universal):
 /// use s3dlio::api::{store_for_uri, ObjectStore};
 /// let store = store_for_uri("s3://bucket/prefix/")?;
@@ -558,10 +570,7 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
                 debug!("  loop: continuation_token={:?}", cont);
             }
 
-            let resp = req_builder
-                .send()
-                .await
-                .context("list_objects_v2 failed")?;
+            let resp = req_builder.send().await.context("list_objects_v2 failed")?;
             debug!(
                 "  page received: {} contents, {} common prefixes",
                 resp.contents().len(),
@@ -582,7 +591,7 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
                 }
             }
 
-            // Handle common prefixes (directories) selectively in non-recursive mode  
+            // Handle common prefixes (directories) selectively in non-recursive mode
             // Only process CommonPrefixes that represent single-character separators (like "/")
             // This handles the case where objects with leading slashes are treated as directories by S3
             if !effective_recursive {
@@ -602,11 +611,12 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
                                         .bucket(&bucket)
                                         .prefix(prefix_key);
                                     // No delimiter for recursive call
-                                    
+
                                     if let Ok(recursive_resp) = recursive_req.send().await {
                                         for obj in recursive_resp.contents() {
                                             if let Some(key) = obj.key() {
-                                                if let Some(obj_basename) = key.strip_prefix(prefix) {
+                                                if let Some(obj_basename) = key.strip_prefix(prefix)
+                                                {
                                                     if re.is_match(obj_basename) {
                                                         debug!("    matched object under slash prefix: '{}'", key);
                                                         keys.push(key.to_string());
@@ -651,7 +661,10 @@ pub async fn list_objects_stream(
     path: String,
     recursive: bool,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
-    debug!("list_objects_stream called: bucket='{}', path='{}', recursive={}", bucket, path, recursive);
+    debug!(
+        "list_objects_stream called: bucket='{}', path='{}', recursive={}",
+        bucket, path, recursive
+    );
 
     // Determine the S3 prefix and regex pattern from the input path.
     // Do this eagerly (before returning the stream) so callers get parse errors immediately.
@@ -662,11 +675,19 @@ pub async fn list_objects_stream(
         }
         None => (String::new(), path.clone()),
     };
-    let final_pattern = if pattern_str.is_empty() { ".*".to_string() } else { pattern_str };
+    let final_pattern = if pattern_str.is_empty() {
+        ".*".to_string()
+    } else {
+        pattern_str
+    };
     let re = Regex::new(&final_pattern)
         .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
 
-    let delimiter = if recursive { None } else { Some("/".to_string()) };
+    let delimiter = if recursive {
+        None
+    } else {
+        Some("/".to_string())
+    };
 
     debug!(
         "list_objects_stream: prefix='{}', pattern='{}', recursive={}, delimiter={:?}",
@@ -764,7 +785,6 @@ pub async fn list_objects_stream(
     }))
 }
 
-
 /// NEW: Async GET by byte-range on full s3:// URI.
 /// If `length` is None, reads from `offset` to end.
 #[cfg_attr(feature = "profiling", instrument(
@@ -776,10 +796,19 @@ pub async fn list_objects_stream(
         length = ?length
     )
 ))]
-pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
+pub async fn get_object_range_uri_async(
+    uri: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Bytes> {
     let (bucket, key) = parse_s3_uri(uri)?;
-    if key.is_empty() { bail!("Cannot GET range: no key specified"); }
-    debug!("get_object_range: uri='{}', offset={}, length={:?}", uri, offset, length);
+    if key.is_empty() {
+        bail!("Cannot GET range: no key specified");
+    }
+    debug!(
+        "get_object_range: uri='{}', offset={}, length={:?}",
+        uri, offset, length
+    );
     let client = aws_s3_client_async().await?;
     let mut range = format!("bytes={}-", offset);
     if let Some(len) = length {
@@ -788,7 +817,8 @@ pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u
             range = format!("bytes={}-{}", offset, end);
         }
     }
-    let resp = client.get_object()
+    let resp = client
+        .get_object()
         .bucket(&bucket)
         .key(key.trim_start_matches('/'))
         .range(range)
@@ -798,7 +828,11 @@ pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u
     let body = resp.body.collect().await.context("collect range body")?;
     // Zero-copy: return Bytes directly
     let bytes = body.into_bytes();
-    debug!("get_object_range: uri='{}', returned {} bytes", uri, bytes.len());
+    debug!(
+        "get_object_range: uri='{}', returned {} bytes",
+        uri,
+        bytes.len()
+    );
     Ok(bytes)
 }
 
@@ -806,12 +840,7 @@ pub async fn get_object_range_uri_async(uri: &str, offset: u64, length: Option<u
 /// A negative or oversize request is truncated to the object size.
 /// Uses the existing `get_object_uri()` helper internally so we don't
 /// duplicate S3-client code right now.
-pub fn get_range(
-    bucket: &str,
-    key: &str,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<Bytes> {
+pub fn get_range(bucket: &str, key: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
     let uri = format!("s3://{bucket}/{key}");
     let bytes = get_object_uri(&uri)?;
     let start = offset as usize;
@@ -867,23 +896,23 @@ pub async fn get_object_concurrent_range_async(
         .context("head_object failed for concurrent range GET")?;
 
     let object_size = head_resp.content_length().unwrap_or(0) as u64;
-    
+
     // Calculate actual range
     let start_offset = offset;
     let end_offset = match length {
         Some(len) => std::cmp::min(start_offset + len, object_size),
         None => object_size,
     };
-    
+
     if start_offset >= object_size {
         return Ok(Bytes::new());
     }
-    
+
     let total_bytes = end_offset - start_offset;
-    
+
     // Determine optimal strategy based on size
     let effective_chunk_size = chunk_size.unwrap_or_else(|| get_optimal_chunk_size(total_bytes));
-    
+
     // Use single request for small objects
     if total_bytes <= effective_chunk_size as u64 {
         debug!("Using single range request for {} bytes", total_bytes);
@@ -891,14 +920,24 @@ pub async fn get_object_concurrent_range_async(
     }
 
     // Use concurrent ranges for large objects
-    let effective_concurrency = max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
-    
+    let effective_concurrency =
+        max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
+
     debug!(
         "Using concurrent range GET: {} bytes, chunk_size={}, concurrency={}",
         total_bytes, effective_chunk_size, effective_concurrency
     );
 
-    concurrent_range_get_impl(&client, &bucket, &key, start_offset, end_offset, effective_chunk_size, effective_concurrency).await
+    concurrent_range_get_impl(
+        &client,
+        &bucket,
+        &key,
+        start_offset,
+        end_offset,
+        effective_chunk_size,
+        effective_concurrency,
+    )
+    .await
 }
 
 /// Internal implementation of concurrent range GET with pre-allocated buffers
@@ -1043,7 +1082,8 @@ pub fn get_object_concurrent_range(
 ) -> Result<Bytes> {
     let uri_owned = uri.to_string(); // Clone the URI to avoid lifetime issues
     run_on_global_rt(async move {
-        get_object_concurrent_range_async(&uri_owned, offset, length, chunk_size, max_concurrency).await
+        get_object_concurrent_range_async(&uri_owned, offset, length, chunk_size, max_concurrency)
+            .await
     })
 }
 
@@ -1053,18 +1093,15 @@ pub fn get_object_concurrent_range(
 
 /// Perform HEAD-object and return all common metadata (async).
 pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
-
     // NOTE: Legacy S3Ops logging call removed here (was: `let _ = build_ops_async()...`)
     // Could hang on non-AWS endpoints. See docs/bugs/PYTHON_LIST_HANG_BUG_REPORT.md
     let key_clean = key.trim_start_matches('/');
 
-    debug!(
-        "stat_object: bucket='{}', key='{}'",
-        bucket, key_clean
-    );
+    debug!("stat_object: bucket='{}', key='{}'", bucket, key_clean);
 
     let client = aws_s3_client_async().await?;
-    let resp = client.head_object()
+    let resp = client
+        .head_object()
         .bucket(bucket)
         .key(key.trim_start_matches('/'))
         .send()
@@ -1072,23 +1109,25 @@ pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
         .context("head_object failed")?;
 
     Ok(ObjectStat {
-        size:                   resp.content_length().unwrap_or_default() as u64,
-        last_modified:          resp.last_modified().map(|t| t.to_string()),
-        e_tag:                  resp.e_tag().map(|s| s.to_string()),
-        content_type:           resp.content_type().map(|s| s.to_string()),
-        content_language:       resp.content_language().map(|s| s.to_string()),
-        content_encoding:       resp.content_encoding().map(|s| s.to_string()),
-        cache_control:          resp.cache_control().map(|s| s.to_string()),
-        content_disposition:    resp.content_disposition().map(|s| s.to_string()),
+        size: resp.content_length().unwrap_or_default() as u64,
+        last_modified: resp.last_modified().map(|t| t.to_string()),
+        e_tag: resp.e_tag().map(|s| s.to_string()),
+        content_type: resp.content_type().map(|s| s.to_string()),
+        content_language: resp.content_language().map(|s| s.to_string()),
+        content_encoding: resp.content_encoding().map(|s| s.to_string()),
+        cache_control: resp.cache_control().map(|s| s.to_string()),
+        content_disposition: resp.content_disposition().map(|s| s.to_string()),
         // if your SDK has `expires()` instead of `expires_string()`, swap accordingly
-        expires:                resp.expires_string().map(|s| s.to_string()),
-        storage_class:          resp.storage_class().map(|s| s.as_str().to_string()),
-        server_side_encryption: resp.server_side_encryption().map(|s| s.as_str().to_string()),
-        ssekms_key_id:          resp.ssekms_key_id().map(|s| s.to_string()),
+        expires: resp.expires_string().map(|s| s.to_string()),
+        storage_class: resp.storage_class().map(|s| s.as_str().to_string()),
+        server_side_encryption: resp
+            .server_side_encryption()
+            .map(|s| s.as_str().to_string()),
+        ssekms_key_id: resp.ssekms_key_id().map(|s| s.to_string()),
         sse_customer_algorithm: resp.sse_customer_algorithm().map(|s| s.to_string()),
-        version_id:             resp.version_id().map(|s| s.to_string()),
-        replication_status:     resp.replication_status().map(|s| s.as_str().to_string()),
-        metadata:               resp.metadata().cloned().unwrap_or_default(),
+        version_id: resp.version_id().map(|s| s.to_string()),
+        replication_status: resp.replication_status().map(|s| s.as_str().to_string()),
+        metadata: resp.metadata().cloned().unwrap_or_default(),
     })
 }
 
@@ -1098,7 +1137,9 @@ pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
 pub async fn stat_object_uri_async(uri: &str) -> Result<ObjectStat> {
     debug!("stat_object_uri_async: uri='{}'", uri);
     let (bucket, key) = parse_s3_uri(uri)?;
-    if key.is_empty() { bail!("Cannot HEAD: no key specified"); }
+    if key.is_empty() {
+        bail!("Cannot HEAD: no key specified");
+    }
     stat_object(&bucket, &key).await
 }
 
@@ -1119,7 +1160,7 @@ pub fn stat_object_uri(uri: &str) -> Result<ObjectStat> {
 }
 */
 
-/// Sync wrapper that is safe uses helper, we don't use the one above now? 
+/// Sync wrapper that is safe uses helper, we don't use the one above now?
 pub fn stat_object_uri(uri: &str) -> anyhow::Result<ObjectStat> {
     let uri = uri.to_string();
     run_on_global_rt(async move { stat_object_uri_async(&uri).await })
@@ -1128,10 +1169,11 @@ pub fn stat_object_uri(uri: &str) -> anyhow::Result<ObjectStat> {
 /// Async stat for many URIs (concurrent).
 pub async fn stat_object_many_async(uris: Vec<String>) -> Result<Vec<ObjectStat>> {
     use futures_util::future::try_join_all;
-    let futs = uris.into_iter().map(|u| async move { stat_object_uri_async(&u).await });
+    let futs = uris
+        .into_iter()
+        .map(|u| async move { stat_object_uri_async(&u).await });
     try_join_all(futs).await
 }
-
 
 // -----------------------------------------------------------------------------
 // Delete operation
@@ -1203,7 +1245,6 @@ pub async fn create_bucket_async(bucket: &str) -> Result<()> {
     Ok(())
 }
 
-
 // -----------------------------------------------------------------------------
 // Download (GET) operations
 // -----------------------------------------------------------------------------
@@ -1212,7 +1253,7 @@ pub async fn create_bucket_async(bucket: &str) -> Result<()> {
 pub async fn get_object(bucket: &str, key: &str) -> Result<Bytes> {
     // delegate to S3Ops (which records the GET) and propagate errors
     let data = build_ops_async().await?.get_object(bucket, key).await?;
-    
+
     debug!("S3 GET s3://{}/{} ({} bytes)", bucket, key, data.len());
     Ok(data)
 }
@@ -1233,14 +1274,12 @@ pub fn get_object_uri(uri: &str) -> anyhow::Result<Bytes> {
 ///   and skips its own HEAD — eliminating both HEAD #1 and #2 (Finding 1 fix).
 ///   On subsequent epochs the cache is already warm; zero HEADs issued.
 /// - O(N log N) sort: replaced O(N²) linear scan with a pre-built HashMap index.
-pub fn get_objects_parallel(
-    uris: &[String],
-    max_in_flight: usize,
-) -> Result<Vec<(String, Bytes)>> {
+pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec<(String, Bytes)>> {
     let uris = uris.to_vec();
     run_on_global_rt(async move {
         // Build position index once (O(N)) for O(N log N) sort later.
-        let uri_positions: HashMap<String, usize> = uris.iter()
+        let uri_positions: HashMap<String, usize> = uris
+            .iter()
             .enumerate()
             .map(|(i, u)| (u.clone(), i))
             .collect();
@@ -1250,19 +1289,22 @@ pub fn get_objects_parallel(
         // Uses the same max_in_flight limit to avoid overwhelming the server.
         if get_range_opt_enabled() {
             let stat_sem = Arc::new(Semaphore::new(max_in_flight));
-            let stat_futs: Vec<_> = uris.iter().map(|uri| {
-                let uri = uri.clone();
-                let stat_sem = stat_sem.clone();
-                async move {
-                    let _permit = stat_sem.acquire().await.ok();
-                    // Only stat if not already cached (subsequent epochs skip this)
-                    if get_size_cache().get(&uri).await.is_none() {
-                        if let Ok(stat) = stat_object_uri_async(&uri).await {
-                            get_size_cache().put(uri, stat.size).await;
+            let stat_futs: Vec<_> = uris
+                .iter()
+                .map(|uri| {
+                    let uri = uri.clone();
+                    let stat_sem = stat_sem.clone();
+                    async move {
+                        let _permit = stat_sem.acquire().await.ok();
+                        // Only stat if not already cached (subsequent epochs skip this)
+                        if get_size_cache().get(&uri).await.is_none() {
+                            if let Ok(stat) = stat_object_uri_async(&uri).await {
+                                get_size_cache().put(uri, stat.size).await;
+                            }
                         }
                     }
-                }
-            }).collect();
+                })
+                .collect();
             futures::future::join_all(stat_futs).await;
         }
 
@@ -1298,7 +1340,8 @@ pub fn get_objects_parallel_with_progress(
     let uris = uris.to_vec(); // own for 'static
     run_on_global_rt(async move {
         // Build position index once (O(N)) for O(N log N) sort later.
-        let uri_positions: HashMap<String, usize> = uris.iter()
+        let uri_positions: HashMap<String, usize> = uris
+            .iter()
             .enumerate()
             .map(|(i, u)| (u.clone(), i))
             .collect();
@@ -1313,12 +1356,12 @@ pub fn get_objects_parallel_with_progress(
                 let _permit = sem.acquire_owned().await.unwrap();
                 let data = get_object_uri_optimized_async(&uri).await?;
                 let byte_count = data.len() as u64;
-                
+
                 // Update progress if callback provided
                 if let Some(ref progress) = progress {
                     progress.object_completed(byte_count);
                 }
-                
+
                 Ok::<_, anyhow::Error>((uri, data))
             }));
         }
@@ -1331,7 +1374,6 @@ pub fn get_objects_parallel_with_progress(
         Ok(out)
     })
 }
-
 
 /// Optimised async GET that honours S3DLIO_ENABLE_RANGE_OPTIMIZATION on ALL paths.
 ///
@@ -1387,7 +1429,11 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
     };
 
     if object_size >= range_threshold {
-        debug!("concurrent range GET {}MB: {}", object_size / (1024 * 1024), uri);
+        debug!(
+            "concurrent range GET {}MB: {}",
+            object_size / (1024 * 1024),
+            uri
+        );
         // Pass known size → internal impl skips its own HEAD (eliminates HEAD #2).
         get_object_with_known_size_async(&bucket, &key, object_size, 0, None, None, None).await
     } else {
@@ -1427,14 +1473,20 @@ async fn get_object_with_known_size_async(
         return get_object_range_uri_async(&uri, start_offset, Some(total_bytes)).await;
     }
 
-    let effective_concurrency = max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
+    let effective_concurrency =
+        max_concurrency.unwrap_or_else(|| get_optimal_concurrency(total_bytes));
     let client = aws_s3_client_async().await?;
     concurrent_range_get_impl(
-        &client, bucket, key, start_offset, end_offset,
-        effective_chunk_size, effective_concurrency,
-    ).await
+        &client,
+        bucket,
+        key,
+        start_offset,
+        end_offset,
+        effective_chunk_size,
+        effective_concurrency,
+    )
+    .await
 }
-
 
 /// Public async get object call
 pub async fn get_object_uri_async(uri: &str) -> Result<Bytes> {
@@ -1470,29 +1522,37 @@ pub fn put_objects_with_random_data_and_type_with_progress(
 ) -> Result<()> {
     info!(
         "put_objects: type={:?}, size={} bytes, uris={} parallelism={}",
-        config.object_type, size, uris.len(), max_in_flight
+        config.object_type,
+        size,
+        uris.len(),
+        max_in_flight
     );
 
-    let buffer: Bytes = generate_object(&config)?;  // or: Bytes::from(generate_object(&config)?)
-    let uris_vec = uris.to_vec();                     // own for 'static
-    debug!("Uploading buffer of {} bytes to {} URIs", buffer.len(), uris_vec.len());
+    let buffer: Bytes = generate_object(&config)?; // or: Bytes::from(generate_object(&config)?)
+    let uris_vec = uris.to_vec(); // own for 'static
+    debug!(
+        "Uploading buffer of {} bytes to {} URIs",
+        buffer.len(),
+        uris_vec.len()
+    );
     put_objects_parallel_with_progress(uris_vec, buffer, max_in_flight, progress_callback)
 }
 
-
-
 /// Upload a single object to S3 **with op‑logging**.
-/// 
+///
 /// Accepts `Bytes` for zero-copy efficiency (no .to_vec() call).
 pub async fn put_object_async(bucket: &str, key: &str, data: Bytes) -> Result<()> {
     debug!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
     // delegate to S3Ops (which records the PUT) - data moved, no copy
-    build_ops_async().await?.put_object(bucket, key, data).await?;
+    build_ops_async()
+        .await?
+        .put_object(bucket, key, data)
+        .await?;
     Ok(())
 }
 
 /// Upload a single object to S3 by URI **with op‑logging**.
-/// 
+///
 /// Accepts `Bytes` for zero-copy efficiency.
 pub async fn put_object_uri_async(uri: &str, data: Bytes) -> Result<()> {
     debug!("put_object_uri_async: uri='{}', {} bytes", uri, data.len());
@@ -1501,21 +1561,26 @@ pub async fn put_object_uri_async(uri: &str, data: Bytes) -> Result<()> {
 }
 
 /// Upload object via multipart using existing MultipartUploadSink infrastructure.
-/// 
+///
 /// Accepts `Bytes` for zero-copy efficiency.
 pub async fn put_object_multipart_uri_async(
     uri: &str,
     data: Bytes,
     part_size: Option<usize>,
 ) -> Result<()> {
-    debug!("put_object_multipart_uri_async: uri='{}', {} bytes, part_size={:?}", uri, data.len(), part_size);
+    debug!(
+        "put_object_multipart_uri_async: uri='{}', {} bytes, part_size={:?}",
+        uri,
+        data.len(),
+        part_size
+    );
     use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
     let cfg = MultipartUploadConfig {
         part_size: part_size.unwrap_or(16 * 1024 * 1024), // 16 MiB default
         ..Default::default()
     };
     let mut sink = MultipartUploadSink::from_uri(uri, cfg)?;
-    sink.write_blocking(&data)?;  // Pass as &[u8] slice
+    sink.write_blocking(&data)?; // Pass as &[u8] slice
     sink.finish_blocking()?;
     Ok(())
 }
@@ -1530,7 +1595,7 @@ pub async fn put_object_multipart_uri_async(
 #[allow(dead_code)]
 pub(crate) fn put_objects_parallel(
     uris: Vec<String>,
-    data: Bytes,                    // ref-counted, cheap to clone
+    data: Bytes, // ref-counted, cheap to clone
     max_in_flight: usize,
 ) -> anyhow::Result<()> {
     put_objects_parallel_with_progress(uris, data, max_in_flight, None)
@@ -1538,39 +1603,39 @@ pub(crate) fn put_objects_parallel(
 
 pub(crate) fn put_objects_parallel_with_progress(
     uris: Vec<String>,
-    data: Bytes,                    // ref-counted, cheap to clone
+    data: Bytes, // ref-counted, cheap to clone
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> anyhow::Result<()> {
     // Get the global logger once, outside the async block
     let logger = global_logger();
-    
+
     run_on_global_rt(async move {
         let sem = Arc::new(Semaphore::new(max_in_flight));
         let mut futs = FuturesUnordered::new();
 
         for uri in uris.into_iter() {
             let sem = Arc::clone(&sem);
-            let payload = data.clone();           // zero-copy clone
+            let payload = data.clone(); // zero-copy clone
             let progress = progress_callback.clone();
-            let logger = logger.clone();          // clone logger for each task
+            let logger = logger.clone(); // clone logger for each task
 
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                
+
                 // Capture len before move (Bytes is cheap to clone, but we only need len)
                 let payload_len = payload.len() as u64;
-                
+
                 // Use universal ObjectStore API with op-log support
                 let store = crate::object_store::store_for_uri_with_logger(&uri, logger)?;
                 // Bytes passed directly for zero-copy
                 store.put(&uri, payload).await?;
-                
+
                 // Update progress after successful upload
                 if let Some(progress) = progress {
                     progress.object_completed(payload_len);
                 }
-                
+
                 Ok::<_, anyhow::Error>(())
             }));
         }
@@ -1594,8 +1659,10 @@ mod tests {
     fn test_list_buckets_aws_no_endpoint_forces_us_east_1() {
         // No custom endpoint → genuine AWS → always us-east-1
         let p = resolve_list_buckets_params(None, Some("eu-west-1"), None);
-        assert_eq!(p.region, "us-east-1",
-            "genuine AWS must always use us-east-1 for global ListBuckets");
+        assert_eq!(
+            p.region, "us-east-1",
+            "genuine AWS must always use us-east-1 for global ListBuckets"
+        );
         assert!(!p.use_path_style);
         assert_eq!(p.endpoint_url, None);
     }
@@ -1604,8 +1671,10 @@ mod tests {
     fn test_list_buckets_empty_endpoint_treated_as_no_endpoint() {
         // An empty string for AWS_ENDPOINT_URL is treated as "not set"
         let p = resolve_list_buckets_params(Some(""), Some("us-central1"), Some("path"));
-        assert_eq!(p.region, "us-east-1",
-            "empty endpoint must still force us-east-1 (genuine AWS path)");
+        assert_eq!(
+            p.region, "us-east-1",
+            "empty endpoint must still force us-east-1 (genuine AWS path)"
+        );
         assert_eq!(p.endpoint_url, None);
     }
 
@@ -1617,22 +1686,25 @@ mod tests {
             Some("us-central1"),
             Some("path"),
         );
-        assert_eq!(p.region, "us-central1",
-            "custom endpoint must use the caller's region, not us-east-1");
+        assert_eq!(
+            p.region, "us-central1",
+            "custom endpoint must use the caller's region, not us-east-1"
+        );
         assert!(p.use_path_style, "path addressing style must be respected");
-        assert_eq!(p.endpoint_url, Some("https://storage.googleapis.com".to_string()));
+        assert_eq!(
+            p.endpoint_url,
+            Some("https://storage.googleapis.com".to_string())
+        );
     }
 
     #[test]
     fn test_list_buckets_custom_endpoint_no_region_falls_back() {
         // Custom endpoint but no region env var → fallback to us-east-1
-        let p = resolve_list_buckets_params(
-            Some("http://minio.local:9000"),
-            None,
-            None,
+        let p = resolve_list_buckets_params(Some("http://minio.local:9000"), None, None);
+        assert_eq!(
+            p.region, "us-east-1",
+            "should fall back to us-east-1 when no region is set even for custom endpoints"
         );
-        assert_eq!(p.region, "us-east-1",
-            "should fall back to us-east-1 when no region is set even for custom endpoints");
         assert!(!p.use_path_style);
         assert_eq!(p.endpoint_url, Some("http://minio.local:9000".to_string()));
     }
@@ -1656,11 +1728,14 @@ mod tests {
         let p_lower = resolve_list_buckets_params(Some("http://host:9000"), None, Some("path"));
         let p_upper = resolve_list_buckets_params(Some("http://host:9000"), None, Some("PATH"));
         let p_mixed = resolve_list_buckets_params(Some("http://host:9000"), None, Some("Path"));
-        let p_virt  = resolve_list_buckets_params(Some("http://host:9000"), None, Some("virtual"));
+        let p_virt = resolve_list_buckets_params(Some("http://host:9000"), None, Some("virtual"));
         assert!(p_lower.use_path_style, "'path' should enable path style");
         assert!(p_upper.use_path_style, "'PATH' should enable path style");
         assert!(p_mixed.use_path_style, "'Path' should enable path style");
-        assert!(!p_virt.use_path_style, "'virtual' should not enable path style");
+        assert!(
+            !p_virt.use_path_style,
+            "'virtual' should not enable path style"
+        );
     }
 
     #[test]
@@ -1710,7 +1785,8 @@ mod tests {
     #[test]
     fn test_parse_s3_uri_endpoint_ip_with_path() {
         // IP endpoint with nested path
-        let result = parse_s3_uri_full("s3://192.168.100.2:9002/testbucket/path/to/object.dat").unwrap();
+        let result =
+            parse_s3_uri_full("s3://192.168.100.2:9002/testbucket/path/to/object.dat").unwrap();
         assert_eq!(result.endpoint, Some("192.168.100.2:9002".to_string()));
         assert_eq!(result.bucket, "testbucket");
         assert_eq!(result.key, "path/to/object.dat");
@@ -1729,7 +1805,10 @@ mod tests {
     fn test_parse_s3_uri_fqdn_endpoint() {
         // FQDN endpoint (detected by multiple dots)
         let result = parse_s3_uri_full("s3://storage.example.com:9000/mybucket/data.bin").unwrap();
-        assert_eq!(result.endpoint, Some("storage.example.com:9000".to_string()));
+        assert_eq!(
+            result.endpoint,
+            Some("storage.example.com:9000".to_string())
+        );
         assert_eq!(result.bucket, "mybucket");
         assert_eq!(result.key, "data.bin");
     }
@@ -1774,7 +1853,10 @@ mod tests {
         // Missing s3:// prefix
         let result = parse_s3_uri_full("mybucket/data.bin");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must start with s3://"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must start with s3://"));
     }
 
     #[test]
@@ -1808,5 +1890,3 @@ mod tests {
         assert_eq!(result.bucket, "bucket");
     }
 }
-
-

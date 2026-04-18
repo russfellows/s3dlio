@@ -51,10 +51,8 @@ use aws_smithy_types::body::SdkBody;
 use http_body_util::BodyExt;
 
 use crate::constants::{
-    ENV_S3DLIO_H2C,
-    ENV_POOL_MAX_IDLE_PER_HOST,  DEFAULT_POOL_MAX_IDLE_PER_HOST,
-    ENV_POOL_IDLE_TIMEOUT_SECS,  DEFAULT_POOL_IDLE_TIMEOUT_SECS,
-    H2WindowConfig,
+    H2WindowConfig, DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST,
+    ENV_POOL_IDLE_TIMEOUT_SECS, ENV_POOL_MAX_IDLE_PER_HOST, ENV_S3DLIO_H2C,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,7 +74,11 @@ static OBSERVED_IS_HTTP2: AtomicBool = AtomicBool::new(false);
 /// after the progress bar finishes to surface the protocol in the summary line.
 pub fn observed_http_version_str() -> Option<&'static str> {
     if PROTOCOL_LOGGED.load(Ordering::Relaxed) {
-        Some(if OBSERVED_IS_HTTP2.load(Ordering::Relaxed) { "HTTP/2" } else { "HTTP/1.1" })
+        Some(if OBSERVED_IS_HTTP2.load(Ordering::Relaxed) {
+            "HTTP/2"
+        } else {
+            "HTTP/1.1"
+        })
     } else {
         None
     }
@@ -87,8 +89,8 @@ pub fn observed_http_version_str() -> Option<&'static str> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const H2C_AUTO_UNKNOWN: u8 = 0; // haven't probed yet
-const H2C_AUTO_OK:      u8 = 1; // probe succeeded — keep using h2c
-const H2C_AUTO_FAILED:  u8 = 2; // probe failed — use HTTP/1.1 from now on
+const H2C_AUTO_OK: u8 = 1; // probe succeeded — keep using h2c
+const H2C_AUTO_FAILED: u8 = 2; // probe failed — use HTTP/1.1 from now on
 
 /// Per-process h2c auto-probe state.  Transitions: UNKNOWN → OK or UNKNOWN → FAILED.
 /// Only consulted when `H2cMode::Auto` is active (the default).
@@ -132,9 +134,9 @@ pub(crate) enum H2cMode {
 /// handles HTTP/2 negotiation there automatically).
 #[derive(Debug, Clone)]
 pub struct ReqwestHttpClient {
-    h2c_client:   reqwest::Client,
+    h2c_client: reqwest::Client,
     http1_client: reqwest::Client,
-    mode:         H2cMode,
+    mode: H2cMode,
 }
 
 impl ReqwestHttpClient {
@@ -142,9 +144,9 @@ impl ReqwestHttpClient {
     /// For auto h2c probing, use [`build_smithy_http_client`] instead.
     pub fn new(client: reqwest::Client) -> Self {
         Self {
-            h2c_client:   client.clone(),
+            h2c_client: client.clone(),
             http1_client: client,
-            mode:         H2cMode::ForceHttp1,
+            mode: H2cMode::ForceHttp1,
         }
     }
 }
@@ -157,9 +159,9 @@ impl HttpClient for ReqwestHttpClient {
     ) -> SharedHttpConnector {
         let read_timeout = settings.read_timeout();
         SharedHttpConnector::new(ReqwestHttpConnector {
-            h2c_client:   self.h2c_client.clone(),
+            h2c_client: self.h2c_client.clone(),
             http1_client: self.http1_client.clone(),
-            mode:         self.mode,
+            mode: self.mode,
             read_timeout,
         })
     }
@@ -170,9 +172,9 @@ impl HttpClient for ReqwestHttpClient {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct ReqwestHttpConnector {
-    h2c_client:   reqwest::Client,
+    h2c_client: reqwest::Client,
     http1_client: reqwest::Client,
-    mode:         H2cMode,
+    mode: H2cMode,
     read_timeout: Option<Duration>,
 }
 
@@ -188,9 +190,9 @@ impl fmt::Debug for ReqwestHttpConnector {
 
 impl HttpConnector for ReqwestHttpConnector {
     fn call(&self, req: HttpRequest) -> HttpConnectorFuture {
-        let h2c_client   = self.h2c_client.clone();
+        let h2c_client = self.h2c_client.clone();
         let http1_client = self.http1_client.clone();
-        let mode         = self.mode;
+        let mode = self.mode;
         let read_timeout = self.read_timeout;
 
         HttpConnectorFuture::new(async move {
@@ -200,7 +202,7 @@ impl HttpConnector for ReqwestHttpConnector {
                 .map_err(|e| ConnectorError::other(e.into(), None))?
                 .into_parts();
 
-            let url    = parts.uri.to_string();
+            let url = parts.uri.to_string();
             let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
                 .map_err(|e| ConnectorError::other(e.into(), None))?;
 
@@ -210,8 +212,9 @@ impl HttpConnector for ReqwestHttpConnector {
             let req_body = sdk_body
                 .collect()
                 .await
-                .map_err(|e: Box<dyn std::error::Error + Send + Sync + 'static>|
-                    ConnectorError::io(e))?
+                .map_err(|e: Box<dyn std::error::Error + Send + Sync + 'static>| {
+                    ConnectorError::io(e)
+                })?
                 .to_bytes();
 
             // ── Pick client for first attempt ─────────────────────────────
@@ -220,11 +223,11 @@ impl HttpConnector for ReqwestHttpConnector {
             // used; rustls ALPN negotiates HTTP/2 (or falls back to HTTP/1.1)
             // transparently during the TLS handshake.
             let is_plain_http = parts.uri.scheme_str() == Some("http");
-            let auto_state    = H2C_AUTO_STATE.load(Ordering::Relaxed);
+            let auto_state = H2C_AUTO_STATE.load(Ordering::Relaxed);
 
             let (choice, is_auto_probe) = select_client(mode, is_plain_http, auto_state);
             let first_client = match choice {
-                ClientChoice::H2c   => &h2c_client,
+                ClientChoice::H2c => &h2c_client,
                 ClientChoice::Http1 => &http1_client,
             };
 
@@ -233,7 +236,9 @@ impl HttpConnector for ReqwestHttpConnector {
             for (name, value) in &parts.headers {
                 builder = builder.header(name.as_str(), value.as_bytes());
             }
-            if let Some(timeout) = read_timeout { builder = builder.timeout(timeout); }
+            if let Some(timeout) = read_timeout {
+                builder = builder.timeout(timeout);
+            }
             builder = builder.body(reqwest::Body::from(req_body.clone()));
 
             let first_result = builder.send().await;
@@ -257,8 +262,10 @@ impl HttpConnector for ReqwestHttpConnector {
                     // compare_exchange: only the first racing failure logs + transitions
                     if H2C_AUTO_STATE
                         .compare_exchange(
-                            H2C_AUTO_UNKNOWN, H2C_AUTO_FAILED,
-                            Ordering::Relaxed, Ordering::Relaxed,
+                            H2C_AUTO_UNKNOWN,
+                            H2C_AUTO_FAILED,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
                         )
                         .is_ok()
                     {
@@ -272,22 +279,30 @@ impl HttpConnector for ReqwestHttpConnector {
                     for (name, value) in &parts.headers {
                         rb = rb.header(name.as_str(), value.as_bytes());
                     }
-                    if let Some(timeout) = read_timeout { rb = rb.timeout(timeout); }
+                    if let Some(timeout) = read_timeout {
+                        rb = rb.timeout(timeout);
+                    }
                     rb = rb.body(reqwest::Body::from(req_body.clone()));
                     rb.send().await.map_err(|e| {
-                        if e.is_connect() || e.is_timeout() { ConnectorError::timeout(e.into()) }
-                        else { ConnectorError::io(e.into()) }
+                        if e.is_connect() || e.is_timeout() {
+                            ConnectorError::timeout(e.into())
+                        } else {
+                            ConnectorError::io(e.into())
+                        }
                     })?
                 }
 
-                Err(e) => return Err(
-                    if e.is_connect() || e.is_timeout() { ConnectorError::timeout(e.into()) }
-                    else { ConnectorError::io(e.into()) }
-                ),
+                Err(e) => {
+                    return Err(if e.is_connect() || e.is_timeout() {
+                        ConnectorError::timeout(e.into())
+                    } else {
+                        ConnectorError::io(e.into())
+                    })
+                }
             };
 
             // ── Protocol-version telemetry (logged once at INFO) ──────────
-            let status  = resp.status().as_u16();
+            let status = resp.status().as_u16();
             let version = resp.version();
             let headers = resp.headers().clone();
 
@@ -298,13 +313,16 @@ impl HttpConnector for ReqwestHttpConnector {
                 tracing::debug!("HTTP protocol: {:?}", version);
             }
 
-            let resp_body = resp.bytes().await
+            let resp_body = resp
+                .bytes()
+                .await
                 .map_err(|e| ConnectorError::io(e.into()))?;
 
             // ── Build Smithy response ─────────────────────────────────────
             let mut response = HttpResponse::new(
                 http::StatusCode::from_u16(status)
-                    .map_err(|e| ConnectorError::other(e.into(), None))?.into(),
+                    .map_err(|e| ConnectorError::other(e.into(), None))?
+                    .into(),
                 SdkBody::from(resp_body),
             );
 
@@ -341,20 +359,24 @@ impl HttpConnector for ReqwestHttpConnector {
 /// - `ClientChoice::H2c`   — use the h2c (prior-knowledge) client
 /// - `ClientChoice::Http1` — use the HTTP/1.1 / ALPN client
 /// - `is_auto_probe`       — `true` only on the very first h2c probe attempt
-pub(crate) fn select_client(mode: H2cMode, is_plain_http: bool, auto_state: u8) -> (ClientChoice, bool) {
+pub(crate) fn select_client(
+    mode: H2cMode,
+    is_plain_http: bool,
+    auto_state: u8,
+) -> (ClientChoice, bool) {
     match mode {
         // ForceH2c: h2c prior-knowledge only makes sense on http://.  On
         // https:// fall through to Http1 so TLS ALPN handles HTTP/2.
-        H2cMode::ForceH2c if is_plain_http  => (ClientChoice::H2c,   false),
-        H2cMode::ForceH2c                   => (ClientChoice::Http1, false),
-        H2cMode::ForceHttp1                 => (ClientChoice::Http1, false),
+        H2cMode::ForceH2c if is_plain_http => (ClientChoice::H2c, false),
+        H2cMode::ForceH2c => (ClientChoice::Http1, false),
+        H2cMode::ForceHttp1 => (ClientChoice::Http1, false),
         // Auto: probe h2c on the first plain-HTTP connection, then remember.
-        H2cMode::Auto if is_plain_http && auto_state == H2C_AUTO_UNKNOWN
-                                            => (ClientChoice::H2c,   true),
-        H2cMode::Auto if is_plain_http && auto_state == H2C_AUTO_OK
-                                            => (ClientChoice::H2c,   false),
+        H2cMode::Auto if is_plain_http && auto_state == H2C_AUTO_UNKNOWN => {
+            (ClientChoice::H2c, true)
+        }
+        H2cMode::Auto if is_plain_http && auto_state == H2C_AUTO_OK => (ClientChoice::H2c, false),
         // Auto + https://, or Auto + http:// but probe already failed.
-        H2cMode::Auto                       => (ClientChoice::Http1, false),
+        H2cMode::Auto => (ClientChoice::Http1, false),
     }
 }
 
@@ -383,9 +405,9 @@ pub(crate) fn h2c_enabled_from_val(val: &str) -> bool {
 /// | falsy (`0`, `false`, …) | `ForceHttp1` — skip probe, always HTTP/1.1 |
 pub(crate) fn h2c_mode_from_env() -> H2cMode {
     match std::env::var(ENV_S3DLIO_H2C) {
-        Err(_)                            => H2cMode::Auto,
+        Err(_) => H2cMode::Auto,
         Ok(v) if h2c_enabled_from_val(&v) => H2cMode::ForceH2c,
-        Ok(_)                             => H2cMode::ForceHttp1,
+        Ok(_) => H2cMode::ForceHttp1,
     }
 }
 
@@ -394,7 +416,10 @@ pub(crate) fn h2c_mode_from_env() -> H2cMode {
 /// When `h2c` is `true`, HTTP/2 flow-control window tuning is applied using
 /// the adaptive/static strategy resolved from env vars via [`H2WindowConfig::from_env`].
 /// See [`crate::constants`] for all tunable environment variable names and defaults.
-fn build_reqwest_client_raw(ca_bundle_path: Option<&str>, h2c: bool) -> anyhow::Result<reqwest::Client> {
+fn build_reqwest_client_raw(
+    ca_bundle_path: Option<&str>,
+    h2c: bool,
+) -> anyhow::Result<reqwest::Client> {
     let max_idle: usize = std::env::var(ENV_POOL_MAX_IDLE_PER_HOST)
         .ok()
         .and_then(|s| s.parse().ok())
@@ -442,7 +467,7 @@ fn build_reqwest_client_raw(ca_bundle_path: Option<&str>, h2c: bool) -> anyhow::
             // S3DLIO_H2_ADAPTIVE_WINDOW=0 or by setting explicit window sizes.
             // These fixed values are used for the lifetime of the process.
             let stream_bytes = win_cfg.stream_window_bytes();
-            let conn_bytes   = win_cfg.conn_window_bytes();
+            let conn_bytes = win_cfg.conn_window_bytes();
             builder = builder
                 .http2_initial_stream_window_size(stream_bytes)
                 .http2_initial_connection_window_size(conn_bytes);
@@ -486,7 +511,10 @@ pub fn build_smithy_http_client(
             let win_desc = if win.adaptive {
                 "adaptive BDP window".to_string()
             } else {
-                format!("static stream={} MiB conn={} MiB", win.stream_window_mb, win.conn_window_mb)
+                format!(
+                    "static stream={} MiB conn={} MiB",
+                    win.stream_window_mb, win.conn_window_mb
+                )
             };
             tracing::info!(
                 "HTTP version mode: FORCED HTTP/2 (S3DLIO_H2C=1) — \
@@ -494,15 +522,17 @@ pub fn build_smithy_http_client(
                  h2 window: {win_desc}"
             );
         }
-        H2cMode::ForceHttp1 => tracing::info!(
-            "HTTP version mode: forced HTTP/1.1 (S3DLIO_H2C=0)"
-        ),
+        H2cMode::ForceHttp1 => tracing::info!("HTTP version mode: forced HTTP/1.1 (S3DLIO_H2C=0)"),
     }
 
-    let h2c_client   = build_reqwest_client_raw(ca_bundle_path, true)?;
+    let h2c_client = build_reqwest_client_raw(ca_bundle_path, true)?;
     let http1_client = build_reqwest_client_raw(ca_bundle_path, false)?;
     Ok(aws_smithy_runtime_api::client::http::SharedHttpClient::new(
-        ReqwestHttpClient { h2c_client, http1_client, mode }
+        ReqwestHttpClient {
+            h2c_client,
+            http1_client,
+            mode,
+        },
     ))
 }
 
@@ -510,24 +540,24 @@ pub fn build_smithy_http_client(
 ///
 /// Prefer [`build_smithy_http_client`] for new code.  This function is kept
 /// for backward compatibility and for callers that need a raw reqwest client.
-pub fn build_reqwest_http_client_with_ca(ca_bundle_path: Option<&str>) -> anyhow::Result<reqwest::Client> {
+pub fn build_reqwest_http_client_with_ca(
+    ca_bundle_path: Option<&str>,
+) -> anyhow::Result<reqwest::Client> {
     build_reqwest_client_raw(ca_bundle_path, false)
 }
 
 /// Convenience wrapper — no custom CA bundle, HTTP/1.1 only.
 pub fn build_reqwest_http_client() -> reqwest::Client {
-    build_reqwest_http_client_with_ca(None)
-        .expect("reqwest client build (no CA) should not fail")
+    build_reqwest_http_client_with_ca(None).expect("reqwest client build (no CA) should not fail")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::constants::{
-        ENV_S3DLIO_H2C, ENV_POOL_MAX_IDLE_PER_HOST, ENV_POOL_IDLE_TIMEOUT_SECS,
-        ENV_H2_ADAPTIVE_WINDOW, ENV_H2_STREAM_WINDOW_MB, ENV_H2_CONN_WINDOW_MB,
-        H2WindowConfig,
-        DEFAULT_H2_STREAM_WINDOW_MB, DEFAULT_H2_CONN_WINDOW_MB,
+        H2WindowConfig, DEFAULT_H2_CONN_WINDOW_MB, DEFAULT_H2_STREAM_WINDOW_MB,
+        ENV_H2_ADAPTIVE_WINDOW, ENV_H2_CONN_WINDOW_MB, ENV_H2_STREAM_WINDOW_MB,
+        ENV_POOL_IDLE_TIMEOUT_SECS, ENV_POOL_MAX_IDLE_PER_HOST, ENV_S3DLIO_H2C,
         H2_WINDOW_MB_HARD_CAP,
     };
 
@@ -540,15 +570,34 @@ mod tests {
 
     #[test]
     fn test_h2c_truthy_values() {
-        for val in &["1", "true", "yes", "on", "enable", "TRUE", "YES", "ON", "ENABLE"] {
-            assert!(h2c_enabled_from_val(val), "Expected h2c enabled for '{val}'");
+        for val in &[
+            "1", "true", "yes", "on", "enable", "TRUE", "YES", "ON", "ENABLE",
+        ] {
+            assert!(
+                h2c_enabled_from_val(val),
+                "Expected h2c enabled for '{val}'"
+            );
         }
     }
 
     #[test]
     fn test_h2c_falsy_values() {
-        for val in &["0", "false", "no", "off", "disable", "", "2", "yes-please", "disabled", "http2"] {
-            assert!(!h2c_enabled_from_val(val), "Expected h2c disabled for '{val}'");
+        for val in &[
+            "0",
+            "false",
+            "no",
+            "off",
+            "disable",
+            "",
+            "2",
+            "yes-please",
+            "disabled",
+            "http2",
+        ] {
+            assert!(
+                !h2c_enabled_from_val(val),
+                "Expected h2c disabled for '{val}'"
+            );
         }
     }
 
@@ -578,7 +627,10 @@ mod tests {
             #[allow(deprecated)]
             None => std::env::remove_var(ENV_S3DLIO_H2C),
         }
-        assert!(result.is_ok(), "build_smithy_http_client() must not panic with S3DLIO_H2C=1");
+        assert!(
+            result.is_ok(),
+            "build_smithy_http_client() must not panic with S3DLIO_H2C=1"
+        );
     }
 
     /// All truthy `S3DLIO_H2C` variants produce a valid `SharedHttpClient`.
@@ -612,13 +664,21 @@ mod tests {
         for val in &["1", "true", "yes", "on", "enable"] {
             #[allow(deprecated)]
             std::env::set_var(ENV_S3DLIO_H2C, val);
-            assert_eq!(h2c_mode_from_env(), H2cMode::ForceH2c, "expected ForceH2c for '{val}'");
+            assert_eq!(
+                h2c_mode_from_env(),
+                H2cMode::ForceH2c,
+                "expected ForceH2c for '{val}'"
+            );
         }
         // Falsy → ForceHttp1
         for val in &["0", "false", "no", "off", "disable"] {
             #[allow(deprecated)]
             std::env::set_var(ENV_S3DLIO_H2C, val);
-            assert_eq!(h2c_mode_from_env(), H2cMode::ForceHttp1, "expected ForceHttp1 for '{val}'");
+            assert_eq!(
+                h2c_mode_from_env(),
+                H2cMode::ForceHttp1,
+                "expected ForceHttp1 for '{val}'"
+            );
         }
         // Restore
         #[allow(deprecated)]
@@ -642,10 +702,7 @@ mod tests {
     #[test]
     fn test_build_client_with_missing_ca_bundle_returns_error() {
         let result = build_reqwest_http_client_with_ca(Some("/nonexistent/path/ca.pem"));
-        assert!(
-            result.is_err(),
-            "Expected error for missing CA bundle path"
-        );
+        assert!(result.is_err(), "Expected error for missing CA bundle path");
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("Failed to read CA bundle"),
@@ -656,7 +713,7 @@ mod tests {
     #[test]
     fn test_pool_settings_from_env() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_idle    = std::env::var(ENV_POOL_MAX_IDLE_PER_HOST).ok();
+        let old_idle = std::env::var(ENV_POOL_MAX_IDLE_PER_HOST).ok();
         let old_timeout = std::env::var(ENV_POOL_IDLE_TIMEOUT_SECS).ok();
         #[allow(deprecated)]
         std::env::set_var(ENV_POOL_MAX_IDLE_PER_HOST, "64");
@@ -696,17 +753,17 @@ mod tests {
         #[allow(deprecated)]
         match saved.0 {
             Some(v) => std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, v),
-            None    => std::env::remove_var(ENV_H2_ADAPTIVE_WINDOW),
+            None => std::env::remove_var(ENV_H2_ADAPTIVE_WINDOW),
         }
         #[allow(deprecated)]
         match saved.1 {
             Some(v) => std::env::set_var(ENV_H2_STREAM_WINDOW_MB, v),
-            None    => std::env::remove_var(ENV_H2_STREAM_WINDOW_MB),
+            None => std::env::remove_var(ENV_H2_STREAM_WINDOW_MB),
         }
         #[allow(deprecated)]
         match saved.2 {
             Some(v) => std::env::set_var(ENV_H2_CONN_WINDOW_MB, v),
-            None    => std::env::remove_var(ENV_H2_CONN_WINDOW_MB),
+            None => std::env::remove_var(ENV_H2_CONN_WINDOW_MB),
         }
     }
 
@@ -726,7 +783,7 @@ mod tests {
         restore_window_env(saved);
         assert!(cfg.adaptive, "unset env must give adaptive=true");
         assert_eq!(cfg.stream_window_mb, DEFAULT_H2_STREAM_WINDOW_MB);
-        assert_eq!(cfg.conn_window_mb,   DEFAULT_H2_CONN_WINDOW_MB);
+        assert_eq!(cfg.conn_window_mb, DEFAULT_H2_CONN_WINDOW_MB);
     }
 
     /// Explicit truthy values for S3DLIO_H2_ADAPTIVE_WINDOW → adaptive ON.
@@ -756,11 +813,19 @@ mod tests {
         }
         let cfg = H2WindowConfig::from_env();
         restore_window_env(saved);
-        assert!(!cfg.adaptive, "adaptive must be false when S3DLIO_H2_ADAPTIVE_WINDOW=0");
-        assert_eq!(cfg.stream_window_mb, DEFAULT_H2_STREAM_WINDOW_MB,
-            "stream window should default to DEFAULT_H2_STREAM_WINDOW_MB");
-        assert_eq!(cfg.conn_window_mb, DEFAULT_H2_STREAM_WINDOW_MB * 4,
-            "conn window should default to 4× stream window");
+        assert!(
+            !cfg.adaptive,
+            "adaptive must be false when S3DLIO_H2_ADAPTIVE_WINDOW=0"
+        );
+        assert_eq!(
+            cfg.stream_window_mb, DEFAULT_H2_STREAM_WINDOW_MB,
+            "stream window should default to DEFAULT_H2_STREAM_WINDOW_MB"
+        );
+        assert_eq!(
+            cfg.conn_window_mb,
+            DEFAULT_H2_STREAM_WINDOW_MB * 4,
+            "conn window should default to 4× stream window"
+        );
     }
 
     /// Static stream window can be overridden; conn defaults to 4× stream.
@@ -798,7 +863,7 @@ mod tests {
         assert_eq!(cfg.stream_window_mb, 8);
         assert_eq!(cfg.conn_window_mb, 32);
         assert_eq!(cfg.stream_window_bytes(), 8 * 1024 * 1024);
-        assert_eq!(cfg.conn_window_bytes(),  32 * 1024 * 1024);
+        assert_eq!(cfg.conn_window_bytes(), 32 * 1024 * 1024);
     }
 
     /// Values above the hard cap (256 MiB) are clamped.
@@ -810,12 +875,14 @@ mod tests {
         {
             std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, "0");
             std::env::set_var(ENV_H2_STREAM_WINDOW_MB, "999");
-            std::env::set_var(ENV_H2_CONN_WINDOW_MB,   "999");
+            std::env::set_var(ENV_H2_CONN_WINDOW_MB, "999");
         }
         let cfg = H2WindowConfig::from_env();
         restore_window_env(saved);
-        assert_eq!(cfg.stream_window_mb, H2_WINDOW_MB_HARD_CAP,
-            "values above hard cap must be clamped to {H2_WINDOW_MB_HARD_CAP}");
+        assert_eq!(
+            cfg.stream_window_mb, H2_WINDOW_MB_HARD_CAP,
+            "values above hard cap must be clamped to {H2_WINDOW_MB_HARD_CAP}"
+        );
         assert_eq!(cfg.conn_window_mb, H2_WINDOW_MB_HARD_CAP);
     }
 
@@ -832,10 +899,16 @@ mod tests {
                 std::env::set_var(ENV_H2_CONN_WINDOW_MB, bad);
             }
             let cfg = H2WindowConfig::from_env();
-            assert!(cfg.stream_window_mb > 0,
-                "stream_window_mb must never be 0 (was {}, input '{bad}')", cfg.stream_window_mb);
-            assert!(cfg.conn_window_mb > 0,
-                "conn_window_mb must never be 0 (was {}, input '{bad}')", cfg.conn_window_mb);
+            assert!(
+                cfg.stream_window_mb > 0,
+                "stream_window_mb must never be 0 (was {}, input '{bad}')",
+                cfg.stream_window_mb
+            );
+            assert!(
+                cfg.conn_window_mb > 0,
+                "conn_window_mb must never be 0 (was {}, input '{bad}')",
+                cfg.conn_window_mb
+            );
         }
         restore_window_env(saved);
     }
@@ -857,10 +930,14 @@ mod tests {
         #[allow(deprecated)]
         match saved_h2c {
             Some(v) => std::env::set_var(ENV_S3DLIO_H2C, v),
-            None    => std::env::remove_var(ENV_S3DLIO_H2C),
+            None => std::env::remove_var(ENV_S3DLIO_H2C),
         }
         restore_window_env(saved_win);
-        assert!(result.is_ok(), "build with static h2 window must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "build with static h2 window must succeed: {:?}",
+            result.err()
+        );
     }
 
     /// Build succeeds with h2c + adaptive window (the default path).
@@ -878,10 +955,14 @@ mod tests {
         #[allow(deprecated)]
         match saved_h2c {
             Some(v) => std::env::set_var(ENV_S3DLIO_H2C, v),
-            None    => std::env::remove_var(ENV_S3DLIO_H2C),
+            None => std::env::remove_var(ENV_S3DLIO_H2C),
         }
         restore_window_env(saved_win);
-        assert!(result.is_ok(), "build with adaptive h2 window must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "build with adaptive h2 window must succeed: {:?}",
+            result.err()
+        );
     }
 
     // ── ReqwestHttpClient (structural — no env var, no network) ─────────────
@@ -944,7 +1025,10 @@ mod tests {
         // Auto mode, http://, no probe yet: send via H2c and mark as probe.
         let (choice, probe) = select_client(H2cMode::Auto, true, H2C_AUTO_UNKNOWN);
         assert_eq!(choice, ClientChoice::H2c);
-        assert!(probe, "First Auto+http:// request must be the probe attempt");
+        assert!(
+            probe,
+            "First Auto+http:// request must be the probe attempt"
+        );
     }
 
     #[test]
@@ -952,7 +1036,10 @@ mod tests {
         // Auto mode, http://, probe previously succeeded: use H2c without probing.
         let (choice, probe) = select_client(H2cMode::Auto, true, H2C_AUTO_OK);
         assert_eq!(choice, ClientChoice::H2c);
-        assert!(!probe, "After successful probe, is_auto_probe must be false");
+        assert!(
+            !probe,
+            "After successful probe, is_auto_probe must be false"
+        );
     }
 
     #[test]
@@ -973,7 +1060,8 @@ mod tests {
         // transparently via ALPN — no special client needed.
         let (choice, probe) = select_client(H2cMode::ForceH2c, false, H2C_AUTO_UNKNOWN);
         assert_eq!(
-            choice, ClientChoice::Http1,
+            choice,
+            ClientChoice::Http1,
             "ForceH2c on https:// must route to Http1 (ALPN handles HTTP/2 in TLS layer)"
         );
         assert!(!probe);

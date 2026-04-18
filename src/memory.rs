@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 
 /// Aligned memory buffer suitable for O_DIRECT I/O and zero-copy operations
-/// 
+///
 /// This buffer is allocated with specific alignment requirements (typically 4096 bytes)
 /// to satisfy O_DIRECT constraints when file I/O is needed, while also being optimal
 /// for memory-only operations.
@@ -25,14 +25,14 @@ unsafe impl Sync for AlignedBuf {}
 
 impl AlignedBuf {
     /// Create a new aligned buffer with the specified size and alignment
-    /// 
+    ///
     /// # Arguments
     /// * `len` - Buffer size in bytes
     /// * `align` - Alignment requirement (typically 4096 for O_DIRECT)
     pub fn new(len: usize, align: usize) -> Self {
-        let layout = Layout::from_size_align(len, align)
-            .expect("Invalid layout for aligned buffer");
-        let ptr = unsafe { 
+        let layout =
+            Layout::from_size_align(len, align).expect("Invalid layout for aligned buffer");
+        let ptr = unsafe {
             let raw_ptr = alloc(layout);
             NonNull::new(raw_ptr).expect("Failed to allocate aligned buffer")
         };
@@ -84,7 +84,7 @@ impl Drop for AlignedBuf {
 }
 
 /// High-performance buffer pool for aligned buffers
-/// 
+///
 /// Maintains a pool of pre-allocated aligned buffers to eliminate allocation
 /// overhead during high-throughput S3 operations. Buffers are reused across
 /// multiple operations to minimize GC pressure and maintain consistent performance.
@@ -99,7 +99,7 @@ pub struct BufferPool {
 
 impl BufferPool {
     /// Create a new buffer pool with the specified capacity and buffer parameters
-    /// 
+    ///
     /// # Arguments
     /// * `capacity` - Number of buffers to maintain in the pool
     /// * `buf_len` - Size of each buffer in bytes
@@ -107,7 +107,7 @@ impl BufferPool {
     pub fn new(capacity: usize, buf_len: usize, align: usize) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(capacity);
         let permits = Arc::new(Semaphore::new(capacity));
-        
+
         let pool = Arc::new(Self {
             tx,
             rx: tokio::sync::Mutex::new(rx),
@@ -134,7 +134,7 @@ impl BufferPool {
     pub async fn take(&self) -> AlignedBuf {
         // Acquire permit first to ensure we don't exceed capacity
         let _permit = self.permits.acquire().await.expect("Pool semaphore closed");
-        
+
         // Try to get a buffer from the pool
         let mut rx = self.rx.lock().await;
         if let Ok(buf) = rx.try_recv() {
@@ -174,9 +174,9 @@ pub struct BufferPoolConfig {
 impl Default for BufferPoolConfig {
     fn default() -> Self {
         Self {
-            capacity: 64,                    // 64 buffers
-            buffer_size: 16 * 1024 * 1024,  // 16 MiB per buffer
-            alignment: 4096,                 // 4 KiB alignment for O_DIRECT
+            capacity: 64,                  // 64 buffers
+            buffer_size: 16 * 1024 * 1024, // 16 MiB per buffer
+            alignment: 4096,               // 4 KiB alignment for O_DIRECT
         }
     }
 }
@@ -216,7 +216,7 @@ mod tests {
         assert_eq!(buf.len(), 8192);
         assert_eq!(buf.align(), 4096);
         assert_eq!(buf.as_ptr() as usize % 4096, 0); // Check alignment
-        
+
         // Ensure we can write to the buffer
         let slice = buf.as_mut_slice();
         slice[0] = 42;
@@ -226,17 +226,17 @@ mod tests {
     #[tokio::test]
     async fn buffer_pool_basic() {
         let pool = BufferPool::new(2, 4096, 4096);
-        
+
         // Take buffer
         let mut buf1 = pool.take().await;
         assert_eq!(buf1.len(), 4096);
-        
+
         // Modify buffer
         buf1.as_mut_slice()[0] = 123;
-        
+
         // Return buffer
         pool.give(buf1).await;
-        
+
         // Take again - should get a buffer (possibly reused)
         let buf2 = pool.take().await;
         assert_eq!(buf2.len(), 4096);
@@ -248,7 +248,7 @@ mod tests {
             .with_capacity(32)
             .with_buffer_size(8 * 1024 * 1024)
             .with_alignment(4096);
-            
+
         assert_eq!(config.capacity, 32);
         assert_eq!(config.buffer_size, 8 * 1024 * 1024);
         assert_eq!(config.alignment, 4096);

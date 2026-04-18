@@ -8,20 +8,19 @@
 //! prefetching, or multi‑threading is included yet—those arrive in the
 //! next stage.
 
+use anyhow::{self, Error as AnyError};
 use async_trait::async_trait;
 use futures_core::stream::Stream;
 use std::pin::Pin;
-use thiserror::Error;
-use anyhow::{self, Error as AnyError}; // <-- bring Error type in
+use thiserror::Error; // <-- bring Error type in
 
 /// A boxed, pinned, sendable async stream of fallible items.
-pub type DynStream<T> =
-    Pin<Box<dyn Stream<Item = Result<T, DatasetError>> + Send + 'static>>;
+pub type DynStream<T> = Pin<Box<dyn Stream<Item = Result<T, DatasetError>> + Send + 'static>>;
 
 /// Item‑level error type for dataset & loader operations.
-#[derive(Error, Debug)] 
+#[derive(Error, Debug)]
 pub enum DatasetError {
-    #[error("index out of range: {0}")]  // if using thiserror
+    #[error("index out of range: {0}")] // if using thiserror
     IndexOutOfRange(usize),
 
     #[error("operation not supported for this dataset type")]
@@ -31,7 +30,6 @@ pub enum DatasetError {
     #[error(transparent)]
     Backend(#[from] AnyError),
 }
-
 
 // Mapping from string to error
 impl From<String> for DatasetError {
@@ -87,4 +85,3 @@ pub trait Dataset: Send + Sync + 'static {
         self.len().map(|n| n == 0).unwrap_or(false)
     }
 }
-

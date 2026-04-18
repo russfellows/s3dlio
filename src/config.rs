@@ -27,7 +27,6 @@ pub enum DataGenAlgorithm {
     Random,
 }
 
-
 /// Data generation modes for performance optimization.
 #[derive(Clone, Copy, Debug, ValueEnum, Deserialize, Serialize)]
 #[clap(rename_all = "kebab-case")] // CLI shows streaming, single-pass
@@ -40,7 +39,6 @@ pub enum DataGenMode {
     /// Single-pass generation (legacy, faster for 16-32MB objects)
     SinglePass,
 }
-
 
 /// S3-specific configuration
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -97,29 +95,29 @@ impl Default for CliConfig {
 /// Runtime parameters used by `data_gen`.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub object_type:    ObjectType, // ← enum of "NPZ" | "HDF5" | "TFRecord" | "RAW"
-    pub elements:       usize,       // number of elements per object
-    pub element_size:   usize,   // bytes per element
-                               
+    pub object_type: ObjectType, // ← enum of "NPZ" | "HDF5" | "TFRecord" | "RAW"
+    pub elements: usize,         // number of elements per object
+    pub element_size: usize,     // bytes per element
+
     // ---- knobs for data pattern generation ----
-    pub use_controlled: bool,    // true => use controlled data generation (data_gen_alt)
-    pub dedup_factor:   usize,       // e.g. 1 (all unique), 3 (1/3 unique)
-    pub compress_factor: usize,    // e.g. 1 (random), 2 (≈50 % zeros)
-    
+    pub use_controlled: bool, // true => use controlled data generation (data_gen_alt)
+    pub dedup_factor: usize,  // e.g. 1 (all unique), 3 (1/3 unique)
+    pub compress_factor: usize, // e.g. 1 (random), 2 (≈50 % zeros)
+
     // ---- performance optimization ----
     pub data_gen_algorithm: DataGenAlgorithm, // random vs prand algorithm
-    pub data_gen_mode: DataGenMode,  // streaming vs single-pass generation  
-    pub chunk_size: usize,           // chunk size for streaming mode (default 256KB)
+    pub data_gen_mode: DataGenMode,           // streaming vs single-pass generation
+    pub chunk_size: usize,                    // chunk size for streaming mode (default 256KB)
 }
 
 impl Config {
     /// Create a new Config with optimal defaults based on performance benchmarks
     pub fn new_with_defaults(
         object_type: ObjectType,
-        elements: usize, 
+        elements: usize,
         element_size: usize,
         dedup_factor: usize,
-        compress_factor: usize
+        compress_factor: usize,
     ) -> Self {
         Self {
             object_type,
@@ -129,23 +127,23 @@ impl Config {
             dedup_factor,
             compress_factor,
             data_gen_algorithm: DataGenAlgorithm::default(), // Random by default
-            data_gen_mode: DataGenMode::default(), // Streaming by default
-            chunk_size: 256 * 1024, // 256KB optimal from benchmarks
+            data_gen_mode: DataGenMode::default(),           // Streaming by default
+            chunk_size: 256 * 1024,                          // 256KB optimal from benchmarks
         }
     }
-    
+
     /// Override data generation algorithm (random vs prand)
     pub fn with_data_gen_algorithm(mut self, algorithm: DataGenAlgorithm) -> Self {
         self.data_gen_algorithm = algorithm;
         self
     }
-    
+
     /// Override data generation mode for specific performance requirements
     pub fn with_data_gen_mode(mut self, mode: DataGenMode) -> Self {
         self.data_gen_mode = mode;
         self
     }
-    
+
     /// Override chunk size for streaming mode
     pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
         self.chunk_size = chunk_size;

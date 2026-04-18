@@ -25,20 +25,20 @@ pub use api::*;
 // ===== Internal Modules (Implementation) =====
 // These are public for internal use but may change without notice
 
+pub mod config;
 pub mod constants;
 pub mod data_formats;
-pub mod config;
-pub mod progress;
-pub mod memory;
-pub mod object_size_cache;  // v0.9.10: Pre-stat size caching for benchmarking
 pub mod download;
+pub mod memory;
+pub mod object_size_cache; // v0.9.10: Pre-stat size caching for benchmarking
+pub mod progress;
 // NOTE: sharded_client.rs and range_engine.rs (the S3-specific variant) were
 // removed in v0.9.90.  They were never-completed stubs with no callers.  The
 // production range engine is range_engine_generic.rs — see that file for context.
-pub mod range_engine_generic;  // Universal stream-based range engine (v0.9.2+)
 pub mod mp;
-pub mod uri_utils;  // v0.9.14: Multi-endpoint URI expansion utilities
-pub mod multi_endpoint;  // v0.9.14: Multi-endpoint load balancing with thread/process control
+pub mod multi_endpoint;
+pub mod range_engine_generic; // Universal stream-based range engine (v0.9.2+)
+pub mod uri_utils; // v0.9.14: Multi-endpoint URI expansion utilities // v0.9.14: Multi-endpoint load balancing with thread/process control
 
 // Hardware detection and optimization (v0.9.35+: always available, runtime detection)
 pub mod hardware;
@@ -53,30 +53,30 @@ pub mod profiling;
 use pyo3::prelude::*;
 
 // Internal modules - these may change in future versions
+pub mod object_store;
+pub(crate) mod redirect_client; // HTTP 307 redirect following (for AIStore compatibility)
 pub mod s3_client;
-pub(crate) mod redirect_client;  // HTTP 307 redirect following (for AIStore compatibility)
 pub mod s3_copy;
-pub mod s3_utils;
 pub mod s3_logger;
 pub mod s3_ops;
-pub mod object_store;
+pub mod s3_utils;
 
 // Arrow backend (optional, feature-gated)
 #[cfg(feature = "arrow-backend")]
 pub mod object_store_arrow;
 
-pub mod file_store;
-pub mod file_store_direct;
-pub mod page_cache;
-pub mod data_gen;
-pub mod data_gen_alt;  // Alternative data generation with ChaCha20
-pub mod streaming_writer;
-pub mod tfrecord_index;
-pub mod object_store_logger;  // Op-log support for all backends
-pub mod data_loader;
-pub mod checkpoint;
 #[cfg(feature = "backend-azure")]
 pub mod azure_client;
+pub mod checkpoint;
+pub mod data_gen;
+pub mod data_gen_alt; // Alternative data generation with ChaCha20
+pub mod data_loader;
+pub mod file_store;
+pub mod file_store_direct;
+pub mod object_store_logger; // Op-log support for all backends
+pub mod page_cache;
+pub mod streaming_writer;
+pub mod tfrecord_index;
 
 // NUMA topology detection (optional, feature-gated)
 #[cfg(feature = "numa")]
@@ -84,12 +84,12 @@ pub mod numa;
 
 // Google Cloud Storage client - feature-gated backend selection
 #[cfg(feature = "gcs-community")]
-pub mod gcs_client;  // Community-maintained gcloud-storage implementation
+pub mod gcs_client; // Community-maintained gcloud-storage implementation
 
 #[cfg(feature = "backend-gcs")]
-pub mod gcs_constants;      // Single source of truth for all GCS/gRPC tuning constants
+pub mod gcs_constants; // Single source of truth for all GCS/gRPC tuning constants
 #[cfg(feature = "backend-gcs")]
-pub mod google_gcs_client;  // Official Google google-cloud-storage implementation
+pub mod google_gcs_client; // Official Google google-cloud-storage implementation
 
 /// Pre-configure the number of gRPC subchannels (TCP connections) the GCS client
 /// will open.  Call this once, before any GCS operation, to auto-tune throughput
@@ -180,13 +180,13 @@ pub async fn query_gcs_rapid_bucket(bucket_or_uri: &str) -> bool {
     }
 }
 
-pub mod list_containers;    // Backend-agnostic bucket/container listing (s3://, gs://, az://, file://)
+pub mod list_containers; // Backend-agnostic bucket/container listing (s3://, gs://, az://, file://)
 pub use list_containers::{list_containers, ContainerInfo};
 
+pub mod adaptive_config; // Optional adaptive tuning for performance
 pub mod concurrency;
-pub mod reqwest_client;  // Reqwest-based HTTP client for AWS SDK (h2c + connection pool tuning)
-pub mod adaptive_config;  // Optional adaptive tuning for performance
 mod multipart;
+pub mod reqwest_client; // Reqwest-based HTTP client for AWS SDK (h2c + connection pool tuning)
 
 // ===== Legacy Re-exports for Backward Compatibility =====
 // DEPRECATED FUNCTIONS REMOVED - Use fill_controlled_data() or data_gen_alt instead
@@ -195,7 +195,7 @@ mod multipart;
 // pub use data_gen::generate_controlled_data;  // REMOVED: Use fill_controlled_data instead
 // #[allow(deprecated)]
 // pub use data_gen::generate_controlled_data_prand;  // REMOVED: Use fill_controlled_data instead
-pub use data_gen::fill_controlled_data;  // Fill-in-place (respects Rayon pool context)
+pub use data_gen::fill_controlled_data; // Fill-in-place (respects Rayon pool context)
 
 // ===== Re-exports expected by tests/test_dataloader.rs at the crate root =====
 // Types:
@@ -203,30 +203,18 @@ pub use crate::data_loader::dataloader::DataLoader;
 pub use crate::data_loader::dataset::{Dataset, DatasetError};
 pub use crate::data_loader::options::LoaderOptions;
 // Module alias so tests can use `s3dlio::dataset::DynStream`:
-pub use crate::data_loader::dataset;  // re-export the whole module as `s3dlio::dataset`
+pub use crate::data_loader::dataset; // re-export the whole module as `s3dlio::dataset`
 
 // Common object store types (available for both backends)
-pub use object_store::{
-    ObjectStore,
-    ObjectMetadata,
-    infer_scheme,
-    Scheme,
-};
+pub use object_store::{infer_scheme, ObjectMetadata, ObjectStore, Scheme};
 
 // Native backend specific exports
 #[cfg(feature = "native-backends")]
 pub use object_store::{
-    S3ObjectStore,
-    store_for_uri,
-    store_for_uri_with_config,
-    direct_io_store_for_uri,
-    high_performance_store_for_uri,
-    store_for_uri_with_high_performance_cloud,
-    generic_upload_files,
-    generic_download_objects,
-    generic_upload_files_with_summary,
-    generic_download_objects_with_summary,
-    TransferSummary,
+    direct_io_store_for_uri, generic_download_objects, generic_download_objects_with_summary,
+    generic_upload_files, generic_upload_files_with_summary, high_performance_store_for_uri,
+    store_for_uri, store_for_uri_with_config, store_for_uri_with_high_performance_cloud,
+    S3ObjectStore, TransferSummary,
 };
 
 // Arrow backend specific exports
@@ -237,50 +225,33 @@ pub use file_store::FileSystemObjectStore;
 
 // Multi-endpoint support (v0.9.14+)
 pub use multi_endpoint::{
-    MultiEndpointStore,
+    EndpointConfig, EndpointStats, EndpointStatsSnapshot, LoadBalanceStrategy, MultiEndpointStore,
     MultiEndpointStoreConfig,
-    EndpointConfig,
-    LoadBalanceStrategy,
-    EndpointStats,
-    EndpointStatsSnapshot,
 };
 
 // ===== Re-exports expected by src/bin/cli.rs at the crate root =====
 // s3_utils items:
 pub use crate::s3_utils::{
-    delete_objects,
-    get_object_uri,
-    get_objects_parallel,
-    get_objects_parallel_with_progress,
-    list_buckets,
-    BucketInfo,
-    parse_s3_uri,
-    parse_s3_uri_full,
-    S3UriComponents,
-    stat_object_uri,
-    put_objects_with_random_data_and_type,
-    put_objects_with_random_data_and_type_with_progress,
-    DEFAULT_OBJECT_SIZE,
+    delete_objects, get_object_uri, get_objects_parallel, get_objects_parallel_with_progress,
+    list_buckets, parse_s3_uri, parse_s3_uri_full, put_objects_with_random_data_and_type,
+    put_objects_with_random_data_and_type_with_progress, stat_object_uri, BucketInfo,
+    S3UriComponents, DEFAULT_OBJECT_SIZE,
 };
 
 // Re-export the multipart public types
-pub use crate::multipart::{
-    MultipartUploadConfig,
-    MultipartUploadSink,
-    MultipartCompleteInfo,
-};
+pub use crate::multipart::{MultipartCompleteInfo, MultipartUploadConfig, MultipartUploadSink};
 
 // types:
 pub use crate::config::ObjectType;
 
 // logger helpers:
-pub use crate::s3_logger::{init_op_logger, finalize_op_logger, set_clock_offset, get_clock_offset};
-
+pub use crate::s3_logger::{
+    finalize_op_logger, get_clock_offset, init_op_logger, set_clock_offset,
+};
 
 // Bring in Python wrappers from python_api.rs when building as extension.
 #[cfg(feature = "extension-module")]
 mod python_api;
-
 
 // ---------------------------------------------------------------------------
 // PyO3 module init -----------------------------------------------------------
@@ -295,4 +266,3 @@ pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
 
     Ok(())
 }
-

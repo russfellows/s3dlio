@@ -59,26 +59,26 @@ impl std::fmt::Display for OpType {
 pub struct OpLogEntry {
     /// Sequential operation index (0-based)
     pub idx: u64,
-    
+
     /// Operation type
     pub op: OpType,
-    
+
     /// Data transferred in bytes (0 for metadata operations)
     pub bytes: u64,
-    
+
     /// Storage backend endpoint (e.g., "s3://", "file://", "az://", "direct://")
     pub endpoint: String,
-    
+
     /// Full object path/key
     pub file: String,
-    
+
     /// Operation start timestamp
     pub start: DateTime<Utc>,
-    
+
     /// Optional duration in nanoseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ns: Option<u64>,
-    
+
     /// Optional error message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

@@ -41,8 +41,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use aws_smithy_runtime_api::client::http::{
-    HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings,
-    SharedHttpClient, SharedHttpConnector,
+    HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
+    SharedHttpConnector,
 };
 use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
 use aws_smithy_runtime_api::client::result::ConnectorError;
@@ -271,14 +271,16 @@ async fn probe_and_record_cert_with_roots(
     );
 
     let connector = tokio_rustls::TlsConnector::from(config);
-    let tcp = tokio::net::TcpStream::connect(&host_port).await.map_err(|e| {
-        ConnectorError::other(
-            boxed_str_error(format!(
-                "TLS cert probe: TCP connect to \"{host_port}\" failed: {e}"
-            )),
-            None,
-        )
-    })?;
+    let tcp = tokio::net::TcpStream::connect(&host_port)
+        .await
+        .map_err(|e| {
+            ConnectorError::other(
+                boxed_str_error(format!(
+                    "TLS cert probe: TCP connect to \"{host_port}\" failed: {e}"
+                )),
+                None,
+            )
+        })?;
 
     let server_name = ServerName::try_from(host.to_owned()).map_err(|e| {
         ConnectorError::other(
@@ -289,17 +291,14 @@ async fn probe_and_record_cert_with_roots(
         )
     })?;
 
-    connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| {
-            ConnectorError::other(
-                boxed_str_error(format!(
-                    "TLS cert probe: TLS handshake with \"{host_port}\" failed: {e}"
-                )),
-                None,
-            )
-        })?;
+    connector.connect(server_name, tcp).await.map_err(|e| {
+        ConnectorError::other(
+            boxed_str_error(format!(
+                "TLS cert probe: TLS handshake with \"{host_port}\" failed: {e}"
+            )),
+            None,
+        )
+    })?;
 
     // Handshake complete — RecordingVerifier has stored the cert. Drop the connection.
     Ok(())
@@ -322,7 +321,11 @@ pub(crate) struct RedirectFollowingConnector {
 }
 
 impl RedirectFollowingConnector {
-    fn new(inner: SharedHttpConnector, max_redirects: u8, cert_store: Option<CertVerifyStore>) -> Self {
+    fn new(
+        inner: SharedHttpConnector,
+        max_redirects: u8,
+        cert_store: Option<CertVerifyStore>,
+    ) -> Self {
         Self {
             inner,
             max_redirects,
@@ -537,9 +540,7 @@ async fn follow_redirects(
                 let origin_authority = uri_host(&this_uri).to_owned();
                 if store.get(&origin_authority).is_none() {
                     let (origin_host, origin_port) = split_host_port(&origin_authority, 443);
-                    if let Err(e) =
-                        probe_and_record_cert(&origin_host, origin_port, store).await
-                    {
+                    if let Err(e) = probe_and_record_cert(&origin_host, origin_port, store).await {
                         warn!(
                             "s3dlio redirect: TLS cert probe for HTTPS origin \
                              \"{}\" failed: {}; cert pinning will not be applied \
@@ -554,9 +555,7 @@ async fn follow_redirects(
                 let target_authority = uri_host(&location).to_owned();
                 if store.get(&target_authority).is_none() {
                     let (target_host, target_port) = split_host_port(&target_authority, 443);
-                    if let Err(e) =
-                        probe_and_record_cert(&target_host, target_port, store).await
-                    {
+                    if let Err(e) = probe_and_record_cert(&target_host, target_port, store).await {
                         warn!(
                             "s3dlio redirect: TLS cert probe for redirect target \
                              \"{}\" failed: {}; cert pinning may not be applied \
@@ -594,16 +593,14 @@ async fn follow_redirects(
         let original_host = uri_host(next_request.uri()).to_owned();
 
         // Rewrite the URI to the redirect target.
-        next_request
-            .set_uri(location.as_str())
-            .map_err(|e| {
-                ConnectorError::other(
-                    boxed_str_error(format!(
-                        "Invalid redirect Location header \"{location}\": {e}"
-                    )),
-                    None,
-                )
-            })?;
+        next_request.set_uri(location.as_str()).map_err(|e| {
+            ConnectorError::other(
+                boxed_str_error(format!(
+                    "Invalid redirect Location header \"{location}\": {e}"
+                )),
+                None,
+            )
+        })?;
 
         let redirect_host = uri_host(next_request.uri()).to_owned();
 
@@ -616,10 +613,7 @@ async fn follow_redirects(
             );
             next_request.headers_mut().remove("authorization");
         } else {
-            debug!(
-                "s3dlio redirect: same-host {} → {}",
-                status, location
-            );
+            debug!("s3dlio redirect: same-host {} → {}", status, location);
         }
 
         // RFC 9110 §15.4.4 — 303 See Other MUST reissue the request as GET
@@ -632,17 +626,18 @@ async fn follow_redirects(
                 "s3dlio redirect: 303 See Other — reissuing as GET (was {})",
                 next_request.method()
             );
-            let mut get_request = HttpRequest::get(next_request.uri())
-                .map_err(|e| {
-                    ConnectorError::other(
-                        boxed_str_error(format!(
-                            "Failed to reissue 303 redirect as GET to \"{location}\": {e}"
-                        )),
-                        None,
-                    )
-                })?;
+            let mut get_request = HttpRequest::get(next_request.uri()).map_err(|e| {
+                ConnectorError::other(
+                    boxed_str_error(format!(
+                        "Failed to reissue 303 redirect as GET to \"{location}\": {e}"
+                    )),
+                    None,
+                )
+            })?;
             for (name, value) in next_request.headers().iter() {
-                get_request.headers_mut().insert(name.to_owned(), value.to_owned());
+                get_request
+                    .headers_mut()
+                    .insert(name.to_owned(), value.to_owned());
             }
             next_request = get_request;
         }
@@ -669,7 +664,11 @@ pub(crate) struct RedirectFollowingHttpClient {
 
 impl fmt::Display for RedirectFollowingHttpClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RedirectFollowingHttpClient(max_redirects={})", self.max_redirects)
+        write!(
+            f,
+            "RedirectFollowingHttpClient(max_redirects={})",
+            self.max_redirects
+        )
     }
 }
 
@@ -714,7 +713,7 @@ pub(crate) fn make_redirecting_client(inner: SharedHttpClient) -> SharedHttpClie
     SharedHttpClient::new(RedirectFollowingHttpClient {
         inner,
         max_redirects: configured_max_redirects(),
-        cert_store: Some(CertVerifyStore::new()),  // activates scheme-downgrade prevention
+        cert_store: Some(CertVerifyStore::new()), // activates scheme-downgrade prevention
     })
 }
 
@@ -733,7 +732,10 @@ mod tests {
     #[test]
     fn uri_host_extracts_host_and_port() {
         assert_eq!(uri_host("http://node1:9000/v1/objects/b/k"), "node1:9000");
-        assert_eq!(uri_host("https://s3.amazonaws.com/bucket/key"), "s3.amazonaws.com");
+        assert_eq!(
+            uri_host("https://s3.amazonaws.com/bucket/key"),
+            "s3.amazonaws.com"
+        );
         assert_eq!(uri_host("http://proxy/"), "proxy");
     }
 
@@ -745,10 +747,18 @@ mod tests {
     #[test]
     fn is_redirect_status_recognises_redirect_codes() {
         for code in [301u16, 302, 303, 307, 308] {
-            assert!(is_redirect_status(code), "expected {} to be a redirect", code);
+            assert!(
+                is_redirect_status(code),
+                "expected {} to be a redirect",
+                code
+            );
         }
         for code in [200u16, 206, 304, 400, 404, 500] {
-            assert!(!is_redirect_status(code), "expected {} NOT to be a redirect", code);
+            assert!(
+                !is_redirect_status(code),
+                "expected {} NOT to be a redirect",
+                code
+            );
         }
     }
 
@@ -851,12 +861,9 @@ mod tests {
             self.seen_auths.lock().unwrap().push(auth);
             self.seen_methods.lock().unwrap().push(method);
 
-            let response = self
-                .responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("MockConnector: test provided fewer responses than the redirect loop consumed");
+            let response = self.responses.lock().unwrap().pop_front().expect(
+                "MockConnector: test provided fewer responses than the redirect loop consumed",
+            );
 
             HttpConnectorFuture::new(async move { Ok::<_, ConnectorError>(response) })
         }
@@ -985,7 +992,11 @@ mod tests {
 
         assert!(result.is_ok());
         let uris = mock.seen_uris();
-        assert_eq!(uris.len(), 2, "connector must be called twice: original + redirect");
+        assert_eq!(
+            uris.len(),
+            2,
+            "connector must be called twice: original + redirect"
+        );
         assert_eq!(
             uris[1], target,
             "second request URI must equal the Location value from the 307 response"
@@ -1093,7 +1104,10 @@ mod tests {
             ok_200(),
         ]);
         let conn = wrap(mock.clone());
-        let req = make_get("http://proxy:9000/bucket/key", Some("Bearer session-token-abc"));
+        let req = make_get(
+            "http://proxy:9000/bucket/key",
+            Some("Bearer session-token-abc"),
+        );
 
         let _ = follow_redirects(conn, req, 5, None).await;
 
@@ -1161,7 +1175,10 @@ mod tests {
 
         let result = follow_redirects(conn, get("http://proxy:9000/bucket/key"), 5, None).await;
 
-        assert!(result.is_ok(), "missing Location must not cause a hard error");
+        assert!(
+            result.is_ok(),
+            "missing Location must not cause a hard error"
+        );
         assert_eq!(
             result.unwrap().status().as_u16(),
             307,
@@ -1198,7 +1215,11 @@ mod tests {
             304,
             "304 Not Modified is NOT a redirect; it must pass through unchanged"
         );
-        assert_eq!(mock.call_count(), 1, "only one connector call for a 304 response");
+        assert_eq!(
+            mock.call_count(),
+            1,
+            "only one connector call for a 304 response"
+        );
     }
 
     /// RFC 9110 §15.4 — Multi-hop redirect chains are followed in sequence up to
@@ -1214,11 +1235,7 @@ mod tests {
     async fn rfc9110_s15_4_multi_hop_chain_is_followed_to_final_response() {
         let node_a = "http://node-a:9000/v1/objects/bucket/key";
         let node_b = "http://node-b:9000/v1/objects/bucket/key";
-        let mock = MockConnector::new(vec![
-            redirect(307, node_a),
-            redirect(307, node_b),
-            ok_200(),
-        ]);
+        let mock = MockConnector::new(vec![redirect(307, node_a), redirect(307, node_b), ok_200()]);
         let conn = wrap(mock.clone());
 
         let result = follow_redirects(conn, get("http://proxy:9000/bucket/key"), 5, None).await;
@@ -1283,17 +1300,18 @@ mod tests {
     /// method change to GET (or HEAD), while 307/308 require method preservation.
     #[tokio::test]
     async fn rfc9110_s15_4_4_303_with_post_must_redirect_as_get() {
-        let mock = MockConnector::new(vec![
-            redirect(303, "http://target:9000/result"),
-            ok_200(),
-        ]);
+        let mock = MockConnector::new(vec![redirect(303, "http://target:9000/result"), ok_200()]);
         let conn = wrap(mock.clone());
 
         // POST with empty body (SdkBody::empty() is cloneable, so try_clone() succeeds)
         let _ = follow_redirects(conn, make_post("http://proxy:9000/upload"), 5, None).await;
 
         let methods = mock.seen_methods();
-        assert_eq!(methods.len(), 2, "connector must be called twice: original POST + redirect");
+        assert_eq!(
+            methods.len(),
+            2,
+            "connector must be called twice: original POST + redirect"
+        );
         assert_eq!(
             methods[1], "GET",
             "RFC 9110 §15.4.4: a 303 response to POST MUST redirect with GET, not POST"
@@ -1377,13 +1395,20 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "identical certificate on redirect target MUST be accepted");
+        assert!(
+            result.is_ok(),
+            "identical certificate on redirect target MUST be accepted"
+        );
         assert_eq!(
             result.unwrap().status().as_u16(),
             200,
             "final response after a cert-pinning-passing redirect must be 200"
         );
-        assert_eq!(mock.call_count(), 2, "connector must be called twice: origin + redirect target");
+        assert_eq!(
+            mock.call_count(),
+            2,
+            "connector must be called twice: origin + redirect target"
+        );
     }
 
     /// TLS policy — HTTPS → HTTPS redirect with a DIFFERENT certificate MUST be refused.
@@ -1461,7 +1486,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "HTTP → HTTP redirect must be allowed when no TLS is involved");
+        assert!(
+            result.is_ok(),
+            "HTTP → HTTP redirect must be allowed when no TLS is involved"
+        );
         assert_eq!(result.unwrap().status().as_u16(), 200);
         assert_eq!(mock.call_count(), 2);
     }
@@ -1548,8 +1576,7 @@ mod tests {
         let cert_der = cert.der().to_vec();
         let key_der = key_pair.serialize_der();
 
-        let server_cert =
-            rustls::pki_types::CertificateDer::from(cert_der.clone());
+        let server_cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
         let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
             rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
         );
@@ -1634,8 +1661,7 @@ mod tests {
         // Empty root store → server cert is not trusted
         let empty_roots = Arc::new(rustls::RootCertStore::empty());
 
-        let result =
-            probe_and_record_cert_with_roots("localhost", port, &store, empty_roots).await;
+        let result = probe_and_record_cert_with_roots("localhost", port, &store, empty_roots).await;
 
         assert!(
             result.is_err(),
@@ -1692,7 +1718,9 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
-                tokio::spawn(async move { let _ = acceptor.accept(tcp).await; });
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(tcp).await;
+                });
             }
         });
         port
@@ -1774,23 +1802,22 @@ mod tests {
         // generates a new key pair and therefore a unique certificate).
         let (port1, cert1_der) = spawn_tls_test_server().await;
         let (port2, cert2_der) = spawn_tls_test_server().await;
-        assert_ne!(cert1_der, cert2_der, "test requires two distinct certificates");
+        assert_ne!(
+            cert1_der, cert2_der,
+            "test requires two distinct certificates"
+        );
 
         // Pre-populate cert store via real TLS probes.
         // The production probe_and_record_cert() uses native roots, which will not
         // trust self-signed rcgen certs.  We use the injectable-roots variant so
         // the probe succeeds and records the real DER bytes.
         let store = CertVerifyStore::new();
-        probe_and_record_cert_with_roots(
-            "localhost", port1, &store, test_root_store(&cert1_der),
-        )
-        .await
-        .expect("probe to server 1 must succeed with matching trust anchor");
-        probe_and_record_cert_with_roots(
-            "localhost", port2, &store, test_root_store(&cert2_der),
-        )
-        .await
-        .expect("probe to server 2 must succeed with matching trust anchor");
+        probe_and_record_cert_with_roots("localhost", port1, &store, test_root_store(&cert1_der))
+            .await
+            .expect("probe to server 1 must succeed with matching trust anchor");
+        probe_and_record_cert_with_roots("localhost", port2, &store, test_root_store(&cert2_der))
+            .await
+            .expect("probe to server 2 must succeed with matching trust anchor");
 
         // Confirm the store holds the real cert bytes we expect.
         assert_eq!(store.get(&format!("localhost:{port1}")).unwrap(), cert1_der);
@@ -1897,7 +1924,11 @@ mod tests {
         );
         assert_eq!(result.unwrap().status().as_u16(), 200);
         // Two connector calls: origin (→307) and target (→200).
-        assert_eq!(mock.call_count(), 2, "both servers must be contacted exactly once");
+        assert_eq!(
+            mock.call_count(),
+            2,
+            "both servers must be contacted exactly once"
+        );
     }
 
     /// **End-to-end Test 4** — HTTP → HTTP redirect with real OS-assigned ports.
@@ -1928,10 +1959,7 @@ mod tests {
         let cert_store = CertVerifyStore::new();
 
         let target_url = format!("http://localhost:{port_target}/v1/objects/bucket/key");
-        let mock = MockConnector::new(vec![
-            redirect(307, &target_url),
-            ok_200(),
-        ]);
+        let mock = MockConnector::new(vec![redirect(307, &target_url), ok_200()]);
         let conn = wrap(mock.clone());
 
         let origin_url = format!("http://localhost:{port_origin}/bucket/key");

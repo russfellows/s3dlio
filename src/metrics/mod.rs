@@ -2,17 +2,16 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 //! Performance metrics and monitoring infrastructure
-//! 
+//!
 //! This module provides comprehensive metrics collection for AI/ML workloads
 //! using HDR histograms for precise tail latency analysis.
 
 pub mod enhanced;
 
 pub use enhanced::{
-    MetricsConfig, HistogramConfig, EnhancedMetricsCollector,
-    PerformanceHistogram, PerformanceReport, HistogramSummary,
-    OperationReport, init_global_metrics, record_operation, record_error,
-    get_global_report, print_global_report
+    get_global_report, init_global_metrics, print_global_report, record_error, record_operation,
+    EnhancedMetricsCollector, HistogramConfig, HistogramSummary, MetricsConfig, OperationReport,
+    PerformanceHistogram, PerformanceReport,
 };
 
 // Re-export convenience functions for backward compatibility

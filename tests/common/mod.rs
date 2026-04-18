@@ -15,12 +15,13 @@ pub struct TestConfig {
 
 /// Get test configuration from environment
 pub fn get_test_config() -> TestConfig {
-    let bucket = env::var("GCS_TEST_BUCKET")
-        .unwrap_or_else(|_| panic!(
+    let bucket = env::var("GCS_TEST_BUCKET").unwrap_or_else(|_| {
+        panic!(
             "GCS_TEST_BUCKET environment variable not set. \
              Please set it to your test bucket name."
-        ));
-    
+        )
+    });
+
     TestConfig {
         bucket,
         test_prefix: "s3dlio-test".to_string(),

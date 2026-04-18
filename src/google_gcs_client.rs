@@ -3,31 +3,30 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use anyhow::{anyhow, bail, Result};
-use bytes::{BufMut, Bytes, BytesMut};
-use futures::Stream;
-use google_cloud_storage::client::{Storage, StorageControl};
-use google_cloud_storage::model_ext::ReadRange;
-use google_cloud_gax::paginator::ItemPaginator;
-use std::collections::HashMap;
-use std::pin::Pin;
-use std::time::{Duration, Instant};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use tokio::sync::OnceCell;
-use tracing::{debug, info, trace, warn};
 use crate::constants::{
-    BYTES_PER_GIB, DEFAULT_GCS_READ_PROGRESS_INTERVAL_SECS,
-    DEFAULT_GCS_READ_TIMEOUT_MAX_SECS, DEFAULT_GCS_READ_TIMEOUT_MIN_SECS,
-    DEFAULT_GCS_READ_TIMEOUT_SECS_PER_GIB, ENV_GCS_BIDI_ATTEMPT_TIMEOUT_SECS,
-    ENV_GCS_READ_CHUNK_TIMEOUT_SECS, ENV_GCS_READ_PROGRESS_INTERVAL_SECS,
-    ENV_GCS_READ_TIMEOUT_MAX_SECS, ENV_GCS_READ_TIMEOUT_MIN_SECS,
-    ENV_GCS_READ_TIMEOUT_SECS_PER_GIB,
+    BYTES_PER_GIB, DEFAULT_GCS_READ_PROGRESS_INTERVAL_SECS, DEFAULT_GCS_READ_TIMEOUT_MAX_SECS,
+    DEFAULT_GCS_READ_TIMEOUT_MIN_SECS, DEFAULT_GCS_READ_TIMEOUT_SECS_PER_GIB,
+    ENV_GCS_BIDI_ATTEMPT_TIMEOUT_SECS, ENV_GCS_READ_CHUNK_TIMEOUT_SECS,
+    ENV_GCS_READ_PROGRESS_INTERVAL_SECS, ENV_GCS_READ_TIMEOUT_MAX_SECS,
+    ENV_GCS_READ_TIMEOUT_MIN_SECS, ENV_GCS_READ_TIMEOUT_SECS_PER_GIB,
 };
 use crate::gcs_constants::{
     DEFAULT_WINDOW_MIB, ENV_GCS_GRPC_CHANNELS, ENV_GRPC_INITIAL_WINDOW_MIB,
     GCS_MAX_CONCURRENT_DELETES, GCS_MIN_CHANNELS,
 };
+use anyhow::{anyhow, bail, Result};
+use bytes::{BufMut, Bytes, BytesMut};
+use futures::Stream;
+use google_cloud_gax::paginator::ItemPaginator;
+use google_cloud_storage::client::{Storage, StorageControl};
+use google_cloud_storage::model_ext::ReadRange;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::OnceCell;
+use tracing::{debug, info, trace, warn};
 
 // Global cached GCS clients - initialized once and reused across all operations
 static GCS_STORAGE: OnceCell<Arc<Storage>> = OnceCell::const_new();
@@ -95,8 +94,8 @@ static DESIRED_GCS_RAPID: AtomicU8 = AtomicU8::new(0);
 /// Has no effect if called after the GCS client has already been initialized.
 pub fn set_gcs_rapid_mode(force: Option<bool>) {
     let v = match force {
-        None        => 0u8,
-        Some(true)  => 1u8,
+        None => 0u8,
+        Some(true) => 1u8,
         Some(false) => 2u8,
     };
     DESIRED_GCS_RAPID.store(v, Ordering::Relaxed);
@@ -118,9 +117,9 @@ pub fn set_gcs_rapid_mode(force: Option<bool>) {
 /// log the effective setting at the start of a workload.
 pub fn get_gcs_rapid_mode() -> Option<bool> {
     match read_rapid_mode() {
-        RapidMode::ForceOn  => Some(true),
+        RapidMode::ForceOn => Some(true),
         RapidMode::ForceOff => Some(false),
-        RapidMode::Auto     => None,
+        RapidMode::Auto => None,
     }
 }
 
@@ -128,12 +127,13 @@ pub fn get_gcs_rapid_mode() -> Option<bool> {
 /// Each entry is a `OnceCell<bool>` so that concurrent callers for the same
 /// bucket block on the *same* detection future rather than all racing to call
 /// `get_storage_layout()` simultaneously (thundering herd fix).
-static BUCKET_RAPID_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<OnceCell<bool>>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static BUCKET_RAPID_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, Arc<OnceCell<bool>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Minimal object metadata for GCS objects.
 /// Maps to the provider-neutral ObjectMetadata type in object_store.rs.
-/// 
+///
 /// NOTE: This struct MUST match the one in gcs_client.rs exactly!
 #[derive(Debug, Clone)]
 pub struct GcsObjectMetadata {
@@ -199,7 +199,7 @@ pub struct GcsClient {
 impl GcsClient {
     /// Create a new GCS client using Application Default Credentials.
     /// This uses cached global clients for efficiency - authentication only happens once.
-    /// 
+    ///
     /// The credentials are automatically discovered from:
     /// - GOOGLE_APPLICATION_CREDENTIALS env var (loaded by dotenvy)
     /// - Metadata server (if running on GCP)
@@ -269,7 +269,7 @@ impl GcsClient {
                     .build()
                     .await
                     .map_err(|e| anyhow!("Failed to initialize GCS Storage client: {}", e))?;
-                
+
                 info!("GCS Storage client initialized successfully");
                 Ok::<Arc<Storage>, anyhow::Error>(Arc::new(client))
             })
@@ -278,23 +278,22 @@ impl GcsClient {
         let control = GCS_CONTROL
             .get_or_try_init(|| async {
                 debug!("Initializing GCS StorageControl client (first time only)");
-                
-                let client = StorageControl::builder()
-                    .build()
-                    .await
-                    .map_err(|e| anyhow!("Failed to initialize GCS StorageControl client: {}", e))?;
-                
+
+                let client = StorageControl::builder().build().await.map_err(|e| {
+                    anyhow!("Failed to initialize GCS StorageControl client: {}", e)
+                })?;
+
                 info!("GCS StorageControl client initialized successfully");
                 Ok::<Arc<StorageControl>, anyhow::Error>(Arc::new(client))
             })
             .await?;
-        
+
         let rapid_mode = *EFFECTIVE_GCS_RAPID_MODE.get_or_init(|| {
             let mode = read_rapid_mode();
             match mode {
-                RapidMode::ForceOn  => info!("GCS RAPID mode: forced ON (gRPC + appendable writes)"),
+                RapidMode::ForceOn => info!("GCS RAPID mode: forced ON (gRPC + appendable writes)"),
                 RapidMode::ForceOff => info!("GCS RAPID mode: forced OFF (standard HTTP reads)"),
-                RapidMode::Auto     => debug!("GCS RAPID mode: auto-detect per bucket"),
+                RapidMode::Auto => debug!("GCS RAPID mode: auto-detect per bucket"),
             }
             mode
         });
@@ -324,9 +323,9 @@ impl GcsClient {
     /// calls that occurred when many jobs started simultaneously.
     async fn is_rapid_bucket(&self, bucket: &str) -> bool {
         match self.rapid_mode {
-            RapidMode::ForceOn  => return true,
+            RapidMode::ForceOn => return true,
             RapidMode::ForceOff => return false,
-            RapidMode::Auto     => {}
+            RapidMode::Auto => {}
         }
 
         // Get or create the per-bucket OnceCell. The std::sync::Mutex is held
@@ -334,8 +333,8 @@ impl GcsClient {
         let cell: Arc<OnceCell<bool>> = {
             let mut map = BUCKET_RAPID_CACHE.lock().unwrap();
             map.entry(bucket.to_string())
-               .or_insert_with(|| Arc::new(OnceCell::new()))
-               .clone()
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
         };
 
         // Exactly one caller runs detect_rapid_bucket(); the rest await it.
@@ -346,15 +345,25 @@ impl GcsClient {
     /// Returns `true` for RAPID/zonal buckets, `false` otherwise.
     async fn detect_rapid_bucket(&self, bucket: &str) -> bool {
         let layout_name = format!("projects/_/buckets/{}/storageLayout", bucket);
-        match self.control.get_storage_layout().set_name(&layout_name).send().await {
+        match self
+            .control
+            .get_storage_layout()
+            .set_name(&layout_name)
+            .send()
+            .await
+        {
             Ok(layout) => {
                 let is_zonal = layout.location_type.eq_ignore_ascii_case("zone");
                 if is_zonal {
-                    info!("GCS auto-detect: bucket '{}' is RAPID/zonal (location={}, type={})",
-                        bucket, layout.location, layout.location_type);
+                    info!(
+                        "GCS auto-detect: bucket '{}' is RAPID/zonal (location={}, type={})",
+                        bucket, layout.location, layout.location_type
+                    );
                 } else {
-                    debug!("GCS auto-detect: bucket '{}' is standard (location={}, type={})",
-                        bucket, layout.location, layout.location_type);
+                    debug!(
+                        "GCS auto-detect: bucket '{}' is standard (location={}, type={})",
+                        bucket, layout.location, layout.location_type
+                    );
                 }
                 is_zonal
             }
@@ -374,10 +383,12 @@ impl GcsClient {
         let bucket_name = format_bucket_name(bucket);
         if self.is_rapid_bucket(bucket).await {
             debug!("GCS GET (gRPC): bucket={}, object={}", bucket, object);
-            self.get_object_via_grpc(&bucket_name, bucket, object, ReadRange::all()).await
+            self.get_object_via_grpc(&bucket_name, bucket, object, ReadRange::all())
+                .await
         } else {
             debug!("GCS GET (HTTP): bucket={}, object={}", bucket, object);
-            self.get_object_via_http(&bucket_name, bucket, object, None).await
+            self.get_object_via_http(&bucket_name, bucket, object, None)
+                .await
         }
     }
 
@@ -425,7 +436,9 @@ impl GcsClient {
             if should_repair_incomplete_full_read(&requested_range, expected_size, data.len()) {
                 let mut repair_attempts = 0usize;
 
-                while data.len() < expected_size && repair_attempts < GCS_FULL_READ_REPAIR_MAX_ATTEMPTS {
+                while data.len() < expected_size
+                    && repair_attempts < GCS_FULL_READ_REPAIR_MAX_ATTEMPTS
+                {
                     let offset = data.len() as u64;
                     let remaining = (expected_size - data.len()) as u64;
                     repair_attempts += 1;
@@ -481,7 +494,11 @@ impl GcsClient {
             }
         }
 
-        debug!("GCS GET (gRPC) success: {} bytes in {} chunk(s)", data.len(), chunk_count);
+        debug!(
+            "GCS GET (gRPC) success: {} bytes in {} chunk(s)",
+            data.len(),
+            chunk_count
+        );
         Ok(data.freeze())
     }
 
@@ -518,7 +535,9 @@ impl GcsClient {
                         );
                         return Err(anyhow!(
                             "GCS GET (gRPC) OUT_OF_RANGE for RAPID object gs://{}/{}: {}",
-                            bucket, object, e
+                            bucket,
+                            object,
+                            e
                         ));
                     }
                     match self.get_object_metadata(bucket, object).await {
@@ -631,25 +650,42 @@ impl GcsClient {
             builder = builder.set_read_range(r);
         }
 
-        let mut reader = builder
-            .send()
-            .await
-            .map_err(|e| anyhow!("GCS GET (HTTP) failed for gs://{}/{}: {}", bucket, object, e))?;
+        let mut reader = builder.send().await.map_err(|e| {
+            anyhow!(
+                "GCS GET (HTTP) failed for gs://{}/{}: {}",
+                bucket,
+                object,
+                e
+            )
+        })?;
 
         // BytesMut grows dynamically here; the HTTP path does not provide an
         // upfront Content-Length so we start with a conservative allocation
         // (1 MiB) and let the buffer double as needed.  freeze() is zero-copy.
         let mut data = BytesMut::with_capacity(1024 * 1024);
         let mut chunk_count: u32 = 0;
-        while let Some(chunk) = reader.next().await.transpose()
-            .map_err(|e| anyhow!("GCS GET (HTTP) stream error for gs://{}/{}: {}", bucket, object, e))?
-        {
+        while let Some(chunk) = reader.next().await.transpose().map_err(|e| {
+            anyhow!(
+                "GCS GET (HTTP) stream error for gs://{}/{}: {}",
+                bucket,
+                object,
+                e
+            )
+        })? {
             chunk_count += 1;
-            trace!("GCS GET (HTTP) chunk #{}: {} bytes", chunk_count, chunk.len());
+            trace!(
+                "GCS GET (HTTP) chunk #{}: {} bytes",
+                chunk_count,
+                chunk.len()
+            );
             data.put_slice(&chunk);
         }
 
-        debug!("GCS GET (HTTP) success: {} bytes in {} chunk(s)", data.len(), chunk_count);
+        debug!(
+            "GCS GET (HTTP) success: {} bytes in {} chunk(s)",
+            data.len(),
+            chunk_count
+        );
         Ok(data.freeze())
     }
 
@@ -678,13 +714,15 @@ impl GcsClient {
                 "GCS GET RANGE (gRPC): bucket={}, object={}, offset={}, length={:?}",
                 bucket, object, offset, length
             );
-            self.get_object_via_grpc(&bucket_name, bucket, object, read_range.clone()).await
+            self.get_object_via_grpc(&bucket_name, bucket, object, read_range.clone())
+                .await
         } else {
             debug!(
                 "GCS GET RANGE (HTTP): bucket={}, object={}, offset={}, length={:?}",
                 bucket, object, offset, length
             );
-            self.get_object_via_http(&bucket_name, bucket, object, Some(read_range)).await
+            self.get_object_via_http(&bucket_name, bucket, object, Some(read_range))
+                .await
         }
     }
 
@@ -726,7 +764,10 @@ impl GcsClient {
 
     /// Delete an object.
     pub async fn delete_object(&self, bucket: &str, object: &str) -> Result<()> {
-        debug!("GCS DELETE (official): bucket={}, object={}", bucket, object);
+        debug!(
+            "GCS DELETE (official): bucket={}, object={}",
+            bucket, object
+        );
 
         // StorageControl requires projects/_/buckets/{bucket} format
         let bucket_name = format_bucket_name(bucket);
@@ -744,19 +785,34 @@ impl GcsClient {
     }
 
     /// Get object metadata without downloading the content.
-    pub async fn get_object_metadata(&self, bucket: &str, object: &str) -> Result<GcsObjectMetadata> {
-        debug!("GCS GET METADATA (official): bucket={}, object={}", bucket, object);
+    pub async fn get_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<GcsObjectMetadata> {
+        debug!(
+            "GCS GET METADATA (official): bucket={}, object={}",
+            bucket, object
+        );
 
         // StorageControl requires projects/_/buckets/{bucket} format
         let bucket_name = format_bucket_name(bucket);
 
-        let obj = self.control
+        let obj = self
+            .control
             .get_object()
             .set_bucket(bucket_name)
             .set_object(object.to_string())
             .send()
             .await
-            .map_err(|e| anyhow!("GCS GET METADATA failed for gs://{}/{}: {}", bucket, object, e))?;
+            .map_err(|e| {
+                anyhow!(
+                    "GCS GET METADATA failed for gs://{}/{}: {}",
+                    bucket,
+                    object,
+                    e
+                )
+            })?;
 
         let metadata = GcsObjectMetadata {
             size: obj.size as u64,
@@ -787,8 +843,15 @@ impl GcsClient {
     }
 
     /// RAPID-safe stat using BidiReadObject descriptor for authoritative metadata.
-    async fn stat_object_via_bidi_read(&self, bucket: &str, object: &str) -> Result<GcsObjectMetadata> {
-        debug!("GCS STAT (BidiRead) for RAPID bucket: gs://{}/{}", bucket, object);
+    async fn stat_object_via_bidi_read(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<GcsObjectMetadata> {
+        debug!(
+            "GCS STAT (BidiRead) for RAPID bucket: gs://{}/{}",
+            bucket, object
+        );
         let bucket_name = format_bucket_name(bucket);
         let attempt_timeout = gcs_bidi_attempt_timeout();
 
@@ -799,7 +862,14 @@ impl GcsClient {
             .with_attempt_timeout(attempt_timeout)
             .send_and_read(ReadRange::segment(0, 1))
             .await
-            .map_err(|e| anyhow!("GCS STAT (BidiRead) failed for gs://{}/{}: {}", bucket, object, e))?;
+            .map_err(|e| {
+                anyhow!(
+                    "GCS STAT (BidiRead) failed for gs://{}/{}: {}",
+                    bucket,
+                    object,
+                    e
+                )
+            })?;
 
         let obj = descriptor.object();
         let metadata = GcsObjectMetadata {
@@ -809,12 +879,15 @@ impl GcsClient {
             key: object.to_string(),
         };
 
-        debug!("GCS STAT (BidiRead) success: {} bytes for gs://{}/{}", metadata.size, bucket, object);
+        debug!(
+            "GCS STAT (BidiRead) success: {} bytes for gs://{}/{}",
+            metadata.size, bucket, object
+        );
         Ok(metadata)
     }
 
     /// List objects in a bucket with optional prefix.
-    /// 
+    ///
     /// When recursive=false, returns both files and subdirectory prefixes (ending with "/").
     /// This matches S3 behavior when using delimiter="/".
     pub async fn list_objects(
@@ -844,7 +917,12 @@ impl GcsClient {
         let bucket_name = format_bucket_name(bucket);
 
         let results = self
-            .list_objects_with_prefix(&bucket_name, bucket, normalized_prefix.as_deref(), recursive)
+            .list_objects_with_prefix(
+                &bucket_name,
+                bucket,
+                normalized_prefix.as_deref(),
+                recursive,
+            )
             .await?;
 
         // If 0 results with normalized prefix (trailing '/') and the original
@@ -961,7 +1039,8 @@ impl GcsClient {
         prefix: Option<&str>,
         recursive: bool,
     ) -> Result<Vec<String>> {
-        let mut builder = self.control
+        let mut builder = self
+            .control
             .list_objects()
             .set_parent(bucket_name.to_string());
 
@@ -982,10 +1061,11 @@ impl GcsClient {
             // Use by_page() to get the full response structure with prefixes
             use google_cloud_gax::paginator::Paginator;
             let mut pages_iter = builder.by_page();
-            
+
             while let Some(result) = pages_iter.next().await {
-                let page = result.map_err(|e| anyhow!("GCS LIST error for gs://{}: {}", bucket, e))?;
-                
+                let page =
+                    result.map_err(|e| anyhow!("GCS LIST error for gs://{}: {}", bucket, e))?;
+
                 // Collect object names (files)
                 results.extend(
                     page.objects
@@ -993,7 +1073,7 @@ impl GcsClient {
                         .map(|obj| obj.name)
                         .inspect(|name| trace!("GCS LIST: object={}", name)),
                 );
-                
+
                 // Collect prefixes (subdirectories) - these end with "/"
                 results.extend(
                     page.prefixes
@@ -1004,9 +1084,12 @@ impl GcsClient {
         } else {
             // For recursive, by_item() is more efficient (no need for prefixes)
             let mut objects_iter = builder.by_item();
-            
-            while let Some(object) = objects_iter.next().await.transpose()
-                .map_err(|e| anyhow!("GCS LIST error for gs://{}: {}", bucket, e))? 
+
+            while let Some(object) = objects_iter
+                .next()
+                .await
+                .transpose()
+                .map_err(|e| anyhow!("GCS LIST error for gs://{}: {}", bucket, e))?
             {
                 trace!("GCS LIST recursive: object={}", object.name);
                 results.push(object.name.clone());
@@ -1058,7 +1141,9 @@ impl GcsClient {
     /// sequential round-trip latency (~80ms each), requests are dispatched
     /// concurrently with a semaphore.
     pub async fn delete_objects(&self, bucket: &str, objects: Vec<String>) -> Result<()> {
-        if objects.is_empty() { return Ok(()); }
+        if objects.is_empty() {
+            return Ok(());
+        }
 
         let total = objects.len();
 
@@ -1107,7 +1192,9 @@ impl GcsClient {
         if fail_count > 0 {
             anyhow::bail!(
                 "GCS delete partially failed: {}/{} objects failed to delete in gs://{}",
-                fail_count, total, bucket
+                fail_count,
+                total,
+                bucket
             );
         }
         debug!("GCS DELETE OBJECTS complete");
@@ -1127,7 +1214,6 @@ impl GcsClient {
         self.put_object(bucket, object, data).await
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Free-standing helpers (pub(crate) so unit tests can exercise them directly)
@@ -1182,11 +1268,13 @@ pub(crate) fn format_bucket_name(bucket: &str) -> String {
 
 fn is_gcs_out_of_range_error(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
-    normalized.contains("out_of_range")
-        || normalized.contains("outside the valid object range")
+    normalized.contains("out_of_range") || normalized.contains("outside the valid object range")
 }
 
-fn should_treat_out_of_range_as_empty_full_read(message: &str, requested_range: &ReadRange) -> bool {
+fn should_treat_out_of_range_as_empty_full_read(
+    message: &str,
+    requested_range: &ReadRange,
+) -> bool {
     is_gcs_out_of_range_error(message) && *requested_range == ReadRange::all()
 }
 
@@ -1269,7 +1357,7 @@ fn gcs_scaled_timeout_secs(expected_size_bytes: u64) -> u64 {
 }
 
 /// Parse a GCS URI (gs://bucket/path/to/object) into (bucket, object_path).
-/// 
+///
 /// Bucket-only URIs are also supported (for prefix listings):
 /// - gs://bucket/ → ("bucket", "")
 /// - gs://bucket  → ("bucket", "") - requires trailing slash for proper parsing
@@ -1321,7 +1409,10 @@ pub async fn query_gcs_rapid_bucket(bucket_or_uri: &str) -> bool {
     match GcsClient::new().await {
         Ok(client) => client.is_rapid_bucket(&bucket).await,
         Err(e) => {
-            warn!("query_gcs_rapid_bucket('{}'): failed to init GCS client: {}", bucket, e);
+            warn!(
+                "query_gcs_rapid_bucket('{}'): failed to init GCS client: {}",
+                bucket, e
+            );
             false
         }
     }
@@ -1423,7 +1514,11 @@ mod tests {
     fn test_rapid_mode_unset_is_auto() {
         let _g = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("S3DLIO_GCS_RAPID");
-        assert_eq!(read_rapid_mode(), RapidMode::Auto, "absent var should default to Auto");
+        assert_eq!(
+            read_rapid_mode(),
+            RapidMode::Auto,
+            "absent var should default to Auto"
+        );
     }
 
     #[test]
@@ -1441,7 +1536,11 @@ mod tests {
         std::env::set_var("S3DLIO_GCS_RAPID", "TRUE");
         let r = read_rapid_mode();
         std::env::remove_var("S3DLIO_GCS_RAPID");
-        assert_eq!(r, RapidMode::ForceOn, "TRUE should force RAPID on (case-insensitive)");
+        assert_eq!(
+            r,
+            RapidMode::ForceOn,
+            "TRUE should force RAPID on (case-insensitive)"
+        );
     }
 
     #[test]
@@ -1468,7 +1567,11 @@ mod tests {
         std::env::set_var("S3DLIO_GCS_RAPID", "YES");
         let r = read_rapid_mode();
         std::env::remove_var("S3DLIO_GCS_RAPID");
-        assert_eq!(r, RapidMode::ForceOn, "YES should force RAPID on (case-insensitive)");
+        assert_eq!(
+            r,
+            RapidMode::ForceOn,
+            "YES should force RAPID on (case-insensitive)"
+        );
     }
 
     #[test]
@@ -1495,7 +1598,11 @@ mod tests {
         std::env::set_var("S3DLIO_GCS_RAPID", "maybe");
         let r = read_rapid_mode();
         std::env::remove_var("S3DLIO_GCS_RAPID");
-        assert_eq!(r, RapidMode::Auto, "unrecognised value should default to Auto");
+        assert_eq!(
+            r,
+            RapidMode::Auto,
+            "unrecognised value should default to Auto"
+        );
     }
 
     #[test]
@@ -1523,13 +1630,20 @@ mod tests {
         let env_path = dir.path().join(".env");
         std::fs::write(&env_path, "S3DLIO_GCS_RAPID=true\n").unwrap();
 
-        assert!(read_rapid_mode() == RapidMode::Auto, "should be Auto before loading .env");
+        assert!(
+            read_rapid_mode() == RapidMode::Auto,
+            "should be Auto before loading .env"
+        );
 
         dotenvy::from_path(&env_path).expect("dotenvy::from_path should succeed");
         let r = read_rapid_mode();
         std::env::remove_var("S3DLIO_GCS_RAPID");
 
-        assert_eq!(r, RapidMode::ForceOn, "RAPID mode should be ForceOn after loading .env with S3DLIO_GCS_RAPID=true");
+        assert_eq!(
+            r,
+            RapidMode::ForceOn,
+            "RAPID mode should be ForceOn after loading .env with S3DLIO_GCS_RAPID=true"
+        );
     }
 
     /// `S3DLIO_GCS_RAPID=false` in a `.env` file should leave RAPID mode off.
@@ -1546,7 +1660,11 @@ mod tests {
         let r = read_rapid_mode();
         std::env::remove_var("S3DLIO_GCS_RAPID");
 
-        assert_eq!(r, RapidMode::ForceOff, "RAPID mode should be ForceOff when .env sets it to false");
+        assert_eq!(
+            r,
+            RapidMode::ForceOff,
+            "RAPID mode should be ForceOff when .env sets it to false"
+        );
     }
 
     /// `GOOGLE_APPLICATION_CREDENTIALS` loaded from a `.env` file should
@@ -1559,8 +1677,11 @@ mod tests {
         let fake_creds = "/workspace/secrets/gcp-sa.json";
         let dir = TempDir::new().unwrap();
         let env_path = dir.path().join(".env");
-        std::fs::write(&env_path, format!("GOOGLE_APPLICATION_CREDENTIALS={}\n", fake_creds))
-            .unwrap();
+        std::fs::write(
+            &env_path,
+            format!("GOOGLE_APPLICATION_CREDENTIALS={}\n", fake_creds),
+        )
+        .unwrap();
 
         dotenvy::from_path(&env_path).expect("dotenvy::from_path should succeed");
         let loaded = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").unwrap_or_default();
@@ -1592,8 +1713,15 @@ mod tests {
         std::env::remove_var("S3DLIO_GCS_RAPID");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
 
-        assert_eq!(rapid, RapidMode::ForceOn, "RAPID mode should be ForceOn via .env");
-        assert_eq!(creds, "/tmp/creds.json", "credentials path should be loaded from .env");
+        assert_eq!(
+            rapid,
+            RapidMode::ForceOn,
+            "RAPID mode should be ForceOn via .env"
+        );
+        assert_eq!(
+            creds, "/tmp/creds.json",
+            "credentials path should be loaded from .env"
+        );
     }
 
     /// An environment variable already set in the shell takes precedence over
@@ -1617,7 +1745,11 @@ mod tests {
         std::env::remove_var("S3DLIO_GCS_RAPID");
 
         assert_eq!(raw, "false", "shell env var must not be overridden by .env");
-        assert_eq!(rapid, RapidMode::ForceOff, "read_rapid_mode() must respect the shell-set value");
+        assert_eq!(
+            rapid,
+            RapidMode::ForceOff,
+            "read_rapid_mode() must respect the shell-set value"
+        );
     }
 
     #[test]
@@ -1635,21 +1767,44 @@ mod tests {
     #[test]
     fn test_should_treat_out_of_range_as_empty_full_read_only_for_full_reads() {
         let msg = "OUT_OF_RANGE: The provided read ranges are outside the valid object range.";
-        assert!(should_treat_out_of_range_as_empty_full_read(msg, &ReadRange::all()));
-        assert!(!should_treat_out_of_range_as_empty_full_read(msg, &ReadRange::segment(0, 1)));
-        assert!(!should_treat_out_of_range_as_empty_full_read("INTERNAL", &ReadRange::all()));
+        assert!(should_treat_out_of_range_as_empty_full_read(
+            msg,
+            &ReadRange::all()
+        ));
+        assert!(!should_treat_out_of_range_as_empty_full_read(
+            msg,
+            &ReadRange::segment(0, 1)
+        ));
+        assert!(!should_treat_out_of_range_as_empty_full_read(
+            "INTERNAL",
+            &ReadRange::all()
+        ));
     }
 
     #[test]
     fn test_should_repair_incomplete_full_read() {
-        assert!(should_repair_incomplete_full_read(&ReadRange::all(), 8 * 1024 * 1024, 3_162_112));
-        assert!(!should_repair_incomplete_full_read(&ReadRange::all(), 8 * 1024 * 1024, 8 * 1024 * 1024));
-        assert!(!should_repair_incomplete_full_read(&ReadRange::segment(0, 1024), 1024, 512));
+        assert!(should_repair_incomplete_full_read(
+            &ReadRange::all(),
+            8 * 1024 * 1024,
+            3_162_112
+        ));
+        assert!(!should_repair_incomplete_full_read(
+            &ReadRange::all(),
+            8 * 1024 * 1024,
+            8 * 1024 * 1024
+        ));
+        assert!(!should_repair_incomplete_full_read(
+            &ReadRange::segment(0, 1024),
+            1024,
+            512
+        ));
     }
 
     #[test]
     fn test_is_retryable_gcs_read_error() {
-        assert!(is_retryable_gcs_read_error("timeout for gs://bucket/object"));
+        assert!(is_retryable_gcs_read_error(
+            "timeout for gs://bucket/object"
+        ));
         assert!(is_retryable_gcs_read_error("UNAVAILABLE: upstream reset"));
         assert!(is_retryable_gcs_read_error("CANCELLED by peer"));
         assert!(!is_retryable_gcs_read_error("PERMISSION_DENIED"));
@@ -1659,7 +1814,10 @@ mod tests {
     fn test_gcs_read_chunk_timeout_default() {
         let _g = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("S3DLIO_GCS_READ_CHUNK_TIMEOUT_SECS");
-        assert_eq!(gcs_read_chunk_timeout(8 * 1024 * 1024), Some(Duration::from_secs(12)));
+        assert_eq!(
+            gcs_read_chunk_timeout(8 * 1024 * 1024),
+            Some(Duration::from_secs(12))
+        );
     }
 
     #[test]
@@ -1766,10 +1924,14 @@ mod zero_copy_tests {
         let frozen: Bytes = buf.freeze();
 
         assert_eq!(
-            frozen.as_ptr(), raw_ptr_before,
+            frozen.as_ptr(),
+            raw_ptr_before,
             "BytesMut::freeze() must be zero-copy — pointer must not change"
         );
-        assert_eq!(&frozen[..], b"hello world this is test data for a gRPC chunk");
+        assert_eq!(
+            &frozen[..],
+            b"hello world this is test data for a gRPC chunk"
+        );
     }
 
     /// `Bytes::clone()` is an Arc reference-count increment — O(1), no memcpy.
@@ -1784,7 +1946,8 @@ mod zero_copy_tests {
         let cloned = bytes.clone();
 
         assert_eq!(
-            cloned.as_ptr(), original_ptr,
+            cloned.as_ptr(),
+            original_ptr,
             "Bytes::clone() must share the same backing buffer (Arc increment, not memcpy)"
         );
         assert_eq!(bytes.len(), cloned.len());
@@ -1823,7 +1986,8 @@ mod zero_copy_tests {
         let bytes = Bytes::from(vec);
 
         assert_eq!(
-            bytes.as_ptr(), vec_ptr,
+            bytes.as_ptr(),
+            vec_ptr,
             "Bytes::from(Vec<u8>) must transfer ownership without copying"
         );
     }
@@ -1851,7 +2015,8 @@ mod zero_copy_tests {
 
         assert!(buffer.is_empty(), "mem::take must empty the source Vec");
         assert_eq!(
-            bytes.as_ptr(), original_ptr,
+            bytes.as_ptr(),
+            original_ptr,
             "GcsBufferedWriter finalise: Bytes::from(mem::take(buffer)) must preserve pointer"
         );
         assert_eq!(bytes.len(), 65536);
@@ -1890,7 +2055,8 @@ mod zero_copy_tests {
         let result = data.freeze();
 
         assert_eq!(
-            result.as_ptr(), alloc_ptr,
+            result.as_ptr(),
+            alloc_ptr,
             "exact pre-allocation + freeze() must not reallocate (zero-copy gRPC read path)"
         );
         assert_eq!(result.len(), total);
@@ -1923,7 +2089,8 @@ mod zero_copy_tests {
         let result = data.freeze();
 
         assert_eq!(
-            result.as_ptr(), alloc_ptr,
+            result.as_ptr(),
+            alloc_ptr,
             "HTTP read: freeze() after exact-fit fill must not reallocate"
         );
         assert_eq!(result.len(), initial_capacity);
@@ -1940,8 +2107,8 @@ mod zero_copy_tests {
     /// producer task never copies data before sending it down the channel.
     #[test]
     fn test_write_producer_chunk_slices_are_zero_copy() {
-        const TOTAL: usize = 6 * 1024 * 1024;   // 6 MiB  (3 × DEFAULT chunk)
-        const CHUNK: usize = 2 * 1024 * 1024;   // 2 MiB  = DEFAULT_GRPC_WRITE_CHUNK_SIZE
+        const TOTAL: usize = 6 * 1024 * 1024; // 6 MiB  (3 × DEFAULT chunk)
+        const CHUNK: usize = 2 * 1024 * 1024; // 2 MiB  = DEFAULT_GRPC_WRITE_CHUNK_SIZE
 
         let data = Bytes::from(vec![0xFFu8; TOTAL]);
         let base_ptr = data.as_ptr();
@@ -1976,7 +2143,8 @@ mod zero_copy_tests {
         let task_data = data.clone();
 
         assert_eq!(
-            task_data.as_ptr(), original_ptr,
+            task_data.as_ptr(),
+            original_ptr,
             "Bytes clone for producer task must be free (Arc increment, not 32 MiB memcpy)"
         );
     }
@@ -2002,14 +2170,16 @@ mod zero_copy_tests {
         let bytes = Bytes::from(file_contents);
 
         assert_eq!(
-            bytes.as_ptr(), data_ptr,
+            bytes.as_ptr(),
+            data_ptr,
             "Bytes::from(file_contents) must not copy — put_object caller boundary"
         );
 
         // Clone for passing to async task (simulates what the runtime may do)
         let bytes2 = bytes.clone();
         assert_eq!(
-            bytes2.as_ptr(), data_ptr,
+            bytes2.as_ptr(),
+            data_ptr,
             "Bytes clone for async dispatch must still point to original buffer"
         );
     }
@@ -2038,9 +2208,18 @@ mod zero_copy_tests {
             "GCS delete partially failed: {}/{} objects failed to delete in gs://{}",
             fail_count, total, bucket
         );
-        assert!(msg.contains("3/10"), "error message must include fail/total ratio");
-        assert!(msg.contains("gs://test-bucket"), "error message must name the bucket");
-        assert!(msg.contains("GCS delete partially failed"), "error message must indicate partial failure");
+        assert!(
+            msg.contains("3/10"),
+            "error message must include fail/total ratio"
+        );
+        assert!(
+            msg.contains("gs://test-bucket"),
+            "error message must name the bucket"
+        );
+        assert!(
+            msg.contains("GCS delete partially failed"),
+            "error message must indicate partial failure"
+        );
     }
 
     /// Confirms that `delete_objects` returns `Ok(())` immediately for an
@@ -2053,7 +2232,9 @@ mod zero_copy_tests {
         // cannot call async code from a sync test without a runtime we just
         // verify the logic by code inspection (the early-return is trivial).
         let objects: Vec<String> = vec![];
-        assert!(objects.is_empty(), "empty slice must trigger early return in delete_objects");
+        assert!(
+            objects.is_empty(),
+            "empty slice must trigger early return in delete_objects"
+        );
     }
 }
-

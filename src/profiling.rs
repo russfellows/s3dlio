@@ -2,19 +2,19 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 //! Profiling infrastructure for s3dlio performance analysis
-//! 
+//!
 //! This module provides CPU sampling profiling, async task monitoring, and structured tracing
 //! when the "profiling" feature is enabled. It helps identify performance bottlenecks in:
 //! - HTTP request/response processing
 //! - Data copying and buffer management
 //! - Async task scheduling and contention
 //! - S3/Azure API call latencies
-//! 
+//!
 //! Usage:
 //! ```bash
 //! # Enable profiling and build with release optimizations
 //! RUSTFLAGS="--cfg tokio_unstable" cargo run --release --features profiling
-//! 
+//!
 //! # For tokio-console monitoring:
 //! RUSTFLAGS="--cfg tokio_unstable" cargo run --release --features profiling
 //! # In another terminal:
@@ -23,22 +23,23 @@
 
 /// Global profiling state
 #[cfg(feature = "profiling")]
-static PROFILING_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROFILING_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(feature = "profiling")]
+use tracing::{debug, info, warn};
 #[cfg(feature = "profiling")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-#[cfg(feature = "profiling")]
-use tracing::{info, warn, debug};
 
 #[cfg(not(feature = "profiling"))]
-use tracing::{warn, debug};
+use tracing::{debug, warn};
 
 /// Initialize comprehensive profiling infrastructure
-/// 
+///
 /// This sets up:
 /// - Structured tracing with environment-based filtering
 /// - Optional tokio-console integration for async task monitoring
-/// 
+///
 /// Call this early in main() when profiling is needed.
 pub fn init_profiling() -> anyhow::Result<()> {
     #[cfg(feature = "profiling")]
@@ -60,13 +61,13 @@ pub fn init_profiling() -> anyhow::Result<()> {
             console_subscriber::init();
             info!("Tokio console subscriber initialized - connect with 'tokio-console'");
         } else {
-            let subscriber = tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer()
+            let subscriber = tracing_subscriber::registry().with(env_filter).with(
+                tracing_subscriber::fmt::layer()
                     .with_target(false)
                     .with_thread_ids(true)
                     .with_file(true)
-                    .with_line_number(true));
+                    .with_line_number(true),
+            );
 
             subscriber.init();
         }
@@ -84,7 +85,7 @@ pub fn init_profiling() -> anyhow::Result<()> {
 }
 
 /// Generate and save CPU flamegraph to file
-/// 
+///
 /// This should be called at the end of a profiling session to dump
 /// the accumulated CPU samples as an SVG flamegraph.
 pub fn save_flamegraph(path: &str) -> anyhow::Result<()> {
@@ -104,7 +105,7 @@ pub fn save_flamegraph(path: &str) -> anyhow::Result<()> {
 }
 
 /// Standalone CPU profiler for specific code sections
-/// 
+///
 /// Use this for targeted profiling of specific operations:
 /// ```rust
 /// let _profiler = s3dlio::profiling::profile_section("my_operation");
@@ -143,7 +144,7 @@ impl SectionProfiler {
         {
             warn!("Cannot save section flamegraph - profiling feature not enabled");
         }
-        
+
         Ok(())
     }
 }
@@ -158,7 +159,7 @@ impl Drop for SectionProfiler {
 }
 
 /// Convenience macro for instrumenting functions with tracing spans
-/// 
+///
 /// When profiling is enabled, this adds detailed tracing spans with
 /// configurable fields for performance analysis.
 #[macro_export]
@@ -190,21 +191,19 @@ macro_rules! profile_span {
 /// Convenience macro for profiling async functions
 #[macro_export]
 macro_rules! profile_async {
-    ($name:expr, $future:expr) => {
+    ($name:expr, $future:expr) => {{
+        #[cfg(feature = "profiling")]
         {
-            #[cfg(feature = "profiling")]
-            {
-                async move {
-                    let span = ::tracing::info_span!($name);
-                    ::tracing::Instrument::instrument($future, span).await
-                }
-            }
-            #[cfg(not(feature = "profiling"))]
-            {
-                $future
+            async move {
+                let span = ::tracing::info_span!($name);
+                ::tracing::Instrument::instrument($future, span).await
             }
         }
-    };
+        #[cfg(not(feature = "profiling"))]
+        {
+            $future
+        }
+    }};
 }
 
 #[cfg(test)]
@@ -217,12 +216,12 @@ mod tests {
         assert!(profiler.is_ok());
     }
 
-    #[tokio::test] 
+    #[tokio::test]
     async fn test_profiling_macros() {
         // These should compile and run without panicking
         profile_span!("test_span");
         profile_span!("test_span", field1 = "value1");
-        
+
         let result = profile_async!("test_async", async { 42 }).await;
         assert_eq!(result, 42);
     }
