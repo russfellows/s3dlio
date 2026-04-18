@@ -441,10 +441,8 @@ impl MultipartUploadSink {
         // At most max_in_flight * part_size bytes are held in Rust task memory
         // at any given time — mirrors minio's _throttle() pattern.
         let permit: OwnedSemaphorePermit = run_on_global_rt(async move {
-            Ok::<_, anyhow::Error>(
-                semaphore.acquire_owned().await
-                    .map_err(|_| anyhow::anyhow!("semaphore closed"))?
-            )
+            semaphore.acquire_owned().await
+                .map_err(|_| anyhow::anyhow!("semaphore closed"))
         })?;
     
         // Spawn directly on global runtime — permit already acquired, so the task
@@ -491,10 +489,8 @@ impl MultipartUploadSink {
 
         // Acquire permit BEFORE spawning (backpressure — same as spawn_part).
         let permit: OwnedSemaphorePermit = run_on_global_rt(async move {
-            Ok::<_, anyhow::Error>(
-                semaphore.acquire_owned().await
-                    .map_err(|_| anyhow::anyhow!("semaphore closed"))?
-            )
+            semaphore.acquire_owned().await
+                .map_err(|_| anyhow::anyhow!("semaphore closed"))
         })?;
     
         // Spawn directly on global runtime without blocking

@@ -54,7 +54,7 @@
 //! # }
 //! ```
 
-use crate::object_store::{ObjectStore, store_for_uri, ObjectMetadata};
+use crate::object_store::{ObjectStore, store_for_uri, ObjectMetadata, S3ObjectStore};
 use anyhow::{Result, Context, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -227,6 +227,10 @@ struct EndpointInfo {
     
     /// Process affinity hint (if configured).
     process_affinity: Option<usize>,
+
+    /// The endpoint URL used to create a dedicated per-endpoint S3 client, if applicable.
+    /// `None` for non-S3 backends or S3 URIs routed through the global singleton client.
+    store_endpoint_url: Option<String>,
 }
 
 /// Multi-endpoint ObjectStore wrapper with load balancing and per-endpoint configuration.
@@ -321,8 +325,34 @@ impl MultiEndpointStore {
         // Create ObjectStore instances for each endpoint
         let mut endpoints = Vec::with_capacity(config.endpoints.len());
         for endpoint_config in &config.endpoints {
-            let store = store_for_uri(&endpoint_config.uri)
-                .with_context(|| format!("Failed to create store for URI: {}", endpoint_config.uri))?;
+            let mut store_endpoint_url: Option<String> = None;
+            let store: Box<dyn ObjectStore> = 'store: {
+                // For S3 URIs with an explicit endpoint host, create a dedicated per-endpoint
+                // client (own connection pool, correct base URL) instead of routing through
+                // the global singleton.
+                if endpoint_config.uri.starts_with("s3://") {
+                    if let Ok(components) = crate::s3_utils::parse_s3_uri_full(&endpoint_config.uri) {
+                        if let Some(ep) = components.endpoint {
+                            let endpoint_url = if ep.starts_with("http://") || ep.starts_with("https://") {
+                                ep
+                            } else {
+                                format!("http://{}", ep)
+                            };
+                            let url_for_store = endpoint_url.clone();
+                            let result = crate::s3_client::run_on_global_rt(async move {
+                                S3ObjectStore::for_endpoint(&url_for_store)
+                                    .await
+                                    .map(|s| Box::new(s) as Box<dyn ObjectStore>)
+                            })
+                            .with_context(|| format!("Failed to create per-endpoint S3 store for: {}", endpoint_config.uri))?;
+                            store_endpoint_url = Some(endpoint_url);
+                            break 'store result;
+                        }
+                    }
+                }
+                store_for_uri(&endpoint_config.uri)
+                    .with_context(|| format!("Failed to create store for URI: {}", endpoint_config.uri))?
+            };
             
             let thread_count = endpoint_config.thread_count
                 .or(config.default_thread_count)
@@ -334,6 +364,7 @@ impl MultiEndpointStore {
                 stats: Arc::new(EndpointStats::new()),
                 thread_count,
                 process_affinity: endpoint_config.process_affinity,
+                store_endpoint_url,
             });
         }
         
@@ -479,6 +510,17 @@ impl MultiEndpointStore {
         self.endpoints.iter()
             .map(|e| (e.uri.clone(), e.thread_count, e.process_affinity))
             .collect()
+    }
+
+    /// Returns the endpoint URL of the underlying S3 store for each configured endpoint.
+    ///
+    /// Returns `Some(url)` for endpoints where a dedicated per-endpoint S3 client was
+    /// created (i.e., URIs with explicit `host:port` like `s3://10.9.0.17:9000/bucket/`),
+    /// or `None` for global-client paths and non-S3 backends.
+    ///
+    /// Primarily useful for verifying per-endpoint isolation in tests.
+    pub fn get_store_endpoint_urls(&self) -> Vec<Option<String>> {
+        self.endpoints.iter().map(|e| e.store_endpoint_url.clone()).collect()
     }
     
     /// Get the current load balancing strategy.
@@ -1610,5 +1652,161 @@ mod tests {
         // Verify file was deleted from ep2
         assert!(!tmp2.path().join("delete_me.txt").exists(), 
             "File should be deleted from ep2");
+    }
+
+    // ── Per-endpoint S3 client isolation tests ───────────────────────────────
+    //
+    // These tests verify the fix for the original bug: before the fix,
+    // MultiEndpointStore always used the global S3ObjectStore singleton
+    // (store_for_uri → S3ObjectStore::new → client=None) regardless of the
+    // endpoint URI, so all endpoints shared one connection pool.
+    //
+    // After the fix, URIs of the form s3://host:port/bucket/ each get their
+    // own per-endpoint client with a distinct connection pool.
+    //
+    // CRED_LOCK serializes tests that set AWS credential env vars.
+
+    /// Mutex to serialize tests that manipulate AWS credential env vars.
+    static CRED_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn restore_env(key: &str, saved: Option<String>) {
+        match saved {
+            #[allow(deprecated)]
+            Some(v) => std::env::set_var(key, v),
+            #[allow(deprecated)]
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// Plain `s3://bucket/prefix/` URIs (no explicit `host:port`) must NOT
+    /// create per-endpoint stores — they fall through to `store_for_uri()` and
+    /// get `store_endpoint_url = None`.  No credentials are required because
+    /// `store_for_uri("s3://...")` calls `S3ObjectStore::boxed()` (no async,
+    /// no credential check).
+    #[test]
+    fn test_s3_plain_uris_use_global_client_path() {
+        let uris = vec![
+            "s3://bucket1/prefix/".to_string(),
+            "s3://bucket2/prefix/".to_string(),
+        ];
+        let store = MultiEndpointStore::new(uris, LoadBalanceStrategy::RoundRobin, None)
+            .expect("MultiEndpointStore creation should succeed for plain s3:// URIs");
+
+        let urls = store.get_store_endpoint_urls();
+        assert_eq!(urls.len(), 2);
+        // Plain s3:// URIs use the global client path — no per-endpoint URL
+        assert!(urls[0].is_none(), "s3://bucket/prefix/ should use global client (no endpoint URL)");
+        assert!(urls[1].is_none(), "s3://bucket/prefix/ should use global client (no endpoint URL)");
+    }
+
+    /// S3 URIs with explicit `host:port` (e.g., `s3://10.9.0.17:9000/bucket/`)
+    /// must each create a dedicated per-endpoint store, not the global client.
+    ///
+    /// This is the primary regression test for the endpoint isolation fix.
+    /// The `get_store_endpoint_urls()` method exposes the endpoint URL that was
+    /// passed to `S3ObjectStore::for_endpoint()`, making this directly testable
+    /// without making any network calls.
+    #[tokio::test]
+    async fn test_s3_endpoints_with_explicit_hosts_create_per_endpoint_stores() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let saved_region = std::env::var("AWS_REGION").ok();
+
+        #[allow(deprecated)]
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_REGION", "us-east-1");
+
+        let result = MultiEndpointStore::new(
+            vec![
+                "s3://10.9.0.17:9000/bucket/".to_string(),
+                "s3://10.9.0.18:9000/bucket/".to_string(),
+            ],
+            LoadBalanceStrategy::RoundRobin,
+            None,
+        );
+
+        restore_env("AWS_ACCESS_KEY_ID", saved_key);
+        restore_env("AWS_SECRET_ACCESS_KEY", saved_secret);
+        restore_env("AWS_REGION", saved_region);
+
+        let store = result.expect("MultiEndpointStore should be created with fake credentials");
+        assert_eq!(store.endpoint_count(), 2);
+
+        let urls = store.get_store_endpoint_urls();
+        assert_eq!(urls.len(), 2);
+
+        // Each endpoint must have a dedicated store (Some URL, not None)
+        assert!(
+            urls[0].is_some(),
+            "s3://10.9.0.17:9000/bucket/ must use a per-endpoint client"
+        );
+        assert!(
+            urls[1].is_some(),
+            "s3://10.9.0.18:9000/bucket/ must use a per-endpoint client"
+        );
+
+        // Each store must target its own endpoint
+        assert!(
+            urls[0].as_deref().unwrap().contains("10.9.0.17:9000"),
+            "First store should target 10.9.0.17:9000, got {:?}", urls[0]
+        );
+        assert!(
+            urls[1].as_deref().unwrap().contains("10.9.0.18:9000"),
+            "Second store should target 10.9.0.18:9000, got {:?}", urls[1]
+        );
+    }
+
+    /// Two endpoints with different IPs must get **different** per-endpoint
+    /// store URLs — proving they received independent clients, not a shared
+    /// singleton.
+    ///
+    /// This is the key regression test.  Before the fix, both would return
+    /// `None` (global client).  After the fix, they return distinct URLs.
+    #[tokio::test]
+    async fn test_two_s3_endpoints_get_different_per_endpoint_clients() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let saved_region = std::env::var("AWS_REGION").ok();
+
+        #[allow(deprecated)]
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_REGION", "us-east-1");
+
+        let result = MultiEndpointStore::new(
+            vec![
+                "s3://10.9.0.17:9000/bucket/".to_string(),
+                "s3://10.9.0.18:9000/bucket/".to_string(),
+                "s3://10.9.0.19:9000/bucket/".to_string(),
+            ],
+            LoadBalanceStrategy::RoundRobin,
+            None,
+        );
+
+        restore_env("AWS_ACCESS_KEY_ID", saved_key);
+        restore_env("AWS_SECRET_ACCESS_KEY", saved_secret);
+        restore_env("AWS_REGION", saved_region);
+
+        let store = result.expect("3-endpoint store should be created");
+        let urls = store.get_store_endpoint_urls();
+
+        // All three must be Some (per-endpoint, not global)
+        for (i, url) in urls.iter().enumerate() {
+            assert!(url.is_some(), "endpoint {i} should have a per-endpoint URL");
+        }
+
+        // All three must be distinct (not a shared singleton)
+        assert_ne!(urls[0], urls[1], "endpoints 0 and 1 must be different");
+        assert_ne!(urls[1], urls[2], "endpoints 1 and 2 must be different");
+        assert_ne!(urls[0], urls[2], "endpoints 0 and 2 must be different");
     }
 }

@@ -141,7 +141,7 @@ pub fn get_gcs_channel_count() -> usize {
     }
     #[cfg(not(feature = "backend-gcs"))]
     {
-        return 0;
+        0
     }
 }
 
@@ -158,7 +158,7 @@ pub fn get_gcs_rapid_mode() -> Option<bool> {
     }
     #[cfg(not(feature = "backend-gcs"))]
     {
-        return None;
+        None
     }
 }
 
@@ -175,7 +175,7 @@ pub async fn query_gcs_rapid_bucket(bucket_or_uri: &str) -> bool {
     #[cfg(not(feature = "backend-gcs"))]
     {
         let _ = bucket_or_uri;
-        return false;
+        false
     }
 }
 
@@ -183,9 +183,7 @@ pub mod list_containers;    // Backend-agnostic bucket/container listing (s3://,
 pub use list_containers::{list_containers, ContainerInfo};
 
 pub mod concurrency;
-#[cfg(feature = "enhanced-http")]
-pub mod http;
-pub mod performance;
+pub mod reqwest_client;  // Reqwest-based HTTP client for AWS SDK (h2c + connection pool tuning)
 pub mod adaptive_config;  // Optional adaptive tuning for performance
 mod multipart;
 

@@ -250,8 +250,7 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
         let stderr_path = stderr_files.get(worker_id).and_then(|p| p.as_ref());
         if !status.success() {
             let first_stderr = stderr_path
-                .map(|p| read_first_non_empty_line(p.as_path()))
-                .flatten()
+                .and_then(|p| read_first_non_empty_line(p.as_path()))
                 .unwrap_or_else(|| "(no stderr output captured)".to_string());
             let status_code = status
                 .code()

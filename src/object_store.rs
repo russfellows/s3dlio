@@ -4,7 +4,7 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::anyhow;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use crc32fast::Hasher;
 use std::io::Write;
@@ -951,7 +951,12 @@ pub struct S3ObjectStore {
     // Note: S3ObjectStore doesn't store config because it doesn't support RangeEngine yet
     // (unlike GCS/Azure which do). The config is only used during construction to set
     // the cache TTL. If RangeEngine support is added later, we can add the config field.
-    size_cache: Arc<crate::object_size_cache::ObjectSizeCache>,
+    size_cache: std::sync::Arc<crate::object_size_cache::ObjectSizeCache>,
+    /// Per-endpoint AWS S3 client. When `Some`, all operations use this client directly
+    /// instead of the global singleton, enabling true per-endpoint connection pools.
+    client: Option<std::sync::Arc<aws_sdk_s3::Client>>,
+    /// The endpoint URL this store was created for (for logging / debugging).
+    endpoint_url: Option<String>,
 }
 
 impl Default for S3ObjectStore {
@@ -965,15 +970,48 @@ impl S3ObjectStore {
         let config = S3Config::default();
         let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
-            size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            client: None,
+            endpoint_url: None,
         }
     }
     
     pub fn with_config(config: S3Config) -> Self {
         let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
         Self {
-            size_cache: Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            client: None,
+            endpoint_url: None,
         }
+    }
+
+    /// Create an `S3ObjectStore` with its own `aws_sdk_s3::Client` configured for a    /// specific endpoint URL.
+    ///
+    /// Unlike [`S3ObjectStore::new`] (which uses the process-wide global client), this
+    /// constructor creates a **dedicated** client with its own connection pool.  Each
+    /// endpoint in a `MultiEndpointStore` should use a separate `for_endpoint` store so
+    /// that PUT/GET traffic is truly distributed across connection pools.
+    ///
+    /// The endpoint URL should include the scheme and port, e.g.:
+    /// - `"http://10.9.0.17:9000"` — MinIO / VAST S3-compatible
+    /// - `"https://s3.us-east-1.amazonaws.com"` — AWS S3
+    pub async fn for_endpoint(endpoint_url: &str) -> anyhow::Result<Self> {
+        let client = crate::s3_client::create_s3_client_for_endpoint(endpoint_url, None).await?;
+        let config = S3Config::default();
+        let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
+        Ok(Self {
+            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(cache_ttl)),
+            client: Some(std::sync::Arc::new(client)),
+            endpoint_url: Some(endpoint_url.to_string()),
+        })
+    }
+
+    /// Returns the endpoint URL this store was created for, if any.
+    ///
+    /// Returns `Some` only for stores created via [`S3ObjectStore::for_endpoint`].
+    /// Returns `None` for stores that use the process-wide global client.
+    pub fn endpoint_url(&self) -> Option<&str> {
+        self.endpoint_url.as_deref()
     }
     
     #[inline]
@@ -994,6 +1032,51 @@ impl S3ObjectStore {
         self.size_cache.put(uri.to_string(), metadata.size).await;
         Ok(metadata.size)
     }
+
+    /// List objects using a given client (shared implementation for list() and list_stream()).
+    async fn list_with_client(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        key_prefix: &str,
+        recursive: bool,
+    ) -> Result<Vec<String>> {
+        use regex::Regex;
+        let (prefix_str, pattern_str) = match key_prefix.rfind('/') {
+            Some(idx) => {
+                let (p, pat) = key_prefix.split_at(idx + 1);
+                (p.to_string(), pat.to_string())
+            }
+            None => (String::new(), key_prefix.to_string()),
+        };
+        let final_pattern = if pattern_str.is_empty() { ".*".to_string() } else { pattern_str };
+        let re = Regex::new(&final_pattern)
+            .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
+        let delimiter = if recursive { None } else { Some("/".to_string()) };
+
+        let mut keys = Vec::new();
+        let mut cont: Option<String> = None;
+        loop {
+            let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix_str.as_str());
+            if let Some(ref d) = delimiter { req = req.delimiter(d.as_str()); }
+            if let Some(ref t) = cont { req = req.continuation_token(t.as_str()); }
+            let resp = req.send().await
+                .with_context(|| format!("list_objects_v2 failed for bucket '{}'", bucket))?;
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    if re.is_match(key) || key.starts_with(&prefix_str) {
+                        keys.push(format!("s3://{}/{}", bucket, key));
+                    }
+                }
+            }
+            if resp.is_truncated().unwrap_or(false) {
+                cont = resp.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
 }
 
 #[async_trait]
@@ -1001,7 +1084,20 @@ impl ObjectStore for S3ObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         debug!("S3ObjectStore::get uri='{}'", uri);
-        
+
+        if let Some(client) = &self.client {
+            let (bucket, key) = parse_s3_uri(uri)?;
+            let resp = client.get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .with_context(|| format!("S3 GET failed for '{}'", uri))?;
+            let data = resp.body.collect().await
+                .context("Failed to read S3 GET response body")?;
+            return Ok(data.into_bytes());
+        }
+
         // Range optimization is ENABLED by default (v0.9.60+).
         // Set S3DLIO_ENABLE_RANGE_OPTIMIZATION=0 (or false/no/off/disable) to disable.
         // Setting it to 1/true/yes/on/enable is accepted but has no effect (already on).
@@ -1020,12 +1116,44 @@ impl ObjectStore for S3ObjectStore {
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         debug!("S3ObjectStore::get_range uri='{}', offset={}, length={:?}", uri, offset, length);
+
+        if let Some(client) = &self.client {
+            let (bucket, key) = parse_s3_uri(uri)?;
+            let range_header = match length {
+                Some(len) => format!("bytes={}-{}", offset, offset + len - 1),
+                None => format!("bytes={}-", offset),
+            };
+            let resp = client.get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .range(range_header)
+                .send()
+                .await
+                .with_context(|| format!("S3 range GET failed for '{}'", uri))?;
+            let data = resp.body.collect().await
+                .context("Failed to read S3 range GET response body")?;
+            return Ok(data.into_bytes());
+        }
+
         s3_get_object_range_uri_async(uri, offset, length).await
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         debug!("S3ObjectStore::put uri='{}', {} bytes", uri, data.len());
+
+        if let Some(client) = &self.client {
+            let (bucket, key) = parse_s3_uri(uri)?;
+            client.put_object()
+                .bucket(&bucket)
+                .key(&key)
+                .body(data.into())
+                .send()
+                .await
+                .with_context(|| format!("S3 PUT failed for '{}'", uri))?;
+            return Ok(());
+        }
+
         s3_put_object_uri_async(uri, data).await
     }
 
@@ -1038,6 +1166,11 @@ impl ObjectStore for S3ObjectStore {
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         debug!("S3ObjectStore::list prefix='{}', recursive={}", uri_prefix, recursive);
         let (bucket, key_prefix) = parse_s3_uri(uri_prefix)?;
+
+        if let Some(client) = &self.client {
+            return Self::list_with_client(client, &bucket, &key_prefix, recursive).await;
+        }
+
         // Use the async streaming version to avoid nested run_on_global_rt deadlock.
         // s3_list_objects (sync) cannot be called from inside the global runtime.
         let mut stream = s3_list_objects_stream(bucket.clone(), key_prefix, recursive).await?;
@@ -1065,6 +1198,16 @@ impl ObjectStore for S3ObjectStore {
                     return;
                 }
             };
+
+            if let Some(client) = &self.client {
+                match S3ObjectStore::list_with_client(client, &bucket, &key_prefix, recursive).await {
+                    Ok(keys) => {
+                        for key in keys { yield Ok(key); }
+                    }
+                    Err(e) => { yield Err(e); }
+                }
+                return;
+            }
             
             let mut stream = match s3_list_objects_stream(bucket.clone(), key_prefix, recursive).await {
                 Ok(s) => s,
@@ -1086,12 +1229,54 @@ impl ObjectStore for S3ObjectStore {
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         debug!("S3ObjectStore::stat uri='{}'", uri);
+
+        if let Some(client) = &self.client {
+            let (bucket, key) = parse_s3_uri(uri)?;
+            let key_clean = key.trim_start_matches('/');
+            let resp = client.head_object()
+                .bucket(&bucket)
+                .key(key_clean)
+                .send()
+                .await
+                .with_context(|| format!("S3 HEAD failed for '{}'", uri))?;
+            return Ok(crate::s3_utils::ObjectStat {
+                size: resp.content_length().unwrap_or_default() as u64,
+                last_modified: resp.last_modified().map(|t| t.to_string()),
+                e_tag: resp.e_tag().map(|s| s.to_string()),
+                content_type: resp.content_type().map(|s| s.to_string()),
+                content_language: resp.content_language().map(|s| s.to_string()),
+                content_encoding: resp.content_encoding().map(|s| s.to_string()),
+                cache_control: resp.cache_control().map(|s| s.to_string()),
+                content_disposition: resp.content_disposition().map(|s| s.to_string()),
+                expires: resp.expires_string().map(|s| s.to_string()),
+                storage_class: resp.storage_class().map(|s| s.as_str().to_string()),
+                server_side_encryption: resp.server_side_encryption().map(|s| s.as_str().to_string()),
+                ssekms_key_id: resp.ssekms_key_id().map(|s| s.to_string()),
+                sse_customer_algorithm: resp.sse_customer_algorithm().map(|s| s.to_string()),
+                version_id: resp.version_id().map(|s| s.to_string()),
+                replication_status: resp.replication_status().map(|s| s.as_str().to_string()),
+                metadata: resp.metadata().cloned().unwrap_or_default(),
+            });
+        }
+
         s3_stat_object_uri_async(uri).await
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
         if !uri.starts_with("s3://") { bail!("S3ObjectStore expected s3:// URI"); }
         debug!("S3ObjectStore::delete uri='{}'", uri);
+
+        if let Some(client) = &self.client {
+            let (bucket, key) = parse_s3_uri(uri)?;
+            client.delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .with_context(|| format!("S3 DELETE failed for '{}'", uri))?;
+            return Ok(());
+        }
+
         let (bucket, key) = parse_s3_uri(uri)?;
         s3_delete_objects_async(&bucket, &[key]).await
     }
@@ -1105,7 +1290,26 @@ impl ObjectStore for S3ObjectStore {
         let keys: Vec<String> = uris.iter()
             .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, key)| key))
             .collect();
-        
+
+        if let Some(client) = &self.client {
+            for chunk in keys.chunks(1000) {
+                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk.iter()
+                    .filter_map(|k| aws_sdk_s3::types::ObjectIdentifier::builder().key(k).build().ok())
+                    .collect();
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(objects))
+                    .build()
+                    .context("Failed to build Delete request")?;
+                client.delete_objects()
+                    .bucket(&bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .with_context(|| format!("S3 batch DELETE failed for bucket '{}'", bucket))?;
+            }
+            return Ok(());
+        }
+
         // Use S3 batch delete API (1000 objects per request)
         s3_delete_objects_async(&bucket, &keys).await
     }
@@ -1117,6 +1321,30 @@ impl ObjectStore for S3ObjectStore {
         let (bucket, mut key_prefix) = parse_s3_uri(uri_prefix)?;
         if !key_prefix.is_empty() && !key_prefix.ends_with('/') { 
             key_prefix.push('/'); 
+        }
+
+        if let Some(client) = &self.client {
+            let keys = Self::list_with_client(client, &bucket, &key_prefix, true).await?;
+            let just_keys: Vec<String> = keys.iter()
+                .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, k)| k))
+                .collect();
+            for chunk in just_keys.chunks(1000) {
+                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk.iter()
+                    .filter_map(|k| aws_sdk_s3::types::ObjectIdentifier::builder().key(k).build().ok())
+                    .collect();
+                if objects.is_empty() { continue; }
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(objects))
+                    .build()
+                    .context("Failed to build Delete request")?;
+                client.delete_objects()
+                    .bucket(&bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .with_context(|| format!("S3 delete_prefix failed for bucket '{}'", bucket))?;
+            }
+            return Ok(());
         }
         
         // Use streaming list to avoid loading millions of keys into memory
@@ -3224,5 +3452,135 @@ pub async fn generic_download_objects_with_summary(
         summary.bytes_transferred = progress.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
     }
     Ok(summary)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests for S3ObjectStore per-endpoint isolation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod s3_object_store_tests {
+    use super::*;
+
+    /// Mutex to serialize tests that manipulate AWS credential env vars.
+    static CRED_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    // ── Tests that need NO credentials / NO network ──────────────────────────
+
+    /// `S3ObjectStore::new()` must NOT pre-configure an endpoint.
+    /// It represents the global-client path (backward-compatible).
+    #[test]
+    fn test_s3_object_store_new_has_no_endpoint_url() {
+        let store = S3ObjectStore::new();
+        assert!(
+            store.endpoint_url().is_none(),
+            "S3ObjectStore::new() should use the global client (endpoint_url=None)"
+        );
+    }
+
+    /// `S3ObjectStore::with_config()` must also produce no endpoint URL.
+    #[test]
+    fn test_s3_object_store_with_config_has_no_endpoint_url() {
+        let store = S3ObjectStore::with_config(S3Config::default());
+        assert!(
+            store.endpoint_url().is_none(),
+            "S3ObjectStore::with_config() should use the global client (endpoint_url=None)"
+        );
+    }
+
+    // ── Tests that need fake credentials (no network calls) ──────────────────
+    //
+    // `S3ObjectStore::for_endpoint()` checks that `AWS_ACCESS_KEY_ID` and
+    // `AWS_SECRET_ACCESS_KEY` are set, then builds an SDK config — all
+    // synchronous.  No actual TCP connection is made at construction time.
+    //
+    // CRED_LOCK serializes these tests to avoid env-var races in parallel runs.
+
+    /// `for_endpoint()` must store the endpoint URL for diagnostics / assertions.
+    #[tokio::test]
+    async fn test_s3_object_store_for_endpoint_sets_endpoint_url() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let saved_region = std::env::var("AWS_REGION").ok();
+
+        #[allow(deprecated)]
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_REGION", "us-east-1");
+
+        let result = S3ObjectStore::for_endpoint("http://127.0.0.1:9000").await;
+
+        // Restore env
+        restore_env("AWS_ACCESS_KEY_ID", saved_key);
+        restore_env("AWS_SECRET_ACCESS_KEY", saved_secret);
+        restore_env("AWS_REGION", saved_region);
+
+        let store = result.expect("for_endpoint() should succeed with fake credentials");
+        assert_eq!(
+            store.endpoint_url(),
+            Some("http://127.0.0.1:9000"),
+            "endpoint_url() must reflect the URL passed to for_endpoint()"
+        );
+    }
+
+    /// Two `for_endpoint()` calls with **different** URLs must produce stores
+    /// that report **different** endpoint URLs — proving they are independent
+    /// instances rather than sharing a global client.
+    ///
+    /// This is the regression test for the original bug where
+    /// `MultiEndpointStore` allocated a single global `S3ObjectStore` for all
+    /// endpoints, causing all traffic to share one connection pool.
+    #[tokio::test]
+    async fn test_two_stores_for_different_endpoints_have_different_urls() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let saved_region = std::env::var("AWS_REGION").ok();
+
+        #[allow(deprecated)]
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_REGION", "us-east-1");
+
+        let r1 = S3ObjectStore::for_endpoint("http://10.9.0.17:9000").await;
+        let r2 = S3ObjectStore::for_endpoint("http://10.9.0.18:9000").await;
+
+        // Restore env
+        restore_env("AWS_ACCESS_KEY_ID", saved_key);
+        restore_env("AWS_SECRET_ACCESS_KEY", saved_secret);
+        restore_env("AWS_REGION", saved_region);
+
+        let s1 = r1.expect("store 1 construction");
+        let s2 = r2.expect("store 2 construction");
+
+        // Each store records its own endpoint URL
+        assert_eq!(s1.endpoint_url(), Some("http://10.9.0.17:9000"));
+        assert_eq!(s2.endpoint_url(), Some("http://10.9.0.18:9000"));
+
+        // Critical: they must be different (not the same global client)
+        assert_ne!(
+            s1.endpoint_url(),
+            s2.endpoint_url(),
+            "Stores for different endpoints must report different endpoint URLs"
+        );
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn restore_env(key: &str, saved: Option<String>) {
+        match saved {
+            #[allow(deprecated)]
+            Some(v) => std::env::set_var(key, v),
+            #[allow(deprecated)]
+            None => std::env::remove_var(key),
+        }
+    }
 }
 

@@ -13,8 +13,6 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::{config::Region, Client};
 use aws_smithy_http_client::{tls, Builder as HttpClientBuilder};
 use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
-#[cfg(feature = "experimental-http-client")]
-use aws_smithy_http_client::Connector;
 use std::{env, fs, thread, time::Duration};
 use tokio::runtime::{Builder as TokioBuilder, Handle};
 use tokio::sync::{oneshot, OnceCell};
@@ -163,35 +161,6 @@ fn tls_context_from_pem(filename: impl AsRef<Path>) -> Result<tls::TlsContext> {
 // HTTP Client Configuration
 // -----------------------------------------------------------------------------
 
-/// Get HTTP configuration values from environment with performance-oriented defaults
-#[cfg(feature = "experimental-http-client")]
-fn get_max_http_connections() -> usize {
-    std::env::var("S3DLIO_MAX_HTTP_CONNECTIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            // Conservative optimization: Don't over-allocate connections
-            // Too many can cause contention, too few limit throughput
-            200  // Reduced from 600 - more conservative approach
-        })
-}
-
-/// Get HTTP idle timeout optimized for storage speed
-/// User suggested: ~100ms per MB for fast local storage
-#[cfg(feature = "experimental-http-client")]
-fn get_http_idle_timeout() -> Duration {
-    std::env::var("S3DLIO_HTTP_IDLE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| {
-            // Back to user's original recommendation: ~100ms per MB
-            // For 8MB objects: 800ms timeout  
-            // More conservative than our previous 2s timeout
-            Duration::from_millis(800)  // Original user recommendation
-        })
-}
-
 /// Get operation timeout for large file transfers
 fn get_operation_timeout() -> Duration {
     std::env::var("S3DLIO_OPERATION_TIMEOUT_SECS")
@@ -204,74 +173,6 @@ fn get_operation_timeout() -> Duration {
             // Use more aggressive timeout for better resource management
             Duration::from_secs(120)  // 2 minutes per operation - much faster
         })
-}
-
-/// Create an optimized HTTP client with connection pool configuration
-/// 
-/// NOTE: This function requires the "experimental-http-client" feature and a patched
-/// aws-smithy-http-client to access hyper_builder. Without the patch, this code won't
-/// compile. Enable via: cargo build --features experimental-http-client
-#[cfg(feature = "experimental-http-client")]
-fn create_optimized_http_client() -> Result<SharedHttpClient> {
-    // Get performance configuration
-    let max_connections = get_max_http_connections();
-    let idle_timeout = get_http_idle_timeout();
-    
-    debug!("Configuring experimental optimized HTTP client: max_connections={}, idle_timeout={:?}", 
-           max_connections, idle_timeout);
-    
-    // Create hyper client with optimized connection pool settings  
-    let executor = hyper_util::rt::TokioExecutor::new();
-    let mut hyper_builder = hyper_util::client::legacy::Builder::new(executor);
-    hyper_builder
-        .pool_max_idle_per_host(max_connections)  // Maximum connections per host
-        .pool_idle_timeout(idle_timeout)          // Keep-alive timeout
-        .timer(hyper_util::rt::TokioTimer::new()) // Use Tokio timer
-        .http2_only(false)                        // Allow HTTP/1.1 and HTTP/2
-        .http2_adaptive_window(true)              // Enable HTTP/2 adaptive windows
-        .http2_keep_alive_interval(Duration::from_secs(30))  // Conservative keep-alive
-        .http2_keep_alive_timeout(Duration::from_secs(10));  // Conservative timeout
-        
-    // Then create a SharedHttpClient from the optimized Connector
-    // Since Connector doesn't implement Clone, we need to create it inside the closure
-    let http_client = HttpClientBuilder::new()
-        .build_with_connector_fn({
-            let max_connections = max_connections;
-            let idle_timeout = idle_timeout;
-            move |_settings, _components| {
-                // Recreate the hyper builder inside the closure
-                let executor = hyper_util::rt::TokioExecutor::new();
-                let mut hyper_builder = hyper_util::client::legacy::Builder::new(executor);
-                hyper_builder
-                    .pool_max_idle_per_host(max_connections)
-                    .pool_idle_timeout(idle_timeout)
-                    .timer(hyper_util::rt::TokioTimer::new())
-                    .http2_only(false)
-                    .http2_adaptive_window(true)
-                    .http2_keep_alive_interval(Duration::from_secs(30))
-                    .http2_keep_alive_timeout(Duration::from_secs(10));
-                    
-                Connector::builder()
-                    .hyper_builder(hyper_builder)
-                    .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
-                    .build()
-            }
-        });
-    
-    info!("Experimental HTTP client: {} max connections/host, idle timeout: {:?}", max_connections, idle_timeout);
-    Ok(http_client)
-}
-
-/// Create default HTTP client without custom optimizations
-/// This is the standard path that doesn't require patched dependencies
-#[cfg(not(feature = "experimental-http-client"))]
-fn create_optimized_http_client() -> Result<SharedHttpClient> {
-    debug!("Using default AWS SDK HTTP client (experimental-http-client feature not enabled)");
-    
-    // Return standard AWS SDK HTTP client with Rustls TLS
-    // build_http() creates an HTTPS client with Rustls by default
-    Ok(HttpClientBuilder::new()
-        .build_http())
 }
 
 
@@ -316,18 +217,13 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                         .build_https())
                 },
                 _ => {
-                    info!("AWS_CA_BUNDLE not set — using system default TLS trust store");
-                    // Check if optimized HTTP client is enabled via environment variable
-                    match env::var("S3DLIO_USE_OPTIMIZED_HTTP").unwrap_or_default().to_lowercase().as_str() {
-                        "true" | "1" | "yes" | "on" | "enable" => {
-                            info!("S3DLIO_USE_OPTIMIZED_HTTP enabled — using enhanced connection pooling");
-                            Some(create_optimized_http_client()?)
-                        },
-                        _ => {
-                            // Use default AWS SDK configuration (DEFAULT)
-                            None
-                        }
-                    }
+                    info!("AWS_CA_BUNDLE not set — using reqwest-based transport");
+                    // Use reqwest-based client for all transports (supports h2c via S3DLIO_H2C)
+                    let reqwest_client = crate::reqwest_client::build_reqwest_http_client();
+                    let http_client = SharedHttpClient::new(
+                        crate::reqwest_client::ReqwestHttpClient::new(reqwest_client)
+                    );
+                    Some(http_client)
                 }
             };
 
@@ -399,4 +295,91 @@ pub async fn aws_s3_client_async() -> Result<Client> {
         .await?;
 
     Ok(client_ref.clone())
+}
+
+// -----------------------------------------------------------------------------
+// Per-endpoint S3 client factory
+// -----------------------------------------------------------------------------
+
+/// Create a new S3 client configured for a specific endpoint URL.
+///
+/// Unlike `aws_s3_client_async()` which returns the global singleton, this
+/// always creates a **new** client with its own connection pool targeting the
+/// given endpoint. Used by `S3ObjectStore::for_endpoint()` to achieve per-endpoint
+/// client isolation (critical for multi-endpoint high-throughput workloads).
+///
+/// The optional `http_client` parameter lets callers inject a custom HTTP transport
+/// (e.g., reqwest-based h2c). When `None`, a new reqwest client is created.
+///
+/// # Environment
+/// - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` — required
+/// - `AWS_REGION` — optional, defaults to `us-east-1`
+/// - `S3DLIO_H2C=1` — enables HTTP/2 cleartext transport
+/// - `S3DLIO_FOLLOW_REDIRECTS=1` — wraps transport with redirect follower
+/// - `AWS_CA_BUNDLE` — custom TLS CA certificate file
+pub async fn create_s3_client_for_endpoint(
+    endpoint_url: &str,
+    http_client: Option<SharedHttpClient>,
+) -> Result<Client> {
+    dotenvy::dotenv().ok();
+
+    if env::var("AWS_ACCESS_KEY_ID").is_err() || env::var("AWS_SECRET_ACCESS_KEY").is_err() {
+        bail!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
+    }
+
+    let region = RegionProviderChain::first_try(env::var("AWS_REGION").ok().map(Region::new))
+        .or_default_provider()
+        .or_else(Region::new(DEFAULT_REGION));
+
+    // Build HTTP client: use provided one, or create a new reqwest/CA-bundle client
+    let http_client = match http_client {
+        Some(c) => c,
+        None => {
+            match env::var("AWS_CA_BUNDLE") {
+                Ok(ca_bundle_path) if !ca_bundle_path.is_empty() => {
+                    let tls_context = tls_context_from_pem(&ca_bundle_path)?;
+                    aws_smithy_http_client::Builder::new()
+                        .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
+                        .tls_context(tls_context)
+                        .build_https()
+                }
+                _ => {
+                    let reqwest_client = crate::reqwest_client::build_reqwest_http_client();
+                    SharedHttpClient::new(crate::reqwest_client::ReqwestHttpClient::new(reqwest_client))
+                }
+            }
+        }
+    };
+
+    // Optionally wrap with redirect follower (AIStore compatibility)
+    let follow_redirects_env = env::var("S3DLIO_FOLLOW_REDIRECTS").unwrap_or_default();
+    let http_client = if matches!(
+        follow_redirects_env.to_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "enable"
+    ) {
+        crate::redirect_client::make_redirecting_client(http_client)
+    } else {
+        http_client
+    };
+
+    let op_timeout = get_operation_timeout();
+    let timeout_config = TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .operation_timeout(op_timeout)
+        .build();
+
+    let cfg = aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12())
+        .region(region)
+        .endpoint_url(endpoint_url)
+        .timeout_config(timeout_config)
+        .http_client(http_client)
+        .load()
+        .await;
+
+    let s3_config = aws_sdk_s3::config::Builder::from(&cfg)
+        .force_path_style(true)
+        .build();
+
+    info!("Per-endpoint S3 client ready (path-style: forced, endpoint: {})", endpoint_url);
+    Ok(Client::from_conf(s3_config))
 }

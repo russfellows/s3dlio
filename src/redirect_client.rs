@@ -186,7 +186,7 @@ fn uri_scheme(uri: &str) -> &str {
 /// [`ConnectorError`] constructors (`Box<dyn Error + Send + Sync>`).
 fn boxed_str_error(msg: String) -> Box<dyn std::error::Error + Send + Sync> {
     // std::io::Error is the simplest stdlib type that satisfies Error + Send + Sync.
-    Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg))
+    Box::new(std::io::Error::other(msg))
 }
 
 /// Send `request` through `connector`, following 3xx redirects up to
