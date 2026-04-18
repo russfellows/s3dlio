@@ -2,6 +2,37 @@
 
 ## Version 0.9.90 - HTTP/2 & h2c Support, ForceH2c Routing Fix, TLS Test Server (April 2026)
 
+### Code cleanup: removed dead-code modules `sharded_client` and `range_engine` (April 2026)
+- Deleted `src/sharded_client.rs` — a never-completed stub that proposed splitting HTTP traffic
+  across multiple `aws_sdk_s3::Client` instances to reduce per-client contention.  The premise
+  is wrong for reqwest 0.13 + HTTP/2 (the connection pool is already concurrent); the
+  implementation's core `get_range()` returned `Bytes::new()` (empty placeholder) and was never
+  wired into any call site.  Removed `pub mod sharded_client` from `lib.rs`.
+- Deleted `src/range_engine.rs` — an S3-specific range-GET engine that depended on
+  `sharded_client`.  Also a stub with placeholder implementations; zero callers outside itself.
+  Removed `pub mod range_engine` from `lib.rs`.
+- The **production** range engine, `src/range_engine_generic.rs`, is unchanged and continues to
+  be used by `file_store.rs`, `file_store_direct.rs`, and `object_store.rs` (Azure/GCS backends).
+  A rationalization comment was added to `range_engine_generic.rs` explaining the history and
+  noting that S3ObjectStore does not yet use this engine (future work item).
+- Build is clean with zero warnings after removal.
+
+### Documentation: `store_for_uri()` async limitation (April 2026)
+- Added an in-code comment block above `store_for_uri()` in `object_store.rs` documenting:
+  - Why the function is intentionally synchronous (all current backends construct without I/O).
+  - The known limitation: callers passing `s3://host:port/bucket/` directly to `store_for_uri()`
+    always get the global singleton client — NOT a per-endpoint isolated client — because
+    `S3ObjectStore::for_endpoint()` is async and cannot be called from a sync context.
+  - How `MultiEndpointStore::from_config()` works around this via `run_on_global_rt()`.
+  - What a future `store_for_uri_async()` would look like if per-endpoint isolation is ever
+    needed outside `MultiEndpointStore`.
+
+### Future work items (range engine)
+- `S3ObjectStore` does not yet use `range_engine_generic` for large-object downloads.  S3 range
+  GETs are handled natively by the AWS SDK streaming path.  Adding an opt-in
+  `enable_range_engine` flag to an `S3Config` struct (mirroring `AzureConfig`/`GcsConfig`)
+  would be the natural next step if S3 workloads would benefit from explicit range splitting.
+
 ### Feature: HTTP/2 and h2c (cleartext HTTP/2) support via `S3DLIO_H2C`
 - Added `S3DLIO_H2C` environment variable to control the HTTP version used by the S3 client:
   - `S3DLIO_H2C=1` — force h2c (HTTP/2 prior-knowledge) on `http://` endpoints; on `https://`

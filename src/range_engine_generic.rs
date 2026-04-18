@@ -2,6 +2,54 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+//
+// ── Range engine history and rationale ──────────────────────────────────────
+//
+// There were briefly TWO range-engine files in this codebase:
+//
+//   range_engine.rs          (S3-specific, removed in v0.9.90)
+//   range_engine_generic.rs  (this file — the one that actually works)
+//
+// range_engine.rs was an early, never-completed experiment.  It depended on
+// sharded_client.rs (also removed in v0.9.90), which proposed splitting HTTP
+// traffic across multiple AWS SDK client instances to reduce per-client
+// contention.  That premise is incorrect for reqwest 0.13 + HTTP/2: the
+// connection pool is already concurrent by design, so multiplying client
+// instances adds memory/connection overhead without benefit.  The key blocker
+// was that range_engine.rs::get_range() returned Bytes::new() — a stub that
+// was never implemented — so no data was ever actually returned.
+//
+// This file (range_engine_generic.rs) is the production engine.  It is:
+//   • Backend-agnostic — accepts any async `fn(offset, length) -> Result<Bytes>`
+//   • Used by file_store.rs, file_store_direct.rs, object_store.rs (Azure/GCS)
+//   • Stream-based with controlled concurrency (Semaphore + buffered())
+//   • Disabled by default for local file backends (seek overhead outweighs gain)
+//
+// FUTURE WORK — S3 range engine
+// ────────────────────────────────
+// S3 range GETs — how they work vs Azure/GCS
+// ─────────────────────────────────────────────
+// S3ObjectStore does NOT use this engine, but S3 range GETs (including
+// concurrent splitting) ARE fully implemented and working via a separate path:
+//
+//   • S3ObjectStore::get_range()         → single-range HTTP GET with Range: header
+//   • S3ObjectStore::get_optimized()     → calls get_object_concurrent_range_async()
+//   • S3ObjectStore::get_range_optimized() → calls get_object_concurrent_range_async()
+//   • s3_utils::get_object_concurrent_range_async() — the actual implementation:
+//       HEAD to get object size, then splits into chunks and fires concurrent
+//       GetObject requests with Range: bytes=N-M headers via FuturesUnordered.
+//       Chunks are sorted and assembled lock-free.  Controlled by env var
+//       S3DLIO_ENABLE_RANGE_OPTIMIZATION (on by default since v0.9.60).
+//
+// Azure and GCS use this generic engine instead (via get_with_range_engine()).
+//
+// FUTURE CONSOLIDATION (non-urgent)
+// The two approaches solve the same problem differently.  Migrating S3 to use
+// this engine would mean passing self.get_range() as the closure, exactly like
+// Azure/GCS.  That would unify the code paths and give S3 the engine's
+// cancellation-token and adaptive-chunk features.  An `enable_range_engine`
+// flag in an S3Config struct would mirror the Azure/GCS pattern.  This is
+// not urgent — both implementations are correct and performant.
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};

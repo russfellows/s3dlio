@@ -28,9 +28,14 @@
 //! probe.  `https://` endpoints are completely unaffected.
 //!
 //! # Environment Variables
-//! - `S3DLIO_H2C=1` — force h2c on plain HTTP, disable auto-fallback
-//! - `S3DLIO_POOL_MAX_IDLE_PER_HOST` — max idle connections per host (default: 32)
-//! - `S3DLIO_POOL_IDLE_TIMEOUT_SECS` — idle connection timeout in seconds (default: 90)
+//! All environment variable names and their defaults are defined in [`crate::constants`].
+//!
+//! - [`crate::constants::ENV_S3DLIO_H2C`] — h2c mode (force/disable/auto)
+//! - [`crate::constants::ENV_POOL_MAX_IDLE_PER_HOST`] — max idle connections per host
+//! - [`crate::constants::ENV_POOL_IDLE_TIMEOUT_SECS`] — idle connection timeout
+//! - [`crate::constants::ENV_H2_ADAPTIVE_WINDOW`] — enable/disable BDP adaptive window
+//! - [`crate::constants::ENV_H2_STREAM_WINDOW_MB`] — per-stream window (static mode)
+//! - [`crate::constants::ENV_H2_CONN_WINDOW_MB`] — per-connection window (static mode)
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -44,6 +49,13 @@ use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::body::SdkBody;
 use http_body_util::BodyExt;
+
+use crate::constants::{
+    ENV_S3DLIO_H2C,
+    ENV_POOL_MAX_IDLE_PER_HOST,  DEFAULT_POOL_MAX_IDLE_PER_HOST,
+    ENV_POOL_IDLE_TIMEOUT_SECS,  DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+    H2WindowConfig,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP-version telemetry
@@ -362,7 +374,7 @@ pub(crate) fn h2c_enabled_from_val(val: &str) -> bool {
     )
 }
 
-/// Determine `H2cMode` from the `S3DLIO_H2C` environment variable.
+/// Determine `H2cMode` from the [`ENV_S3DLIO_H2C`] environment variable.
 ///
 /// | `S3DLIO_H2C` value | Mode |
 /// |---|---|
@@ -370,24 +382,28 @@ pub(crate) fn h2c_enabled_from_val(val: &str) -> bool {
 /// | truthy (`1`, `true`, …) | `ForceH2c` — always h2c, no fallback |
 /// | falsy (`0`, `false`, …) | `ForceHttp1` — skip probe, always HTTP/1.1 |
 pub(crate) fn h2c_mode_from_env() -> H2cMode {
-    match std::env::var("S3DLIO_H2C") {
-        Err(_)                                    => H2cMode::Auto,
-        Ok(v) if h2c_enabled_from_val(&v)         => H2cMode::ForceH2c,
-        Ok(_)                                     => H2cMode::ForceHttp1,
+    match std::env::var(ENV_S3DLIO_H2C) {
+        Err(_)                            => H2cMode::Auto,
+        Ok(v) if h2c_enabled_from_val(&v) => H2cMode::ForceH2c,
+        Ok(_)                             => H2cMode::ForceHttp1,
     }
 }
 
 /// Internal: build one reqwest client with or without h2c prior knowledge.
+///
+/// When `h2c` is `true`, HTTP/2 flow-control window tuning is applied using
+/// the adaptive/static strategy resolved from env vars via [`H2WindowConfig::from_env`].
+/// See [`crate::constants`] for all tunable environment variable names and defaults.
 fn build_reqwest_client_raw(ca_bundle_path: Option<&str>, h2c: bool) -> anyhow::Result<reqwest::Client> {
-    let max_idle: usize = std::env::var("S3DLIO_POOL_MAX_IDLE_PER_HOST")
+    let max_idle: usize = std::env::var(ENV_POOL_MAX_IDLE_PER_HOST)
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(32);
+        .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST);
 
-    let idle_timeout_secs: u64 = std::env::var("S3DLIO_POOL_IDLE_TIMEOUT_SECS")
+    let idle_timeout_secs: u64 = std::env::var(ENV_POOL_IDLE_TIMEOUT_SECS)
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(90);
+        .unwrap_or(DEFAULT_POOL_IDLE_TIMEOUT_SECS);
 
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(max_idle)
@@ -406,6 +422,36 @@ fn build_reqwest_client_raw(ca_bundle_path: Option<&str>, h2c: bool) -> anyhow::
 
     if h2c {
         builder = builder.http2_prior_knowledge();
+
+        // ── HTTP/2 flow-control window tuning ─────────────────────────────
+        // Resolved once from env vars; see constants::H2WindowConfig for docs.
+        let win_cfg = H2WindowConfig::from_env();
+
+        if win_cfg.adaptive {
+            // BDP-based adaptive window: hyper measures RTT via H2 PINGs and
+            // issues WINDOW_UPDATE proactively to keep the window ≥ bandwidth×RTT.
+            // Self-tuning from 64 KB up to hundreds of MiB — works for all
+            // object sizes without manual configuration.
+            builder = builder.http2_adaptive_window(true);
+            tracing::debug!(
+                "HTTP/2 window mode: adaptive (BDP estimator) \
+                 — stream/conn windows auto-tune to link bandwidth×RTT"
+            );
+        } else {
+            // Static windows: user has opted out of adaptive mode by setting
+            // S3DLIO_H2_ADAPTIVE_WINDOW=0 or by setting explicit window sizes.
+            // These fixed values are used for the lifetime of the process.
+            let stream_bytes = win_cfg.stream_window_bytes();
+            let conn_bytes   = win_cfg.conn_window_bytes();
+            builder = builder
+                .http2_initial_stream_window_size(stream_bytes)
+                .http2_initial_connection_window_size(conn_bytes);
+            tracing::debug!(
+                "HTTP/2 window mode: static  stream={} MiB  connection={} MiB",
+                win_cfg.stream_window_mb,
+                win_cfg.conn_window_mb,
+            );
+        }
     }
 
     Ok(builder
@@ -435,10 +481,19 @@ pub fn build_smithy_http_client(
             "HTTP version mode: auto \
              (https:// → HTTP/2 via TLS ALPN; http:// → h2c probe once, HTTP/1.1 fallback)"
         ),
-        H2cMode::ForceH2c => tracing::info!(
-            "HTTP version mode: FORCED HTTP/2 (S3DLIO_H2C=1) — \
-             https:// uses HTTP/2 via ALPN; http:// uses h2c prior-knowledge, no fallback"
-        ),
+        H2cMode::ForceH2c => {
+            let win = H2WindowConfig::from_env();
+            let win_desc = if win.adaptive {
+                "adaptive BDP window".to_string()
+            } else {
+                format!("static stream={} MiB conn={} MiB", win.stream_window_mb, win.conn_window_mb)
+            };
+            tracing::info!(
+                "HTTP version mode: FORCED HTTP/2 (S3DLIO_H2C=1) — \
+                 https:// uses HTTP/2 via ALPN; http:// uses h2c prior-knowledge, no fallback; \
+                 h2 window: {win_desc}"
+            );
+        }
         H2cMode::ForceHttp1 => tracing::info!(
             "HTTP version mode: forced HTTP/1.1 (S3DLIO_H2C=0)"
         ),
@@ -468,6 +523,13 @@ pub fn build_reqwest_http_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{
+        ENV_S3DLIO_H2C, ENV_POOL_MAX_IDLE_PER_HOST, ENV_POOL_IDLE_TIMEOUT_SECS,
+        ENV_H2_ADAPTIVE_WINDOW, ENV_H2_STREAM_WINDOW_MB, ENV_H2_CONN_WINDOW_MB,
+        H2WindowConfig,
+        DEFAULT_H2_STREAM_WINDOW_MB, DEFAULT_H2_CONN_WINDOW_MB,
+        H2_WINDOW_MB_HARD_CAP,
+    };
 
     /// Mutex to serialize tests that manipulate `S3DLIO_H2C` / pool env vars.
     /// `std::env::set_var` is not thread-safe; holding this lock before calling it
@@ -506,15 +568,15 @@ mod tests {
     #[test]
     fn test_build_h2c_client_succeeds() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_val = std::env::var("S3DLIO_H2C").ok();
+        let old_val = std::env::var(ENV_S3DLIO_H2C).ok();
         #[allow(deprecated)]
-        std::env::set_var("S3DLIO_H2C", "1");
+        std::env::set_var(ENV_S3DLIO_H2C, "1");
         let result = build_smithy_http_client(None);
         match old_val {
             #[allow(deprecated)]
-            Some(v) => std::env::set_var("S3DLIO_H2C", v),
+            Some(v) => std::env::set_var(ENV_S3DLIO_H2C, v),
             #[allow(deprecated)]
-            None => std::env::remove_var("S3DLIO_H2C"),
+            None => std::env::remove_var(ENV_S3DLIO_H2C),
         }
         assert!(result.is_ok(), "build_smithy_http_client() must not panic with S3DLIO_H2C=1");
     }
@@ -524,15 +586,15 @@ mod tests {
     fn test_build_h2c_client_all_truthy_variants() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for val in &["1", "true", "yes", "on", "enable"] {
-            let old_val = std::env::var("S3DLIO_H2C").ok();
+            let old_val = std::env::var(ENV_S3DLIO_H2C).ok();
             #[allow(deprecated)]
-            std::env::set_var("S3DLIO_H2C", val);
+            std::env::set_var(ENV_S3DLIO_H2C, val);
             let result = build_smithy_http_client(None);
             match old_val {
                 #[allow(deprecated)]
-                Some(v) => std::env::set_var("S3DLIO_H2C", v),
+                Some(v) => std::env::set_var(ENV_S3DLIO_H2C, v),
                 #[allow(deprecated)]
-                None => std::env::remove_var("S3DLIO_H2C"),
+                None => std::env::remove_var(ENV_S3DLIO_H2C),
             }
             assert!(result.is_ok(), "build failed for S3DLIO_H2C={val}");
         }
@@ -544,23 +606,23 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Not set → Auto
         #[allow(deprecated)]
-        std::env::remove_var("S3DLIO_H2C");
+        std::env::remove_var(ENV_S3DLIO_H2C);
         assert_eq!(h2c_mode_from_env(), H2cMode::Auto);
         // Truthy → ForceH2c
         for val in &["1", "true", "yes", "on", "enable"] {
             #[allow(deprecated)]
-            std::env::set_var("S3DLIO_H2C", val);
+            std::env::set_var(ENV_S3DLIO_H2C, val);
             assert_eq!(h2c_mode_from_env(), H2cMode::ForceH2c, "expected ForceH2c for '{val}'");
         }
         // Falsy → ForceHttp1
         for val in &["0", "false", "no", "off", "disable"] {
             #[allow(deprecated)]
-            std::env::set_var("S3DLIO_H2C", val);
+            std::env::set_var(ENV_S3DLIO_H2C, val);
             assert_eq!(h2c_mode_from_env(), H2cMode::ForceHttp1, "expected ForceHttp1 for '{val}'");
         }
         // Restore
         #[allow(deprecated)]
-        std::env::remove_var("S3DLIO_H2C");
+        std::env::remove_var(ENV_S3DLIO_H2C);
     }
 
     /// Verify that `build_smithy_http_client` loads a valid CA bundle correctly.
@@ -594,25 +656,232 @@ mod tests {
     #[test]
     fn test_pool_settings_from_env() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_idle = std::env::var("S3DLIO_POOL_MAX_IDLE_PER_HOST").ok();
-        let old_timeout = std::env::var("S3DLIO_POOL_IDLE_TIMEOUT_SECS").ok();
+        let old_idle    = std::env::var(ENV_POOL_MAX_IDLE_PER_HOST).ok();
+        let old_timeout = std::env::var(ENV_POOL_IDLE_TIMEOUT_SECS).ok();
         #[allow(deprecated)]
-        std::env::set_var("S3DLIO_POOL_MAX_IDLE_PER_HOST", "64");
+        std::env::set_var(ENV_POOL_MAX_IDLE_PER_HOST, "64");
         #[allow(deprecated)]
-        std::env::set_var("S3DLIO_POOL_IDLE_TIMEOUT_SECS", "120");
+        std::env::set_var(ENV_POOL_IDLE_TIMEOUT_SECS, "120");
         let _ = build_reqwest_http_client(); // must not panic
         match old_idle {
             #[allow(deprecated)]
-            Some(v) => std::env::set_var("S3DLIO_POOL_MAX_IDLE_PER_HOST", v),
+            Some(v) => std::env::set_var(ENV_POOL_MAX_IDLE_PER_HOST, v),
             #[allow(deprecated)]
-            None => std::env::remove_var("S3DLIO_POOL_MAX_IDLE_PER_HOST"),
+            None => std::env::remove_var(ENV_POOL_MAX_IDLE_PER_HOST),
         }
         match old_timeout {
             #[allow(deprecated)]
-            Some(v) => std::env::set_var("S3DLIO_POOL_IDLE_TIMEOUT_SECS", v),
+            Some(v) => std::env::set_var(ENV_POOL_IDLE_TIMEOUT_SECS, v),
             #[allow(deprecated)]
-            None => std::env::remove_var("S3DLIO_POOL_IDLE_TIMEOUT_SECS"),
+            None => std::env::remove_var(ENV_POOL_IDLE_TIMEOUT_SECS),
         }
+    }
+
+    // ── H2WindowConfig env-var parsing ─────────────────────────────────────
+    //
+    // These tests verify the from_env() logic. Because they manipulate env
+    // vars, they all hold ENV_LOCK for serialisation.
+
+    /// Helper: save + clear all three window env vars; returns old values.
+    fn save_window_env() -> (Option<String>, Option<String>, Option<String>) {
+        (
+            std::env::var(ENV_H2_ADAPTIVE_WINDOW).ok(),
+            std::env::var(ENV_H2_STREAM_WINDOW_MB).ok(),
+            std::env::var(ENV_H2_CONN_WINDOW_MB).ok(),
+        )
+    }
+
+    /// Helper: restore window env vars from saved values.
+    fn restore_window_env(saved: (Option<String>, Option<String>, Option<String>)) {
+        #[allow(deprecated)]
+        match saved.0 {
+            Some(v) => std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, v),
+            None    => std::env::remove_var(ENV_H2_ADAPTIVE_WINDOW),
+        }
+        #[allow(deprecated)]
+        match saved.1 {
+            Some(v) => std::env::set_var(ENV_H2_STREAM_WINDOW_MB, v),
+            None    => std::env::remove_var(ENV_H2_STREAM_WINDOW_MB),
+        }
+        #[allow(deprecated)]
+        match saved.2 {
+            Some(v) => std::env::set_var(ENV_H2_CONN_WINDOW_MB, v),
+            None    => std::env::remove_var(ENV_H2_CONN_WINDOW_MB),
+        }
+    }
+
+    /// Unset env → adaptive ON with default static sizes (though static sizes
+    /// are irrelevant when adaptive is true).
+    #[test]
+    fn test_h2_window_config_unset_is_adaptive() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = save_window_env();
+        #[allow(deprecated)]
+        {
+            std::env::remove_var(ENV_H2_ADAPTIVE_WINDOW);
+            std::env::remove_var(ENV_H2_STREAM_WINDOW_MB);
+            std::env::remove_var(ENV_H2_CONN_WINDOW_MB);
+        }
+        let cfg = H2WindowConfig::from_env();
+        restore_window_env(saved);
+        assert!(cfg.adaptive, "unset env must give adaptive=true");
+        assert_eq!(cfg.stream_window_mb, DEFAULT_H2_STREAM_WINDOW_MB);
+        assert_eq!(cfg.conn_window_mb,   DEFAULT_H2_CONN_WINDOW_MB);
+    }
+
+    /// Explicit truthy values for S3DLIO_H2_ADAPTIVE_WINDOW → adaptive ON.
+    #[test]
+    fn test_h2_window_config_adaptive_truthy() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = save_window_env();
+        for val in &["1", "true", "yes", "on"] {
+            #[allow(deprecated)]
+            std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, val);
+            let cfg = H2WindowConfig::from_env();
+            assert!(cfg.adaptive, "adaptive must be true for '{val}'");
+        }
+        restore_window_env(saved);
+    }
+
+    /// Explicit falsy values for S3DLIO_H2_ADAPTIVE_WINDOW → static mode.
+    #[test]
+    fn test_h2_window_config_adaptive_off_uses_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = save_window_env();
+        #[allow(deprecated)]
+        {
+            std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, "0");
+            std::env::remove_var(ENV_H2_STREAM_WINDOW_MB);
+            std::env::remove_var(ENV_H2_CONN_WINDOW_MB);
+        }
+        let cfg = H2WindowConfig::from_env();
+        restore_window_env(saved);
+        assert!(!cfg.adaptive, "adaptive must be false when S3DLIO_H2_ADAPTIVE_WINDOW=0");
+        assert_eq!(cfg.stream_window_mb, DEFAULT_H2_STREAM_WINDOW_MB,
+            "stream window should default to DEFAULT_H2_STREAM_WINDOW_MB");
+        assert_eq!(cfg.conn_window_mb, DEFAULT_H2_STREAM_WINDOW_MB * 4,
+            "conn window should default to 4× stream window");
+    }
+
+    /// Static stream window can be overridden; conn defaults to 4× stream.
+    #[test]
+    fn test_h2_window_config_static_stream_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = save_window_env();
+        #[allow(deprecated)]
+        {
+            std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, "0");
+            std::env::set_var(ENV_H2_STREAM_WINDOW_MB, "16");
+            std::env::remove_var(ENV_H2_CONN_WINDOW_MB);
+        }
+        let cfg = H2WindowConfig::from_env();
+        restore_window_env(saved);
+        assert!(!cfg.adaptive);
+        assert_eq!(cfg.stream_window_mb, 16);
+        assert_eq!(cfg.conn_window_mb, 64, "conn should be 4× stream = 64 MiB");
+    }
+
+    /// Both stream and conn can be set independently.
+    #[test]
+    fn test_h2_window_config_static_both_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = save_window_env();
+        #[allow(deprecated)]
+        {
+            std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, "false");
+            std::env::set_var(ENV_H2_STREAM_WINDOW_MB, "8");
+            std::env::set_var(ENV_H2_CONN_WINDOW_MB, "32");
+        }
+        let cfg = H2WindowConfig::from_env();
+        restore_window_env(saved);
+        assert!(!cfg.adaptive);
+        assert_eq!(cfg.stream_window_mb, 8);
+        assert_eq!(cfg.conn_window_mb, 32);
+        assert_eq!(cfg.stream_window_bytes(), 8 * 1024 * 1024);
+        assert_eq!(cfg.conn_window_bytes(),  32 * 1024 * 1024);
+    }
+
+    /// Values above the hard cap (256 MiB) are clamped.
+    #[test]
+    fn test_h2_window_config_hard_cap_clamps() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = save_window_env();
+        #[allow(deprecated)]
+        {
+            std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, "0");
+            std::env::set_var(ENV_H2_STREAM_WINDOW_MB, "999");
+            std::env::set_var(ENV_H2_CONN_WINDOW_MB,   "999");
+        }
+        let cfg = H2WindowConfig::from_env();
+        restore_window_env(saved);
+        assert_eq!(cfg.stream_window_mb, H2_WINDOW_MB_HARD_CAP,
+            "values above hard cap must be clamped to {H2_WINDOW_MB_HARD_CAP}");
+        assert_eq!(cfg.conn_window_mb, H2_WINDOW_MB_HARD_CAP);
+    }
+
+    /// Zero and invalid values fall back to defaults (not zero).
+    #[test]
+    fn test_h2_window_config_zero_and_invalid_use_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = save_window_env();
+        for bad in &["0", "abc", "-1", ""] {
+            #[allow(deprecated)]
+            {
+                std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, "0");
+                std::env::set_var(ENV_H2_STREAM_WINDOW_MB, bad);
+                std::env::set_var(ENV_H2_CONN_WINDOW_MB, bad);
+            }
+            let cfg = H2WindowConfig::from_env();
+            assert!(cfg.stream_window_mb > 0,
+                "stream_window_mb must never be 0 (was {}, input '{bad}')", cfg.stream_window_mb);
+            assert!(cfg.conn_window_mb > 0,
+                "conn_window_mb must never be 0 (was {}, input '{bad}')", cfg.conn_window_mb);
+        }
+        restore_window_env(saved);
+    }
+
+    /// Build succeeds with h2c + static window configuration (no network needed).
+    #[test]
+    fn test_build_h2c_client_with_static_window_succeeds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_h2c = std::env::var(ENV_S3DLIO_H2C).ok();
+        let saved_win = save_window_env();
+        #[allow(deprecated)]
+        {
+            std::env::set_var(ENV_S3DLIO_H2C, "1");
+            std::env::set_var(ENV_H2_ADAPTIVE_WINDOW, "0");
+            std::env::set_var(ENV_H2_STREAM_WINDOW_MB, "4");
+            std::env::set_var(ENV_H2_CONN_WINDOW_MB, "16");
+        }
+        let result = build_smithy_http_client(None);
+        #[allow(deprecated)]
+        match saved_h2c {
+            Some(v) => std::env::set_var(ENV_S3DLIO_H2C, v),
+            None    => std::env::remove_var(ENV_S3DLIO_H2C),
+        }
+        restore_window_env(saved_win);
+        assert!(result.is_ok(), "build with static h2 window must succeed: {:?}", result.err());
+    }
+
+    /// Build succeeds with h2c + adaptive window (the default path).
+    #[test]
+    fn test_build_h2c_client_with_adaptive_window_succeeds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_h2c = std::env::var(ENV_S3DLIO_H2C).ok();
+        let saved_win = save_window_env();
+        #[allow(deprecated)]
+        {
+            std::env::set_var(ENV_S3DLIO_H2C, "1");
+            std::env::remove_var(ENV_H2_ADAPTIVE_WINDOW); // unset = adaptive ON
+        }
+        let result = build_smithy_http_client(None);
+        #[allow(deprecated)]
+        match saved_h2c {
+            Some(v) => std::env::set_var(ENV_S3DLIO_H2C, v),
+            None    => std::env::remove_var(ENV_S3DLIO_H2C),
+        }
+        restore_window_env(saved_win);
+        assert!(result.is_ok(), "build with adaptive h2 window must succeed: {:?}", result.err());
     }
 
     // ── ReqwestHttpClient (structural — no env var, no network) ─────────────

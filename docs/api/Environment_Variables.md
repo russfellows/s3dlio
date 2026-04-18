@@ -16,6 +16,9 @@ This document provides a comprehensive reference for all environment variables s
 | `S3DLIO_H2C` | *(not set)* | HTTP/2 cleartext (h2c) mode for `http://` endpoints. **Not set** = auto-probe h2c on the first plain-HTTP connection; fall back to HTTP/1.1 if rejected, remember for the rest of the process. **`1`** (or `true`, `yes`, `on`, `enable`) = force h2c prior-knowledge, no fallback — use for storage systems that require HTTP/2 on their `http://` API endpoint. **`0`** (or `false`, `no`, `off`, `disable`) = always HTTP/1.1, skip the probe. Has **no effect** on `https://` connections — those negotiate HTTP/2 automatically via TLS ALPN. |
 | `S3DLIO_POOL_MAX_IDLE_PER_HOST` | `32` | Maximum idle connections kept in the reqwest connection pool per host. Increase for very high-concurrency workloads. |
 | `S3DLIO_POOL_IDLE_TIMEOUT_SECS` | `90` | Seconds before an idle pooled connection is closed. |
+| `S3DLIO_H2_ADAPTIVE_WINDOW` | `1` (enabled) | HTTP/2 flow-control window mode. **`1`** (or `true`, `yes`, `on`) = adaptive (BDP estimator): hyper measures bandwidth-delay product via H2 PINGs and auto-tunes the window from 64 KB up to hundreds of MiB. Best for most workloads. **`0`** = static windows controlled by `S3DLIO_H2_STREAM_WINDOW_MB` / `S3DLIO_H2_CONN_WINDOW_MB`. Only active when `S3DLIO_H2C=1`. |
+| `S3DLIO_H2_STREAM_WINDOW_MB` | `4` | HTTP/2 per-stream flow-control window in MiB (static mode only, i.e. `S3DLIO_H2_ADAPTIVE_WINDOW=0`). Clamped to 256 MiB maximum. |
+| `S3DLIO_H2_CONN_WINDOW_MB` | `4×stream` | HTTP/2 connection-level flow-control window in MiB (static mode only). Defaults to 4× `S3DLIO_H2_STREAM_WINDOW_MB`, capped at 256 MiB. |
 
 ### HTTP/2 on TLS endpoints (`https://`)
 
@@ -35,6 +38,59 @@ S3DLIO_H2C=1 AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli put s3://bucket/pr
 
 # Force HTTP/1.1 (skip probe entirely)
 S3DLIO_H2C=0 AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli ls s3://bucket/
+```
+
+### HTTP/2 flow-control window tuning
+
+Applies only when `S3DLIO_H2C=1` (cleartext HTTP/2).
+
+#### What the three knobs actually do
+
+Every HTTP/2 connection carries two flow-control windows at all times:
+
+**Per-stream window** (`S3DLIO_H2_STREAM_WINDOW_MB`)
+Controls how much DATA the remote peer may send on a single stream before it must stop and wait for the client to issue a `WINDOW_UPDATE` frame.  The H2 spec default is **65,535 bytes (~64 KB)** — far too small for high-throughput storage I/O.  For GET operations this window directly caps download throughput: if the server exhausts the window mid-object it stalls until we acknowledge receipt.
+
+**Connection-level window** (`S3DLIO_H2_CONN_WINDOW_MB`)
+The aggregate receive budget across *all* concurrent streams on one TCP connection.  Must be ≥ the per-stream window to be useful.  Setting a large stream window but a small connection window makes the connection window the bottleneck instead (e.g. stream = 16 MiB but conn = 4 MiB → the connection stalls after 4 MiB regardless of how many streams are open).  H2 spec default is also 65,535 bytes.
+
+**Adaptive BDP estimator** (`S3DLIO_H2_ADAPTIVE_WINDOW`)
+When enabled (the default), hyper sends periodic H2 `PING` frames, measures the round-trip time, and computes the Bandwidth-Delay Product:
+
+```
+BDP = throughput × RTT
+```
+
+It then proactively issues `WINDOW_UPDATE` frames to keep the window ≥ BDP at all times.  This eliminates stalls on any network without manual tuning.  **When adaptive mode is ON, both static size variables (`S3DLIO_H2_STREAM_WINDOW_MB` and `S3DLIO_H2_CONN_WINDOW_MB`) are completely ignored — reqwest/hyper overrides them.**
+
+#### GET vs PUT behaviour
+
+- **GETs**: the window governs how much response data the server may send before the client acknowledges.  A 64 KB default window on a 100 Gb/s LAN limits a single stream to ~64 KB per RTT (~64 KB ÷ 0.1 ms = ~640 MB/s maximum per stream before stalling).  Adaptive mode eliminates this cap automatically.
+- **PUTs**: the server's *own* advertised window (not these settings) controls how much of the request body we can send.  These client-side variables affect only how quickly we receive the `200 OK` response body (~200 bytes), so they have negligible impact on upload throughput.  Nevertheless, a large window still avoids any framing stalls in bidirectional scenarios.
+
+#### When to use static mode
+
+Use `S3DLIO_H2_ADAPTIVE_WINDOW=0` when you need:
+- **Reproducible benchmarks** — adaptive mode changes window sizes mid-run; static windows keep the protocol behaviour constant across runs.
+- **Known network characteristics** — if BDP is measured and fixed (e.g. 10 GbE at 0.1 ms RTT ≈ 125 KB), you can set windows exactly.
+- **Adaptive-mode overhead avoidance** — each PING adds a small round-trip; on very-low-latency (<< 0.1 ms) local connections the overhead is sometimes visible.
+
+For all other workloads, leave adaptive ON (the default).
+
+```bash
+# Default: adaptive BDP estimator (recommended for most workloads)
+S3DLIO_H2C=1 s3-cli get s3://bucket/large-dataset/ -o /data/
+
+# Static windows — useful for reproducible benchmarks
+S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
+  S3DLIO_H2_STREAM_WINDOW_MB=16 \
+  S3DLIO_H2_CONN_WINDOW_MB=64 \
+  s3-cli get s3://bucket/large-dataset/ -o /data/
+
+# High-throughput static config (many large objects, low-latency network)
+S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
+  S3DLIO_H2_STREAM_WINDOW_MB=64 \
+  s3-cli put s3://bucket/prefix/ -n 500
 ```
 
 ### Tokio Runtime Configuration

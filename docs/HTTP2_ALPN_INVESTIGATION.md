@@ -166,16 +166,67 @@ PUT summary: attempted=1, succeeded=1, failed=0, protocol=HTTP/2
 
 ### Test h2c (cleartext HTTP/2, for plain http:// endpoints)
 
-The test server is TLS-only.  To test h2c, use a server that speaks h2c prior-knowledge
-(e.g. the `h2spec` tool, or any HTTP/2-capable server bound to a plain `http://` port).
+A dedicated h2c test server is provided at `examples/h2c_test_server.rs`.  It listens on
+`http://127.0.0.1:9080` with no TLS and accepts both h2c prior-knowledge and HTTP/1.1
+connections.  `hyper_util::server::conn::auto::Builder` detects the HTTP/2 connection
+preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) automatically — no ALPN involved.
 
 ```bash
-# With S3DLIO_H2C=1, http:// endpoint:
-AWS_ENDPOINT_URL=http://h2c-server:port S3DLIO_H2C=1 cargo run --bin s3-cli -- stat s3://bucket/key
-
-# Expected: "HTTP version mode: FORCED HTTP/2 (S3DLIO_H2C=1)"
-#           "HTTP protocol (first response): HTTP/2.0"
+# Terminal 1 — start the h2c server
+cargo run --example h2c_test_server
+# Output: Listening on http://127.0.0.1:9080  (h2c prior-knowledge + HTTP/1.1, no TLS)
 ```
+
+```bash
+# Terminal 2 — test with curl
+# HTTP/2 via h2c prior-knowledge:
+curl --http2-prior-knowledge -sv http://127.0.0.1:9080/bucket/key
+# Server logs: [server] HEAD /bucket/key HTTP/2
+
+# Force HTTP/1.1 to confirm both modes work:
+curl --http1.1 -sv http://127.0.0.1:9080/bucket/key
+# Server logs: [server] HEAD /bucket/key HTTP/1.1
+```
+
+```bash
+# Terminal 2 — test the full stack with s3-cli
+export AWS_ENDPOINT_URL=http://127.0.0.1:9080
+
+# Forced h2c (S3DLIO_H2C=1):
+S3DLIO_H2C=1 cargo run --bin s3-cli -- -v stat s3://bucket/key
+# Expected client output: "HTTP version mode: FORCED HTTP/2 (S3DLIO_H2C=1)"
+#                         "HTTP protocol (first response): HTTP/2.0"
+# Expected server log:    "[server] HEAD /bucket/key HTTP/2"
+
+# Auto-probe (S3DLIO_H2C unset) — probe fires once, succeeds, all requests use h2c:
+cargo run --bin s3-cli -- -v stat s3://bucket/key
+# Expected client output: "HTTP version mode: auto (http:// → h2c prior-knowledge probe ...)"
+#                         "HTTP protocol (first response): HTTP/2.0"
+
+# Forced HTTP/1.1 (S3DLIO_H2C=0) — skips probe entirely:
+S3DLIO_H2C=0 cargo run --bin s3-cli -- -v stat s3://bucket/key
+# Expected server log: "[server] HEAD /bucket/key HTTP/1.1"
+
+# PUT write path:
+S3DLIO_H2C=1 cargo run --bin s3-cli -- -v put s3://bucket/prefix -n 1 -s 4096
+# Expected: "PUT summary: ... protocol=HTTP/2"
+```
+
+### Verified results (2026-04-18, s3dlio v0.9.90)
+
+Two independent end-to-end test runs against `h2c_test_server` on `http://127.0.0.1:9080`
+— first with `AWS_CA_BUNDLE` set to a local cert, second with `AWS_CA_BUNDLE` unset
+(system default TLS trust store).  Both runs produced identical results, confirming that
+CA bundle configuration has no bearing on plain `http://` connections.
+
+| `S3DLIO_H2C` | Mode | Key log line | Protocol confirmed |
+|---|---|---|---|
+| `1` | Forced h2c | `HTTP version mode: FORCED HTTP/2 (S3DLIO_H2C=1)` → `HTTP protocol (first response): HTTP/2.0` | ✅ HTTP/2 |
+| *(unset)* | Auto-probe | `h2c auto-probe succeeded — HTTP/2 cleartext active` → `HTTP protocol (first response): HTTP/2.0` | ✅ HTTP/2 |
+| `0` | Forced HTTP/1.1 | `HTTP version mode: forced HTTP/1.1 (S3DLIO_H2C=0)` → `HTTP protocol (first response): HTTP/1.1` | ✅ HTTP/1.1 |
+
+The auto-probe result is the most significant: with no configuration, s3dlio detected
+that the server speaks h2c and promoted the connection to HTTP/2 automatically.
 
 ---
 

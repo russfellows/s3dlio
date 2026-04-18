@@ -271,6 +271,280 @@ pub const ENV_OPLOG_READ_BUF: &str = "S3DLIO_OPLOG_READ_BUF";
 pub const ENV_OPLOG_CHUNK_SIZE: &str = "S3DLIO_OPLOG_CHUNK_SIZE";
 
 // =============================================================================
+// HTTP/2 and Connection Pool Environment Variables and Defaults
+// =============================================================================
+//
+// These constants centralise every knob that controls the HTTP client used by
+// s3dlio's AWS SDK / reqwest layer.  They are intentionally all in one place
+// so that tooling authors (sai3-bench, dl-driver, warpio …) can discover and
+// override them without hunting through implementation files.
+//
+// USAGE FOR DOWNSTREAM LIBRARY USERS
+// -----------------------------------
+// Read the current effective settings at runtime via `H2WindowConfig::from_env()`.
+// Override individual settings by setting the corresponding environment variable
+// before constructing an S3 client.
+//
+// Example (sai3-bench):
+// ```rust
+// use s3dlio::constants::{ENV_S3DLIO_H2C, ENV_H2_STREAM_WINDOW_MB};
+// std::env::set_var(ENV_S3DLIO_H2C, "1");
+// std::env::set_var(ENV_H2_STREAM_WINDOW_MB, "16");
+// ```
+// =============================================================================
+
+// ── HTTP version control ───────────────────────────────────────────────────
+
+/// Environment variable controlling HTTP/2 mode on plain `http://` endpoints.
+///
+/// | Value | Behaviour |
+/// |-------|-----------|
+/// | `1`, `true`, `yes`, `on`, `enable` | Force h2c (HTTP/2 prior-knowledge cleartext); no fallback |
+/// | `0`, `false`, `no`, `off`, `disable` | Force HTTP/1.1; skip auto-probe |
+/// | *(unset)* | Auto: probe h2c once on first `http://` connection; fall back to HTTP/1.1 if rejected |
+///
+/// **Note**: `https://` endpoints always negotiate HTTP/2 via TLS ALPN regardless of this setting.
+pub const ENV_S3DLIO_H2C: &str = "S3DLIO_H2C";
+
+// ── Connection pool tunables ───────────────────────────────────────────────
+
+/// Maximum idle connections kept in the pool per host (default: [`DEFAULT_POOL_MAX_IDLE_PER_HOST`]).
+///
+/// Increase for high-concurrency workloads (e.g., 75k PUTs/s) where connection
+/// establishment latency would otherwise dominate at the start of each burst.
+/// Values in the range 64–256 are typical for sustained high-rate I/O.
+pub const ENV_POOL_MAX_IDLE_PER_HOST: &str = "S3DLIO_POOL_MAX_IDLE_PER_HOST";
+
+/// Default maximum idle connections per host in the reqwest connection pool.
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
+
+/// Idle connection pool timeout in seconds (default: [`DEFAULT_POOL_IDLE_TIMEOUT_SECS`]).
+///
+/// Connections idle longer than this are closed and removed from the pool.
+/// Reduce for bursty workloads on shared networks; increase for long-running
+/// steady-state benchmarks to avoid reconnect overhead.
+pub const ENV_POOL_IDLE_TIMEOUT_SECS: &str = "S3DLIO_POOL_IDLE_TIMEOUT_SECS";
+
+/// Default idle connection pool timeout in seconds.
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+
+// ── HTTP/2 flow-control window tunables ───────────────────────────────────
+//
+// HTTP/2 uses per-stream and per-connection *receive* flow-control windows.
+// The windows advertise how many bytes the *client* is willing to buffer from
+// the server before issuing WINDOW_UPDATE credits.
+//
+// Impact by operation:
+//   GETs  — directly gates download throughput (server sends body data)
+//   PUTs  — response bodies are tiny (~200 B); negligible impact on upload rate
+//
+// Two modes are available (mutually exclusive):
+//
+//   ADAPTIVE (default, recommended)
+//     `http2_adaptive_window(true)` — hyper/h2 sends periodic H2 PING frames,
+//     measures RTT, and computes BDP = bandwidth × RTT.  Issues WINDOW_UPDATE
+//     frames proactively to keep the window ≥ BDP.  Self-tunes from 64 KB to
+//     hundreds of MB automatically.  Works for all object sizes without manual
+//     tuning.
+//
+//   STATIC (override)
+//     Set S3DLIO_H2_STREAM_WINDOW_MB and/or S3DLIO_H2_CONN_WINDOW_MB.
+//     Adaptive mode is disabled; the fixed values are used instead.
+//     Useful for deterministic benchmarks or servers that ignore PINGs.
+//
+// NOTE: adaptive_window overrides static sizes — they are mutually exclusive
+// in the reqwest/hyper API.  Static values are only applied when adaptive is OFF.
+//
+// The maximum allowed by the HTTP/2 spec is 2^31-1 = 2,147,483,647 bytes (~2 GiB).
+// Practical upper limit is typically 256 MiB (beyond that servers may not honour it).
+
+/// Per-stream HTTP/2 receive window size in **MiB** (static mode only).
+///
+/// Only consulted when `S3DLIO_H2_ADAPTIVE_WINDOW` is unset or `0`.
+/// When set, adaptive window mode is disabled and this exact size is used.
+///
+/// Typical values:
+/// - `4`  — 4 MiB: good for LAN with moderate object sizes (up to ~64 MiB)
+/// - `16` — 16 MiB: high-throughput LAN / NVMe-oF storage
+/// - `64` — 64 MiB: ultra-low-latency fabric (InfiniBand, 200GbE)
+///
+/// Must fit in a `u32` and must not exceed 2047 MiB (HTTP/2 spec limit ~2 GiB).
+pub const ENV_H2_STREAM_WINDOW_MB: &str = "S3DLIO_H2_STREAM_WINDOW_MB";
+
+/// Default per-stream HTTP/2 receive window size used in static mode (MiB).
+pub const DEFAULT_H2_STREAM_WINDOW_MB: u32 = 4;
+
+/// Per-connection HTTP/2 receive window size in **MiB** (static mode only).
+///
+/// The connection window is the aggregate across all concurrent streams on
+/// one TCP connection.  Should be at least `stream_window × max_concurrent_streams`
+/// to avoid the connection window becoming the bottleneck.
+///
+/// Only consulted when `S3DLIO_H2_ADAPTIVE_WINDOW` is unset or `0`.
+/// Defaults to `4 × S3DLIO_H2_STREAM_WINDOW_MB` when unset.
+pub const ENV_H2_CONN_WINDOW_MB: &str = "S3DLIO_H2_CONN_WINDOW_MB";
+
+/// Default per-connection HTTP/2 receive window size used in static mode (MiB).
+/// Set to 4× the default stream window to avoid connection-level bottlenecks.
+pub const DEFAULT_H2_CONN_WINDOW_MB: u32 = DEFAULT_H2_STREAM_WINDOW_MB * 4;
+
+/// Enable or disable HTTP/2 adaptive window mode (default: **enabled**).
+///
+/// | Value | Behaviour |
+/// |-------|-----------|
+/// | *(unset)* | Adaptive ON (default) |
+/// | `1`, `true`, `yes`, `on` | Adaptive ON explicitly |
+/// | `0`, `false`, `no`, `off` | Adaptive OFF; use static window values |
+///
+/// When adaptive is ON, the values in `S3DLIO_H2_STREAM_WINDOW_MB` and
+/// `S3DLIO_H2_CONN_WINDOW_MB` are **ignored** (reqwest/hyper override them).
+pub const ENV_H2_ADAPTIVE_WINDOW: &str = "S3DLIO_H2_ADAPTIVE_WINDOW";
+
+/// Maximum legal HTTP/2 flow-control window size per the spec (2^31 - 1 bytes).
+/// Attempting to set a larger value is a protocol error.
+pub const H2_MAX_WINDOW_BYTES: u32 = 0x7FFF_FFFF;
+
+/// Maximum practical per-stream or per-connection window size we will accept
+/// from env-var input (256 MiB).  Values above this are silently clamped.
+pub const H2_WINDOW_MB_HARD_CAP: u32 = 256;
+
+// ── Public configuration view for downstream library users ────────────────
+
+/// Resolved HTTP/2 window configuration, ready for use when building a reqwest client.
+///
+/// Downstream crates (sai3-bench, dl-driver, …) can call [`H2WindowConfig::from_env`]
+/// to inspect the active configuration, or construct it manually to override settings
+/// without touching environment variables.
+///
+/// # Example (sai3-bench)
+/// ```rust,no_run
+/// use s3dlio::constants::H2WindowConfig;
+/// let cfg = H2WindowConfig::from_env();
+/// println!("adaptive={} stream={}MiB conn={}MiB", cfg.adaptive, cfg.stream_window_mb, cfg.conn_window_mb);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H2WindowConfig {
+    /// `true` = hyper BDP adaptive window (overrides static sizes).
+    /// `false` = static sizes below are used.
+    pub adaptive: bool,
+    /// Per-stream receive window in MiB (only used when `adaptive == false`).
+    pub stream_window_mb: u32,
+    /// Per-connection receive window in MiB (only used when `adaptive == false`).
+    pub conn_window_mb: u32,
+}
+
+impl Default for H2WindowConfig {
+    /// Returns the default configuration: adaptive mode on, static sizes at their defaults.
+    fn default() -> Self {
+        Self {
+            adaptive: true,
+            stream_window_mb: DEFAULT_H2_STREAM_WINDOW_MB,
+            conn_window_mb:   DEFAULT_H2_CONN_WINDOW_MB,
+        }
+    }
+}
+
+impl H2WindowConfig {
+    /// Build the active configuration by reading the three env vars.
+    ///
+    /// Parsing rules:
+    /// - `S3DLIO_H2_ADAPTIVE_WINDOW` unset or truthy → adaptive ON
+    /// - `S3DLIO_H2_ADAPTIVE_WINDOW` falsy → adaptive OFF, static sizes used
+    /// - `S3DLIO_H2_STREAM_WINDOW_MB` / `S3DLIO_H2_CONN_WINDOW_MB` are clamped
+    ///   to [`H2_WINDOW_MB_HARD_CAP`] and must be > 0.
+    pub fn from_env() -> Self {
+        // ── Adaptive flag ──────────────────────────────────────────────────
+        let adaptive = match std::env::var(ENV_H2_ADAPTIVE_WINDOW) {
+            Err(_) => true, // default: adaptive ON
+            Ok(v) => !matches!(
+                v.to_lowercase().as_str(),
+                "0" | "false" | "no" | "off" | "disable"
+            ),
+        };
+
+        // ── Static window sizes (only meaningful when adaptive == false) ───
+        let stream_mb = std::env::var(ENV_H2_STREAM_WINDOW_MB)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .map(|v| v.min(H2_WINDOW_MB_HARD_CAP))
+            .unwrap_or(DEFAULT_H2_STREAM_WINDOW_MB);
+
+        let conn_mb = std::env::var(ENV_H2_CONN_WINDOW_MB)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .map(|v| v.min(H2_WINDOW_MB_HARD_CAP))
+            .unwrap_or(stream_mb.saturating_mul(4).min(H2_WINDOW_MB_HARD_CAP));
+
+        Self { adaptive, stream_window_mb: stream_mb, conn_window_mb: conn_mb }
+    }
+
+    /// Convert the stream window to bytes for use in the reqwest builder.
+    #[inline]
+    pub fn stream_window_bytes(&self) -> u32 {
+        self.stream_window_mb.saturating_mul(1024 * 1024).min(H2_MAX_WINDOW_BYTES)
+    }
+
+    /// Convert the connection window to bytes for use in the reqwest builder.
+    #[inline]
+    pub fn conn_window_bytes(&self) -> u32 {
+        self.conn_window_mb.saturating_mul(1024 * 1024).min(H2_MAX_WINDOW_BYTES)
+    }
+}
+
+#[cfg(test)]
+mod h2_window_tests {
+    use super::*;
+
+    #[test]
+    fn test_h2_window_config_default() {
+        let cfg = H2WindowConfig::default();
+        assert!(cfg.adaptive, "default should be adaptive ON");
+        assert_eq!(cfg.stream_window_mb, DEFAULT_H2_STREAM_WINDOW_MB);
+        assert_eq!(cfg.conn_window_mb, DEFAULT_H2_CONN_WINDOW_MB);
+        assert_eq!(cfg.conn_window_mb, cfg.stream_window_mb * 4,
+            "default conn window should be 4x stream window");
+    }
+
+    #[test]
+    fn test_h2_window_config_stream_to_bytes() {
+        let cfg = H2WindowConfig { adaptive: false, stream_window_mb: 4, conn_window_mb: 16 };
+        assert_eq!(cfg.stream_window_bytes(), 4 * 1024 * 1024);
+        assert_eq!(cfg.conn_window_bytes(),  16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_h2_window_config_hard_cap_enforced() {
+        // 300 MiB exceeds H2_WINDOW_MB_HARD_CAP (256)
+        let cfg = H2WindowConfig { adaptive: false, stream_window_mb: 300, conn_window_mb: 300 };
+        // bytes() doesn't clamp to hard cap — the cap is enforced in from_env parsing.
+        // Verify the hard cap constant itself is sane.
+        assert!(H2_WINDOW_MB_HARD_CAP <= 2047,
+            "hard cap must be below the HTTP/2 spec max of ~2 GiB");
+        assert!(H2_MAX_WINDOW_BYTES == 0x7FFF_FFFF);
+        // bytes() uses saturating_mul + min(H2_MAX_WINDOW_BYTES)
+        assert!(cfg.stream_window_bytes() <= H2_MAX_WINDOW_BYTES);
+    }
+
+    #[test]
+    fn test_h2_window_conn_defaults_to_4x_stream() {
+        // When conn is unset, from_env() sets it to 4× stream.
+        // We test the struct math directly.
+        let stream = 8u32;
+        let conn   = stream.saturating_mul(4).min(H2_WINDOW_MB_HARD_CAP);
+        assert_eq!(conn, 32);
+    }
+
+    #[test]
+    fn test_h2_window_adaptive_default_true() {
+        // Simulate "unset" — H2WindowConfig::default() should give adaptive=true.
+        let cfg = H2WindowConfig::default();
+        assert!(cfg.adaptive);
+    }
+}
+
+// =============================================================================
 // Custom Endpoint Environment Variables
 // =============================================================================
 

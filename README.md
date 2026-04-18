@@ -236,26 +236,30 @@ For detailed release notes and migration guides, see the [Complete Changelog](do
 ### Universal Backend Architecture
 s3dlio provides unified storage operations across all backends with consistent URI patterns:
 
-- **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations (5+ GB/s reads, 2.5+ GB/s writes)
+- **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations (5+ GB/s reads, 2.5+ GB/s writes) with built-in concurrent range GETs (on by default)
 - **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with **RangeEngine** (30-50% faster for large blobs)
 - **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - Production ready with **RangeEngine** and full ObjectStore integration
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations with **RangeEngine** support
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance with **RangeEngine**
 
-### RangeEngine Performance Features (v0.9.3+, Updated v0.9.6)
+### Concurrent Range GET Performance Features (v0.9.3+, Updated v0.9.60)
 Concurrent range downloads hide network latency by parallelizing HTTP range requests.
 
-**Backends with RangeEngine Support:**
-- ✅ **Azure Blob Storage**: 30-50% faster for large files (must enable explicitly)
-- ✅ **Google Cloud Storage**: 30-50% faster for large files (must enable explicitly)
-- ✅ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
-- ✅ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
-- 🔄 **S3**: Implemented by default in version 0.9.70 and later.   
+**All backends support concurrent range GETs — but via two different mechanisms:**
 
-**Default Configuration (v0.9.6+):**
-- **Status**: Disabled by default (was: enabled in v0.9.5)
-- **Reason**: Extra HEAD request on every GET causes 50% slowdown for typical workloads
-- **Threshold**: 32MB Default threshold for automatic range GET enablement (can be tuned with `S3DLIO_RANGE_THRESHOLD`) 
+**Mechanism 1 — S3 built-in (on by default, v0.9.60+)**
+- ✅ **Amazon S3**: Concurrent range splitting enabled by default via `S3DLIO_ENABLE_RANGE_OPTIMIZATION` (default: on). Uses `get_object_concurrent_range_async()` — fires parallel `GetObject(Range: bytes=N-M)` requests via the AWS SDK with lock-free chunk assembly. Controlled by `S3DLIO_RANGE_THRESHOLD_MB` (default: 32 MiB) and `S3DLIO_RANGE_CONCURRENCY` (default: auto-scaled). Disable with `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0`.
+
+**Mechanism 2 — RangeEngine (per-store config flag, must enable explicitly)**
+- ✅ **Azure Blob Storage**: 30-50% faster for large files (`enable_range_engine: true` in `AzureConfig`)
+- ✅ **Google Cloud Storage**: 30-50% faster for large files (`enable_range_engine: true` in `GcsConfig`)
+- ⚠️ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
+- ⚠️ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
+
+**RangeEngine config flag defaults (v0.9.6+):**
+- **Status**: `enable_range_engine: false` by default in all per-store config structs
+- **Reason**: Extra HEAD request on every GET causes ~50% slowdown for small-object workloads
+- **Threshold**: 32 MiB default (tunable per-store via `RangeEngineConfig::min_split_size`)
 
 **How to Enable for Large-File Workloads:**
 ```rust
@@ -507,10 +511,10 @@ loaded_data = store.load('model_state')
 ### Environment Variables
 s3dlio supports comprehensive configuration through environment variables:
 
-- **HTTP Client Optimization**: `S3DLIO_USE_OPTIMIZED_HTTP=true` - Enhanced connection pooling
-- **Runtime Scaling**: `S3DLIO_RT_THREADS=32` - Tokio worker threads  
-- **Connection Pool**: `S3DLIO_MAX_HTTP_CONNECTIONS=400` - Max connections per host
-- **Range GET**: `S3DLIO_RANGE_CONCURRENCY=64` - Large object optimization
+- **HTTP/2 mode**: `S3DLIO_H2C=1` - Force h2c (HTTP/2 cleartext) on http:// endpoints; `S3DLIO_H2C=0` - Force HTTP/1.1; unset = auto-probe (default)
+- **Runtime Scaling**: `S3DLIO_RT_THREADS=32` - Tokio worker threads
+- **Connection Pool**: `S3DLIO_POOL_MAX_IDLE_PER_HOST=32` - Max idle connections per host (default: 32)
+- **S3 Range GET**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` - Disable concurrent range splitting (enabled by default); `S3DLIO_RANGE_THRESHOLD_MB=64` - Size threshold in MiB (default: 32); `S3DLIO_RANGE_CONCURRENCY=64` - Max concurrent range requests
 - **Operation Logging**: `S3DLIO_OPLOG_LEVEL=2` - S3 operation tracking
 
 📖 [Environment Variables Reference](docs/api/Environment_Variables.md)

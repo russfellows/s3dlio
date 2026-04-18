@@ -948,9 +948,10 @@ impl Default for S3Config {
 
 #[derive(Clone)]
 pub struct S3ObjectStore {
-    // Note: S3ObjectStore doesn't store config because it doesn't support RangeEngine yet
-    // (unlike GCS/Azure which do). The config is only used during construction to set
-    // the cache TTL. If RangeEngine support is added later, we can add the config field.
+    // Note: S3ObjectStore doesn't use range_engine_generic (unlike GCS/Azure).
+    // S3 concurrent range splitting is implemented in s3_utils::get_object_concurrent_range_async()
+    // and wired in via get_optimized() / get_range_optimized().  See the comment at the top of
+    // range_engine_generic.rs for full context and future consolidation notes.
     size_cache: std::sync::Arc<crate::object_size_cache::ObjectSizeCache>,
     /// Per-endpoint AWS S3 client. When `Some`, all operations use this client directly
     /// instead of the global singleton, enabling true per-endpoint connection pools.
@@ -2791,6 +2792,57 @@ impl ObjectWriter for GcsBufferedWriter {
 // ============================================================================
 // Convenience factory that picks a backend from a URI
 // ============================================================================
+//
+// NOTE — Why store_for_uri() is synchronous and why that is intentional
+// -----------------------------------------------------------------------
+// This function and its siblings (store_for_uri_with_logger,
+// store_for_uri_with_config, store_for_uri_with_config_and_logger) are
+// deliberately synchronous (non-async).
+//
+// All backends that it dispatches to are constructed synchronously:
+//   • file://   → FileSystemObjectStore::boxed()                   — sync ✓
+//   • direct:// → ConfigurableFileSystemObjectStore::boxed_direct_io() — sync ✓
+//   • s3://     → S3ObjectStore::boxed()  (global client, no I/O)  — sync ✓
+//   • az://     → AzureObjectStore::boxed()                        — sync ✓
+//   • gs://     → GcsObjectStore::boxed()                          — sync ✓
+//
+// The S3 global-singleton client is lazily initialised on the *first request*
+// (via OnceCell inside aws_s3_client_async), not at construction time.  So
+// store_for_uri("s3://...") makes no network calls and needs no await.
+//
+// KNOWN LIMITATION — per-endpoint S3 stores
+// ------------------------------------------
+// S3ObjectStore::for_endpoint(url) IS async because it creates a fresh
+// aws_sdk_s3::Client that fully loads the AWS config chain.  Because
+// store_for_uri() is sync, it cannot call for_endpoint(); it always
+// produces the global-client variant (S3ObjectStore::boxed()).
+//
+// This matters for multi-endpoint workloads:
+//   MultiEndpointStore::from_config() detects s3://host:port/bucket/ URIs
+//   and calls for_endpoint() via run_on_global_rt() instead of falling back
+//   to store_for_uri().  See multi_endpoint.rs::from_config() for details.
+//
+// Callers that pass plain s3://bucket/prefix/ URIs to store_for_uri()
+// always get the global client — there is no per-endpoint isolation for
+// them.  This is acceptable for single-endpoint deployments.
+//
+// FUTURE WORK
+// -----------
+// If s3dlio ever needs a fully async factory (e.g., to allow users to call
+// store_for_uri("s3://myhost:9000/bucket/") with per-endpoint isolation), we
+// would need to introduce an async version such as:
+//
+//   pub async fn store_for_uri_async(uri: &str) -> Result<Box<dyn ObjectStore>>
+//
+// That path would check for an explicit host and, when present, call
+// S3ObjectStore::for_endpoint() instead of S3ObjectStore::boxed().
+// Downstream callers (sai3-bench, dl-driver Python API) would need to be
+// updated to await the result.  The sync variant should be kept as a
+// compatibility shim for non-S3 backends that don't need per-endpoint clients.
+//
+// Until that work is done: if you see unexpected S3 connections going to the
+// wrong endpoint even though store_for_uri() was called with an explicit host,
+// the cause is almost certainly this sync / global-client limitation.
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_logger(uri, None)
 }
