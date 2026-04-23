@@ -476,15 +476,7 @@ fn strip_separators(s: &str) -> String {
                 if !sep_ptr.is_null() {
                     if let Ok(sep_str) = std::ffi::CStr::from_ptr(sep_ptr).to_str() {
                         let mut chars = sep_str.chars();
-                        if let Some(ch) = chars.next() {
-                            if chars.next().is_none() && !ch.is_alphanumeric() {
-                                Some(ch)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
+                        chars.next().filter(|&ch| chars.next().is_none() && !ch.is_alphanumeric())
                     } else {
                         None
                     }

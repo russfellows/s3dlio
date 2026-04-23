@@ -30,7 +30,8 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::constants::{
-    DEFAULT_MULTIPART_BUFFER_CAPACITY, DEFAULT_S3_MULTIPART_PART_SIZE, MIN_S3_MULTIPART_PART_SIZE,
+    DEFAULT_MULTIPART_BUFFER_CAPACITY, DEFAULT_S3_MULTIPART_PART_SIZE, MAX_MULTIPART_PARTS,
+    MIN_S3_MULTIPART_PART_SIZE,
 };
 
 use std::time::SystemTime;
@@ -79,10 +80,12 @@ impl Default for MultipartUploadConfig {
 /// - part_size = 32 MiB → max(32, 16) = 32
 /// - part_size = 64 MiB → max(32,  8) = 32
 ///
-/// Memory ceiling: `max_in_flight × part_size`
-/// - @ 8 MiB:  64 × 8 MiB  = 512 MiB  (pipeline buffer)
-/// - @ 16 MiB: 32 × 16 MiB = 512 MiB
-/// - @ 32 MiB: 32 × 32 MiB = 1 GiB
+/// Memory ceiling: `~2 × max_in_flight × part_size`
+/// (both the channel and the semaphore are sized `max_in_flight`; in the worst
+/// case all channel slots are full AND all semaphore slots are in-flight)
+/// - @ 8 MiB:  2 × 64 × 8 MiB  ≈ 1 GiB
+/// - @ 16 MiB: 2 × 32 × 16 MiB ≈ 1 GiB
+/// - @ 32 MiB: 2 × 32 × 32 MiB ≈ 2 GiB
 ///
 /// This is the maximum bytes that can be buffered in the coordinator channel
 /// + in-flight UploadPart tasks combined.
@@ -267,16 +270,41 @@ impl MultipartUploadSink {
         Ok(())
     }
 
-    /// Async write (kept for backwards compat with async callers).
+    /// Async write — safe to call from a Tokio async task.
+    ///
+    /// Uses `part_tx.send().await` so the task yields instead of parking an OS
+    /// thread when the channel is full.  The Python hot-path uses
+    /// `write_blocking()` which is unchanged.
     #[cfg_attr(feature = "profiling", instrument(
         name = "mpu.write",
         skip(self, data),
         fields(data_len = data.len())
     ))]
     pub async fn write(&mut self, data: Vec<u8>) -> Result<()> {
-        // Delegate: async write just calls the blocking version here because
-        // the channel send is synchronous from the Rust perspective.
-        self.write_blocking(&data)
+        let data_len = data.len();
+        if self.buf.is_empty() && data_len >= self.cfg.part_size {
+            let bytes = Bytes::from(data);
+            let mut offset = 0usize;
+            while bytes.len() - offset >= self.cfg.part_size {
+                let end = offset + self.cfg.part_size;
+                let chunk = bytes.slice(offset..end);
+                offset = end;
+                self.enqueue_part_async(chunk).await?;
+            }
+            if offset < bytes.len() {
+                self.buf.extend_from_slice(&bytes[offset..]);
+            }
+            self.total_bytes += data_len as u64;
+            return Ok(());
+        }
+        self.buf.extend_from_slice(&data);
+        self.total_bytes += data_len as u64;
+        while self.buf.len() >= self.cfg.part_size {
+            let chunk = Bytes::copy_from_slice(&self.buf[..self.cfg.part_size]);
+            self.buf.drain(..self.cfg.part_size);
+            self.enqueue_part_async(chunk).await?;
+        }
+        Ok(())
     }
 
     /// Zero-copy blocking write: accepts an owned Vec, converts to Bytes.
@@ -308,9 +336,9 @@ impl MultipartUploadSink {
         Ok(())
     }
 
-    /// Async version of `write_owned_blocking`.
+    /// Async version of `write_owned_blocking` — safe to call from a Tokio async task.
     pub async fn write_owned(&mut self, data: Vec<u8>) -> Result<()> {
-        self.write_owned_blocking(data)
+        self.write(data).await
     }
 
     /// Flush any buffered data as a (possibly short) part.
@@ -322,8 +350,41 @@ impl MultipartUploadSink {
         Ok(())
     }
 
+    /// Async flush — safe to call from a Tokio async task.
     pub async fn flush(&mut self) -> Result<()> {
-        self.flush_blocking()
+        if !self.buf.is_empty() {
+            let chunk = Bytes::from(std::mem::take(&mut self.buf));
+            self.enqueue_part_async(chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// Async finish — safe to call from a Tokio async task.
+    ///
+    /// Flushes any buffered tail, signals the coordinator, and awaits
+    /// `CompleteMultipartUpload`.  Use this instead of `finish_blocking()`
+    /// when already inside a Tokio runtime.
+    pub async fn finish(&mut self) -> Result<MultipartCompleteInfo> {
+        if self.finished {
+            bail!("finish() called more than once");
+        }
+        if !self.buf.is_empty() {
+            let chunk = Bytes::from(std::mem::take(&mut self.buf));
+            self.enqueue_part_async(chunk).await?;
+        }
+        self.part_tx
+            .send(PartMsg::Finish)
+            .await
+            .map_err(|_| anyhow::anyhow!("coordinator task exited before Finish was sent"))?;
+        let coordinator = self
+            .coordinator
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("coordinator already consumed"))?;
+        let info = coordinator
+            .await
+            .map_err(|e| anyhow::anyhow!("coordinator task panicked: {e}"))??;
+        self.finished = true;
+        Ok(info)
     }
 
     // ── finish / abort ───────────────────────────────────────────────────────
@@ -391,13 +452,40 @@ impl MultipartUploadSink {
     /// `blocking_send` parks the caller (Python thread) only when the channel
     /// is full — i.e., `resolved_mif` parts are already queued or in-flight.
     /// This is the backpressure point: memory is bounded at
-    /// `resolved_mif × part_size` bytes.
+    /// `~2 × resolved_mif × part_size` bytes.
+    ///
+    /// **Must only be called from non-Tokio threads** (e.g. Python threads).
+    /// Use `enqueue_part_async` from async Tokio tasks.
     fn enqueue_part(&mut self, data: Bytes) -> Result<()> {
         let part_number = self.next_part_number;
+        if part_number as usize > MAX_MULTIPART_PARTS {
+            bail!(
+                "exceeded S3 maximum of {MAX_MULTIPART_PARTS} parts; \
+                 use a larger part_size for objects this large"
+            );
+        }
         self.next_part_number += 1;
 
         self.part_tx
             .blocking_send(PartMsg::Part { data, part_number })
+            .map_err(|_| anyhow::anyhow!("coordinator task exited unexpectedly"))?;
+        Ok(())
+    }
+
+    /// Async variant of `enqueue_part` — safe to call from a Tokio async task.
+    async fn enqueue_part_async(&mut self, data: Bytes) -> Result<()> {
+        let part_number = self.next_part_number;
+        if part_number as usize > MAX_MULTIPART_PARTS {
+            bail!(
+                "exceeded S3 maximum of {MAX_MULTIPART_PARTS} parts; \
+                 use a larger part_size for objects this large"
+            );
+        }
+        self.next_part_number += 1;
+
+        self.part_tx
+            .send(PartMsg::Part { data, part_number })
+            .await
             .map_err(|_| anyhow::anyhow!("coordinator task exited unexpectedly"))?;
         Ok(())
     }
@@ -425,53 +513,45 @@ async fn coordinator_task(
     let mut total_bytes: u64 = 0;
     let mut part_tasks: Vec<JoinHandle<Result<(i32, String)>>> = Vec::new();
 
-    loop {
-        match part_rx.recv().await {
-            Some(PartMsg::Part { data, part_number }) => {
-                total_bytes += data.len() as u64;
+    while let Some(PartMsg::Part { data, part_number }) = part_rx.recv().await {
+        total_bytes += data.len() as u64;
 
-                // Acquire a semaphore permit ASYNCHRONOUSLY.
-                // This never parks the Python caller thread.
-                let permit = sem
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("semaphore closed"))?;
+        // Acquire a semaphore permit ASYNCHRONOUSLY.
+        // This never parks the Python caller thread.
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("semaphore closed"))?;
 
-                let c  = client.clone();
-                let b  = bucket.clone();
-                let k  = key.clone();
-                let uid = upload_id.clone();
+        let c  = client.clone();
+        let b  = bucket.clone();
+        let k  = key.clone();
+        let uid = upload_id.clone();
 
-                let handle = tokio::task::spawn(async move {
-                    let _permit = permit; // released when task completes
+        let handle = tokio::task::spawn(async move {
+            let _permit = permit; // released when task completes
 
-                    let body = ByteStream::from(data);
-                    let resp = c
-                        .upload_part()
-                        .bucket(b)
-                        .key(k)
-                        .upload_id(uid)
-                        .part_number(part_number)
-                        .body(body)
-                        .send()
-                        .await
-                        .context("UploadPart failed")?;
+            let body = ByteStream::from(data);
+            let resp = c
+                .upload_part()
+                .bucket(b)
+                .key(k)
+                .upload_id(uid)
+                .part_number(part_number)
+                .body(body)
+                .send()
+                .await
+                .context("UploadPart failed")?;
 
-                    let etag = resp.e_tag().unwrap_or_default().to_string();
-                    if etag.is_empty() {
-                        bail!("UploadPart returned empty ETag for part {part_number}");
-                    }
-                    Ok::<(i32, String), anyhow::Error>((part_number, etag))
-                });
-
-                part_tasks.push(handle);
+            let etag = resp.e_tag().unwrap_or_default().to_string();
+            if etag.is_empty() {
+                bail!("UploadPart returned empty ETag for part {part_number}");
             }
-            Some(PartMsg::Finish) | None => {
-                // All parts sent. Wait for all in-flight uploads.
-                break;
-            }
-        }
+            Ok::<(i32, String), anyhow::Error>((part_number, etag))
+        });
+
+        part_tasks.push(handle);
     }
 
     // Join all part tasks.
@@ -599,6 +679,28 @@ mod tests {
         let mif_16mib = auto_max_in_flight(16 * 1024 * 1024); // 512/16 = 32
         assert_eq!(mif_8mib,  64);
         assert_eq!(mif_16mib, 32);
+    }
+
+    /// Proves that calling `blocking_send` from within a Tokio runtime panics.
+    /// This is the exact bug class that the old `write()` / `write_owned()` had:
+    /// they delegated to `write_blocking()` which calls `blocking_send()` via
+    /// `enqueue_part()`.  The fixed async methods use `send().await` instead.
+    #[test]
+    fn test_blocking_send_panics_inside_tokio_runtime() {
+        use std::panic;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<i32>(4);
+        // blocking_send must panic when called from within a Tokio runtime.
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            rt.block_on(async { let _ = tx.blocking_send(42); })
+        }));
+        assert!(
+            result.is_err(),
+            "blocking_send must panic inside a Tokio runtime — \
+             this is the bug class write()/write_owned() previously had"
+        );
     }
 
     #[test]

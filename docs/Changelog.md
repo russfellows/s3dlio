@@ -1,5 +1,25 @@
 # s3dlio Changelog
 
+## Version 0.9.92 — Post-review async safety fixes, MAX_MULTIPART_PARTS guard, clippy (April 23, 2026)
+
+_This entry documents the second round of fixes committed on top of the coordinator-task rewrite below._
+
+### Fixes (`src/multipart.rs`, `src/bin/cli.rs`)
+
+| # | Severity | Issue | Resolution |
+|---|---|---|---|
+| 1 | 🔴 Latent panic | `write()`, `write_owned()`, `flush()` called `blocking_send` from async context | Added `enqueue_part_async()` using `send().await`; rewrote all three methods to use it; added `async fn finish()` |
+| 2 | 🔴 Policy | 2 clippy warnings (coordinator `loop { match }`, manual `Option::filter`) | `while let` loop in coordinator; `.filter()` in `cli.rs` |
+| 3 | 🟡 UX | `MAX_MULTIPART_PARTS` (10 000) defined but never enforced | Checked in both `enqueue_part()` and `enqueue_part_async()` with a clear bail message |
+| 4 | 🟡 Docs | Memory ceiling doc off by ~2× | Updated to `~2 × max_in_flight × part_size` with corrected examples |
+
+A new unit test `test_blocking_send_panics_inside_tokio_runtime` was added to prove the pre-fix
+panic class via `std::panic::catch_unwind`.
+
+**Test count**: 580 passing (247 Rust unit tests + Python integration tests).
+
+---
+
 ## Version 0.9.92 — Multipart upload: coordinator task, auto-scale max_in_flight, panic fix (April 2026)
 
 _This entry covers work added on top of the base v0.9.92 release (connection pool / runtime changes documented below)._

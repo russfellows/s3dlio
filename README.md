@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-559-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.90-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-580-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.92-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,13 +10,15 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.90 — Full NVIDIA AIStore support, HTTP/2, and 5 issues closed.**
+> **v0.9.92 — Multipart upload rewrite: coordinator task, auto-scale, async safety fixes.**
 >
-> **NVIDIA AIStore (redirects + security):** s3dlio now has complete, security-hardened support for NVIDIA AIStore. AIStore routes S3 clients through a proxy that issues HTTP 307 redirects to the target storage node. `RedirectFollowingConnector` (opt-in via `S3DLIO_FOLLOW_REDIRECTS=1`) follows these redirects while enforcing four security policies: standard TLS WebPKI verification, cross-host `Authorization` header stripping (RFC 9110), HTTPS→HTTP scheme-downgrade prevention, and certificate pinning across the redirect chain via a pre-flight TLS probe using `RecordingVerifier`. Two production security gaps that were present since the initial redirect implementation are now closed. All four redirect scenarios are validated with end-to-end tests against real OS-assigned loopback ports. See [docs/AIStore_redirect_implementation_v0.9.90.md](docs/AIStore_redirect_implementation_v0.9.90.md) for the full implementation reference.
+> **Coordinator task + bounded channel:** The multipart upload hot path now runs a background `coordinator_task` on the Tokio runtime. Python `write()` calls `blocking_send()` on a bounded mpsc channel (backpressure) instead of crossing the Python→Tokio bridge on every part. This replaces up to N `run_on_global_rt` calls per upload with a single one at `finish()`, delivering **+33% NP=1 and +10% NP=4** throughput on 512 MiB objects.
 >
-> **HTTP/2:** s3dlio now speaks HTTP/2 natively — full HTTP/2 over TLS via ALPN negotiation on `https://` endpoints, and cleartext h2c (HTTP/2 prior-knowledge) on `http://` endpoints for storage systems that support it. Set `S3DLIO_H2C=1` to force h2c, `S3DLIO_H2C=0` to force HTTP/1.1, or leave it unset for automatic detection. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+> **Auto-scale `max_in_flight`:** The default is now computed automatically (`max(32, ⌈512 MiB ÷ part_size⌉)`) so all parts of a large object stay in flight simultaneously without batching. Pass `max_in_flight=N` explicitly to restore the old behaviour.
 >
-> **Also in this release:** GCS delete errors now propagate correctly instead of being silently swallowed (#135); small object PUT size rounding fixed (#136); `list_containers()` exposed to the Python API (#133). Closes issues #126, #133, #134, #135, #136.
+> **Async safety fixes:** `write()`, `write_owned()`, `flush()`, and a new `finish()` method are now genuinely async — they use `send().await` instead of `blocking_send`, making them safe to call from any Tokio task. A proof-of-concept unit test (`test_blocking_send_panics_inside_tokio_runtime`) documents the pre-fix panic class. `MAX_MULTIPART_PARTS` (10 000) is now enforced at write time with a clear error.
+>
+> **v0.9.90 highlights also in this release:** Full NVIDIA AIStore redirect support, HTTP/2 (ALPN + h2c), connection pool autoscale, unlimited pool size, runtime thread scaling, `list_containers()` in Python API, GCS delete propagation fix, small object PUT rounding fix. See [docs/Changelog.md](docs/Changelog.md) for full history.
 
 ## 📦 Installation
 
