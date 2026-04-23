@@ -1,5 +1,183 @@
 # s3dlio Changelog
 
+## Version 0.9.92 — Post-review async safety fixes, MAX_MULTIPART_PARTS guard, clippy (April 23, 2026)
+
+_This entry documents the second round of fixes committed on top of the coordinator-task rewrite below._
+
+### Fixes (`src/multipart.rs`, `src/bin/cli.rs`)
+
+| # | Severity | Issue | Resolution |
+|---|---|---|---|
+| 1 | 🔴 Latent panic | `write()`, `write_owned()`, `flush()` called `blocking_send` from async context | Added `enqueue_part_async()` using `send().await`; rewrote all three methods to use it; added `async fn finish()` |
+| 2 | 🔴 Policy | 2 clippy warnings (coordinator `loop { match }`, manual `Option::filter`) | `while let` loop in coordinator; `.filter()` in `cli.rs` |
+| 3 | 🟡 UX | `MAX_MULTIPART_PARTS` (10 000) defined but never enforced | Checked in both `enqueue_part()` and `enqueue_part_async()` with a clear bail message |
+| 4 | 🟡 Docs | Memory ceiling doc off by ~2× | Updated to `~2 × max_in_flight × part_size` with corrected examples |
+
+A new unit test `test_blocking_send_panics_inside_tokio_runtime` was added to prove the pre-fix
+panic class via `std::panic::catch_unwind`.
+
+**Test count**: 580 passing (247 Rust unit tests + Python integration tests).
+
+### CI / Release workflow updates (`.github/workflows/`)
+
+| File | Change |
+|---|---|
+| `ci.yml` | Removed Python 3.10 (unsupported by our PyO3 version); added `ubuntu-24.04-arm` runner — CI now tests 3.11, 3.12, 3.13 on both x86_64 and aarch64 (6 matrix jobs) |
+| `publish-pypi.yml` | Added `aarch64` to wheel build matrix; `runs-on` selects `ubuntu-24.04-arm` natively for ARM builds; result: 6 wheels published per release (3 Python versions × 2 architectures) plus sdist |
+
+---
+
+## Version 0.9.92 — Multipart upload: coordinator task, auto-scale max_in_flight, panic fix (April 2026)
+
+_This entry covers work added on top of the base v0.9.92 release (connection pool / runtime changes documented below)._
+
+### Multipart upload rewrite (`src/multipart.rs`)
+
+The multipart upload implementation was fully rewritten to resolve two correctness issues and
+improve throughput at high part counts.
+
+**Change 1 — Coordinator task + bounded mpsc channel**
+
+Previously each `write()` call ran `run_on_global_rt(semaphore.acquire_owned())`, crossing the
+Python→Tokio boundary on every part. Under high concurrency this caused stalls because
+`run_on_global_rt` parks the calling thread until the future resolves.
+
+The new design uses a background `coordinator_task` running entirely on the Tokio runtime. It owns
+a `tokio::sync::mpsc` bounded channel (capacity = `max_in_flight`). Python `write()` calls
+`blocking_send()` on the channel — this parks the Python thread only when all slots are genuinely
+occupied (true backpressure). The coordinator acquires the semaphore and spawns UploadPart tasks
+async-natively. `finish_blocking()` sends a `Finish` sentinel and makes a single `run_on_global_rt`
+call to await the coordinator, replacing one blocking cross-thread trip per part with one per upload.
+
+**Change 2 — Auto-scale `max_in_flight`**
+
+`MultipartUploadConfig.max_in_flight` changed from `usize` to `Option<usize>`:
+- `None` (new default) → auto: `max(32, ⌈512 MiB ÷ part_size⌉)`
+- `Some(n)` → explicit override, same as before
+
+At the default 16 MiB part size this raises the default from 16 → 32 concurrent upload slots,
+doubling the parallelism for callers that never passed an explicit value. At 8 MiB parts it becomes
+64 slots, scaling to match the higher part count for large objects.
+
+Python callers that pass `max_in_flight=N` explicitly (e.g. `dlio_benchmark` checkpointing, which
+reads `S3DLIO_MULTIPART_MAX_IN_FLIGHT`) are unaffected — `Some(N)` is used as before.
+
+**Change 3 — Fix latent panic in `put_object_multipart_uri_async` (`src/s3_utils.rs`)**
+
+`put_object_multipart_uri_async` is an `async fn` called from within the Tokio runtime (via
+`ObjectStore::put_multipart`), but it previously called `sink.write_blocking()` and
+`sink.finish_blocking()` directly. These call `blocking_send()` and `run_on_global_rt()`, which
+park a Tokio worker thread when the channel fills. For objects larger than
+`max_in_flight × part_size` (~512 MiB at the old defaults) this would panic.
+
+Fixed by wrapping the entire sink lifecycle in `tokio::task::spawn_blocking`, so blocking calls
+run on a dedicated blocking thread rather than a worker thread. `run_on_global_rt` detects the
+runtime context and uses `std::sync::mpsc` blocking recv, which is safe from blocking threads.
+
+### Benchmark results (real MinIO, HTTPS, vs s3torchconnector 1.5.0)
+
+| Object size | NP=1 | NP=4 |
+|---|---|---|
+| 512 MiB | 0.659 GB/s (+33% vs baseline) | 0.944 GB/s (+10%) |
+| 5 GiB | 0.941 GB/s (1.10× s3torchconnector) | 1.015 GB/s (1.03×) |
+
+### New tests
+
+- `python/tests/test_issue134_backpressure.py` — 7 tests (integrity, OOM, concurrency, throughput)
+  all passing on real MinIO
+- `python/tests/test_mpu_throughput.py` — 7 throughput regression tests
+- `python/tests/bench_multipart_vs_s3torchconnector.py` — benchmark harness, 5 GiB default
+
+### Summary table
+
+| Change | File(s) | Detail |
+|--------|---------|--------|
+| Coordinator task | `src/multipart.rs` | `coordinator_task` + `mpsc::bounded(max_in_flight)` replaces per-part `run_on_global_rt` |
+| Auto-scale | `src/multipart.rs`, `src/python_api/python_advanced_api.rs` | `max_in_flight: usize` → `Option<usize>`; `None` = auto formula |
+| Panic fix | `src/s3_utils.rs` | `put_object_multipart_uri_async` wrapped in `spawn_blocking` |
+| Test compat | `tests/test_multipart.rs` | Integration test struct literals updated to `Some(n)` |
+
+---
+
+## Version 0.9.92 — Default HTTP/2 off, unlimited connection pool, runtime scaling, concurrency API (April 2026)
+
+### Summary of code changes
+
+| Fix | File(s) | Change |
+|-----|---------|--------|
+| 1 — Unlimited connection pool | `src/constants.rs` | `DEFAULT_POOL_MAX_IDLE_PER_HOST`: `32` → `usize::MAX`. Pool still shrinks via `pool_idle_timeout` (90 s). Doc comment explains the 794 µs root cause at high concurrency. |
+| 2 — Thread cap removed | `src/s3_client.rs` | `get_runtime_threads()`: replaced `min(max(8, cores*2), 32)` with `max(4, cores)`. 28-core machine unchanged (28 threads); 96-core machine goes 32 → 96. |
+| 3 — Concurrency hint API | `src/s3_client.rs`, `src/lib.rs` | Added `CONCURRENCY_HINT: AtomicUsize` static and `pub fn configure_for_concurrency(n: usize)`, exported at crate root as `s3dlio::configure_for_concurrency`. If the hint exceeds the CPU baseline, runtime thread count is `min(hint, cores*4)`. Must be called before the first S3 operation. |
+| 4 — Connection pool warmup | `src/reqwest_client.rs` | Added `pub async fn warmup_connection_pool(endpoint_url: &str, connections: usize)` — fires `connections` concurrent HEAD requests to pre-fill the pool and eliminate TCP handshake storms at benchmark start. |
+| 5 — HTTP/2 default off | `src/constants.rs`, `src/reqwest_client.rs` | `DEFAULT_H2C_ENABLED = false` added. `h2c_mode_from_env()` now returns `ForceHttp1` when `S3DLIO_H2C` is unset (was `Auto`). Benchmarking showed HTTP/2 reduces throughput on plain `http://` endpoints. Set `S3DLIO_H2C=1` to opt in. |
+
+All changes compile with zero warnings; **243 tests pass**.
+
+### Breaking change: `S3DLIO_H2C` default changed to HTTP/1.1
+
+HTTP/2 on plain `http://` endpoints is now **off by default**. Benchmarking on loopback TCP
+showed HTTP/2 reduces PUT/GET throughput compared with HTTP/1.1 and an unlimited connection pool.
+The `Auto` mode (probe h2c once, fall back if rejected) is no longer the default.
+
+| Scenario | Before v0.9.92 | v0.9.92+ |
+|---|---|---|
+| `S3DLIO_H2C` not set, `http://` endpoint | h2c probe once, HTTP/1.1 fallback | **HTTP/1.1 (no probe)** |
+| `S3DLIO_H2C=1`, `http://` endpoint | Force h2c, no fallback | Force h2c, no fallback (unchanged) |
+| `S3DLIO_H2C=0`, `http://` endpoint | Force HTTP/1.1 | Force HTTP/1.1 (unchanged) |
+| Any `https://` endpoint | HTTP/2 via TLS ALPN | HTTP/2 via TLS ALPN (unchanged) |
+
+Set `S3DLIO_H2C=1` to restore h2c for storage systems that require HTTP/2 on `http://` endpoints.
+The new default is documented in `src/constants.rs` as `DEFAULT_H2C_ENABLED = false`.
+
+### Performance: connection pool default changed to unlimited
+
+`S3DLIO_POOL_MAX_IDLE_PER_HOST` default changed from `32` to `usize::MAX` (unlimited).
+
+With t=128 concurrent workers and a pool cap of 32, the 96 workers that couldn't hold an idle
+connection paid a full TCP handshake penalty on every request (~794 µs on loopback). This capped
+throughput at ~47k ops/s externally vs ~240k ops/s in-process. With an unlimited pool, idle
+connections are retained for all workers; the `S3DLIO_POOL_IDLE_TIMEOUT_SECS` (default 90 s)
+eviction timer handles cleanup when load drops.
+
+Set `S3DLIO_POOL_MAX_IDLE_PER_HOST=<n>` to impose a hard ceiling in memory-constrained environments.
+
+### Performance: s3dlio internal runtime thread cap removed
+
+`get_runtime_threads()` previously capped at 32 even on large machines (e.g. 96-core hosts got
+32 Tokio threads). The cap is removed; the default is now `max(4, num_cpus)`. The floor of 4
+prevents thread starvation on single/dual-core VMs. This primarily benefits Python/sync callers
+that route through the s3dlio-internal runtime.
+
+### New API: `configure_for_concurrency(n)`
+
+```rust
+s3dlio::configure_for_concurrency(128);
+// … then call blocking S3 helpers from 128 threads …
+```
+
+Must be called before the first S3 operation. Ensures the internal Tokio runtime has enough
+threads to overlap `n` concurrent requests for blocking/Python callers. Ignored by async callers
+(e.g. sai3-bench) that bring their own runtime.
+
+### New API: `reqwest_client::warmup_connection_pool(endpoint_url, n)`
+
+```rust
+s3dlio::reqwest_client::warmup_connection_pool("http://127.0.0.1:9000", 128).await;
+```
+
+Fires `n` concurrent HEAD requests to pre-fill the connection pool before benchmarking, eliminating
+the TCP handshake storm at burst start that biases early-window latency measurements.
+
+### CLI improvements (carried from in-progress work)
+
+- `parse_human_count()`: `--num` argument accepts human suffixes (`1k`, `100m`, `1g`, binary `1ki`,
+  `1mi`, `1gi`) and underscore separators (`100_000_000`).
+- `parse_jobs()`: all `--jobs` / `--concurrent` arguments clamped to `MAX_JOBS = 4_096` with a
+  clear error on overflow.
+- `MAX_JOBS = 4_096` added to `src/constants.rs`.
+
+---
+
 ## Version 0.9.90 - AIStore Full Support, TLS Security Fixes, HTTP/2, 5 Issues Closed (April 2026)
 
 ### Feature: Full NVIDIA AIStore support — redirects + complete TLS security (closes #126)

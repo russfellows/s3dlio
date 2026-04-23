@@ -157,12 +157,8 @@ impl SchedulerMetrics {
         let total_bytes = self.total_bytes.load(Ordering::Relaxed);
         let total_time_ms = self.total_time_ms.load(Ordering::Relaxed);
 
-        if total_time_ms > 0 {
-            let bytes_per_sec = (total_bytes * 1000) / total_time_ms;
-            Throughput::new_bytes_per_sec(bytes_per_sec)
-        } else {
-            Throughput::new_bytes_per_sec(0)
-        }
+        let bytes_per_sec = (total_bytes * 1000).checked_div(total_time_ms).unwrap_or(0);
+        Throughput::new_bytes_per_sec(bytes_per_sec)
     }
 
     /// Get number of in-flight operations

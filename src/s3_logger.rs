@@ -326,7 +326,7 @@ impl Logger {
         let clock_offset = Arc::new(AtomicI64::new(0));
         let clock_offset_clone = Arc::clone(&clock_offset);
         thread::spawn(move || {
-            for (idx, mut entry) in (0_u64..).zip(receiver.into_iter()) {
+            for (idx, mut entry) in (0_u64..).zip(receiver) {
                 if entry.operation == SHUTDOWN_OP {
                     break;
                 }

@@ -59,7 +59,7 @@ impl PyMultipartUploadWriter {
             cfg.part_size = ps;
         }
         if let Some(mif) = max_in_flight {
-            cfg.max_in_flight = mif;
+            cfg.max_in_flight = Some(mif);
         }
         if let Some(ct) = content_type {
             cfg.content_type = Some(ct);
@@ -102,7 +102,7 @@ impl PyMultipartUploadWriter {
             cfg.part_size = ps;
         }
         if let Some(mif) = max_in_flight {
-            cfg.max_in_flight = mif;
+            cfg.max_in_flight = Some(mif);
         }
         if let Some(ct) = content_type {
             cfg.content_type = Some(ct);

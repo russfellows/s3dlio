@@ -12,7 +12,7 @@ use s3dlio::object_store::{store_for_uri, ObjectStore};
 // Test configuration
 const MIN_TEST_DURATION: Duration = Duration::from_secs(120); // 2 minutes minimum
 const OBJECT_SIZES: &[usize] = &[
-    1024 * 1024,  // 1MB
+    1024 * 1024,      // 1MB
     10 * 1024 * 1024, // 10MB
 ];
 const PUT_CONCURRENCY: usize = 16; // Match s3dlio defaults

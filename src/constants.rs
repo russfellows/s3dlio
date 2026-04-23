@@ -49,6 +49,14 @@ pub const MIN_S3_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 /// Default buffer capacity for multipart operations (2 MB)
 pub const DEFAULT_MULTIPART_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
 
+/// Maximum number of concurrent jobs (parallel workers) for any CLI command.
+///
+/// Chosen to accommodate the largest reasonable real-world deployment:
+/// a 256-core host driving 16 S3 endpoints with ~16 async tasks per core
+/// gives 256 × 16 = 4,096.  Beyond this, connection overhead and OS scheduler
+/// pressure outweigh any throughput gains.
+pub const MAX_JOBS: usize = 4_096;
+
 // ============================================================================
 // RangeEngine Configuration Constants
 // ============================================================================
@@ -301,22 +309,49 @@ pub const ENV_OPLOG_CHUNK_SIZE: &str = "S3DLIO_OPLOG_CHUNK_SIZE";
 /// |-------|-----------|
 /// | `1`, `true`, `yes`, `on`, `enable` | Force h2c (HTTP/2 prior-knowledge cleartext); no fallback |
 /// | `0`, `false`, `no`, `off`, `disable` | Force HTTP/1.1; skip auto-probe |
-/// | *(unset)* | Auto: probe h2c once on first `http://` connection; fall back to HTTP/1.1 if rejected |
+/// | *(unset)* | HTTP/1.1 (default — equivalent to `0`) |
+///
+/// **Default changed in v0.9.92**: the previous default was `Auto` (probe h2c once, fall back to
+/// HTTP/1.1 if rejected). Benchmarking on loopback TCP endpoints showed that HTTP/2 consistently
+/// reduces PUT/GET throughput compared with HTTP/1.1 and an unlimited connection pool. The default
+/// is now HTTP/1.1. Set `S3DLIO_H2C=1` to opt in to h2c on `http://` endpoints.
 ///
 /// **Note**: `https://` endpoints always negotiate HTTP/2 via TLS ALPN regardless of this setting.
 pub const ENV_S3DLIO_H2C: &str = "S3DLIO_H2C";
+
+/// Default HTTP/2 cleartext (h2c) behaviour when [`ENV_S3DLIO_H2C`] is not set: `false` (HTTP/1.1).
+///
+/// **Changed to `false` in v0.9.92.** Previous default was `Auto` (h2c probe once, fall back to
+/// HTTP/1.1 if rejected). Benchmarking on plain `http://` endpoints showed that HTTP/2 reduces
+/// throughput relative to HTTP/1.1 with an unlimited connection pool, so the default is now off.
+///
+/// `https://` endpoints are unaffected — HTTP/2 is still negotiated automatically via TLS ALPN.
+/// Set `S3DLIO_H2C=1` to enable h2c for storage systems that require HTTP/2 on plain-HTTP endpoints.
+pub const DEFAULT_H2C_ENABLED: bool = false;
 
 // ── Connection pool tunables ───────────────────────────────────────────────
 
 /// Maximum idle connections kept in the pool per host (default: [`DEFAULT_POOL_MAX_IDLE_PER_HOST`]).
 ///
-/// Increase for high-concurrency workloads (e.g., 75k PUTs/s) where connection
-/// establishment latency would otherwise dominate at the start of each burst.
-/// Values in the range 64–256 are typical for sustained high-rate I/O.
+/// The default is unlimited (`usize::MAX`); idle connections are still evicted
+/// after `S3DLIO_POOL_IDLE_TIMEOUT_SECS` (default 90 s) of inactivity.
+/// Set to a positive integer to impose a hard ceiling — useful for
+/// memory-constrained environments or testing specific pool-pressure scenarios.
 pub const ENV_POOL_MAX_IDLE_PER_HOST: &str = "S3DLIO_POOL_MAX_IDLE_PER_HOST";
 
 /// Default maximum idle connections per host in the reqwest connection pool.
-pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
+///
+/// Set to [`usize::MAX`] (unlimited) so the pool always retains one idle
+/// connection per concurrent worker.  Under high concurrency (e.g. t=128) a
+/// fixed cap of 32 caused 96 workers to tear down their connection on every
+/// request completion, paying a full TCP handshake penalty each round-trip
+/// (~794 µs overhead on loopback, ~5 µs without).
+///
+/// Connections are still cleaned up by `pool_idle_timeout` (default 90 s),
+/// so the pool shrinks automatically when load drops.
+///
+/// Override with `S3DLIO_POOL_MAX_IDLE_PER_HOST=<n>` to impose a hard ceiling.
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = usize::MAX;
 
 /// Idle connection pool timeout in seconds (default: [`DEFAULT_POOL_IDLE_TIMEOUT_SECS`]).
 ///

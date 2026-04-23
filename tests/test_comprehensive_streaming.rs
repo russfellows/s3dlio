@@ -110,8 +110,7 @@ fn test_deduplication_edge_cases() {
         let test_seed = 12345u64;
 
         // Stream with 1KB chunks
-        let mut obj_gen1 =
-            ObjectGenAlt::new_with_seed(size, dedup, compress, test_seed);
+        let mut obj_gen1 = ObjectGenAlt::new_with_seed(size, dedup, compress, test_seed);
         let mut streamed1 = Vec::with_capacity(size);
         let mut buf1 = vec![0u8; 1024];
         loop {
@@ -123,8 +122,7 @@ fn test_deduplication_edge_cases() {
         }
 
         // Stream with 2KB chunks (different chunk size)
-        let mut obj_gen2 =
-            ObjectGenAlt::new_with_seed(size, dedup, compress, test_seed);
+        let mut obj_gen2 = ObjectGenAlt::new_with_seed(size, dedup, compress, test_seed);
         let mut streamed2 = Vec::with_capacity(size);
         let mut buf2 = vec![0u8; 2048];
         loop {
