@@ -1575,13 +1575,23 @@ pub async fn put_object_multipart_uri_async(
         part_size
     );
     use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
+    let uri_owned = uri.to_string();
     let cfg = MultipartUploadConfig {
         part_size: part_size.unwrap_or(16 * 1024 * 1024), // 16 MiB default
         ..Default::default()
     };
-    let mut sink = MultipartUploadSink::from_uri(uri, cfg)?;
-    sink.write_blocking(&data)?; // Pass as &[u8] slice
-    sink.finish_blocking()?;
+    // Use spawn_blocking so that blocking_send() and run_on_global_rt() calls
+    // inside write_blocking()/finish_blocking() never park a Tokio worker thread.
+    // Without this, objects larger than max_in_flight × part_size panic because
+    // blocking_send() on a full channel would stall a worker.
+    tokio::task::spawn_blocking(move || {
+        let mut sink = MultipartUploadSink::from_uri(&uri_owned, cfg)?;
+        sink.write_blocking(&data)?;
+        sink.finish_blocking()?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("put_object_multipart_uri_async task panicked: {e}"))??;
     Ok(())
 }
 

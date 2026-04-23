@@ -1,5 +1,77 @@
 # s3dlio Changelog
 
+## Version 0.9.92 — Multipart upload: coordinator task, auto-scale max_in_flight, panic fix (April 2026)
+
+_This entry covers work added on top of the base v0.9.92 release (connection pool / runtime changes documented below)._
+
+### Multipart upload rewrite (`src/multipart.rs`)
+
+The multipart upload implementation was fully rewritten to resolve two correctness issues and
+improve throughput at high part counts.
+
+**Change 1 — Coordinator task + bounded mpsc channel**
+
+Previously each `write()` call ran `run_on_global_rt(semaphore.acquire_owned())`, crossing the
+Python→Tokio boundary on every part. Under high concurrency this caused stalls because
+`run_on_global_rt` parks the calling thread until the future resolves.
+
+The new design uses a background `coordinator_task` running entirely on the Tokio runtime. It owns
+a `tokio::sync::mpsc` bounded channel (capacity = `max_in_flight`). Python `write()` calls
+`blocking_send()` on the channel — this parks the Python thread only when all slots are genuinely
+occupied (true backpressure). The coordinator acquires the semaphore and spawns UploadPart tasks
+async-natively. `finish_blocking()` sends a `Finish` sentinel and makes a single `run_on_global_rt`
+call to await the coordinator, replacing one blocking cross-thread trip per part with one per upload.
+
+**Change 2 — Auto-scale `max_in_flight`**
+
+`MultipartUploadConfig.max_in_flight` changed from `usize` to `Option<usize>`:
+- `None` (new default) → auto: `max(32, ⌈512 MiB ÷ part_size⌉)`
+- `Some(n)` → explicit override, same as before
+
+At the default 16 MiB part size this raises the default from 16 → 32 concurrent upload slots,
+doubling the parallelism for callers that never passed an explicit value. At 8 MiB parts it becomes
+64 slots, scaling to match the higher part count for large objects.
+
+Python callers that pass `max_in_flight=N` explicitly (e.g. `dlio_benchmark` checkpointing, which
+reads `S3DLIO_MULTIPART_MAX_IN_FLIGHT`) are unaffected — `Some(N)` is used as before.
+
+**Change 3 — Fix latent panic in `put_object_multipart_uri_async` (`src/s3_utils.rs`)**
+
+`put_object_multipart_uri_async` is an `async fn` called from within the Tokio runtime (via
+`ObjectStore::put_multipart`), but it previously called `sink.write_blocking()` and
+`sink.finish_blocking()` directly. These call `blocking_send()` and `run_on_global_rt()`, which
+park a Tokio worker thread when the channel fills. For objects larger than
+`max_in_flight × part_size` (~512 MiB at the old defaults) this would panic.
+
+Fixed by wrapping the entire sink lifecycle in `tokio::task::spawn_blocking`, so blocking calls
+run on a dedicated blocking thread rather than a worker thread. `run_on_global_rt` detects the
+runtime context and uses `std::sync::mpsc` blocking recv, which is safe from blocking threads.
+
+### Benchmark results (real MinIO, HTTPS, vs s3torchconnector 1.5.0)
+
+| Object size | NP=1 | NP=4 |
+|---|---|---|
+| 512 MiB | 0.659 GB/s (+33% vs baseline) | 0.944 GB/s (+10%) |
+| 5 GiB | 0.941 GB/s (1.10× s3torchconnector) | 1.015 GB/s (1.03×) |
+
+### New tests
+
+- `python/tests/test_issue134_backpressure.py` — 7 tests (integrity, OOM, concurrency, throughput)
+  all passing on real MinIO
+- `python/tests/test_mpu_throughput.py` — 7 throughput regression tests
+- `python/tests/bench_multipart_vs_s3torchconnector.py` — benchmark harness, 5 GiB default
+
+### Summary table
+
+| Change | File(s) | Detail |
+|--------|---------|--------|
+| Coordinator task | `src/multipart.rs` | `coordinator_task` + `mpsc::bounded(max_in_flight)` replaces per-part `run_on_global_rt` |
+| Auto-scale | `src/multipart.rs`, `src/python_api/python_advanced_api.rs` | `max_in_flight: usize` → `Option<usize>`; `None` = auto formula |
+| Panic fix | `src/s3_utils.rs` | `put_object_multipart_uri_async` wrapped in `spawn_blocking` |
+| Test compat | `tests/test_multipart.rs` | Integration test struct literals updated to `Some(n)` |
+
+---
+
 ## Version 0.9.92 — Default HTTP/2 off, unlimited connection pool, runtime scaling, concurrency API (April 2026)
 
 ### Summary of code changes

@@ -42,7 +42,7 @@ fn multipart_upload_basic() -> Result<()> {
     // Upload ~65 MiB in 8 MiB writes
     let cfg = MultipartUploadConfig {
         part_size: 32 * 1024 * 1024,
-        max_in_flight: 8,
+        max_in_flight: Some(8),
         ..Default::default()
     };
     let mut sink = MultipartUploadSink::new(&bucket, key, cfg)?;
@@ -121,7 +121,7 @@ fn multipart_upload_abort() -> Result<()> {
     // Start upload and then abort
     let cfg = MultipartUploadConfig {
         part_size: 16 * 1024 * 1024,
-        max_in_flight: 4,
+        max_in_flight: Some(4),
         ..Default::default()
     };
     let mut sink = MultipartUploadSink::new(&bucket, key, cfg)?;
