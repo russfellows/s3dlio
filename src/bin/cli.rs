@@ -1658,8 +1658,7 @@ async fn get_cmd(
             // Estimate total bytes = bytes so far + avg_bytes/obj × remaining objects.
             // This keeps the bar fill and ETA reasonable even while listing is still
             // ongoing.  Once listing finishes the estimate converges to reality.
-            if completed > 0 {
-                let avg_bytes_per_obj = bytes / completed;
+            if let Some(avg_bytes_per_obj) = bytes.checked_div(completed) {
                 let remaining = listed.saturating_sub(completed);
                 let estimated_total = bytes + remaining * avg_bytes_per_obj;
                 pb_bg.set_length(estimated_total);
