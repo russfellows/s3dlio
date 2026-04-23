@@ -78,9 +78,9 @@ async fn spawn_counting_http_server() -> (u16, Arc<AtomicUsize>) {
                         service_fn(|_: Request<Incoming>| async {
                             // Empty 200 OK — HEAD has no body so keep-alive
                             // immediately reclaims the connection.
-                            Ok::<Response<Empty<Bytes>>, std::convert::Infallible>(
-                                Response::new(Empty::new()),
-                            )
+                            Ok::<Response<Empty<Bytes>>, std::convert::Infallible>(Response::new(
+                                Empty::new(),
+                            ))
                         }),
                     )
                     .await;
@@ -328,7 +328,10 @@ fn test_thread_formula_no_hard_cap() {
     println!("New formula  max(4, cores)              = {new_formula}");
 
     // Floor: always at least 4.
-    assert!(new_formula >= 4, "thread count must have a floor of 4 (got {new_formula})");
+    assert!(
+        new_formula >= 4,
+        "thread count must have a floor of 4 (got {new_formula})"
+    );
 
     // Scales with hardware.
     if cores >= 4 {
@@ -344,9 +347,7 @@ fn test_thread_formula_no_hard_cap() {
             new_formula > old_formula,
             "on {cores}-core host, new={new_formula} must exceed old capped formula={old_formula}"
         );
-        println!(
-            "Large-machine assertion: new={new_formula} > old cap {old_formula}  ✓"
-        );
+        println!("Large-machine assertion: new={new_formula} > old cap {old_formula}  ✓");
     } else {
         println!(
             "Note: cap removal most visible on >32-core hosts; \
@@ -430,8 +431,7 @@ fn test_global_runtime_thread_count_matches_formula() {
     // Spawn enough tasks to keep all workers busy simultaneously.
     // Each task occupies a worker via block_in_place for ~30 ms.
     let n_tasks = expected_min * 3; // 3 waves
-    let ids: Arc<Mutex<HashSet<std::thread::ThreadId>>> =
-        Arc::new(Mutex::new(HashSet::new()));
+    let ids: Arc<Mutex<HashSet<std::thread::ThreadId>>> = Arc::new(Mutex::new(HashSet::new()));
     let done = Arc::new(AtomicUsize::new(0));
 
     for _ in 0..n_tasks {
@@ -442,10 +442,7 @@ fn test_global_runtime_thread_count_matches_formula() {
             // Tokio promotes a replacement thread so other tasks continue.
             tokio::task::block_in_place(|| {
                 std::thread::sleep(Duration::from_millis(30));
-                ids_c
-                    .lock()
-                    .unwrap()
-                    .insert(std::thread::current().id());
+                ids_c.lock().unwrap().insert(std::thread::current().id());
             });
             done_c.fetch_add(1, Ordering::Relaxed);
         });
@@ -671,8 +668,8 @@ async fn test_s3_warmup_before_concurrent_workload() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires s3-ultra: AWS_ENDPOINT_URL=http://127.0.0.1:9000 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 S3DLIO_H2C=0 S3DLIO_TEST_BUCKET=sai3bench-1k"]
 async fn test_s3_pool_reuse_two_waves() {
-    let endpoint = std::env::var("AWS_ENDPOINT_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+    let endpoint =
+        std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
     let bucket = std::env::var("S3DLIO_TEST_BUCKET")
         .or_else(|_| std::env::var("S3_BUCKET"))
         .unwrap_or_else(|_| "sai3bench-1k".to_string());
@@ -690,7 +687,10 @@ async fn test_s3_pool_reuse_two_waves() {
 
     // One sequential PUT to initialise the S3 client + open first connection.
     let init_uri = format!("{base_uri}init.bin");
-    store.put(&init_uri, payload.clone()).await.expect("init PUT");
+    store
+        .put(&init_uri, payload.clone())
+        .await
+        .expect("init PUT");
 
     // ── Wave 1 ────────────────────────────────────────────────────────────
     let t0 = Instant::now();
@@ -712,8 +712,10 @@ async fn test_s3_pool_reuse_two_waves() {
         .map(|r| r.expect("task join"))
         .collect();
     let wave1_wall = t0.elapsed();
-    let wave1_avg_ms =
-        wave1_latencies.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>()
+    let wave1_avg_ms = wave1_latencies
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .sum::<f64>()
         / concurrency as f64;
     println!(
         "Wave 1: {concurrency} PUTs  wall={:.0}ms  avg_latency={wave1_avg_ms:.2}ms",
@@ -743,8 +745,10 @@ async fn test_s3_pool_reuse_two_waves() {
         .map(|r| r.expect("task join"))
         .collect();
     let wave2_wall = t0.elapsed();
-    let wave2_avg_ms =
-        wave2_latencies.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>()
+    let wave2_avg_ms = wave2_latencies
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .sum::<f64>()
         / concurrency as f64;
     println!(
         "Wave 2: {concurrency} PUTs  wall={:.0}ms  avg_latency={wave2_avg_ms:.2}ms",
@@ -754,9 +758,7 @@ async fn test_s3_pool_reuse_two_waves() {
     // With connection reuse, wave 2 should not be slower than wave 1.
     // Allow 20% headroom for scheduling jitter.
     let threshold_ms = wave1_avg_ms * 1.20;
-    println!(
-        "Assert wave2_avg ({wave2_avg_ms:.2}ms) ≤ wave1_avg×1.20 ({threshold_ms:.2}ms)"
-    );
+    println!("Assert wave2_avg ({wave2_avg_ms:.2}ms) ≤ wave1_avg×1.20 ({threshold_ms:.2}ms)");
     assert!(
         wave2_avg_ms <= threshold_ms,
         "Wave 2 avg latency {wave2_avg_ms:.2}ms > {threshold_ms:.2}ms — \

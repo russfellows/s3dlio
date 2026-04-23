@@ -28,15 +28,19 @@ fn test_s3_uri_components_type() {
 #[test]
 fn test_warp_style_multi_endpoint_uris() {
     // Warp-style URIs with different IP addresses and ports
-    let uris = ["s3://192.168.100.1:9001/bucket/test.dat",
+    let uris = [
+        "s3://192.168.100.1:9001/bucket/test.dat",
         "s3://192.168.100.1:9002/bucket/test.dat",
         "s3://192.168.100.2:9001/bucket/test.dat",
-        "s3://192.168.100.2:9002/bucket/test.dat"];
+        "s3://192.168.100.2:9002/bucket/test.dat",
+    ];
 
-    let expected_endpoints = ["192.168.100.1:9001",
+    let expected_endpoints = [
+        "192.168.100.1:9001",
         "192.168.100.1:9002",
         "192.168.100.2:9001",
-        "192.168.100.2:9002"];
+        "192.168.100.2:9002",
+    ];
 
     for (uri, expected_endpoint) in uris.iter().zip(expected_endpoints.iter()) {
         let result = parse_s3_uri_full(uri).unwrap();
@@ -49,9 +53,11 @@ fn test_warp_style_multi_endpoint_uris() {
 #[test]
 fn test_minio_cluster_endpoints() {
     // Multiple MinIO servers in a cluster
-    let uris = ["s3://minio1.example.com:9000/mybucket/data/file1.bin",
+    let uris = [
+        "s3://minio1.example.com:9000/mybucket/data/file1.bin",
         "s3://minio2.example.com:9000/mybucket/data/file2.bin",
-        "s3://minio3.example.com:9000/mybucket/data/file3.bin"];
+        "s3://minio3.example.com:9000/mybucket/data/file3.bin",
+    ];
 
     for (idx, uri) in uris.iter().enumerate() {
         let result = parse_s3_uri_full(uri).unwrap();

@@ -527,7 +527,9 @@ pub fn build_smithy_http_client(
                  h2 window: {win_desc}"
             );
         }
-        H2cMode::ForceHttp1 => tracing::info!("HTTP version mode: HTTP/1.1 (S3DLIO_H2C unset or 0)"),
+        H2cMode::ForceHttp1 => {
+            tracing::info!("HTTP version mode: HTTP/1.1 (S3DLIO_H2C unset or 0)")
+        }
     }
 
     let h2c_client = build_reqwest_client_raw(ca_bundle_path, true)?;
@@ -593,7 +595,11 @@ pub async fn warmup_connection_pool(endpoint_url: &str, connections: usize) {
         .collect();
 
     join_all(tasks).await;
-    tracing::debug!("warmup_connection_pool: {} connections established to {}", connections, url);
+    tracing::debug!(
+        "warmup_connection_pool: {} connections established to {}",
+        connections,
+        url
+    );
 }
 
 #[cfg(test)]
@@ -728,7 +734,11 @@ mod tests {
         // "auto" → Auto (re-enables pre-v0.9.92 h2c probe-then-fallback behaviour)
         #[allow(deprecated)]
         std::env::set_var(ENV_S3DLIO_H2C, "auto");
-        assert_eq!(h2c_mode_from_env(), H2cMode::Auto, "expected Auto for 'auto'");
+        assert_eq!(
+            h2c_mode_from_env(),
+            H2cMode::Auto,
+            "expected Auto for 'auto'"
+        );
         // Restore
         #[allow(deprecated)]
         std::env::remove_var(ENV_S3DLIO_H2C);
