@@ -253,8 +253,7 @@ impl EnhancedMetricsCollector {
         }
 
         // Calculate and record throughput (bytes per second)
-        if latency_us > 0 {
-            let throughput_bps = (response_size * 1_000_000) / latency_us; // Convert to bytes per second
+        if let Some(throughput_bps) = (response_size * 1_000_000).checked_div(latency_us) {
             if let Some(histogram) = self.throughput_histograms.get_mut(operation) {
                 histogram.record(throughput_bps)?;
             }
