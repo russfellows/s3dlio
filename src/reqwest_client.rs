@@ -19,13 +19,14 @@
 //! | Endpoint scheme | Default behaviour | Override |
 //! |---|---|---|
 //! | `https://` | ALPN auto-negotiates h2 — **no config needed** | — |
-//! | `http://` | Probes h2c once; falls back to HTTP/1.1 if rejected | `S3DLIO_H2C=1` to force h2c with no fallback |
+//! | `http://` | **HTTP/1.1 (default)** | `S3DLIO_H2C=1` to force h2c; `S3DLIO_H2C=auto` is no longer the default |
 //!
-//! The h2c probe fires exactly once per process on the first plain-HTTP connection.
-//! If the server responds with anything other than a valid HTTP/2 frame (e.g.
-//! an HTTP/1.1 400), the probe is marked as failed, the connection is retried
-//! transparently on the HTTP/1.1 client, and all subsequent connections skip the
-//! probe.  `https://` endpoints are completely unaffected.
+//! **Default changed in v0.9.92**: plain `http://` endpoints now use HTTP/1.1 by default.
+//! Benchmarking showed HTTP/2 reduces throughput on `http://` endpoints compared with HTTP/1.1
+//! and an unlimited connection pool. Set `S3DLIO_H2C=1` to opt in to h2c.
+//!
+//! The h2c auto-probe mode (try h2c once, fall back if rejected) is still supported via
+//! `H2cMode::Auto` but is no longer the default. `https://` endpoints are completely unaffected.
 //!
 //! # Environment Variables
 //! All environment variable names and their defaults are defined in [`crate::constants`].
@@ -93,7 +94,7 @@ const H2C_AUTO_OK: u8 = 1; // probe succeeded — keep using h2c
 const H2C_AUTO_FAILED: u8 = 2; // probe failed — use HTTP/1.1 from now on
 
 /// Per-process h2c auto-probe state.  Transitions: UNKNOWN → OK or UNKNOWN → FAILED.
-/// Only consulted when `H2cMode::Auto` is active (the default).
+/// Only consulted when `H2cMode::Auto` is active.
 static H2C_AUTO_STATE: AtomicU8 = AtomicU8::new(H2C_AUTO_UNKNOWN);
 
 /// Which reqwest client to use for a given request.
@@ -113,7 +114,8 @@ pub(crate) enum ClientChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum H2cMode {
     /// Probe h2c on first plain-HTTP connection; fall back transparently if rejected.
-    /// This is the **default** when `S3DLIO_H2C` is not set.
+    /// **No longer the default** as of v0.9.92 (see [`crate::constants::DEFAULT_H2C_ENABLED`]).
+    /// Can still be selected programmatically; not reachable via [`h2c_mode_from_env`] with unset var.
     Auto,
     /// Always use h2c prior knowledge; never fall back.  Set via `S3DLIO_H2C=1`.
     ForceH2c,
@@ -400,13 +402,16 @@ pub(crate) fn h2c_enabled_from_val(val: &str) -> bool {
 ///
 /// | `S3DLIO_H2C` value | Mode |
 /// |---|---|
-/// | not set | `Auto` — probe h2c once, fall back to HTTP/1.1 if rejected |
+/// | not set | `ForceHttp1` — HTTP/1.1 (default since v0.9.92; see [`crate::constants::DEFAULT_H2C_ENABLED`]) |
 /// | truthy (`1`, `true`, …) | `ForceH2c` — always h2c, no fallback |
-/// | falsy (`0`, `false`, …) | `ForceHttp1` — skip probe, always HTTP/1.1 |
+/// | falsy (`0`, `false`, …) | `ForceHttp1` — always HTTP/1.1 |
 pub(crate) fn h2c_mode_from_env() -> H2cMode {
     match std::env::var(ENV_S3DLIO_H2C) {
-        Err(_) => H2cMode::Auto,
+        Err(_) => H2cMode::ForceHttp1, // default: HTTP/1.1 (changed from Auto in v0.9.92)
         Ok(v) if h2c_enabled_from_val(&v) => H2cMode::ForceH2c,
+        // S3DLIO_H2C=auto re-enables the pre-v0.9.92 behaviour: probe h2c on the
+        // first plain-HTTP connection and fall back to HTTP/1.1 if it fails.
+        Ok(v) if v.to_lowercase() == "auto" => H2cMode::Auto,
         Ok(_) => H2cMode::ForceHttp1,
     }
 }
@@ -522,7 +527,7 @@ pub fn build_smithy_http_client(
                  h2 window: {win_desc}"
             );
         }
-        H2cMode::ForceHttp1 => tracing::info!("HTTP version mode: forced HTTP/1.1 (S3DLIO_H2C=0)"),
+        H2cMode::ForceHttp1 => tracing::info!("HTTP version mode: HTTP/1.1 (S3DLIO_H2C unset or 0)"),
     }
 
     let h2c_client = build_reqwest_client_raw(ca_bundle_path, true)?;
@@ -549,6 +554,46 @@ pub fn build_reqwest_http_client_with_ca(
 /// Convenience wrapper — no custom CA bundle, HTTP/1.1 only.
 pub fn build_reqwest_http_client() -> reqwest::Client {
     build_reqwest_http_client_with_ca(None).expect("reqwest client build (no CA) should not fail")
+}
+
+/// Pre-warm the HTTP connection pool by opening `connections` parallel
+/// TCP connections to `endpoint_url`.
+///
+/// Fires `connections` concurrent HEAD requests to `endpoint_url` (e.g.
+/// `"http://127.0.0.1:9000"`).  By the time this function returns, the
+/// shared reqwest pool holds up to `connections` idle sockets, eliminating
+/// the TCP-handshake spike that would otherwise occur at the start of a
+/// high-concurrency benchmark.
+///
+/// HTTP 4xx/5xx responses are ignored — only TCP connectivity matters.
+/// Call this once, from an async context, before starting the workload.
+///
+/// # Example
+/// ```no_run
+/// # async fn example() {
+/// s3dlio::reqwest_client::warmup_connection_pool("http://127.0.0.1:9000", 128).await;
+/// # }
+/// ```
+pub async fn warmup_connection_pool(endpoint_url: &str, connections: usize) {
+    use futures::future::join_all;
+
+    let client = build_reqwest_http_client();
+    let url = endpoint_url.to_string();
+
+    let tasks: Vec<_> = (0..connections)
+        .map(|_| {
+            let c = client.clone();
+            let u = url.clone();
+            async move {
+                // HEAD to the root path — we only care about establishing the TCP
+                // connection, not the response status.
+                let _ = c.head(&u).send().await;
+            }
+        })
+        .collect();
+
+    join_all(tasks).await;
+    tracing::debug!("warmup_connection_pool: {} connections established to {}", connections, url);
 }
 
 #[cfg(test)]
@@ -656,10 +701,10 @@ mod tests {
     #[test]
     fn test_h2c_mode_from_env() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Not set → Auto
+        // Not set → ForceHttp1 (default since v0.9.92)
         #[allow(deprecated)]
         std::env::remove_var(ENV_S3DLIO_H2C);
-        assert_eq!(h2c_mode_from_env(), H2cMode::Auto);
+        assert_eq!(h2c_mode_from_env(), H2cMode::ForceHttp1);
         // Truthy → ForceH2c
         for val in &["1", "true", "yes", "on", "enable"] {
             #[allow(deprecated)]
@@ -680,6 +725,10 @@ mod tests {
                 "expected ForceHttp1 for '{val}'"
             );
         }
+        // "auto" → Auto (re-enables pre-v0.9.92 h2c probe-then-fallback behaviour)
+        #[allow(deprecated)]
+        std::env::set_var(ENV_S3DLIO_H2C, "auto");
+        assert_eq!(h2c_mode_from_env(), H2cMode::Auto, "expected Auto for 'auto'");
         // Restore
         #[allow(deprecated)]
         std::env::remove_var(ENV_S3DLIO_H2C);

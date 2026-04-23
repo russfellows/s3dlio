@@ -13,6 +13,7 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::{config::Region, Client};
 
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::{env, thread, time::Duration};
 use tokio::runtime::{Builder as TokioBuilder, Handle};
@@ -29,6 +30,37 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 // -----------------------------------------------------------------------------
 static RT_HANDLE: once_cell::sync::OnceCell<Handle> = once_cell::sync::OnceCell::new();
 static CLIENT: OnceCell<Client> = OnceCell::const_new();
+
+/// Concurrency hint set by [`configure_for_concurrency`].
+/// Zero means "not set" — `get_runtime_threads` uses the CPU-based default.
+static CONCURRENCY_HINT: AtomicUsize = AtomicUsize::new(0);
+
+/// Inform s3dlio of your expected peak concurrency level **before** the first
+/// S3 operation.
+///
+/// This hint is consulted exactly once when the global Tokio runtime is
+/// first initialized, so it **must** be called before any S3 I/O.
+///
+/// Effect: ensures the internal Tokio runtime has at least `n` worker threads
+/// so that sync/Python callers (which dispatch through the s3dlio runtime)
+/// can overlap `n` concurrent requests without thread starvation.
+///
+/// For async callers (e.g. sai3-bench or any `tokio::main` program) that bring
+/// their own runtime, this hint does not affect their thread pool — it only
+/// influences the s3dlio-internal runtime used by blocking/Python callers.
+///
+/// The connection pool is already unlimited by default
+/// (see [`crate::constants::DEFAULT_POOL_MAX_IDLE_PER_HOST`]), so no pool
+/// configuration is needed for throughput tuning.
+///
+/// # Example
+/// ```no_run
+/// s3dlio::configure_for_concurrency(128);
+/// // … now call blocking S3 helpers from 128 threads …
+/// ```
+pub fn configure_for_concurrency(n: usize) {
+    CONCURRENCY_HINT.store(n, Ordering::Relaxed);
+}
 
 // Create (once) a background multi-thread Tokio runtime and return its Handle.
 fn global_rt_handle() -> &'static Handle {
@@ -60,17 +92,39 @@ fn global_rt_handle() -> &'static Handle {
     })
 }
 
-/// Get optimal number of runtime threads with environment override
+/// Get optimal number of runtime threads with environment override.
+///
+/// Resolution order (first match wins):
+/// 1. `S3DLIO_RT_THREADS` env var (explicit override)
+/// 2. Concurrency hint from [`configure_for_concurrency`], if > CPU baseline
+/// 3. `max(4, num_cpus)` — scales with hardware, floor at 4 for tiny VMs
+///
+/// The old `min(cores×2, 32)` hard cap has been removed.  On a 96-core host
+/// it capped at 32, wasting 64 cores for Python/sync callers.  Tokio I/O
+/// threads sit in epoll/io_uring when idle — no CPU cost.
 fn get_runtime_threads() -> usize {
-    std::env::var("S3DLIO_RT_THREADS")
+    // Env var always wins.
+    if let Some(n) = std::env::var("S3DLIO_RT_THREADS")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            let cores = num_cpus::get();
-            let default_threads = std::cmp::max(8, cores * 2);
-            // Cap at reasonable maximum to avoid thread explosion
-            std::cmp::min(default_threads, 32)
-        })
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return n;
+    }
+
+    let cores = num_cpus::get();
+    // Floor at 4 for single/dual-core VMs.
+    let base = std::cmp::max(4, cores);
+
+    // Respect a concurrency hint (e.g. configure_for_concurrency(128) on a
+    // 4-core machine should give the runtime enough threads to interleave I/O
+    // for 128 tasks).  Cap at cores*4 to avoid unbounded thread creation on
+    // hosts with a tiny core count and a very large hint.
+    let hint = CONCURRENCY_HINT.load(Ordering::Relaxed);
+    if hint > base {
+        std::cmp::min(hint, cores * 4)
+    } else {
+        base
+    }
 }
 
 /// Run an async `fut` on the global runtime and block the **current** thread

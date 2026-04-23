@@ -36,6 +36,7 @@ use tracing_subscriber::EnvFilter;
 // Import shared functions from the crate.
 use s3dlio::{
     config::{Config, DataGenMode},
+    constants::MAX_JOBS,
     data_gen::generate_object,
     list_containers,
     multi_endpoint::{LoadBalanceStrategy, MultiEndpointStore},
@@ -155,8 +156,9 @@ enum Command {
         /// S3 URI (single key or prefix ending with `/`).
         uri: String,
 
-        /// Batch size (number of parallel delete calls).
-        #[arg(short = 'j', long = "jobs", default_value_t = 1000)]
+        /// Batch size (number of keys per DeleteObjects API call).
+        /// The S3 API accepts up to 1,000 keys per batch request.
+        #[arg(short = 'j', long = "jobs", default_value_t = 1000, value_parser = parse_jobs)]
         jobs: usize,
 
         /// Perform the operation recursively.
@@ -172,12 +174,14 @@ enum Command {
         /// S3 URI – can be a full key or a prefix ending with `/`.
         uri: Option<String>,
 
-        /// Maximum concurrent GET requests.
-        #[arg(short = 'j', long = "jobs", default_value_t = 64)]
+        /// Maximum concurrent GET requests (default 64, max 4096).
+        /// Accepts human suffixes: k=1,000  m=1,000,000  (e.g. 64, 128, 256).
+        #[arg(short = 'j', long = "jobs", default_value_t = 64, value_parser = parse_jobs)]
         jobs: usize,
 
         /// Alternative: maximum concurrent GET requests (for mp compatibility).
-        #[arg(long = "concurrent")]
+        /// Accepts human suffixes: k=1,000  m=1,000,000 (max 4096).
+        #[arg(long = "concurrent", value_parser = parse_jobs)]
         concurrent: Option<usize>,
 
         /// File containing list of S3 URIs to download (one per line).
@@ -216,11 +220,15 @@ enum Command {
         dedup_f: usize,
 
         /// Maximum concurrent uploads (jobs), but is modified to be min(jobs, num).
-        #[arg(short = 'j', long = "jobs", default_value_t = 32)]
+        /// Accepts human suffixes: k=1,000 (e.g. 32, 64, 256, max is: 4096).
+        #[arg(short = 'j', long = "jobs", default_value_t = 32, value_parser = parse_jobs)]
         jobs: usize,
 
         /// Number of objects to create and upload.
-        #[arg(short = 'n', long = "num", default_value_t = 1)]
+        /// Accepts human suffixes: 1k=1,000  1m=1,000,000  1g=1,000,000,000
+        /// and binary suffixes: 1ki=1,024  1mi=1,048,576  1gi=1,073,741,824.
+        /// Examples: 100000000  100m  1g
+        #[arg(short = 'n', long = "num", default_value_t = 1, value_parser = parse_human_count)]
         num: usize,
 
         /// Specify Type of object to generate:
@@ -261,8 +269,9 @@ enum Command {
         files: Vec<PathBuf>,
         /// Destination URI (s3://bucket/, az://container/, gs://bucket/, file:///path/, direct:///path/) **ending with '/'**
         dest: String,
-        /// Maximum parallel uploads
-        #[arg(short = 'j', long = "jobs", default_value_t = 32)]
+        /// Maximum parallel uploads (default 32, max 4096).
+        /// Accepts human suffixes: k=1,000  m=1,000,000 (e.g. 32, 64, 256).
+        #[arg(short = 'j', long = "jobs", default_value_t = 32, value_parser = parse_jobs)]
         jobs: usize,
         /// Create the bucket if it doesn’t exist
         #[arg(short = 'c', long = "create-bucket")]
@@ -274,8 +283,9 @@ enum Command {
         src: String,
         /// Local directory to write into
         dest_dir: PathBuf,
-        /// Maximum parallel downloads
-        #[arg(short = 'j', long = "jobs", default_value_t = 64)]
+        /// Maximum parallel downloads (default 64, max 4096).
+        /// Accepts human suffixes: k=1,000  m=1,000,000 (e.g. 64, 128, 256).
+        #[arg(short = 'j', long = "jobs", default_value_t = 64, value_parser = parse_jobs)]
         jobs: usize,
         /// Download recursively
         #[clap(short, long)]
@@ -292,8 +302,9 @@ enum Command {
         src: String,
         /// Destination local path or storage URI
         dest: String,
-        /// Maximum parallel operations
-        #[arg(short = 'j', long = "jobs", default_value_t = 32)]
+        /// Maximum parallel operations (default 32, max 4096).
+        /// Accepts human suffixes: k=1,000  m=1,000,000 (e.g. 32, 64, 256).
+        #[arg(short = 'j', long = "jobs", default_value_t = 32, value_parser = parse_jobs)]
         jobs: usize,
         /// Recursive mode for URI-prefix downloads
         #[clap(short, long)]
@@ -445,8 +456,141 @@ fn is_storage_uri(path_or_uri: &str) -> bool {
         || path_or_uri.starts_with("direct://")
 }
 
+/// Strip visual thousands-separator characters from a human-readable number string.
+///
+/// Always strips `_` (universal). Also strips the locale thousands-separator
+/// character when it is a single non-alphanumeric character (e.g. `,` in
+/// en-US, `.` in de-DE).  Only the *thousands* separator is stripped — the
+/// *decimal-point* character is never touched, so `8.5m` still fails cleanly
+/// in en-US locales.
+///
+/// Applied to the raw input before digit scanning so that `100_000_000`,
+/// `100,000,000`, and `100.000.000` all parse correctly.
+fn strip_separators(s: &str) -> String {
+    let locale_sep: Option<char> = {
+        #[cfg(unix)]
+        unsafe {
+            let lc = libc::localeconv();
+            if !lc.is_null() {
+                let sep_ptr = (*lc).thousands_sep;
+                if !sep_ptr.is_null() {
+                    if let Ok(sep_str) = std::ffi::CStr::from_ptr(sep_ptr).to_str() {
+                        let mut chars = sep_str.chars();
+                        if let Some(ch) = chars.next() {
+                            if chars.next().is_none() && !ch.is_alphanumeric() {
+                                Some(ch)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        #[cfg(not(unix))]
+        { None }
+    };
+    s.chars().filter(|&c| c != '_' && Some(c) != locale_sep).collect()
+}
+
+/// Parse a human-readable count (number of objects, jobs, etc.) from a string.
+///
+/// Accepts a plain integer or a number followed by a metric (SI) or binary (IEC) suffix.
+/// Suffixes are **case-insensitive**.
+///
+/// | Suffix              | Meaning         | Value             |
+/// |---------------------|-----------------|-------------------|
+/// | *(none)*            | exact count     | 1                 |
+/// | `k`, `kb`           | kilo (SI)       | 1,000             |
+/// | `m`, `mb`           | mega (SI)       | 1,000,000         |
+/// | `g`, `gb`           | giga (SI)       | 1,000,000,000     |
+/// | `ki`, `kib`         | kibi (binary)   | 1,024             |
+/// | `mi`, `mib`         | mebi (binary)   | 1,048,576         |
+/// | `gi`, `gib`         | gibi (binary)   | 1,073,741,824     |
+///
+/// # Examples
+///
+/// ```text
+/// 100000000  =>  100,000,000   (plain integer)
+/// 100m       =>  100,000,000   (SI mega)
+/// 1g         =>    1,000,000,000
+/// 384k       =>      384,000
+/// 1ki        =>        1,024   (binary kibi)
+/// 1Mi        =>    1,048,576   (binary mebi)
+/// ```
+fn parse_human_count(input: &str) -> std::result::Result<usize, String> {
+    let stripped = strip_separators(input.trim());
+    let trimmed = stripped.as_str();
+    if trimmed.is_empty() {
+        return Err("count cannot be empty".to_string());
+    }
+
+    let numeric_len = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+
+    if numeric_len == 0 {
+        return Err(format!("invalid count '{}': must start with digits", input));
+    }
+
+    let (value_str, suffix_str) = trimmed.split_at(numeric_len);
+    let value: u128 = value_str
+        .parse()
+        .map_err(|_| format!("invalid count '{}': invalid number", input))?;
+
+    let suffix = suffix_str.trim().to_ascii_lowercase();
+    let multiplier: u128 = match suffix.as_str() {
+        "" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "ki" | "kib" => 1_024,
+        "mi" | "mib" => 1_048_576,
+        "gi" | "gib" => 1_073_741_824,
+        _ => {
+            return Err(format!(
+                "invalid count '{}': unsupported suffix '{}'. \
+                 Use k/m/g for SI (1k=1,000  1m=1,000,000  1g=1,000,000,000) \
+                 or ki/mi/gi for binary (1ki=1,024  1mi=1,048,576  1gi=1,073,741,824)",
+                input, suffix_str
+            ))
+        }
+    };
+
+    let count = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("invalid count '{}': value is too large", input))?;
+
+    usize::try_from(count)
+        .map_err(|_| format!("invalid count '{}': value exceeds platform usize limit", input))
+}
+
+/// Like `parse_human_count` but enforces `MAX_JOBS` as an upper bound.
+///
+/// Used for `--jobs` arguments across all subcommands.  The ceiling is defined
+/// in `s3dlio::constants::MAX_JOBS` (currently 4,096).
+fn parse_jobs(input: &str) -> std::result::Result<usize, String> {
+    let n = parse_human_count(input)?;
+    if n > MAX_JOBS {
+        return Err(format!(
+            "invalid jobs value '{}': {} exceeds the maximum of {} jobs. \
+             On even the largest systems (256-core hosts) values above {} are \
+             counterproductive due to connection overhead.",
+            input, n, MAX_JOBS, MAX_JOBS
+        ));
+    }
+    Ok(n)
+}
+
 fn parse_human_size(input: &str) -> std::result::Result<usize, String> {
-    let trimmed = input.trim();
+    let stripped = strip_separators(input.trim());
+    let trimmed = stripped.as_str();
     if trimmed.is_empty() {
         return Err("size cannot be empty".to_string());
     }
@@ -2208,9 +2352,10 @@ async fn put_many_cmd(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_s3_endpoint_uris, build_s3_host_root_uris, extract_container_name, parse_human_size,
-        Cli, Command,
+        build_s3_endpoint_uris, build_s3_host_root_uris, extract_container_name,
+        parse_human_count, parse_human_size, parse_jobs, Cli, Command,
     };
+    use s3dlio::constants::MAX_JOBS;
     use clap::Parser;
 
     // ------------------------------------------------------------------
@@ -2366,6 +2511,98 @@ mod tests {
         assert!(parse_human_size("mb").is_err());
         assert!(parse_human_size("8XB").is_err());
         assert!(parse_human_size("8.5MB").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // parse_human_count — SI and binary count suffixes
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_human_count_accepts_plain_integers() {
+        assert_eq!(parse_human_count("0").unwrap(), 0);
+        assert_eq!(parse_human_count("1").unwrap(), 1);
+        assert_eq!(parse_human_count("100000000").unwrap(), 100_000_000);
+        assert_eq!(parse_human_count("384").unwrap(), 384);
+    }
+
+    #[test]
+    fn parse_human_count_si_suffixes() {
+        // SI: k=1,000  m=1,000,000  g=1,000,000,000 (case-insensitive)
+        assert_eq!(parse_human_count("1k").unwrap(), 1_000);
+        assert_eq!(parse_human_count("1K").unwrap(), 1_000);
+        assert_eq!(parse_human_count("1kb").unwrap(), 1_000);
+        assert_eq!(parse_human_count("1KB").unwrap(), 1_000);
+        assert_eq!(parse_human_count("100m").unwrap(), 100_000_000);
+        assert_eq!(parse_human_count("100M").unwrap(), 100_000_000);
+        assert_eq!(parse_human_count("100mb").unwrap(), 100_000_000);
+        assert_eq!(parse_human_count("1g").unwrap(), 1_000_000_000);
+        assert_eq!(parse_human_count("1G").unwrap(), 1_000_000_000);
+        assert_eq!(parse_human_count("1gb").unwrap(), 1_000_000_000);
+        assert_eq!(parse_human_count("384k").unwrap(), 384_000);
+    }
+
+    #[test]
+    fn parse_human_count_binary_suffixes() {
+        // Binary: ki=1,024  mi=1,048,576  gi=1,073,741,824 (case-insensitive)
+        assert_eq!(parse_human_count("1ki").unwrap(), 1_024);
+        assert_eq!(parse_human_count("1Ki").unwrap(), 1_024);
+        assert_eq!(parse_human_count("1kib").unwrap(), 1_024);
+        assert_eq!(parse_human_count("1KiB").unwrap(), 1_024);
+        assert_eq!(parse_human_count("1mi").unwrap(), 1_048_576);
+        assert_eq!(parse_human_count("1Mi").unwrap(), 1_048_576);
+        assert_eq!(parse_human_count("1mib").unwrap(), 1_048_576);
+        assert_eq!(parse_human_count("1MiB").unwrap(), 1_048_576);
+        assert_eq!(parse_human_count("1gi").unwrap(), 1_073_741_824);
+        assert_eq!(parse_human_count("1Gi").unwrap(), 1_073_741_824);
+        assert_eq!(parse_human_count("1gib").unwrap(), 1_073_741_824);
+    }
+
+    #[test]
+    fn parse_human_count_rejects_invalid_values() {
+        assert!(parse_human_count("").is_err());       // empty
+        assert!(parse_human_count("m").is_err());      // suffix without number
+        assert!(parse_human_count("8XB").is_err());    // unknown suffix
+        assert!(parse_human_count("8.5m").is_err());   // decimal not supported (en-US locale)
+        assert!(parse_human_count("8b").is_err());     // 'b' is not a valid count suffix
+    }
+
+    #[test]
+    fn parse_human_count_strips_separators() {
+        // Underscore is always stripped (universal visual separator)
+        assert_eq!(parse_human_count("100_000_000").unwrap(), 100_000_000);
+        assert_eq!(parse_human_count("1_000").unwrap(), 1_000);
+        assert_eq!(parse_human_count("100_000m").unwrap(), 100_000 * 1_000_000);
+        // Leading/trailing underscores around the suffix are fine
+        assert_eq!(parse_human_count("1_000k").unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn parse_human_size_strips_separators() {
+        // Underscore is always stripped
+        assert_eq!(parse_human_size("8_388_608").unwrap(), 8_388_608);
+        assert_eq!(parse_human_size("1_024k").unwrap(), 1_024_000);
+        assert_eq!(parse_human_size("1_048_576b").unwrap(), 1_048_576);
+    }
+
+    // ------------------------------------------------------------------
+    // parse_jobs — wraps parse_human_count with MAX_JOBS ceiling
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_jobs_accepts_reasonable_values() {
+        assert_eq!(parse_jobs("1").unwrap(), 1);
+        assert_eq!(parse_jobs("32").unwrap(), 32);
+        assert_eq!(parse_jobs("64").unwrap(), 64);
+        assert_eq!(parse_jobs("256").unwrap(), 256);
+        assert_eq!(parse_jobs("1000").unwrap(), 1000); // delete default
+        assert_eq!(parse_jobs(&MAX_JOBS.to_string()).unwrap(), MAX_JOBS); // exactly at ceiling
+    }
+
+    #[test]
+    fn parse_jobs_rejects_above_max() {
+        assert!(parse_jobs(&(MAX_JOBS + 1).to_string()).is_err());
+        assert!(parse_jobs("5000").is_err());
+        assert!(parse_jobs("1m").is_err()); // 1,000,000 >> MAX_JOBS
     }
 
     // ------------------------------------------------------------------

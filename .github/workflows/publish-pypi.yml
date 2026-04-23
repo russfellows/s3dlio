@@ -30,7 +30,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --interpreter python3.12 python3.13 --features extension-module
+          args: --release --out dist --interpreter python3.11 python3.12 python3.13 --features extension-module
           sccache: 'true'
           manylinux: auto
           before-script-linux: |

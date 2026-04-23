@@ -188,6 +188,10 @@ pub mod concurrency;
 mod multipart;
 pub mod reqwest_client; // Reqwest-based HTTP client for AWS SDK (h2c + connection pool tuning)
 
+// Connection-pool / runtime tuning helpers — available at the crate root for
+// ergonomic use: `s3dlio::configure_for_concurrency(128)`.
+pub use s3_client::configure_for_concurrency;
+
 // ===== Legacy Re-exports for Backward Compatibility =====
 // DEPRECATED FUNCTIONS REMOVED - Use fill_controlled_data() or data_gen_alt instead
 // Old exports commented out to prevent accidental usage:

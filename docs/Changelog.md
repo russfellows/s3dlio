@@ -1,5 +1,84 @@
 # s3dlio Changelog
 
+## Version 0.9.92 — Default HTTP/2 off, unlimited connection pool, runtime scaling, concurrency API (April 2026)
+
+### Summary of code changes
+
+| Fix | File(s) | Change |
+|-----|---------|--------|
+| 1 — Unlimited connection pool | `src/constants.rs` | `DEFAULT_POOL_MAX_IDLE_PER_HOST`: `32` → `usize::MAX`. Pool still shrinks via `pool_idle_timeout` (90 s). Doc comment explains the 794 µs root cause at high concurrency. |
+| 2 — Thread cap removed | `src/s3_client.rs` | `get_runtime_threads()`: replaced `min(max(8, cores*2), 32)` with `max(4, cores)`. 28-core machine unchanged (28 threads); 96-core machine goes 32 → 96. |
+| 3 — Concurrency hint API | `src/s3_client.rs`, `src/lib.rs` | Added `CONCURRENCY_HINT: AtomicUsize` static and `pub fn configure_for_concurrency(n: usize)`, exported at crate root as `s3dlio::configure_for_concurrency`. If the hint exceeds the CPU baseline, runtime thread count is `min(hint, cores*4)`. Must be called before the first S3 operation. |
+| 4 — Connection pool warmup | `src/reqwest_client.rs` | Added `pub async fn warmup_connection_pool(endpoint_url: &str, connections: usize)` — fires `connections` concurrent HEAD requests to pre-fill the pool and eliminate TCP handshake storms at benchmark start. |
+| 5 — HTTP/2 default off | `src/constants.rs`, `src/reqwest_client.rs` | `DEFAULT_H2C_ENABLED = false` added. `h2c_mode_from_env()` now returns `ForceHttp1` when `S3DLIO_H2C` is unset (was `Auto`). Benchmarking showed HTTP/2 reduces throughput on plain `http://` endpoints. Set `S3DLIO_H2C=1` to opt in. |
+
+All changes compile with zero warnings; **243 tests pass**.
+
+### Breaking change: `S3DLIO_H2C` default changed to HTTP/1.1
+
+HTTP/2 on plain `http://` endpoints is now **off by default**. Benchmarking on loopback TCP
+showed HTTP/2 reduces PUT/GET throughput compared with HTTP/1.1 and an unlimited connection pool.
+The `Auto` mode (probe h2c once, fall back if rejected) is no longer the default.
+
+| Scenario | Before v0.9.92 | v0.9.92+ |
+|---|---|---|
+| `S3DLIO_H2C` not set, `http://` endpoint | h2c probe once, HTTP/1.1 fallback | **HTTP/1.1 (no probe)** |
+| `S3DLIO_H2C=1`, `http://` endpoint | Force h2c, no fallback | Force h2c, no fallback (unchanged) |
+| `S3DLIO_H2C=0`, `http://` endpoint | Force HTTP/1.1 | Force HTTP/1.1 (unchanged) |
+| Any `https://` endpoint | HTTP/2 via TLS ALPN | HTTP/2 via TLS ALPN (unchanged) |
+
+Set `S3DLIO_H2C=1` to restore h2c for storage systems that require HTTP/2 on `http://` endpoints.
+The new default is documented in `src/constants.rs` as `DEFAULT_H2C_ENABLED = false`.
+
+### Performance: connection pool default changed to unlimited
+
+`S3DLIO_POOL_MAX_IDLE_PER_HOST` default changed from `32` to `usize::MAX` (unlimited).
+
+With t=128 concurrent workers and a pool cap of 32, the 96 workers that couldn't hold an idle
+connection paid a full TCP handshake penalty on every request (~794 µs on loopback). This capped
+throughput at ~47k ops/s externally vs ~240k ops/s in-process. With an unlimited pool, idle
+connections are retained for all workers; the `S3DLIO_POOL_IDLE_TIMEOUT_SECS` (default 90 s)
+eviction timer handles cleanup when load drops.
+
+Set `S3DLIO_POOL_MAX_IDLE_PER_HOST=<n>` to impose a hard ceiling in memory-constrained environments.
+
+### Performance: s3dlio internal runtime thread cap removed
+
+`get_runtime_threads()` previously capped at 32 even on large machines (e.g. 96-core hosts got
+32 Tokio threads). The cap is removed; the default is now `max(4, num_cpus)`. The floor of 4
+prevents thread starvation on single/dual-core VMs. This primarily benefits Python/sync callers
+that route through the s3dlio-internal runtime.
+
+### New API: `configure_for_concurrency(n)`
+
+```rust
+s3dlio::configure_for_concurrency(128);
+// … then call blocking S3 helpers from 128 threads …
+```
+
+Must be called before the first S3 operation. Ensures the internal Tokio runtime has enough
+threads to overlap `n` concurrent requests for blocking/Python callers. Ignored by async callers
+(e.g. sai3-bench) that bring their own runtime.
+
+### New API: `reqwest_client::warmup_connection_pool(endpoint_url, n)`
+
+```rust
+s3dlio::reqwest_client::warmup_connection_pool("http://127.0.0.1:9000", 128).await;
+```
+
+Fires `n` concurrent HEAD requests to pre-fill the connection pool before benchmarking, eliminating
+the TCP handshake storm at burst start that biases early-window latency measurements.
+
+### CLI improvements (carried from in-progress work)
+
+- `parse_human_count()`: `--num` argument accepts human suffixes (`1k`, `100m`, `1g`, binary `1ki`,
+  `1mi`, `1gi`) and underscore separators (`100_000_000`).
+- `parse_jobs()`: all `--jobs` / `--concurrent` arguments clamped to `MAX_JOBS = 4_096` with a
+  clear error on overflow.
+- `MAX_JOBS = 4_096` added to `src/constants.rs`.
+
+---
+
 ## Version 0.9.90 - AIStore Full Support, TLS Security Fixes, HTTP/2, 5 Issues Closed (April 2026)
 
 ### Feature: Full NVIDIA AIStore support — redirects + complete TLS security (closes #126)
