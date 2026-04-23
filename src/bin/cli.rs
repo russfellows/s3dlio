@@ -476,7 +476,9 @@ fn strip_separators(s: &str) -> String {
                 if !sep_ptr.is_null() {
                     if let Ok(sep_str) = std::ffi::CStr::from_ptr(sep_ptr).to_str() {
                         let mut chars = sep_str.chars();
-                        chars.next().filter(|&ch| chars.next().is_none() && !ch.is_alphanumeric())
+                        chars
+                            .next()
+                            .filter(|&ch| chars.next().is_none() && !ch.is_alphanumeric())
                     } else {
                         None
                     }
@@ -488,9 +490,13 @@ fn strip_separators(s: &str) -> String {
             }
         }
         #[cfg(not(unix))]
-        { None }
+        {
+            None
+        }
     };
-    s.chars().filter(|&c| c != '_' && Some(c) != locale_sep).collect()
+    s.chars()
+        .filter(|&c| c != '_' && Some(c) != locale_sep)
+        .collect()
 }
 
 /// Parse a human-readable count (number of objects, jobs, etc.) from a string.
@@ -559,8 +565,12 @@ fn parse_human_count(input: &str) -> std::result::Result<usize, String> {
         .checked_mul(multiplier)
         .ok_or_else(|| format!("invalid count '{}': value is too large", input))?;
 
-    usize::try_from(count)
-        .map_err(|_| format!("invalid count '{}': value exceeds platform usize limit", input))
+    usize::try_from(count).map_err(|_| {
+        format!(
+            "invalid count '{}': value exceeds platform usize limit",
+            input
+        )
+    })
 }
 
 /// Like `parse_human_count` but enforces `MAX_JOBS` as an upper bound.
@@ -2344,11 +2354,11 @@ async fn put_many_cmd(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_s3_endpoint_uris, build_s3_host_root_uris, extract_container_name,
-        parse_human_count, parse_human_size, parse_jobs, Cli, Command,
+        build_s3_endpoint_uris, build_s3_host_root_uris, extract_container_name, parse_human_count,
+        parse_human_size, parse_jobs, Cli, Command,
     };
-    use s3dlio::constants::MAX_JOBS;
     use clap::Parser;
+    use s3dlio::constants::MAX_JOBS;
 
     // ------------------------------------------------------------------
     // extract_container_name — no network access, pure string parsing
@@ -2551,11 +2561,11 @@ mod tests {
 
     #[test]
     fn parse_human_count_rejects_invalid_values() {
-        assert!(parse_human_count("").is_err());       // empty
-        assert!(parse_human_count("m").is_err());      // suffix without number
-        assert!(parse_human_count("8XB").is_err());    // unknown suffix
-        assert!(parse_human_count("8.5m").is_err());   // decimal not supported (en-US locale)
-        assert!(parse_human_count("8b").is_err());     // 'b' is not a valid count suffix
+        assert!(parse_human_count("").is_err()); // empty
+        assert!(parse_human_count("m").is_err()); // suffix without number
+        assert!(parse_human_count("8XB").is_err()); // unknown suffix
+        assert!(parse_human_count("8.5m").is_err()); // decimal not supported (en-US locale)
+        assert!(parse_human_count("8b").is_err()); // 'b' is not a valid count suffix
     }
 
     #[test]

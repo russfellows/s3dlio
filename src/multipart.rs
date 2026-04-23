@@ -151,10 +151,10 @@ impl Drop for MultipartUploadSink {
         }
         // Drop the sender — coordinator will see channel closed and can abort.
         // Also fire-and-forget an explicit AbortMultipartUpload for safety.
-        let client     = self.client.clone();
-        let bucket     = self.bucket.clone();
-        let key        = self.key.clone();
-        let upload_id  = self.upload_id.clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key.clone();
+        let upload_id = self.upload_id.clone();
         let _ = run_on_global_rt(async move {
             let _ = client
                 .abort_multipart_upload()
@@ -193,7 +193,9 @@ impl MultipartUploadSink {
             }
         }
 
-        let resolved_mif = cfg.max_in_flight.unwrap_or_else(|| auto_max_in_flight(cfg.part_size));
+        let resolved_mif = cfg
+            .max_in_flight
+            .unwrap_or_else(|| auto_max_in_flight(cfg.part_size));
 
         let client = aws_s3_client_async().await?;
         let mut req = client.create_multipart_upload().bucket(bucket).key(key);
@@ -427,9 +429,9 @@ impl MultipartUploadSink {
         // Drop the sender — coordinator sees channel closed and exits.
         // The Drop impl fires AbortMultipartUpload.
         self.finished = true; // prevent Drop from double-aborting
-        let client    = self.client.clone();
-        let bucket    = self.bucket.clone();
-        let key       = self.key.clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key.clone();
         let upload_id = self.upload_id.clone();
 
         let _ = run_on_global_rt(async move {
@@ -524,9 +526,9 @@ async fn coordinator_task(
             .await
             .map_err(|_| anyhow::anyhow!("semaphore closed"))?;
 
-        let c  = client.clone();
-        let b  = bucket.clone();
-        let k  = key.clone();
+        let c = client.clone();
+        let b = bucket.clone();
+        let k = key.clone();
         let uid = upload_id.clone();
 
         let handle = tokio::task::spawn(async move {
@@ -618,7 +620,8 @@ mod tests {
             .expect("must fail with part_size < 5 MiB");
         assert!(
             err.to_string().contains("5 MiB"),
-            "error must mention 5 MiB minimum, got: {}", err
+            "error must mention 5 MiB minimum, got: {}",
+            err
         );
     }
 
@@ -634,7 +637,8 @@ mod tests {
             .expect("must fail with max_in_flight = 0");
         assert!(
             err.to_string().contains("max_in_flight"),
-            "error must mention max_in_flight, got: {}", err
+            "error must mention max_in_flight, got: {}",
+            err
         );
     }
 
@@ -645,7 +649,10 @@ mod tests {
         let err = MultipartUploadSink::from_uri("not-a-valid-uri", cfg)
             .err()
             .expect("must fail for invalid URI");
-        assert!(!err.to_string().is_empty(), "error message must not be empty");
+        assert!(
+            !err.to_string().is_empty(),
+            "error message must not be empty"
+        );
     }
 
     /// Default MultipartUploadConfig has valid values.
@@ -654,11 +661,16 @@ mod tests {
         let cfg = MultipartUploadConfig::default();
         assert!(
             cfg.part_size >= MIN_S3_MULTIPART_PART_SIZE,
-            "default part_size {} must be >= MIN {}", cfg.part_size, MIN_S3_MULTIPART_PART_SIZE
+            "default part_size {} must be >= MIN {}",
+            cfg.part_size,
+            MIN_S3_MULTIPART_PART_SIZE
         );
         assert!(cfg.abort_on_drop, "default abort_on_drop should be true");
         // max_in_flight=None means auto
-        assert!(cfg.max_in_flight.is_none(), "default max_in_flight should be None (auto)");
+        assert!(
+            cfg.max_in_flight.is_none(),
+            "default max_in_flight should be None (auto)"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -668,16 +680,16 @@ mod tests {
     #[test]
     fn test_auto_max_in_flight_floor() {
         // Any part size large enough to produce a value below 32 should still give 32.
-        assert_eq!(auto_max_in_flight(64 * 1024 * 1024), 32);  // 64 MiB → 8, floor=32
+        assert_eq!(auto_max_in_flight(64 * 1024 * 1024), 32); // 64 MiB → 8, floor=32
         assert_eq!(auto_max_in_flight(128 * 1024 * 1024), 32); // 128 MiB → 4, floor=32
     }
 
     #[test]
     fn test_auto_max_in_flight_scales_with_small_parts() {
         // Small parts produce larger max_in_flight.
-        let mif_8mib  = auto_max_in_flight(8 * 1024 * 1024);  // 512/8 = 64
+        let mif_8mib = auto_max_in_flight(8 * 1024 * 1024); // 512/8 = 64
         let mif_16mib = auto_max_in_flight(16 * 1024 * 1024); // 512/16 = 32
-        assert_eq!(mif_8mib,  64);
+        assert_eq!(mif_8mib, 64);
         assert_eq!(mif_16mib, 32);
     }
 
@@ -694,7 +706,9 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<i32>(4);
         // blocking_send must panic when called from within a Tokio runtime.
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            rt.block_on(async { let _ = tx.blocking_send(42); })
+            rt.block_on(async {
+                let _ = tx.blocking_send(42);
+            })
         }));
         assert!(
             result.is_err(),
@@ -718,4 +732,3 @@ mod tests {
         }
     }
 }
-
