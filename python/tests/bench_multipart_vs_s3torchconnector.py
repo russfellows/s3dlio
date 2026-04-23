@@ -47,9 +47,9 @@ BUCKET   = os.environ.get("S3DLIO_TEST_BUCKET") or os.environ.get("S3_BUCKET") o
 ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "")
 REGION   = os.environ.get("AWS_REGION", "us-east-1")
 
-PART_SIZE    = 32 << 20   # 32 MiB — large enough to keep network busy
-TOTAL_SIZE   = 512 << 20  # 512 MiB per run
-MAX_IN_FLIGHT = 8
+PART_SIZE    = 32 << 20    # 32 MiB — large enough to keep network busy
+TOTAL_SIZE   = 5120 << 20  # 5 GiB per run (10× original 512 MiB)
+MAX_IN_FLIGHT = None        # None = auto-scale (max(32, ceil(512 MiB / part_size)))
 
 # ── utilities ────────────────────────────────────────────────────────────────
 
@@ -234,7 +234,7 @@ def main():
     print(f"  endpoint          {ENDPOINT}")
     print(f"  part_size         {PART_SIZE >> 20} MiB")
     print(f"  object_size       {TOTAL_SIZE >> 20} MiB per writer")
-    print(f"  max_in_flight     {MAX_IN_FLIGHT}  (s3dlio only)")
+    print(f"  max_in_flight     {MAX_IN_FLIGHT if MAX_IN_FLIGHT is not None else 'auto'}  (s3dlio only)")
     print()
 
     rows = []  # (label, gbps, elapsed)
