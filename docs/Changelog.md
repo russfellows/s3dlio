@@ -18,6 +18,13 @@ panic class via `std::panic::catch_unwind`.
 
 **Test count**: 580 passing (247 Rust unit tests + Python integration tests).
 
+### CI / Release workflow updates (`.github/workflows/`)
+
+| File | Change |
+|---|---|
+| `ci.yml` | Removed Python 3.10 (unsupported by our PyO3 version); added `ubuntu-24.04-arm` runner — CI now tests 3.11, 3.12, 3.13 on both x86_64 and aarch64 (6 matrix jobs) |
+| `publish-pypi.yml` | Added `aarch64` to wheel build matrix; `runs-on` selects `ubuntu-24.04-arm` natively for ARM builds; result: 6 wheels published per release (3 Python versions × 2 architectures) plus sdist |
+
 ---
 
 ## Version 0.9.92 — Multipart upload: coordinator task, auto-scale max_in_flight, panic fix (April 2026)

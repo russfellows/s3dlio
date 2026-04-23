@@ -18,7 +18,7 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 >
 > **Async safety fixes:** `write()`, `write_owned()`, `flush()`, and a new `finish()` method are now genuinely async — they use `send().await` instead of `blocking_send`, making them safe to call from any Tokio task. A proof-of-concept unit test (`test_blocking_send_panics_inside_tokio_runtime`) documents the pre-fix panic class. `MAX_MULTIPART_PARTS` (10 000) is now enforced at write time with a clear error.
 >
-> **v0.9.90 highlights also in this release:** Full NVIDIA AIStore redirect support, HTTP/2 (ALPN + h2c), connection pool autoscale, unlimited pool size, runtime thread scaling, `list_containers()` in Python API, GCS delete propagation fix, small object PUT rounding fix. See [docs/Changelog.md](docs/Changelog.md) for full history.
+> **v0.9.90 highlights also in this release:** Full NVIDIA AIStore redirect support, HTTP/2 (opt-in via `S3DLIO_H2C=1`, not the default — HTTP/1.1 is almost always faster), connection pool autoscale, unlimited pool size, runtime thread scaling, `list_containers()` in Python API, GCS delete propagation fix, small object PUT rounding fix. See [docs/Changelog.md](docs/Changelog.md) for full history.
 
 ## 📦 Installation
 
@@ -213,7 +213,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 - **High Performance**: High-throughput multi GB/s reads and writes on platforms with sufficient network and storage capabilities
 - **Zero-Copy Architecture**: `bytes::Bytes` throughout for minimal memory overhead
 - **Multi-Protocol**: S3, Azure Blob, GCS, file://, direct:// (O_DIRECT)
-- **HTTP/2 Support (NEW)**: s3dlio now speaks HTTP/2. On `https://` endpoints, HTTP/2 is negotiated automatically via TLS ALPN — no configuration needed. On `http://` endpoints, cleartext h2c (HTTP/2 prior-knowledge) is available for storage systems that support it. Control via `S3DLIO_H2C`: `=1` forces h2c, `=0` forces HTTP/1.1, unset = auto. HTTP/2 multiplexing enables far higher request rates on supporting servers. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+- **HTTP/2 Support (opt-in)**: HTTP/2 is available but **HTTP/1.1 is the default** — HTTP/2 is almost always slower for bulk storage workloads. Opt in by setting `S3DLIO_H2C=1`. Both TLS ALPN (`https://`) and cleartext h2c (`http://`) are supported when enabled. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 - **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
 - **Multi-Endpoint Load Balancing**: RoundRobin/LeastConnections across storage endpoints
 - **AI/ML Ready**: PyTorch DataLoader integration, TFRecord/NPZ format support
@@ -221,10 +221,11 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.90** (April 2026) — **HTTP/2 support lands in s3dlio.** Both TLS (`https://`, via ALPN) and cleartext h2c (`http://`, prior-knowledge) are now fully supported. `S3DLIO_H2C` controls the mode; auto-detection works out of the box. Includes a built-in TLS test server (`examples/tls_test_server`) for local HTTP/2 verification, startup logging of the active HTTP version mode, and 10 new routing unit tests. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+**v0.9.92** (April 2026) — Multipart upload rewrite: coordinator task (+33% NP=1 throughput), auto-scale `max_in_flight`, async safety fixes, 580 tests. See [docs/Changelog.md](docs/Changelog.md).
 
 **Recent highlights:**
-- **v0.9.90** - Full NVIDIA AIStore support (`S3DLIO_FOLLOW_REDIRECTS=1`) with all TLS security policies; HTTP/2 (TLS ALPN + h2c); 5 issues closed (#126, #133, #134, #135, #136); 559 tests passing
+- **v0.9.92** - MPU coordinator task, auto-scale, async write/flush/finish safety fixes, MAX_MULTIPART_PARTS guard; 580 tests passing
+- **v0.9.90** - Full NVIDIA AIStore support (`S3DLIO_FOLLOW_REDIRECTS=1`) with all TLS security policies; HTTP/2 available (opt-in via `S3DLIO_H2C=1`, **not the default**); 5 issues closed (#126, #133, #134, #135, #136); 559 tests passing
 - **v0.9.86** - Redirect follower for NVIDIA AIStore (S3 path); HTTPS→HTTP downgrade prevention; 21 new redirect tests; redirect security analysis documented
 - **v0.9.84** - HEAD elimination (ObjectSizeCache); OnceLock env-var caching; lock-free range assembly; `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE`; structured tracing
 - **v0.9.80** - Python list hang fix (IMDSv2 legacy call removed); tracing deadlock fix (`tokio::spawn` → inline stream); async S3 delete/bucket helpers; deprecated Python APIs cleaned up
@@ -500,7 +501,7 @@ s3dlio delivers world-class performance across all operations:
 | **Streaming Mode** | 2.6-3.5x faster | For 1-8MB objects vs single-pass |
 
 ### Optimization Features
-- **HTTP/2 Support (NEW)**: HTTP/2 multiplexing for dramatically higher request-rate workloads. Negotiated automatically via TLS ALPN on `https://`; cleartext h2c on `http://` via `S3DLIO_H2C=1` or auto-probe.
+- **HTTP/2 Support (opt-in)**: HTTP/2 is supported but **not the default** — HTTP/1.1 is used unless you set `S3DLIO_H2C=1`. HTTP/2 is available for scenarios that benefit from multiplexing, but is typically slower for bulk storage workloads.
 - **Intelligent Defaults**: Streaming mode automatically selected based on benchmarks
 - **Multi-Process Architecture**: Massive parallelism for maximum performance
 - **Zero-Copy Streaming**: Memory-efficient operations for large datasets
