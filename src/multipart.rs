@@ -309,6 +309,35 @@ impl MultipartUploadSink {
         Ok(())
     }
 
+    /// True zero-copy blocking write: accepts already-owned Bytes (e.g. from BytesView Arc clone).
+    /// No memcpy at all — just slices the shared Arc into part-sized chunks.
+    pub fn write_bytes_blocking(&mut self, data: Bytes) -> Result<()> {
+        let data_len = data.len() as u64;
+
+        if self.buf.is_empty() && data.len() >= self.cfg.part_size {
+            let mut offset = 0usize;
+            while data.len() - offset >= self.cfg.part_size {
+                let end = offset + self.cfg.part_size;
+                let chunk = data.slice(offset..end); // zero-copy Arc slice
+                offset = end;
+                self.enqueue_part(chunk)?;
+            }
+            if offset < data.len() {
+                self.buf.extend_from_slice(&data[offset..]);
+            }
+        } else {
+            self.buf.extend_from_slice(&data);
+            while self.buf.len() >= self.cfg.part_size {
+                let chunk = Bytes::copy_from_slice(&self.buf[..self.cfg.part_size]);
+                self.buf.drain(..self.cfg.part_size);
+                self.enqueue_part(chunk)?;
+            }
+        }
+
+        self.total_bytes += data_len;
+        Ok(())
+    }
+
     /// Zero-copy blocking write: accepts an owned Vec, converts to Bytes.
     pub fn write_owned_blocking(&mut self, data: Vec<u8>) -> Result<()> {
         let data_len = data.len() as u64;

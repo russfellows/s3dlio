@@ -208,6 +208,233 @@ pub fn build_multi_npz(arrays: Vec<(&str, &ArrayD<f32>)>) -> Result<Bytes> {
     Ok(Bytes::from(cursor.into_inner()))
 }
 
+// =============================================================================
+// Fast NPZ builder — single allocation, Rayon in-place generation
+// =============================================================================
+
+/// Build an NPY 1.0 header for any shape and dtype.
+/// The header is padded to a 64-byte boundary (NPY 1.0 spec).
+fn build_npy_header_typed(shape: &[usize], dtype_str: &str) -> Vec<u8> {
+    let shape_str: String = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shape_tuple = if shape.len() == 1 {
+        format!("({},)", shape_str)
+    } else {
+        format!("({})", shape_str)
+    };
+    let dict =
+        format!("{{'descr': '{dtype_str}', 'fortran_order': False, 'shape': {shape_tuple}, }}");
+    let header_len = dict.len() + 1; // +1 for newline
+    let padding = (64 - ((6 + 2 + 2 + header_len) % 64)) % 64;
+    let header_data_len = (header_len + padding) as u16;
+
+    let mut result = Vec::with_capacity(6 + 2 + 2 + header_len + padding);
+    result.extend_from_slice(b"\x93NUMPY\x01\x00");
+    result.extend_from_slice(&header_data_len.to_le_bytes());
+    result.extend_from_slice(dict.as_bytes());
+    result.extend(std::iter::repeat_n(b' ', padding));
+    result.push(b'\n');
+    result
+}
+
+/// Infer element size in bytes from an NPY dtype string.
+fn dtype_element_size(dtype_str: &str) -> usize {
+    dtype_str
+        .chars()
+        .rev()
+        .find(|c| c.is_ascii_digit())
+        .and_then(|c| c.to_digit(10))
+        .map(|d| d as usize)
+        .unwrap_or(4)
+}
+
+/// Write a ZIP local file header (30 + name.len() bytes) into dst.
+/// CRC32 and data_size may be zero (placeholders) and patched later.
+fn write_local_file_header(dst: &mut [u8], name: &[u8], crc32: u32, data_size: u32) {
+    dst[0..4].copy_from_slice(b"PK\x03\x04");
+    dst[4..6].copy_from_slice(&20u16.to_le_bytes());
+    dst[6..8].copy_from_slice(&0u16.to_le_bytes());
+    dst[8..10].copy_from_slice(&0u16.to_le_bytes()); // STORED
+    dst[10..12].copy_from_slice(&0u16.to_le_bytes());
+    dst[12..14].copy_from_slice(&0u16.to_le_bytes());
+    dst[14..18].copy_from_slice(&crc32.to_le_bytes());
+    dst[18..22].copy_from_slice(&data_size.to_le_bytes());
+    dst[22..26].copy_from_slice(&data_size.to_le_bytes());
+    dst[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    dst[28..30].copy_from_slice(&0u16.to_le_bytes());
+    dst[30..30 + name.len()].copy_from_slice(name);
+}
+
+/// Write a ZIP central directory entry (46 + name.len() bytes) into dst.
+fn write_central_dir_entry(
+    dst: &mut [u8],
+    name: &[u8],
+    data_size: u32,
+    crc32: u32,
+    local_offset: u32,
+) {
+    dst[0..4].copy_from_slice(b"PK\x01\x02");
+    dst[4..6].copy_from_slice(&20u16.to_le_bytes());
+    dst[6..8].copy_from_slice(&20u16.to_le_bytes());
+    dst[8..10].copy_from_slice(&0u16.to_le_bytes());
+    dst[10..12].copy_from_slice(&0u16.to_le_bytes()); // STORED
+    dst[12..14].copy_from_slice(&0u16.to_le_bytes());
+    dst[14..16].copy_from_slice(&0u16.to_le_bytes());
+    dst[16..20].copy_from_slice(&crc32.to_le_bytes());
+    dst[20..24].copy_from_slice(&data_size.to_le_bytes());
+    dst[24..28].copy_from_slice(&data_size.to_le_bytes());
+    dst[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    dst[30..32].copy_from_slice(&0u16.to_le_bytes());
+    dst[32..34].copy_from_slice(&0u16.to_le_bytes());
+    dst[34..36].copy_from_slice(&0u16.to_le_bytes());
+    dst[36..38].copy_from_slice(&0u16.to_le_bytes());
+    dst[38..42].copy_from_slice(&0u32.to_le_bytes());
+    dst[42..46].copy_from_slice(&local_offset.to_le_bytes());
+    dst[46..46 + name.len()].copy_from_slice(name);
+}
+
+/// Write the ZIP end-of-central-directory record (22 bytes) into dst.
+fn write_eocd(dst: &mut [u8], num_entries: u16, cd_size: u32, cd_offset: u32) {
+    dst[0..4].copy_from_slice(b"PK\x05\x06");
+    dst[4..6].copy_from_slice(&0u16.to_le_bytes());
+    dst[6..8].copy_from_slice(&0u16.to_le_bytes());
+    dst[8..10].copy_from_slice(&num_entries.to_le_bytes());
+    dst[10..12].copy_from_slice(&num_entries.to_le_bytes());
+    dst[12..16].copy_from_slice(&cd_size.to_le_bytes());
+    dst[16..20].copy_from_slice(&cd_offset.to_le_bytes());
+    dst[20..22].copy_from_slice(&0u16.to_le_bytes());
+}
+
+/// Build a complete NPZ archive with random data.
+///
+/// Uses a single Vec<u8> allocation.  Rayon fills the x-data region directly
+/// into the output buffer (no intermediate copy), then crc32fast computes the
+/// checksum over the already-hot pages.
+///
+/// # NPZ structure
+/// ```text
+/// x.npy  -- dtype array with the given shape, filled with random bytes
+/// y.npy  -- int64 array of shape (num_samples,) containing zeros (labels)
+/// ```
+pub fn generate_npz_bytes_raw(
+    shape: &[usize],
+    dtype_str: &str,
+    num_samples: usize,
+) -> Result<Vec<u8>> {
+    use rand::{RngCore, SeedableRng};
+    use rand_xoshiro::Xoshiro256PlusPlus;
+    use rayon::prelude::*;
+
+    let npy_hdr_x = build_npy_header_typed(shape, dtype_str);
+    let npy_hdr_y = build_npy_header_typed(&[num_samples], "<i8");
+
+    let elem_size = dtype_element_size(dtype_str);
+    let x_data_size: usize = shape.iter().product::<usize>() * elem_size;
+    let y_data_size: usize = num_samples * 8;
+    let x_npy_size: usize = npy_hdr_x.len() + x_data_size;
+    let y_npy_size: usize = npy_hdr_y.len() + y_data_size;
+
+    let name_x: &[u8] = b"x.npy";
+    let name_y: &[u8] = b"y.npy";
+
+    // ZIP structural constants
+    const LOCAL_BASE: usize = 30;
+    const CD_BASE: usize = 46;
+    let x_local_hdr = LOCAL_BASE + name_x.len();
+    let y_local_hdr = LOCAL_BASE + name_y.len();
+    let x_cd_entry = CD_BASE + name_x.len();
+    let y_cd_entry = CD_BASE + name_y.len();
+
+    // Exact byte offsets
+    let off_x_local: usize = 0;
+    let off_x_npy_hdr: usize = off_x_local + x_local_hdr;
+    let off_x_data: usize = off_x_npy_hdr + npy_hdr_x.len();
+
+    let off_y_local: usize = off_x_data + x_data_size;
+    let off_y_npy_hdr: usize = off_y_local + y_local_hdr;
+    let off_y_data: usize = off_y_npy_hdr + npy_hdr_y.len();
+
+    let off_cd: usize = off_y_data + y_data_size;
+    let off_cd_y: usize = off_cd + x_cd_entry;
+    let off_eocd: usize = off_cd_y + y_cd_entry;
+    let total: usize = off_eocd + 22;
+
+    // Single allocation -- zeroed, then fully overwritten before returning.
+    let mut buf: Vec<u8> = vec![0u8; total];
+
+    // x.npy local header (placeholder CRC/size, patched below)
+    write_local_file_header(&mut buf[off_x_local..], name_x, 0, 0);
+
+    // x.npy NPY header
+    buf[off_x_npy_hdr..off_x_npy_hdr + npy_hdr_x.len()].copy_from_slice(&npy_hdr_x);
+
+    // x.npy random data -- Rayon writes directly into output buffer (no copy)
+    // Each 2 MiB chunk gets a unique seed; page faults distributed across all cores.
+    const CHUNK: usize = 2 * 1024 * 1024;
+    buf[off_x_data..off_x_data + x_data_size]
+        .par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let mut rng = Xoshiro256PlusPlus::seed_from_u64(i as u64);
+            rng.fill_bytes(chunk);
+        });
+
+    // CRC32 over x.npy content -- pages already hot, fast L3/RAM read
+    let crc_x = crc32fast::hash(&buf[off_x_npy_hdr..off_x_npy_hdr + x_npy_size]);
+
+    // Patch x.npy local header
+    let x_npy_size_u32 = x_npy_size as u32;
+    buf[off_x_local + 14..off_x_local + 18].copy_from_slice(&crc_x.to_le_bytes());
+    buf[off_x_local + 18..off_x_local + 22].copy_from_slice(&x_npy_size_u32.to_le_bytes());
+    buf[off_x_local + 22..off_x_local + 26].copy_from_slice(&x_npy_size_u32.to_le_bytes());
+
+    // y.npy local header
+    write_local_file_header(&mut buf[off_y_local..], name_y, 0, 0);
+
+    // y.npy NPY header
+    buf[off_y_npy_hdr..off_y_npy_hdr + npy_hdr_y.len()].copy_from_slice(&npy_hdr_y);
+
+    // y.npy data (int64 zeros)
+    buf[off_y_data..off_y_data + y_data_size].fill(0);
+
+    // CRC32 for y.npy
+    let crc_y = crc32fast::hash(&buf[off_y_npy_hdr..off_y_npy_hdr + y_npy_size]);
+
+    // Patch y.npy local header
+    let y_npy_size_u32 = y_npy_size as u32;
+    buf[off_y_local + 14..off_y_local + 18].copy_from_slice(&crc_y.to_le_bytes());
+    buf[off_y_local + 18..off_y_local + 22].copy_from_slice(&y_npy_size_u32.to_le_bytes());
+    buf[off_y_local + 22..off_y_local + 26].copy_from_slice(&y_npy_size_u32.to_le_bytes());
+
+    // Central directory
+    write_central_dir_entry(
+        &mut buf[off_cd..],
+        name_x,
+        x_npy_size_u32,
+        crc_x,
+        off_x_local as u32,
+    );
+    write_central_dir_entry(
+        &mut buf[off_cd_y..],
+        name_y,
+        y_npy_size_u32,
+        crc_y,
+        off_y_local as u32,
+    );
+
+    // EOCD
+    let cd_total = (x_cd_entry + y_cd_entry) as u32;
+    write_eocd(&mut buf[off_eocd..], 2, cd_total, off_cd as u32);
+
+    debug_assert_eq!(buf.len(), total, "NPZ size mismatch");
+    Ok(buf)
+}
+
+// =============================================================================
+
 /// Read an NPY file from bytes and parse into ArrayD<f32>.
 ///
 /// This function parses the NPY 1.0 format:

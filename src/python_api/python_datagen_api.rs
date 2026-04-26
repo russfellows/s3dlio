@@ -9,113 +9,10 @@
 //! the buffer protocol. Python code can use memoryview() for zero-copy access.
 
 use pyo3::buffer::PyBuffer;
-use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 
-use crate::data_gen_alt::{default_data_gen_threads, total_cpus, DataBuffer, DataGenerator};
-
-// =============================================================================
-// Zero-Copy Buffer Support
-// =============================================================================
-
-/// A Python-visible wrapper around DataBuffer (UMA or NUMA) that exposes buffer protocol.
-/// This allows Python code to get a memoryview without copying data.
-///
-/// ZERO-COPY: Python accesses the NUMA-allocated memory directly via raw pointer!
-/// This matches dgen-rs implementation for maximum performance.
-#[pyclass(name = "BytesView")]
-pub struct PyBytesView {
-    /// The underlying DataBuffer (Vec for UMA, hwlocality Bytes for NUMA)
-    buffer: DataBuffer,
-}
-
-#[pymethods]
-impl PyBytesView {
-    /// Get the length of the data
-    fn __len__(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// Support bytes() conversion - returns a copy
-    fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, self.buffer.as_slice())
-    }
-
-    /// Implement Python buffer protocol for zero-copy access.
-    /// This allows `memoryview(data)` to work directly.
-    ///
-    /// The buffer is read-only; requesting a writable buffer will raise BufferError.
-    unsafe fn __getbuffer__(
-        slf: PyRef<'_, Self>,
-        view: *mut ffi::Py_buffer,
-        flags: std::os::raw::c_int,
-    ) -> PyResult<()> {
-        // Check for writable request - we only support read-only buffers
-        if (flags & ffi::PyBUF_WRITABLE) != 0 {
-            return Err(pyo3::exceptions::PyBufferError::new_err(
-                "BytesView is read-only and does not support writable buffers",
-            ));
-        }
-
-        let buffer = &slf.buffer;
-        let len = buffer.len();
-        let ptr = buffer.as_ptr();
-
-        // Fill in the Py_buffer struct with DataBuffer's raw pointer
-        unsafe {
-            (*view).buf = ptr as *mut std::os::raw::c_void;
-            (*view).len = len as isize;
-            (*view).readonly = 1;
-            (*view).itemsize = 1;
-
-            // Format string: "B" = unsigned byte (matches u8)
-            (*view).format = if (flags & ffi::PyBUF_FORMAT) != 0 {
-                c"B".as_ptr() as *mut std::os::raw::c_char
-            } else {
-                std::ptr::null_mut()
-            };
-
-            (*view).ndim = 1;
-
-            // Shape: pointer to the length (1D array of len elements)
-            (*view).shape = if (flags & ffi::PyBUF_ND) != 0 {
-                &(*view).len as *const isize as *mut isize
-            } else {
-                std::ptr::null_mut()
-            };
-
-            // Strides: 1 byte per element
-            (*view).strides = if (flags & ffi::PyBUF_STRIDES) != 0 {
-                &(*view).itemsize as *const isize as *mut isize
-            } else {
-                std::ptr::null_mut()
-            };
-
-            (*view).suboffsets = std::ptr::null_mut();
-            (*view).internal = std::ptr::null_mut();
-
-            // CRITICAL: Store a reference to the PyBytesView object
-            // This prevents the DataBuffer (Vec or NUMA Bytes) from being deallocated
-            // while the Python memoryview is in use
-            // Note: Cast is intentionally explicit for PyO3 FFI compatibility across versions
-            #[allow(clippy::unnecessary_cast)]
-            {
-                (*view).obj = slf.as_ptr() as *mut ffi::PyObject;
-            }
-            ffi::Py_INCREF((*view).obj);
-        }
-
-        Ok(())
-    }
-
-    /// Release the buffer - called when the memoryview is garbage collected.
-    /// Python decrefs view.obj which will eventually drop the PyBytesView and DataBuffer
-    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
-        // Nothing to do - the Py_DECREF on view.obj will be handled by Python
-        // and will eventually drop the PyBytesView (and thus the DataBuffer) when refcount hits 0
-    }
-}
+use super::python_core_api::PyBytesView;
+use crate::data_gen_alt::{default_data_gen_threads, total_cpus, DataGenerator};
 
 // =============================================================================
 // Simple API - Single-call data generation
@@ -171,8 +68,8 @@ fn generate_data(
         gen_data(config) // Returns DataBuffer directly - NO copies!
     });
 
-    // Return BytesView - Python can use memoryview() for TRUE zero-copy access
-    Py::new(py, PyBytesView { buffer })
+    // Convert to Bytes (zero-copy for Uma/Vec via Bytes::from(vec)) and wrap
+    Py::new(py, PyBytesView::new(buffer.into_bytes()))
 }
 
 /// Generate random data with custom thread count (ZERO-COPY)
@@ -223,8 +120,8 @@ fn generate_data_with_threads(
         generate_data(config) // Returns DataBuffer directly - NO 16GB copy to bytes::Bytes!
     });
 
-    // Return BytesView for zero-copy access (no conversion needed!)
-    Py::new(py, PyBytesView { buffer })
+    // Convert to Bytes (zero-copy for Uma/Vec via Bytes::from(vec)) and wrap
+    Py::new(py, PyBytesView::new(buffer.into_bytes()))
 }
 
 /// Generate data directly into existing Python buffer (ZERO-COPY WRITE)
@@ -475,18 +372,67 @@ impl PyGenerator {
 }
 
 // =============================================================================
+// NPZ Fast-Build API
+// =============================================================================
+
+/// Build a complete NPZ archive with random data in Rust (hardware-accelerated CRC32).
+///
+/// This replaces `numpy.savez()` for object-store workloads, eliminating the
+/// Python-side CRC32 bottleneck (~178 ms for 140 MiB using software `zlib.crc32`).
+/// Rust's `crc32fast` uses SSE4.2/NEON and runs at 4–8 GB/s, giving a ~5× speedup.
+///
+/// The generated archive matches numpy's format and is loadable by `numpy.load()`.
+///
+/// # Arguments
+/// * `shape`       — Python list of ints, e.g. `[6053, 6053, 1]`
+/// * `dtype`       — NumPy dtype string (default `"<f4"` = float32 little-endian)
+/// * `num_samples` — number of label samples in y.npy (default `1`)
+///
+/// # Returns
+/// A `BytesView` supporting the buffer protocol for zero-copy upload.
+///
+/// # Example
+/// ```python
+/// import s3dlio
+///
+/// # Generate a 140 MiB unet3d-style NPZ (~50 ms vs ~270 ms for numpy.savez)
+/// npz = s3dlio.generate_npz_bytes(shape=[6053, 6053, 1])
+/// s3dlio.put_bytes("s3://bucket/file.npz", npz)   # zero-copy upload
+/// ```
+#[pyfunction]
+#[pyo3(signature = (shape, dtype="<f4", num_samples=1))]
+fn generate_npz_bytes(
+    py: Python<'_>,
+    shape: Vec<usize>,
+    dtype: &str,
+    num_samples: usize,
+) -> PyResult<Py<PyBytesView>> {
+    let dtype_owned = dtype.to_string(); // move into closure
+
+    // Build the NPZ entirely without holding the GIL (parallel generation + CRC32)
+    let vec = py
+        .detach(|| {
+            crate::data_formats::npz::generate_npz_bytes_raw(&shape, &dtype_owned, num_samples)
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))?;
+
+    let bytes = bytes::Bytes::from(vec); // zero-copy: wraps Vec<u8> in Arc
+    Py::new(py, PyBytesView::new(bytes))
+}
+
+// =============================================================================
 // Module Registration
 // =============================================================================
 
 pub fn register_datagen_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register classes
-    m.add_class::<PyBytesView>()?;
     m.add_class::<PyGenerator>()?;
 
     // Register data generation functions
     m.add_function(wrap_pyfunction!(generate_data, m)?)?;
     m.add_function(wrap_pyfunction!(generate_data_with_threads, m)?)?;
     m.add_function(wrap_pyfunction!(generate_into_buffer, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_npz_bytes, m)?)?;
 
     // Register utility functions
     m.add_function(wrap_pyfunction!(py_default_data_gen_threads, m)?)?;

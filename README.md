@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-580-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.92-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.94-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,15 +10,15 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.92 — Multipart upload rewrite: coordinator task, auto-scale, async safety fixes.**
+> **v0.9.94 — Fast NPZ generation, zero-copy `BytesView` upload path, `write_bytes_blocking()`**
 >
-> **Coordinator task + bounded channel:** The multipart upload hot path now runs a background `coordinator_task` on the Tokio runtime. Python `write()` calls `blocking_send()` on a bounded mpsc channel (backpressure) instead of crossing the Python→Tokio bridge on every part. This replaces up to N `run_on_global_rt` calls per upload with a single one at `finish()`, delivering **+33% NP=1 and +10% NP=4** throughput on 512 MiB objects.
+> **`generate_npz_bytes(shape, dtype, num_samples)`:** Builds a complete NumPy `.npz` archive in Rust without holding the GIL. Single allocation, Rayon in-place random fill, hardware-accelerated CRC32 via `crc32fast`. ~5× faster than `numpy.savez()` for 140 MiB files (~20 ms vs ~178 ms). Returns a `BytesView` for zero-copy upload.
 >
-> **Auto-scale `max_in_flight`:** The default is now computed automatically (`max(32, ⌈512 MiB ÷ part_size⌉)`) so all parts of a large object stay in flight simultaneously without batching. Pass `max_in_flight=N` explicitly to restore the old behaviour.
+> **Zero-copy `BytesView` upload path:** `MultipartUploadWriter.write()` now detects `BytesView` objects first (path 0) via an Arc refcount increment — no `memcpy` at all. The GIL is released for the full duration of `write_bytes_blocking()`. For 140 MiB files this drops write latency from ~109 ms to ~6 ms and raises sustained upload throughput from ~1,250 MiB/s to ~2,440 MiB/s at N=48.
 >
-> **Async safety fixes:** `write()`, `write_owned()`, `flush()`, and a new `finish()` method are now genuinely async — they use `send().await` instead of `blocking_send`, making them safe to call from any Tokio task. A proof-of-concept unit test (`test_blocking_send_panics_inside_tokio_runtime`) documents the pre-fix panic class. `MAX_MULTIPART_PARTS` (10 000) is now enforced at write time with a clear error.
+> **`write_bytes_blocking(data: Bytes)`:** New zero-copy method on `MultipartUploadSink` — slices the shared `Arc<[u8]>` into part-sized chunks with `Bytes::slice()` (no copy), enqueues them to the coordinator channel, and copies only the final sub-part tail.
 >
-> **v0.9.90 highlights also in this release:** Full NVIDIA AIStore redirect support, HTTP/2 (opt-in via `S3DLIO_H2C=1`, not the default — HTTP/1.1 is almost always faster), connection pool autoscale, unlimited pool size, runtime thread scaling, `list_containers()` in Python API, GCS delete propagation fix, small object PUT rounding fix. See [docs/Changelog.md](docs/Changelog.md) for full history.
+> **v0.9.92 highlights also in this release:** Coordinator task + bounded channel MPU rewrite, auto-scale `max_in_flight`, async safety fixes. See [docs/Changelog.md](docs/Changelog.md) for full history.
 
 ## 📦 Installation
 

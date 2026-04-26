@@ -18,7 +18,6 @@ use tokio::task;
 use std::path::PathBuf;
 
 use tracing::{warn, Level};
-use tracing_subscriber;
 
 // Project crates
 use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
@@ -153,8 +152,9 @@ where
 /// so that `memoryview(bytes_view)` works directly with zero-copy access.
 #[pyclass(name = "BytesView")]
 pub struct PyBytesView {
-    /// The underlying Bytes (reference-counted, cheap to clone)
-    bytes: Bytes,
+    /// The underlying Bytes (reference-counted, cheap to clone).
+    /// `pub` so sibling modules (e.g. python_advanced_api) can Arc-clone with zero data copy.
+    pub bytes: Bytes,
     /// Cached length stored in the heap object for a stable shape[0] pointer.
     /// The Python buffer protocol requires shape/strides pointers to remain
     /// valid for the full lifetime of the Py_buffer view.  Storing `len_isize`
@@ -218,7 +218,7 @@ impl PyBytesView {
 
             // Format: "B" = unsigned byte.
             (*view).format = if (flags & ffi::PyBUF_FORMAT) != 0 {
-                b"B\0".as_ptr() as *mut std::os::raw::c_char
+                c"B".as_ptr() as *mut std::os::raw::c_char
             } else {
                 std::ptr::null_mut()
             };
@@ -242,7 +242,7 @@ impl PyBytesView {
             (*view).internal = std::ptr::null_mut();
 
             // Keep this PyBytesView alive for the duration of the buffer view.
-            (*view).obj = slf.as_ptr() as *mut ffi::PyObject;
+            (*view).obj = slf.as_ptr();
             ffi::Py_INCREF((*view).obj);
         }
         Ok(())
@@ -330,7 +330,6 @@ pub fn py_err<E: std::fmt::Display>(error: E) -> PyErr {
 ///         - throughput_mb_s (float): Overall throughput in MB/s
 ///         - ops_per_sec (float): Operations per second
 ///         - workers (list): Per-worker performance stats
-
 /// Find the s3-cli binary for use as worker processes
 fn find_s3_cli_binary() -> Result<String, anyhow::Error> {
     use std::path::Path;
@@ -452,7 +451,7 @@ pub fn mp_get(
         }
         dict.set_item("workers", workers)?;
 
-        Ok(dict.into_py_any(py)?.into())
+        dict.into_py_any(py)
     })
 }
 
@@ -632,6 +631,7 @@ pub fn delete_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
     dedup_factor = 1, compress_factor = 1,
     data_gen_algorithm = "random", data_gen_mode = "streaming", chunk_size = 262144
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn put(
     py: Python<'_>,
     prefix: &str,
@@ -674,6 +674,7 @@ pub fn put(
     dedup_factor = 1, compress_factor = 1,
     data_gen_algorithm = "random", data_gen_mode = "streaming", chunk_size = 262144
 ))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn put_async_py<'p>(
     py: Python<'p>,
     prefix: &'p str,
@@ -894,11 +895,7 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
     let data_owned = if let Ok(buffer) = PyBuffer::<u8>::get(data) {
         // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
         let len = buffer.len_bytes();
-        let mut vec = Vec::<u8>::with_capacity(len);
-        unsafe {
-            vec.set_len(len);
-        }
-
+        let mut vec = vec![0u8; len];
         buffer.copy_to_slice(py, &mut vec[..]).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!("Buffer copy failed: {}", e))
         })?;
@@ -974,11 +971,7 @@ fn put_bytes_async<'py>(
         // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
         // This is the most common path for external buffer objects
         let len = buffer.len_bytes();
-        let mut vec = Vec::<u8>::with_capacity(len);
-        unsafe {
-            vec.set_len(len);
-        }
-
+        let mut vec = vec![0u8; len];
         buffer.copy_to_slice(py, &mut vec[..]).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!("Buffer copy failed: {}", e))
         })?;
@@ -1452,7 +1445,7 @@ pub fn upload(
                             .trim_start_matches("azure://")
                             .split('/')
                             .collect();
-                        if let Some(container) = parts.get(0) {
+                        if let Some(container) = parts.first() {
                             if let Err(e) = store.create_container(container).await {
                                 warn!("Failed to create container {}: {}", container, e);
                             }
@@ -1696,11 +1689,7 @@ impl PyObjectWriter {
         // Try buffer protocol
         if let Ok(buffer) = PyBuffer::<u8>::get(data) {
             let len = buffer.len_bytes();
-            let mut vec = Vec::<u8>::with_capacity(len);
-            unsafe {
-                vec.set_len(len);
-            }
-
+            let mut vec = vec![0u8; len];
             buffer
                 .copy_to_slice(data.py(), &mut vec[..])
                 .map_err(|e| PyRuntimeError::new_err(format!("Buffer copy failed: {}", e)))?;
@@ -1737,9 +1726,8 @@ impl PyObjectWriter {
                     Ok::<(u64, u64), PyErr>(stats)
                 })
             })
-            .map(|stats| {
+            .inspect(|&stats| {
                 self.finalized_stats = Some(stats);
-                stats
             })
         } else {
             Err(PyRuntimeError::new_err("Writer already finalized"))
@@ -1781,9 +1769,7 @@ pub fn create_s3_writer(
     uri: String,
     options: Option<&PyWriterOptions>,
 ) -> PyResult<PyObjectWriter> {
-    let opts = options
-        .map(|o| o.inner.clone())
-        .unwrap_or_else(WriterOptions::new);
+    let opts = options.map(|o| o.inner.clone()).unwrap_or_default();
 
     py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
@@ -1808,9 +1794,7 @@ pub fn create_azure_writer(
     uri: String,
     options: Option<&PyWriterOptions>,
 ) -> PyResult<PyObjectWriter> {
-    let opts = options
-        .map(|o| o.inner.clone())
-        .unwrap_or_else(WriterOptions::new);
+    let opts = options.map(|o| o.inner.clone()).unwrap_or_default();
 
     py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
@@ -1847,9 +1831,7 @@ pub fn create_filesystem_writer(
     uri: String,
     options: Option<&PyWriterOptions>,
 ) -> PyResult<PyObjectWriter> {
-    let opts = options
-        .map(|o| o.inner.clone())
-        .unwrap_or_else(WriterOptions::new);
+    let opts = options.map(|o| o.inner.clone()).unwrap_or_default();
 
     py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
@@ -1873,9 +1855,7 @@ pub fn create_direct_filesystem_writer(
     uri: String,
     options: Option<&PyWriterOptions>,
 ) -> PyResult<PyObjectWriter> {
-    let opts = options
-        .map(|o| o.inner.clone())
-        .unwrap_or_else(WriterOptions::new);
+    let opts = options.map(|o| o.inner.clone()).unwrap_or_default();
 
     py.detach(|| {
         pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
