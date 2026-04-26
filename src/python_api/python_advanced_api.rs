@@ -14,6 +14,7 @@ use std::os::raw::c_char;
 
 // Project crates
 use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
+use crate::python_api::python_core_api::PyBytesView;
 
 // ---------------------------------------------------------------------------
 // Multipart upload code
@@ -140,13 +141,26 @@ impl PyMultipartUploadWriter {
 
         const OWNED_THRESHOLD: usize = 8 * 1024 * 1024; // 8 MiB
 
+        // 0) Fast path: our own BytesView — Arc clone, NO GIL-held memcpy.
+        //    Caller passes generate_npz_bytes() result directly; 32 concurrent
+        //    uploads can all share the same underlying Arc<[u8]> without any copy.
+        if let Ok(bv) = data.extract::<PyRef<PyBytesView>>() {
+            let bytes = bv.bytes.clone(); // just atomic refcount++, no data movement
+            let len = bytes.len();
+            let res = if len >= OWNED_THRESHOLD {
+                py.detach(|| inner.write_bytes_blocking(bytes))
+            } else {
+                py.detach(|| inner.write_blocking(&bytes))
+            };
+            return res
+                .map(|_| len)
+                .map_err(|e| PyRuntimeError::new_err(format!("write failed: {e}")));
+        }
+
         // 1) Fast path for any buffer-protocol object (NumPy, memoryview, bytearray, etc.)
         if let Ok(buf) = data.extract::<pyo3::buffer::PyBuffer<u8>>() {
             let len = buf.len_bytes();
-            let mut vec = Vec::<u8>::with_capacity(len);
-            unsafe {
-                vec.set_len(len);
-            }
+            let mut vec = vec![0u8; len];
             buf.copy_to_slice(py, &mut vec[..])
                 .map_err(|e| PyRuntimeError::new_err(format!("buffer copy failed: {e}")))?;
 

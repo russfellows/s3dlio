@@ -153,6 +153,7 @@ impl PyBytesAsyncDataLoader {
 }
 
 #[pyclass]
+#[allow(clippy::type_complexity)]
 pub struct PyBytesAsyncDataLoaderIter {
     rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Bytes>, DatasetError>>>>,
 }
@@ -227,13 +228,11 @@ impl PyBytesAsyncDataLoaderIter {
                         }
                     }
 
-                    // Convert to batch (filter_map skips None, but all should be Some)
-                    let batch: Vec<Bytes> = batch_results.into_iter().filter_map(|x| x).collect();
+                    // Convert to batch — flatten() drops None results
+                    let batch: Vec<Bytes> = batch_results.into_iter().flatten().collect();
 
-                    if !batch.is_empty() {
-                        if tx.send(Ok(batch)).await.is_err() {
-                            break;
-                        }
+                    if !batch.is_empty() && tx.send(Ok(batch)).await.is_err() {
+                        break;
                     }
                     i += batch_size;
                 }
@@ -277,6 +276,7 @@ impl PyBytesAsyncDataLoaderIter {
 
 // async loader over S3BytesDataset
 #[pyclass]
+#[allow(clippy::type_complexity)]
 pub struct PyS3AsyncDataLoader {
     rx: Arc<Mutex<mpsc::Receiver<Result<Vec<Bytes>, DatasetError>>>>,
 }
@@ -331,7 +331,7 @@ impl PyS3AsyncDataLoader {
                             Py::new(py, view).map(|p| p.into_any())
                         })
                         .collect::<PyResult<Vec<_>>>()?;
-                    Ok(out.into_py_any(py)?)
+                    out.into_py_any(py)
                 }),
                 Some(Err(e)) => Err(PyRuntimeError::new_err(format!("{:?}", e))),
                 None => Err(PyStopAsyncIteration::new_err("end of stream")),
@@ -788,6 +788,7 @@ impl PyAsyncDataLoader {
 }
 
 #[pyclass]
+#[allow(clippy::type_complexity)]
 pub struct PyAsyncDataLoaderIter {
     rx: Arc<Mutex<mpsc::Receiver<Result<Vec<i32>, DatasetError>>>>,
 }
@@ -1392,7 +1393,7 @@ impl PyCheckpointReader {
             .map_err(|e| PyRuntimeError::new_err(format!("Read shard failed: {}", e)))?;
 
         // Return zero-copy BytesView as PyObject
-        Ok(PyBytesView::new(data).into_py_any(py)?)
+        PyBytesView::new(data).into_py_any(py)
     }
 }
 
@@ -1489,6 +1490,7 @@ fn load_checkpoint(py: Python<'_>, uri: String) -> PyResult<Option<Py<PyAny>>> {
 #[cfg(feature = "extension-module")]
 #[pyfunction]
 #[pyo3(text_signature = "(uri, step, epoch, framework, data, world_size, rank)")]
+#[allow(clippy::too_many_arguments)]
 fn save_distributed_shard(
     py: Python<'_>,
     uri: String,
@@ -1509,6 +1511,7 @@ fn save_distributed_shard(
 #[pyo3(
     text_signature = "(uri, step, epoch, framework, shard_metas, world_size, rank, user_meta=None)"
 )]
+#[allow(clippy::too_many_arguments)]
 fn finalize_distributed_checkpoint(
     py: Python<'_>,
     uri: String,
@@ -1606,7 +1609,7 @@ pub fn create_async_loader(
     uri: &str,
     opts: Option<Bound<'_, PyDict>>,
 ) -> PyResult<PyBytesAsyncDataLoader> {
-    let dataset = create_dataset(uri, opts.as_ref().map(|d| d.clone()))?;
+    let dataset = create_dataset(uri, opts.clone())?;
 
     // For async loaders, default to batch_size = 1 for intuitive individual item iteration
     let mut loader_opts = opts_from_dict(opts);

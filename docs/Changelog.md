@@ -1,5 +1,58 @@
 # s3dlio Changelog
 
+## Version 0.9.94 — Fast NPZ generation, zero-copy BytesView upload path (April 25, 2026)
+
+### New: `generate_npz_bytes()` — Rust NPZ builder (`src/data_formats/npz.rs`, `src/python_api/python_datagen_api.rs`)
+
+Generates a complete NumPy `.npz` archive in Rust without holding the GIL.
+
+**Design:**
+- Single `Vec<u8>` allocation sized exactly to the final file — no intermediate copies
+- Random data (`x.npy`) filled in-place with Xoshiro256++ via Rayon (2 MiB chunks, each with an independent seed — page faults distributed across all cores)
+- CRC32 computed by `crc32fast` (SSE4.2/NEON hardware acceleration) on already-hot pages
+- ZIP structure (local file headers, central directory, EOCD) written with fixed-offset pointer arithmetic — no `ZipWriter` state machine overhead
+- Labels (`y.npy`) are int64 zeros, matching the unet3d training format
+
+**Performance (140 MiB file, 28-core machine):**
+
+| Method | Latency |
+|--------|---------|
+| `numpy.savez()` (Python CRC32 via `zlib`) | ~178 ms |
+| `generate_npz_bytes_raw()` (Rust, this change) | ~20 ms |
+
+The returned `Vec<u8>` is wrapped in `Bytes::from(vec)` (zero-cost Arc) and returned as a `PyBytesView`.
+
+### Fix: Duplicate `PyBytesView` causing silent zero-copy failure (`src/python_api/python_datagen_api.rs`)
+
+`python_datagen_api` previously defined its own `PyBytesView` (backed by `DataBuffer`) and registered it as Python's `BytesView` class. Because `python_datagen_api` was registered after `python_core_api`, the datagen version silently replaced the core version at the Python class level. `MultipartUploadWriter.write()`'s fast path tried to extract `python_core_api::PyBytesView` — the extraction always failed and fell through to the `PyBuffer` path, which held the GIL during a full `memcpy` (~109 ms for 140 MiB, serializing all concurrent threads).
+
+**Fix:** Removed the duplicate struct entirely. `python_datagen_api` now imports and uses `python_core_api::PyBytesView`. Generate functions use `DataBuffer::into_bytes()` (zero-cost for `Uma(Vec<u8>)` via `Bytes::from(vec)`) before wrapping.
+
+**Impact:** Write latency for 140 MiB BytesView dropped from ~109 ms → ~6 ms. Sustained upload throughput at N=48 improved from ~1,250 MiB/s → ~2,440 MiB/s (1.95×).
+
+### New: `write_bytes_blocking()` on `MultipartUploadSink` (`src/multipart.rs`)
+
+Zero-copy write method accepting owned `bytes::Bytes`. For large inputs (≥ `part_size`), slices the shared `Arc<[u8]>` into part-sized chunks using `Bytes::slice(offset..end)` — no `memcpy`. Only the final sub-part tail (< `part_size`, typically ≤ 12 MiB for 16 MiB parts) is copied into the accumulation buffer. Enqueues parts to the coordinator channel (~1–70 µs per `blocking_send`).
+
+### New: `PyBytesView` fast path in `MultipartUploadWriter.write()` (`src/python_api/python_advanced_api.rs`)
+
+Added path 0 (before the existing `PyBuffer` path) that detects `BytesView` objects via `data.extract::<PyRef<PyBytesView>>()`, performs an Arc refcount increment (`bv.bytes.clone()` — O(1), no data movement), releases the GIL, and calls `write_bytes_blocking()`. The existing `PyBuffer` path remains as fallback for plain `bytes`, `bytearray`, `memoryview`, and NumPy arrays.
+
+### Fix: `PyBytesView::bytes` field made `pub` (`src/python_api/python_core_api.rs`)
+
+Required for `python_advanced_api` to Arc-clone the underlying `Bytes` without unsafe code.
+
+### Fix: README typo (`README.md`)
+
+Trailing `m` removed from v0.9.92 blurb (`"fixesm"` → `"fixes"`); blurb replaced with v0.9.94 highlights.
+
+### Docs added (`docs/`)
+
+- `CUSTOM_S3_CLIENT_ANALYSIS.md` — Analysis of AWS SDK overhead vs. lightweight reqwest client; motivates future custom SigV4 signer work
+- `SHA256_SIGV4_OPTIMIZATION_ANALYSIS.md` — Deep-dive on SHA-256 hot path in SigV4 signing; benchmark data from sai3-bench → s3-ultra loopback profiling
+
+---
+
 ## Version 0.9.92 — Post-review async safety fixes, MAX_MULTIPART_PARTS guard, clippy (April 23, 2026)
 
 _This entry documents the second round of fixes committed on top of the coordinator-task rewrite below._

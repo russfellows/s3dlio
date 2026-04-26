@@ -1,7 +1,7 @@
 # s3dlio Python API Guide
 
-**Version:** 0.9.50  
-**Last Updated:** February 13, 2026
+**Version:** 0.9.94  
+**Last Updated:** April 25, 2026
 
 ## Table of Contents
 
@@ -15,8 +15,9 @@
 8. [Multi-Endpoint Load Balancing](#multi-endpoint-load-balancing)
 9. [Streaming API](#streaming-api)
 10. [AI/ML Integration](#aiml-integration)
-11. [s3torchconnector Compatibility](#s3torchconnector-compatibility)
-12. [Checkpoint System](#checkpoint-system)
+11. [Data Generation (NPZ / NPY)](#data-generation-npz--npy)
+12. [s3torchconnector Compatibility](#s3torchconnector-compatibility)
+13. [Checkpoint System](#checkpoint-system)
 13. [Performance & Threading](#performance--threading)
 14. [Advanced Features](#advanced-features)
 15. [API Reference](#api-reference)
@@ -500,6 +501,82 @@ for batch in ds:
 
 ---
 
+## Data Generation (NPZ / NPY)
+
+**Added in v0.9.94.** Generate complete NumPy NPZ archives in Rust — single allocation, Rayon parallel fill, hardware-accelerated CRC32 — without holding the Python GIL. ~5× faster than `numpy.savez()` for large files.
+
+### `generate_npz_bytes()` — Build NPZ in Rust
+
+```python
+import s3dlio
+
+# Build a 140 MiB unet3d-style NPZ archive (~20 ms vs ~178 ms for numpy.savez)
+npz = s3dlio.generate_npz_bytes(
+    shape=[6053, 6053, 1],   # x.npy array shape
+    dtype="<f4",             # float32 little-endian (default)
+    num_samples=1,           # number of labels in y.npy (default)
+)
+print(type(npz))   # <class 's3dlio.BytesView'>
+print(len(npz))    # ~146,800,000 bytes
+```
+
+**Arguments:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `shape` | `list[int]` | required | Array shape for `x.npy` |
+| `dtype` | `str` | `"<f4"` | NumPy dtype string, e.g. `"<f4"` (float32), `"<f8"` (float64) |
+| `num_samples` | `int` | `1` | Length of label array `y.npy` (int64 zeros) |
+
+**Returns:** `BytesView` — zero-copy buffer supporting Python buffer protocol. Pass directly to `MultipartUploadWriter.write()`, `put_bytes()`, or any buffer-accepting API.
+
+### Upload NPZ zero-copy
+
+```python
+import s3dlio, concurrent.futures
+
+# Pre-generate once (shape is fixed per benchmark run)
+buf = s3dlio.generate_npz_bytes(shape=[6053, 6053, 1])
+
+# Upload 48 files concurrently — no GIL contention, no memcpy
+def upload(i):
+    with s3dlio.MultipartUploadWriter.from_uri(
+        f"s3://my-bucket/train/sample_{i:06d}.npz"
+    ) as w:
+        w.write(buf)  # BytesView fast path: Arc clone only, GIL released
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
+    list(pool.map(upload, range(1000)))
+```
+
+**Performance (28-core machine, loopback fake S3):**
+
+| Method | write() latency (140 MiB) | Throughput N=48 |
+|--------|--------------------------|------------------|
+| `numpy.savez()` + `bytes()` + `put_bytes()` | ~178 ms gen + ~109 ms write | ~1,250 MiB/s |
+| `generate_npz_bytes()` + `write(BytesView)` | ~20 ms gen + ~6 ms write | ~2,440 MiB/s |
+
+### NPZ file structure
+
+The generated archive matches NumPy's format exactly:
+
+```
+file.npz
+├── x.npy   — float32 (or dtype) array, shape as specified, Rayon-filled random data
+└── y.npy   — int64 array of shape (num_samples,), all zeros (class labels)
+```
+
+Load with standard NumPy:
+
+```python
+import numpy as np
+arrays = np.load("file.npz")
+x = arrays["x"]   # float32 ndarray
+y = arrays["y"]   # int64 ndarray
+```
+
+---
+
 ## s3torchconnector Compatibility
 
 s3dlio provides a **drop-in replacement** for AWS `s3torchconnector`. Change one import line:
@@ -816,6 +893,12 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `mp_get(uri, procs, jobs, num, template)` | Multi-process GET | dict |
 | `create_bucket(name)` | Create S3 bucket | None |
 | `delete_bucket(name)` | Delete S3 bucket | None |
+
+### Data Generation Functions (v0.9.94+)
+
+| Function | Description | Returns |
+|----------|-------------|---------|
+| `generate_npz_bytes(shape, dtype="<f4", num_samples=1)` | Build NPZ archive in Rust (GIL-free, Rayon parallel fill) | BytesView |
 
 ### BytesView
 
