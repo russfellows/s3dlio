@@ -93,7 +93,7 @@ if s3dlio.exists("s3://my-bucket/data.bin"):
 | `gs://` | `gs://bucket/key` | Google Cloud Storage |
 | `az://` | `az://account/container/key` | Azure Blob Storage |
 | `file://` | `file:///path/to/file` | Local filesystem |
-| `direct://` | `direct:///path/to/file` | Direct I/O (O_DIRECT) |
+| `direct://` | `direct:///path/to/file` | Direct I/O (O_DIRECT) — bypasses the OS page cache. **v0.9.95:** correctly routed through `ConfigurableFileSystemObjectStore::with_direct_io()` in `get_many()` (previously silently used buffered I/O). |
 
 ---
 
@@ -306,7 +306,12 @@ results = s3dlio.get_many(uris, workers=64)
 
 # Async version
 results = await s3dlio.get_many_async(uris)
+
+# O_DIRECT reads — bypass page cache (v0.9.95: now correctly uses O_DIRECT)
+results = s3dlio.get_many(["direct:///data/file1.npz", "direct:///data/file2.npz"])
 ```
+
+> **v0.9.95 fix:** `direct://` URIs in `get_many()` previously fell through to the standard buffered `tokio::fs::read()` path — O_DIRECT was never engaged. Fixed in v0.9.95: `direct://` reads now go through `ConfigurableFileSystemObjectStore::with_direct_io()`, correctly bypassing the OS page cache.
 
 ### upload() / download() — Bulk File Transfer
 

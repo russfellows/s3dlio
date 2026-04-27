@@ -63,7 +63,9 @@ pub fn configure_for_concurrency(n: usize) {
 }
 
 // Create (once) a background multi-thread Tokio runtime and return its Handle.
-fn global_rt_handle() -> &'static Handle {
+// pub(crate) so that other modules (e.g. memory.rs) can spawn onto the same
+// runtime, ensuring consistent async behaviour across all URI schemes.
+pub(crate) fn global_rt_handle() -> &'static Handle {
     RT_HANDLE.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel(1);
         thread::Builder::new()

@@ -1269,9 +1269,43 @@ pub fn get_many(
                     .map(|(u, b)| (u, PyBytesView::new(b)))
                     .collect())
             }
-            Scheme::File | Scheme::Direct => {
-                // Parallel file reads
-                // Submit to global runtime (io_uring pattern — never calls block_on)
+            Scheme::Direct => {
+                // Parallel O_DIRECT reads — bypass page cache via ConfigurableFileSystemObjectStore
+                let uris_clone = uris.clone();
+                let res = submit_io(async move {
+                    let store = Arc::new(ConfigurableFileSystemObjectStore::with_direct_io());
+                    let sem = Arc::new(Semaphore::new(max_in_flight));
+                    let mut futs = FuturesUnordered::new();
+
+                    for uri in uris_clone.iter().cloned() {
+                        let store = Arc::clone(&store);
+                        let sem = Arc::clone(&sem);
+                        futs.push(tokio::spawn(async move {
+                            let _permit = sem.acquire_owned().await.unwrap();
+                            let bytes = store.get(&uri).await?;
+                            Ok::<_, anyhow::Error>((uri, bytes))
+                        }));
+                    }
+
+                    let mut out = Vec::new();
+                    while let Some(res) = futs.next().await {
+                        let (uri, bytes) =
+                            res.map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+                        out.push((uri, bytes));
+                    }
+
+                    // Maintain input order
+                    out.sort_by_key(|(u, _)| uris_clone.iter().position(|x| x == u).unwrap());
+                    Ok::<_, anyhow::Error>(out)
+                })?;
+
+                Ok(res
+                    .into_iter()
+                    .map(|(u, b)| (u, PyBytesView::new(b)))
+                    .collect())
+            }
+            Scheme::File => {
+                // Parallel buffered file reads
                 let uris_clone = uris.clone();
                 let res = submit_io(async move {
                     let sem = Arc::new(Semaphore::new(max_in_flight));
@@ -1281,10 +1315,7 @@ pub fn get_many(
                         let sem = Arc::clone(&sem);
                         futs.push(tokio::spawn(async move {
                             let _permit = sem.acquire_owned().await.unwrap();
-                            let path = uri
-                                .strip_prefix("file://")
-                                .or_else(|| uri.strip_prefix("direct://"))
-                                .unwrap_or(&uri);
+                            let path = uri.strip_prefix("file://").unwrap_or(&uri);
                             let file_bytes = tokio::fs::read(path).await?;
                             Ok::<_, std::io::Error>((uri, Bytes::from(file_bytes)))
                         }));

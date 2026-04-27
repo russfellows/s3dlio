@@ -1111,8 +1111,11 @@ impl ConfigurableFileSystemObjectStore {
         let result = out.freeze();
 
         // Return aligned buffer to pool for reuse (v0.9.9+)
+        // give() is non-blocking (try_send): if the pool channel is full because
+        // a fallback-allocated buffer was used while the pre-alloc had already
+        // filled the channel, we simply drop the buffer rather than deadlocking.
         if let Some(pool) = &self.config.buffer_pool {
-            pool.give(aligned).await;
+            pool.give(aligned);
         }
 
         Ok(result)

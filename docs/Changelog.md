@@ -1,5 +1,31 @@
 # s3dlio Changelog
 
+## Version 0.9.95 — O_DIRECT fix, BufferPool deadlock fix (April 27, 2026)
+
+### Fix: `direct://` URIs now correctly use O_DIRECT in `get_many()` (`src/python_api/python_core_api.rs`)
+
+`Scheme::Direct` was previously handled by the same code branch as `Scheme::File`, causing `direct://` URIs to silently fall through to `tokio::fs::read()` — the standard buffered I/O path. Page-cache bypass was never actually engaged in `get_many()`.
+
+**Fix:** Split into two separate match arms. `Scheme::Direct` now creates a `ConfigurableFileSystemObjectStore::with_direct_io()` and submits all reads through it, bypassing the OS page cache as intended. `Scheme::File` retains its existing `tokio::fs::read()` path with the stale `direct://` prefix-stripping code removed.
+
+**Impact:** `direct://` reads in Python (`get_many(["direct:///path/file", ...])`) now actually bypass the page cache. This was a silent correctness bug — the API appeared to work but provided no O_DIRECT benefit.
+
+### Fix: `BufferPool::give()` deadlock (`src/memory.rs`, `src/file_store_direct.rs`)
+
+**Root cause:** `BufferPool::new(n, …)` spawns a pre-allocation task on the global background runtime that fills the channel to capacity `n`. If `take()` runs before pre-alloc completes (the normal case — the caller's runtime is usually faster), it allocates a new buffer via the fallback path, creating a `n+1`th buffer that the channel cannot hold. The previous `async fn give()` called `tx.send(buf).await`, which blocks indefinitely on a full channel with no concurrent drainer → **permanent deadlock**.
+
+This is a real production bug, not just a test issue. Any caller using `BufferPool` under high concurrency where `take()`'s fallback path fires (by design) could deadlock.
+
+**Fix:** `give()` changed from `async fn` using `tx.send().await` to a sync `fn` using `tx.try_send()`. If the channel is full, the buffer is simply dropped — correct behaviour, since fallback-allocated buffers are not needed by the pool. All call sites updated (`src/file_store_direct.rs`, `tests/test_buffer_pool_directio.rs`).
+
+**Test hardening:** `buffer_pool_basic` now wraps the test body in `tokio::time::timeout(5s)` so a regression will fail with a clear message instead of hanging indefinitely.
+
+### Internal: `global_rt_handle()` made `pub(crate)` (`src/s3_client.rs`)
+
+Allows `memory.rs` to spawn `BufferPool` pre-allocation tasks on the same background runtime used by all other async operations — consistent runtime behaviour across all URI schemes.
+
+---
+
 ## Version 0.9.94 — Fast NPZ generation, zero-copy BytesView upload path (April 25, 2026)
 
 ### New: `generate_npz_bytes()` — Rust NPZ builder (`src/data_formats/npz.rs`, `src/python_api/python_datagen_api.rs`)
