@@ -34,9 +34,9 @@ async fn test_buffer_pool_initialization() -> Result<()> {
     let buf2 = pool.take().await;
     assert_eq!(buf2.len(), 64 * 1024 * 1024, "Pool buffer should be 64MB");
 
-    // Return buffers
-    pool.give(buf1).await;
-    pool.give(buf2).await;
+    // Return buffers — give() is non-blocking (try_send), no .await needed
+    pool.give(buf1);
+    pool.give(buf2);
 
     // Take many buffers to verify pool can handle concurrent access
     let mut buffers = Vec::new();
@@ -51,9 +51,9 @@ async fn test_buffer_pool_initialization() -> Result<()> {
         buffers.push(buf.unwrap());
     }
 
-    // Return all buffers to pool for reuse
+    // Return all buffers to pool for reuse — give() is non-blocking (try_send)
     for buf in buffers {
-        pool.give(buf).await;
+        pool.give(buf);
     }
 
     println!("✅ Buffer pool initialization validated: semaphore-based capacity control with grow-on-demand");

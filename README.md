@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-580-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.94-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.95-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,15 +10,13 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.94 — Fast NPZ generation, zero-copy `BytesView` upload path, `write_bytes_blocking()`**
+> **v0.9.95 — O_DIRECT fix, BufferPool deadlock fix**
 >
-> **`generate_npz_bytes(shape, dtype, num_samples)`:** Builds a complete NumPy `.npz` archive in Rust without holding the GIL. Single allocation, Rayon in-place random fill, hardware-accelerated CRC32 via `crc32fast`. ~5× faster than `numpy.savez()` for 140 MiB files (~20 ms vs ~178 ms). Returns a `BytesView` for zero-copy upload.
+> **`direct://` URIs now actually bypass the page cache:** `get_many(["direct:///path/file", ...])` was silently falling through to buffered `tokio::fs::read()` — O_DIRECT was never engaged. Fixed by routing `Scheme::Direct` through `ConfigurableFileSystemObjectStore::with_direct_io()`.
 >
-> **Zero-copy `BytesView` upload path:** `MultipartUploadWriter.write()` now detects `BytesView` objects first (path 0) via an Arc refcount increment — no `memcpy` at all. The GIL is released for the full duration of `write_bytes_blocking()`. For 140 MiB files this drops write latency from ~109 ms to ~6 ms and raises sustained upload throughput from ~1,250 MiB/s to ~2,440 MiB/s at N=48.
+> **BufferPool deadlock fix:** `BufferPool::give()` changed from async (`tx.send().await`) to sync (`tx.try_send()`). Prevents a race between the pre-allocation task and the caller's runtime that could deadlock when the channel is full.
 >
-> **`write_bytes_blocking(data: Bytes)`:** New zero-copy method on `MultipartUploadSink` — slices the shared `Arc<[u8]>` into part-sized chunks with `Bytes::slice()` (no copy), enqueues them to the coordinator channel, and copies only the final sub-part tail.
->
-> **v0.9.92 highlights also in this release:** Coordinator task + bounded channel MPU rewrite, auto-scale `max_in_flight`, async safety fixes. See [docs/Changelog.md](docs/Changelog.md) for full history.
+> **v0.9.94 also in this release:** Fast NPZ generation (`generate_npz_bytes()` — ~5× faster than `numpy.savez()`, GIL-free, Rayon parallel), zero-copy `BytesView` upload path (~2,440 MiB/s at N=48). See [docs/Changelog.md](docs/Changelog.md) for full history.
 
 ## 📦 Installation
 

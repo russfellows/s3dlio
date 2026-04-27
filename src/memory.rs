@@ -8,6 +8,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 
+// Import global runtime handle so BufferPool pre-allocation uses the same
+// dedicated s3dlio runtime as all other async operations (S3, file://, direct://).
+use crate::s3_client::global_rt_handle;
+
 /// Aligned memory buffer suitable for O_DIRECT I/O and zero-copy operations
 ///
 /// This buffer is allocated with specific alignment requirements (typically 4096 bytes)
@@ -116,9 +120,15 @@ impl BufferPool {
             align,
         });
 
-        // Pre-allocate all buffers
+        // Pre-allocate all buffers onto the global s3dlio Tokio runtime.
+        //
+        // Using global_rt_handle().spawn() (instead of tokio::spawn()) makes
+        // file:// and direct:// behave exactly like S3: all async work goes
+        // through the same dedicated background runtime regardless of URI scheme.
+        // This is safe to call from any thread context — the global runtime is
+        // always available once first accessed (lazy init via OnceLock).
         let pool_clone = pool.clone();
-        tokio::spawn(async move {
+        global_rt_handle().spawn(async move {
             for _ in 0..capacity {
                 let buf = AlignedBuf::new(buf_len, align);
                 if pool_clone.tx.send(buf).await.is_err() {
@@ -146,10 +156,14 @@ impl BufferPool {
     }
 
     /// Return a buffer to the pool for reuse
-    pub async fn give(&self, buf: AlignedBuf) {
+    ///
+    /// Uses `try_send` (non-blocking): if the pool channel is already at capacity
+    /// (e.g. because all pre-allocated buffers are present), the returned buffer is
+    /// simply dropped rather than blocking the caller forever.
+    pub fn give(&self, buf: AlignedBuf) {
         // Only return buffers with the correct size and alignment
         if buf.len() == self.buf_len && buf.align() == self.align {
-            let _ = self.tx.send(buf).await; // Ignore error if pool is full/closed
+            let _ = self.tx.try_send(buf); // Non-blocking: drop if pool is full
         }
         // If buffer doesn't match pool parameters, just drop it
     }
@@ -225,21 +239,31 @@ mod tests {
 
     #[tokio::test]
     async fn buffer_pool_basic() {
-        let pool = BufferPool::new(2, 4096, 4096);
+        // Timeout guard: this test must complete in under 5 seconds.
+        // A hang here means give() is blocking on a full channel (deadlock) —
+        // that is a real production bug, not just a test issue.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let pool = BufferPool::new(2, 4096, 4096);
 
-        // Take buffer
-        let mut buf1 = pool.take().await;
-        assert_eq!(buf1.len(), 4096);
+            // Take buffer
+            let mut buf1 = pool.take().await;
+            assert_eq!(buf1.len(), 4096);
 
-        // Modify buffer
-        buf1.as_mut_slice()[0] = 123;
+            // Modify buffer
+            buf1.as_mut_slice()[0] = 123;
 
-        // Return buffer
-        pool.give(buf1).await;
+            // Return buffer (non-blocking try_send — must not deadlock even if pool is full)
+            pool.give(buf1);
 
-        // Take again - should get a buffer (possibly reused)
-        let buf2 = pool.take().await;
-        assert_eq!(buf2.len(), 4096);
+            // Take again - should get a buffer (possibly reused)
+            let buf2 = pool.take().await;
+            assert_eq!(buf2.len(), 4096);
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "buffer_pool_basic timed out — give() deadlocked on full channel"
+        );
     }
 
     #[test]
