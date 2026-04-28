@@ -321,7 +321,7 @@ fn test_thread_formula_no_hard_cap() {
     let new_formula = std::cmp::max(4, cores);
 
     // Old formula for comparison (we cannot call the private fn directly).
-    let old_formula = std::cmp::min(std::cmp::max(8_usize, cores * 2), 32);
+    let old_formula = (cores * 2).clamp(8_usize, 32);
 
     println!("CPU cores detected: {cores}");
     println!("Old formula  min(max(8, cores×2), 32)  = {old_formula}");

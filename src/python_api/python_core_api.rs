@@ -715,6 +715,73 @@ pub(crate) fn put_async_py<'p>(
     })
 }
 
+/// Configure S3-compatible connection parameters from Python code.
+///
+/// This is the Python equivalent of the CLI's `--endpoint-url`, `--region`,
+/// and `--ca-bundle` global flags.  It applies to **all** S3 operations:
+/// `list`, `get`, `put`, `stat`, `delete`, `upload`, `download`, etc.
+///
+/// Call this **before the first S3 operation** in your script.  The
+/// configuration is process-wide: the underlying AWS SDK client is a
+/// global singleton that is initialised on first use and cannot be
+/// reconfigured afterwards.  Calling `configure_s3()` after the first
+/// S3 call has no effect on the already-initialised client.
+///
+/// This function also clears the internal store cache so that any
+/// previously created store objects are discarded and rebuilt with the
+/// new settings on the next operation.
+///
+/// Parameters
+/// ----------
+/// endpoint_url : str or None
+///     Full URL of the S3-compatible endpoint, e.g. ``"https://minio.corp:9000"``.
+///     Sets ``AWS_ENDPOINT_URL``.
+/// region : str or None
+///     AWS region name, e.g. ``"us-east-1"``.  Sets ``AWS_DEFAULT_REGION``.
+/// ca_bundle : str or None
+///     Filesystem path to a PEM CA certificate bundle for TLS verification.
+///     Sets ``AWS_CA_BUNDLE``.
+///
+/// Example
+/// -------
+/// ```python
+/// import s3dlio
+/// s3dlio.configure_s3(
+///     endpoint_url="https://172.16.1.40:9000",
+///     region="us-east-1",
+///     ca_bundle="/etc/ssl/certs/my-ca.pem",
+/// )
+/// # Now all operations target the custom endpoint:
+/// keys   = s3dlio.list("s3://my-bucket/", recursive=False)
+/// data   = s3dlio.get("s3://my-bucket/my-file.bin")
+/// s3dlio.put("s3://my-bucket/out.bin", data)
+/// info   = s3dlio.stat("s3://my-bucket/my-file.bin")
+/// s3dlio.delete("s3://my-bucket/my-file.bin")
+/// ```
+#[pyfunction]
+#[pyo3(signature = (endpoint_url = None, region = None, ca_bundle = None))]
+pub fn configure_s3(
+    endpoint_url: Option<&str>,
+    region: Option<&str>,
+    ca_bundle: Option<&str>,
+) -> PyResult<()> {
+    // SAFETY: Python is single-threaded at this call site (GIL held); no S3
+    // client or store has been created yet in the expected call pattern.
+    if let Some(url) = endpoint_url {
+        unsafe { std::env::set_var("AWS_ENDPOINT_URL", url) };
+    }
+    if let Some(r) = region {
+        unsafe { std::env::set_var("AWS_DEFAULT_REGION", r) };
+    }
+    if let Some(bundle) = ca_bundle {
+        unsafe { std::env::set_var("AWS_CA_BUNDLE", bundle) };
+    }
+    // Clear the store cache so subsequent operations create fresh stores
+    // with the updated configuration rather than reusing stale ones.
+    STORE_CACHE.clear();
+    Ok(())
+}
+
 // --- `list` function
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false, pattern = None))]
@@ -727,11 +794,20 @@ pub fn list(uri: &str, recursive: bool, pattern: Option<&str>) -> PyResult<Vec<S
     // Submit to global runtime (io_uring pattern — never calls block_on)
     let mut keys = submit_io(async move { store.list(&uri_owned, recursive).await })?;
 
-    // Apply client-side regex filtering if pattern provided
+    // Apply client-side regex filtering against the relative path (after the listing prefix).
+    // Pattern sees only the key portion after the URI prefix, e.g. "llama3-8b/" not the full URI.
     if let Some(pat) = pattern {
         use regex::Regex;
         let re = Regex::new(pat).map_err(py_err)?;
-        keys.retain(|k| re.is_match(k));
+        let base = if uri.ends_with('/') {
+            uri.to_owned()
+        } else {
+            format!("{}/", uri)
+        };
+        keys.retain(|k| {
+            let relative = k.strip_prefix(base.as_str()).unwrap_or(k.as_str());
+            re.is_match(relative)
+        });
     }
 
     Ok(keys)
@@ -2154,6 +2230,49 @@ fn create_multi_endpoint_store_from_file(
     create_multi_endpoint_store(uris, strategy)
 }
 
+/// Create a multi-endpoint store from the ``S3_ENDPOINT_URIS`` environment variable
+///
+/// Reads a comma-separated list of storage URIs from the ``S3_ENDPOINT_URIS``
+/// environment variable and creates a :class:`MultiEndpointStore`.  All URIs
+/// must use the same scheme.  The list must contain between 1 and
+/// ``MAX_ENDPOINTS`` (32) entries.
+///
+/// Args:
+///     strategy: Load balancing strategy - use "round_robin" or "least_connections" (default: "round_robin")
+///
+/// Returns:
+///     MultiEndpointStore instance
+///
+/// Raises:
+///     RuntimeError: If ``S3_ENDPOINT_URIS`` is unset, empty, exceeds MAX_ENDPOINTS, or contains mixed schemes
+///
+/// Example:
+///     >>> import os, asyncio
+///     >>> os.environ['S3_ENDPOINT_URIS'] = 's3://host1:9000/bucket/,s3://host2:9000/bucket/'
+///     >>> store = s3dlio.create_multi_endpoint_store_from_env(strategy="round_robin")
+#[pyfunction]
+fn create_multi_endpoint_store_from_env(strategy: Option<&str>) -> PyResult<PyMultiEndpointStore> {
+    let lb_strategy = match strategy.unwrap_or("round_robin") {
+        "round_robin" => LoadBalanceStrategy::RoundRobin,
+        "least_connections" => LoadBalanceStrategy::LeastConnections,
+        s => {
+            return Err(PyRuntimeError::new_err(format!(
+                "Invalid strategy '{}'. Use 'round_robin' or 'least_connections'",
+                s
+            )))
+        }
+    };
+    let store = MultiEndpointStore::from_env(lb_strategy, None).map_err(|e| {
+        PyRuntimeError::new_err(format!(
+            "Failed to create multi-endpoint store from S3_ENDPOINT_URIS: {}",
+            e
+        ))
+    })?;
+    Ok(PyMultiEndpointStore {
+        store: Arc::new(store),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // GCS tuning — programmatic setters, getters, and bucket RAPID query
 // ---------------------------------------------------------------------------
@@ -2312,6 +2431,9 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // URI parsing utilities
     m.add_function(wrap_pyfunction!(parse_s3_uri_full, m)?)?;
 
+    // S3 connection configuration (equivalent to CLI --endpoint-url / --region / --ca-bundle)
+    m.add_function(wrap_pyfunction!(configure_s3, m)?)?;
+
     // Bucket / container management
     m.add_function(wrap_pyfunction!(create_bucket, m)?)?;
     m.add_function(wrap_pyfunction!(delete_bucket, m)?)?;
@@ -2362,6 +2484,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_file, m)?)?;
+    m.add_function(wrap_pyfunction!(create_multi_endpoint_store_from_env, m)?)?;
 
     // GCS tuning (programmatic setters / getters / bucket RAPID query)
     m.add_function(wrap_pyfunction!(gcs_set_channel_count, m)?)?;

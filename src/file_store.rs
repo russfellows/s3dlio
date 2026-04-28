@@ -607,12 +607,19 @@ impl ObjectStore for FileSystemObjectStore {
             if recursive {
                 Self::collect_files_recursive(&base_path, "", &mut results).await?;
             } else {
-                // Non-recursive: only direct children
+                // Non-recursive: direct children — files as-is, directories with trailing slash
+                // (mirrors S3 "common prefix" semantics so callers can distinguish them).
                 let mut entries = fs::read_dir(&base_path).await?;
                 while let Some(entry) = entries.next_entry().await? {
                     let entry_path = entry.path();
                     if entry_path.is_file() {
                         results.push(Self::path_to_uri(&entry_path));
+                    } else if entry_path.is_dir() {
+                        let mut dir_uri = Self::path_to_uri(&entry_path);
+                        if !dir_uri.ends_with('/') {
+                            dir_uri.push('/');
+                        }
+                        results.push(dir_uri);
                     }
                 }
             }

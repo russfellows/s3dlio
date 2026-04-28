@@ -192,12 +192,7 @@ fn get_operation_timeout() -> Duration {
         .ok()
         .and_then(|s| s.parse().ok())
         .map(Duration::from_secs)
-        .unwrap_or_else(|| {
-            // For fast storage: ~1 second per 8MB object should be plenty
-            // 5000 objects * 1 second = 83 minutes max (very conservative)
-            // Use more aggressive timeout for better resource management
-            Duration::from_secs(120) // 2 minutes per operation - much faster
-        })
+        .unwrap_or_else(|| Duration::from_secs(crate::constants::DEFAULT_OPERATION_TIMEOUT_SECS))
 }
 
 // -----------------------------------------------------------------------------
@@ -254,7 +249,11 @@ pub async fn aws_s3_client_async() -> Result<Client> {
             };
 
             // Region & optional endpoint
-            debug!("AWS_REGION env: {}", env::var("AWS_REGION").as_deref().unwrap_or("<not set — using provider chain>"));
+            let effective_region = env::var("AWS_REGION")
+                .ok()
+                .or_else(|| env::var("AWS_DEFAULT_REGION").ok());
+            debug!("Region env: {}",
+                effective_region.as_deref().unwrap_or("<not set — defaulting to us-east-1>"));
             let region =
                 RegionProviderChain::first_try(env::var("AWS_REGION").ok().map(Region::new))
                     .or_default_provider()

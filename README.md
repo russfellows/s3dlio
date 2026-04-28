@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-580-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.95-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-613-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.96-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,13 +10,15 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.95 — O_DIRECT fix, BufferPool deadlock fix**
+> **v0.9.96 — Multi-endpoint correctness, S3_ENDPOINT_URIS enforcement, new CLI options**
 >
-> **`direct://` URIs now actually bypass the page cache:** `get_many(["direct:///path/file", ...])` was silently falling through to buffered `tokio::fs::read()` — O_DIRECT was never engaged. Fixed by routing `Scheme::Direct` through `ConfigurableFileSystemObjectStore::with_direct_io()`.
+> **All endpoints in `S3_ENDPOINT_URIS` are now used:** Previously, setting `S3_ENDPOINT_URIS=uri1,uri2,uri3,uri4` did not guarantee all four endpoints were load-balanced. Fixed — every entry is now parsed, whitespace-trimmed, and registered. Counts outside 1–32 (`MAX_ENDPOINTS`) are rejected with a clear error.
 >
-> **BufferPool deadlock fix:** `BufferPool::give()` changed from async (`tx.send().await`) to sync (`tx.try_send()`). Prevents a race between the pre-allocation task and the caller's runtime that could deadlock when the channel is full.
+> **New CLI options:** `--endpoint-url` (alias `--endpoint`), `--region`, and `--ca-bundle` are now accepted directly on the `s3dlio` command line, removing the need to set environment variables for single-command overrides.
 >
-> **v0.9.94 also in this release:** Fast NPZ generation (`generate_npz_bytes()` — ~5× faster than `numpy.savez()`, GIL-free, Rayon parallel), zero-copy `BytesView` upload path (~2,440 MiB/s at N=48). See [docs/Changelog.md](docs/Changelog.md) for full history.
+> **Fix: non-recursive `list()` now returns directory entries** — subdirectories are included with a trailing `/`, matching S3 common-prefix semantics.
+>
+> **v0.9.95 also in this release:** O_DIRECT fix, BufferPool deadlock fix. See [docs/Changelog.md](docs/Changelog.md) for full history.
 
 ## 📦 Installation
 

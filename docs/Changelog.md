@@ -1,5 +1,48 @@
 # s3dlio Changelog
 
+## Version 0.9.96 — Multi-endpoint correctness, S3_ENDPOINT_URIS enforcement, new CLI options (April 28, 2026)
+
+### Fix: All endpoints in `S3_ENDPOINT_URIS` are now used (`src/multi_endpoint.rs`)
+
+Previously, passing multiple endpoints via the `S3_ENDPOINT_URIS` environment variable (comma-separated URIs) did not guarantee that all listed endpoints were actually consumed. `MultiEndpointStore::from_env()` now parses the full comma-separated list, trims whitespace around each entry, and passes all N URIs to `MultiEndpointStore::new()`. Any count from 1 to `MAX_ENDPOINTS` (32) is accepted; 0 or >32 returns an error.
+
+### New: `MultiEndpointStore::from_env()` public API (`src/multi_endpoint.rs`)
+
+New method that reads `S3_ENDPOINT_URIS` and constructs a `MultiEndpointStore` with the requested `LoadBalanceStrategy`. Accepts both `RoundRobin` and `LeastConnections`. Used internally by the CLI and Python API, and now also by sai3-bench as a fallback when no YAML `multi_endpoint:` block is present.
+
+### New: `MAX_ENDPOINTS` constant and `max_endpoints()` accessor (`src/constants.rs`)
+
+`MAX_ENDPOINTS = 32` is now a named constant (was previously a magic number). Exposed as `s3dlio::constants::max_endpoints()` for downstream crates to reference programmatically without hard-coding the value.
+
+### Fix: Non-recursive `list()` now returns directory entries (`src/file_store.rs`)
+
+`FileSystemObjectStore::list(uri, recursive=false)` was silently dropping directory entries — only files were returned. Fixed to include subdirectories with a trailing `/` (matching S3 common-prefix semantics). Recursive listing is unchanged.
+
+### New: CLI options `--endpoint-url`, `--region`, `--ca-bundle` (`src/bin/cli.rs`)
+
+The `s3dlio` CLI now accepts:
+- `--endpoint-url` (alias `--endpoint`) — override the S3 endpoint URL for a single command
+- `--region` — override the AWS region
+- `--ca-bundle` — path to a custom CA certificate bundle (for self-signed TLS)
+
+`--endpoint-url` values are also validated: if `--endpoints` is supplied simultaneously, the count must not exceed `MAX_ENDPOINTS`.
+
+### New: CLI `--endpoints` validation (`src/bin/cli.rs`)
+
+`build_s3_endpoint_uris()` now rejects endpoint lists exceeding `MAX_ENDPOINTS` with a clear error message. Previously, oversized lists were silently accepted and could cause undefined behaviour at runtime.
+
+### New: Python API `create_multi_endpoint_store_from_env()` (`src/python_api/python_core_api.rs`)
+
+Python callers can now construct a `MultiEndpointStore` directly from the `S3_ENDPOINT_URIS` environment variable without writing endpoint lists into Python code.
+
+### Tests: 613 passing (lib + integration + CLI)
+
+- 3 new `from_env` consistency tests in `multi_endpoint.rs` (`test_from_env_4_endpoints_all_present`, `test_from_env_whitespace_is_trimmed`, `test_from_env_valid_counts_1_to_max`)
+- 8 CLI endpoint boundary tests in `src/bin/cli.rs`
+- Updated `tests/test_file_store.rs` to assert correct non-recursive listing behaviour (file + subdir)
+
+---
+
 ## Version 0.9.95 — O_DIRECT fix, BufferPool deadlock fix (April 27, 2026)
 
 ### Fix: `direct://` URIs now correctly use O_DIRECT in `get_many()` (`src/python_api/python_core_api.rs`)

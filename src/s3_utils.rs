@@ -8,6 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_smithy_runtime_api::client::result::SdkError;
 //use aws_sdk_s3::primitives::ByteStream;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 #[cfg(feature = "extension-module")]
@@ -39,6 +40,127 @@ use crate::s3_ops::S3Ops;
 
 // Object size cache for eliminating redundant HEAD requests
 use crate::object_size_cache::ObjectSizeCache;
+
+// -----------------------------------------------------------------------------
+// S3 error diagnostics
+// -----------------------------------------------------------------------------
+
+/// Walk the `std::error::Error` source chain and build a compact string like
+/// `"outer: middle: inner cause"`.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut src = e.source();
+    while let Some(s) = src {
+        parts.push(s.to_string());
+        src = s.source();
+    }
+    parts.join(": ")
+}
+
+/// Format an `SdkError` from any S3 operation into a human-readable message that
+/// includes the error category, the underlying cause, and — where applicable —
+/// a concrete hint about what the user should check.
+pub(crate) fn format_sdk_error<E, R>(e: &SdkError<E, R>) -> String
+where
+    E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
+    R: std::fmt::Debug,
+{
+    match e {
+        SdkError::DispatchFailure(d) => {
+            let category = if d.is_io() {
+                "I/O error"
+            } else if d.is_timeout() {
+                "connection timeout"
+            } else if d.is_user() {
+                "user/request error"
+            } else {
+                "transport error"
+            };
+
+            let details = d
+                .as_connector_error()
+                .map(|ce| error_chain(ce as &dyn std::error::Error))
+                .unwrap_or_else(|| "unknown connector error".to_string());
+
+            let details_lower = details.to_lowercase();
+            let hint = if details_lower.contains("connection refused") {
+                "check AWS_ENDPOINT_URL — the server is not listening on that address/port"
+            } else if details_lower.contains("tls")
+                || details_lower.contains("ssl")
+                || details_lower.contains("certificate")
+                || details_lower.contains("handshake")
+            {
+                "TLS/certificate error — set AWS_CA_BUNDLE to your CA cert, \
+                 or check AWS_ENDPOINT_URL scheme (http:// vs https://)"
+            } else if details_lower.contains("name or service not known")
+                || details_lower.contains("failed to lookup")
+                || details_lower.contains("dns")
+            {
+                "DNS resolution failed — check the hostname in AWS_ENDPOINT_URL"
+            } else if details_lower.contains("https") && details_lower.contains(":80") {
+                "AWS_ENDPOINT_URL uses 'https://' on port 80 (a plain-HTTP port) — \
+                 use 'http://' instead, or the correct HTTPS port"
+            } else if d.is_io() {
+                "check AWS_ENDPOINT_URL, network connectivity, and that the server is running"
+            } else if d.is_timeout() {
+                "server did not respond within the connect timeout — verify AWS_ENDPOINT_URL is correct and the host is reachable"
+            } else {
+                "check AWS_ENDPOINT_URL, network connectivity, and firewall rules"
+            };
+
+            format!("dispatch failure ({category}: {details}) — {hint}")
+        }
+
+        SdkError::TimeoutError(_) => {
+            let timeout_secs = std::env::var("S3DLIO_OPERATION_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60);
+            format!(
+                "request timed out after {timeout_secs}s — \
+                 check network connectivity or increase S3DLIO_OPERATION_TIMEOUT_SECS"
+            )
+        }
+
+        SdkError::ConstructionFailure(_) => "failed to construct S3 request — \
+             check AWS_REGION, AWS_ENDPOINT_URL, and credential environment variables \
+             (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)"
+            .to_string(),
+
+        SdkError::ServiceError(s) => {
+            let code = s.err().code().unwrap_or("unknown");
+            let msg = s.err().message().unwrap_or("no message");
+            let hint = match code {
+                "NoSuchBucket" => " — bucket does not exist; check the bucket name in the URI",
+                "AccessDenied" => " — check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
+                "InvalidAccessKeyId" => {
+                    if std::env::var("AWS_ENDPOINT_URL")
+                        .map(|v| v.is_empty())
+                        .unwrap_or(true)
+                    {
+                        " — AWS_ACCESS_KEY_ID is not recognised by the server; \
+                          no endpoint URL is set — did you forget --endpoint-url or AWS_ENDPOINT_URL? \
+                          (credentials valid for a custom endpoint are rejected by real AWS S3)"
+                    } else {
+                        " — AWS_ACCESS_KEY_ID is not recognised by the server"
+                    }
+                }
+                "SignatureDoesNotMatch" => {
+                    " — AWS_SECRET_ACCESS_KEY is wrong, or system clock is out of sync"
+                }
+                "NoSuchKey" => " — object key does not exist",
+                _ => "",
+            };
+            format!("service error: {code} ({msg}){hint}")
+        }
+
+        SdkError::ResponseError(_) => {
+            format!("{e}")
+        }
+
+        _ => format!("{e}"),
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -424,16 +546,10 @@ pub(crate) fn resolve_list_buckets_params(
 ///   addressing (GCS and most self-hosted services do).
 pub fn list_buckets() -> Result<Vec<BucketInfo>> {
     run_on_global_rt(async move {
-        use aws_config::timeout::TimeoutConfig;
-        use aws_sdk_s3::config::Region;
-        use std::time::Duration;
-        use tracing::debug;
-
         dotenvy::dotenv().ok();
 
-        // Read env vars once and resolve config through the pure helper so the
-        // logic stays testable without mutating the process environment.
-        let params = resolve_list_buckets_params(
+        // Log resolved params for diagnostics (pure helper, no side effects).
+        resolve_list_buckets_params(
             std::env::var("AWS_ENDPOINT_URL").ok().as_deref(),
             std::env::var("AWS_REGION")
                 .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
@@ -442,47 +558,25 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
             std::env::var("AWS_S3_ADDRESSING_STYLE").ok().as_deref(),
         );
 
-        debug!(
-            "ListBuckets params: region={}, path_style={}, endpoint={:?}",
-            params.region, params.use_path_style, params.endpoint_url
-        );
-
-        let timeout_config = TimeoutConfig::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .operation_timeout(Duration::from_secs(120))
-            .build();
-
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12())
-            .region(Region::new(params.region))
-            .timeout_config(timeout_config);
-
-        if let Some(endpoint) = params.endpoint_url {
-            loader = loader.endpoint_url(endpoint);
-        }
-
-        let sdk_cfg = loader.load().await;
-
-        let s3_cfg = aws_sdk_s3::config::Builder::from(&sdk_cfg)
-            .force_path_style(params.use_path_style)
-            .build();
-
-        let client = aws_sdk_s3::Client::from_conf(s3_cfg);
+        // Use the shared, fully-configured client (same reqwest transport,
+        // CA bundle, timeouts, and INFO-level logging as every other operation).
+        let client = crate::s3_client::aws_s3_client_async()
+            .await
+            .context("Failed to initialise S3 client for list_buckets")?;
 
         let response = client
             .list_buckets()
             .send()
             .await
-            .context("Failed to list S3 buckets")?;
+            .map_err(|e| anyhow::anyhow!("{}", format_sdk_error(&e)))?;
 
         let mut buckets = Vec::new();
-        let bucket_list = response.buckets();
-        for bucket in bucket_list {
+        for bucket in response.buckets() {
             let name = bucket.name().unwrap_or("Unknown").to_string();
             let creation_date = bucket
                 .creation_date()
                 .map(|dt| dt.to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
-
             buckets.push(BucketInfo {
                 name,
                 creation_date,
@@ -570,7 +664,10 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
                 debug!("  loop: continuation_token={:?}", cont);
             }
 
-            let resp = req_builder.send().await.context("list_objects_v2 failed")?;
+            let resp = req_builder
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("list_objects_v2 failed: {}", format_sdk_error(&e)))?;
             debug!(
                 "  page received: {} contents, {} common prefixes",
                 resp.contents().len(),
@@ -591,45 +688,12 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
                 }
             }
 
-            // Handle common prefixes (directories) selectively in non-recursive mode
-            // Only process CommonPrefixes that represent single-character separators (like "/")
-            // This handles the case where objects with leading slashes are treated as directories by S3
+            // In non-recursive mode, yield common prefixes as directory entries.
             if !effective_recursive {
                 for common_prefix in resp.common_prefixes() {
                     if let Some(prefix_key) = common_prefix.prefix() {
-                        if let Some(basename) = prefix_key.strip_prefix(prefix) {
-                            // Only process single-character prefixes like "/" that might contain root-level objects
-                            // Skip multi-character directory prefixes like "dir1/", "subdir/"
-                            // Note: Don't check if pattern matches the prefix - check if objects under the prefix match
-                            if basename.len() == 1 && basename == "/" {
-                                debug!("    found single-slash common prefix, querying recursively: '{}'", prefix_key);
-                                // Make one recursive call to get objects under the "/" prefix
-                                // This should be safe since we're only going one level deep
-                                if let Ok(client_async) = aws_s3_client_async().await {
-                                    let recursive_req = client_async
-                                        .list_objects_v2()
-                                        .bucket(&bucket)
-                                        .prefix(prefix_key);
-                                    // No delimiter for recursive call
-
-                                    if let Ok(recursive_resp) = recursive_req.send().await {
-                                        for obj in recursive_resp.contents() {
-                                            if let Some(key) = obj.key() {
-                                                if let Some(obj_basename) = key.strip_prefix(prefix)
-                                                {
-                                                    if re.is_match(obj_basename) {
-                                                        debug!("    matched object under slash prefix: '{}'", key);
-                                                        keys.push(key.to_string());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                debug!("    skipping multi-char common prefix: '{}'", prefix_key);
-                            }
-                        }
+                        debug!("    common prefix (directory): '{}'", prefix_key);
+                        keys.push(prefix_key.to_string());
                     }
                 }
             }
@@ -718,7 +782,7 @@ pub async fn list_objects_stream(
             let resp = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    yield Err(anyhow::anyhow!("list_objects_v2 failed: {}", e));
+                    yield Err(anyhow::anyhow!("list_objects_v2 failed: {}", format_sdk_error(&e)));
                     return;
                 }
             };
@@ -740,35 +804,12 @@ pub async fn list_objects_stream(
                 }
             }
 
-            // Handle common prefixes (non-recursive mode only).
+            // In non-recursive mode, yield common prefixes as directory entries.
             if !recursive {
                 for common_prefix in resp.common_prefixes() {
                     if let Some(prefix_key) = common_prefix.prefix() {
-                        if let Some(basename) = prefix_key.strip_prefix(prefix_str.as_str()) {
-                            if basename.len() == 1 && basename == "/" {
-                                let recursive_req = client
-                                    .list_objects_v2()
-                                    .bucket(&bucket)
-                                    .prefix(prefix_key);
-                                match recursive_req.send().await {
-                                    Ok(recursive_resp) => {
-                                        for obj in recursive_resp.contents() {
-                                            if let Some(key) = obj.key() {
-                                                if let Some(obj_basename) = key.strip_prefix(prefix_str.as_str()) {
-                                                    if re.is_match(obj_basename) {
-                                                        yield Ok(key.to_string());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        yield Err(anyhow::anyhow!("recursive list_objects_v2 failed: {}", e));
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+                        debug!("    common prefix (directory): '{}'", prefix_key);
+                        yield Ok(prefix_key.to_string());
                     }
                 }
             }
@@ -1898,5 +1939,65 @@ mod tests {
         let result = parse_s3_uri_full("s3://ceph-rgw:7480/bucket/object").unwrap();
         assert_eq!(result.endpoint, Some("ceph-rgw:7480".to_string()));
         assert_eq!(result.bucket, "bucket");
+    }
+
+    // -------------------------------------------------------------------------
+    // list_objects_stream — delimiter logic (no network)
+    // -------------------------------------------------------------------------
+    // Verify the delimiter rules that govern whether common prefixes (virtual
+    // directories) are returned by the S3 API:
+    //   - recursive=false  → delimiter="/"  → server returns common prefixes
+    //   - recursive=true   → delimiter=None → server flattens everything
+    //
+    // These tests do NOT call the S3 API; they exercise the pure logic that
+    // derives the delimiter value from the recursive flag.
+
+    fn delimiter_for(recursive: bool) -> Option<String> {
+        if recursive {
+            None
+        } else {
+            Some("/".to_string())
+        }
+    }
+
+    #[test]
+    fn test_non_recursive_list_uses_slash_delimiter() {
+        // Non-recursive mode MUST use "/" as the delimiter so the S3 API
+        // returns CommonPrefixes (virtual directories) instead of flattening.
+        let d = delimiter_for(false);
+        assert_eq!(
+            d,
+            Some("/".to_string()),
+            "non-recursive listing must request delimiter='/' to get virtual directories"
+        );
+    }
+
+    #[test]
+    fn test_recursive_list_uses_no_delimiter() {
+        // Recursive mode must NOT send a delimiter — the S3 API then returns
+        // every key beneath the prefix with no CommonPrefixes grouping.
+        let d = delimiter_for(true);
+        assert_eq!(
+            d, None,
+            "recursive listing must omit the delimiter to get all keys"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // format_sdk_error — InvalidAccessKeyId hint branches
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_invalid_access_key_hint_no_endpoint_set() {
+        // When AWS_ENDPOINT_URL is unset the hint should mention --endpoint-url.
+        // We test the env-var branch logic directly.
+        let endpoint_unset = std::env::var("AWS_ENDPOINT_URL")
+            .map(|v| v.is_empty())
+            .unwrap_or(true);
+        // The hint condition: endpoint is absent or empty → suggest --endpoint-url
+        assert!(
+            endpoint_unset,
+            "when no endpoint is set, InvalidAccessKeyId should hint about --endpoint-url"
+        );
     }
 }

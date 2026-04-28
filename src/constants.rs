@@ -28,8 +28,20 @@ pub const DEFAULT_AZURE_MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 /// Maximum number of parts in a multipart upload
 pub const MAX_MULTIPART_PARTS: usize = 10000;
 
-/// Default timeout for storage operations (seconds)
-pub const DEFAULT_OPERATION_TIMEOUT_SECS: u64 = 300; // 5 minutes
+/// Default TCP connect timeout in seconds.
+///
+/// Covers only the TCP handshake (SYN → SYN-ACK).  On a LAN/datacenter network
+/// a connect that hasn't completed in 10 s indicates a dead host, wrong IP, or
+/// a firewall silently dropping packets.  Override with `S3DLIO_CONNECT_TIMEOUT_SECS`.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Default operation timeout in seconds.
+///
+/// Covers the full request/response cycle once the TCP connection is established
+/// (send request headers + body, wait for response headers + body).  60 s is
+/// sufficient for objects up to ~6 GB at 100 MB/s and ~60 GB at 1 GB/s.
+/// Override with `S3DLIO_OPERATION_TIMEOUT_SECS`.
+pub const DEFAULT_OPERATION_TIMEOUT_SECS: u64 = 60;
 
 /// Default retry count for storage operations
 pub const DEFAULT_RETRY_COUNT: usize = 3;
@@ -56,6 +68,27 @@ pub const DEFAULT_MULTIPART_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
 /// gives 256 × 16 = 4,096.  Beyond this, connection overhead and OS scheduler
 /// pressure outweigh any throughput gains.
 pub const MAX_JOBS: usize = 4_096;
+
+/// Maximum number of endpoints in a multi-endpoint configuration.
+///
+/// A multi-endpoint list always has at least 1 entry (single endpoint, no load
+/// balancing overhead beyond one extra indirection) and at most this many entries.
+/// 32 covers the largest anticipated deployments (e.g. 32 independent storage
+/// nodes each with its own IP and bucket).
+pub const MAX_ENDPOINTS: usize = 32;
+
+/// Returns the maximum allowed number of endpoints in a multi-endpoint configuration.
+///
+/// Downstream tools (e.g. sai3-bench) should call this rather than hard-coding the
+/// limit, so the single source of truth remains in s3dlio.
+///
+/// # Example
+/// ```rust
+/// assert!(s3dlio::constants::max_endpoints() >= 1);
+/// ```
+pub fn max_endpoints() -> usize {
+    MAX_ENDPOINTS
+}
 
 // ============================================================================
 // RangeEngine Configuration Constants
