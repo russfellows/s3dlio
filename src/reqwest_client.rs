@@ -438,6 +438,9 @@ fn build_reqwest_client_raw(
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(max_idle)
         .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
+        .connect_timeout(Duration::from_secs(
+            crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS,
+        ))
         .tcp_nodelay(true);
 
     // Load custom CA bundle if provided (e.g. self-signed MinIO / private PKI).

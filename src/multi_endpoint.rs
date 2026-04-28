@@ -312,6 +312,14 @@ impl MultiEndpointStore {
             ));
         }
 
+        if config.endpoints.len() > crate::constants::MAX_ENDPOINTS {
+            return Err(anyhow!(
+                "Too many endpoints: {} exceeds maximum of {} (MAX_ENDPOINTS)",
+                config.endpoints.len(),
+                crate::constants::MAX_ENDPOINTS
+            ));
+        }
+
         // Validate all endpoints use the same scheme
         let first_scheme = crate::uri_utils::infer_scheme_from_uri(&config.endpoints[0].uri)?;
         for endpoint in &config.endpoints[1..] {
@@ -489,6 +497,35 @@ impl MultiEndpointStore {
                     .expect("endpoints list is non-empty")
             }
         }
+    }
+
+    /// Create a multi-endpoint store from the `S3_ENDPOINT_URIS` environment variable.
+    ///
+    /// The variable must contain a comma-separated list of storage URIs.
+    /// The list is subject to the same validation as [`MultiEndpointStore::new`]:
+    /// - At least 1 URI required
+    /// - At most [`crate::constants::MAX_ENDPOINTS`] URIs allowed
+    /// - All URIs must use the same scheme
+    ///
+    /// # Errors
+    /// Returns an error if the variable is unset, empty, contains more than
+    /// `MAX_ENDPOINTS` entries, or contains URIs with mixed schemes.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use s3dlio::multi_endpoint::{MultiEndpointStore, LoadBalanceStrategy};
+    /// // S3_ENDPOINT_URIS="s3://host1:9000/bucket/,s3://host2:9000/bucket/"
+    /// let store = MultiEndpointStore::from_env(LoadBalanceStrategy::RoundRobin, None).unwrap();
+    /// ```
+    pub fn from_env(
+        strategy: LoadBalanceStrategy,
+        default_thread_count: Option<usize>,
+    ) -> Result<Self> {
+        let raw = std::env::var("S3_ENDPOINT_URIS")
+            .map_err(|_| anyhow!("S3_ENDPOINT_URIS environment variable is not set"))?;
+        let uris =
+            crate::uri_utils::parse_uri_list(&raw).context("Failed to parse S3_ENDPOINT_URIS")?;
+        Self::new(uris, strategy, default_thread_count)
     }
 
     /// Get statistics for all endpoints.
@@ -1994,5 +2031,663 @@ mod tests {
         assert_ne!(urls[0], urls[1], "endpoints 0 and 1 must be different");
         assert_ne!(urls[1], urls[2], "endpoints 1 and 2 must be different");
         assert_ne!(urls[0], urls[2], "endpoints 0 and 2 must be different");
+    }
+
+    // =========================================================================
+    // Endpoint count boundary tests
+    // These verify that 1..=MAX_ENDPOINTS are accepted, 0 and >MAX are rejected.
+    // =========================================================================
+
+    /// A store with exactly ONE endpoint must succeed and expose `endpoint_count() == 1`.
+    #[test]
+    fn test_single_endpoint_boundary_works() {
+        let tmp = TempDir::new().unwrap();
+        let uris = vec![format!("file://{}/", tmp.path().display())];
+        let store = MultiEndpointStore::new(uris, LoadBalanceStrategy::RoundRobin, None)
+            .expect("single-endpoint store must be created");
+        assert_eq!(store.endpoint_count(), 1);
+    }
+
+    /// A store with exactly `MAX_ENDPOINTS` (32) endpoints must succeed.
+    #[test]
+    fn test_max_endpoints_boundary_works() {
+        // Build MAX_ENDPOINTS temporary directories.
+        let tmps: Vec<TempDir> = (0..crate::constants::MAX_ENDPOINTS)
+            .map(|_| TempDir::new().unwrap())
+            .collect();
+        let uris: Vec<String> = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect();
+        assert_eq!(uris.len(), crate::constants::MAX_ENDPOINTS);
+
+        let store = MultiEndpointStore::new(uris, LoadBalanceStrategy::RoundRobin, None)
+            .expect("32-endpoint (MAX_ENDPOINTS) store must be created");
+        assert_eq!(store.endpoint_count(), crate::constants::MAX_ENDPOINTS);
+    }
+
+    /// A store with `MAX_ENDPOINTS + 1` (33) endpoints must be rejected.
+    #[test]
+    fn test_too_many_endpoints_fails() {
+        let tmps: Vec<TempDir> = (0..crate::constants::MAX_ENDPOINTS + 1)
+            .map(|_| TempDir::new().unwrap())
+            .collect();
+        let uris: Vec<String> = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect();
+        assert_eq!(uris.len(), crate::constants::MAX_ENDPOINTS + 1);
+
+        let result = MultiEndpointStore::new(uris, LoadBalanceStrategy::RoundRobin, None);
+        assert!(result.is_err(), "33 endpoints must be rejected");
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("Too many endpoints") || msg.contains("exceeds"),
+            "error must mention the limit, got: {msg}"
+        );
+    }
+
+    /// `from_config` must also reject more than MAX_ENDPOINTS endpoints.
+    #[test]
+    fn test_from_config_too_many_endpoints_fails() {
+        let tmps: Vec<TempDir> = (0..crate::constants::MAX_ENDPOINTS + 1)
+            .map(|_| TempDir::new().unwrap())
+            .collect();
+        let endpoints: Vec<EndpointConfig> = tmps
+            .iter()
+            .map(|t| EndpointConfig::new(format!("file://{}/", t.path().display())))
+            .collect();
+        let config = MultiEndpointStoreConfig {
+            endpoints,
+            strategy: LoadBalanceStrategy::RoundRobin,
+            default_thread_count: None,
+        };
+        let result = MultiEndpointStore::from_config(config);
+        assert!(
+            result.is_err(),
+            "from_config with 33 endpoints must be rejected"
+        );
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("Too many endpoints") || msg.contains("exceeds"),
+            "error must mention the limit, got: {msg}"
+        );
+    }
+
+    // =========================================================================
+    // Round-robin distribution tests
+    // For N endpoints with N sequential requests, every endpoint must be used
+    // exactly once.  For 2N requests, every endpoint must be used exactly twice.
+    // =========================================================================
+
+    /// With 4 endpoints and 4 sequential GET requests, each endpoint is hit exactly once.
+    #[tokio::test]
+    async fn test_round_robin_all_4_endpoints_utilized_with_n_requests() {
+        const N: usize = 4;
+        let tmps: Vec<TempDir> = (0..N).map(|_| TempDir::new().unwrap()).collect();
+        let test_data = b"rr test data";
+        for t in &tmps {
+            fs::write(t.path().join("obj.bin"), test_data).unwrap();
+        }
+        let uris: Vec<String> = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect();
+        let store =
+            MultiEndpointStore::new(uris.clone(), LoadBalanceStrategy::RoundRobin, None).unwrap();
+
+        // N GET requests using the first endpoint's URI prefix (round-robin rewrites it).
+        let base_uri = format!("file://{}/obj.bin", tmps[0].path().display());
+        for _ in 0..N {
+            let _ = store.get(&base_uri).await;
+        }
+
+        let stats = store.get_all_stats();
+        assert_eq!(stats.len(), N, "must have N stats entries");
+        for (ep_uri, stat) in &stats {
+            assert_eq!(
+                stat.total_requests, 1,
+                "round-robin: endpoint {ep_uri} must receive exactly 1 of {N} requests"
+            );
+        }
+    }
+
+    /// With 3 endpoints and 6 (= 2N) sequential GET requests, each endpoint is hit exactly twice.
+    #[tokio::test]
+    async fn test_round_robin_all_3_endpoints_utilized_with_2n_requests() {
+        const N: usize = 3;
+        let tmps: Vec<TempDir> = (0..N).map(|_| TempDir::new().unwrap()).collect();
+        let test_data = b"rr 2n test";
+        for t in &tmps {
+            fs::write(t.path().join("data.bin"), test_data).unwrap();
+        }
+        let uris: Vec<String> = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect();
+        let store =
+            MultiEndpointStore::new(uris.clone(), LoadBalanceStrategy::RoundRobin, None).unwrap();
+
+        let base_uri = format!("file://{}/data.bin", tmps[0].path().display());
+        for _ in 0..(2 * N) {
+            let _ = store.get(&base_uri).await;
+        }
+
+        let stats = store.get_all_stats();
+        for (ep_uri, stat) in &stats {
+            assert_eq!(
+                stat.total_requests,
+                2,
+                "round-robin: endpoint {ep_uri} must receive exactly 2 of {} requests",
+                2 * N
+            );
+        }
+    }
+
+    /// Round-robin distributes PUT operations evenly across all N endpoints.
+    #[tokio::test]
+    async fn test_round_robin_put_all_endpoints_utilized() {
+        const N: usize = 4;
+        let tmps: Vec<TempDir> = (0..N).map(|_| TempDir::new().unwrap()).collect();
+        let uris: Vec<String> = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect();
+        let store =
+            MultiEndpointStore::new(uris.clone(), LoadBalanceStrategy::RoundRobin, None).unwrap();
+
+        // N PUT requests using a relative path (round-robin rewrites to each endpoint in turn).
+        for i in 0..N {
+            let data = bytes::Bytes::from(format!("put_data_{i}"));
+            // Use first-endpoint URI prefix; round-robin will distribute across all N.
+            let dest = format!("file://{}/obj_{i}.bin", tmps[0].path().display());
+            let _ = store.put(&dest, data).await;
+        }
+
+        let stats = store.get_all_stats();
+        assert_eq!(stats.len(), N);
+        for (ep_uri, stat) in &stats {
+            assert_eq!(
+                stat.total_requests, 1,
+                "round-robin PUT: endpoint {ep_uri} must receive exactly 1 of {N} requests"
+            );
+        }
+    }
+
+    /// Round-robin distributes LIST operations so all N endpoints are utilised for N requests.
+    #[tokio::test]
+    async fn test_round_robin_list_all_endpoints_utilized() {
+        const N: usize = 3;
+        let tmps: Vec<TempDir> = (0..N).map(|_| TempDir::new().unwrap()).collect();
+        for t in &tmps {
+            fs::write(t.path().join("item.bin"), b"x").unwrap();
+        }
+        let uris: Vec<String> = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect();
+        let store =
+            MultiEndpointStore::new(uris.clone(), LoadBalanceStrategy::RoundRobin, None).unwrap();
+
+        // N LIST requests against the first endpoint's prefix (round-robin rewrites).
+        let list_prefix = format!("file://{}/", tmps[0].path().display());
+        for _ in 0..N {
+            let _ = store.list(&list_prefix, false).await;
+        }
+
+        let stats = store.get_all_stats();
+        for (ep_uri, stat) in &stats {
+            assert_eq!(
+                stat.total_requests, 1,
+                "round-robin LIST: endpoint {ep_uri} must receive exactly 1 of {N} requests"
+            );
+        }
+    }
+
+    /// Round-robin distributes STAT operations so all N endpoints are utilised.
+    #[tokio::test]
+    async fn test_round_robin_stat_all_endpoints_utilized() {
+        const N: usize = 3;
+        let tmps: Vec<TempDir> = (0..N).map(|_| TempDir::new().unwrap()).collect();
+        for t in &tmps {
+            fs::write(t.path().join("meta.bin"), b"stat-test").unwrap();
+        }
+        let uris: Vec<String> = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect();
+        let store =
+            MultiEndpointStore::new(uris.clone(), LoadBalanceStrategy::RoundRobin, None).unwrap();
+
+        let stat_uri = format!("file://{}/meta.bin", tmps[0].path().display());
+        for _ in 0..N {
+            let _ = store.stat(&stat_uri).await;
+        }
+
+        let stats = store.get_all_stats();
+        for (ep_uri, stat) in &stats {
+            assert_eq!(
+                stat.total_requests, 1,
+                "round-robin STAT: endpoint {ep_uri} must receive exactly 1 of {N} requests"
+            );
+        }
+    }
+
+    /// Round-robin distributes DELETE operations so all N endpoints are utilised.
+    #[tokio::test]
+    async fn test_round_robin_delete_all_endpoints_utilized() {
+        const N: usize = 3;
+        let tmps: Vec<TempDir> = (0..N).map(|_| TempDir::new().unwrap()).collect();
+        for t in &tmps {
+            fs::write(t.path().join("del.bin"), b"to-delete").unwrap();
+        }
+        let uris: Vec<String> = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect();
+        let store =
+            MultiEndpointStore::new(uris.clone(), LoadBalanceStrategy::RoundRobin, None).unwrap();
+
+        let del_uri = format!("file://{}/del.bin", tmps[0].path().display());
+        for _ in 0..N {
+            // DELETE errors are expected for non-existent rewrites, but requests must be counted.
+            let _ = store.delete(&del_uri).await;
+        }
+
+        let stats = store.get_all_stats();
+        let total: u64 = stats.iter().map(|(_, s)| s.total_requests).sum();
+        assert_eq!(total, N as u64, "all {N} DELETE requests must be counted");
+        for (ep_uri, stat) in &stats {
+            assert_eq!(
+                stat.total_requests, 1,
+                "round-robin DELETE: endpoint {ep_uri} must receive exactly 1 of {N} requests"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Least-connections distribution tests
+    // =========================================================================
+
+    /// With N endpoints and N *concurrent* GET requests, least-connections routes
+    /// all to different endpoints (each in-flight request holds active_requests=1,
+    /// so the next pick sees different load counts).
+    #[tokio::test]
+    async fn test_least_connections_all_4_endpoints_utilized() {
+        const N: usize = 4;
+        let tmps: Vec<TempDir> = (0..N).map(|_| TempDir::new().unwrap()).collect();
+        let test_data = b"lc test data";
+        for t in &tmps {
+            fs::write(t.path().join("obj.bin"), test_data).unwrap();
+        }
+        let uris: Vec<String> = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect();
+        let store = std::sync::Arc::new(
+            MultiEndpointStore::new(uris.clone(), LoadBalanceStrategy::LeastConnections, None)
+                .unwrap(),
+        );
+
+        // Fire N requests *concurrently*: each request holds active_requests=1 while
+        // in-flight, so subsequent picks see increasing load and choose different endpoints.
+        let base_uri = format!("file://{}/obj.bin", tmps[0].path().display());
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let store_clone = store.clone();
+            let uri = base_uri.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = store_clone.get(&uri).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let stats = store.get_all_stats();
+        let total: u64 = stats.iter().map(|(_, s)| s.total_requests).sum();
+        assert_eq!(total, N as u64, "total requests must equal N");
+
+        // Each endpoint must have received at least one request (concurrent dispatch
+        // ensures each successive pick sees different active-connection counts).
+        for (ep_uri, stat) in &stats {
+            assert!(
+                stat.total_requests >= 1,
+                "least-connections: endpoint {ep_uri} must have received at least 1 request"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Both strategies work with 2+ endpoints
+    // =========================================================================
+
+    /// Both round_robin and least_connections can create stores and serve requests
+    /// with exactly 2 endpoints.
+    #[tokio::test]
+    async fn test_both_strategies_work_with_2_endpoints() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        fs::write(tmp1.path().join("f.bin"), b"hello").unwrap();
+        fs::write(tmp2.path().join("f.bin"), b"hello").unwrap();
+
+        let uris = vec![
+            format!("file://{}/", tmp1.path().display()),
+            format!("file://{}/", tmp2.path().display()),
+        ];
+
+        for strategy in [
+            LoadBalanceStrategy::RoundRobin,
+            LoadBalanceStrategy::LeastConnections,
+        ] {
+            let store = MultiEndpointStore::new(uris.clone(), strategy, None)
+                .unwrap_or_else(|e| panic!("store creation failed for {strategy:?}: {e}"));
+            assert_eq!(store.endpoint_count(), 2);
+
+            let base_uri = format!("file://{}/f.bin", tmp1.path().display());
+            // 2 requests → both endpoints should be hit.
+            for _ in 0..2 {
+                let _ = store.get(&base_uri).await;
+            }
+
+            let total: u64 = store
+                .get_all_stats()
+                .iter()
+                .map(|(_, s)| s.total_requests)
+                .sum();
+            assert_eq!(total, 2, "strategy {strategy:?}: expected 2 total requests");
+        }
+    }
+
+    /// All valid endpoint counts from 1 to MAX_ENDPOINTS must succeed for both strategies.
+    #[test]
+    fn test_valid_endpoint_counts_1_to_max_work_for_both_strategies() {
+        let tmps: Vec<TempDir> = (0..crate::constants::MAX_ENDPOINTS)
+            .map(|_| TempDir::new().unwrap())
+            .collect();
+
+        for count in [1usize, 2, 4, 8, 16, crate::constants::MAX_ENDPOINTS] {
+            let uris: Vec<String> = tmps[..count]
+                .iter()
+                .map(|t| format!("file://{}/", t.path().display()))
+                .collect();
+
+            for strategy in [
+                LoadBalanceStrategy::RoundRobin,
+                LoadBalanceStrategy::LeastConnections,
+            ] {
+                let result = MultiEndpointStore::new(uris.clone(), strategy, None);
+                assert!(
+                    result.is_ok(),
+                    "{count} endpoints with {strategy:?} must succeed, got: {:?}",
+                    result.err()
+                );
+                assert_eq!(result.unwrap().endpoint_count(), count);
+            }
+        }
+    }
+
+    // =========================================================================
+    // S3_ENDPOINT_URIS environment variable tests
+    // These tests use CRED_LOCK to serialize env-var manipulation.
+    // =========================================================================
+
+    /// `from_env` reads `S3_ENDPOINT_URIS` and creates a working store.
+    #[tokio::test]
+    async fn test_from_env_reads_s3_endpoint_uris() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        fs::write(tmp1.path().join("e.bin"), b"env-test").unwrap();
+        fs::write(tmp2.path().join("e.bin"), b"env-test").unwrap();
+
+        let uri1 = format!("file://{}/", tmp1.path().display());
+        let uri2 = format!("file://{}/", tmp2.path().display());
+        let saved = std::env::var("S3_ENDPOINT_URIS").ok();
+        #[allow(deprecated)]
+        std::env::set_var("S3_ENDPOINT_URIS", format!("{},{}", uri1, uri2));
+
+        let result = MultiEndpointStore::from_env(LoadBalanceStrategy::RoundRobin, None);
+
+        restore_env("S3_ENDPOINT_URIS", saved);
+
+        let store = result.expect("from_env must succeed when S3_ENDPOINT_URIS is set");
+        assert_eq!(
+            store.endpoint_count(),
+            2,
+            "must have 2 endpoints from env var"
+        );
+    }
+
+    /// `from_env` with only one URI in `S3_ENDPOINT_URIS` must succeed.
+    #[tokio::test]
+    async fn test_from_env_single_uri_works() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let tmp = TempDir::new().unwrap();
+        let uri = format!("file://{}/", tmp.path().display());
+        let saved = std::env::var("S3_ENDPOINT_URIS").ok();
+        #[allow(deprecated)]
+        std::env::set_var("S3_ENDPOINT_URIS", &uri);
+
+        let result = MultiEndpointStore::from_env(LoadBalanceStrategy::RoundRobin, None);
+
+        restore_env("S3_ENDPOINT_URIS", saved);
+
+        let store = result.expect("from_env must accept a single-URI S3_ENDPOINT_URIS");
+        assert_eq!(store.endpoint_count(), 1);
+    }
+
+    /// `from_env` when `S3_ENDPOINT_URIS` is not set must return an error mentioning the variable.
+    #[tokio::test]
+    async fn test_from_env_unset_fails() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let saved = std::env::var("S3_ENDPOINT_URIS").ok();
+        #[allow(deprecated)]
+        std::env::remove_var("S3_ENDPOINT_URIS");
+
+        let result = MultiEndpointStore::from_env(LoadBalanceStrategy::RoundRobin, None);
+
+        restore_env("S3_ENDPOINT_URIS", saved);
+
+        assert!(
+            result.is_err(),
+            "from_env must fail when S3_ENDPOINT_URIS is unset"
+        );
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("S3_ENDPOINT_URIS"),
+            "error must mention S3_ENDPOINT_URIS, got: {msg}"
+        );
+    }
+
+    /// `from_env` when `S3_ENDPOINT_URIS` is an empty string must return an error.
+    #[tokio::test]
+    async fn test_from_env_empty_string_fails() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let saved = std::env::var("S3_ENDPOINT_URIS").ok();
+        #[allow(deprecated)]
+        std::env::set_var("S3_ENDPOINT_URIS", "");
+
+        let result = MultiEndpointStore::from_env(LoadBalanceStrategy::RoundRobin, None);
+
+        restore_env("S3_ENDPOINT_URIS", saved);
+
+        assert!(
+            result.is_err(),
+            "from_env with empty S3_ENDPOINT_URIS must fail"
+        );
+    }
+
+    /// `from_env` when `S3_ENDPOINT_URIS` contains MAX_ENDPOINTS+1 entries must return an error.
+    #[tokio::test]
+    async fn test_from_env_too_many_endpoints_fails() {
+        let _guard = CRED_LOCK.lock().await;
+
+        // Build MAX+1 file:// URIs (directories needn't actually exist for creation to fail on count).
+        let too_many = crate::constants::MAX_ENDPOINTS + 1;
+        let tmps: Vec<TempDir> = (0..too_many).map(|_| TempDir::new().unwrap()).collect();
+        let uris_csv: String = tmps
+            .iter()
+            .map(|t| format!("file://{}/", t.path().display()))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let saved = std::env::var("S3_ENDPOINT_URIS").ok();
+        #[allow(deprecated)]
+        std::env::set_var("S3_ENDPOINT_URIS", &uris_csv);
+
+        let result = MultiEndpointStore::from_env(LoadBalanceStrategy::RoundRobin, None);
+
+        restore_env("S3_ENDPOINT_URIS", saved);
+
+        assert!(
+            result.is_err(),
+            "from_env with {} endpoints (> MAX_ENDPOINTS) must fail",
+            too_many
+        );
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("Too many endpoints") || msg.contains("exceeds"),
+            "error must mention the limit, got: {msg}"
+        );
+    }
+
+    /// `from_env` works with both round_robin and least_connections strategies.
+    #[tokio::test]
+    async fn test_from_env_both_strategies_work() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let uri1 = format!("file://{}/", tmp1.path().display());
+        let uri2 = format!("file://{}/", tmp2.path().display());
+        let csv = format!("{},{}", uri1, uri2);
+
+        let saved = std::env::var("S3_ENDPOINT_URIS").ok();
+
+        for strategy in [
+            LoadBalanceStrategy::RoundRobin,
+            LoadBalanceStrategy::LeastConnections,
+        ] {
+            #[allow(deprecated)]
+            std::env::set_var("S3_ENDPOINT_URIS", &csv);
+
+            let result = MultiEndpointStore::from_env(strategy, None);
+
+            let store = result.unwrap_or_else(|e| {
+                restore_env("S3_ENDPOINT_URIS", saved.clone());
+                panic!("from_env with {strategy:?} must succeed: {e}");
+            });
+
+            assert_eq!(
+                store.endpoint_count(),
+                2,
+                "strategy {strategy:?}: must have 2 endpoints"
+            );
+        }
+
+        restore_env("S3_ENDPOINT_URIS", saved);
+    }
+
+    /// `from_env` with 4 URIs in `S3_ENDPOINT_URIS` must produce exactly 4 endpoints,
+    /// confirming that ALL listed values are consumed, not just the first.
+    #[tokio::test]
+    async fn test_from_env_4_endpoints_all_present() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
+        let uris: Vec<String> = dirs
+            .iter()
+            .map(|d| format!("file://{}/", d.path().display()))
+            .collect();
+        let csv = uris.join(",");
+
+        let saved = std::env::var("S3_ENDPOINT_URIS").ok();
+        #[allow(deprecated)]
+        std::env::set_var("S3_ENDPOINT_URIS", &csv);
+
+        let result = MultiEndpointStore::from_env(LoadBalanceStrategy::RoundRobin, None);
+        restore_env("S3_ENDPOINT_URIS", saved);
+
+        let store = result.expect("from_env must succeed with 4 URIs in S3_ENDPOINT_URIS");
+        assert_eq!(
+            store.endpoint_count(),
+            4,
+            "all 4 URIs in S3_ENDPOINT_URIS must be used; found {}",
+            store.endpoint_count()
+        );
+    }
+
+    /// `from_env` must correctly handle URIs with surrounding whitespace (spaces/tabs).
+    /// Each entry is trimmed before use, so "  uri1  , uri2  " → 2 endpoints.
+    #[tokio::test]
+    async fn test_from_env_whitespace_is_trimmed() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let uri1 = format!("file://{}/", tmp1.path().display());
+        let uri2 = format!("file://{}/", tmp2.path().display());
+        // Deliberately add surrounding whitespace and a tab
+        let csv = format!("  {}  ,\t{} ", uri1, uri2);
+
+        let saved = std::env::var("S3_ENDPOINT_URIS").ok();
+        #[allow(deprecated)]
+        std::env::set_var("S3_ENDPOINT_URIS", &csv);
+
+        let result = MultiEndpointStore::from_env(LoadBalanceStrategy::RoundRobin, None);
+        restore_env("S3_ENDPOINT_URIS", saved);
+
+        let store = result.expect("from_env must trim whitespace around each URI");
+        assert_eq!(
+            store.endpoint_count(),
+            2,
+            "whitespace-padded CSV must yield exactly 2 endpoints"
+        );
+    }
+
+    /// `from_env` correctly populates a store for every valid count:
+    /// 1, 2, 4, 8, 16, and MAX_ENDPOINTS (32).
+    /// This mirrors the YAML-config count test, but through the env-var path.
+    #[tokio::test]
+    async fn test_from_env_valid_counts_1_to_max() {
+        let _guard = CRED_LOCK.lock().await;
+
+        let max = crate::constants::MAX_ENDPOINTS;
+        // Pre-create MAX_ENDPOINTS temp dirs so we can slice them per iteration.
+        let dirs: Vec<TempDir> = (0..max).map(|_| TempDir::new().unwrap()).collect();
+        let all_uris: Vec<String> = dirs
+            .iter()
+            .map(|d| format!("file://{}/", d.path().display()))
+            .collect();
+
+        let saved = std::env::var("S3_ENDPOINT_URIS").ok();
+
+        for count in [1usize, 2, 4, 8, 16, max] {
+            let csv = all_uris[..count].join(",");
+            #[allow(deprecated)]
+            std::env::set_var("S3_ENDPOINT_URIS", &csv);
+
+            let result = MultiEndpointStore::from_env(LoadBalanceStrategy::RoundRobin, None);
+            if result.is_err() {
+                restore_env("S3_ENDPOINT_URIS", saved.clone());
+                panic!(
+                    "from_env with count={count} must succeed: {:?}",
+                    result.err()
+                );
+            }
+            let store = result.unwrap();
+            assert_eq!(
+                store.endpoint_count(),
+                count,
+                "S3_ENDPOINT_URIS with {count} entries must yield {count} endpoints"
+            );
+        }
+
+        restore_env("S3_ENDPOINT_URIS", saved);
     }
 }

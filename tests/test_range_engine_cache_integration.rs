@@ -52,7 +52,9 @@ async fn test_range_engine_decision_with_cached_size() -> Result<()> {
         let store = FileSystemObjectStore::new();
 
         // Pre-stat to populate cache
-        let cached = store.pre_stat_and_cache(&[uri.clone()], 1).await?;
+        let cached = store
+            .pre_stat_and_cache(std::slice::from_ref(&uri), 1)
+            .await?;
         println!("  Cached {} size", cached);
 
         // Download - should use cached size to decide RangeEngine
@@ -225,7 +227,9 @@ async fn test_cache_miss_vs_cache_hit_performance() -> Result<()> {
     println!("  Note: Includes stat() overhead");
 
     // Pre-stat to populate cache
-    store.pre_stat_and_cache(&[uri.clone()], 1).await?;
+    store
+        .pre_stat_and_cache(std::slice::from_ref(&uri), 1)
+        .await?;
 
     // Test 2: Cache hit (second access with pre-stat)
     println!("\n2. Second access (cache hit - no stat):");

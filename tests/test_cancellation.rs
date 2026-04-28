@@ -83,7 +83,7 @@ async fn test_dataloader_cancellation_during_streaming() {
     // Stream should end relatively quickly after cancellation
     let remaining_batches = tokio::time::timeout(Duration::from_secs(2), async {
         let mut count = 0;
-        while let Some(_) = stream.next().await {
+        while stream.next().await.is_some() {
             count += 1;
         }
         count
@@ -216,7 +216,7 @@ async fn test_async_pool_dataloader_cancellation_during_streaming() {
     // Stream should end relatively quickly
     let remaining_batches = tokio::time::timeout(Duration::from_secs(2), async {
         let mut count = 0;
-        while let Some(_) = stream.next().await {
+        while stream.next().await.is_some() {
             count += 1;
         }
         count
@@ -358,8 +358,8 @@ async fn test_multiple_loaders_shared_token() {
 
     // Both should end relatively quickly
     let result = tokio::time::timeout(Duration::from_secs(2), async {
-        while let Some(_) = stream1.next().await {}
-        while let Some(_) = stream2.next().await {}
+        while stream1.next().await.is_some() {}
+        while stream2.next().await.is_some() {}
     })
     .await;
 

@@ -114,7 +114,7 @@ fn bench_uri_parsing(c: &mut Criterion) {
             |b, uri| {
                 b.iter(|| {
                     let result = parse_s3_uri(uri);
-                    criterion::black_box(result);
+                    let _ = criterion::black_box(result);
                 });
             },
         );

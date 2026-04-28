@@ -30,6 +30,7 @@ use crate::s3_utils::{
     create_bucket_async as s3_create_bucket_async,
     delete_bucket_async as s3_delete_bucket_async,
     delete_objects_async as s3_delete_objects_async,
+    format_sdk_error,
     get_object_range_uri_async as s3_get_object_range_uri_async,
     get_object_uri_async as s3_get_object_uri_async,
     get_object_uri_optimized_async as s3_get_object_uri_optimized_async,
@@ -1119,14 +1120,25 @@ impl S3ObjectStore {
             if let Some(ref t) = cont {
                 req = req.continuation_token(t.as_str());
             }
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("list_objects_v2 failed for bucket '{}'", bucket))?;
+            let resp = req.send().await.map_err(|e| {
+                anyhow::anyhow!(
+                    "list_objects_v2 failed for bucket '{}': {}",
+                    bucket,
+                    format_sdk_error(&e)
+                )
+            })?;
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
                     if re.is_match(key) || key.starts_with(&prefix_str) {
                         keys.push(format!("s3://{}/{}", bucket, key));
+                    }
+                }
+            }
+            // In non-recursive mode, include common prefixes (virtual directories).
+            if !recursive {
+                for cp in resp.common_prefixes() {
+                    if let Some(prefix_key) = cp.prefix() {
+                        keys.push(format!("s3://{}/{}", bucket, prefix_key));
                     }
                 }
             }
@@ -3043,7 +3055,7 @@ impl ObjectWriter for GcsBufferedWriter {
 // All backends that it dispatches to are constructed synchronously:
 //   • file://   → FileSystemObjectStore::boxed()                   — sync ✓
 //   • direct:// → ConfigurableFileSystemObjectStore::boxed_direct_io() — sync ✓
-//   • s3://     → S3ObjectStore::boxed()  (global client, no I/O)  — sync ✓
+//   • s3://     → S3ObjectStore  (see below)                       — sync ✓
 //   • az://     → AzureObjectStore::boxed()                        — sync ✓
 //   • gs://     → GcsObjectStore::boxed()                          — sync ✓
 //
@@ -3051,39 +3063,41 @@ impl ObjectWriter for GcsBufferedWriter {
 // (via OnceCell inside aws_s3_client_async), not at construction time.  So
 // store_for_uri("s3://...") makes no network calls and needs no await.
 //
-// KNOWN LIMITATION — per-endpoint S3 stores
-// ------------------------------------------
-// S3ObjectStore::for_endpoint(url) IS async because it creates a fresh
-// aws_sdk_s3::Client that fully loads the AWS config chain.  Because
-// store_for_uri() is sync, it cannot call for_endpoint(); it always
-// produces the global-client variant (S3ObjectStore::boxed()).
+// PER-ENDPOINT S3 STORES
+// ----------------------
+// When the URI contains an explicit host:port (e.g. s3://10.9.0.17:80/...),
+// s3_endpoint_url_from_uri() extracts the HTTP endpoint URL and
+// store_for_uri_with_logger() calls S3ObjectStore::for_endpoint() via
+// run_on_global_rt() to create a **dedicated** AWS SDK client with its own
+// connection pool.  This client ignores AWS_ENDPOINT_URL entirely.
 //
-// This matters for multi-endpoint workloads:
-//   MultiEndpointStore::from_config() detects s3://host:port/bucket/ URIs
-//   and calls for_endpoint() via run_on_global_rt() instead of falling back
-//   to store_for_uri().  See multi_endpoint.rs::from_config() for details.
-//
-// Callers that pass plain s3://bucket/prefix/ URIs to store_for_uri()
-// always get the global client — there is no per-endpoint isolation for
-// them.  This is acceptable for single-endpoint deployments.
-//
-// FUTURE WORK
-// -----------
-// If s3dlio ever needs a fully async factory (e.g., to allow users to call
-// store_for_uri("s3://myhost:9000/bucket/") with per-endpoint isolation), we
-// would need to introduce an async version such as:
-//
-//   pub async fn store_for_uri_async(uri: &str) -> Result<Box<dyn ObjectStore>>
-//
-// That path would check for an explicit host and, when present, call
-// S3ObjectStore::for_endpoint() instead of S3ObjectStore::boxed().
-// Downstream callers (sai3-bench, dl-driver Python API) would need to be
-// updated to await the result.  The sync variant should be kept as a
-// compatibility shim for non-S3 backends that don't need per-endpoint clients.
-//
-// Until that work is done: if you see unexpected S3 connections going to the
-// wrong endpoint even though store_for_uri() was called with an explicit host,
-// the cause is almost certainly this sync / global-client limitation.
+// Plain bucket URIs (s3://my-bucket/prefix/) have no port and continue to
+// use the global singleton client (which reads AWS_ENDPOINT_URL).  This is
+// correct for single-endpoint and AWS S3 deployments.
+
+/// Extract a per-endpoint HTTP URL from an S3 URI that contains an explicit host:port.
+///
+/// Returns `Some(endpoint_url)` when the URI authority contains a port number
+/// (e.g. `s3://10.9.0.17:80/bucket/` → `Some("http://10.9.0.17:80")`).
+/// Returns `None` for plain bucket URIs like `s3://my-bucket/prefix/`.
+///
+/// Used by [`store_for_uri_with_logger`] to create per-endpoint S3 clients
+/// rather than falling back to the global singleton (which honours
+/// `AWS_ENDPOINT_URL` and would route all traffic to one host).
+fn s3_endpoint_url_from_uri(uri: &str) -> Option<String> {
+    let after_scheme = uri.strip_prefix("s3://")?;
+    // Authority is everything before the first '/'
+    let authority = after_scheme.split('/').next()?;
+    // Only treat as explicit host:port when a ':' is present
+    if !authority.contains(':') {
+        return None;
+    }
+    // Determine HTTP scheme from port: 443 → https, everything else → http
+    let port: u16 = authority.rsplit(':').next()?.parse().ok()?;
+    let http_scheme = if port == 443 { "https" } else { "http" };
+    Some(format!("{http_scheme}://{authority}"))
+}
+
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_logger(uri, None)
 }
@@ -3124,7 +3138,18 @@ pub fn store_for_uri_with_logger(
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => FileSystemObjectStore::boxed(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
-        Scheme::S3 => S3ObjectStore::boxed(),
+        Scheme::S3 => {
+            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri) {
+                // Per-endpoint store: dedicated connection pool, ignores AWS_ENDPOINT_URL.
+                crate::s3_client::run_on_global_rt(async move {
+                    S3ObjectStore::for_endpoint(&endpoint_url)
+                        .await
+                        .map(|s| Box::new(s) as Box<dyn ObjectStore>)
+                })?
+            } else {
+                S3ObjectStore::boxed()
+            }
+        }
         Scheme::Azure => {
             #[cfg(feature = "backend-azure")]
             {
@@ -3190,7 +3215,18 @@ pub fn store_for_uri_with_config_and_logger(
                 "Cannot use DirectFileSystemConfig with file:// URI - use FileSystemConfig instead"
             )
         }
-        (Scheme::S3, _) => S3ObjectStore::boxed(),
+        (Scheme::S3, _) => {
+            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri) {
+                // Per-endpoint store: dedicated connection pool, ignores AWS_ENDPOINT_URL.
+                crate::s3_client::run_on_global_rt(async move {
+                    S3ObjectStore::for_endpoint(&endpoint_url)
+                        .await
+                        .map(|s| Box::new(s) as Box<dyn ObjectStore>)
+                })?
+            } else {
+                S3ObjectStore::boxed()
+            }
+        }
         (Scheme::Azure, _) => {
             #[cfg(feature = "backend-azure")]
             {
@@ -3921,5 +3957,94 @@ mod s3_object_store_tests {
             #[allow(deprecated)]
             None => std::env::remove_var(key),
         }
+    }
+}
+
+// =============================================================================
+// ObjectStore::list() — common-prefix (virtual directory) tests
+//
+// These tests use `file://` URIs so they run without any cloud credentials.
+// They specifically guard against regressions where non-recursive listing
+// silently discards common prefixes (subdirectory entries).
+// =============================================================================
+#[cfg(test)]
+mod list_common_prefix_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Build a temporary directory tree and return its path:
+    ///   <root>/
+    ///     top_file.txt
+    ///     subdir/
+    ///       nested_file.txt
+    fn make_tree() -> TempDir {
+        let dir = TempDir::new().expect("create tempdir");
+        fs::write(dir.path().join("top_file.txt"), b"top").unwrap();
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+        fs::write(dir.path().join("subdir").join("nested_file.txt"), b"nested").unwrap();
+        dir
+    }
+
+    /// Non-recursive list of the root must include the subdirectory entry AND
+    /// the top-level file.  Before the fix, directory entries were silently dropped.
+    #[tokio::test]
+    async fn test_non_recursive_list_includes_subdirectory() {
+        let tree = make_tree();
+        let uri = format!("file://{}/", tree.path().display());
+        let store = store_for_uri_with_logger(&uri, None).expect("create file store");
+        let keys = store.list(&uri, /*recursive=*/ false).await.expect("list");
+
+        let has_subdir = keys.iter().any(|k| k.contains("subdir"));
+        let has_top_file = keys.iter().any(|k| k.contains("top_file.txt"));
+
+        assert!(
+            has_subdir,
+            "non-recursive list must include subdirectory entries; got: {:?}",
+            keys
+        );
+        assert!(
+            has_top_file,
+            "non-recursive list must include top-level files; got: {:?}",
+            keys
+        );
+    }
+
+    /// Recursive list must include the nested file but NOT add an extra synthetic
+    /// directory entry for the subdirectory.
+    #[tokio::test]
+    async fn test_recursive_list_includes_nested_file() {
+        let tree = make_tree();
+        let uri = format!("file://{}/", tree.path().display());
+        let store = store_for_uri_with_logger(&uri, None).expect("create file store");
+        let keys = store.list(&uri, /*recursive=*/ true).await.expect("list");
+
+        let has_nested = keys.iter().any(|k| k.contains("nested_file.txt"));
+        assert!(
+            has_nested,
+            "recursive list must include nested files; got: {:?}",
+            keys
+        );
+    }
+
+    /// Non-recursive list of a subdirectory must only return its own contents,
+    /// not sibling directories.
+    #[tokio::test]
+    async fn test_non_recursive_list_of_subdir() {
+        let tree = make_tree();
+        let uri = format!("file://{}/subdir/", tree.path().display());
+        let store = store_for_uri_with_logger(&uri, None).expect("create file store");
+        let keys = store.list(&uri, /*recursive=*/ false).await.expect("list");
+
+        assert!(
+            keys.iter().any(|k| k.contains("nested_file.txt")),
+            "listing subdir/ must include nested_file.txt; got: {:?}",
+            keys
+        );
+        assert!(
+            !keys.iter().any(|k| k.contains("top_file.txt")),
+            "listing subdir/ must NOT include sibling top_file.txt; got: {:?}",
+            keys
+        );
     }
 }

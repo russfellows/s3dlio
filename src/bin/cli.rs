@@ -104,6 +104,45 @@ struct Cli {
     )]
     verbose: u8,
 
+    /// Override the S3 endpoint URL (equivalent to AWS_ENDPOINT_URL).
+    ///
+    /// Examples:
+    ///   --endpoint-url http://minio.local:9000
+    ///   --endpoint-url https://s3.example.com
+    ///
+    /// Takes precedence over the AWS_ENDPOINT_URL environment variable.
+    /// Alias --endpoint is also accepted for compatibility with other tools.
+    #[arg(
+        long = "endpoint-url",
+        alias = "endpoint",
+        value_name = "URL",
+        help = "S3 endpoint URL (overrides AWS_ENDPOINT_URL)"
+    )]
+    endpoint_url: Option<String>,
+
+    /// AWS region to use (overrides AWS_DEFAULT_REGION / AWS_REGION).
+    ///
+    /// Examples:
+    ///   --region us-east-1
+    ///   --region eu-west-2
+    #[arg(
+        long = "region",
+        value_name = "REGION",
+        help = "AWS region (overrides AWS_DEFAULT_REGION)"
+    )]
+    region: Option<String>,
+
+    /// Path to a custom CA certificate bundle for TLS verification (overrides AWS_CA_BUNDLE).
+    ///
+    /// Example:
+    ///   --ca-bundle /etc/ssl/certs/my-corp-ca.pem
+    #[arg(
+        long = "ca-bundle",
+        value_name = "PATH",
+        help = "CA certificate bundle path (overrides AWS_CA_BUNDLE)"
+    )]
+    ca_bundle: Option<String>,
+
     /// Write warp‑replay compatible op‑log (.tsv.zst). Disabled if not provided.
     #[arg(long = "op-log", value_name = "FILE")]
     op_log: Option<PathBuf>,
@@ -332,17 +371,6 @@ enum Command {
         /// Count objects only (don't print URIs) - faster for large result sets
         #[clap(short, long)]
         count_only: bool,
-    },
-
-    /// Generate NVIDIA DALI-compatible index file for a TFRecord file
-    #[clap(name = "tfrecord-index")]
-    TfrecordIndex {
-        /// Path to TFRecord file (input)
-        tfrecord_path: PathBuf,
-
-        /// Path to index file (output, typically .idx extension)
-        #[arg(default_value = None)]
-        index_path: Option<PathBuf>,
     },
 }
 
@@ -640,6 +668,22 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
+
+    // If --endpoint-url was given on the command line, inject it into the
+    // environment now — before any S3 client is initialised — so that all
+    // downstream code (aws_s3_client_async, list_buckets, store_for_uri, …)
+    // picks it up via AWS_ENDPOINT_URL without modification.
+    // CLI flag takes precedence over whatever is already in the environment.
+    if let Some(ref url) = cli.endpoint_url {
+        // SAFETY: single-threaded at this point; no S3 client has been created yet.
+        unsafe { std::env::set_var("AWS_ENDPOINT_URL", url) };
+    }
+    if let Some(ref region) = cli.region {
+        unsafe { std::env::set_var("AWS_DEFAULT_REGION", region) };
+    }
+    if let Some(ref bundle) = cli.ca_bundle {
+        unsafe { std::env::set_var("AWS_CA_BUNDLE", bundle) };
+    }
 
     // Initialize tracing with env filter (compatible with dl-driver/s3-bench)
     // NOTE: 2025-12-03 - Debug-level logging for ALL crates causes hangs during AWS SDK operations.
@@ -1113,18 +1157,6 @@ async fn main() -> Result<()> {
             }
             generic_list_cmd(&uri, recursive, pattern.as_deref(), count_only).await?
         }
-
-        Command::TfrecordIndex {
-            tfrecord_path,
-            index_path,
-        } => {
-            // Check AWS credentials only for S3 paths
-            let tfrecord_str = tfrecord_path.to_string_lossy();
-            if requires_aws_credentials(&tfrecord_str) {
-                check_aws_credentials()?;
-            }
-            tfrecord_index_cmd(&tfrecord_path, index_path.as_deref())?
-        }
     } // End of match cli.cmd
 
     // If set, finalize the op‑logger
@@ -1168,10 +1200,22 @@ async fn generic_list_cmd(
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger)?;
 
-    // Compile regex pattern if provided
+    // Compile regex pattern if provided.
+    // Pattern is matched against the relative path (key portion after the listing prefix),
+    // e.g. listing s3://bucket/prefix/ and key s3://bucket/prefix/foo/bar → pattern sees "foo/bar".
     let re = pattern
         .map(|pat| Regex::new(pat).with_context(|| format!("Invalid regex pattern: '{}'", pat)))
         .transpose()?;
+    // Normalise the prefix for stripping: ensure it ends with '/'
+    let base = if uri.ends_with('/') {
+        uri.to_owned()
+    } else {
+        format!("{}/", uri)
+    };
+    debug!(
+        "generic_list_cmd: cli pattern={:?} (matched against relative path after '{}')",
+        pattern, base
+    );
 
     let mut stream = store.list_stream(uri, recursive);
     let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1220,9 +1264,10 @@ async fn generic_list_cmd(
     while let Some(result) = stream.next().await {
         let key = result?;
 
-        // Apply client-side regex filtering if pattern provided
+        // Apply client-side regex filtering against the relative path (after the listing prefix)
         if let Some(ref regex) = re {
-            if !regex.is_match(&key) {
+            let relative = key.strip_prefix(base.as_str()).unwrap_or(&key);
+            if !regex.is_match(relative) {
                 continue;
             }
         }
@@ -1256,45 +1301,6 @@ async fn generic_list_cmd(
         elapsed,
         format_with_commas(rate)
     )?;
-    Ok(())
-}
-
-/// TFRecord index generation command
-/// Creates NVIDIA DALI-compatible index files for TFRecord files
-fn tfrecord_index_cmd(tfrecord_path: &PathBuf, index_path: Option<&Path>) -> Result<()> {
-    use s3dlio::tfrecord_index::write_index_for_tfrecord_file;
-
-    // Determine output path: use provided or default to input + ".idx"
-    let output_path = match index_path {
-        Some(p) => p.to_path_buf(),
-        None => {
-            let mut p = tfrecord_path.clone();
-            let current_name = p
-                .file_name()
-                .context("Invalid TFRecord path")?
-                .to_string_lossy()
-                .to_string();
-            p.set_file_name(format!("{}.idx", current_name));
-            p
-        }
-    };
-
-    info!("Indexing TFRecord file: {}", tfrecord_path.display());
-    info!("Output index file: {}", output_path.display());
-
-    let start = Instant::now();
-    let num_records = write_index_for_tfrecord_file(tfrecord_path, &output_path)
-        .map_err(|e| anyhow::anyhow!("Failed to create index: {}", e))?;
-    let elapsed = start.elapsed();
-
-    safe_println!(
-        "Successfully indexed {} records in {:.2?}",
-        num_records,
-        elapsed
-    );
-    safe_println!("Index file: {}", output_path.display());
-    safe_println!("Format: NVIDIA DALI compatible (text, space-separated)");
-
     Ok(())
 }
 
@@ -2174,6 +2180,13 @@ fn build_s3_endpoint_uris(endpoints: &str, base_uri: &str) -> Result<Vec<String>
     if uris.is_empty() {
         bail!("--endpoints requires at least one host:port value");
     }
+    if uris.len() > s3dlio::constants::MAX_ENDPOINTS {
+        bail!(
+            "--endpoints: {} endpoints exceeds the maximum of {} (MAX_ENDPOINTS)",
+            uris.len(),
+            s3dlio::constants::MAX_ENDPOINTS
+        );
+    }
     Ok(uris)
 }
 
@@ -2714,5 +2727,53 @@ mod tests {
         } else {
             panic!("expected Command::Put");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // build_s3_endpoint_uris count-boundary tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_s3_endpoint_uris_accepts_exactly_one() {
+        let uris = build_s3_endpoint_uris("10.9.0.17:9000", "s3://bucket/prefix/").unwrap();
+        assert_eq!(uris.len(), 1);
+        assert_eq!(uris[0], "s3://10.9.0.17:9000/bucket/prefix/");
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_accepts_exactly_max_endpoints() {
+        // Build MAX_ENDPOINTS (32) host:port pairs.
+        let hosts: Vec<String> = (1..=s3dlio::constants::MAX_ENDPOINTS)
+            .map(|i| format!("10.0.0.{}:9000", i))
+            .collect();
+        let endpoints_str = hosts.join(",");
+        let result = build_s3_endpoint_uris(&endpoints_str, "s3://bucket/prefix/");
+        assert!(
+            result.is_ok(),
+            "exactly MAX_ENDPOINTS ({}) endpoints must be accepted, got: {:?}",
+            s3dlio::constants::MAX_ENDPOINTS,
+            result.err()
+        );
+        assert_eq!(result.unwrap().len(), s3dlio::constants::MAX_ENDPOINTS);
+    }
+
+    #[test]
+    fn build_s3_endpoint_uris_rejects_more_than_max_endpoints() {
+        // Build MAX_ENDPOINTS+1 (33) host:port pairs.
+        let hosts: Vec<String> = (1..=(s3dlio::constants::MAX_ENDPOINTS + 1))
+            .map(|i| format!("10.0.0.{}:9000", i))
+            .collect();
+        let endpoints_str = hosts.join(",");
+        let result = build_s3_endpoint_uris(&endpoints_str, "s3://bucket/prefix/");
+        assert!(
+            result.is_err(),
+            "MAX_ENDPOINTS+1 ({}) endpoints must be rejected",
+            s3dlio::constants::MAX_ENDPOINTS + 1
+        );
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("exceeds") || msg.contains("maximum"),
+            "error must mention the limit, got: {msg}"
+        );
     }
 }

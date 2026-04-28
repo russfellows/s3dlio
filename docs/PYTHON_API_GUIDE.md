@@ -1,13 +1,14 @@
 # s3dlio Python API Guide
 
-**Version:** 0.9.94  
-**Last Updated:** April 25, 2026
+**Version:** 0.9.96  
+**Last Updated:** April 27, 2026
 
 ## Table of Contents
 
 1. [Installation](#installation)
 2. [Quick Start](#quick-start)
-3. [Architecture](#architecture)
+3. [S3 Connection Configuration](#s3-connection-configuration)
+4. [Architecture](#architecture)
 4. [Core Storage Operations](#core-storage-operations)
 5. [Zero-Copy Data Flow](#zero-copy-data-flow)
 6. [Batch Operations](#batch-operations)
@@ -94,6 +95,100 @@ if s3dlio.exists("s3://my-bucket/data.bin"):
 | `az://` | `az://account/container/key` | Azure Blob Storage |
 | `file://` | `file:///path/to/file` | Local filesystem |
 | `direct://` | `direct:///path/to/file` | Direct I/O (O_DIRECT) — bypasses the OS page cache. **v0.9.95:** correctly routed through `ConfigurableFileSystemObjectStore::with_direct_io()` in `get_many()` (previously silently used buffered I/O). |
+
+---
+
+## S3 Connection Configuration
+
+`configure_s3()` is the Python equivalent of the CLI's `--endpoint-url`, `--region`, and
+`--ca-bundle` global flags.  It sets the corresponding environment variables **and** clears
+the internal store cache so the next operation creates a fresh connection with the new
+settings.
+
+### Signature
+
+```python
+s3dlio.configure_s3(
+    endpoint_url: str | None = None,
+    region:       str | None = None,
+    ca_bundle:    str | None = None,
+) -> None
+```
+
+| Parameter | Env var set | CLI equivalent | Description |
+|-----------|-------------|----------------|-------------|
+| `endpoint_url` | `AWS_ENDPOINT_URL` | `--endpoint-url` | Full URL of the S3-compatible server, e.g. `"https://minio.corp:9000"` |
+| `region` | `AWS_DEFAULT_REGION` | `--region` | AWS region name, e.g. `"us-east-1"` |
+| `ca_bundle` | `AWS_CA_BUNDLE` | `--ca-bundle` | Filesystem path to a PEM CA certificate bundle for TLS |
+
+### Example
+
+```python
+import s3dlio
+
+# Must be called BEFORE the first S3 operation (see critical note below)
+s3dlio.configure_s3(
+    endpoint_url="https://172.16.1.40:9000",
+    region="us-east-1",
+    ca_bundle="/etc/ssl/certs/my-ca.pem",
+)
+
+# All S3 operations now use the configured endpoint:
+keys  = s3dlio.list("s3://my-bucket/", recursive=False)
+data  = s3dlio.get("s3://my-bucket/file.bin")
+s3dlio.put_bytes("s3://my-bucket/out.bin", data)
+info  = s3dlio.stat("s3://my-bucket/file.bin")
+s3dlio.delete("s3://my-bucket/file.bin")
+```
+
+### Scope
+
+`configure_s3()` applies to **all** S3 operations: `list`, `get`, `get_range`, `get_many`,
+`put_bytes`, `put_many`, `stat`, `exists`, `delete`, `upload`, `download`, `mp_get`,
+`create_bucket`, `delete_bucket`, and all async variants.  It does **not** affect Azure or
+GCS backends (those use their own environment variables — see [Authentication](#authentication)).
+
+### ⚠️ Critical: Call Before the First S3 Operation
+
+The underlying AWS SDK client is a **process-global singleton** (`OnceCell`) that is
+initialised exactly once — on the first S3 call — and **cannot be reconfigured afterwards**.
+
+```python
+import s3dlio
+
+# ✅ CORRECT — configure before any S3 operation
+s3dlio.configure_s3(endpoint_url="https://minio:9000", region="us-east-1")
+data = s3dlio.get("s3://bucket/key")   # uses the configured endpoint
+
+# ❌ WRONG — SDK client already initialised; configure_s3() has no effect
+data = s3dlio.get("s3://bucket/key")   # initialises client with default settings
+s3dlio.configure_s3(endpoint_url="https://minio:9000")  # too late — ignored
+```
+
+`configure_s3()` **does** clear the store cache (`STORE_CACHE`), so if you only need to
+switch endpoints between operations (and the AWS SDK client settings are compatible with
+both), calling it mid-script will cause the next operation to build a new store against
+the new endpoint.
+
+### Relationship to Environment Variables
+
+`configure_s3()` is syntactic sugar for `os.environ` assignments plus a cache flush.  Both
+approaches are equivalent:
+
+```python
+# These two blocks are identical in effect:
+
+# Option A — configure_s3()
+s3dlio.configure_s3(endpoint_url="https://minio:9000", region="us-east-1")
+
+# Option B — environment variables directly
+import os
+os.environ["AWS_ENDPOINT_URL"]    = "https://minio:9000"
+os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+# (no cache flush needed if called before any S3 op)
+```
+
+Prefer `configure_s3()` when you want the cache flush guarantee.
 
 ---
 
@@ -876,6 +971,7 @@ meta = s3dlio.stat_object("s3://bucket/key")
 
 | Function | Description | Returns |
 |----------|-------------|---------|
+| `configure_s3(endpoint_url, region, ca_bundle)` | Configure S3 endpoint, region, and CA bundle; clears store cache — **call before first S3 op** | None |
 | `put_bytes(uri, data)` | Upload bytes | None |
 | `put_bytes_async(uri, data)` | Async upload | Coroutine |
 | `put_many(items)` | Batch upload `[(uri, data), ...]` | None |

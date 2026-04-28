@@ -156,10 +156,18 @@ async fn test_file_store_directory_operations() -> Result<()> {
         .put(&file2_uri, bytes::Bytes::from_static(b"File 2 content"))
         .await?;
 
-    // Test listing files non-recursively
+    // Test listing files non-recursively: must include file1.txt AND the subdir/ entry
+    // (non-recursive listing returns immediate children — both files and subdirectories)
     let files_non_recursive = store.list(&dir1_uri, false).await?;
-    assert_eq!(files_non_recursive.len(), 1); // Only file1.txt
+    assert_eq!(files_non_recursive.len(), 2); // file1.txt + subdir/
     assert!(files_non_recursive.contains(&file1_uri));
+    // subdir is returned with a trailing slash
+    let subdir_uri = format!("file://{}/", base_path.join("dir1/subdir").display());
+    assert!(
+        files_non_recursive.contains(&subdir_uri),
+        "non-recursive list must include subdir/; got: {:?}",
+        files_non_recursive
+    );
 
     // Test listing files recursively
     let files_recursive = store.list(&dir1_uri, true).await?;
