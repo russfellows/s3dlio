@@ -362,6 +362,25 @@ pub const ENV_S3DLIO_H2C: &str = "S3DLIO_H2C";
 /// Set `S3DLIO_H2C=1` to enable h2c for storage systems that require HTTP/2 on plain-HTTP endpoints.
 pub const DEFAULT_H2C_ENABLED: bool = false;
 
+// ── Payload signing bypass ─────────────────────────────────────────────────
+
+/// Environment variable to disable SigV4 payload (body) signing on S3 PUT requests.
+///
+/// When set to `1`, `true`, `yes`, `on`, or `enable`, the AWS SDK will send
+/// `x-amz-content-sha256: UNSIGNED-PAYLOAD` instead of computing a SHA-256
+/// digest of the entire request body on every PUT.  This eliminates per-request
+/// CPU cost proportional to object size and can substantially improve PUT
+/// throughput on endpoints that don't enforce payload integrity (e.g. MinIO,
+/// s3-ultra, Ceph RGW in path-style mode).
+///
+/// **WARNING**: Disabling payload signing removes a data-integrity check.  Only
+/// use this against trusted, internal storage endpoints.  Never enable on
+/// production AWS S3 workloads where data integrity is critical.
+pub const ENV_UNSIGNED_PAYLOAD: &str = "S3DLIO_UNSIGNED_PAYLOAD";
+
+/// Default payload signing behaviour: `false` (signed, safe default).
+pub const DEFAULT_UNSIGNED_PAYLOAD: bool = false;
+
 // ── Connection pool tunables ───────────────────────────────────────────────
 
 /// Maximum idle connections kept in the pool per host (default: [`DEFAULT_POOL_MAX_IDLE_PER_HOST`]).

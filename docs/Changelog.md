@@ -1,5 +1,64 @@
 # s3dlio Changelog
 
+## Version 0.9.97 — Unsigned payload support for PUT operations (May 4, 2026)
+
+### New: `S3DLIO_UNSIGNED_PAYLOAD` — bypass SHA-256 body hashing on PUT (`src/constants.rs`, `src/s3_client.rs`, `src/object_store.rs`, `src/s3_ops.rs`)
+
+Adds opt-in support for skipping AWS SigV4 payload signing on PUT operations. Enabled via
+the `S3DLIO_UNSIGNED_PAYLOAD=1` environment variable (also accepts `true`, `yes`, `on`,
+`enable`). Default is `false` — existing behaviour is unchanged.
+
+**When to use**: Only on internal, trusted, non-TLS endpoints (MinIO, s3-ultra, Ceph RGW,
+or any private S3-compatible server where the network path is considered secure). Must
+**never** be used against real AWS S3 endpoints — AWS requires a valid payload hash for
+SigV4-signed requests over HTTPS.
+
+**When it helps**: Primarily for large objects (1 MiB+) where SHA-256 computation becomes
+a meaningful fraction of per-request CPU time. For objects ≤ 1 KiB, the cost of SHA-256
+hashing (~0.3 µs) is negligible compared to network latency — no throughput improvement
+is expected or observed at small sizes.
+
+**Changes made**:
+
+- **`src/constants.rs`** — Two new constants:
+  ```rust
+  pub const ENV_UNSIGNED_PAYLOAD: &str = "S3DLIO_UNSIGNED_PAYLOAD";
+  pub const DEFAULT_UNSIGNED_PAYLOAD: bool = false;
+  ```
+
+- **`src/s3_client.rs`** — New helper function `unsigned_payload_enabled()` using
+  `std::sync::OnceLock` to read and cache the environment variable exactly once at first
+  call (zero-cost on the hot path for all subsequent requests):
+  ```rust
+  pub fn unsigned_payload_enabled() -> bool {
+      static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+      *CACHE.get_or_init(|| {
+          std::env::var(crate::constants::ENV_UNSIGNED_PAYLOAD)
+              .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on" | "enable"))
+              .unwrap_or(crate::constants::DEFAULT_UNSIGNED_PAYLOAD)
+      })
+  }
+  ```
+
+- **`src/object_store.rs`** — `S3ObjectStore::put()` conditionally calls
+  `.customize().disable_payload_signing()` on the `PutObjectFluentBuilder` when
+  `unsigned_payload_enabled()` returns `true`.
+
+- **`src/s3_ops.rs`** — `S3Ops::put_object()` conditionally calls
+  `.customize().disable_payload_signing()` on the same builder path.
+
+**Not available for GET**: The `disable_payload_signing()` API in the AWS SDK only exists
+on `PutObject` and `UploadPart` builders. GET requests carry an empty body whose SHA-256
+is the compile-time constant `e3b0c44298fc1c149afb...` — there is no computation to skip.
+
+### Tests: No new tests added for this feature
+
+This feature was validated empirically via benchmark comparison against s3-ultra. A unit
+test for `unsigned_payload_enabled()` (env-var parsing and OnceLock behaviour) would be
+a good follow-up addition.
+
+---
+
 ## Version 0.9.96 — Multi-endpoint correctness, S3_ENDPOINT_URIS enforcement, new CLI options (April 28, 2026)
 
 ### Fix: All endpoints in `S3_ENDPOINT_URIS` are now used (`src/multi_endpoint.rs`)

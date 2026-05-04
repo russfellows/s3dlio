@@ -1240,14 +1240,27 @@ impl ObjectStore for S3ObjectStore {
 
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(&key)
-                .body(data.into())
-                .send()
-                .await
-                .with_context(|| format!("S3 PUT failed for '{}'", uri))?;
+            if crate::s3_client::unsigned_payload_enabled() {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(data.into())
+                    .customize()
+                    .disable_payload_signing()
+                    .send()
+                    .await
+                    .with_context(|| format!("S3 PUT (unsigned) failed for '{}'", uri))?;
+            } else {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(data.into())
+                    .send()
+                    .await
+                    .with_context(|| format!("S3 PUT failed for '{}'", uri))?;
+            }
             return Ok(());
         }
 
