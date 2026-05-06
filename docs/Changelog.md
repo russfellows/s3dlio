@@ -1,6 +1,45 @@
 # s3dlio Changelog
 
-## Version 0.9.97 — Unsigned payload support for PUT operations (May 4, 2026)
+## Version 0.9.97 — Unsigned payload support + XorStream Python bindings (May 4, 2026)
+
+### New: `XorStream` — fast, dedup-safe data generation via `dgen-data` crate (May 2026)
+
+Adds `s3dlio.XorStream`, a high-performance data generator for Python and Rust callers.
+Backed by [`dgen_data::UniqueXorStream`] — a 1 MiB random base buffer + `AtomicU64`
+counter + splitmix64 + Xoshiro256++ XOR keystream. Each `fill()` / `generate()` call
+produces a unique 512-byte-block-level output, guaranteeing dedup incompressibility.
+
+**Thread-safe**: `&self` API, no mutex, `Sync + Send`. ~15 GB/s per core.
+
+**Python API** (no changes to existing API):
+
+```python
+import s3dlio
+
+stream = s3dlio.XorStream()
+
+# In-place fill — fastest, no per-call heap allocation
+buf = bytearray(8 * 1024 * 1024)
+stream.fill(buf)                     # unique 8 MiB payload
+stream.fill(buf)                     # different 8 MiB payload, guaranteed
+
+# Allocate + fill in one call — returns BytesView (buffer protocol)
+data = stream.generate(8 * 1024 * 1024)
+view = memoryview(data)              # zero-copy access
+import numpy as np
+arr = np.frombuffer(view, dtype=np.uint8)  # zero-copy numpy array
+
+print(stream.objects_generated)     # == 3
+```
+
+**Changes**:
+
+- **`Cargo.toml`** — Added `dgen-data = { path = "../dgen-rs", default-features = false }`.
+  Must be changed to a git tag before PyPI release.
+- **`src/python_api/python_datagen_api.rs`** — `PyXorStream` class (`fill`, `generate`,
+  `objects_generated` property); registered via `register_datagen_functions()`.
+
+---
 
 ### New: `S3DLIO_UNSIGNED_PAYLOAD` — bypass SHA-256 body hashing on PUT (`src/constants.rs`, `src/s3_client.rs`, `src/object_store.rs`, `src/s3_ops.rs`)
 

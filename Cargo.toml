@@ -102,6 +102,12 @@ numpy        = "^0.27"
 ndarray      = "^0.17"
 # ndarray-npy removed - we use custom NPY/NPZ implementation for better performance and zero-copy
 
+# ---- Data generation library (high-performance, dedup-safe) ----------------
+# Provides UniqueXorStream, RollingPool, thread_local::next_slice.
+# NOTE: Switch to git tag dep before any public release/PyPI push:
+#   dgen-data = { git = "https://github.com/russfellows/dgen-rs.git", tag = "v0.2.4", default-features = false }
+dgen-data = { path = "../dgen-rs", default-features = false }
+
 # Other (updated rand ecosystem to 0.9 for consistency)
 rayon       = { version = "^1.10" }
 num_cpus    = "^1.16"

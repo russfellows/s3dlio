@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-613-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.96-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.97-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,15 +10,13 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.96 — Multi-endpoint correctness, S3_ENDPOINT_URIS enforcement, new CLI options**
+> **v0.9.97 — `XorStream` Python bindings + `S3DLIO_UNSIGNED_PAYLOAD`**
 >
-> **All endpoints in `S3_ENDPOINT_URIS` are now used:** Previously, setting `S3_ENDPOINT_URIS=uri1,uri2,uri3,uri4` did not guarantee all four endpoints were load-balanced. Fixed — every entry is now parsed, whitespace-trimmed, and registered. Counts outside 1–32 (`MAX_ENDPOINTS`) are rejected with a clear error.
+> **`s3dlio.XorStream`**: fast, dedup-safe data generation via `dgen-data` crate — ~15 GB/s per core, lock-free, `Sync + Send`. Ideal for high-concurrency PUT benchmarks (≥ 32 workers).  Includes `fill(buf)` (in-place, no allocation) and `generate(size)` (returns `BytesView`).
 >
-> **New CLI options:** `--endpoint-url` (alias `--endpoint`), `--region`, and `--ca-bundle` are now accepted directly on the `s3dlio` command line, removing the need to set environment variables for single-command overrides.
+> **`S3DLIO_UNSIGNED_PAYLOAD=1`**: bypass SHA-256 body hashing on PUT for private/trusted S3-compatible endpoints (MinIO, s3-ultra, Ceph RGW). **Never use against real AWS S3.**
 >
-> **Fix: non-recursive `list()` now returns directory entries** — subdirectories are included with a trailing `/`, matching S3 common-prefix semantics.
->
-> **v0.9.95 also in this release:** O_DIRECT fix, BufferPool deadlock fix. See [docs/Changelog.md](docs/Changelog.md) for full history.
+> **v0.9.96 (prior):** Multi-endpoint correctness, `S3_ENDPOINT_URIS` enforcement, new CLI options. See [docs/Changelog.md](docs/Changelog.md) for full history.
 
 ## 📦 Installation
 
@@ -221,9 +219,10 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.92** (April 2026) — Multipart upload rewrite: coordinator task (+33% NP=1 throughput), auto-scale `max_in_flight`, async safety fixes, 580 tests. See [docs/Changelog.md](docs/Changelog.md).
+**v0.9.97** (May 2026) — Unsigned payload support (`S3DLIO_UNSIGNED_PAYLOAD`) + `XorStream` Python bindings via `dgen-data`. See [docs/Changelog.md](docs/Changelog.md).
 
 **Recent highlights:**
+- **v0.9.97** - `XorStream` (dedup-safe, ~15 GB/s/core); `S3DLIO_UNSIGNED_PAYLOAD` opt-in for private S3-compatible endpoints
 - **v0.9.92** - MPU coordinator task, auto-scale, async write/flush/finish safety fixes, MAX_MULTIPART_PARTS guard; 580 tests passing
 - **v0.9.90** - Full NVIDIA AIStore support (`S3DLIO_FOLLOW_REDIRECTS=1`) with all TLS security policies; HTTP/2 available (opt-in via `S3DLIO_H2C=1`, **not the default**); 5 issues closed (#126, #133, #134, #135, #136); 559 tests passing
 - **v0.9.86** - Redirect follower for NVIDIA AIStore (S3 path); HTTPS→HTTP downgrade prevention; 21 new redirect tests; redirect security analysis documented
@@ -464,6 +463,54 @@ stats = writer.finalize()  # Returns (bytes_written, compressed_bytes)
 s3dlio.put("s3://bucket/test-data-{}.bin", num=1000, size=4194304, 
           data_gen_mode="streaming")  # 2.6-3.5x faster for most cases
 ```
+
+**XorStream — dedup-safe data generation (v0.9.97+):**
+
+`XorStream` generates unique, incompressible data at ~15 GB/s per core without Rayon
+thread management overhead. Every `fill()` / `generate()` call is guaranteed to produce a
+different 512-byte-block-level fingerprint. Ideal for PUT-heavy benchmarks where many
+worker threads share a single generator.
+
+```python
+import s3dlio
+import numpy as np
+
+stream = s3dlio.XorStream()
+
+# --- Fastest path: in-place fill into pre-allocated bytearray ---
+buf = bytearray(8 * 1024 * 1024)   # 8 MiB working buffer
+stream.fill(buf)                    # fill once — unique payload
+stream.fill(buf)                    # fill again — different payload, guaranteed
+
+print(stream.objects_generated)     # == 2
+
+# --- Convenience path: allocate + fill in one call ---
+data = stream.generate(8 * 1024 * 1024)  # returns BytesView
+view = memoryview(data)                   # zero-copy Python view
+arr  = np.frombuffer(view, dtype=np.uint8)  # zero-copy numpy array
+
+# --- PUT with XorStream data (benchmark pattern) ---
+import threading
+
+def worker(stream, uri_template, n):
+    buf = bytearray(8 * 1024 * 1024)
+    for i in range(n):
+        stream.fill(buf)       # reuse buffer, unique data each time
+        s3dlio.put_bytes(buf, uri_template.format(i))
+
+threads = [threading.Thread(target=worker, args=(stream, "s3://bucket/obj-{}.bin", 100))
+           for _ in range(32)]
+for t in threads: t.start()
+for t in threads: t.join()
+```
+
+| Scenario | Best choice |
+|---|---|
+| High concurrency PUT (≥ 32 workers) | **`XorStream`** — no Rayon scheduling |
+| Medium objects 1–32 MiB | **`XorStream`** — no per-call allocation |
+| Controllable compress/dedup ratios | `generate_data()` / `Generator` |
+| Very large objects (≥ 256 MiB) | `Generator.fill_chunk()` |
+
 
 **Multi-Endpoint Load Balancing (v0.9.14+):**
 ```python

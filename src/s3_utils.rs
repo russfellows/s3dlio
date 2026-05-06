@@ -1989,15 +1989,26 @@ mod tests {
 
     #[test]
     fn test_invalid_access_key_hint_no_endpoint_set() {
-        // When AWS_ENDPOINT_URL is unset the hint should mention --endpoint-url.
-        // We test the env-var branch logic directly.
-        let endpoint_unset = std::env::var("AWS_ENDPOINT_URL")
-            .map(|v| v.is_empty())
-            .unwrap_or(true);
-        // The hint condition: endpoint is absent or empty → suggest --endpoint-url
-        assert!(
-            endpoint_unset,
-            "when no endpoint is set, InvalidAccessKeyId should hint about --endpoint-url"
-        );
+        // Verify the condition that gates the "no endpoint" hint for
+        // InvalidAccessKeyId errors.  The hint is shown when AWS_ENDPOINT_URL
+        // is absent OR empty; suppressed when a real URL is present.
+        //
+        // We test the logic directly with known Option values so the test is
+        // independent of the process environment (AWS_ENDPOINT_URL may be set
+        // on developer machines and CI hosts).
+        let absent: Option<&str> = None;
+        let empty: Option<&str> = Some("");
+        let real: Option<&str> = Some("http://10.0.0.1:9000");
+
+        // absent → endpoint_unset = true  (hint shown)
+        let cond_absent = absent.map(|v| v.is_empty()).unwrap_or(true);
+        // empty string → endpoint_unset = true (hint shown)
+        let cond_empty = empty.map(|v| v.is_empty()).unwrap_or(true);
+        // real URL → endpoint_unset = false (hint suppressed)
+        let cond_real = real.map(|v| v.is_empty()).unwrap_or(true);
+
+        assert!(cond_absent, "absent endpoint → should show --endpoint-url hint");
+        assert!(cond_empty, "empty endpoint → should show --endpoint-url hint");
+        assert!(!cond_real, "real endpoint URL → should not show --endpoint-url hint");
     }
 }

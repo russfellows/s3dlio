@@ -4,7 +4,7 @@
 src/*.save
 src/bin/*.save
 
-# Misc #
+# Log files #
 ###########
 *.zst
 
@@ -28,6 +28,7 @@ venv/
 # Local environment files with secrets (do not commit)
 *.local
 *-env.local
+.env*
 API_COMPATIBILITY_REPORT.md
 
 # Remote testing results (local analysis only)

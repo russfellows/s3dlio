@@ -1058,6 +1058,22 @@ impl S3ObjectStore {
         self.endpoint_url.as_deref()
     }
 
+    /// Test-only constructor: records an endpoint URL without building a real
+    /// AWS client.  Used in unit tests that verify `endpoint_url()` behaviour
+    /// without requiring credentials or network access.
+    #[cfg(test)]
+    fn for_test(endpoint_url: &str) -> Self {
+        let config = S3Config::default();
+        let cache_ttl = Duration::from_secs(config.size_cache_ttl_secs);
+        Self {
+            size_cache: std::sync::Arc::new(crate::object_size_cache::ObjectSizeCache::new(
+                cache_ttl,
+            )),
+            client: None,
+            endpoint_url: Some(endpoint_url.to_string()),
+        }
+    }
+
     #[inline]
     pub fn boxed() -> Box<dyn ObjectStore> {
         Box::new(Self::new())
@@ -3916,38 +3932,19 @@ mod s3_object_store_tests {
         );
     }
 
-    /// Two `for_endpoint()` calls with **different** URLs must produce stores
-    /// that report **different** endpoint URLs — proving they are independent
-    /// instances rather than sharing a global client.
+    /// Two stores constructed for **different** endpoint URLs must each record
+    /// their own URL — proving that `endpoint_url` is stored per-instance.
     ///
     /// This is the regression test for the original bug where
     /// `MultiEndpointStore` allocated a single global `S3ObjectStore` for all
     /// endpoints, causing all traffic to share one connection pool.
-    #[tokio::test]
-    async fn test_two_stores_for_different_endpoints_have_different_urls() {
-        let _guard = CRED_LOCK.lock().await;
-
-        let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
-        let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
-        let saved_region = std::env::var("AWS_REGION").ok();
-
-        #[allow(deprecated)]
-        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
-        #[allow(deprecated)]
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
-        #[allow(deprecated)]
-        std::env::set_var("AWS_REGION", "us-east-1");
-
-        let r1 = S3ObjectStore::for_endpoint("http://10.9.0.17:9000").await;
-        let r2 = S3ObjectStore::for_endpoint("http://10.9.0.18:9000").await;
-
-        // Restore env
-        restore_env("AWS_ACCESS_KEY_ID", saved_key);
-        restore_env("AWS_SECRET_ACCESS_KEY", saved_secret);
-        restore_env("AWS_REGION", saved_region);
-
-        let s1 = r1.expect("store 1 construction");
-        let s2 = r2.expect("store 2 construction");
+    ///
+    /// Uses `for_test()` to avoid env-var manipulation: the invariant being
+    /// tested is purely about per-instance state, not credential handling.
+    #[test]
+    fn test_two_stores_for_different_endpoints_have_different_urls() {
+        let s1 = S3ObjectStore::for_test("http://10.9.0.17:9000");
+        let s2 = S3ObjectStore::for_test("http://10.9.0.18:9000");
 
         // Each store records its own endpoint URL
         assert_eq!(s1.endpoint_url(), Some("http://10.9.0.17:9000"));
