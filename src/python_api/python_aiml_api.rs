@@ -1603,12 +1603,72 @@ pub fn create_dataset(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Py
 }
 
 /// Create an async data loader from any supported URI scheme (convenience function)
+///
+/// Extra `opts` keys handled by this function (in addition to standard [`LoaderOptions`] keys):
+///
+/// | Key | Type | Description |
+/// |-----|------|-------------|
+/// | `"format"` | `str` | `"parquet"` — enable row-group mode (requires `parquet` feature) |
+/// | `"columns"` | `list[int]` | Column indices to include per row group (`None` = all) |
+/// | `"footer_cap"` | `int` | Bytes to fetch from file tail for footer parsing (default 4 MiB) |
 #[pyfunction]
 #[pyo3(signature = (uri, opts=None))]
 pub fn create_async_loader(
     uri: &str,
     opts: Option<Bound<'_, PyDict>>,
 ) -> PyResult<PyBytesAsyncDataLoader> {
+    // Check for parquet format before falling through to the generic path.
+    #[cfg(feature = "parquet")]
+    if let Some(ref d) = opts {
+        let format_str = d
+            .get_item("format")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<String>().ok());
+
+        if format_str.as_deref() == Some("parquet") {
+            use crate::data_loader::ParquetRowGroupDataset;
+            use crate::data_loader::DEFAULT_FOOTER_CAP;
+
+            // Extract column indices: list[int] or None
+            let col_indices: Option<Vec<usize>> = d
+                .get_item("columns")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<Vec<usize>>().ok());
+
+            // Extract footer_cap (bytes from file tail for footer parsing)
+            let footer_cap: usize = d
+                .get_item("footer_cap")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<usize>().ok())
+                .unwrap_or(DEFAULT_FOOTER_CAP);
+
+            let pq_dataset = ParquetRowGroupDataset::new(
+                uri,
+                col_indices.as_deref(),
+                footer_cap,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            let inner: Arc<dyn crate::data_loader::dataset::Dataset<Item = bytes::Bytes>> =
+                Arc::from(pq_dataset);
+            let dataset = PyDataset { inner };
+
+            let mut loader_opts = opts_from_dict(opts);
+            if loader_opts.batch_size == LoaderOptions::default().batch_size {
+                loader_opts.batch_size = 1;
+            }
+
+            return Ok(PyBytesAsyncDataLoader {
+                dataset,
+                opts: loader_opts,
+            });
+        }
+    }
+
+    // Generic path: S3BytesDataset (or any other URI-scheme dataset)
     let dataset = create_dataset(uri, opts.clone())?;
 
     // For async loaders, default to batch_size = 1 for intuitive individual item iteration
