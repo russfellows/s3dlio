@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
-use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyDictMethods, PyList};
 use pyo3::Bound;
@@ -149,6 +149,91 @@ impl PyBytesAsyncDataLoader {
         py: Python<'py>,
     ) -> PyResult<Py<PyBytesAsyncDataLoaderIter>> {
         PyBytesAsyncDataLoaderIter::spawn_stream(py, slf.dataset.clone(), slf.opts.clone())
+    }
+
+    /// Synchronous iterator — `for item in loader:` works in plain Python (no asyncio).
+    ///
+    /// The producer runs as a Tokio task using `buffer_unordered(prefetch)` to drive
+    /// up to `prefetch` concurrent dataset fetches in flight simultaneously.  Tokio's
+    /// own work-stealing thread pool determines the actual parallelism — no manual
+    /// thread-count tuning required; it adapts automatically from 8-core laptops to
+    /// 128-core servers.
+    ///
+    /// The bounded channel (capacity = `prefetch`) is the backpressure mechanism:
+    /// when Python is slow the producer blocks on `tx.send().await`; when Python is
+    /// fast the channel stays ahead.  No Semaphore, no JoinSet, no guessing.
+    fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<PyBytesDataLoaderSyncIter>> {
+        let prefetch = slf.opts.prefetch.max(1);
+        let dataset = slf.dataset.clone();
+
+        // Bounded channel: capacity = prefetch depth.
+        // Producer backs off automatically when Python consumer is slow.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, DatasetError>>(prefetch);
+
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            if let Some(len) = dataset.inner.len() {
+                // buffer_unordered drives up to `prefetch` futures concurrently.
+                // Tokio's scheduler handles the thread count — no Semaphore needed.
+                use futures_util::stream::{self, StreamExt as _};
+                let mut stream = stream::iter(0..len)
+                    .map(|idx| {
+                        let ds = dataset.clone();
+                        async move { ds.inner.get(idx).await }
+                    })
+                    .buffer_unordered(prefetch);
+
+                while let Some(result) = stream.next().await {
+                    // blocks when channel full → natural backpressure
+                    if tx.send(result).await.is_err() {
+                        break; // Python consumer dropped the iterator
+                    }
+                }
+            }
+        });
+
+        Py::new(slf.py(), PyBytesDataLoaderSyncIter {
+            rx: std::sync::Mutex::new(rx),
+        })
+    }
+}
+
+/// Synchronous iterator returned by `PyBytesAsyncDataLoader.__iter__()`.
+///
+/// Each `__next__()` call releases the GIL (`py.allow_threads`) while waiting
+/// for the next item from the Tokio producer, then re-acquires it to wrap the
+/// result in a `PyBytesView`.  Other Python threads run freely while waiting.
+///
+/// Each item is one row-group's bytes (when using the parquet format) or one
+/// object's bytes (when using the default S3 bytes format).
+#[pyclass]
+pub struct PyBytesDataLoaderSyncIter {
+    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<Bytes, DatasetError>>>,
+}
+
+#[pymethods]
+impl PyBytesDataLoaderSyncIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Release the GIL while the Tokio channel is empty (network I/O in flight).
+        // When the next item arrives the GIL is re-acquired automatically and `py`
+        // is valid again — no Python::attach / Python::with_gil needed.
+        let result = py.detach(|| {
+            self.rx
+                .lock()
+                .expect("sync iter rx mutex poisoned")
+                .blocking_recv()
+        });
+
+        match result {
+            Some(Ok(item)) => {
+                Py::new(py, PyBytesView::new(item))?.into_py_any(py)
+            }
+            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            None => Err(PyStopIteration::new_err("end of dataset")),
+        }
     }
 }
 
@@ -708,6 +793,10 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             "shard_world_size",
             "worker_id",
             "num_workers_pytorch",
+            // Format-routing keys consumed by create_async_loader / create_dataset
+            "format",
+            "columns",
+            "footer_cap",
         ];
         for key in d.keys() {
             if let Ok(key_str) = key.extract::<&str>() {
@@ -1903,6 +1992,7 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncDataLoaderIter>()?;
     m.add_class::<PyBytesAsyncDataLoader>()?;
     m.add_class::<PyBytesAsyncDataLoaderIter>()?;
+    m.add_class::<PyBytesDataLoaderSyncIter>()?;
 
     // Compatibility classes (deprecated)
     m.add_class::<PyS3DatasetCompat>()?;

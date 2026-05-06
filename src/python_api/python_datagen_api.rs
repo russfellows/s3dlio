@@ -12,8 +12,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 
 use dgen_data::{
-    generate_data as dgen_generate_data, DataBuffer, DataGenerator, GenerationMethod,
-    GeneratorConfig, NumaMode,
+    generate_data as dgen_generate_data, DataBuffer, DataGenerator, GeneratorConfig, NumaMode,
 };
 
 use super::python_core_api::PyBytesView;
@@ -66,7 +65,6 @@ fn generate_data(
             numa_node: None,
             block_size: None,
             seed: None,
-            method: GenerationMethod::Parallel,
         };
         dgen_generate_data(config)
     });
@@ -116,7 +114,6 @@ fn generate_data_with_threads(
             numa_node: None,
             block_size: None,
             seed: None,
-            method: GenerationMethod::Parallel,
         };
         dgen_generate_data(config)
     });
@@ -189,7 +186,6 @@ fn generate_into_buffer(
             numa_node: None,
             block_size: None,
             seed: None,
-            method: GenerationMethod::Parallel,
         };
         dgen_generate_data(config)
     });
@@ -307,7 +303,6 @@ impl PyGenerator {
             numa_node: None,
             block_size: None,
             seed,
-            method: GenerationMethod::Parallel,
         };
 
         let chunk_size = chunk_size.unwrap_or_else(DataGenerator::recommended_chunk_size);
