@@ -877,6 +877,51 @@ pub async fn get_object_range_uri_async(
     Ok(bytes)
 }
 
+/// Like [`get_object_range_uri_async`] but returns split timing information
+/// to help diagnose whether latency is in network RTT (TTFB) or transfer time.
+///
+/// Returns `(bytes, ttfb, transfer)` where:
+/// - `ttfb` — time from request start until the HTTP response headers are
+///   received (i.e., `.send().await` returns); this is the true TTFB.
+/// - `transfer` — time from headers received until the full body has been
+///   streamed and assembled (i.e., `.collect().await` returns).
+///
+/// Total wall time for the GET ≈ `ttfb + transfer`.
+pub async fn get_object_range_uri_timed_async(
+    uri: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(Bytes, std::time::Duration, std::time::Duration)> {
+    use std::time::Instant;
+    let (bucket, key) = parse_s3_uri(uri)?;
+    if key.is_empty() {
+        bail!("Cannot GET range: no key specified");
+    }
+    let client = aws_s3_client_async().await?;
+    let mut range = format!("bytes={}-", offset);
+    if let Some(len) = length {
+        if len > 0 {
+            let end = offset.saturating_add(len).saturating_sub(1);
+            range = format!("bytes={}-{}", offset, end);
+        }
+    }
+    let t0 = Instant::now();
+    let resp = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key.trim_start_matches('/'))
+        .range(range)
+        .send()
+        .await
+        .context("get_object(range) failed")?;
+    let ttfb = t0.elapsed();
+    let body = resp.body.collect().await.context("collect range body")?;
+    let total = t0.elapsed();
+    let transfer = total.saturating_sub(ttfb);
+    let bytes = body.into_bytes();
+    Ok((bytes, ttfb, transfer))
+}
+
 /// Read `length` bytes starting at `offset` from `s3://bucket/key`.
 /// A negative or oversize request is truncated to the object size.
 /// Uses the existing `get_object_uri()` helper internally so we don't
