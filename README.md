@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-613-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.97-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-648-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.98-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,13 +10,11 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.97 — `XorStream` Python bindings + `S3DLIO_UNSIGNED_PAYLOAD`**
+> **v0.9.98 — Parquet DataLoader with epoch-2 fast path and Arrow IPC decode**
 >
-> **`s3dlio.XorStream`**: fast, dedup-safe data generation via `dgen-data` crate — ~15 GB/s per core, lock-free, `Sync + Send`. Ideal for high-concurrency PUT benchmarks (≥ 32 workers).  Includes `fill(buf)` (in-place, no allocation) and `generate(size)` (returns `BytesView`).
+> **`ParquetRowGroupDataset`**: epoch-aware Parquet DataLoader for AI/ML training loops. Each item is one Parquet row group. Zero S3 re-fetches on epoch 2+ (2.5× faster construction, scales to 10×+ for 64+ files). Two decode modes: `Raw` (Python decodes with PyArrow) and `ArrowIpc` (Rust decodes to Arrow `RecordBatch`, returns IPC bytes). 8 concurrent workers share process-global metadata caches — no 8× RAM duplication. See [docs/Parquet_Data-Loader.md](docs/Parquet_Data-Loader.md).
 >
-> **`S3DLIO_UNSIGNED_PAYLOAD=1`**: bypass SHA-256 body hashing on PUT for private/trusted S3-compatible endpoints (MinIO, s3-ultra, Ceph RGW). **Never use against real AWS S3.**
->
-> **v0.9.96 (prior):** Multi-endpoint correctness, `S3_ENDPOINT_URIS` enforcement, new CLI options. See [docs/Changelog.md](docs/Changelog.md) for full history.
+> **v0.9.97 (prior):** `XorStream` (dedup-safe, ~15 GB/s/core); `S3DLIO_UNSIGNED_PAYLOAD` opt-in for private S3-compatible endpoints. See [docs/Changelog.md](docs/Changelog.md) for full history.
 
 ## 📦 Installation
 
@@ -215,14 +213,16 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 - **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
 - **Multi-Endpoint Load Balancing**: RoundRobin/LeastConnections across storage endpoints
 - **AI/ML Ready**: PyTorch DataLoader integration, TFRecord/NPZ format support
+- **Parquet DataLoader**: Per-row-group epoch-aware DataLoader with 2.5×+ epoch-2 speedup, Raw + Arrow IPC decode modes, 8-worker concurrency with shared metadata caches — [see guide](docs/Parquet_Data-Loader.md)
 - **High-Speed Data Generation**: 50+ GB/s test data with configurable compression/dedup
 
 ## 🌟 Latest Release
 
-**v0.9.97** (May 2026) — Unsigned payload support (`S3DLIO_UNSIGNED_PAYLOAD`) + `XorStream` Python bindings via `dgen-data`. See [docs/Changelog.md](docs/Changelog.md).
+**v0.9.98** (May 2026) — Parquet DataLoader with epoch-2 fast path and Arrow IPC decode. See [docs/Changelog.md](docs/Changelog.md).
 
 **Recent highlights:**
-- **v0.9.97** - `XorStream` (dedup-safe, ~15 GB/s/core); `S3DLIO_UNSIGNED_PAYLOAD` opt-in for private S3-compatible endpoints
+- **v0.9.98** - **Parquet DataLoader** (`ParquetRowGroupDataset`): per-row-group Dataset, epoch-2 zero-re-fetch (2.5× speedup proven), Raw + ArrowIpc decode modes, 8-worker shared caches; 648 tests passing
+- **v0.9.97** - `XorStream` (dedup-safe, ~15 GB/s/core); `S3DLIO_UNSIGNED_PAYLOAD` opt-in for private S3-compatible endpoints; 613 tests passing
 - **v0.9.92** - MPU coordinator task, auto-scale, async write/flush/finish safety fixes, MAX_MULTIPART_PARTS guard; 580 tests passing
 - **v0.9.90** - Full NVIDIA AIStore support (`S3DLIO_FOLLOW_REDIRECTS=1`) with all TLS security policies; HTTP/2 available (opt-in via `S3DLIO_H2C=1`, **not the default**); 5 issues closed (#126, #133, #134, #135, #136); 559 tests passing
 - **v0.9.86** - Redirect follower for NVIDIA AIStore (S3 path); HTTPS→HTTP downgrade prevention; 21 new redirect tests; redirect security analysis documented
@@ -368,12 +368,12 @@ pip install s3dlio
 
 - **[CLI Guide](docs/CLI_GUIDE.md)** - Complete command-line interface reference with examples
 - **[Python API Guide](docs/PYTHON_API_GUIDE.md)** - Complete Python library reference with examples
+- **[Parquet DataLoader Guide](docs/Parquet_Data-Loader.md)** - Epoch-aware per-row-group Parquet DataLoader (v0.9.98+)
 - **[Multi-Endpoint Guide](docs/MULTI_ENDPOINT_GUIDE.md)** - Load balancing across multiple storage endpoints (v0.9.14+)
 - **[Rust API Guide v0.9.0](docs/api/rust-api-v0.9.0.md)** - Complete Rust library reference with migration guide
 - **[Changelog](docs/Changelog.md)** - Version history and release notes
 - **[Adaptive Tuning Guide](docs/ADAPTIVE-TUNING.md)** - Optional performance auto-tuning
 - **[Testing Guide](docs/TESTING-GUIDE.md)** - Test suite documentation
-- **[v0.9.2 Test Summary](docs/v0.9.2_Test_Summary.md)** - ✅ 122/130 tests passing (93.8%)
 
 ## Core Capabilities
 
@@ -535,7 +535,55 @@ for i, s in enumerate(stats):
 ```
 📖 **[Complete Multi-Endpoint Guide](docs/MULTI_ENDPOINT_GUIDE.md)** - Load balancing, configuration, use cases
 
+### 📦 Parquet DataLoader — Epoch-Aware Training (v0.9.98+)
+
+The Parquet DataLoader provides per-row-group streaming for Parquet files on S3. Each
+iterator item is one Parquet row group. Two decode modes: `Raw` (Python decodes) and
+`ArrowIpc` (Rust decodes to Arrow IPC bytes). **Zero S3 footer re-fetches on epoch 2+**
+(row-group byte ranges cached in a process-global DashMap after epoch 1).
+
+```python
+import s3dlio
+
+# Raw mode — Python decodes with PyArrow (default)
+loader = s3dlio.create_async_loader(
+    "s3://bucket/train/",
+    {"format": "parquet", "prefetch": 32}
+)
+for item in loader:
+    # item["data"]: bytes, item["uri"]: str, item["rg_idx"]: int
+    table = pyarrow.parquet.read_table(io.BytesIO(item["data"]))
+
+# Arrow IPC mode — Rust decodes, Python gets ready-to-use RecordBatch bytes
+loader = s3dlio.create_async_loader(
+    "s3://bucket/train/",
+    {"format": "parquet", "decode": "arrow", "prefetch": 32}
+)
+for item in loader:
+    batch = pa.ipc.open_stream(pa.py_buffer(item["data"])).read_next_batch()
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `"format"` | `str` | — | Must be `"parquet"` to activate Parquet mode |
+| `"decode"` | `str` | `"raw"` | `"raw"` or `"arrow"` (Rust-side decode) |
+| `"columns"` | `list[int]` | `None` | Column subset; `None` = all columns |
+| `"footer_cap"` | `int` | 4 MiB | Bytes from file tail for footer parsing |
+| `"prefetch"` | `int` | `32` | Concurrent in-flight row-group GETs |
+
+**Epoch-2+ speedup** — measured against live MinIO:
+
+| Epoch | Construction time | Notes |
+|-------|-----------------|-------|
+| 1 | 20.4 ms | `list_objects` + footer GETs |
+| 2+ | 8.3 ms | `list_objects` only — **2.5× faster** |
+
+**Memory**: only metadata in RAM; 8 concurrent workers share process-global caches (no 8× duplication).
+
+📖 **[Complete Parquet DataLoader Guide](docs/Parquet_Data-Loader.md)**
+
 ## Performance
+
 
 ### Benchmark Results
 s3dlio delivers world-class performance across all operations:
@@ -658,7 +706,8 @@ podman build -t s3dlio .
 
 - **🖥️ CLI Guide**: [docs/CLI_GUIDE.md](docs/CLI_GUIDE.md) - Complete command-line reference
 - **🐍 Python API**: [docs/PYTHON_API_GUIDE.md](docs/PYTHON_API_GUIDE.md) - Python library reference
-- **📚 API Documentation**: [docs/api/](docs/api/)
+- **� Parquet DataLoader**: [docs/Parquet_Data-Loader.md](docs/Parquet_Data-Loader.md) - Epoch-aware Parquet DataLoader guide (v0.9.98+)
+- **�📚 API Documentation**: [docs/api/](docs/api/)
 - **📝 Changelog**: [docs/Changelog.md](docs/Changelog.md)
 - **🧪 Testing Guide**: [docs/TESTING-GUIDE.md](docs/TESTING-GUIDE.md)
 - **🚀 Performance**: [docs/performance/](docs/performance/)
