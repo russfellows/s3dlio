@@ -11,8 +11,12 @@
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 
+use dgen_data::{
+    generate_data as dgen_generate_data, DataBuffer, DataGenerator, GeneratorConfig, NumaMode,
+};
+
 use super::python_core_api::PyBytesView;
-use crate::data_gen_alt::{default_data_gen_threads, total_cpus, DataGenerator};
+use crate::hardware::{recommended_data_gen_threads, total_cpus};
 
 // =============================================================================
 // Simple API - Single-call data generation
@@ -51,24 +55,21 @@ fn generate_data(
     compress: usize,
 ) -> PyResult<Py<PyBytesView>> {
     // Generate data WITHOUT holding GIL (allows parallel Python threads)
-    let buffer = py.detach(|| {
-        use crate::data_gen_alt::{generate_data as gen_data, GeneratorConfig, NumaMode};
-
+    let buffer: DataBuffer = py.detach(|| {
         let config = GeneratorConfig {
             size,
             dedup_factor: dedup,
             compress_factor: compress,
             numa_mode: NumaMode::Auto,
-            max_threads: Some(default_data_gen_threads()),
+            max_threads: Some(recommended_data_gen_threads(None, None)),
             numa_node: None,
             block_size: None,
             seed: None,
         };
-
-        gen_data(config) // Returns DataBuffer directly - NO copies!
+        dgen_generate_data(config)
     });
 
-    // Convert to Bytes (zero-copy for Uma/Vec via Bytes::from(vec)) and wrap
+    // Convert to Bytes (zero-copy for UMA via Bytes::from(vec)) and wrap
     Py::new(py, PyBytesView::new(buffer.into_bytes()))
 }
 
@@ -100,12 +101,10 @@ fn generate_data_with_threads(
     compress: usize,
     threads: Option<usize>,
 ) -> PyResult<Py<PyBytesView>> {
-    let num_threads = threads.unwrap_or_else(default_data_gen_threads);
+    let num_threads = threads.unwrap_or_else(|| recommended_data_gen_threads(None, None));
 
     // Generate with custom thread count, WITHOUT holding GIL
-    let buffer = py.detach(|| {
-        use crate::data_gen_alt::{generate_data, GeneratorConfig, NumaMode};
-
+    let buffer: DataBuffer = py.detach(|| {
         let config = GeneratorConfig {
             size,
             dedup_factor: dedup,
@@ -116,11 +115,10 @@ fn generate_data_with_threads(
             block_size: None,
             seed: None,
         };
-
-        generate_data(config) // Returns DataBuffer directly - NO 16GB copy to bytes::Bytes!
+        dgen_generate_data(config)
     });
 
-    // Convert to Bytes (zero-copy for Uma/Vec via Bytes::from(vec)) and wrap
+    // Convert to Bytes (zero-copy for UMA via Bytes::from(vec)) and wrap
     Py::new(py, PyBytesView::new(buffer.into_bytes()))
 }
 
@@ -175,12 +173,10 @@ fn generate_into_buffer(
     }
 
     let size = buf.len_bytes();
-    let num_threads = threads.unwrap_or_else(default_data_gen_threads);
+    let num_threads = threads.unwrap_or_else(|| recommended_data_gen_threads(None, None));
 
     // Generate data directly into DataBuffer (NO intermediate bytes::Bytes conversion!)
-    let data_buffer = py.detach(|| {
-        use crate::data_gen_alt::{generate_data, GeneratorConfig, NumaMode};
-
+    let data_buffer: DataBuffer = py.detach(|| {
         let config = GeneratorConfig {
             size,
             dedup_factor: dedup,
@@ -191,8 +187,7 @@ fn generate_into_buffer(
             block_size: None,
             seed: None,
         };
-
-        generate_data(config) // Returns DataBuffer directly - NO 16GB copy to bytes::Bytes!
+        dgen_generate_data(config)
     });
 
     // Write into buffer (single copy only - can't avoid this since user provided the buffer)
@@ -222,7 +217,7 @@ fn generate_into_buffer(
 /// ```
 #[pyfunction]
 fn py_default_data_gen_threads() -> usize {
-    default_data_gen_threads()
+    recommended_data_gen_threads(None, None)
 }
 
 /// Get total number of CPU cores/threads available
@@ -299,8 +294,6 @@ impl PyGenerator {
         chunk_size: Option<usize>,
         seed: Option<u64>,
     ) -> PyResult<Self> {
-        use crate::data_gen_alt::{GeneratorConfig, NumaMode};
-
         let config = GeneratorConfig {
             size,
             dedup_factor: dedup,

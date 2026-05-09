@@ -1,5 +1,228 @@
 # s3dlio Changelog
 
+## Version 0.9.98 — Parquet DataLoader with epoch-2 fast path and Arrow IPC decode (May 9, 2026)
+
+### New: `ParquetRowGroupDataset` — epoch-aware Parquet DataLoader for AI/ML training loops
+
+Adds a production-ready Parquet DataLoader where each dataset item is one Parquet **row
+group** — the natural I/O unit for distributed training. The loader is designed for multi-epoch
+training with 8+ concurrent worker processes.
+
+**Key capabilities:**
+
+- **Zero re-fetch on epoch 2+**: Row-group byte ranges (start offset + length + row count) are
+  cached in a process-global `DashMap` after the first epoch. Epoch-2+ `new()` calls read
+  from this cache — no S3 footer GETs issued. Measured **2.5× speedup** on epoch-2
+  construction vs epoch-1 (20.4 ms → 8.3 ms on 2-file / 4-RG test dataset; proportionally
+  larger at scale with 64+ files).
+
+- **Two decode modes:**
+  - `Raw` (default, `parquet` feature): Python receives compressed Parquet column-chunk bytes.
+    Ideal for pure storage benchmarks or when Python controls decoding.
+  - `ArrowIpc` (`parquet-arrow` feature, also default): Rust decodes Parquet column data to
+    Arrow `RecordBatch` and serialises to Arrow IPC stream format. Python reconstructs via
+    `pa.ipc.open_stream(pa.py_buffer(item["data"])).read_next_batch()`.
+
+- **Minimal RAM**: Only metadata held in RAM. 8 concurrent worker instances share the
+  process-global footer cache and row-group index — no 8× duplication. Each `get()` call
+  fetches exactly one row group, freed when Python releases the `bytes` reference.
+
+- **Concurrent prefetch**: `PyParquetStreamLoader` spawns one Tokio task per iterator,
+  keeping `prefetch` (default 32) row-group GETs in flight simultaneously via
+  `buffer_unordered`. A bounded `mpsc::channel(prefetch)` provides back-pressure — no
+  Semaphore, no JoinSet overhead.
+
+- **Column projection**: Pass `columns=[0, 2, 5]` to fetch only those column indices per
+  row group (reduces per-item byte range).
+
+- **DLIO benchmark integration**: Drop-in replacement for dlio_benchmark's native Parquet
+  reader via `create_async_loader(prefix, {"format": "parquet", "decode": "raw"})`.
+
+**Subcomponents added:**
+
+| File | Purpose |
+|------|---------|
+| `src/data_loader/parquet_rg.rs` | `ParquetRowGroupDataset`, `ParquetDecodeMode`, `RgExtent`, `build_extents()`, epoch-2 fast path |
+| `src/data_loader/parquet_index.rs` | `ParquetIndex` — process-global `OnceLock<DashMap>` keyed by S3 URI |
+| `src/data_loader/parquet_file_cache.rs` | Per-URI footer cache with `Arc<ParquetMetaData>` sharing and `OnceCell` for concurrent-fetch coalescing |
+| `src/python_api/python_aiml_api.rs` | `PyParquetStreamLoader`, `ParquetStreamIter`, `create_async_loader` parquet path |
+| `tests/test_parquet_dataloader.py` | Python integration tests (raw loader, Arrow IPC, epoch fast path) |
+
+**Feature flags:**
+
+| Feature | Default? | What it enables |
+|---------|----------|-----------------|
+| `parquet` | ✅ Yes | `ParquetRowGroupDataset`, `ParquetIndex`, `parquet_file_cache`, `Raw` mode |
+| `parquet-arrow` | ✅ Yes | `ArrowIpc` decode mode (Rust → Arrow RecordBatch → IPC bytes) |
+
+> Note: `arrow-backend` (Apache Arrow's `object_store` as the S3 client) is a separate,
+> mutually exclusive feature and is **not** related to the Parquet DataLoader.
+
+**Python API:**
+
+```python
+import s3dlio
+
+# Raw mode (default) — Python receives Parquet bytes, decodes with PyArrow
+loader = s3dlio.create_async_loader(
+    "s3://bucket/train/",
+    {"format": "parquet", "prefetch": 32}
+)
+for item in loader:
+    # item["data"]: bytes, item["uri"]: str, item["rg_idx"]: int
+    table = pyarrow.parquet.read_table(io.BytesIO(item["data"]))
+
+# Arrow IPC mode — Rust decodes, Python gets ready-to-use RecordBatch bytes
+loader = s3dlio.create_async_loader(
+    "s3://bucket/train/",
+    {"format": "parquet", "decode": "arrow", "prefetch": 32}
+)
+for item in loader:
+    batch = pa.ipc.open_stream(pa.py_buffer(item["data"])).read_next_batch()
+```
+
+**Testing — 17 unit tests + 6 MinIO integration tests (all passing):**
+
+Unit tests (no network, `cargo test --features parquet-arrow -- parquet`):
+- Footer parser: magic check, bad magic rejection, too-small buffer rejection
+- Decode mode: default is Raw, variants compile and differ
+- `needs_file_metadata`: Raw=false, ArrowIpc=true, modes differ
+- Global index singleton: same pointer on every `global()` call
+- Global index col_indices: always None (all-column extents)
+- `ParquetIndex`: insert/lookup, binary search, range lookup, epoch counter, invalidate, combined
+
+Integration tests (live MinIO, `--test-threads=1 --ignored`):
+- Epoch-1 construction: 4 RGs, index populated, `get(0)` non-empty
+- Epoch-2 fast path: identical results to epoch-1
+- Row offset consistency: `rg_num_rows()` matches `num_rows_in_rg()`
+- **Timing proof**: epoch-2 ≤ epoch-1 construction time, < 2 s absolute
+- Raw fast path: `file_metadata_len() == 0` on epoch-2 (Raw mode skips file_metadata)
+- ArrowIpc fast path: `file_metadata_len() == num_files` on epoch-2
+
+**Memory model:**
+
+| What | Size | Scope |
+|------|------|-------|
+| `extents` (byte ranges) | ~48 B × N_rgs | Per dataset instance |
+| `parquet_file_cache` (parsed footer) | few MB per file, Arc-shared | Process-global |
+| `parquet_index` DashMap entries | ~80 B × N_rgs | Process-global singleton |
+| Active `get()` payload | 1 row-group ≈ 1–100 MB | Freed when Python releases `bytes` |
+
+📖 **[Complete Parquet DataLoader Guide](Parquet_Data-Loader.md)**
+
+---
+
+### Changes in v0.9.98
+
+- **`Cargo.toml` / `pyproject.toml`**: Bump version `0.9.97 → 0.9.98`
+- **`Cargo.toml` features**: `parquet = ["dep:parquet", ...]` and `parquet-arrow = [...]` added to default feature set
+- **`src/data_loader/mod.rs`**: Export `parquet_rg`, `parquet_index`, `parquet_file_cache`, `ParquetRowGroupDataset`, `ParquetDecodeMode`, `DEFAULT_FOOTER_CAP`
+- **`src/data_loader/parquet_rg.rs`**: New file — full `ParquetRowGroupDataset` implementation with epoch-2 fast path, `Raw` + `ArrowIpc` modes, 17 unit + 6 integration tests
+- **`src/data_loader/parquet_index.rs`**: New file — `ParquetIndex` global singleton + 6 unit tests
+- **`src/data_loader/parquet_file_cache.rs`**: New file — per-URI footer de-duplication
+- **`src/python_api/python_aiml_api.rs`**: `PyParquetStreamLoader`, `ParquetStreamIter`, extended `create_async_loader` for parquet format
+- **`tests/test_parquet_dataloader.py`**: Python integration test suite
+
+---
+
+## Version 0.9.97 — Unsigned payload support + XorStream Python bindings (May 4, 2026)
+
+### New: `XorStream` — fast, dedup-safe data generation via `dgen-data` crate (May 2026)
+
+Adds `s3dlio.XorStream`, a high-performance data generator for Python and Rust callers.
+Backed by [`dgen_data::UniqueXorStream`] — a 1 MiB random base buffer + `AtomicU64`
+counter + splitmix64 + Xoshiro256++ XOR keystream. Each `fill()` / `generate()` call
+produces a unique 512-byte-block-level output, guaranteeing dedup incompressibility.
+
+**Thread-safe**: `&self` API, no mutex, `Sync + Send`. ~15 GB/s per core.
+
+**Python API** (no changes to existing API):
+
+```python
+import s3dlio
+
+stream = s3dlio.XorStream()
+
+# In-place fill — fastest, no per-call heap allocation
+buf = bytearray(8 * 1024 * 1024)
+stream.fill(buf)                     # unique 8 MiB payload
+stream.fill(buf)                     # different 8 MiB payload, guaranteed
+
+# Allocate + fill in one call — returns BytesView (buffer protocol)
+data = stream.generate(8 * 1024 * 1024)
+view = memoryview(data)              # zero-copy access
+import numpy as np
+arr = np.frombuffer(view, dtype=np.uint8)  # zero-copy numpy array
+
+print(stream.objects_generated)     # == 3
+```
+
+**Changes**:
+
+- **`Cargo.toml`** — Added `dgen-data = { path = "../dgen-rs", default-features = false }`.
+  Must be changed to a git tag before PyPI release.
+- **`src/python_api/python_datagen_api.rs`** — `PyXorStream` class (`fill`, `generate`,
+  `objects_generated` property); registered via `register_datagen_functions()`.
+
+---
+
+### New: `S3DLIO_UNSIGNED_PAYLOAD` — bypass SHA-256 body hashing on PUT (`src/constants.rs`, `src/s3_client.rs`, `src/object_store.rs`, `src/s3_ops.rs`)
+
+Adds opt-in support for skipping AWS SigV4 payload signing on PUT operations. Enabled via
+the `S3DLIO_UNSIGNED_PAYLOAD=1` environment variable (also accepts `true`, `yes`, `on`,
+`enable`). Default is `false` — existing behaviour is unchanged.
+
+**When to use**: Only on internal, trusted, non-TLS endpoints (MinIO, s3-ultra, Ceph RGW,
+or any private S3-compatible server where the network path is considered secure). Must
+**never** be used against real AWS S3 endpoints — AWS requires a valid payload hash for
+SigV4-signed requests over HTTPS.
+
+**When it helps**: Primarily for large objects (1 MiB+) where SHA-256 computation becomes
+a meaningful fraction of per-request CPU time. For objects ≤ 1 KiB, the cost of SHA-256
+hashing (~0.3 µs) is negligible compared to network latency — no throughput improvement
+is expected or observed at small sizes.
+
+**Changes made**:
+
+- **`src/constants.rs`** — Two new constants:
+  ```rust
+  pub const ENV_UNSIGNED_PAYLOAD: &str = "S3DLIO_UNSIGNED_PAYLOAD";
+  pub const DEFAULT_UNSIGNED_PAYLOAD: bool = false;
+  ```
+
+- **`src/s3_client.rs`** — New helper function `unsigned_payload_enabled()` using
+  `std::sync::OnceLock` to read and cache the environment variable exactly once at first
+  call (zero-cost on the hot path for all subsequent requests):
+  ```rust
+  pub fn unsigned_payload_enabled() -> bool {
+      static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+      *CACHE.get_or_init(|| {
+          std::env::var(crate::constants::ENV_UNSIGNED_PAYLOAD)
+              .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on" | "enable"))
+              .unwrap_or(crate::constants::DEFAULT_UNSIGNED_PAYLOAD)
+      })
+  }
+  ```
+
+- **`src/object_store.rs`** — `S3ObjectStore::put()` conditionally calls
+  `.customize().disable_payload_signing()` on the `PutObjectFluentBuilder` when
+  `unsigned_payload_enabled()` returns `true`.
+
+- **`src/s3_ops.rs`** — `S3Ops::put_object()` conditionally calls
+  `.customize().disable_payload_signing()` on the same builder path.
+
+**Not available for GET**: The `disable_payload_signing()` API in the AWS SDK only exists
+on `PutObject` and `UploadPart` builders. GET requests carry an empty body whose SHA-256
+is the compile-time constant `e3b0c44298fc1c149afb...` — there is no computation to skip.
+
+### Tests: No new tests added for this feature
+
+This feature was validated empirically via benchmark comparison against s3-ultra. A unit
+test for `unsigned_payload_enabled()` (env-var parsing and OnceLock behaviour) would be
+a good follow-up addition.
+
+---
+
 ## Version 0.9.96 — Multi-endpoint correctness, S3_ENDPOINT_URIS enforcement, new CLI options (April 28, 2026)
 
 ### Fix: All endpoints in `S3_ENDPOINT_URIS` are now used (`src/multi_endpoint.rs`)

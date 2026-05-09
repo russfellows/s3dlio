@@ -62,6 +62,31 @@ pub fn configure_for_concurrency(n: usize) {
     CONCURRENCY_HINT.store(n, Ordering::Relaxed);
 }
 
+/// Returns `true` when `S3DLIO_UNSIGNED_PAYLOAD=1` (or `true`/`yes`/`on`/`enable`).
+///
+/// When enabled, S3 PUT requests send `x-amz-content-sha256: UNSIGNED-PAYLOAD`
+/// instead of computing a SHA-256 digest of the request body, eliminating
+/// per-request CPU cost proportional to object size.
+///
+/// The result is cached in a `OnceLock` — the env var is read exactly once on
+/// first call, so there is zero env-var lookup overhead on the hot path.
+///
+/// Only use on trusted, internal endpoints (MinIO, s3-ultra, Ceph RGW).
+/// See [`crate::constants::ENV_UNSIGNED_PAYLOAD`] for full documentation.
+pub fn unsigned_payload_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var(crate::constants::ENV_UNSIGNED_PAYLOAD)
+            .map(|v| {
+                matches!(
+                    v.to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "enable"
+                )
+            })
+            .unwrap_or(crate::constants::DEFAULT_UNSIGNED_PAYLOAD)
+    })
+}
+
 // Create (once) a background multi-thread Tokio runtime and return its Handle.
 // pub(crate) so that other modules (e.g. memory.rs) can spawn onto the same
 // runtime, ensuring consistent async behaviour across all URI schemes.

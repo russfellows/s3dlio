@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
-use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyDictMethods, PyList};
 use pyo3::Bound;
@@ -149,6 +149,144 @@ impl PyBytesAsyncDataLoader {
         py: Python<'py>,
     ) -> PyResult<Py<PyBytesAsyncDataLoaderIter>> {
         PyBytesAsyncDataLoaderIter::spawn_stream(py, slf.dataset.clone(), slf.opts.clone())
+    }
+
+    /// Synchronous iterator — `for item in loader:` works in plain Python (no asyncio).
+    ///
+    /// The producer runs as a Tokio task using `buffer_unordered(prefetch)` to drive
+    /// up to `prefetch` concurrent dataset fetches in flight simultaneously.  Tokio's
+    /// own work-stealing thread pool determines the actual parallelism — no manual
+    /// thread-count tuning required; it adapts automatically from 8-core laptops to
+    /// 128-core servers.
+    ///
+    /// The bounded channel (capacity = `prefetch`) is the backpressure mechanism:
+    /// when Python is slow the producer blocks on `tx.send().await`; when Python is
+    /// fast the channel stays ahead.  No Semaphore, no JoinSet, no guessing.
+    fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<PyBytesDataLoaderSyncIter>> {
+        let prefetch = slf.opts.prefetch.max(1);
+        let dataset = slf.dataset.clone();
+
+        // Bounded channel: capacity = prefetch depth.
+        // Producer backs off automatically when Python consumer is slow.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, DatasetError>>(prefetch);
+
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            if let Some(len) = dataset.inner.len() {
+                // buffer_unordered drives up to `prefetch` futures concurrently.
+                // Tokio's scheduler handles the thread count — no Semaphore needed.
+                use futures_util::stream::{self, StreamExt as _};
+                use std::time::Instant;
+
+                let t_start = Instant::now();
+                let mut total_bytes: u64 = 0;
+                let mut count: usize = 0;
+                let mut t_last_log = Instant::now();
+
+                tracing::info!(
+                    total_items = len,
+                    prefetch,
+                    "[s3dlio] loader starting: {} items, prefetch depth {}",
+                    len,
+                    prefetch
+                );
+
+                let mut stream = stream::iter(0..len)
+                    .map(|idx| {
+                        let ds = dataset.clone();
+                        async move { ds.inner.get(idx).await }
+                    })
+                    .buffer_unordered(prefetch);
+
+                while let Some(result) = stream.next().await {
+                    if let Ok(ref bytes) = result {
+                        total_bytes += bytes.len() as u64;
+                        count += 1;
+
+                        // Log progress every 20 items OR every 5 seconds
+                        if count % 20 == 0 || t_last_log.elapsed().as_secs() >= 5 {
+                            let elapsed = t_start.elapsed().as_secs_f64();
+                            tracing::info!(
+                                count,
+                                total_items = len,
+                                total_bytes,
+                                elapsed_s = elapsed,
+                                "[s3dlio] progress: {}/{} items | {:.1} MiB | {:.0} MB/s",
+                                count,
+                                len,
+                                total_bytes as f64 / 1024.0 / 1024.0,
+                                total_bytes as f64 / elapsed / 1024.0 / 1024.0
+                            );
+                            t_last_log = Instant::now();
+                        }
+                    }
+                    // blocks when channel full → natural backpressure
+                    if tx.send(result).await.is_err() {
+                        break; // Python consumer dropped the iterator
+                    }
+                }
+
+                let elapsed = t_start.elapsed().as_secs_f64();
+                tracing::info!(
+                    count,
+                    total_bytes,
+                    elapsed_s = elapsed,
+                    "[s3dlio] loader done: {}/{} items | {:.1} MiB | {:.0} MB/s",
+                    count,
+                    len,
+                    total_bytes as f64 / 1024.0 / 1024.0,
+                    if elapsed > 0.0 {
+                        total_bytes as f64 / elapsed / 1024.0 / 1024.0
+                    } else {
+                        0.0
+                    }
+                );
+            }
+        });
+
+        Py::new(
+            slf.py(),
+            PyBytesDataLoaderSyncIter {
+                rx: std::sync::Mutex::new(rx),
+            },
+        )
+    }
+}
+
+/// Synchronous iterator returned by `PyBytesAsyncDataLoader.__iter__()`.
+///
+/// Each `__next__()` call releases the GIL (`py.allow_threads`) while waiting
+/// for the next item from the Tokio producer, then re-acquires it to wrap the
+/// result in a `PyBytesView`.  Other Python threads run freely while waiting.
+///
+/// Each item is one row-group's bytes (when using the parquet format) or one
+/// object's bytes (when using the default S3 bytes format).
+#[pyclass]
+pub struct PyBytesDataLoaderSyncIter {
+    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<Bytes, DatasetError>>>,
+}
+
+#[pymethods]
+impl PyBytesDataLoaderSyncIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Release the GIL while the Tokio channel is empty (network I/O in flight).
+        // When the next item arrives the GIL is re-acquired automatically and `py`
+        // is valid again — no Python::attach / Python::with_gil needed.
+        let result = py.detach(|| {
+            self.rx
+                .lock()
+                .expect("sync iter rx mutex poisoned")
+                .blocking_recv()
+        });
+
+        match result {
+            Some(Ok(item)) => Py::new(py, PyBytesView::new(item))?.into_py_any(py),
+            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            None => Err(PyStopIteration::new_err("end of dataset")),
+        }
     }
 }
 
@@ -708,6 +846,11 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             "shard_world_size",
             "worker_id",
             "num_workers_pytorch",
+            // Format-routing keys consumed by create_async_loader / create_dataset
+            "format",
+            "columns",
+            "footer_cap",
+            "decode", // "raw" (default) | "arrow" (Rust Arrow IPC) | "none" (raw, no Python decode)
         ];
         for key in d.keys() {
             if let Ok(key_str) = key.extract::<&str>() {
@@ -1602,13 +1745,308 @@ pub fn create_dataset(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Py
     PyDataset::new(uri, opts)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Parquet streaming loader — one dataset for ALL files, items in arrival order
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One row group returned from `PyParquetStreamLoader`.
+///
+/// Python attributes:
+///   `item.file_uri`   → full S3/file URI of the containing Parquet file
+///   `item.rg_idx`     → row-group index within that file
+///   `item.byte_count` → compressed byte count (length of the raw data)
+///   `bytes(item)`     → raw compressed column-chunk bytes (for PyArrow decode)
+///   `len(item)`       → same as `byte_count`
+#[pyclass]
+pub struct PyParquetItem {
+    #[pyo3(get)]
+    pub file_uri: String,
+    #[pyo3(get)]
+    pub rg_idx: usize,
+    data: Bytes,
+}
+
+#[pymethods]
+impl PyParquetItem {
+    #[getter]
+    fn byte_count(&self) -> usize {
+        self.data.len()
+    }
+
+    fn __len__(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Return the raw compressed bytes.  Creates a Python bytes copy.
+    /// For `decode_mode="none"` use `item.byte_count` instead to avoid the copy.
+    fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.data)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PyParquetItem(file_uri={:?}, rg_idx={}, byte_count={})",
+            self.file_uri,
+            self.rg_idx,
+            self.data.len()
+        )
+    }
+}
+
+/// Synchronous iterator returned by `PyParquetStreamLoader.__iter__()`.
+///
+/// Items arrive in **network completion order**, not file/RG index order.
+/// The GIL is released while waiting for the next item.
+///
+/// Each item is a `PyParquetItem` carrying `file_uri`, `rg_idx`, and the raw
+/// bytes — enough for the Python consumer to cache by `(file_uri, rg_idx)`.
+#[pyclass]
+pub struct ParquetStreamIter {
+    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<(usize, Bytes), DatasetError>>>,
+    /// global_rg_idx → (file_uri_idx, rg_idx_in_file)
+    rg_info: Arc<Vec<(usize, usize)>>,
+    file_uris: Arc<Vec<String>>,
+}
+
+#[pymethods]
+impl ParquetStreamIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Release the GIL while waiting — other Python threads continue freely.
+        let result = py.detach(|| {
+            self.rx
+                .lock()
+                .expect("ParquetStreamIter rx mutex poisoned")
+                .blocking_recv()
+        });
+
+        match result {
+            Some(Ok((global_idx, bytes))) => {
+                let (file_uri_idx, rg_idx) = self.rg_info[global_idx];
+                let file_uri = self.file_uris[file_uri_idx].clone();
+                let item = PyParquetItem {
+                    file_uri,
+                    rg_idx,
+                    data: bytes,
+                };
+                Py::new(py, item)?.into_py_any(py)
+            }
+            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            None => Err(PyStopIteration::new_err("parquet stream exhausted")),
+        }
+    }
+}
+
+/// Parquet prefetch stream loader.
+///
+/// Creates **one** `ParquetRowGroupDataset` covering ALL files under `prefix`.
+/// `__iter__()` spawns a single Tokio producer task that keeps `concurrency`
+/// row-group range-GETs in flight simultaneously via `buffer_unordered`.
+///
+/// Items are delivered to Python in network completion order through a bounded
+/// `mpsc::channel(concurrency)`.  The bounded channel is the sole backpressure
+/// mechanism — no `Semaphore`, no `JoinSet`, no manual worker counting.
+///
+/// Memory at any instant: ≤ `concurrency` row groups held in the channel
+/// (each ~1–8 MiB depending on dataset).
+///
+/// This is the "all files, all row groups, prefetch N ahead" design:
+///   producer: `buffer_unordered(concurrency)` over global_rg_idx 0..total
+///   consumer: Python pops items, caches by (file_uri, rg_idx), serves on demand
+#[cfg(feature = "parquet")]
+#[pyclass]
+pub struct PyParquetStreamLoader {
+    dataset: Arc<crate::data_loader::ParquetRowGroupDataset>,
+    /// How many row-group GETs to keep in flight simultaneously.
+    /// Also the bounded channel capacity (= always 1 full "batch" ahead minimum).
+    concurrency: usize,
+}
+
+#[cfg(feature = "parquet")]
+#[pymethods]
+impl PyParquetStreamLoader {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<ParquetStreamIter>> {
+        let concurrency = slf.concurrency;
+        let dataset = Arc::clone(&slf.dataset);
+        let total = dataset.len().unwrap_or(0);
+
+        let rg_info = Arc::new(dataset.rg_info_vec());
+        let file_uris = dataset.file_uris_arc();
+
+        // Bounded channel: capacity = concurrency.
+        // Producer blocks here (not in a Semaphore) when Python is slow.
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<(usize, Bytes), DatasetError>>(concurrency);
+
+        tracing::info!(
+            total_items = total,
+            concurrency,
+            "[s3dlio] ParquetStreamLoader.__iter__: {} row-groups, {} concurrent GETs",
+            total,
+            concurrency
+        );
+
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            use futures_util::stream::{self, StreamExt as _};
+            use std::time::Instant;
+
+            let t_start = Instant::now();
+            let mut count: usize = 0;
+            let mut total_bytes: u64 = 0;
+            let mut t_last_log = Instant::now();
+
+            let mut stream = stream::iter(0..total)
+                .map(|idx| {
+                    let ds = Arc::clone(&dataset);
+                    async move { ds.get(idx).await.map(|b| (idx, b)) }
+                })
+                .buffer_unordered(concurrency);
+
+            while let Some(result) = stream.next().await {
+                if let Ok((_, ref b)) = result {
+                    total_bytes += b.len() as u64;
+                    count += 1;
+                    if count % 50 == 0 || t_last_log.elapsed().as_secs() >= 5 {
+                        let elapsed = t_start.elapsed().as_secs_f64();
+                        tracing::info!(
+                            count,
+                            total_items = total,
+                            "[s3dlio] parquet stream: {}/{} RGs | {:.0} MB/s",
+                            count,
+                            total,
+                            total_bytes as f64 / elapsed / 1024.0 / 1024.0
+                        );
+                        t_last_log = Instant::now();
+                    }
+                }
+                // Bounded send — blocks when channel full (Python not consuming).
+                if tx.send(result).await.is_err() {
+                    tracing::debug!("[s3dlio] parquet stream: consumer dropped iterator");
+                    break;
+                }
+            }
+
+            let elapsed = t_start.elapsed().as_secs_f64();
+            tracing::info!(
+                "[s3dlio] parquet stream done: {}/{} RGs | {:.0} MB/s",
+                count,
+                total,
+                if elapsed > 0.0 {
+                    total_bytes as f64 / elapsed / 1024.0 / 1024.0
+                } else {
+                    0.0
+                }
+            );
+        });
+
+        Py::new(
+            slf.py(),
+            ParquetStreamIter {
+                rx: std::sync::Mutex::new(rx),
+                rg_info,
+                file_uris,
+            },
+        )
+    }
+}
+
 /// Create an async data loader from any supported URI scheme (convenience function)
+///
+/// Extra `opts` keys handled by this function (in addition to standard [`LoaderOptions`] keys):
+///
+/// | Key | Type | Description |
+/// |-----|------|-------------|
+/// | `"format"` | `str` | `"parquet"` — enable row-group mode (requires `parquet` feature) |
+/// | `"columns"` | `list[int]` | Column indices to include per row group (`None` = all) |
+/// | `"footer_cap"` | `int` | Bytes to fetch from file tail for footer parsing (default 4 MiB) |
 #[pyfunction]
 #[pyo3(signature = (uri, opts=None))]
 pub fn create_async_loader(
+    py: Python<'_>,
     uri: &str,
     opts: Option<Bound<'_, PyDict>>,
-) -> PyResult<PyBytesAsyncDataLoader> {
+) -> PyResult<Py<PyAny>> {
+    // Check for parquet format before falling through to the generic path.
+    #[cfg(feature = "parquet")]
+    if let Some(ref d) = opts {
+        let format_str = d
+            .get_item("format")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<String>().ok());
+
+        if format_str.as_deref() == Some("parquet") {
+            use crate::data_loader::ParquetDecodeMode;
+            use crate::data_loader::ParquetRowGroupDataset;
+            use crate::data_loader::DEFAULT_FOOTER_CAP;
+
+            // Extract column indices: list[int] or None
+            let col_indices: Option<Vec<usize>> = d
+                .get_item("columns")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<Vec<usize>>().ok());
+
+            // Extract footer_cap (bytes from file tail for footer parsing)
+            let footer_cap: usize = d
+                .get_item("footer_cap")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<usize>().ok())
+                .unwrap_or(DEFAULT_FOOTER_CAP);
+
+            // Decode mode: "raw" (default) or "arrow" (Rust-side Arrow IPC decode).
+            // "none" is treated identically to "raw" at the Rust layer; the Python
+            // caller (dlio_benchmark) is responsible for not invoking PyArrow on the
+            // raw bytes in that case.
+            let decode_mode = {
+                let s = d
+                    .get_item("decode")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract::<String>().ok());
+                match s.as_deref() {
+                    #[cfg(feature = "parquet-arrow")]
+                    Some("arrow") => ParquetDecodeMode::ArrowIpc,
+                    #[cfg(not(feature = "parquet-arrow"))]
+                    Some("arrow") => {
+                        return Err(PyRuntimeError::new_err(
+                            "decode=\"arrow\" requires the parquet-arrow feature (not compiled in)",
+                        ));
+                    }
+                    _ => ParquetDecodeMode::Raw, // "raw", "none", or not set
+                }
+            };
+
+            let pq_dataset =
+                ParquetRowGroupDataset::new(uri, col_indices.as_deref(), footer_cap, decode_mode)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // Concurrency: how many row-group GETs to keep in flight.
+            // "prefetch" key sets this; default 32 (matches old Python 32-thread pool).
+            let concurrency: usize = d
+                .get_item("prefetch")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<usize>().ok())
+                .unwrap_or(32)
+                .max(1);
+
+            return Py::new(
+                py,
+                PyParquetStreamLoader {
+                    dataset: Arc::new(pq_dataset),
+                    concurrency,
+                },
+            )?
+            .into_py_any(py);
+        }
+    }
+
+    // Generic path: S3BytesDataset (or any other URI-scheme dataset)
     let dataset = create_dataset(uri, opts.clone())?;
 
     // For async loaders, default to batch_size = 1 for intuitive individual item iteration
@@ -1618,10 +2056,14 @@ pub fn create_async_loader(
         loader_opts.batch_size = 1;
     }
 
-    Ok(PyBytesAsyncDataLoader {
-        dataset,
-        opts: loader_opts,
-    })
+    Py::new(
+        py,
+        PyBytesAsyncDataLoader {
+            dataset,
+            opts: loader_opts,
+        },
+    )?
+    .into_py_any(py)
 }
 
 // ---------------------------------------------------------------------------
@@ -1686,8 +2128,20 @@ impl PyS3AsyncDataLoaderCompat {
         }
 
         eprintln!("Warning: PyS3AsyncDataLoader is deprecated. Use create_async_loader() instead.");
-        let loader = create_async_loader(uri, opts)?;
-        Ok(Self { inner: loader })
+        // Build a PyBytesAsyncDataLoader directly (the compat type wraps that struct).
+        // We can't call create_async_loader() here because its return type is now
+        // PyObject (to accommodate both PyBytesAsyncDataLoader and PyParquetStreamLoader).
+        let dataset = create_dataset(uri, opts.clone())?;
+        let mut loader_opts = opts_from_dict(opts);
+        if loader_opts.batch_size == LoaderOptions::default().batch_size {
+            loader_opts.batch_size = 1;
+        }
+        Ok(Self {
+            inner: PyBytesAsyncDataLoader {
+                dataset,
+                opts: loader_opts,
+            },
+        })
     }
 
     fn __aiter__(&self) -> PyResult<PyBytesAsyncDataLoader> {
@@ -1825,6 +2279,249 @@ pub fn read_tfrecord_index(index_path: &str) -> PyResult<Vec<(u64, u64)>> {
 }
 
 // ---------------------------------------------------------------------------
+// Parquet metadata cache helpers
+// ---------------------------------------------------------------------------
+
+/// Return cumulative row-group row offsets for a single Parquet file.
+///
+/// The result is a list of length `num_row_groups + 1`:
+/// - `offsets[i]`    = first sample row in row group `i`
+/// - `offsets[-1]`   = total rows in the file
+///
+/// The metadata is fetched from s3 on the first call and cached for the
+/// process lifetime (zero network I/O on subsequent calls).
+///
+/// This replaces any Python-side footer read (e.g. `_build_rg_offsets` with
+/// PyArrow + `_S3RangeFile`) with a single Rust call that hits the in-memory
+/// cache after the first `create_async_loader` for the same file.
+///
+/// Example::
+///
+///     import s3dlio
+///     offsets = s3dlio.parquet_rg_row_offsets("s3://bucket/path/file.parquet")
+///     # offsets == [0, 8192, 16384, ..., 1000000]
+#[cfg(feature = "parquet")]
+#[pyfunction]
+pub fn parquet_rg_row_offsets(uri: &str) -> PyResult<Vec<i64>> {
+    use crate::data_loader::parquet_file_cache;
+    use crate::data_loader::parquet_rg::DEFAULT_FOOTER_CAP;
+    use crate::s3_client::run_on_global_rt;
+    use pyo3::exceptions::PyRuntimeError;
+
+    let uri_owned = uri.to_owned();
+    let cached = run_on_global_rt(async move {
+        parquet_file_cache::get_or_fetch(&uri_owned, DEFAULT_FOOTER_CAP as u64).await
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(cached.rg_row_offsets.clone())
+}
+
+/// Evict a single file from the Parquet metadata cache.
+///
+/// Useful after a file has been rewritten and you want the next
+/// `parquet_rg_row_offsets` / `create_async_loader` call to re-fetch it.
+#[cfg(feature = "parquet")]
+#[pyfunction]
+pub fn parquet_cache_invalidate(uri: &str) {
+    use crate::data_loader::parquet_file_cache;
+    parquet_file_cache::invalidate(uri);
+}
+
+/// Clear the entire Parquet metadata cache.
+#[cfg(feature = "parquet")]
+#[pyfunction]
+pub fn parquet_cache_clear() {
+    use crate::data_loader::parquet_file_cache;
+    parquet_file_cache::clear();
+}
+
+/// Return the number of files currently held in the Parquet metadata cache.
+#[cfg(feature = "parquet")]
+#[pyfunction]
+pub fn parquet_cache_len() -> usize {
+    use crate::data_loader::parquet_file_cache;
+    parquet_file_cache::len()
+}
+
+// ---------------------------------------------------------------------------
+// PyParquetIndex — epoch-aware Parquet row-group byte-range index
+// ---------------------------------------------------------------------------
+
+/// Epoch-aware Parquet row-group byte-range index.
+///
+/// `PyParquetIndex` caches `(file_uri, rg_idx) → (byte_offset, byte_length)`
+/// for every row group across all indexed files.  Footers are fetched lazily
+/// in configurable batches and dropped after extracting byte ranges.  Entries
+/// are retained across epochs; `last_epoch` tracks per-epoch fetch status so
+/// row groups are not re-fetched within the same epoch.
+///
+/// ## Usage
+///
+/// ```python
+/// import s3dlio
+///
+/// idx = s3dlio.PyParquetIndex()          # col_indices=None (all), footer_cap=4 MiB
+///
+/// # Index a batch of files (fetches footers concurrently, batch_size at a time)
+/// uris = ["s3://bucket/data/file0.parquet", "s3://bucket/data/file1.parquet"]
+/// idx.ensure_indexed(uris, epoch=1, batch_size=16)
+///
+/// # Fast O(1) lookup: sample index → RG index + byte range
+/// rg_idx, offset, length = idx.rg_lookup("s3://bucket/data/file0.parquet", sample_idx=42)
+///
+/// # Issue the range GET directly
+/// data = s3dlio.get_range("s3://bucket/data/file0.parquet", offset, length)
+///
+/// # Mark as fetched this epoch (avoids duplicate GETs)
+/// idx.mark_fetched("s3://bucket/data/file0.parquet", rg_idx, epoch=1)
+///
+/// # Next epoch: entries already present, just check last_epoch
+/// idx.ensure_indexed(uris, epoch=2, batch_size=16)  # no-op: footers cached
+/// rg_idx, offset, length = idx.rg_lookup(...)       # still O(1)
+/// ```
+#[cfg(feature = "parquet")]
+#[pyclass]
+pub struct PyParquetIndex {
+    inner: std::sync::Arc<crate::data_loader::parquet_index::ParquetIndex>,
+}
+
+#[cfg(feature = "parquet")]
+#[pymethods]
+impl PyParquetIndex {
+    /// Create a new empty index.
+    ///
+    /// Args:
+    ///     col_indices: List of column indices to include in byte-range
+    ///         computation, or ``None`` to include all columns.  Must be
+    ///         consistent across all files.
+    ///     footer_cap: Bytes fetched from each file tail for footer parsing.
+    ///         Default 4 MiB covers DLRM (~2.66 MiB footers) and most workloads.
+    #[new]
+    #[pyo3(signature = (col_indices=None, footer_cap=4194304))]
+    fn new(col_indices: Option<Vec<usize>>, footer_cap: u64) -> Self {
+        Self {
+            inner: std::sync::Arc::new(crate::data_loader::parquet_index::ParquetIndex::new(
+                col_indices,
+                footer_cap,
+            )),
+        }
+    }
+
+    /// Ensure all URIs in `uris` have their row groups indexed.
+    ///
+    /// Already-indexed URIs are skipped.  Footers are fetched concurrently in
+    /// batches of `batch_size` (default 16).  Blocks until the batch completes,
+    /// releasing the GIL during network I/O.
+    ///
+    /// Args:
+    ///     uris: S3/file URIs to index.
+    ///     epoch: Current epoch number (used to initialise ``last_epoch``).
+    ///     batch_size: Concurrent footer fetches per batch (default 16).
+    #[pyo3(signature = (uris, epoch=1, batch_size=16))]
+    fn ensure_indexed(
+        &self,
+        py: Python<'_>,
+        uris: Vec<String>,
+        epoch: u32,
+        batch_size: usize,
+    ) -> PyResult<()> {
+        let inner = std::sync::Arc::clone(&self.inner);
+        py.detach(|| {
+            inner
+                .ensure_indexed(&uris, epoch, batch_size)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Find which row group contains `sample_idx` (0-based within the file).
+    ///
+    /// Returns the row-group index.  Raises ``RuntimeError`` if the URI is not
+    /// yet indexed.
+    fn rg_for_sample(&self, uri: &str, sample_idx: i64) -> PyResult<u32> {
+        self.inner
+            .rg_for_sample(uri, sample_idx)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Return ``(byte_offset, byte_length)`` for ``(uri, rg_idx)``.
+    fn rg_range(&self, uri: &str, rg_idx: u32) -> PyResult<(u64, u64)> {
+        self.inner
+            .rg_range(uri, rg_idx)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Combined lookup: sample → ``(rg_idx, byte_offset, byte_length)``.
+    ///
+    /// Combines ``rg_for_sample`` + ``rg_range`` into one PyO3 call, halving
+    /// FFI overhead on the per-sample hot path.
+    fn rg_lookup(&self, uri: &str, sample_idx: i64) -> PyResult<(u32, u64, u64)> {
+        self.inner
+            .rg_lookup(uri, sample_idx)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// ``True`` if ``(uri, rg_idx)`` was fetched during epoch ``epoch``.
+    fn was_fetched(&self, uri: &str, rg_idx: u32, epoch: u32) -> bool {
+        self.inner.was_fetched(uri, rg_idx, epoch)
+    }
+
+    /// Record that ``(uri, rg_idx)`` was fetched during epoch ``epoch``.
+    fn mark_fetched(&self, uri: &str, rg_idx: u32, epoch: u32) {
+        self.inner.mark_fetched(uri, rg_idx, epoch);
+    }
+
+    /// Combined ``was_fetched`` + ``mark_fetched`` in one DashMap access.
+    ///
+    /// Returns ``True`` if already fetched this epoch (caller skips GET).
+    /// If not fetched, atomically sets ``last_epoch = epoch`` and returns
+    /// ``False`` (caller should issue the GET).
+    fn check_and_mark(&self, uri: &str, rg_idx: u32, epoch: u32) -> bool {
+        self.inner.check_and_mark(uri, rg_idx, epoch)
+    }
+
+    /// ``True`` if ``uri`` is already fully indexed.
+    fn is_indexed(&self, uri: &str) -> bool {
+        self.inner.is_indexed(uri)
+    }
+
+    /// Number of row groups in ``uri``, or ``None`` if not indexed.
+    fn file_rg_count(&self, uri: &str) -> Option<u32> {
+        self.inner.file_rg_count(uri)
+    }
+
+    /// Number of row-group entries in the index (across all files).
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Number of files whose row groups are indexed.
+    fn file_count(&self) -> usize {
+        self.inner.file_count()
+    }
+
+    /// Remove all entries for ``uri`` (e.g. after a file is rewritten).
+    fn invalidate_uri(&self, uri: &str) {
+        self.inner.invalidate_uri(uri);
+    }
+
+    /// Clear all row-group entries (keeps URI interning table).
+    fn clear(&self) {
+        self.inner.clear();
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PyParquetIndex(files={}, rgs={}, col_indices={:?}, footer_cap={})",
+            self.inner.file_count(),
+            self.inner.len(),
+            self.inner.col_indices,
+            self.inner.footer_cap,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module registration function for AI/ML API
 // ---------------------------------------------------------------------------
 pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1843,6 +2540,13 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncDataLoaderIter>()?;
     m.add_class::<PyBytesAsyncDataLoader>()?;
     m.add_class::<PyBytesAsyncDataLoaderIter>()?;
+    m.add_class::<PyBytesDataLoaderSyncIter>()?;
+    m.add_class::<PyParquetItem>()?;
+    m.add_class::<ParquetStreamIter>()?;
+    #[cfg(feature = "parquet")]
+    m.add_class::<PyParquetStreamLoader>()?;
+    #[cfg(feature = "parquet")]
+    m.add_class::<PyParquetIndex>()?;
 
     // Compatibility classes (deprecated)
     m.add_class::<PyS3DatasetCompat>()?;
@@ -1851,6 +2555,16 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Dataset factory functions
     m.add_function(wrap_pyfunction!(create_dataset, m)?)?;
     m.add_function(wrap_pyfunction!(create_async_loader, m)?)?;
+
+    // Parquet metadata cache helpers
+    #[cfg(feature = "parquet")]
+    m.add_function(wrap_pyfunction!(parquet_rg_row_offsets, m)?)?;
+    #[cfg(feature = "parquet")]
+    m.add_function(wrap_pyfunction!(parquet_cache_invalidate, m)?)?;
+    #[cfg(feature = "parquet")]
+    m.add_function(wrap_pyfunction!(parquet_cache_clear, m)?)?;
+    #[cfg(feature = "parquet")]
+    m.add_function(wrap_pyfunction!(parquet_cache_len, m)?)?;
 
     // TFRecord index generation (NVIDIA DALI compatible)
     m.add_function(wrap_pyfunction!(create_tfrecord_index, m)?)?;

@@ -165,16 +165,29 @@ impl S3Ops {
         let bytes = data.len() as u64;
         let body = data.into(); // Bytes → ByteStream is zero-copy (refcount bump)
 
-        let result = self
-            .client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(body)
-            .send()
-            .await;
+        let result = if crate::s3_client::unsigned_payload_enabled() {
+            self.client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(body)
+                .customize()
+                .disable_payload_signing()
+                .send()
+                .await
+                .map(|_| ())
+        } else {
+            self.client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(body)
+                .send()
+                .await
+                .map(|_| ())
+        };
         self.log_op(ctx, &Ok::<(), &str>(()), bytes, None);
-        Ok(result.map(|_| ())?)
+        Ok(result?)
     }
 
     /// STAT (Metadata) of an object.

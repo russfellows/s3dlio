@@ -1,7 +1,7 @@
 # s3dlio Python API Guide
 
-**Version:** 0.9.96  
-**Last Updated:** April 27, 2026
+**Version:** 0.9.98  
+**Last Updated:** May 9, 2026
 
 ## Table of Contents
 
@@ -16,13 +16,14 @@
 8. [Multi-Endpoint Load Balancing](#multi-endpoint-load-balancing)
 9. [Streaming API](#streaming-api)
 10. [AI/ML Integration](#aiml-integration)
-11. [Data Generation (NPZ / NPY)](#data-generation-npz--npy)
-12. [s3torchconnector Compatibility](#s3torchconnector-compatibility)
-13. [Checkpoint System](#checkpoint-system)
-13. [Performance & Threading](#performance--threading)
-14. [Advanced Features](#advanced-features)
-15. [API Reference](#api-reference)
-16. [Migration Guide](#migration-guide)
+11. [**Parquet DataLoader**](#parquet-dataloader) ✨ New in v0.9.98
+12. [Data Generation (NPZ / NPY)](#data-generation-npz--npy)
+13. [s3torchconnector Compatibility](#s3torchconnector-compatibility)
+14. [Checkpoint System](#checkpoint-system)
+15. [Performance & Threading](#performance--threading)
+16. [Advanced Features](#advanced-features)
+17. [API Reference](#api-reference)
+18. [Migration Guide](#migration-guide)
 
 ---
 
@@ -598,6 +599,138 @@ ds = make_tf_dataset(uri="s3://bucket/train/", batch_size=32, shuffle=True)
 for batch in ds:
     pass  # TF training
 ```
+
+---
+
+## Parquet DataLoader
+
+**New in v0.9.98.** A production-ready, epoch-aware Parquet DataLoader for AI/ML training
+loops. Works with **any s3dlio storage backend** — S3, Azure Blob Storage, GCS, local
+`file://` paths, and `direct://` (O_DIRECT). Each dataset item is one Parquet **row group**
+— the natural I/O unit for distributed training with large columnar datasets.
+
+> **Feature flags**: Both `parquet` and `parquet-arrow` are **enabled by default** — no
+> build flags required. See the [complete guide](Parquet_Data-Loader.md) for full details.
+
+> **Backend-agnostic**: Only the URI prefix changes when switching storage backends. No
+> code changes are needed — `s3://`, `az://`, `gs://`, `file://`, and `direct://` all work
+> with the same `create_async_loader()` call.
+
+### Quick start
+
+```python
+import s3dlio
+
+# Raw mode (default) — Python receives compressed Parquet column-chunk bytes
+loader = s3dlio.create_async_loader(
+    "s3://bucket/train/",
+    {"format": "parquet", "prefetch": 32}
+)
+
+for item in loader:
+    # item["data"]: bytes  — the row-group payload
+    # item["uri"]:  str   — URI of the source file (any s3dlio scheme)
+    # item["rg_idx"]: int — row-group index within the file
+    import pyarrow.parquet as pq, io
+    table = pq.read_table(io.BytesIO(item["data"]))
+    # ... feed to PyTorch / JAX / TensorFlow ...
+```
+
+### Decode modes
+
+| Mode | `decode=` value | Python receives | When to use |
+|------|-----------------|-----------------|-------------|
+| **Raw** (default) | `"raw"` or omit | Compressed Parquet column-chunk `bytes` | Pure I/O benchmark, or Python controls decoding |
+| **ArrowIpc** | `"arrow"` | Arrow IPC stream `bytes` (Rust-decoded) | CPU-bound training; eliminates Python decode overhead |
+
+```python
+# Arrow IPC mode — Rust decodes to Arrow RecordBatch, serialises to IPC bytes
+loader = s3dlio.create_async_loader(
+    "s3://bucket/train/",
+    {"format": "parquet", "decode": "arrow", "prefetch": 32}
+)
+
+for item in loader:
+    import pyarrow as pa
+    batch = pa.ipc.open_stream(pa.py_buffer(item["data"])).read_next_batch()
+    # batch: pyarrow.RecordBatch — fully decoded, in Arrow memory format
+```
+
+### `create_async_loader()` — Parquet options
+
+```python
+loader = s3dlio.create_async_loader(
+    uri,   # any s3dlio URI prefix: "s3://bucket/train/", "az://container/train/",
+           #   "gs://bucket/train/", "file:///data/train/", "direct:///mnt/nvme/train/"
+    opts   # dict of options
+)
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `"format"` | `str` | — | Must be `"parquet"` to activate Parquet mode |
+| `"decode"` | `str` | `"raw"` | `"raw"` or `"arrow"` |
+| `"columns"` | `list[int]` \| `None` | `None` | Column subset (0-based indices); `None` = all columns |
+| `"footer_cap"` | `int` | `4194304` | Bytes to fetch from file tail for footer parsing (4 MiB default covers all known workloads including DLRM at ~2.66 MiB) |
+| `"prefetch"` | `int` | `32` | Concurrent in-flight row-group GETs (bounded channel capacity) |
+
+### Epoch-2+ fast path — zero re-fetches
+
+After the first epoch, row-group byte ranges are cached in a process-global index. Epoch 2+
+construction issues **zero storage footer reads** — only a directory listing still hits the
+network or filesystem. This applies to all backends (S3, Azure, GCS, file, direct).
+
+```python
+for epoch in range(num_epochs):
+    loader = s3dlio.create_async_loader(
+        "s3://bucket/train/",
+        {"format": "parquet", "prefetch": 32}
+    )
+    for item in loader:
+        train(item["data"])
+    # Index persists across loop iterations — epoch 2+ is 2.5× faster to construct
+```
+
+**Measured speedup (MinIO, 2 files / 4 row groups):**
+
+| Epoch | Construction time | What happened |
+|-------|-----------------|---------------|
+| 1 | 20.4 ms | `list_objects` + 2 footer GETs |
+| 2+ | 8.3 ms | `list_objects` only; DashMap lookup ≈ 0 ms |
+| Speedup | **2.5×** | Scales to 10×+ for 64+ files |
+
+### Memory model
+
+s3dlio holds **only metadata** in RAM — no row-group bulk data is buffered between `get()`
+calls. 8 concurrent workers sharing the same process share the process-global caches:
+
+| Component | RAM | Shared? |
+|-----------|-----|--------|
+| `extents` (byte ranges per RG) | ~48 B × N_rgs | Per instance |
+| `parquet_file_cache` (parsed footer) | few MB per file | Process-global, Arc-shared |
+| `parquet_index` (DashMap) | ~80 B × N_rgs | Process-global singleton |
+| Active `get()` payload | 1 row-group (1–100 MB) | Freed on Python release |
+
+**8 workers, 100 MB RGs, prefetch=2:** peak ≈ 1.6 GB data + ~20 MB shared metadata.
+
+### dlio_benchmark integration
+
+```python
+# In a DLIO plugin / reader callback:
+loader = s3dlio.create_async_loader(
+    config.data_folder,   # any s3dlio URI: "s3://…", "az://…", "gs://…", "file://…", "direct://…"
+    {
+        "format":   "parquet",
+        "decode":   "raw",     # decode_mode=none equivalent
+        "prefetch": config.prefetch_size,
+    }
+)
+for item in loader:
+    yield item["data"]  # return bytes to DLIO without decoding
+```
+
+📖 **[Complete Parquet DataLoader Guide](Parquet_Data-Loader.md)** — full API reference,
+Rust examples, architecture deep dive, and all test documentation.
 
 ---
 

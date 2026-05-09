@@ -11,6 +11,12 @@ pub mod dataset;
 pub mod directio_bytes;
 pub mod fs_bytes;
 pub mod options;
+#[cfg(feature = "parquet")]
+pub mod parquet_file_cache;
+#[cfg(feature = "parquet")]
+pub mod parquet_index;
+#[cfg(feature = "parquet")]
+pub mod parquet_rg;
 pub mod prefetch;
 pub mod s3_bytes;
 pub mod sampler;
@@ -29,3 +35,6 @@ pub use options::{
     SamplerType,
 };
 pub use s3_bytes::S3BytesDataset;
+
+#[cfg(feature = "parquet")]
+pub use parquet_rg::{ParquetDecodeMode, ParquetRowGroupDataset, DEFAULT_FOOTER_CAP};

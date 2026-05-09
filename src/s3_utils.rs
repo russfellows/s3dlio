@@ -877,6 +877,51 @@ pub async fn get_object_range_uri_async(
     Ok(bytes)
 }
 
+/// Like [`get_object_range_uri_async`] but returns split timing information
+/// to help diagnose whether latency is in network RTT (TTFB) or transfer time.
+///
+/// Returns `(bytes, ttfb, transfer)` where:
+/// - `ttfb` — time from request start until the HTTP response headers are
+///   received (i.e., `.send().await` returns); this is the true TTFB.
+/// - `transfer` — time from headers received until the full body has been
+///   streamed and assembled (i.e., `.collect().await` returns).
+///
+/// Total wall time for the GET ≈ `ttfb + transfer`.
+pub async fn get_object_range_uri_timed_async(
+    uri: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(Bytes, std::time::Duration, std::time::Duration)> {
+    use std::time::Instant;
+    let (bucket, key) = parse_s3_uri(uri)?;
+    if key.is_empty() {
+        bail!("Cannot GET range: no key specified");
+    }
+    let client = aws_s3_client_async().await?;
+    let mut range = format!("bytes={}-", offset);
+    if let Some(len) = length {
+        if len > 0 {
+            let end = offset.saturating_add(len).saturating_sub(1);
+            range = format!("bytes={}-{}", offset, end);
+        }
+    }
+    let t0 = Instant::now();
+    let resp = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key.trim_start_matches('/'))
+        .range(range)
+        .send()
+        .await
+        .context("get_object(range) failed")?;
+    let ttfb = t0.elapsed();
+    let body = resp.body.collect().await.context("collect range body")?;
+    let total = t0.elapsed();
+    let transfer = total.saturating_sub(ttfb);
+    let bytes = body.into_bytes();
+    Ok((bytes, ttfb, transfer))
+}
+
 /// Read `length` bytes starting at `offset` from `s3://bucket/key`.
 /// A negative or oversize request is truncated to the object size.
 /// Uses the existing `get_object_uri()` helper internally so we don't
@@ -1989,15 +2034,35 @@ mod tests {
 
     #[test]
     fn test_invalid_access_key_hint_no_endpoint_set() {
-        // When AWS_ENDPOINT_URL is unset the hint should mention --endpoint-url.
-        // We test the env-var branch logic directly.
-        let endpoint_unset = std::env::var("AWS_ENDPOINT_URL")
-            .map(|v| v.is_empty())
-            .unwrap_or(true);
-        // The hint condition: endpoint is absent or empty → suggest --endpoint-url
+        // Verify the condition that gates the "no endpoint" hint for
+        // InvalidAccessKeyId errors.  The hint is shown when AWS_ENDPOINT_URL
+        // is absent OR empty; suppressed when a real URL is present.
+        //
+        // We test the logic directly with known Option values so the test is
+        // independent of the process environment (AWS_ENDPOINT_URL may be set
+        // on developer machines and CI hosts).
+        let absent: Option<&str> = None;
+        let empty: Option<&str> = Some("");
+        let real: Option<&str> = Some("http://10.0.0.1:9000");
+
+        // absent → endpoint_unset = true  (hint shown)
+        let cond_absent = absent.map(|v| v.is_empty()).unwrap_or(true);
+        // empty string → endpoint_unset = true (hint shown)
+        let cond_empty = empty.map(|v| v.is_empty()).unwrap_or(true);
+        // real URL → endpoint_unset = false (hint suppressed)
+        let cond_real = real.map(|v| v.is_empty()).unwrap_or(true);
+
         assert!(
-            endpoint_unset,
-            "when no endpoint is set, InvalidAccessKeyId should hint about --endpoint-url"
+            cond_absent,
+            "absent endpoint → should show --endpoint-url hint"
+        );
+        assert!(
+            cond_empty,
+            "empty endpoint → should show --endpoint-url hint"
+        );
+        assert!(
+            !cond_real,
+            "real endpoint URL → should not show --endpoint-url hint"
         );
     }
 }

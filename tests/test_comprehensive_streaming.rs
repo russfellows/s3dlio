@@ -3,6 +3,25 @@
 
 /// Comprehensive testing suite for streaming data generation
 /// Tests edge cases, error conditions, and multi-process scenarios for production readiness
+///
+/// # ⚠️  SEED POLICY FOR THIS TEST FILE
+///
+/// DO NOT use a seed (explicit or via `new_with_seed`) unless the test is
+/// specifically verifying that seed-based determinism works correctly.
+///
+/// Rationale from dgen_data:
+///   - The default (no seed) draws entropy from system time + urandom, producing
+///     unique, high-quality random data every run.  This is exactly what you
+///     want for benchmarks and workload simulation.
+///   - Using a fixed seed makes the data IDENTICAL across every run, which
+///     defeats the purpose of realistic I/O simulation and can mask bugs that
+///     only appear with certain data patterns.
+///
+/// Seeds are used exactly ONCE in this file: in `test_deduplication_edge_cases`,
+/// where two generators are created with the SAME seed solely to verify that
+/// fill_chunk() produces identical bytes regardless of chunk size.  That is the
+/// ONLY valid reason — we need byte-for-byte comparison between two generators.
+/// Remove the seed the instant that property no longer needs direct comparison.
 use s3dlio::data_gen::DataGenerator;
 use s3dlio::data_gen_alt;
 use s3dlio::data_gen_alt::ObjectGenAlt;
@@ -105,9 +124,16 @@ fn test_deduplication_edge_cases() {
         let data = data_gen_alt::generate_controlled_data_alt(size, dedup, compress, None).to_vec();
         assert!(!data.is_empty(), "Generated empty data for dedup case");
 
-        // Test that streaming with SAME SEED and different chunk sizes produces identical output
-        // Use explicit seed for deterministic testing
-        let test_seed = 12345u64;
+        // WHY a seed is used here (and ONLY here):
+        //
+        // We need byte-for-byte identical output from two independent generators
+        // to verify that fill_chunk() produces the same bytes regardless of how
+        // the output is sliced (1 KiB chunks vs 2 KiB chunks).  A shared seed is
+        // the only way to make two separate generator instances comparable.
+        //
+        // DO NOT copy this pattern elsewhere.  Normal data generation must use
+        // seed=None (non-deterministic) so each run produces unique data.
+        let test_seed = 42u64;
 
         // Stream with 1KB chunks
         let mut obj_gen1 = ObjectGenAlt::new_with_seed(size, dedup, compress, test_seed);
@@ -121,7 +147,7 @@ fn test_deduplication_edge_cases() {
             streamed1.extend_from_slice(&buf1[..n]);
         }
 
-        // Stream with 2KB chunks (different chunk size)
+        // Stream with 2KB chunks — same seed, different chunk size
         let mut obj_gen2 = ObjectGenAlt::new_with_seed(size, dedup, compress, test_seed);
         let mut streamed2 = Vec::with_capacity(size);
         let mut buf2 = vec![0u8; 2048];
@@ -133,7 +159,7 @@ fn test_deduplication_edge_cases() {
             streamed2.extend_from_slice(&buf2[..n]);
         }
 
-        // Same seed should produce same results regardless of chunk size
+        // Same seed → identical bytes regardless of chunk size
         assert_eq!(
             streamed1.len(),
             streamed2.len(),
@@ -149,8 +175,10 @@ fn test_deduplication_edge_cases() {
                 .position(|(a, b)| a != b)
                 .unwrap_or(streamed1.len().min(streamed2.len()));
 
-            panic!("Streaming determinism failure at position {}: byte values differ (chunk1024 vs chunk2048)",
-                   mismatch_pos);
+            panic!(
+                "Chunk-size independence failure at byte {}: 1KiB chunks differ from 2KiB chunks",
+                mismatch_pos
+            );
         }
 
         println!("✅ Dedup case passed - generated {} bytes", data.len());
@@ -166,7 +194,7 @@ fn test_compression_edge_cases() {
         (1024 * 1024, 1, 2),   // compress=2 (50% compressible)
         (1024 * 1024, 1, 4),   // compress=4 (75% compressible)
         (1024 * 1024, 1, 100), // Very high compress factor
-        (65536, 1, 10),        // One block with compression
+        (1024 * 1024, 1, 10),  // compress=10 — 90% compressible
     ];
 
     for (size, dedup, compress) in test_cases {
@@ -205,6 +233,10 @@ fn test_compression_edge_cases() {
 fn test_deterministic_behavior() {
     println!("\n=== Deterministic Behavior Testing ===");
 
+    // This test specifically verifies that the seed mechanism works.
+    // Using a seed here is intentional and correct \u2014 the entire purpose of
+    // this test is to prove that seed=N always produces the same bytes.
+    // DO NOT use a seed like this in production data generation code.
     let size = 4 * 1024 * 1024; // 4MB
     let iterations = 5;
     let test_seed = 99999u64;

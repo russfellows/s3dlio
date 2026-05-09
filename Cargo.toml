@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.96"
+version = "0.9.98"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -102,6 +102,10 @@ numpy        = "^0.27"
 ndarray      = "^0.17"
 # ndarray-npy removed - we use custom NPY/NPZ implementation for better performance and zero-copy
 
+# ---- Data generation library (high-performance, dedup-safe) ----------------
+# Provides UniqueXorStream, RollingPool, thread_local::next_slice.
+dgen-data = { version = "0.2.4", default-features = false }
+
 # Other (updated rand ecosystem to 0.9 for consistency)
 rayon       = { version = "^1.10" }
 num_cpus    = "^1.16"
@@ -134,6 +138,16 @@ rustls-native-certs = "0.8"
 # --- Arrow backend (optional, enabled via "arrow-backend" feature) -------
 object_store = { version = "0.13", default-features = false, features = ["aws", "azure", "http", "gcp"], optional = true }
 url = { version = "2.5", optional = true }
+
+# --- Parquet reader (optional, enabled via "parquet" feature) ---------------
+# default-features = false avoids pulling in arrow/datafusion; only thrift + bytes
+parquet = { version = "58", default-features = false, optional = true }
+
+# --- Arrow crates for parquet-arrow feature (Rust-side decode → Arrow IPC) ---
+# Same major version as parquet so Cargo resolves a single copy of shared types.
+arrow-array  = { version = "58", default-features = false, optional = true }
+arrow-schema = { version = "58", default-features = false, optional = true }
+arrow-ipc    = { version = "58", default-features = false, optional = true }
 
 
 # --- High-performance memory and file I/O ------------------------------------
@@ -169,7 +183,7 @@ hyper-util   = { version = "0.1", features = ["server", "server-auto", "tokio"] 
 # - 'numa' requires the hwloc2 C library (not available on WSL/minimal systems)
 # - 'hdf5' requires libhdf5 (not available on WSL/minimal systems)
 # Enable these manually: cargo build --features numa,hdf5
-default = ["s3", "native-backends", "thread-pinning", "backend-aws"]
+default = ["s3", "native-backends", "thread-pinning", "backend-aws", "parquet", "parquet-arrow"]
 s3 = []
 native-backends = []                    # Current AWS/Azure implementations
 backend-aws = []
@@ -178,6 +192,9 @@ backend-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-c
 full-backends = ["backend-aws", "backend-azure", "backend-gcs"]
 gcs-community = ["backend-gcs", "dep:gcloud-storage"]  # Legacy community GCS client (JSON API, no RAPID support; conflicts with official GCS client)
 arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
+parquet       = ["dep:parquet"]                  # Parquet row-group DataLoader (raw bytes mode)
+parquet-arrow = ["parquet", "parquet/arrow", "parquet/async",
+                 "dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc"]  # Adds Rust-side Arrow IPC decode mode
 h2c = []                             # Enable HTTP/2 cleartext (h2c) transport for high-throughput PUT workloads
 direct-io = ["dep:nix"]              # O_DIRECT file I/O for high-performance storage
 numa = ["dep:hwlocality"]  # NUMA topology detection - requires hwloc2 C library (optional, not in defaults)
