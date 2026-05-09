@@ -170,12 +170,17 @@ impl ParquetIndex {
     /// `true` if all row groups for `uri` are already in the index.
     pub fn is_indexed(&self, uri: &str) -> bool {
         self.get_id(uri)
-            .map_or(false, |id| self.row_offsets.contains_key(&id))
+            .is_some_and(|id| self.row_offsets.contains_key(&id))
     }
 
     /// Number of row-group entries in the index (across all files).
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// `true` if the index has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Number of files whose row groups are indexed.
@@ -246,10 +251,10 @@ impl ParquetIndex {
 
     /// `true` if `(uri, rg_idx)` was fetched during epoch `epoch`.
     pub fn was_fetched(&self, uri: &str, rg_idx: u32, epoch: u32) -> bool {
-        self.get_id(uri).map_or(false, |file_id| {
+        self.get_id(uri).is_some_and(|file_id| {
             self.entries
                 .get(&(file_id, rg_idx))
-                .map_or(false, |e| e.last_epoch >= epoch)
+                .is_some_and(|e| e.last_epoch >= epoch)
         })
     }
 

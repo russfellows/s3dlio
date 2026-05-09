@@ -258,7 +258,7 @@ impl DataGenerator {
     /// Create a new `DataGenerator`.
     ///
     /// - `seed`: `None` = use system entropy (unique per instance).
-    ///           `Some(s)` = reproducible data.
+    ///   `Some(s)` = reproducible data.
     pub fn new(seed: Option<u64>) -> Self {
         Self::new_impl(seed)
     }
