@@ -2052,8 +2052,17 @@ mod tests {
         // real URL → endpoint_unset = false (hint suppressed)
         let cond_real = real.map(|v| v.is_empty()).unwrap_or(true);
 
-        assert!(cond_absent, "absent endpoint → should show --endpoint-url hint");
-        assert!(cond_empty, "empty endpoint → should show --endpoint-url hint");
-        assert!(!cond_real, "real endpoint URL → should not show --endpoint-url hint");
+        assert!(
+            cond_absent,
+            "absent endpoint → should show --endpoint-url hint"
+        );
+        assert!(
+            cond_empty,
+            "empty endpoint → should show --endpoint-url hint"
+        );
+        assert!(
+            !cond_real,
+            "real endpoint URL → should not show --endpoint-url hint"
+        );
     }
 }

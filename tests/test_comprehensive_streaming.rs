@@ -141,7 +141,9 @@ fn test_deduplication_edge_cases() {
         let mut buf1 = vec![0u8; 1024];
         loop {
             let n = obj_gen1.fill_chunk(&mut buf1);
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             streamed1.extend_from_slice(&buf1[..n]);
         }
 
@@ -151,7 +153,9 @@ fn test_deduplication_edge_cases() {
         let mut buf2 = vec![0u8; 2048];
         loop {
             let n = obj_gen2.fill_chunk(&mut buf2);
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             streamed2.extend_from_slice(&buf2[..n]);
         }
 
@@ -171,8 +175,10 @@ fn test_deduplication_edge_cases() {
                 .position(|(a, b)| a != b)
                 .unwrap_or(streamed1.len().min(streamed2.len()));
 
-            panic!("Chunk-size independence failure at byte {}: 1KiB chunks differ from 2KiB chunks",
-                   mismatch_pos);
+            panic!(
+                "Chunk-size independence failure at byte {}: 1KiB chunks differ from 2KiB chunks",
+                mismatch_pos
+            );
         }
 
         println!("✅ Dedup case passed - generated {} bytes", data.len());
@@ -188,7 +194,7 @@ fn test_compression_edge_cases() {
         (1024 * 1024, 1, 2),   // compress=2 (50% compressible)
         (1024 * 1024, 1, 4),   // compress=4 (75% compressible)
         (1024 * 1024, 1, 100), // Very high compress factor
-        (1024 * 1024, 1, 10), // compress=10 — 90% compressible
+        (1024 * 1024, 1, 10),  // compress=10 — 90% compressible
     ];
 
     for (size, dedup, compress) in test_cases {

@@ -73,10 +73,7 @@ fn cache() -> &'static DashMap<String, Arc<CachedFileMeta>> {
 /// issue a fetch; the second result is discarded (last-writer-wins).  Both
 /// callers receive correct data.  For typical Parquet workloads (one listing
 /// phase before training starts) this never happens.
-pub async fn get_or_fetch(
-    uri: &str,
-    footer_cap: u64,
-) -> anyhow::Result<Arc<CachedFileMeta>> {
+pub async fn get_or_fetch(uri: &str, footer_cap: u64) -> anyhow::Result<Arc<CachedFileMeta>> {
     let c = cache();
 
     // Fast path: already cached.
@@ -112,8 +109,8 @@ pub fn len() -> usize {
 
 async fn fetch_and_parse(uri: &str, footer_cap: u64) -> anyhow::Result<CachedFileMeta> {
     use crate::s3_utils::{get_object_range_uri_async, stat_object_uri_async};
-    use parquet::file::metadata::ParquetMetaDataReader;
     use bytes::Bytes;
+    use parquet::file::metadata::ParquetMetaDataReader;
 
     // 1. Stat to get file size.
     let stat = stat_object_uri_async(uri)
@@ -151,7 +148,11 @@ async fn fetch_and_parse(uri: &str, footer_cap: u64) -> anyhow::Result<CachedFil
         anyhow::bail!(
             "'{}': Parquet metadata ({} bytes) + suffix ({} bytes) exceeds \
              fetched buffer ({} bytes). Increase footer_cap (currently {} bytes).",
-            uri, meta_len, SUFFIX, buf_len, footer_cap
+            uri,
+            meta_len,
+            SUFFIX,
+            buf_len,
+            footer_cap
         );
     }
 

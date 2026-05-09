@@ -328,12 +328,7 @@ impl ParquetIndex {
                 let (uri, cached) = result?;
                 // Extract byte ranges and drop our Arc<CachedFileMeta> reference.
                 // The global parquet_file_cache keeps its own Arc.
-                self.insert_file(
-                    &uri,
-                    &cached.parquet_meta,
-                    &cached.rg_row_offsets,
-                    epoch,
-                )?;
+                self.insert_file(&uri, &cached.parquet_meta, &cached.rg_row_offsets, epoch)?;
                 // `cached` Arc dropped here — heavy ParquetMetaData released.
             }
         }
@@ -450,8 +445,22 @@ mod tests {
         // Manually populate via the interning + entries DashMap
         // (insert_file needs real ParquetMetaData; test RgEntry directly).
         let file_id = idx.intern(uri);
-        idx.entries.insert((file_id, 0), RgEntry { byte_offset: 100, byte_length: 500, last_epoch: 0 });
-        idx.entries.insert((file_id, 1), RgEntry { byte_offset: 600, byte_length: 400, last_epoch: 0 });
+        idx.entries.insert(
+            (file_id, 0),
+            RgEntry {
+                byte_offset: 100,
+                byte_length: 500,
+                last_epoch: 0,
+            },
+        );
+        idx.entries.insert(
+            (file_id, 1),
+            RgEntry {
+                byte_offset: 600,
+                byte_length: 400,
+                last_epoch: 0,
+            },
+        );
         // row_offsets: [0, 128, 384] → rg0 has 128 rows, rg1 has 256 rows.
         idx.row_offsets.insert(file_id, vec![0i64, 128, 384]);
 
@@ -473,9 +482,30 @@ mod tests {
         let idx = ParquetIndex::new(None, 4 * 1024 * 1024);
         let uri = "s3://test-bucket/data/part-1.parquet";
         let file_id = idx.intern(uri);
-        idx.entries.insert((file_id, 0), RgEntry { byte_offset: 0, byte_length: 256, last_epoch: 0 });
-        idx.entries.insert((file_id, 1), RgEntry { byte_offset: 256, byte_length: 256, last_epoch: 0 });
-        idx.entries.insert((file_id, 2), RgEntry { byte_offset: 512, byte_length: 128, last_epoch: 0 });
+        idx.entries.insert(
+            (file_id, 0),
+            RgEntry {
+                byte_offset: 0,
+                byte_length: 256,
+                last_epoch: 0,
+            },
+        );
+        idx.entries.insert(
+            (file_id, 1),
+            RgEntry {
+                byte_offset: 256,
+                byte_length: 256,
+                last_epoch: 0,
+            },
+        );
+        idx.entries.insert(
+            (file_id, 2),
+            RgEntry {
+                byte_offset: 512,
+                byte_length: 128,
+                last_epoch: 0,
+            },
+        );
         // rg0: 0..100, rg1: 100..200, rg2: 200..250
         idx.row_offsets.insert(file_id, vec![0i64, 100, 200, 250]);
 
@@ -493,7 +523,14 @@ mod tests {
         let idx = ParquetIndex::new(None, 4 * 1024 * 1024);
         let uri = "s3://test-bucket/data/part-2.parquet";
         let file_id = idx.intern(uri);
-        idx.entries.insert((file_id, 0), RgEntry { byte_offset: 1024, byte_length: 8192, last_epoch: 0 });
+        idx.entries.insert(
+            (file_id, 0),
+            RgEntry {
+                byte_offset: 1024,
+                byte_length: 8192,
+                last_epoch: 0,
+            },
+        );
         idx.row_offsets.insert(file_id, vec![0i64, 64]);
 
         let (off, len) = idx.rg_range(uri, 0).unwrap();
@@ -508,7 +545,14 @@ mod tests {
         let idx = ParquetIndex::new(None, 4 * 1024 * 1024);
         let uri = "s3://test-bucket/data/part-3.parquet";
         let file_id = idx.intern(uri);
-        idx.entries.insert((file_id, 0), RgEntry { byte_offset: 0, byte_length: 64, last_epoch: 0 });
+        idx.entries.insert(
+            (file_id, 0),
+            RgEntry {
+                byte_offset: 0,
+                byte_length: 64,
+                last_epoch: 0,
+            },
+        );
         idx.row_offsets.insert(file_id, vec![0i64, 32]);
 
         // Epoch 1: not yet fetched → returns false, marks it.
@@ -528,7 +572,14 @@ mod tests {
         let uri_b = "s3://test-bucket/data/b.parquet";
         for uri in [uri_a, uri_b] {
             let fid = idx.intern(uri);
-            idx.entries.insert((fid, 0), RgEntry { byte_offset: 0, byte_length: 64, last_epoch: 0 });
+            idx.entries.insert(
+                (fid, 0),
+                RgEntry {
+                    byte_offset: 0,
+                    byte_length: 64,
+                    last_epoch: 0,
+                },
+            );
             idx.row_offsets.insert(fid, vec![0i64, 10]);
         }
         assert_eq!(idx.file_count(), 2);
@@ -544,8 +595,22 @@ mod tests {
         let idx = ParquetIndex::new(None, 4 * 1024 * 1024);
         let uri = "s3://test-bucket/data/part-4.parquet";
         let file_id = idx.intern(uri);
-        idx.entries.insert((file_id, 0), RgEntry { byte_offset: 200, byte_length: 300, last_epoch: 0 });
-        idx.entries.insert((file_id, 1), RgEntry { byte_offset: 500, byte_length: 400, last_epoch: 0 });
+        idx.entries.insert(
+            (file_id, 0),
+            RgEntry {
+                byte_offset: 200,
+                byte_length: 300,
+                last_epoch: 0,
+            },
+        );
+        idx.entries.insert(
+            (file_id, 1),
+            RgEntry {
+                byte_offset: 500,
+                byte_length: 400,
+                last_epoch: 0,
+            },
+        );
         idx.row_offsets.insert(file_id, vec![0i64, 50, 100]);
 
         // Sample 30 → rg 0 (rows 0..50)

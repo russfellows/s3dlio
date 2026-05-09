@@ -113,7 +113,11 @@ pub fn generate_random_data(size: usize) -> Vec<u8> {
         let block_size = block_end - offset;
 
         if block_size > 0 {
-            let first_len = if block_size >= MOD_SIZE { MOD_SIZE } else { block_size };
+            let first_len = if block_size >= MOD_SIZE {
+                MOD_SIZE
+            } else {
+                block_size
+            };
             rng.fill(&mut data[offset..offset + first_len]);
         }
 
@@ -402,7 +406,11 @@ mod tests {
     fn test_fill_controlled_data_size_preserved() {
         let mut buf = vec![0u8; BLOCK * 2];
         fill_controlled_data(&mut buf, 1, 1);
-        assert_eq!(buf.len(), BLOCK * 2, "fill_controlled_data must not change buffer length");
+        assert_eq!(
+            buf.len(),
+            BLOCK * 2,
+            "fill_controlled_data must not change buffer length"
+        );
     }
 
     #[test]
@@ -422,7 +430,10 @@ mod tests {
         // Each call uses current-time entropy so they should differ
         // (not a strict guarantee but overwhelmingly likely in practice)
         let differs = a.iter().zip(b.iter()).any(|(x, y)| x != y);
-        assert!(differs, "Two fill_controlled_data calls should produce different data");
+        assert!(
+            differs,
+            "Two fill_controlled_data calls should produce different data"
+        );
     }
 
     #[test]
@@ -487,7 +498,10 @@ mod tests {
 
         assert_eq!(collected, total);
         assert!(obj.is_complete());
-        assert!(obj.fill_chunk(BLOCK).is_none(), "fill_chunk after complete must return None");
+        assert!(
+            obj.fill_chunk(BLOCK).is_none(),
+            "fill_chunk after complete must return None"
+        );
     }
 
     #[test]
@@ -508,7 +522,9 @@ mod tests {
         // Default should not panic and should produce data
         let gen = DataGenerator::default();
         let mut obj = gen.begin_object(4096, 1, 1);
-        let chunk = obj.fill_chunk(4096).expect("First fill_chunk must return data");
+        let chunk = obj
+            .fill_chunk(4096)
+            .expect("First fill_chunk must return data");
         assert_eq!(chunk.len(), 4096);
     }
 }

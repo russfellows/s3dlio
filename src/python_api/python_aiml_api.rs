@@ -234,14 +234,21 @@ impl PyBytesAsyncDataLoader {
                     count,
                     len,
                     total_bytes as f64 / 1024.0 / 1024.0,
-                    if elapsed > 0.0 { total_bytes as f64 / elapsed / 1024.0 / 1024.0 } else { 0.0 }
+                    if elapsed > 0.0 {
+                        total_bytes as f64 / elapsed / 1024.0 / 1024.0
+                    } else {
+                        0.0
+                    }
                 );
             }
         });
 
-        Py::new(slf.py(), PyBytesDataLoaderSyncIter {
-            rx: std::sync::Mutex::new(rx),
-        })
+        Py::new(
+            slf.py(),
+            PyBytesDataLoaderSyncIter {
+                rx: std::sync::Mutex::new(rx),
+            },
+        )
     }
 }
 
@@ -276,9 +283,7 @@ impl PyBytesDataLoaderSyncIter {
         });
 
         match result {
-            Some(Ok(item)) => {
-                Py::new(py, PyBytesView::new(item))?.into_py_any(py)
-            }
+            Some(Ok(item)) => Py::new(py, PyBytesView::new(item))?.into_py_any(py),
             Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
             None => Err(PyStopIteration::new_err("end of dataset")),
         }
@@ -845,7 +850,7 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             "format",
             "columns",
             "footer_cap",
-            "decode",   // "raw" (default) | "arrow" (Rust Arrow IPC) | "none" (raw, no Python decode)
+            "decode", // "raw" (default) | "arrow" (Rust Arrow IPC) | "none" (raw, no Python decode)
         ];
         for key in d.keys() {
             if let Ok(key_str) = key.extract::<&str>() {
@@ -1797,9 +1802,7 @@ impl PyParquetItem {
 /// bytes — enough for the Python consumer to cache by `(file_uri, rg_idx)`.
 #[pyclass]
 pub struct ParquetStreamIter {
-    rx: std::sync::Mutex<
-        tokio::sync::mpsc::Receiver<Result<(usize, Bytes), DatasetError>>,
-    >,
+    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<(usize, Bytes), DatasetError>>>,
     /// global_rg_idx → (file_uri_idx, rg_idx_in_file)
     rg_info: Arc<Vec<(usize, usize)>>,
     file_uris: Arc<Vec<String>>,
@@ -1824,7 +1827,11 @@ impl ParquetStreamIter {
             Some(Ok((global_idx, bytes))) => {
                 let (file_uri_idx, rg_idx) = self.rg_info[global_idx];
                 let file_uri = self.file_uris[file_uri_idx].clone();
-                let item = PyParquetItem { file_uri, rg_idx, data: bytes };
+                let item = PyParquetItem {
+                    file_uri,
+                    rg_idx,
+                    data: bytes,
+                };
                 Py::new(py, item)?.into_py_any(py)
             }
             Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
@@ -1871,9 +1878,8 @@ impl PyParquetStreamLoader {
 
         // Bounded channel: capacity = concurrency.
         // Producer blocks here (not in a Semaphore) when Python is slow.
-        let (tx, rx) = tokio::sync::mpsc::channel::<
-            Result<(usize, Bytes), DatasetError>,
-        >(concurrency);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<(usize, Bytes), DatasetError>>(concurrency);
 
         tracing::info!(
             total_items = total,
@@ -2015,13 +2021,9 @@ pub fn create_async_loader(
                 }
             };
 
-            let pq_dataset = ParquetRowGroupDataset::new(
-                uri,
-                col_indices.as_deref(),
-                footer_cap,
-                decode_mode,
-            )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let pq_dataset =
+                ParquetRowGroupDataset::new(uri, col_indices.as_deref(), footer_cap, decode_mode)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             // Concurrency: how many row-group GETs to keep in flight.
             // "prefetch" key sets this; default 32 (matches old Python 32-thread pool).
@@ -2399,9 +2401,10 @@ impl PyParquetIndex {
     #[pyo3(signature = (col_indices=None, footer_cap=4194304))]
     fn new(col_indices: Option<Vec<usize>>, footer_cap: u64) -> Self {
         Self {
-            inner: std::sync::Arc::new(
-                crate::data_loader::parquet_index::ParquetIndex::new(col_indices, footer_cap),
-            ),
+            inner: std::sync::Arc::new(crate::data_loader::parquet_index::ParquetIndex::new(
+                col_indices,
+                footer_cap,
+            )),
         }
     }
 

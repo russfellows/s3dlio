@@ -77,7 +77,12 @@ pub fn unsigned_payload_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
         std::env::var(crate::constants::ENV_UNSIGNED_PAYLOAD)
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on" | "enable"))
+            .map(|v| {
+                matches!(
+                    v.to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "enable"
+                )
+            })
             .unwrap_or(crate::constants::DEFAULT_UNSIGNED_PAYLOAD)
     })
 }

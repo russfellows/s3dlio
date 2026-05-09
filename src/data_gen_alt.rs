@@ -102,12 +102,7 @@ impl ObjectGenAlt {
     }
 
     /// Create a new streaming generator for one object.
-    pub fn new_with_seed(
-        total_size: usize,
-        dedup: usize,
-        compress: usize,
-        seed: u64,
-    ) -> Self {
+    pub fn new_with_seed(total_size: usize, dedup: usize, compress: usize, seed: u64) -> Self {
         let config = GeneratorConfig {
             size: total_size,
             dedup_factor: dedup.max(1),
@@ -172,7 +167,11 @@ mod tests {
         // generate_data_simple returns exactly the requested size.
         // Use BLOCK (1 MiB) as a convenient round size.
         let data = generate_data_simple(BLOCK, 1, 1);
-        assert_eq!(data.len(), BLOCK, "generate_data_simple must return exactly the requested byte count");
+        assert_eq!(
+            data.len(),
+            BLOCK,
+            "generate_data_simple must return exactly the requested byte count"
+        );
     }
 
     #[test]
@@ -253,8 +252,15 @@ mod tests {
             collected += n;
         }
 
-        assert_eq!(collected, total, "Streaming must yield exactly {total} bytes");
-        assert_eq!(gen.fill_chunk(&mut buf), 0, "fill_chunk after complete must return 0");
+        assert_eq!(
+            collected, total,
+            "Streaming must yield exactly {total} bytes"
+        );
+        assert_eq!(
+            gen.fill_chunk(&mut buf),
+            0,
+            "fill_chunk after complete must return 0"
+        );
     }
 
     #[test]
@@ -270,7 +276,9 @@ mod tests {
 
         while !gen.is_complete() {
             let n = gen.fill_chunk(&mut buf);
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             collected += n;
         }
 

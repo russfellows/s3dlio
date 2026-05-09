@@ -68,18 +68,16 @@
 use crate::data_loader::{Dataset, DatasetError};
 use crate::s3_client::run_on_global_rt;
 use crate::s3_utils::{
-    get_object_range_uri_async, get_object_range_uri_timed_async,
-    list_objects as list_objects_rs, parse_s3_uri,
+    get_object_range_uri_async, get_object_range_uri_timed_async, list_objects as list_objects_rs,
+    parse_s3_uri,
 };
-use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
-use parquet::file::metadata::{
-    ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData,
-};
 #[cfg(test)]
 use parquet::file::metadata::ParquetMetaDataReader;
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use std::sync::Arc;
+use std::time::Instant;
 
 // ── Parquet footer constants (test-only) ────────────────────────────────────
 
@@ -208,11 +206,16 @@ impl ParquetRowGroupDataset {
         let footer_cap_u64 = footer_cap as u64;
         let uris_for_init = file_uris.clone();
 
-        let (extents, file_metadata) =
-            run_on_global_rt(async move {
-                build_extents(uris_for_init, col_indices_owned, footer_cap_u64, decode_mode).await
-            })
-            .map_err(|e| DatasetError::from(e.to_string()))?;
+        let (extents, file_metadata) = run_on_global_rt(async move {
+            build_extents(
+                uris_for_init,
+                col_indices_owned,
+                footer_cap_u64,
+                decode_mode,
+            )
+            .await
+        })
+        .map_err(|e| DatasetError::from(e.to_string()))?;
 
         let elapsed = t_new.elapsed();
         let total_rgs = extents.len();
@@ -549,9 +552,7 @@ async fn build_extents(
                 let rg_data = gidx
                     .file_extents(uri)
                     .ok_or_else(|| anyhow::anyhow!("index inconsistency for '{}'", uri))?;
-                for (rg_idx_in_file, (start, length, num_rows)) in
-                    rg_data.into_iter().enumerate()
-                {
+                for (rg_idx_in_file, (start, length, num_rows)) in rg_data.into_iter().enumerate() {
                     extents.push(RgExtent {
                         file_uri_idx,
                         rg_idx_in_file,
@@ -606,21 +607,15 @@ async fn build_extents(
     let mut file_metadata: Vec<Arc<ParquetMetaData>> = Vec::with_capacity(file_uris.len());
 
     for (file_uri_idx, result) in cache_results.into_iter().enumerate() {
-        let cached = result.map_err(|e| {
-            anyhow::anyhow!("metadata '{}': {}", file_uris[file_uri_idx], e)
-        })?;
+        let cached =
+            result.map_err(|e| anyhow::anyhow!("metadata '{}': {}", file_uris[file_uri_idx], e))?;
 
         let meta = &cached.parquet_meta;
 
         for rg_idx in 0..meta.num_row_groups() {
             let rg = meta.row_group(rg_idx);
             let (start, length) = rg_byte_extent(rg, col_indices.as_deref()).map_err(|e| {
-                anyhow::anyhow!(
-                    "'{}' rg[{}]: {}",
-                    file_uris[file_uri_idx],
-                    rg_idx,
-                    e
-                )
+                anyhow::anyhow!("'{}' rg[{}]: {}", file_uris[file_uri_idx], rg_idx, e)
             })?;
             extents.push(RgExtent {
                 file_uri_idx,
@@ -828,7 +823,10 @@ mod tests {
         // Write wrong magic
         buf[12..16].copy_from_slice(b"NOPE");
         let result = parse_footer(buf.len() as u64, &Bytes::from(buf));
-        assert!(result.unwrap_err().to_string().contains("Invalid Parquet magic"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid Parquet magic"));
     }
 
     #[test]
@@ -900,7 +898,10 @@ mod tests {
         for rg_idx in 0..2 {
             let rg = meta.row_group(rg_idx);
             let (start, length) = rg_byte_extent(rg, Some(&[0])).unwrap();
-            assert!(length > 0, "rg[{rg_idx}] column 0 extent length must be > 0");
+            assert!(
+                length > 0,
+                "rg[{rg_idx}] column 0 extent length must be > 0"
+            );
             assert!(
                 start + length <= file_size,
                 "rg[{rg_idx}] extent must lie within file"
@@ -955,7 +956,10 @@ mod tests {
         use crate::data_loader::parquet_index;
         let a = parquet_index::global() as *const _;
         let b = parquet_index::global() as *const _;
-        assert_eq!(a, b, "global() must return the same ParquetIndex every time");
+        assert_eq!(
+            a, b,
+            "global() must return the same ParquetIndex every time"
+        );
     }
 
     /// The global index's `col_indices` must be `None` (all columns).
@@ -1003,9 +1007,7 @@ mod integration_tests {
 
     /// Return `None` when the MinIO env vars are absent — caller skips the test.
     fn require_minio() -> Option<()> {
-        if std::env::var("AWS_ENDPOINT_URL").is_ok()
-            && std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-        {
+        if std::env::var("AWS_ENDPOINT_URL").is_ok() && std::env::var("AWS_ACCESS_KEY_ID").is_ok() {
             Some(())
         } else {
             eprintln!("Skipping MinIO integration test: AWS_ENDPOINT_URL not set");
@@ -1108,7 +1110,9 @@ mod integration_tests {
     #[test]
     #[ignore = "requires live MinIO; run with: set -a && source .env && set +a && cargo test --features parquet-arrow -- --ignored parquet --test-threads=1 --nocapture"]
     fn test_parquet_dataset_epoch1_construction() {
-        if require_minio().is_none() { return; }
+        if require_minio().is_none() {
+            return;
+        }
 
         with_test_files(|prefix_uri| {
             // Clear the global index so this test is isolated.
@@ -1133,9 +1137,10 @@ mod integration_tests {
 
             // Fetch one row group — must return non-empty bytes.
             let file_uris_for_check = ds.file_uris_arc();
-            let bytes: Bytes = run_on_global_rt(async move {
-                ds.get(0).await.map_err(|e| anyhow::anyhow!("{}", e))
-            })?;
+            let bytes: Bytes =
+                run_on_global_rt(
+                    async move { ds.get(0).await.map_err(|e| anyhow::anyhow!("{}", e)) },
+                )?;
             assert!(!bytes.is_empty(), "row group bytes must not be empty");
 
             // After epoch-1 construction, both files must be in the global index.
@@ -1162,7 +1167,9 @@ mod integration_tests {
     #[test]
     #[ignore = "requires live MinIO; run with: set -a && source .env && set +a && cargo test --features parquet-arrow -- --ignored parquet --test-threads=1 --nocapture"]
     fn test_parquet_dataset_epoch2_fast_path() {
-        if require_minio().is_none() { return; }
+        if require_minio().is_none() {
+            return;
+        }
 
         with_test_files(|prefix_uri| {
             // Epoch 1: populate the global index.
@@ -1209,7 +1216,9 @@ mod integration_tests {
     #[test]
     #[ignore = "requires live MinIO; run with: set -a && source .env && set +a && cargo test --features parquet-arrow -- --ignored parquet --test-threads=1 --nocapture"]
     fn test_parquet_index_row_offsets_consistency() {
-        if require_minio().is_none() { return; }
+        if require_minio().is_none() {
+            return;
+        }
 
         with_test_files(|prefix_uri| {
             parquet_index::global().clear();
@@ -1255,7 +1264,9 @@ mod integration_tests {
     #[test]
     #[ignore = "requires live MinIO; run with: set -a && source .env && set +a && cargo test --features parquet-arrow -- --ignored parquet --test-threads=1 --nocapture"]
     fn test_epoch2_faster_than_epoch1() {
-        if require_minio().is_none() { return; }
+        if require_minio().is_none() {
+            return;
+        }
 
         with_test_files(|prefix_uri| {
             // Clear everything so epoch-1 must do real footer fetches.
@@ -1273,7 +1284,10 @@ mod integration_tests {
             let elapsed_epoch1 = t_epoch1.elapsed();
 
             assert_eq!(ds1.len(), Some(4));
-            eprintln!("  Epoch-1 construction: {:.1} ms", elapsed_epoch1.as_secs_f64() * 1000.0);
+            eprintln!(
+                "  Epoch-1 construction: {:.1} ms",
+                elapsed_epoch1.as_secs_f64() * 1000.0
+            );
 
             // Verify the global index was populated by epoch-1.
             for uri in ds1.file_uris_arc().iter() {
@@ -1301,7 +1315,10 @@ mod integration_tests {
             let elapsed_epoch2 = t_epoch2.elapsed();
 
             assert_eq!(ds2.len(), Some(4));
-            eprintln!("  Epoch-2 construction: {:.1} ms", elapsed_epoch2.as_secs_f64() * 1000.0);
+            eprintln!(
+                "  Epoch-2 construction: {:.1} ms",
+                elapsed_epoch2.as_secs_f64() * 1000.0
+            );
             eprintln!(
                 "  Speedup: {:.1}×",
                 elapsed_epoch1.as_secs_f64() / elapsed_epoch2.as_secs_f64().max(0.0001)
@@ -1346,7 +1363,9 @@ mod integration_tests {
     #[test]
     #[ignore = "requires live MinIO; run with: set -a && source .env && set +a && cargo test --features parquet-arrow -- --ignored parquet --test-threads=1 --nocapture"]
     fn test_raw_fast_path_skips_file_metadata() {
-        if require_minio().is_none() { return; }
+        if require_minio().is_none() {
+            return;
+        }
 
         with_test_files(|prefix_uri| {
             // Epoch 1: slow path populates index.
@@ -1386,7 +1405,9 @@ mod integration_tests {
     #[test]
     #[ignore = "requires live MinIO; run with: set -a && source .env && set +a && cargo test --features parquet-arrow -- --ignored parquet --test-threads=1 --nocapture"]
     fn test_arrow_ipc_fast_path_keeps_file_metadata() {
-        if require_minio().is_none() { return; }
+        if require_minio().is_none() {
+            return;
+        }
 
         with_test_files(|prefix_uri| {
             // Epoch 1: populate index.
