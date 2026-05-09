@@ -12,7 +12,7 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 > **v0.9.98 — Parquet DataLoader with epoch-2 fast path and Arrow IPC decode**
 >
-> **`ParquetRowGroupDataset`**: epoch-aware Parquet DataLoader for AI/ML training loops. Each item is one Parquet row group. Zero S3 re-fetches on epoch 2+ (2.5× faster construction, scales to 10×+ for 64+ files). Two decode modes: `Raw` (Python decodes with PyArrow) and `ArrowIpc` (Rust decodes to Arrow `RecordBatch`, returns IPC bytes). 8 concurrent workers share process-global metadata caches — no 8× RAM duplication. See [docs/Parquet_Data-Loader.md](docs/Parquet_Data-Loader.md).
+> **`ParquetRowGroupDataset`**: epoch-aware Parquet DataLoader for AI/ML training loops. Works with **any s3dlio storage backend** — S3, Azure Blob, GCS, `file://`, and `direct://` (O_DIRECT). Each item is one Parquet row group. Zero re-fetches on epoch 2+ (2.5× faster construction, scales to 10×+ for 64+ files). Two decode modes: `Raw` (Python decodes with PyArrow) and `ArrowIpc` (Rust decodes to Arrow `RecordBatch`, returns IPC bytes). 8 concurrent workers share process-global metadata caches — no 8× RAM duplication. See [docs/Parquet_Data-Loader.md](docs/Parquet_Data-Loader.md).
 >
 > **v0.9.97 (prior):** `XorStream` (dedup-safe, ~15 GB/s/core); `S3DLIO_UNSIGNED_PAYLOAD` opt-in for private S3-compatible endpoints. See [docs/Changelog.md](docs/Changelog.md) for full history.
 
@@ -213,7 +213,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 - **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
 - **Multi-Endpoint Load Balancing**: RoundRobin/LeastConnections across storage endpoints
 - **AI/ML Ready**: PyTorch DataLoader integration, TFRecord/NPZ format support
-- **Parquet DataLoader**: Per-row-group epoch-aware DataLoader with 2.5×+ epoch-2 speedup, Raw + Arrow IPC decode modes, 8-worker concurrency with shared metadata caches — [see guide](docs/Parquet_Data-Loader.md)
+- **Parquet DataLoader**: Per-row-group epoch-aware DataLoader for any s3dlio storage backend (S3, Azure Blob, GCS, file://, direct://). Epoch-2 zero re-fetch speedup (2.5×+), Raw + Arrow IPC decode modes, 8-worker concurrency with shared metadata caches — [see guide](docs/Parquet_Data-Loader.md)
 - **High-Speed Data Generation**: 50+ GB/s test data with configurable compression/dedup
 
 ## 🌟 Latest Release
@@ -537,13 +537,22 @@ for i, s in enumerate(stats):
 
 ### 📦 Parquet DataLoader — Epoch-Aware Training (v0.9.98+)
 
-The Parquet DataLoader provides per-row-group streaming for Parquet files on S3. Each
-iterator item is one Parquet row group. Two decode modes: `Raw` (Python decodes) and
-`ArrowIpc` (Rust decodes to Arrow IPC bytes). **Zero S3 footer re-fetches on epoch 2+**
-(row-group byte ranges cached in a process-global DashMap after epoch 1).
+The Parquet DataLoader provides per-row-group streaming for Parquet files on **any
+s3dlio-accessible storage** — S3, Azure Blob, GCS, `file://`, and `direct://` (O_DIRECT;
+tested and working). Only the URI prefix changes; no code changes needed to switch backends.
+Two decode modes: `Raw` (Python decodes) and `ArrowIpc` (Rust decodes to Arrow IPC bytes).
+**Zero footer re-fetches on epoch 2+** (row-group byte ranges cached in a process-global
+DashMap after epoch 1; backend-agnostic).
 
 ```python
 import s3dlio
+
+# Works with any s3dlio URI — just change the prefix:
+#   "s3://bucket/train/"           Amazon S3 / MinIO / Ceph
+#   "az://container/train/"        Azure Blob Storage
+#   "gs://bucket/train/"           Google Cloud Storage
+#   "file:///mnt/data/train/"      Local filesystem
+#   "direct:///mnt/nvme/train/"    Local O_DIRECT (bypass page cache)
 
 # Raw mode — Python decodes with PyArrow (default)
 loader = s3dlio.create_async_loader(
@@ -556,7 +565,7 @@ for item in loader:
 
 # Arrow IPC mode — Rust decodes, Python gets ready-to-use RecordBatch bytes
 loader = s3dlio.create_async_loader(
-    "s3://bucket/train/",
+    "direct:///mnt/nvme/train/",   # same API, different backend
     {"format": "parquet", "decode": "arrow", "prefetch": 32}
 )
 for item in loader:

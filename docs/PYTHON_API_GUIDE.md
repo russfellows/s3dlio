@@ -605,11 +605,16 @@ for batch in ds:
 ## Parquet DataLoader
 
 **New in v0.9.98.** A production-ready, epoch-aware Parquet DataLoader for AI/ML training
-loops. Each dataset item is one Parquet **row group** — the natural I/O unit for distributed
-training with large columnar datasets.
+loops. Works with **any s3dlio storage backend** — S3, Azure Blob Storage, GCS, local
+`file://` paths, and `direct://` (O_DIRECT). Each dataset item is one Parquet **row group**
+— the natural I/O unit for distributed training with large columnar datasets.
 
 > **Feature flags**: Both `parquet` and `parquet-arrow` are **enabled by default** — no
 > build flags required. See the [complete guide](Parquet_Data-Loader.md) for full details.
+
+> **Backend-agnostic**: Only the URI prefix changes when switching storage backends. No
+> code changes are needed — `s3://`, `az://`, `gs://`, `file://`, and `direct://` all work
+> with the same `create_async_loader()` call.
 
 ### Quick start
 
@@ -624,7 +629,7 @@ loader = s3dlio.create_async_loader(
 
 for item in loader:
     # item["data"]: bytes  — the row-group payload
-    # item["uri"]:  str   — S3 URI of the source file
+    # item["uri"]:  str   — URI of the source file (any s3dlio scheme)
     # item["rg_idx"]: int — row-group index within the file
     import pyarrow.parquet as pq, io
     table = pq.read_table(io.BytesIO(item["data"]))
@@ -655,8 +660,9 @@ for item in loader:
 
 ```python
 loader = s3dlio.create_async_loader(
-    uri,            # S3 prefix, e.g. "s3://bucket/train/"
-    opts            # dict of options
+    uri,   # any s3dlio URI prefix: "s3://bucket/train/", "az://container/train/",
+           #   "gs://bucket/train/", "file:///data/train/", "direct:///mnt/nvme/train/"
+    opts   # dict of options
 )
 ```
 
@@ -671,7 +677,8 @@ loader = s3dlio.create_async_loader(
 ### Epoch-2+ fast path — zero re-fetches
 
 After the first epoch, row-group byte ranges are cached in a process-global index. Epoch 2+
-construction issues **zero S3 footer GETs** — only `list_objects` still hits the network.
+construction issues **zero storage footer reads** — only a directory listing still hits the
+network or filesystem. This applies to all backends (S3, Azure, GCS, file, direct).
 
 ```python
 for epoch in range(num_epochs):
@@ -711,7 +718,7 @@ calls. 8 concurrent workers sharing the same process share the process-global ca
 ```python
 # In a DLIO plugin / reader callback:
 loader = s3dlio.create_async_loader(
-    config.data_folder,   # e.g. "s3://bucket/train/"
+    config.data_folder,   # any s3dlio URI: "s3://…", "az://…", "gs://…", "file://…", "direct://…"
     {
         "format":   "parquet",
         "decode":   "raw",     # decode_mode=none equivalent

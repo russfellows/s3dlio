@@ -24,18 +24,34 @@
 ## Overview
 
 The **Parquet DataLoader** provides a high-performance, epoch-aware training data loader for
-Parquet files stored on s3dlio -compatible storage. Each dataset item corresponds to one
-Parquet **row group** — the natural unit of parallelism and I/O for Parquet files.
+Parquet files on **any storage backend supported by s3dlio** — S3, Azure Blob Storage, GCS,
+local `file://` paths, and high-speed `direct://` (O_DIRECT) local storage. Each dataset
+item corresponds to one Parquet **row group** — the natural unit of parallelism and I/O for
+Parquet files.
+
+### Supported storage backends
+
+| URI scheme | Backend | Notes |
+|------------|---------|-------|
+| `s3://bucket/prefix/` | AWS S3, MinIO, Ceph RGW, any S3-compatible | Tested at production scale |
+| `az://container/prefix/` | Azure Blob Storage | Standard Azure SDK |
+| `gs://bucket/prefix/` | Google Cloud Storage | Standard GCS SDK |
+| `file:///path/to/dir/` | Local filesystem | Buffered I/O |
+| `direct:///path/to/dir/` | Local filesystem | O_DIRECT (bypass page cache) — tested and working |
+
+The URI prefix is passed directly to s3dlio's `store_for_uri()` resolver. Any backend
+reachable by s3dlio works without code changes — only the URI prefix changes.
 
 Key properties:
 
 - **Zero re-fetch on epoch 2+**: Row-group byte ranges (offsets + lengths) are cached in a
-  process-global `DashMap` after the first epoch. Subsequent epochs skip all S3 footer GETs.
+  process-global `DashMap` after the first epoch. Subsequent epochs skip all storage footer
+  reads — no network or disk round-trips for footer parsing.
 - **Minimal RAM**: The dataset holds only metadata in RAM. Each `get()` call fetches one row
   group payload which is freed when Python releases it.
 - **Two decode modes**: `Raw` (Python receives compressed Parquet bytes) and `ArrowIpc`
   (Rust decodes to Arrow RecordBatch, returns IPC stream bytes).
-- **Concurrent prefetch**: The Python-facing `PyParquetStreamLoader` keeps N row-group GETs
+- **Concurrent prefetch**: The Python-facing `PyParquetStreamLoader` keeps N row-group reads
   in flight simultaneously using Tokio `buffer_unordered`.
 - **8-instance safe**: All process-global caches are shared, so 8 concurrent dataset
   instances incur no 8× duplication of metadata.
@@ -106,7 +122,9 @@ pub struct ParquetRowGroupDataset { /* ... */ }
 impl ParquetRowGroupDataset {
     /// Construct the dataset.
     ///
-    /// * `uri_prefix`  — S3 prefix, e.g. `"s3://bucket/data/train/"`
+    /// * `uri_prefix`  — storage URI prefix (any s3dlio scheme), e.g.
+    ///   `"s3://bucket/data/train/"`, `"az://container/train/"`,
+    ///   `"gs://bucket/train/"`, `"file:///data/train/"`, `"direct:///mnt/nvme/train/"`
     /// * `col_indices` — column indices to include per RG; `None` = all columns
     /// * `footer_cap`  — bytes to fetch from file tail for footer parsing (≥ largest footer)
     /// * `decode_mode` — `Raw` or `ArrowIpc`
@@ -123,7 +141,7 @@ impl ParquetRowGroupDataset {
     /// Number of rows in the row group at `global_rg_idx`.
     pub fn num_rows_in_rg(&self, global_rg_idx: usize) -> Option<i64>;
 
-    /// S3 URI of the file containing `global_rg_idx`.
+    /// Storage URI of the file containing `global_rg_idx`.
     pub fn file_uri_for_rg(&self, global_rg_idx: usize) -> Option<&str>;
 
     /// The active decode mode for this dataset instance.
@@ -372,7 +390,7 @@ loader = s3dlio.create_async_loader(
 )
 ```
 
-> **Note**: Column projection only applies to the byte range fetched from S3. The global
+> **Note**: Column projection only applies to the byte range fetched from storage. The global
 > index fast path is **disabled** when `col_indices` is not `None`, because the cached byte
 > ranges cover all columns and per-column extents are not separately stored in the index.
 > Epoch-2 speedup is only available for full-column (all-column) workloads.
@@ -443,9 +461,9 @@ s3dlio's Parquet DataLoader is a drop-in replacement for `dlio_benchmark`'s nati
 Set `format: parquet` and `record_length` to your average row-group size:
 
 ```yaml
-# dlio_benchmark config
+# dlio_benchmark config — any s3dlio URI scheme works here
 dataset:
-  data_folder: s3://bucket/train/
+  data_folder: s3://bucket/train/       # or az://container/train/, file:///data/train/, etc.
   format: parquet
   record_length: 52428800   # 50 MiB (average row-group size)
 
@@ -458,7 +476,7 @@ In Python (or DLIO plugin code):
 
 ```python
 loader = s3dlio.create_async_loader(
-    config.data_folder,
+    config.data_folder,  # any s3dlio URI: s3://, az://, gs://, file://, direct://
     {
         "format":   "parquet",
         "decode":   "raw",       # DLIO's decode_mode=none equivalent
@@ -496,7 +514,8 @@ use s3dlio::data_loader::{
     Dataset, DatasetError, ParquetDecodeMode, ParquetRowGroupDataset, DEFAULT_FOOTER_CAP,
 };
 
-// Build dataset (epoch 1 — fetches footers from S3)
+// Build dataset (epoch 1 — fetches footers from storage).
+// Any s3dlio URI scheme works: s3://, az://, gs://, file://, direct://
 let ds = ParquetRowGroupDataset::new(
     "s3://bucket/data/train/",
     None,              // all columns
@@ -609,7 +628,7 @@ PyParquetStreamLoader              ← Python object (__iter__ returns ParquetSt
     │ contains Arc<>
     ▼
 ParquetRowGroupDataset             ← Rust struct; immutable after construction
-    ├── file_uris: Arc<Vec<String>>       ← S3 URIs (sorted by list order)
+    ├── file_uris: Arc<Vec<String>>       ← storage URIs (sorted by list order; any s3dlio scheme)
     ├── extents: Arc<Vec<RgExtent>>       ← byte range per RG (start, length, num_rows)
     ├── file_metadata: Arc<Vec<Arc<ParquetMetaData>>>  ← per-file footer (empty in Raw fast path)
     ├── col_indices: Arc<Option<Vec<usize>>>           ← column projection
