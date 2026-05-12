@@ -66,11 +66,9 @@
 //! `ArrowIpc` mode additionally requires the `parquet-arrow` feature (also default).
 
 use crate::data_loader::{Dataset, DatasetError};
+use crate::object_store::store_for_uri;
 use crate::s3_client::run_on_global_rt;
-use crate::s3_utils::{
-    get_object_range_uri_async, get_object_range_uri_timed_async, list_objects as list_objects_rs,
-    parse_s3_uri,
-};
+use crate::s3_utils::get_object_range_uri_timed_async;
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(test)]
@@ -107,9 +105,6 @@ pub enum ParquetDecodeMode {
     /// import pyarrow as pa
     /// batch = pa.ipc.open_stream(pa.py_buffer(bytes(item))).read_next_batch()
     /// ```
-    ///
-    /// Requires the `parquet-arrow` cargo feature.
-    #[cfg(feature = "parquet-arrow")]
     ArrowIpc,
 }
 
@@ -176,22 +171,23 @@ impl ParquetRowGroupDataset {
         );
 
         // ── 1. List .parquet files under prefix ─────────────────────────────
-        let (bucket, prefix) =
-            parse_s3_uri(uri_prefix).map_err(|e| DatasetError::from(e.to_string()))?;
+        // Use the generic ObjectStore so all URI schemes work:
+        // s3://, file://, direct://, az://, gs://
+        let store = store_for_uri(uri_prefix).map_err(|e| DatasetError::from(e.to_string()))?;
 
-        let keys = list_objects_rs(&bucket, &prefix, true)
-            .map_err(|e| DatasetError::from(e.to_string()))?;
-
-        let file_uris: Vec<String> = keys
-            .into_iter()
-            .filter(|k| k.ends_with(".parquet"))
-            .map(|k| format!("s3://{}/{}", bucket, k))
-            .collect();
+        // Own the prefix string so it can cross the async move boundary.
+        let uri_prefix_owned = uri_prefix.to_owned();
+        let file_uris: Vec<String> =
+            run_on_global_rt(async move { store.list(&uri_prefix_owned, true).await })
+                .map_err(|e| DatasetError::from(e.to_string()))?
+                .into_iter()
+                .filter(|u| u.ends_with(".parquet"))
+                .collect();
 
         if file_uris.is_empty() {
             return Err(DatasetError::from(format!(
-                "No .parquet files found under '{}' (bucket='{}', prefix='{}')",
-                uri_prefix, bucket, prefix
+                "No .parquet files found under '{}'",
+                uri_prefix
             )));
         }
 
@@ -316,7 +312,6 @@ impl Dataset for ParquetRowGroupDataset {
     async fn get(&self, global_idx: usize) -> Result<Self::Item, DatasetError> {
         match self.decode_mode {
             ParquetDecodeMode::Raw => self.get_raw(global_idx).await,
-            #[cfg(feature = "parquet-arrow")]
             ParquetDecodeMode::ArrowIpc => self.get_arrow_ipc(global_idx).await,
         }
     }
@@ -333,7 +328,9 @@ impl ParquetRowGroupDataset {
             .ok_or(DatasetError::IndexOutOfRange(global_idx))?;
         let uri = &self.file_uris[ext.file_uri_idx];
         let t0 = Instant::now();
-        let result = get_object_range_uri_async(uri, ext.start, Some(ext.length))
+        let store = store_for_uri(uri).map_err(DatasetError::from)?;
+        let result = store
+            .get_range(uri, ext.start, Some(ext.length))
             .await
             .map_err(DatasetError::from);
         let elapsed = t0.elapsed();
@@ -358,7 +355,6 @@ impl ParquetRowGroupDataset {
     /// ```python
     /// batch = pa.ipc.open_stream(pa.py_buffer(bytes(item))).read_next_batch()
     /// ```
-    #[cfg(feature = "parquet-arrow")]
     async fn get_arrow_ipc(&self, global_idx: usize) -> Result<Bytes, DatasetError> {
         use arrow_array::RecordBatch;
         use arrow_ipc::writer::StreamWriter;
@@ -384,6 +380,10 @@ impl ParquetRowGroupDataset {
 
         // Read only this specific row group.
         builder = builder.with_row_groups(vec![rg_idx]);
+        // Return all rows in the row group in a single RecordBatch.  Without
+        // this the parquet-rs default of 1024 rows/batch would truncate large
+        // row groups.
+        builder = builder.with_batch_size(usize::MAX);
 
         // Apply column projection if requested.
         if let Some(cols) = col_indices.as_deref() {
@@ -419,25 +419,22 @@ impl ParquetRowGroupDataset {
     }
 }
 
-// ── S3AsyncFileReader (parquet-arrow only) ────────────────────────────────────
+// ── S3AsyncFileReader ──────────────────────────────────────────────────────────
 
 /// Implements `parquet::arrow::async_reader::AsyncFileReader` using s3dlio's
 /// range GET.  Provides pre-parsed metadata so parquet-rs skips its own footer
 /// fetch.
-#[cfg(feature = "parquet-arrow")]
-struct S3AsyncFileReader {
+pub struct S3AsyncFileReader {
     uri: String,
     metadata: Arc<ParquetMetaData>,
 }
 
-#[cfg(feature = "parquet-arrow")]
 impl S3AsyncFileReader {
-    fn new(uri: String, metadata: Arc<ParquetMetaData>) -> Self {
+    pub fn new(uri: String, metadata: Arc<ParquetMetaData>) -> Self {
         Self { uri, metadata }
     }
 }
 
-#[cfg(feature = "parquet-arrow")]
 impl parquet::arrow::async_reader::AsyncFileReader for S3AsyncFileReader {
     fn get_bytes(
         &mut self,
@@ -447,7 +444,10 @@ impl parquet::arrow::async_reader::AsyncFileReader for S3AsyncFileReader {
         let start = range.start;
         let len = range.end - range.start;
         Box::pin(async move {
-            get_object_range_uri_async(&uri, start, Some(len))
+            let store = store_for_uri(&uri)
+                .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
+            store
+                .get_range(&uri, start, Some(len))
                 .await
                 .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))
         })
@@ -498,7 +498,6 @@ impl ParquetRowGroupDataset {
 fn needs_file_metadata(mode: ParquetDecodeMode) -> bool {
     match mode {
         ParquetDecodeMode::Raw => false,
-        #[cfg(feature = "parquet-arrow")]
         ParquetDecodeMode::ArrowIpc => true,
     }
 }
@@ -842,7 +841,6 @@ mod tests {
     }
 
     /// Verify round-trip decode-mode accessors compile and return the right value.
-    #[cfg(feature = "parquet-arrow")]
     #[test]
     fn test_decode_mode_variants_compile() {
         let modes = [ParquetDecodeMode::Raw, ParquetDecodeMode::ArrowIpc];
@@ -853,10 +851,6 @@ mod tests {
 
     /// Write a real minimal Parquet file in memory, read it back via
     /// `parse_footer`, and verify the row-group extent calculation.
-    ///
-    /// This test is gated on `parquet-arrow` because it uses the `parquet`
-    /// crate's write path (which needs the arrow feature for easy construction).
-    #[cfg(feature = "parquet-arrow")]
     #[test]
     fn test_rg_extent_round_trip() {
         use arrow_array::{Int32Array, RecordBatch};
@@ -927,7 +921,6 @@ mod tests {
 
     /// `ArrowIpc` mode MUST request file_metadata (the Arrow decoder needs the
     /// schema embedded in `ParquetMetaData`).
-    #[cfg(feature = "parquet-arrow")]
     #[test]
     fn test_needs_file_metadata_arrow_ipc_is_true() {
         assert!(
@@ -938,7 +931,6 @@ mod tests {
 
     /// The `needs_file_metadata` function must cover all variants without
     /// returning the same value for both.
-    #[cfg(feature = "parquet-arrow")]
     #[test]
     fn test_needs_file_metadata_modes_differ() {
         assert_ne!(

@@ -851,6 +851,7 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             "columns",
             "footer_cap",
             "decode", // "raw" (default) | "arrow" (Rust Arrow IPC) | "none" (raw, no Python decode)
+            "max_threads", // limit pyo3 Tokio runtime threads (MPI: set to num_cpus / world_size)
         ];
         for key in d.keys() {
             if let Ok(key_str) = key.extract::<&str>() {
@@ -1856,7 +1857,6 @@ impl ParquetStreamIter {
 /// This is the "all files, all row groups, prefetch N ahead" design:
 ///   producer: `buffer_unordered(concurrency)` over global_rg_idx 0..total
 ///   consumer: Python pops items, caches by (file_uri, rg_idx), serves on demand
-#[cfg(feature = "parquet")]
 #[pyclass]
 pub struct PyParquetStreamLoader {
     dataset: Arc<crate::data_loader::ParquetRowGroupDataset>,
@@ -1865,7 +1865,6 @@ pub struct PyParquetStreamLoader {
     concurrency: usize,
 }
 
-#[cfg(feature = "parquet")]
 #[pymethods]
 impl PyParquetStreamLoader {
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<ParquetStreamIter>> {
@@ -1953,6 +1952,361 @@ impl PyParquetStreamLoader {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-row-group fetch + optional Rust Arrow decode (index-based hot path)
+// ---------------------------------------------------------------------------
+
+/// Generate a complete Parquet file in memory and return it as a `PyBytesView`.
+///
+/// All columns are Float32. Data is generated using `dgen_data::RollingPool`
+/// (Xoshiro256++ streaming) — one pool instantiated per call, reused across
+/// every column of every row group without re-seeding.
+///
+/// ## Arguments
+/// * `num_cols`       — number of Float32 columns
+/// * `rows_per_rg`    — rows per row group
+/// * `num_row_groups` — number of row groups
+///
+/// ## Example
+/// ```python
+/// import s3dlio
+/// bv = s3dlio.generate_parquet_bytes(200, 8192, 123)
+/// with open("/mnt/test/train/img_00_of_64.parquet", "wb") as f:
+///     f.write(memoryview(bv))
+/// ```
+#[pyfunction]
+#[pyo3(signature = (num_cols, rows_per_rg, num_row_groups))]
+pub fn generate_parquet_bytes(
+    py: Python<'_>,
+    num_cols: usize,
+    rows_per_rg: usize,
+    num_row_groups: usize,
+) -> PyResult<crate::python_api::python_core_api::PyBytesView> {
+    use crate::data_formats::parquet_gen;
+    use crate::python_api::python_core_api::PyBytesView;
+
+    let bytes = py
+        .detach(|| parquet_gen::generate_parquet_bytes(num_cols, rows_per_rg, num_row_groups))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(PyBytesView::new(bytes))
+}
+
+/// Generate a complete Parquet file and write it directly to any URI.
+///
+/// Everything — data generation, Parquet serialization, and the store write —
+/// happens inside a single `py.detach()` block.  The GIL is released exactly
+/// once for the entire operation; no data crosses the Python/Rust boundary
+/// mid-file.
+///
+/// Supports `file://`, `direct://`, `s3://`, `az://`, `gs://`.
+///
+/// ## Arguments
+/// * `uri`            — destination URI (any supported scheme)
+/// * `num_cols`       — number of Float32 columns
+/// * `rows_per_rg`    — rows per row group
+/// * `num_row_groups` — number of row groups
+///
+/// ## Example
+/// ```python
+/// import s3dlio
+/// s3dlio.generate_and_write_parquet(
+///     "file:///mnt/test/train/img_00_of_64.parquet", 200, 8192, 123)
+/// ```
+#[pyfunction]
+#[pyo3(signature = (uri, num_cols, rows_per_rg, num_row_groups))]
+pub fn generate_and_write_parquet(
+    py: Python<'_>,
+    uri: &str,
+    num_cols: usize,
+    rows_per_rg: usize,
+    num_row_groups: usize,
+) -> PyResult<()> {
+    use crate::data_formats::parquet_gen;
+    use crate::s3_client::run_on_global_rt;
+
+    let uri_owned = uri.to_owned();
+    py.detach(|| {
+        run_on_global_rt(async move {
+            parquet_gen::generate_and_write_parquet(
+                &uri_owned,
+                num_cols,
+                rows_per_rg,
+                num_row_groups,
+            )
+            .await
+        })
+    })
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Generate a Parquet file in memory with a named, schema-flexible column layout.
+///
+/// `columns` is a list of `(name, num_float32_per_row)` tuples:
+/// - `num_float32_per_row == 1` → plain `Float32` scalar column
+/// - `num_float32_per_row > 1`  → `FixedSizeList<Float32>[N]` embedding column
+///
+/// All data is generated in Rust using the Xoshiro256++ RollingPool — zero
+/// Python involvement, zero numpy.
+///
+/// ## Example (Flux schema)
+/// ```python
+/// import s3dlio
+/// bv = s3dlio.generate_parquet_bytes_schema(
+///     columns=[("t5_encodings", 524328), ("clip_encodings", 409),
+///              ("mean", 8232), ("logvar", 8232), ("timestamp", 7)],
+///     rows_per_rg=48, num_row_groups=6)
+/// with open("/mnt/test/train.parquet", "wb") as f:
+///     f.write(memoryview(bv))
+/// ```
+#[pyfunction]
+#[pyo3(signature = (columns, rows_per_rg, num_row_groups))]
+pub fn generate_parquet_bytes_schema(
+    py: Python<'_>,
+    columns: Vec<(String, usize)>,
+    rows_per_rg: usize,
+    num_row_groups: usize,
+) -> PyResult<crate::python_api::python_core_api::PyBytesView> {
+    use crate::data_formats::parquet_gen;
+    use crate::python_api::python_core_api::PyBytesView;
+
+    let bytes = py
+        .detach(|| parquet_gen::generate_parquet_bytes_schema(&columns, rows_per_rg, num_row_groups))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(PyBytesView::new(bytes))
+}
+
+/// Generate a named-schema Parquet file and write it to any URI in one call.
+///
+/// `columns` is a list of `(name, num_float32_per_row)` tuples (see
+/// [`generate_parquet_bytes_schema`] for schema rules).  The entire pipeline —
+/// data generation, Parquet serialization, and store write — runs off the GIL.
+///
+/// Supports `file://`, `direct://`, `s3://`, `az://`, `gs://`.
+///
+/// ## Example (Flux schema, local filesystem)
+/// ```python
+/// import s3dlio
+/// s3dlio.generate_and_write_parquet_schema(
+///     "file:///mnt/test/data/flux/train/train_0000.parquet",
+///     columns=[("t5_encodings", 524328), ("clip_encodings", 409),
+///              ("mean", 8232), ("logvar", 8232), ("timestamp", 7)],
+///     rows_per_rg=48, num_row_groups=6)
+/// ```
+#[pyfunction]
+#[pyo3(signature = (uri, columns, rows_per_rg, num_row_groups))]
+pub fn generate_and_write_parquet_schema(
+    py: Python<'_>,
+    uri: &str,
+    columns: Vec<(String, usize)>,
+    rows_per_rg: usize,
+    num_row_groups: usize,
+) -> PyResult<()> {
+    use crate::data_formats::parquet_gen;
+    use crate::s3_client::run_on_global_rt;
+
+    let uri_owned = uri.to_owned();
+    py.detach(|| {
+        run_on_global_rt(async move {
+            parquet_gen::generate_and_write_parquet_schema(
+                &uri_owned,
+                columns,
+                rows_per_rg,
+                num_row_groups,
+            )
+            .await
+        })
+    })
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Generate a Parquet file with a named schema and stream it to an S3 URI,
+/// pipelining row-group generation with multipart upload.
+///
+/// Unlike ``generate_and_write_parquet_schema`` (which builds the entire file
+/// in memory before uploading), this function opens the multipart upload
+/// immediately and sends each completed row group as a part while the next
+/// row group is being generated.  Peak memory is ~2× one row group rather
+/// than the full file size.
+///
+/// ## Parameters
+/// - ``uri``: S3 URI, e.g. ``"s3://bucket/path/file.parquet"``
+/// - ``columns``: list of ``(name, num_float32_per_row)`` tuples
+/// - ``rows_per_rg``: rows per row group
+/// - ``num_row_groups``: number of row groups
+///
+/// ## Example
+/// ```python
+/// import s3dlio
+/// s3dlio.generate_and_write_parquet_schema_streaming(
+///     "s3://mlp-flux/data/flux/train/train_0000.parquet",
+///     columns=[("t5_encodings", 524328), ("clip_encodings", 409),
+///              ("mean", 8232), ("logvar", 8232), ("timestamp", 7)],
+///     rows_per_rg=48, num_row_groups=6)
+/// ```
+#[pyfunction]
+#[pyo3(signature = (uri, columns, rows_per_rg, num_row_groups))]
+pub fn generate_and_write_parquet_schema_streaming(
+    py: Python<'_>,
+    uri: &str,
+    columns: Vec<(String, usize)>,
+    rows_per_rg: usize,
+    num_row_groups: usize,
+) -> PyResult<()> {
+    use crate::data_formats::parquet_gen;
+    use crate::s3_client::run_on_global_rt;
+
+    let uri_owned = uri.to_owned();
+    py.detach(|| {
+        run_on_global_rt(async move {
+            parquet_gen::generate_and_write_parquet_schema_streaming(
+                &uri_owned,
+                columns,
+                rows_per_rg,
+                num_row_groups,
+            )
+            .await
+        })
+    })
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Fetch a single Parquet row group and optionally decode it to Arrow IPC.
+///
+/// This is the per-sample hot-path function for index-based access patterns
+/// (e.g. random-access training, PyTorch `DataLoader` with shuffle).  It is
+/// the Arrow-decode counterpart of `s3dlio.get_range()`:
+///
+/// * `s3dlio.get_range(uri, offset, length)` — raw bytes, no decode
+/// * `s3dlio.parquet_get_rg(uri, rg_idx)` — single RG, optional Rust Arrow decode
+///
+/// ## Usage with `PyParquetIndex`
+///
+/// ```python
+/// import s3dlio, pyarrow as pa
+///
+/// idx = s3dlio.PyParquetIndex()
+/// idx.ensure_indexed(uris, epoch=1)
+///
+/// # Per-sample lookup → fetch → decode in one call
+/// rg_idx, offset, length = idx.rg_lookup(uri, sample_row)
+/// bv = s3dlio.parquet_get_rg(uri, rg_idx)                    # Rust Arrow IPC
+/// batch = pa.ipc.open_stream(pa.py_buffer(bytes(bv))).read_next_batch()
+/// tensor = torch.from_numpy(batch.column(0).to_pydict())
+/// ```
+///
+/// ## Arguments
+/// * `uri`         — full URI of the `.parquet` file (any supported scheme).
+/// * `rg_idx`      — 0-based row-group index within the file.
+/// * `col_indices` — column indices to decode; `None` = all columns.
+/// * `footer_cap`  — footer fetch size in bytes (default 4 MiB).
+/// * `decode`      — `"arrow"` (default) returns Arrow IPC bytes;
+///                   `"raw"` returns raw compressed Parquet column-chunk bytes.
+///
+/// ## Thread safety
+///
+/// The footer is fetched once and cached in the process-global
+/// `parquet_file_cache` — subsequent calls for the same file are zero-cost at
+/// the metadata level.  The function releases the GIL while waiting for I/O.
+#[pyfunction]
+#[pyo3(signature = (uri, rg_idx, col_indices=None, footer_cap=4194304, decode="arrow"))]
+pub fn parquet_get_rg(
+    py: Python<'_>,
+    uri: &str,
+    rg_idx: usize,
+    col_indices: Option<Vec<usize>>,
+    footer_cap: usize,
+    decode: &str,
+) -> PyResult<crate::python_api::python_core_api::PyBytesView> {
+    use crate::data_loader::{parquet_file_cache, parquet_rg};
+    use crate::object_store::store_for_uri;
+    use crate::python_api::python_core_api::PyBytesView;
+    use crate::s3_client::run_on_global_rt;
+
+    let uri_owned = uri.to_owned();
+    let do_arrow = decode.eq_ignore_ascii_case("arrow");
+
+    let bytes = py
+        .detach(|| {
+            run_on_global_rt(async move {
+                // ── 1. Footer metadata (cache hit on epoch 2+) ───────────────────
+                let cached =
+                    parquet_file_cache::get_or_fetch(&uri_owned, footer_cap as u64).await?;
+                let meta = Arc::clone(&cached.parquet_meta);
+
+                if rg_idx >= meta.num_row_groups() {
+                    anyhow::bail!(
+                        "rg_idx {} out of range for '{}' ({} row groups)",
+                        rg_idx,
+                        uri_owned,
+                        meta.num_row_groups()
+                    );
+                }
+
+                if do_arrow {
+                    // ── 2a. Arrow IPC decode path ─────────────────────────────────
+                    use arrow_array::RecordBatch;
+                    use arrow_ipc::writer::StreamWriter;
+                    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+                    use parquet::arrow::ProjectionMask;
+
+                    let reader = parquet_rg::S3AsyncFileReader::new(uri_owned, meta);
+                    let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("parquet reader init: {}", e))?;
+
+                    builder = builder.with_row_groups(vec![rg_idx]);
+                    // Return all rows in the row group in a single RecordBatch.
+                    builder = builder.with_batch_size(usize::MAX);
+
+                    if let Some(ref cols) = col_indices {
+                        let mask =
+                            ProjectionMask::leaves(builder.parquet_schema(), cols.iter().copied());
+                        builder = builder.with_projection(mask);
+                    }
+
+                    let mut stream = builder
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("parquet stream build: {}", e))?;
+
+                    use futures_util::StreamExt as _;
+                    let batch: RecordBatch = stream
+                        .next()
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("parquet stream returned no batch"))?
+                        .map_err(|e| anyhow::anyhow!("parquet stream read: {}", e))?;
+
+                    let mut buf: Vec<u8> = Vec::with_capacity(batch.get_array_memory_size() + 512);
+                    {
+                        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
+                            .map_err(|e| anyhow::anyhow!("ipc writer init: {}", e))?;
+                        writer
+                            .write(&batch)
+                            .map_err(|e| anyhow::anyhow!("ipc write: {}", e))?;
+                        writer
+                            .finish()
+                            .map_err(|e| anyhow::anyhow!("ipc finish: {}", e))?;
+                    }
+                    return Ok(bytes::Bytes::from(buf));
+                }
+
+                // ── 2b. Raw bytes path ────────────────────────────────────────────
+                let rg_meta = meta.row_group(rg_idx);
+                let (offset, length) = parquet_rg::rg_byte_extent(rg_meta, col_indices.as_deref())
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let store = store_for_uri(&uri_owned)?;
+                store
+                    .get_range(&uri_owned, offset, Some(length))
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(PyBytesView::new(bytes))
+}
+
 /// Create an async data loader from any supported URI scheme (convenience function)
 ///
 /// Extra `opts` keys handled by this function (in addition to standard [`LoaderOptions`] keys):
@@ -1970,7 +2324,6 @@ pub fn create_async_loader(
     opts: Option<Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     // Check for parquet format before falling through to the generic path.
-    #[cfg(feature = "parquet")]
     if let Some(ref d) = opts {
         let format_str = d
             .get_item("format")
@@ -2009,14 +2362,7 @@ pub fn create_async_loader(
                     .flatten()
                     .and_then(|v| v.extract::<String>().ok());
                 match s.as_deref() {
-                    #[cfg(feature = "parquet-arrow")]
                     Some("arrow") => ParquetDecodeMode::ArrowIpc,
-                    #[cfg(not(feature = "parquet-arrow"))]
-                    Some("arrow") => {
-                        return Err(PyRuntimeError::new_err(
-                            "decode=\"arrow\" requires the parquet-arrow feature (not compiled in)",
-                        ));
-                    }
                     _ => ParquetDecodeMode::Raw, // "raw", "none", or not set
                 }
             };
@@ -2024,6 +2370,18 @@ pub fn create_async_loader(
             let pq_dataset =
                 ParquetRowGroupDataset::new(uri, col_indices.as_deref(), footer_cap, decode_mode)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // max_threads: configure the pyo3 Tokio runtime thread count
+            // BEFORE the first spawn.  Only takes effect if the runtime has
+            // not yet been initialized (OnceLock — first call wins).
+            if let Some(n) = d
+                .get_item("max_threads")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<usize>().ok())
+            {
+                configure_tokio_threads(n);
+            }
 
             // Concurrency: how many row-group GETs to keep in flight.
             // "prefetch" key sets this; default 32 (matches old Python 32-thread pool).
@@ -2300,7 +2658,6 @@ pub fn read_tfrecord_index(index_path: &str) -> PyResult<Vec<(u64, u64)>> {
 ///     import s3dlio
 ///     offsets = s3dlio.parquet_rg_row_offsets("s3://bucket/path/file.parquet")
 ///     # offsets == [0, 8192, 16384, ..., 1000000]
-#[cfg(feature = "parquet")]
 #[pyfunction]
 pub fn parquet_rg_row_offsets(uri: &str) -> PyResult<Vec<i64>> {
     use crate::data_loader::parquet_file_cache;
@@ -2321,7 +2678,6 @@ pub fn parquet_rg_row_offsets(uri: &str) -> PyResult<Vec<i64>> {
 ///
 /// Useful after a file has been rewritten and you want the next
 /// `parquet_rg_row_offsets` / `create_async_loader` call to re-fetch it.
-#[cfg(feature = "parquet")]
 #[pyfunction]
 pub fn parquet_cache_invalidate(uri: &str) {
     use crate::data_loader::parquet_file_cache;
@@ -2329,7 +2685,6 @@ pub fn parquet_cache_invalidate(uri: &str) {
 }
 
 /// Clear the entire Parquet metadata cache.
-#[cfg(feature = "parquet")]
 #[pyfunction]
 pub fn parquet_cache_clear() {
     use crate::data_loader::parquet_file_cache;
@@ -2337,7 +2692,6 @@ pub fn parquet_cache_clear() {
 }
 
 /// Return the number of files currently held in the Parquet metadata cache.
-#[cfg(feature = "parquet")]
 #[pyfunction]
 pub fn parquet_cache_len() -> usize {
     use crate::data_loader::parquet_file_cache;
@@ -2380,13 +2734,11 @@ pub fn parquet_cache_len() -> usize {
 /// idx.ensure_indexed(uris, epoch=2, batch_size=16)  # no-op: footers cached
 /// rg_idx, offset, length = idx.rg_lookup(...)       # still O(1)
 /// ```
-#[cfg(feature = "parquet")]
 #[pyclass]
 pub struct PyParquetIndex {
     inner: std::sync::Arc<crate::data_loader::parquet_index::ParquetIndex>,
 }
 
-#[cfg(feature = "parquet")]
 #[pymethods]
 impl PyParquetIndex {
     /// Create a new empty index.
@@ -2522,6 +2874,78 @@ impl PyParquetIndex {
 }
 
 // ---------------------------------------------------------------------------
+// Tokio thread-count configuration for the pyo3 async runtime
+// ---------------------------------------------------------------------------
+
+/// Configure the number of Tokio worker threads used by `create_async_loader`.
+///
+/// Controls the **`pyo3_async_runtimes`** Tokio runtime — the one that drives
+/// the `buffer_unordered` streaming pipeline and Rust Arrow IPC decode.
+///
+/// **Must be called before the first `create_async_loader` call** in each
+/// process.  Once the runtime is first used it is permanently fixed;
+/// subsequent calls are silently ignored.
+///
+/// ## Default (n=0): auto-detect from MPI environment variables
+///
+/// When called with no arguments (or `n=0`), reads standard MPI env vars to
+/// determine world size and divides available CPUs accordingly:
+///
+/// ```python
+/// import s3dlio
+/// s3dlio.configure_tokio_threads()   # auto: reads OMPI_COMM_WORLD_SIZE etc.
+/// ```
+///
+/// Checked env vars (first one found wins):
+///   - `OMPI_COMM_WORLD_SIZE` — Open MPI
+///   - `PMI_SIZE`             — MPICH / Slurm PMI
+///   - `WORLD_SIZE`           — PyTorch distributed / torchrun
+///
+/// ## Explicit thread count
+///
+/// ```python
+/// s3dlio.configure_tokio_threads(4)  # force 4 Tokio threads per process
+/// ```
+///
+/// ## Arguments
+/// * `n` — worker thread count.  `0` (default) = auto from MPI env vars.
+#[pyfunction]
+#[pyo3(signature = (n=0))]
+pub fn configure_tokio_threads(n: usize) {
+    use crate::s3_client::RT_THREADS_LIMIT;
+    use std::sync::atomic::Ordering;
+
+    let thread_count = if n > 0 {
+        n
+    } else {
+        // Auto-detect from standard MPI / distributed-training env vars.
+        let world_size: usize = std::env::var("OMPI_COMM_WORLD_SIZE")
+            .or_else(|_| std::env::var("PMI_SIZE"))
+            .or_else(|_| std::env::var("WORLD_SIZE"))
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let cpus = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+        (cpus / world_size).max(1)
+    };
+
+    // Constrain the global rt (used by generate_and_write_parquet, parquet_get_rg,
+    // put_bytes, etc.) with the same budget.  Must be set before the first
+    // run_on_global_rt call to take effect (the global rt is a OnceLock).
+    RT_THREADS_LIMIT.store(thread_count, Ordering::Relaxed);
+
+    // Constrain the pyo3-async-runtimes rt (used by create_async_loader).
+    let mut builder = ::tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(thread_count);
+    builder.enable_all();
+    builder.thread_name("s3dlio-decode");
+    pyo3_async_runtimes::tokio::init(builder);
+}
+
+// ---------------------------------------------------------------------------
 // Module registration function for AI/ML API
 // ---------------------------------------------------------------------------
 pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2543,9 +2967,7 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBytesDataLoaderSyncIter>()?;
     m.add_class::<PyParquetItem>()?;
     m.add_class::<ParquetStreamIter>()?;
-    #[cfg(feature = "parquet")]
     m.add_class::<PyParquetStreamLoader>()?;
-    #[cfg(feature = "parquet")]
     m.add_class::<PyParquetIndex>()?;
 
     // Compatibility classes (deprecated)
@@ -2555,15 +2977,22 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Dataset factory functions
     m.add_function(wrap_pyfunction!(create_dataset, m)?)?;
     m.add_function(wrap_pyfunction!(create_async_loader, m)?)?;
+    m.add_function(wrap_pyfunction!(configure_tokio_threads, m)?)?;
+    // Per-RG fetch + optional Rust Arrow decode (index-based hot path)
+    m.add_function(wrap_pyfunction!(parquet_get_rg, m)?)?;
+    // Fast Parquet file generation (all-Float32, random data via dgen_data)
+    m.add_function(wrap_pyfunction!(generate_parquet_bytes, m)?)?;
+    // Generate + write entire file in one GIL-release (high-level API)
+    m.add_function(wrap_pyfunction!(generate_and_write_parquet, m)?)?;
+    // Schema-flexible generation: named columns, per-column float32 count
+    m.add_function(wrap_pyfunction!(generate_parquet_bytes_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_and_write_parquet_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_and_write_parquet_schema_streaming, m)?)?;
 
     // Parquet metadata cache helpers
-    #[cfg(feature = "parquet")]
     m.add_function(wrap_pyfunction!(parquet_rg_row_offsets, m)?)?;
-    #[cfg(feature = "parquet")]
     m.add_function(wrap_pyfunction!(parquet_cache_invalidate, m)?)?;
-    #[cfg(feature = "parquet")]
     m.add_function(wrap_pyfunction!(parquet_cache_clear, m)?)?;
-    #[cfg(feature = "parquet")]
     m.add_function(wrap_pyfunction!(parquet_cache_len, m)?)?;
 
     // TFRecord index generation (NVIDIA DALI compatible)
