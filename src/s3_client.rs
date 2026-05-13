@@ -35,6 +35,10 @@ static CLIENT: OnceCell<Client> = OnceCell::const_new();
 /// Zero means "not set" — `get_runtime_threads` uses the CPU-based default.
 static CONCURRENCY_HINT: AtomicUsize = AtomicUsize::new(0);
 
+/// Hard upper-bound on global-rt worker threads set by [`set_rt_threads_limit`].
+/// Zero means "not set" — no cap beyond the CPU-based default.
+pub(crate) static RT_THREADS_LIMIT: AtomicUsize = AtomicUsize::new(0);
+
 /// Inform s3dlio of your expected peak concurrency level **before** the first
 /// S3 operation.
 ///
@@ -147,10 +151,19 @@ fn get_runtime_threads() -> usize {
     // for 128 tasks).  Cap at cores*4 to avoid unbounded thread creation on
     // hosts with a tiny core count and a very large hint.
     let hint = CONCURRENCY_HINT.load(Ordering::Relaxed);
-    if hint > base {
+    let threads = if hint > base {
         std::cmp::min(hint, cores * 4)
     } else {
         base
+    };
+
+    // Hard upper bound set by configure_tokio_threads() — enforces MPI-aware
+    // per-process thread budget so NP processes don't all claim all cores.
+    let limit = RT_THREADS_LIMIT.load(Ordering::Relaxed);
+    if limit > 0 {
+        std::cmp::min(threads, limit).max(1)
+    } else {
+        threads
     }
 }
 
@@ -317,6 +330,12 @@ pub async fn aws_s3_client_async() -> Result<Client> {
             // =========================================================================
             let s3_config = aws_sdk_s3::config::Builder::from(&cfg)
                 .force_path_style(true)
+                // Disable automatic CRC checksum on PUT and validation on GET.
+                // AWS SDK v2026+ defaults to CRC64-NVME on all requests, which
+                // breaks S3-compatible servers (s3-ultra, MinIO older builds, etc.)
+                // that don't store or return AWS-style checksum headers.
+                .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+                .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
                 .build();
             info!("S3 client ready (path-style: forced, endpoint: {})",
                 env::var("AWS_ENDPOINT_URL").ok().as_deref().unwrap_or("AWS default"));
@@ -400,6 +419,8 @@ pub async fn create_s3_client_for_endpoint(
 
     let s3_config = aws_sdk_s3::config::Builder::from(&cfg)
         .force_path_style(true)
+        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
         .build();
 
     info!(

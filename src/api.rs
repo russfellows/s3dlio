@@ -241,6 +241,29 @@ pub fn dataset_for_uri_with_options(
     }
 }
 
+/// Create a dataset from an explicit list of URIs — no listing occurs.
+///
+/// Unlike [`dataset_for_uri`] / [`dataset_for_uri_with_options`], which list
+/// objects under a prefix URI, this function uses the caller-supplied list
+/// directly.  Use it whenever you already have a manifest file, a
+/// pre-computed shard, a per-worker file list, or any other pre-built URI
+/// collection.
+///
+/// All URIs must use the same scheme (`s3://`, `file://`, `az://`, …).  The
+/// backend is inferred from the first entry.
+///
+/// # Errors
+/// Returns an error if `uris` is empty or if the backend cannot be
+/// constructed (e.g. missing credentials).
+pub fn dataset_from_uris(uris: Vec<String>) -> Result<Box<dyn Dataset<Item = bytes::Bytes>>> {
+    use crate::data_loader::async_pool_dataloader::MultiBackendDataset;
+    if uris.is_empty() {
+        anyhow::bail!("uris list must be non-empty");
+    }
+    let ds = MultiBackendDataset::from_uris(uris)?;
+    Ok(Box::new(ds))
+}
+
 /// Advanced API for power users
 pub mod advanced;
 

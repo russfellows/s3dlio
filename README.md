@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-648-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.98-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-314-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.100-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,11 +10,11 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.98 — Parquet DataLoader with epoch-2 fast path and Arrow IPC decode**
+> **v0.9.100 — General-purpose object data loader: `PyDataset.from_uris()`, `items()`, `collect_batch()`, `skip_head` HEAD optimisation**
 >
-> **`ParquetRowGroupDataset`**: epoch-aware Parquet DataLoader for AI/ML training loops. Works with **any s3dlio storage backend** — S3, Azure Blob, GCS, `file://`, and `direct://` (O_DIRECT). Each item is one Parquet row group. Zero re-fetches on epoch 2+ (2.5× faster construction, scales to 10×+ for 64+ files). Two decode modes: `Raw` (Python decodes with PyArrow) and `ArrowIpc` (Rust decodes to Arrow `RecordBatch`, returns IPC bytes). 8 concurrent workers share process-global metadata caches — no 8× RAM duplication. See [docs/Parquet_Data-Loader.md](docs/Parquet_Data-Loader.md).
+> **`PyDataset.from_uris(uris)`**: map-style dataset from a pre-built URI list — no listing overhead. **`PyBytesAsyncDataLoader.items()`**: URI-carrying sliding-window iterator; Tokio keeps `prefetch` GETs permanently in flight via `buffer_unordered`. **`collect_batch(n)`**: drains `n` items with one GIL crossing. **`skip_head=True` (new default)**: skips the per-object HEAD request; actual size is cached after each GET so range splitting fires correctly from epoch 2. See [docs/Python_Data-Loader.md](docs/Python_Data-Loader.md).
 >
-> **v0.9.97 (prior):** `XorStream` (dedup-safe, ~15 GB/s/core); `S3DLIO_UNSIGNED_PAYLOAD` opt-in for private S3-compatible endpoints. See [docs/Changelog.md](docs/Changelog.md) for full history.
+> **v0.9.98 (prior):** `ParquetRowGroupDataset` — epoch-aware Parquet DataLoader with epoch-2 fast path and Arrow IPC decode. See [docs/Changelog.md](docs/Changelog.md) for full history.
 
 ## 📦 Installation
 

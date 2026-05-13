@@ -2,6 +2,8 @@
 
 **Last Updated:** May 9, 2026
 
+↩ [Python Data Loaders overview](Python_Data-Loader.md) · [Python API Guide](PYTHON_API_GUIDE.md)
+
 ## Table of Contents
 
 1. [Overview](#overview)

@@ -87,6 +87,11 @@ impl Dataset for MultiBackendDataset {
         Some(self.uris.len())
     }
 
+    /// Return all URIs — enables URI-carrying iterators (e.g. `PyBytesAsyncDataLoader.items()`).
+    fn keys(&self) -> Option<Vec<String>> {
+        Some(self.uris.clone())
+    }
+
     async fn get(&self, idx: usize) -> Result<Self::Item, DatasetError> {
         let uri = self
             .uris

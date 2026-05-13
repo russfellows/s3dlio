@@ -1,5 +1,171 @@
 # s3dlio Changelog
 
+## Version 0.9.100 — General-purpose object data loader: `PyDataset.from_uris()`, `items()`, `collect_batch()` (May 12, 2026)
+
+### New: URI-manifest dataset and URI-carrying iterators
+
+Adds three new Python API primitives for building high-performance object streaming
+pipelines from pre-built URI lists.  All three are backend-agnostic: they work with
+`s3://`, `file://`, `direct://`, `az://`, and `gs://` URIs.
+
+---
+
+#### `PyDataset.from_uris(uris, _opts=None)` — map-style dataset from a URI list
+
+```python
+ds = s3dlio.PyDataset.from_uris(uris)
+```
+
+Creates a map-style `PyDataset` directly from a `list[str]` of full URIs.  **No listing
+occurs** — the URIs are used as-is.  The storage backend is inferred from the first entry.
+
+Use this whenever you already have a manifest, a per-worker shard, or any other
+pre-computed file list and you do not want the overhead of a prefix listing.
+
+- All URIs must share the same scheme (backend is selected from `uris[0]`).
+- `len(ds)` equals `len(uris)`.
+- Pass the result directly to `PyBytesAsyncDataLoader`.
+
+Contrast with `PyDataset(prefix_uri)`, which calls `list_objects()` on a storage prefix
+and discovers files at runtime.
+
+---
+
+#### `PyBytesAsyncDataLoader.items()` → `PyObjectDataLoaderSyncIter`
+
+```python
+item_iter = loader.items()
+for item in item_iter:          # GIL released per item while waiting
+    process(item.uri, len(item))
+```
+
+Synchronous iterator that yields `PyObjectItem` values in **network-completion order**.
+
+Unlike `__iter__()` (which returns bare `PyBytesView`), `items()` attaches the source URI
+to every result.  Python never needs a parallel index to know which object arrived.
+
+**Concurrency model:** Tokio keeps exactly `prefetch` GET requests in flight at all times
+via `buffer_unordered`.  Each Python consumption frees one slot and immediately triggers
+one new GET — a true sliding window with no chunk boundaries and no idle gaps.
+
+**GIL behaviour:** The GIL is released on every `__next__()` call while
+`blocking_recv()` waits for the channel.  Other PyTorch DataLoader worker processes run
+freely during that wait (each worker has its own GIL).
+
+**`PyObjectItem` attributes:**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `item.uri` | `str` | Full URI of the completed GET |
+| `item.byte_count` | `int` | Bytes transferred (same as `len(item)`) |
+| `len(item)` | `int` | Alias for `byte_count` |
+| `bytes(item)` | `bytes` | Raw data — creates one Python-heap copy |
+
+---
+
+#### `PyObjectDataLoaderSyncIter.collect_batch(n)` → `list[PyObjectItem]`
+
+```python
+item_iter = loader.items()
+while batch := item_iter.collect_batch(16):   # returns [] at end of stream
+    for item in batch:
+        process(item.uri, len(item))
+```
+
+Drains up to `n` completed items from the Rust channel with **one GIL crossing** for the
+entire batch, instead of one crossing per item.
+
+**How it works:** A single `py.detach()` block calls `blocking_recv()` up to `n` times
+without touching the GIL.  After collecting all `n` items (or reaching end of stream) the
+GIL is reacquired once to wrap the raw `(uri, Bytes)` tuples into a Python list.  Python
+then iterates a plain list — no `__next__()` dispatch overhead per element.
+
+**Choosing `n`:** A natural value for DLIO-style loops is
+`max(1, batch_size // num_samples_per_file)` — one training batch's worth of files per
+drain.  This aligns Rust drain boundaries with training batch boundaries and works
+correctly for both `num_samples_per_file=1` (JPEG/PNG) and `num_samples_per_file=4`
+(NPZ/NPY).
+
+Returns an **empty list** when the stream is exhausted — use this as the stop signal
+(compatible with the walrus-operator `while batch :=` pattern).
+
+---
+
+### Internal: `MultiBackendDataset::from_uris()` and `keys()`
+
+- `MultiBackendDataset::from_uris(uris)` — public Rust constructor for URI-manifest
+  datasets; backend selected from `uris[0]` via `store_for_uri()`.
+- `MultiBackendDataset::keys()` — implements `Dataset::keys()`, returning `Some(self.uris.clone())`.
+  Required for `items()` to attach URIs to completed GETs.
+- `api::dataset_from_uris()` — public stable-API wrapper used by `PyDataset::from_uris()`.
+
+---
+
+### GIL overhead analysis
+
+At typical object store rates (~1,600 completions/sec per subprocess worker at loopback
+latency), `items()` per-item GIL cost is ~0.33% of wall time per worker.  `collect_batch(n)`
+reduces this to a single crossing per `n` items; the primary value of `collect_batch()` is
+reduced Python object-allocation pressure (one list allocation vs. `n` `PyObjectItem`
+constructor calls interleaved with network waits).
+
+Full analysis: [`docs/api/batch-api-design-analysis.md`](api/batch-api-design-analysis.md).
+
+---
+
+### New: `skip_head` — process-wide HEAD-skip optimisation
+
+Eliminates redundant HEAD requests that previously fired once per object on first
+access when using the range-optimisation path.
+
+**Background:** `get_object_uri_optimized_async` previously issued a HEAD request on
+every cache-miss URI to learn the object size before deciding whether to use a plain
+streaming GET or parallel range GETs (threshold: 32 MiB).  For small objects (images,
+NPZ, HDF5 row groups) the size is always below the threshold, so the HEAD learned
+nothing useful and was pure overhead — adding one extra RTT per object per epoch-1
+pass.
+
+**What changed:**
+
+- New `skip_head: bool` field in `LoaderOptions` — defaults to **`true`**.
+- When `true`, `get_object_uri_optimized_async` skips the HEAD and issues a plain
+  streaming GET immediately.  After the GET completes the actual size (from
+  `Bytes::len()`) is stored in the `ObjectSizeCache` — so epoch 2+ still gets correct
+  range-split routing for large objects at zero extra cost.
+- New `set_skip_head(bool)` public function in `s3_utils` that activates the
+  process-wide `AtomicBool` latch; also read from the `S3DLIO_SKIP_HEAD=1` env var
+  on first call.
+- `PyBytesAsyncDataLoader.items()` and `__iter__()` call `set_skip_head(true)` when
+  `opts["skip_head"] == True`.
+
+**Effective GET pattern per epoch:**
+
+```
+Epoch 1 (skip_head=True):   plain GET  → cache size     (no HEAD)
+Epoch 2+:                   cache hit  → route decision  (range GET if ≥ 32 MiB)
+```
+
+**Python API:**
+
+```python
+# Small objects (default) — no HEAD ever
+loader = s3dlio.PyBytesAsyncDataLoader(ds, {"prefetch": 64})
+
+# Large objects, single-epoch job — HEAD fires on epoch 1 for immediate range GETs
+loader = s3dlio.PyBytesAsyncDataLoader(ds, {"prefetch": 8, "skip_head": False})
+
+# Or via environment (no code change)
+# export S3DLIO_SKIP_HEAD=1
+```
+
+**Observed impact (retinanet, 500 k objects, loopback S3):** eliminates 500 HEAD/s
+visible on server-side metrics during epoch 1.  Epoch-1 throughput unchanged at
+~150 MiB/s / ~97% AU; epoch-2 identical (no regression).
+
+See [`docs/Python_Data-Loader.md § HEAD-skip optimisation`](Python_Data-Loader.md#head-skip-optimisation).
+
+---
+
 ## Version 0.9.98 — Parquet DataLoader with epoch-2 fast path and Arrow IPC decode (May 9, 2026)
 
 ### New: `ParquetRowGroupDataset` — epoch-aware Parquet DataLoader for AI/ML training loops

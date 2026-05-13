@@ -108,12 +108,18 @@ pub fn len() -> usize {
 // ── Internal fetch + parse ────────────────────────────────────────────────────
 
 async fn fetch_and_parse(uri: &str, footer_cap: u64) -> anyhow::Result<CachedFileMeta> {
-    use crate::s3_utils::{get_object_range_uri_async, stat_object_uri_async};
+    use crate::object_store::store_for_uri;
     use bytes::Bytes;
     use parquet::file::metadata::ParquetMetaDataReader;
 
+    // Use the generic ObjectStore so all URI schemes work:
+    // s3://, file://, direct://, az://, gs://
+    let store =
+        store_for_uri(uri).map_err(|e| anyhow::anyhow!("store_for_uri '{}': {}", uri, e))?;
+
     // 1. Stat to get file size.
-    let stat = stat_object_uri_async(uri)
+    let stat = store
+        .stat(uri)
         .await
         .map_err(|e| anyhow::anyhow!("stat '{}': {}", uri, e))?;
     let file_size = stat.size;
@@ -121,7 +127,8 @@ async fn fetch_and_parse(uri: &str, footer_cap: u64) -> anyhow::Result<CachedFil
     // 2. Fetch last `footer_cap` bytes (or the whole file if smaller).
     let fetch_len = footer_cap.min(file_size);
     let offset = file_size - fetch_len;
-    let buf: Bytes = get_object_range_uri_async(uri, offset, Some(fetch_len))
+    let buf: Bytes = store
+        .get_range(uri, offset, Some(fetch_len))
         .await
         .map_err(|e| anyhow::anyhow!("footer GET '{}': {}", uri, e))?;
 

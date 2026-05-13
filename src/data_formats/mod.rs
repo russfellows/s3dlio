@@ -4,6 +4,7 @@
 #[cfg(feature = "hdf5")]
 pub mod hdf5;
 pub mod npz;
+pub mod parquet_gen;
 pub mod raw;
 pub mod tfrecord;
 
