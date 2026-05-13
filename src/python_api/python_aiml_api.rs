@@ -115,6 +115,44 @@ impl PyDataset {
             .keys()
             .ok_or_else(|| PyRuntimeError::new_err("keys() not supported for this dataset type"))
     }
+
+    /// Create a dataset from a pre-built list of URIs — no listing occurs.
+    ///
+    /// This is the general-purpose alternative to ``PyDataset(uri)`` (which
+    /// lists all objects under a prefix URI).  Use it whenever you already
+    /// have a manifest file, a per-worker shard, or any other pre-built URI
+    /// collection.
+    ///
+    /// All URIs must use the same scheme (``s3://``, ``file://``, ``az://``,
+    /// …).  The backend is inferred from the first entry.
+    ///
+    /// Parameters
+    /// ----------
+    /// uris : list[str]
+    ///     Full URIs of every object in the dataset.  Must be non-empty.
+    ///
+    /// Returns
+    /// -------
+    /// PyDataset
+    ///     A map-style dataset whose ``len()`` equals ``len(uris)``.
+    ///     Pass it to ``PyBytesAsyncDataLoader`` for sliding-window I/O.
+    ///
+    /// Examples
+    /// --------
+    /// >>> uris = ["s3://bucket/shard/a.jpg", "s3://bucket/shard/b.jpg"]
+    /// >>> ds = s3dlio.PyDataset.from_uris(uris)
+    /// >>> loader = s3dlio.PyBytesAsyncDataLoader(ds, {"prefetch": 64})
+    /// >>> for item in loader:          # GIL released while waiting
+    /// ...     process(len(item))       # bytes per object
+    #[staticmethod]
+    #[pyo3(signature = (uris, _opts=None))]
+    fn from_uris(uris: Vec<String>, _opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
+        let ds = crate::api::dataset_from_uris(uris)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::from(ds),
+        })
+    }
 }
 
 impl Clone for PyDataset {
@@ -165,6 +203,11 @@ impl PyBytesAsyncDataLoader {
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<PyBytesDataLoaderSyncIter>> {
         let prefetch = slf.opts.prefetch.max(1);
         let dataset = slf.dataset.clone();
+
+        // Activate process-wide HEAD-skip latch if requested.
+        if slf.opts.skip_head {
+            crate::s3_utils::set_skip_head(true);
+        }
 
         // Bounded channel: capacity = prefetch depth.
         // Producer backs off automatically when Python consumer is slow.
@@ -249,6 +292,269 @@ impl PyBytesAsyncDataLoader {
                 rx: std::sync::Mutex::new(rx),
             },
         )
+    }
+
+    /// Sliding-window iterator that yields `PyObjectItem` in network-completion order.
+    ///
+    /// Unlike `__iter__()` (which returns bare `PyBytesView`), `items()` attaches the
+    /// full URI to every result so Python always knows *which* object arrived — even
+    /// when completions are out of submission order.
+    ///
+    /// Concurrency model
+    /// -----------------
+    /// Tokio keeps exactly ``prefetch`` GET requests in flight at all times via
+    /// `buffer_unordered`.  Each item Python consumes frees one slot and immediately
+    /// triggers one new GET — a true sliding window with no chunk boundaries, no
+    /// thundering-herd spikes, and no idle periods between chunks.
+    ///
+    /// Backpressure
+    /// ------------
+    /// The mpsc channel capacity equals ``prefetch``.  If Python is slow the producer
+    /// blocks on ``tx.send().await``; if Python is fast the channel stays full.  No
+    /// semaphores, no polling, no explicit rate-limiting required.
+    ///
+    /// Example
+    /// -------
+    /// ```python
+    /// uris = ["s3://bucket/a.jpg", "s3://bucket/b.jpg"]
+    /// ds = s3dlio.PyDataset.from_uris(uris)
+    /// loader = s3dlio.PyBytesAsyncDataLoader(ds, {"prefetch": 64})
+    /// for item in loader.items():
+    ///     process(item.uri, len(item))
+    /// ```
+    fn items(slf: PyRef<'_, Self>) -> PyResult<Py<PyObjectDataLoaderSyncIter>> {
+        use futures_util::stream::{self, StreamExt as _};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let prefetch = slf.opts.prefetch.max(1);
+        let dataset = slf.dataset.clone();
+
+        // Activate process-wide HEAD-skip latch if requested.
+        if slf.opts.skip_head {
+            crate::s3_utils::set_skip_head(true);
+        }
+
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<(String, Bytes), DatasetError>>(prefetch);
+
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            if let Some(len) = dataset.inner.len() {
+                // Snapshot keys once — attaches URI to each completed item.
+                // Fallback to "item:<idx>" for datasets that don't expose keys().
+                let keys: Arc<Option<Vec<String>>> = Arc::new(dataset.inner.keys());
+
+                let t_start = Instant::now();
+                let mut total_bytes: u64 = 0;
+                let mut count: usize = 0;
+
+                tracing::info!(
+                    total_items = len,
+                    prefetch,
+                    "[s3dlio] items() starting: {} items, {} in-flight",
+                    len,
+                    prefetch,
+                );
+
+                let mut stream = stream::iter(0..len)
+                    .map(|idx| {
+                        let ds = dataset.clone();
+                        let k = Arc::clone(&keys);
+                        async move {
+                            let uri = k
+                                .as_ref()
+                                .as_ref()
+                                .and_then(|v| v.get(idx).cloned())
+                                .unwrap_or_else(|| format!("item:{}", idx));
+                            ds.inner.get(idx).await.map(|b| (uri, b))
+                        }
+                    })
+                    .buffer_unordered(prefetch);
+
+                while let Some(result) = stream.next().await {
+                    if let Ok((_, ref bytes)) = result {
+                        total_bytes += bytes.len() as u64;
+                        count += 1;
+                        if count % 500 == 0 {
+                            let elapsed = t_start.elapsed().as_secs_f64();
+                            tracing::info!(
+                                "[s3dlio] items() progress: {}/{} | {:.0} MB/s",
+                                count,
+                                len,
+                                total_bytes as f64 / elapsed.max(0.001) / 1_048_576.0,
+                            );
+                        }
+                    }
+                    if tx.send(result).await.is_err() {
+                        break; // Python dropped the iterator
+                    }
+                }
+
+                let elapsed = t_start.elapsed().as_secs_f64();
+                tracing::info!(
+                    "[s3dlio] items() done: {}/{} | {:.1} MiB | {:.0} MB/s",
+                    count,
+                    len,
+                    total_bytes as f64 / 1_048_576.0,
+                    total_bytes as f64 / elapsed.max(0.001) / 1_048_576.0,
+                );
+            }
+            // Note: iterable-style datasets (as_stream) have no per-item URI;
+            // use __iter__() for those. items() is for map-style datasets where
+            // every item has a stable, known URI.
+        });
+
+        Py::new(
+            slf.py(),
+            PyObjectDataLoaderSyncIter {
+                rx: std::sync::Mutex::new(rx),
+            },
+        )
+    }
+}
+
+/// A single object returned by `PyBytesAsyncDataLoader.items()`.
+///
+/// Carries both the URI and the raw bytes so Python never has to maintain a
+/// parallel index to know *which* object arrived.  Because s3dlio's Tokio
+/// runtime delivers items in network-completion order, the URI is the only
+/// reliable way to identify each item on the Python side.
+///
+/// Attributes (Python)
+/// -------------------
+/// ``item.uri``        — full URI of the object (``s3://…``, ``file://…``, …)
+/// ``item.byte_count`` — number of bytes transferred (same as ``len(item)``)
+/// ``bytes(item)``     — raw bytes; creates a Python ``bytes`` copy
+/// ``len(item)``       — alias for ``byte_count``
+#[pyclass]
+pub struct PyObjectItem {
+    #[pyo3(get)]
+    pub uri: String,
+    data: Bytes,
+}
+
+#[pymethods]
+impl PyObjectItem {
+    #[getter]
+    fn byte_count(&self) -> usize {
+        self.data.len()
+    }
+
+    fn __len__(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Return the raw bytes as a Python ``bytes`` object (one copy).
+    fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.data)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PyObjectItem(uri={:?}, byte_count={})",
+            self.uri,
+            self.data.len()
+        )
+    }
+}
+
+/// Synchronous iterator returned by `PyBytesAsyncDataLoader.items()`.
+///
+/// Yields `PyObjectItem` values in network-completion order — whichever GET
+/// finishes first is delivered first, eliminating tail-latency stalls.
+///
+/// The GIL is released on every `__next__()` call while waiting for the
+/// Tokio channel; other Python threads (including other DataLoader workers)
+/// run freely during that wait.
+#[pyclass]
+pub struct PyObjectDataLoaderSyncIter {
+    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<(String, Bytes), DatasetError>>>,
+}
+
+#[pymethods]
+impl PyObjectDataLoaderSyncIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyObjectItem>> {
+        // Release GIL while the channel is empty (Tokio GETs in flight).
+        let result = py.detach(|| {
+            self.rx
+                .lock()
+                .expect("PyObjectDataLoaderSyncIter rx mutex poisoned")
+                .blocking_recv()
+        });
+
+        match result {
+            Some(Ok((uri, data))) => Py::new(py, PyObjectItem { uri, data }),
+            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            None => Err(PyStopIteration::new_err("end of dataset")),
+        }
+    }
+
+    /// Collect up to `n` completed items from the Rust/Tokio sliding window and
+    /// return them as a Python **list** of `PyObjectItem`.
+    ///
+    /// # GIL behaviour
+    ///
+    /// The GIL is released **once** for the entire batch.  Inside the
+    /// `py.detach()` block, `blocking_recv()` is called up to `n` times
+    /// without ever reacquiring the GIL.  After all `n` items (or end-of-stream)
+    /// are collected into a plain Rust `Vec`, the GIL is reacquired exactly
+    /// **once** to wrap each `(uri, Bytes)` pair into a `PyObjectItem`.
+    ///
+    /// Contrast with calling `__next__()` n times: that would be n GIL
+    /// release + reacquire cycles.  Here there is exactly 1, regardless of n.
+    ///
+    /// # Return value
+    ///
+    /// Returns an empty list when the stream is exhausted.  The caller should
+    /// treat an empty return as the stop signal:
+    ///
+    /// ```python
+    /// item_iter = loader.items()
+    /// while batch := item_iter.collect_batch(16):
+    ///     for item in batch:
+    ///         process(item)
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Propagates any `DatasetError` from a failed GET as a Python
+    /// `RuntimeError`, aborting the batch.
+    #[pyo3(signature = (n))]
+    fn collect_batch(&self, py: Python<'_>, n: usize) -> PyResult<Vec<Py<PyObjectItem>>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Release GIL for the entire drain loop — no Python objects created here.
+        let raw: Vec<Result<(String, Bytes), DatasetError>> = py.detach(|| {
+            let mut rx = self
+                .rx
+                .lock()
+                .expect("PyObjectDataLoaderSyncIter rx mutex poisoned");
+            let mut buf = Vec::with_capacity(n);
+            for _ in 0..n {
+                match rx.blocking_recv() {
+                    Some(item) => buf.push(item),
+                    None => break, // channel closed — stream exhausted
+                }
+            }
+            buf
+        });
+
+        // GIL reacquired exactly once here.  Build Python objects from the
+        // collected raw tuples.
+        let mut items = Vec::with_capacity(raw.len());
+        for result in raw {
+            match result {
+                Ok((uri, data)) => items.push(Py::new(py, PyObjectItem { uri, data })?),
+                Err(e) => return Err(PyRuntimeError::new_err(e.to_string())),
+            }
+        }
+        Ok(items)
     }
 }
 
@@ -852,6 +1158,7 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             "footer_cap",
             "decode", // "raw" (default) | "arrow" (Rust Arrow IPC) | "none" (raw, no Python decode)
             "max_threads", // limit pyo3 Tokio runtime threads (MPI: set to num_cpus / world_size)
+            "skip_head", // skip HEAD requests; sets process-wide latch (see s3_utils::set_skip_head)
         ];
         for key in d.keys() {
             if let Ok(key_str) = key.extract::<&str>() {
@@ -873,6 +1180,7 @@ fn opts_from_dict(d: Option<Bound<'_, PyDict>>) -> LoaderOptions {
             num_workers: g_usize("num_workers", def.num_workers),
             prefetch: g_usize("prefetch", def.prefetch),
             auto_tune: g_bool("auto_tune", def.auto_tune),
+            skip_head: g_bool("skip_head", def.skip_head),
 
             // new fields
             loading_mode: def.loading_mode, // Use default loading mode
@@ -2071,7 +2379,9 @@ pub fn generate_parquet_bytes_schema(
     use crate::python_api::python_core_api::PyBytesView;
 
     let bytes = py
-        .detach(|| parquet_gen::generate_parquet_bytes_schema(&columns, rows_per_rg, num_row_groups))
+        .detach(|| {
+            parquet_gen::generate_parquet_bytes_schema(&columns, rows_per_rg, num_row_groups)
+        })
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     Ok(PyBytesView::new(bytes))
@@ -2965,6 +3275,8 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBytesAsyncDataLoader>()?;
     m.add_class::<PyBytesAsyncDataLoaderIter>()?;
     m.add_class::<PyBytesDataLoaderSyncIter>()?;
+    m.add_class::<PyObjectItem>()?;
+    m.add_class::<PyObjectDataLoaderSyncIter>()?;
     m.add_class::<PyParquetItem>()?;
     m.add_class::<ParquetStreamIter>()?;
     m.add_class::<PyParquetStreamLoader>()?;
@@ -2987,7 +3299,10 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Schema-flexible generation: named columns, per-column float32 count
     m.add_function(wrap_pyfunction!(generate_parquet_bytes_schema, m)?)?;
     m.add_function(wrap_pyfunction!(generate_and_write_parquet_schema, m)?)?;
-    m.add_function(wrap_pyfunction!(generate_and_write_parquet_schema_streaming, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        generate_and_write_parquet_schema_streaming,
+        m
+    )?)?;
 
     // Parquet metadata cache helpers
     m.add_function(wrap_pyfunction!(parquet_rg_row_offsets, m)?)?;

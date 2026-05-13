@@ -128,7 +128,10 @@ pub async fn generate_and_write_parquet(
 ) -> Result<()> {
     let bytes = generate_parquet_bytes(num_cols, rows_per_rg, num_row_groups)?;
     let store = store_for_uri(uri)?;
-    store.put_multipart(uri, bytes, None).await.context("store put_multipart")?;
+    store
+        .put_multipart(uri, bytes, None)
+        .await
+        .context("store put_multipart")?;
     Ok(())
 }
 
@@ -212,11 +215,9 @@ pub fn generate_parquet_bytes_schema(
                     Arc::new(Float32Array::new(scalar_buf, None))
                 } else {
                     // FixedSizeList<Float32>[col_size] embedding column
-                    let scalar_buf =
-                        arrow_buffer::ScalarBuffer::<f32>::new(arr_buf, 0, n_floats);
+                    let scalar_buf = arrow_buffer::ScalarBuffer::<f32>::new(arr_buf, 0, n_floats);
                     let values = Arc::new(Float32Array::new(scalar_buf, None));
-                    let child_field =
-                        Arc::new(Field::new("element", DataType::Float32, false));
+                    let child_field = Arc::new(Field::new("element", DataType::Float32, false));
                     Arc::new(FixedSizeListArray::new(
                         child_field,
                         *col_size as i32,
@@ -227,8 +228,8 @@ pub fn generate_parquet_bytes_schema(
             })
             .collect();
 
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
-            .context("RecordBatch::try_new")?;
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), arrays).context("RecordBatch::try_new")?;
         writer.write(&batch).context("ArrowWriter::write")?;
         writer.flush().context("ArrowWriter::flush")?;
     }
@@ -249,7 +250,10 @@ pub async fn generate_and_write_parquet_schema(
 ) -> Result<()> {
     let bytes = generate_parquet_bytes_schema(&columns, rows_per_rg, num_row_groups)?;
     let store = store_for_uri(uri)?;
-    store.put_multipart(uri, bytes, None).await.context("store put_multipart")?;
+    store
+        .put_multipart(uri, bytes, None)
+        .await
+        .context("store put_multipart")?;
     Ok(())
 }
 
@@ -358,10 +362,11 @@ pub async fn generate_and_write_parquet_schema_streaming(
 
         // Shared buffer: ArrowWriter writes here; we drain it per row group.
         let shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let writer_buf = SharedBufWriter { inner: Arc::clone(&shared) };
-        let mut writer =
-            ArrowWriter::try_new(writer_buf, Arc::clone(&schema), Some(props))
-                .context("ArrowWriter init")?;
+        let writer_buf = SharedBufWriter {
+            inner: Arc::clone(&shared),
+        };
+        let mut writer = ArrowWriter::try_new(writer_buf, Arc::clone(&schema), Some(props))
+            .context("ArrowWriter init")?;
 
         // ONE pool reused across all row groups and columns — no re-seeding.
         let mut pool = RollingPool::new(1, 1);
@@ -371,8 +376,7 @@ pub async fn generate_and_write_parquet_schema_streaming(
                 .iter()
                 .map(|(_, col_size)| -> Arc<dyn Array> {
                     let n_floats = rows_per_rg * col_size;
-                    let raw: Bytes =
-                        pool.next_slice(n_floats * std::mem::size_of::<f32>());
+                    let raw: Bytes = pool.next_slice(n_floats * std::mem::size_of::<f32>());
                     let arr_buf: Buffer = raw.into();
                     if *col_size == 1 {
                         let scalar_buf =
@@ -382,8 +386,7 @@ pub async fn generate_and_write_parquet_schema_streaming(
                         let scalar_buf =
                             arrow_buffer::ScalarBuffer::<f32>::new(arr_buf, 0, n_floats);
                         let values = Arc::new(Float32Array::new(scalar_buf, None));
-                        let child_field =
-                            Arc::new(Field::new("element", DataType::Float32, false));
+                        let child_field = Arc::new(Field::new("element", DataType::Float32, false));
                         Arc::new(FixedSizeListArray::new(
                             child_field,
                             *col_size as i32,
@@ -404,8 +407,9 @@ pub async fn generate_and_write_parquet_schema_streaming(
 
             let chunk = std::mem::take(&mut *shared.lock().unwrap());
             if !chunk.is_empty() {
-                tx.blocking_send(chunk)
-                    .map_err(|_| anyhow::anyhow!("upload consumer dropped before all row groups"))?;
+                tx.blocking_send(chunk).map_err(|_| {
+                    anyhow::anyhow!("upload consumer dropped before all row groups")
+                })?;
             }
         }
 
@@ -424,14 +428,15 @@ pub async fn generate_and_write_parquet_schema_streaming(
     // Open the multipart upload before the first chunk arrives so that
     // CreateMultipartUpload is in flight while the producer generates RG 0.
     let (bucket, key) = parse_s3_uri(uri)?;
-    let mut sink =
-        MultipartUploadSink::new_async(&bucket, &key, MultipartUploadConfig::default())
-            .await
-            .context("CreateMultipartUpload failed")?;
+    let mut sink = MultipartUploadSink::new_async(&bucket, &key, MultipartUploadConfig::default())
+        .await
+        .context("CreateMultipartUpload failed")?;
 
     while let Some(chunk) = rx.recv().await {
         // Vec<u8> → Bytes::from() is zero-copy inside write().
-        sink.write(chunk).await.context("multipart write chunk failed")?;
+        sink.write(chunk)
+            .await
+            .context("multipart write chunk failed")?;
     }
 
     // Propagate any generation error from the producer.
@@ -441,7 +446,9 @@ pub async fn generate_and_write_parquet_schema_streaming(
         .context("row group generation failed")?;
 
     // Flush tail + CompleteMultipartUpload.
-    sink.finish().await.context("CompleteMultipartUpload failed")?;
+    sink.finish()
+        .await
+        .context("CompleteMultipartUpload failed")?;
 
     Ok(())
 }

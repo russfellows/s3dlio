@@ -179,6 +179,17 @@ pub struct LoaderOptions {
     /// When set, all prefetch loops and async workers will cooperatively cancel
     /// Enables clean Ctrl-C handling and prevents orphaned background tasks
     pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    // ── New in v0.9.100 (HEAD-skip optimisation) ─────────────────────────────
+    /// When `true` (default), skips the HEAD request in
+    /// `get_object_uri_optimized_async` and issues a plain streaming GET.
+    /// The actual object size is cached after every GET, so from epoch 2
+    /// onwards range splitting fires correctly for large objects — there is
+    /// no long-term downside to skipping HEAD.
+    ///
+    /// Set to `false` only when you need range splitting to be active from
+    /// the very first epoch (e.g. very large objects, single-epoch jobs).
+    /// Equivalent to setting `S3DLIO_SKIP_HEAD=0` in the environment.
+    pub skip_head: bool,
 }
 
 impl Default for LoaderOptions {
@@ -224,6 +235,9 @@ impl Default for LoaderOptions {
 
             // new defaults (v0.9.2 - cancellation support)
             cancellation_token: None, // No cancellation by default
+
+            // new defaults (v0.9.100 - HEAD-skip)
+            skip_head: true, // On by default; cache is populated after GET so epoch 2+ still range-splits
         }
     }
 }

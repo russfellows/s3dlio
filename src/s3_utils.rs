@@ -16,6 +16,7 @@ use pyo3::{FromPyObject, PyAny};
 use regex::Regex;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -179,6 +180,49 @@ pub const DEFAULT_OBJECT_SIZE: usize = 20 * 1024 * 1024;
 static RANGE_OPT_ENABLED: OnceLock<bool> = OnceLock::new();
 static RANGE_THRESHOLD_BYTES: OnceLock<u64> = OnceLock::new();
 static GLOBAL_SIZE_CACHE: OnceLock<Arc<ObjectSizeCache>> = OnceLock::new();
+
+/// Process-wide latch: when true, `get_object_uri_optimized_async` skips the
+/// HEAD request entirely and issues a plain streaming GET for every object.
+///
+/// Set programmatically via `set_skip_head(true)` (triggered by the
+/// `skip_head` loader option) **or** by setting `S3DLIO_SKIP_HEAD=1` in the
+/// process environment before startup.  Once set to `true` it stays `true`
+/// for the lifetime of the process — intentional: a process that elects to
+/// skip HEADs for one loader should skip them for all loaders.
+static SKIP_HEAD: AtomicBool = AtomicBool::new(false);
+
+/// Activate the process-wide HEAD-skip latch.
+///
+/// Called from `PyBytesAsyncDataLoader` when the user passes
+/// `{"skip_head": True}` in the loader opts dict.  Safe to call from any
+/// thread; subsequent calls are no-ops (latch stays `true`).
+pub fn set_skip_head(v: bool) {
+    if v {
+        SKIP_HEAD.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Returns `true` if HEAD requests should be skipped globally.
+///
+/// Checks both the runtime latch (set via `set_skip_head`) and the
+/// `S3DLIO_SKIP_HEAD` env var (read once on first call, then cached).
+fn get_skip_head() -> bool {
+    if SKIP_HEAD.load(Ordering::Relaxed) {
+        return true;
+    }
+    // Lazily check env var once and latch if set.
+    static ENV_CHECKED: OnceLock<bool> = OnceLock::new();
+    *ENV_CHECKED.get_or_init(|| {
+        let from_env = std::env::var("S3DLIO_SKIP_HEAD")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if from_env {
+            SKIP_HEAD.store(true, Ordering::Relaxed);
+        }
+        from_env
+    })
+}
 
 /// Whether range optimization (range splitting) is enabled.
 /// Cached once per process from S3DLIO_ENABLE_RANGE_OPTIMIZATION.
@@ -1484,6 +1528,20 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
     if !get_range_opt_enabled() {
         debug!("range_opt disabled: single GET for {}", uri);
         return get_object(&bucket, &key).await;
+    }
+
+    // Fast path: skip_head latch — skip HEAD, issue plain GET directly.
+    // Activated by `skip_head=True` loader opt or S3DLIO_SKIP_HEAD=1 env var.
+    // After the GET we populate the ObjectSizeCache so that epoch 2+ can use
+    // range splitting for large objects — zero downside to skipping HEAD.
+    if get_skip_head() {
+        debug!("skip_head: plain GET (no HEAD) for {}", uri);
+        let bytes = get_object(&bucket, &key).await?;
+        // Cache the actual size so future calls can range-split if warranted.
+        get_size_cache()
+            .put(uri.to_string(), bytes.len() as u64)
+            .await;
+        return Ok(bytes);
     }
 
     let range_threshold = get_range_threshold_bytes();
