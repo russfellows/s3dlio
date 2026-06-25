@@ -1,5 +1,136 @@
 # s3dlio Changelog
 
+## Version 0.9.102 — SDK error-chain diagnostics + cold-start timeout / retry knobs (mlcommons/storage#506)
+
+### Why this release
+
+External report mlcommons/storage#506 surfaced a `RuntimeError: dispatch
+failure` from the s3dlio `collect_batch()` path at warmup of a 50 M-file
+RetinaNet B200 training run.  Investigation found two distinct problems
+sitting underneath the opaque error string:
+
+1. The bare `SdkError::DispatchFailure` Display was being passed through
+   to Python with no connector-chain detail attached — operators could
+   not tell whether the underlying cause was I/O, TLS, DNS, timeout, or
+   connection refused.  The pre-existing `format_sdk_error()` helper was
+   wired on the LIST path only; every GET / HEAD / PUT / range / multipart
+   site dropped the chain via `?` or `.context()`.
+2. The TCP connect timeout was hardcoded (5 s on the SDK layer, 10 s on
+   the reqwest transport — the smaller wins, so 5 s in practice).  The
+   constant's doc-comment claimed `S3DLIO_CONNECT_TIMEOUT_SECS` was an
+   override, but no code read it.  Under cold-start fan-out (128 worker
+   processes × 64 prefetch_window = 8 K concurrent connects) the 5 s
+   ceiling was a credible cause of the dispatch failures.
+
+This release ships the diagnostic fix plus the timeout/retry knobs
+operators need to mitigate or fast-fail-debug the cold-start case.
+
+### Changed: SdkError → anyhow conversion now preserves the connector chain
+
+22 call sites across `s3_ops.rs`, `s3_utils.rs`, `object_store.rs`, and
+`multipart.rs` now route every SDK error through `format_sdk_error()`
+before reaching the caller.  Two new helpers in `s3_utils.rs`:
+
+- `pub(crate) fn sdk_anyhow(ctx, e: SdkError<E, R>) -> anyhow::Error`
+- `pub(crate) trait SdkResultExt<T> { fn sdk_context(self, ctx) -> Result<T> }`
+
+Both wrap `format_sdk_error()`, which already understands the SDK
+categories (I/O / timeout / TLS / DNS / refused / signature / construction)
+and emits a hint string per failure shape.  Python now sees, for example:
+
+```
+RuntimeError: S3 GET for s3://bkt/key failed:
+  dispatch failure (connection timeout: connect error: connection
+  attempt timed out after 5 seconds) — server did not respond within
+  the connect timeout — verify AWS_ENDPOINT_URL is correct and the
+  host is reachable
+```
+
+instead of the bare `dispatch failure`.  Behaviour on the success path
+is unchanged.
+
+A regression test `test_sdk_anyhow_keeps_context_in_top_message` in
+`s3_utils::tests` locks in the contract: the top-line message must
+contain both the operation context and the connector-error detail.
+
+> Note: this pass covers the S3 backend only.  The `gs://`, `az://`,
+> `file://`, and `direct://` backends still have similar opaque-error
+> sites and should get an equivalent helper + audit pass in a follow-up.
+> Doc-comments on both helpers call this out.
+
+### New env var: `S3DLIO_CONNECT_TIMEOUT_SECS`
+
+Default `20` (bumped from the previous hardcoded 10 s, which itself was
+shadowed by a 5 s SDK-layer ceiling — the *effective* connect timeout
+before this release was 5 s).  Honored by both the reqwest transport
+and the AWS SDK `TimeoutConfig` layer; the two layers now agree on a
+single value.  Raise (e.g. `30`, `60`) for extreme fan-out where the
+endpoint's TCP accept queue is briefly saturated by thousands of
+concurrent connects.
+
+Default rationale: 20 s is comfortable for healthy datacenter hosts
+(a stalled handshake at 20 s still indicates a problem worth flagging)
+and absorbs typical cold-start bursts without forcing operators to set
+the env var.
+
+### New env var: `S3DLIO_MAX_RETRY_ATTEMPTS`
+
+Default `3` — matches the AWS SDK's own default and the previous
+unread `DEFAULT_RETRY_COUNT` constant (which has been removed).  Wired
+via `RetryConfig::standard().with_max_attempts(N)` on both the global
+and per-endpoint S3 clients.  Two practical use cases:
+
+- `S3DLIO_MAX_RETRY_ATTEMPTS=1` — **fast-fail at warmup**.  Surfaces a
+  dispatch failure in ~one connect budget (~connect_timeout) instead
+  of ~3 × connect_timeout + exponential backoff.  Useful when
+  reproducing #506-style cold-start issues.
+- `S3DLIO_MAX_RETRY_ATTEMPTS=5+` — ride out flaky-network bursts on
+  unreliable links.
+
+Clamped to a minimum of 1 (the SDK rejects 0).
+
+### Docs
+
+- `docs/Environment_Variables.md`:
+  - Replaced dead names in 4 example blocks
+    (`S3DLIO_USE_OPTIMIZED_HTTP`, `S3DLIO_MAX_HTTP_CONNECTIONS`,
+    `S3DLIO_HTTP_IDLE_TIMEOUT_MS`) with real wired equivalents.
+  - New "Cold-Start Fan-Out Configuration" example targeting #506.
+  - New "Debug Configuration — Fast-Fail on Cold-Start Issues" block.
+  - New "Connection Timeouts and Retries" table row documenting the
+    new env vars.
+  - Stale "capped at 32" note on `S3DLIO_RT_THREADS` corrected (cap
+    was removed in v0.9.92).
+  - New "deprecated/dead names" block explicitly listing 8 fictitious
+    or unread variable names (including five that an external operator
+    set in their mpirun env: `S3DLIO_MAX_CONCURRENCY`,
+    `S3DLIO_CONNECTION_TIMEOUT`, `S3DLIO_READ_TIMEOUT`,
+    `S3DLIO_MULTIPART_THRESHOLD`, `S3DLIO_PART_SIZE`) — points each
+    to its real wired equivalent.
+
+### Tests
+
+- 9 new unit tests under `constants::connect_timeout_tests` and
+  `constants::max_retry_tests` cover the env-var helpers (default
+  fallback, parse, clamp, empty/unparseable).
+- 1 new regression guard in `s3_utils::tests` for the SDK error chain.
+- Full lib suite: **324 passed / 0 failed** (was 315 before this release).
+
+### Breaking changes
+
+- `pub const DEFAULT_RETRY_COUNT: usize = 3` was removed from
+  `constants.rs`.  It was declared but read by no production code; a
+  workspace-wide grep across known downstream crates (dl-driver,
+  sai3-bench) showed no consumers.  If a stable consumer surfaces
+  we'll re-add it as an alias to `DEFAULT_MAX_RETRY_ATTEMPTS`.
+
+- Default `DEFAULT_CONNECT_TIMEOUT_SECS` changed from `10` to `20`.
+  The *effective* connect timeout for almost all callers was previously
+  5 s (the SDK ceiling shadowed the 10 s transport setting), so most
+  users will see strictly more patience, not less.
+
+---
+
 ## Version 0.9.100 — General-purpose object data loader: `PyDataset.from_uris()`, `items()`, `collect_batch()` (May 12, 2026)
 
 ### New: URI-manifest dataset and URI-carrying iterators

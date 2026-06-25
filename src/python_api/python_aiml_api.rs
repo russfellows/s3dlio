@@ -246,7 +246,7 @@ impl PyBytesAsyncDataLoader {
                         count += 1;
 
                         // Log progress every 20 items OR every 5 seconds
-                        if count % 20 == 0 || t_last_log.elapsed().as_secs() >= 5 {
+                        if count.is_multiple_of(20) || t_last_log.elapsed().as_secs() >= 5 {
                             let elapsed = t_start.elapsed().as_secs_f64();
                             tracing::info!(
                                 count,
@@ -375,7 +375,7 @@ impl PyBytesAsyncDataLoader {
                     if let Ok((_, ref bytes)) = result {
                         total_bytes += bytes.len() as u64;
                         count += 1;
-                        if count % 500 == 0 {
+                        if count.is_multiple_of(500) {
                             let elapsed = t_start.elapsed().as_secs_f64();
                             tracing::info!(
                                 "[s3dlio] items() progress: {}/{} | {:.0} MB/s",
@@ -2216,7 +2216,7 @@ impl PyParquetStreamLoader {
                 if let Ok((_, ref b)) = result {
                     total_bytes += b.len() as u64;
                     count += 1;
-                    if count % 50 == 0 || t_last_log.elapsed().as_secs() >= 5 {
+                    if count.is_multiple_of(50) || t_last_log.elapsed().as_secs() >= 5 {
                         let elapsed = t_start.elapsed().as_secs_f64();
                         tracing::info!(
                             count,
@@ -2606,10 +2606,7 @@ pub fn parquet_get_rg(
                 let (offset, length) = parquet_rg::rg_byte_extent(rg_meta, col_indices.as_deref())
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 let store = store_for_uri(&uri_owned)?;
-                store
-                    .get_range(&uri_owned, offset, Some(length))
-                    .await
-                    .map_err(anyhow::Error::from)
+                store.get_range(&uri_owned, offset, Some(length)).await
             })
         })
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

@@ -34,7 +34,7 @@ pub const MAX_MULTIPART_PARTS: usize = 10000;
 /// a connect that hasn't completed in 20 s indicates a dead host, wrong IP, a
 /// firewall silently dropping packets, or — under heavy cold-start fan-out —
 /// an endpoint whose TCP accept queue is briefly saturated.  Default bumped
-/// from 10 s to 20 s in v0.9.101 after mlcommons/storage#506 showed the
+/// from 10 s to 20 s in v0.9.102 after mlcommons/storage#506 showed the
 /// hardcoded 5 s SDK ceiling was the trigger for warmup dispatch failures
 /// on RetinaNet B200 (2 048 concurrent connects to a single endpoint).
 /// Override with `S3DLIO_CONNECT_TIMEOUT_SECS`.
