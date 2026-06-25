@@ -35,6 +35,33 @@ pub const MAX_MULTIPART_PARTS: usize = 10000;
 /// a firewall silently dropping packets.  Override with `S3DLIO_CONNECT_TIMEOUT_SECS`.
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
+/// Environment variable name for the TCP connect-timeout override.
+///
+/// See [`DEFAULT_CONNECT_TIMEOUT_SECS`].  Consumed by every HTTP-client builder
+/// in s3dlio via [`connect_timeout_secs()`] so both the reqwest transport and
+/// the AWS-SDK `TimeoutConfig` layer agree on a single value — and on the same
+/// number reported in the docs.
+///
+/// Use a longer value under cold-start fan-out (e.g. mlperf-storage retinanet
+/// runs that issue thousands of concurrent connects at warmup): the default
+/// 10 s may be too aggressive when the endpoint's TCP accept queue is briefly
+/// saturated.  Example: `S3DLIO_CONNECT_TIMEOUT_SECS=30`.
+pub const ENV_CONNECT_TIMEOUT_SECS: &str = "S3DLIO_CONNECT_TIMEOUT_SECS";
+
+/// Resolve the effective TCP connect timeout in seconds.
+///
+/// Reads [`ENV_CONNECT_TIMEOUT_SECS`] each call (cheap; called only at HTTP
+/// client construction time, which happens once per process); falls back to
+/// [`DEFAULT_CONNECT_TIMEOUT_SECS`] when unset or unparseable.  Keep this in
+/// the constants module so reqwest_client.rs, s3_client.rs, and any future
+/// HTTP transport read from the same source.
+pub fn connect_timeout_secs() -> u64 {
+    std::env::var(ENV_CONNECT_TIMEOUT_SECS)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS)
+}
+
 /// Default operation timeout in seconds.
 ///
 /// Covers the full request/response cycle once the TCP connection is established
@@ -733,5 +760,58 @@ mod h2_window_tests {
         // Simulate "unset" — H2WindowConfig::default() should give adaptive=true.
         let cfg = H2WindowConfig::default();
         assert!(cfg.adaptive);
+    }
+}
+
+#[cfg(test)]
+mod connect_timeout_tests {
+    use super::*;
+
+    // These tests mutate process-global env; they run serially within the
+    // same module (cargo's default per-thread test execution would race).
+    // We use a Mutex to enforce serial access across the few tests below.
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_var<F: FnOnce()>(value: Option<&str>, body: F) {
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let prev = std::env::var(ENV_CONNECT_TIMEOUT_SECS).ok();
+        match value {
+            Some(v) => std::env::set_var(ENV_CONNECT_TIMEOUT_SECS, v),
+            None => std::env::remove_var(ENV_CONNECT_TIMEOUT_SECS),
+        }
+        body();
+        match prev {
+            Some(v) => std::env::set_var(ENV_CONNECT_TIMEOUT_SECS, v),
+            None => std::env::remove_var(ENV_CONNECT_TIMEOUT_SECS),
+        }
+    }
+
+    #[test]
+    fn test_connect_timeout_falls_back_to_default_when_unset() {
+        with_var(None, || {
+            assert_eq!(connect_timeout_secs(), DEFAULT_CONNECT_TIMEOUT_SECS);
+        });
+    }
+
+    #[test]
+    fn test_connect_timeout_honors_env_override() {
+        with_var(Some("30"), || {
+            assert_eq!(connect_timeout_secs(), 30);
+        });
+    }
+
+    #[test]
+    fn test_connect_timeout_unparseable_falls_back_to_default() {
+        with_var(Some("not-a-number"), || {
+            assert_eq!(connect_timeout_secs(), DEFAULT_CONNECT_TIMEOUT_SECS);
+        });
+    }
+
+    #[test]
+    fn test_connect_timeout_empty_falls_back_to_default() {
+        with_var(Some(""), || {
+            assert_eq!(connect_timeout_secs(), DEFAULT_CONNECT_TIMEOUT_SECS);
+        });
     }
 }

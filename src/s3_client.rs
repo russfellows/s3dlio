@@ -306,12 +306,18 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                 }
             }
 
-            // Load config fully async with optimized timeout configuration
+            // Load config fully async with optimized timeout configuration.
+            // connect_timeout honors S3DLIO_CONNECT_TIMEOUT_SECS (default 10s) —
+            // unified with the reqwest transport so both layers agree.
             let op_timeout = get_operation_timeout();
-            debug!("Timeouts — connect: 5s, operation: {:?}", op_timeout);
+            let connect_secs = crate::constants::connect_timeout_secs();
+            debug!(
+                "Timeouts — connect: {}s, operation: {:?}",
+                connect_secs, op_timeout
+            );
             let timeout_config = TimeoutConfig::builder()
-                .connect_timeout(Duration::from_secs(5))  // Quick connection timeout
-                .operation_timeout(op_timeout)             // Configurable for large transfers
+                .connect_timeout(Duration::from_secs(connect_secs))
+                .operation_timeout(op_timeout)
                 .build();
 
             let mut config_builder = loader.timeout_config(timeout_config);
@@ -404,8 +410,10 @@ pub async fn create_s3_client_for_endpoint(
     };
 
     let op_timeout = get_operation_timeout();
+    // Per-endpoint client: same connect-timeout policy as the global client.
+    // S3DLIO_CONNECT_TIMEOUT_SECS (default 10s) for both transport and SDK layers.
     let timeout_config = TimeoutConfig::builder()
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(crate::constants::connect_timeout_secs()))
         .operation_timeout(op_timeout)
         .build();
 

@@ -439,7 +439,7 @@ fn build_reqwest_client_raw(
         .pool_max_idle_per_host(max_idle)
         .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
         .connect_timeout(Duration::from_secs(
-            crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS,
+            crate::constants::connect_timeout_secs(),
         ))
         .tcp_nodelay(true);
 
