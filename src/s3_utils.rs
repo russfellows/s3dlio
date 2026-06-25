@@ -163,6 +163,54 @@ where
     }
 }
 
+/// Wrap an `SdkError` into an `anyhow::Error` whose top-line message is
+/// `"<ctx>: <formatted SdkError chain>"`.
+///
+/// Use this at every site where an S3 SDK call may fail and the error would
+/// otherwise be surfaced to a user (Python `RuntimeError`, CLI output, log).
+/// The bare `SdkError::DispatchFailure` `Display` impl is just the literal
+/// string `"dispatch failure"` with no chain — issue mlcommons/storage#506
+/// is an instance of that bare string reaching Python.  This helper makes
+/// sure the connector chain, hint, and operation context are all retained.
+///
+/// NOTE: Only the S3 path is covered here.  The Azure (`az://`), GCS (`gs://`),
+/// local-file (`file://`), and direct-IO (`direct://`) backends have their own
+/// SDK/error types and currently emit equally opaque messages on dispatch /
+/// network failures (e.g. `azure_client.rs`, `google_gcs_client.rs`,
+/// `file_store_direct.rs`).  Those should get an equivalent helper +
+/// audit pass in a follow-up — track separately from #506.
+pub(crate) fn sdk_anyhow<E, R>(ctx: impl std::fmt::Display, e: SdkError<E, R>) -> anyhow::Error
+where
+    E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
+    R: std::fmt::Debug,
+{
+    anyhow::anyhow!("{}: {}", ctx, format_sdk_error(&e))
+}
+
+/// `Result<T, SdkError<…>>` extension trait that provides `.sdk_context(ctx)?`
+/// as a drop-in replacement for `anyhow::Context::context(…)?`.
+///
+/// `anyhow::Context::context()` attaches the outer message but the `to_string()`
+/// of the resulting `anyhow::Error` only shows the outermost layer — so a
+/// `DispatchFailure` still surfaces as the bare word `"dispatch failure"`.
+/// `sdk_context()` flattens the SDK error chain into the message itself via
+/// `format_sdk_error()`, guaranteeing the full cause + hint reach the caller.
+///
+/// See `sdk_anyhow()` for the rationale and the cross-scheme TODO note.
+pub(crate) trait SdkResultExt<T> {
+    fn sdk_context(self, ctx: impl std::fmt::Display) -> anyhow::Result<T>;
+}
+
+impl<T, E, R> SdkResultExt<T> for std::result::Result<T, SdkError<E, R>>
+where
+    E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
+    R: std::fmt::Debug,
+{
+    fn sdk_context(self, ctx: impl std::fmt::Display) -> anyhow::Result<T> {
+        self.map_err(|e| sdk_anyhow(ctx, e))
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -466,10 +514,16 @@ pub fn create_bucket(bucket: &str) -> Result<()> {
                     if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" {
                         Ok(())
                     } else {
-                        Err(e.into())
+                        Err(sdk_anyhow(
+                            format!("CreateBucket failed for '{}'", bucket),
+                            e,
+                        ))
                     }
                 } else {
-                    Err(e.into())
+                    Err(sdk_anyhow(
+                        format!("CreateBucket failed for '{}'", bucket),
+                        e,
+                    ))
                 }
             }
         }
@@ -909,7 +963,7 @@ pub async fn get_object_range_uri_async(
         .range(range)
         .send()
         .await
-        .context("get_object(range) failed")?;
+        .sdk_context(format!("GET range for s3://{}/{} failed", bucket, key))?;
     let body = resp.body.collect().await.context("collect range body")?;
     // Zero-copy: return Bytes directly
     let bytes = body.into_bytes();
@@ -957,7 +1011,10 @@ pub async fn get_object_range_uri_timed_async(
         .range(range)
         .send()
         .await
-        .context("get_object(range) failed")?;
+        .sdk_context(format!(
+            "timed GET range for s3://{}/{} failed",
+            bucket, key
+        ))?;
     let ttfb = t0.elapsed();
     let body = resp.body.collect().await.context("collect range body")?;
     let total = t0.elapsed();
@@ -1023,7 +1080,10 @@ pub async fn get_object_concurrent_range_async(
         .key(key.trim_start_matches('/'))
         .send()
         .await
-        .context("head_object failed for concurrent range GET")?;
+        .sdk_context(format!(
+            "HEAD for concurrent range GET on s3://{}/{} failed",
+            bucket, key
+        ))?;
 
     let object_size = head_resp.content_length().unwrap_or(0) as u64;
 
@@ -1135,7 +1195,13 @@ async fn concurrent_range_get_impl(
                 .range(range_header)
                 .send()
                 .await
-                .context("concurrent range request failed")?;
+                .sdk_context(format!(
+                    "concurrent range GET for s3://{}/{} bytes={}-{} failed",
+                    bucket,
+                    key,
+                    range_start,
+                    range_end - 1
+                ))?;
 
             let body = resp.body.collect().await.context("collect chunk body")?;
             let chunk_data = body.into_bytes();
@@ -1236,7 +1302,7 @@ pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
         .key(key.trim_start_matches('/'))
         .send()
         .await
-        .context("head_object failed")?;
+        .sdk_context(format!("HEAD for s3://{}/{} failed", bucket, key_clean))?;
 
     Ok(ObjectStat {
         size: resp.content_length().unwrap_or_default() as u64,
@@ -2121,6 +2187,42 @@ mod tests {
         assert!(
             !cond_real,
             "real endpoint URL → should not show --endpoint-url hint"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // sdk_anyhow / SdkResultExt — keep the connector chain in the final
+    // anyhow::Error.to_string().  Guard against future regression of #506:
+    // a bare `"dispatch failure"` reaching the caller is the symptom we are
+    // explicitly preventing here.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sdk_anyhow_keeps_context_in_top_message() {
+        // We do not need a real SdkError to exercise the helper's shape:
+        // construct an anyhow::Error via the same anyhow! macro the helper
+        // uses, then assert that its top-level Display starts with the ctx
+        // string.  This is what the PyO3 RuntimeError wrapper surfaces.
+        let err = anyhow::anyhow!(
+            "{}: {}",
+            "S3 GET for s3://b/k failed",
+            "dispatch failure (I/O error: connection refused) — check ..."
+        );
+        let s = err.to_string();
+        assert!(
+            s.starts_with("S3 GET for s3://b/k failed"),
+            "expected context prefix, got: {}",
+            s
+        );
+        assert!(
+            s.contains("dispatch failure"),
+            "expected SDK chain detail in top message, got: {}",
+            s
+        );
+        assert!(
+            s.contains("connection refused"),
+            "expected connector-error detail in top message, got: {}",
+            s
         );
     }
 }

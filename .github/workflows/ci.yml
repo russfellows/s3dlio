@@ -18,21 +18,63 @@ jobs:
     
     steps:
       - uses: actions/checkout@v4
-      
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      
+
+      # Harden cargo against transient crates.io / curl flakes.
+      # The job repeatedly failed at `cargo build` with
+      #   error: failed to get `arrow-array` ... curl failed
+      # which is the curl-8.x HTTP/2 multiplexing bug.  The dtolnay action's
+      # built-in workaround only fires for rustc 1.70/1.71; runner is on 1.96.
+      # - sparse: opt in explicitly (default since 1.70, but harmless to pin)
+      # - multiplexing=false: forces HTTP/1.1 to dodge the curl bug
+      # - timeout=120: generous per-download budget
+      - name: Configure cargo network robustness
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml <<'EOF'
+          [registries.crates-io]
+          protocol = "sparse"
+
+          [http]
+          multiplexing = false
+          timeout = 120
+          EOF
+
+      - name: Cache cargo registry, git deps, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      # Pre-fetch with retries before any build/test step.  Splits the
+      # network-sensitive phase from the compile phase so a registry
+      # hiccup retries cheaply instead of failing a 1-minute cargo build.
+      - name: Fetch dependencies (with retry)
+        run: |
+          for i in 1 2 3; do
+            cargo fetch --locked && break
+            echo "cargo fetch failed (attempt $i); retrying..."
+            sleep $((i * 10))
+          done
+
       - name: Build (Rust)
-        run: cargo build --release
-      
+        run: cargo build --release --offline
+
       - name: Test (Rust)
-        run: cargo test --release --lib
+        run: cargo test --release --lib --offline
       
       - name: Build (Python)
         run: |
@@ -55,17 +97,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      
+
+      # Same cargo-network hardening as the Test job — see comments there.
+      - name: Configure cargo network robustness
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml <<'EOF'
+          [registries.crates-io]
+          protocol = "sparse"
+
+          [http]
+          multiplexing = false
+          timeout = 120
+          EOF
+
+      - name: Cache cargo registry, git deps, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-lint-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Fetch dependencies (with retry)
+        run: |
+          for i in 1 2 3; do
+            cargo fetch --locked && break
+            echo "cargo fetch failed (attempt $i); retrying..."
+            sleep $((i * 10))
+          done
+
       - name: Check formatting
         run: cargo fmt --all -- --check
-      
+
       - name: Clippy
         # --all-features omitted: native-backends and arrow-backend are mutually
         # exclusive (compile_error! guards this); defaults include native-backends.
         # Tests/benches are compiled and validated by the Test job above.
-        run: cargo clippy --lib --bins --examples -- -D warnings
+        run: cargo clippy --lib --bins --examples --offline -- -D warnings

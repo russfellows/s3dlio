@@ -9,6 +9,7 @@
 
 use anyhow::{bail, Result};
 use aws_config::meta::region::RegionProviderChain;
+use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::{config::Region, Client};
 
@@ -306,15 +307,27 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                 }
             }
 
-            // Load config fully async with optimized timeout configuration
+            // Load config fully async with optimized timeout configuration.
+            // connect_timeout honors S3DLIO_CONNECT_TIMEOUT_SECS (default 20s) —
+            // unified with the reqwest transport so both layers agree.
+            // Retry count honors S3DLIO_MAX_RETRY_ATTEMPTS (default 3, same as
+            // SDK default); set to 1 for fast-fail at warmup.
             let op_timeout = get_operation_timeout();
-            debug!("Timeouts — connect: 5s, operation: {:?}", op_timeout);
+            let connect_secs = crate::constants::connect_timeout_secs();
+            let max_attempts = crate::constants::max_retry_attempts();
+            debug!(
+                "Timeouts — connect: {}s, operation: {:?}, max_attempts: {}",
+                connect_secs, op_timeout, max_attempts
+            );
             let timeout_config = TimeoutConfig::builder()
-                .connect_timeout(Duration::from_secs(5))  // Quick connection timeout
-                .operation_timeout(op_timeout)             // Configurable for large transfers
+                .connect_timeout(Duration::from_secs(connect_secs))
+                .operation_timeout(op_timeout)
                 .build();
+            let retry_config = RetryConfig::standard().with_max_attempts(max_attempts);
 
-            let mut config_builder = loader.timeout_config(timeout_config);
+            let mut config_builder = loader
+                .timeout_config(timeout_config)
+                .retry_config(retry_config);
 
             // Conditionally set HTTP client only if we have one
             config_builder = config_builder.http_client(http_client);
@@ -404,15 +417,21 @@ pub async fn create_s3_client_for_endpoint(
     };
 
     let op_timeout = get_operation_timeout();
+    // Per-endpoint client: same connect-timeout / retry policy as the global
+    // client.  S3DLIO_CONNECT_TIMEOUT_SECS (default 20s) for both transport
+    // and SDK layers; S3DLIO_MAX_RETRY_ATTEMPTS (default 3) for SDK retries.
     let timeout_config = TimeoutConfig::builder()
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(crate::constants::connect_timeout_secs()))
         .operation_timeout(op_timeout)
         .build();
+    let retry_config =
+        RetryConfig::standard().with_max_attempts(crate::constants::max_retry_attempts());
 
     let cfg = aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12())
         .region(region)
         .endpoint_url(endpoint_url)
         .timeout_config(timeout_config)
+        .retry_config(retry_config)
         .http_client(http_client)
         .load()
         .await;

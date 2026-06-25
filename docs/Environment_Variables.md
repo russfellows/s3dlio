@@ -99,7 +99,14 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 ### Tokio Runtime Configuration
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3DLIO_RT_THREADS` | `max(8, cores*2)` | Number of Tokio runtime worker threads (capped at 32) |
+| `S3DLIO_RT_THREADS` | `max(4, cores)`, scaled by concurrency hint up to `cores * 4` | Number of Tokio runtime worker threads.  May be further bounded by `configure_tokio_threads()` for MPI-aware per-process budgets.  Note: the historical "capped at 32" docstring referred to the pre-v0.9.92 ceiling that was removed when the auto-scaling formula was rewritten. |
+
+### Connection Timeouts and Retries
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_CONNECT_TIMEOUT_SECS` | `20` | TCP connect timeout in seconds.  Covers only the SYN → SYN-ACK handshake.  Honored by both the reqwest transport and the AWS SDK `TimeoutConfig` layer (unified in v0.9.102).  Default bumped from 10 s to 20 s in v0.9.102 after mlcommons/storage#506 showed the previous 5 s SDK-layer ceiling was the trigger for cold-start dispatch failures.  Raise further (e.g. `30` or `60`) for extreme fan-out scenarios where the endpoint's TCP accept queue is briefly saturated by thousands of concurrent connects. |
+| `S3DLIO_OPERATION_TIMEOUT_SECS` | `60` | Full request/response cycle timeout in seconds (excluding the connect handshake).  60 s is sufficient for ~6 GB at 100 MB/s and ~60 GB at 1 GB/s.  Raise for very large single objects or slow networks. |
+| `S3DLIO_MAX_RETRY_ATTEMPTS` | `3` | Maximum number of attempts (1 initial + N−1 retries) the AWS SDK makes per operation before propagating the error.  Matches the SDK's own default.  Set to `1` for **fast-fail at warmup** (no retries; surface a dispatch failure in one connect budget instead of three) — useful for debugging mlcommons/storage#506-style cold-start issues.  Set to `5` or higher to ride out flaky-network bursts.  Clamped to a minimum of 1; the SDK rejects 0. |
 
 ## Range GET Optimization
 
@@ -227,23 +234,48 @@ sai3-bench util ls gs://testbucket/
 
 ### High-Performance Configuration
 ```bash
-# Optimize for high-throughput workloads
-export S3DLIO_USE_OPTIMIZED_HTTP=true
-export S3DLIO_MAX_HTTP_CONNECTIONS=400
-export S3DLIO_HTTP_IDLE_TIMEOUT_MS=2000
-export S3DLIO_RT_THREADS=32
-export S3DLIO_RANGE_CONCURRENCY=64
+# Optimize for high-throughput workloads (large objects, many concurrent GETs)
+export S3DLIO_RT_THREADS=32                  # Tokio worker threads
+export S3DLIO_RANGE_CONCURRENCY=64           # concurrent range chunks per object
+export S3DLIO_RANGE_THRESHOLD_MB=32          # objects ≥ 32 MB use parallel range GETs
+export S3DLIO_POOL_MAX_IDLE_PER_HOST=0       # 0 = unlimited; keep idle conns alive between requests
+export S3DLIO_POOL_IDLE_TIMEOUT_SECS=300     # don't tear down idle conns for 5 min
+export S3DLIO_OPERATION_TIMEOUT_SECS=120     # raise from 60 s default for very large objects
 
 ./target/release/s3-cli get s3://bucket/large-dataset/
+```
+
+### Cold-Start Fan-Out Configuration (mlperf-storage scale)
+```bash
+# Mitigate "dispatch failure" at warmup when hundreds of worker processes
+# all issue their first GETs simultaneously (e.g. retinanet B200 with 128
+# DataLoader workers × 64 prefetch_window = 8 K concurrent connects).
+export S3DLIO_CONNECT_TIMEOUT_SECS=30        # raise from 20 s default — the
+                                             # endpoint's TCP accept queue may
+                                             # take longer under burst
+export S3DLIO_OPERATION_TIMEOUT_SECS=120     # plus a generous full-request budget
+export S3DLIO_MAX_RETRY_ATTEMPTS=5           # SDK rides out brief transient failures
+export S3DLIO_POOL_MAX_IDLE_PER_HOST=0       # never tear down warm conns
+export S3DLIO_RT_THREADS=16                  # per-process; tune to ranks_per_node
+```
+
+### Debug Configuration — Fast-Fail on Cold-Start Issues
+```bash
+# When investigating dispatch-failure root cause, you usually want to fail
+# in one connect budget instead of three.  This stops retries from masking
+# the original symptom and shrinks the time-to-failure roughly 3×.
+export S3DLIO_MAX_RETRY_ATTEMPTS=1           # one shot, no retries
+export S3DLIO_CONNECT_TIMEOUT_SECS=10        # back to the previous default for a tighter loop
+export RUST_BACKTRACE=full                   # full backtrace in the panic / error path
 ```
 
 ### Memory-Constrained Configuration
 ```bash
 # Optimize for lower memory usage
 export S3DLIO_RT_THREADS=8
-export S3DLIO_MAX_HTTP_CONNECTIONS=50
 export S3DLIO_RANGE_CONCURRENCY=8
-export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0  # Disable range optimization (on by default since v0.9.60)
+export S3DLIO_POOL_MAX_IDLE_PER_HOST=8       # cap idle conns per host
+export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # Disable range optimization (on by default since v0.9.60)
 
 ./target/release/s3-cli get s3://bucket/files/
 ```
@@ -261,8 +293,9 @@ export S3DLIO_OPLOG_BUF=16384
 ### Conservative Configuration
 ```bash
 # Use AWS SDK defaults with minimal optimization
-export S3DLIO_USE_OPTIMIZED_HTTP=false
 export S3DLIO_RT_THREADS=8
+export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
+# (do not set the high-throughput vars above; defaults are conservative)
 
 ./target/release/s3-cli get s3://bucket/files/
 ```
@@ -273,9 +306,20 @@ export S3DLIO_RT_THREADS=8
 - Range optimization is **enabled by default** (v0.9.60+); no action needed
 - Lower `S3DLIO_RANGE_THRESHOLD_MB` if needed (default is 32 MB)
 - Increase `S3DLIO_RANGE_CONCURRENCY` to 32-64
-- Use `S3DLIO_USE_OPTIMIZED_HTTP=true`
-- Set `S3DLIO_MAX_HTTP_CONNECTIONS=400`
+- Set `S3DLIO_POOL_MAX_IDLE_PER_HOST=0` (unlimited) to amortize TCP handshakes across requests
+- Raise `S3DLIO_OPERATION_TIMEOUT_SECS` if a single object can exceed the 60 s default
 - Consider `S3DLIO_RT_THREADS=32` on high-core systems
+
+> **Note on deprecated/dead names.** Older versions of this guide and external
+> tutorials sometimes reference `S3DLIO_USE_OPTIMIZED_HTTP`,
+> `S3DLIO_MAX_HTTP_CONNECTIONS`, `S3DLIO_HTTP_IDLE_TIMEOUT_MS`,
+> `S3DLIO_MAX_CONCURRENCY`, `S3DLIO_CONNECTION_TIMEOUT`,
+> `S3DLIO_READ_TIMEOUT`, `S3DLIO_MULTIPART_THRESHOLD`, or
+> `S3DLIO_PART_SIZE`.  **None of these are read by s3dlio source code as of
+> v0.9.102.**  Use the wired equivalents above
+> (`S3DLIO_POOL_MAX_IDLE_PER_HOST`, `S3DLIO_POOL_IDLE_TIMEOUT_SECS`,
+> `S3DLIO_CONNECT_TIMEOUT_SECS`, `S3DLIO_OPERATION_TIMEOUT_SECS`,
+> `S3DLIO_RANGE_CONCURRENCY`) instead.
 
 ### For Many Small Objects
 - **Disable range optimization**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` (enabled by default since v0.9.60)
