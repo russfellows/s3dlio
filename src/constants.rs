@@ -31,9 +31,14 @@ pub const MAX_MULTIPART_PARTS: usize = 10000;
 /// Default TCP connect timeout in seconds.
 ///
 /// Covers only the TCP handshake (SYN → SYN-ACK).  On a LAN/datacenter network
-/// a connect that hasn't completed in 10 s indicates a dead host, wrong IP, or
-/// a firewall silently dropping packets.  Override with `S3DLIO_CONNECT_TIMEOUT_SECS`.
-pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// a connect that hasn't completed in 20 s indicates a dead host, wrong IP, a
+/// firewall silently dropping packets, or — under heavy cold-start fan-out —
+/// an endpoint whose TCP accept queue is briefly saturated.  Default bumped
+/// from 10 s to 20 s in v0.9.101 after mlcommons/storage#506 showed the
+/// hardcoded 5 s SDK ceiling was the trigger for warmup dispatch failures
+/// on RetinaNet B200 (2 048 concurrent connects to a single endpoint).
+/// Override with `S3DLIO_CONNECT_TIMEOUT_SECS`.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 20;
 
 /// Environment variable name for the TCP connect-timeout override.
 ///
@@ -70,8 +75,34 @@ pub fn connect_timeout_secs() -> u64 {
 /// Override with `S3DLIO_OPERATION_TIMEOUT_SECS`.
 pub const DEFAULT_OPERATION_TIMEOUT_SECS: u64 = 60;
 
-/// Default retry count for storage operations
-pub const DEFAULT_RETRY_COUNT: usize = 3;
+/// Default max retry attempts for AWS SDK operations.
+///
+/// Matches the AWS SDK's own default (3 attempts: 1 initial + 2 retries).
+/// Override with `S3DLIO_MAX_RETRY_ATTEMPTS`:
+///   - `1` — fast-fail at warmup (no retries; surface dispatch failures in
+///     ~connect_timeout instead of ~3× connect_timeout + exponential backoff)
+///   - `5` or higher — ride out flaky-network bursts
+pub const DEFAULT_MAX_RETRY_ATTEMPTS: u32 = 3;
+
+/// Environment variable name for the SDK retry-count override.
+///
+/// See [`DEFAULT_MAX_RETRY_ATTEMPTS`].  Read by [`max_retry_attempts()`]
+/// and applied via `aws_config::retry::RetryConfig` in `s3_client.rs`.
+pub const ENV_MAX_RETRY_ATTEMPTS: &str = "S3DLIO_MAX_RETRY_ATTEMPTS";
+
+/// Resolve the effective max retry attempts for AWS SDK calls.
+///
+/// Reads [`ENV_MAX_RETRY_ATTEMPTS`] each call (cheap; called only at HTTP
+/// client construction time); falls back to [`DEFAULT_MAX_RETRY_ATTEMPTS`]
+/// when unset or unparseable.  Clamped to a minimum of 1 (zero retries
+/// would mean "do not even attempt", which the SDK rejects).
+pub fn max_retry_attempts() -> u32 {
+    std::env::var(ENV_MAX_RETRY_ATTEMPTS)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_RETRY_ATTEMPTS)
+        .max(1)
+}
 
 /// Default concurrent upload limit for multipart operations
 pub const DEFAULT_CONCURRENT_UPLOADS: usize = 32;
@@ -812,6 +843,66 @@ mod connect_timeout_tests {
     fn test_connect_timeout_empty_falls_back_to_default() {
         with_var(Some(""), || {
             assert_eq!(connect_timeout_secs(), DEFAULT_CONNECT_TIMEOUT_SECS);
+        });
+    }
+}
+
+#[cfg(test)]
+mod max_retry_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_var<F: FnOnce()>(value: Option<&str>, body: F) {
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let prev = std::env::var(ENV_MAX_RETRY_ATTEMPTS).ok();
+        match value {
+            Some(v) => std::env::set_var(ENV_MAX_RETRY_ATTEMPTS, v),
+            None => std::env::remove_var(ENV_MAX_RETRY_ATTEMPTS),
+        }
+        body();
+        match prev {
+            Some(v) => std::env::set_var(ENV_MAX_RETRY_ATTEMPTS, v),
+            None => std::env::remove_var(ENV_MAX_RETRY_ATTEMPTS),
+        }
+    }
+
+    #[test]
+    fn test_max_retry_default_when_unset() {
+        with_var(None, || {
+            assert_eq!(max_retry_attempts(), DEFAULT_MAX_RETRY_ATTEMPTS);
+        });
+    }
+
+    #[test]
+    fn test_max_retry_honors_override() {
+        with_var(Some("5"), || {
+            assert_eq!(max_retry_attempts(), 5);
+        });
+    }
+
+    #[test]
+    fn test_max_retry_one_is_valid_fast_fail() {
+        // Operators may set 1 to surface dispatch failures in one connect
+        // budget instead of three.
+        with_var(Some("1"), || {
+            assert_eq!(max_retry_attempts(), 1);
+        });
+    }
+
+    #[test]
+    fn test_max_retry_zero_clamped_to_one() {
+        // SDK rejects max_attempts=0; the helper clamps to 1.
+        with_var(Some("0"), || {
+            assert_eq!(max_retry_attempts(), 1);
+        });
+    }
+
+    #[test]
+    fn test_max_retry_unparseable_falls_back_to_default() {
+        with_var(Some("not-a-number"), || {
+            assert_eq!(max_retry_attempts(), DEFAULT_MAX_RETRY_ATTEMPTS);
         });
     }
 }

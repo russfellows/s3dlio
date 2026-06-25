@@ -101,11 +101,12 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 |----------|---------|-------------|
 | `S3DLIO_RT_THREADS` | `max(4, cores)`, scaled by concurrency hint up to `cores * 4` | Number of Tokio runtime worker threads.  May be further bounded by `configure_tokio_threads()` for MPI-aware per-process budgets.  Note: the historical "capped at 32" docstring referred to the pre-v0.9.92 ceiling that was removed when the auto-scaling formula was rewritten. |
 
-### Connection Timeouts
+### Connection Timeouts and Retries
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3DLIO_CONNECT_TIMEOUT_SECS` | `10` | TCP connect timeout in seconds.  Covers only the SYN → SYN-ACK handshake.  Honored by both the reqwest transport and the AWS SDK `TimeoutConfig` layer (unified in v0.9.101).  Raise (e.g. `30` or `60`) for cold-start fan-out scenarios where the endpoint's TCP accept queue is briefly saturated by thousands of concurrent connects — common in mlperf-storage retinanet runs at warmup. |
+| `S3DLIO_CONNECT_TIMEOUT_SECS` | `20` | TCP connect timeout in seconds.  Covers only the SYN → SYN-ACK handshake.  Honored by both the reqwest transport and the AWS SDK `TimeoutConfig` layer (unified in v0.9.101).  Default bumped from 10 s to 20 s in v0.9.101 after mlcommons/storage#506 showed the previous 5 s SDK-layer ceiling was the trigger for cold-start dispatch failures.  Raise further (e.g. `30` or `60`) for extreme fan-out scenarios where the endpoint's TCP accept queue is briefly saturated by thousands of concurrent connects. |
 | `S3DLIO_OPERATION_TIMEOUT_SECS` | `60` | Full request/response cycle timeout in seconds (excluding the connect handshake).  60 s is sufficient for ~6 GB at 100 MB/s and ~60 GB at 1 GB/s.  Raise for very large single objects or slow networks. |
+| `S3DLIO_MAX_RETRY_ATTEMPTS` | `3` | Maximum number of attempts (1 initial + N−1 retries) the AWS SDK makes per operation before propagating the error.  Matches the SDK's own default.  Set to `1` for **fast-fail at warmup** (no retries; surface a dispatch failure in one connect budget instead of three) — useful for debugging mlcommons/storage#506-style cold-start issues.  Set to `5` or higher to ride out flaky-network bursts.  Clamped to a minimum of 1; the SDK rejects 0. |
 
 ## Range GET Optimization
 
@@ -249,12 +250,23 @@ export S3DLIO_OPERATION_TIMEOUT_SECS=120     # raise from 60 s default for very 
 # Mitigate "dispatch failure" at warmup when hundreds of worker processes
 # all issue their first GETs simultaneously (e.g. retinanet B200 with 128
 # DataLoader workers × 64 prefetch_window = 8 K concurrent connects).
-export S3DLIO_CONNECT_TIMEOUT_SECS=30        # raise from 10 s default — the
+export S3DLIO_CONNECT_TIMEOUT_SECS=30        # raise from 20 s default — the
                                              # endpoint's TCP accept queue may
-                                             # take longer than 10 s under burst
+                                             # take longer under burst
 export S3DLIO_OPERATION_TIMEOUT_SECS=120     # plus a generous full-request budget
+export S3DLIO_MAX_RETRY_ATTEMPTS=5           # SDK rides out brief transient failures
 export S3DLIO_POOL_MAX_IDLE_PER_HOST=0       # never tear down warm conns
 export S3DLIO_RT_THREADS=16                  # per-process; tune to ranks_per_node
+```
+
+### Debug Configuration — Fast-Fail on Cold-Start Issues
+```bash
+# When investigating dispatch-failure root cause, you usually want to fail
+# in one connect budget instead of three.  This stops retries from masking
+# the original symptom and shrinks the time-to-failure roughly 3×.
+export S3DLIO_MAX_RETRY_ATTEMPTS=1           # one shot, no retries
+export S3DLIO_CONNECT_TIMEOUT_SECS=10        # back to the previous default for a tighter loop
+export RUST_BACKTRACE=full                   # full backtrace in the panic / error path
 ```
 
 ### Memory-Constrained Configuration
