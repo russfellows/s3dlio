@@ -514,10 +514,16 @@ pub fn create_bucket(bucket: &str) -> Result<()> {
                     if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" {
                         Ok(())
                     } else {
-                        Err(sdk_anyhow(format!("CreateBucket failed for '{}'", bucket), e))
+                        Err(sdk_anyhow(
+                            format!("CreateBucket failed for '{}'", bucket),
+                            e,
+                        ))
                     }
                 } else {
-                    Err(sdk_anyhow(format!("CreateBucket failed for '{}'", bucket), e))
+                    Err(sdk_anyhow(
+                        format!("CreateBucket failed for '{}'", bucket),
+                        e,
+                    ))
                 }
             }
         }
@@ -1005,7 +1011,10 @@ pub async fn get_object_range_uri_timed_async(
         .range(range)
         .send()
         .await
-        .sdk_context(format!("timed GET range for s3://{}/{} failed", bucket, key))?;
+        .sdk_context(format!(
+            "timed GET range for s3://{}/{} failed",
+            bucket, key
+        ))?;
     let ttfb = t0.elapsed();
     let body = resp.body.collect().await.context("collect range body")?;
     let total = t0.elapsed();

@@ -40,9 +40,9 @@ use crate::s3_utils::{
     // NEW: PUT operations via ObjectStore
     put_object_uri_async as s3_put_object_uri_async,
     stat_object_uri_async as s3_stat_object_uri_async,
-    SdkResultExt,
     // Reuse existing S3 helpers
     ObjectStat as S3ObjectStat,
+    SdkResultExt,
 };
 
 use crate::s3_logger::global_logger;

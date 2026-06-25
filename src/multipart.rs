@@ -202,13 +202,10 @@ impl MultipartUploadSink {
         if let Some(ct) = &cfg.content_type {
             req = req.content_type(ct);
         }
-        let resp = req
-            .send()
-            .await
-            .sdk_context(format!(
-                "CreateMultipartUpload failed for s3://{}/{}",
-                bucket, key
-            ))?;
+        let resp = req.send().await.sdk_context(format!(
+            "CreateMultipartUpload failed for s3://{}/{}",
+            bucket, key
+        ))?;
         let upload_id = resp.upload_id().unwrap_or_default().to_string();
         if upload_id.is_empty() {
             bail!("CreateMultipartUpload returned empty upload_id");
@@ -573,8 +570,7 @@ async fn coordinator_task(
             // Build the error-context string before moving b/k into the request
             // builder.  Preserves the bucket+key+part_number in the message
             // even when the upload fails with a bare dispatch failure.
-            let upload_ctx =
-                format!("UploadPart {} failed for s3://{}/{}", part_number, b, k);
+            let upload_ctx = format!("UploadPart {} failed for s3://{}/{}", part_number, b, k);
             let resp = c
                 .upload_part()
                 .bucket(b)
@@ -621,8 +617,7 @@ async fn coordinator_task(
         .set_parts(Some(completed_parts))
         .build();
 
-    let complete_ctx =
-        format!("CompleteMultipartUpload failed for s3://{}/{}", bucket, key);
+    let complete_ctx = format!("CompleteMultipartUpload failed for s3://{}/{}", bucket, key);
     let resp = client
         .complete_multipart_upload()
         .bucket(bucket)
