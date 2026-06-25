@@ -9,6 +9,7 @@
 //! to provide simplified, blocking I/O operations with detailed tracing.
 
 use crate::s3_logger::{LogEntry, Logger};
+use crate::s3_utils::{format_sdk_error, sdk_anyhow};
 use anyhow::Result;
 use aws_sdk_s3::{types::Delete, Client};
 use bytes::Bytes;
@@ -105,8 +106,18 @@ impl S3Ops {
                 Ok(body)
             }
             Err(e) => {
-                self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None);
-                Err(e.into())
+                // format_sdk_error preserves the connector chain (I/O, timeout,
+                // TLS, DNS, refused) plus a hint string.  Without this the bare
+                // `SdkError::DispatchFailure` Display impl is the literal text
+                // "dispatch failure" — the opaque message reported in
+                // mlcommons/storage#506.  Log uses the same detail so the
+                // s3dlio op-log file matches what the caller sees.
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 GET for s3://{}/{} failed", bucket, key),
+                    e,
+                ))
             }
         }
     }
@@ -146,8 +157,16 @@ impl S3Ops {
                 Ok(body)
             }
             Err(e) => {
-                self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None);
-                Err(e.into())
+                // See note on the GET path above re: format_sdk_error and #506.
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!(
+                        "S3 GET_RANGE for s3://{}/{} bytes={}-{} failed",
+                        bucket, key, start, end
+                    ),
+                    e,
+                ))
             }
         }
     }
@@ -186,8 +205,22 @@ impl S3Ops {
                 .await
                 .map(|_| ())
         };
-        self.log_op(ctx, &Ok::<(), &str>(()), bytes, None);
-        Ok(result?)
+        match result {
+            Ok(()) => {
+                self.log_op(ctx, &Ok::<(), &str>(()), bytes, None);
+                Ok(())
+            }
+            Err(e) => {
+                // Surface the SDK connector chain (e.g. dispatch failure detail)
+                // instead of the bare SdkError Display. See note in get_object.
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 PUT for s3://{}/{} failed", bucket, key),
+                    e,
+                ))
+            }
+        }
     }
 
     /// STAT (Metadata) of an object.
@@ -206,8 +239,20 @@ impl S3Ops {
             .key(key)
             .send()
             .await;
-        self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
-        Ok(result.map(|_| ())?)
+        match result {
+            Ok(_) => {
+                self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
+                Ok(())
+            }
+            Err(e) => {
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 HEAD for s3://{}/{} failed", bucket, key),
+                    e,
+                ))
+            }
+        }
     }
 
     /// DELETE a single object.
@@ -226,8 +271,20 @@ impl S3Ops {
             .key(key)
             .send()
             .await;
-        self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
-        Ok(result.map(|_| ())?)
+        match result {
+            Ok(_) => {
+                self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
+                Ok(())
+            }
+            Err(e) => {
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 DELETE for s3://{}/{} failed", bucket, key),
+                    e,
+                ))
+            }
+        }
     }
 
     /// DELETE multiple objects in a single batch request.
@@ -262,8 +319,20 @@ impl S3Ops {
             .send()
             .await;
 
-        self.log_op(ctx, &result, 0, None);
-        Ok(result.map(|_| ())?)
+        match result {
+            Ok(_) => {
+                self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
+                Ok(())
+            }
+            Err(e) => {
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 batch DELETE for bucket '{}' failed", bucket),
+                    e,
+                ))
+            }
+        }
     }
 
     /// LIST objects with a given prefix.
@@ -296,8 +365,12 @@ impl S3Ops {
                 Ok(count)
             }
             Err(e) => {
-                self.log_op(ctx, &Err::<(), _>(e.to_string()), 0, None);
-                Err(e.into())
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 LIST for bucket '{}' prefix '{}' failed", bucket, prefix),
+                    e,
+                ))
             }
         }
     }

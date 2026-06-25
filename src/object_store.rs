@@ -40,6 +40,7 @@ use crate::s3_utils::{
     // NEW: PUT operations via ObjectStore
     put_object_uri_async as s3_put_object_uri_async,
     stat_object_uri_async as s3_stat_object_uri_async,
+    SdkResultExt,
     // Reuse existing S3 helpers
     ObjectStat as S3ObjectStat,
 };
@@ -1185,7 +1186,7 @@ impl ObjectStore for S3ObjectStore {
                 .key(&key)
                 .send()
                 .await
-                .with_context(|| format!("S3 GET failed for '{}'", uri))?;
+                .sdk_context(format!("S3 GET failed for '{}'", uri))?;
             let data = resp
                 .body
                 .collect()
@@ -1236,7 +1237,7 @@ impl ObjectStore for S3ObjectStore {
                 .range(range_header)
                 .send()
                 .await
-                .with_context(|| format!("S3 range GET failed for '{}'", uri))?;
+                .sdk_context(format!("S3 range GET failed for '{}'", uri))?;
             let data = resp
                 .body
                 .collect()
@@ -1266,7 +1267,7 @@ impl ObjectStore for S3ObjectStore {
                     .disable_payload_signing()
                     .send()
                     .await
-                    .with_context(|| format!("S3 PUT (unsigned) failed for '{}'", uri))?;
+                    .sdk_context(format!("S3 PUT (unsigned) failed for '{}'", uri))?;
             } else {
                 client
                     .put_object()
@@ -1275,7 +1276,7 @@ impl ObjectStore for S3ObjectStore {
                     .body(data.into())
                     .send()
                     .await
-                    .with_context(|| format!("S3 PUT failed for '{}'", uri))?;
+                    .sdk_context(format!("S3 PUT failed for '{}'", uri))?;
             }
             return Ok(());
         }
@@ -1377,7 +1378,7 @@ impl ObjectStore for S3ObjectStore {
                 .key(key_clean)
                 .send()
                 .await
-                .with_context(|| format!("S3 HEAD failed for '{}'", uri))?;
+                .sdk_context(format!("S3 HEAD failed for '{}'", uri))?;
             return Ok(crate::s3_utils::ObjectStat {
                 size: resp.content_length().unwrap_or_default() as u64,
                 last_modified: resp.last_modified().map(|t| t.to_string()),
