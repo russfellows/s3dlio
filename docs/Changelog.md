@@ -158,7 +158,7 @@ Verification and Retry".
   verifies HEAD reflects the new size (not stale metadata).
   Run: `cargo test --test test_put_bytes -- --ignored`
 
-Full suite: 664 passed, 0 failed. `cargo clippy -- -D warnings` clean.
+Full suite: 659 passed, 0 failed (integration tests marked `#[ignore]` require a live endpoint and are excluded from the standard count). `cargo clippy -- -D warnings` clean.
 
 ---
 
