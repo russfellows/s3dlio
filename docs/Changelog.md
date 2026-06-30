@@ -111,7 +111,7 @@ reference the new section.
   and passes after.
   Run: `cargo test -- --include-ignored test_finish_verifies_stored_bytes`
 
-Full suite: 39 passed, 0 failed, 10 ignored. `cargo clippy -- -D warnings` clean.
+Full suite: 659 passed, 0 failed. `cargo clippy -- -D warnings` clean.
 
 ---
 
