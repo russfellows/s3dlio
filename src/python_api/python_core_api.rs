@@ -145,19 +145,29 @@ where
 // PUT with HEAD verification and automatic retry (all backends)
 // ---------------------------------------------------------------------------
 
-/// PUT `data` to `uri` via `store`, verify the stored size with a HEAD request,
-/// and retry up to `S3DLIO_PUT_MAX_RETRIES` times (default 3) on mismatch or
-/// transient PUT failure.
+/// PUT `data` to `uri` via `store`.
 ///
-/// On size mismatch the truncated object is deleted before retrying, mirroring
-/// the same cleanup logic used by the multipart coordinator_task.
+/// By default this is a single PUT — the same cost as every other S3 client
+/// library (no extra round-trip), relying on `S3DLIO_MAX_RETRY_ATTEMPTS` (SDK
+/// layer) to ride out transient network failures.
 ///
-/// **Skipped for `file://` and `direct://`**: local writes have OS-level durability
-/// guarantees so the extra round-trip is unnecessary overhead.
+/// Set `S3DLIO_PUT_VERIFY=true` to opt into HEAD-after-PUT verification: after
+/// the PUT, a HEAD request confirms the stored byte count matches what was
+/// sent, and retries up to `S3DLIO_PUT_MAX_RETRIES` times (default 3) on
+/// mismatch or transient PUT failure.  On size mismatch the truncated object
+/// is deleted before retrying, mirroring the same cleanup logic used by the
+/// multipart coordinator_task.  This protects against backends that return a
+/// successful PUT response for an object that is not actually fully/durably
+/// stored (see mlcommons/storage#593) — at the cost of one extra round-trip
+/// per object, so it is opt-in rather than the default.
+///
+/// **Always skipped for `file://` and `direct://`**: local writes have
+/// OS-level durability guarantees so the extra round-trip is never useful.
 ///
 /// Env vars (read at call time, no caching needed):
-///   `S3DLIO_PUT_MAX_RETRIES`   — total attempts, default 3
-///   `S3DLIO_PUT_RETRY_DELAY_MS` — delay between attempts in ms, default 1000
+///   `S3DLIO_PUT_VERIFY`         — enable HEAD verification + retry, default false
+///   `S3DLIO_PUT_MAX_RETRIES`    — total attempts (only used when verify is on), default 3
+///   `S3DLIO_PUT_RETRY_DELAY_MS` — delay between attempts in ms (only used when verify is on), default 1000
 async fn put_verified_with_retry(
     store: &dyn ObjectStore,
     uri: &str,
@@ -166,6 +176,17 @@ async fn put_verified_with_retry(
     // Local stores have strong write durability — skip the extra HEAD call.
     let scheme = uri.split("://").next().unwrap_or("");
     if scheme == "file" || scheme == "direct" {
+        return store.put(uri, data).await;
+    }
+
+    let verify_enabled = std::env::var("S3DLIO_PUT_VERIFY")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !verify_enabled {
+        // Default path: single PUT, no HEAD — matches the cost of every other
+        // S3 client library. Transient failures are covered by the SDK's own
+        // retry layer (S3DLIO_MAX_RETRY_ATTEMPTS).
         return store.put(uri, data).await;
     }
 
@@ -2623,4 +2644,96 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gcs_query_rapid_bucket, m)?)?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests — put_verified_with_retry opt-in verification (storage#593, v0.9.106)
+// ---------------------------------------------------------------------------
+
+// This module lives inside `python_api`, which is gated behind the
+// `extension-module` feature (not in the default feature set). Run with:
+//   cargo test --lib --features extension-module -- --ignored --test-threads=1 put_verify_tests
+// `--test-threads=1` is required: both tests mutate the shared process-wide
+// `S3DLIO_PUT_VERIFY` env var and would otherwise race if run concurrently.
+#[cfg(test)]
+mod put_verify_tests {
+    use super::*;
+
+    fn bucket() -> String {
+        std::env::var("BUCKET").unwrap_or_else(|_| "mlp-s3dlio".to_string())
+    }
+
+    fn unique_key(tag: &str) -> String {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("test-put-verify-{tag}-{ts}.bin")
+    }
+
+    /// Default behavior (`S3DLIO_PUT_VERIFY` unset): a single PUT lands the
+    /// object correctly with no internal HEAD call.  Confirmed here via an
+    /// independent stat from the test itself, not via internal logic.
+    ///
+    /// Run with: `cargo test --lib -- --ignored test_put_verify_default_off`
+    #[test]
+    #[ignore = "requires live S3 endpoint (set AWS_* + BUCKET env vars or use .env file)"]
+    fn test_put_verify_default_off() -> anyhow::Result<()> {
+        dotenvy::dotenv().ok();
+        std::env::remove_var("S3DLIO_PUT_VERIFY"); // explicit: exercise the default
+        let bucket = bucket();
+        let key = unique_key("default-off");
+        let uri = format!("s3://{bucket}/{key}");
+        let data = Bytes::from(vec![0x42u8; 4096]);
+        let expected = data.len() as u64;
+
+        run_on_global_rt(async move {
+            let store = store_for_uri_with_logger(&uri, None)?;
+            put_verified_with_retry(store.as_ref(), &uri, data).await?;
+            let meta = store.stat(&uri).await?;
+            anyhow::ensure!(
+                meta.size == expected,
+                "object must land correctly even without internal verification: \
+                 expected {} got {}",
+                expected,
+                meta.size
+            );
+            store.delete(&uri).await?;
+            Ok(())
+        })
+    }
+
+    /// Opt-in behavior (`S3DLIO_PUT_VERIFY=true`): the HEAD-verify-retry path
+    /// runs and confirms the stored size, same correctness guarantee as
+    /// before v0.9.106 made this opt-in.
+    ///
+    /// Run with: `cargo test --lib -- --ignored test_put_verify_opt_in`
+    #[test]
+    #[ignore = "requires live S3 endpoint (set AWS_* + BUCKET env vars or use .env file)"]
+    fn test_put_verify_opt_in() -> anyhow::Result<()> {
+        dotenvy::dotenv().ok();
+        std::env::set_var("S3DLIO_PUT_VERIFY", "true");
+        let bucket = bucket();
+        let key = unique_key("opt-in");
+        let uri = format!("s3://{bucket}/{key}");
+        let data = Bytes::from(vec![0x99u8; 4096]);
+        let expected = data.len() as u64;
+
+        let result = run_on_global_rt(async move {
+            let store = store_for_uri_with_logger(&uri, None)?;
+            put_verified_with_retry(store.as_ref(), &uri, data).await?;
+            let meta = store.stat(&uri).await?;
+            anyhow::ensure!(
+                meta.size == expected,
+                "HEAD-verified size mismatch: expected {} got {}",
+                expected,
+                meta.size
+            );
+            store.delete(&uri).await?;
+            Ok(())
+        });
+
+        std::env::remove_var("S3DLIO_PUT_VERIFY");
+        result
+    }
 }

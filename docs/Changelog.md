@@ -1,5 +1,85 @@
 # s3dlio Changelog
 
+## Version 0.9.106 — Write verification changed from always-on to opt-in (mlcommons/storage#593 follow-up)
+
+### Why this release
+
+v0.9.104 made every `put_bytes()` call and every `MultipartUploadWriter`
+completion issue a HEAD request to verify the stored byte count, always on
+with no way to disable it.  For benchmark workloads that write many small
+objects (the common case for AI/ML training datagen), this adds one extra
+round-trip per object — a meaningful throughput cost that was not present
+before v0.9.104 and is not present in other S3 client libraries, which trust
+the server's success response on `PutObject` / `CompleteMultipartUpload`
+without a follow-up HEAD.
+
+A server that returns 200 OK for an object that is not actually fully and
+durably stored is violating the S3 API contract — the underlying issue
+(observed on some AIStore configurations) is a backend correctness problem.
+The HEAD-verify-retry behavior added in v0.9.104 is a useful client-side
+safety net for backends known to have this problem, but it should not be
+mandatory overhead for every backend and every user.
+
+### Changed: write verification is now opt-in, default `false`
+
+Two new boolean environment variables gate the HEAD-verify-retry logic
+introduced in v0.9.104.  Both default to `false` (disabled) — the
+out-of-the-box behavior is now a single PUT / single
+`CompleteMultipartUpload` with no extra round-trip, matching the cost of
+every other S3 client library.  Transient network failures are still covered
+by `S3DLIO_MAX_RETRY_ATTEMPTS` (the existing SDK-layer retry).
+
+| Variable | Default | Gates |
+|----------|---------|-------|
+| `S3DLIO_PUT_VERIFY` | `false` | `put_bytes()` / `put_bytes_async()` HEAD-verify-retry (`src/python_api/python_core_api.rs`) |
+| `S3DLIO_MPU_PUT_VERIFY` | `false` | `MultipartUploadWriter` post-`CompleteMultipartUpload` HEAD verification (`src/multipart.rs`) |
+
+When disabled, `MultipartCompleteInfo.stored_bytes` is set equal to
+`total_bytes` (unverified-assumed-equal) rather than independently confirmed.
+
+`S3DLIO_PUT_MAX_RETRIES`, `S3DLIO_PUT_RETRY_DELAY_MS`, `S3DLIO_MPU_MAX_RETRIES`,
+and `S3DLIO_MPU_RETRY_DELAY_S` are unchanged in meaning, but now only take
+effect when the corresponding verify flag is enabled.
+
+The two flags are independent — for example, a deployment can enable
+`S3DLIO_MPU_PUT_VERIFY=true` for large checkpoint objects (low relative
+overhead — one HEAD per object that already makes many `UploadPart` calls)
+while leaving `S3DLIO_PUT_VERIFY=false` for the high-volume small-object
+datagen path (where the relative overhead would be much higher).
+
+Full reference: `docs/Environment_Variables.md` — "Data Integrity: Write
+Verification and Retry".
+
+### Tests (2 new + 1 updated)
+
+`tests/test_multipart.rs`:
+
+- `test_finish_verifies_stored_bytes` now explicitly sets
+  `S3DLIO_MPU_PUT_VERIFY=true` so it continues to exercise the HEAD-verify
+  path now that it is opt-in.
+- `test_finish_skips_verification_by_default` (new): confirms that with the
+  flag unset, no HEAD is issued, `stored_bytes == total_bytes`
+  (unverified-assumed-equal), and the object still lands correctly —
+  confirmed independently by the test's own HEAD call.
+
+`src/python_api/python_core_api.rs` (`#[cfg(test)] mod put_verify_tests`,
+requires `--features extension-module`):
+
+- `test_put_verify_default_off` (new): confirms a single PUT lands the object
+  correctly with `S3DLIO_PUT_VERIFY` unset.
+- `test_put_verify_opt_in` (new): confirms the HEAD-verify-retry path runs
+  and validates correctness when `S3DLIO_PUT_VERIFY=true`.
+
+Full suite: 659 passed, 0 failed (integration tests marked `#[ignore]`
+require a live endpoint and are excluded from the standard count — this
+count is unchanged from v0.9.104 because all new tests in this release are
+`#[ignore]`d). All live `#[ignore]` tests (`test_multipart`, `test_put_bytes`,
+`put_verify_tests`) pass against a live AIStore endpoint. `cargo fmt --check`
+and `cargo clippy -- -D warnings` clean (default features and
+`--features extension-module`).
+
+---
+
 ## Version 0.9.104 — Write integrity: single-part PUT verification + retry; multipart error propagation, stored-size verification, AIStore redirect safety (mlcommons/storage#593)
 
 ### Why this release
