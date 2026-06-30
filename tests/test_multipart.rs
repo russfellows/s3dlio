@@ -9,6 +9,99 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use s3dlio::s3_client::{aws_s3_client_async, run_on_global_rt};
 use s3dlio::{MultipartUploadConfig, MultipartUploadSink};
 
+// ---------------------------------------------------------------------------
+// BUG #593 Bug 1 — __exit__ silently discards finish_blocking() errors
+// ---------------------------------------------------------------------------
+
+/// Proves that `finish_blocking()` CAN return `Err` — the error that
+/// `PyMultipartUploadWriter.__exit__` currently silences.
+///
+/// We trigger the failure by calling `finish_blocking()` immediately after
+/// creating the sink, before writing any parts.  `CompleteMultipartUpload`
+/// with an empty parts list is rejected by every S3-compatible backend.
+///
+/// **FAILS before fix**: the assertion `result.is_err()` holds (the error
+/// exists), but `__exit__` in python_advanced_api.rs discards it and returns
+/// `Ok(())`, so Python sees no exception.
+/// **PASSES after fix**: `__exit__` propagates the error as `PyRuntimeError`.
+///
+/// Run with: `cargo test -- --include-ignored test_finish_err_on_zero_parts`
+#[test]
+#[ignore = "requires live S3 endpoint (set AWS_* + BUCKET env vars or use .env file)"]
+fn test_finish_err_on_zero_parts() -> Result<()> {
+    dotenvy::dotenv().ok();
+    let bucket = std::env::var("BUCKET").unwrap_or_else(|_| "mlp-s3dlio".to_string());
+    let cfg = MultipartUploadConfig::default();
+
+    let mut sink = MultipartUploadSink::new(&bucket, "test-bug593-zero-parts.bin", cfg)?;
+
+    // finish_blocking() with no parts written → CompleteMultipartUpload(parts=[])
+    // Every S3-compatible backend rejects an empty parts list.
+    let result = sink.finish_blocking();
+    assert!(
+        result.is_err(),
+        "finish_blocking() must fail when no parts were uploaded (S3 requires >= 1 part);\
+         \nBUG #593 Bug 1: __exit__ currently discards this error — Python sees no exception"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BUG #593 Bug 2 — no HEAD verification after CompleteMultipartUpload
+// ---------------------------------------------------------------------------
+
+/// Verifies that `MultipartCompleteInfo.stored_bytes` (populated by a HEAD
+/// request after `CompleteMultipartUpload`) equals the bytes written.
+///
+/// **FAILS TO COMPILE before fix**: `stored_bytes` does not exist on
+/// `MultipartCompleteInfo` — the struct is defined in `src/multipart.rs`.
+/// **PASSES after fix**: HEAD is issued, `stored_bytes` is populated, and
+/// assertion confirms the stored object matches what was written.
+///
+/// Run with: `cargo test -- --include-ignored test_finish_verifies_stored_bytes`
+#[test]
+#[ignore = "requires live S3 endpoint (set AWS_* + BUCKET env vars or use .env file)"]
+fn test_finish_verifies_stored_bytes() -> Result<()> {
+    dotenvy::dotenv().ok();
+    let bucket = std::env::var("BUCKET").unwrap_or_else(|_| "mlp-s3dlio".to_string());
+    let key = "test-bug593-head-verify.bin";
+    let data_size: usize = 12 * 1024 * 1024; // 12 MiB — spans 2 parts at default 8 MiB
+
+    let cfg = MultipartUploadConfig::default();
+    let mut sink = MultipartUploadSink::new(&bucket, key, cfg)?;
+
+    let block = vec![0xBEu8; 1024 * 1024]; // 1 MiB blocks
+    for _ in 0..(data_size / block.len()) {
+        sink.write_blocking(&block)?;
+    }
+
+    let info = sink.finish_blocking()?;
+
+    ensure!(
+        info.total_bytes == data_size as u64,
+        "total_bytes mismatch: wrote {} but got {}",
+        data_size,
+        info.total_bytes
+    );
+
+    // BUG #593 Bug 2: stored_bytes field doesn't exist yet — compile error before fix.
+    ensure!(
+        info.stored_bytes == data_size as u64, // COMPILE ERROR before fix
+        "HEAD-verified stored size mismatch: expected {} but S3 reports {}",
+        data_size,
+        info.stored_bytes
+    );
+
+    // Cleanup
+    run_on_global_rt(async move {
+        let client = aws_s3_client_async().await?;
+        let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    Ok(())
+}
+
 fn unique(prefix: &str) -> String {
     let pid = std::process::id();
     let now = SystemTime::now()

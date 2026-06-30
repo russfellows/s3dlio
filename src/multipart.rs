@@ -39,6 +39,8 @@ use std::time::SystemTime;
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt, spawn_on_global_rt};
 use crate::s3_utils::{parse_s3_uri, SdkResultExt};
 
+use tracing::{debug, warn};
+
 #[cfg(feature = "profiling")]
 use tracing::instrument;
 
@@ -100,7 +102,11 @@ pub fn auto_max_in_flight(part_size: usize) -> usize {
 #[derive(Clone, Debug)]
 pub struct MultipartCompleteInfo {
     pub e_tag: Option<String>,
+    /// Bytes written by the caller (sum of all parts).
     pub total_bytes: u64,
+    /// Bytes confirmed stored by HEAD request after CompleteMultipartUpload.
+    /// Must equal `total_bytes`; a mismatch means the backend silently dropped data.
+    pub stored_bytes: u64,
     pub parts: usize,
     pub started_at: SystemTime,
     pub completed_at: SystemTime,
@@ -547,8 +553,19 @@ async fn coordinator_task(
     let mut total_bytes: u64 = 0;
     let mut part_tasks: Vec<JoinHandle<Result<(i32, String)>>> = Vec::new();
 
+    debug!(
+        "s3dlio MPU: start upload_id={} s3://{}/{}",
+        upload_id, bucket, key
+    );
+
     while let Some(PartMsg::Part { data, part_number }) = part_rx.recv().await {
-        total_bytes += data.len() as u64;
+        let part_bytes = data.len() as u64;
+        total_bytes += part_bytes;
+
+        debug!(
+            "s3dlio MPU: enqueue part={} size={} total_so_far={} s3://{}/{}",
+            part_number, part_bytes, total_bytes, bucket, key
+        );
 
         // Acquire a semaphore permit ASYNCHRONOUSLY.
         // This never parks the Python caller thread.
@@ -566,6 +583,9 @@ async fn coordinator_task(
         let handle = tokio::task::spawn(async move {
             let _permit = permit; // released when task completes
 
+            // ByteStream::from(Bytes) creates an in-memory body; the redirect
+            // client's try_clone() succeeds, so AIStore 307 redirects on
+            // UploadPart are followed correctly.
             let body = ByteStream::from(data);
             // Build the error-context string before moving b/k into the request
             // builder.  Preserves the bucket+key+part_number in the message
@@ -573,8 +593,8 @@ async fn coordinator_task(
             let upload_ctx = format!("UploadPart {} failed for s3://{}/{}", part_number, b, k);
             let resp = c
                 .upload_part()
-                .bucket(b)
-                .key(k)
+                .bucket(&b)
+                .key(&k)
                 .upload_id(uid)
                 .part_number(part_number)
                 .body(body)
@@ -586,6 +606,10 @@ async fn coordinator_task(
             if etag.is_empty() {
                 bail!("UploadPart returned empty ETag for part {part_number}");
             }
+            debug!(
+                "s3dlio MPU: part={} done ETag={} s3://{}/{}",
+                part_number, etag, b, k
+            );
             Ok::<(i32, String), anyhow::Error>((part_number, etag))
         });
 
@@ -603,6 +627,11 @@ async fn coordinator_task(
     parts.sort_by_key(|(pn, _)| *pn);
 
     let n_parts = parts.len();
+    debug!(
+        "s3dlio MPU: CompleteMultipartUpload parts={} total_bytes={} s3://{}/{}",
+        n_parts, total_bytes, bucket, key
+    );
+
     let completed_parts: Vec<CompletedPart> = parts
         .into_iter()
         .map(|(pn, etag)| {
@@ -620,17 +649,90 @@ async fn coordinator_task(
     let complete_ctx = format!("CompleteMultipartUpload failed for s3://{}/{}", bucket, key);
     let resp = client
         .complete_multipart_upload()
-        .bucket(bucket)
-        .key(key)
+        .bucket(&bucket)
+        .key(&key)
         .upload_id(upload_id)
         .multipart_upload(cmu)
         .send()
         .await
         .sdk_context(complete_ctx)?;
 
+    debug!(
+        "s3dlio MPU: CompleteMultipartUpload OK ETag={:?} s3://{}/{}",
+        resp.e_tag, bucket, key
+    );
+
+    // Verify the stored object size via HEAD.  S3-compatible backends (AIStore
+    // in particular) can silently drop parts and still return valid ETags;
+    // without this check a truncated upload appears successful.  If this
+    // fails, the caller sees an error rather than a silently truncated object.
+    // Enable DEBUG logging (RUST_LOG=s3dlio=debug) to trace redirect hops and
+    // per-part ETags when diagnosing size mismatches on multi-node AIStore.
+    let head_ctx = format!("HeadObject after upload failed for s3://{}/{}", bucket, key);
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key(&key)
+        .send()
+        .await
+        .sdk_context(head_ctx)?;
+    let stored_bytes = head.content_length().unwrap_or(0) as u64;
+    if stored_bytes != total_bytes {
+        warn!(
+            "s3dlio MPU: size mismatch s3://{}/{} written={} stored={} — \
+             possible redirect or AIStore replication issue; \
+             set RUST_LOG=s3dlio=debug for per-part trace",
+            bucket, key, total_bytes, stored_bytes
+        );
+
+        // Delete the truncated object so callers and downstream readers do not
+        // silently consume corrupt data.  The streaming write data is already
+        // consumed; the caller must restart the upload from scratch.
+        let cleanup_ok = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .is_ok();
+        if cleanup_ok {
+            warn!(
+                "s3dlio MPU: deleted truncated object s3://{}/{} — caller must retry upload",
+                bucket, key
+            );
+        } else {
+            warn!(
+                "s3dlio MPU: failed to delete truncated object s3://{}/{} — \
+                 delete it manually before retrying",
+                bucket, key
+            );
+        }
+
+        bail!(
+            "Size mismatch after CompleteMultipartUpload for s3://{}/{}: \
+             wrote {} bytes but HEAD reports {} bytes stored. \
+             {} Retry the upload from scratch.",
+            bucket,
+            key,
+            total_bytes,
+            stored_bytes,
+            if cleanup_ok {
+                "Truncated object has been deleted."
+            } else {
+                "WARNING: truncated object could not be deleted — remove it manually before retrying."
+            }
+        );
+    }
+
+    debug!(
+        "s3dlio MPU: HEAD verified stored={} bytes s3://{}/{}",
+        stored_bytes, bucket, key
+    );
+
     Ok(MultipartCompleteInfo {
         e_tag: resp.e_tag.map(|s| s.to_string()),
         total_bytes,
+        stored_bytes,
         parts: n_parts,
         started_at,
         completed_at: SystemTime::now(),
@@ -767,5 +869,34 @@ mod tests {
                 pipeline_bytes >> 20
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // BUG #593 Bug 2 — structural test
+    // ------------------------------------------------------------------
+
+    /// `MultipartCompleteInfo` must carry `stored_bytes: u64` populated by a
+    /// HEAD request after `CompleteMultipartUpload`.  Without it the
+    /// coordinator never verifies that the stored file size equals the bytes
+    /// written — AIStore can silently drop parts and return valid ETags.
+    ///
+    /// This test **FAILS TO COMPILE** before the fix because `stored_bytes`
+    /// does not exist on the struct.  After the fix it compiles and the
+    /// assertion verifies the field is reachable.
+    #[test]
+    fn test_complete_info_has_stored_bytes_field() {
+        let info = MultipartCompleteInfo {
+            e_tag: None,
+            total_bytes: 1024,
+            stored_bytes: 1024, // BUG: field missing → compile error before fix
+            parts: 1,
+            started_at: SystemTime::UNIX_EPOCH,
+            completed_at: SystemTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            info.stored_bytes,
+            info.total_bytes,
+            "stored size from HEAD must match bytes written"
+        );
     }
 }

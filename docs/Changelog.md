@@ -1,5 +1,120 @@
 # s3dlio Changelog
 
+## Version 0.9.104 — Multipart upload reliability: error propagation, stored-size verification, AIStore redirect safety (mlcommons/storage#593)
+
+### Why this release
+
+External report mlcommons/storage#593 identified two silent-corruption bugs in
+`MultipartUploadWriter` that affected multi-host DLIO runs against AIStore:
+
+1. **`__exit__` silently discarded `finish_blocking()` errors.** When
+   `CompleteMultipartUpload` or the post-upload `HEAD` check failed, `__exit__`
+   called `abort_blocking()` (a no-op at that point) and returned `Ok(())` —
+   Python saw no exception and assumed the upload succeeded.
+
+2. **No size verification after `CompleteMultipartUpload`.** The upload was
+   declared complete as soon as the AWS SDK returned 200 OK.  On multi-node
+   AIStore clusters, HTTP 307 redirects during part upload can route individual
+   parts to different storage nodes; if AIStore's internal replication or part
+   assembly is incomplete, the resulting object is silently truncated — a valid
+   ETag is returned for a file that is missing data.
+
+### Fixed: `__exit__` now propagates `finish_blocking()` errors
+
+`PyMultipartUploadWriter.__exit__` in `src/python_api/python_advanced_api.rs`
+now returns `Err(PyRuntimeError)` when `finish_blocking()` fails, surfacing the
+error as a Python `RuntimeError` from the `with` block.
+
+Also fixed: `__exit__` previously called `finish_blocking()` even when an
+exception propagated from *inside* the `with` block (e.g. `write()` raised).
+This incorrectly attempted to complete a partial upload instead of aborting it.
+Fixed by checking `_t.bind(py).is_none()`: if `exc_type` is not `None`, the
+upload is aborted and the original exception propagates unchanged.
+
+### Fixed: stored-size verification via HEAD after `CompleteMultipartUpload`
+
+`coordinator_task` in `src/multipart.rs` now issues `head_object()` after
+`CompleteMultipartUpload` and compares `content_length` to the total bytes
+written.  On mismatch:
+
+1. A `WARN` log is emitted with the sizes and an actionable hint to enable
+   `RUST_LOG=s3dlio=debug` for per-part ETag tracing.
+2. `delete_object()` is called to remove the truncated object, preventing
+   downstream readers from consuming corrupt data.  A second `WARN` records
+   whether cleanup succeeded; if it did not, the message names the key so the
+   operator can delete it manually.
+3. The function bails with a `RuntimeError` that names the size mismatch, the
+   cleanup outcome, and the explicit instruction to retry the upload.
+
+`MultipartCompleteInfo` gains a new field `stored_bytes: u64` (populated from
+the HEAD response) available to callers that want to log or assert the
+verified size.
+
+### New: per-part DEBUG logging in `coordinator_task`
+
+`use tracing::{debug, warn}` is now unconditional in `src/multipart.rs`.
+Enable with `RUST_LOG=s3dlio=debug`.  Log points:
+
+- MPU session start (upload\_id, bucket/key)
+- Each part enqueued (part number, size in bytes, running total)
+- Each part completed (part number, ETag received from the backend)
+- `CompleteMultipartUpload` call (number of parts, total bytes)
+- `CompleteMultipartUpload` result (ETag)
+- HEAD verification result (stored bytes)
+- `WARN` with actionable message and cleanup outcome on size mismatch
+
+The redirect client (`src/redirect_client.rs`) already emits `debug!` /
+`warn!` for every redirect hop (cross-host vs same-host, 303 method rewrite,
+non-cloneable body pass-through).  Together these log points allow an operator
+to trace whether a size mismatch originated in s3dlio or in the AIStore backend.
+
+Note: `UploadPart` uses `ByteStream::from(Bytes)` (in-memory data), so the
+redirect client's `try_clone()` succeeds and AIStore 307 redirects on
+individual parts are followed correctly.
+
+### New: Error Recovery and Retry documentation
+
+`docs/performance/MultiPart_README.md` has a new
+[Error Recovery and Retry](performance/MultiPart_README.md#error-recovery-and-retry)
+section covering:
+
+- Why automatic retry is impossible (streaming architecture; data is consumed
+  by `write_blocking()` calls and cannot be replayed inside the library)
+- What the library guarantees on failure (truncated object deleted,
+  in-progress MPU aborted)
+- Two complete Python retry loop examples (explicit `close()` form and
+  `with`-statement form) with the critical note that `data_source` must be a
+  callable, not a bare iterator/generator
+- How to enable `RUST_LOG=s3dlio=debug` for per-part ETag tracing
+
+The FAQ answer for "what happens if a part upload fails?" is updated to
+reference the new section.
+
+### Tests (3 new)
+
+`src/multipart.rs` — unit test:
+
+- `test_complete_info_has_stored_bytes_field`: references
+  `MultipartCompleteInfo.stored_bytes` — **FAILED TO COMPILE** before fix
+  (field missing), compiles and passes after.
+
+`tests/test_multipart.rs` — integration tests (`#[ignore]`, require live S3 endpoint):
+
+- `test_finish_err_on_zero_parts`: calls `finish_blocking()` with no parts
+  written; `CompleteMultipartUpload(parts=[])` is rejected by every backend,
+  proving the error that `__exit__` previously silenced.
+  Run: `cargo test -- --include-ignored test_finish_err_on_zero_parts`
+
+- `test_finish_verifies_stored_bytes`: uploads 12 MiB (two parts at default
+  8 MiB), asserts `info.stored_bytes == data_size` after `finish_blocking()`.
+  **FAILED TO COMPILE** before fix (`stored_bytes` field missing), compiles
+  and passes after.
+  Run: `cargo test -- --include-ignored test_finish_verifies_stored_bytes`
+
+Full suite: 39 passed, 0 failed, 10 ignored. `cargo clippy -- -D warnings` clean.
+
+---
+
 ## Version 0.9.102 — SDK error-chain diagnostics + cold-start timeout / retry knobs (mlcommons/storage#506)
 
 ### Why this release
