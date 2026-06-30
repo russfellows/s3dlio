@@ -24,6 +24,7 @@ This document explains how to use the **streaming, concurrent multipart upload (
 
   * [Flushing partial parts](#flushing-partial-parts)
   * [Aborting an MPU](#aborting-an-mpu)
+  * [Error Recovery and Retry](#error-recovery-and-retry)
   * [Content type / metadata](#content-type--metadata)
   * [Throughput tuning](#throughput-tuning)
 * [Large Object Downloads](#large-object-downloads)
@@ -186,6 +187,144 @@ w.write(memoryview(arr))
 
 `abort()` cancels the upload and best‑effort cleans up the server state. After abort, the writer is unusable.
 
+### Error Recovery and Retry
+
+#### What the library does on failure
+
+`MultipartUploadWriter` is a **streaming** writer. Data passed to `write()` is immediately
+queued for upload and cannot be replayed inside the library. This has two important
+consequences for error handling:
+
+1. **No automatic retry.** When `close()` raises, the data is already consumed. The
+   library cannot restart the upload internally — the caller must re-supply the data.
+
+2. **Truncated objects are deleted automatically.** If `CompleteMultipartUpload`
+   succeeds but a subsequent `HEAD` reveals the stored size does not match the bytes
+   written (a known failure mode on multi-node AIStore clusters), the library
+   **deletes the partial object** before raising. Downstream readers will never see
+   corrupt data. The error message states whether cleanup succeeded; if it did not,
+   the message names the key so you can delete it manually before retrying.
+
+#### Retry loop — recommended pattern
+
+The golden rule: **your data source must be callable more than once.** A bare
+`iterator` or `generator` is exhausted after the first attempt and cannot be
+retried. Wrap it in a function (or use a list/buffer for small objects).
+
+```python
+import time
+import s3dlio
+from s3dlio import MultipartUploadWriter
+
+MAX_RETRIES = 3
+RETRY_DELAY_S = 5
+
+def upload_with_retry(bucket: str, key: str, data_source, max_retries=MAX_RETRIES):
+    """
+    Upload to S3 with automatic retry on transient failures.
+
+    Parameters
+    ----------
+    bucket, key  : S3 destination.
+    data_source  : A *callable* (zero-argument function) that returns an
+                   iterable of byte chunks each time it is called.  It will
+                   be called once per upload attempt.  It MUST be re-callable
+                   because data is consumed during upload and cannot be replayed.
+
+                   Examples:
+                     # OK — reads the file fresh each attempt
+                     data_source = lambda: open("model.bin", "rb").read_in_chunks()
+
+                     # OK — re-generates data each attempt
+                     data_source = lambda: [generate_npz_bytes(shape=[6053, 6053, 1])]
+
+                     # OK — iterates an in-memory list each attempt
+                     data_source = lambda: [chunk1, chunk2, chunk3]
+
+                     # WRONG — a bare generator is exhausted after one pass
+                     data_source = (chunk for chunk in source)  # DO NOT do this
+    """
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        writer = MultipartUploadWriter(bucket, key)
+        try:
+            for chunk in data_source():
+                writer.write(chunk)
+            info = writer.close()
+            return info  # success
+        except RuntimeError as e:
+            last_err = e
+            # If the error came from close() after CompleteMultipartUpload,
+            # the library already deleted any truncated object.
+            # If the error came from write(), the MPU is still in-progress;
+            # abort() cancels it and frees the upload slot on the server.
+            try:
+                writer.abort()
+            except Exception:
+                pass  # abort is best-effort; ignore secondary failures
+            if attempt < max_retries:
+                print(f"[s3 upload] attempt {attempt}/{max_retries} failed: {e}")
+                print(f"[s3 upload] retrying in {RETRY_DELAY_S}s ...")
+                time.sleep(RETRY_DELAY_S)
+
+    raise RuntimeError(
+        f"Upload to s3://{bucket}/{key} failed after {max_retries} attempts"
+    ) from last_err
+```
+
+#### Using the `with` statement with retry
+
+If you prefer the context-manager form, note that an exception raised inside the
+`with` block causes `__exit__` to **abort** the upload (not complete it) before
+re-raising the original exception.  This makes it safe to catch and retry:
+
+```python
+def upload_with_retry_ctx(bucket: str, key: str, data_source, max_retries=MAX_RETRIES):
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with MultipartUploadWriter(bucket, key) as w:
+                for chunk in data_source():
+                    w.write(chunk)
+            # __exit__ calls close() here; raises RuntimeError on failure
+            return  # success
+        except RuntimeError as e:
+            last_err = e
+            # The library has already aborted or cleaned up — no extra steps needed.
+            if attempt < max_retries:
+                print(f"[s3 upload] attempt {attempt}/{max_retries} failed: {e}")
+                time.sleep(RETRY_DELAY_S)
+
+    raise RuntimeError(
+        f"Upload to s3://{bucket}/{key} failed after {max_retries} attempts"
+    ) from last_err
+```
+
+#### Enabling debug logging to diagnose failures
+
+On multi-node AIStore or any S3-compatible cluster, size mismatches may be caused
+by redirect routing, replication lag, or part-assembly issues that are outside
+s3dlio's control. Set `RUST_LOG=s3dlio=debug` to get a per-part trace:
+
+```python
+import os
+os.environ["RUST_LOG"] = "s3dlio=debug"
+
+import s3dlio
+s3dlio.init_logging("debug")  # also routes Rust tracing to Python's log system
+```
+
+The debug output records:
+- MPU session start (upload\_id, bucket/key)
+- Each part enqueued (part number, size in bytes, running total)
+- Each part completed (part number, ETag received from the backend)
+- `CompleteMultipartUpload` call (number of parts, total bytes)
+- `CompleteMultipartUpload` result (final ETag)
+- `HEAD` verification result (stored bytes vs written bytes)
+
+If the trace shows the correct ETag for every part but HEAD reports a smaller size,
+the issue is in the backend (AIStore replication / part assembly), not in s3dlio.
+
 ### Content type / metadata
 
 You can set `content_type` on creation. Future versions may expose additional headers/metadata if needed.
@@ -292,8 +431,13 @@ export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
 **Q: Do I have to use `reserve()`?**
 A: No. It’s the fastest path, but `write()` works with any bytes‑like object and is simpler.
 
-**Q: What happens if a part upload fails?**
-A: `close()` returns an error. You can call `abort()` to clean up. (A future version may auto‑abort on the first failure.)
+**Q: What happens if a part upload fails or the stored size doesn't match?**
+A: `close()` (or `__exit__`) raises `RuntimeError`. The library automatically
+aborts any in-progress MPU (for mid-write failures) or deletes the truncated
+object (for post-`CompleteMultipartUpload` size mismatches). In both cases the
+data is gone from the writer — you must restart the upload from scratch.
+See **[Error Recovery and Retry](#error-recovery-and-retry)** for working retry
+loop examples.
 
 **Q: Can I stream more data after `close()`?**
 A: No. Create a new writer for another object.

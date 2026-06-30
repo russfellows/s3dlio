@@ -17,7 +17,7 @@ use tokio::task;
 
 use std::path::PathBuf;
 
-use tracing::{warn, Level};
+use tracing::{debug, warn, Level};
 
 // Project crates
 use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
@@ -139,6 +139,137 @@ where
     T: Send + 'static,
 {
     run_on_global_rt(fut).map_err(py_err)
+}
+
+// ---------------------------------------------------------------------------
+// PUT with HEAD verification and automatic retry (all backends)
+// ---------------------------------------------------------------------------
+
+/// PUT `data` to `uri` via `store`, verify the stored size with a HEAD request,
+/// and retry up to `S3DLIO_PUT_MAX_RETRIES` times (default 3) on mismatch or
+/// transient PUT failure.
+///
+/// On size mismatch the truncated object is deleted before retrying, mirroring
+/// the same cleanup logic used by the multipart coordinator_task.
+///
+/// **Skipped for `file://` and `direct://`**: local writes have OS-level durability
+/// guarantees so the extra round-trip is unnecessary overhead.
+///
+/// Env vars (read at call time, no caching needed):
+///   `S3DLIO_PUT_MAX_RETRIES`   — total attempts, default 3
+///   `S3DLIO_PUT_RETRY_DELAY_MS` — delay between attempts in ms, default 1000
+async fn put_verified_with_retry(
+    store: &dyn ObjectStore,
+    uri: &str,
+    data: Bytes,
+) -> anyhow::Result<()> {
+    // Local stores have strong write durability — skip the extra HEAD call.
+    let scheme = uri.split("://").next().unwrap_or("");
+    if scheme == "file" || scheme == "direct" {
+        return store.put(uri, data).await;
+    }
+
+    let expected_len = data.len() as u64;
+    let max_attempts: u32 = std::env::var("S3DLIO_PUT_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let retry_delay_ms: u64 = std::env::var("S3DLIO_PUT_RETRY_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000);
+
+    let mut last_err = anyhow::anyhow!("no attempts made");
+
+    for attempt in 1..=max_attempts {
+        debug!(
+            "s3dlio put_bytes: attempt={}/{} uri={} bytes={}",
+            attempt, max_attempts, uri, expected_len
+        );
+
+        // PUT — Bytes is Arc-backed; clone is a ref-count bump, not a data copy.
+        if let Err(e) = store.put(uri, data.clone()).await {
+            last_err = e;
+            warn!(
+                "s3dlio put_bytes: PUT attempt {}/{} failed for {}: {} — {}",
+                attempt,
+                max_attempts,
+                uri,
+                last_err,
+                if attempt < max_attempts {
+                    "retrying"
+                } else {
+                    "giving up"
+                }
+            );
+            if attempt < max_attempts {
+                tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+            }
+            continue;
+        }
+
+        // HEAD verification — works on every backend (S3, Azure, GCS, file, direct).
+        match store.stat(uri).await {
+            Err(e) => {
+                // Stat failed after a successful PUT — warn but return Ok rather
+                // than deleting an object that may be perfectly intact.
+                warn!(
+                    "s3dlio put_bytes: stat failed for {} after successful PUT: {} — assuming data intact",
+                    uri, e
+                );
+                return Ok(());
+            }
+            Ok(meta) => {
+                if meta.size == expected_len {
+                    debug!(
+                        "s3dlio put_bytes: verified {} bytes stored at {}",
+                        expected_len, uri
+                    );
+                    return Ok(());
+                }
+
+                // Truncated object — mirrors multipart coordinator_task cleanup.
+                warn!(
+                    "s3dlio put_bytes: size mismatch at {} — wrote {} bytes but HEAD reports {} bytes; \
+                     set RUST_LOG=s3dlio=debug for per-attempt trace",
+                    uri, expected_len, meta.size
+                );
+                let cleanup_ok = store.delete(uri).await.is_ok();
+                if cleanup_ok {
+                    warn!(
+                        "s3dlio put_bytes: deleted truncated object at {} — {}",
+                        uri,
+                        if attempt < max_attempts {
+                            "will retry"
+                        } else {
+                            "caller must retry upload"
+                        }
+                    );
+                } else {
+                    warn!(
+                        "s3dlio put_bytes: failed to delete truncated object at {} — delete it manually before retrying",
+                        uri
+                    );
+                }
+                last_err = anyhow::anyhow!(
+                    "PUT size mismatch for {}: wrote {} bytes but HEAD reports {} bytes. {}",
+                    uri,
+                    expected_len,
+                    meta.size,
+                    if cleanup_ok {
+                        "Truncated object has been deleted."
+                    } else {
+                        "WARNING: truncated object could not be deleted — remove it manually before retrying."
+                    }
+                );
+                if attempt < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,12 +1145,8 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
             let logger = global_logger();
-
-            // Get cached store (or create if first time)
             let store = get_or_create_store(&uri, logger)?;
-
-            // Execute operation using cached client — zero-copy Bytes
-            store.put(&uri, data_owned).await
+            put_verified_with_retry(store.as_ref(), &uri, data_owned).await
         })
     })
 }
@@ -1090,7 +1217,9 @@ fn put_bytes_async<'py>(
     future_into_py(py, async move {
         let logger = global_logger();
         let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
-        store.put(&uri, data_owned).await.map_err(py_err)
+        put_verified_with_retry(store.as_ref(), &uri, data_owned)
+            .await
+            .map_err(py_err)
     })
 }
 

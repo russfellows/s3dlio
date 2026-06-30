@@ -362,7 +362,12 @@ impl PyMultipartUploadWriter {
         Ok(slf)
     }
 
-    /// Context manager exit: closes on success; aborts on exception.
+    /// Context manager exit: closes on success; aborts and raises on error.
+    ///
+    /// If an exception propagated from inside the `with` block (_t is not None),
+    /// the upload is aborted and the original exception is re-raised unchanged.
+    /// If no exception occurred, `finish_blocking()` is called; any error it
+    /// returns is surfaced as a new `RuntimeError`.
     #[pyo3(text_signature = "(self, exc_type, exc, tb)")]
     fn __exit__(
         &mut self,
@@ -371,11 +376,18 @@ impl PyMultipartUploadWriter {
         _v: Py<PyAny>,
         _tb: Py<PyAny>,
     ) -> PyResult<()> {
-        if self.inner.is_some() {
-            if let Some(mut inner) = self.inner.take() {
-                if let Err(_e) = py.detach(|| inner.finish_blocking()) {
-                    let _ = py.detach(|| inner.abort_blocking());
-                }
+        if let Some(mut inner) = self.inner.take() {
+            if !_t.bind(py).is_none() {
+                // An exception propagated from inside the `with` block — abort the
+                // upload and let the original exception propagate unchanged.
+                let _ = py.detach(|| inner.abort_blocking());
+                return Ok(()); // returning Ok(()) (falsy) does NOT suppress the exception
+            }
+            if let Err(e) = py.detach(|| inner.finish_blocking()) {
+                let _ = py.detach(|| inner.abort_blocking());
+                return Err(PyRuntimeError::new_err(format!(
+                    "multipart upload failed: {e}"
+                )));
             }
         }
         Ok(())

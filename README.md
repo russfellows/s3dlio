@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-324-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.102-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-659-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.104-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,13 +10,17 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.102 — SDK error-chain diagnostics + cold-start timeout / retry knobs (mlcommons/storage#506)**
+> **v0.9.104 — Write integrity for every object write (mlcommons/storage#593)**
 >
-> Every `SdkError` on the S3 GET / HEAD / PUT / range / multipart paths now reaches Python with its full connector-error chain (I/O / TLS / DNS / timeout / refused) plus an actionable hint string — no more bare `RuntimeError: dispatch failure`.  Two new wired env vars: `S3DLIO_CONNECT_TIMEOUT_SECS` (default 20 s, was effectively hardcoded 5 s) and `S3DLIO_MAX_RETRY_ATTEMPTS` (default 3, set to `1` for fast-fail debugging).  See [docs/Changelog.md](docs/Changelog.md) for full details.
+> **Single-part PUT** (`put_bytes` / `put_bytes_async`): after every `PUT` to a network backend (S3, Azure, GCS), a HEAD request confirms the stored byte count matches bytes sent.  On mismatch the truncated object is automatically deleted and the write is retried.  Configurable via `S3DLIO_PUT_MAX_RETRIES` (default 3) and `S3DLIO_PUT_RETRY_DELAY_MS` (default 1000 ms).  `file://`/`direct://` bypass the HEAD round-trip — local writes have OS-level durability.
+>
+> **Multipart upload** (`MultipartUploadWriter`): two silent-corruption bugs fixed — (1) `__exit__` now raises `RuntimeError` when `finish_blocking()` fails rather than discarding the error; (2) a HEAD request after `CompleteMultipartUpload` verifies the stored size, deletes the truncated object on mismatch, and raises an actionable error.  Per-part `DEBUG` logging added (`RUST_LOG=s3dlio=debug`).
+>
+> New [Error Recovery and Retry](docs/performance/MultiPart_README.md#error-recovery-and-retry) guide and full env-var reference in [docs/Environment_Variables.md](docs/Environment_Variables.md) — "Data Integrity: Write Verification and Retry".  See [docs/Changelog.md](docs/Changelog.md) for full details.
+>
+> **v0.9.102 (prior):** SDK error-chain diagnostics + cold-start timeout / retry knobs (mlcommons/storage#506).
 >
 > **v0.9.100 (prior):** General-purpose object data loader — `PyDataset.from_uris()`, `items()`, `collect_batch()`, `skip_head` HEAD optimisation.  See [docs/Python_Data-Loader.md](docs/Python_Data-Loader.md).
->
-> **v0.9.98 (prior):** `ParquetRowGroupDataset` — epoch-aware Parquet DataLoader with epoch-2 fast path and Arrow IPC decode. See [docs/Changelog.md](docs/Changelog.md) for full history.
 
 ## 📦 Installation
 
