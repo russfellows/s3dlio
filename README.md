@@ -10,9 +10,13 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.104 — Multipart upload reliability: error propagation, stored-size verification, AIStore redirect safety (mlcommons/storage#593)**
+> **v0.9.104 — Write integrity for every object write (mlcommons/storage#593)**
 >
-> Fixes two silent-corruption bugs in `MultipartUploadWriter`: (1) `__exit__` now raises `RuntimeError` when `finish_blocking()` fails rather than discarding the error; (2) a `HEAD` request after `CompleteMultipartUpload` verifies the stored size matches bytes written — if not, the truncated object is automatically deleted and an actionable error is raised.  Per-part `DEBUG` logging added for AIStore redirect diagnosis (`RUST_LOG=s3dlio=debug`).  New [Error Recovery and Retry](docs/performance/MultiPart_README.md#error-recovery-and-retry) guide with complete Python retry loop examples.  See [docs/Changelog.md](docs/Changelog.md) for full details.
+> **Single-part PUT** (`put_bytes` / `put_bytes_async`): after every `PUT` to a network backend (S3, Azure, GCS), a HEAD request confirms the stored byte count matches bytes sent.  On mismatch the truncated object is automatically deleted and the write is retried.  Configurable via `S3DLIO_PUT_MAX_RETRIES` (default 3) and `S3DLIO_PUT_RETRY_DELAY_MS` (default 1000 ms).  `file://`/`direct://` bypass the HEAD round-trip — local writes have OS-level durability.
+>
+> **Multipart upload** (`MultipartUploadWriter`): two silent-corruption bugs fixed — (1) `__exit__` now raises `RuntimeError` when `finish_blocking()` fails rather than discarding the error; (2) a HEAD request after `CompleteMultipartUpload` verifies the stored size, deletes the truncated object on mismatch, and raises an actionable error.  Per-part `DEBUG` logging added (`RUST_LOG=s3dlio=debug`).
+>
+> New [Error Recovery and Retry](docs/performance/MultiPart_README.md#error-recovery-and-retry) guide and full env-var reference in [docs/Environment_Variables.md](docs/Environment_Variables.md) — "Data Integrity: Write Verification and Retry".  See [docs/Changelog.md](docs/Changelog.md) for full details.
 >
 > **v0.9.102 (prior):** SDK error-chain diagnostics + cold-start timeout / retry knobs (mlcommons/storage#506).
 >

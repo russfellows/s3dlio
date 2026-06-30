@@ -1,6 +1,6 @@
 # s3dlio Changelog
 
-## Version 0.9.104 — Multipart upload reliability: error propagation, stored-size verification, AIStore redirect safety (mlcommons/storage#593)
+## Version 0.9.104 — Write integrity: single-part PUT verification + retry; multipart error propagation, stored-size verification, AIStore redirect safety (mlcommons/storage#593)
 
 ### Why this release
 
@@ -90,7 +90,44 @@ section covering:
 The FAQ answer for "what happens if a part upload fails?" is updated to
 reference the new section.
 
-### Tests (3 new)
+### New: `put_bytes()` / `put_bytes_async()` verify stored size and retry (all network backends)
+
+`put_verified_with_retry` — a new private async helper in
+`src/python_api/python_core_api.rs` — wraps every `store.put()` call with a
+HEAD verification step and automatic retry logic.  Both `put_bytes` (sync)
+and `put_bytes_async` now call this helper instead of a bare `store.put()`.
+
+**What it does:**
+
+1. Issues `store.put(uri, data)`.
+2. Issues `store.stat(uri)` and compares `meta.size` to `data.len()`.
+3. On mismatch: logs a `WARN`, calls `store.delete(uri)` to remove the
+   truncated object, and retries (up to `S3DLIO_PUT_MAX_RETRIES` attempts,
+   with `S3DLIO_PUT_RETRY_DELAY_MS` ms between attempts).
+4. If `store.stat()` itself fails after a successful PUT (rare): logs a
+   `WARN` and returns `Ok(())` rather than deleting an object that may be
+   perfectly intact.
+
+**Backends covered:** S3-compatible, Azure Blob, GCS — anything the
+`ObjectStore` trait drives.  `file://` and `direct://` are excluded: local
+writes have OS-level durability so the extra HEAD round-trip is unnecessary
+overhead.
+
+**Retry is free:** `Bytes` is Arc-backed; `.clone()` is a reference-count
+bump, not a data copy.  The data is held in memory for the retry loop at
+zero extra cost.
+
+**New env vars** (read at call time, no process-startup caching needed):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_PUT_MAX_RETRIES` | `3` | Total PUT attempts before `put_bytes()` raises. |
+| `S3DLIO_PUT_RETRY_DELAY_MS` | `1000` | Milliseconds between retry attempts. |
+
+Full reference: `docs/Environment_Variables.md` — "Data Integrity: Write
+Verification and Retry".
+
+### Tests (8 new, 3 multipart + 5 put_bytes)
 
 `src/multipart.rs` — unit test:
 
@@ -103,15 +140,25 @@ reference the new section.
 - `test_finish_err_on_zero_parts`: calls `finish_blocking()` with no parts
   written; `CompleteMultipartUpload(parts=[])` is rejected by every backend,
   proving the error that `__exit__` previously silenced.
-  Run: `cargo test -- --include-ignored test_finish_err_on_zero_parts`
+  Run: `cargo test --test test_multipart -- --ignored`
 
 - `test_finish_verifies_stored_bytes`: uploads 12 MiB (two parts at default
   8 MiB), asserts `info.stored_bytes == data_size` after `finish_blocking()`.
-  **FAILED TO COMPILE** before fix (`stored_bytes` field missing), compiles
-  and passes after.
-  Run: `cargo test -- --include-ignored test_finish_verifies_stored_bytes`
+  Run: `cargo test --test test_multipart -- --ignored`
 
-Full suite: 659 passed, 0 failed. `cargo clippy -- -D warnings` clean.
+`tests/test_put_bytes.rs` — integration tests (`#[ignore]`, require live S3 endpoint):
+
+- `test_put_bytes_small_object_verified`: 1 KiB PUT → HEAD round-trip; verifies
+  stored byte count matches.
+- `test_put_bytes_medium_object_verified`: 1 MiB PUT → HEAD; single-part path.
+- `test_put_bytes_large_single_part_verified`: 20 MiB PUT → HEAD; exercises
+  single-part PUT for objects larger than the DLIO multipart threshold.
+- `test_put_bytes_zero_length_object`: empty object → HEAD must report 0 bytes.
+- `test_put_bytes_overwrite_size_updates`: two sequential PUTs to the same key;
+  verifies HEAD reflects the new size (not stale metadata).
+  Run: `cargo test --test test_put_bytes -- --ignored`
+
+Full suite: 664 passed, 0 failed. `cargo clippy -- -D warnings` clean.
 
 ---
 

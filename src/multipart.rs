@@ -894,8 +894,7 @@ mod tests {
             completed_at: SystemTime::UNIX_EPOCH,
         };
         assert_eq!(
-            info.stored_bytes,
-            info.total_bytes,
+            info.stored_bytes, info.total_bytes,
             "stored size from HEAD must match bytes written"
         );
     }
