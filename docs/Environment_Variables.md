@@ -108,11 +108,13 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 | `S3DLIO_OPERATION_TIMEOUT_SECS` | `60` | Full request/response cycle timeout in seconds (excluding the connect handshake).  60 s is sufficient for ~6 GB at 100 MB/s and ~60 GB at 1 GB/s.  Raise for very large single objects or slow networks. |
 | `S3DLIO_MAX_RETRY_ATTEMPTS` | `3` | Maximum number of attempts (1 initial + N−1 retries) the AWS SDK makes per operation before propagating the error.  Matches the SDK's own default.  Set to `1` for **fast-fail at warmup** (no retries; surface a dispatch failure in one connect budget instead of three) — useful for debugging mlcommons/storage#506-style cold-start issues.  Set to `5` or higher to ride out flaky-network bursts.  Clamped to a minimum of 1; the SDK rejects 0. |
 
-## Data Integrity: Write Verification and Retry (v0.9.104+)
+## Data Integrity: Write Verification and Retry (v0.9.104+, opt-in as of v0.9.106)
 
-s3dlio and its DLIO integration layer guard every object write with a HEAD verification step and automatic retry.  Corrupt or truncated objects are detected immediately after the write, deleted, and re-uploaded without requiring any action from the caller.  The feature was introduced in v0.9.104 in response to silent-corruption bugs documented in mlcommons/storage#593.
+s3dlio can guard object writes with a HEAD verification step and automatic retry: corrupt or truncated objects are detected immediately after the write, deleted, and re-uploaded without requiring any action from the caller.  This protects against backends that return a successful PUT / CompleteMultipartUpload response for an object that is not actually fully or durably stored (see mlcommons/storage#593) — a server-side contract violation observed on some S3-compatible backends (e.g. AIStore) under certain conditions.
 
-**Two layers, four variables** — single-part PUT is handled entirely inside the Rust library; multipart upload is handled by the DLIO Python integration layer which calls the library.  Each layer exposes its own retry knobs.
+**Disabled by default as of v0.9.106.**  HEAD-after-write verification adds one extra round-trip per object.  For benchmark workloads writing many small objects this can meaningfully reduce measured throughput, and every other major S3 client library (e.g. the AWS CRT-based connectors) trusts the server's success response without a follow-up HEAD.  s3dlio now matches that default: a single PUT (or a single CompleteMultipartUpload), no extra round-trip, relying on `S3DLIO_MAX_RETRY_ATTEMPTS` (SDK layer) to cover transient network failures.  Set the verify flags below to opt back into the HEAD-verify-retry behavior on backends where silent truncation has actually been observed.
+
+**Two independent layers, two independent verify flags** — single-part PUT is handled entirely inside the Rust library; multipart upload verification is also in the Rust library, but multipart *retry-the-whole-upload* orchestration is handled by the DLIO Python integration layer.  You can enable verification for one path and not the other.
 
 ### Single-Part PUT — Rust library layer
 
@@ -120,22 +122,28 @@ These variables are read by `put_bytes()` / `put_bytes_async()` inside the s3dli
 
 | Variable | Default | Allowable values | Description |
 |----------|---------|-----------------|-------------|
-| `S3DLIO_PUT_MAX_RETRIES` | `3` | Integer ≥ 1 | Total PUT attempts (1 initial + N−1 retries) before `put_bytes()` raises an error.  After each attempt the library issues a HEAD request and compares the reported byte count with the expected size.  On mismatch the truncated object is deleted before the next attempt so the retry always writes to a clean slot.  **`1`** = no retries (fail-fast — useful in tests to surface corruption immediately).  **`5`+** = extra resilience against flaky networks.  Non-numeric or < 1 values are silently treated as `3` (the default). |
-| `S3DLIO_PUT_RETRY_DELAY_MS` | `1000` | Integer ≥ 0 (milliseconds) | Milliseconds to wait between PUT retry attempts.  Applies to both network-error retries and size-mismatch retries.  **`0`** = back-to-back retries with no sleep (useful in unit/integration tests where the backend is local and instant).  **`5000`+** recommended on unreliable WAN links to give the storage backend time to recover.  Non-numeric values are silently treated as `1000`. |
+| `S3DLIO_PUT_VERIFY` | `false` | `1`/`true`/`yes`/`on` (case-insensitive) = enabled; anything else / unset = disabled | Opt-in master switch for single-part write verification.  When `false` (default), `put_bytes()` issues a single PUT and returns — no HEAD, no extra round-trip, matching the cost of every other S3 client library.  When `true`, the HEAD-verify-retry behavior below is active. |
+| `S3DLIO_PUT_MAX_RETRIES` | `3` | Integer ≥ 1 | **Only takes effect when `S3DLIO_PUT_VERIFY=true`.**  Total PUT attempts (1 initial + N−1 retries) before `put_bytes()` raises an error.  After each attempt the library issues a HEAD request and compares the reported byte count with the expected size.  On mismatch the truncated object is deleted before the next attempt so the retry always writes to a clean slot.  **`1`** = no retries (fail-fast — useful in tests to surface corruption immediately).  **`5`+** = extra resilience against flaky networks.  Non-numeric or < 1 values are silently treated as `3` (the default). |
+| `S3DLIO_PUT_RETRY_DELAY_MS` | `1000` | Integer ≥ 0 (milliseconds) | **Only takes effect when `S3DLIO_PUT_VERIFY=true`.**  Milliseconds to wait between PUT retry attempts.  Applies to both network-error retries and size-mismatch retries.  **`0`** = back-to-back retries with no sleep (useful in unit/integration tests where the backend is local and instant).  **`5000`+** recommended on unreliable WAN links to give the storage backend time to recover.  Non-numeric values are silently treated as `1000`. |
 
-> **`file://` and `direct://` bypass:** local stores have OS-level write durability so the HEAD verification round-trip is skipped entirely for those URI schemes.  The variables above have no effect when writing to local paths.
+> **`file://` and `direct://` bypass:** local stores have OS-level write durability so the HEAD verification round-trip is skipped entirely for those URI schemes, regardless of `S3DLIO_PUT_VERIFY`.
 
-> **Debug tracing:** set `RUST_LOG=s3dlio=debug` to see per-attempt PUT and HEAD trace lines including URI, byte counts, and attempt numbers.
+> **Debug tracing:** set `RUST_LOG=s3dlio=debug` to see per-attempt PUT and HEAD trace lines including URI, byte counts, and attempt numbers (only emitted when verification is enabled).
 
 ```bash
-# Default: 3 attempts, 1-second delay between retries (recommended for most workloads).
-# No action needed — these variables are optional.
+# Default: single PUT, no verification, no extra round-trip.
+# No action needed — this is the out-of-the-box behavior.
 
-# Fast-fail for tests and debugging: one attempt, no delay.
+# Opt in to write verification with default retry settings (3 attempts, 1s delay).
+export S3DLIO_PUT_VERIFY=true
+
+# Opt in, fast-fail for tests and debugging: one attempt, no delay.
+export S3DLIO_PUT_VERIFY=true
 export S3DLIO_PUT_MAX_RETRIES=1
 export S3DLIO_PUT_RETRY_DELAY_MS=0
 
-# Maximum resilience for unreliable WAN or overloaded cluster.
+# Opt in, maximum resilience for unreliable WAN or overloaded cluster.
+export S3DLIO_PUT_VERIFY=true
 export S3DLIO_PUT_MAX_RETRIES=5
 export S3DLIO_PUT_RETRY_DELAY_MS=5000
 
@@ -143,43 +151,50 @@ export S3DLIO_PUT_RETRY_DELAY_MS=5000
 export RUST_LOG=s3dlio=debug
 ```
 
-### Multipart Upload — DLIO Python integration layer
+### Multipart Upload — Rust verification + DLIO Python retry orchestration
 
-These variables are read by `ObjStoreLibStorage` in DLIO (`dlio_benchmark/storage/obj_store_lib.py`).  They apply only when DLIO is the calling application (i.e., training data generation / upload via `--storage-library s3dlio`).  They are **not** read by the s3dlio Rust library itself.
+`S3DLIO_MPU_PUT_VERIFY` is read by the s3dlio Rust library's multipart coordinator (`MultipartUploadWriter`).  `S3DLIO_MULTIPART_THRESHOLD_MB`, `S3DLIO_MPU_MAX_RETRIES`, and `S3DLIO_MPU_RETRY_DELAY_S` are read by `ObjStoreLibStorage` in DLIO (`dlio_benchmark/storage/obj_store_lib.py`) and apply only when DLIO is the calling application (i.e., training data generation / upload via `--storage-library s3dlio`).
 
-| Variable | Default | Allowable values | Description |
-|----------|---------|-----------------|-------------|
-| `S3DLIO_MULTIPART_THRESHOLD_MB` | `16` | Integer ≥ 0 (MiB) | Object size threshold in MiB above which DLIO switches from `put_bytes()` (single-part PUT) to `MultipartUploadWriter` (concurrent multi-part upload).  **`0`** = always use multipart (not recommended for small objects — adds MPU overhead with no throughput benefit).  Set to a very large value (e.g. `999999`) to force all writes through `put_bytes()` regardless of size.  Default 16 MiB is a good balance for MinIO with AI/ML dataset files. |
-| `S3DLIO_MPU_MAX_RETRIES` | `3` | Integer ≥ 1 | Total multipart upload attempts before DLIO raises `RuntimeError`.  On each failure DLIO calls `writer.abort()` to free the in-progress upload slot on the server, then starts a fresh `MultipartUploadWriter` for the next attempt.  Because the payload is already in memory (no disk re-read), retrying is cheap.  **`1`** = no retries (raise on the first failure — useful for debugging).  Non-numeric or < 1 values are silently treated as `3`. |
-| `S3DLIO_MPU_RETRY_DELAY_S` | `5` | Number ≥ 0 (seconds, floats accepted) | Seconds to sleep between multipart upload retry attempts.  **`0`** = back-to-back retries with no sleep (useful in unit tests).  **`30`+** recommended when the storage backend needs time to recover between attempts (e.g. after an upload quota event).  Non-numeric values are silently treated as `5`. |
+| Variable | Layer | Default | Allowable values | Description |
+|----------|-------|---------|-----------------|-------------|
+| `S3DLIO_MPU_PUT_VERIFY` | Rust | `false` | `1`/`true`/`yes`/`on` (case-insensitive) = enabled; anything else / unset = disabled | Opt-in master switch for multipart write verification.  When `false` (default), `MultipartUploadWriter` does not issue a HEAD after `CompleteMultipartUpload`; `stored_bytes` in the result is set equal to `total_bytes` (unverified-assumed-equal).  When `true`, a HEAD confirms the stored size and a mismatch raises an error — see below for what happens next on the DLIO side. |
+| `S3DLIO_MULTIPART_THRESHOLD_MB` | DLIO (Python) | `16` | Integer ≥ 0 (MiB) | Object size threshold in MiB above which DLIO switches from `put_bytes()` (single-part PUT) to `MultipartUploadWriter` (concurrent multi-part upload).  **`0`** = always use multipart (not recommended for small objects — adds MPU overhead with no throughput benefit).  Set to a very large value (e.g. `999999`) to force all writes through `put_bytes()` regardless of size.  Default 16 MiB is a good balance for MinIO with AI/ML dataset files. |
+| `S3DLIO_MPU_MAX_RETRIES` | DLIO (Python) | `3` | Integer ≥ 1 | **Only meaningful when `S3DLIO_MPU_PUT_VERIFY=true`** — without it, the Rust layer never raises on a size mismatch, so this retry loop is only reached on genuine API errors (e.g. a failed `UploadPart`).  Total multipart upload attempts before DLIO raises `RuntimeError`.  On each failure DLIO calls `writer.abort()` to free the in-progress upload slot on the server, then starts a fresh `MultipartUploadWriter` for the next attempt.  Because the payload is already in memory (no disk re-read), retrying is cheap.  **`1`** = no retries (raise on the first failure — useful for debugging).  Non-numeric or < 1 values are silently treated as `3`. |
+| `S3DLIO_MPU_RETRY_DELAY_S` | DLIO (Python) | `5` | Number ≥ 0 (seconds, floats accepted) | Seconds to sleep between multipart upload retry attempts.  **`0`** = back-to-back retries with no sleep (useful in unit tests).  **`30`+** recommended when the storage backend needs time to recover between attempts (e.g. after an upload quota event).  Non-numeric values are silently treated as `5`. |
 
 ```bash
-# Default multipart threshold: objects ≥ 16 MiB use MultipartUploadWriter.
-# No action needed — these variables are optional.
+# Default: no HEAD verification after CompleteMultipartUpload, no extra round-trip.
+# No action needed — this is the out-of-the-box behavior.
 
-# Raise the threshold so only very large objects use multipart.
+# Opt in to multipart write verification (recommended on backends where
+# silent truncation has been observed, e.g. some AIStore configurations).
+export S3DLIO_MPU_PUT_VERIFY=true
+
+# Raise the single-part/multipart threshold so only very large objects use multipart.
 export S3DLIO_MULTIPART_THRESHOLD_MB=64
 
 # Force all uploads through put_bytes (bypass MultipartUploadWriter entirely).
 export S3DLIO_MULTIPART_THRESHOLD_MB=999999
 
-# Aggressive retry for unreliable storage.
+# Opt in to verification with aggressive retry for unreliable storage.
+export S3DLIO_MPU_PUT_VERIFY=true
 export S3DLIO_MPU_MAX_RETRIES=5
 export S3DLIO_MPU_RETRY_DELAY_S=30
 
-# Fast-fail for debugging (first failure raises immediately, no sleep).
+# Opt in, fast-fail for debugging (first failure raises immediately, no sleep).
+export S3DLIO_MPU_PUT_VERIFY=true
 export S3DLIO_MPU_MAX_RETRIES=1
 export S3DLIO_MPU_RETRY_DELAY_S=0
 ```
 
 ### How the two layers interact
 
-For any single object write, exactly one retry system is active — the two are mutually exclusive:
+For any single object write, exactly one path is active — the two are mutually exclusive:
 
-- **`payload_size < S3DLIO_MULTIPART_THRESHOLD_MB MiB`** → DLIO calls `put_bytes()` → the s3dlio Rust library's `S3DLIO_PUT_*` retry logic runs (HEAD verify included).
-- **`payload_size ≥ S3DLIO_MULTIPART_THRESHOLD_MB MiB`** → DLIO calls `MultipartUploadWriter` → the Python `S3DLIO_MPU_*` retry logic runs (DLIO orchestrates the retry loop; s3dlio handles the individual parts).
+- **`payload_size < S3DLIO_MULTIPART_THRESHOLD_MB MiB`** → DLIO calls `put_bytes()` → the s3dlio Rust library's `S3DLIO_PUT_*` logic runs (HEAD verify only if `S3DLIO_PUT_VERIFY=true`).
+- **`payload_size ≥ S3DLIO_MULTIPART_THRESHOLD_MB MiB`** → DLIO calls `MultipartUploadWriter` → the Rust library's `S3DLIO_MPU_PUT_VERIFY` check runs after `CompleteMultipartUpload`; if it raises, DLIO's `S3DLIO_MPU_*` retry loop orchestrates the retry.
 
-There is no double-retry: if the multipart path is active, the single-part Rust retry path is not, and vice versa.
+There is no double-retry: if the multipart path is active, the single-part Rust retry path is not, and vice versa.  Verification is independently configurable per path — for example, enabling `S3DLIO_MPU_PUT_VERIFY` for large checkpoint objects while leaving `S3DLIO_PUT_VERIFY` off for the high-volume small-object datagen path.
 
 ## Range GET Optimization
 
@@ -364,23 +379,43 @@ export S3DLIO_OPLOG_BUF=16384
 ```
 
 ### Write Integrity Verification — Debug / Fast-Fail
+
+Write verification is off by default (see "Data Integrity" above).  To debug a
+suspected silent-corruption issue against a local or test backend, opt in
+with fast-fail settings and verbose trace:
+
 ```bash
-# During debugging or CI runs against a local storage backend:
-# one attempt only, no delay, verbose trace.
+export S3DLIO_PUT_VERIFY=true           # opt in: single-part HEAD verification
 export S3DLIO_PUT_MAX_RETRIES=1         # single-part: fail immediately on any PUT error
 export S3DLIO_PUT_RETRY_DELAY_MS=0      # no sleep between (there are no) retries
+export S3DLIO_MPU_PUT_VERIFY=true       # opt in: multipart HEAD verification
 export S3DLIO_MPU_MAX_RETRIES=1         # multipart (DLIO layer): same, fail immediately
 export S3DLIO_MPU_RETRY_DELAY_S=0
 export RUST_LOG=s3dlio=debug            # see each PUT attempt + HEAD verification line
 ```
 
-### Write Integrity Verification — Production / Unreliable WAN
+### Write Integrity Verification — Production / Backend With Known Truncation Issues
+
+For a backend where silent truncation has actually been observed (e.g. some
+AIStore configurations under storage#593), opt in to verification with
+resilient retry settings for a high-latency or intermittently overloaded
+cluster:
+
 ```bash
-# Maximum resilience for a high-latency or intermittently overloaded cluster.
+export S3DLIO_PUT_VERIFY=true
 export S3DLIO_PUT_MAX_RETRIES=5
 export S3DLIO_PUT_RETRY_DELAY_MS=5000   # 5-second backoff between single-part retries
+export S3DLIO_MPU_PUT_VERIFY=true
 export S3DLIO_MPU_MAX_RETRIES=5
 export S3DLIO_MPU_RETRY_DELAY_S=30      # 30-second backoff between multipart retries
+```
+
+### Write Integrity Verification — Default (No Action Needed)
+
+```bash
+# Out-of-the-box behavior as of v0.9.106: no HEAD verification, no extra
+# round-trip per object. Matches the default behavior of other S3 client
+# libraries. Nothing to set.
 ```
 
 ### Conservative Configuration
@@ -432,6 +467,7 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 
 ## Version History
 
+- **v0.9.106**: Write verification (single-part `S3DLIO_PUT_VERIFY` and multipart `S3DLIO_MPU_PUT_VERIFY`) changed from always-on to **opt-in, default `false`** — matches the default behavior of other S3 client libraries and avoids an extra round-trip on every object write for benchmark workloads.  `S3DLIO_PUT_MAX_RETRIES`/`S3DLIO_PUT_RETRY_DELAY_MS` and `S3DLIO_MPU_MAX_RETRIES`/`S3DLIO_MPU_RETRY_DELAY_S` are unchanged but now only take effect when the corresponding verify flag is enabled (mlcommons/storage#593)
 - **v0.9.104**: Added `S3DLIO_PUT_MAX_RETRIES` and `S3DLIO_PUT_RETRY_DELAY_MS` — single-part PUT with HEAD verification and automatic retry for all network backends (S3, Azure, GCS); `file://`/`direct://` bypass.  DLIO integration layer adds `S3DLIO_MPU_MAX_RETRIES` and `S3DLIO_MPU_RETRY_DELAY_S` for multipart upload retry (mlcommons/storage#593)
 - **v0.9.102**: Added `S3DLIO_CONNECT_TIMEOUT_SECS` (default 20 s, up from 5 s SDK default), `S3DLIO_OPERATION_TIMEOUT_SECS`, `S3DLIO_MAX_RETRY_ATTEMPTS`; unified AWS SDK and reqwest timeout layers
 - **v0.9.92**: `S3DLIO_H2C` default changed from `auto` to `0` (HTTP/1.1); `S3DLIO_POOL_MAX_IDLE_PER_HOST` default changed to unlimited; `S3DLIO_H2_ADAPTIVE_WINDOW`, `S3DLIO_H2_STREAM_WINDOW_MB`, `S3DLIO_H2_CONN_WINDOW_MB` added

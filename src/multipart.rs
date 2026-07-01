@@ -104,8 +104,10 @@ pub struct MultipartCompleteInfo {
     pub e_tag: Option<String>,
     /// Bytes written by the caller (sum of all parts).
     pub total_bytes: u64,
-    /// Bytes confirmed stored by HEAD request after CompleteMultipartUpload.
-    /// Must equal `total_bytes`; a mismatch means the backend silently dropped data.
+    /// Bytes confirmed stored by HEAD request after CompleteMultipartUpload —
+    /// only when `S3DLIO_MPU_PUT_VERIFY=true` (default off; see coordinator_task).
+    /// When verification is disabled this is set equal to `total_bytes` (unverified).
+    /// When verification is enabled, a mismatch means the backend silently dropped data.
     pub stored_bytes: u64,
     pub parts: usize,
     pub started_at: SystemTime,
@@ -662,22 +664,39 @@ async fn coordinator_task(
         resp.e_tag, bucket, key
     );
 
-    // Verify the stored object size via HEAD.  S3-compatible backends (AIStore
-    // in particular) can silently drop parts and still return valid ETags;
-    // without this check a truncated upload appears successful.  If this
-    // fails, the caller sees an error rather than a silently truncated object.
+    // Verify the stored object size via HEAD — opt-in via S3DLIO_MPU_PUT_VERIFY
+    // (default off).  S3-compatible backends (AIStore in particular) have been
+    // observed to silently drop parts and still return valid ETags / a 200 OK
+    // on CompleteMultipartUpload; without this check a truncated upload
+    // appears successful.  This is a server-side contract violation (a 200
+    // response should mean the object is fully and durably stored), so the
+    // check is opt-in rather than mandatory overhead for every backend.
     // Enable DEBUG logging (RUST_LOG=s3dlio=debug) to trace redirect hops and
     // per-part ETags when diagnosing size mismatches on multi-node AIStore.
-    let head_ctx = format!("HeadObject after upload failed for s3://{}/{}", bucket, key);
-    let head = client
-        .head_object()
-        .bucket(&bucket)
-        .key(&key)
-        .send()
-        .await
-        .sdk_context(head_ctx)?;
-    let stored_bytes = head.content_length().unwrap_or(0) as u64;
-    if stored_bytes != total_bytes {
+    let verify_enabled = std::env::var("S3DLIO_MPU_PUT_VERIFY")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+
+    let stored_bytes = if !verify_enabled {
+        debug!(
+            "s3dlio MPU: skipping HEAD verification for s3://{}/{} (set S3DLIO_MPU_PUT_VERIFY=true to enable)",
+            bucket, key
+        );
+        total_bytes
+    } else {
+        let head_ctx = format!("HeadObject after upload failed for s3://{}/{}", bucket, key);
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .sdk_context(head_ctx)?;
+        head.content_length().unwrap_or(0) as u64
+    };
+
+    if verify_enabled && stored_bytes != total_bytes {
         warn!(
             "s3dlio MPU: size mismatch s3://{}/{} written={} stored={} — \
              possible redirect or AIStore replication issue; \
@@ -724,10 +743,12 @@ async fn coordinator_task(
         );
     }
 
-    debug!(
-        "s3dlio MPU: HEAD verified stored={} bytes s3://{}/{}",
-        stored_bytes, bucket, key
-    );
+    if verify_enabled {
+        debug!(
+            "s3dlio MPU: HEAD verified stored={} bytes s3://{}/{}",
+            stored_bytes, bucket, key
+        );
+    }
 
     Ok(MultipartCompleteInfo {
         e_tag: resp.e_tag.map(|s| s.to_string()),

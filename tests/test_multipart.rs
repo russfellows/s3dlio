@@ -51,7 +51,10 @@ fn test_finish_err_on_zero_parts() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Verifies that `MultipartCompleteInfo.stored_bytes` (populated by a HEAD
-/// request after `CompleteMultipartUpload`) equals the bytes written.
+/// request after `CompleteMultipartUpload`) equals the bytes written, when
+/// `S3DLIO_MPU_PUT_VERIFY=true` is set.  As of v0.9.106 this HEAD check is
+/// opt-in (default off) — see `test_finish_skips_verification_by_default` for
+/// the default-off behavior.
 ///
 /// **FAILS TO COMPILE before fix**: `stored_bytes` does not exist on
 /// `MultipartCompleteInfo` — the struct is defined in `src/multipart.rs`.
@@ -63,6 +66,7 @@ fn test_finish_err_on_zero_parts() -> Result<()> {
 #[ignore = "requires live S3 endpoint (set AWS_* + BUCKET env vars or use .env file)"]
 fn test_finish_verifies_stored_bytes() -> Result<()> {
     dotenvy::dotenv().ok();
+    std::env::set_var("S3DLIO_MPU_PUT_VERIFY", "true");
     let bucket = std::env::var("BUCKET").unwrap_or_else(|_| "mlp-s3dlio".to_string());
     let key = "test-bug593-head-verify.bin";
     let data_size: usize = 12 * 1024 * 1024; // 12 MiB — spans 2 parts at default 8 MiB
@@ -97,6 +101,87 @@ fn test_finish_verifies_stored_bytes() -> Result<()> {
         let client = aws_s3_client_async().await?;
         let _ = client.delete_object().bucket(&bucket).key(key).send().await;
         Ok::<(), anyhow::Error>(())
+    })?;
+
+    std::env::remove_var("S3DLIO_MPU_PUT_VERIFY");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BUG #593 follow-up — verification is opt-in (default off) as of v0.9.106
+// ---------------------------------------------------------------------------
+
+/// Confirms that with `S3DLIO_MPU_PUT_VERIFY` unset (the default), no HEAD is
+/// issued after `CompleteMultipartUpload` and `stored_bytes` is set equal to
+/// `total_bytes` (unverified-assumed-equal) rather than independently
+/// confirmed.  The object must still land correctly — verified here directly
+/// by the test via its own HEAD call, independent of s3dlio's internal logic.
+///
+/// Run with: `cargo test -- --include-ignored test_finish_skips_verification_by_default`
+#[test]
+#[ignore = "requires live S3 endpoint (set AWS_* + BUCKET env vars or use .env file)"]
+fn test_finish_skips_verification_by_default() -> Result<()> {
+    dotenvy::dotenv().ok();
+    std::env::remove_var("S3DLIO_MPU_PUT_VERIFY"); // explicit: exercise the default
+    let bucket = std::env::var("BUCKET").unwrap_or_else(|_| "mlp-s3dlio".to_string());
+    let key = "test-bug593-default-no-verify.bin";
+    let data_size: usize = 12 * 1024 * 1024; // 12 MiB — spans 2 parts at default 8 MiB
+
+    let cfg = MultipartUploadConfig::default();
+    let mut sink = MultipartUploadSink::new(&bucket, key, cfg)?;
+
+    let block = vec![0xEFu8; 1024 * 1024]; // 1 MiB blocks
+    for _ in 0..(data_size / block.len()) {
+        sink.write_blocking(&block)?;
+    }
+
+    let info = sink.finish_blocking()?;
+
+    ensure!(
+        info.total_bytes == data_size as u64,
+        "total_bytes mismatch: wrote {} but got {}",
+        data_size,
+        info.total_bytes
+    );
+
+    // Verification was skipped — stored_bytes is set equal to total_bytes
+    // (unverified-assumed-equal), not independently confirmed via HEAD.
+    ensure!(
+        info.stored_bytes == info.total_bytes,
+        "stored_bytes must equal total_bytes when verification is disabled: {} vs {}",
+        info.stored_bytes,
+        info.total_bytes
+    );
+
+    // The test itself independently confirms the object landed correctly,
+    // proving the upload succeeded even though s3dlio didn't verify it.
+    run_on_global_rt({
+        let bucket = bucket.clone();
+        let key = key.to_string();
+        async move {
+            let client = aws_s3_client_async().await?;
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await?;
+            let size = head.content_length().unwrap_or_default();
+            ensure!(
+                size == data_size as i64,
+                "independent HEAD size mismatch: {} vs {}",
+                size,
+                data_size
+            );
+            let _ = client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await;
+            Ok::<(), anyhow::Error>(())
+        }
     })?;
 
     Ok(())
