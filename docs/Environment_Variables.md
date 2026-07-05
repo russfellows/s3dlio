@@ -205,6 +205,37 @@ There is no double-retry: if the multipart path is active, the single-part Rust 
 | `S3DLIO_RANGE_CONCURRENCY` | Auto-tuned | Number of concurrent range requests for large objects |
 | `S3DLIO_CHUNK_SIZE` | Auto-calculated | Chunk size for range requests (default: 1-8 MB based on object size) |
 | `S3DLIO_CONCURRENT_THRESHOLD` | Auto-tuned | Threshold for enabling concurrent operations |
+| `S3DLIO_SKIP_HEAD` | unset (loader default: `true`) | `1`/`true`/`yes`/`on` (case-insensitive) = force-enable the process-wide HEAD-skip latch. See [HEAD-Skip Latch](#head-skip-latch-s3dlio_skip_head) below |
+
+### HEAD-Skip Latch (`S3DLIO_SKIP_HEAD`)
+
+`get_object_uri_optimized_async()` (the function backing `S3ObjectStore::get()` and the
+data-loader read path) decides per-object whether to issue a HEAD first to learn the
+object size before choosing plain-GET vs. range-split.  Since **v0.9.100**, this decision
+is gated by a **process-wide latch**, `SKIP_HEAD`, not a per-call flag:
+
+- The `PyBytesAsyncDataLoader` / `PyDataset` loader option `"skip_head"` defaults to
+  `True` — the first loader constructed in a process sets the latch, and once set it
+  stays `true` for that process's lifetime (it cannot be un-set by a later loader that
+  passes `"skip_head": False`).
+- Setting `S3DLIO_SKIP_HEAD=1` in the environment before process startup sets the same
+  latch, independent of any loader option, and **takes effect on the very first GET**
+  regardless of what any individual caller's `skip_head` option says — so it overrides
+  a caller/integration layer that hardcodes `skip_head=False` for some objects (e.g. to
+  force range-splitting on large records from epoch 1).
+
+```bash
+# Force whole-object GETs (no HEAD) for every object, for the life of the process —
+# wins over any per-loader skip_head=False set by calling code.
+export S3DLIO_SKIP_HEAD=1
+```
+
+This is the more targeted lever when the only goal is "never issue a HEAD"; see
+`S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` below for disabling the range-split subsystem
+entirely (a blunter, related but distinct setting — it also skips HEAD, but as a side
+effect of turning off range-splitting rather than as the primary intent). Full
+rationale and a "when to use `skip_head=False`" rule of thumb are in
+[`Python_Data-Loader.md § HEAD-skip optimisation`](Python_Data-Loader.md#head-skip-optimisation).
 
 ### Range Optimization Details
 
