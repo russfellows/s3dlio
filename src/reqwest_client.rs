@@ -53,7 +53,8 @@ use http_body_util::BodyExt;
 
 use crate::constants::{
     H2WindowConfig, DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST,
-    ENV_POOL_IDLE_TIMEOUT_SECS, ENV_POOL_MAX_IDLE_PER_HOST, ENV_S3DLIO_H2C,
+    ENV_POOL_IDLE_TIMEOUT_SECS, ENV_POOL_MAX_IDLE_PER_HOST, ENV_S3DLIO_ENABLE_HTTP2,
+    ENV_S3DLIO_H2C, ENV_S3DLIO_HTTPS_H2,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -416,14 +417,78 @@ pub(crate) fn h2c_mode_from_env() -> H2cMode {
     }
 }
 
-/// Internal: build one reqwest client with or without h2c prior knowledge.
+/// Which HTTP/2 modes are enabled for each URL scheme.
 ///
-/// When `h2c` is `true`, HTTP/2 flow-control window tuning is applied using
-/// the adaptive/static strategy resolved from env vars via [`H2WindowConfig::from_env`].
-/// See [`crate::constants`] for all tunable environment variable names and defaults.
+/// Resolved once from environment variables via [`Http2Modes::from_env`].
+/// A single `Http2Modes` value applies to a single reqwest client build.
+///
+/// * `h2c = true`: build the client with `http2_prior_knowledge` for use
+///   on `http://` endpoints. Used for the dedicated h2c client only.
+/// * `https_h2 = true`: build the client to permit HTTP/2 over TLS (ALPN
+///   advertises `h2`). Used for the generic client that handles `https://`.
+///
+/// When BOTH are false (the default state, since v0.9.107), the client is
+/// built with `.http1_only()` — no HTTP/2 at all, on any scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Http2Modes {
+    pub h2c: bool,
+    pub https_h2: bool,
+}
+
+impl Http2Modes {
+    /// True iff at least one scheme is HTTP/2-enabled — used to gate the
+    /// window-tuning branch in [`build_reqwest_client_raw`], since window
+    /// tuning is only meaningful when HTTP/2 is actually going to be used.
+    pub(crate) fn any_h2(&self) -> bool {
+        self.h2c || self.https_h2
+    }
+
+    /// Testable core of [`Http2Modes::from_env`] — takes the raw env-var
+    /// values as parameters so tests can exercise every combination
+    /// without touching real process environment.
+    ///
+    /// Precedence: HTTP/2 is enabled for scheme S iff
+    ///   (per-scheme var for S is truthy) OR (master switch is truthy).
+    /// The master switch cannot *disable* H2 that a per-scheme var
+    /// enabled, but since both defaults are "off" that asymmetry is
+    /// harmless.
+    pub(crate) fn from_env_values(
+        h2c_val: Option<&str>,
+        https_h2_val: Option<&str>,
+        enable_all_val: Option<&str>,
+    ) -> Self {
+        let master = enable_all_val.map(h2c_enabled_from_val).unwrap_or(false);
+        Self {
+            h2c: master || h2c_val.map(h2c_enabled_from_val).unwrap_or(false),
+            https_h2: master || https_h2_val.map(h2c_enabled_from_val).unwrap_or(false),
+        }
+    }
+
+    /// Resolve `Http2Modes` from the current process environment.
+    /// Reads [`ENV_S3DLIO_H2C`], [`ENV_S3DLIO_HTTPS_H2`], and
+    /// [`ENV_S3DLIO_ENABLE_HTTP2`].
+    pub(crate) fn from_env() -> Self {
+        Self::from_env_values(
+            std::env::var(ENV_S3DLIO_H2C).ok().as_deref(),
+            std::env::var(ENV_S3DLIO_HTTPS_H2).ok().as_deref(),
+            std::env::var(ENV_S3DLIO_ENABLE_HTTP2).ok().as_deref(),
+        )
+    }
+}
+
+/// Internal: build one reqwest client with the given HTTP/2 mode combination.
+///
+/// * `h2c=false, https_h2=false`  → `.http1_only()`, strict HTTP/1.1.
+/// * `h2c=true`                    → `.http2_prior_knowledge()` (for http:// only).
+/// * `https_h2=true` (h2c=false)   → default reqwest builder + advertise h2 over ALPN.
+///
+/// H2 window tuning ([`H2WindowConfig::from_env`]) is applied when any H2
+/// mode is enabled, since it's only meaningful for HTTP/2 traffic.
+///
+/// See [`crate::constants`] for all tunable environment variable names.
 fn build_reqwest_client_raw(
     ca_bundle_path: Option<&str>,
-    h2c: bool,
+    modes: Http2Modes,
 ) -> anyhow::Result<reqwest::Client> {
     let max_idle: usize = std::env::var(ENV_POOL_MAX_IDLE_PER_HOST)
         .ok()
@@ -451,11 +516,29 @@ fn build_reqwest_client_raw(
         builder = builder.add_root_certificate(cert);
     }
 
-    if h2c {
+    if modes.h2c {
+        // h2c client: HTTP/2 prior knowledge over plain HTTP. Only ever
+        // used for http:// endpoints (see the routing in
+        // ReqwestHttpConnector::call).
         builder = builder.http2_prior_knowledge();
+    } else if !modes.https_h2 {
+        // Default (both flags off) — since v0.9.107 (issue #148):
+        // constrain the reqwest client to HTTP/1.1 everywhere it might be
+        // used, including https://. This restricts ALPN so the server
+        // cannot negotiate h2 with us. Users who want ALPN-negotiated H2
+        // over TLS must opt in via S3DLIO_HTTPS_H2 (or the master switch
+        // S3DLIO_ENABLE_HTTP2).
+        builder = builder.http1_only();
+    }
+    // else: modes = { h2c: false, https_h2: true } — leave the reqwest
+    // builder at its defaults so it can advertise h2 over ALPN and let
+    // the server pick.
 
+    if modes.any_h2() {
         // ── HTTP/2 flow-control window tuning ─────────────────────────────
-        // Resolved once from env vars; see constants::H2WindowConfig for docs.
+        // Only meaningful when H2 will actually be used, either as h2c or
+        // ALPN-negotiated h2 over TLS. Resolved once from env vars; see
+        // constants::H2WindowConfig for docs.
         let win_cfg = H2WindowConfig::from_env();
 
         if win_cfg.adaptive {
@@ -466,7 +549,8 @@ fn build_reqwest_client_raw(
             builder = builder.http2_adaptive_window(true);
             tracing::debug!(
                 "HTTP/2 window mode: adaptive (BDP estimator) \
-                 — stream/conn windows auto-tune to link bandwidth×RTT"
+                 — stream/conn windows auto-tune to link bandwidth×RTT (modes={:?})",
+                modes
             );
         } else {
             // Static windows: user has opted out of adaptive mode by setting
@@ -478,9 +562,10 @@ fn build_reqwest_client_raw(
                 .http2_initial_stream_window_size(stream_bytes)
                 .http2_initial_connection_window_size(conn_bytes);
             tracing::debug!(
-                "HTTP/2 window mode: static  stream={} MiB  connection={} MiB",
+                "HTTP/2 window mode: static  stream={} MiB  connection={} MiB  modes={:?}",
                 win_cfg.stream_window_mb,
                 win_cfg.conn_window_mb,
+                modes,
             );
         }
     }
@@ -492,13 +577,15 @@ fn build_reqwest_client_raw(
 
 /// Build a `SharedHttpClient` ready for the AWS SDK.
 ///
-/// This is the **preferred** constructor.  It pre-builds both an h2c and an
-/// HTTP/1.1 reqwest client and wires them into the auto-probe logic:
+/// This is the **preferred** constructor.  It pre-builds two reqwest clients
+/// — a dedicated h2c client and a generic client used for `https://` and
+/// for `http://` HTTP/1.1 fallback — and wires them into the routing logic.
 ///
-/// - **`https://` endpoints** — HTTP/2 via TLS ALPN, fully automatic.
-/// - **`http://` endpoints** — h2c probed once on the first connection;
-///   transparent HTTP/1.1 fallback if the server rejects it.
-/// - **`S3DLIO_H2C=1`** — force h2c on plain HTTP, no fallback.
+/// Defaults (since v0.9.107, issue #148):
+/// - `https://` endpoints → HTTP/1.1. Set `S3DLIO_HTTPS_H2=1` (or the master
+///   switch `S3DLIO_ENABLE_HTTP2=1`) to opt in to HTTP/2 via TLS ALPN.
+/// - `http://` endpoints  → HTTP/1.1. Set `S3DLIO_H2C=1` (or the master
+///   switch) to opt in to h2c prior-knowledge HTTP/2 cleartext.
 ///
 /// `ca_bundle_path` adds a custom PEM root certificate (for private-PKI /
 /// self-signed endpoints) and is independent of HTTP version negotiation.
@@ -506,11 +593,17 @@ pub fn build_smithy_http_client(
     ca_bundle_path: Option<&str>,
 ) -> anyhow::Result<aws_smithy_runtime_api::client::http::SharedHttpClient> {
     let mode = h2c_mode_from_env();
+    let modes = Http2Modes::from_env();
 
     match mode {
         H2cMode::Auto => tracing::info!(
-            "HTTP version mode: auto \
-             (https:// → HTTP/2 via TLS ALPN; http:// → h2c probe once, HTTP/1.1 fallback)"
+            "HTTP version mode: auto (h2c probe on http://; https:// controlled by \
+             S3DLIO_HTTPS_H2 — currently {})",
+            if modes.https_h2 {
+                "H2 via ALPN"
+            } else {
+                "HTTP/1.1"
+            }
         ),
         H2cMode::ForceH2c => {
             let win = H2WindowConfig::from_env();
@@ -524,17 +617,46 @@ pub fn build_smithy_http_client(
             };
             tracing::info!(
                 "HTTP version mode: FORCED HTTP/2 (S3DLIO_H2C=1) — \
-                 https:// uses HTTP/2 via ALPN; http:// uses h2c prior-knowledge, no fallback; \
-                 h2 window: {win_desc}"
+                 http:// uses h2c prior-knowledge; https:// {}; \
+                 h2 window: {win_desc}",
+                if modes.https_h2 {
+                    "uses HTTP/2 via ALPN"
+                } else {
+                    "uses HTTP/1.1 (set S3DLIO_HTTPS_H2=1 to opt in)"
+                }
             );
         }
         H2cMode::ForceHttp1 => {
-            tracing::info!("HTTP version mode: HTTP/1.1 (S3DLIO_H2C unset or 0)")
+            let https_desc = if modes.https_h2 {
+                "HTTP/2 via ALPN (S3DLIO_HTTPS_H2 or S3DLIO_ENABLE_HTTP2 set)"
+            } else {
+                "HTTP/1.1 (default; set S3DLIO_HTTPS_H2=1 to opt in to HTTP/2)"
+            };
+            tracing::info!(
+                "HTTP version mode: HTTP/1.1 on http:// (S3DLIO_H2C unset or 0); https:// {}",
+                https_desc
+            );
         }
     }
 
-    let h2c_client = build_reqwest_client_raw(ca_bundle_path, true)?;
-    let http1_client = build_reqwest_client_raw(ca_bundle_path, false)?;
+    // h2c client: HTTP/2 prior-knowledge, only used when a request routes
+    // to it. Always built (harmless if never invoked).
+    let h2c_client = build_reqwest_client_raw(
+        ca_bundle_path,
+        Http2Modes {
+            h2c: true,
+            https_h2: false,
+        },
+    )?;
+    // Generic client: used for https:// (and for http:// non-h2c fallback).
+    // https_h2 flag decides whether ALPN may negotiate H2 over TLS.
+    let http1_client = build_reqwest_client_raw(
+        ca_bundle_path,
+        Http2Modes {
+            h2c: false,
+            https_h2: modes.https_h2,
+        },
+    )?;
     Ok(aws_smithy_runtime_api::client::http::SharedHttpClient::new(
         ReqwestHttpClient {
             h2c_client,
@@ -544,14 +666,20 @@ pub fn build_smithy_http_client(
     ))
 }
 
-/// Build a single `reqwest::Client` (no h2c, no auto-probe).
+/// Build a single `reqwest::Client` (no h2c prior-knowledge, no auto-probe).
 ///
-/// Prefer [`build_smithy_http_client`] for new code.  This function is kept
-/// for backward compatibility and for callers that need a raw reqwest client.
+/// The client's `https://` behavior follows [`Http2Modes::from_env`] —
+/// HTTP/1.1 by default, HTTP/2 via ALPN if `S3DLIO_HTTPS_H2=1` or
+/// `S3DLIO_ENABLE_HTTP2=1` is set. Prefer [`build_smithy_http_client`]
+/// for new code.
 pub fn build_reqwest_http_client_with_ca(
     ca_bundle_path: Option<&str>,
 ) -> anyhow::Result<reqwest::Client> {
-    build_reqwest_client_raw(ca_bundle_path, false)
+    let modes = Http2Modes {
+        h2c: false,
+        https_h2: Http2Modes::from_env().https_h2,
+    };
+    build_reqwest_client_raw(ca_bundle_path, modes)
 }
 
 /// Convenience wrapper — no custom CA bundle, HTTP/1.1 only.
@@ -1285,10 +1413,17 @@ mod tests {
     async fn phase3_default_https_client_negotiates_http1() {
         let (port, ca_path) = phase3_spawn_tls_server(&[b"h2", b"http/1.1"]).await;
 
-        // Build the default generic client (h2c=false) — this is exactly
-        // what build_smithy_http_client uses for https:// today.
-        let client = build_reqwest_client_raw(Some(&ca_path), false)
-            .expect("client build failed");
+        // Build the default generic client (all HTTP/2 modes off) — this
+        // is what build_smithy_http_client uses for https:// when no
+        // opt-in var is set.
+        let client = build_reqwest_client_raw(
+            Some(&ca_path),
+            Http2Modes {
+                h2c: false,
+                https_h2: false,
+            },
+        )
+        .expect("client build failed");
 
         let url = format!("https://127.0.0.1:{port}/");
         let resp = client
@@ -1309,5 +1444,167 @@ mod tests {
 
         // Cleanup the PEM file — tests writing to /tmp shouldn't accumulate.
         let _ = std::fs::remove_file(&ca_path);
+    }
+
+    /// Phase 3 GREEN — https_h2 opt-in produces HTTP/2 over TLS.
+    ///
+    /// Symmetric complement to the default-HTTP1 test above: when the
+    /// client is built with `Http2Modes { h2c: false, https_h2: true }`
+    /// (which is what setting `S3DLIO_HTTPS_H2=1` or
+    /// `S3DLIO_ENABLE_HTTP2=1` produces), `.http1_only()` is NOT set on
+    /// the reqwest builder, ALPN advertises `h2`, and our test server
+    /// picks `h2`. Response version is HTTP/2.0.
+    #[tokio::test]
+    async fn phase3_https_h2_opt_in_negotiates_h2() {
+        let (port, ca_path) = phase3_spawn_tls_server(&[b"h2", b"http/1.1"]).await;
+
+        let client = build_reqwest_client_raw(
+            Some(&ca_path),
+            Http2Modes {
+                h2c: false,
+                https_h2: true,
+            },
+        )
+        .expect("client build failed");
+
+        let url = format!("https://127.0.0.1:{port}/");
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .expect("test server GET failed");
+
+        assert_eq!(
+            resp.version(),
+            Version::HTTP_2,
+            "With https_h2 opted in, ALPN should negotiate HTTP/2 over TLS. \
+             Got {:?} instead.",
+            resp.version(),
+        );
+
+        let _ = std::fs::remove_file(&ca_path);
+    }
+
+    /// Phase 3 GREEN — server-only-offers-HTTP/1.1 case: even when the
+    /// client opts in to h2, if the server's ALPN advertisement doesn't
+    /// include `h2`, rustls falls through to `http/1.1`. This confirms
+    /// opt-in is a *permission*, not a *force*.
+    #[tokio::test]
+    async fn phase3_https_h2_opt_in_falls_back_when_server_only_offers_http1() {
+        let (port, ca_path) = phase3_spawn_tls_server(&[b"http/1.1"]).await;
+
+        let client = build_reqwest_client_raw(
+            Some(&ca_path),
+            Http2Modes {
+                h2c: false,
+                https_h2: true,
+            },
+        )
+        .expect("client build failed");
+
+        let url = format!("https://127.0.0.1:{port}/");
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .expect("test server GET failed");
+
+        assert_eq!(
+            resp.version(),
+            Version::HTTP_11,
+            "With server offering only http/1.1 in ALPN, negotiated version \
+             should be HTTP/1.1 regardless of client opt-in. Got {:?}.",
+            resp.version(),
+        );
+
+        let _ = std::fs::remove_file(&ca_path);
+    }
+
+    // ── Http2Modes env-var parsing ────────────────────────────────────────
+    //
+    // These test the pure resolver Http2Modes::from_env_values, which
+    // takes the env-var *values* as parameters and does no real env
+    // manipulation. No serialization/ENV_LOCK needed.
+
+    #[test]
+    fn test_http2_modes_all_unset_is_http1_only() {
+        let modes = Http2Modes::from_env_values(None, None, None);
+        assert!(!modes.h2c);
+        assert!(!modes.https_h2);
+        assert!(!modes.any_h2());
+    }
+
+    #[test]
+    fn test_http2_modes_h2c_only() {
+        let modes = Http2Modes::from_env_values(Some("1"), None, None);
+        assert!(modes.h2c);
+        assert!(!modes.https_h2);
+        assert!(modes.any_h2());
+    }
+
+    #[test]
+    fn test_http2_modes_https_h2_only() {
+        let modes = Http2Modes::from_env_values(None, Some("1"), None);
+        assert!(!modes.h2c);
+        assert!(modes.https_h2);
+        assert!(modes.any_h2());
+    }
+
+    #[test]
+    fn test_http2_modes_master_switch_enables_both() {
+        let modes = Http2Modes::from_env_values(None, None, Some("1"));
+        assert!(modes.h2c, "master switch should enable h2c");
+        assert!(modes.https_h2, "master switch should enable https_h2");
+        assert!(modes.any_h2());
+    }
+
+    #[test]
+    fn test_http2_modes_master_overrides_missing_per_scheme() {
+        // Master truthy, per-scheme unset → both enabled (master wins).
+        let modes = Http2Modes::from_env_values(None, None, Some("true"));
+        assert!(modes.h2c);
+        assert!(modes.https_h2);
+    }
+
+    #[test]
+    fn test_http2_modes_master_wins_over_falsy_per_scheme() {
+        // The precedence rule is "OR of per-scheme + master", so master=1
+        // with per-scheme=0 → the scheme is still enabled. Documented
+        // behavior; the master switch never *disables*.
+        let modes = Http2Modes::from_env_values(Some("0"), Some("0"), Some("1"));
+        assert!(
+            modes.h2c,
+            "master switch enables even when per-scheme is falsy"
+        );
+        assert!(modes.https_h2);
+    }
+
+    #[test]
+    fn test_http2_modes_all_falsy_stays_off() {
+        let modes = Http2Modes::from_env_values(Some("0"), Some("false"), Some("no"));
+        assert!(!modes.h2c);
+        assert!(!modes.https_h2);
+    }
+
+    #[test]
+    fn test_http2_modes_case_insensitive_truthy() {
+        // h2c_enabled_from_val already accepts case-insensitive; verify
+        // from_env_values passes through the same recognition set.
+        let modes = Http2Modes::from_env_values(Some("YES"), Some("ON"), None);
+        assert!(modes.h2c);
+        assert!(modes.https_h2);
+    }
+
+    /// Regression: `S3DLIO_H2C=1` still opts in to h2c after the Phase 3
+    /// refactor and does NOT accidentally enable https_h2 too.
+    #[test]
+    fn test_http2_modes_h2c_alone_does_not_enable_https_h2() {
+        let modes = Http2Modes::from_env_values(Some("1"), None, None);
+        assert!(modes.h2c);
+        assert!(
+            !modes.https_h2,
+            "S3DLIO_H2C=1 alone must not enable https_h2 — that's what \
+             S3DLIO_HTTPS_H2 or S3DLIO_ENABLE_HTTP2 are for"
+        );
     }
 }

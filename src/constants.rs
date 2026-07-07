@@ -402,23 +402,53 @@ pub const ENV_OPLOG_CHUNK_SIZE: &str = "S3DLIO_OPLOG_CHUNK_SIZE";
 /// | `0`, `false`, `no`, `off`, `disable` | Force HTTP/1.1; skip auto-probe |
 /// | *(unset)* | HTTP/1.1 (default — equivalent to `0`) |
 ///
-/// **Default changed in v0.9.92**: the previous default was `Auto` (probe h2c once, fall back to
-/// HTTP/1.1 if rejected). Benchmarking on loopback TCP endpoints showed that HTTP/2 consistently
-/// reduces PUT/GET throughput compared with HTTP/1.1 and an unlimited connection pool. The default
-/// is now HTTP/1.1. Set `S3DLIO_H2C=1` to opt in to h2c on `http://` endpoints.
-///
-/// **Note**: `https://` endpoints always negotiate HTTP/2 via TLS ALPN regardless of this setting.
+/// **Default is HTTP/1.1** for `http://`. Set `S3DLIO_H2C=1` to opt in to h2c on `http://`.
+/// See also [`ENV_S3DLIO_ENABLE_HTTP2`] for a master switch that opts both `http://` and
+/// `https://` into HTTP/2 in one setting.
 pub const ENV_S3DLIO_H2C: &str = "S3DLIO_H2C";
 
 /// Default HTTP/2 cleartext (h2c) behaviour when [`ENV_S3DLIO_H2C`] is not set: `false` (HTTP/1.1).
 ///
-/// **Changed to `false` in v0.9.92.** Previous default was `Auto` (h2c probe once, fall back to
-/// HTTP/1.1 if rejected). Benchmarking on plain `http://` endpoints showed that HTTP/2 reduces
-/// throughput relative to HTTP/1.1 with an unlimited connection pool, so the default is now off.
-///
-/// `https://` endpoints are unaffected — HTTP/2 is still negotiated automatically via TLS ALPN.
-/// Set `S3DLIO_H2C=1` to enable h2c for storage systems that require HTTP/2 on plain-HTTP endpoints.
+/// **Default is `false`** since v0.9.92. Benchmarking on `http://` endpoints showed HTTP/2
+/// reduces throughput relative to HTTP/1.1 with an unlimited connection pool. Set `S3DLIO_H2C=1`
+/// to opt in to h2c for storage systems that require it.
 pub const DEFAULT_H2C_ENABLED: bool = false;
+
+/// Environment variable controlling HTTP/2 mode on `https://` endpoints.
+///
+/// | Value | Behaviour |
+/// |-------|-----------|
+/// | `1`, `true`, `yes`, `on`, `enable` | Opt in to HTTP/2 (via TLS ALPN); apply H2 window tuning |
+/// | `0`, `false`, `no`, `off`, `disable`, *(unset)* | HTTP/1.1 (default — reqwest builder calls `.http1_only()`) |
+///
+/// **Default changed in v0.9.107 (issue #148)**: previously `https://` endpoints always
+/// negotiated HTTP/2 via TLS ALPN unconditionally. Benchmarking against real-world S3-compatible
+/// endpoints showed HTTP/2 is frequently slower than HTTP/1.1 for this workload class,
+/// primarily due to single-connection flow-control constraints even with adaptive windows.
+/// The default is now HTTP/1.1 — matching the `http://` default. Set `S3DLIO_HTTPS_H2=1`
+/// to restore the pre-v0.9.107 behaviour, or set [`ENV_S3DLIO_ENABLE_HTTP2`] to opt in
+/// to HTTP/2 on both `http://` and `https://` in one variable.
+///
+/// **BREAKING CHANGE from v0.9.106**: any deployment that relied on ALPN-negotiated H2
+/// on `https://` will now see HTTP/1.1 unless this var (or the master switch) is set.
+pub const ENV_S3DLIO_HTTPS_H2: &str = "S3DLIO_HTTPS_H2";
+
+/// Default HTTP/2 opt-in state for `https://` when [`ENV_S3DLIO_HTTPS_H2`] is unset:
+/// `false` (HTTP/1.1). See [`ENV_S3DLIO_HTTPS_H2`] for rationale.
+pub const DEFAULT_HTTPS_H2_ENABLED: bool = false;
+
+/// Master switch: opt in to HTTP/2 on **both** `http://` and `https://` in one variable.
+///
+/// | Value | Behaviour |
+/// |-------|-----------|
+/// | `1`, `true`, `yes`, `on`, `enable` | Equivalent to setting both `S3DLIO_H2C=1` and `S3DLIO_HTTPS_H2=1` |
+/// | `0`, `false`, `no`, `off`, `disable`, *(unset)* | No effect; the per-scheme vars decide |
+///
+/// Precedence: HTTP/2 is enabled for scheme *S* iff the per-scheme variable for *S* is
+/// truthy **or** this master switch is truthy. Setting this switch cannot *disable* H2
+/// on a scheme where the per-scheme var already enabled it — but that's a non-issue
+/// since both defaults are already "off".
+pub const ENV_S3DLIO_ENABLE_HTTP2: &str = "S3DLIO_ENABLE_HTTP2";
 
 // ── Payload signing bypass ─────────────────────────────────────────────────
 
