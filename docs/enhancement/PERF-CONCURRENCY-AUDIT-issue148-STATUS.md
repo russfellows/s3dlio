@@ -1,9 +1,9 @@
 # Issue #148 — Where we are, what's next
 
 **Date paused**: 2026-07-07
-**Branch**: `perf/148-phase3-http2-optin` (13 commits ahead of `main`)
+**Branch**: `perf/148-phase3-http2-optin` (13 commits ahead of `main`, plus 2 audit-docs + parent-CLAUDE commits that already merged into `main`)
 **Working tree**: clean, nothing uncommitted
-**Push state**: **NOTHING PUSHED**. All 13 commits are local-only. Per Prime Directive #1, do not push without an explicit instruction.
+**Push state**: **NOTHING PUSHED FROM THE BRANCH**. All 13 branch commits are local-only. The two commits already on `main` (`8a42ebb`, `e4b9ae4`) are also local-only — `main` itself is ahead of `origin/main` and has not been pushed. Per Prime Directive #1, do not push anything without an explicit instruction.
 
 Detailed audit lives at [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-AUDIT-issue148.md); adversarial review at [`PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md`](PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md). This doc is the operational handoff: what's on the branch, what proved GREEN, and exactly where to pick up.
 
@@ -23,13 +23,20 @@ Detailed audit lives at [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-
 
 ---
 
-## What's committed on the branch (`perf/148-phase3-http2-optin`)
+## What's committed
 
-Chronological, oldest first:
+### Already on local `main` (2 commits, also local-only — `main` is ahead of `origin/main`)
 
 ```
-8a42ebb docs(enhancement): add issue #148 performance/concurrency audit + adversarial review
 e4b9ae4 docs: add project-level CLAUDE.md with RED/GREEN policy + s3dlio-specific rules
+8a42ebb docs(enhancement): add issue #148 performance/concurrency audit + adversarial review
+```
+
+These were committed before the branch was cut, so they show as "on main" but they too are unpushed — `origin/main` is still at `38fe812` (the v0.9.106 baseline).
+
+### On branch `perf/148-phase3-http2-optin` (13 commits, oldest first)
+
+```
 01898ca test(148/phase1): add RED peak-memory test for range assembly double-copy
 d4632a8 fix(148/phase1): pre-allocate range-assembly buffers to halve peak memory
 b3dd699 chore(148/phase1): eliminate warnings by scope-fixing shared test module
@@ -42,9 +49,10 @@ e8f4774 release: bump s3dlio/pyproject.toml to 0.9.108 + harden CLAUDE.md scope 
 44510e8 chore: cargo update + CLAUDE.md — document uv and ./build_pyo3.sh
 e5f3bec docs(148): mark Phase 1 + Phase 3 done in the audit progress table
 08bcda6 chore: relax AWS SDK pins, keep Azure at 0.31/0.8
+6ab7547 docs(148): add STATUS handoff document for resuming after the pause  ← this doc
 ```
 
-The branch was cut from `main`'s `38fe812` (v0.9.106 baseline). Phase 1 was originally on a sub-branch `perf/148-phase1-buffer-copies`, but Phase 3 branched off it and then Phase 1 was implicitly folded in — the parent branch `perf/concurrency-audit-issue148` and the Phase 1 sub-branch still exist locally and can be deleted safely if you don't need them for reference.
+Phase 1 was originally on a sub-branch `perf/148-phase1-buffer-copies`, then Phase 3 branched off it — Phase 1's commits show up in Phase 3's history as ancestors. The old parent branches `perf/concurrency-audit-issue148` and `perf/148-phase1-buffer-copies` still exist locally and can be deleted (`git branch -d <name>`) if you don't need them for reference.
 
 ---
 
@@ -180,7 +188,7 @@ The `feedback_cargo_pyproject_version_sync` memory has been updated to make it e
 ```bash
 cd /home/eval/Documents/Code/s3dlio
 git status
-git log --oneline main..HEAD    # should show 13 commits ending in 08bcda6
+git log --oneline main..HEAD    # should show 13 commits ending in 6ab7547
 git branch --show-current       # perf/148-phase3-http2-optin
 
 # Sanity check: re-run the gate
