@@ -1155,4 +1155,159 @@ mod tests {
         assert_eq!(choice, ClientChoice::Http1);
         assert!(!probe);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 3 (issue #148) — wire-level protocol negotiation tests.
+    //
+    // These start a local TLS server that offers both `h2` and `http/1.1`
+    // in ALPN, drive a real reqwest client at it, and inspect the negotiated
+    // protocol via `response.version()`. This lets us assert the actual
+    // behavior of the crate's client-construction path end-to-end, not just
+    // that a builder returned Ok(_).
+    //
+    // The Phase 3 RED gate is the first test:
+    //   `phase3_default_https_client_negotiates_http1`
+    // On unmodified `main` this test FAILS — the default reqwest client
+    // built via `build_reqwest_client_raw(_, h2c=false)` allows ALPN to
+    // negotiate HTTP/2 for https, and this assertion catches that. After
+    // Phase 3 lands, the default client will call `.http1_only()` and the
+    // assertion will pass (GREEN).
+    // ─────────────────────────────────────────────────────────────────────
+
+    use bytes::Bytes as PhaseBytes;
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response, StatusCode, Version};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as AutoBuilder;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::ServerConfig;
+    use std::convert::Infallible;
+    use std::io::Write;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    /// Handle: return 200 OK with a tiny body. We only care about the
+    /// negotiated wire protocol on the client side, not the payload.
+    async fn phase3_handle(
+        _req: Request<Incoming>,
+    ) -> Result<Response<Full<PhaseBytes>>, Infallible> {
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-length", 2)
+            .body(Full::new(PhaseBytes::from_static(b"ok")))
+            .unwrap())
+    }
+
+    /// Spawn a local TLS server on 127.0.0.1 that offers ALPN `["h2",
+    /// "http/1.1"]`. Returns the bound port and the path to a PEM CA bundle
+    /// the client can trust. The server runs on the current tokio runtime
+    /// until the test's runtime shuts down; each test starts its own server
+    /// (fresh cert, fresh port) so tests don't share state.
+    async fn phase3_spawn_tls_server(alpn: &[&[u8]]) -> (u16, String) {
+        // aws-lc-rs is s3dlio's chosen crypto provider (see
+        // build_reqwest_client_raw). Install it once per process — later
+        // calls are no-ops so it's safe to call from every test.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let subject_alt_names = vec!["127.0.0.1".to_string(), "localhost".to_string()];
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
+
+        // Write PEM to a temp file with a unique name derived from the
+        // system-random-primed PID+nanos so parallel tests don't collide.
+        let pem = cert.pem();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ca_path = std::env::temp_dir().join(format!(
+            "s3dlio_phase3_ca_{}_{}.pem",
+            std::process::id(),
+            nanos
+        ));
+        let mut f = std::fs::File::create(&ca_path).unwrap();
+        f.write_all(pem.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        let ca_path_str = ca_path.to_string_lossy().into_owned();
+
+        let cert_der: CertificateDer<'static> = cert.der().clone();
+        let key_der: PrivateKeyDer<'static> =
+            PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
+
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        server_config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _peer) = match listener.accept().await {
+                    Ok(t) => t,
+                    Err(_) => break,
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let tls = match acceptor.accept(tcp).await {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
+                    let io = TokioIo::new(tls);
+                    let _ = AutoBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, service_fn(phase3_handle))
+                        .await;
+                });
+            }
+        });
+
+        (port, ca_path_str)
+    }
+
+    /// Phase 3 RED — default https client MUST negotiate HTTP/1.1, not H2.
+    ///
+    /// Against unmodified main: `build_reqwest_client_raw(_, h2c=false)`
+    /// builds a reqwest client that allows ALPN, and rustls negotiates
+    /// `h2` since our test server offers it. `response.version()` returns
+    /// `HTTP_2`, so the assertion below FAILS. This is the RED gate for
+    /// Phase 3.
+    ///
+    /// After Phase 3 lands, the same construction call will pass
+    /// `.http1_only()` under the hood (because no opt-in var is set),
+    /// so ALPN advertises only http/1.1 and this assertion PASSES.
+    #[tokio::test]
+    async fn phase3_default_https_client_negotiates_http1() {
+        let (port, ca_path) = phase3_spawn_tls_server(&[b"h2", b"http/1.1"]).await;
+
+        // Build the default generic client (h2c=false) — this is exactly
+        // what build_smithy_http_client uses for https:// today.
+        let client = build_reqwest_client_raw(Some(&ca_path), false)
+            .expect("client build failed");
+
+        let url = format!("https://127.0.0.1:{port}/");
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .expect("test server GET failed");
+
+        assert_eq!(
+            resp.version(),
+            Version::HTTP_11,
+            "Default https:// client must negotiate HTTP/1.1, but negotiated {:?}. \
+             This is Phase 3's RED gate — issue #148 audit §2.2 calls for the default \
+             to be HTTP/1.1 with H2 opt-in via S3DLIO_HTTPS_H2 or S3DLIO_ENABLE_HTTP2. \
+             Until that lands, this assertion is expected to fail against unmodified main.",
+            resp.version(),
+        );
+
+        // Cleanup the PEM file — tests writing to /tmp shouldn't accumulate.
+        let _ = std::fs::remove_file(&ca_path);
+    }
 }
