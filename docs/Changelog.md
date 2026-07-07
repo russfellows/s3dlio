@@ -1,6 +1,6 @@
 # s3dlio Changelog
 
-## Version 0.9.107 — HTTP/2 is now opt-in on both schemes (issue #148 Phase 3)
+## Version 0.9.108 — HTTP/2 is now opt-in on both schemes (issue #148 Phase 3)
 
 ### BREAKING CHANGE: `https://` no longer negotiates HTTP/2 by default
 
@@ -13,7 +13,7 @@ Benchmarking on real workloads has repeatedly shown that HTTP/2 is often
 case, primarily due to single-connection flow-control constraints that
 survive even adaptive window tuning.
 
-Starting in v0.9.107 (issue #148 Phase 3), the default for `https://`
+Starting in v0.9.108 (issue #148 Phase 3), the default for `https://`
 matches the existing default for `http://`: **HTTP/1.1 unless explicitly
 opted in**. Deployments that relied on ALPN-negotiated HTTP/2 for `https://`
 will now see HTTP/1.1. Restore the previous behavior with either:

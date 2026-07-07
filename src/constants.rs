@@ -421,12 +421,12 @@ pub const DEFAULT_H2C_ENABLED: bool = false;
 /// | `1`, `true`, `yes`, `on`, `enable` | Opt in to HTTP/2 (via TLS ALPN); apply H2 window tuning |
 /// | `0`, `false`, `no`, `off`, `disable`, *(unset)* | HTTP/1.1 (default — reqwest builder calls `.http1_only()`) |
 ///
-/// **Default changed in v0.9.107 (issue #148)**: previously `https://` endpoints always
+/// **Default changed in v0.9.108 (issue #148)**: previously `https://` endpoints always
 /// negotiated HTTP/2 via TLS ALPN unconditionally. Benchmarking against real-world S3-compatible
 /// endpoints showed HTTP/2 is frequently slower than HTTP/1.1 for this workload class,
 /// primarily due to single-connection flow-control constraints even with adaptive windows.
 /// The default is now HTTP/1.1 — matching the `http://` default. Set `S3DLIO_HTTPS_H2=1`
-/// to restore the pre-v0.9.107 behaviour, or set [`ENV_S3DLIO_ENABLE_HTTP2`] to opt in
+/// to restore the pre-v0.9.108 behaviour, or set [`ENV_S3DLIO_ENABLE_HTTP2`] to opt in
 /// to HTTP/2 on both `http://` and `https://` in one variable.
 ///
 /// **BREAKING CHANGE from v0.9.106**: any deployment that relied on ALPN-negotiated H2

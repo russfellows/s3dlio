@@ -427,7 +427,7 @@ pub(crate) fn h2c_mode_from_env() -> H2cMode {
 /// * `https_h2 = true`: build the client to permit HTTP/2 over TLS (ALPN
 ///   advertises `h2`). Used for the generic client that handles `https://`.
 ///
-/// When BOTH are false (the default state, since v0.9.107), the client is
+/// When BOTH are false (the default state, since v0.9.108), the client is
 /// built with `.http1_only()` — no HTTP/2 at all, on any scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Http2Modes {
@@ -522,7 +522,7 @@ fn build_reqwest_client_raw(
         // ReqwestHttpConnector::call).
         builder = builder.http2_prior_knowledge();
     } else if !modes.https_h2 {
-        // Default (both flags off) — since v0.9.107 (issue #148):
+        // Default (both flags off) — since v0.9.108 (issue #148):
         // constrain the reqwest client to HTTP/1.1 everywhere it might be
         // used, including https://. This restricts ALPN so the server
         // cannot negotiate h2 with us. Users who want ALPN-negotiated H2
@@ -581,7 +581,7 @@ fn build_reqwest_client_raw(
 /// — a dedicated h2c client and a generic client used for `https://` and
 /// for `http://` HTTP/1.1 fallback — and wires them into the routing logic.
 ///
-/// Defaults (since v0.9.107, issue #148):
+/// Defaults (since v0.9.108, issue #148):
 /// - `https://` endpoints → HTTP/1.1. Set `S3DLIO_HTTPS_H2=1` (or the master
 ///   switch `S3DLIO_ENABLE_HTTP2=1`) to opt in to HTTP/2 via TLS ALPN.
 /// - `http://` endpoints  → HTTP/1.1. Set `S3DLIO_H2C=1` (or the master

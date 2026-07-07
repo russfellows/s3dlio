@@ -1146,7 +1146,7 @@ pub async fn get_object_concurrent_range_async(
 ))]
 /// Internal concurrent range GET implementation.
 ///
-/// v0.9.107+ (issue #148, audit §1.3 / Patch 3): eliminated the second
+/// v0.9.108+ (issue #148, audit §1.3 / Patch 3): eliminated the second
 /// buffer copy by pre-allocating one master `BytesMut` of `total_bytes`,
 /// splitting it into per-range segments up front (each segment is a
 /// zero-copy view into the same underlying allocation), moving each
