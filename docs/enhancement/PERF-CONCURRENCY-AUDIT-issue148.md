@@ -1,8 +1,8 @@
 # Performance & Concurrency Audit — Issue #148 and Related Findings
 
 **Date**: 2026-07-07
-**Revised**: 2026-07-07 — incorporated corrections from the [adversarial review](./PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md) (5 corrections, see §6) and a maintainer design decision on HTTP/2 opt-out controls (§2.2, Phase 3)
-**Status**: Proposed — awaiting developer review before implementation
+**Revised**: 2026-07-07 — incorporated corrections from the [adversarial review](./PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md) (5 corrections, see §6), reversed Phase 3 direction to HTTP/2 opt-in for both schemes (§2.2), and tracked implementation progress (§5)
+**Status**: **Partial — Phase 1 and Phase 3 landed locally on branch `perf/148-phase3-http2-optin` in v0.9.108 (see §5 progress table). Phases 2 and 4 pending.**
 **Origin**: [mlcommons/storage#701](https://github.com/mlcommons/storage/issues/701) (unet3d object-storage benchmark, client-bound at ~1.1 GB/s/process against a ~10 GB/s/node endpoint), tracked in [russfellows/s3dlio#148](https://github.com/russfellows/s3dlio/issues/148)
 **Verified against**: s3dlio `main` @ `38fe812` (past v0.9.106)
 **Context**: s3dlio is approaching a 1.0 release. The priority for every item below is **stability first** — nothing here should ship without the tests called out in the plan. Several items are genuine correctness risks (not just performance), including one credible silent-data-corruption path; those are flagged explicitly.
@@ -380,26 +380,40 @@ Ordered by risk and dependency. Each phase should land as its own PR (or small s
 
 ## 5. Quick-reference table
 
-| # | File:line | Issue class | Severity/Confidence | Phase |
-|---|---|---|---|---|
-| 1.1 | `python_api/python_aiml_api.rs:239,372,~2213` | Single-task async concurrency | Confirmed (original report) | 2 |
-| 1.2 | `reqwest_client.rs:424` (`build_reqwest_client_raw`) | No H2 window tuning on https | Confirmed (original report) | 3 |
-| 1.3 | `s3_utils.rs:1154` (`concurrent_range_get_impl`) | Double-copy buffer assembly | Confirmed (original report) | 1 |
-| 1.4 | `reqwest_client.rs:317` (connector) | Full-buffer before streaming | Confirmed (original report) | 4 |
-| 3.1a | `data_loader/async_pool_dataloader.rs:234-315` | Single-task async concurrency | High | 2 |
-| 3.1b | `s3_utils.rs:1483-1504` (pre-stat) | Single-task async concurrency | High | 2 |
-| 3.1c | `data_loader/parquet_file_cache.rs:110` (+2 callers) | Single-task async concurrency (CPU-bound) | High | 2 |
-| 3.1d | `checkpoint/reader.rs:203-244` | Single-task async concurrency | High | 2 |
-| 3.1e | `azure_client.rs:436-472` | Single-task async concurrency (no spawn at all) | High | 2 |
-| 3.1f | `range_engine_generic.rs:305-369` | Single-task async concurrency | High (low current exposure — disabled by default) | 2 |
-| 3.1g | `object_store.rs:565-583`, `s3_utils.rs:1364-1371` | Single-task async concurrency (HEAD-only) | Medium | 2 |
-| 3.1h | `data_loader/s3_bytes.rs:97-110` | Single-task async concurrency | Medium | 2 |
-| 3.2 | `multipart.rs:556-627`, `s3_utils.rs:1508-1520,1554-1567,1843-1856` | Drop-doesn't-abort on existing spawns | High | 2 |
-| 3.3a | `range_engine_generic.rs:371-389` | Double-copy buffer assembly | High | 1 |
-| 3.3b | `data_loader/s3_bytes.rs:99-114` | Double-copy buffer assembly | Medium-high | 1 |
-| 3.3c | `file_store_direct.rs:819-869` | Missing capacity hint | Medium (low impact) | 1 |
-| 3.4 | Crate-wide | No shared retry helper (3 divergent shapes, Patch 4 would add a 4th) | High (design smell, not a bug) | 4 |
-| 3.4a | `google_gcs_client.rs:404-483` | Retry with no backoff | Medium | Not scheduled — flag for separate GCS-focused pass |
+**Progress as of 2026-07-07** (v0.9.108, branch `perf/148-phase3-http2-optin`):
+
+| Phase | Items | Status | Landed via |
+|---|---|---|---|
+| 1 — buffer double-copy + capacity hint | 1.3, 3.3a, 3.3b, 3.3c | **✅ DONE** (4/4) | `d4632a8` fix + `01898ca` RED test, verified peak overhead 2.28× → 1.03× |
+| 3 — HTTPS H2 opt-in reversal + window tuning | 1.2 | **✅ DONE** (1/1) | `1451c4f` fix + `61f0731` RED test + `5294959` docs + `e47cce2` version bump |
+| 2 — loader task-level parallelism + drop-doesn't-abort | 1.1, 3.1a–h, 3.2 | ⏳ **PENDING** (0/10) | Not started; sub-branches TBD |
+| 4 — streaming connector + centralized retry | 1.4, 3.4 | ⏳ **PENDING** (0/2) | Blocked on Phase 2 (per §4 introduction — Phase 4 hard-depends on Phase 1's shared-segment design and Phase 2 is the natural intermediary for centralized retry) |
+| Not scheduled (deferred) | 3.4a | ⏳ **DEFERRED** (0/1) | Flagged for a separate GCS-focused pass |
+
+**Overall: 5 / 17 in-scope items complete + 1 deferred. Phase 1 and Phase 3 verified GREEN; 337/337 lib tests pass, 4/4 wire-level Phase 3 tests, 4/4 Phase 1 peak-memory tests, zero warnings, zero clippy findings.**
+
+### Per-item detail
+
+| # | File:line | Issue class | Severity/Confidence | Phase | Status |
+|---|---|---|---|---|---|
+| 1.1 | `python_api/python_aiml_api.rs:239,372,~2213` | Single-task async concurrency | Confirmed (original report) | 2 | ⏳ pending |
+| 1.2 | `reqwest_client.rs:424` (`build_reqwest_client_raw`) | No H2 window tuning on https | Confirmed (original report) | 3 | ✅ done — window tuning extended to https; default reversed to HTTP/1.1 with opt-in via `S3DLIO_HTTPS_H2` / `S3DLIO_ENABLE_HTTP2` |
+| 1.3 | `s3_utils.rs:1154` (`concurrent_range_get_impl`) | Double-copy buffer assembly | Confirmed (original report) | 1 | ✅ done — pre-split segments, stream directly into segment via `ByteStream::next()`, O(1) `unsplit` |
+| 1.4 | `reqwest_client.rs:317` (connector) | Full-buffer before streaming | Confirmed (original report) | 4 | ⏳ pending |
+| 3.1a | `data_loader/async_pool_dataloader.rs:234-315` | Single-task async concurrency | High | 2 | ⏳ pending |
+| 3.1b | `s3_utils.rs:1483-1504` (pre-stat) | Single-task async concurrency | High | 2 | ⏳ pending |
+| 3.1c | `data_loader/parquet_file_cache.rs:110` (+2 callers) | Single-task async concurrency (CPU-bound) | High | 2 | ⏳ pending |
+| 3.1d | `checkpoint/reader.rs:203-244` | Single-task async concurrency | High | 2 | ⏳ pending |
+| 3.1e | `azure_client.rs:436-472` | Single-task async concurrency (no spawn at all) | High | 2 | ⏳ pending |
+| 3.1f | `range_engine_generic.rs:305-369` | Single-task async concurrency | High (low current exposure — disabled by default) | 2 | ⏳ pending |
+| 3.1g | `object_store.rs:565-583`, `s3_utils.rs:1364-1371` | Single-task async concurrency (HEAD-only) | Medium | 2 | ⏳ pending |
+| 3.1h | `data_loader/s3_bytes.rs:97-110` | Single-task async concurrency | Medium | 2 | ⏳ pending |
+| 3.2 | `multipart.rs:556-627`, `s3_utils.rs:1508-1520,1554-1567,1843-1856` | Drop-doesn't-abort on existing spawns | High | 2 | ⏳ pending |
+| 3.3a | `range_engine_generic.rs:371-389` | Double-copy buffer assembly | High | 1 | ✅ done — pre-allocate master `BytesMut`, copy into offset as each `.buffered()` result arrives, drop source immediately |
+| 3.3b | `data_loader/s3_bytes.rs:99-114` | Double-copy buffer assembly | Medium-high | 1 | ✅ done — same technique as 3.3a applied to `ReaderMode::Range` |
+| 3.3c | `file_store_direct.rs:819-869` | Missing capacity hint | Medium (low impact) | 1 | ✅ done — `Vec::with_capacity(file_size)` in the O_DIRECT read loop |
+| 3.4 | Crate-wide | No shared retry helper (3 divergent shapes, Patch 4 would add a 4th) | High (design smell, not a bug) | 4 | ⏳ pending — will land alongside Phase 4's streaming-connector work |
+| 3.4a | `google_gcs_client.rs:404-483` | Retry with no backoff | Medium | Not scheduled — flag for separate GCS-focused pass | ⏳ deferred |
 
 ---
 
