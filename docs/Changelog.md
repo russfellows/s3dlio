@@ -1,5 +1,63 @@
 # s3dlio Changelog
 
+## Version 0.9.107 — HTTP/2 is now opt-in on both schemes (issue #148 Phase 3)
+
+### BREAKING CHANGE: `https://` no longer negotiates HTTP/2 by default
+
+Prior to this release, s3dlio's reqwest client unconditionally advertised
+`["h2", "http/1.1"]` in every TLS ClientHello, and rustls picked whichever
+protocol the server chose — which for modern S3-compatible endpoints (MinIO,
+Ceph RGW, AIStore, most managed object stores) is almost always HTTP/2.
+Benchmarking on real workloads has repeatedly shown that HTTP/2 is often
+**slower** than HTTP/1.1 for object-storage traffic in this codebase's use
+case, primarily due to single-connection flow-control constraints that
+survive even adaptive window tuning.
+
+Starting in v0.9.107 (issue #148 Phase 3), the default for `https://`
+matches the existing default for `http://`: **HTTP/1.1 unless explicitly
+opted in**. Deployments that relied on ALPN-negotiated HTTP/2 for `https://`
+will now see HTTP/1.1. Restore the previous behavior with either:
+
+```bash
+S3DLIO_HTTPS_H2=1        # opt in per-scheme (https only)
+S3DLIO_ENABLE_HTTP2=1    # master switch: HTTP/2 on both http and https
+```
+
+Both variables accept `1`, `true`, `yes`, `on`, `enable` (case-insensitive).
+Any other value or unset means "off".
+
+### Env-var summary
+
+| Variable | Scheme | Default | Notes |
+|---|---|---|---|
+| `S3DLIO_H2C` | `http://` | off | Unchanged — opt in to h2c on plain HTTP. |
+| `S3DLIO_HTTPS_H2` | `https://` | off | **New.** Opt in to HTTP/2 via TLS ALPN. |
+| `S3DLIO_ENABLE_HTTP2` | both | off | **New.** Master switch — implies both of the above. |
+
+Precedence: H2 is enabled on scheme *S* iff (per-scheme var truthy) OR
+(master switch truthy). Setting the master switch cannot *disable* H2 on a
+scheme that the per-scheme var already enabled, but since both defaults are
+"off", that asymmetry is harmless.
+
+### Related changes
+
+* HTTP/2 flow-control window tuning (`S3DLIO_H2_ADAPTIVE_WINDOW`,
+  `S3DLIO_H2_STREAM_WINDOW_MB`, `S3DLIO_H2_CONN_WINDOW_MB`) now applies
+  whenever HTTP/2 is enabled — previously it only applied to h2c on
+  `http://`. This fixes the uncapped ~5 MiB default receive window that
+  bottlenecked `https://` H2 clients per the issue #148 audit §1.2.
+* The reqwest client builder gained an internal `Http2Modes { h2c,
+  https_h2 }` configuration struct with a pure `from_env_values` resolver
+  suitable for unit testing.
+* Full wire-level tests added: local TLS test server with configurable
+  ALPN + assertions on `response.version()` to prove HTTP/1.1 default and
+  HTTP/2 opt-in behavior end-to-end.
+
+See [docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148.md](enhancement/PERF-CONCURRENCY-AUDIT-issue148.md)
+for the full audit and rationale.
+
+---
+
 ## Version 0.9.106 — Write verification changed from always-on to opt-in (mlcommons/storage#593 follow-up)
 
 ### Why this release

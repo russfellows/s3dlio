@@ -13,39 +13,46 @@ This document provides a comprehensive reference for all environment variables s
 ### HTTP Client Control
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3DLIO_H2C` | `0` (HTTP/1.1) | HTTP/2 cleartext (h2c) mode for `http://` endpoints. **Default (unset or `0`)** = always HTTP/1.1 — benchmarking showed HTTP/2 reduces throughput on plain-HTTP endpoints vs HTTP/1.1 with an unlimited connection pool (changed from auto-probe in v0.9.92). **`1`** (or `true`, `yes`, `on`, `enable`) = force h2c prior-knowledge, no fallback — use for storage systems that require HTTP/2 on their `http://` API endpoint. **`auto`** = probe h2c on the first plain-HTTP connection and fall back to HTTP/1.1 if the server rejects it (pre-v0.9.92 behaviour). Has **no effect** on `https://` connections — those negotiate HTTP/2 automatically via TLS ALPN. |
+| `S3DLIO_H2C` | `0` (HTTP/1.1) | HTTP/2 cleartext (h2c) mode for `http://` endpoints. **Default (unset or `0`)** = HTTP/1.1. **`1`** (or `true`, `yes`, `on`, `enable`) = force h2c prior-knowledge, no fallback — use for storage systems that require HTTP/2 on their `http://` API endpoint. **`auto`** = probe h2c on the first plain-HTTP connection and fall back to HTTP/1.1 if rejected (pre-v0.9.92 behaviour). Has no effect on `https://`; use `S3DLIO_HTTPS_H2` for that. |
+| `S3DLIO_HTTPS_H2` | `0` (HTTP/1.1) | **New in v0.9.107.** HTTP/2 mode for `https://` endpoints (opt-in). **Default (unset or `0`)** = HTTP/1.1 (reqwest builder calls `.http1_only()`, ALPN advertises only `http/1.1`). **`1`** (or `true`, `yes`, `on`, `enable`) = allow HTTP/2 over TLS ALPN — reqwest advertises `["h2", "http/1.1"]` and the server picks. **BREAKING CHANGE from v0.9.106**: previously `https://` unconditionally negotiated HTTP/2 via ALPN. That is now off by default; opt in via this variable or `S3DLIO_ENABLE_HTTP2`. |
+| `S3DLIO_ENABLE_HTTP2` | `0` | **New in v0.9.107.** Master switch: when set to `1` (or `true`, `yes`, `on`, `enable`), opts in to HTTP/2 on **both** `http://` (equivalent to `S3DLIO_H2C=1`) and `https://` (equivalent to `S3DLIO_HTTPS_H2=1`). Convenience for callers who want HTTP/2 wherever it's available without setting two variables. Precedence is `OR`: this switch cannot *disable* H2 on a scheme where the per-scheme var already enabled it, but both defaults are already "off" so that's harmless. |
 | `S3DLIO_POOL_MAX_IDLE_PER_HOST` | unlimited | Maximum idle connections kept in the reqwest connection pool per host. Default changed to unlimited in v0.9.92: previously 32, which caused TCP connection churn at concurrency levels above 32 (each worker paid a full handshake penalty when the pool was full). Idle connections are still evicted after `S3DLIO_POOL_IDLE_TIMEOUT_SECS` seconds. Set to a positive integer to impose a hard ceiling. |
 | `S3DLIO_POOL_IDLE_TIMEOUT_SECS` | `90` | Seconds before an idle pooled connection is closed. |
-| `S3DLIO_H2_ADAPTIVE_WINDOW` | `1` (enabled) | HTTP/2 flow-control window mode. **`1`** (or `true`, `yes`, `on`) = adaptive (BDP estimator): hyper measures bandwidth-delay product via H2 PINGs and auto-tunes the window from 64 KB up to hundreds of MiB. Best for most workloads. **`0`** = static windows controlled by `S3DLIO_H2_STREAM_WINDOW_MB` / `S3DLIO_H2_CONN_WINDOW_MB`. Only active when `S3DLIO_H2C=1`. |
+| `S3DLIO_H2_ADAPTIVE_WINDOW` | `1` (enabled) | HTTP/2 flow-control window mode. **`1`** (or `true`, `yes`, `on`) = adaptive (BDP estimator): hyper measures bandwidth-delay product via H2 PINGs and auto-tunes the window from 64 KB up to hundreds of MiB. Best for most workloads. **`0`** = static windows controlled by `S3DLIO_H2_STREAM_WINDOW_MB` / `S3DLIO_H2_CONN_WINDOW_MB`. Applied whenever HTTP/2 is enabled (either scheme). |
 | `S3DLIO_H2_STREAM_WINDOW_MB` | `4` | HTTP/2 per-stream flow-control window in MiB (static mode only, i.e. `S3DLIO_H2_ADAPTIVE_WINDOW=0`). Clamped to 256 MiB maximum. |
 | `S3DLIO_H2_CONN_WINDOW_MB` | `4×stream` | HTTP/2 connection-level flow-control window in MiB (static mode only). Defaults to 4× `S3DLIO_H2_STREAM_WINDOW_MB`, capped at 256 MiB. |
 
-### HTTP/2 on TLS endpoints (`https://`)
+### HTTP protocol selection (both schemes)
 
-No configuration is needed.  s3dlio's reqwest client (rustls + aws-lc-rs) advertises
-`["h2", "http/1.1"]` in every TLS ClientHello.  If the server selects `h2`, HTTP/2 is
-used automatically; otherwise HTTP/1.1 is used.  The negotiated protocol is reported in
-startup INFO logs and in the PUT summary line (`protocol=HTTP/2` or `protocol=HTTP/1.1`).
+Since v0.9.107 (issue #148), HTTP/2 is **opt-in on every scheme**. HTTP/1.1 is the default.
+The reversal reflects benchmarking evidence that HTTP/2 is often slower than HTTP/1.1 for
+S3-style object-storage workloads, due to single-connection flow-control constraints even
+with adaptive windows.
 
-### HTTP/2 on cleartext endpoints (`http://`)
+Precedence: H2 is enabled for scheme *S* iff `(per-scheme var for S is truthy) OR (master
+switch is truthy)`.
 
 ```bash
-# Default: HTTP/1.1 (S3DLIO_H2C unset or 0 — changed from auto-probe in v0.9.92)
-AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli stat s3://bucket/key
+# Default (nothing set) — HTTP/1.1 everywhere
+AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli stat s3://bucket/key
 
-# Force h2c (for systems that require HTTP/2 cleartext)
-S3DLIO_H2C=1 AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli put s3://bucket/prefix -n 100
+# Opt in to h2c on http:// only
+S3DLIO_H2C=1  AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli put s3://bucket/prefix -n 100
 
-# Force HTTP/1.1 explicitly (same as default)
-S3DLIO_H2C=0 AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli ls s3://bucket/
+# Opt in to HTTP/2 on https:// only (restores pre-v0.9.107 default)
+S3DLIO_HTTPS_H2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli get s3://bucket/dataset/ -o /data/
 
-# Re-enable pre-v0.9.92 auto-probe behaviour (probe h2c, fall back to HTTP/1.1)
-S3DLIO_H2C=auto AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli put s3://bucket/prefix -n 100
+# Master switch — HTTP/2 on both schemes with one variable
+S3DLIO_ENABLE_HTTP2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli put s3://bucket/prefix -n 100
 ```
+
+The negotiated protocol is reported in startup INFO logs and in the PUT summary line
+(`protocol=HTTP/2` or `protocol=HTTP/1.1`).
 
 ### HTTP/2 flow-control window tuning
 
-Applies only when `S3DLIO_H2C=1` (cleartext HTTP/2).
+Applies whenever HTTP/2 is enabled — via `S3DLIO_H2C=1` (h2c), `S3DLIO_HTTPS_H2=1`
+(ALPN-negotiated H2 over TLS), or the master switch `S3DLIO_ENABLE_HTTP2=1`.
 
 #### What the three knobs actually do
 
