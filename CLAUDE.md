@@ -53,6 +53,29 @@ are clean:
 For Python wheel changes, additionally rebuild via `maturin` and smoke-test
 against the wheel in a `uv` env.
 
+### Zero warnings — no exceptions, no underscore hacks
+
+Per the parent Prime Directive #4, never leave a warning behind. In this
+project specifically:
+
+- `cargo test`, `cargo build`, `cargo clippy` must all produce zero warnings
+  from crate-local code. Warnings from dependencies are out of scope; ours
+  are not.
+- **Never prefix an unused variable, argument, or field with `_` to silence
+  the compiler.** In s3dlio, that pattern has historically hidden
+  Send/Sync bound violations that were only meant to be caught at
+  compile-time, missed `.await` chains that dropped in-flight tasks, and
+  buffer offsets that were computed but never written to. If a binding is
+  unused, delete it — or find the missing call site and wire it up. Do
+  not rename it to hide.
+- If a warning fires from `tests/common/mod.rs` in a specific test binary,
+  that means the test binary is `mod common;`-ing utilities it doesn't
+  use. Fix it by narrowing what the test binary imports, not by
+  broad-brush `#[allow(dead_code)]` on the shared module.
+- `#[allow(...)]` on a specific item is acceptable only when the warning
+  is a documented false positive AND the reason is written in a
+  one-line comment right above the attribute.
+
 ### Stability first — s3dlio is approaching 1.0
 
 Correctness > performance > new features. Do not destabilize working code for

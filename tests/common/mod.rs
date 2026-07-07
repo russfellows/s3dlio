@@ -2,15 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
-//
-// Shared helpers used across the integration-test binaries. Each Rust
-// integration test file compiles to its own binary and sees this module
-// independently, so items used only by some binaries look "unused" in
-// the others — hence the module-level dead_code allow.
-
-#![allow(dead_code)]
-
-pub mod peak_alloc;
 
 use std::env;
 

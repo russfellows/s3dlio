@@ -14,18 +14,97 @@
 // offset, and drops the source Bytes immediately, holding peak memory to
 // ~1 * total object size plus a small in-flight budget.
 //
-// These tests use a peak-tracking global allocator (see
-// tests/common/peak_alloc.rs) to make the peak-memory difference
-// observable, and assert that peak overhead stays below a threshold that
-// only the fixed code can satisfy. Against the unmodified code they FAIL
-// (RED). After Patch 3 lands they PASS (GREEN).
-
-mod common;
+// These tests install a peak-tracking global allocator (defined inline
+// below — nothing else uses it yet, so it lives here rather than in a
+// shared helper module) to make the peak-memory difference observable,
+// and assert that peak overhead stays below a threshold that only the
+// fixed code can satisfy. Against the unmodified code they FAIL (RED).
+// After Patch 3 lands they PASS (GREEN).
 
 use bytes::Bytes;
-use common::peak_alloc::PeakAlloc;
 use s3dlio::range_engine_generic::{RangeEngine, RangeEngineConfig};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+/// Peak-tracking wrapper around System. Reports the maximum
+/// (bytes_allocated - bytes_deallocated) observed since the last `reset()`.
+/// stats_alloc only exposes cumulative counters, which cannot distinguish
+/// a temporal peak from a steady-state footprint of the same size — the
+/// bug being tested here is a temporal peak difference, so peak tracking
+/// is the metric we need.
+struct PeakAlloc {
+    live: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl PeakAlloc {
+    const fn new() -> Self {
+        Self {
+            live: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    fn live(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// Reset peak to the current live total. Call at the start of the
+    /// region to measure, after any warmup has finished.
+    fn reset(&self) {
+        let current = self.live.load(Ordering::Relaxed);
+        self.peak.store(current, Ordering::Relaxed);
+    }
+
+    fn note_grow(&self, delta: usize) {
+        let new_live = self.live.fetch_add(delta, Ordering::Relaxed) + delta;
+        let mut peak = self.peak.load(Ordering::Relaxed);
+        while new_live > peak {
+            match self.peak.compare_exchange_weak(
+                peak,
+                new_live,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => peak = observed,
+            }
+        }
+    }
+}
+
+unsafe impl GlobalAlloc for PeakAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = System.alloc(layout);
+        if !ptr.is_null() {
+            self.note_grow(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+        self.live.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_ptr = System.realloc(ptr, layout, new_size);
+        if !new_ptr.is_null() {
+            let old_size = layout.size();
+            if new_size > old_size {
+                self.note_grow(new_size - old_size);
+            } else if new_size < old_size {
+                self.live.fetch_sub(old_size - new_size, Ordering::Relaxed);
+            }
+        }
+        new_ptr
+    }
+}
 
 #[global_allocator]
 static ALLOC: PeakAlloc = PeakAlloc::new();
