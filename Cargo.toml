@@ -175,6 +175,10 @@ rcgen        = { version = "0.13", default-features = false, features = ["pem", 
 hyper        = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util   = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 
+# (No extra crate needed for the Phase 1 allocation tests — they use a small
+# in-tree peak-tracking wrapper around System, defined in
+# tests/common/peak_alloc.rs.)
+
 [features]
 #default = []
 # Note: 'numa' and 'hdf5' are intentionally excluded from defaults.
