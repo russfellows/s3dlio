@@ -1,7 +1,46 @@
 # s3dlio — session rules
 
 The parent [/home/eval/Documents/Code/CLAUDE.md](../CLAUDE.md) Prime Directives
-apply here in full and are not repeated. The rules below are additive.
+apply here in full and are not repeated. In particular, remember Prime
+Directive #1 (never push without an explicit instruction) and Prime
+Directive #2 (only touch the repo you were asked to change).
+
+The rules below are additive.
+
+## No pushes, no PRs, no publishes — s3dlio-specific reinforcement
+
+- `git push`, `git push --tags`, `gh pr create`, `gh release create`,
+  `cargo publish`, `maturin publish`, and `twine upload` are all
+  forbidden without an explicit instruction from the user in the current
+  turn. "Bump the version," "commit the fix," "run the tests" — none
+  of these authorize a push.
+- Version bumps in `Cargo.toml` / `pyproject.toml` are **local file
+  edits**. They do not entitle you to push, tag, publish a wheel, or
+  touch a downstream repo's pin. Those are all separate explicit steps.
+- Approaching a 1.0 release makes this rule *more* important, not less.
+  An accidental publish of a broken pre-1.0 wheel is harder to undo than
+  a bad commit on a local branch.
+
+## Version-bump scope
+
+When the user says "bump the version" or "we need to go to v0.9.X",
+that refers to s3dlio's OWN version files ONLY:
+
+- `s3dlio/Cargo.toml` — `[workspace.package] version = "..."` (single
+  source of truth; the subcrate `crates/s3dlio-oplog/Cargo.toml`
+  inherits via `version.workspace = true`).
+- `s3dlio/pyproject.toml` — the `[project] version = "..."` line for
+  the Python wheel.
+- `s3dlio/docs/Changelog.md` — new version heading and change notes.
+- `s3dlio/docs/Environment_Variables.md` — Version History entry.
+- In-code doc comments in `src/` that cite the new version.
+
+Do **not** touch downstream pin files in sibling repos
+(`DLIO_local_changes/pyproject.toml`, `mlp-storage/pyproject.toml`, or
+any other) unless the user explicitly names those repos in the current
+turn. The version-sync memory rule reminds you those files *will need*
+updating eventually — that reminder is a prompt to ask, not
+pre-authorization to act.
 
 ## RED/GREEN test discipline (applies to every bug fix, every project)
 
