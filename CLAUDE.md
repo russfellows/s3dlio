@@ -79,6 +79,27 @@ promises has bitten us before.
 
 Also update `docs/Changelog.md` in the same commit as the version bump.
 
+### Python build + test environment — always uv, always ./build_pyo3.sh
+
+- **All Python testing runs under `uv`.** Do not invoke `python` /
+  `python3` / `pytest` directly on the system interpreter, and do not
+  create your own venv. Use `uv run pytest ...`, `uv run python ...`,
+  etc. — `uv` reads `pyproject.toml` and resolves the correct
+  interpreter and dependency set for this project.
+- **To build the s3dlio Python wheel, use the in-repo script
+  [`./build_pyo3.sh`](build_pyo3.sh)**, not raw `maturin build`. The
+  script handles platform detection (x86_64/aarch64, Linux/Darwin),
+  feature-set selection (`default`/`slim`/`full`), and produces the
+  wheel under `target/wheels/`. Do NOT call `maturin` directly —
+  arguments and feature flags in the script are the tested combination
+  for this repo.
+- Example:
+  ```bash
+  ./build_pyo3.sh          # AWS + file/direct backends (default/slim)
+  ./build_pyo3.sh full     # + Azure + GCS
+  uv run pytest tests/...  # run Python tests against the built wheel
+  ```
+
 ### Pre-push quality gate
 
 Before pushing any code change, run in this order and only push if all three
@@ -89,8 +110,8 @@ are clean:
 3. `cargo test --lib` (unit tests) — plus any integration tests specifically
    touching the changed area.
 
-For Python wheel changes, additionally rebuild via `maturin` and smoke-test
-against the wheel in a `uv` env.
+For Python wheel changes, additionally rebuild via `./build_pyo3.sh` (see
+above) and smoke-test against the wheel via `uv run pytest`.
 
 ### Zero warnings — no exceptions, no underscore hacks
 
