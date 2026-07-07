@@ -56,7 +56,11 @@ fn make_engine(chunk_size: usize, max_concurrent_ranges: usize) -> RangeEngine {
 async fn warmup(engine: &RangeEngine) {
     // Small, throwaway download.
     let _ = engine
-        .download(4096, |off, len| async move { Ok(allocate_range(off, len)) }, None)
+        .download(
+            4096,
+            |off, len| async move { Ok(allocate_range(off, len)) },
+            None,
+        )
         .await
         .expect("warmup download failed");
     // Drop scratch allocations before the next measurement.
@@ -129,10 +133,20 @@ async fn range_engine_download_peak_memory_bounded() {
     let overhead = peak.saturating_sub(baseline_live);
 
     // Correctness first.
-    assert_eq!(stats.ranges_processed, n_ranges, "expected {} ranges", n_ranges);
+    assert_eq!(
+        stats.ranges_processed, n_ranges,
+        "expected {} ranges",
+        n_ranges
+    );
     assert_output_matches(total_size, chunk_size, &bytes);
 
     let threshold = (total_size as f64 * 1.5) as usize;
+    eprintln!(
+        "range_engine peak overhead: {} bytes ({:.2}x total_size {})",
+        overhead,
+        overhead as f64 / total_size as f64,
+        total_size,
+    );
     assert!(
         overhead <= threshold,
         "Peak memory overhead {} bytes ({:.2}x total_size {}) exceeds threshold {} bytes (1.50x). \

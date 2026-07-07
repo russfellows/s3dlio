@@ -52,7 +52,7 @@
 // not urgent — both implementations are correct and performant.
 
 use anyhow::{bail, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -368,27 +368,51 @@ impl RangeEngine {
                 })
                 .buffered(self.config.max_concurrent_ranges);
 
-        // Collect results with ordered reassembly
-        let mut parts: Vec<(usize, Bytes)> = Vec::with_capacity(n_ranges);
+        // Pre-allocate the master output buffer once, up front (issue #148,
+        // audit §3.3a / Patch 3). `.buffered(N)` from futures-util returns
+        // outputs in the same order as the underlying stream (built on
+        // FuturesOrdered — verified against futures-util source), so the
+        // ranges arrive here in ascending offset order and we can copy each
+        // one into the correct offset and drop the source Bytes immediately.
+        // This holds peak live memory to ~total_size plus at most
+        // max_concurrent_ranges * chunk_size still in flight, instead of
+        // holding every completed range's Bytes alive in an intermediate
+        // `parts` Vec while separately allocating a same-size assembled Vec.
+        let mut master = BytesMut::zeroed(object_size as usize);
+        let mut write_offset: usize = 0;
+        let mut ranges_seen: usize = 0;
+
         while let Some(result) = chunks.next().await {
             let (idx, bytes) = result?;
-            parts.push((idx, bytes));
+            let len = bytes.len();
+            tracing::trace!("Assembling range {} ({} bytes)", idx, len);
+
+            let end = write_offset
+                .checked_add(len)
+                .ok_or_else(|| anyhow::anyhow!("range assembly offset overflow"))?;
+            if end > master.len() {
+                bail!(
+                    "range {} would write {}..{} but master buffer is only {} bytes",
+                    idx,
+                    write_offset,
+                    end,
+                    master.len()
+                );
+            }
+            master[write_offset..end].copy_from_slice(&bytes);
+            write_offset = end;
+            ranges_seen += 1;
+            drop(bytes);
         }
 
-        // Sort by index to ensure correct order
-        // (buffered() doesn't guarantee output order)
-        parts.sort_by_key(|(idx, _)| *idx);
-
-        // Assemble final buffer
-        let total_size: usize = parts.iter().map(|(_, b)| b.len()).sum();
-        let mut assembled = Vec::with_capacity(total_size);
-
-        for (idx, bytes) in parts {
-            tracing::trace!("Assembling range {} ({} bytes)", idx, bytes.len());
-            assembled.extend_from_slice(&bytes);
+        // Trim if any range returned short (matches previous behavior of
+        // returning whatever total length was actually produced).
+        if write_offset < master.len() {
+            master.truncate(write_offset);
         }
 
-        let bytes_downloaded = assembled.len() as u64;
+        let bytes_downloaded = master.len() as u64;
+        let _ = ranges_seen;
         let elapsed = start_time.elapsed();
 
         let stats = RangeDownloadStats {
@@ -406,7 +430,7 @@ impl RangeEngine {
             stats.throughput_gbps()
         );
 
-        Ok((Bytes::from(assembled), stats))
+        Ok((master.freeze(), stats))
     }
 
     /// Calculate optimal range splits for an object

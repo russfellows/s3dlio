@@ -1146,11 +1146,23 @@ pub async fn get_object_concurrent_range_async(
 ))]
 /// Internal concurrent range GET implementation.
 ///
-/// v0.9.31+: Replaced Arc<Mutex<BytesMut>> shared buffer with a collect-then-assemble
-/// approach (Finding 5 fix). Each chunk future returns its (buffer_offset, data) pair
-/// independently — no shared state, no lock contention. Chunks are sorted by offset
-/// once at the end and assembled into a single BytesMut with one sequential pass.
-/// This eliminates mutex serialisation across up to 37 concurrent writers per file.
+/// v0.9.107+ (issue #148, audit §1.3 / Patch 3): eliminated the second
+/// buffer copy by pre-allocating one master `BytesMut` of `total_bytes`,
+/// splitting it into per-range segments up front (each segment is a
+/// zero-copy view into the same underlying allocation), moving each
+/// segment into its range future, and streaming the AWS SDK response body
+/// **directly into the segment** via `ByteStream::next()` and
+/// `copy_from_slice`. On completion, segments are `unsplit` in ascending
+/// order — the fast path is O(1) contiguous reunification into the
+/// original allocation (see `bytes::BytesMut::unsplit` — non-contiguous
+/// falls back to `extend_from_slice`, which cannot happen here since
+/// segments were produced by ascending `split_to` from one buffer).
+/// Peak live memory during assembly is ~total_bytes, not ~2 * total_bytes.
+///
+/// Prior history: v0.9.31 replaced an `Arc<Mutex<BytesMut>>` shared buffer
+/// with a collect-then-assemble approach (Finding 5). That eliminated the
+/// mutex but retained a second copy from the per-chunk `Bytes` into an
+/// assembled buffer. This change closes that gap.
 async fn concurrent_range_get_impl(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -1162,20 +1174,37 @@ async fn concurrent_range_get_impl(
 ) -> Result<Bytes> {
     let total_bytes = (end_offset - start_offset) as usize;
 
-    // Build (range_start, range_end, buffer_offset) tuples
-    let mut ranges: Vec<(u64, u64, usize)> = Vec::new();
+    // Build (range_start, range_end) tuples in ascending offset order.
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
     let mut current_offset = start_offset;
     while current_offset < end_offset {
         let chunk_end = std::cmp::min(current_offset + chunk_size as u64, end_offset);
-        let buffer_start = (current_offset - start_offset) as usize;
-        ranges.push((current_offset, chunk_end, buffer_start));
+        ranges.push((current_offset, chunk_end));
         current_offset = chunk_end;
     }
+
+    // Pre-allocate the master buffer once and pre-split it into per-range
+    // segments. `split_to(len)` returns the first `len` bytes as its own
+    // `BytesMut` view into the shared allocation, leaving `master` holding
+    // the remainder. Assemble later via `unsplit` in the same ascending
+    // order to trigger the O(1) contiguous fast path.
+    let mut master = BytesMut::zeroed(total_bytes);
+    let mut segments: Vec<BytesMut> = Vec::with_capacity(ranges.len());
+    for (range_start, range_end) in &ranges {
+        let seg_len = (range_end - range_start) as usize;
+        segments.push(master.split_to(seg_len));
+    }
+    debug_assert!(
+        master.is_empty(),
+        "master should be fully consumed by segments"
+    );
 
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
     let mut futures = FuturesUnordered::new();
 
-    for (range_start, range_end, buffer_offset) in ranges {
+    for (idx, ((range_start, range_end), mut seg)) in
+        ranges.into_iter().zip(segments.into_iter()).enumerate()
+    {
         let client = client.clone();
         let bucket = bucket.to_string();
         let key = key.to_string();
@@ -1188,7 +1217,7 @@ async fn concurrent_range_get_impl(
                 .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
             let range_header = format!("bytes={}-{}", range_start, range_end - 1);
-            let resp = client
+            let mut resp = client
                 .get_object()
                 .bucket(&bucket)
                 .key(key.trim_start_matches('/'))
@@ -1203,27 +1232,63 @@ async fn concurrent_range_get_impl(
                     range_end - 1
                 ))?;
 
-            let body = resp.body.collect().await.context("collect chunk body")?;
-            let chunk_data = body.into_bytes();
+            // Stream the body directly into the pre-allocated segment.
+            let seg_len = seg.len();
+            let mut written: usize = 0;
+            while let Some(chunk) = resp.body.next().await {
+                let chunk = chunk.context("read chunk body byte stream")?;
+                let n = chunk.len();
+                if written + n > seg_len {
+                    bail!(
+                        "range chunk overflow: got {} bytes past segment end at range {}..{}",
+                        (written + n) - seg_len,
+                        range_start,
+                        range_end
+                    );
+                }
+                seg[written..written + n].copy_from_slice(&chunk);
+                written += n;
+            }
+            if written != seg_len {
+                bail!(
+                    "range short read: wrote {}/{} bytes for range {}..{}",
+                    written,
+                    seg_len,
+                    range_start,
+                    range_end
+                );
+            }
 
-            // Return (buffer_offset, data) — no shared mutex, no contention
-            Ok::<(usize, Bytes), anyhow::Error>((buffer_offset, chunk_data))
+            Ok::<(usize, BytesMut), anyhow::Error>((idx, seg))
         });
     }
 
-    // Collect all (offset, chunk) pairs — order is non-deterministic (FuturesUnordered)
-    let mut chunks: Vec<(usize, Bytes)> = Vec::new();
+    // Collect all (idx, segment) pairs — order is non-deterministic
+    // (FuturesUnordered).
+    let mut chunks: Vec<(usize, BytesMut)> = Vec::with_capacity(max_concurrency);
     while let Some(result) = futures.next().await {
         chunks.push(result.context("concurrent range chunk failed")?);
     }
 
-    // Sort by buffer offset, then assemble with a single sequential pass
-    chunks.sort_unstable_by_key(|(offset, _)| *offset);
-
-    let mut output = BytesMut::with_capacity(total_bytes);
-    for (_, chunk) in chunks {
-        output.extend_from_slice(&chunk);
+    // Sort by segment index (== ascending offset order), then reunify.
+    // Because segments were produced by ascending `split_to` from one
+    // allocation and are unsplit here in that same order, this hits the
+    // O(1) contiguous fast path — the master buffer is reconstituted
+    // in place with no additional copies.
+    chunks.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut assembled: Option<BytesMut> = None;
+    for (_, seg) in chunks {
+        match assembled.as_mut() {
+            Some(acc) => acc.unsplit(seg),
+            None => assembled = Some(seg),
+        }
     }
+    let output = assembled.unwrap_or_default();
+    debug_assert_eq!(
+        output.len(),
+        total_bytes,
+        "assembled length must equal requested total_bytes"
+    );
 
     Ok(output.freeze())
 }

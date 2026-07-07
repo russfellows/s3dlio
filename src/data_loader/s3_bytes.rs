@@ -13,7 +13,7 @@ use crate::s3_utils::{
     stat_object_uri_async,
 };
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{self, StreamExt};
 
 #[derive(Clone)]
@@ -95,8 +95,13 @@ impl Dataset for S3BytesDataset {
                 let n_parts = size.div_ceil(part) as usize;
                 let max_inflight = self.max_inflight_parts.max(1);
 
-                // Fetch parts concurrently, preserving order
-                let mut out = Vec::with_capacity(size as usize);
+                // Pre-allocate the master output buffer once (issue #148,
+                // audit §3.3b / Patch 3). `.buffered(N)` returns items in
+                // stream order, so we can copy each range into its offset
+                // as it completes and drop the source Bytes immediately —
+                // keeping peak live memory to ~size instead of ~2 * size.
+                let mut out = BytesMut::zeroed(size as usize);
+                let mut write_offset: usize = 0;
                 let mut chunks = stream::iter(0..n_parts)
                     .map(|i| {
                         let start = (i as u64) * part;
@@ -108,10 +113,25 @@ impl Dataset for S3BytesDataset {
 
                 while let Some(res) = chunks.next().await {
                     let bytes = res.map_err(DatasetError::from)?;
-                    // Extend Vec with bytes from Bytes
-                    out.extend_from_slice(&bytes);
+                    let len = bytes.len();
+                    let end = write_offset + len;
+                    if end > out.len() {
+                        return Err(DatasetError::from(format!(
+                            "range assembly overflow: writing {}..{} but buffer is {} bytes",
+                            write_offset,
+                            end,
+                            out.len()
+                        )));
+                    }
+                    out[write_offset..end].copy_from_slice(&bytes);
+                    write_offset = end;
+                    drop(bytes);
                 }
-                Ok(Bytes::from(out))
+
+                if write_offset < out.len() {
+                    out.truncate(write_offset);
+                }
+                Ok(out.freeze())
             }
         }
     }
