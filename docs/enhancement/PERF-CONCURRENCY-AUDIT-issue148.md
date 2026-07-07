@@ -121,19 +121,19 @@ Today, a panic inside a bare (unspawned) fetch future propagates up through the 
 
 The original critique claimed forced HTTP/1.1 would require "each chunk request to do its own TCP+TLS handshake." That overstates the cost: `DEFAULT_POOL_MAX_IDLE_PER_HOST = usize::MAX` (`src/constants.rs:464`) means the reqwest pool already keeps large numbers of idle HTTP/1.1 keep-alive connections around, so **HTTP/1.1 requests can and do reuse pooled connections** rather than paying a fresh handshake every time. The defensible, weaker claim is: forcing HTTP/1.1 gives up H2 multiplexing, likely needs more concurrent TCP/TLS connections for the same fan-out (e.g. `concurrent_range_get_impl`'s many parallel range-GETs against one object), and so *could* trade one bottleneck (uncapped H2 window) for another (connection-count/handshake overhead) — a real but conditional, benchmark-dependent concern, not a certainty.
 
-**Maintainer decision (overrides the original "do not implement" recommendation on this point)**: regardless of the H2-multiplexing design rationale above, the maintainer's own operational experience is that HTTP/2 is *nearly always slower* than HTTP/1.1 in practice for this workload class, and the crate must make it trivial for users to disable HTTP/2 — for **both** `http://` and `https://` traffic, ideally via one simple switch that turns both off, with finer per-scheme control available underneath. This is now a settled product requirement, not an open design question awaiting sign-off.
+**Maintainer decision (final, 2026-07-07 revision, supersedes the earlier "opt-out" direction)**: HTTP/2 is *nearly always slower* than HTTP/1.1 in practice for this workload class, in the maintainer's own experience. The default must therefore **reverse**: HTTP/1.1 becomes the default for **both** `http://` and `https://`, and HTTP/2 becomes explicitly opt-in for each. This is a breaking change to the default `https://` behavior (was ALPN-negotiated H2, now HTTP/1.1); it lands in a minor-version bump under the pre-1.0 semver-cargo convention and is called out in the changelog.
 
-**Revised scope** — three pieces, all opt-in, none changing today's default behavior:
+**Revised scope** — three pieces, all opt-in, all defaulting to HTTP/1.1:
 
-1. **Window tuning for https (the original recommended alternative, unchanged)**: extend the *existing* `H2WindowConfig::from_env()` tuning (`src/reqwest_client.rs:459-485`, already written, currently gated to the `h2c`-only branch) to also apply when H2 is ALPN-negotiated over https. Fixes the uncapped 5 MiB default window for anyone who keeps H2 on.
-2. **A per-scheme https opt-out**: new env var, e.g. `S3DLIO_HTTPS_H2=auto|off` (default `auto` = current always-on ALPN-negotiated behavior, unchanged). Setting `off` calls `builder.http1_only()` on the https-configured client — this is Patch 2's original mechanism, now opt-in rather than default. Note `http://` traffic already defaults to HTTP/1.1 today (`S3DLIO_H2C` is the existing opt-*in* to h2c), so a symmetric `S3DLIO_HTTP_H2C=on|off` alias is not strictly new — it's `S3DLIO_H2C` under another name — so no new var is needed on that side; keep `S3DLIO_H2C` as-is per the existing naming, per §6.2's recommendation not to overload its meaning.
-3. **One master switch for both schemes**: new env var `S3DLIO_DISABLE_HTTP2=1` — when set, forces HTTP/1.1 on **both** `http://` (overriding `S3DLIO_H2C` even if it's also set) and `https://` (equivalent to `S3DLIO_HTTPS_H2=off`). This is the "one variable that shuts off both" the maintainer asked for — a single, memorable kill switch layered on top of the two finer-grained controls, evaluated first so it always wins over the per-scheme vars.
+1. **`S3DLIO_H2C=1`** — unchanged. Continues to opt-in to h2c (HTTP/2 cleartext prior-knowledge) on `http://`. Existing users of this var see no change.
+2. **`S3DLIO_HTTPS_H2=1`** — new. Opt-in to HTTP/2 on `https://` via TLS ALPN. When set, the reqwest builder does *not* call `.http1_only()` and reqwest offers `h2` in its ALPN advertisement so the server may negotiate H2. When unset (the new default), the reqwest builder calls `.http1_only()`, restricting the connection to HTTP/1.1 regardless of ALPN.
+3. **`S3DLIO_ENABLE_HTTP2=1`** — new master switch. When set, implies both `S3DLIO_H2C=1` and `S3DLIO_HTTPS_H2=1` — a single, memorable var for users who want H2 wherever it's available. Precedence is a simple OR: H2 is enabled for scheme S iff the per-scheme var for S is set OR the master switch is set.
 
-Precedence, most to least specific override: `S3DLIO_DISABLE_HTTP2=1` (master off) → per-scheme vars (`S3DLIO_HTTPS_H2`, `S3DLIO_H2C`) → default (https auto-H2, http H1.1).
+**Window tuning** (originally the recommended alternative to Patch 2) still lands: extend `H2WindowConfig::from_env()` (currently gated to the `h2c=true` branch) to also apply when `https_h2=true`. Fixes the uncapped default receive window for anyone who opts in — the fix is only relevant when H2 is on.
 
-Update the doc comments in `reqwest_client.rs`/`constants.rs` that currently assert https-ALPN-H2 is unconditionally "always on, no config needed" — replace with "on by default, disable via `S3DLIO_DISABLE_HTTP2=1` or `S3DLIO_HTTPS_H2=off`."
+**Correction to the earlier draft of this section**: the previous rev proposed `S3DLIO_DISABLE_HTTP2` as a master OFF switch on top of an https-H2-on-by-default. That framing is superseded — since the default is now OFF, an OFF-master would be redundant, and the ON-master (`S3DLIO_ENABLE_HTTP2`) is the useful one.
 
-**Verdict**: implement all three pieces together in Phase 3 (see §4). Window tuning (piece 1) benefits everyone who keeps H2 on; pieces 2–3 give users the explicit, easy disable path the maintainer has directed, without changing the current default for anyone who doesn't ask for it. No further design sign-off needed — the shape above is the agreed design.
+**Verdict**: implement all four pieces (three env vars + window tuning) together in Phase 3 (see §4). Default behavior *changes* for https: H2 users must now set `S3DLIO_HTTPS_H2=1` or `S3DLIO_ENABLE_HTTP2=1`. This is called out as a breaking change in the changelog. No design sign-off remaining — the shape above is the agreed design.
 
 ### 2.3 — Patch 3: pre-split segments, O(1) unsplit (range engine) — **SAFE TO IMPLEMENT AS-IS**
 
@@ -337,24 +337,29 @@ Ordered by risk and dependency. Each phase should land as its own PR (or small s
 - A panic-inside-fetch test confirming the panic surfaces as a proper error to the caller (Python `PyRuntimeError` for the loader sites; `Result::Err` for the Rust-only sites), not a silent truncation — this locks in the bonus fix noted in §2.1.
 - For the full-drain retrofit: a test with a mix of succeeding and failing tasks in the same batch, asserting *all* tasks are awaited to completion (no detached stragglers) and the returned summary correctly reflects every outcome, not just the first failure.
 
-### Phase 3 — HTTPS/H2 window tuning + explicit HTTP/2 opt-out controls (Patch 2 rework) — design decided, ready to implement
+### Phase 3 — Reverse the HTTP/2 default: everything opt-in (Patch 2 final form) — design decided, ready to implement
 
-**Scope** (see §2.2 for full rationale — this is a maintainer-directed design, not an open question):
+**Scope** (see §2.2 for full rationale — this is a maintainer-directed design change; the *default* now flips to HTTP/1.1 for both schemes, and this is a breaking change called out in the changelog):
 
-1. **Window tuning for https**: extend the existing `H2WindowConfig::from_env()` tuning (`src/reqwest_client.rs:459-485`) to also apply on the ALPN-negotiated https client, removing the `if h2c` gate around window configuration specifically (window tuning becomes unconditional; h2c-vs-ALPN-h2 negotiation-forcing logic stays as-is). Fixes the uncapped 5 MiB default window for anyone who keeps H2 on — this piece alone was the original recommended alternative to Patch 2.
-2. **New env var `S3DLIO_HTTPS_H2=auto|off`** (default `auto`, i.e. unchanged behavior): `off` calls `builder.http1_only()` on the https-configured client. Keep the existing `S3DLIO_H2C` scoped to plain-http as today — do not overload its meaning (§6.2).
-3. **New master switch `S3DLIO_DISABLE_HTTP2=1`**: forces HTTP/1.1 on both `http://` (overrides `S3DLIO_H2C` if also set) and `https://` (equivalent to `S3DLIO_HTTPS_H2=off`). Evaluate this first, before the per-scheme vars, so it always wins.
-4. Update the doc comments in `reqwest_client.rs`/`constants.rs` that currently assert https-ALPN-H2 is unconditionally "always on, no config needed" — replace with "on by default, disable via `S3DLIO_DISABLE_HTTP2=1` or `S3DLIO_HTTPS_H2=off`."
-5. Document the precedence order (`S3DLIO_DISABLE_HTTP2` > per-scheme vars > default) in the env-var reference doc, with a short "why you might want this" note reflecting the maintainer's real-world observation that H2 is frequently slower than H1.1 for this workload class.
+1. **Default HTTP/1.1 for both schemes.** The generic reqwest client (used for `https://` and for `http://` non-H2C fallback) is now built with `.http1_only()` unless an opt-in var enables H2 for the target scheme. This changes `https://` behavior: previously it always negotiated H2 via TLS ALPN; now it only does so if the user opts in.
+2. **`S3DLIO_H2C=1`** — unchanged. Continues to opt in to h2c for `http://`.
+3. **`S3DLIO_HTTPS_H2=1`** — new. Opt in to HTTP/2 (via TLS ALPN) for `https://`. When set, the generic client is *not* built with `.http1_only()` and window tuning is applied.
+4. **`S3DLIO_ENABLE_HTTP2=1`** — new master switch. When set, implies both of the above. Precedence: H2 is enabled for scheme S iff (per-scheme var for S is set) OR (master switch is set).
+5. **Window tuning**: extend `H2WindowConfig::from_env()` (currently gated to `h2c=true`) to also apply when `https_h2=true`. Only relevant when H2 is opted in on some scheme.
+6. **Doc updates** in `reqwest_client.rs`, `constants.rs`, and `docs/Environment_Variables.md`. Retire the "https-ALPN-H2 is always on" claims and replace with "HTTP/1.1 by default; opt in via `S3DLIO_HTTPS_H2=1` or `S3DLIO_ENABLE_HTTP2=1`."
+7. **Changelog entry** in `docs/Changelog.md` explicitly flagging the `https://` default flip as a breaking change from `v0.9.106`.
 
-**Risk**: medium — window tuning changes behavior on the default request path for every https connection (additive: sizes only get tuned, protocol selection unchanged for anyone not setting the new vars). The opt-out vars themselves are zero-risk to users who don't set them, by construction (default `auto`/unset preserves current behavior exactly).
+**Risk**: medium — the `https://` default behavior changes for every user of the crate. Mitigation: the change is trivially reversible for any user who wants the prior behavior (set `S3DLIO_HTTPS_H2=1`), and the change reflects real-world benchmarking (H2 is frequently slower than H1.1 for this workload class).
 
 **Required tests**:
-- A test confirming H2 window config values (adaptive or static, per existing `S3DLIO_H2_*` env vars) are actually applied to the https/ALPN client the same way they're already tested for the h2c client (check for existing h2c window tests in `reqwest_client.rs`'s test module and mirror them).
-- A test confirming `S3DLIO_HTTPS_H2=off` actually produces an HTTP/1.1 connection (assert negotiated protocol, not just that the client builds without error).
-- A test confirming `S3DLIO_DISABLE_HTTP2=1` forces HTTP/1.1 on both schemes and correctly overrides `S3DLIO_H2C=1` when both are set simultaneously (precedence test).
-- A test confirming the untouched default path (`auto`, no new vars set) is byte-for-byte behaviorally unchanged from current `main` — this is the regression guard for existing users.
-- A throughput regression check against Phase 1's range-GET path specifically, if Phase 3 lands after Phase 1 (preferred order for cleaner benchmarking, not a hard dependency — §6.3); if Phase 3 lands first, this check can be deferred to whichever phase lands second.
+- Env-var parsing unit tests for the new `Http2Modes::from_env_values` helper, covering: unset defaults, `S3DLIO_H2C=1` sets `h2c` only, `S3DLIO_HTTPS_H2=1` sets `https_h2` only, `S3DLIO_ENABLE_HTTP2=1` sets both, and combinations (both scheme + master; contradictory values).
+- Wire-level RED-then-GREEN test: hit a local TLS test server (self-signed cert; server offers both `h2` and `http/1.1` in ALPN) with the built reqwest client and assert `response.version()`:
+  - Default (no opt-in vars) → HTTP/1.1. **RED against unmodified main** (which negotiates H2 via ALPN).
+  - `Http2Modes { h2c: false, https_h2: true }` → HTTP/2. RED against unmodified main (env var doesn't exist).
+  - `Http2Modes { h2c: false, https_h2: false }` with client hitting an http:// server → HTTP/1.1 (unchanged).
+- H2 window-tuning applies on the https-H2 client when `https_h2=true` (mirror the existing h2c-only window tests).
+- Precedence test: `S3DLIO_ENABLE_HTTP2=1` alone produces `Http2Modes { h2c: true, https_h2: true }`.
+- Throughput regression check against Phase 1's range-GET path, if Phase 3 lands after Phase 1 (preferred order for cleaner benchmarking, not a hard dependency — §6.3).
 
 ### Phase 4 — Streaming connector + centralized retry (highest risk, do last)
 
