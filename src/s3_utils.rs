@@ -1206,9 +1206,7 @@ async fn concurrent_range_get_impl(
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
     let mut futures = FuturesUnordered::new();
 
-    for (idx, ((range_start, range_end), mut seg)) in
-        ranges.into_iter().zip(segments.into_iter()).enumerate()
-    {
+    for (idx, ((range_start, range_end), mut seg)) in ranges.into_iter().zip(segments).enumerate() {
         let client = client.clone();
         let bucket = bucket.to_string();
         let key = key.to_string();
