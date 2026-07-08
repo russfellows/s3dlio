@@ -4,13 +4,52 @@
 use super::latest::{read_latest, Latest};
 use super::manifest::Manifest;
 use super::paths::KeyLayout;
-use crate::object_store::ObjectStore;
+use crate::data_loader::parallel_fetch::DropCancel;
+use crate::object_store::{store_for_uri, ObjectStore};
 use anyhow::Result;
 use bytes::Bytes;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 pub struct Reader<'a> {
     pub store: &'a dyn ObjectStore,
     pub base_uri: String,
+}
+
+/// Read one shard by relative key from an owned store handle.
+///
+/// Functionally equivalent to `Reader::read_shard(_with_validation)?` but
+/// takes an owned `Arc<dyn ObjectStore>` and a base URI directly, so it
+/// can be called from a `tokio::spawn`ed task (which requires `'static`
+/// captures — the borrowed `Reader<'a>` cannot cross that boundary).
+///
+/// Used by `read_all_shards_concurrent` and its `_with_validation`
+/// companion (issue #148 site 3.1d). When `expected_checksum` is `Some`,
+/// dispatches to `store.get_with_validation`; otherwise plain
+/// `store.get`. `.zst` shards are decompressed identically to the
+/// `Reader` methods.
+async fn read_shard_owned(
+    store: &Arc<dyn ObjectStore>,
+    base_uri: &str,
+    shard_rel_key: &str,
+    expected_checksum: Option<&str>,
+) -> Result<Bytes> {
+    let uri = format!("{}/{}", base_uri, shard_rel_key);
+    let data = match expected_checksum {
+        Some(cs) => store.get_with_validation(&uri, Some(cs)).await?,
+        None => store.get(&uri).await?,
+    };
+
+    if shard_rel_key.ends_with(".zst") {
+        use std::io::Read;
+        let mut decoder = zstd::Decoder::new(&data[..])?;
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)?;
+        Ok(Bytes::from(decompressed))
+    } else {
+        Ok(data)
+    }
 }
 
 impl<'a> Reader<'a> {
@@ -200,47 +239,136 @@ impl<'a> Reader<'a> {
         Ok(results)
     }
 
-    /// Read all shards concurrently for better performance
+    /// Read all shards concurrently for better performance.
+    ///
+    /// Task-level parallelism (issue #148 site 3.1d): each shard read is
+    /// `tokio::spawn`'d so tokio can distribute both the network I/O and
+    /// any zstd decode work (see `read_shard`) across worker threads.
+    /// `DropCancel` on this frame + `select!` in each spawn cancels
+    /// in-flight reads on any exit path (normal return, panic here, or
+    /// the task holding this Reader being dropped).
+    ///
+    /// Because `Reader<'a>` borrows `&'a dyn ObjectStore` — non-`'static`,
+    /// so `tokio::spawn` can't capture it — an owned `Arc<dyn ObjectStore>`
+    /// is looked up once via `store_for_uri(&self.base_uri)` and cloned
+    /// into each spawn. `store_for_uri` is deterministic for a given URI,
+    /// so the freshly-looked-up store is functionally equivalent to the
+    /// borrowed `self.store` for the read+decompress leaf operation.
     pub async fn read_all_shards_concurrent(
         &self,
         manifest: &Manifest,
     ) -> Result<Vec<(u32, Bytes)>> {
-        use futures::future::try_join_all;
+        let cancel = CancellationToken::new();
+        let _drop_cancel = DropCancel(cancel.clone());
+        let store_arc: Arc<dyn ObjectStore> = Arc::from(store_for_uri(&self.base_uri)?);
+        let base_uri = self.base_uri.clone();
 
-        let futures = manifest.shards.iter().map(|shard| {
-            let rank = shard.rank;
-            let key = shard.key.clone();
-            async move {
-                let data = self.read_shard(&key).await?;
-                Ok::<(u32, Bytes), anyhow::Error>((rank, data))
+        let handles: Vec<JoinHandle<Result<(u32, Bytes)>>> = manifest
+            .shards
+            .iter()
+            .map(|shard| {
+                let rank = shard.rank;
+                let key = shard.key.clone();
+                let store = Arc::clone(&store_arc);
+                let base_uri = base_uri.clone();
+                let token = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = token.cancelled() => Err(anyhow::anyhow!(
+                            "checkpoint shard read cancelled"
+                        )),
+                        r = read_shard_owned(&store, &base_uri, &key, None) => {
+                            r.map(|data| (rank, data))
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // Drain-first-then-first-error (site 3.2 pattern): no JoinHandle
+        // is dropped mid-flight, so no shard read is left detached.
+        let mut results = Vec::with_capacity(handles.len());
+        let mut first_err: Option<anyhow::Error> = None;
+        for h in handles {
+            match h.await {
+                Ok(Ok(pair)) => results.push(pair),
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(join_err) if join_err.is_panic() => {
+                    first_err.get_or_insert(anyhow::anyhow!(
+                        "checkpoint shard read task panicked: {}",
+                        join_err
+                    ));
+                }
+                Err(_) => {} // cancelled during shutdown
             }
-        });
-
-        let mut results = try_join_all(futures).await?;
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
         results.sort_by_key(|(rank, _)| *rank);
         Ok(results)
     }
 
-    /// Read all shards concurrently with integrity validation
+    /// Read all shards concurrently with integrity validation.
+    ///
+    /// Task-level parallelism companion to `read_all_shards_concurrent` —
+    /// same DropCancel + spawn + select! pattern; the only difference is
+    /// each shard is read via `read_shard_owned` with the per-shard
+    /// expected checksum passed through for validation.
     pub async fn read_all_shards_concurrent_with_validation(
         &self,
         manifest: &Manifest,
     ) -> Result<Vec<(u32, Bytes)>> {
-        use futures::future::try_join_all;
+        let cancel = CancellationToken::new();
+        let _drop_cancel = DropCancel(cancel.clone());
+        let store_arc: Arc<dyn ObjectStore> = Arc::from(store_for_uri(&self.base_uri)?);
+        let base_uri = self.base_uri.clone();
 
-        let futures = manifest.shards.iter().map(|shard| {
-            let rank = shard.rank;
-            let key = shard.key.clone();
-            let checksum = shard.checksum.clone();
-            async move {
-                let data = self
-                    .read_shard_with_validation(&key, checksum.as_deref())
-                    .await?;
-                Ok::<(u32, Bytes), anyhow::Error>((rank, data))
+        let handles: Vec<JoinHandle<Result<(u32, Bytes)>>> = manifest
+            .shards
+            .iter()
+            .map(|shard| {
+                let rank = shard.rank;
+                let key = shard.key.clone();
+                let checksum = shard.checksum.clone();
+                let store = Arc::clone(&store_arc);
+                let base_uri = base_uri.clone();
+                let token = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = token.cancelled() => Err(anyhow::anyhow!(
+                            "checkpoint shard read cancelled"
+                        )),
+                        r = read_shard_owned(&store, &base_uri, &key, checksum.as_deref()) => {
+                            r.map(|data| (rank, data))
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(handles.len());
+        let mut first_err: Option<anyhow::Error> = None;
+        for h in handles {
+            match h.await {
+                Ok(Ok(pair)) => results.push(pair),
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(join_err) if join_err.is_panic() => {
+                    first_err.get_or_insert(anyhow::anyhow!(
+                        "checkpoint shard read task panicked: {}",
+                        join_err
+                    ));
+                }
+                Err(_) => {}
             }
-        });
-
-        let mut results = try_join_all(futures).await?;
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
         results.sort_by_key(|(rank, _)| *rank);
         Ok(results)
     }
