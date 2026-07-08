@@ -1583,8 +1583,28 @@ pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec
             }));
         }
         let mut out = Vec::with_capacity(uris.len());
+        // Full-drain-first-then-error (issue #148 finding 3.2): the previous
+        // shape was `out.push(res??)` — that returned on the first Err,
+        // dropping the remaining JoinHandles in `futs`. Dropped JoinHandles
+        // detach (leak) their tasks rather than aborting them, so any GETs
+        // still in flight kept running in the background after this
+        // function had already returned an error. Draining every task
+        // before returning eliminates the leak; we surface the first
+        // error observed.
+        let mut first_err: Option<anyhow::Error> = None;
         while let Some(res) = futs.next().await {
-            out.push(res??);
+            match res {
+                Ok(Ok(item)) => out.push(item),
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(join_err) => {
+                    first_err.get_or_insert(anyhow::anyhow!("GET task panicked: {}", join_err));
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         // O(N log N) sort using pre-built position map
         out.sort_by_key(|(u, _)| uri_positions.get(u.as_str()).copied().unwrap_or(0));
@@ -1627,8 +1647,22 @@ pub fn get_objects_parallel_with_progress(
             }));
         }
         let mut out = Vec::with_capacity(uris.len());
+        // Full-drain-first-then-error — see companion note in
+        // `get_objects_parallel`. Issue #148 finding 3.2.
+        let mut first_err: Option<anyhow::Error> = None;
         while let Some(res) = futs.next().await {
-            out.push(res??);
+            match res {
+                Ok(Ok(item)) => out.push(item),
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(join_err) => {
+                    first_err.get_or_insert(anyhow::anyhow!("GET task panicked: {}", join_err));
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         // O(N log N) sort using pre-built position map
         out.sort_by_key(|(u, _)| uri_positions.get(u.as_str()).copied().unwrap_or(0));
@@ -1925,8 +1959,26 @@ pub(crate) fn put_objects_parallel_with_progress(
             }));
         }
 
+        // Full-drain-first-then-error (issue #148 finding 3.2): the previous
+        // shape was `res??`, which returned on the first Err and dropped the
+        // remaining JoinHandles. Detached PUT tasks would keep running in
+        // the background after the caller had already been told the whole
+        // operation failed — a genuine resource leak on top of a
+        // now-orphaned upload.
+        let mut first_err: Option<anyhow::Error> = None;
         while let Some(res) = futs.next().await {
-            res??;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(join_err) => {
+                    first_err.get_or_insert(anyhow::anyhow!("PUT task panicked: {}", join_err));
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         Ok(())
     })
