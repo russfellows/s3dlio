@@ -55,6 +55,7 @@ use pyo3::prelude::*;
 // Internal modules - these may change in future versions
 pub mod object_store;
 pub(crate) mod redirect_client; // HTTP 307 redirect following (for AIStore compatibility)
+pub mod retry; // v0.9.108+ Phase 4: shared retry helper for body-transfer failures
 pub mod s3_client;
 pub mod s3_copy;
 pub mod s3_logger;
