@@ -546,6 +546,19 @@ pub trait ObjectStore: Send + Sync {
     /// This method has a default implementation that stats objects CONCURRENTLY
     /// using the provided max_concurrent limit. No need to override unless you
     /// want custom behavior.
+    ///
+    /// Issue #148 site 3.1g caveat: the default implementation uses
+    /// `.buffer_unordered(N)` which polls every in-flight stat inside a
+    /// single tokio task. This limits per-stat CPU work (URI parsing,
+    /// signing, HEAD response parsing) to one worker thread. Full task
+    /// parallelism would require `tokio::spawn`, but that needs
+    /// `Arc<Self>: 'static + Send + Sync` — not obtainable from a
+    /// `&self` method through a `dyn ObjectStore`. Backends that need
+    /// N-core parallelism should override with a spawn-based
+    /// implementation using their own owned handle (see
+    /// `crate::s3_utils::stat_object_many_async` for the pattern). For
+    /// most callers, HEAD is small enough that this is not the
+    /// bottleneck.
     async fn pre_stat_objects(
         &self,
         uris: &[String],

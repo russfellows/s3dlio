@@ -1432,12 +1432,59 @@ pub fn stat_object_uri(uri: &str) -> anyhow::Result<ObjectStat> {
 }
 
 /// Async stat for many URIs (concurrent).
+///
+/// Task-level parallelism (issue #148 site 3.1g): each stat is
+/// `tokio::spawn`'d so tokio can distribute per-stat work (URI parsing,
+/// signing, header parsing on the HEAD response) across worker threads
+/// instead of serializing on this task's poll cycle. `Vec<JoinHandle>`
+/// awaited in order preserves the previous input→output ordering (the
+/// spawns run concurrently regardless of iteration order). Panics are
+/// surfaced as errors instead of silently truncating the result.
 pub async fn stat_object_many_async(uris: Vec<String>) -> Result<Vec<ObjectStat>> {
-    use futures_util::future::try_join_all;
-    let futs = uris
+    let cancel = CancellationToken::new();
+    let _drop_cancel = DropCancel(cancel.clone());
+
+    let handles: Vec<JoinHandle<Result<ObjectStat>>> = uris
         .into_iter()
-        .map(|u| async move { stat_object_uri_async(&u).await });
-    try_join_all(futs).await
+        .map(|u| {
+            let token = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = token.cancelled() => Err(anyhow::anyhow!("stat cancelled: {}", u)),
+                    r = stat_object_uri_async(&u) => r,
+                }
+            })
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(handles.len());
+    let mut first_err: Option<anyhow::Error> = None;
+    for h in handles {
+        match h.await {
+            Ok(Ok(stat)) => {
+                if first_err.is_none() {
+                    out.push(stat);
+                }
+            }
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                    cancel.cancel();
+                }
+            }
+            Err(join_err) if join_err.is_panic() => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("stat task panicked: {}", join_err));
+                    cancel.cancel();
+                }
+            }
+            Err(_cancelled) => {}
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(out)
 }
 
 // -----------------------------------------------------------------------------
