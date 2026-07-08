@@ -14,6 +14,7 @@ Licensed under Apache 2.0
 Compatible with DLIO Benchmark v1.0+
 """
 
+import logging
 import os
 from urllib.parse import urlparse
 
@@ -27,6 +28,21 @@ from dlio_benchmark.utils.utility import Profile
 from . import _multipart_config
 
 dlp = Profile(MODULE_STORAGE)
+_logger = logging.getLogger(__name__)
+
+
+def _rank_from_env():
+    """Return the current process's rank from the first available of
+    OMPI_COMM_WORLD_RANK / SLURM_PROCID / PMI_RANK -- the same env var
+    set already read by _select_endpoint_via_mpi -- or None if none are
+    set."""
+    if "OMPI_COMM_WORLD_RANK" in os.environ:
+        return int(os.environ["OMPI_COMM_WORLD_RANK"])
+    elif "SLURM_PROCID" in os.environ:
+        return int(os.environ["SLURM_PROCID"])
+    elif "PMI_RANK" in os.environ:
+        return int(os.environ["PMI_RANK"])
+    return None
 
 
 class S3dlioStorage(DataStorage):
@@ -197,27 +213,52 @@ class S3dlioStorage(DataStorage):
         Select endpoint using specified load balancing strategy.
 
         Strategies:
-          - round_robin: Rotate through endpoints (simple, static)
-          - least_connections: Not implemented yet (needs connection tracking)
-          - random: Random selection (for testing)
+          - round_robin: rank-based deterministic assignment when an
+            MPI/SLURM/PMI rank env var is available (rank % N -- the
+            same rank vars _select_endpoint_via_mpi reads), falling back
+            to pid % N (logged as best-effort) only when no rank var is
+            set. Audit #153 bug 3.10 (B9): previously this always used
+            pid % N regardless of rank, which is not round-robin across
+            ranks at all -- every process on a distributed run maps to
+            whatever endpoint its OS-assigned PID happens to hash to.
+            NOTE: because this now matches _select_endpoint_via_mpi's
+            rank-based logic whenever a rank var is present,
+            use_mpi_endpoint_distribution=true and
+            load_balance_strategy=round_robin collapse to the same
+            endpoint assignment in that case -- the flag becomes
+            vestigial but harmless.
+          - least_connections: not implemented yet (needs connection
+            tracking); falls back to round_robin (logged).
+          - random: random.choice(), seeded from rank-if-available or
+            pid-otherwise so repeated runs aren't identically skewed
+            across processes.
 
         Note: For production multi-endpoint with least_connections,
         use s3dlio.MultiEndpointStore when available.
         """
         import random
 
+        rank = _rank_from_env()
+
         if strategy == "round_robin":
-            # Use process ID for semi-stable round-robin
-            pid = os.getpid()
-            index = pid % len(endpoint_uris)
+            if rank is not None:
+                index = rank % len(endpoint_uris)
+            else:
+                _logger.warning(
+                    "[s3dlio] round_robin endpoint selection requested but no "
+                    "MPI/SLURM/PMI rank env var found; falling back to "
+                    "pid %% N (best-effort -- not a true round-robin across ranks)"
+                )
+                index = os.getpid() % len(endpoint_uris)
             return endpoint_uris[index]
         elif strategy == "random":
+            random.seed(rank if rank is not None else os.getpid())
             return random.choice(endpoint_uris)
         elif strategy == "least_connections":
             # TODO: Implement connection tracking
             # For now, fall back to round_robin
-            print(
-                "[s3dlio] Warning: least_connections not fully implemented, using round_robin"
+            _logger.warning(
+                "[s3dlio] least_connections not fully implemented, using round_robin"
             )
             return self._select_endpoint_via_strategy(endpoint_uris, "round_robin")
         else:
