@@ -402,6 +402,86 @@ pub struct S3UriComponents {
     pub key: String,
 }
 
+/// Default set of hostname-like suffixes checked by [`looks_like_s3_endpoint`]
+/// against the LAST dot-separated label of a URI's first path segment.
+/// Extend at runtime via the comma-separated `S3DLIO_S3_ENDPOINT_HINT_TLDS`
+/// env var (audit #154 bug 4.1 / B8).
+const DEFAULT_ENDPOINT_HINT_TLDS: &[&str] = &[
+    // common public TLDs frequently used for self-hosted S3-compatible endpoints
+    "com", "net", "org", "io", "co", "dev", "cloud", "app", "biz", "info",
+    // conventional private/internal-infrastructure suffixes
+    "local", "internal", "lan", "corp", "home", "cluster", "svc", "network",
+];
+
+/// Returns the effective endpoint-hint suffix list: the built-in defaults
+/// plus any comma-separated entries from `S3DLIO_S3_ENDPOINT_HINT_TLDS`.
+fn endpoint_hint_tlds() -> Vec<String> {
+    let mut tlds: Vec<String> = DEFAULT_ENDPOINT_HINT_TLDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Ok(extra) = std::env::var("S3DLIO_S3_ENDPOINT_HINT_TLDS") {
+        for t in extra.split(',') {
+            let t = t.trim().to_lowercase();
+            if !t.is_empty() {
+                tlds.push(t);
+            }
+        }
+    }
+    tlds
+}
+
+/// True if `s` is a syntactically valid dotted-quad IPv4 address (four
+/// `0..=255` octets separated by dots). S3 bucket names are explicitly
+/// forbidden from being formatted as an IP address, so this check is
+/// unambiguous — it can never misclassify a legal bucket name.
+fn looks_like_ipv4(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 3
+                && p.chars().all(|c| c.is_ascii_digit())
+                && p.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
+        })
+}
+
+/// Decide whether the first path segment of an `s3://` URI (the part
+/// before the first `/`) should be treated as a custom endpoint
+/// hostname rather than a bucket name.
+///
+/// Narrowed in v0.9.109 (audit #154 bug 4.1 / B8) to only fire on
+/// strings that are grammatically unambiguous or plausibly look like a
+/// real hostname:
+/// - contains `:` (a port — bucket names can never contain a colon)
+/// - is a dotted-quad IPv4 address (bucket names can never be formatted
+///   as an IP address, per S3 bucket naming rules)
+/// - contains a dot AND its last dot-separated label matches a known
+///   endpoint-hint suffix (see [`DEFAULT_ENDPOINT_HINT_TLDS`] /
+///   `S3DLIO_S3_ENDPOINT_HINT_TLDS`)
+///
+/// Deliberately does NOT fire on: a bare digit prefix, 2+ dots alone, or
+/// a `minio`/`ceph`/`localhost` substring — all of which are legal
+/// components of real S3 bucket names and were the source of the
+/// pre-v0.9.109 misclassification bug.
+fn looks_like_s3_endpoint(before_slash: &str) -> bool {
+    if before_slash.contains(':') {
+        return true;
+    }
+    if looks_like_ipv4(before_slash) {
+        return true;
+    }
+    if let Some(last_label) = before_slash.rsplit('.').next() {
+        if before_slash.contains('.') {
+            let last_label = last_label.to_lowercase();
+            if endpoint_hint_tlds().contains(&last_label) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Parse S3 URI with optional endpoint support (Hybrid Approach - Option C)
 ///
 /// Supports two formats:
@@ -435,6 +515,22 @@ pub struct S3UriComponents {
 /// let result = parse_s3_uri_full("s3://minio.local:9000/mybucket/path/to/file").unwrap();
 /// assert_eq!(result.endpoint, Some("minio.local:9000".to_string()));
 /// ```
+///
+/// # Behavior change (v0.9.109, audit #154 bug 4.1 / B8)
+///
+/// Prior to v0.9.109, the first path segment was treated as an endpoint
+/// if it merely contained 2+ dots, started with a digit, or contained
+/// "minio"/"ceph"/"localhost" as a substring — misrouting legitimate S3
+/// bucket names using dotted naming conventions (e.g. `mycompany.data.
+/// backups`), digit-prefixed names (explicitly legal per S3 bucket
+/// naming rules, e.g. `2024-training-data`), or names merely containing
+/// those cluster-software names (e.g. `minio-tenant-a`). As of v0.9.109
+/// the heuristic only fires on a colon (port), a dotted-quad IPv4
+/// address, or a recognized hostname-like suffix — see
+/// [`looks_like_s3_endpoint`]. **If you relied on the old broader
+/// heuristic to route a bucket-shaped endpoint hostname with no port and
+/// no recognized suffix, add your suffix to
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` (comma-separated) or include a port.**
 pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
     let trimmed = uri
         .strip_prefix("s3://")
@@ -447,17 +543,7 @@ pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
     let before_slash = &trimmed[..slash_pos];
     let after_slash = &trimmed[slash_pos + 1..];
 
-    // Heuristic to detect if first part is an endpoint:
-    // - Contains ':' (has port) → definitely endpoint
-    // - Starts with digit → likely IP address → endpoint
-    // - Contains multiple dots → likely IP or FQDN → endpoint
-    // - Common hostnames like "minio", "ceph" → endpoint
-    let is_endpoint = before_slash.contains(':')
-        || before_slash.starts_with(|c: char| c.is_ascii_digit())
-        || before_slash.matches('.').count() >= 2
-        || before_slash.starts_with("minio")
-        || before_slash.starts_with("ceph")
-        || before_slash.contains("localhost");
+    let is_endpoint = looks_like_s3_endpoint(before_slash);
 
     if is_endpoint {
         // Format: s3://endpoint:port/bucket/key or s3://endpoint/bucket/key

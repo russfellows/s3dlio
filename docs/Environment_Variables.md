@@ -334,6 +334,16 @@ Standard AWS environment variables are also supported:
 | `AWS_ENDPOINT_URL` | Custom S3 endpoint URL (for MinIO or other S3-compatible storage) |
 | `AWS_CA_BUNDLE` | Path to custom CA certificate bundle (standard AWS SDK name) |
 
+### `s3://host/bucket/key` endpoint-in-URI detection (v0.9.109+)
+
+`parse_s3_uri_full` (used when a URI's first path segment might be a custom endpoint hostname rather than a bucket, e.g. for MinIO/Ceph clusters addressed directly in the URI) decides bucket-vs-endpoint using: a colon (port) present, the segment is a dotted-quad IPv4 address, or the segment contains a dot and its last label matches a known hostname-like suffix.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_S3_ENDPOINT_HINT_TLDS` | (unset) | Comma-separated list of additional suffixes (case-insensitive, no leading dot) to recognize as hostname-like when a URI's first path segment has no port — e.g. `export S3DLIO_S3_ENDPOINT_HINT_TLDS=storagegrid,mynas` lets `s3://cluster.storagegrid/bucket/key` route as an endpoint. Extends, does not replace, the built-in default list (`com`, `net`, `org`, `io`, `co`, `dev`, `cloud`, `app`, `biz`, `info`, `local`, `internal`, `lan`, `corp`, `home`, `cluster`, `svc`, `network`). |
+
+> **Behavior change (v0.9.109).** Before this release, ANY first-path-segment with 2+ dots, a leading digit, or containing `minio`/`ceph`/`localhost` as a substring was misrouted as an endpoint — even though all of those are legal S3 bucket name shapes (e.g. `mycompany.data.backups`, `2024-training-data`, `minio-tenant-a`). Those now correctly parse as bucket names. If you relied on the old broader heuristic to route a no-port, unusual-suffix endpoint hostname, either add a port to the URI or add your hostname's suffix to `S3DLIO_S3_ENDPOINT_HINT_TLDS`.
+
 ## Azure Blob Storage Configuration
 
 | Variable | Description |
