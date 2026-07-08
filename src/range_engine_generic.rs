@@ -66,6 +66,35 @@ use crate::constants::{
 };
 use crate::data_loader::parallel_fetch::DropCancel;
 
+/// Compute the inclusive end-of-range byte offset for a `bytes=start-end`
+/// style range request, given a start `offset` and a nonzero byte `length`.
+///
+/// audit #152 findings 2.5/2.6/2.7 (bug B4): the S3, Azure, and
+/// community-GCS `get_range()` implementations each computed this as a bare
+/// `offset + length - 1`, which underflows — wrapping to a huge value in
+/// release builds, panicking in debug builds — whenever `length == 0`.
+///
+/// Callers MUST short-circuit `length == 0` themselves before calling this
+/// helper (return an empty buffer without issuing a range request at all —
+/// RFC 7233 range units can't express an empty range, so there is no valid
+/// inclusive end to compute). As defense in depth, this function still
+/// returns `Err` rather than underflowing if it's ever called with
+/// `length == 0` anyway. It also guards `offset + length` overflowing
+/// `u64` via `checked_add`, returning an error instead of silently
+/// wrapping.
+pub fn range_end_inclusive(offset: u64, length: u64) -> Result<u64> {
+    let len_minus_one = length.checked_sub(1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "range_end_inclusive called with length=0 for offset={offset} — \
+             callers must short-circuit zero-length ranges before requesting \
+             a byte range (a zero-byte range has no valid inclusive end)"
+        )
+    })?;
+    offset.checked_add(len_minus_one).ok_or_else(|| {
+        anyhow::anyhow!("range end overflow: offset={offset} + length={length} exceeds u64::MAX")
+    })
+}
+
 /// Configuration for range-based concurrent downloads
 ///
 /// **Performance Considerations**:
@@ -551,6 +580,45 @@ impl RangeEngine {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // RED-then-GREEN regression tests for s3dlio issue #152 findings
+    // 2.5/2.6/2.7 (bug B4): `offset + length - 1` underflows when
+    // `length == 0`. These exercise the shared `range_end_inclusive`
+    // helper directly; separate tests exercise the S3/Azure/GCS
+    // `get_range()` call sites that consume it.
+
+    #[test]
+    fn range_end_inclusive_zero_length_is_an_error_not_an_underflow() {
+        // Pre-fix, the call sites computed `offset + 0 - 1` directly,
+        // which panics (debug builds, overflow-checks-on) or wraps to
+        // u64::MAX - 1 + offset (release builds) instead of ever reaching
+        // this helper. The helper itself must never underflow either.
+        let result = range_end_inclusive(100, 0);
+        assert!(
+            result.is_err(),
+            "length=0 must be rejected, not silently underflow"
+        );
+    }
+
+    #[test]
+    fn range_end_inclusive_single_byte_at_offset_zero() {
+        assert_eq!(range_end_inclusive(0, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn range_end_inclusive_normal_range() {
+        // offset=100, length=50 -> bytes 100..=149
+        assert_eq!(range_end_inclusive(100, 50).unwrap(), 149);
+    }
+
+    #[test]
+    fn range_end_inclusive_overflow_is_an_error() {
+        let result = range_end_inclusive(u64::MAX - 1, 10);
+        assert!(
+            result.is_err(),
+            "offset+length overflowing u64 must be an error, not a silent wrap"
+        );
+    }
 
     #[tokio::test]
     async fn test_small_object_single_request() {

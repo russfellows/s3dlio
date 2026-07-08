@@ -1258,10 +1258,22 @@ impl ObjectStore for S3ObjectStore {
             uri, offset, length
         );
 
+        // audit #152 finding 2.5 (bug B4): a zero-length range request has
+        // no valid `bytes=start-end` header at all (RFC 7233 can't express
+        // an empty range) — short-circuit it here instead of falling into
+        // the `offset + len - 1` underflow below.
+        if length == Some(0) {
+            return Ok(Bytes::new());
+        }
+
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
             let range_header = match length {
-                Some(len) => format!("bytes={}-{}", offset, offset + len - 1),
+                Some(len) => format!(
+                    "bytes={}-{}",
+                    offset,
+                    crate::range_engine_generic::range_end_inclusive(offset, len)?
+                ),
                 None => format!("bytes={}-", offset),
             };
             // v0.9.108+ (issue #148 Phase 4b): same reasoning as the
@@ -2126,7 +2138,15 @@ impl ObjectStore for AzureObjectStore {
             "AzureObjectStore::get_range uri='{}', offset={}, length={:?}",
             uri, offset, length
         );
-        let end = length.map(|len| offset + len - 1);
+        // audit #152 finding 2.6 (bug B4): same zero-length short-circuit
+        // as S3ObjectStore::get_range above — avoids the `offset + len - 1`
+        // underflow and the pointless network round-trip.
+        if length == Some(0) {
+            return Ok(Bytes::new());
+        }
+        let end = length
+            .map(|len| crate::range_engine_generic::range_end_inclusive(offset, len))
+            .transpose()?;
         let b = cli.get_range(&key, offset, end).await?; // Bytes - return directly for zero-copy
         Ok(b)
     }

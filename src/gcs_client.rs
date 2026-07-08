@@ -143,8 +143,19 @@ impl GcsClient {
             bucket, object, offset, length
         );
 
+        // audit #152 finding 2.7 (bug B4): same zero-length short-circuit as
+        // the S3/Azure get_range() implementations — avoids the
+        // `offset + len - 1` underflow and the pointless network round-trip.
+        if length == Some(0) {
+            return Ok(Bytes::new());
+        }
         let range = match length {
-            Some(len) => Range(Some(offset), Some(offset + len - 1)),
+            Some(len) => Range(
+                Some(offset),
+                Some(crate::range_engine_generic::range_end_inclusive(
+                    offset, len,
+                )?),
+            ),
             None => Range(Some(offset), None),
         };
 
