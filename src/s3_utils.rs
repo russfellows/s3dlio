@@ -1221,46 +1221,55 @@ async fn concurrent_range_get_impl(
                 .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
             let range_header = format!("bytes={}-{}", range_start, range_end - 1);
-            let mut resp = client
-                .get_object()
-                .bucket(&bucket)
-                .key(key.trim_start_matches('/'))
-                .range(range_header)
-                .send()
-                .await
-                .sdk_context(format!(
-                    "concurrent range GET for s3://{}/{} bytes={}-{} failed",
-                    bucket,
-                    key,
-                    range_start,
-                    range_end - 1
-                ))?;
 
-            // Stream the body directly into the pre-allocated segment.
-            let seg_len = seg.len();
-            let mut written: usize = 0;
-            while let Some(chunk) = resp.body.next().await {
-                let chunk = chunk.context("read chunk body byte stream")?;
-                let n = chunk.len();
-                if written + n > seg_len {
-                    bail!(
-                        "range chunk overflow: got {} bytes past segment end at range {}..{}",
-                        (written + n) - seg_len,
-                        range_start,
-                        range_end
-                    );
-                }
-                seg[written..written + n].copy_from_slice(&chunk);
-                written += n;
-            }
-            if written != seg_len {
-                bail!(
-                    "range short read: wrote {}/{} bytes for range {}..{}",
-                    written,
-                    seg_len,
+            // Bounded retry over send() + body-stream (issue #148
+            // Phase 4b). Once the reqwest connector streams response
+            // bodies, smithy's own retry stops covering body-transfer
+            // failures — we retry the whole send()+stream pair here.
+            //
+            // Inline (not `crate::retry::retry_get_body`) because that
+            // helper's `FnMut() -> Fut` signature can't share `&mut seg`
+            // across attempts without Arc<Mutex> or unsafe. Semantics
+            // match: max_retry_attempts() budget + linear 100ms*attempt
+            // backoff.
+            //
+            // Silent-data-corruption gate (audit §2.4): `written`
+            // MUST be declared inside `attempt_range_chunk_fill` so
+            // each retry attempt starts writing at position 0. If it
+            // leaked across attempts, a partial failed stream's bytes
+            // would remain at [0..old_written] mixed with successful
+            // retry bytes, length would still be seg_len but content
+            // would be a mix of two attempts — no error raised.
+            // Locked in by tests/test_phase4_retry_fault_injection.rs.
+            let attempts = crate::constants::max_retry_attempts().max(1);
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut succeeded = false;
+            for attempt in 1..=attempts {
+                match attempt_range_chunk_fill(
+                    &client,
+                    &bucket,
+                    &key,
+                    &range_header,
                     range_start,
-                    range_end
-                );
+                    range_end,
+                    &mut seg,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        succeeded = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt < attempts {
+                            tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                        }
+                    }
+                }
+            }
+            if !succeeded {
+                return Err(last_err.expect("attempts >= 1"));
             }
 
             Ok::<(usize, BytesMut), anyhow::Error>((idx, seg))
@@ -1295,6 +1304,70 @@ async fn concurrent_range_get_impl(
     );
 
     Ok(output.freeze())
+}
+
+/// One attempt at streaming a range GET's body into a pre-allocated
+/// segment (issue #148 Phase 4b). Declares `written = 0` inside the
+/// function body — the audit §2.4 silent-data-corruption gate — so
+/// each retry call from `concurrent_range_get_impl` starts writing at
+/// position 0 into `seg` regardless of how many bytes a previous
+/// failed attempt already wrote there. `tests/test_phase4_retry_fault_injection.rs`
+/// locks in this invariant.
+///
+/// On any error (send failure, body-stream failure, chunk-overflow,
+/// short read), the caller retries the whole call up to
+/// `max_retry_attempts()` times with linear backoff.
+async fn attempt_range_chunk_fill(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    range_header: &str,
+    range_start: u64,
+    range_end: u64,
+    seg: &mut BytesMut,
+) -> Result<()> {
+    let seg_len = seg.len();
+    let mut written: usize = 0;
+
+    let mut resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(key.trim_start_matches('/'))
+        .range(range_header)
+        .send()
+        .await
+        .sdk_context(format!(
+            "concurrent range GET for s3://{}/{} bytes={}-{} failed",
+            bucket,
+            key,
+            range_start,
+            range_end - 1
+        ))?;
+
+    while let Some(chunk) = resp.body.next().await {
+        let chunk = chunk.context("read chunk body byte stream")?;
+        let n = chunk.len();
+        if written + n > seg_len {
+            bail!(
+                "range chunk overflow: got {} bytes past segment end at range {}..{}",
+                (written + n) - seg_len,
+                range_start,
+                range_end
+            );
+        }
+        seg[written..written + n].copy_from_slice(&chunk);
+        written += n;
+    }
+    if written != seg_len {
+        bail!(
+            "range short read: wrote {}/{} bytes for range {}..{}",
+            written,
+            seg_len,
+            range_start,
+            range_end
+        );
+    }
+    Ok(())
 }
 
 /// Get optimal chunk size based on total transfer size

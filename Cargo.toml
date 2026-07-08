@@ -62,10 +62,12 @@ tokio-stream = { version = "^0.1", features = ["sync"] }
 tokio-util = "^0.7"  # For CancellationToken and other utilities
 async-stream = "^0.3"  # For stream! macro in list_stream implementations
 # HTTP stack
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
 http    = "^1"             # Re-exported by reqwest, but needed as direct dep for response building
+http-body       = "^1"     # v0.9.108+ Phase 4b: StreamBody wrapping for streaming connector
 http-body-util  = "^0.1"   # BodyExt::collect() for SdkBody async collection
-aws-smithy-types = "^1"   # SdkBody type used by reqwest_client.rs bridge
+sync_wrapper    = { version = "^1", features = ["futures"] }  # v0.9.108+ Phase 4b: SyncStream for SdkBody::from_body_1_x
+aws-smithy-types = { version = "^1", features = ["http-body-1-x"] }   # v0.9.108+ Phase 4b: from_body_1_x streaming SdkBody
 aws-smithy-http-client = { version = "^1", features = ["rustls-aws-lc"] }
 aws-smithy-runtime-api = "^1"                         # ← Added for HTTP client types
 

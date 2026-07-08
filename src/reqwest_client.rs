@@ -49,7 +49,8 @@ use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
 use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::body::SdkBody;
-use http_body_util::BodyExt;
+use futures::StreamExt;
+use http_body_util::{BodyExt, StreamBody};
 
 use crate::constants::{
     H2WindowConfig, DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST,
@@ -316,17 +317,48 @@ impl HttpConnector for ReqwestHttpConnector {
                 tracing::debug!("HTTP protocol: {:?}", version);
             }
 
-            let resp_body = resp
-                .bytes()
-                .await
-                .map_err(|e| ConnectorError::io(e.into()))?;
+            // ── Streaming response body (issue #148 Phase 4b) ─────────────
+            //
+            // Prior code did `resp.bytes().await` here — buffering the
+            // entire response body into a single Bytes before handing
+            // it to the SDK as SdkBody::from(resp_body). That fully
+            // serialized: SDK saw byte one only after the last byte
+            // arrived, and every body-transfer connection interruption
+            // that could be handled by re-streaming had to be recovered
+            // by the smithy retry loop instead.
+            //
+            // Now: hand the SDK a live stream via SdkBody::from_body_1_x.
+            // `resp.bytes_stream()` yields chunks as they arrive on the
+            // wire; we lift each chunk to an http_body::Frame::data and
+            // wrap the stream in SyncStream so it satisfies the
+            // Send + Sync + 'static bound that from_body_1_x requires
+            // (per audit §2.4 — reqwest's stream is Send but not Sync;
+            // SyncStream provides Sync via Rust aliasing rules, no
+            // runtime cost).
+            //
+            // Consequence: SDK-level retry no longer covers
+            // body-transfer failures — send() now resolves at response
+            // headers rather than after the full body downloads. The
+            // four caller sites (S3Ops::get_object, get_object_range,
+            // S3ObjectStore::get, concurrent_range_get_impl range-chunk)
+            // must wrap their send()+body-consume pair in
+            // `crate::retry::retry_get_body` to compensate. See audit
+            // §2.4 for the fault-injection gate on the range-chunk
+            // path; see tests/test_phase4_retry_fault_injection.rs for
+            // the RED-then-GREEN regression test.
+            let byte_stream = resp
+                .bytes_stream()
+                .map(|res| res.map(http_body::Frame::data));
+            let sync_stream = sync_wrapper::SyncStream::new(byte_stream);
+            let stream_body = StreamBody::new(sync_stream);
+            let sdk_body = SdkBody::from_body_1_x(stream_body);
 
             // ── Build Smithy response ─────────────────────────────────────
             let mut response = HttpResponse::new(
                 http::StatusCode::from_u16(status)
                     .map_err(|e| ConnectorError::other(e.into(), None))?
                     .into(),
-                SdkBody::from(resp_body),
+                sdk_body,
             );
 
             for (name, value) in &headers {

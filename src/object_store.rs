@@ -1193,19 +1193,28 @@ impl ObjectStore for S3ObjectStore {
 
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
-            let resp = client
-                .get_object()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .await
-                .sdk_context(format!("S3 GET failed for '{}'", uri))?;
-            let data = resp
-                .body
-                .collect()
-                .await
-                .context("Failed to read S3 GET response body")?;
-            return Ok(data.into_bytes());
+            // v0.9.108+ (issue #148 Phase 4b): wrap send()+collect() in
+            // retry_get_body so body-transfer failures (no longer
+            // covered by smithy's send()-level retry once the connector
+            // streams) are retried at this caller level. GETs are
+            // idempotent; each attempt allocates a fresh Bytes.
+            let data = crate::retry::retry_get_body(|| async {
+                let resp = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .sdk_context(format!("S3 GET failed for '{}'", uri))?;
+                let data = resp
+                    .body
+                    .collect()
+                    .await
+                    .context("Failed to read S3 GET response body")?;
+                Ok::<_, anyhow::Error>(data.into_bytes())
+            })
+            .await?;
+            return Ok(data);
         }
 
         // Range optimization is ENABLED by default (v0.9.60+).
@@ -1243,20 +1252,27 @@ impl ObjectStore for S3ObjectStore {
                 Some(len) => format!("bytes={}-{}", offset, offset + len - 1),
                 None => format!("bytes={}-", offset),
             };
-            let resp = client
-                .get_object()
-                .bucket(&bucket)
-                .key(&key)
-                .range(range_header)
-                .send()
-                .await
-                .sdk_context(format!("S3 range GET failed for '{}'", uri))?;
-            let data = resp
-                .body
-                .collect()
-                .await
-                .context("Failed to read S3 range GET response body")?;
-            return Ok(data.into_bytes());
+            // v0.9.108+ (issue #148 Phase 4b): same reasoning as the
+            // whole-object get() above — wrap send()+collect() in the
+            // shared retry helper.
+            let data = crate::retry::retry_get_body(|| async {
+                let resp = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .range(&range_header)
+                    .send()
+                    .await
+                    .sdk_context(format!("S3 range GET failed for '{}'", uri))?;
+                let data = resp
+                    .body
+                    .collect()
+                    .await
+                    .context("Failed to read S3 range GET response body")?;
+                Ok::<_, anyhow::Error>(data.into_bytes())
+            })
+            .await?;
+            return Ok(data);
         }
 
         s3_get_object_range_uri_async(uri, offset, length).await

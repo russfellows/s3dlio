@@ -8,9 +8,10 @@
 //! This module provides an `S3Ops` struct that wraps the AWS S3 client
 //! to provide simplified, blocking I/O operations with detailed tracing.
 
+use crate::retry::retry_get_body;
 use crate::s3_logger::{LogEntry, Logger};
-use crate::s3_utils::{format_sdk_error, sdk_anyhow};
-use anyhow::Result;
+use crate::s3_utils::{format_sdk_error, sdk_anyhow, SdkResultExt};
+use anyhow::{Context, Result};
 use aws_sdk_s3::{types::Delete, Client};
 use bytes::Bytes;
 //use std::sync::Arc;
@@ -80,6 +81,12 @@ impl S3Ops {
     }
 
     /// GET (Download) an object.
+    ///
+    /// v0.9.108+ (issue #148 Phase 4b): wrapped in `retry_get_body` so
+    /// body-transfer failures — which the streaming connector no longer
+    /// surfaces to the SDK's smithy-level retry — are retried at this
+    /// caller level. GETs are idempotent and each attempt allocates a
+    /// fresh `Bytes`, so retries are trivially safe here.
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes> {
         let ctx = LogContext {
             operation: "GET",
@@ -88,41 +95,59 @@ impl S3Ops {
             start_time: SystemTime::now(),
         };
 
-        let result = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await;
-        let first_byte_time = SystemTime::now();
+        // Retry the whole send()+collect() pair — each attempt re-issues
+        // the request and drains a fresh body stream. Each closure
+        // invocation returns (Bytes, SystemTime) so `first_byte_time`
+        // reflects the successful attempt without capturing outer state
+        // through the FnMut closure. Errors are converted to anyhow at
+        // the closure boundary via `sdk_context` for send() (preserves
+        // the SDK's connector chain — see #506) and `context` for the
+        // body-collect step.
+        let result: Result<(Bytes, SystemTime)> = retry_get_body(|| async {
+            let output = self
+                .client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .sdk_context(format!("S3 GET for s3://{}/{} failed", bucket, key))?;
+            let first_byte = SystemTime::now();
+            let body = output
+                .body
+                .collect()
+                .await
+                .context("S3 GET body stream failed")?
+                .into_bytes();
+            Ok((body, first_byte))
+        })
+        .await;
 
         match result {
-            Ok(output) => {
-                let body = output.body.collect().await?.into_bytes();
+            Ok((body, first_byte_time)) => {
                 let bytes = body.len() as u64;
                 self.log_op(ctx, &Ok::<(), &str>(()), bytes, Some(first_byte_time));
                 // Zero-copy: return Bytes directly instead of converting to Vec
                 Ok(body)
             }
             Err(e) => {
-                // format_sdk_error preserves the connector chain (I/O, timeout,
-                // TLS, DNS, refused) plus a hint string.  Without this the bare
-                // `SdkError::DispatchFailure` Display impl is the literal text
-                // "dispatch failure" — the opaque message reported in
-                // mlcommons/storage#506.  Log uses the same detail so the
-                // s3dlio op-log file matches what the caller sees.
-                let detail = format_sdk_error(&e);
+                // `sdk_context` already flattened the SDK connector
+                // chain into the message — Display of the anyhow chain
+                // via `{:#}` reproduces the same detail we'd get from
+                // format_sdk_error() applied directly.
+                let detail = format!("{:#}", e);
                 self.log_op(ctx, &Err::<(), _>(detail), 0, None);
-                Err(sdk_anyhow(
-                    format!("S3 GET for s3://{}/{} failed", bucket, key),
-                    e,
-                ))
+                Err(e)
             }
         }
     }
 
     /// GET (Download) a range of bytes from an object.
+    ///
+    /// v0.9.108+ (issue #148 Phase 4b): wrapped in `retry_get_body` —
+    /// see the get_object doc-comment for the same reasoning. Range
+    /// GETs are idempotent, so retrying the whole send()+collect()
+    /// pair after a body-transfer failure is trivially safe.
     pub async fn get_object_range(
         &self,
         bucket: &str,
@@ -136,37 +161,43 @@ impl S3Ops {
             num_objects: 1,
             start_time: SystemTime::now(),
         };
-
         let range = format!("bytes={}-{}", start, end);
-        let result = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .range(range)
-            .send()
-            .await;
-        let first_byte_time = SystemTime::now();
+
+        let result: Result<(Bytes, SystemTime)> = retry_get_body(|| async {
+            let output = self
+                .client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .range(&range)
+                .send()
+                .await
+                .sdk_context(format!(
+                    "S3 GET_RANGE for s3://{}/{} bytes={}-{} failed",
+                    bucket, key, start, end
+                ))?;
+            let first_byte = SystemTime::now();
+            let body = output
+                .body
+                .collect()
+                .await
+                .context("S3 GET_RANGE body stream failed")?
+                .into_bytes();
+            Ok((body, first_byte))
+        })
+        .await;
 
         match result {
-            Ok(output) => {
-                let body = output.body.collect().await?.into_bytes();
+            Ok((body, first_byte_time)) => {
                 let bytes = body.len() as u64;
                 self.log_op(ctx, &Ok::<(), &str>(()), bytes, Some(first_byte_time));
                 // Zero-copy: return Bytes directly
                 Ok(body)
             }
             Err(e) => {
-                // See note on the GET path above re: format_sdk_error and #506.
-                let detail = format_sdk_error(&e);
+                let detail = format!("{:#}", e);
                 self.log_op(ctx, &Err::<(), _>(detail), 0, None);
-                Err(sdk_anyhow(
-                    format!(
-                        "S3 GET_RANGE for s3://{}/{} bytes={}-{} failed",
-                        bucket, key, start, end
-                    ),
-                    e,
-                ))
+                Err(e)
             }
         }
     }
