@@ -203,6 +203,32 @@ For any single object write, exactly one path is active — the two are mutually
 
 There is no double-retry: if the multipart path is active, the single-part Rust retry path is not, and vice versa.  Verification is independently configurable per path — for example, enabling `S3DLIO_MPU_PUT_VERIFY` for large checkpoint objects while leaving `S3DLIO_PUT_VERIFY` off for the high-volume small-object datagen path.
 
+### Multipart Upload threshold — s3dlio-native DLIO integration (v0.9.109+)
+
+The variables above apply to `ObjStoreLibStorage` (`dlio_benchmark/storage/obj_store_lib.py`, a separate file living in the DLIO_local_changes repo).  s3dlio also ships its own DLIO storage backends directly — `S3dlioStorage` (`python/s3dlio/integrations/dlio/s3dlio_storage.py`) and `S3PyTorchConnectorStorage` (`python/s3dlio/integrations/dlio/s3_torch_storage.py`) — which had their own, separately hardcoded multipart threshold with no env var override at all (mlcommons/storage#715; s3dlio issue #153 bug 3.1 / B10).  As of v0.9.109 both backends read the following, via the shared `python/s3dlio/integrations/dlio/_multipart_config.py` module:
+
+| Variable | Default | Allowable values | Description |
+|----------|---------|-----------------|-------------|
+| `S3DLIO_MULTIPART_THRESHOLD_MB` | `32` | Integer ≥ 0 (MiB) | **Reuses the same variable name as `ObjStoreLibStorage` above** (different default here — 32 MiB, matching s3dlio's Rust-side `DEFAULT_S3_MULTIPART_THRESHOLD`, vs 16 MiB there — but the same env var controls both if you set it, since both backends read the identical name).  `0` = always use multipart.  Non-numeric or negative values fall back to the default. |
+| `S3DLIO_MULTIPART_PART_SIZE_MB` | `32` | Integer ≥ 1 (MiB) | Part size used when the multipart path is taken.  Unlike the threshold, `0` has no valid meaning here (the upload loop would never advance) and falls back to the default, same as non-numeric or negative values. |
+| `S3DLIO_MULTIPART_MAX_IN_FLIGHT` | `8` | Integer ≥ 1 | Concurrent in-flight parts per object during multipart upload.  Non-numeric or non-positive values fall back to the default. |
+| `S3DLIO_DISABLE_MULTIPART` | `false` | `1`/`true`/`yes`/`on` (case-insensitive) = disabled; anything else / unset = normal threshold-based behavior | Explicit switch that forces every write through `put_bytes()` regardless of size or the threshold setting — an alternative to setting `S3DLIO_MULTIPART_THRESHOLD_MB` to an implausibly large value. |
+
+```bash
+# Lower the threshold so more objects go through multipart (e.g. for benchmarking MPU throughput).
+export S3DLIO_MULTIPART_THRESHOLD_MB=8
+
+# Always use multipart, even for tiny objects.
+export S3DLIO_MULTIPART_THRESHOLD_MB=0
+
+# Force single-PUT-only behavior regardless of object size.
+export S3DLIO_DISABLE_MULTIPART=true
+
+# Tune part size and concurrency for a high-bandwidth link.
+export S3DLIO_MULTIPART_PART_SIZE_MB=64
+export S3DLIO_MULTIPART_MAX_IN_FLIGHT=16
+```
+
 ## Range GET Optimization
 
 | Variable | Default | Description |

@@ -24,11 +24,7 @@ from dlio_benchmark.storage.storage_handler import DataStorage, Namespace
 from dlio_benchmark.common.enumerations import NamespaceType, MetadataType
 from dlio_benchmark.utils.utility import Profile
 
-# Match s3dlio's DEFAULT_S3_MULTIPART_THRESHOLD (src/constants.rs).
-# Objects below this size use a single PUT; at or above use multipart upload.
-_MULTIPART_THRESHOLD = 32 * 1024 * 1024  # 32 MiB
-_MULTIPART_PART_SIZE = 32 * 1024 * 1024  # 32 MiB per part
-_MULTIPART_MAX_IN_FLIGHT = 8  # concurrent parts per object
+from . import _multipart_config
 
 dlp = Profile(MODULE_STORAGE)
 
@@ -334,9 +330,13 @@ class S3dlioStorage(DataStorage):
         """
         Write data to storage using s3dlio.
 
-        Objects below _MULTIPART_THRESHOLD (32 MiB) use a single PUT for lowest
-        overhead.  Objects at or above use MultipartUploadWriter for maximum
-        throughput and to avoid the S3 5 GiB single-PUT limit.
+        Objects below the S3DLIO_MULTIPART_THRESHOLD_MB threshold (default
+        32 MiB) use a single PUT for lowest overhead.  Objects at or above
+        use MultipartUploadWriter for maximum throughput and to avoid the
+        S3 5 GiB single-PUT limit.  See
+        s3dlio.integrations.dlio._multipart_config for the full env var
+        contract (S3DLIO_MULTIPART_THRESHOLD_MB, S3DLIO_MULTIPART_PART_SIZE_MB,
+        S3DLIO_MULTIPART_MAX_IN_FLIGHT, S3DLIO_DISABLE_MULTIPART).
 
         Args:
             id: Path or full URI
@@ -358,20 +358,22 @@ class S3dlioStorage(DataStorage):
 
         try:
             size = len(content)
-            if size < _MULTIPART_THRESHOLD:
+            threshold = _multipart_config.multipart_threshold_bytes()
+            if _multipart_config.multipart_disabled() or size < threshold:
                 # Single PUT — no three-phase overhead, matches library default behaviour.
                 s3dlio.put_bytes(uri, content)
             else:
                 # Multipart upload — higher throughput for large objects.
+                part_size = _multipart_config.multipart_part_size_bytes()
                 writer = s3dlio.MultipartUploadWriter.from_uri(
                     uri,
-                    part_size=_MULTIPART_PART_SIZE,
-                    max_in_flight=_MULTIPART_MAX_IN_FLIGHT,
+                    part_size=part_size,
+                    max_in_flight=_multipart_config.multipart_max_in_flight(),
                     abort_on_drop=True,
                 )
                 offset_pos = 0
                 while offset_pos < size:
-                    n = min(_MULTIPART_PART_SIZE, size - offset_pos)
+                    n = min(part_size, size - offset_pos)
                     writer.write(content[offset_pos : offset_pos + n])
                     offset_pos += n
                 writer.close()
