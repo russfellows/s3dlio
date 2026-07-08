@@ -70,6 +70,12 @@ pub const DELETE_FAILS_MARKER: &str = "delete-fails";
 /// reproduce bug B3 (a HEAD that succeeds but doesn't report a size).
 pub const NO_CONTENT_LENGTH_MARKER: &str = "no-content-length";
 
+/// Key substring marker that makes the mock server's GetObject handler
+/// fail the FIRST request to that key with a transient 500 and succeed
+/// on every request after — used to prove a caller retries the whole
+/// request rather than surfacing the first transient failure (bug B1).
+pub const GET_FAILS_ONCE_MARKER: &str = "get-fails-once";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -96,6 +102,17 @@ impl MockS3State {
         let mut map = self.per_path.lock().unwrap();
         let entry = map.entry(key_path.to_string()).or_default();
         f(entry);
+    }
+
+    /// Like `record`, but returns the value of `get_calls` AFTER
+    /// applying `f` — lets the GetObject handler decide "is this the
+    /// first attempt?" atomically with incrementing the counter (no
+    /// separate read-then-write race under concurrent requests).
+    fn record_and_get(&self, key_path: &str, f: impl FnOnce(&mut PathCallCounts)) -> usize {
+        let mut map = self.per_path.lock().unwrap();
+        let entry = map.entry(key_path.to_string()).or_default();
+        f(entry);
+        entry.get_calls
     }
 
     /// Snapshot of call counts observed for one S3 key path so far.
@@ -357,8 +374,17 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     // GetObject (plain or ranged): GET on a key path with no other
     // matched query shape. Tracked so tests can assert a fast-path
     // return (e.g. length=Some(0), bug B2) never reached the network.
+    //
+    // A key containing GET_FAILS_ONCE_MARKER returns a transient 500 on
+    // its FIRST request and succeeds on every subsequent one — used to
+    // prove a caller retries the whole send()+collect() pair (bug B1)
+    // rather than literally reproducing a mid-body TCP truncation
+    // (which Full<Bytes> response bodies can't under-deliver).
     if method == Method::GET {
-        state.record(&path, |c| c.get_calls += 1);
+        let attempt = state.record_and_get(&path, |c| c.get_calls += 1);
+        if path.contains(GET_FAILS_ONCE_MARKER) && attempt == 1 {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockTransientGetFailure");
+        }
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Length", "4")

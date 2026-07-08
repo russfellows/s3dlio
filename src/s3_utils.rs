@@ -37,6 +37,7 @@ use crate::config::ObjectType;
 use crate::data_gen::generate_object;
 
 // S3 client creation
+use crate::retry::retry_get_body;
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
 
 // S3 operation logging
@@ -971,17 +972,37 @@ pub async fn get_object_range_uri_async(
             range = format!("bytes={}-{}", offset, end);
         }
     }
-    let resp = client
-        .get_object()
-        .bucket(&bucket)
-        .key(key.trim_start_matches('/'))
-        .range(range)
-        .send()
-        .await
-        .sdk_context(format!("GET range for s3://{}/{} failed", bucket, key))?;
-    let body = resp.body.collect().await.context("collect range body")?;
-    // Zero-copy: return Bytes directly
-    let bytes = body.into_bytes();
+
+    // Locked contract (audit #152 f19, docs/implementation-plans/
+    // v0.9.109-audit-fix-plan.md bug B1): Phase 4b (v0.9.108) made the
+    // response body stream via `SdkBody::from_body_1_x`, which moved
+    // body-transfer failures (TCP FIN mid-body, HTTP/2 RST, connection
+    // reset after headers) out from under smithy's send()-level retry —
+    // smithy already returned Ok(response) at headers by the time a
+    // streamed body can fail. This send()+collect() pair was left
+    // unwrapped, so a transient body-transfer glitch now aborts the
+    // whole GET instead of being retried, a regression from pre-Phase-4b
+    // behavior. Four production callers reach this function
+    // (data_loader/s3_bytes.rs, object_store.rs's client-present
+    // get_range fallback, and two internal fast-paths in this file);
+    // wrapping here fixes all of them. GETs are idempotent and each
+    // attempt allocates a fresh Bytes, so retrying the whole pair is
+    // trivially safe.
+    let bytes = retry_get_body(|| async {
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key.trim_start_matches('/'))
+            .range(&range)
+            .send()
+            .await
+            .sdk_context(format!("GET range for s3://{}/{} failed", bucket, key))?;
+        let body = resp.body.collect().await.context("collect range body")?;
+        // Zero-copy: return Bytes directly
+        Ok::<Bytes, anyhow::Error>(body.into_bytes())
+    })
+    .await?;
+
     debug!(
         "get_object_range: uri='{}', returned {} bytes",
         uri,
