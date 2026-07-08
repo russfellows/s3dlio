@@ -1,9 +1,9 @@
 # Issue #148 — Where we are, what's next
 
-**Date paused**: 2026-07-07
-**Branch**: `perf/148-phase3-http2-optin` (13 commits ahead of `main`, plus 2 audit-docs + parent-CLAUDE commits that already merged into `main`)
+**Last updated**: 2026-07-07 (after Phase 2 sites 3.1a + 1.1 + 3.2 landed)
+**Branch**: `perf/148-phase2-loader-parallelism` at `053583f`, 18 commits ahead of local `main`
 **Working tree**: clean, nothing uncommitted
-**Push state**: **NOTHING PUSHED FROM THE BRANCH**. All 13 branch commits are local-only. The two commits already on `main` (`8a42ebb`, `e4b9ae4`) are also local-only — `main` itself is ahead of `origin/main` and has not been pushed. Per Prime Directive #1, do not push anything without an explicit instruction.
+**Push state**: **NOTHING PUSHED**. The branch is local-only. Local `main` is also 2 commits ahead of `origin/main` (the audit docs + parent CLAUDE.md — `8a42ebb`, `e4b9ae4`) and unpushed. Per Prime Directive #1, do not push anything without an explicit instruction.
 
 Detailed audit lives at [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-AUDIT-issue148.md); adversarial review at [`PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md`](PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md). This doc is the operational handoff: what's on the branch, what proved GREEN, and exactly where to pick up.
 
@@ -13,145 +13,162 @@ Detailed audit lives at [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-
 
 | Phase | Scope | Items | Status |
 |---|---|---|---|
-| **1** | Range-assembly double-copy + capacity hint | 4 / 4 | ✅ **DONE** — peak memory 2.28× → 1.03× |
-| **3** | HTTP/2 opt-in reversal + window tuning for https | 1 / 1 | ✅ **DONE** — default now HTTP/1.1 on both schemes |
-| **2** | Loader task-level parallelism + drop-doesn't-abort | 0 / 10 | ⏳ **NEXT UP** |
-| **4** | Streaming connector + centralized retry | 0 / 2 | ⏳ Blocked on Phase 2 |
-| Deferred | GCS retry-with-no-backoff (finding 3.4a) | 0 / 1 | Separate GCS-focused pass |
+| **1** | Range-assembly double-copy + capacity hint | **4 / 4** | ✅ **DONE** — peak memory 2.28× → 1.03× total_size |
+| **3** | HTTP/2 opt-in reversal + window tuning for https | **1 / 1** | ✅ **DONE** — default now HTTP/1.1 on both schemes |
+| **2 — bug class A** (spawn + cancel) | Task-level parallelism (findings 1.1, 3.1a–h) | **2 / 9** | ⏳ 3.1a + 1.1 DONE; **3.1b–h pending (7 sites)** |
+| **2 — bug class B** (drop doesn't abort) | Full-drain-first-then-error (finding 3.2) | **1 / 1** | ✅ **DONE** — all 4 short-circuit sites retrofitted |
+| **4** | Streaming connector + centralized retry (findings 1.4, 3.4) | **0 / 2** | ⏳ Not started; hard-depends on Phase 1 (already done) |
+| Deferred | GCS retry-with-no-backoff (finding 3.4a) | 0 / 1 | Separate GCS-focused pass; unscheduled |
 
-**Overall: 5 in-scope + 1 deferred out of 17 in-scope + 1 deferred.** Version bumped `0.9.106` → **`0.9.108`** locally in `Cargo.toml`, `pyproject.toml`, `docs/Changelog.md`, and `docs/Environment_Variables.md`.
+**Overall: 8 in-scope + 1 deferred out of 17 in-scope + 1 deferred.** Version bumped `0.9.106` → **`0.9.108`** locally in `Cargo.toml`, `pyproject.toml`, `docs/Changelog.md`, and `docs/Environment_Variables.md`.
 
 ---
 
 ## What's committed
 
-### Already on local `main` (2 commits, also local-only — `main` is ahead of `origin/main`)
+### Already on local `main` (2 commits, also unpushed — `main` is ahead of `origin/main`)
 
 ```
 e4b9ae4 docs: add project-level CLAUDE.md with RED/GREEN policy + s3dlio-specific rules
 8a42ebb docs(enhancement): add issue #148 performance/concurrency audit + adversarial review
 ```
 
-These were committed before the branch was cut, so they show as "on main" but they too are unpushed — `origin/main` is still at `38fe812` (the v0.9.106 baseline).
+`origin/main` is still at `38fe812` (the v0.9.106 baseline).
 
-### On branch `perf/148-phase3-http2-optin` (13 commits, oldest first)
+### On branch `perf/148-phase2-loader-parallelism` (18 commits, oldest first)
 
+Phase 1 (peak-memory range-assembly fix):
 ```
 01898ca test(148/phase1): add RED peak-memory test for range assembly double-copy
 d4632a8 fix(148/phase1): pre-allocate range-assembly buffers to halve peak memory
 b3dd699 chore(148/phase1): eliminate warnings by scope-fixing shared test module
+```
+
+Phase 3 (HTTP/2 opt-in reversal):
+```
 1fe9067 docs(148/phase3): reverse Phase 3 direction — HTTP/2 is now opt-in for both schemes
 61f0731 test(148/phase3): add RED wire-level test asserting default https is HTTP/1.1
 1451c4f fix(148/phase3): reverse HTTP/2 default — HTTP/1.1 unless explicitly opted in
 5294959 docs(148/phase3): env-var reference + changelog for HTTP/2 opt-in reversal
+```
+
+Release + tooling:
+```
 e47cce2 release: bump version 0.9.106 → 0.9.108 for the issue #148 Phase 1 + Phase 3 changes
 e8f4774 release: bump s3dlio/pyproject.toml to 0.9.108 + harden CLAUDE.md scope rule
 44510e8 chore: cargo update + CLAUDE.md — document uv and ./build_pyo3.sh
 e5f3bec docs(148): mark Phase 1 + Phase 3 done in the audit progress table
 08bcda6 chore: relax AWS SDK pins, keep Azure at 0.31/0.8
-6ab7547 docs(148): add STATUS handoff document for resuming after the pause  ← this doc
+6ab7547 docs(148): add STATUS handoff document for resuming after the pause
+20d4887 docs(148): correct STATUS commit listing — separate branch commits from main commits
 ```
 
-Phase 1 was originally on a sub-branch `perf/148-phase1-buffer-copies`, then Phase 3 branched off it — Phase 1's commits show up in Phase 3's history as ancestors. The old parent branches `perf/concurrency-audit-issue148` and `perf/148-phase1-buffer-copies` still exist locally and can be deleted (`git branch -d <name>`) if you don't need them for reference.
+Phase 2 (task-level parallelism + drain-first-then-error):
+```
+63651f4 test(148/phase2): add RED tests for async_pool_dataloader.rs task-level parallelism
+bfd9527 fix(148/phase2): spawn each fetch as its own tokio task in async_pool_dataloader  ← 3.1a
+1070a93 fix(148/phase2): apply task-level parallelism to python_aiml_api.rs (site 1.1)
+053583f fix(148/phase2): drain-first-then-error at 4 short-circuit-on-error sites (site 3.2)  ← current tip
+```
+
+The branch history has ancestors on `perf/148-phase1-buffer-copies` and `perf/148-phase3-http2-optin`. Those old branches still exist locally; if you don't need them for reference they can be deleted with `git branch -d <name>` once this rolls up.
 
 ---
 
 ## What's proven GREEN
 
-Run this to reproduce the full gate at any time:
+Run this to reproduce the full gate at any time (Rust side):
 
 ```bash
 cd /home/eval/Documents/Code/s3dlio
-cargo test --lib                                        # 337/337 pass
-cargo test --test test_phase1_zero_copy_assembly        # 4/4 pass (peak overhead 1.03×)
+cargo test --lib                                              # 337/337 pass
+cargo test --test test_phase1_zero_copy_assembly              # 4/4 pass  (peak overhead 1.03×)
+cargo test --test test_phase2_loader_parallelism              # 4/4 pass  (site 3.1a)
+cargo test --test test_phase2_drain_first_err                 # 2/2 pass  (site 3.2 patterns)
+cargo test --test test_async_pool_dataloader                  # 6/6 pass  (integration)
 cargo test --test test_file_range_engine \
            --test test_directio_range_engine \
            --test test_range_engine_defaults \
            --test test_range_engine_cache_integration \
            --test test_file_store \
            --test test_direct_io \
-           --test test_buffer_pool_directio             # 48/48 pass
-cargo fmt --all -- --check                              # clean
-cargo clippy --lib --tests --no-deps -- -D warnings     # clean, zero warnings
+           --test test_buffer_pool_directio                   # 48/48 pass
+cargo fmt --all -- --check                                    # clean
+cargo clippy --lib --tests --no-deps -- -D warnings           # clean, zero warnings
 ```
 
-Additionally, the reqwest_client wire-level tests (inside `cargo test --lib`) cover:
-- `phase3_default_https_client_negotiates_http1` — default https client speaks HTTP/1.1 (RED gate for Phase 3).
-- `phase3_https_h2_opt_in_negotiates_h2` — `Http2Modes { https_h2: true }` → HTTP/2 via ALPN.
-- `phase3_https_h2_opt_in_falls_back_when_server_only_offers_http1` — opt-in is permission, not force.
-- 9 `test_http2_modes_*` — `Http2Modes::from_env_values` precedence rules across all env-var combinations.
+Python side (requires the `0.9.108` wheel installed in the venv — see below):
+
+```bash
+source .venv/bin/activate
+./build_pyo3.sh                                                            # cp312 + cp313 wheels
+uv pip install --reinstall target/wheels/s3dlio-0.9.108-cp313-*.whl
+uv run python tests/test_phase2_python_loader_parallelism.py               # 4/4 subtests pass
+uv run python tests/test_loader_return_type.py                             # OK
+uv run python tests/test_zero_copy.py                                      # 12 pass
+uv run python tests/test_python_oplog.py                                   # OK
+uv run python tests/test_s3dlio_datagen.py                                 # OK
+```
+
+**Key wire/measurement observations captured across the RED→GREEN transitions:**
+
+Phase 1 (peak memory during range assembly, 32 MiB / 1 MiB chunks / 4 concurrent):
+- Pre-fix: 2.28× total_size (~76 MiB overhead — all chunks retained in `parts` while `assembled` grew)
+- Post-fix: 1.03× total_size (~1 MiB overhead)
+
+Phase 3 (default https protocol via ALPN wire test):
+- Pre-fix: `HTTP/2.0` (server offered `h2` + `http/1.1`)
+- Post-fix: `HTTP/1.1` unless `S3DLIO_HTTPS_H2=1` or `S3DLIO_ENABLE_HTTP2=1` is set
+
+Phase 2 site 3.1a (parallelism, 4 × 100ms sync-sleep, worker_threads=4):
+- Pre-fix: 401ms (serialized on one task)
+- Post-fix: ~150ms (parallel across workers)
+
+Phase 2 site 3.1a (external cancel latency):
+- Pre-fix: 2.001s (waited for at least one in-flight fetch to complete)
+- Post-fix: <500ms (`select!` drops the fetch immediately)
+
+Phase 2 site 3.1a (panic-in-fetch):
+- Pre-fix: silent truncation (Python side sees `StopIteration`)
+- Post-fix: `Err(DatasetError::Backend(...))` surfaced to caller
+
+Phase 2 site 1.1 (Python early-drop iterator latency, 200 files, prefetch=32):
+- Post-fix: 43–65ms drop return time; regression guard, would trip a naive `tokio::spawn` without cancel wiring
+
+Phase 2 site 3.2 (drain vs short-circuit pattern, synthetic scenario):
+- Short-circuit (RED): elapsed <50ms, counter <3 (leaks in-flight tasks)
+- Drain (GREEN): elapsed ≥250ms (waited for 300ms slowest task), counter ==3 (all tasks completed)
 
 ---
 
-## Phase 2 — Next up (pick up here)
+## What's left in Phase 2 — bug class A, seven more sites
 
-Phase 2 is the biggest of the remaining phases: **10 call sites** across the loader, checkpoint reader, parquet cache, and both S3/Azure batch operations. Two distinct bug classes to fix:
+Same pattern as sites 3.1a + 1.1 (both already done). The fix is:
 
-### Bug class A — "single-task async concurrency" (findings 1.1, 3.1a–h)
+1. Replace `stream::iter(0..N).map(async fetch).buffer_unordered(K)` with `FuturesUnordered<JoinHandle<Result<T>>>` fed by an explicit `spawn_fetch(idx)` closure.
+2. Producer stack holds `let _drop_cancel = DropCancel(cancel.clone());` — this is the shared type in `src/data_loader/parallel_fetch.rs::DropCancel` (already exists).
+3. Each spawn wraps the fetch in `tokio::select! { _ = token.cancelled() => Err("cancelled"), r = fetch => r, }`.
+4. Drive with a while-let-Some over `pending.next().await`, translating `JoinError::is_panic()` into `Err(DatasetError::Backend(...))`.
 
-Places where `buffer_unordered(N)` or `.buffered(N)` drives many futures inside **one** async task. Tokio can only run that one task on one worker thread, so no matter how deep the buffer, all request-driving + body-accumulation work funnels through ~one core's capacity. Fix: `tokio::spawn` each fetch so the runtime can multi-thread them.
+The exact code shape lives in `src/data_loader/async_pool_dataloader.rs::run_async_pool_worker` and the three sites in `src/python_api/python_aiml_api.rs` — copy the closure + loop pattern from there.
 
-**Sites** (in the audit's order — recommend implementing in this order, since each is a variation on the same technique and it's easier to review sequentially):
-
-| # | File:line | Notes |
+| # | File(s) | Notes |
 |---|---|---|
-| 1.1 | `src/python_api/python_aiml_api.rs:239, 372, ~2213` | Three call sites in the Python bindings — the original issue #148 report. |
-| 3.1a | `src/data_loader/async_pool_dataloader.rs:234-315` | Core Rust-level DataLoader; the Python bindings sit on top. **Same bug in the layer below** the Python fix. |
-| 3.1b | `src/s3_utils.rs:1483-1504` | `get_objects_parallel` pre-stat phase. Only 6 lines away, the GET phase *does* spawn — internal inconsistency is strong evidence it's an oversight. |
-| 3.1c | `src/data_loader/parquet_file_cache.rs:110` (+2 callers at `parquet_rg.rs:567-602`, `parquet_index.rs:316-329`) | CPU-bound Thrift metadata parsing — strongest case for spawning since it's CPU, not just I/O. |
-| 3.1d | `src/checkpoint/reader.rs:203-244` | `read_all_shards_concurrent` distributed-checkpoint reads. |
-| 3.1e | `src/azure_client.rs:436-472` | Azure multipart upload `stage_block` fan-out. No spawn at all. |
-| 3.1f | `src/range_engine_generic.rs:305-369` | Azure/GCS shared range engine (used via `RangeEngine::download_with_ranges`, disabled by default in backend configs). Lower urgency but same technique. |
-| 3.1g | `src/object_store.rs:565-583` + `src/s3_utils.rs:1364-1371` | HEAD-only stat batch calls. Lower per-item cost (no body), but at high concurrency the request-signing work still bottlenecks one core. |
-| 3.1h | `src/data_loader/s3_bytes.rs:97-110` | `ReaderMode::Range`'s loop. Note this file *also* has finding 3.3b (double-copy) which Phase 1 already fixed — the file has both bug classes. |
+| 3.1b | `src/s3_utils.rs::get_objects_parallel` pre-stat phase | `join_all(stat_futs).await` — no spawn. The GET phase 20 lines below already spawns correctly; internal inconsistency confirms it's an oversight. |
+| 3.1c | `src/data_loader/parquet_file_cache.rs::fetch_and_parse` + 2 callers in `parquet_rg.rs`, `parquet_index.rs` | CPU-bound Thrift metadata parsing. Strongest case for spawn since it's CPU, not just I/O. |
+| 3.1d | `src/checkpoint/reader.rs::read_all_shards_concurrent` (and `*_with_validation`) | Distributed-checkpoint shard reads via `try_join_all`, no spawn. |
+| 3.1e | `src/azure_client.rs::upload_multipart_stream` | `FuturesUnordered` over `stage_block` calls, no spawn at all. |
+| 3.1f | `src/range_engine_generic.rs::download_with_ranges` (spawn side) | Shared Azure/GCS range engine. Disabled by default in backend configs so exposure is currently low, but the fix is the same. |
+| 3.1g | `src/object_store.rs::pre_stat` default + `src/s3_utils.rs::stat_object_many_async` | HEAD-only stat batches — lighter per-item, but at 100+ concurrency the sig/header work still bottlenecks. |
+| 3.1h | `src/data_loader/s3_bytes.rs::ReaderMode::Range` | `.buffered(max_inflight)` over range GET + body. Same shape as the confirmed bug. Note: this file also had finding 3.3b (double-copy) which Phase 1 already fixed — the file has both bug classes. |
 
-**Critical**: converting bare futures to `tokio::spawn` changes cancellation semantics. Dropping a bare unspawned future cancels it; dropping a `JoinHandle` **detaches** (task keeps running). The audit §2.1 has a detailed "cancellation must be fixed in the same change" discussion. The precedent already in this codebase is `CancellationToken`-based cooperative cancellation — see `src/data_loader/async_pool_dataloader.rs:194, 201, 228, 244-288` and `src/data_loader/options.rs:181` for how it's wired.
-
-### Bug class B — "drop doesn't abort" on *existing* spawns (finding 3.2)
-
-Distinct from A: these places already spawn correctly, but the drain loop short-circuits on the first error (`res??`), dropping the remaining `Vec<JoinHandle>` before other tasks finish — which detaches them, not aborts them.
-
-**Sites** (all can be fixed with the same "full-drain + summary" pattern):
-
-| File:line | What |
-|---|---|
-| `src/multipart.rs:556-627` | S3 multipart part upload |
-| `src/s3_utils.rs:1508-1520` | `get_objects_parallel` GET phase |
-| `src/s3_utils.rs:1554-1567` | `*_with_progress` variant |
-| `src/s3_utils.rs:1843-1856` | `put_objects_parallel_with_progress` |
-
-The audit §3.2 shows the **known-good template** already in this codebase: `src/object_store.rs:3646-3722` (`generic_upload_files`, `generic_download_objects`) — full-drain over `FuturesUnordered<JoinHandle<...>>`, accumulate succeeded/failed into a summary struct, never bail on first error. Also `src/prefetch.rs:38-54`. Retrofit those 4 sites to match.
-
-### Phase 2 RED/GREEN test plan
-
-Per the CLAUDE.md RED/GREEN rule, each fix ships with a test that goes RED against pre-fix code:
-
-- **For class A (single-task → spawn)**: hardest to test at the throughput level — the difference is in parallelism, not correctness. Two options:
-  1. **Behavioral**: spawn N slow futures via a mock closure; measure wall time. Sequential polling ~= N × delay; parallel spawning ~= max(delay). Wall-time bounded assertion — RED against pre-fix (single-task) code, GREEN after spawn. **Fragile** (CI variability).
-  2. **Cancellation-drop test**: start the iterator, drop it early, assert no dangling background work continues (via a counter or a channel that would receive unwanted results if a "cancelled" fetch actually completed). This is real RED against unmodified code today (bare futures cancel for free, so it's a no-op) but real RED against a **naive spawn** without cancellation handling (leaks). Doubles as the safety net for the spawn conversion.
-  3. **Panic-inside-fetch test**: assert a panic in a fetch surfaces as a proper error to the caller (Python `PyRuntimeError` for the loader sites; `Result::Err` for the Rust-only sites) rather than silently truncating the iterator — locks in the bonus fix noted in §2.1.
-
-- **For class B (full-drain retrofit)**: test that a mix of succeeding and failing tasks all get awaited (not just the first failure), and the returned summary reflects every outcome. RED against short-circuit code (fails: only the first outcome is captured), GREEN after retrofit.
-
-The audit's §4 "Phase 2 required tests" section has the full authoritative list — cross-check it before finalizing.
-
-### Suggested branch structure for Phase 2
-
-Given the size (10 sites × 2 bug classes), don't do one giant commit. Suggested:
-
-1. Branch `perf/148-phase2-loader-parallelism` off current `perf/148-phase3-http2-optin`.
-2. **Sub-commit A**: bug class A at site 1.1 only (Python loader — the original issue #148 report) + cancellation handling. RED test + GREEN.
-3. **Sub-commit B**: bug class A at site 3.1a (`async_pool_dataloader.rs` — the core Rust layer). Same technique, different call site.
-4. **Sub-commits C, D, E, F, G, H**: remaining §3.1 sites in the audit's order. Group logically — the parquet-cache sites (3.1c) are three call sites for one shared function, so they belong together.
-5. **Sub-commit I**: bug class B — the four `drop-doesn't-abort` retrofits at once (they share the exact same pattern; one commit is fine).
-
-Each sub-commit follows RED-then-GREEN with the new failing test committed alongside the fix. See how Phase 1 was structured (`01898ca` RED → `d4632a8` GREEN) as the template.
+Each site is small (~30-60 lines of change) and mechanical. The DropCancel + spawn pattern is now well-established in this codebase (four uses). Suggested approach: one commit per site (or one commit per closely-related pair like 3.1c's three callers), each with a small Rust test if the site has a testable seam, otherwise leaning on the pattern being validated by the 3.1a + 3.2 tests.
 
 ---
 
 ## Phase 4 — After Phase 2
 
-Blocked on Phase 2 landing first. Two items:
+Blocked on Phase 2 finishing (not on any specific site, but on the overall Phase 2 wrap-up per the audit's dependency plan). Two items:
 
 - **Finding 1.4** (`src/reqwest_client.rs:317` connector) — the smithy HTTP connector currently does `resp.bytes().await` and hands a fully-buffered body to the SDK. Fix: stream via `SdkBody::from_body_1_x` over `StreamBody`/`sync_wrapper::SyncStream` so bytes flow through as they arrive.
 - **Finding 3.4** (crate-wide retry) — three independently hand-rolled retry-loop shapes (`src/s3_client.rs`, `src/python_api/python_core_api.rs`, `src/google_gcs_client.rs`) and Patch 4 would add a fourth. Introduce a single shared `retry_get_body()`-shaped helper as part of the same change.
@@ -188,22 +205,25 @@ The `feedback_cargo_pyproject_version_sync` memory has been updated to make it e
 ```bash
 cd /home/eval/Documents/Code/s3dlio
 git status
-git log --oneline main..HEAD    # should show 13 commits ending in 6ab7547
-git branch --show-current       # perf/148-phase3-http2-optin
+git log --oneline main..HEAD    # should show 18 commits ending in 053583f
+git branch --show-current       # perf/148-phase2-loader-parallelism
 
-# Sanity check: re-run the gate
-cargo test --lib                 # expect 337/337
-cargo test --test test_phase1_zero_copy_assembly    # expect 4/4
+# Sanity check: re-run the gate (see "What's proven GREEN" above)
+cargo test --lib
+cargo test --test test_phase2_loader_parallelism
+cargo test --test test_phase2_drain_first_err
+cargo test --test test_phase1_zero_copy_assembly
 cargo fmt --all -- --check
 cargo clippy --lib --tests --no-deps -- -D warnings
 
-# Then to start Phase 2:
-git checkout -b perf/148-phase2-loader-parallelism
-# Open src/python_api/python_aiml_api.rs at ~line 239 (PyBytesAsyncDataLoader::__iter__)
-# and start with the RED test for site 1.1 per the plan above.
+# To continue Phase 2 (bug class A, next 7 sites):
+# Pick any of 3.1b through 3.1h from the table above. Model the fix on
+# src/data_loader/async_pool_dataloader.rs::run_async_pool_worker (site 3.1a)
+# or src/python_api/python_aiml_api.rs (site 1.1). Both use DropCancel from
+# src/data_loader/parallel_fetch.rs — same import, same pattern.
 ```
 
-Read this file, [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-AUDIT-issue148.md) (especially §2.1 for cancellation, §3.1 for the site list, §3.2 for the drop-doesn't-abort template, §4 for the phased plan and required tests), and [`PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md`](PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md) (§6 corrections, especially §6.1 on `buffered` vs `buffer_unordered`) before starting the first change.
+Read this file, [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-AUDIT-issue148.md) (especially §2.1 for cancellation, §3.1 for the site list, §3.2 for the drop-doesn't-abort template — now done, §4 for the phased plan), and [`PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md`](PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md) (§6 corrections) before starting the first change.
 
 ---
 
@@ -212,9 +232,15 @@ Read this file, [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-AUDIT-is
 | File | Why |
 |---|---|
 | `docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148.md` | The plan. §5 has the progress table; §2 has per-patch design; §3 has the site list; §4 has the phased implementation plan; §6 has the correction history. |
-| `docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md` | Independent review that surfaced 5 corrections to the audit; §6.1 (combinator semantics) is important for Phase 2 test design. |
+| `docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md` | Independent review that surfaced 5 corrections to the audit; §6.1 (combinator semantics) is important for the remaining Phase 2 sites' test design. |
 | `CLAUDE.md` (this repo) | Standing rules: RED/GREEN, zero warnings, no-underscore-hack, uv + `./build_pyo3.sh` for Python, no pushes without explicit instruction, version-bump scope. |
 | `../CLAUDE.md` (parent) | Prime Directives #1 (never push without instruction) and #2 (never touch a repo not named in the current instruction). |
-| `src/reqwest_client.rs` | Home of Phase 3's Http2Modes struct + wire tests (search `phase3_`). Reference for how end-to-end wire tests are structured. |
-| `src/range_engine_generic.rs`, `src/s3_utils.rs`, `src/data_loader/s3_bytes.rs`, `src/file_store_direct.rs` | The four sites Phase 1 fixed. Reference for the pre-allocate-and-copy-into-offset technique. |
-| `tests/test_phase1_zero_copy_assembly.rs` | Reference for the peak-tracking global allocator pattern (may be reusable for Phase 2 if a memory-based assertion is needed). |
+| `src/data_loader/parallel_fetch.rs` | Home of `DropCancel`. Shared type used by every Phase 2 site so far. |
+| `src/data_loader/async_pool_dataloader.rs` | Reference implementation of the Phase 2 spawn + CancellationToken + select! pattern (site 3.1a). |
+| `src/python_api/python_aiml_api.rs` | Same pattern applied at three PyO3 iterator sites (site 1.1). |
+| `src/s3_utils.rs`, `src/multipart.rs` | The four drain-first-then-error sites (finding 3.2, all done). |
+| `src/reqwest_client.rs` | Home of Phase 3's `Http2Modes` struct + wire tests (search `phase3_`). Reference for end-to-end wire-level test structure. |
+| `tests/test_phase1_zero_copy_assembly.rs` | Reference for the peak-tracking global allocator pattern. |
+| `tests/test_phase2_loader_parallelism.rs` | Reference for how site 3.1a's tests were structured (mock ObjectStore + tokio::test with pinned worker_threads). |
+| `tests/test_phase2_drain_first_err.rs` | Side-by-side RED vs GREEN pattern documentation for the drop-doesn't-abort fix. |
+| `tests/test_phase2_python_loader_parallelism.py` | End-to-end Python-surface test for site 1.1. |
