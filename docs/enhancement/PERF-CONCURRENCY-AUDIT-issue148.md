@@ -2,7 +2,7 @@
 
 **Date**: 2026-07-07
 **Revised**: 2026-07-07 — incorporated corrections from the [adversarial review](./PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md) (5 corrections, see §6), reversed Phase 3 direction to HTTP/2 opt-in for both schemes (§2.2), and tracked implementation progress (§5)
-**Status**: **Partial — 12 of 17 in-scope items landed locally on branch `perf/148-phase2-loader-parallelism` in v0.9.108 (see §5 progress table). Phase 1 (✅ 4/4), Phase 3 (✅ 1/1), Phase 2 bug class B / finding 3.2 (✅ 1/1), Phase 2 bug class A partial (6/9 — 1.1 + 3.1a + 3.1b + 3.1c + 3.1d + 3.1e done, 3.1f–h pending). Phase 4 pending.**
+**Status**: **Partial — 15 of 17 in-scope items landed locally on branch `perf/148-phase2-loader-parallelism` in v0.9.108 (see §5 progress table). Phase 1 (✅ 4/4), Phase 3 (✅ 1/1), Phase 2 bug class B / finding 3.2 (✅ 1/1), Phase 2 bug class A COMPLETE (✅ 9/9). Only Phase 4 (2 items) remains.**
 **Origin**: [mlcommons/storage#701](https://github.com/mlcommons/storage/issues/701) (unet3d object-storage benchmark, client-bound at ~1.1 GB/s/process against a ~10 GB/s/node endpoint), tracked in [russfellows/s3dlio#148](https://github.com/russfellows/s3dlio/issues/148)
 **Verified against**: s3dlio `main` @ `38fe812` (past v0.9.106)
 **Context**: s3dlio is approaching a 1.0 release. The priority for every item below is **stability first** — nothing here should ship without the tests called out in the plan. Several items are genuine correctness risks (not just performance), including one credible silent-data-corruption path; those are flagged explicitly.
@@ -386,12 +386,12 @@ Ordered by risk and dependency. Each phase should land as its own PR (or small s
 |---|---|---|---|
 | 1 — buffer double-copy + capacity hint | 1.3, 3.3a, 3.3b, 3.3c | **✅ DONE** (4/4) | `d4632a8` fix + `01898ca` RED test, verified peak overhead 2.28× → 1.03× |
 | 3 — HTTPS H2 opt-in reversal + window tuning | 1.2 | **✅ DONE** (1/1) | `1451c4f` fix + `61f0731` RED test + `5294959` docs + `e47cce2` version bump |
-| 2 bug class A — loader task-level parallelism | 1.1, 3.1a–h | ⏳ **PARTIAL** (6/9) | 3.1a: `bfd9527`; 1.1 (3 sites): `1070a93`; 3.1b: `6c53f12`; 3.1c: `262014d`; 3.1d: `d2bc6cd`; 3.1e: `ec7c098`. 3.1f–h pending. |
+| 2 bug class A — loader task-level parallelism | 1.1, 3.1a–h | **✅ DONE** (9/9) | 3.1a: `bfd9527`; 1.1: `1070a93`; 3.1b: `6c53f12`; 3.1c: `262014d`; 3.1d: `d2bc6cd`; 3.1e: `ec7c098`; 3.1f: `0f542ec`; 3.1g: `c157013`; 3.1h: `82a638f`. |
 | 2 bug class B — drop-doesn't-abort | 3.2 | **✅ DONE** (1/1) | `053583f` — 4 short-circuit sites retrofitted with drain-first-then-error pattern. Pattern-level RED/GREEN in `test_phase2_drain_first_err.rs`. |
 | 4 — streaming connector + centralized retry | 1.4, 3.4 | ⏳ **PENDING** (0/2) | Blocked on Phase 2 wrap-up. Fault-injection test mandatory at merge. |
 | Not scheduled (deferred) | 3.4a | ⏳ **DEFERRED** (0/1) | Flagged for a separate GCS-focused pass. |
 
-**Overall: 12 / 17 in-scope items complete + 1 deferred. Every commit landed GREEN through `cargo test --lib` (337/337), site-specific Phase 1/2/3 test suites (14/14 across three files), integration tests unaffected (`cargo test --test test_async_pool_dataloader` 6/6, various range/file store 48/48), and `cargo clippy -- -D warnings` clean at every step.**
+**Overall: 15 / 17 in-scope items complete + 1 deferred. Every commit landed GREEN through `cargo test --lib` (337/337), site-specific Phase 1/2/3 test suites (14/14 across three files), integration tests unaffected (`cargo test --test test_async_pool_dataloader` 6/6, various range/file store 48/48), and `cargo clippy -- -D warnings` clean at every step.**
 
 ### Per-item detail
 
@@ -406,9 +406,9 @@ Ordered by risk and dependency. Each phase should land as its own PR (or small s
 | 3.1c | `data_loader/parquet_file_cache.rs:110` (+2 callers) | Single-task async concurrency (CPU-bound) | High | 2A | ✅ done — shared `spawned_fetch_all_metadata` helper; both `build_extents` fast/slow paths + `parquet_index` batched loop now spawn per-file Thrift decode. |
 | 3.1d | `checkpoint/reader.rs:203-244` | Single-task async concurrency | High | 2A | ✅ done — `read_shard_owned` free fn taking `Arc<dyn ObjectStore>` unblocks `tokio::spawn` past the `Reader<'a>` lifetime; both concurrent-read paths converted. |
 | 3.1e | `azure_client.rs:436-472` | Single-task async concurrency (no spawn at all) | High | 2A | ✅ done — spawn each `stage_block` with select! + DropCancel; `absorb_stage_block_result` folds JoinHandle outcomes into first-error slot and fires cancellation to speed drain. |
-| 3.1f | `range_engine_generic.rs:305-369` | Single-task async concurrency | High (low current exposure — disabled by default) | 2A | ⏳ pending |
-| 3.1g | `object_store.rs:565-583`, `s3_utils.rs:1364-1371` | Single-task async concurrency (HEAD-only) | Medium | 2A | ⏳ pending |
-| 3.1h | `data_loader/s3_bytes.rs:97-110` | Single-task async concurrency | Medium | 2A | ⏳ pending |
+| 3.1f | `range_engine_generic.rs:305-369` | Single-task async concurrency | High (low current exposure — disabled by default) | 2A | ✅ done — `FuturesOrdered<JoinHandle<...>>` + bounded prime-and-refill pool preserves running-write-offset assembly and caps peak memory; external cancel honored via second select! arm. |
+| 3.1g | `object_store.rs:565-583`, `s3_utils.rs:1364-1371` | Single-task async concurrency (HEAD-only) | Medium | 2A | ✅ done — `stat_object_many_async` converted to Vec<JoinHandle> + DropCancel + drain-first-then-first-err. Trait default `pre_stat_objects` cannot be spawn-based without breaking trait dyn compatibility (needs `Arc<Self>: 'static`); documented with a caveat pointing backends at `stat_object_many_async` as the copy pattern. |
+| 3.1h | `data_loader/s3_bytes.rs:97-110` | Single-task async concurrency | Medium | 2A | ✅ done — same `FuturesOrdered` + bounded pool + DropCancel pattern as 3.1f; preserves 3.3b's peak-memory guarantee via prime-and-refill instead of spawn-all-up-front. |
 | 3.2 | `multipart.rs:622-628`, `s3_utils.rs:1587,1631,1929` | Drop-doesn't-abort on existing spawns | High | 2B | ✅ done — all 4 short-circuit `res??` / `handle.await??` sites replaced with drain-first-then-first-error pattern (matches the known-good template in `object_store.rs:3646`). No JoinHandle dropped mid-flight. Pattern-level RED/GREEN in `test_phase2_drain_first_err.rs` (elapsed 300ms drain vs <50ms short-circuit; counter 3 vs <3). |
 | 3.3a | `range_engine_generic.rs:371-389` | Double-copy buffer assembly | High | 1 | ✅ done — pre-allocate master `BytesMut`, copy into offset as each `.buffered()` result arrives, drop source immediately |
 | 3.3b | `data_loader/s3_bytes.rs:99-114` | Double-copy buffer assembly | Medium-high | 1 | ✅ done — same technique as 3.3a applied to `ReaderMode::Range` |

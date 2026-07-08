@@ -1,7 +1,7 @@
 # Issue #148 — Where we are, what's next
 
-**Last updated**: 2026-07-07 (after Phase 2 sites 3.1b + 3.1c + 3.1d + 3.1e landed)
-**Branch**: `perf/148-phase2-loader-parallelism` at `ec7c098`, 23 commits ahead of local `main`
+**Last updated**: 2026-07-07 (after Phase 2 sites 3.1f + 3.1g + 3.1h landed — Phase 2 bug class A COMPLETE)
+**Branch**: `perf/148-phase2-loader-parallelism` at `82a638f`, 28 commits ahead of local `main`
 **Working tree**: clean (impact-analysis doc untracked, not staged)
 **Push state**: **NOTHING PUSHED**. The branch is local-only. Local `main` is also 2 commits ahead of `origin/main` (the audit docs + parent CLAUDE.md — `8a42ebb`, `e4b9ae4`) and unpushed. Per Prime Directive #1, do not push anything without an explicit instruction.
 
@@ -15,12 +15,12 @@ Detailed audit lives at [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-
 |---|---|---|---|
 | **1** | Range-assembly double-copy + capacity hint | **4 / 4** | ✅ **DONE** — peak memory 2.28× → 1.03× total_size |
 | **3** | HTTP/2 opt-in reversal + window tuning for https | **1 / 1** | ✅ **DONE** — default now HTTP/1.1 on both schemes |
-| **2 — bug class A** (spawn + cancel) | Task-level parallelism (findings 1.1, 3.1a–h) | **6 / 9** | ⏳ 3.1a + 1.1 + 3.1b + 3.1c + 3.1d + 3.1e DONE; **3.1f + 3.1g + 3.1h pending (3 sites)** |
+| **2 — bug class A** (spawn + cancel) | Task-level parallelism (findings 1.1, 3.1a–h) | **9 / 9** | ✅ **DONE** — all 9 sites converted to `tokio::spawn` + DropCancel + select! |
 | **2 — bug class B** (drop doesn't abort) | Full-drain-first-then-error (finding 3.2) | **1 / 1** | ✅ **DONE** — all 4 short-circuit sites retrofitted |
 | **4** | Streaming connector + centralized retry (findings 1.4, 3.4) | **0 / 2** | ⏳ Not started; hard-depends on Phase 1 (already done) |
 | Deferred | GCS retry-with-no-backoff (finding 3.4a) | 0 / 1 | Separate GCS-focused pass; unscheduled |
 
-**Overall: 12 in-scope + 1 deferred out of 17 in-scope + 1 deferred.** Version bumped `0.9.106` → **`0.9.108`** locally in `Cargo.toml`, `pyproject.toml`, `docs/Changelog.md`, and `docs/Environment_Variables.md`.
+**Overall: 15 in-scope + 1 deferred out of 17 in-scope + 1 deferred.** Phase 2 is fully complete. Only Phase 4 (2 items) remains. Version bumped `0.9.106` → **`0.9.108`** locally in `Cargo.toml`, `pyproject.toml`, `docs/Changelog.md`, and `docs/Environment_Variables.md`.
 
 ---
 
@@ -35,7 +35,7 @@ e4b9ae4 docs: add project-level CLAUDE.md with RED/GREEN policy + s3dlio-specifi
 
 `origin/main` is still at `38fe812` (the v0.9.106 baseline).
 
-### On branch `perf/148-phase2-loader-parallelism` (23 commits, oldest first)
+### On branch `perf/148-phase2-loader-parallelism` (28 commits, oldest first)
 
 Phase 1 (peak-memory range-assembly fix):
 ```
@@ -73,7 +73,12 @@ bfd9527 fix(148/phase2): spawn each fetch as its own tokio task in async_pool_da
 6c53f12 fix(148/phase2): spawn stat tasks in get_objects_parallel pre-stat phase (site 3.1b)
 262014d fix(148/phase2): spawn parquet footer-fetch tasks in 3 call sites (site 3.1c)
 d2bc6cd fix(148/phase2): spawn per-shard reads in checkpoint::Reader (site 3.1d)
-ec7c098 fix(148/phase2): spawn stage_block in Azure upload_multipart_stream (site 3.1e)  ← current tip
+ec7c098 fix(148/phase2): spawn stage_block in Azure upload_multipart_stream (site 3.1e)
+a8a2a9a docs(148): refresh STATUS + audit §5 for Phase 2 sites 3.1b-3.1e
+4c07d1b docs(148): mark sites 3.1b-3.1e ✅ done in audit §5
+0f542ec fix(148/phase2): spawn range fetches in range_engine_generic (site 3.1f)
+c157013 fix(148/phase2): spawn stat_object_many_async + document trait limit (site 3.1g)
+82a638f fix(148/phase2): spawn range GETs in ReaderMode::Range (site 3.1h)  ← current tip
 ```
 
 The branch history has ancestors on `perf/148-phase1-buffer-copies` and `perf/148-phase3-http2-optin`. Those old branches still exist locally; if you don't need them for reference they can be deleted with `git branch -d <name>` once this rolls up.
@@ -146,24 +151,29 @@ Phase 2 site 3.2 (drain vs short-circuit pattern, synthetic scenario):
 
 ---
 
-## What's left in Phase 2 — bug class A, three more sites
+## Phase 2 bug class A — COMPLETE
 
-Same pattern as sites 3.1a + 1.1 (both already done). The fix is:
+All 9 sites have been converted:
 
-1. Replace `stream::iter(0..N).map(async fetch).buffer_unordered(K)` with `FuturesUnordered<JoinHandle<Result<T>>>` fed by an explicit `spawn_fetch(idx)` closure.
-2. Producer stack holds `let _drop_cancel = DropCancel(cancel.clone());` — this is the shared type in `src/data_loader/parallel_fetch.rs::DropCancel` (already exists).
-3. Each spawn wraps the fetch in `tokio::select! { _ = token.cancelled() => Err("cancelled"), r = fetch => r, }`.
-4. Drive with a while-let-Some over `pending.next().await`, translating `JoinError::is_panic()` into `Err(DatasetError::Backend(...))`.
-
-The exact code shape lives in `src/data_loader/async_pool_dataloader.rs::run_async_pool_worker` and the three sites in `src/python_api/python_aiml_api.rs` — copy the closure + loop pattern from there.
-
-| # | File(s) | Notes |
+| # | File | Commit |
 |---|---|---|
-| 3.1f | `src/range_engine_generic.rs::download_with_ranges` (spawn side) | Shared Azure/GCS range engine. Disabled by default in backend configs so exposure is currently low, but the fix is the same. |
-| 3.1g | `src/object_store.rs::pre_stat` default + `src/s3_utils.rs::stat_object_many_async` | HEAD-only stat batches — lighter per-item, but at 100+ concurrency the sig/header work still bottlenecks. |
-| 3.1h | `src/data_loader/s3_bytes.rs::ReaderMode::Range` | `.buffered(max_inflight)` over range GET + body. Same shape as the confirmed bug. Note: this file also had finding 3.3b (double-copy) which Phase 1 already fixed — the file has both bug classes. |
+| 3.1a | `src/data_loader/async_pool_dataloader.rs::run_async_pool_worker` | `bfd9527` |
+| 1.1 | `src/python_api/python_aiml_api.rs` (3 iterator sites) | `1070a93` |
+| 3.1b | `src/s3_utils.rs::get_objects_parallel` pre-stat | `6c53f12` |
+| 3.1c | `src/data_loader/parquet_rg.rs` + `parquet_index.rs` (3 sites) | `262014d` |
+| 3.1d | `src/checkpoint/reader.rs` (2 sites) | `d2bc6cd` |
+| 3.1e | `src/azure_client.rs::upload_multipart_stream` | `ec7c098` |
+| 3.1f | `src/range_engine_generic.rs::download_with_ranges` | `0f542ec` |
+| 3.1g | `src/s3_utils.rs::stat_object_many_async` (+ trait-default doc note) | `c157013` |
+| 3.1h | `src/data_loader/s3_bytes.rs::ReaderMode::Range` | `82a638f` |
 
-Each site is small (~30-60 lines of change) and mechanical. The DropCancel + spawn pattern is now well-established in this codebase (eight uses). Suggested approach: one commit per site, leaning on `tests/test_phase2_join_all_vs_spawn.rs` as the pattern-level RED/GREEN proof; site-specific tests only where the site has a clean testable seam.
+Common pattern across every site: `tokio::spawn` per unit of work + `DropCancel` guard on the enclosing task + `tokio::select!` inside each spawn against a `CancellationToken` so mid-flight fetches bail on error/drop instead of running to completion. Panics surface as errors instead of silently truncating results.
+
+Site-specific adaptations:
+- Sites 3.1f (range_engine_generic) and 3.1h (s3_bytes) use `FuturesOrdered` + a bounded prime-and-refill pool to preserve the running-write-offset assembly (short-read semantics) and cap peak memory. Without the pool cap, spawned JoinHandles would each hold a chunk-sized Bytes after completion, blowing peak memory to `n_parts * part_size` and regressing the Phase 1 guarantee.
+- Site 3.1g documents (rather than fixes) the `ObjectStore::pre_stat_objects` trait default. That default takes `&self` through `dyn ObjectStore`, so `tokio::spawn` (which needs `Arc<Self>: 'static`) is not possible without a breaking trait change. The comment points backends at `stat_object_many_async` as the pattern to copy if they need N-core stat parallelism.
+
+**Only Phase 4 remains** — see below.
 
 ---
 
@@ -206,7 +216,7 @@ The `feedback_cargo_pyproject_version_sync` memory has been updated to make it e
 ```bash
 cd /home/eval/Documents/Code/s3dlio
 git status
-git log --oneline main..HEAD    # should show 23 commits ending in ec7c098
+git log --oneline main..HEAD    # should show 28 commits ending in 82a638f
 git branch --show-current       # perf/148-phase2-loader-parallelism
 
 # Sanity check: re-run the gate (see "What's proven GREEN" above)
@@ -218,14 +228,8 @@ cargo test --test test_phase1_zero_copy_assembly
 cargo fmt --all -- --check
 cargo clippy --lib --tests --no-deps -- -D warnings
 
-# To continue Phase 2 (bug class A, next 3 sites):
-# Pick any of 3.1f, 3.1g, 3.1h from the table above. Model the fix on
-# src/data_loader/async_pool_dataloader.rs::run_async_pool_worker (site 3.1a),
-# src/python_api/python_aiml_api.rs (site 1.1), src/s3_utils.rs pre-stat
-# phase (site 3.1b), src/data_loader/parquet_rg.rs (site 3.1c),
-# src/checkpoint/reader.rs (site 3.1d), or src/azure_client.rs (site 3.1e).
-# All use DropCancel from src/data_loader/parallel_fetch.rs — same import,
-# same pattern.
+# Phase 2 is complete. Next: Phase 4 (streaming connector + centralized
+# retry — see below). Fault-injection test is mandatory at merge.
 ```
 
 Read this file, [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-AUDIT-issue148.md) (especially §2.1 for cancellation, §3.1 for the site list, §3.2 for the drop-doesn't-abort template — now done, §4 for the phased plan), and [`PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md`](PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md) (§6 corrections) before starting the first change.
