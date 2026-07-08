@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use crate::data_loader::options::{LoaderOptions, ReaderMode};
+use crate::data_loader::parallel_fetch::DropCancel;
 use crate::data_loader::{Dataset, DatasetError};
 use crate::s3_utils::{
     get_object_range_uri_async, // NEW: implemented in s3_utils.rs next
@@ -14,7 +15,9 @@ use crate::s3_utils::{
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::stream::{self, StreamExt};
+use futures::stream::{FuturesOrdered, StreamExt};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct S3BytesDataset {
@@ -95,37 +98,93 @@ impl Dataset for S3BytesDataset {
                 let n_parts = size.div_ceil(part) as usize;
                 let max_inflight = self.max_inflight_parts.max(1);
 
-                // Pre-allocate the master output buffer once (issue #148,
-                // audit §3.3b / Patch 3). `.buffered(N)` returns items in
-                // stream order, so we can copy each range into its offset
-                // as it completes and drop the source Bytes immediately —
-                // keeping peak live memory to ~size instead of ~2 * size.
+                // Task-level parallelism (issue #148 site 3.1h): each
+                // range GET is `tokio::spawn`'d so tokio can distribute
+                // per-range CPU work (signing, header parsing, body
+                // assembly) across worker threads. Prior `.buffered(N)`
+                // polled every in-flight fetch inside a single task.
+                //
+                // Uses the same shape as 3.1f (range_engine_generic):
+                // FuturesOrdered preserves in-order assembly (running
+                // write_offset + short-read semantics), and a bounded
+                // spawn pool (prime + refill-on-consume) keeps at most
+                // `max_inflight` fetches alive at once so peak memory
+                // stays ~size instead of blowing up to size * n_parts.
+                // DropCancel guard cancels in-flight fetches if the
+                // caller drops this future mid-download.
+                let cancel = CancellationToken::new();
+                let _drop_cancel = DropCancel(cancel.clone());
+
+                let spawn_part = |i: usize| {
+                    let start = (i as u64) * part;
+                    let len = (size - start).min(part);
+                    let uri = uri.clone();
+                    let token = cancel.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = token.cancelled() => Err(anyhow::anyhow!(
+                                "range GET cancelled: part {}", i
+                            )),
+                            r = get_object_range_uri_async(&uri, start, Some(len)) => r,
+                        }
+                    })
+                };
+
+                let mut pending: FuturesOrdered<JoinHandle<anyhow::Result<Bytes>>> =
+                    FuturesOrdered::new();
+                let mut next_part = 0usize;
+                while next_part < n_parts && pending.len() < max_inflight {
+                    pending.push_back(spawn_part(next_part));
+                    next_part += 1;
+                }
+
                 let mut out = BytesMut::zeroed(size as usize);
                 let mut write_offset: usize = 0;
-                let mut chunks = stream::iter(0..n_parts)
-                    .map(|i| {
-                        let start = (i as u64) * part;
-                        let len = (size - start).min(part);
-                        let uri = uri.clone();
-                        async move { get_object_range_uri_async(&uri, start, Some(len)).await }
-                    })
-                    .buffered(max_inflight);
+                let mut first_err: Option<DatasetError> = None;
 
-                while let Some(res) = chunks.next().await {
-                    let bytes = res.map_err(DatasetError::from)?;
-                    let len = bytes.len();
-                    let end = write_offset + len;
-                    if end > out.len() {
-                        return Err(DatasetError::from(format!(
-                            "range assembly overflow: writing {}..{} but buffer is {} bytes",
-                            write_offset,
-                            end,
-                            out.len()
-                        )));
+                while let Some(join_res) = pending.next().await {
+                    match join_res {
+                        Ok(Ok(bytes)) => {
+                            if first_err.is_none() {
+                                let len = bytes.len();
+                                let end = write_offset + len;
+                                if end > out.len() {
+                                    return Err(DatasetError::from(format!(
+                                        "range assembly overflow: writing {}..{} but buffer is {} bytes",
+                                        write_offset, end, out.len()
+                                    )));
+                                }
+                                out[write_offset..end].copy_from_slice(&bytes);
+                                write_offset = end;
+                            }
+                            drop(bytes);
+                        }
+                        Ok(Err(e)) => {
+                            if first_err.is_none() {
+                                first_err = Some(DatasetError::from(e));
+                                cancel.cancel();
+                            }
+                        }
+                        Err(join_err) if join_err.is_panic() => {
+                            if first_err.is_none() {
+                                first_err = Some(DatasetError::from(format!(
+                                    "range GET task panicked: {}",
+                                    join_err
+                                )));
+                                cancel.cancel();
+                            }
+                        }
+                        Err(_cancelled) => {}
                     }
-                    out[write_offset..end].copy_from_slice(&bytes);
-                    write_offset = end;
-                    drop(bytes);
+
+                    if first_err.is_none() && next_part < n_parts {
+                        pending.push_back(spawn_part(next_part));
+                        next_part += 1;
+                    }
+                }
+
+                if let Some(e) = first_err {
+                    return Err(e);
                 }
 
                 if write_offset < out.len() {
