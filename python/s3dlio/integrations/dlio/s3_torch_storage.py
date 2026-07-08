@@ -22,6 +22,7 @@ Licensed under Apache 2.0
 Compatible with DLIO Benchmark v1.0+ (after PR #307)
 """
 
+import logging
 import os
 from urllib.parse import urlparse
 
@@ -36,6 +37,7 @@ from dlio_benchmark.utils.utility import Profile
 from . import _multipart_config
 
 dlp = Profile(MODULE_STORAGE)
+_logger = logging.getLogger(__name__)
 
 
 class S3PyTorchConnectorStorage(S3Storage):
@@ -106,15 +108,21 @@ class S3PyTorchConnectorStorage(S3Storage):
 
     @dlp.log
     def create_node(self, id, exist_ok=False):
-        """Create directory node using s3dlio.mkdir for all backends."""
+        """Create directory node using s3dlio.mkdir for all backends.
+
+        Audit #153 bug 3.4 (C2): see s3dlio_storage.py's create_node for
+        the full rationale -- only a genuine already-exists signal
+        (FileExistsError) is treated as success; everything else
+        propagates regardless of exist_ok.
+        """
         uri = self.get_uri(id)
         try:
             s3dlio.mkdir(uri)
             return True
-        except Exception:
-            if not exist_ok:
-                raise
-            return True
+        except FileExistsError:
+            if exist_ok:
+                return True
+            raise
 
     @dlp.log
     def get_node(self, id=""):
@@ -198,19 +206,28 @@ class S3PyTorchConnectorStorage(S3Storage):
 
             return paths
 
-        except Exception as e:
-            print(f"Error listing {id}: {e}")
-            return []
+        except Exception:
+            # Audit #153 bug 3.3 (C1): see s3dlio_storage.py's walk_node
+            # for the full rationale -- log and propagate instead of
+            # returning [] (indistinguishable from "legitimately empty").
+            _logger.exception("Error listing %s", id)
+            raise
 
     @dlp.log
     def delete_node(self, id):
-        """Delete an object."""
+        """Delete an object.
+
+        Audit #153 bug 3.5 (C3): see s3dlio_storage.py's delete_node for
+        the full rationale -- only a genuine not-found signal
+        (FileNotFoundError) is treated as success; everything else
+        propagates.
+        """
         uri = self.get_uri(id)
         try:
             s3dlio.delete(uri)
             return True
-        except Exception:
-            return False
+        except FileNotFoundError:
+            return True
 
     @dlp.log
     def put_data(self, id, data, offset=None, length=None):

@@ -292,15 +292,25 @@ class S3dlioStorage(DataStorage):
 
     @dlp.log
     def create_node(self, id, exist_ok=False):
-        """Create directory node using s3dlio.mkdir."""
+        """Create directory node using s3dlio.mkdir.
+
+        Audit #153 bug 3.4 (C2): previously ANY exception from
+        s3dlio.mkdir was swallowed into `return True` whenever
+        exist_ok=True -- an auth failure, a network error, or (common
+        for cloud backends, where mkdir is frequently unimplemented) a
+        "not implemented" error was all silently treated as "already
+        exists, success". Only a genuine already-exists signal
+        (FileExistsError) is now treated as success; everything else
+        propagates regardless of exist_ok.
+        """
         uri = self._make_uri(id)
         try:
             s3dlio.mkdir(uri)
             return True
-        except Exception:
-            if not exist_ok:
-                raise
-            return True
+        except FileExistsError:
+            if exist_ok:
+                return True
+            raise
 
     @dlp.log
     def get_node(self, id=""):
@@ -352,19 +362,32 @@ class S3dlioStorage(DataStorage):
 
             return paths
 
-        except Exception as e:
-            print(f"[s3dlio] Error listing {uri}: {e}")
-            return []
+        except Exception:
+            # Audit #153 bug 3.3 (C1): previously swallowed and returned
+            # [] -- indistinguishable from "legitimately empty". Log for
+            # operator visibility and propagate; a caller iterating a
+            # dataset must see the real error, not silently train on
+            # zero samples.
+            _logger.exception("[s3dlio] Error listing %s", uri)
+            raise
 
     @dlp.log
     def delete_node(self, id):
-        """Delete an object."""
+        """Delete an object.
+
+        Audit #153 bug 3.5 (C3): previously ANY exception from
+        s3dlio.delete was swallowed into `return False` -- indistinguishable
+        from "already gone" vs. a real failure (auth, network, etc). Only
+        a genuine not-found signal (FileNotFoundError) is now treated as
+        success (the goal -- "this object doesn't exist" -- is already
+        met); everything else propagates.
+        """
         uri = self._make_uri(id)
         try:
             s3dlio.delete(uri)
             return True
-        except Exception:
-            return False
+        except FileNotFoundError:
+            return True
 
     @dlp.log
     def put_data(self, id, data, offset=None, length=None):
