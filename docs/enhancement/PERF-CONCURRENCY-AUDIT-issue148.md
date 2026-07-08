@@ -2,7 +2,7 @@
 
 **Date**: 2026-07-07
 **Revised**: 2026-07-07 — incorporated corrections from the [adversarial review](./PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md) (5 corrections, see §6), reversed Phase 3 direction to HTTP/2 opt-in for both schemes (§2.2), and tracked implementation progress (§5)
-**Status**: **Partial — 15 of 17 in-scope items landed locally on branch `perf/148-phase2-loader-parallelism` in v0.9.108 (see §5 progress table). Phase 1 (✅ 4/4), Phase 3 (✅ 1/1), Phase 2 bug class B / finding 3.2 (✅ 1/1), Phase 2 bug class A COMPLETE (✅ 9/9). Only Phase 4 (2 items) remains.**
+**Status**: **ALL 17 IN-SCOPE ITEMS COMPLETE (v0.9.108, branch `perf/148-phase2-loader-parallelism`). Phase 1 (✅ 4/4), Phase 3 (✅ 1/1), Phase 2 bug class A (✅ 9/9), Phase 2 bug class B (✅ 1/1), Phase 4 (✅ 2/2). GCS retry-with-no-backoff (finding 3.4a) remains deferred. Fault-injection silent-data-corruption gate (§2.4) GREEN. Live end-to-end verified against MinIO byte-for-byte.**
 **Origin**: [mlcommons/storage#701](https://github.com/mlcommons/storage/issues/701) (unet3d object-storage benchmark, client-bound at ~1.1 GB/s/process against a ~10 GB/s/node endpoint), tracked in [russfellows/s3dlio#148](https://github.com/russfellows/s3dlio/issues/148)
 **Verified against**: s3dlio `main` @ `38fe812` (past v0.9.106)
 **Context**: s3dlio is approaching a 1.0 release. The priority for every item below is **stability first** — nothing here should ship without the tests called out in the plan. Several items are genuine correctness risks (not just performance), including one credible silent-data-corruption path; those are flagged explicitly.
@@ -391,7 +391,7 @@ Ordered by risk and dependency. Each phase should land as its own PR (or small s
 | 4 — streaming connector + centralized retry | 1.4, 3.4 | ⏳ **PENDING** (0/2) | Blocked on Phase 2 wrap-up. Fault-injection test mandatory at merge. |
 | Not scheduled (deferred) | 3.4a | ⏳ **DEFERRED** (0/1) | Flagged for a separate GCS-focused pass. |
 
-**Overall: 15 / 17 in-scope items complete + 1 deferred. Every commit landed GREEN through `cargo test --lib` (337/337), site-specific Phase 1/2/3 test suites (14/14 across three files), integration tests unaffected (`cargo test --test test_async_pool_dataloader` 6/6, various range/file store 48/48), and `cargo clippy -- -D warnings` clean at every step.**
+**Overall: ALL 17 / 17 in-scope items complete + 1 deferred (GCS 3.4a). Every commit landed GREEN through `cargo test --lib` (337/337), site-specific Phase 1/2/3 test suites (14/14 across three files), integration tests unaffected (`cargo test --test test_async_pool_dataloader` 6/6, various range/file store 48/48), and `cargo clippy -- -D warnings` clean at every step.**
 
 ### Per-item detail
 
@@ -400,7 +400,7 @@ Ordered by risk and dependency. Each phase should land as its own PR (or small s
 | 1.1 | `python_api/python_aiml_api.rs:239,372,~2213` | Single-task async concurrency | Confirmed (original report) | 2A | ✅ done — spawn each fetch, `DropCancel` on producer stack, `select!` cancellation, JoinError→DatasetError. Same pattern as 3.1a applied across all three call sites (`__iter__`, `.items()`, Parquet stream). |
 | 1.2 | `reqwest_client.rs:424` (`build_reqwest_client_raw`) | No H2 window tuning on https | Confirmed (original report) | 3 | ✅ done — window tuning extended to https; default reversed to HTTP/1.1 with opt-in via `S3DLIO_HTTPS_H2` / `S3DLIO_ENABLE_HTTP2` |
 | 1.3 | `s3_utils.rs:1154` (`concurrent_range_get_impl`) | Double-copy buffer assembly | Confirmed (original report) | 1 | ✅ done — pre-split segments, stream directly into segment via `ByteStream::next()`, O(1) `unsplit` |
-| 1.4 | `reqwest_client.rs:317` (connector) | Full-buffer before streaming | Confirmed (original report) | 4 | ⏳ pending |
+| 1.4 | `reqwest_client.rs:317` (connector) | Full-buffer before streaming | Confirmed (original report) | 4 | ✅ done — `SdkBody::from_body_1_x(StreamBody::new(SyncStream::new(bytes_stream)))` — SDK sees byte one at wire-arrival. |
 | 3.1a | `data_loader/async_pool_dataloader.rs:234-315` | Single-task async concurrency | High | 2A | ✅ done — `tokio::spawn` each fetch, `CancellationToken`+`select!` cancellation, DropCancel guard on worker stack, JoinError-is-panic → `DatasetError::Backend`. RED/GREEN in `test_phase2_loader_parallelism.rs` (parallelism 401ms→150ms; cancel 2s→<500ms; panic-surfaces-as-error). |
 | 3.1b | `s3_utils.rs:1483-1504` (pre-stat) | Single-task async concurrency | High | 2A | ✅ done — spawn stat futures with DropCancel + select!; drain-first-then-error on JoinHandle results. |
 | 3.1c | `data_loader/parquet_file_cache.rs:110` (+2 callers) | Single-task async concurrency (CPU-bound) | High | 2A | ✅ done — shared `spawned_fetch_all_metadata` helper; both `build_extents` fast/slow paths + `parquet_index` batched loop now spawn per-file Thrift decode. |
@@ -413,7 +413,7 @@ Ordered by risk and dependency. Each phase should land as its own PR (or small s
 | 3.3a | `range_engine_generic.rs:371-389` | Double-copy buffer assembly | High | 1 | ✅ done — pre-allocate master `BytesMut`, copy into offset as each `.buffered()` result arrives, drop source immediately |
 | 3.3b | `data_loader/s3_bytes.rs:99-114` | Double-copy buffer assembly | Medium-high | 1 | ✅ done — same technique as 3.3a applied to `ReaderMode::Range` |
 | 3.3c | `file_store_direct.rs:819-869` | Missing capacity hint | Medium (low impact) | 1 | ✅ done — `Vec::with_capacity(file_size)` in the O_DIRECT read loop |
-| 3.4 | Crate-wide | No shared retry helper (3 divergent shapes, Patch 4 would add a 4th) | High (design smell, not a bug) | 4 | ⏳ pending — will land alongside Phase 4's streaming-connector work |
+| 3.4 | Crate-wide | No shared retry helper (3 divergent shapes, Patch 4 would add a 4th) | High (design smell, not a bug) | 4 | ✅ done — `src/retry.rs::retry_get_body` used at 4 body-transfer sites; fault-injection gate GREEN. |
 | 3.4a | `google_gcs_client.rs:404-483` | Retry with no backoff | Medium | Not scheduled — flag for separate GCS-focused pass | ⏳ deferred |
 
 ---

@@ -1,7 +1,7 @@
 # Issue #148 — Where we are, what's next
 
-**Last updated**: 2026-07-07 (after Phase 2 sites 3.1f + 3.1g + 3.1h landed — Phase 2 bug class A COMPLETE)
-**Branch**: `perf/148-phase2-loader-parallelism` at `82a638f`, 28 commits ahead of local `main`
+**Last updated**: 2026-07-07 (after Phase 4a + 4b landed — Phase 4 CORE COMPLETE)
+**Branch**: `perf/148-phase2-loader-parallelism` at `df01f09`, 31 commits ahead of local `main`
 **Working tree**: clean (impact-analysis doc untracked, not staged)
 **Push state**: **NOTHING PUSHED**. The branch is local-only. Local `main` is also 2 commits ahead of `origin/main` (the audit docs + parent CLAUDE.md — `8a42ebb`, `e4b9ae4`) and unpushed. Per Prime Directive #1, do not push anything without an explicit instruction.
 
@@ -17,10 +17,10 @@ Detailed audit lives at [`PERF-CONCURRENCY-AUDIT-issue148.md`](PERF-CONCURRENCY-
 | **3** | HTTP/2 opt-in reversal + window tuning for https | **1 / 1** | ✅ **DONE** — default now HTTP/1.1 on both schemes |
 | **2 — bug class A** (spawn + cancel) | Task-level parallelism (findings 1.1, 3.1a–h) | **9 / 9** | ✅ **DONE** — all 9 sites converted to `tokio::spawn` + DropCancel + select! |
 | **2 — bug class B** (drop doesn't abort) | Full-drain-first-then-error (finding 3.2) | **1 / 1** | ✅ **DONE** — all 4 short-circuit sites retrofitted |
-| **4** | Streaming connector + centralized retry (findings 1.4, 3.4) | **0 / 2** | ⏳ Not started; hard-depends on Phase 1 (already done) |
+| **4** | Streaming connector + centralized retry (findings 1.4, 3.4) | **2 / 2** | ✅ **DONE** — `SdkBody::from_body_1_x` streaming + shared `retry_get_body` helper at 4 body-transfer sites; fault-injection gate GREEN. |
 | Deferred | GCS retry-with-no-backoff (finding 3.4a) | 0 / 1 | Separate GCS-focused pass; unscheduled |
 
-**Overall: 15 in-scope + 1 deferred out of 17 in-scope + 1 deferred.** Phase 2 is fully complete. Only Phase 4 (2 items) remains. Version bumped `0.9.106` → **`0.9.108`** locally in `Cargo.toml`, `pyproject.toml`, `docs/Changelog.md`, and `docs/Environment_Variables.md`.
+**Overall: 17 in-scope + 1 deferred out of 17 in-scope + 1 deferred — ALL IN-SCOPE ITEMS COMPLETE.** Version bumped `0.9.106` → **`0.9.108`** locally in `Cargo.toml`, `pyproject.toml`, `docs/Changelog.md`, and `docs/Environment_Variables.md`.
 
 ---
 
@@ -35,7 +35,7 @@ e4b9ae4 docs: add project-level CLAUDE.md with RED/GREEN policy + s3dlio-specifi
 
 `origin/main` is still at `38fe812` (the v0.9.106 baseline).
 
-### On branch `perf/148-phase2-loader-parallelism` (28 commits, oldest first)
+### On branch `perf/148-phase2-loader-parallelism` (31 commits, oldest first)
 
 Phase 1 (peak-memory range-assembly fix):
 ```
@@ -78,7 +78,10 @@ a8a2a9a docs(148): refresh STATUS + audit §5 for Phase 2 sites 3.1b-3.1e
 4c07d1b docs(148): mark sites 3.1b-3.1e ✅ done in audit §5
 0f542ec fix(148/phase2): spawn range fetches in range_engine_generic (site 3.1f)
 c157013 fix(148/phase2): spawn stat_object_many_async + document trait limit (site 3.1g)
-82a638f fix(148/phase2): spawn range GETs in ReaderMode::Range (site 3.1h)  ← current tip
+82a638f fix(148/phase2): spawn range GETs in ReaderMode::Range (site 3.1h)
+e7c8545 docs(148): mark Phase 2 bug class A COMPLETE (all 9 sites)
+d26ad84 feat(148/phase4a): add retry_get_body helper + fault-injection RED test
+df01f09 feat(148/phase4b): streaming connector body + retry_get_body at 4 sites  ← current tip
 ```
 
 The branch history has ancestors on `perf/148-phase1-buffer-copies` and `perf/148-phase3-http2-optin`. Those old branches still exist locally; if you don't need them for reference they can be deleted with `git branch -d <name>` once this rolls up.
@@ -150,6 +153,49 @@ Phase 2 site 3.2 (drain vs short-circuit pattern, synthetic scenario):
 - Drain (GREEN): elapsed ≥250ms (waited for 300ms slowest task), counter ==3 (all tasks completed)
 
 ---
+
+## Phase 4 — COMPLETE
+
+Both items landed:
+
+- **Finding 1.4** — connector streaming (`src/reqwest_client.rs`).
+  Replaced `resp.bytes().await` (full-buffer response body) with
+  `SdkBody::from_body_1_x(StreamBody::new(SyncStream::new(bytes_stream)))`.
+  SDK now sees byte one at the moment it arrives on the wire.
+- **Finding 3.4** — shared `retry_get_body` helper (`src/retry.rs`)
+  wraps body-transfer failures at 4 caller sites:
+  `S3Ops::get_object`, `S3Ops::get_object_range`,
+  `S3ObjectStore::get` direct-client path, `S3ObjectStore::get_range`
+  direct-client path, plus an inline retry loop with matching semantics
+  at `s3_utils::concurrent_range_get_impl`'s range-chunk task (the
+  critical §2.4 site — inline because retry_get_body's `FnMut() → Fut`
+  signature can't share `&mut seg` across attempts without
+  Arc<Mutex> or unsafe).
+
+Fault-injection gate (audit §2.4, silent-data-corruption class):
+- `tests/test_phase4_retry_fault_injection.rs::phase4_range_chunk_retry_resets_written_cursor_on_each_attempt`
+  locks in the "declare `written = 0` inside each attempt" invariant.
+  If a partial failed stream leaks `written` across attempts, later
+  successful retries would start writing at the leaked offset, leaving
+  earlier attempts' bytes at [0..old_written]. Length would be correct,
+  content would be silently corrupt.
+- The invariant is enforced by keeping the write cursor local to the
+  `attempt_range_chunk_fill` function in `s3_utils.rs` (not captured
+  from an outer scope).
+
+Live end-to-end verification against MinIO at 172.16.1.40:9000:
+- Rust integration tests (`tests/test_s3_backend_comparison.rs`):
+  basic PUT+GET, range GET (4 offsets), streaming write of 409 KB with
+  integrity-verified readback — 3/4 PASS. The 4th
+  (`test_s3_compression_operations`) fails on a pre-existing test-code
+  key-name bug unrelated to Phase 4.
+- Python-layer smoke tests hitting the streaming connector end-to-end:
+  12 KB whole GET + 200 B range GET + 100 B tail range GET, all
+  byte-for-byte identical. 16 MiB single-request whole GET, 4 range
+  GETs across the object, byte-for-byte identical. 64 MiB with forced
+  concurrent range GET (16 × 4 MiB chunks through
+  `concurrent_range_get_impl` — the fault-injection-gate site) at
+  225 MiB/s, byte-for-byte identical.
 
 ## Phase 2 bug class A — COMPLETE
 
