@@ -57,6 +57,14 @@ pub const ABORT_FAILS_MARKER: &str = "abort-fails";
 /// coordinator into its error path without ever reaching Complete.
 pub const UPLOAD_PART_FAILS_MARKER: &str = "part-fails";
 
+/// Key substring marker that makes the mock server report a per-object
+/// error for that key in a `DeleteObjects` response, while still
+/// returning HTTP 200 overall — this is exactly the real S3 behavior
+/// bug A4 guards against (per-object failure inside a 200 response).
+/// Any key containing this substring comes back in the response's
+/// `<Error>` list instead of `<Deleted>`.
+pub const DELETE_FAILS_MARKER: &str = "delete-fails";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -209,8 +217,41 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
-    // Drain the body so the connection can be cleanly reused/closed.
-    let _ = req.into_body().collect().await;
+    // Collect the body — DeleteObjects needs to inspect which keys were
+    // requested (see below); every other route just needs it drained so
+    // the connection can be cleanly reused/closed.
+    let body_bytes = req
+        .into_body()
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+
+    // DeleteObjects: POST /{bucket}?delete, XML body listing <Object><Key>...
+    // Any key containing DELETE_FAILS_MARKER comes back as a per-object
+    // <Error> entry instead of <Deleted> — HTTP status stays 200 either
+    // way, matching real S3 behavior (bug A4's whole point).
+    if method == Method::POST && query.contains("delete") {
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        let keys = extract_xml_tag_values(&body_str, "Key");
+        let mut deleted_xml = String::new();
+        let mut error_xml = String::new();
+        for key in &keys {
+            if key.contains(DELETE_FAILS_MARKER) {
+                error_xml.push_str(&format!(
+                    "<Error><Key>{key}</Key><Code>AccessDenied</Code>\
+                     <Message>mock server injected per-object delete failure</Message></Error>"
+                ));
+            } else {
+                deleted_xml.push_str(&format!("<Deleted><Key>{key}</Key></Deleted>"));
+            }
+        }
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>{deleted_xml}{error_xml}\
+             </DeleteResult>"
+        );
+        return xml_response(StatusCode::OK, &xml);
+    }
 
     // CreateMultipartUpload: POST .../{key}?uploads[=...]
     if method == Method::POST && query.contains("uploads") && !query.contains("uploadId") {
@@ -296,4 +337,25 @@ fn error_response(status: StatusCode, code: &str) -> Response<Full<Bytes>> {
         .header("content-type", "application/xml")
         .body(Full::new(Bytes::from(xml)))
         .unwrap()
+}
+
+/// Extract every `<tag>value</tag>` occurrence's inner text from a flat
+/// XML body. Good enough for the DeleteObjects request shape the AWS SDK
+/// generates (`<Object><Key>...</Key></Object>` repeated) — this is a
+/// test-only mock, not a general XML parser.
+fn extract_xml_tag_values(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        rest = &rest[start + open.len()..];
+        if let Some(end) = rest.find(&close) {
+            values.push(rest[..end].to_string());
+            rest = &rest[end + close.len()..];
+        } else {
+            break;
+        }
+    }
+    values
 }

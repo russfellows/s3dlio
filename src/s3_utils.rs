@@ -1593,13 +1593,44 @@ pub async fn delete_objects_async(bucket: &str, keys: &[String]) -> Result<()> {
             .set_objects(Some(objects))
             .build()
             .context("Failed to build Delete request")?;
-        client
+        let output = client
             .delete_objects()
             .bucket(bucket)
             .delete(delete)
             .send()
             .await
             .with_context(|| format!("delete_objects_async failed for bucket '{}'", bucket))?;
+
+        // Locked contract (audit #151 f36, docs/implementation-plans/
+        // v0.9.109-audit-fix-plan.md bug A4): S3's DeleteObjects returns
+        // HTTP 200 even when individual keys failed to delete — the
+        // per-object outcome lives in the response body's `errors` list,
+        // not the HTTP status. Discarding the response here (as this
+        // function previously did) silently reported partial or total
+        // batch failures as success.
+        let errs = output.errors();
+        if !errs.is_empty() {
+            let detail = errs
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}: {} ({})",
+                        e.key().unwrap_or("<unknown key>"),
+                        e.code().unwrap_or("<unknown code>"),
+                        e.message().unwrap_or("<no message>")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "delete_objects_async for bucket '{}' partially failed: {} of {} object(s) \
+                 not deleted: {}",
+                bucket,
+                errs.len(),
+                chunk.len(),
+                detail
+            );
+        }
     }
     Ok(())
 }

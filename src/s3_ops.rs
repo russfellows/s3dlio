@@ -11,7 +11,7 @@
 use crate::retry::retry_get_body;
 use crate::s3_logger::{LogEntry, Logger};
 use crate::s3_utils::{format_sdk_error, sdk_anyhow, SdkResultExt};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use aws_sdk_s3::{types::Delete, Client};
 use bytes::Bytes;
 //use std::sync::Arc;
@@ -351,7 +351,41 @@ impl S3Ops {
             .await;
 
         match result {
-            Ok(_) => {
+            Ok(output) => {
+                // Locked contract (audit #151 f36, docs/implementation-plans/
+                // v0.9.109-audit-fix-plan.md bug A4): S3's DeleteObjects
+                // returns HTTP 200 even when individual keys failed to
+                // delete (ACL denial, object-lock retention, throttling,
+                // etc.) — the per-object outcome lives in the response
+                // body's `errors` list, not the HTTP status. A bare
+                // `Ok(_)` here silently discarded that list, so a caller
+                // could believe a batch fully succeeded when some or all
+                // of it didn't. Keep the `Result<()>` signature (no API
+                // break) but inspect `.errors()` and surface them as Err.
+                let errs = output.errors();
+                if !errs.is_empty() {
+                    let detail = errs
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{}: {} ({})",
+                                e.key().unwrap_or("<unknown key>"),
+                                e.code().unwrap_or("<unknown code>"),
+                                e.message().unwrap_or("<no message>")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.log_op(ctx, &Err::<(), _>(detail.clone()), 0, None);
+                    bail!(
+                        "S3 batch DELETE for bucket '{}' partially failed: {} of {} object(s) \
+                         not deleted: {}",
+                        bucket,
+                        errs.len(),
+                        num_objects,
+                        detail
+                    );
+                }
                 self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
                 Ok(())
             }
