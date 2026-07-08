@@ -28,6 +28,7 @@ use bytes::Bytes;
 
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::constants::{
     DEFAULT_MULTIPART_BUFFER_CAPACITY, DEFAULT_S3_MULTIPART_PART_SIZE, MAX_MULTIPART_PARTS,
@@ -135,6 +136,12 @@ pub struct MultipartUploadSink {
     part_tx: mpsc::Sender<PartMsg>,
     /// Coordinator task handle; awaited in finish_blocking().
     coordinator: Option<JoinHandle<Result<MultipartCompleteInfo>>>,
+    /// Signaled on Drop / abort() to stop the coordinator BEFORE it can
+    /// reach CompleteMultipartUpload. See `cancel_coordinator_and_maybe_abort`
+    /// (audit #151 findings f11/f12 — issue #148 CLAUDE.md bug class:
+    /// dropping `part_tx` alone is not enough, because dropping a
+    /// `JoinHandle` detaches rather than cancels the task it points to).
+    cancel: CancellationToken,
 
     // buffering (same as before — happens before channel send)
     buf: Vec<u8>,
@@ -154,25 +161,15 @@ pub struct MultipartUploadSink {
 
 impl Drop for MultipartUploadSink {
     fn drop(&mut self) {
-        if self.finished || !self.cfg.abort_on_drop {
+        if self.finished {
             return;
         }
-        // Drop the sender — coordinator will see channel closed and can abort.
-        // Also fire-and-forget an explicit AbortMultipartUpload for safety.
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key = self.key.clone();
-        let upload_id = self.upload_id.clone();
-        let _ = run_on_global_rt(async move {
-            let _ = client
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .await;
-            Ok::<_, anyhow::Error>(())
-        });
+        // abort_on_drop gates only whether the best-effort S3-side Abort
+        // fires; the coordinator is ALWAYS cancelled so it can never
+        // reach CompleteMultipartUpload for a sink that was dropped
+        // without finish() (audit #151 f12 — locked contract, see
+        // docs/implementation-plans/v0.9.109-audit-fix-plan.md bug A2).
+        self.cancel_coordinator_and_maybe_abort(self.cfg.abort_on_drop);
     }
 }
 
@@ -223,6 +220,11 @@ impl MultipartUploadSink {
         // when this channel is full — meaning all resolved_mif slots are occupied.
         let (part_tx, part_rx) = mpsc::channel::<PartMsg>(resolved_mif);
 
+        // Cancellation token: Drop / abort() signal this to stop the
+        // coordinator BEFORE it can reach CompleteMultipartUpload
+        // (audit #151 f11/f12). Cloned into the coordinator task below.
+        let cancel = CancellationToken::new();
+
         // Spawn the coordinator task on the global runtime.
         let coordinator = spawn_on_global_rt(coordinator_task(
             client.clone(),
@@ -231,11 +233,13 @@ impl MultipartUploadSink {
             upload_id.clone(),
             resolved_mif,
             part_rx,
+            cancel.clone(),
         ));
 
         Ok(Self {
             part_tx,
             coordinator: Some(coordinator),
+            cancel,
             buf: Vec::with_capacity(DEFAULT_MULTIPART_BUFFER_CAPACITY),
             next_part_number: 1,
             total_bytes: 0,
@@ -465,29 +469,75 @@ impl MultipartUploadSink {
         Ok(info)
     }
 
+    /// Explicitly abort the upload.
+    ///
+    /// Locked contract (audit #151 f11, docs/implementation-plans/
+    /// v0.9.109-audit-fix-plan.md bug A3): always cancels the coordinator
+    /// (so it can never reach CompleteMultipartUpload after this call),
+    /// always attempts a best-effort `AbortMultipartUpload`, and always
+    /// returns `Ok(())` — the caller asked to abort; a transient failure
+    /// of the *cleanup* request doesn't change that outcome, it only
+    /// means the server-side upload may need manual cleanup (a
+    /// `tracing::warn!` records the upload_id for that). Unlike Drop,
+    /// this is an explicit user action, so the S3-side Abort always
+    /// fires regardless of `abort_on_drop` (that flag only gates
+    /// *implicit* cleanup-on-drop).
     pub fn abort_blocking(&mut self) -> Result<()> {
-        // Drop the sender — coordinator sees channel closed and exits.
-        // The Drop impl fires AbortMultipartUpload.
-        self.finished = true; // prevent Drop from double-aborting
+        self.cancel_coordinator_and_maybe_abort(true);
+        Ok(())
+    }
+
+    // ── internal ─────────────────────────────────────────────────────────────
+
+    /// Shared by `Drop::drop` and `abort_blocking()`: stop the coordinator
+    /// before it can reach Complete, then optionally fire a best-effort
+    /// `AbortMultipartUpload`. `fire_abort=false` is used only from Drop
+    /// when `abort_on_drop=false` — the operator explicitly opted into
+    /// leaving the upload dangling rather than paying for the extra
+    /// request, per the locked A2 contract.
+    fn cancel_coordinator_and_maybe_abort(&mut self, fire_abort: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        // Signal cancellation FIRST, before anything else — this is what
+        // stops the coordinator from falling through to Complete once
+        // part_tx closes. Cancelling here (rather than relying solely on
+        // channel-close) closes the race window entirely: the
+        // coordinator's select! observes cancellation independently of
+        // channel state.
+        self.cancel.cancel();
+
+        if !fire_abort {
+            return;
+        }
+
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.key.clone();
         let upload_id = self.upload_id.clone();
 
-        let _ = run_on_global_rt(async move {
-            let _ = client
+        let abort_result = run_on_global_rt(async move {
+            client
                 .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(upload_id)
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
                 .send()
-                .await;
-            Ok::<_, anyhow::Error>(())
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("AbortMultipartUpload failed: {e}"))
         });
-        Ok(())
-    }
 
-    // ── internal ─────────────────────────────────────────────────────────────
+        if let Err(e) = abort_result {
+            warn!(
+                "s3dlio MPU: best-effort AbortMultipartUpload failed for s3://{}/{} \
+                 upload_id={}: {e} — the in-progress upload may need manual cleanup",
+                self.bucket, self.key, self.upload_id
+            );
+        }
+    }
 
     /// Enqueue a complete part for upload via the coordinator channel.
     ///
@@ -549,6 +599,7 @@ async fn coordinator_task(
     upload_id: String,
     max_in_flight: usize,
     mut part_rx: mpsc::Receiver<PartMsg>,
+    cancel: CancellationToken,
 ) -> Result<MultipartCompleteInfo> {
     let sem = std::sync::Arc::new(Semaphore::new(max_in_flight));
     let started_at = SystemTime::now();
@@ -560,7 +611,33 @@ async fn coordinator_task(
         upload_id, bucket, key
     );
 
-    while let Some(PartMsg::Part { data, part_number }) = part_rx.recv().await {
+    // Locked contract (audit #151 f11/f12, docs/implementation-plans/
+    // v0.9.109-audit-fix-plan.md bug A2/A3): racing cancellation against
+    // the receive is what actually stops this task from reaching
+    // CompleteMultipartUpload after the sink is dropped or abort() is
+    // called. The prior design relied on `part_tx` closing to end the
+    // loop, but that path fell through to Complete unconditionally —
+    // dropping a `JoinHandle` (as the struct's own Drop does with
+    // `coordinator`) detaches the task rather than cancelling it, so
+    // there was no way to signal "stop, don't commit" from outside.
+    // `biased` ensures a cancellation that raced in alongside a
+    // already-buffered part is still honored before processing it.
+    let mut cancelled = false;
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                cancelled = true;
+                None
+            }
+            m = part_rx.recv() => m,
+        };
+
+        let (data, part_number) = match msg {
+            Some(PartMsg::Part { data, part_number }) => (data, part_number),
+            Some(PartMsg::Finish) | None => break,
+        };
+
         let part_bytes = data.len() as u64;
         total_bytes += part_bytes;
 
@@ -616,6 +693,31 @@ async fn coordinator_task(
         });
 
         part_tasks.push(handle);
+    }
+
+    if cancelled {
+        // Deliberately do NOT join part_tasks or call CompleteMultipartUpload.
+        // Already-spawned UploadPart tasks keep running independently on
+        // this runtime (dropping their JoinHandles here just detaches,
+        // same as before) and either land as harmless uncommitted parts
+        // (cleaned up by AbortMultipartUpload, when it fires) or are left
+        // dangling if the caller opted out via abort_on_drop=false.
+        debug!(
+            "s3dlio MPU: coordinator cancelled before Finish for upload_id={} s3://{}/{} \
+             ({} part upload task(s) were in flight and will not be awaited) — \
+             CompleteMultipartUpload will NOT be called",
+            upload_id,
+            bucket,
+            key,
+            part_tasks.len()
+        );
+        bail!(
+            "multipart upload for s3://{}/{} (upload_id={}) was aborted before finish() \
+             was called — the sink was dropped or abort() was invoked",
+            bucket,
+            key,
+            upload_id
+        );
     }
 
     // Join all part tasks.
