@@ -14,23 +14,22 @@ from __future__ import annotations
 import asyncio
 import threading
 import queue
-from typing import Optional, Dict, Any, Iterable, Callable
+from typing import Optional, Dict, Any, Callable
 
 import numpy as np
-import jax.numpy as jnp
 
 from . import _pymod as _core
 
 
 def _normalize_opts(**kwargs) -> Dict[str, Any]:
     return {
-        "batch_size":  kwargs.get("batch_size", 1),
-        "drop_last":  kwargs.get("drop_last", False),
-        "shuffle":    kwargs.get("shuffle", False),
-        "seed":       kwargs.get("seed", 0),
-        "num_workers":kwargs.get("num_workers", 0),
-        "prefetch":   kwargs.get("prefetch", 8),
-        "auto_tune":  kwargs.get("auto_tune", False),
+        "batch_size": kwargs.get("batch_size", 1),
+        "drop_last": kwargs.get("drop_last", False),
+        "shuffle": kwargs.get("shuffle", False),
+        "seed": kwargs.get("seed", 0),
+        "num_workers": kwargs.get("num_workers", 0),
+        "prefetch": kwargs.get("prefetch", 8),
+        "auto_tune": kwargs.get("auto_tune", False),
     }
 
 
@@ -38,9 +37,10 @@ class _AsyncBytesSource:
     """
     Drives the Rust async dataloader in a background thread + event loop,
     pushing samples (bytes) into a Queue for synchronous consumption.
-    
+
     Works with any URI scheme supported by the ObjectStore interface.
     """
+
     def __init__(
         self,
         uri: str,
@@ -65,7 +65,7 @@ class _AsyncBytesSource:
                 # Use generic create_async_loader - works with any URI scheme
                 loader = _core.create_async_loader(self._uri, self._opts)
                 try:
-                    async for batch in loader:     # batch: List[bytes]
+                    async for batch in loader:  # batch: List[bytes]
                         for b in batch:
                             self._q.put(b, block=True)
                 finally:
@@ -101,7 +101,7 @@ class _AsyncBytesSource:
 class JaxIterable:
     """
     JAX-friendly iterator yielding NumPy uint8 arrays (caller can jnp.asarray).
-    
+
     Supports all URI schemes: file://, s3://, az://, gs://, direct://
 
     >>> it = JaxIterable.from_prefix("file:///data/prefix/", prefetch=8, num_workers=32)
@@ -117,13 +117,13 @@ class JaxIterable:
         *,
         loader_opts: Dict[str, Any],
         transform: Optional[Callable] = None,
-        writable: bool = False,                    # NEW
-        suppress_nonwritable_warning: bool = True, # NEW
+        writable: bool = False,  # NEW
+        suppress_nonwritable_warning: bool = True,  # NEW
     ):
         self._uri = uri
         self._opts = loader_opts
         self._xfm = transform
-        self._writable = writable           # NEW
+        self._writable = writable  # NEW
         self._suppress_nonwritable_warning = suppress_nonwritable_warning
 
     @classmethod
@@ -139,19 +139,31 @@ class JaxIterable:
         seed: int = 0,
         auto_tune: bool = False,
         transform: Optional[Callable] = None,
-        writable: bool = False,             # NEW
+        writable: bool = False,  # NEW
         suppress_nonwritable_warning: bool = True,
     ) -> "JaxIterable":
         opts = _normalize_opts(
-            batch_size=batch_size, drop_last=drop_last, shuffle=shuffle, seed=seed,
-            num_workers=num_workers, prefetch=prefetch, auto_tune=auto_tune
+            batch_size=batch_size,
+            drop_last=drop_last,
+            shuffle=shuffle,
+            seed=seed,
+            num_workers=num_workers,
+            prefetch=prefetch,
+            auto_tune=auto_tune,
         )
-        return cls( uri, loader_opts=opts, transform=transform, writable=writable,
+        return cls(
+            uri,
+            loader_opts=opts,
+            transform=transform,
+            writable=writable,
             suppress_nonwritable_warning=suppress_nonwritable_warning,
         )
 
     def __iter__(self):
-        src = _AsyncBytesSource( self._uri, self._opts, writable=self._writable,
+        src = _AsyncBytesSource(
+            self._uri,
+            self._opts,
+            writable=self._writable,
             suppress_nonwritable_warning=self._suppress_nonwritable_warning,
         ).start()
         try:
@@ -184,18 +196,26 @@ def make_tf_dataset(
 ):
     """
     Build a tf.data.Dataset that streams uint8 tensors from the Rust ObjectStore loader.
-    
+
     Supports all URI schemes: file://, s3://, az://, gs://, direct://
     """
     import tensorflow as tf  # lazy import
 
     opts = _normalize_opts(
-        batch_size=batch_size, drop_last=drop_last, shuffle=shuffle, seed=seed,
-        num_workers=num_workers, prefetch=prefetch, auto_tune=auto_tune
+        batch_size=batch_size,
+        drop_last=drop_last,
+        shuffle=shuffle,
+        seed=seed,
+        num_workers=num_workers,
+        prefetch=prefetch,
+        auto_tune=auto_tune,
     )
 
     def gen():
-        src = _AsyncBytesSource( uri, opts, writable=writable,
+        src = _AsyncBytesSource(
+            uri,
+            opts,
+            writable=writable,
             suppress_nonwritable_warning=suppress_nonwritable_warning,
         ).start()
         try:
@@ -221,19 +241,20 @@ def make_tf_dataset(
 # -----------------------------------------------------------------------------
 # Deprecated alias for backward compatibility
 # -----------------------------------------------------------------------------
-import warnings as _warnings
+import warnings as _warnings  # noqa: E402 -- deliberately placed next to the deprecated aliases that use it, not at top of file
+
 
 class S3JaxIterable(JaxIterable):
     """
     DEPRECATED: Use JaxIterable instead. This alias exists for backward compatibility.
-    
+
     JaxIterable now supports all URI schemes (file://, s3://, az://, gs://, direct://).
     """
+
     def __init__(self, *args, **kwargs):
         _warnings.warn(
             "S3JaxIterable is deprecated. Use JaxIterable instead - it supports all URI schemes.",
             DeprecationWarning,
-            stacklevel=2
+            stacklevel=2,
         )
         super().__init__(*args, **kwargs)
-
