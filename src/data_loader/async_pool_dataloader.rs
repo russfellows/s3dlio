@@ -5,6 +5,7 @@
 
 use crate::data_loader::dataset::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, LoadingMode};
+use crate::data_loader::parallel_fetch::DropCancel;
 use crate::object_store::{store_for_uri, ObjectStore};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,26 +17,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-
-/// Cancel the wrapped token on drop.
-///
-/// The worker holds one of these on its stack: if the worker returns
-/// for any reason (normal exit, `tx.send()` failure because the
-/// receiver dropped, external cancel, panic on the worker's own
-/// frame), the token gets cancelled, signalling every in-flight
-/// spawned fetch to bail out via its `select!` cancellation arm.
-///
-/// This is the mechanism that makes `tokio::spawn` for each fetch
-/// safe: dropping a `JoinHandle` normally **detaches** the task
-/// (leaks it); we instead broadcast cancellation to the tasks
-/// themselves so they voluntarily terminate.
-struct DropCancel(CancellationToken);
-
-impl Drop for DropCancel {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
 
 /// Request metadata for tracking async operations
 #[derive(Debug, Clone)]

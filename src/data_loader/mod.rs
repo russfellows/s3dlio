@@ -11,6 +11,7 @@ pub mod dataset;
 pub mod directio_bytes;
 pub mod fs_bytes;
 pub mod options;
+pub(crate) mod parallel_fetch;
 pub mod parquet_file_cache;
 pub mod parquet_index;
 pub mod parquet_rg;

@@ -30,12 +30,16 @@ use crate::checkpoint::{CheckpointConfig, CheckpointInfo, CheckpointStore, Strat
 use crate::data_loader::{
     dataset::{Dataset, DatasetError},
     options::{LoaderOptions, ReaderMode},
+    parallel_fetch::DropCancel,
     s3_bytes::S3BytesDataset,
     DataLoader,
 };
 use crate::object_store::store_for_uri;
 use crate::python_api::python_core_api::PyBytesView;
 use crate::s3_utils::get_object_uri;
+use futures::stream::FuturesUnordered;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 // Import io_uring-style submit from s3_client (never calls block_on)
 use crate::s3_client::run_on_global_rt;
@@ -215,9 +219,17 @@ impl PyBytesAsyncDataLoader {
 
         pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
             if let Some(len) = dataset.inner.len() {
-                // buffer_unordered drives up to `prefetch` futures concurrently.
-                // Tokio's scheduler handles the thread count — no Semaphore needed.
-                use futures_util::stream::{self, StreamExt as _};
+                // Task-level parallelism (issue #148 site 1.1): each fetch is
+                // spawned onto tokio's scheduler so requests can be polled
+                // across worker threads instead of funneled through this one
+                // producer task. `DropCancel` on our stack + `select!` inside
+                // each spawned task means: producer exit for ANY reason
+                // (normal end, Python dropped the iterator so tx.send fails,
+                // producer panic) cancels every in-flight fetch, dropping
+                // their I/O. Same pattern as `AsyncPoolDataLoader` site 3.1a.
+                let cancel = CancellationToken::new();
+                let _drop_cancel = DropCancel(cancel.clone());
+
                 use std::time::Instant;
 
                 let t_start = Instant::now();
@@ -233,14 +245,40 @@ impl PyBytesAsyncDataLoader {
                     prefetch
                 );
 
-                let mut stream = stream::iter(0..len)
-                    .map(|idx| {
-                        let ds = dataset.clone();
-                        async move { ds.inner.get(idx).await }
+                let spawn_fetch = |idx: usize| -> JoinHandle<Result<Bytes, DatasetError>> {
+                    let ds = dataset.clone();
+                    let token = cancel.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = token.cancelled() => {
+                                Err(DatasetError::from("fetch cancelled"))
+                            }
+                            r = ds.inner.get(idx) => r,
+                        }
                     })
-                    .buffer_unordered(prefetch);
+                };
 
-                while let Some(result) = stream.next().await {
+                let mut pending: FuturesUnordered<JoinHandle<Result<Bytes, DatasetError>>> =
+                    FuturesUnordered::new();
+                let mut next_idx = 0usize;
+
+                // Fill initial window.
+                while next_idx < len && pending.len() < prefetch {
+                    pending.push(spawn_fetch(next_idx));
+                    next_idx += 1;
+                }
+
+                while let Some(join_res) = pending.next().await {
+                    let result: Result<Bytes, DatasetError> = match join_res {
+                        Ok(r) => r,
+                        Err(join_err) if join_err.is_panic() => Err(DatasetError::from(format!(
+                            "fetch task panicked: {}",
+                            join_err
+                        ))),
+                        // Cancelled during shutdown — skip cleanly.
+                        Err(_) => continue,
+                    };
+
                     if let Ok(ref bytes) = result {
                         total_bytes += bytes.len() as u64;
                         count += 1;
@@ -265,6 +303,11 @@ impl PyBytesAsyncDataLoader {
                     // blocks when channel full → natural backpressure
                     if tx.send(result).await.is_err() {
                         break; // Python consumer dropped the iterator
+                    }
+                    // Refill the sliding window.
+                    if next_idx < len {
+                        pending.push(spawn_fetch(next_idx));
+                        next_idx += 1;
                     }
                 }
 
@@ -323,7 +366,6 @@ impl PyBytesAsyncDataLoader {
     ///     process(item.uri, len(item))
     /// ```
     fn items(slf: PyRef<'_, Self>) -> PyResult<Py<PyObjectDataLoaderSyncIter>> {
-        use futures_util::stream::{self, StreamExt as _};
         use std::sync::Arc;
         use std::time::Instant;
 
@@ -340,6 +382,14 @@ impl PyBytesAsyncDataLoader {
 
         pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
             if let Some(len) = dataset.inner.len() {
+                // Task-level parallelism (issue #148 site 1.1 — items()
+                // variant). See the __iter__ version above for the full
+                // rationale; the only difference here is that each fetched
+                // item is paired with its URI/key so completions arrive as
+                // (uri, bytes).
+                let cancel = CancellationToken::new();
+                let _drop_cancel = DropCancel(cancel.clone());
+
                 // Snapshot keys once — attaches URI to each completed item.
                 // Fallback to "item:<idx>" for datasets that don't expose keys().
                 let keys: Arc<Option<Vec<String>>> = Arc::new(dataset.inner.keys());
@@ -356,22 +406,46 @@ impl PyBytesAsyncDataLoader {
                     prefetch,
                 );
 
-                let mut stream = stream::iter(0..len)
-                    .map(|idx| {
+                let spawn_fetch =
+                    |idx: usize| -> JoinHandle<Result<(String, Bytes), DatasetError>> {
                         let ds = dataset.clone();
                         let k = Arc::clone(&keys);
-                        async move {
+                        let token = cancel.clone();
+                        tokio::spawn(async move {
                             let uri = k
                                 .as_ref()
                                 .as_ref()
                                 .and_then(|v| v.get(idx).cloned())
                                 .unwrap_or_else(|| format!("item:{}", idx));
-                            ds.inner.get(idx).await.map(|b| (uri, b))
-                        }
-                    })
-                    .buffer_unordered(prefetch);
+                            tokio::select! {
+                                _ = token.cancelled() => {
+                                    Err(DatasetError::from("fetch cancelled"))
+                                }
+                                r = ds.inner.get(idx) => r.map(|b| (uri, b)),
+                            }
+                        })
+                    };
 
-                while let Some(result) = stream.next().await {
+                let mut pending: FuturesUnordered<
+                    JoinHandle<Result<(String, Bytes), DatasetError>>,
+                > = FuturesUnordered::new();
+                let mut next_idx = 0usize;
+
+                while next_idx < len && pending.len() < prefetch {
+                    pending.push(spawn_fetch(next_idx));
+                    next_idx += 1;
+                }
+
+                while let Some(join_res) = pending.next().await {
+                    let result: Result<(String, Bytes), DatasetError> = match join_res {
+                        Ok(r) => r,
+                        Err(join_err) if join_err.is_panic() => Err(DatasetError::from(format!(
+                            "fetch task panicked: {}",
+                            join_err
+                        ))),
+                        Err(_) => continue,
+                    };
+
                     if let Ok((_, ref bytes)) = result {
                         total_bytes += bytes.len() as u64;
                         count += 1;
@@ -387,6 +461,10 @@ impl PyBytesAsyncDataLoader {
                     }
                     if tx.send(result).await.is_err() {
                         break; // Python dropped the iterator
+                    }
+                    if next_idx < len {
+                        pending.push(spawn_fetch(next_idx));
+                        next_idx += 1;
                     }
                 }
 
@@ -2197,7 +2275,13 @@ impl PyParquetStreamLoader {
         );
 
         pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-            use futures_util::stream::{self, StreamExt as _};
+            // Task-level parallelism (issue #148 site 1.1 — Parquet stream
+            // variant). Same DropCancel + spawn-each + select! pattern as
+            // the other two sites in this file; item type here is
+            // (row_group_idx, bytes) instead of Bytes / (uri, bytes).
+            let cancel = CancellationToken::new();
+            let _drop_cancel = DropCancel(cancel.clone());
+
             use std::time::Instant;
 
             let t_start = Instant::now();
@@ -2205,14 +2289,38 @@ impl PyParquetStreamLoader {
             let mut total_bytes: u64 = 0;
             let mut t_last_log = Instant::now();
 
-            let mut stream = stream::iter(0..total)
-                .map(|idx| {
-                    let ds = Arc::clone(&dataset);
-                    async move { ds.get(idx).await.map(|b| (idx, b)) }
+            let spawn_fetch = |idx: usize| -> JoinHandle<Result<(usize, Bytes), DatasetError>> {
+                let ds = Arc::clone(&dataset);
+                let token = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            Err(DatasetError::from("fetch cancelled"))
+                        }
+                        r = ds.get(idx) => r.map(|b| (idx, b)),
+                    }
                 })
-                .buffer_unordered(concurrency);
+            };
 
-            while let Some(result) = stream.next().await {
+            let mut pending: FuturesUnordered<JoinHandle<Result<(usize, Bytes), DatasetError>>> =
+                FuturesUnordered::new();
+            let mut next_idx = 0usize;
+
+            while next_idx < total && pending.len() < concurrency {
+                pending.push(spawn_fetch(next_idx));
+                next_idx += 1;
+            }
+
+            while let Some(join_res) = pending.next().await {
+                let result: Result<(usize, Bytes), DatasetError> = match join_res {
+                    Ok(r) => r,
+                    Err(join_err) if join_err.is_panic() => Err(DatasetError::from(format!(
+                        "fetch task panicked: {}",
+                        join_err
+                    ))),
+                    Err(_) => continue,
+                };
+
                 if let Ok((_, ref b)) = result {
                     total_bytes += b.len() as u64;
                     count += 1;
@@ -2233,6 +2341,10 @@ impl PyParquetStreamLoader {
                 if tx.send(result).await.is_err() {
                     tracing::debug!("[s3dlio] parquet stream: consumer dropped iterator");
                     break;
+                }
+                if next_idx < total {
+                    pending.push(spawn_fetch(next_idx));
+                    next_idx += 1;
                 }
             }
 
