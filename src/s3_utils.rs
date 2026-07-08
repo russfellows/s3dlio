@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::data_loader::parallel_fetch::DropCancel;
 
 use bytes::{Bytes, BytesMut};
 #[cfg(feature = "profiling")]
@@ -1548,25 +1552,58 @@ pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec
         // Pre-stat phase: populate ObjectSizeCache for all URIs concurrently.
         // Only runs when range opt is enabled (if disabled, HEAD is skipped anyway).
         // Uses the same max_in_flight limit to avoid overwhelming the server.
+        //
+        // Task-level parallelism (issue #148 site 3.1b): the previous shape
+        // used `futures::future::join_all(stat_futs).await`, which polled
+        // every stat future inside THIS task. Any CPU work in a single
+        // stat's poll (request signing, header parsing, cache-write
+        // serialization) blocked every other in-flight stat on the same
+        // worker thread. Fix: `tokio::spawn` each stat so tokio can
+        // distribute polling across worker threads, wired through a
+        // CancellationToken so any early exit of this function (normal
+        // return or panic on our frame) drops in-flight stats via their
+        // `select!` cancel arm rather than detaching them. Same pattern as
+        // site 3.1a in `data_loader/async_pool_dataloader.rs`.
         if get_range_opt_enabled() {
+            let cancel = CancellationToken::new();
+            let _drop_cancel = DropCancel(cancel.clone());
             let stat_sem = Arc::new(Semaphore::new(max_in_flight));
-            let stat_futs: Vec<_> = uris
-                .iter()
-                .map(|uri| {
-                    let uri = uri.clone();
-                    let stat_sem = stat_sem.clone();
-                    async move {
-                        let _permit = stat_sem.acquire().await.ok();
-                        // Only stat if not already cached (subsequent epochs skip this)
-                        if get_size_cache().get(&uri).await.is_none() {
-                            if let Ok(stat) = stat_object_uri_async(&uri).await {
-                                get_size_cache().put(uri, stat.size).await;
+            let mut stat_futs: FuturesUnordered<JoinHandle<()>> = FuturesUnordered::new();
+            for uri in uris.iter().cloned() {
+                let stat_sem = stat_sem.clone();
+                let token = cancel.clone();
+                stat_futs.push(tokio::spawn(async move {
+                    tokio::select! {
+                        _ = token.cancelled() => {}
+                        _ = async {
+                            let _permit = stat_sem.acquire().await.ok();
+                            // Only stat if not already cached (subsequent epochs skip this)
+                            if get_size_cache().get(&uri).await.is_none() {
+                                if let Ok(stat) = stat_object_uri_async(&uri).await {
+                                    get_size_cache().put(uri, stat.size).await;
+                                }
                             }
-                        }
+                        } => {}
                     }
-                })
-                .collect();
-            futures::future::join_all(stat_futs).await;
+                }));
+            }
+            // Drain to completion so no JoinHandle is dropped mid-flight.
+            // Stat outcomes are already swallowed above (fire-and-forget cache
+            // warm), so we only care about awaiting every task; JoinError from
+            // a panicked stat task is logged and skipped since the pre-warm
+            // cache is a best-effort optimization.
+            while let Some(join_res) = stat_futs.next().await {
+                if let Err(e) = join_res {
+                    if e.is_panic() {
+                        tracing::warn!(
+                            "pre-stat task panicked during cache warm: {}; \
+                             continuing without that entry",
+                            e
+                        );
+                    }
+                    // Otherwise: cancelled during shutdown, expected on early exit.
+                }
+            }
         }
 
         // GET phase: get_object_uri_optimized_async() will find sizes in cache,
