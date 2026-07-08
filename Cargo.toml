@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.106"
+version = "0.9.108"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -25,11 +25,16 @@ name = "s3-cli"
 path = "src/bin/cli.rs"
 
 [dependencies]
-# AWS SDK - pinned to latest stable (update by running: cargo search aws-config)
-aws-config         = "=1.8.15"
-aws-sdk-s3         = "=1.129.0"
+# AWS SDK - relaxed to any 1.x so `cargo update` picks up patch/minor bumps
+# (was pinned to =1.8.15 / =1.129.0; policy is now to stay current with the
+# stable 1.x line; run `cargo update -p aws-config -p aws-sdk-s3` to refresh).
+aws-config         = "1"
+aws-sdk-s3         = "1"
 
-# Azure SDK crates (keep minor versions flexible; they evolve together)
+# Azure SDK crates - kept at exact 0.31 / 0.8 pins. These three reached 1.0
+# in early 2026, but that upgrade is deliberately deferred (Azure API surface
+# has non-trivial breaking changes at 0.x → 1.0; will be tackled as its own
+# task, separately from the AWS-side updates above).
 azure_core = { version = "=0.31.0", optional = true }          # Response/Body, paging, errors
 azure_identity = { version = "=0.31.0", optional = true }      # DefaultAzureCredential
 azure_storage_blob = { version = "=0.8.0", optional = true }   # Blob/Container/BlockBlob clients
@@ -57,10 +62,12 @@ tokio-stream = { version = "^0.1", features = ["sync"] }
 tokio-util = "^0.7"  # For CancellationToken and other utilities
 async-stream = "^0.3"  # For stream! macro in list_stream implementations
 # HTTP stack
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
 http    = "^1"             # Re-exported by reqwest, but needed as direct dep for response building
+http-body       = "^1"     # v0.9.108+ Phase 4b: StreamBody wrapping for streaming connector
 http-body-util  = "^0.1"   # BodyExt::collect() for SdkBody async collection
-aws-smithy-types = "^1"   # SdkBody type used by reqwest_client.rs bridge
+sync_wrapper    = { version = "^1", features = ["futures"] }  # v0.9.108+ Phase 4b: SyncStream for SdkBody::from_body_1_x
+aws-smithy-types = { version = "^1", features = ["http-body-1-x"] }   # v0.9.108+ Phase 4b: from_body_1_x streaming SdkBody
 aws-smithy-http-client = { version = "^1", features = ["rustls-aws-lc"] }
 aws-smithy-runtime-api = "^1"                         # ← Added for HTTP client types
 
@@ -174,6 +181,10 @@ aws-smithy-types = "^1"        # needed for SdkBody::empty() in test fixtures
 rcgen        = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 hyper        = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util   = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+
+# (No extra crate needed for the Phase 1 allocation tests — they use a small
+# in-tree peak-tracking wrapper around System, defined in
+# tests/common/peak_alloc.rs.)
 
 [features]
 #default = []

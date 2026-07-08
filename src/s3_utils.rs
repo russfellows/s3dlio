@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::data_loader::parallel_fetch::DropCancel;
 
 use bytes::{Bytes, BytesMut};
 #[cfg(feature = "profiling")]
@@ -1146,11 +1150,23 @@ pub async fn get_object_concurrent_range_async(
 ))]
 /// Internal concurrent range GET implementation.
 ///
-/// v0.9.31+: Replaced Arc<Mutex<BytesMut>> shared buffer with a collect-then-assemble
-/// approach (Finding 5 fix). Each chunk future returns its (buffer_offset, data) pair
-/// independently — no shared state, no lock contention. Chunks are sorted by offset
-/// once at the end and assembled into a single BytesMut with one sequential pass.
-/// This eliminates mutex serialisation across up to 37 concurrent writers per file.
+/// v0.9.108+ (issue #148, audit §1.3 / Patch 3): eliminated the second
+/// buffer copy by pre-allocating one master `BytesMut` of `total_bytes`,
+/// splitting it into per-range segments up front (each segment is a
+/// zero-copy view into the same underlying allocation), moving each
+/// segment into its range future, and streaming the AWS SDK response body
+/// **directly into the segment** via `ByteStream::next()` and
+/// `copy_from_slice`. On completion, segments are `unsplit` in ascending
+/// order — the fast path is O(1) contiguous reunification into the
+/// original allocation (see `bytes::BytesMut::unsplit` — non-contiguous
+/// falls back to `extend_from_slice`, which cannot happen here since
+/// segments were produced by ascending `split_to` from one buffer).
+/// Peak live memory during assembly is ~total_bytes, not ~2 * total_bytes.
+///
+/// Prior history: v0.9.31 replaced an `Arc<Mutex<BytesMut>>` shared buffer
+/// with a collect-then-assemble approach (Finding 5). That eliminated the
+/// mutex but retained a second copy from the per-chunk `Bytes` into an
+/// assembled buffer. This change closes that gap.
 async fn concurrent_range_get_impl(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -1162,20 +1178,35 @@ async fn concurrent_range_get_impl(
 ) -> Result<Bytes> {
     let total_bytes = (end_offset - start_offset) as usize;
 
-    // Build (range_start, range_end, buffer_offset) tuples
-    let mut ranges: Vec<(u64, u64, usize)> = Vec::new();
+    // Build (range_start, range_end) tuples in ascending offset order.
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
     let mut current_offset = start_offset;
     while current_offset < end_offset {
         let chunk_end = std::cmp::min(current_offset + chunk_size as u64, end_offset);
-        let buffer_start = (current_offset - start_offset) as usize;
-        ranges.push((current_offset, chunk_end, buffer_start));
+        ranges.push((current_offset, chunk_end));
         current_offset = chunk_end;
     }
+
+    // Pre-allocate the master buffer once and pre-split it into per-range
+    // segments. `split_to(len)` returns the first `len` bytes as its own
+    // `BytesMut` view into the shared allocation, leaving `master` holding
+    // the remainder. Assemble later via `unsplit` in the same ascending
+    // order to trigger the O(1) contiguous fast path.
+    let mut master = BytesMut::zeroed(total_bytes);
+    let mut segments: Vec<BytesMut> = Vec::with_capacity(ranges.len());
+    for (range_start, range_end) in &ranges {
+        let seg_len = (range_end - range_start) as usize;
+        segments.push(master.split_to(seg_len));
+    }
+    debug_assert!(
+        master.is_empty(),
+        "master should be fully consumed by segments"
+    );
 
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
     let mut futures = FuturesUnordered::new();
 
-    for (range_start, range_end, buffer_offset) in ranges {
+    for (idx, ((range_start, range_end), mut seg)) in ranges.into_iter().zip(segments).enumerate() {
         let client = client.clone();
         let bucket = bucket.to_string();
         let key = key.to_string();
@@ -1188,44 +1219,153 @@ async fn concurrent_range_get_impl(
                 .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
             let range_header = format!("bytes={}-{}", range_start, range_end - 1);
-            let resp = client
-                .get_object()
-                .bucket(&bucket)
-                .key(key.trim_start_matches('/'))
-                .range(range_header)
-                .send()
-                .await
-                .sdk_context(format!(
-                    "concurrent range GET for s3://{}/{} bytes={}-{} failed",
-                    bucket,
-                    key,
+
+            // Bounded retry over send() + body-stream (issue #148
+            // Phase 4b). Once the reqwest connector streams response
+            // bodies, smithy's own retry stops covering body-transfer
+            // failures — we retry the whole send()+stream pair here.
+            //
+            // Inline (not `crate::retry::retry_get_body`) because that
+            // helper's `FnMut() -> Fut` signature can't share `&mut seg`
+            // across attempts without Arc<Mutex> or unsafe. Semantics
+            // match: max_retry_attempts() budget + linear 100ms*attempt
+            // backoff.
+            //
+            // Silent-data-corruption gate (audit §2.4): `written`
+            // MUST be declared inside `attempt_range_chunk_fill` so
+            // each retry attempt starts writing at position 0. If it
+            // leaked across attempts, a partial failed stream's bytes
+            // would remain at [0..old_written] mixed with successful
+            // retry bytes, length would still be seg_len but content
+            // would be a mix of two attempts — no error raised.
+            // Locked in by tests/test_phase4_retry_fault_injection.rs.
+            let attempts = crate::constants::max_retry_attempts().max(1);
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut succeeded = false;
+            for attempt in 1..=attempts {
+                match attempt_range_chunk_fill(
+                    &client,
+                    &bucket,
+                    &key,
+                    &range_header,
                     range_start,
-                    range_end - 1
-                ))?;
+                    range_end,
+                    &mut seg,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        succeeded = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt < attempts {
+                            tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                        }
+                    }
+                }
+            }
+            if !succeeded {
+                return Err(last_err.expect("attempts >= 1"));
+            }
 
-            let body = resp.body.collect().await.context("collect chunk body")?;
-            let chunk_data = body.into_bytes();
-
-            // Return (buffer_offset, data) — no shared mutex, no contention
-            Ok::<(usize, Bytes), anyhow::Error>((buffer_offset, chunk_data))
+            Ok::<(usize, BytesMut), anyhow::Error>((idx, seg))
         });
     }
 
-    // Collect all (offset, chunk) pairs — order is non-deterministic (FuturesUnordered)
-    let mut chunks: Vec<(usize, Bytes)> = Vec::new();
+    // Collect all (idx, segment) pairs — order is non-deterministic
+    // (FuturesUnordered).
+    let mut chunks: Vec<(usize, BytesMut)> = Vec::with_capacity(max_concurrency);
     while let Some(result) = futures.next().await {
         chunks.push(result.context("concurrent range chunk failed")?);
     }
 
-    // Sort by buffer offset, then assemble with a single sequential pass
-    chunks.sort_unstable_by_key(|(offset, _)| *offset);
-
-    let mut output = BytesMut::with_capacity(total_bytes);
-    for (_, chunk) in chunks {
-        output.extend_from_slice(&chunk);
+    // Sort by segment index (== ascending offset order), then reunify.
+    // Because segments were produced by ascending `split_to` from one
+    // allocation and are unsplit here in that same order, this hits the
+    // O(1) contiguous fast path — the master buffer is reconstituted
+    // in place with no additional copies.
+    chunks.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut assembled: Option<BytesMut> = None;
+    for (_, seg) in chunks {
+        match assembled.as_mut() {
+            Some(acc) => acc.unsplit(seg),
+            None => assembled = Some(seg),
+        }
     }
+    let output = assembled.unwrap_or_default();
+    debug_assert_eq!(
+        output.len(),
+        total_bytes,
+        "assembled length must equal requested total_bytes"
+    );
 
     Ok(output.freeze())
+}
+
+/// One attempt at streaming a range GET's body into a pre-allocated
+/// segment (issue #148 Phase 4b). Declares `written = 0` inside the
+/// function body — the audit §2.4 silent-data-corruption gate — so
+/// each retry call from `concurrent_range_get_impl` starts writing at
+/// position 0 into `seg` regardless of how many bytes a previous
+/// failed attempt already wrote there. `tests/test_phase4_retry_fault_injection.rs`
+/// locks in this invariant.
+///
+/// On any error (send failure, body-stream failure, chunk-overflow,
+/// short read), the caller retries the whole call up to
+/// `max_retry_attempts()` times with linear backoff.
+async fn attempt_range_chunk_fill(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    range_header: &str,
+    range_start: u64,
+    range_end: u64,
+    seg: &mut BytesMut,
+) -> Result<()> {
+    let seg_len = seg.len();
+    let mut written: usize = 0;
+
+    let mut resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(key.trim_start_matches('/'))
+        .range(range_header)
+        .send()
+        .await
+        .sdk_context(format!(
+            "concurrent range GET for s3://{}/{} bytes={}-{} failed",
+            bucket,
+            key,
+            range_start,
+            range_end - 1
+        ))?;
+
+    while let Some(chunk) = resp.body.next().await {
+        let chunk = chunk.context("read chunk body byte stream")?;
+        let n = chunk.len();
+        if written + n > seg_len {
+            bail!(
+                "range chunk overflow: got {} bytes past segment end at range {}..{}",
+                (written + n) - seg_len,
+                range_start,
+                range_end
+            );
+        }
+        seg[written..written + n].copy_from_slice(&chunk);
+        written += n;
+    }
+    if written != seg_len {
+        bail!(
+            "range short read: wrote {}/{} bytes for range {}..{}",
+            written,
+            seg_len,
+            range_start,
+            range_end
+        );
+    }
+    Ok(())
 }
 
 /// Get optimal chunk size based on total transfer size
@@ -1363,12 +1503,59 @@ pub fn stat_object_uri(uri: &str) -> anyhow::Result<ObjectStat> {
 }
 
 /// Async stat for many URIs (concurrent).
+///
+/// Task-level parallelism (issue #148 site 3.1g): each stat is
+/// `tokio::spawn`'d so tokio can distribute per-stat work (URI parsing,
+/// signing, header parsing on the HEAD response) across worker threads
+/// instead of serializing on this task's poll cycle. `Vec<JoinHandle>`
+/// awaited in order preserves the previous input→output ordering (the
+/// spawns run concurrently regardless of iteration order). Panics are
+/// surfaced as errors instead of silently truncating the result.
 pub async fn stat_object_many_async(uris: Vec<String>) -> Result<Vec<ObjectStat>> {
-    use futures_util::future::try_join_all;
-    let futs = uris
+    let cancel = CancellationToken::new();
+    let _drop_cancel = DropCancel(cancel.clone());
+
+    let handles: Vec<JoinHandle<Result<ObjectStat>>> = uris
         .into_iter()
-        .map(|u| async move { stat_object_uri_async(&u).await });
-    try_join_all(futs).await
+        .map(|u| {
+            let token = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = token.cancelled() => Err(anyhow::anyhow!("stat cancelled: {}", u)),
+                    r = stat_object_uri_async(&u) => r,
+                }
+            })
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(handles.len());
+    let mut first_err: Option<anyhow::Error> = None;
+    for h in handles {
+        match h.await {
+            Ok(Ok(stat)) => {
+                if first_err.is_none() {
+                    out.push(stat);
+                }
+            }
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                    cancel.cancel();
+                }
+            }
+            Err(join_err) if join_err.is_panic() => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("stat task panicked: {}", join_err));
+                    cancel.cancel();
+                }
+            }
+            Err(_cancelled) => {}
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(out)
 }
 
 // -----------------------------------------------------------------------------
@@ -1483,25 +1670,58 @@ pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec
         // Pre-stat phase: populate ObjectSizeCache for all URIs concurrently.
         // Only runs when range opt is enabled (if disabled, HEAD is skipped anyway).
         // Uses the same max_in_flight limit to avoid overwhelming the server.
+        //
+        // Task-level parallelism (issue #148 site 3.1b): the previous shape
+        // used `futures::future::join_all(stat_futs).await`, which polled
+        // every stat future inside THIS task. Any CPU work in a single
+        // stat's poll (request signing, header parsing, cache-write
+        // serialization) blocked every other in-flight stat on the same
+        // worker thread. Fix: `tokio::spawn` each stat so tokio can
+        // distribute polling across worker threads, wired through a
+        // CancellationToken so any early exit of this function (normal
+        // return or panic on our frame) drops in-flight stats via their
+        // `select!` cancel arm rather than detaching them. Same pattern as
+        // site 3.1a in `data_loader/async_pool_dataloader.rs`.
         if get_range_opt_enabled() {
+            let cancel = CancellationToken::new();
+            let _drop_cancel = DropCancel(cancel.clone());
             let stat_sem = Arc::new(Semaphore::new(max_in_flight));
-            let stat_futs: Vec<_> = uris
-                .iter()
-                .map(|uri| {
-                    let uri = uri.clone();
-                    let stat_sem = stat_sem.clone();
-                    async move {
-                        let _permit = stat_sem.acquire().await.ok();
-                        // Only stat if not already cached (subsequent epochs skip this)
-                        if get_size_cache().get(&uri).await.is_none() {
-                            if let Ok(stat) = stat_object_uri_async(&uri).await {
-                                get_size_cache().put(uri, stat.size).await;
+            let mut stat_futs: FuturesUnordered<JoinHandle<()>> = FuturesUnordered::new();
+            for uri in uris.iter().cloned() {
+                let stat_sem = stat_sem.clone();
+                let token = cancel.clone();
+                stat_futs.push(tokio::spawn(async move {
+                    tokio::select! {
+                        _ = token.cancelled() => {}
+                        _ = async {
+                            let _permit = stat_sem.acquire().await.ok();
+                            // Only stat if not already cached (subsequent epochs skip this)
+                            if get_size_cache().get(&uri).await.is_none() {
+                                if let Ok(stat) = stat_object_uri_async(&uri).await {
+                                    get_size_cache().put(uri, stat.size).await;
+                                }
                             }
-                        }
+                        } => {}
                     }
-                })
-                .collect();
-            futures::future::join_all(stat_futs).await;
+                }));
+            }
+            // Drain to completion so no JoinHandle is dropped mid-flight.
+            // Stat outcomes are already swallowed above (fire-and-forget cache
+            // warm), so we only care about awaiting every task; JoinError from
+            // a panicked stat task is logged and skipped since the pre-warm
+            // cache is a best-effort optimization.
+            while let Some(join_res) = stat_futs.next().await {
+                if let Err(e) = join_res {
+                    if e.is_panic() {
+                        tracing::warn!(
+                            "pre-stat task panicked during cache warm: {}; \
+                             continuing without that entry",
+                            e
+                        );
+                    }
+                    // Otherwise: cancelled during shutdown, expected on early exit.
+                }
+            }
         }
 
         // GET phase: get_object_uri_optimized_async() will find sizes in cache,
@@ -1518,8 +1738,28 @@ pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec
             }));
         }
         let mut out = Vec::with_capacity(uris.len());
+        // Full-drain-first-then-error (issue #148 finding 3.2): the previous
+        // shape was `out.push(res??)` — that returned on the first Err,
+        // dropping the remaining JoinHandles in `futs`. Dropped JoinHandles
+        // detach (leak) their tasks rather than aborting them, so any GETs
+        // still in flight kept running in the background after this
+        // function had already returned an error. Draining every task
+        // before returning eliminates the leak; we surface the first
+        // error observed.
+        let mut first_err: Option<anyhow::Error> = None;
         while let Some(res) = futs.next().await {
-            out.push(res??);
+            match res {
+                Ok(Ok(item)) => out.push(item),
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(join_err) => {
+                    first_err.get_or_insert(anyhow::anyhow!("GET task panicked: {}", join_err));
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         // O(N log N) sort using pre-built position map
         out.sort_by_key(|(u, _)| uri_positions.get(u.as_str()).copied().unwrap_or(0));
@@ -1562,8 +1802,22 @@ pub fn get_objects_parallel_with_progress(
             }));
         }
         let mut out = Vec::with_capacity(uris.len());
+        // Full-drain-first-then-error — see companion note in
+        // `get_objects_parallel`. Issue #148 finding 3.2.
+        let mut first_err: Option<anyhow::Error> = None;
         while let Some(res) = futs.next().await {
-            out.push(res??);
+            match res {
+                Ok(Ok(item)) => out.push(item),
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(join_err) => {
+                    first_err.get_or_insert(anyhow::anyhow!("GET task panicked: {}", join_err));
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         // O(N log N) sort using pre-built position map
         out.sort_by_key(|(u, _)| uri_positions.get(u.as_str()).copied().unwrap_or(0));
@@ -1860,8 +2114,26 @@ pub(crate) fn put_objects_parallel_with_progress(
             }));
         }
 
+        // Full-drain-first-then-error (issue #148 finding 3.2): the previous
+        // shape was `res??`, which returned on the first Err and dropped the
+        // remaining JoinHandles. Detached PUT tasks would keep running in
+        // the background after the caller had already been told the whole
+        // operation failed — a genuine resource leak on top of a
+        // now-orphaned upload.
+        let mut first_err: Option<anyhow::Error> = None;
         while let Some(res) = futs.next().await {
-            res??;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(join_err) => {
+                    first_err.get_or_insert(anyhow::anyhow!("PUT task panicked: {}", join_err));
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         Ok(())
     })

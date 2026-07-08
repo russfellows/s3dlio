@@ -42,9 +42,20 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
+use crate::data_loader::parallel_fetch::DropCancel;
 use crate::data_loader::parquet_file_cache;
 use crate::data_loader::parquet_rg::rg_byte_extent;
 use crate::s3_client::run_on_global_rt;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+/// Return type of one spawned footer-fetch task in `build_index_chunk`
+/// (issue #148 site 3.1c): each task returns `(uri, cached_meta)` on
+/// success, or an error that will be surfaced by the caller after the
+/// full-drain. Aliased to keep the `Vec<JoinHandle<...>>` declaration
+/// below within clippy's `type_complexity` threshold.
+type IndexFetchResult =
+    anyhow::Result<(String, std::sync::Arc<parquet_file_cache::CachedFileMeta>)>;
 
 // ── Process-lifetime singleton ────────────────────────────────────────────────
 
@@ -315,18 +326,57 @@ impl ParquetIndex {
             let chunk_owned: Vec<String> = chunk.to_vec();
 
             let results = run_on_global_rt(async move {
-                use futures::future::join_all;
-                let futs: Vec<_> = chunk_owned
+                // Task-level parallelism (issue #148 site 3.1c): each
+                // footer fetch + Thrift metadata decode is now
+                // `tokio::spawn`'d so tokio distributes the CPU-bound
+                // parsing across worker threads. `DropCancel` on this
+                // async block's stack cancels every in-flight spawn on
+                // any exit path via each task's `select!` cancellation
+                // arm. Uses `Vec<JoinHandle>` iterated in order to
+                // preserve the URI ordering the downstream loop relies
+                // on (execution is still concurrent — all handles are
+                // spawned before we start awaiting).
+                let cancel = CancellationToken::new();
+                let _drop_cancel = DropCancel(cancel.clone());
+
+                let handles: Vec<JoinHandle<IndexFetchResult>> = chunk_owned
                     .iter()
                     .map(|uri| {
                         let u = uri.clone();
-                        async move {
-                            let meta = parquet_file_cache::get_or_fetch(&u, footer_cap).await?;
-                            anyhow::Ok((u, meta))
-                        }
+                        let token = cancel.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = token.cancelled() => Err(anyhow::anyhow!(
+                                    "parquet index footer fetch cancelled"
+                                )),
+                                r = parquet_file_cache::get_or_fetch(&u, footer_cap) => {
+                                    r.map(|meta| (u, meta))
+                                }
+                            }
+                        })
                     })
                     .collect();
-                Ok(join_all(futs).await)
+
+                // Drain in order — same drain-first-then-first-err shape
+                // as sites 3.2 / 3.1b: every JoinHandle is awaited so no
+                // task is detached; the first error is surfaced.
+                let mut results: Vec<IndexFetchResult> = Vec::with_capacity(handles.len());
+                for h in handles {
+                    match h.await {
+                        Ok(r) => results.push(r),
+                        Err(join_err) if join_err.is_panic() => {
+                            results.push(Err(anyhow::anyhow!(
+                                "parquet index footer task panicked: {}",
+                                join_err
+                            )));
+                        }
+                        Err(_) => {
+                            results
+                                .push(Err(anyhow::anyhow!("parquet index footer task cancelled")));
+                        }
+                    }
+                }
+                anyhow::Ok(results)
             })?;
 
             for result in results {

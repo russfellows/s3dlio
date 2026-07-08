@@ -619,12 +619,32 @@ async fn coordinator_task(
     }
 
     // Join all part tasks.
+    //
+    // Full-drain-first-then-error (issue #148 finding 3.2): the previous
+    // shape used `handle.await.map_err(...)??` inside a `for` loop, so on
+    // the first failed part every remaining `JoinHandle` in `part_tasks`
+    // got dropped — which detaches the tasks rather than aborting them.
+    // The result was that in-flight UploadPart calls kept running against
+    // S3 after this coordinator had already returned an error to the
+    // Python caller, wasting bandwidth and (worse) sometimes producing
+    // orphaned parts that showed up in later ListMultipartUploads calls.
+    // Draining every task first eliminates the leak; the first observed
+    // error is what we surface.
     let mut parts: Vec<(i32, String)> = Vec::with_capacity(part_tasks.len());
+    let mut first_err: Option<anyhow::Error> = None;
     for handle in part_tasks {
-        let (pn, etag) = handle
-            .await
-            .map_err(|e| anyhow::anyhow!("part task panicked: {e}"))??;
-        parts.push((pn, etag));
+        match handle.await {
+            Ok(Ok(pair)) => parts.push(pair),
+            Ok(Err(e)) => {
+                first_err.get_or_insert(e);
+            }
+            Err(join_err) => {
+                first_err.get_or_insert(anyhow::anyhow!("part task panicked: {}", join_err));
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
     parts.sort_by_key(|(pn, _)| *pn);
 

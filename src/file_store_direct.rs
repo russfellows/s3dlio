@@ -845,8 +845,13 @@ impl ConfigurableFileSystemObjectStore {
                     .custom_flags(libc::O_DIRECT)
                     .open(&path)?;
 
-                // Read in aligned chunks using aligned buffer
-                let mut result = Vec::new();
+                // Read in aligned chunks using aligned buffer.
+                // Pre-size `result` to `file_size` (issue #148, audit §3.3c)
+                // — `file_size` is known before the loop, and growing a
+                // `Vec` from zero here would incur log2(file_size /
+                // alignment) reallocations that we can avoid with a single
+                // up-front allocation.
+                let mut result = Vec::with_capacity(file_size);
                 let mut temp_buffer = create_aligned_buffer(alignment, alignment);
                 unsafe {
                     temp_buffer.set_len(alignment);

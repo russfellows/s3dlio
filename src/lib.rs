@@ -55,6 +55,7 @@ use pyo3::prelude::*;
 // Internal modules - these may change in future versions
 pub mod object_store;
 pub(crate) mod redirect_client; // HTTP 307 redirect following (for AIStore compatibility)
+pub mod retry; // v0.9.108+ Phase 4: shared retry helper for body-transfer failures
 pub mod s3_client;
 pub mod s3_copy;
 pub mod s3_logger;
@@ -138,7 +139,7 @@ pub fn set_gcs_rapid_mode(force: Option<bool>) {
 pub fn get_gcs_channel_count() -> usize {
     #[cfg(feature = "backend-gcs")]
     {
-        return google_gcs_client::get_gcs_channel_count();
+        google_gcs_client::get_gcs_channel_count()
     }
     #[cfg(not(feature = "backend-gcs"))]
     {
@@ -155,7 +156,7 @@ pub fn get_gcs_channel_count() -> usize {
 pub fn get_gcs_rapid_mode() -> Option<bool> {
     #[cfg(feature = "backend-gcs")]
     {
-        return google_gcs_client::get_gcs_rapid_mode();
+        google_gcs_client::get_gcs_rapid_mode()
     }
     #[cfg(not(feature = "backend-gcs"))]
     {

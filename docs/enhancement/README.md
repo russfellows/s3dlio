@@ -57,6 +57,25 @@ Extends s3dlio to support raw block devices (`/dev/nvme0n1`, `/dev/sdb`) for max
 
 ---
 
+### 3. [Performance & Concurrency Audit — Issue #148](PERF-CONCURRENCY-AUDIT-issue148.md)
+
+**Status**: Proposed — awaiting developer review before implementation. Revised 2026-07-07 to incorporate an [adversarial review](PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md) (5 corrections) and a maintainer decision on HTTP/2 opt-out controls (Phase 3).
+**Origin**: [mlcommons/storage#701](https://github.com/mlcommons/storage/issues/701), tracked in [russfellows/s3dlio#148](https://github.com/russfellows/s3dlio/issues/148)
+**Complexity**: Mixed — see phased plan (Phase 1 low, Phase 4 highest)
+
+Not a new-feature proposal — a stability-focused audit of a reported client-throughput ceiling (unet3d/S3, ~1.1 GB/s/process vs. ~10 GB/s/node available) and a broader sweep for the same bug classes elsewhere in the crate. Covers a deep correctness review of the four originally-proposed patches (two need rework, one is safe as-is, one needs a mandatory fault-injection test for a credible silent-data-corruption interaction), plus ~12 additional instances of the same two bug classes (missing task-level parallelism; avoidable buffer double-copies) found across the loader, checkpoint reader, parquet cache, and the Azure/GCS backends. A companion [adversarial review](PERF-CONCURRENCY-AUDIT-issue148-adversarial-review.md) independently re-verified the findings against source and corrected five points of precision (combinator semantics, an overstated HTTP/1.1 handshake-cost claim, an overstated phase dependency, an understated closing summary, and one wrong file citation) — all folded into the main document's revision history (§6).
+
+**Key findings**:
+- Confirmed: loader single-task bottleneck, no https H2 window tuning, range-GET double-copy, connector full-buffering (all four from the original report).
+- New: the identical single-task bottleneck exists in the core Rust-level `async_pool_dataloader.rs`, not just the Python bindings; a related "drop doesn't abort" leak affects ~half of the codebase's *existing* `tokio::spawn` call sites; the double-copy bug recurs in the shared Azure/GCS range engine and the ML data-loader's per-sample read path; retry logic has three independently hand-rolled shapes with no shared helper.
+
+**Implementation Highlights**:
+- 4-phase plan ordered by risk/dependency: (1) buffer-copy fixes, (2) loader parallelism + cancellation handling, (3) H2 window tuning for https **plus explicit HTTP/2 opt-out env vars** (`S3DLIO_HTTPS_H2`, master switch `S3DLIO_DISABLE_HTTP2`) so users can disable H2 for either or both of `http://`/`https://` — a maintainer-directed requirement, not just the originally-proposed blanket HTTP/1.1 flip, (4) streaming connector + centralized retry, gated on a mandatory fault-injection test.
+- Only Phase 4 hard-depends on Phase 1; Phase 3 is independent (dependency claim corrected in the adversarial review).
+- Explicit required-tests list per phase.
+
+---
+
 ## Comparison Matrix
 
 | Feature | SEWT Load Balancing | Block Storage |

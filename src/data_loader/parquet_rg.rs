@@ -65,6 +65,7 @@
 //! Both `parquet` and `parquet-arrow` are enabled by default.
 //! `ArrowIpc` mode additionally requires the `parquet-arrow` feature (also default).
 
+use crate::data_loader::parallel_fetch::DropCancel;
 use crate::data_loader::{Dataset, DatasetError};
 use crate::object_store::store_for_uri;
 use crate::s3_client::run_on_global_rt;
@@ -76,6 +77,8 @@ use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 // ── Parquet footer constants (test-only) ────────────────────────────────────
 
@@ -524,15 +527,77 @@ fn needs_file_metadata(mode: ParquetDecodeMode) -> bool {
 /// calls take the fast path.
 ///
 /// Returns `(extents, per_file_metadata)`.
+/// Spawn one `tokio` task per file to warm the shared
+/// `parquet_file_cache`, drain in URI order, and return a
+/// `Vec<Result<...>>` with one entry per URI in the same order.
+///
+/// Task-level parallelism (issue #148 site 3.1c): each
+/// `parquet_file_cache::get_or_fetch` is `tokio::spawn`'d so tokio can
+/// distribute both the HeadObject/GET I/O AND the Thrift metadata
+/// decode across worker threads. `DropCancel` on the caller's stack
+/// (both `build_extents` call sites) cancels every in-flight spawn
+/// on any exit path via each task's `select!` cancellation arm.
+///
+/// Iteration over the returned `Vec<JoinHandle<_>>` is intentionally
+/// sequential: it does NOT serialize execution (every task is already
+/// running on the runtime by the time we start awaiting) but it DOES
+/// preserve the URI-order shape that callers depend on for their
+/// per-file error messages and metadata indexing.
+async fn spawned_fetch_all_metadata(
+    file_uris: &[String],
+    footer_cap: u64,
+) -> Vec<anyhow::Result<std::sync::Arc<crate::data_loader::parquet_file_cache::CachedFileMeta>>> {
+    use crate::data_loader::parquet_file_cache;
+
+    let cancel = CancellationToken::new();
+    let _drop_cancel = DropCancel(cancel.clone());
+
+    let handles: Vec<
+        JoinHandle<anyhow::Result<std::sync::Arc<parquet_file_cache::CachedFileMeta>>>,
+    > = file_uris
+        .iter()
+        .map(|uri| {
+            let u = uri.clone();
+            let token = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = token.cancelled() => Err(anyhow::anyhow!(
+                        "parquet metadata fetch cancelled"
+                    )),
+                    r = parquet_file_cache::get_or_fetch(&u, footer_cap) => r,
+                }
+            })
+        })
+        .collect();
+
+    // Drain every handle so no JoinHandle is dropped mid-flight (would
+    // detach the task rather than aborting it). Order-preserving.
+    let mut results = Vec::with_capacity(handles.len());
+    for h in handles {
+        match h.await {
+            Ok(r) => results.push(r),
+            Err(join_err) if join_err.is_panic() => {
+                results.push(Err(anyhow::anyhow!(
+                    "parquet fetch task panicked: {}",
+                    join_err
+                )));
+            }
+            Err(_) => {
+                // Cancelled during shutdown — surface a benign error so
+                // the caller's `?` in `.collect::<Result<_>>()` bails.
+                results.push(Err(anyhow::anyhow!("parquet fetch task cancelled")));
+            }
+        }
+    }
+    results
+}
+
 async fn build_extents(
     file_uris: Vec<String>,
     col_indices: Option<Vec<usize>>,
     footer_cap: u64,
     decode_mode: ParquetDecodeMode,
 ) -> anyhow::Result<(Vec<RgExtent>, Vec<Arc<ParquetMetaData>>)> {
-    use crate::data_loader::parquet_file_cache;
-    use futures::future::join_all;
-
     // ── Fast path: global index hit ───────────────────────────────────────────
     // All files are already indexed from a prior construction in the same
     // process (typical epoch-2+ scenario for DataLoader workers).
@@ -564,15 +629,19 @@ async fn build_extents(
 
             // For ArrowIpc mode we still need file_metadata, but the file
             // cache is warm so this is just a DashMap lookup (no network I/O).
+            //
+            // Task-level parallelism (issue #148 site 3.1c): the previous
+            // shape used `join_all` over bare `get_or_fetch` futures, which
+            // polled every fetch (including its Thrift metadata decode —
+            // genuinely CPU-bound work) inside this task on one worker
+            // thread. `tokio::spawn`'ing each fetch lets tokio distribute
+            // that CPU work across worker threads. Same DropCancel +
+            // select! pattern as the other Phase 2 sites; the enclosing
+            // `Vec<JoinHandle>` gives us in-order iteration (which we need
+            // for the `enumerate` + per-file error message below) while
+            // still running every spawn concurrently.
             let file_metadata = if needs_file_metadata(decode_mode) {
-                let futs: Vec<_> = file_uris
-                    .iter()
-                    .map(|uri| {
-                        let u = uri.clone();
-                        async move { parquet_file_cache::get_or_fetch(&u, footer_cap).await }
-                    })
-                    .collect();
-                join_all(futs)
+                spawned_fetch_all_metadata(&file_uris, footer_cap)
                     .await
                     .into_iter()
                     .enumerate()
@@ -591,15 +660,11 @@ async fn build_extents(
     }
 
     // ── Slow path: fetch (or hit file cache for) all footers concurrently ────
-    let cache_futs: Vec<_> = file_uris
-        .iter()
-        .map(|uri| {
-            let u = uri.clone();
-            async move { parquet_file_cache::get_or_fetch(&u, footer_cap).await }
-        })
-        .collect();
-
-    let cache_results = join_all(cache_futs).await;
+    //
+    // Same spawn-per-fetch reasoning as the fast path above — the footer
+    // decode is CPU-bound Thrift parsing and benefits directly from
+    // being spread across worker threads.
+    let cache_results = spawned_fetch_all_metadata(&file_uris, footer_cap).await;
 
     // ── Build extents from cached metadata ────────────────────────────────────
     let mut extents = Vec::new();

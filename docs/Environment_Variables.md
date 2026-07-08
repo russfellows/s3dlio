@@ -13,39 +13,46 @@ This document provides a comprehensive reference for all environment variables s
 ### HTTP Client Control
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3DLIO_H2C` | `0` (HTTP/1.1) | HTTP/2 cleartext (h2c) mode for `http://` endpoints. **Default (unset or `0`)** = always HTTP/1.1 — benchmarking showed HTTP/2 reduces throughput on plain-HTTP endpoints vs HTTP/1.1 with an unlimited connection pool (changed from auto-probe in v0.9.92). **`1`** (or `true`, `yes`, `on`, `enable`) = force h2c prior-knowledge, no fallback — use for storage systems that require HTTP/2 on their `http://` API endpoint. **`auto`** = probe h2c on the first plain-HTTP connection and fall back to HTTP/1.1 if the server rejects it (pre-v0.9.92 behaviour). Has **no effect** on `https://` connections — those negotiate HTTP/2 automatically via TLS ALPN. |
+| `S3DLIO_H2C` | `0` (HTTP/1.1) | HTTP/2 cleartext (h2c) mode for `http://` endpoints. **Default (unset or `0`)** = HTTP/1.1. **`1`** (or `true`, `yes`, `on`, `enable`) = force h2c prior-knowledge, no fallback — use for storage systems that require HTTP/2 on their `http://` API endpoint. **`auto`** = probe h2c on the first plain-HTTP connection and fall back to HTTP/1.1 if rejected (pre-v0.9.92 behaviour). Has no effect on `https://`; use `S3DLIO_HTTPS_H2` for that. |
+| `S3DLIO_HTTPS_H2` | `0` (HTTP/1.1) | **New in v0.9.108.** HTTP/2 mode for `https://` endpoints (opt-in). **Default (unset or `0`)** = HTTP/1.1 (reqwest builder calls `.http1_only()`, ALPN advertises only `http/1.1`). **`1`** (or `true`, `yes`, `on`, `enable`) = allow HTTP/2 over TLS ALPN — reqwest advertises `["h2", "http/1.1"]` and the server picks. **BREAKING CHANGE from v0.9.106**: previously `https://` unconditionally negotiated HTTP/2 via ALPN. That is now off by default; opt in via this variable or `S3DLIO_ENABLE_HTTP2`. |
+| `S3DLIO_ENABLE_HTTP2` | `0` | **New in v0.9.108.** Master switch: when set to `1` (or `true`, `yes`, `on`, `enable`), opts in to HTTP/2 on **both** `http://` (equivalent to `S3DLIO_H2C=1`) and `https://` (equivalent to `S3DLIO_HTTPS_H2=1`). Convenience for callers who want HTTP/2 wherever it's available without setting two variables. Precedence is `OR`: this switch cannot *disable* H2 on a scheme where the per-scheme var already enabled it, but both defaults are already "off" so that's harmless. |
 | `S3DLIO_POOL_MAX_IDLE_PER_HOST` | unlimited | Maximum idle connections kept in the reqwest connection pool per host. Default changed to unlimited in v0.9.92: previously 32, which caused TCP connection churn at concurrency levels above 32 (each worker paid a full handshake penalty when the pool was full). Idle connections are still evicted after `S3DLIO_POOL_IDLE_TIMEOUT_SECS` seconds. Set to a positive integer to impose a hard ceiling. |
 | `S3DLIO_POOL_IDLE_TIMEOUT_SECS` | `90` | Seconds before an idle pooled connection is closed. |
-| `S3DLIO_H2_ADAPTIVE_WINDOW` | `1` (enabled) | HTTP/2 flow-control window mode. **`1`** (or `true`, `yes`, `on`) = adaptive (BDP estimator): hyper measures bandwidth-delay product via H2 PINGs and auto-tunes the window from 64 KB up to hundreds of MiB. Best for most workloads. **`0`** = static windows controlled by `S3DLIO_H2_STREAM_WINDOW_MB` / `S3DLIO_H2_CONN_WINDOW_MB`. Only active when `S3DLIO_H2C=1`. |
+| `S3DLIO_H2_ADAPTIVE_WINDOW` | `1` (enabled) | HTTP/2 flow-control window mode. **`1`** (or `true`, `yes`, `on`) = adaptive (BDP estimator): hyper measures bandwidth-delay product via H2 PINGs and auto-tunes the window from 64 KB up to hundreds of MiB. Best for most workloads. **`0`** = static windows controlled by `S3DLIO_H2_STREAM_WINDOW_MB` / `S3DLIO_H2_CONN_WINDOW_MB`. Applied whenever HTTP/2 is enabled (either scheme). |
 | `S3DLIO_H2_STREAM_WINDOW_MB` | `4` | HTTP/2 per-stream flow-control window in MiB (static mode only, i.e. `S3DLIO_H2_ADAPTIVE_WINDOW=0`). Clamped to 256 MiB maximum. |
 | `S3DLIO_H2_CONN_WINDOW_MB` | `4×stream` | HTTP/2 connection-level flow-control window in MiB (static mode only). Defaults to 4× `S3DLIO_H2_STREAM_WINDOW_MB`, capped at 256 MiB. |
 
-### HTTP/2 on TLS endpoints (`https://`)
+### HTTP protocol selection (both schemes)
 
-No configuration is needed.  s3dlio's reqwest client (rustls + aws-lc-rs) advertises
-`["h2", "http/1.1"]` in every TLS ClientHello.  If the server selects `h2`, HTTP/2 is
-used automatically; otherwise HTTP/1.1 is used.  The negotiated protocol is reported in
-startup INFO logs and in the PUT summary line (`protocol=HTTP/2` or `protocol=HTTP/1.1`).
+Since v0.9.108 (issue #148), HTTP/2 is **opt-in on every scheme**. HTTP/1.1 is the default.
+The reversal reflects benchmarking evidence that HTTP/2 is often slower than HTTP/1.1 for
+S3-style object-storage workloads, due to single-connection flow-control constraints even
+with adaptive windows.
 
-### HTTP/2 on cleartext endpoints (`http://`)
+Precedence: H2 is enabled for scheme *S* iff `(per-scheme var for S is truthy) OR (master
+switch is truthy)`.
 
 ```bash
-# Default: HTTP/1.1 (S3DLIO_H2C unset or 0 — changed from auto-probe in v0.9.92)
-AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli stat s3://bucket/key
+# Default (nothing set) — HTTP/1.1 everywhere
+AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli stat s3://bucket/key
 
-# Force h2c (for systems that require HTTP/2 cleartext)
-S3DLIO_H2C=1 AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli put s3://bucket/prefix -n 100
+# Opt in to h2c on http:// only
+S3DLIO_H2C=1  AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli put s3://bucket/prefix -n 100
 
-# Force HTTP/1.1 explicitly (same as default)
-S3DLIO_H2C=0 AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli ls s3://bucket/
+# Opt in to HTTP/2 on https:// only (restores pre-v0.9.108 default)
+S3DLIO_HTTPS_H2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli get s3://bucket/dataset/ -o /data/
 
-# Re-enable pre-v0.9.92 auto-probe behaviour (probe h2c, fall back to HTTP/1.1)
-S3DLIO_H2C=auto AWS_ENDPOINT_URL=http://storage-host:9000 s3-cli put s3://bucket/prefix -n 100
+# Master switch — HTTP/2 on both schemes with one variable
+S3DLIO_ENABLE_HTTP2=1  AWS_ENDPOINT_URL=https://storage-host:9443 s3-cli put s3://bucket/prefix -n 100
 ```
+
+The negotiated protocol is reported in startup INFO logs and in the PUT summary line
+(`protocol=HTTP/2` or `protocol=HTTP/1.1`).
 
 ### HTTP/2 flow-control window tuning
 
-Applies only when `S3DLIO_H2C=1` (cleartext HTTP/2).
+Applies whenever HTTP/2 is enabled — via `S3DLIO_H2C=1` (h2c), `S3DLIO_HTTPS_H2=1`
+(ALPN-negotiated H2 over TLS), or the master switch `S3DLIO_ENABLE_HTTP2=1`.
 
 #### What the three knobs actually do
 
@@ -106,7 +113,7 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 |----------|---------|-------------|
 | `S3DLIO_CONNECT_TIMEOUT_SECS` | `20` | TCP connect timeout in seconds.  Covers only the SYN → SYN-ACK handshake.  Honored by both the reqwest transport and the AWS SDK `TimeoutConfig` layer (unified in v0.9.102).  Default bumped from 10 s to 20 s in v0.9.102 after mlcommons/storage#506 showed the previous 5 s SDK-layer ceiling was the trigger for cold-start dispatch failures.  Raise further (e.g. `30` or `60`) for extreme fan-out scenarios where the endpoint's TCP accept queue is briefly saturated by thousands of concurrent connects. |
 | `S3DLIO_OPERATION_TIMEOUT_SECS` | `60` | Full request/response cycle timeout in seconds (excluding the connect handshake).  60 s is sufficient for ~6 GB at 100 MB/s and ~60 GB at 1 GB/s.  Raise for very large single objects or slow networks. |
-| `S3DLIO_MAX_RETRY_ATTEMPTS` | `3` | Maximum number of attempts (1 initial + N−1 retries) the AWS SDK makes per operation before propagating the error.  Matches the SDK's own default.  Set to `1` for **fast-fail at warmup** (no retries; surface a dispatch failure in one connect budget instead of three) — useful for debugging mlcommons/storage#506-style cold-start issues.  Set to `5` or higher to ride out flaky-network bursts.  Clamped to a minimum of 1; the SDK rejects 0. |
+| `S3DLIO_MAX_RETRY_ATTEMPTS` | `3` | Maximum number of attempts (1 initial + N−1 retries) per operation before propagating the error.  Governs **two** retry layers: (a) the AWS SDK's own retry (matches the SDK's default) which covers `send()`-phase failures such as connect / dispatch errors, and (b) since v0.9.108 (issue #148 Phase 4) the shared `retry_get_body` helper which covers **body-transfer** failures — once the reqwest connector streams response bodies to the SDK (`SdkBody::from_body_1_x`), smithy's retry no longer covers errors that surface while the caller consumes the streaming body, so a bounded-linear-backoff retry loop with the same attempt budget is applied at four caller sites (`S3Ops::get_object`/`get_object_range`, `S3ObjectStore::get`/`get_range` direct-client paths, and the range-chunk task inside `concurrent_range_get_impl`).  Set to `1` for **fast-fail at warmup** (no retries; surface a dispatch failure in one connect budget instead of three) — useful for debugging mlcommons/storage#506-style cold-start issues.  Set to `5` or higher to ride out flaky-network bursts.  Clamped to a minimum of 1; the SDK rejects 0. |
 
 ## Data Integrity: Write Verification and Retry (v0.9.104+, opt-in as of v0.9.106)
 
@@ -498,6 +505,14 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 
 ## Version History
 
+- **v0.9.108** *(BREAKING for `https://`)*: complete issue #148 performance/concurrency audit — all 17 in-scope items landed.
+  - **Phase 3 (HTTP protocol default reversed):** `S3DLIO_HTTPS_H2` and `S3DLIO_ENABLE_HTTP2` (master switch) added; `S3DLIO_H2C` unchanged. Previously `https://` unconditionally negotiated HTTP/2 via TLS ALPN; now `https://` uses HTTP/1.1 unless `S3DLIO_HTTPS_H2=1` or `S3DLIO_ENABLE_HTTP2=1` is set. `S3DLIO_H2_ADAPTIVE_WINDOW`/`S3DLIO_H2_STREAM_WINDOW_MB`/`S3DLIO_H2_CONN_WINDOW_MB` now apply whenever HTTP/2 is on (either scheme), not just h2c.
+  - **Phase 1 (peak memory):** range-assembly path pre-allocates the output buffer, cutting peak memory during concurrent range downloads from ~2× total_size to ~1× total_size at all 4 sites (S3 `concurrent_range_get_impl`, shared `range_engine_generic`, `s3_bytes::ReaderMode::Range`, `file_store_direct` capacity hint). No new env vars.
+  - **Phase 2 bug class A (task-level parallelism, 9 sites):** replaces `.buffered(N)`/`join_all(...)`/`try_join_all(...)` with per-fetch `tokio::spawn` + `DropCancel` + `select!`, so per-fetch CPU work distributes across worker cores instead of serializing on one. Fixes the workload pattern reported in mlcommons/storage#701 (many small objects, high concurrency). No new env vars.
+  - **Phase 2 bug class B (drop-doesn't-abort, 4 sites):** retrofits short-circuit `while let ... { out.push(res??) }` sites with drain-first-then-first-error so no `JoinHandle` is detached mid-flight. No new env vars.
+  - **Phase 4 (streaming connector + centralized retry):** reqwest connector now hands SDK a live streaming body via `SdkBody::from_body_1_x` instead of buffering the full response first. `S3DLIO_MAX_RETRY_ATTEMPTS` now **also** governs the new body-transfer retry layer (the shared `retry_get_body` helper at 4 caller sites) — smithy's own retry no longer covers body-transfer failures once the connector streams, so a bounded-linear-backoff retry loop with the same attempt budget compensates.  No new env vars.
+  - See [`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148.md`](enhancement/PERF-CONCURRENCY-AUDIT-issue148.md) for the full audit,
+    [`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md`](enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md) for measured before/after numbers.
 - **v0.9.106**: Write verification (single-part `S3DLIO_PUT_VERIFY` and multipart `S3DLIO_MPU_PUT_VERIFY`) changed from always-on to **opt-in, default `false`** — matches the default behavior of other S3 client libraries and avoids an extra round-trip on every object write for benchmark workloads.  `S3DLIO_PUT_MAX_RETRIES`/`S3DLIO_PUT_RETRY_DELAY_MS` and `S3DLIO_MPU_MAX_RETRIES`/`S3DLIO_MPU_RETRY_DELAY_S` are unchanged but now only take effect when the corresponding verify flag is enabled (mlcommons/storage#593)
 - **v0.9.104**: Added `S3DLIO_PUT_MAX_RETRIES` and `S3DLIO_PUT_RETRY_DELAY_MS` — single-part PUT with HEAD verification and automatic retry for all network backends (S3, Azure, GCS); `file://`/`direct://` bypass.  DLIO integration layer adds `S3DLIO_MPU_MAX_RETRIES` and `S3DLIO_MPU_RETRY_DELAY_S` for multipart upload retry (mlcommons/storage#593)
 - **v0.9.102**: Added `S3DLIO_CONNECT_TIMEOUT_SECS` (default 20 s, up from 5 s SDK default), `S3DLIO_OPERATION_TIMEOUT_SECS`, `S3DLIO_MAX_RETRY_ATTEMPTS`; unified AWS SDK and reqwest timeout layers

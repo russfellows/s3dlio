@@ -8,6 +8,10 @@ use bytes::Bytes;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::data_loader::parallel_fetch::DropCancel;
 
 use azure_core::credentials::TokenCredential;
 use azure_core::http::{Body, NoFormat, RequestContent, XmlFormat};
@@ -435,11 +439,30 @@ impl AzureBlob {
         S: Stream<Item = Bytes> + Unpin + Send + 'static,
     {
         debug!("AzureBlob::upload_multipart_stream container='{}', key='{}', part_size={}, max_in_flight={}", self.container, key, part_size, max_in_flight);
-        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+
+        // Task-level parallelism (issue #148 site 3.1e): each stage_block
+        // is `tokio::spawn`'d so tokio can distribute request signing +
+        // upload work across worker threads instead of funneling every
+        // block through this task's polling budget. DropCancel + select!
+        // on each spawn honors both early-drop and mid-stream errors:
+        // when we detect an error (either from a backpressure-drained
+        // task or a final-drain task), we `cancel` explicitly to let
+        // remaining in-flight blocks bail quickly, then drain to
+        // completion so no JoinHandle is dropped mid-flight.
+        let cancel = CancellationToken::new();
+        let _drop_cancel = DropCancel(cancel.clone());
+        let mut in_flight: FuturesUnordered<JoinHandle<Result<()>>> = FuturesUnordered::new();
         let mut next_idx: u64 = 0;
         let mut committed_ids: Vec<Vec<u8>> = Vec::new();
+        let mut first_err: Option<anyhow::Error> = None;
 
         while let Some(chunk) = stream.next().await {
+            // Stop enqueuing new work once we've seen an error — but keep
+            // draining in_flight below so no spawned task is left detached.
+            if first_err.is_some() {
+                break;
+            }
+
             // Fixed-width raw bytes (SDK will base64 on the wire)
             let id_str = format!("{:016x}-{:08x}", next_idx, part_size as u32);
             let id_bytes = id_str.as_bytes().to_vec();
@@ -447,28 +470,39 @@ impl AzureBlob {
             // Maintain order of IDs to match blob composition.
             committed_ids.push(id_bytes.clone());
 
-            // Backpressure
+            // Backpressure — await the oldest completion when the pool
+            // is full. Record (but do not bail on) any error observed so
+            // we continue draining rather than leaking the rest.
             if in_flight.len() >= max_in_flight {
-                in_flight
-                    .next()
-                    .await
-                    .transpose()?
-                    .ok_or_else(|| anyhow!("stage_block task ended unexpectedly"))?;
+                if let Some(join_res) = in_flight.next().await {
+                    absorb_stage_block_result(join_res, &mut first_err, &cancel);
+                }
             }
 
             let this = self.clone_for_upload();
             let key_owned = key.to_string();
-            in_flight.push(async move { this.stage_block(&key_owned, &id_bytes, chunk).await });
+            let token = cancel.clone();
+            in_flight.push(tokio::spawn(async move {
+                tokio::select! {
+                    _ = token.cancelled() => Err(anyhow!("stage_block cancelled")),
+                    r = this.stage_block(&key_owned, &id_bytes, chunk) => r,
+                }
+            }));
 
             next_idx += 1;
         }
 
-        // Drain remaining tasks
-        while let Some(res) = in_flight.next().await {
-            res?;
+        // Drain remaining tasks — cancellation may have fired above; any
+        // still-running spawn will bail through its select! arm quickly.
+        while let Some(join_res) = in_flight.next().await {
+            absorb_stage_block_result(join_res, &mut first_err, &cancel);
         }
 
-        // Commit in produced order
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+
+        // Commit in produced order.
         self.commit_block_list(key, committed_ids).await
     }
 
@@ -479,7 +513,42 @@ impl AzureBlob {
             credential: self.credential.clone(),
         }
     }
+}
 
+/// Fold one spawned `stage_block` outcome into the first-error slot,
+/// firing the shared cancellation token on the first observed error so
+/// still-running blocks can bail quickly through their `select!` arm.
+///
+/// Extracted from `upload_multipart_stream` (issue #148 site 3.1e) so
+/// both the backpressure step and the final drain reuse the same
+/// bookkeeping.
+fn absorb_stage_block_result(
+    join_res: std::result::Result<Result<()>, tokio::task::JoinError>,
+    first_err: &mut Option<anyhow::Error>,
+    cancel: &CancellationToken,
+) {
+    match join_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if first_err.is_none() {
+                *first_err = Some(e);
+                cancel.cancel();
+            }
+        }
+        Err(join_err) if join_err.is_panic() => {
+            if first_err.is_none() {
+                *first_err = Some(anyhow::anyhow!("stage_block task panicked: {}", join_err));
+                cancel.cancel();
+            }
+        }
+        Err(_) => {
+            // Task was cancelled (via the select! arm) — expected during
+            // shutdown after an earlier error already fired cancel.
+        }
+    }
+}
+
+impl AzureBlob {
     // ----------------------------------------------------------------------
     // Container helpers (optional)
     // ----------------------------------------------------------------------

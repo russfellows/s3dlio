@@ -52,17 +52,19 @@
 // not urgent — both implementations are correct and performant.
 
 use anyhow::{bail, Result};
-use bytes::Bytes;
-use futures::stream::{self, StreamExt};
+use bytes::{Bytes, BytesMut};
+use futures::stream::{FuturesOrdered, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::constants::{
     DEFAULT_FILE_RANGE_ENGINE_THRESHOLD, DEFAULT_RANGE_ENGINE_CHUNK_SIZE,
     DEFAULT_RANGE_ENGINE_MAX_CONCURRENT, DEFAULT_RANGE_TIMEOUT_SECS,
 };
+use crate::data_loader::parallel_fetch::DropCancel;
 
 /// Configuration for range-based concurrent downloads
 ///
@@ -302,93 +304,175 @@ impl RangeEngine {
         let semaphore = Arc::clone(&self.concurrency_limiter);
         let timeout = self.config.range_timeout;
 
-        // Create stream of concurrent range requests
-        // This is the key pattern: stream::iter().map().buffered()
-        let mut chunks =
-            stream::iter(ranges)
-                .enumerate()
-                .map(|(idx, (offset, length))| {
-                    let get_range = get_range.clone();
-                    let semaphore = Arc::clone(&semaphore);
-                    let cancel = cancel.clone();
+        // Task-level parallelism (issue #148 site 3.1f): each range fetch
+        // is `tokio::spawn`'d as its own task so tokio can distribute the
+        // per-range CPU work (signing, header parsing, body assembly)
+        // across worker threads. The prior `.buffered(N)` pattern polled
+        // every future inside this task's poll cycle.
+        //
+        // Ordering + peak-memory preservation: results are consumed via
+        // `FuturesOrdered<JoinHandle<...>>` in submission order — that
+        // preserves the running-write-offset assembly (short read from
+        // range k does NOT leave a zero-filled hole at range k+1's
+        // offset) and matches the previous `.buffered()` semantics.
+        //
+        // Bounded spawn pool: we prime the pool with `max_concurrent`
+        // spawns, then produce a new spawn each time we consume a result.
+        // Without this cap all N spawns would be alive simultaneously,
+        // each holding a chunk-sized Bytes in its JoinHandle after
+        // completion — driving peak memory to ~2× total_size (observed
+        // failure of `range_engine_download_peak_memory_bounded`).
+        //
+        // DropCancel guards mid-flight drop; external cancel is honored
+        // via a second select! arm.
+        let internal_cancel = CancellationToken::new();
+        let _drop_cancel = DropCancel(internal_cancel.clone());
 
-                    async move {
-                        // Check cancellation before starting
-                        if let Some(ref token) = cancel {
-                            if token.is_cancelled() {
-                                return Err(anyhow::anyhow!("Download cancelled by user"));
-                            }
-                        }
+        let spawn_fetch = |idx: usize, offset: u64, length: u64| {
+            let get_range = get_range.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let external_cancel = cancel.clone();
+            let internal_token = internal_cancel.clone();
+            tokio::spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Semaphore acquisition failed: {}", e))?;
 
-                        // Acquire concurrency permit (backpressure control)
-                        let _permit = semaphore
-                            .acquire()
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Semaphore acquisition failed: {}", e))?;
-
-                        tracing::trace!(
-                            "Fetching range {}: offset={}, length={}",
-                            idx,
-                            offset,
-                            length
-                        );
-
-                        // Execute range request with timeout
-                        let bytes = tokio::time::timeout(timeout, get_range(offset, length))
-                            .await
-                            .map_err(|_| {
-                                anyhow::anyhow!(
-                                    "Range {} timeout after {:?} (offset={}, length={})",
-                                    idx,
-                                    timeout,
-                                    offset,
-                                    length
-                                )
-                            })?
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "Range {} request failed (offset={}, length={}): {}",
-                                    idx,
-                                    offset,
-                                    length,
-                                    e
-                                )
-                            })?;
-
-                        // Verify we got the expected amount of data
-                        if bytes.len() != length as usize {
-                            tracing::warn!(
+                let fetch = async {
+                    let bytes = tokio::time::timeout(timeout, get_range(offset, length))
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "Range {} timeout after {:?} (offset={}, length={})",
+                                idx,
+                                timeout,
+                                offset,
+                                length
+                            )
+                        })?
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Range {} request failed (offset={}, length={}): {}",
+                                idx,
+                                offset,
+                                length,
+                                e
+                            )
+                        })?;
+                    if bytes.len() != length as usize {
+                        tracing::warn!(
                             "Range {} returned {} bytes, expected {} (offset={}, last_range={})",
-                            idx, bytes.len(), length, offset, idx == n_ranges - 1
+                            idx,
+                            bytes.len(),
+                            length,
+                            offset,
+                            idx == n_ranges - 1
                         );
-                        }
-
-                        Ok((idx, bytes))
                     }
-                })
-                .buffered(self.config.max_concurrent_ranges);
+                    Ok::<(usize, Bytes), anyhow::Error>((idx, bytes))
+                };
 
-        // Collect results with ordered reassembly
-        let mut parts: Vec<(usize, Bytes)> = Vec::with_capacity(n_ranges);
-        while let Some(result) = chunks.next().await {
-            let (idx, bytes) = result?;
-            parts.push((idx, bytes));
+                let external_wait = async {
+                    match external_cancel {
+                        Some(t) => t.cancelled().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+
+                tokio::select! {
+                    _ = internal_token.cancelled() => {
+                        Err(anyhow::anyhow!("Range {} cancelled (drop)", idx))
+                    }
+                    _ = external_wait => {
+                        Err(anyhow::anyhow!("Range {} cancelled by user", idx))
+                    }
+                    r = fetch => r,
+                }
+            })
+        };
+
+        let pool_cap = self.config.max_concurrent_ranges;
+        let mut pending: FuturesOrdered<JoinHandle<Result<(usize, Bytes)>>> = FuturesOrdered::new();
+        let mut next_range = 0usize;
+        while next_range < n_ranges && pending.len() < pool_cap {
+            let (offset, length) = ranges[next_range];
+            pending.push_back(spawn_fetch(next_range, offset, length));
+            next_range += 1;
         }
 
-        // Sort by index to ensure correct order
-        // (buffered() doesn't guarantee output order)
-        parts.sort_by_key(|(idx, _)| *idx);
+        // Pre-allocate the master output buffer (issue #148, audit
+        // §3.3a / Patch 3). Peak live memory is bounded by
+        // `pool_cap * chunk_size` (in-flight/queued) + `master`.
+        let mut master = BytesMut::zeroed(object_size as usize);
+        let mut write_offset: usize = 0;
+        let mut ranges_seen: usize = 0;
+        let mut first_err: Option<anyhow::Error> = None;
 
-        // Assemble final buffer
-        let total_size: usize = parts.iter().map(|(_, b)| b.len()).sum();
-        let mut assembled = Vec::with_capacity(total_size);
+        while let Some(join_res) = pending.next().await {
+            match join_res {
+                Ok(Ok((idx, bytes))) => {
+                    if first_err.is_none() {
+                        let len = bytes.len();
+                        tracing::trace!("Assembling range {} ({} bytes)", idx, len);
 
-        for (idx, bytes) in parts {
-            tracing::trace!("Assembling range {} ({} bytes)", idx, bytes.len());
-            assembled.extend_from_slice(&bytes);
+                        let end = write_offset
+                            .checked_add(len)
+                            .ok_or_else(|| anyhow::anyhow!("range assembly offset overflow"))?;
+                        if end > master.len() {
+                            bail!(
+                                "range {} would write {}..{} but master buffer is only {} bytes",
+                                idx,
+                                write_offset,
+                                end,
+                                master.len()
+                            );
+                        }
+                        master[write_offset..end].copy_from_slice(&bytes);
+                        write_offset = end;
+                        ranges_seen += 1;
+                    }
+                    drop(bytes);
+                }
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                        internal_cancel.cancel();
+                    }
+                }
+                Err(join_err) if join_err.is_panic() => {
+                    if first_err.is_none() {
+                        first_err =
+                            Some(anyhow::anyhow!("range fetch task panicked: {}", join_err));
+                        internal_cancel.cancel();
+                    }
+                }
+                Err(_cancelled) => {
+                    // Task was cancelled via the select! arm — expected
+                    // during shutdown after an earlier error fired cancel.
+                }
+            }
+
+            // Refill the spawn pool as slots free up.
+            if first_err.is_none() && next_range < n_ranges {
+                let (offset, length) = ranges[next_range];
+                pending.push_back(spawn_fetch(next_range, offset, length));
+                next_range += 1;
+            }
         }
 
-        let bytes_downloaded = assembled.len() as u64;
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        let _ = ranges_seen;
+
+        // Trim if any range returned short (matches previous behavior of
+        // returning whatever total length was actually produced).
+        if write_offset < master.len() {
+            master.truncate(write_offset);
+        }
+
+        let bytes_downloaded = master.len() as u64;
         let elapsed = start_time.elapsed();
 
         let stats = RangeDownloadStats {
@@ -406,7 +490,7 @@ impl RangeEngine {
             stats.throughput_gbps()
         );
 
-        Ok((Bytes::from(assembled), stats))
+        Ok((master.freeze(), stats))
     }
 
     /// Calculate optimal range splits for an object

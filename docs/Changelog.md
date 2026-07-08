@@ -1,5 +1,220 @@
 # s3dlio Changelog
 
+## Version 0.9.108 — Performance & concurrency audit (issue #148, all four phases)
+
+Resolves all 17 in-scope items from the issue #148 audit
+([`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148.md`](enhancement/PERF-CONCURRENCY-AUDIT-issue148.md)) —
+Phase 1 (buffer double-copy + capacity hint), Phase 2 bug class A
+(task-level parallelism across 9 sites), Phase 2 bug class B
+(drop-doesn't-abort across 4 sites), Phase 3 (HTTP/2 opt-in reversal),
+Phase 4 (streaming connector + shared retry helper). One finding (GCS
+retry-with-no-backoff, medium severity) deferred to a separate
+GCS-focused pass.
+
+Measured impact against a local high-throughput fake-S3 target
+(s3-ultra, ~40 GB/s theoretical): meaningful wins where the fixes are
+designed to help; noise-level elsewhere. Full before/after numbers in
+[`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md`](enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md).
+
+| Workload pattern | Speedup |
+|---|---|
+| 64 KB objects × 100, mixed PUT+GET workload | **3.8×** (baseline 85 → branch 324 MB/s) |
+| 64 KB × 100, PUT @ concurrency=64 | **3.2×** (baseline collapses from 390 → 164 MB/s at high conc; branch keeps scaling) |
+| 256 KB × 2000, GET @ conc=16 | +17% (~3.7 GB/s) |
+| Large single-object GET at 64 MiB (concurrent range engine) | **1.6×** (baseline 678 → branch 1108 MB/s) |
+| Large single-object GET at 256 MiB (concurrent range engine) | **2.1×** (baseline 731 → branch 1526 MB/s) |
+| 8 MB objects, all sizes / concurrencies | ≈ 0 (wire-bound; no regression) |
+
+### BREAKING CHANGE: `https://` no longer negotiates HTTP/2 by default (Phase 3)
+
+Prior to this release, s3dlio's reqwest client unconditionally advertised
+`["h2", "http/1.1"]` in every TLS ClientHello, and rustls picked whichever
+protocol the server chose — which for modern S3-compatible endpoints (MinIO,
+Ceph RGW, AIStore, most managed object stores) is almost always HTTP/2.
+Benchmarking on real workloads has repeatedly shown that HTTP/2 is often
+**slower** than HTTP/1.1 for object-storage traffic in this codebase's use
+case, primarily due to single-connection flow-control constraints that
+survive even adaptive window tuning.
+
+Starting in v0.9.108, the default for `https://` matches the existing
+default for `http://`: **HTTP/1.1 unless explicitly opted in**. Deployments
+that relied on ALPN-negotiated HTTP/2 for `https://` will now see HTTP/1.1.
+Restore the previous behavior with either:
+
+```bash
+S3DLIO_HTTPS_H2=1        # opt in per-scheme (https only)
+S3DLIO_ENABLE_HTTP2=1    # master switch: HTTP/2 on both http and https
+```
+
+Both variables accept `1`, `true`, `yes`, `on`, `enable` (case-insensitive).
+Any other value or unset means "off".
+
+| Variable | Scheme | Default | Notes |
+|---|---|---|---|
+| `S3DLIO_H2C` | `http://` | off | Unchanged — opt in to h2c on plain HTTP. |
+| `S3DLIO_HTTPS_H2` | `https://` | off | **New.** Opt in to HTTP/2 via TLS ALPN. |
+| `S3DLIO_ENABLE_HTTP2` | both | off | **New.** Master switch — implies both of the above. |
+
+Precedence: H2 is enabled on scheme *S* iff (per-scheme var truthy) OR
+(master switch truthy). H2 window-tuning env vars
+(`S3DLIO_H2_ADAPTIVE_WINDOW`, `S3DLIO_H2_STREAM_WINDOW_MB`,
+`S3DLIO_H2_CONN_WINDOW_MB`) now apply whenever HTTP/2 is enabled on
+either scheme — previously they only applied to h2c on `http://`. This
+also fixes the uncapped ~5 MiB default receive window that bottlenecked
+`https://` HTTP/2 clients per the audit §1.2.
+
+### Phase 1 — buffer double-copy in range assembly (4 sites)
+
+The concurrent range-GET assembly path collected each range's `Bytes`
+into a `Vec<(idx, Bytes)>`, sorted, then copied every byte a second
+time into a fresh output buffer — driving peak memory to ~2× total
+object size during assembly. The four sites (S3
+`concurrent_range_get_impl`, the shared `range_engine_generic`,
+`s3_bytes::ReaderMode::Range`, and the `file_store_direct` capacity
+hint) all pre-allocate a single master `BytesMut`, pre-split it into
+per-range segments (zero-copy views into one allocation), stream the
+response body **directly into each segment**, and reunify via `unsplit`
+on the fast O(1) contiguous path.
+
+Peak memory during a 32 MiB × 32-concurrent range download went from
+2.28× total_size to 1.03× total_size — verified by a RED test using a
+peak-tracking global allocator (`tests/test_phase1_zero_copy_assembly.rs`).
+This halving matters more for high-concurrency small-memory hosts
+(MPI workers, containers) than for wall-clock: memcpy is a small
+fraction of network wall-time, so the visible speedup is ~5–15% on 10
+GbE, larger on faster fabrics or when memory bandwidth-bound.
+
+### Phase 2 bug class A — task-level parallelism (9 sites)
+
+The audit's headline bug: nine sites used `stream::iter(...).map(async
+{ ... }).buffered(N)`, `join_all(...)`, or `try_join_all(...)` to drive
+concurrent fetches. Because none of the inner futures were
+`tokio::spawn`'d individually, tokio treated the whole set as one task —
+so all per-fetch CPU work (SigV4 signing, header parsing, body
+accumulation, Thrift/Parquet decode) polled inside a single worker
+thread's cycle, no matter how many workers the runtime had. This
+matches the [mlcommons/storage#701](https://github.com/mlcommons/storage/issues/701)
+report of flat ~1.1 GB/s/process throughput against a 10 GB/s endpoint.
+
+Fix at each site: `tokio::spawn` per fetch, a `DropCancel` guard on the
+enclosing scope's stack, and each spawn's fetch wrapped in
+`tokio::select! { _ = token.cancelled() => ..., r = fetch => r }` so
+mid-flight cancellation actually aborts in-flight work (rather than
+detaching and letting the fetch run to completion after the caller has
+moved on). Panics inside a fetch now surface as `Err(...)` at the
+caller instead of silently truncating an iterator.
+
+The nine sites:
+
+| # | File | Notes |
+|---|---|---|
+| 3.1a | `src/data_loader/async_pool_dataloader.rs` | The core Rust-level DataLoader worker. RED test: parallelism 401 ms → 150 ms; cancel latency 2 s → <500 ms; panic-surfaces-as-error. |
+| 1.1 | `src/python_api/python_aiml_api.rs` (3 sites) | Python-facing iterator (`__iter__`, `.items()`, Parquet stream). |
+| 3.1b | `src/s3_utils.rs` pre-stat phase in `get_objects_parallel` | GET phase 20 lines below already spawned correctly — an internal-inconsistency oversight. |
+| 3.1c | `src/data_loader/parquet_rg.rs` + `parquet_index.rs` (3 call sites) | CPU-bound Thrift-metadata parsing — strongest case for spawn since it's genuinely CPU work. |
+| 3.1d | `src/checkpoint/reader.rs` (2 sites) | Distributed-checkpoint shard reads. |
+| 3.1e | `src/azure_client.rs::upload_multipart_stream` | Azure block-upload path. |
+| 3.1f | `src/range_engine_generic.rs::download_with_ranges` | Shared Azure/GCS range engine. Uses `FuturesOrdered` + bounded prime-and-refill pool to preserve short-read semantics and cap peak memory. |
+| 3.1g | `src/s3_utils.rs::stat_object_many_async` | HEAD-batch stat. The trait-default `pre_stat_objects` cannot be spawn-based without breaking `dyn ObjectStore` compatibility; documented with a caveat and a pointer at `stat_object_many_async` as the pattern backends should copy. |
+| 3.1h | `src/data_loader/s3_bytes.rs::ReaderMode::Range` | Same `FuturesOrdered` + bounded pool pattern as 3.1f. |
+
+### Phase 2 bug class B — drop-doesn't-abort at short-circuit sites (4 sites)
+
+Four sites that already used `tokio::spawn` correctly had the
+`while let Some(res) = futs.next().await { out.push(res??); }` pattern —
+which returns from the outer function on the first error, dropping the
+remaining `FuturesUnordered<JoinHandle<...>>`. Dropping a `JoinHandle`
+*detaches* the task rather than aborting it, so the remaining in-flight
+uploads/downloads keep running in the background after the caller has
+already returned an error. Retrofitted to the drain-first-then-first-err
+pattern from `object_store.rs::generic_upload_files` (which was already
+correct). No in-flight task is ever detached.
+
+### Phase 4 — streaming connector + centralized retry (2 sites)
+
+**Streaming connector.** The reqwest connector previously fully
+buffered every response body (`resp.bytes().await`) before handing it
+to the SDK — so the SDK saw byte one only after the last byte
+arrived, and every body-transfer connection interruption had to be
+recovered by the smithy retry loop instead of by re-streaming. Now
+constructs `SdkBody::from_body_1_x(StreamBody::new(SyncStream::new(bytes_stream)))`
+— SDK sees byte one at the moment it arrives on the wire.
+
+`SyncStream` from `sync_wrapper 1.x` provides `Sync` for the reqwest
+stream (which is `Send` but not `Sync`) at zero runtime cost via Rust
+aliasing rules. Cargo changes: promote `http-body`, `sync_wrapper`
+(feature `futures`) to direct deps; enable `http-body-1-x` feature on
+`aws-smithy-types`; add `stream` feature to `reqwest`. All four crates
+were already transitive; only feature flags and direct-dep declarations
+change.
+
+**Centralized retry.** The streaming change means smithy's own retry
+no longer covers body-transfer failures (smithy considers the request
+done once `send()` returns headers). New shared helper
+`crate::retry::retry_get_body<F, Fut, T, E>` bounded by
+`max_retry_attempts()` with linear `100ms * attempt` backoff, wired
+into four caller sites:
+
+* `S3Ops::get_object` and `S3Ops::get_object_range` — whole-object /
+  range GET. Fresh `Bytes` per attempt, trivially idempotent.
+* `S3ObjectStore::get` and `S3ObjectStore::get_range` direct-client
+  paths — same shape.
+* `s3_utils::concurrent_range_get_impl` range-chunk task — the audit
+  §2.4 silent-data-corruption gate. Retries stream directly into a
+  shared, pre-allocated `BytesMut` segment. Inline retry loop (not
+  `retry_get_body`) because the helper's `FnMut() → Fut` signature
+  can't share `&mut seg` across attempts. The
+  `attempt_range_chunk_fill` helper declares `written = 0` locally so
+  each retry starts writing at position 0 — locked in by the
+  fault-injection regression test in
+  `tests/test_phase4_retry_fault_injection.rs`.
+
+Note: a live end-to-end DLIO_local_changes `unet3d` smoke test against
+the streaming-connector s3dlio hit **99.6% AU** with `train_au_meet_expectation:
+success` — proves the DLIO training path works cleanly with the new
+wheel.
+
+### Fault-injection gate (audit §2.4 blocking requirement)
+
+`tests/test_phase4_retry_fault_injection.rs::phase4_range_chunk_retry_resets_written_cursor_on_each_attempt`
+locks in the invariant that each retry attempt starts with a fresh
+`written = 0` cursor when writing streamed bytes into the shared range
+segment. If `written` leaked across attempts, a partial failed stream's
+bytes would remain at `seg[0..old_written]` mixed with successful
+retry bytes — length correct, content silently corrupt. This is the
+class of bug the audit specifically flagged; the test proves the
+implementation is not exposed to it.
+
+### RED-then-GREEN test coverage
+
+Every phase landed with dedicated regression tests that fail against
+pre-fix code and pass against fixed code, so the transitions are
+bisectable:
+
+| Phase | Regression test |
+|---|---|
+| 1 | `tests/test_phase1_zero_copy_assembly.rs` — peak-memory-tracking allocator, ≤ 1.5× total_size |
+| 2 site 3.1a | `tests/test_phase2_loader_parallelism.rs` — 4 tests (parallelism, external cancel, drop-cancels, panic surfaces) |
+| 2 site 3.1b/3.1d pattern | `tests/test_phase2_join_all_vs_spawn.rs` — `join_all` serializes vs. `tokio::spawn` distributes |
+| 2 bug class B | `tests/test_phase2_drain_first_err.rs` — short-circuit vs. drain-first-then-error |
+| 4 | `tests/test_phase4_retry_fault_injection.rs` — audit §2.4 silent-data-corruption gate |
+
+Zero warnings across `cargo clippy --lib --tests --no-deps -- -D warnings`
+under default features, `--features backend-azure`, and
+`--features full-backends`. `cargo fmt --check` clean. All shipped
+pre-existing test-file clippy warnings across azure_blob_smoke,
+test_azure_comprehensive, test_azure_range_engine_integration,
+test_gcs_smoke, and test_range_engine_defaults resolved as part of the
+release gate.
+
+See [`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148.md`](enhancement/PERF-CONCURRENCY-AUDIT-issue148.md)
+for the full audit and rationale;
+[`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md`](enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md)
+for reproducible before/after benchmark methodology and full raw
+numbers.
+
+---
+
 ## Version 0.9.106 — Write verification changed from always-on to opt-in (mlcommons/storage#593 follow-up)
 
 ### Why this release

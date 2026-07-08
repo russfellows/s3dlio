@@ -5,15 +5,16 @@
 
 use crate::data_loader::dataset::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, LoadingMode};
+use crate::data_loader::parallel_fetch::DropCancel;
 use crate::object_store::{store_for_uri, ObjectStore};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
@@ -217,7 +218,23 @@ impl AsyncPoolDataLoader {
         ReceiverStream::new(rx)
     }
 
-    /// Core async pooling worker with cancellation support
+    /// Core async pooling worker with cancellation support.
+    ///
+    /// Each fetch is `tokio::spawn`'d as its own task so tokio can
+    /// distribute polling across worker threads (issue #148, audit
+    /// §1.1 / §3.1a). To make that safe for early-drop and external-
+    /// cancel scenarios, an internal `CancellationToken` is wired
+    /// through each spawned task via `tokio::select!` — cancelling
+    /// the internal token drops the fetch future, cancelling the
+    /// in-flight I/O for free (no JoinHandle tracking / abort() needed).
+    ///
+    /// The internal token is a child of the external `cancel_token`
+    /// when the caller supplied one, so external cancels propagate
+    /// automatically. A `DropCancel` guard on this function's stack
+    /// cancels the internal token on ANY exit path (normal return,
+    /// early `break` from receiver-drop, panic on this function's
+    /// own frame) — that's what keeps a "the worker went home"
+    /// event from leaving detached fetch tasks running.
     async fn run_async_pool_worker(
         dataset: Arc<MultiBackendDataset>,
         tx: mpsc::Sender<Result<Vec<Bytes>, DatasetError>>,
@@ -227,121 +244,137 @@ impl AsyncPoolDataLoader {
         dataset_len: usize,
         cancel_token: Option<CancellationToken>,
     ) -> Result<()> {
-        type RequestFuture = Pin<
-            Box<dyn std::future::Future<Output = (usize, Result<Bytes, anyhow::Error>)> + Send>,
-        >;
+        // Child of the external token when supplied; otherwise a
+        // fresh independent token. Cancelling the child does NOT
+        // cancel the parent, so users' external tokens are safe from
+        // us; but the child DOES get cancelled when the parent does.
+        let internal_token = match &cancel_token {
+            Some(ext) => ext.child_token(),
+            None => CancellationToken::new(),
+        };
+        // Belt: cancel on any function exit path.
+        let _drop_cancel = DropCancel(internal_token.clone());
 
-        let mut pending_requests: FuturesUnordered<RequestFuture> = FuturesUnordered::new();
+        type SpawnedFetch = JoinHandle<(usize, Result<Bytes, anyhow::Error>)>;
+
+        let mut pending_requests: FuturesUnordered<SpawnedFetch> = FuturesUnordered::new();
         let mut next_index = 0;
         let mut completed_data = std::collections::HashMap::new();
         let mut current_batch = Vec::new();
         let total_items = dataset_len;
         let timeout = pool_config.batch_timeout;
 
-        // Start initial pool of requests
-        for _ in 0..pool_config.pool_size.min(total_items) {
-            // Check cancellation before submitting initial requests
-            if let Some(ref token) = cancel_token {
-                if token.is_cancelled() {
-                    break;
-                }
-            }
-
-            if next_index < total_items {
-                if let Some(uri) = dataset.get_uri(next_index) {
-                    let store = dataset.store.clone();
-                    let uri = uri.to_string();
-                    let index = next_index;
-
-                    let fut: RequestFuture = Box::pin(async move {
-                        let result = match tokio::time::timeout(timeout, store.get(&uri)).await {
-                            Ok(Ok(data)) => Ok(data), // Return Bytes directly - zero-copy!
+        // Helper: build one spawned fetch task with cancellation wired
+        // through a select!. Returning the JoinHandle keeps the FuturesUnordered
+        // homogeneous.
+        let spawn_fetch = |index: usize| -> SpawnedFetch {
+            let uri = dataset.get_uri(index).unwrap_or_default().to_string();
+            let store = dataset.store.clone();
+            let token = internal_token.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    // Cancellation arm: dropping the fetch future
+                    // aborts the in-flight I/O.
+                    _ = token.cancelled() => {
+                        (index, Err(anyhow::anyhow!("Request cancelled")))
+                    }
+                    // Fetch arm.
+                    r = tokio::time::timeout(timeout, store.get(&uri)) => {
+                        let result = match r {
+                            Ok(Ok(data)) => Ok(data),
                             Ok(Err(e)) => Err(anyhow::anyhow!("Store error: {}", e)),
                             Err(_) => Err(anyhow::anyhow!("Request timeout after {:?}", timeout)),
                         };
                         (index, result)
-                    });
-                    pending_requests.push(fut);
-                    next_index += 1;
+                    }
                 }
+            })
+        };
+
+        // Start initial pool of requests.
+        for _ in 0..pool_config.pool_size.min(total_items) {
+            if internal_token.is_cancelled() {
+                break;
+            }
+            if next_index < total_items && dataset.get_uri(next_index).is_some() {
+                pending_requests.push(spawn_fetch(next_index));
+                next_index += 1;
             }
         }
 
-        // Process completions and maintain pool
+        // Process completions and maintain pool.
         while !pending_requests.is_empty() {
-            // Check cancellation before processing next completion
-            if let Some(ref token) = cancel_token {
-                if token.is_cancelled() {
-                    break;
-                }
+            if internal_token.is_cancelled() {
+                break;
             }
 
-            if let Some((index, result)) = pending_requests.next().await {
-                match result {
-                    Ok(data) => {
-                        completed_data.insert(index, data);
+            let join_res = match pending_requests.next().await {
+                Some(r) => r,
+                None => continue,
+            };
 
-                        // Add more requests to maintain pool size
-                        if next_index < total_items {
-                            // Check cancellation before submitting new requests
-                            if let Some(ref token) = cancel_token {
-                                if token.is_cancelled() {
-                                    // Don't submit new requests, but continue processing pending ones
-                                    continue;
-                                }
-                            }
+            // Convert a spawned-task outcome into a (index, Result<Bytes>)
+            // pair. A panic in the fetch surfaces as JoinError::is_panic() —
+            // we translate it into a DatasetError::Backend so the caller
+            // sees the error instead of silent truncation (audit §2.1's
+            // "bonus fix").
+            let (index, result) = match join_res {
+                Ok(pair) => pair,
+                Err(join_err) if join_err.is_panic() => {
+                    let msg = format!("fetch task panicked: {}", join_err);
+                    let _ = tx
+                        .send(Err(DatasetError::Backend(anyhow::anyhow!(msg))))
+                        .await;
+                    // A panicked task can't tell us its index, so the
+                    // pool bookkeeping (completed_data, batching)
+                    // can't recover it. Break to end gracefully.
+                    break;
+                }
+                Err(_) => {
+                    // Cancelled or otherwise — happens during shutdown.
+                    // The DropCancel + select! path is the intended
+                    // shutdown flow; skip silently and continue draining.
+                    continue;
+                }
+            };
 
-                            if let Some(uri) = dataset.get_uri(next_index) {
-                                let store = dataset.store.clone();
-                                let uri = uri.to_string();
-                                let req_index = next_index;
+            match result {
+                Ok(data) => {
+                    completed_data.insert(index, data);
 
-                                let fut: RequestFuture = Box::pin(async move {
-                                    let result = match tokio::time::timeout(
-                                        timeout,
-                                        store.get(&uri),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(data)) => Ok(data), // Return Bytes directly - zero-copy!
-                                        Ok(Err(e)) => Err(anyhow::anyhow!("Store error: {}", e)),
-                                        Err(_) => Err(anyhow::anyhow!(
-                                            "Request timeout after {:?}",
-                                            timeout
-                                        )),
-                                    };
-                                    (req_index, result)
-                                });
-                                pending_requests.push(fut);
-                                next_index += 1;
-                            }
-                        }
+                    // Refill: submit another fetch if items remain and
+                    // we haven't been asked to stop taking new work.
+                    if next_index < total_items
+                        && !internal_token.is_cancelled()
+                        && dataset.get_uri(next_index).is_some()
+                    {
+                        pending_requests.push(spawn_fetch(next_index));
+                        next_index += 1;
+                    }
 
-                        // Try to form batches from completed data (out-of-order completion)
-                        while current_batch.len() < batch_size && !completed_data.is_empty() {
-                            // Take any available completed item (out-of-order)
-                            if let Some(&key) = completed_data.keys().next() {
-                                let data = completed_data.remove(&key).unwrap();
-                                current_batch.push(data);
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Send complete batch
-                        if current_batch.len() == batch_size
-                            && tx
-                                .send(Ok(std::mem::take(&mut current_batch)))
-                                .await
-                                .is_err()
-                        {
-                            break; // Receiver dropped
+                    // Try to form batches from completed data (out-of-order completion).
+                    while current_batch.len() < batch_size && !completed_data.is_empty() {
+                        if let Some(&key) = completed_data.keys().next() {
+                            let data = completed_data.remove(&key).unwrap();
+                            current_batch.push(data);
+                        } else {
+                            break;
                         }
                     }
-                    Err(e) => {
-                        if tx.send(Err(DatasetError::Backend(e))).await.is_err() {
-                            break; // Receiver dropped
-                        }
+
+                    // Send complete batch.
+                    if current_batch.len() == batch_size
+                        && tx
+                            .send(Ok(std::mem::take(&mut current_batch)))
+                            .await
+                            .is_err()
+                    {
+                        break; // Receiver dropped
+                    }
+                }
+                Err(e) => {
+                    if tx.send(Err(DatasetError::Backend(e))).await.is_err() {
+                        break; // Receiver dropped
                     }
                 }
             }
