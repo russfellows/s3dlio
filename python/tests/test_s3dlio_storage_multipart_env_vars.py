@@ -30,35 +30,35 @@ import types
 import pytest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 
 def _install_fake_dlio_benchmark():
     """Register minimal fake dlio_benchmark.* submodules in sys.modules
     so `import dlio_benchmark.common.constants` etc. succeeds without the
     real package installed. Returns nothing; idempotent."""
-    if 'dlio_benchmark' in sys.modules:
+    if "dlio_benchmark" in sys.modules:
         return
 
-    dlio_benchmark = types.ModuleType('dlio_benchmark')
+    dlio_benchmark = types.ModuleType("dlio_benchmark")
 
-    common = types.ModuleType('dlio_benchmark.common')
-    constants = types.ModuleType('dlio_benchmark.common.constants')
-    constants.MODULE_STORAGE = 'storage'
-    enumerations = types.ModuleType('dlio_benchmark.common.enumerations')
+    common = types.ModuleType("dlio_benchmark.common")
+    constants = types.ModuleType("dlio_benchmark.common.constants")
+    constants.MODULE_STORAGE = "storage"
+    enumerations = types.ModuleType("dlio_benchmark.common.enumerations")
 
     class NamespaceType:
-        FLAT = 'flat'
+        FLAT = "flat"
 
     class MetadataType:
-        FILE = 'file'
-        DIRECTORY = 'directory'
+        FILE = "file"
+        DIRECTORY = "directory"
 
     enumerations.NamespaceType = NamespaceType
     enumerations.MetadataType = MetadataType
 
-    storage = types.ModuleType('dlio_benchmark.storage')
-    storage_handler = types.ModuleType('dlio_benchmark.storage.storage_handler')
+    storage = types.ModuleType("dlio_benchmark.storage")
+    storage_handler = types.ModuleType("dlio_benchmark.storage.storage_handler")
 
     class Namespace:
         def __init__(self, name, ns_type):
@@ -80,15 +80,15 @@ def _install_fake_dlio_benchmark():
     # "wins" the idempotent `if 'dlio_benchmark' in sys.modules: return`
     # guard, so every installer must register the full set every other
     # DLIO test file needs, regardless of pytest collection order.
-    s3_storage_mod = types.ModuleType('dlio_benchmark.storage.s3_storage')
+    s3_storage_mod = types.ModuleType("dlio_benchmark.storage.s3_storage")
 
     class S3Storage(DataStorage):
         pass
 
     s3_storage_mod.S3Storage = S3Storage
 
-    utils = types.ModuleType('dlio_benchmark.utils')
-    utility = types.ModuleType('dlio_benchmark.utils.utility')
+    utils = types.ModuleType("dlio_benchmark.utils")
+    utility = types.ModuleType("dlio_benchmark.utils.utility")
 
     class _NullProfileDecorator:
         def __call__(self, fn):
@@ -102,27 +102,35 @@ def _install_fake_dlio_benchmark():
 
     utility.Profile = Profile
 
-    sys.modules['dlio_benchmark'] = dlio_benchmark
-    sys.modules['dlio_benchmark.common'] = common
-    sys.modules['dlio_benchmark.common.constants'] = constants
-    sys.modules['dlio_benchmark.common.enumerations'] = enumerations
-    sys.modules['dlio_benchmark.storage'] = storage
-    sys.modules['dlio_benchmark.storage.storage_handler'] = storage_handler
-    sys.modules['dlio_benchmark.storage.s3_storage'] = s3_storage_mod
-    sys.modules['dlio_benchmark.utils'] = utils
-    sys.modules['dlio_benchmark.utils.utility'] = utility
+    sys.modules["dlio_benchmark"] = dlio_benchmark
+    sys.modules["dlio_benchmark.common"] = common
+    sys.modules["dlio_benchmark.common.constants"] = constants
+    sys.modules["dlio_benchmark.common.enumerations"] = enumerations
+    sys.modules["dlio_benchmark.storage"] = storage
+    sys.modules["dlio_benchmark.storage.storage_handler"] = storage_handler
+    sys.modules["dlio_benchmark.storage.s3_storage"] = s3_storage_mod
+    sys.modules["dlio_benchmark.utils"] = utils
+    sys.modules["dlio_benchmark.utils.utility"] = utility
 
 
 _install_fake_dlio_benchmark()
 
 import s3dlio  # noqa: E402  (real module; put_bytes()/MultipartUploadWriter are mocked per-test)
 from s3dlio.integrations.dlio import s3dlio_storage  # noqa: E402
+from s3dlio.integrations.dlio import s3_torch_storage  # noqa: E402
 
 
 def _make_storage():
     store = object.__new__(s3dlio_storage.S3dlioStorage)
     store.prefix = "s3://bucket"
     return store
+
+
+def _make_torch_storage():
+    """S3PyTorchConnectorStorage.put_data() passes `id` straight through
+    (no self._make_uri call, unlike S3dlioStorage) -- no attributes need
+    to be set up beyond bypassing __init__."""
+    return object.__new__(s3_torch_storage.S3PyTorchConnectorStorage)
 
 
 ENV_VARS = (
@@ -153,8 +161,10 @@ class TestMultipartEnvVarWiring:
         """No env vars set -- a tiny object stays on the single-PUT path,
         exactly like before B10 (regression guard on the default)."""
         store = _make_storage()
-        with mock.patch.object(s3dlio, "put_bytes") as mock_put_bytes, \
-             mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls:
+        with (
+            mock.patch.object(s3dlio, "put_bytes") as mock_put_bytes,
+            mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls,
+        ):
             store.put_data("key", b"tiny-object")
 
         mock_put_bytes.assert_called_once_with("s3://bucket/key", b"tiny-object")
@@ -168,8 +178,10 @@ class TestMultipartEnvVarWiring:
         os.environ["S3DLIO_MULTIPART_THRESHOLD_MB"] = "0"
         store = _make_storage()
         mock_writer = mock.MagicMock()
-        with mock.patch.object(s3dlio, "put_bytes") as mock_put_bytes, \
-             mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls:
+        with (
+            mock.patch.object(s3dlio, "put_bytes") as mock_put_bytes,
+            mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls,
+        ):
             mock_writer_cls.from_uri.return_value = mock_writer
             store.put_data("key", b"tiny-object")
 
@@ -183,8 +195,10 @@ class TestMultipartEnvVarWiring:
         os.environ["S3DLIO_MULTIPART_THRESHOLD_MB"] = "0"
         os.environ["S3DLIO_DISABLE_MULTIPART"] = "true"
         store = _make_storage()
-        with mock.patch.object(s3dlio, "put_bytes") as mock_put_bytes, \
-             mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls:
+        with (
+            mock.patch.object(s3dlio, "put_bytes") as mock_put_bytes,
+            mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls,
+        ):
             store.put_data("key", b"tiny-object")
 
         mock_put_bytes.assert_called_once_with("s3://bucket/key", b"tiny-object")
@@ -200,8 +214,10 @@ class TestMultipartEnvVarWiring:
         os.environ["S3DLIO_MULTIPART_MAX_IN_FLIGHT"] = "3"
         store = _make_storage()
         mock_writer = mock.MagicMock()
-        with mock.patch.object(s3dlio, "put_bytes"), \
-             mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls:
+        with (
+            mock.patch.object(s3dlio, "put_bytes"),
+            mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls,
+        ):
             mock_writer_cls.from_uri.return_value = mock_writer
             store.put_data("key", b"tiny-object")
 
@@ -210,5 +226,71 @@ class TestMultipartEnvVarWiring:
         assert kwargs["max_in_flight"] == 3
 
 
-if __name__ == '__main__':
-    sys.exit(pytest.main([__file__, '-v']))
+class TestTorchStorageMultipartEnvVarWiring:
+    """Same bug (audit #153 bug 3.2 / B6), same fix, second file:
+    s3_torch_storage.py::S3PyTorchConnectorStorage.put_data(). Prior to
+    B6 this method had NO multipart path at all -- every write, of any
+    size, went through a single s3dlio.put_bytes() call, hitting the S3
+    5 GiB single-PUT limit for large checkpoint/dataset objects."""
+
+    def test_default_threshold_small_object_uses_put_bytes(self):
+        store = _make_torch_storage()
+        with (
+            mock.patch.object(s3dlio, "put_bytes") as mock_put_bytes,
+            mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls,
+        ):
+            store.put_data("s3://bucket/key", b"tiny-object")
+
+        mock_put_bytes.assert_called_once_with("s3://bucket/key", b"tiny-object")
+        mock_writer_cls.from_uri.assert_not_called()
+
+    def test_threshold_zero_forces_multipart_even_for_tiny_object(self):
+        """Pre-B6, there was no threshold check of any kind -- put_data()
+        always called put_bytes() regardless of this env var."""
+        os.environ["S3DLIO_MULTIPART_THRESHOLD_MB"] = "0"
+        store = _make_torch_storage()
+        mock_writer = mock.MagicMock()
+        with (
+            mock.patch.object(s3dlio, "put_bytes") as mock_put_bytes,
+            mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls,
+        ):
+            mock_writer_cls.from_uri.return_value = mock_writer
+            store.put_data("s3://bucket/key", b"tiny-object")
+
+        mock_put_bytes.assert_not_called()
+        mock_writer_cls.from_uri.assert_called_once()
+        mock_writer.close.assert_called_once()
+
+    def test_disable_switch_forces_put_bytes_even_when_threshold_is_zero(self):
+        os.environ["S3DLIO_MULTIPART_THRESHOLD_MB"] = "0"
+        os.environ["S3DLIO_DISABLE_MULTIPART"] = "true"
+        store = _make_torch_storage()
+        with (
+            mock.patch.object(s3dlio, "put_bytes") as mock_put_bytes,
+            mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls,
+        ):
+            store.put_data("s3://bucket/key", b"tiny-object")
+
+        mock_put_bytes.assert_called_once_with("s3://bucket/key", b"tiny-object")
+        mock_writer_cls.from_uri.assert_not_called()
+
+    def test_part_size_and_max_in_flight_env_vars_are_passed_through(self):
+        os.environ["S3DLIO_MULTIPART_THRESHOLD_MB"] = "0"
+        os.environ["S3DLIO_MULTIPART_PART_SIZE_MB"] = "5"
+        os.environ["S3DLIO_MULTIPART_MAX_IN_FLIGHT"] = "3"
+        store = _make_torch_storage()
+        mock_writer = mock.MagicMock()
+        with (
+            mock.patch.object(s3dlio, "put_bytes"),
+            mock.patch.object(s3dlio, "MultipartUploadWriter") as mock_writer_cls,
+        ):
+            mock_writer_cls.from_uri.return_value = mock_writer
+            store.put_data("s3://bucket/key", b"tiny-object")
+
+        _, kwargs = mock_writer_cls.from_uri.call_args
+        assert kwargs["part_size"] == 5 * 1024 * 1024
+        assert kwargs["max_in_flight"] == 3
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

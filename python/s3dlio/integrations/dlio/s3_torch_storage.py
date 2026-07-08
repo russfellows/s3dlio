@@ -33,6 +33,8 @@ from dlio_benchmark.storage.s3_storage import S3Storage
 from dlio_benchmark.common.enumerations import NamespaceType, MetadataType
 from dlio_benchmark.utils.utility import Profile
 
+from . import _multipart_config
+
 dlp = Profile(MODULE_STORAGE)
 
 
@@ -215,6 +217,14 @@ class S3PyTorchConnectorStorage(S3Storage):
         """
         Write data to storage.
 
+        Objects below the S3DLIO_MULTIPART_THRESHOLD_MB threshold (default
+        32 MiB) use a single PUT for lowest overhead.  Objects at or above
+        use MultipartUploadWriter for maximum throughput and to avoid the
+        S3 5 GiB single-PUT limit.  See
+        s3dlio.integrations.dlio._multipart_config for the full env var
+        contract (S3DLIO_MULTIPART_THRESHOLD_MB, S3DLIO_MULTIPART_PART_SIZE_MB,
+        S3DLIO_MULTIPART_MAX_IN_FLIGHT, S3DLIO_DISABLE_MULTIPART).
+
         Args:
             id: Full URI (e.g., s3://bucket/key, az://container/blob, file:///path)
             data: bytes or BytesIO object
@@ -233,7 +243,27 @@ class S3PyTorchConnectorStorage(S3Storage):
             content = data
 
         try:
-            s3dlio.put_bytes(id, content)
+            size = len(content)
+            threshold = _multipart_config.multipart_threshold_bytes()
+            if _multipart_config.multipart_disabled() or size < threshold:
+                # Single PUT — no three-phase overhead, matches library default behaviour.
+                s3dlio.put_bytes(id, content)
+            else:
+                # Multipart upload — higher throughput for large objects,
+                # avoids the S3 5 GiB single-PUT limit (audit #153 bug 3.2 / B6).
+                part_size = _multipart_config.multipart_part_size_bytes()
+                writer = s3dlio.MultipartUploadWriter.from_uri(
+                    id,
+                    part_size=part_size,
+                    max_in_flight=_multipart_config.multipart_max_in_flight(),
+                    abort_on_drop=True,
+                )
+                offset_pos = 0
+                while offset_pos < size:
+                    n = min(part_size, size - offset_pos)
+                    writer.write(content[offset_pos : offset_pos + n])
+                    offset_pos += n
+                writer.close()
             return None
         except Exception as e:
             print(f"Error writing to {id}: {e}")
