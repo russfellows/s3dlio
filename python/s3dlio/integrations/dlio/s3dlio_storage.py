@@ -387,11 +387,23 @@ class S3dlioStorage(DataStorage):
             BytesView: Zero-copy view into Rust-allocated memory (buffer protocol)
         """
         uri = self._make_uri(id)
-        
+
+        # Locked contract (audit #153 f4, docs/implementation-plans/
+        # v0.9.109-audit-fix-plan.md bug B5): offset and length are each
+        # independently optional per this method's own docstring, but the
+        # old `if offset is not None and length is not None` guard only
+        # took the get_range() path when BOTH were given. offset-only or
+        # length-only silently fell through to a full-object get(),
+        # returning the wrong bytes with no error. s3dlio.get_range()'s
+        # own contract already treats length=None as "read to end of
+        # object", so passing it straight through here is correct.
         try:
-            if offset is not None and length is not None:
-                # Return BytesView directly - zero-copy!
+            if offset is not None:
+                # offset given; length may be None (read to end) or set.
                 return s3dlio.get_range(uri, offset=offset, length=length)
+            elif length is not None:
+                # length-only: read the first `length` bytes from the start.
+                return s3dlio.get_range(uri, offset=0, length=length)
             else:
                 # Return BytesView directly - zero-copy!
                 return s3dlio.get(uri)

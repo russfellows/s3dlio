@@ -247,9 +247,18 @@ class S3PyTorchConnectorStorage(S3Storage):
             offset: Start byte offset (optional)
             length: Number of bytes to read (optional)
         """
+        # Locked contract (audit #153 f4, docs/implementation-plans/
+        # v0.9.109-audit-fix-plan.md bug B5) -- same fix as
+        # s3dlio_storage.py's get_data: offset and length are each
+        # independently optional per this method's docstring, but the old
+        # `and`-guard only took the get_range() path when BOTH were
+        # given, silently returning the full object for offset-only or
+        # length-only calls.
         try:
-            if offset is not None and length is not None:
+            if offset is not None:
                 return s3dlio.get_range(id, offset=offset, length=length)
+            elif length is not None:
+                return s3dlio.get_range(id, offset=0, length=length)
             else:
                 return s3dlio.get(id)
         except Exception as e:
