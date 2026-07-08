@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-659-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.106-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.108-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,15 +10,19 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.106 — Write integrity for every object write, opt-in (mlcommons/storage#593)**
+> **v0.9.108 — Performance & concurrency audit — 17 fixes across 4 phases (issue #148)**
 >
-> s3dlio can guard object writes with HEAD-after-write verification and automatic retry, protecting against backends that return a successful `PUT` / `CompleteMultipartUpload` response for an object that isn't actually fully stored.  This is **opt-in, disabled by default** — it adds a round-trip per object, and most backends don't need it.  Enable with `S3DLIO_PUT_VERIFY=true` (single-part `put_bytes`/`put_bytes_async`) and/or `S3DLIO_MPU_PUT_VERIFY=true` (multipart `MultipartUploadWriter`); the two flags are independent.  `MultipartUploadWriter` also fixed two error-handling bugs: `__exit__` now raises `RuntimeError` instead of silently discarding upload failures, and per-part `DEBUG` logging is available via `RUST_LOG=s3dlio=debug`.
+> Resolves the full [issue #148](https://github.com/russfellows/s3dlio/issues/148) audit: task-level parallelism at 9 sites, drain-first-then-first-error at 4 short-circuit sites, peak-memory halving in range assembly at 4 sites, HTTP/2 opt-in reversal (**BREAKING for `https://`** — see below), streaming connector via `SdkBody::from_body_1_x`, and a shared `retry_get_body` helper for body-transfer failures with a fault-injection regression test locking in the audit §2.4 silent-data-corruption gate.
 >
-> Full env-var reference: [docs/Environment_Variables.md](docs/Environment_Variables.md) — "Data Integrity: Write Verification and Retry".  See [docs/Changelog.md](docs/Changelog.md) for full details.
+> **Measured impact** against a local ~40 GB/s fake-S3 target: 3.8× on bulk mixed workload with 64 KB objects at high concurrency; 2.1× on single-object range GET at 256 MiB; ~15–20% wins in the 256 KB–1 MB range; wire-bound (no-op, no regression) at 8 MB+. Full before/after tables in [`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md`](docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md).
+>
+> **BREAKING CHANGE:** `https://` no longer negotiates HTTP/2 by default. It now matches `http://` — HTTP/1.1 unless explicitly opted in via `S3DLIO_HTTPS_H2=1` (per-scheme) or `S3DLIO_ENABLE_HTTP2=1` (master switch). See [docs/Changelog.md](docs/Changelog.md) for full detail.
+>
+> Audit and rationale: [`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148.md`](docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148.md).
+>
+> **v0.9.106 (prior):** Write verification (`S3DLIO_PUT_VERIFY`, `S3DLIO_MPU_PUT_VERIFY`) changed from always-on to opt-in (mlcommons/storage#593 follow-up).
 >
 > **v0.9.102 (prior):** SDK error-chain diagnostics + cold-start timeout / retry knobs (mlcommons/storage#506).
->
-> **v0.9.100 (prior):** General-purpose object data loader — `PyDataset.from_uris()`, `items()`, `collect_batch()`, `skip_head` HEAD optimisation.  See [docs/Python_Data-Loader.md](docs/Python_Data-Loader.md).
 
 ## 📦 Installation
 
