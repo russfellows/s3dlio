@@ -952,6 +952,17 @@ pub async fn get_object_range_uri_async(
         "get_object_range: uri='{}', offset={}, length={:?}",
         uri, offset, length
     );
+    // Locked contract (audit #152 f42, docs/implementation-plans/
+    // v0.9.109-audit-fix-plan.md bug B2): `length=Some(0)` must return
+    // zero bytes without a network call. The range-string builder below
+    // only overwrote the default `bytes={offset}-` (open-ended, meaning
+    // "to end of object") inside `if len > 0`, so a caller asking for
+    // zero bytes silently got the entire remainder of the object
+    // instead.
+    if length == Some(0) {
+        return Ok(Bytes::new());
+    }
+
     let client = aws_s3_client_async().await?;
     let mut range = format!("bytes={}-", offset);
     if let Some(len) = length {
@@ -999,6 +1010,16 @@ pub async fn get_object_range_uri_timed_async(
     if key.is_empty() {
         bail!("Cannot GET range: no key specified");
     }
+    // Same length=Some(0) fast path as get_object_range_uri_async (bug B2)
+    // — return zero bytes / zero durations without a network call.
+    if length == Some(0) {
+        return Ok((
+            Bytes::new(),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        ));
+    }
+
     let client = aws_s3_client_async().await?;
     let mut range = format!("bytes={}-", offset);
     if let Some(len) = length {
@@ -1089,7 +1110,22 @@ pub async fn get_object_concurrent_range_async(
             bucket, key
         ))?;
 
-    let object_size = head_resp.content_length().unwrap_or(0) as u64;
+    // Locked contract (audit #152 f37, docs/implementation-plans/
+    // v0.9.109-audit-fix-plan.md bug B3): a HEAD that succeeds but omits
+    // Content-Length (seen on some S3-compatible backends behind a
+    // 307-redirect proxy, or a gateway that strips the header) must NOT
+    // be silently coerced to object_size=0 — `unwrap_or(0)` did that,
+    // which then tripped the `start_offset >= object_size` guard below
+    // and returned an empty Bytes with Ok status for an object that
+    // actually has data. Surface the anomaly instead.
+    let object_size = head_resp.content_length().ok_or_else(|| {
+        anyhow::anyhow!(
+            "HEAD for s3://{}/{} succeeded but returned no Content-Length header \
+             — cannot determine object size for a range GET",
+            bucket,
+            key
+        )
+    })? as u64;
 
     // Calculate actual range
     let start_offset = offset;
@@ -1911,11 +1947,24 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
             .send()
             .await
         {
-            Ok(resp) => {
-                let sz = resp.content_length().unwrap_or(0) as u64;
-                get_size_cache().put(uri.to_string(), sz).await;
-                sz
-            }
+            // Locked contract (audit #152 f37, bug B3): a HEAD that
+            // succeeds but omits Content-Length must not be cached as
+            // size=0 (unwrap_or(0) did that here) — that poisons the
+            // ObjectSizeCache for every subsequent call to this URI and
+            // routes small-object reads through range-GET machinery
+            // with a bogus zero-byte range. Treat "no Content-Length"
+            // the same as a HEAD failure: fall back to a plain GET
+            // without caching anything.
+            Ok(resp) => match resp.content_length() {
+                Some(sz) => {
+                    let sz = sz as u64;
+                    get_size_cache().put(uri.to_string(), sz).await;
+                    sz
+                }
+                None => {
+                    return get_object(&bucket, &key).await;
+                }
+            },
             Err(_) => {
                 // HEAD failed: fall back to single GET without range splitting.
                 return get_object(&bucket, &key).await;

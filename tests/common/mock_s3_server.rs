@@ -65,6 +65,11 @@ pub const UPLOAD_PART_FAILS_MARKER: &str = "part-fails";
 /// `<Error>` list instead of `<Deleted>`.
 pub const DELETE_FAILS_MARKER: &str = "delete-fails";
 
+/// Key substring marker that makes the mock server's HeadObject response
+/// omit the `Content-Length` header entirely (still HTTP 200) — used to
+/// reproduce bug B3 (a HEAD that succeeds but doesn't report a size).
+pub const NO_CONTENT_LENGTH_MARKER: &str = "no-content-length";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -77,6 +82,8 @@ pub struct PathCallCounts {
     pub complete_calls: usize,
     pub abort_calls: usize,
     pub abort_failures_returned: usize,
+    pub get_calls: usize,
+    pub head_calls: usize,
 }
 
 #[derive(Clone, Default)]
@@ -328,13 +335,34 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         return xml_response(StatusCode::OK, xml);
     }
 
-    // HeadObject (used by S3DLIO_MPU_PUT_VERIFY — not exercised by A2/A3,
-    // but harmless to answer so any accidental call doesn't hang).
+    // HeadObject (used by S3DLIO_MPU_PUT_VERIFY, and by concurrent-range
+    // GET's size lookup — bug B3). A key containing NO_CONTENT_LENGTH_MARKER
+    // gets a 200 with no Content-Length header at all, reproducing the
+    // "HEAD succeeded but didn't report a size" scenario.
     if method == Method::HEAD {
+        state.record(&path, |c| c.head_calls += 1);
+        if path.contains(NO_CONTENT_LENGTH_MARKER) {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+        }
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Length", "0")
             .body(Full::new(Bytes::new()))
+            .unwrap();
+    }
+
+    // GetObject (plain or ranged): GET on a key path with no other
+    // matched query shape. Tracked so tests can assert a fast-path
+    // return (e.g. length=Some(0), bug B2) never reached the network.
+    if method == Method::GET {
+        state.record(&path, |c| c.get_calls += 1);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Length", "4")
+            .body(Full::new(Bytes::from_static(b"mock")))
             .unwrap();
     }
 
