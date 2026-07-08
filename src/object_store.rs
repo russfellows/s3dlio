@@ -1159,7 +1159,19 @@ impl S3ObjectStore {
             })?;
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
-                    if re.is_match(key) || key.starts_with(&prefix_str) {
+                    // Locked contract (audit #154 f24, docs/implementation-plans/
+                    // v0.9.109-audit-fix-plan.md bug B7): the regex must match
+                    // against the key's tail PAST the prefix, not the whole
+                    // key. `key.starts_with(&prefix_str)` was always true here
+                    // (S3 was already queried with `prefix(prefix_str)`), which
+                    // made the `||` a vacuous OR and the regex dead code —
+                    // every key under the prefix passed regardless of whether
+                    // it matched `final_pattern`.
+                    let tail_matches = key
+                        .strip_prefix(prefix_str.as_str())
+                        .map(|rest| re.is_match(rest))
+                        .unwrap_or(false);
+                    if tail_matches {
                         keys.push(format!("s3://{}/{}", bucket, key));
                     }
                 }

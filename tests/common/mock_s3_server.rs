@@ -253,6 +253,32 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         return xml_response(StatusCode::OK, &xml);
     }
 
+    // ListObjectsV2: GET /{bucket}?list-type=2&prefix=...
+    //
+    // Always returns exactly two synthetic keys under whatever prefix was
+    // requested: "{prefix}bar" and "{prefix}other/deep.dat" — chosen so a
+    // test can pass a `key_prefix` ending in `/bar` and get one key whose
+    // tail-past-prefix matches the resulting regex ("bar") and one whose
+    // tail doesn't ("other/deep.dat"), directly reproducing the B7 dead-
+    // filter scenario from the audit (`list("s3://bucket/foo/bar")`
+    // returning `foo/other/deep.dat` alongside `foo/bar`).
+    if method == Method::GET && query.contains("list-type=2") {
+        let prefix = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("prefix="))
+            .map(percent_decode)
+            .unwrap_or_default();
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
+             <Name>mock-bucket</Name><Prefix>{prefix}</Prefix>\
+             <KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
+             <Contents><Key>{prefix}bar</Key></Contents>\
+             <Contents><Key>{prefix}other/deep.dat</Key></Contents>\
+             </ListBucketResult>"
+        );
+        return xml_response(StatusCode::OK, &xml);
+    }
+
     // CreateMultipartUpload: POST .../{key}?uploads[=...]
     if method == Method::POST && query.contains("uploads") && !query.contains("uploadId") {
         state.record(&path, |c| c.create_calls += 1);
@@ -337,6 +363,29 @@ fn error_response(status: StatusCode, code: &str) -> Response<Full<Bytes>> {
         .header("content-type", "application/xml")
         .body(Full::new(Bytes::from(xml)))
         .unwrap()
+}
+
+/// Minimal `%XX` percent-decoder for query-string values — good enough
+/// for the ASCII prefixes this test harness uses (slashes, hyphens,
+/// alphanumerics); not a general URL-decoding implementation.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Extract every `<tag>value</tag>` occurrence's inner text from a flat
