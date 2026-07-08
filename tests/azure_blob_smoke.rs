@@ -81,7 +81,7 @@ async fn put_get_list_stat_delete_smoke() -> Result<()> {
 
     // get
     let got = client.get(&key).await?;
-    assert_eq!(&got[..], &payload[..], "roundtrip mismatch");
+    assert_eq!(got, payload, "roundtrip mismatch");
     assert_eq!(crc32(&got), crc_in, "crc mismatch after GET");
 
     // stat
@@ -103,7 +103,7 @@ async fn put_get_list_stat_delete_smoke() -> Result<()> {
     assert_eq!(&rng[..], &payload[start as usize..=end as usize]);
 
     // cleanup
-    client.delete_objects(&vec![key.clone()]).await?;
+    client.delete_objects(std::slice::from_ref(&key)).await?;
     Ok(())
 }
 
@@ -134,10 +134,7 @@ async fn multipart_stream_upload_roundtrip() -> Result<()> {
     let crc_in = crc32(&data);
 
     // Build a stream of Bytes chunks
-    let chunks: Vec<Bytes> = data
-        .chunks(part_size)
-        .map(|c| Bytes::copy_from_slice(c))
-        .collect();
+    let chunks: Vec<Bytes> = data.chunks(part_size).map(Bytes::copy_from_slice).collect();
 
     let stream = stream::iter(chunks);
 
@@ -165,7 +162,7 @@ async fn multipart_stream_upload_roundtrip() -> Result<()> {
     }
 
     // cleanup
-    client.delete_objects(&vec![key.clone()]).await?;
+    client.delete_objects(std::slice::from_ref(&key)).await?;
     Ok(())
 }
 

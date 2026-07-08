@@ -139,7 +139,7 @@ pub fn set_gcs_rapid_mode(force: Option<bool>) {
 pub fn get_gcs_channel_count() -> usize {
     #[cfg(feature = "backend-gcs")]
     {
-        return google_gcs_client::get_gcs_channel_count();
+        google_gcs_client::get_gcs_channel_count()
     }
     #[cfg(not(feature = "backend-gcs"))]
     {
@@ -156,7 +156,7 @@ pub fn get_gcs_channel_count() -> usize {
 pub fn get_gcs_rapid_mode() -> Option<bool> {
     #[cfg(feature = "backend-gcs")]
     {
-        return google_gcs_client::get_gcs_rapid_mode();
+        google_gcs_client::get_gcs_rapid_mode()
     }
     #[cfg(not(feature = "backend-gcs"))]
     {

@@ -13,8 +13,8 @@ mod range_engine_defaults {
     #[test]
     fn test_azure_config_default_range_engine_disabled() {
         let config = AzureConfig::default();
-        assert_eq!(
-            config.enable_range_engine, false,
+        assert!(
+            !config.enable_range_engine,
             "AzureConfig::default() should have enable_range_engine=false (v0.9.6+)"
         );
         println!("✅ AzureConfig: RangeEngine disabled by default");
@@ -23,8 +23,8 @@ mod range_engine_defaults {
     #[test]
     fn test_gcs_config_default_range_engine_disabled() {
         let config = GcsConfig::default();
-        assert_eq!(
-            config.enable_range_engine, false,
+        assert!(
+            !config.enable_range_engine,
             "GcsConfig::default() should have enable_range_engine=false (v0.9.6+)"
         );
         println!("✅ GcsConfig: RangeEngine disabled by default");
@@ -33,8 +33,8 @@ mod range_engine_defaults {
     #[test]
     fn test_file_config_default_range_engine_disabled() {
         let config = FileSystemConfig::default();
-        assert_eq!(
-            config.enable_range_engine, false,
+        assert!(
+            !config.enable_range_engine,
             "FileSystemConfig::default() should have enable_range_engine=false (v0.9.6+)"
         );
         println!("✅ FileSystemConfig: RangeEngine disabled by default");
@@ -43,8 +43,8 @@ mod range_engine_defaults {
     #[test]
     fn test_directio_config_default_range_engine_disabled() {
         let config = DirectIOConfig::default();
-        assert_eq!(
-            config.enable_range_engine, false,
+        assert!(
+            !config.enable_range_engine,
             "DirectIOConfig::default() should have enable_range_engine=false (v0.9.6+)"
         );
         println!("✅ DirectIOConfig (default): RangeEngine disabled");
@@ -53,8 +53,8 @@ mod range_engine_defaults {
     #[tokio::test]
     async fn test_directio_config_direct_io_range_engine_disabled() {
         let config = DirectIOConfig::direct_io();
-        assert_eq!(
-            config.enable_range_engine, false,
+        assert!(
+            !config.enable_range_engine,
             "DirectIOConfig::direct_io() should have enable_range_engine=false (v0.9.6+)"
         );
         println!("✅ DirectIOConfig (direct_io): RangeEngine disabled");
@@ -63,8 +63,8 @@ mod range_engine_defaults {
     #[tokio::test]
     async fn test_directio_config_high_performance_range_engine_disabled() {
         let config = DirectIOConfig::high_performance();
-        assert_eq!(
-            config.enable_range_engine, false,
+        assert!(
+            !config.enable_range_engine,
             "DirectIOConfig::high_performance() should have enable_range_engine=false (v0.9.6+)"
         );
         println!("✅ DirectIOConfig (high_performance): RangeEngine disabled");

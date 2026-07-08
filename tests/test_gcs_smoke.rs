@@ -43,7 +43,7 @@ async fn test_gcs_put_get_delete_small() -> Result<()> {
 
     // Upload
     println!("📤 PUT: Uploading 1MB...");
-    store.put(&test_uri, test_data.clone().into()).await?;
+    store.put(&test_uri, test_data.clone()).await?;
 
     // Download - should use simple download (below 4MB threshold)
     println!("📥 GET: Downloading 1MB (simple download)...");
@@ -81,7 +81,7 @@ async fn test_gcs_put_get_delete_large_rangeengine() -> Result<()> {
     // Upload
     println!("📤 PUT: Uploading 128MB...");
     let start = std::time::Instant::now();
-    store.put(&test_uri, test_data.clone().into()).await?;
+    store.put(&test_uri, test_data.clone()).await?;
     let upload_time = start.elapsed();
     println!(
         "   Upload: {:.2} MB/s",
@@ -140,7 +140,7 @@ async fn test_gcs_get_range() -> Result<()> {
 
     // Upload
     println!("📤 PUT: Uploading 10KB pattern data...");
-    store.put(&test_uri, test_data.clone().into()).await?;
+    store.put(&test_uri, test_data.clone()).await?;
 
     // Test range read: bytes 1024-2047 (1KB starting at offset 1024)
     println!("📥 GET_RANGE: Reading bytes 1024-2047...");
@@ -187,7 +187,7 @@ async fn test_gcs_stat() -> Result<()> {
 
     // Upload
     println!("📤 PUT: Uploading 5MB...");
-    store.put(&test_uri, test_data.clone().into()).await?;
+    store.put(&test_uri, test_data.clone()).await?;
 
     // Stat
     println!("📊 STAT: Getting metadata...");
@@ -233,7 +233,7 @@ async fn test_gcs_list() -> Result<()> {
 
     println!("📤 PUT: Creating 3 test files...");
     for uri in &test_uris {
-        store.put(uri, test_data.clone().into()).await?;
+        store.put(uri, test_data.clone()).await?;
     }
 
     // List
