@@ -344,6 +344,14 @@ Standard AWS environment variables are also supported:
 
 > **Behavior change (v0.9.109).** Before this release, ANY first-path-segment with 2+ dots, a leading digit, or containing `minio`/`ceph`/`localhost` as a substring was misrouted as an endpoint — even though all of those are legal S3 bucket name shapes (e.g. `mycompany.data.backups`, `2024-training-data`, `minio-tenant-a`). Those now correctly parse as bucket names. If you relied on the old broader heuristic to route a no-port, unusual-suffix endpoint hostname, either add a port to the URI or add your hostname's suffix to `S3DLIO_S3_ENDPOINT_HINT_TLDS`.
 
+### `s3://host:port/bucket/key` per-endpoint TLS detection (v0.9.110+)
+
+When a URI's authority contains an explicit `host:port`, s3dlio creates a dedicated per-endpoint S3 client (see above) and must guess `http` vs `https` from the port alone, since no other scheme hint is available in an `s3://` URI. Port 443 always uses `https`; every other port defaults to `http`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_S3_ENDPOINT_TLS_PORTS` | (unset) | Comma-separated list of additional port numbers to treat as TLS-terminated (`https`) — e.g. `export S3DLIO_S3_ENDPOINT_TLS_PORTS=9001,9443` makes `s3://minio.example:9001/bucket/key` use `https://minio.example:9001`. Useful when a load balancer or reverse proxy terminates TLS on a non-standard port. |
+
 ## Azure Blob Storage Configuration
 
 | Variable | Description |
