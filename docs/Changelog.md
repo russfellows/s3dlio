@@ -1,5 +1,160 @@
 # s3dlio Changelog
 
+## Version 0.9.109 — Multi-agent bug audit fix release (issues #151–#157, Phase A+B+C, 22 bugs)
+
+A follow-up multi-agent code audit (triggered by mlcommons/storage#715) found 39 bugs
+across 7 GitHub issues, ranging from silent data corruption to silent exception
+swallowing. This release closes the audit's release-floor + hardening scope — all of
+Phase A (silent-corruption/silent-commit bugs), Phase B (wrong-data / reachable
+bugs), and Phase C (silent-failure elimination) — 22 bugs in total. The remaining 17
+bugs (Phase D "hygiene", Phase E "edge cases", Phase F "env-var/config") are lower
+severity and tracked for v0.9.110.
+
+Full plan and locked contracts:
+[`docs/implementation-plans/v0.9.109-audit-fix-plan.md`](implementation-plans/v0.9.109-audit-fix-plan.md).
+Every fix below landed with a RED-then-GREEN regression test, verified to fail
+against the unmodified code for the exact reason the bug describes, then pass after
+the fix (parent CLAUDE.md §6).
+
+### Behavior changes — read before upgrading
+
+- **`parse_s3_uri_full` endpoint-detection heuristic narrowed (B8, issue #154).**
+  Previously, an `s3://` URI's first path segment was treated as a custom endpoint
+  hostname if it merely contained 2+ dots, started with a digit, or contained
+  `minio`/`ceph`/`localhost` as a substring — misrouting legitimate bucket names
+  using those shapes (e.g. `mycompany.data.backups`, `2024-training-data`,
+  `minio-tenant-a`). As of this release the heuristic only fires on a colon (port),
+  a dotted-quad IPv4 address, or a recognized hostname-like suffix (configurable via
+  the new `S3DLIO_S3_ENDPOINT_HINT_TLDS` env var). If you relied on the old broader
+  heuristic to route a no-port, unusual-suffix endpoint hostname, either add a port
+  to the URI or add your hostname's suffix to `S3DLIO_S3_ENDPOINT_HINT_TLDS`. See
+  `docs/Environment_Variables.md`.
+- **`round_robin` DLIO endpoint selection now rank-based (B9, issue #153).**
+  `S3dlioStorage`'s `round_robin` load-balance strategy previously used
+  `pid % N` — not round-robin at all (a static per-process value unrelated to MPI
+  rank). It now uses `rank % N` when an MPI/SLURM/PMI rank env var is present
+  (falling back to the old pid-based behavior, now logged, only when no rank var is
+  available). `use_mpi_endpoint_distribution=true` and
+  `load_balance_strategy=round_robin` now collapse to the same assignment whenever a
+  rank var is present.
+- **DLIO storage `create_node`/`delete_node` no longer swallow arbitrary errors
+  (C1–C3, issue #153).** `walk_node()` now propagates listing errors instead of
+  returning `[]`; `create_node(exist_ok=True)` only treats `FileExistsError` as
+  success (everything else propagates, even with `exist_ok=True`);
+  `delete_node()` only treats `FileNotFoundError` as success. If your code depended
+  on these methods silently swallowing real errors (auth failures, network errors,
+  "not implemented" backends), you will now see exceptions where you previously saw
+  `[]`/`True`/`False`.
+
+### New environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `S3DLIO_S3_ENDPOINT_HINT_TLDS` | Comma-separated extra suffixes for the narrowed endpoint-detection heuristic (B8). |
+| `S3DLIO_MULTIPART_THRESHOLD_MB` | Single-PUT vs multipart threshold for `S3dlioStorage`/`S3PyTorchConnectorStorage` (B6/B10) — reuses the name already used by DLIO's own `obj_store_lib.py`. |
+| `S3DLIO_MULTIPART_PART_SIZE_MB` | Multipart part size for the same two DLIO storage backends (B6/B10). |
+| `S3DLIO_MULTIPART_MAX_IN_FLIGHT` | Multipart concurrent-part limit for the same two backends (B6/B10). |
+| `S3DLIO_DISABLE_MULTIPART` | Explicit switch to force single-PUT-only behavior regardless of size (B6/B10). |
+
+See `docs/Environment_Variables.md` for defaults and full semantics.
+
+### Phase A — Silent data corruption / silent commit (4 bugs, issue #151)
+
+- **A1 (2.1)** `RangeEngine::download_with_ranges` tolerated a length-mismatched
+  chunk with a `tracing::warn!` and truncated the assembled buffer instead of
+  erroring — a short/over read on a middle range silently corrupted downloaded
+  data. Now a hard error.
+- **A2 (1.1)** `MultipartUploadWriter`'s `Drop` impl let the coordinator task fall
+  through to `CompleteMultipartUpload` even when `abort_on_drop=false` was set,
+  committing a partial object the caller explicitly asked to discard. The
+  coordinator is now always cancelled on drop; `abort_on_drop` only gates the
+  best-effort S3-side `AbortMultipartUpload` call.
+- **A3 (1.2)** `abort_blocking()` discarded the `AbortMultipartUpload` result via
+  `let _ = ...` and never stopped the coordinator, so an explicit `.abort()` call
+  could still race to `CompleteMultipartUpload`. Now always cancels the coordinator
+  first and logs (`tracing::warn!`, naming bucket/key/upload_id) if the best-effort
+  S3-side abort itself fails.
+- **A4 (4.5)** `S3Ops::delete_objects` / `s3_utils::delete_objects_async` treated any
+  HTTP 200 response as full success, ignoring per-object `<Error>` entries in the
+  `DeleteObjects` response body — objects could silently fail to delete. Now
+  inspects `output.errors()` and bails with the per-key failure detail when
+  non-empty.
+
+### Phase B — Wrong data / reachable from public API (10 sub-bugs across 7 items, issues #152–#154)
+
+- **B1 (2.2)** `get_object_range_uri_async` (and 4 downstream callers) did a bare
+  `send()`+`collect()` with no retry wrap — a Phase 4b (v0.9.108) regression: once
+  response bodies started streaming, a mid-body connection failure (TCP FIN, HTTP/2
+  RST) aborted the whole GET instead of retrying, because smithy's own retry only
+  covers complete failed responses. Now wrapped in the shared `retry_get_body`
+  helper.
+- **B2 (2.3)** `length=Some(0)` range GETs left the range-header builder on its
+  open-ended `bytes={offset}-` branch, silently downloading the entire remainder of
+  the object instead of zero bytes. Now short-circuits to `Ok(Bytes::new())` with no
+  network call.
+- **B3 (2.4)** A HEAD response missing `Content-Length` was treated as size `0` via
+  `.unwrap_or(0)`, silently truncating range reads and poisoning the object-size
+  cache for all subsequent calls. Now a proper error (or, for the optimized-GET
+  cache path, a fallback to a fresh plain GET without poisoning the cache).
+- **B4 (2.5+2.6+2.7)** `get_range()` in the S3, Azure, and community-GCS backends
+  each computed the range end as bare `offset + length - 1`, underflowing (panic in
+  debug, wrap in release) when `length=Some(0)`. Fixed via a shared, checked
+  `range_end_inclusive()` helper plus a `length=Some(0)` fast path at all three
+  sites.
+- **B5 (3.6)** `S3dlioStorage`/`S3PyTorchConnectorStorage`'s `get_data()` only took
+  the `get_range()` path when BOTH `offset` and `length` were given, silently
+  returning the full object for offset-only or length-only calls (both documented
+  as independently optional). Fixed to route through `get_range()` whenever either
+  is given.
+- **B6 (3.2)** `S3PyTorchConnectorStorage.put_data()` had no multipart path at all —
+  every write, any size, went through a single `put_bytes()` call, hitting the S3
+  5 GiB single-PUT limit. Now shares the same env-var-driven multipart threshold as
+  `S3dlioStorage` (see B10).
+- **B7 (4.4)** `S3ObjectStore::list_with_client`'s regex filter was
+  `re.is_match(key) || key.starts_with(prefix)` — since the S3 API is already
+  queried with that prefix, every returned key trivially starts with it, making the
+  regex check dead code. Fixed to match the regex against the key's tail past the
+  prefix.
+- **B8 (4.1)** See "Behavior changes" above.
+- **B9 (3.10)** See "Behavior changes" above.
+- **B10 (3.1)** The mlcommons/storage#715 seed bug: `S3dlioStorage`'s multipart
+  threshold/part-size/max-in-flight were hardcoded module constants with no env-var
+  override. See "New environment variables" above.
+
+### Phase C — Silent failure elimination (6 bugs, issues #151/#153/#156/#157)
+
+- **C1 (3.3)** `walk_node()` in both DLIO storage backends caught any listing
+  exception and returned `[]` — indistinguishable from "legitimately empty". Now
+  logs and propagates.
+- **C2 (3.4)** `create_node(exist_ok=True)` caught any exception from
+  `s3dlio.mkdir` and returned `True`. Now only `FileExistsError` is treated as
+  success.
+- **C3 (3.5)** `delete_node()` caught any exception from `s3dlio.delete` and
+  returned `False`. Now only `FileNotFoundError` is treated as success.
+- **C4 (1.4)** Investigated and confirmed already resolved as a side effect of
+  A2/A3: `PyMultipartUploadWriter.__exit__`'s `let _ = ...abort_blocking()` calls
+  look like they discard a failure signal, but `abort_blocking()` is infallible by
+  contract as of A3 (always `Ok`, with the real S3-side failure already logged
+  internally) — documented in place, no behavior change needed.
+- **C5 (5.3)** The official-GCS-client `delete_objects` logged a panicked/cancelled
+  delete task via `tracing::warn!` but never counted it toward the failure total,
+  so the function could return `Ok(())` even though an object was never actually
+  deleted. Now counted identically to a task's own reported delete failure.
+- **C6 (6.1)** `try_read_range_direct`'s to-end-of-file branch panicked via
+  `std::fs::metadata(path).unwrap()` (e.g. a TOCTOU-unlinked file) and via a bare
+  `metadata.len() - offset` underflow when `offset` exceeded the file's actual
+  size — either panic defeated the caller's O_DIRECT/fallback-to-regular-I/O
+  design, since a panic isn't caught by that `match`. Both are now clean errors.
+
+### Quality gate
+
+Every fix above: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
+(and, for the two GCS/Azure-gated fixes, `--features backend-gcs` /
+`--features backend-azure,gcs-community` clippy+build checks), `cargo test --lib`
+(348 passing, up from 341 at the start of this session), plus the relevant targeted
+integration test(s) and the Python DLIO-integration suite (`ruff check`, `ruff
+format --check`, `python -m compileall`, `uv run pytest`) all clean.
+
 ## Version 0.9.108 — Performance & concurrency audit (issue #148, all four phases)
 
 Resolves all 17 in-scope items from the issue #148 audit
