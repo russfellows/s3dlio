@@ -23,6 +23,39 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+/// Build the HTTP-tuning env vars passed to each spawned worker from
+/// `MpGetConfig`'s `max_http_connections`/`optimized_http` fields.
+///
+/// audit #157 bug 7.1 (F1): this previously wrote
+/// `S3DLIO_MAX_HTTP_CONNECTIONS` and `S3DLIO_USE_OPTIMIZED_HTTP` -- names
+/// that no read site anywhere in the crate recognized, silently discarding
+/// both `Runner::max_http_connections()` and `Runner::optimized_http()`.
+/// Writes the env vars the HTTP client builder actually reads instead (see
+/// `reqwest_client.rs`): [`crate::constants::ENV_POOL_MAX_IDLE_PER_HOST`]
+/// for connection pool size, [`crate::constants::ENV_S3DLIO_ENABLE_HTTP2`]
+/// for the HTTP/2 master switch. Extracted as a pure function so the
+/// mapping is directly unit-testable without spawning a real child
+/// process.
+fn http_tuning_env_vars(
+    max_http_connections: Option<usize>,
+    optimized_http: bool,
+) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    if let Some(max_http) = max_http_connections {
+        vars.push((
+            crate::constants::ENV_POOL_MAX_IDLE_PER_HOST.to_string(),
+            max_http.to_string(),
+        ));
+    }
+    if optimized_http {
+        vars.push((
+            crate::constants::ENV_S3DLIO_ENABLE_HTTP2.to_string(),
+            "true".to_string(),
+        ));
+    }
+    vars
+}
+
 /// Configuration for multi-process GET operations
 #[derive(Debug, Clone)]
 pub struct MpGetConfig {
@@ -220,18 +253,13 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
             env_vars.push(("S3DLIO_RT_THREADS".to_string(), rt_threads.to_string()));
         }
 
-        // Set max HTTP connections
-        if let Some(max_http) = cfg.max_http_connections {
-            env_vars.push((
-                "S3DLIO_MAX_HTTP_CONNECTIONS".to_string(),
-                max_http.to_string(),
-            ));
-        }
-
-        // Set optimized HTTP
-        if cfg.optimized_http {
-            env_vars.push(("S3DLIO_USE_OPTIMIZED_HTTP".to_string(), "true".to_string()));
-        }
+        // audit #157 bug 7.1 (F1): see http_tuning_env_vars() -- this used to
+        // write dead env var names that no code anywhere in the crate ever
+        // read.
+        env_vars.extend(http_tuning_env_vars(
+            cfg.max_http_connections,
+            cfg.optimized_http,
+        ));
 
         // Apply environment variables
         for (key, value) in env_vars {
@@ -592,6 +620,46 @@ mod tests {
         // Sharding should be deterministic
         let shards2 = shard_keys(&keys, 2);
         assert_eq!(shards, shards2);
+    }
+
+    // RED-then-GREEN regression tests for s3dlio issue #157 bug 7.1 (F1).
+    //
+    // Bug: worker env vars were built from S3DLIO_MAX_HTTP_CONNECTIONS and
+    // S3DLIO_USE_OPTIMIZED_HTTP -- names no read site in the crate ever
+    // recognized, so Runner::max_http_connections()/optimized_http() had
+    // zero effect on spawned workers.
+
+    #[test]
+    fn http_tuning_env_vars_uses_the_real_pool_size_var_name() {
+        let vars = http_tuning_env_vars(Some(200), false);
+        assert_eq!(
+            vars,
+            vec![(
+                crate::constants::ENV_POOL_MAX_IDLE_PER_HOST.to_string(),
+                "200".to_string()
+            )],
+            "must write the env var reqwest_client.rs actually reads for pool sizing, \
+             not the dead S3DLIO_MAX_HTTP_CONNECTIONS name"
+        );
+    }
+
+    #[test]
+    fn http_tuning_env_vars_uses_the_real_http2_var_name() {
+        let vars = http_tuning_env_vars(None, true);
+        assert_eq!(
+            vars,
+            vec![(
+                crate::constants::ENV_S3DLIO_ENABLE_HTTP2.to_string(),
+                "true".to_string()
+            )],
+            "must write the env var reqwest_client.rs actually reads for the HTTP/2 \
+             switch, not the dead S3DLIO_USE_OPTIMIZED_HTTP name"
+        );
+    }
+
+    #[test]
+    fn http_tuning_env_vars_empty_when_nothing_configured() {
+        assert_eq!(http_tuning_env_vars(None, false), Vec::new());
     }
 
     #[test]

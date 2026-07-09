@@ -252,6 +252,38 @@ impl LogEntry {
     }
 }
 
+/// Capacity (in log entries) of the bounded channel that feeds the
+/// background writer thread; entries are dropped via `try_send()` once
+/// full.
+///
+/// audit #157 bug 7.3 (F3): this previously defaulted to 256, while
+/// `docs/Environment_Variables.md` documented 8192 -- a 32x mismatch. Under
+/// a moderately fast burst of ops the 256-slot channel filled and started
+/// silently dropping entries at a fraction of the load the docs promised.
+/// Corrected the code default to match the documented value rather than
+/// weakening the docs to match the smaller, operationally worse default.
+fn oplog_channel_capacity() -> usize {
+    std::env::var("S3DLIO_OPLOG_BUF")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192)
+}
+
+/// Byte capacity of the `BufWriter` used for the op-log file.
+///
+/// audit #157 bug 7.3 (F3): `docs/Environment_Variables.md` documented a
+/// default of 4096 bytes, but the code default is 256 KiB (262144) -- a
+/// buffered-I/O size, not an entry count, chosen to avoid flushing on
+/// every write. Corrected the docs to match this code default rather than
+/// shrinking the buffer 64x (which would increase flush frequency and hurt
+/// write throughput for no benefit).
+fn oplog_write_buffer_capacity() -> usize {
+    std::env::var("S3DLIO_OPLOG_WBUFCAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256 * 1024)
+}
+
 /// Handle for sending log entries and waiting on shutdown.
 #[derive(Debug)]
 pub struct Logger {
@@ -290,14 +322,8 @@ impl Logger {
                 let (sender, receiver): (SyncSender<LogEntry>, Receiver<LogEntry>) = sync_channel(256);
         */
         // Tunable buffer sizes via (env) variables:
-        let cap: usize = std::env::var("S3DLIO_OPLOG_BUF")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256);
-        let wbuf: usize = std::env::var("S3DLIO_OPLOG_WBUFCAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256 * 1024);
+        let cap: usize = oplog_channel_capacity();
+        let wbuf: usize = oplog_write_buffer_capacity();
         let level: i32 = std::env::var("S3DLIO_OPLOG_LEVEL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -388,5 +414,57 @@ impl Logger {
                 eprintln!("op-log channel full; dropping entry: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod oplog_buffer_default_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Mutex to serialize tests that manipulate the shared process-wide
+    // S3DLIO_OPLOG_BUF / S3DLIO_OPLOG_WBUFCAP env vars.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // RED-then-GREEN regression tests for s3dlio issue #157 bug 7.3 (F3).
+    //
+    // Bug: code and docs disagreed on both buffer defaults. Assert the
+    // code defaults match the values documented in
+    // docs/Environment_Variables.md (which was corrected in the same
+    // commit as this fix).
+
+    #[test]
+    fn channel_capacity_default_matches_documented_8192() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        #[allow(deprecated)]
+        std::env::remove_var("S3DLIO_OPLOG_BUF");
+        assert_eq!(
+            oplog_channel_capacity(),
+            8192,
+            "S3DLIO_OPLOG_BUF's code default must match the documented default"
+        );
+    }
+
+    #[test]
+    fn write_buffer_capacity_default_matches_documented_262144() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        #[allow(deprecated)]
+        std::env::remove_var("S3DLIO_OPLOG_WBUFCAP");
+        assert_eq!(
+            oplog_write_buffer_capacity(),
+            256 * 1024,
+            "S3DLIO_OPLOG_WBUFCAP's code default must match the documented default"
+        );
+    }
+
+    #[test]
+    fn channel_capacity_env_override_still_works() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        #[allow(deprecated)]
+        std::env::set_var("S3DLIO_OPLOG_BUF", "42");
+        let result = oplog_channel_capacity();
+        #[allow(deprecated)]
+        std::env::remove_var("S3DLIO_OPLOG_BUF");
+        assert_eq!(result, 42);
     }
 }

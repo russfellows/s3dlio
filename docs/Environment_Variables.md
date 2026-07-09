@@ -317,8 +317,8 @@ export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `S3DLIO_OPLOG_LOSSLESS` | `false` | Enable lossless operation logging (higher memory usage) |
-| `S3DLIO_OPLOG_BUF` | `8192` | Operation log buffer capacity |
-| `S3DLIO_OPLOG_WBUFCAP` | `4096` | Write buffer capacity for operation logging |
+| `S3DLIO_OPLOG_BUF` | `8192` | Bounded channel capacity, in log *entries*, between the calling thread and the background writer thread. Entries are dropped (with an stderr warning) once full, unless `S3DLIO_OPLOG_LOSSLESS=true`. |
+| `S3DLIO_OPLOG_WBUFCAP` | `262144` | `BufWriter` capacity, in *bytes*, for the op-log output file. A larger buffer flushes to disk less often. (v0.9.110: corrected from a previously-documented `4096`, which never matched the code default — see Version History.) |
 | `S3DLIO_OPLOG_LEVEL` | `1` | Operation logging level (0=off, 1=basic, 2=verbose) |
 
 ## AWS Configuration
@@ -525,27 +525,32 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 > `S3DLIO_MAX_HTTP_CONNECTIONS`, `S3DLIO_HTTP_IDLE_TIMEOUT_MS`,
 > `S3DLIO_MAX_CONCURRENCY`, `S3DLIO_CONNECTION_TIMEOUT`,
 > `S3DLIO_READ_TIMEOUT`, `S3DLIO_MULTIPART_THRESHOLD`, or
-> `S3DLIO_PART_SIZE`.  **None of these are read by s3dlio source code as of
-> v0.9.102.**  Use the wired equivalents above
-> (`S3DLIO_POOL_MAX_IDLE_PER_HOST`, `S3DLIO_POOL_IDLE_TIMEOUT_SECS`,
+> `S3DLIO_PART_SIZE` as env vars to export directly. **None of these are
+> read as env vars by s3dlio source code.** (v0.9.110: the Rust-only
+> `mp::Runner` builder API's `.max_http_connections()`/`.optimized_http()`
+> methods now translate to the real wired vars below when spawning worker
+> processes — see Changelog — but exporting `S3DLIO_MAX_HTTP_CONNECTIONS`
+> or `S3DLIO_USE_OPTIMIZED_HTTP` yourself still has no effect for `s3-cli`,
+> Python, or any other direct usage.) Use the wired equivalents below
+> instead: `S3DLIO_POOL_MAX_IDLE_PER_HOST`, `S3DLIO_POOL_IDLE_TIMEOUT_SECS`,
 > `S3DLIO_CONNECT_TIMEOUT_SECS`, `S3DLIO_OPERATION_TIMEOUT_SECS`,
-> `S3DLIO_RANGE_CONCURRENCY`) instead.
+> `S3DLIO_RANGE_CONCURRENCY`, `S3DLIO_ENABLE_HTTP2`.
 
 ### For Many Small Objects
 - **Disable range optimization**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` (enabled by default since v0.9.60)
-- Use `S3DLIO_USE_OPTIMIZED_HTTP=true` 
-- Set `S3DLIO_MAX_HTTP_CONNECTIONS=200-400`
+- Enable `S3DLIO_ENABLE_HTTP2=1` for HTTP/2 multiplexing over one connection
+- Set `S3DLIO_POOL_MAX_IDLE_PER_HOST=200-400`
 - Increase `S3DLIO_RT_THREADS` for better parallelism
 
 ### For Bandwidth-Limited Networks
 - Reduce `S3DLIO_RANGE_CONCURRENCY` to 8-16
-- Increase `S3DLIO_HTTP_IDLE_TIMEOUT_MS` to 2000-5000
-- Use moderate `S3DLIO_MAX_HTTP_CONNECTIONS=100`
+- Increase `S3DLIO_POOL_IDLE_TIMEOUT_SECS` to 60-120
+- Use moderate `S3DLIO_POOL_MAX_IDLE_PER_HOST=100`
 
 ### For High-Latency Networks
 - Increase `S3DLIO_OPERATION_TIMEOUT_SECS` to 300-600
-- Use `S3DLIO_HTTP_IDLE_TIMEOUT_MS=5000` or higher
-- Enable `S3DLIO_USE_OPTIMIZED_HTTP=true` for better connection reuse
+- Use `S3DLIO_POOL_IDLE_TIMEOUT_SECS=120` or higher
+- Enable `S3DLIO_ENABLE_HTTP2=1` for better connection reuse
 
 ## Version History
 
