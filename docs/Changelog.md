@@ -128,15 +128,60 @@ See `docs/Environment_Variables.md` for defaults and full semantics.
 - **F1 (7.1)**, **F2 (7.4)**, **F3 (7.3)**, **F4 (7.2)** — see "New environment
   variables" and "Behavior changes" above.
 
+### Commits in this release
+
+v0.9.109 and v0.9.110 shipped together as one branch/PR (`fix/151-157-audit-v0.9.110`)
+covering the full 39-bug, 6-phase, 7-issue audit. Full commit list, oldest to newest:
+
+| Commit | Subject |
+|--------|---------|
+| `0c2174f` | docs(148-audit): add v0.9.109+v0.9.110 fix plan for issues #151-#157 |
+| `7eced7c` | fix(152): range engine silently corrupts buffer on short/over read (A1) |
+| `74f146b` | fix(151): multipart Drop silently commits partial upload (A2) |
+| `2d28441` | test(151): dedicated RED-then-GREEN coverage for abort_blocking() (A3) |
+| `c099032` | fix(154): delete_objects ignores S3 per-object error list (A4) |
+| `f0b2d64` | fix(154): list_with_client dead regex filter returns unrelated keys (B7) |
+| `52376ec` | fix(152): length=Some(0) downloads full remainder; missing HEAD Content-Length silently returns empty (B2+B3) |
+| `624d3a6` | fix(152): get_object_range_uri_async missing retry_get_body wrap (B1) |
+| `31f5d14` | fix(153): get_data AND-guard silently returns full object for offset-only or length-only reads (B5) |
+| `5314d18` | Adopt ruff for Python lint/format/compile gate; clean python/s3dlio/ |
+| `3b32a3f` | fix(152): u64 underflow in get_range() offset+length-1 across 3 backends (B4) |
+| `8f468b1` | fix(153): wire multipart threshold/part-size/max-in-flight via env vars (B10) |
+| `d1cc0cb` | fix(153): add multipart path to S3PyTorchConnectorStorage.put_data (B6) |
+| `2d69473` | fix(154): narrow parse_s3_uri_full endpoint-detection heuristic (B8) |
+| `97967dc` | fix(153): round_robin endpoint selection was a static PID hash, not round-robin (B9) |
+| `21ce506` | fix(153): eliminate silent exception-swallowing in walk/create/delete_node (C1-C3) |
+| `276c6b6` | docs(151): confirm __exit__'s abort_blocking() discard is already safe (C4) |
+| `f6fdf29` | fix(156): try_read_range_direct panics on missing file or offset past EOF (C6) |
+| `414a02b` | fix(157): official GCS delete_objects doesn't count panicked/cancelled tasks (C5) |
+| `3878fed` | release: bump version 0.9.108 → 0.9.109 for the audit fix release |
+| `85f4abf` | fix(157): GCS full-read retry loop had no backoff delay (D1) |
+| `a4bff42` | fix(157): GCS RAPID bucket detection cache poisoned by transient failures (D2) |
+| `5deb8fa` | fix(151): MPU_PUT_VERIFY treated a failed HEAD request as data corruption (D3) |
+| `f52248a` | fix(151): Azure multipart upload failure was silent -- no log, no cleanup note (D4) |
+| `e34314d` | fix(157): consolidate community-GCS put_object_multipart stub into put_object (D5) |
+| `b9f9e19` | fix(153): D6 write-loop abort + fix a pre-existing sys.path bug affecting every Python test's source resolution |
+| `753170f` | fix(153): S3PyTorchConnectorStorage.walk_node dropped subdirectory structure (D7) |
+| `07870ea` | fix(153): AWS_ENDPOINT_URL clobbered a user-set env value (D8) |
+| `1904579` | fix(range-engine): D9 — zero-sized object should succeed, not bail |
+| `2dc7f93` | fix(object-store): E1+E2 — URI scheme/endpoint detection edge cases |
+| `41da275` | fix(azure): E3 — client-side cap for Azure's 50,000-block-per-blob limit |
+| `4745ed3` | fix(direct-io): E4 — list() on a direct:// store returned file:// URIs |
+| `41bc847` | fix(env-vars): F1-F4 — dead knobs, doc/code default mismatches, PUT_MAX_RETRIES=0 clamp |
+| `618fa74` | chore(release): bump version 0.9.109 -> 0.9.110 + Changelog |
+| `fd3a953` | style: ruff-format test_dlio_storage_get_data_range.py |
+
 ### Quality gate
 
 Every fix above: `cargo fmt --check`, `cargo clippy --lib --bins --examples -- -D
 warnings` (CI's invocation) plus `cargo clippy --lib --tests --features
 backend-azure,backend-gcs,gcs-community -- -D warnings` and `cargo clippy --lib
---tests --features extension-module -- -D warnings` for the feature-gated fixes,
-`cargo test --lib` (368 passing default features / 453 with
-backend-azure,backend-gcs,gcs-community / 372 with extension-module, up from 349 at
-the start of this phase), plus the relevant targeted integration test(s) all clean.
+--tests --features extension-module -- -D warnings` for the feature-gated fixes.
+**748 tests passing** across the full suite (every `cargo test` binary — lib unit
+tests plus every `tests/*.rs` integration file — across the relevant feature
+combinations), up from 689 at the start of this work, plus the Python DLIO
+integration suite (`ruff check`, `ruff format --check`, `python -m compileall`,
+`uv run pytest`) all clean.
 
 ## Version 0.9.109 — Multi-agent bug audit fix release (issues #151–#157, Phase A+B+C, 22 bugs)
 
@@ -288,10 +333,12 @@ See `docs/Environment_Variables.md` for defaults and full semantics.
 
 Every fix above: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
 (and, for the two GCS/Azure-gated fixes, `--features backend-gcs` /
-`--features backend-azure,gcs-community` clippy+build checks), `cargo test --lib`
-(348 passing, up from 341 at the start of this session), plus the relevant targeted
-integration test(s) and the Python DLIO-integration suite (`ruff check`, `ruff
-format --check`, `python -m compileall`, `uv run pytest`) all clean.
+`--features backend-azure,gcs-community` clippy+build checks), plus the relevant
+targeted integration test(s) and the Python DLIO-integration suite (`ruff check`,
+`ruff format --check`, `python -m compileall`, `uv run pytest`) all clean. This
+version shipped in the same branch/PR as v0.9.110 (Phase D+E+F) — see that
+section above for the full commit list and the final total of **748 tests
+passing** across the whole suite.
 
 ## Version 0.9.108 — Performance & concurrency audit (issue #148, all four phases)
 
