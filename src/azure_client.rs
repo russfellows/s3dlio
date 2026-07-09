@@ -27,7 +27,7 @@ use azure_storage_blob::models::{
     BlockBlobClientCommitBlockListOptions, BlockBlobClientStageBlockOptions,
     BlockBlobClientUploadOptions, BlockList, BlockListType, BlockLookupList,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 // Global credential cache to avoid repeated authentication
 static AZURE_CREDENTIAL: OnceCell<Arc<dyn TokenCredential>> = OnceCell::const_new();
@@ -499,6 +499,20 @@ impl AzureBlob {
         }
 
         if let Some(e) = first_err {
+            // audit #151 bug 1.5 (D4): previously returned bare Err with
+            // no log at all — an operator watching logs had no way to
+            // tell a multipart Azure upload failed mid-stream, or how
+            // much was staged before it did. commit_block_list is never
+            // called in this branch, so the already-staged blocks stay
+            // uncommitted; Azure garbage-collects uncommitted blocks
+            // automatically (no explicit delete API exists for "just
+            // the uncommitted blocks" short of committing an empty/
+            // unrelated list, which risks clobbering any pre-existing
+            // committed data at this key — not attempted here).
+            warn!(
+                "{}",
+                staged_blocks_failure_warning(&self.container, key, committed_ids.len(), &e)
+            );
             return Err(e);
         }
 
@@ -513,6 +527,26 @@ impl AzureBlob {
             credential: self.credential.clone(),
         }
     }
+}
+
+/// Build the operator-visibility warning logged when
+/// `upload_multipart_stream` fails mid-stream (audit #151 bug 1.5 / D4).
+/// Extracted as a pure function — independent of any Azure client or
+/// network call — so its content (naming the container, blob key, and
+/// how many blocks were staged before the failure) is directly
+/// unit-testable without needing an Azure mock server, which this repo
+/// does not have (unlike the S3 mock harness in tests/common/).
+fn staged_blocks_failure_warning(
+    container: &str,
+    key: &str,
+    staged_count: usize,
+    err: &anyhow::Error,
+) -> String {
+    format!(
+        "s3dlio Azure MPU: upload_multipart_stream failed for container='{container}' key='{key}' \
+         after staging {staged_count} block(s) — those staged blocks were never committed and will \
+         be garbage-collected automatically by Azure: {err}"
+    )
 }
 
 /// Fold one spawned `stage_block` outcome into the first-error slot,
@@ -658,6 +692,52 @@ mod tests {
 
     // Mutex to serialize tests that modify environment variables
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // RED-then-GREEN regression tests for s3dlio issue #151 bug 1.5 (D4).
+    //
+    // Bug: upload_multipart_stream's failure branch returned a bare
+    // `Err(e)` with no log at all when a stage_block failed mid-stream
+    // -- an operator watching logs had no way to tell an Azure multipart
+    // upload failed, or how many blocks were staged (and left
+    // uncommitted, pending Azure's automatic GC) before it did.
+    //
+    // staged_blocks_failure_warning() is a pure function extracted from
+    // the failure branch specifically so its content is testable without
+    // an Azure mock server (this repo has one for S3, not Azure).
+
+    #[test]
+    fn staged_blocks_failure_warning_names_container_key_and_count() {
+        let err = anyhow::anyhow!("stage_block cancelled");
+        let msg = staged_blocks_failure_warning("my-container", "my-blob.bin", 7, &err);
+
+        assert!(
+            msg.contains("my-container"),
+            "warning must name the container: {msg}"
+        );
+        assert!(
+            msg.contains("my-blob.bin"),
+            "warning must name the blob key: {msg}"
+        );
+        assert!(
+            msg.contains('7'),
+            "warning must include the staged block count: {msg}"
+        );
+        assert!(
+            msg.contains("stage_block cancelled"),
+            "warning must include the underlying error: {msg}"
+        );
+    }
+
+    #[test]
+    fn staged_blocks_failure_warning_handles_zero_staged_blocks() {
+        // The very first block failed -- nothing was staged yet.
+        let err = anyhow::anyhow!("connection refused");
+        let msg = staged_blocks_failure_warning("c", "k", 0, &err);
+        assert!(
+            msg.contains('0'),
+            "warning must report 0 staged blocks: {msg}"
+        );
+    }
 
     #[test]
     fn test_account_url_from_account() {
