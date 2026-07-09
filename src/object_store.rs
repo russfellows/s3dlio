@@ -2787,20 +2787,21 @@ impl ObjectStore for GcsObjectStore {
         client.put_object(&bucket, &object, data).await
     }
 
-    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, _part_size: Option<usize>) -> Result<()> {
+        // audit #157 bug 5.4 (D5): the community GCS client has no real
+        // chunked/resumable upload implementation (see put_object's doc
+        // comment in gcs_client.rs) — `_part_size` has no effect and is
+        // accepted only to satisfy the ObjectStore trait's shared
+        // signature with the S3/Azure backends, which do support it.
         let (bucket, object) = parse_gcs_uri(uri)?;
-        let chunk_size = part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE);
         debug!(
-            "GcsObjectStore::put_multipart uri='{}', {} bytes, chunk_size={}",
+            "GcsObjectStore::put_multipart uri='{}', {} bytes (community GCS client has no \
+             chunked upload; routed to simple upload)",
             uri,
-            data.len(),
-            chunk_size
+            data.len()
         );
         let client = self.get_client().await?;
-        // Pass Bytes directly — put_object_multipart now takes Bytes, zero-copy end-to-end.
-        client
-            .put_object_multipart(&bucket, &object, data, chunk_size)
-            .await
+        client.put_object(&bucket, &object, data).await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
@@ -3074,27 +3075,19 @@ impl ObjectWriter for GcsBufferedWriter {
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
         let client = get_global_gcs_client().await?;
 
-        // Use multipart for large objects, simple put for small ones.
-        // `Bytes::from(Vec<u8>)` transfers ownership without copying — zero-cost.
-        // `std::mem::take` moves the buffer out so the encoder can be dropped too.
-        if self.buffer.len() > crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE {
-            client
-                .put_object_multipart(
-                    &bucket,
-                    &object,
-                    Bytes::from(std::mem::take(&mut self.buffer)),
-                    crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE,
-                )
-                .await
-        } else {
-            client
-                .put_object(
-                    &bucket,
-                    &object,
-                    Bytes::from(std::mem::take(&mut self.buffer)),
-                )
-                .await
-        }
+        // audit #157 bug 5.4 (D5): the community GCS client has no real
+        // chunked/resumable upload — both branches used to call
+        // functions with byte-for-byte identical bodies under different
+        // names. `Bytes::from(Vec<u8>)` transfers ownership without
+        // copying — zero-cost. `std::mem::take` moves the buffer out so
+        // the encoder can be dropped too.
+        client
+            .put_object(
+                &bucket,
+                &object,
+                Bytes::from(std::mem::take(&mut self.buffer)),
+            )
+            .await
     }
 
     fn bytes_written(&self) -> u64 {
