@@ -35,6 +35,54 @@ static EFFECTIVE_GCS_RAPID_MODE: std::sync::OnceLock<RapidMode> = std::sync::Onc
 const GCS_FULL_READ_REPAIR_MAX_ATTEMPTS: usize = 4;
 const GCS_FULL_READ_RETRY_MAX_ATTEMPTS: usize = 3;
 
+/// Exponential backoff delay for GCS full-read retry attempts.
+///
+/// audit #157 bug 5.1 (D1): the full-read retry loop in
+/// `get_object_via_grpc` previously retried immediately with no delay
+/// at all on a retryable error (e.g. UNAVAILABLE), hammering a
+/// transiently-overloaded or rate-limited endpoint on every attempt.
+/// Base 100ms, doubling per attempt (1-indexed: attempt 1 -> 100ms,
+/// attempt 2 -> 200ms, attempt 3 -> 400ms, ...), capped at 2s.
+fn gcs_retry_backoff_delay(attempt: usize) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(10) as u32; // generous cap on the shift itself; .min(2000) below is the real cap
+    let delay_ms = 100u64.saturating_mul(1u64 << exponent);
+    Duration::from_millis(delay_ms.min(2000))
+}
+
+/// Run `operation` up to `max_attempts` times (1-indexed attempt number
+/// passed to each call), sleeping `gcs_retry_backoff_delay(attempt)`
+/// between attempts whenever the error is retryable per
+/// `is_retryable_gcs_read_error` and attempts remain.
+///
+/// Extracted from `get_object_via_grpc`'s full-read retry loop
+/// (audit #157 bug 5.1 / D1) specifically so the backoff-timing
+/// contract is independently unit-testable: driving the real call site
+/// requires a live or mocked GCS gRPC `StorageControl` client, which
+/// isn't available in this test environment, but this function can be
+/// driven with a synthetic `operation` closure under a paused Tokio
+/// clock (`#[tokio::test(start_paused = true)]`) for exact, non-flaky
+/// timing assertions.
+async fn retry_with_backoff<T, Fut>(
+    max_attempts: usize,
+    mut operation: impl FnMut(usize) -> Fut,
+) -> Result<T>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match operation(attempt).await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < max_attempts && is_retryable_gcs_read_error(&e.to_string()) => {
+                tokio::time::sleep(gcs_retry_backoff_delay(attempt)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Desired gRPC subchannel count, set by the caller before the first GCS operation.
 ///
 /// This allows the CLI (or any library user) to auto-tune the connection count to
@@ -402,31 +450,21 @@ impl GcsClient {
     ) -> Result<Bytes> {
         let requested_range = range.clone();
         let (expected_size, mut data, mut chunk_count) = if requested_range == ReadRange::all() {
-            let mut attempt = 0usize;
-            loop {
-                attempt += 1;
-                match self
-                    .get_object_via_grpc_once(bucket_name, bucket, object, range.clone())
-                    .await
-                {
-                    Ok(result) => break result,
-                    Err(e)
-                        if attempt < GCS_FULL_READ_RETRY_MAX_ATTEMPTS
-                            && is_retryable_gcs_read_error(&e.to_string()) =>
-                    {
-                        info!(
-                            "GCS GET (gRPC) full-read attempt {}/{} failed for gs://{}/{}; retrying quickly: {}",
-                            attempt,
-                            GCS_FULL_READ_RETRY_MAX_ATTEMPTS,
-                            bucket,
-                            object,
+            retry_with_backoff(GCS_FULL_READ_RETRY_MAX_ATTEMPTS, |attempt| {
+                let range = range.clone();
+                async move {
+                    self.get_object_via_grpc_once(bucket_name, bucket, object, range)
+                        .await
+                        .map_err(|e| {
+                            info!(
+                                "GCS GET (gRPC) full-read attempt {}/{} failed for gs://{}/{}: {}",
+                                attempt, GCS_FULL_READ_RETRY_MAX_ATTEMPTS, bucket, object, e
+                            );
                             e
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
+                        })
                 }
-            }
+            })
+            .await?
         } else {
             self.get_object_via_grpc_once(bucket_name, bucket, object, range)
                 .await?
@@ -1901,6 +1939,105 @@ mod tests {
         assert!(is_retryable_gcs_read_error("UNAVAILABLE: upstream reset"));
         assert!(is_retryable_gcs_read_error("CANCELLED by peer"));
         assert!(!is_retryable_gcs_read_error("PERMISSION_DENIED"));
+    }
+
+    // RED-then-GREEN regression tests for s3dlio issue #157 bug 5.1 (D1).
+    //
+    // Bug: the full-read retry loop in get_object_via_grpc retried
+    // immediately on a retryable error (e.g. UNAVAILABLE) with no delay
+    // at all between attempts -- hammering a transiently-overloaded or
+    // rate-limited endpoint instead of backing off.
+    //
+    // gcs_retry_backoff_delay() is a pure function, so its exponential
+    // growth is directly and deterministically testable with no timing
+    // flakiness. retry_with_backoff() is the exact function
+    // get_object_via_grpc's full-read branch calls (extracted for this
+    // reason) -- tested here under a paused Tokio clock with a
+    // synthetic operation closure, since driving the real call site
+    // needs a live or mocked gRPC StorageControl client.
+
+    #[test]
+    fn gcs_retry_backoff_delay_grows_exponentially_and_caps() {
+        assert_eq!(gcs_retry_backoff_delay(1), Duration::from_millis(100));
+        assert_eq!(gcs_retry_backoff_delay(2), Duration::from_millis(200));
+        assert_eq!(gcs_retry_backoff_delay(3), Duration::from_millis(400));
+        assert_eq!(gcs_retry_backoff_delay(4), Duration::from_millis(800));
+        assert_eq!(gcs_retry_backoff_delay(5), Duration::from_millis(1600));
+        // Cap at 2s -- attempt 6 would be 3200ms uncapped.
+        assert_eq!(gcs_retry_backoff_delay(6), Duration::from_millis(2000));
+        assert_eq!(gcs_retry_backoff_delay(100), Duration::from_millis(2000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_sleeps_between_retryable_failures() {
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let start = tokio::time::Instant::now();
+
+        let attempts_clone = attempts.clone();
+        let result = retry_with_backoff(3, move |_attempt| {
+            let attempts = attempts_clone.clone();
+            async move {
+                let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err(anyhow!("UNAVAILABLE: simulated transient failure"))
+                } else {
+                    Ok("done")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "should have taken exactly 3 attempts (2 retries)"
+        );
+        // Two sleeps elapsed: gcs_retry_backoff_delay(1) + gcs_retry_backoff_delay(2)
+        // = 100ms + 200ms = 300ms of virtual time.
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_does_not_sleep_on_non_retryable_error() {
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let start = tokio::time::Instant::now();
+
+        let attempts_clone = attempts.clone();
+        let result: Result<()> = retry_with_backoff(3, move |_attempt| {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("PERMISSION_DENIED"))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a non-retryable error must not be retried"
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_gives_up_after_max_attempts() {
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let attempts_clone = attempts.clone();
+        let result: Result<()> = retry_with_backoff(3, move |_attempt| {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("UNAVAILABLE: always fails"))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[test]
