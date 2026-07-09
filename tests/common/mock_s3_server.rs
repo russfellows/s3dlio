@@ -76,6 +76,14 @@ pub const NO_CONTENT_LENGTH_MARKER: &str = "no-content-length";
 /// request rather than surfacing the first transient failure (bug B1).
 pub const GET_FAILS_ONCE_MARKER: &str = "get-fails-once";
 
+/// Key substring marker that makes the mock server's HeadObject handler
+/// return a 500 for every HEAD request on that key — used to reproduce
+/// a HEAD *request* failure (distinct from `NO_CONTENT_LENGTH_MARKER`,
+/// where the HEAD succeeds but omits a header) for bug D3: the
+/// S3DLIO_MPU_PUT_VERIFY HEAD check must not treat a failed
+/// verification *call* as proof the just-completed upload is corrupt.
+pub const HEAD_FAILS_MARKER: &str = "head-fails";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -358,6 +366,9 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     // "HEAD succeeded but didn't report a size" scenario.
     if method == Method::HEAD {
         state.record(&path, |c| c.head_calls += 1);
+        if path.contains(HEAD_FAILS_MARKER) {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockHeadObjectFailure");
+        }
         if path.contains(NO_CONTENT_LENGTH_MARKER) {
             return Response::builder()
                 .status(StatusCode::OK)

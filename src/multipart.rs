@@ -807,15 +807,30 @@ async fn coordinator_task(
         );
         total_bytes
     } else {
-        let head_ctx = format!("HeadObject after upload failed for s3://{}/{}", bucket, key);
-        let head = client
-            .head_object()
-            .bucket(&bucket)
-            .key(&key)
-            .send()
-            .await
-            .sdk_context(head_ctx)?;
-        head.content_length().unwrap_or(0) as u64
+        match client.head_object().bucket(&bucket).key(&key).send().await {
+            Ok(head) => head.content_length().unwrap_or(0) as u64,
+            Err(e) => {
+                // audit #151 bug 1.3 (D3): CompleteMultipartUpload above
+                // already succeeded (we have its ETag). A transient
+                // failure of the HEAD verification REQUEST ITSELF
+                // (network blip, throttling) is not evidence the object
+                // is corrupt — it's evidence the verification call
+                // failed. Treating it as a hard error here would delete
+                // a perfectly good object (the size-mismatch branch
+                // below does exactly that) on nothing more than a flaky
+                // HEAD. Soft-fail: warn and assume the upload is correct
+                // rather than manufacturing data-corruption handling out
+                // of an unrelated RPC hiccup.
+                warn!(
+                    "s3dlio MPU: HEAD verification request failed for s3://{}/{} \
+                     (CompleteMultipartUpload already succeeded, ETag={:?}) — assuming the \
+                     upload is correct rather than treating a failed verification call as \
+                     data corruption: {}",
+                    bucket, key, resp.e_tag, e
+                );
+                total_bytes
+            }
+        }
     };
 
     if verify_enabled && stored_bytes != total_bytes {
