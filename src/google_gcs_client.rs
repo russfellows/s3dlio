@@ -1156,7 +1156,7 @@ impl GcsClient {
         let sem = Arc::new(tokio::sync::Semaphore::new(GCS_MAX_CONCURRENT_DELETES));
         let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let mut futs = futures_util::stream::FuturesUnordered::new();
+        let futs = futures_util::stream::FuturesUnordered::new();
 
         for object in objects {
             let sem = sem.clone();
@@ -1181,12 +1181,7 @@ impl GcsClient {
             }));
         }
 
-        // Drain all futures
-        while let Some(result) = futures_util::StreamExt::next(&mut futs).await {
-            if let Err(e) = result {
-                tracing::warn!("Delete task panicked: {}", e);
-            }
-        }
+        drain_delete_tasks_counting_panics(futs, &failed).await;
 
         let fail_count = failed.load(std::sync::atomic::Ordering::Relaxed);
         if fail_count > 0 {
@@ -1212,6 +1207,104 @@ impl GcsClient {
         // GCS handles large-object chunking internally via `write_object_grpc`
         // (16 MiB chunks, concurrent producer).  Pass Bytes through unchanged.
         self.put_object(bucket, object, data).await
+    }
+}
+
+/// Drain all in-flight `delete_objects` tasks, counting BOTH per-object
+/// failures (already recorded via `failed.fetch_add` inside each task
+/// before this function ever observes anything) and task panics or
+/// cancellations (`JoinError`, surfaced here as `Err(result)`).
+///
+/// audit #157 bug 5.3 (C5): previously a panicked or cancelled delete
+/// task was logged via `tracing::warn!` but never counted toward
+/// `failed`, so `delete_objects` could return `Ok(())` even though one
+/// or more objects were never actually deleted (the task crashed before
+/// its own `failed.fetch_add` call could run). Extracted as a
+/// standalone function — rather than left as delete_objects' inline
+/// drain loop — so this panic-accounting contract is independently
+/// unit-testable with synthetic tasks: panicking a *real* spawned GCS
+/// delete task requires a live or mocked gRPC `StorageControl` client,
+/// which isn't available in this test environment, but a bare
+/// `tokio::spawn(async { panic!() })` exercises the exact same
+/// `JoinHandle`/`JoinError` mechanics this function depends on.
+async fn drain_delete_tasks_counting_panics(
+    mut futs: futures_util::stream::FuturesUnordered<tokio::task::JoinHandle<()>>,
+    failed: &Arc<AtomicUsize>,
+) {
+    while let Some(result) = futures_util::StreamExt::next(&mut futs).await {
+        if let Err(e) = result {
+            tracing::warn!("Delete task panicked or was cancelled: {}", e);
+            failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_objects_panic_accounting_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn panicked_task_is_counted_as_a_failure() {
+        let failed = Arc::new(AtomicUsize::new(0));
+        let futs = futures_util::stream::FuturesUnordered::new();
+        futs.push(tokio::spawn(async {
+            panic!("simulated delete task panic");
+        }));
+
+        drain_delete_tasks_counting_panics(futs, &failed).await;
+
+        assert_eq!(
+            failed.load(Ordering::Relaxed),
+            1,
+            "a panicked delete task must be counted as a failure, not silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_is_counted_as_a_failure() {
+        let failed = Arc::new(AtomicUsize::new(0));
+        let futs = futures_util::stream::FuturesUnordered::new();
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        handle.abort();
+        futs.push(handle);
+
+        drain_delete_tasks_counting_panics(futs, &failed).await;
+
+        assert_eq!(
+            failed.load(Ordering::Relaxed),
+            1,
+            "a cancelled delete task must be counted as a failure, not silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_tasks_are_not_counted() {
+        let failed = Arc::new(AtomicUsize::new(0));
+        let futs = futures_util::stream::FuturesUnordered::new();
+        for _ in 0..3 {
+            futs.push(tokio::spawn(async {}));
+        }
+
+        drain_delete_tasks_counting_panics(futs, &failed).await;
+
+        assert_eq!(failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_success_and_panic_counts_only_the_panic() {
+        let failed = Arc::new(AtomicUsize::new(0));
+        let futs = futures_util::stream::FuturesUnordered::new();
+        futs.push(tokio::spawn(async {}));
+        futs.push(tokio::spawn(async {
+            panic!("simulated delete task panic");
+        }));
+        futs.push(tokio::spawn(async {}));
+
+        drain_delete_tasks_counting_panics(futs, &failed).await;
+
+        assert_eq!(failed.load(Ordering::Relaxed), 1);
     }
 }
 
