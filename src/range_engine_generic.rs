@@ -244,8 +244,21 @@ impl RangeEngine {
         F: Fn(u64, u64) -> Fut + Send + Sync + Clone + 'static,
         Fut: std::future::Future<Output = Result<Bytes>> + Send,
     {
+        // audit #152 bug 2.8 (D9): a zero-byte object is a legitimate,
+        // existing object (an empty file) -- not an error. Previously
+        // this bailed with "Cannot download zero-sized object", turning
+        // a perfectly normal empty read into a hard failure for any
+        // caller whose object size happened to be 0.
         if object_size == 0 {
-            bail!("Cannot download zero-sized object");
+            return Ok((
+                Bytes::new(),
+                RangeDownloadStats {
+                    bytes_downloaded: 0,
+                    ranges_processed: 0,
+                    elapsed_time: Duration::ZERO,
+                    throughput_bps: 0,
+                },
+            ));
         }
 
         let start_time = Instant::now();
@@ -618,6 +631,30 @@ mod tests {
             result.is_err(),
             "offset+length overflowing u64 must be an error, not a silent wrap"
         );
+    }
+
+    #[tokio::test]
+    async fn test_zero_sized_object_returns_empty_bytes_not_error() {
+        // RED-then-GREEN regression test for s3dlio issue #152 bug 2.8 (D9).
+        // Pre-fix, `download()` unconditionally `bail!`-ed on
+        // `object_size == 0`, treating a legitimate empty object as an
+        // error. An empty object is not a failure -- it should download
+        // as zero bytes, same as reading an empty file.
+        let engine = RangeEngine::new(RangeEngineConfig {
+            min_split_size: 1, // force any nonzero size through the split path
+            ..RangeEngineConfig::default()
+        });
+
+        let get_range = move |_offset: u64, _length: u64| async move { Ok(Bytes::new()) };
+
+        let (bytes, stats) = engine
+            .download(0, get_range, None)
+            .await
+            .expect("downloading a zero-sized object must succeed, not error");
+
+        assert_eq!(bytes.len(), 0);
+        assert_eq!(stats.bytes_downloaded, 0);
+        assert_eq!(stats.ranges_processed, 0);
     }
 
     #[tokio::test]
