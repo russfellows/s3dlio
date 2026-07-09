@@ -35,6 +35,54 @@ static EFFECTIVE_GCS_RAPID_MODE: std::sync::OnceLock<RapidMode> = std::sync::Onc
 const GCS_FULL_READ_REPAIR_MAX_ATTEMPTS: usize = 4;
 const GCS_FULL_READ_RETRY_MAX_ATTEMPTS: usize = 3;
 
+/// Exponential backoff delay for GCS full-read retry attempts.
+///
+/// audit #157 bug 5.1 (D1): the full-read retry loop in
+/// `get_object_via_grpc` previously retried immediately with no delay
+/// at all on a retryable error (e.g. UNAVAILABLE), hammering a
+/// transiently-overloaded or rate-limited endpoint on every attempt.
+/// Base 100ms, doubling per attempt (1-indexed: attempt 1 -> 100ms,
+/// attempt 2 -> 200ms, attempt 3 -> 400ms, ...), capped at 2s.
+fn gcs_retry_backoff_delay(attempt: usize) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(10) as u32; // generous cap on the shift itself; .min(2000) below is the real cap
+    let delay_ms = 100u64.saturating_mul(1u64 << exponent);
+    Duration::from_millis(delay_ms.min(2000))
+}
+
+/// Run `operation` up to `max_attempts` times (1-indexed attempt number
+/// passed to each call), sleeping `gcs_retry_backoff_delay(attempt)`
+/// between attempts whenever the error is retryable per
+/// `is_retryable_gcs_read_error` and attempts remain.
+///
+/// Extracted from `get_object_via_grpc`'s full-read retry loop
+/// (audit #157 bug 5.1 / D1) specifically so the backoff-timing
+/// contract is independently unit-testable: driving the real call site
+/// requires a live or mocked GCS gRPC `StorageControl` client, which
+/// isn't available in this test environment, but this function can be
+/// driven with a synthetic `operation` closure under a paused Tokio
+/// clock (`#[tokio::test(start_paused = true)]`) for exact, non-flaky
+/// timing assertions.
+async fn retry_with_backoff<T, Fut>(
+    max_attempts: usize,
+    mut operation: impl FnMut(usize) -> Fut,
+) -> Result<T>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match operation(attempt).await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < max_attempts && is_retryable_gcs_read_error(&e.to_string()) => {
+                tokio::time::sleep(gcs_retry_backoff_delay(attempt)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Desired gRPC subchannel count, set by the caller before the first GCS operation.
 ///
 /// This allows the CLI (or any library user) to auto-tune the connection count to
@@ -337,41 +385,60 @@ impl GcsClient {
                 .clone()
         };
 
-        // Exactly one caller runs detect_rapid_bucket(); the rest await it.
-        *cell.get_or_init(|| self.detect_rapid_bucket(bucket)).await
+        // Exactly one caller runs detect_rapid_bucket_result(); the rest
+        // await it. audit #157 bug 5.2 (D2): uses get_or_try_init, NOT
+        // get_or_init -- a transient RPC failure must not permanently
+        // cache "standard" for this bucket. get_or_try_init only
+        // populates the cell on Ok, so a failed attempt leaves it
+        // uninitialized and a later call retries detection instead of
+        // being stuck with a stale fallback forever. Concurrent callers
+        // still share a single in-flight detection attempt either way
+        // (the thundering-herd protection this cache exists for).
+        match cell
+            .get_or_try_init(|| self.detect_rapid_bucket_result(bucket))
+            .await
+        {
+            Ok(is_zonal) => *is_zonal,
+            Err(e) => {
+                warn!(
+                    "GCS auto-detect: failed to get storage layout for '{}': {} — assuming \
+                     standard bucket for this call (not cached, will retry next call)",
+                    bucket, e
+                );
+                false
+            }
+        }
     }
 
     /// Query GCS `get_storage_layout()` to determine if a bucket is zonal.
-    /// Returns `true` for RAPID/zonal buckets, `false` otherwise.
-    async fn detect_rapid_bucket(&self, bucket: &str) -> bool {
+    /// Returns `Ok(true)` for RAPID/zonal buckets, `Ok(false)` otherwise,
+    /// `Err` on an RPC failure. Deliberately does NOT collapse the error
+    /// case to `Ok(false)` here — see `is_rapid_bucket`'s use of
+    /// `get_or_try_init` (audit #157 bug 5.2 / D2): only a genuine
+    /// successful detection should ever be cached.
+    async fn detect_rapid_bucket_result(&self, bucket: &str) -> Result<bool> {
         let layout_name = format!("projects/_/buckets/{}/storageLayout", bucket);
-        match self
+        let layout = self
             .control
             .get_storage_layout()
             .set_name(&layout_name)
             .send()
             .await
-        {
-            Ok(layout) => {
-                let is_zonal = layout.location_type.eq_ignore_ascii_case("zone");
-                if is_zonal {
-                    info!(
-                        "GCS auto-detect: bucket '{}' is RAPID/zonal (location={}, type={})",
-                        bucket, layout.location, layout.location_type
-                    );
-                } else {
-                    debug!(
-                        "GCS auto-detect: bucket '{}' is standard (location={}, type={})",
-                        bucket, layout.location, layout.location_type
-                    );
-                }
-                is_zonal
-            }
-            Err(e) => {
-                warn!("GCS auto-detect: failed to get storage layout for '{}': {} — assuming standard bucket", bucket, e);
-                false
-            }
+            .map_err(|e| anyhow!("get_storage_layout failed for '{}': {}", bucket, e))?;
+
+        let is_zonal = layout.location_type.eq_ignore_ascii_case("zone");
+        if is_zonal {
+            info!(
+                "GCS auto-detect: bucket '{}' is RAPID/zonal (location={}, type={})",
+                bucket, layout.location, layout.location_type
+            );
+        } else {
+            debug!(
+                "GCS auto-detect: bucket '{}' is standard (location={}, type={})",
+                bucket, layout.location, layout.location_type
+            );
         }
+        Ok(is_zonal)
     }
 
     /// Get entire object as bytes.
@@ -402,31 +469,21 @@ impl GcsClient {
     ) -> Result<Bytes> {
         let requested_range = range.clone();
         let (expected_size, mut data, mut chunk_count) = if requested_range == ReadRange::all() {
-            let mut attempt = 0usize;
-            loop {
-                attempt += 1;
-                match self
-                    .get_object_via_grpc_once(bucket_name, bucket, object, range.clone())
-                    .await
-                {
-                    Ok(result) => break result,
-                    Err(e)
-                        if attempt < GCS_FULL_READ_RETRY_MAX_ATTEMPTS
-                            && is_retryable_gcs_read_error(&e.to_string()) =>
-                    {
-                        info!(
-                            "GCS GET (gRPC) full-read attempt {}/{} failed for gs://{}/{}; retrying quickly: {}",
-                            attempt,
-                            GCS_FULL_READ_RETRY_MAX_ATTEMPTS,
-                            bucket,
-                            object,
+            retry_with_backoff(GCS_FULL_READ_RETRY_MAX_ATTEMPTS, |attempt| {
+                let range = range.clone();
+                async move {
+                    self.get_object_via_grpc_once(bucket_name, bucket, object, range)
+                        .await
+                        .map_err(|e| {
+                            info!(
+                                "GCS GET (gRPC) full-read attempt {}/{} failed for gs://{}/{}: {}",
+                                attempt, GCS_FULL_READ_RETRY_MAX_ATTEMPTS, bucket, object, e
+                            );
                             e
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
+                        })
                 }
-            }
+            })
+            .await?
         } else {
             self.get_object_via_grpc_once(bucket_name, bucket, object, range)
                 .await?
@@ -1156,7 +1213,7 @@ impl GcsClient {
         let sem = Arc::new(tokio::sync::Semaphore::new(GCS_MAX_CONCURRENT_DELETES));
         let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let mut futs = futures_util::stream::FuturesUnordered::new();
+        let futs = futures_util::stream::FuturesUnordered::new();
 
         for object in objects {
             let sem = sem.clone();
@@ -1181,12 +1238,7 @@ impl GcsClient {
             }));
         }
 
-        // Drain all futures
-        while let Some(result) = futures_util::StreamExt::next(&mut futs).await {
-            if let Err(e) = result {
-                tracing::warn!("Delete task panicked: {}", e);
-            }
-        }
+        drain_delete_tasks_counting_panics(futs, &failed).await;
 
         let fail_count = failed.load(std::sync::atomic::Ordering::Relaxed);
         if fail_count > 0 {
@@ -1212,6 +1264,104 @@ impl GcsClient {
         // GCS handles large-object chunking internally via `write_object_grpc`
         // (16 MiB chunks, concurrent producer).  Pass Bytes through unchanged.
         self.put_object(bucket, object, data).await
+    }
+}
+
+/// Drain all in-flight `delete_objects` tasks, counting BOTH per-object
+/// failures (already recorded via `failed.fetch_add` inside each task
+/// before this function ever observes anything) and task panics or
+/// cancellations (`JoinError`, surfaced here as `Err(result)`).
+///
+/// audit #157 bug 5.3 (C5): previously a panicked or cancelled delete
+/// task was logged via `tracing::warn!` but never counted toward
+/// `failed`, so `delete_objects` could return `Ok(())` even though one
+/// or more objects were never actually deleted (the task crashed before
+/// its own `failed.fetch_add` call could run). Extracted as a
+/// standalone function — rather than left as delete_objects' inline
+/// drain loop — so this panic-accounting contract is independently
+/// unit-testable with synthetic tasks: panicking a *real* spawned GCS
+/// delete task requires a live or mocked gRPC `StorageControl` client,
+/// which isn't available in this test environment, but a bare
+/// `tokio::spawn(async { panic!() })` exercises the exact same
+/// `JoinHandle`/`JoinError` mechanics this function depends on.
+async fn drain_delete_tasks_counting_panics(
+    mut futs: futures_util::stream::FuturesUnordered<tokio::task::JoinHandle<()>>,
+    failed: &Arc<AtomicUsize>,
+) {
+    while let Some(result) = futures_util::StreamExt::next(&mut futs).await {
+        if let Err(e) = result {
+            tracing::warn!("Delete task panicked or was cancelled: {}", e);
+            failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_objects_panic_accounting_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn panicked_task_is_counted_as_a_failure() {
+        let failed = Arc::new(AtomicUsize::new(0));
+        let futs = futures_util::stream::FuturesUnordered::new();
+        futs.push(tokio::spawn(async {
+            panic!("simulated delete task panic");
+        }));
+
+        drain_delete_tasks_counting_panics(futs, &failed).await;
+
+        assert_eq!(
+            failed.load(Ordering::Relaxed),
+            1,
+            "a panicked delete task must be counted as a failure, not silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_is_counted_as_a_failure() {
+        let failed = Arc::new(AtomicUsize::new(0));
+        let futs = futures_util::stream::FuturesUnordered::new();
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        handle.abort();
+        futs.push(handle);
+
+        drain_delete_tasks_counting_panics(futs, &failed).await;
+
+        assert_eq!(
+            failed.load(Ordering::Relaxed),
+            1,
+            "a cancelled delete task must be counted as a failure, not silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_tasks_are_not_counted() {
+        let failed = Arc::new(AtomicUsize::new(0));
+        let futs = futures_util::stream::FuturesUnordered::new();
+        for _ in 0..3 {
+            futs.push(tokio::spawn(async {}));
+        }
+
+        drain_delete_tasks_counting_panics(futs, &failed).await;
+
+        assert_eq!(failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_success_and_panic_counts_only_the_panic() {
+        let failed = Arc::new(AtomicUsize::new(0));
+        let futs = futures_util::stream::FuturesUnordered::new();
+        futs.push(tokio::spawn(async {}));
+        futs.push(tokio::spawn(async {
+            panic!("simulated delete task panic");
+        }));
+        futs.push(tokio::spawn(async {}));
+
+        drain_delete_tasks_counting_panics(futs, &failed).await;
+
+        assert_eq!(failed.load(Ordering::Relaxed), 1);
     }
 }
 
@@ -1614,6 +1764,92 @@ mod tests {
         assert_eq!(r, RapidMode::Auto, "\"auto\" should set Auto mode");
     }
 
+    // RED-then-GREEN regression tests for s3dlio issue #157 bug 5.2 (D2).
+    //
+    // Bug: is_rapid_bucket() cached detect_rapid_bucket()'s result in a
+    // per-bucket `OnceCell<bool>` via `get_or_init`, which always
+    // populates the cell with whatever the closure returns -- including
+    // the `false` fallback detect_rapid_bucket used on an RPC failure.
+    // A single transient get_storage_layout() failure (network blip,
+    // auth hiccup) therefore permanently mis-cached a RAPID/zonal bucket
+    // as "standard" for the lifetime of the process: gRPC/RAPID
+    // performance benefits lost forever, with no retry.
+    //
+    // The fix (get_or_try_init instead of get_or_init) is exercised here
+    // directly against a synthetic `Arc<OnceCell<bool>>` + counting
+    // detect closure -- driving the real is_rapid_bucket() needs a live
+    // or mocked GCS gRPC StorageControl client, unavailable in this
+    // environment (matches the "requires exposing the mockable
+    // interface" adequacy note in the fix plan for this bug). This is
+    // the exact tokio::sync::OnceCell API and calling pattern
+    // is_rapid_bucket() uses, so it proves the caching CONTRACT
+    // (retry-after-failure, no poisoning, thundering-herd-safe) that the
+    // real method depends on.
+
+    #[tokio::test]
+    async fn failed_detection_does_not_poison_the_cache() {
+        let cell: OnceCell<bool> = OnceCell::new();
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // First call: detection fails (simulated transient RPC error).
+        let attempts_clone = attempts.clone();
+        let first: Result<bool, anyhow::Error> = cell
+            .get_or_try_init(|| async move {
+                attempts_clone.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("UNAVAILABLE: simulated transient failure"))
+            })
+            .await
+            .copied();
+        assert!(first.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Second call: detection now succeeds. Pre-fix (get_or_init),
+        // the cell would already be permanently set to `false` from the
+        // first call and this closure would never run again.
+        let attempts_clone = attempts.clone();
+        let second: Result<bool, anyhow::Error> = cell
+            .get_or_try_init(|| async move {
+                attempts_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(true) // genuinely a RAPID/zonal bucket
+            })
+            .await
+            .copied();
+        assert!(
+            second.unwrap(),
+            "a failed first attempt must not poison the cache with a wrong fallback value"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "detection must be retried after a prior failure, not skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_detection_is_cached_and_not_retried() {
+        let cell: OnceCell<bool> = OnceCell::new();
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let attempts_clone = attempts.clone();
+            let result: Result<bool, anyhow::Error> = cell
+                .get_or_try_init(|| async move {
+                    attempts_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+                .await
+                .copied();
+            assert!(result.unwrap());
+        }
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a successful detection must be cached -- only the first of 3 calls should \
+             actually invoke the detection closure"
+        );
+    }
+
     // ------------------------------------------------------------------
     // dotenvy — load vars from a .env file
     // ------------------------------------------------------------------
@@ -1808,6 +2044,105 @@ mod tests {
         assert!(is_retryable_gcs_read_error("UNAVAILABLE: upstream reset"));
         assert!(is_retryable_gcs_read_error("CANCELLED by peer"));
         assert!(!is_retryable_gcs_read_error("PERMISSION_DENIED"));
+    }
+
+    // RED-then-GREEN regression tests for s3dlio issue #157 bug 5.1 (D1).
+    //
+    // Bug: the full-read retry loop in get_object_via_grpc retried
+    // immediately on a retryable error (e.g. UNAVAILABLE) with no delay
+    // at all between attempts -- hammering a transiently-overloaded or
+    // rate-limited endpoint instead of backing off.
+    //
+    // gcs_retry_backoff_delay() is a pure function, so its exponential
+    // growth is directly and deterministically testable with no timing
+    // flakiness. retry_with_backoff() is the exact function
+    // get_object_via_grpc's full-read branch calls (extracted for this
+    // reason) -- tested here under a paused Tokio clock with a
+    // synthetic operation closure, since driving the real call site
+    // needs a live or mocked gRPC StorageControl client.
+
+    #[test]
+    fn gcs_retry_backoff_delay_grows_exponentially_and_caps() {
+        assert_eq!(gcs_retry_backoff_delay(1), Duration::from_millis(100));
+        assert_eq!(gcs_retry_backoff_delay(2), Duration::from_millis(200));
+        assert_eq!(gcs_retry_backoff_delay(3), Duration::from_millis(400));
+        assert_eq!(gcs_retry_backoff_delay(4), Duration::from_millis(800));
+        assert_eq!(gcs_retry_backoff_delay(5), Duration::from_millis(1600));
+        // Cap at 2s -- attempt 6 would be 3200ms uncapped.
+        assert_eq!(gcs_retry_backoff_delay(6), Duration::from_millis(2000));
+        assert_eq!(gcs_retry_backoff_delay(100), Duration::from_millis(2000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_sleeps_between_retryable_failures() {
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let start = tokio::time::Instant::now();
+
+        let attempts_clone = attempts.clone();
+        let result = retry_with_backoff(3, move |_attempt| {
+            let attempts = attempts_clone.clone();
+            async move {
+                let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err(anyhow!("UNAVAILABLE: simulated transient failure"))
+                } else {
+                    Ok("done")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "should have taken exactly 3 attempts (2 retries)"
+        );
+        // Two sleeps elapsed: gcs_retry_backoff_delay(1) + gcs_retry_backoff_delay(2)
+        // = 100ms + 200ms = 300ms of virtual time.
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_does_not_sleep_on_non_retryable_error() {
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let start = tokio::time::Instant::now();
+
+        let attempts_clone = attempts.clone();
+        let result: Result<()> = retry_with_backoff(3, move |_attempt| {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("PERMISSION_DENIED"))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a non-retryable error must not be retried"
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_gives_up_after_max_attempts() {
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let attempts_clone = attempts.clone();
+        let result: Result<()> = retry_with_backoff(3, move |_attempt| {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("UNAVAILABLE: always fails"))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[test]

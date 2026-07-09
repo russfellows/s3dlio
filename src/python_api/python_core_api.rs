@@ -145,6 +145,23 @@ where
 // PUT with HEAD verification and automatic retry (all backends)
 // ---------------------------------------------------------------------------
 
+/// Parse `S3DLIO_PUT_MAX_RETRIES` per its documented contract: "non-numeric
+/// or < 1 values are silently treated as 3 (the default)".
+///
+/// audit #157 bug 7.4 (F2): the previous inline parse was
+/// `.and_then(|v| v.parse().ok()).unwrap_or(3)`, which only caught
+/// non-numeric values. `0` parses as a perfectly valid `u32`, so it sailed
+/// through untouched -- and `for attempt in 1..=0` never iterates, so
+/// `put_bytes`/`put_bytes_async` returned the placeholder "no attempts
+/// made" error without ever issuing a PUT, even against a healthy backend.
+/// Extracted as a pure function so the clamp is directly unit-testable
+/// without needing a live or mocked `ObjectStore`.
+fn parse_put_max_retries(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(3)
+}
+
 /// PUT `data` to `uri` via `store`.
 ///
 /// By default this is a single PUT — the same cost as every other S3 client
@@ -191,10 +208,8 @@ async fn put_verified_with_retry(
     }
 
     let expected_len = data.len() as u64;
-    let max_attempts: u32 = std::env::var("S3DLIO_PUT_MAX_RETRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
+    let max_attempts: u32 =
+        parse_put_max_retries(std::env::var("S3DLIO_PUT_MAX_RETRIES").ok().as_deref());
     let retry_delay_ms: u64 = std::env::var("S3DLIO_PUT_RETRY_DELAY_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2655,6 +2670,40 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 //   cargo test --lib --features extension-module -- --ignored --test-threads=1 put_verify_tests
 // `--test-threads=1` is required: both tests mutate the shared process-wide
 // `S3DLIO_PUT_VERIFY` env var and would otherwise race if run concurrently.
+#[cfg(test)]
+mod parse_put_max_retries_tests {
+    use super::*;
+
+    // RED-then-GREEN regression tests for s3dlio issue #157 bug 7.4 (F2).
+    // No live/mocked ObjectStore needed -- the clamp is a pure function.
+
+    #[test]
+    fn zero_is_clamped_to_the_documented_default_of_3() {
+        assert_eq!(
+            parse_put_max_retries(Some("0")),
+            3,
+            "S3DLIO_PUT_MAX_RETRIES=0 must fall back to the documented \
+             default of 3, not produce a 0-iteration retry loop"
+        );
+    }
+
+    #[test]
+    fn non_numeric_is_clamped_to_the_documented_default_of_3() {
+        assert_eq!(parse_put_max_retries(Some("not-a-number")), 3);
+    }
+
+    #[test]
+    fn unset_uses_the_documented_default_of_3() {
+        assert_eq!(parse_put_max_retries(None), 3);
+    }
+
+    #[test]
+    fn valid_positive_value_passes_through_unchanged() {
+        assert_eq!(parse_put_max_retries(Some("7")), 7);
+        assert_eq!(parse_put_max_retries(Some("1")), 1);
+    }
+}
+
 #[cfg(test)]
 mod put_verify_tests {
     use super::*;

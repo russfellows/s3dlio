@@ -690,10 +690,32 @@ impl ConfigurableFileSystemObjectStore {
         uri.starts_with("file://") || uri.starts_with("direct://")
     }
 
-    /// Convert a filesystem path back to a URI for list operations
-    fn path_to_uri(path: &Path) -> String {
+    /// Extract the scheme prefix ("file" or "direct") a URI was addressed
+    /// with, for round-tripping into URIs this store produces (e.g. from
+    /// `list()`). Defaults to "file" for anything else, matching the
+    /// pre-existing hardcoded behavior for callers that don't go through a
+    /// recognized scheme.
+    fn scheme_of(uri: &str) -> &'static str {
+        if uri.starts_with("direct://") {
+            "direct"
+        } else {
+            "file"
+        }
+    }
+
+    /// Convert a filesystem path back to a URI for list operations.
+    ///
+    /// audit #156 bug 6.2 (E4): this previously hardcoded "file://"
+    /// unconditionally, so `list()` on a `direct://` store returned
+    /// `file://` URIs for every entry. Round-tripping one of those URIs
+    /// back through `store_for_uri()` would route to the buffered
+    /// `file://` store instead of the O_DIRECT store the caller was
+    /// actually using, silently losing the direct-I/O behavior. `scheme`
+    /// must be the scheme the caller originally addressed this store with
+    /// (see `scheme_of`), not a hardcoded constant.
+    fn path_to_uri(path: &Path, scheme: &str) -> String {
         if path.is_absolute() {
-            format!("file://{}", path.display())
+            format!("{scheme}://{}", path.display())
         } else {
             path.display().to_string()
         }
@@ -1060,11 +1082,30 @@ impl ConfigurableFileSystemObjectStore {
         let aligned_offset = (offset / alignment) * alignment;
         let offset_adjustment = (offset - aligned_offset) as usize;
 
-        let read_length = length.unwrap_or_else(|| {
-            // Read to end of file
-            let metadata = std::fs::metadata(path).unwrap();
-            metadata.len() - offset
-        });
+        // audit #156 bug 6.1 (C6): previously `std::fs::metadata(path)
+        // .unwrap()` panicked on any stat failure (most notably the
+        // TOCTOU window where a caller's earlier `path.exists()` check
+        // passed but the file was unlinked before this call runs), and
+        // `metadata.len() - offset` underflowed (u64) whenever `offset`
+        // exceeded the file's actual size. Both are now clean errors.
+        let read_length = match length {
+            Some(len) => len,
+            None => {
+                let metadata = fs::metadata(path).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to stat {} for a to-end-of-file range read: {e}",
+                        path.display()
+                    )
+                })?;
+                metadata.len().checked_sub(offset).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "range offset {offset} exceeds file size {} for {}",
+                        metadata.len(),
+                        path.display()
+                    )
+                })?
+            }
+        };
 
         let total_length = offset_adjustment + read_length as usize;
         let aligned_length = total_length.div_ceil(self.config.alignment) * self.config.alignment;
@@ -1165,10 +1206,13 @@ impl ConfigurableFileSystemObjectStore {
         self.read_file_direct(&path).await
     }
 
-    /// Recursively collect files in a directory
+    /// Recursively collect files in a directory. `scheme` is the scheme
+    /// ("file" or "direct") the caller originally addressed this store
+    /// with (audit #156 bug 6.2 / E4) -- see `path_to_uri`.
     async fn collect_files_recursive(
         dir: &Path,
         prefix: &str,
+        scheme: &str,
         results: &mut Vec<String>,
     ) -> Result<()> {
         let mut entries = fs::read_dir(dir).await?;
@@ -1189,11 +1233,12 @@ impl ConfigurableFileSystemObjectStore {
                 Box::pin(Self::collect_files_recursive(
                     &entry_path,
                     &new_prefix,
+                    scheme,
                     results,
                 ))
                 .await?;
             } else {
-                let file_uri = Self::path_to_uri(&entry_path);
+                let file_uri = Self::path_to_uri(&entry_path, scheme);
                 results.push(file_uri);
             }
         }
@@ -1317,6 +1362,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
             bail!("FileSystemObjectStore expected file:// or direct:// URI");
         }
         let base_path = Self::uri_to_path(uri_prefix)?;
+        let scheme = Self::scheme_of(uri_prefix);
         debug!(
             "ConfigurableFileSystemObjectStore::list prefix='{}', recursive={}",
             uri_prefix, recursive
@@ -1329,20 +1375,20 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
 
         if base_path.is_file() {
             // If the prefix points to a file, return just that file
-            results.push(Self::path_to_uri(&base_path));
+            results.push(Self::path_to_uri(&base_path, scheme));
             return Ok(results);
         }
 
         if base_path.is_dir() {
             if recursive {
-                Self::collect_files_recursive(&base_path, "", &mut results).await?;
+                Self::collect_files_recursive(&base_path, "", scheme, &mut results).await?;
             } else {
                 // Non-recursive: only direct children
                 let mut entries = fs::read_dir(&base_path).await?;
                 while let Some(entry) = entries.next_entry().await? {
                     let entry_path = entry.path();
                     if entry_path.is_file() {
-                        results.push(Self::path_to_uri(&entry_path));
+                        results.push(Self::path_to_uri(&entry_path, scheme));
                     }
                 }
             }
@@ -1582,5 +1628,154 @@ impl ConfigurableFileSystemObjectStore {
     #[inline]
     pub fn boxed_high_performance() -> Box<dyn ObjectStore> {
         Box::new(Self::high_performance())
+    }
+}
+
+#[cfg(test)]
+mod try_read_range_direct_tests {
+    use super::*;
+
+    // RED-then-GREEN regression tests for s3dlio issue #156 bug 6.1 (C6).
+    //
+    // Bug: `try_read_range_direct`'s `length=None` branch computed the
+    // read length as `std::fs::metadata(path).unwrap().len() - offset`.
+    // Two independent panics:
+    //   (a) `.unwrap()` on the metadata() call — panics if the file
+    //       can't be stat'd, most notably the TOCTOU window where a
+    //       caller's earlier `path.exists()` check passed but the file
+    //       was unlinked before this call runs.
+    //   (b) even when metadata() succeeds, `metadata.len() - offset`
+    //       underflows (u64) whenever the caller passes an `offset`
+    //       larger than the file's actual size.
+    //
+    // These are white-box unit tests (calling the private method
+    // directly) because reliably forcing the TOCTOU race through the
+    // public `get_range()` API — whose own `path.exists()` guard runs
+    // first — isn't deterministic; see the adequacy note in
+    // docs/implementation-plans/v0.9.109-audit-fix-plan.md §11 (C6/6.1b:
+    // "TOCTOU race, hard to reproduce reliably"). Calling the vulnerable
+    // function directly with a path that's already missing reproduces
+    // the same failure mode deterministically. Neither panic requires
+    // O_DIRECT to actually be supported by the underlying filesystem —
+    // both occur in plain Rust code before any O_DIRECT syscall is
+    // attempted, so a tmpfs-backed TempDir is sufficient.
+
+    #[tokio::test]
+    async fn missing_file_is_a_clean_error_not_a_panic() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let missing = temp_dir.path().join("does-not-exist.dat");
+        let store = ConfigurableFileSystemObjectStore::with_direct_io();
+
+        let result = store.try_read_range_direct(&missing, 0, None).await;
+        assert!(
+            result.is_err(),
+            "a missing file (TOCTOU-equivalent: unlinked before this call) must be a clean \
+             Err, not a panic from metadata().unwrap()"
+        );
+    }
+
+    #[tokio::test]
+    async fn offset_past_eof_is_a_clean_error_not_an_underflow_panic() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("small.dat");
+        tokio::fs::write(&path, vec![0u8; 100]).await.unwrap();
+        let store = ConfigurableFileSystemObjectStore::with_direct_io();
+
+        let result = store.try_read_range_direct(&path, 1_000_000, None).await;
+        assert!(
+            result.is_err(),
+            "offset (1_000_000) exceeding the file's actual size (100 bytes) must be a clean \
+             Err, not a `metadata.len() - offset` u64 underflow panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn offset_within_file_size_still_works() {
+        // Sanity check: the fix must not break the normal case. Uses the
+        // public get_range() API (which has its own fallback-to-regular-
+        // I/O path when O_DIRECT isn't usable on the backing filesystem,
+        // e.g. tmpfs) rather than calling the private O_DIRECT-only
+        // try_read_range_direct() directly, so this test is meaningful
+        // regardless of the test environment's O_DIRECT support.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = ConfigurableFileSystemObjectStore::with_direct_io();
+        let uri = format!("file://{}/normal.dat", temp_dir.path().to_str().unwrap());
+        let data = vec![0xABu8; 4096];
+        store.put(&uri, Bytes::from(data)).await.unwrap();
+
+        let bytes = store
+            .get_range(&uri, 100, None)
+            .await
+            .expect("a valid in-range offset must still succeed");
+        assert_eq!(bytes.len(), 4096 - 100);
+    }
+}
+
+#[cfg(test)]
+mod path_to_uri_scheme_tests {
+    use super::*;
+
+    // RED-then-GREEN regression tests for s3dlio issue #156 bug 6.2 (E4).
+    //
+    // Bug: `path_to_uri` hardcoded the "file://" scheme unconditionally,
+    // so `list()` on a `direct://`-addressed store returned `file://`
+    // URIs for every entry. Round-tripping one of those URIs back through
+    // `store_for_uri()` would silently route to the buffered `file://`
+    // store instead of the O_DIRECT store the caller was actually using.
+
+    #[test]
+    fn scheme_of_direct_uri_is_direct() {
+        assert_eq!(
+            ConfigurableFileSystemObjectStore::scheme_of("direct:///tmp/x/"),
+            "direct"
+        );
+    }
+
+    #[test]
+    fn scheme_of_file_uri_is_file() {
+        assert_eq!(
+            ConfigurableFileSystemObjectStore::scheme_of("file:///tmp/x/"),
+            "file"
+        );
+    }
+
+    #[test]
+    fn path_to_uri_uses_the_given_scheme_not_a_hardcoded_one() {
+        let path = Path::new("/tmp/x/data.bin");
+        assert_eq!(
+            ConfigurableFileSystemObjectStore::path_to_uri(path, "direct"),
+            "direct:///tmp/x/data.bin"
+        );
+        assert_eq!(
+            ConfigurableFileSystemObjectStore::path_to_uri(path, "file"),
+            "file:///tmp/x/data.bin"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_on_a_direct_scheme_store_returns_direct_scheme_uris() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = ConfigurableFileSystemObjectStore::with_direct_io();
+        let base_uri = format!("direct://{}/", temp_dir.path().display());
+
+        let file_uri = format!("{base_uri}data.bin");
+        store
+            .put(&file_uri, Bytes::from(vec![0u8; 4096]))
+            .await
+            .unwrap();
+
+        let non_recursive = store.list(&base_uri, false).await.unwrap();
+        assert!(
+            non_recursive.iter().all(|u| u.starts_with("direct://")),
+            "non-recursive list() on a direct:// store must return direct:// \
+             URIs, got: {non_recursive:?}"
+        );
+
+        let recursive = store.list(&base_uri, true).await.unwrap();
+        assert!(
+            recursive.iter().all(|u| u.starts_with("direct://")),
+            "recursive list() on a direct:// store must return direct:// \
+             URIs, got: {recursive:?}"
+        );
     }
 }

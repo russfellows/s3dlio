@@ -27,10 +27,19 @@ use azure_storage_blob::models::{
     BlockBlobClientCommitBlockListOptions, BlockBlobClientStageBlockOptions,
     BlockBlobClientUploadOptions, BlockList, BlockListType, BlockLookupList,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 // Global credential cache to avoid repeated authentication
 static AZURE_CREDENTIAL: OnceCell<Arc<dyn TokenCredential>> = OnceCell::const_new();
+
+/// Azure's documented maximum number of uncommitted blocks per block blob.
+/// See <https://learn.microsoft.com/en-us/rest/api/storageservices/put-block>.
+/// Exceeding this is a `commit_block_list` failure on Azure's side; audit
+/// #151 bug 1.6 (E3) is that `upload_multipart_stream` never checked this
+/// client-side, so a caller with a `part_size` too small for their object
+/// would stage tens of thousands of blocks only to have the final commit
+/// fail server-side, with all staged blocks wasted.
+const AZURE_MAX_BLOCK_COUNT: usize = 50_000;
 
 /// Minimal properties surfaced by `stat`.
 #[derive(Debug, Clone)]
@@ -463,6 +472,20 @@ impl AzureBlob {
                 break;
             }
 
+            // audit #151 bug 1.6 (E3): client-side safety cap so an
+            // object whose part_size is too small for its size fails
+            // fast with a clear, actionable error instead of staging
+            // tens of thousands of blocks only to have commit_block_list
+            // reject the blob server-side once the limit is exceeded.
+            if exceeds_azure_block_count_limit(next_idx as usize) {
+                first_err = Some(azure_block_count_limit_error(
+                    &self.container,
+                    key,
+                    part_size,
+                ));
+                break;
+            }
+
             // Fixed-width raw bytes (SDK will base64 on the wire)
             let id_str = format!("{:016x}-{:08x}", next_idx, part_size as u32);
             let id_bytes = id_str.as_bytes().to_vec();
@@ -499,6 +522,20 @@ impl AzureBlob {
         }
 
         if let Some(e) = first_err {
+            // audit #151 bug 1.5 (D4): previously returned bare Err with
+            // no log at all — an operator watching logs had no way to
+            // tell a multipart Azure upload failed mid-stream, or how
+            // much was staged before it did. commit_block_list is never
+            // called in this branch, so the already-staged blocks stay
+            // uncommitted; Azure garbage-collects uncommitted blocks
+            // automatically (no explicit delete API exists for "just
+            // the uncommitted blocks" short of committing an empty/
+            // unrelated list, which risks clobbering any pre-existing
+            // committed data at this key — not attempted here).
+            warn!(
+                "{}",
+                staged_blocks_failure_warning(&self.container, key, committed_ids.len(), &e)
+            );
             return Err(e);
         }
 
@@ -513,6 +550,50 @@ impl AzureBlob {
             credential: self.credential.clone(),
         }
     }
+}
+
+/// Build the operator-visibility warning logged when
+/// `upload_multipart_stream` fails mid-stream (audit #151 bug 1.5 / D4).
+/// Extracted as a pure function — independent of any Azure client or
+/// network call — so its content (naming the container, blob key, and
+/// how many blocks were staged before the failure) is directly
+/// unit-testable without needing an Azure mock server, which this repo
+/// does not have (unlike the S3 mock harness in tests/common/).
+fn staged_blocks_failure_warning(
+    container: &str,
+    key: &str,
+    staged_count: usize,
+    err: &anyhow::Error,
+) -> String {
+    format!(
+        "s3dlio Azure MPU: upload_multipart_stream failed for container='{container}' key='{key}' \
+         after staging {staged_count} block(s) — those staged blocks were never committed and will \
+         be garbage-collected automatically by Azure: {err}"
+    )
+}
+
+/// Would staging a block at `next_block_index` (0-based) exceed Azure's
+/// `AZURE_MAX_BLOCK_COUNT`-block-per-blob limit?
+///
+/// audit #151 bug 1.6 (E3): pure decision function extracted so the
+/// client-side safety cap is directly unit-testable without staging tens
+/// of thousands of real blocks against a live Azure account (this repo has
+/// no Azure mock server, unlike the S3 mock harness in tests/common/).
+fn exceeds_azure_block_count_limit(next_block_index: usize) -> bool {
+    next_block_index >= AZURE_MAX_BLOCK_COUNT
+}
+
+/// Build the error returned when `upload_multipart_stream` hits the
+/// client-side block-count safety cap (audit #151 bug 1.6 / E3), before
+/// ever attempting `commit_block_list` (which would otherwise fail
+/// server-side, wasting every block staged up to that point).
+fn azure_block_count_limit_error(container: &str, key: &str, part_size: usize) -> anyhow::Error {
+    anyhow!(
+        "s3dlio Azure MPU: upload_multipart_stream aborted for container='{container}' \
+         key='{key}' — object requires more than Azure's {AZURE_MAX_BLOCK_COUNT}-block-per-blob \
+         limit at part_size={part_size} bytes; increase part_size (or S3DLIO_MULTIPART_PART_SIZE_MB) \
+         to reduce the block count"
+    )
 }
 
 /// Fold one spawned `stage_block` outcome into the first-error slot,
@@ -658,6 +739,96 @@ mod tests {
 
     // Mutex to serialize tests that modify environment variables
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // RED-then-GREEN regression tests for s3dlio issue #151 bug 1.5 (D4).
+    //
+    // Bug: upload_multipart_stream's failure branch returned a bare
+    // `Err(e)` with no log at all when a stage_block failed mid-stream
+    // -- an operator watching logs had no way to tell an Azure multipart
+    // upload failed, or how many blocks were staged (and left
+    // uncommitted, pending Azure's automatic GC) before it did.
+    //
+    // staged_blocks_failure_warning() is a pure function extracted from
+    // the failure branch specifically so its content is testable without
+    // an Azure mock server (this repo has one for S3, not Azure).
+
+    #[test]
+    fn staged_blocks_failure_warning_names_container_key_and_count() {
+        let err = anyhow::anyhow!("stage_block cancelled");
+        let msg = staged_blocks_failure_warning("my-container", "my-blob.bin", 7, &err);
+
+        assert!(
+            msg.contains("my-container"),
+            "warning must name the container: {msg}"
+        );
+        assert!(
+            msg.contains("my-blob.bin"),
+            "warning must name the blob key: {msg}"
+        );
+        assert!(
+            msg.contains('7'),
+            "warning must include the staged block count: {msg}"
+        );
+        assert!(
+            msg.contains("stage_block cancelled"),
+            "warning must include the underlying error: {msg}"
+        );
+    }
+
+    #[test]
+    fn staged_blocks_failure_warning_handles_zero_staged_blocks() {
+        // The very first block failed -- nothing was staged yet.
+        let err = anyhow::anyhow!("connection refused");
+        let msg = staged_blocks_failure_warning("c", "k", 0, &err);
+        assert!(
+            msg.contains('0'),
+            "warning must report 0 staged blocks: {msg}"
+        );
+    }
+
+    // RED-then-GREEN regression tests for s3dlio issue #151 bug 1.6 (E3).
+    //
+    // Bug: upload_multipart_stream never checked Azure's documented
+    // 50,000-block-per-blob limit, so a caller whose part_size was too
+    // small for their object would stage tens of thousands of blocks only
+    // to have commit_block_list fail server-side, wasting every staged
+    // block. exceeds_azure_block_count_limit() is the pure decision
+    // extracted from that loop so the cap is testable without staging
+    // 50,000+ real blocks against a live Azure account.
+
+    #[test]
+    fn exceeds_azure_block_count_limit_false_below_cap() {
+        assert!(!exceeds_azure_block_count_limit(0));
+        assert!(!exceeds_azure_block_count_limit(AZURE_MAX_BLOCK_COUNT - 1));
+    }
+
+    #[test]
+    fn exceeds_azure_block_count_limit_true_at_and_above_cap() {
+        assert!(exceeds_azure_block_count_limit(AZURE_MAX_BLOCK_COUNT));
+        assert!(exceeds_azure_block_count_limit(AZURE_MAX_BLOCK_COUNT + 1));
+    }
+
+    #[test]
+    fn azure_block_count_limit_error_names_container_key_and_part_size() {
+        let err = azure_block_count_limit_error("my-container", "my-blob.bin", 4 * 1024 * 1024);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-container"),
+            "error must name the container: {msg}"
+        );
+        assert!(
+            msg.contains("my-blob.bin"),
+            "error must name the blob key: {msg}"
+        );
+        assert!(
+            msg.contains("50000") || msg.contains("50,000"),
+            "error must name the block-count limit: {msg}"
+        );
+        assert!(
+            msg.contains(&(4 * 1024 * 1024).to_string()),
+            "error must name the part_size that caused the overflow: {msg}"
+        );
+    }
 
     #[test]
     fn test_account_url_from_account() {

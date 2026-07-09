@@ -36,6 +36,7 @@ pub struct GcsObjectMetadata {
 /// 1. GOOGLE_APPLICATION_CREDENTIALS environment variable (service account JSON)
 /// 2. GCE/GKE metadata server (automatic for Google Cloud workloads)
 /// 3. gcloud CLI credentials (~/.config/gcloud/application_default_credentials.json)
+#[derive(Clone)]
 pub struct GcsClient {
     client: Arc<Client>,
 }
@@ -143,8 +144,19 @@ impl GcsClient {
             bucket, object, offset, length
         );
 
+        // audit #152 finding 2.7 (bug B4): same zero-length short-circuit as
+        // the S3/Azure get_range() implementations — avoids the
+        // `offset + len - 1` underflow and the pointless network round-trip.
+        if length == Some(0) {
+            return Ok(Bytes::new());
+        }
         let range = match length {
-            Some(len) => Range(Some(offset), Some(offset + len - 1)),
+            Some(len) => Range(
+                Some(offset),
+                Some(crate::range_engine_generic::range_end_inclusive(
+                    offset, len,
+                )?),
+            ),
             None => Range(Some(offset), None),
         };
 
@@ -166,8 +178,24 @@ impl GcsClient {
         Ok(Bytes::from(data))
     }
 
-    /// Upload object with simple upload (for small objects).
-    pub async fn put_object(&self, bucket: &str, object: &str, data: &[u8]) -> Result<()> {
+    /// Upload an object via GCS simple (single-request) upload.
+    ///
+    /// audit #157 bug 5.4 (D5): this function used to have a
+    /// `put_object_multipart` sibling that claimed ("Upload large object
+    /// using resumable upload") to do real chunked/resumable upload for
+    /// large objects, but its body was byte-for-byte identical to this
+    /// one -- it silently ignored its `chunk_size` parameter and just
+    /// called simple upload too. Two identically-behaving functions
+    /// under different names is actively misleading (a caller choosing
+    /// `put_object_multipart` for a large object reasonably expects
+    /// resumable-upload semantics it never got). Per the locked
+    /// contract ("smallest surgical fix": consolidate rather than
+    /// implement real resumable upload as a separate project), the stub
+    /// was deleted and both call sites route through this one, honestly
+    /// named, function. `data: Bytes` (not `&[u8]`) matches the
+    /// zero-copy `Bytes`-everywhere convention the rest of
+    /// object_store.rs already uses for the other backends.
+    pub async fn put_object(&self, bucket: &str, object: &str, data: Bytes) -> Result<()> {
         debug!(
             "GCS PUT: bucket={}, object={}, size={}",
             bucket,
@@ -190,47 +218,6 @@ impl GcsClient {
             .map_err(|e| anyhow!("GCS PUT failed for gs://{}/{}: {}", bucket, object, e))?;
 
         debug!("GCS PUT success: {} bytes", data.len());
-        Ok(())
-    }
-
-    /// Upload large object using resumable upload.
-    pub async fn put_object_multipart(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &[u8],
-        _chunk_size: usize,
-    ) -> Result<()> {
-        debug!(
-            "GCS PUT MULTIPART: bucket={}, object={}, size={}",
-            bucket,
-            object,
-            data.len()
-        );
-
-        // For now, use simple upload - will implement resumable upload in GcsObjectWriter
-        let upload_type = UploadType::Simple(Media::new(object.to_string()));
-
-        self.client
-            .upload_object(
-                &UploadObjectRequest {
-                    bucket: bucket.to_string(),
-                    ..Default::default()
-                },
-                data.to_vec(),
-                &upload_type,
-            )
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "GCS PUT MULTIPART failed for gs://{}/{}: {}",
-                    bucket,
-                    object,
-                    e
-                )
-            })?;
-
-        debug!("GCS PUT MULTIPART success: {} bytes", data.len());
         Ok(())
     }
 

@@ -263,6 +263,28 @@ pub struct ObjectProperties {
     pub storage_class: Option<String>,
 }
 
+/// Returns true when `uri`'s authority (host[:port]) component is, or ends
+/// with, an Azure Blob Storage hostname (`*.blob.core.windows.net`).
+///
+/// audit #154 bug 4.2 (E1): the previous check was
+/// `uri.contains(".blob.core.windows.net/")`, a substring match against the
+/// *entire* URI. That falsely matches any URI whose path/key happens to
+/// contain that literal text -- e.g. an S3 object key that mirrors an Azure
+/// blob path, `s3://backups/mirror/acct.blob.core.windows.net/file.dat` --
+/// misrouting it to the Azure backend. Restrict the check to the authority
+/// component only, and require it as a suffix rather than a substring.
+fn is_azure_blob_host(uri: &str) -> bool {
+    let Some(after_scheme_idx) = uri.find("://") else {
+        return false;
+    };
+    let after_scheme = &uri[after_scheme_idx + 3..];
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // Strip optional "user@" userinfo and a trailing ":port".
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    host.ends_with(".blob.core.windows.net")
+}
+
 /// Best-effort scheme inference from a URI.
 pub fn infer_scheme(uri: &str) -> Scheme {
     if uri.starts_with("file://") {
@@ -271,7 +293,7 @@ pub fn infer_scheme(uri: &str) -> Scheme {
         Scheme::Direct
     } else if uri.starts_with("s3://") {
         Scheme::S3
-    } else if uri.starts_with("az://") || uri.contains(".blob.core.windows.net/") {
+    } else if uri.starts_with("az://") || is_azure_blob_host(uri) {
         Scheme::Azure
     } else if uri.starts_with("gs://") || uri.starts_with("gcs://") {
         Scheme::Gcs
@@ -1159,7 +1181,19 @@ impl S3ObjectStore {
             })?;
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
-                    if re.is_match(key) || key.starts_with(&prefix_str) {
+                    // Locked contract (audit #154 f24, docs/implementation-plans/
+                    // v0.9.109-audit-fix-plan.md bug B7): the regex must match
+                    // against the key's tail PAST the prefix, not the whole
+                    // key. `key.starts_with(&prefix_str)` was always true here
+                    // (S3 was already queried with `prefix(prefix_str)`), which
+                    // made the `||` a vacuous OR and the regex dead code —
+                    // every key under the prefix passed regardless of whether
+                    // it matched `final_pattern`.
+                    let tail_matches = key
+                        .strip_prefix(prefix_str.as_str())
+                        .map(|rest| re.is_match(rest))
+                        .unwrap_or(false);
+                    if tail_matches {
                         keys.push(format!("s3://{}/{}", bucket, key));
                     }
                 }
@@ -1246,10 +1280,22 @@ impl ObjectStore for S3ObjectStore {
             uri, offset, length
         );
 
+        // audit #152 finding 2.5 (bug B4): a zero-length range request has
+        // no valid `bytes=start-end` header at all (RFC 7233 can't express
+        // an empty range) — short-circuit it here instead of falling into
+        // the `offset + len - 1` underflow below.
+        if length == Some(0) {
+            return Ok(Bytes::new());
+        }
+
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
             let range_header = match length {
-                Some(len) => format!("bytes={}-{}", offset, offset + len - 1),
+                Some(len) => format!(
+                    "bytes={}-{}",
+                    offset,
+                    crate::range_engine_generic::range_end_inclusive(offset, len)?
+                ),
                 None => format!("bytes={}-", offset),
             };
             // v0.9.108+ (issue #148 Phase 4b): same reasoning as the
@@ -1864,7 +1910,7 @@ impl ObjectWriter for S3BufferedWriter {
 fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     // Supports:
     // - az://{account}/{container}/{key...}
-    // - https://{account}.blob.core.windows.net/{container}/{key...}
+    // - http(s)://{account}.blob.core.windows.net/{container}/{key...}
     if let Some(rest) = uri.strip_prefix("az://") {
         let mut it = rest.splitn(3, '/');
         let account = it
@@ -1877,13 +1923,19 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
         return Ok((account.to_string(), container.to_string(), key));
     }
 
-    //if let Some(host_i) = uri.find(".blob.core.windows.net/") {
-    if uri.contains(".blob.core.windows.net/") {
-        // crude parse: "https://{account}.blob.core.windows.net/{container}/{key...}"
-        // find "https://" then account up to first '.'
+    if is_azure_blob_host(uri) {
+        // audit #154 bug 4.2 (E1): this previously hard-required a
+        // "https://" prefix via strip_prefix, so a URL that `infer_scheme`
+        // had already routed here as Azure (e.g.
+        // "http://myacct.blob.core.windows.net/container/key") failed with
+        // a confusing "expected https:// for Azure URL" instead of parsing.
+        // Accept any scheme prefix once the host is confirmed to be an
+        // Azure Blob Storage host -- the scheme doesn't change which
+        // account/container/key the URL names.
         let after_scheme = uri
-            .strip_prefix("https://")
-            .ok_or_else(|| anyhow!("expected https:// for Azure URL"))?;
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .ok_or_else(|| anyhow!("expected a scheme (http:// or https://) for Azure URL"))?;
         let mut host_and_path = after_scheme.splitn(2, '/');
         let host = host_and_path.next().unwrap_or("");
         let path = host_and_path.next().unwrap_or("");
@@ -2114,7 +2166,15 @@ impl ObjectStore for AzureObjectStore {
             "AzureObjectStore::get_range uri='{}', offset={}, length={:?}",
             uri, offset, length
         );
-        let end = length.map(|len| offset + len - 1);
+        // audit #152 finding 2.6 (bug B4): same zero-length short-circuit
+        // as S3ObjectStore::get_range above — avoids the `offset + len - 1`
+        // underflow and the pointless network round-trip.
+        if length == Some(0) {
+            return Ok(Bytes::new());
+        }
+        let end = length
+            .map(|len| crate::range_engine_generic::range_end_inclusive(offset, len))
+            .transpose()?;
         let b = cli.get_range(&key, offset, end).await?; // Bytes - return directly for zero-copy
         Ok(b)
     }
@@ -2755,20 +2815,21 @@ impl ObjectStore for GcsObjectStore {
         client.put_object(&bucket, &object, data).await
     }
 
-    async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, _part_size: Option<usize>) -> Result<()> {
+        // audit #157 bug 5.4 (D5): the community GCS client has no real
+        // chunked/resumable upload implementation (see put_object's doc
+        // comment in gcs_client.rs) — `_part_size` has no effect and is
+        // accepted only to satisfy the ObjectStore trait's shared
+        // signature with the S3/Azure backends, which do support it.
         let (bucket, object) = parse_gcs_uri(uri)?;
-        let chunk_size = part_size.unwrap_or(crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE);
         debug!(
-            "GcsObjectStore::put_multipart uri='{}', {} bytes, chunk_size={}",
+            "GcsObjectStore::put_multipart uri='{}', {} bytes (community GCS client has no \
+             chunked upload; routed to simple upload)",
             uri,
-            data.len(),
-            chunk_size
+            data.len()
         );
         let client = self.get_client().await?;
-        // Pass Bytes directly — put_object_multipart now takes Bytes, zero-copy end-to-end.
-        client
-            .put_object_multipart(&bucket, &object, data, chunk_size)
-            .await
+        client.put_object(&bucket, &object, data).await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
@@ -3042,27 +3103,19 @@ impl ObjectWriter for GcsBufferedWriter {
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
         let client = get_global_gcs_client().await?;
 
-        // Use multipart for large objects, simple put for small ones.
-        // `Bytes::from(Vec<u8>)` transfers ownership without copying — zero-cost.
-        // `std::mem::take` moves the buffer out so the encoder can be dropped too.
-        if self.buffer.len() > crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE {
-            client
-                .put_object_multipart(
-                    &bucket,
-                    &object,
-                    Bytes::from(std::mem::take(&mut self.buffer)),
-                    crate::constants::DEFAULT_S3_MULTIPART_PART_SIZE,
-                )
-                .await
-        } else {
-            client
-                .put_object(
-                    &bucket,
-                    &object,
-                    Bytes::from(std::mem::take(&mut self.buffer)),
-                )
-                .await
-        }
+        // audit #157 bug 5.4 (D5): the community GCS client has no real
+        // chunked/resumable upload — both branches used to call
+        // functions with byte-for-byte identical bodies under different
+        // names. `Bytes::from(Vec<u8>)` transfers ownership without
+        // copying — zero-cost. `std::mem::take` moves the buffer out so
+        // the encoder can be dropped too.
+        client
+            .put_object(
+                &bucket,
+                &object,
+                Bytes::from(std::mem::take(&mut self.buffer)),
+            )
+            .await
     }
 
     fn bytes_written(&self) -> u64 {
@@ -3147,14 +3200,57 @@ fn s3_endpoint_url_from_uri(uri: &str) -> Option<String> {
     let after_scheme = uri.strip_prefix("s3://")?;
     // Authority is everything before the first '/'
     let authority = after_scheme.split('/').next()?;
-    // Only treat as explicit host:port when a ':' is present
-    if !authority.contains(':') {
-        return None;
-    }
-    // Determine HTTP scheme from port: 443 → https, everything else → http
-    let port: u16 = authority.rsplit(':').next()?.parse().ok()?;
-    let http_scheme = if port == 443 { "https" } else { "http" };
+
+    // audit #154 bug 4.3 (E2): the previous check was
+    // `authority.contains(':')` + `authority.rsplit(':').next()`. That
+    // happens to produce the same result as the explicit parse below for
+    // every case exercised here, but only by accident of `rsplit` always
+    // returning the segment after the *last* colon -- it never validated
+    // IPv6 grammar. Parse bracketed-IPv6 and bare host:port authorities
+    // explicitly instead of relying on that coincidence, so the "no port"
+    // vs "has port" decision is deliberate rather than a fallout of a
+    // failed numeric parse.
+    let port_str = if let Some(bracket_end) = authority.find(']') {
+        // Bracketed IPv6 with no ':port' suffix -> not an endpoint URI.
+        authority[bracket_end + 1..].strip_prefix(':')?
+    } else {
+        match authority.matches(':').count() {
+            // S3 bucket names can't contain colons, so a lone ':' in a
+            // non-bracketed authority is unambiguously a port separator;
+            // zero colons is a plain bucket name; unbracketed IPv6 (2+
+            // colons) is ambiguous and rejected rather than guessed at.
+            1 => authority.rsplit(':').next()?,
+            _ => return None,
+        }
+    };
+
+    // Determine HTTP scheme from port: 443 → https, everything else → http,
+    // unless the operator has named this port as TLS-terminated via
+    // S3DLIO_S3_ENDPOINT_TLS_PORTS (audit #154 bug 4.3 / E2 -- TLS-terminated
+    // S3-compatible endpoints on non-standard ports, e.g. a load balancer
+    // terminating TLS on :9001, otherwise had no way to get an https:// URL
+    // out of this heuristic short of literally using port 443).
+    let port: u16 = port_str.parse().ok()?;
+    let http_scheme = if port == 443 || s3_endpoint_tls_ports_from_env().contains(&port) {
+        "https"
+    } else {
+        "http"
+    };
     Some(format!("{http_scheme}://{authority}"))
+}
+
+/// Additional ports to treat as TLS-terminated for [`s3_endpoint_url_from_uri`],
+/// beyond the always-TLS default of 443. Comma-separated list of u16 ports in
+/// `S3DLIO_S3_ENDPOINT_TLS_PORTS`; invalid tokens are ignored.
+fn s3_endpoint_tls_ports_from_env() -> std::collections::HashSet<u16> {
+    std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|tok| tok.trim().parse::<u16>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
@@ -3986,6 +4082,126 @@ mod s3_object_store_tests {
             s2.endpoint_url(),
             "Stores for different endpoints must report different endpoint URLs"
         );
+    }
+
+    // ── E1 (audit #154 bug 4.2) — infer_scheme / is_azure_blob_host ──────────
+    //
+    // RED-then-GREEN regression tests: pre-fix, `infer_scheme` used
+    // `uri.contains(".blob.core.windows.net/")` against the *entire* URI.
+    // Adversarial verify on the original audit finding confirmed `s3://...`
+    // can't reproduce the misroute (it short-circuits earlier in the
+    // if/else chain), but `gs://...` genuinely can: the Azure substring
+    // check runs *before* the `gs://` prefix check, so a GCS URI whose key
+    // happens to contain that literal text was misrouted to Azure.
+
+    #[test]
+    fn infer_scheme_routes_azure_https_hostname_to_azure() {
+        assert_eq!(
+            infer_scheme("https://myacct.blob.core.windows.net/c/k"),
+            Scheme::Azure
+        );
+    }
+
+    #[test]
+    fn infer_scheme_does_not_misroute_gcs_key_that_mentions_azure_host_in_path() {
+        // Pre-fix: `.contains(".blob.core.windows.net/")` matched here
+        // because the substring appears in the *key*, and that check ran
+        // before the `gs://` prefix check -- misrouting this to Azure.
+        assert_eq!(
+            infer_scheme("gs://bucket/mirror/acct.blob.core.windows.net/file.dat"),
+            Scheme::Gcs
+        );
+    }
+
+    #[test]
+    fn infer_scheme_still_recognizes_az_scheme() {
+        assert_eq!(infer_scheme("az://container/blob"), Scheme::Azure);
+    }
+
+    // parse_azure_uri() is only compiled under backend-azure; this is the
+    // other half of E1 -- the audit's actual failure scenario is that
+    // infer_scheme() correctly routes an `http://...blob.core.windows.net/...`
+    // URL to Azure, but parse_azure_uri() then hard-required a "https://"
+    // prefix and bailed with a confusing "expected https://" error instead
+    // of parsing it.
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_uri_accepts_http_scheme_not_just_https() {
+        let (account, container, key) =
+            parse_azure_uri("http://myacct.blob.core.windows.net/container/key/nested")
+                .expect("http:// Azure blob URL must parse, not require https://");
+        assert_eq!(account, "myacct");
+        assert_eq!(container, "container");
+        assert_eq!(key, "key/nested");
+    }
+
+    // ── E2 (audit #154 bug 4.3) — s3_endpoint_url_from_uri ────────────────────
+    //
+    // RED-then-GREEN regression test: pre-fix, scheme selection was purely
+    // `port == 443`, with no way for an operator to mark a TLS-terminated
+    // S3-compatible endpoint running on a non-standard port (e.g. a load
+    // balancer terminating TLS on :9001) as https. S3DLIO_S3_ENDPOINT_TLS_PORTS
+    // closes that gap.
+
+    static ENDPOINT_TLS_PORTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn s3_endpoint_url_from_uri_plain_bucket_has_no_endpoint() {
+        assert_eq!(s3_endpoint_url_from_uri("s3://my-bucket/prefix/key"), None);
+    }
+
+    #[test]
+    fn s3_endpoint_url_from_uri_host_port_uses_http() {
+        assert_eq!(
+            s3_endpoint_url_from_uri("s3://10.9.0.17:80/bucket/key"),
+            Some("http://10.9.0.17:80".to_string())
+        );
+    }
+
+    #[test]
+    fn s3_endpoint_url_from_uri_port_443_uses_https() {
+        assert_eq!(
+            s3_endpoint_url_from_uri("s3://minio.example.com:443/bucket/key"),
+            Some("https://minio.example.com:443".to_string())
+        );
+    }
+
+    #[test]
+    fn s3_endpoint_url_from_uri_bracketed_ipv6_with_port() {
+        assert_eq!(
+            s3_endpoint_url_from_uri("s3://[::1]:9000/bucket/key"),
+            Some("http://[::1]:9000".to_string())
+        );
+    }
+
+    #[test]
+    fn s3_endpoint_url_from_uri_custom_tls_port_via_env_var() {
+        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
+
+        #[allow(deprecated)]
+        std::env::set_var("S3DLIO_S3_ENDPOINT_TLS_PORTS", "9001,9443");
+        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key");
+        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
+
+        assert_eq!(
+            result,
+            Some("https://minio.example:9001".to_string()),
+            "a port named in S3DLIO_S3_ENDPOINT_TLS_PORTS must produce an https:// endpoint"
+        );
+    }
+
+    #[test]
+    fn s3_endpoint_url_from_uri_unlisted_custom_port_still_uses_http() {
+        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
+
+        #[allow(deprecated)]
+        std::env::remove_var("S3DLIO_S3_ENDPOINT_TLS_PORTS");
+        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key");
+        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
+
+        assert_eq!(result, Some("http://minio.example:9001".to_string()));
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

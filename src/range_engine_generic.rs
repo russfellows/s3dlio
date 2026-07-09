@@ -66,6 +66,35 @@ use crate::constants::{
 };
 use crate::data_loader::parallel_fetch::DropCancel;
 
+/// Compute the inclusive end-of-range byte offset for a `bytes=start-end`
+/// style range request, given a start `offset` and a nonzero byte `length`.
+///
+/// audit #152 findings 2.5/2.6/2.7 (bug B4): the S3, Azure, and
+/// community-GCS `get_range()` implementations each computed this as a bare
+/// `offset + length - 1`, which underflows — wrapping to a huge value in
+/// release builds, panicking in debug builds — whenever `length == 0`.
+///
+/// Callers MUST short-circuit `length == 0` themselves before calling this
+/// helper (return an empty buffer without issuing a range request at all —
+/// RFC 7233 range units can't express an empty range, so there is no valid
+/// inclusive end to compute). As defense in depth, this function still
+/// returns `Err` rather than underflowing if it's ever called with
+/// `length == 0` anyway. It also guards `offset + length` overflowing
+/// `u64` via `checked_add`, returning an error instead of silently
+/// wrapping.
+pub fn range_end_inclusive(offset: u64, length: u64) -> Result<u64> {
+    let len_minus_one = length.checked_sub(1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "range_end_inclusive called with length=0 for offset={offset} — \
+             callers must short-circuit zero-length ranges before requesting \
+             a byte range (a zero-byte range has no valid inclusive end)"
+        )
+    })?;
+    offset.checked_add(len_minus_one).ok_or_else(|| {
+        anyhow::anyhow!("range end overflow: offset={offset} + length={length} exceeds u64::MAX")
+    })
+}
+
 /// Configuration for range-based concurrent downloads
 ///
 /// **Performance Considerations**:
@@ -215,8 +244,21 @@ impl RangeEngine {
         F: Fn(u64, u64) -> Fut + Send + Sync + Clone + 'static,
         Fut: std::future::Future<Output = Result<Bytes>> + Send,
     {
+        // audit #152 bug 2.8 (D9): a zero-byte object is a legitimate,
+        // existing object (an empty file) -- not an error. Previously
+        // this bailed with "Cannot download zero-sized object", turning
+        // a perfectly normal empty read into a hard failure for any
+        // caller whose object size happened to be 0.
         if object_size == 0 {
-            bail!("Cannot download zero-sized object");
+            return Ok((
+                Bytes::new(),
+                RangeDownloadStats {
+                    bytes_downloaded: 0,
+                    ranges_processed: 0,
+                    elapsed_time: Duration::ZERO,
+                    throughput_bps: 0,
+                },
+            ));
         }
 
         let start_time = Instant::now();
@@ -360,15 +402,27 @@ impl RangeEngine {
                                 e
                             )
                         })?;
+                    // Locked contract (issue #152 / audit finding f39,
+                    // docs/implementation-plans/v0.9.109-audit-fix-plan.md
+                    // §3 bug A1): any short OR over read is a hard error.
+                    // Assembly below writes each chunk at a running
+                    // cursor rather than its declared range offset, so a
+                    // length mismatch on any non-final chunk — even one
+                    // that's later "compensated" by a mismatch elsewhere
+                    // and sums to the right total — silently shifts every
+                    // subsequent chunk to the wrong position. There is no
+                    // safe way to tolerate a mismatch here; it must abort
+                    // the whole download.
                     if bytes.len() != length as usize {
-                        tracing::warn!(
-                            "Range {} returned {} bytes, expected {} (offset={}, last_range={})",
+                        return Err(anyhow::anyhow!(
+                            "Range {} short/over read: expected {} bytes at offset {}, got {} \
+                             bytes (last_range={})",
                             idx,
-                            bytes.len(),
                             length,
                             offset,
+                            bytes.len(),
                             idx == n_ranges - 1
-                        );
+                        ));
                     }
                     Ok::<(usize, Bytes), anyhow::Error>((idx, bytes))
                 };
@@ -466,10 +520,22 @@ impl RangeEngine {
         }
         let _ = ranges_seen;
 
-        // Trim if any range returned short (matches previous behavior of
-        // returning whatever total length was actually produced).
-        if write_offset < master.len() {
-            master.truncate(write_offset);
+        // Defense in depth: every chunk that reached this point matched
+        // its declared range length exactly (enforced above), and
+        // `calculate_ranges` partitions `object_size` exactly, so
+        // `write_offset` must equal `master.len()` here. This should be
+        // unreachable — if it ever fires, something upstream violated
+        // the per-chunk length invariant without going through the
+        // error path above, which is itself a bug worth surfacing
+        // loudly rather than silently truncating (the old behavior,
+        // which is the root cause this fix closes out).
+        if write_offset != master.len() {
+            bail!(
+                "range assembly invariant violated: wrote {} bytes but master buffer is {} \
+                 bytes (object_size drifted from the sum of range lengths)",
+                write_offset,
+                master.len()
+            );
         }
 
         let bytes_downloaded = master.len() as u64;
@@ -527,6 +593,69 @@ impl RangeEngine {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // RED-then-GREEN regression tests for s3dlio issue #152 findings
+    // 2.5/2.6/2.7 (bug B4): `offset + length - 1` underflows when
+    // `length == 0`. These exercise the shared `range_end_inclusive`
+    // helper directly; separate tests exercise the S3/Azure/GCS
+    // `get_range()` call sites that consume it.
+
+    #[test]
+    fn range_end_inclusive_zero_length_is_an_error_not_an_underflow() {
+        // Pre-fix, the call sites computed `offset + 0 - 1` directly,
+        // which panics (debug builds, overflow-checks-on) or wraps to
+        // u64::MAX - 1 + offset (release builds) instead of ever reaching
+        // this helper. The helper itself must never underflow either.
+        let result = range_end_inclusive(100, 0);
+        assert!(
+            result.is_err(),
+            "length=0 must be rejected, not silently underflow"
+        );
+    }
+
+    #[test]
+    fn range_end_inclusive_single_byte_at_offset_zero() {
+        assert_eq!(range_end_inclusive(0, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn range_end_inclusive_normal_range() {
+        // offset=100, length=50 -> bytes 100..=149
+        assert_eq!(range_end_inclusive(100, 50).unwrap(), 149);
+    }
+
+    #[test]
+    fn range_end_inclusive_overflow_is_an_error() {
+        let result = range_end_inclusive(u64::MAX - 1, 10);
+        assert!(
+            result.is_err(),
+            "offset+length overflowing u64 must be an error, not a silent wrap"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_sized_object_returns_empty_bytes_not_error() {
+        // RED-then-GREEN regression test for s3dlio issue #152 bug 2.8 (D9).
+        // Pre-fix, `download()` unconditionally `bail!`-ed on
+        // `object_size == 0`, treating a legitimate empty object as an
+        // error. An empty object is not a failure -- it should download
+        // as zero bytes, same as reading an empty file.
+        let engine = RangeEngine::new(RangeEngineConfig {
+            min_split_size: 1, // force any nonzero size through the split path
+            ..RangeEngineConfig::default()
+        });
+
+        let get_range = move |_offset: u64, _length: u64| async move { Ok(Bytes::new()) };
+
+        let (bytes, stats) = engine
+            .download(0, get_range, None)
+            .await
+            .expect("downloading a zero-sized object must succeed, not error");
+
+        assert_eq!(bytes.len(), 0);
+        assert_eq!(stats.bytes_downloaded, 0);
+        assert_eq!(stats.ranges_processed, 0);
+    }
 
     #[tokio::test]
     async fn test_small_object_single_request() {

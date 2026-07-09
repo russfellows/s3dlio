@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.108"
+version = "0.9.110"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -169,7 +169,7 @@ pprof             = { version = "0.15", features = ["flamegraph"], optional = tr
 
 
 [dev-dependencies]
-tokio         = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio         = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-sync   = "^0.1.8"
 futures-util  = "^0.3"
 async-trait   = "^0.1"   # needed by the mock datasets

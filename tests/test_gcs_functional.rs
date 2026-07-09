@@ -350,8 +350,8 @@ async fn test_gcs_delete_multiple_objects() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires GCS credentials and GCS_TEST_BUCKET env var"]
-async fn test_gcs_multipart_upload() -> Result<()> {
-    println!("\n=== Testing GCS Multipart Upload ===");
+async fn test_gcs_large_object_upload() -> Result<()> {
+    println!("\n=== Testing GCS Large Object Upload ===");
 
     let bucket = get_test_bucket()?;
     let client = GcsClient::new().await?;
@@ -368,17 +368,14 @@ async fn test_gcs_multipart_upload() -> Result<()> {
         data_size / (1024 * 1024)
     );
 
-    // Use multipart upload with 256 KB chunks
-    let chunk_size = 256 * 1024;
+    // audit #157 bug 5.4 (D5): the community GCS client has no real
+    // chunked/resumable upload — put_object_multipart was a stub
+    // identical to put_object and has been removed; this now exercises
+    // put_object directly with the same large payload.
     client
-        .put_object_multipart(
-            &bucket,
-            &object_key,
-            Bytes::from(test_data.clone()),
-            chunk_size,
-        )
+        .put_object(&bucket, &object_key, Bytes::from(test_data.clone()))
         .await?;
-    println!("✓ Multipart PUT successful");
+    println!("✓ Large object PUT successful");
 
     // Verify object metadata
     let metadata = client.stat_object(&bucket, &object_key).await?;

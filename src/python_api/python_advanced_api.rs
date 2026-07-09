@@ -368,6 +368,19 @@ impl PyMultipartUploadWriter {
     /// the upload is aborted and the original exception is re-raised unchanged.
     /// If no exception occurred, `finish_blocking()` is called; any error it
     /// returns is surfaced as a new `RuntimeError`.
+    ///
+    /// Audit #151 bug 1.4 (C4): both `let _ = ...abort_blocking()` calls
+    /// below look like they discard a failure signal, but they don't —
+    /// `abort_blocking()` is infallible by contract (bug A3, this session):
+    /// it always cancels the coordinator and always returns `Ok(())`, even
+    /// when the underlying `AbortMultipartUpload` request itself fails.
+    /// That failure is not lost — `cancel_coordinator_and_maybe_abort`
+    /// (shared by `abort_blocking()` and `Drop`) emits a `tracing::warn!`
+    /// naming the bucket/key/upload_id right where the failure occurs, so
+    /// there is nothing left for `__exit__` to swallow. See
+    /// `abort_blocking_returns_ok_and_never_completes_even_when_s3_abort_fails`
+    /// in tests/test_multipart_abort_blocking.rs, which proves this
+    /// invariant directly against the mock server's induced-failure mode.
     #[pyo3(text_signature = "(self, exc_type, exc, tb)")]
     fn __exit__(
         &mut self,
@@ -380,10 +393,13 @@ impl PyMultipartUploadWriter {
             if !_t.bind(py).is_none() {
                 // An exception propagated from inside the `with` block — abort the
                 // upload and let the original exception propagate unchanged.
+                // Safe to discard: see the infallibility note above.
                 let _ = py.detach(|| inner.abort_blocking());
                 return Ok(()); // returning Ok(()) (falsy) does NOT suppress the exception
             }
             if let Err(e) = py.detach(|| inner.finish_blocking()) {
+                // Best-effort cleanup after a failed finish; safe to
+                // discard for the same reason as above.
                 let _ = py.detach(|| inner.abort_blocking());
                 return Err(PyRuntimeError::new_err(format!(
                     "multipart upload failed: {e}"

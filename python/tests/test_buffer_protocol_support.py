@@ -16,7 +16,7 @@ from pathlib import Path
 import asyncio
 
 # Add the project root to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import s3dlio
 

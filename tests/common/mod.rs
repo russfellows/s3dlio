@@ -5,6 +5,8 @@
 
 use std::env;
 
+pub mod mock_s3_server;
+
 /// Test configuration for GCS tests
 pub struct TestConfig {
     /// The GCS bucket to use for testing

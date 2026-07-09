@@ -7,7 +7,7 @@ to use s3dlio instead of s3torchconnector.
 IMPORTANT: While this file is named "s3_torch_storage.py" for compatibility
 with DLIO's existing infrastructure, it supports ALL s3dlio backends:
   - s3://   - Amazon S3, MinIO, Ceph, S3-compatible stores
-  - az://   - Azure Blob Storage  
+  - az://   - Azure Blob Storage
   - gs://   - Google Cloud Storage
   - file:// - Local filesystem (POSIX)
   - direct:// - Direct I/O filesystem (O_DIRECT)
@@ -21,47 +21,52 @@ Licensed under Apache 2.0
 
 Compatible with DLIO Benchmark v1.0+ (after PR #307)
 """
+
+import logging
 import os
 from urllib.parse import urlparse
 
 import s3dlio
 
 from dlio_benchmark.common.constants import MODULE_STORAGE
-from dlio_benchmark.storage.storage_handler import DataStorage, Namespace
+from dlio_benchmark.storage.storage_handler import Namespace
 from dlio_benchmark.storage.s3_storage import S3Storage
 from dlio_benchmark.common.enumerations import NamespaceType, MetadataType
 from dlio_benchmark.utils.utility import Profile
 
+from . import _multipart_config
+
 dlp = Profile(MODULE_STORAGE)
+_logger = logging.getLogger(__name__)
 
 
 class S3PyTorchConnectorStorage(S3Storage):
     """
     Storage backend using s3dlio for high-performance multi-protocol I/O.
-    
+
     Despite the class name (kept for DLIO compatibility), this backend
     supports ALL s3dlio storage protocols:
-    
+
     - s3://     Amazon S3, MinIO, Ceph, S3-compatible stores
     - az://     Azure Blob Storage
     - gs://     Google Cloud Storage
     - file://   Local filesystem (POSIX)
     - direct:// Direct I/O filesystem (O_DIRECT)
-    
+
     Environment Variables by Backend:
-    
+
     S3 (s3://):
         AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
         AWS_ENDPOINT_URL (for MinIO, Ceph, etc.)
-    
+
     Azure (az://):
         AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCOUNT_KEY
         AZURE_STORAGE_ENDPOINT (optional)
-    
+
     GCS (gs://):
         GOOGLE_APPLICATION_CREDENTIALS (path to service account JSON)
         GCS_ENDPOINT_URL (optional)
-    
+
     File/Direct (file://, direct://):
         No credentials needed - uses local filesystem
     """
@@ -70,16 +75,18 @@ class S3PyTorchConnectorStorage(S3Storage):
     def __init__(self, namespace, framework=None):
         super().__init__(framework)
         self.namespace = Namespace(namespace, NamespaceType.FLAT)
-        
+
         # Get storage options from config (same as original s3_torch_storage.py)
         storage_options = getattr(self._args, "storage_options", {}) or {}
-        
+
         # Set environment variables from config if provided
         # This maintains compatibility with DLIO's YAML config format
         if storage_options.get("access_key_id"):
             os.environ.setdefault("AWS_ACCESS_KEY_ID", storage_options["access_key_id"])
         if storage_options.get("secret_access_key"):
-            os.environ.setdefault("AWS_SECRET_ACCESS_KEY", storage_options["secret_access_key"])
+            os.environ.setdefault(
+                "AWS_SECRET_ACCESS_KEY", storage_options["secret_access_key"]
+            )
         if storage_options.get("region"):
             os.environ.setdefault("AWS_REGION", storage_options["region"])
         if storage_options.get("endpoint_url"):
@@ -101,52 +108,58 @@ class S3PyTorchConnectorStorage(S3Storage):
 
     @dlp.log
     def create_node(self, id, exist_ok=False):
-        """Create directory node using s3dlio.mkdir for all backends."""
+        """Create directory node using s3dlio.mkdir for all backends.
+
+        Audit #153 bug 3.4 (C2): see s3dlio_storage.py's create_node for
+        the full rationale -- only a genuine already-exists signal
+        (FileExistsError) is treated as success; everything else
+        propagates regardless of exist_ok.
+        """
         uri = self.get_uri(id)
         try:
             s3dlio.mkdir(uri)
             return True
-        except Exception as e:
-            if not exist_ok:
-                raise
-            return True
+        except FileExistsError:
+            if exist_ok:
+                return True
+            raise
 
     @dlp.log
     def get_node(self, id=""):
         """Get node type (FILE, DIRECTORY, or None)."""
         uri = self.get_uri(id)
-        
+
         # Check if it's a file
-        if hasattr(s3dlio, 'exists'):
+        if hasattr(s3dlio, "exists"):
             if s3dlio.exists(uri):
                 return MetadataType.FILE
         else:
             # Fallback for older s3dlio versions
             try:
                 metadata = s3dlio.stat(uri)
-                if metadata and 'size' in metadata:
+                if metadata and "size" in metadata:
                     return MetadataType.FILE
             except Exception:
                 pass
-        
+
         # Check if it's a "directory" by listing children
         try:
-            check_uri = uri if uri.endswith('/') else uri + '/'
+            check_uri = uri if uri.endswith("/") else uri + "/"
             children = s3dlio.list(check_uri)
             if children:
                 return MetadataType.DIRECTORY
         except Exception:
             pass
-        
+
         return None
 
     @dlp.log
     def walk_node(self, id, use_pattern=False):
         """
         List objects under a path. Returns relative filenames.
-        
+
         Works with all URI schemes: s3://, az://, gs://, file://, direct://
-        
+
         This matches the original s3_torch_storage.py behavior where
         walk_node returns just the filenames, not full URIs.
         """
@@ -158,60 +171,85 @@ class S3PyTorchConnectorStorage(S3Storage):
             raise ValueError(
                 f"URI must include scheme (s3://, az://, gs://, file://, direct://): {id}"
             )
-        
+
         try:
             # Handle file:// URIs differently (no netloc, path is the full path)
-            if parsed.scheme in ('file', 'direct'):
+            if parsed.scheme in ("file", "direct"):
                 base_path = parsed.path
-                prefix = base_path.rstrip('/')
-                if prefix and not prefix.endswith('/'):
-                    prefix += '/'
+                prefix = base_path.rstrip("/")
+                if prefix and not prefix.endswith("/"):
+                    prefix += "/"
                 full_uri = f"{parsed.scheme}://{prefix}"
             else:
                 # Cloud storage: scheme://bucket/prefix
                 bucket = parsed.netloc
-                prefix = parsed.path.lstrip('/')
-                if prefix and not prefix.endswith('/'):
-                    prefix += '/'
+                prefix = parsed.path.lstrip("/")
+                if prefix and not prefix.endswith("/"):
+                    prefix += "/"
                 full_uri = f"{parsed.scheme}://{bucket}/{prefix}"
-            
-            # s3dlio.list returns keys (not full URIs)
+
+            # s3dlio.list returns full URIs (e.g. "s3://bucket/train/a/x"),
+            # NOT bare keys -- this comment used to claim the opposite,
+            # which was the bug (audit #153 bug 3.8 / D7): comparing each
+            # returned full URI against the bare relative `prefix` (e.g.
+            # "train/") never matched, so every call fell through to the
+            # os.path.basename() branch below, silently dropping any
+            # subdirectory structure ("train/a/x" became just "x" instead
+            # of "a/x"). Compare against `full_uri` instead, matching the
+            # sibling s3dlio_storage.py::walk_node implementation.
             keys = s3dlio.list(full_uri)
-            
+
             # Convert to relative paths (just filenames)
             # This matches the original s3_torch_storage.py behavior
             paths = []
             for key in keys:
                 # Strip the prefix to get relative path
-                if key.startswith(prefix):
-                    relative = key[len(prefix):]
+                if key.startswith(full_uri):
+                    relative = key[len(full_uri) :]
                 else:
                     relative = os.path.basename(key)
-                
+
                 if relative:  # Skip empty strings
                     paths.append(relative)
-            
+
             return paths
-            
-        except Exception as e:
-            print(f"Error listing {id}: {e}")
-            return []
+
+        except Exception:
+            # Audit #153 bug 3.3 (C1): see s3dlio_storage.py's walk_node
+            # for the full rationale -- log and propagate instead of
+            # returning [] (indistinguishable from "legitimately empty").
+            _logger.exception("Error listing %s", id)
+            raise
 
     @dlp.log
     def delete_node(self, id):
-        """Delete an object."""
+        """Delete an object.
+
+        Audit #153 bug 3.5 (C3): see s3dlio_storage.py's delete_node for
+        the full rationale -- only a genuine not-found signal
+        (FileNotFoundError) is treated as success; everything else
+        propagates.
+        """
         uri = self.get_uri(id)
         try:
             s3dlio.delete(uri)
             return True
-        except Exception:
-            return False
+        except FileNotFoundError:
+            return True
 
     @dlp.log
     def put_data(self, id, data, offset=None, length=None):
         """
         Write data to storage.
-        
+
+        Objects below the S3DLIO_MULTIPART_THRESHOLD_MB threshold (default
+        32 MiB) use a single PUT for lowest overhead.  Objects at or above
+        use MultipartUploadWriter for maximum throughput and to avoid the
+        S3 5 GiB single-PUT limit.  See
+        s3dlio.integrations.dlio._multipart_config for the full env var
+        contract (S3DLIO_MULTIPART_THRESHOLD_MB, S3DLIO_MULTIPART_PART_SIZE_MB,
+        S3DLIO_MULTIPART_MAX_IN_FLIGHT, S3DLIO_DISABLE_MULTIPART).
+
         Args:
             id: Full URI (e.g., s3://bucket/key, az://container/blob, file:///path)
             data: bytes or BytesIO object
@@ -219,18 +257,38 @@ class S3PyTorchConnectorStorage(S3Storage):
             length: Not supported (full object write only)
         """
         # Handle BytesIO objects (from numpy.save, etc.)
-        if hasattr(data, 'getvalue'):
+        if hasattr(data, "getvalue"):
             content = data.getvalue()
-        elif hasattr(data, 'read'):
+        elif hasattr(data, "read"):
             # Seek to beginning if possible
-            if hasattr(data, 'seek'):
+            if hasattr(data, "seek"):
                 data.seek(0)
             content = data.read()
         else:
             content = data
-        
+
         try:
-            s3dlio.put_bytes(id, content)
+            size = len(content)
+            threshold = _multipart_config.multipart_threshold_bytes()
+            if _multipart_config.multipart_disabled() or size < threshold:
+                # Single PUT — no three-phase overhead, matches library default behaviour.
+                s3dlio.put_bytes(id, content)
+            else:
+                # Multipart upload — higher throughput for large objects,
+                # avoids the S3 5 GiB single-PUT limit (audit #153 bug 3.2 / B6).
+                part_size = _multipart_config.multipart_part_size_bytes()
+                writer = s3dlio.MultipartUploadWriter.from_uri(
+                    id,
+                    part_size=part_size,
+                    max_in_flight=_multipart_config.multipart_max_in_flight(),
+                    abort_on_drop=True,
+                )
+                offset_pos = 0
+                while offset_pos < size:
+                    n = min(part_size, size - offset_pos)
+                    writer.write(content[offset_pos : offset_pos + n])
+                    offset_pos += n
+                writer.close()
             return None
         except Exception as e:
             print(f"Error writing to {id}: {e}")
@@ -240,16 +298,25 @@ class S3PyTorchConnectorStorage(S3Storage):
     def get_data(self, id, data=None, offset=None, length=None):
         """
         Read data from storage.
-        
+
         Args:
             id: Full URI (e.g., s3://bucket/key, az://container/blob, file:///path)
             data: Ignored (buffer not needed with s3dlio)
             offset: Start byte offset (optional)
             length: Number of bytes to read (optional)
         """
+        # Locked contract (audit #153 f4, docs/implementation-plans/
+        # v0.9.109-audit-fix-plan.md bug B5) -- same fix as
+        # s3dlio_storage.py's get_data: offset and length are each
+        # independently optional per this method's docstring, but the old
+        # `and`-guard only took the get_range() path when BOTH were
+        # given, silently returning the full object for offset-only or
+        # length-only calls.
         try:
-            if offset is not None and length is not None:
+            if offset is not None:
                 return s3dlio.get_range(id, offset=offset, length=length)
+            elif length is not None:
+                return s3dlio.get_range(id, offset=0, length=length)
             else:
                 return s3dlio.get(id)
         except Exception as e:
@@ -260,12 +327,12 @@ class S3PyTorchConnectorStorage(S3Storage):
     def isfile(self, id):
         """Check if path is a file (object exists)."""
         uri = self.get_uri(id)
-        if hasattr(s3dlio, 'exists'):
+        if hasattr(s3dlio, "exists"):
             return s3dlio.exists(uri)
         # Fallback for older s3dlio versions
         try:
             metadata = s3dlio.stat(uri)
-            return metadata is not None and 'size' in metadata
+            return metadata is not None and "size" in metadata
         except Exception:
             return False
 

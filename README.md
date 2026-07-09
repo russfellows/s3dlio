@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-689-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.108-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-748-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.110-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,15 +10,11 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.108 — Performance & concurrency audit — 17 fixes across 4 phases (issue #148)**
+> **v0.9.110 — Multi-agent bug audit fix release — 39 fixes across 6 phases (issues #151–#157)**
 >
-> Resolves the full [issue #148](https://github.com/russfellows/s3dlio/issues/148) audit: task-level parallelism at 9 sites, drain-first-then-first-error at 4 short-circuit sites, peak-memory halving in range assembly at 4 sites, HTTP/2 opt-in reversal (**BREAKING for `https://`** — see below), streaming connector via `SdkBody::from_body_1_x`, and a shared `retry_get_body` helper for body-transfer failures with a fault-injection regression test locking in the audit §2.4 silent-data-corruption gate.
+> Closes a coordinated 7-issue, 39-bug audit of s3dlio HEAD, fanning out specialized reviewers by subsystem then adversarially verifying every finding: silent data corruption in range/multipart paths (Phase A), wrong-data-returned bugs reachable from the public API (Phase B), silent exception-swallowing (Phase C), backend correctness/hygiene across S3/Azure/GCS (Phase D), URI-parsing and scheme-detection edge cases (Phase E), and dead/mismatched env-var knobs (Phase F). Every fix landed with a RED-then-GREEN regression test that fails against unmodified code and passes after the fix. Full bug-by-bug table and per-commit list: [docs/Changelog.md](docs/Changelog.md).
 >
-> **Measured impact** against a local ~40 GB/s fake-S3 target: 3.8× on bulk mixed workload with 64 KB objects at high concurrency; 2.1× on single-object range GET at 256 MiB; ~15–20% wins in the 256 KB–1 MB range; wire-bound (no-op, no regression) at 8 MB+. Full before/after tables in [`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md`](docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148_Bench-Results.md).
->
-> **BREAKING CHANGE:** `https://` no longer negotiates HTTP/2 by default. It now matches `http://` — HTTP/1.1 unless explicitly opted in via `S3DLIO_HTTPS_H2=1` (per-scheme) or `S3DLIO_ENABLE_HTTP2=1` (master switch). See [docs/Changelog.md](docs/Changelog.md) for full detail.
->
-> Audit and rationale: [`docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148.md`](docs/enhancement/PERF-CONCURRENCY-AUDIT-issue148.md).
+> **v0.9.108 (prior):** Performance & concurrency audit — 17 fixes across 4 phases (issue #148). **BREAKING for `https://`:** no longer negotiates HTTP/2 by default (now matches `http://` — HTTP/1.1 unless opted in via `S3DLIO_HTTPS_H2=1`/`S3DLIO_ENABLE_HTTP2=1`).
 >
 > **v0.9.106 (prior):** Write verification (`S3DLIO_PUT_VERIFY`, `S3DLIO_MPU_PUT_VERIFY`) changed from always-on to opt-in (mlcommons/storage#593 follow-up).
 >
@@ -226,9 +222,11 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.98** (May 2026) — Parquet DataLoader with epoch-2 fast path and Arrow IPC decode. See [docs/Changelog.md](docs/Changelog.md).
+**v0.9.110** — Multi-agent bug audit fix release: 39 fixes across 6 phases, 7 issues (#151–#157). See [docs/Changelog.md](docs/Changelog.md).
 
 **Recent highlights:**
+- **v0.9.110** - Phase D+E+F of the audit (17 bugs): backend correctness/hygiene (GCS retry backoff, RAPID-bucket cache poisoning, Azure 50K-block cap, community-GCS multipart stub), URI/scheme-detection edge cases, dead/mismatched env-var knobs; new `S3DLIO_S3_ENDPOINT_TLS_PORTS`; 748 tests passing
+- **v0.9.109** - Phase A+B+C of the audit (22 bugs): silent data corruption in range/multipart paths, wrong-data-returned bugs, silent exception-swallowing; new `S3DLIO_S3_ENDPOINT_HINT_TLDS` + DLIO multipart env vars
 - **v0.9.98** - **Parquet DataLoader** (`ParquetRowGroupDataset`): per-row-group Dataset, epoch-2 zero-re-fetch (2.5× speedup proven), Raw + ArrowIpc decode modes, 8-worker shared caches; 648 tests passing
 - **v0.9.97** - `XorStream` (dedup-safe, ~15 GB/s/core); `S3DLIO_UNSIGNED_PAYLOAD` opt-in for private S3-compatible endpoints; 613 tests passing
 - **v0.9.92** - MPU coordinator task, auto-scale, async write/flush/finish safety fixes, MAX_MULTIPART_PARTS guard; 580 tests passing

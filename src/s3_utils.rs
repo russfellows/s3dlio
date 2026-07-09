@@ -37,6 +37,7 @@ use crate::config::ObjectType;
 use crate::data_gen::generate_object;
 
 // S3 client creation
+use crate::retry::retry_get_body;
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
 
 // S3 operation logging
@@ -401,6 +402,86 @@ pub struct S3UriComponents {
     pub key: String,
 }
 
+/// Default set of hostname-like suffixes checked by [`looks_like_s3_endpoint`]
+/// against the LAST dot-separated label of a URI's first path segment.
+/// Extend at runtime via the comma-separated `S3DLIO_S3_ENDPOINT_HINT_TLDS`
+/// env var (audit #154 bug 4.1 / B8).
+const DEFAULT_ENDPOINT_HINT_TLDS: &[&str] = &[
+    // common public TLDs frequently used for self-hosted S3-compatible endpoints
+    "com", "net", "org", "io", "co", "dev", "cloud", "app", "biz", "info",
+    // conventional private/internal-infrastructure suffixes
+    "local", "internal", "lan", "corp", "home", "cluster", "svc", "network",
+];
+
+/// Returns the effective endpoint-hint suffix list: the built-in defaults
+/// plus any comma-separated entries from `S3DLIO_S3_ENDPOINT_HINT_TLDS`.
+fn endpoint_hint_tlds() -> Vec<String> {
+    let mut tlds: Vec<String> = DEFAULT_ENDPOINT_HINT_TLDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Ok(extra) = std::env::var("S3DLIO_S3_ENDPOINT_HINT_TLDS") {
+        for t in extra.split(',') {
+            let t = t.trim().to_lowercase();
+            if !t.is_empty() {
+                tlds.push(t);
+            }
+        }
+    }
+    tlds
+}
+
+/// True if `s` is a syntactically valid dotted-quad IPv4 address (four
+/// `0..=255` octets separated by dots). S3 bucket names are explicitly
+/// forbidden from being formatted as an IP address, so this check is
+/// unambiguous — it can never misclassify a legal bucket name.
+fn looks_like_ipv4(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 3
+                && p.chars().all(|c| c.is_ascii_digit())
+                && p.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
+        })
+}
+
+/// Decide whether the first path segment of an `s3://` URI (the part
+/// before the first `/`) should be treated as a custom endpoint
+/// hostname rather than a bucket name.
+///
+/// Narrowed in v0.9.109 (audit #154 bug 4.1 / B8) to only fire on
+/// strings that are grammatically unambiguous or plausibly look like a
+/// real hostname:
+/// - contains `:` (a port — bucket names can never contain a colon)
+/// - is a dotted-quad IPv4 address (bucket names can never be formatted
+///   as an IP address, per S3 bucket naming rules)
+/// - contains a dot AND its last dot-separated label matches a known
+///   endpoint-hint suffix (see [`DEFAULT_ENDPOINT_HINT_TLDS`] /
+///   `S3DLIO_S3_ENDPOINT_HINT_TLDS`)
+///
+/// Deliberately does NOT fire on: a bare digit prefix, 2+ dots alone, or
+/// a `minio`/`ceph`/`localhost` substring — all of which are legal
+/// components of real S3 bucket names and were the source of the
+/// pre-v0.9.109 misclassification bug.
+fn looks_like_s3_endpoint(before_slash: &str) -> bool {
+    if before_slash.contains(':') {
+        return true;
+    }
+    if looks_like_ipv4(before_slash) {
+        return true;
+    }
+    if let Some(last_label) = before_slash.rsplit('.').next() {
+        if before_slash.contains('.') {
+            let last_label = last_label.to_lowercase();
+            if endpoint_hint_tlds().contains(&last_label) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Parse S3 URI with optional endpoint support (Hybrid Approach - Option C)
 ///
 /// Supports two formats:
@@ -434,6 +515,22 @@ pub struct S3UriComponents {
 /// let result = parse_s3_uri_full("s3://minio.local:9000/mybucket/path/to/file").unwrap();
 /// assert_eq!(result.endpoint, Some("minio.local:9000".to_string()));
 /// ```
+///
+/// # Behavior change (v0.9.109, audit #154 bug 4.1 / B8)
+///
+/// Prior to v0.9.109, the first path segment was treated as an endpoint
+/// if it merely contained 2+ dots, started with a digit, or contained
+/// "minio"/"ceph"/"localhost" as a substring — misrouting legitimate S3
+/// bucket names using dotted naming conventions (e.g. `mycompany.data.
+/// backups`), digit-prefixed names (explicitly legal per S3 bucket
+/// naming rules, e.g. `2024-training-data`), or names merely containing
+/// those cluster-software names (e.g. `minio-tenant-a`). As of v0.9.109
+/// the heuristic only fires on a colon (port), a dotted-quad IPv4
+/// address, or a recognized hostname-like suffix — see
+/// [`looks_like_s3_endpoint`]. **If you relied on the old broader
+/// heuristic to route a bucket-shaped endpoint hostname with no port and
+/// no recognized suffix, add your suffix to
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` (comma-separated) or include a port.**
 pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
     let trimmed = uri
         .strip_prefix("s3://")
@@ -446,17 +543,7 @@ pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
     let before_slash = &trimmed[..slash_pos];
     let after_slash = &trimmed[slash_pos + 1..];
 
-    // Heuristic to detect if first part is an endpoint:
-    // - Contains ':' (has port) → definitely endpoint
-    // - Starts with digit → likely IP address → endpoint
-    // - Contains multiple dots → likely IP or FQDN → endpoint
-    // - Common hostnames like "minio", "ceph" → endpoint
-    let is_endpoint = before_slash.contains(':')
-        || before_slash.starts_with(|c: char| c.is_ascii_digit())
-        || before_slash.matches('.').count() >= 2
-        || before_slash.starts_with("minio")
-        || before_slash.starts_with("ceph")
-        || before_slash.contains("localhost");
+    let is_endpoint = looks_like_s3_endpoint(before_slash);
 
     if is_endpoint {
         // Format: s3://endpoint:port/bucket/key or s3://endpoint/bucket/key
@@ -952,6 +1039,17 @@ pub async fn get_object_range_uri_async(
         "get_object_range: uri='{}', offset={}, length={:?}",
         uri, offset, length
     );
+    // Locked contract (audit #152 f42, docs/implementation-plans/
+    // v0.9.109-audit-fix-plan.md bug B2): `length=Some(0)` must return
+    // zero bytes without a network call. The range-string builder below
+    // only overwrote the default `bytes={offset}-` (open-ended, meaning
+    // "to end of object") inside `if len > 0`, so a caller asking for
+    // zero bytes silently got the entire remainder of the object
+    // instead.
+    if length == Some(0) {
+        return Ok(Bytes::new());
+    }
+
     let client = aws_s3_client_async().await?;
     let mut range = format!("bytes={}-", offset);
     if let Some(len) = length {
@@ -960,17 +1058,37 @@ pub async fn get_object_range_uri_async(
             range = format!("bytes={}-{}", offset, end);
         }
     }
-    let resp = client
-        .get_object()
-        .bucket(&bucket)
-        .key(key.trim_start_matches('/'))
-        .range(range)
-        .send()
-        .await
-        .sdk_context(format!("GET range for s3://{}/{} failed", bucket, key))?;
-    let body = resp.body.collect().await.context("collect range body")?;
-    // Zero-copy: return Bytes directly
-    let bytes = body.into_bytes();
+
+    // Locked contract (audit #152 f19, docs/implementation-plans/
+    // v0.9.109-audit-fix-plan.md bug B1): Phase 4b (v0.9.108) made the
+    // response body stream via `SdkBody::from_body_1_x`, which moved
+    // body-transfer failures (TCP FIN mid-body, HTTP/2 RST, connection
+    // reset after headers) out from under smithy's send()-level retry —
+    // smithy already returned Ok(response) at headers by the time a
+    // streamed body can fail. This send()+collect() pair was left
+    // unwrapped, so a transient body-transfer glitch now aborts the
+    // whole GET instead of being retried, a regression from pre-Phase-4b
+    // behavior. Four production callers reach this function
+    // (data_loader/s3_bytes.rs, object_store.rs's client-present
+    // get_range fallback, and two internal fast-paths in this file);
+    // wrapping here fixes all of them. GETs are idempotent and each
+    // attempt allocates a fresh Bytes, so retrying the whole pair is
+    // trivially safe.
+    let bytes = retry_get_body(|| async {
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key.trim_start_matches('/'))
+            .range(&range)
+            .send()
+            .await
+            .sdk_context(format!("GET range for s3://{}/{} failed", bucket, key))?;
+        let body = resp.body.collect().await.context("collect range body")?;
+        // Zero-copy: return Bytes directly
+        Ok::<Bytes, anyhow::Error>(body.into_bytes())
+    })
+    .await?;
+
     debug!(
         "get_object_range: uri='{}', returned {} bytes",
         uri,
@@ -999,6 +1117,16 @@ pub async fn get_object_range_uri_timed_async(
     if key.is_empty() {
         bail!("Cannot GET range: no key specified");
     }
+    // Same length=Some(0) fast path as get_object_range_uri_async (bug B2)
+    // — return zero bytes / zero durations without a network call.
+    if length == Some(0) {
+        return Ok((
+            Bytes::new(),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        ));
+    }
+
     let client = aws_s3_client_async().await?;
     let mut range = format!("bytes={}-", offset);
     if let Some(len) = length {
@@ -1089,7 +1217,22 @@ pub async fn get_object_concurrent_range_async(
             bucket, key
         ))?;
 
-    let object_size = head_resp.content_length().unwrap_or(0) as u64;
+    // Locked contract (audit #152 f37, docs/implementation-plans/
+    // v0.9.109-audit-fix-plan.md bug B3): a HEAD that succeeds but omits
+    // Content-Length (seen on some S3-compatible backends behind a
+    // 307-redirect proxy, or a gateway that strips the header) must NOT
+    // be silently coerced to object_size=0 — `unwrap_or(0)` did that,
+    // which then tripped the `start_offset >= object_size` guard below
+    // and returned an empty Bytes with Ok status for an object that
+    // actually has data. Surface the anomaly instead.
+    let object_size = head_resp.content_length().ok_or_else(|| {
+        anyhow::anyhow!(
+            "HEAD for s3://{}/{} succeeded but returned no Content-Length header \
+             — cannot determine object size for a range GET",
+            bucket,
+            key
+        )
+    })? as u64;
 
     // Calculate actual range
     let start_offset = offset;
@@ -1593,13 +1736,44 @@ pub async fn delete_objects_async(bucket: &str, keys: &[String]) -> Result<()> {
             .set_objects(Some(objects))
             .build()
             .context("Failed to build Delete request")?;
-        client
+        let output = client
             .delete_objects()
             .bucket(bucket)
             .delete(delete)
             .send()
             .await
             .with_context(|| format!("delete_objects_async failed for bucket '{}'", bucket))?;
+
+        // Locked contract (audit #151 f36, docs/implementation-plans/
+        // v0.9.109-audit-fix-plan.md bug A4): S3's DeleteObjects returns
+        // HTTP 200 even when individual keys failed to delete — the
+        // per-object outcome lives in the response body's `errors` list,
+        // not the HTTP status. Discarding the response here (as this
+        // function previously did) silently reported partial or total
+        // batch failures as success.
+        let errs = output.errors();
+        if !errs.is_empty() {
+            let detail = errs
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}: {} ({})",
+                        e.key().unwrap_or("<unknown key>"),
+                        e.code().unwrap_or("<unknown code>"),
+                        e.message().unwrap_or("<no message>")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "delete_objects_async for bucket '{}' partially failed: {} of {} object(s) \
+                 not deleted: {}",
+                bucket,
+                errs.len(),
+                chunk.len(),
+                detail
+            );
+        }
     }
     Ok(())
 }
@@ -1880,11 +2054,24 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
             .send()
             .await
         {
-            Ok(resp) => {
-                let sz = resp.content_length().unwrap_or(0) as u64;
-                get_size_cache().put(uri.to_string(), sz).await;
-                sz
-            }
+            // Locked contract (audit #152 f37, bug B3): a HEAD that
+            // succeeds but omits Content-Length must not be cached as
+            // size=0 (unwrap_or(0) did that here) — that poisons the
+            // ObjectSizeCache for every subsequent call to this URI and
+            // routes small-object reads through range-GET machinery
+            // with a bogus zero-byte range. Treat "no Content-Length"
+            // the same as a HEAD failure: fall back to a plain GET
+            // without caching anything.
+            Ok(resp) => match resp.content_length() {
+                Some(sz) => {
+                    let sz = sz as u64;
+                    get_size_cache().put(uri.to_string(), sz).await;
+                    sz
+                }
+                None => {
+                    return get_object(&bucket, &key).await;
+                }
+            },
             Err(_) => {
                 // HEAD failed: fall back to single GET without range splitting.
                 return get_object(&bucket, &key).await;

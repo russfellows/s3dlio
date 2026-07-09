@@ -113,6 +113,15 @@ are clean:
 For Python wheel changes, additionally rebuild via `./build_pyo3.sh` (see
 above) and smoke-test against the wheel via `uv run pytest`.
 
+For any change touching `python/` (including `python/s3dlio/...` and
+`python/tests/...`), additionally run (per the parent CLAUDE.md rule #7):
+
+4. `ruff check python/`
+5. `ruff format --check python/`
+6. `uv run python -m compileall -q python/s3dlio python/tests`
+
+All three must be clean before considering the Python side of a change done.
+
 ### Zero warnings — no exceptions, no underscore hacks
 
 Per the parent Prime Directive #4, never leave a warning behind. In this

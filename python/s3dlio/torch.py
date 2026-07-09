@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import queue
-from typing import Iterable, Dict, Any, Sequence, Optional, Iterator, Tuple
+from typing import Iterable, Dict, Any, Sequence, Optional, Tuple
 
 import torch
 from torch.utils.data import IterableDataset, Dataset, get_worker_info
@@ -51,6 +51,7 @@ class _BytesReader:
       __enter__/__exit__ (context manager)
       __len__() -> int (payload length)
     """
+
     __slots__ = ("_buf", "_pos", "_closed")
 
     def __init__(self, data: bytes):
@@ -110,17 +111,16 @@ def _normalize_opts(**kwargs) -> Dict[str, Any]:
       #   shard_rank, shard_world_size, worker_id, num_workers_pytorch
     """
     opts: Dict[str, Any] = {
-        "batch_size":   kwargs.get("batch_size", 1),
-        "drop_last":    kwargs.get("drop_last", False),
-        "shuffle":      kwargs.get("shuffle", False),
-        "seed":         kwargs.get("seed", 0),
-        "num_workers":  kwargs.get("num_workers", 0),
-        "prefetch":     kwargs.get("prefetch", 8),
-        "auto_tune":    kwargs.get("auto_tune", False),
-
+        "batch_size": kwargs.get("batch_size", 1),
+        "drop_last": kwargs.get("drop_last", False),
+        "shuffle": kwargs.get("shuffle", False),
+        "seed": kwargs.get("seed", 0),
+        "num_workers": kwargs.get("num_workers", 0),
+        "prefetch": kwargs.get("prefetch", 8),
+        "auto_tune": kwargs.get("auto_tune", False),
         # NEW: reader strategy & tuning
-        "reader_mode":        kwargs.get("reader_mode", "sequential"),
-        "part_size":          kwargs.get("part_size", 8 << 20),  # 8 MiB
+        "reader_mode": kwargs.get("reader_mode", "sequential"),
+        "part_size": kwargs.get("part_size", 8 << 20),  # 8 MiB
         "max_inflight_parts": kwargs.get("max_inflight_parts", 4),
     }
     return opts
@@ -130,6 +130,7 @@ def _dist_info() -> Tuple[int, int]:
     """Best-effort torch.distributed rank/world_size (works if not initialized)."""
     try:
         import torch.distributed as dist
+
         if dist.is_available() and dist.is_initialized():
             return dist.get_rank(), dist.get_world_size()
     except Exception:
@@ -141,7 +142,7 @@ class _AsyncBytesSource:
     """
     Drives the Rust async dataloader in a background thread + event loop,
     pushing *samples* (bytes) into a Queue for synchronous consumption.
-    
+
     Works with any URI scheme supported by the ObjectStore interface.
     """
 
@@ -196,7 +197,7 @@ class _AsyncBytesSource:
 class ObjectStoreIterableDataset(IterableDataset):
     """
     Stream objects as 1D uint8 tensors (or bytes/reader) via the Rust ObjectStore DataLoader.
-    
+
     Supports all URI schemes: file://, s3://, az://, gs://, direct://
 
     Usage
@@ -256,9 +257,16 @@ class ObjectStoreIterableDataset(IterableDataset):
         return_type: str = "tensor",
     ) -> "ObjectStoreIterableDataset":
         opts = _normalize_opts(
-            batch_size=batch_size, drop_last=drop_last, shuffle=shuffle, seed=seed,
-            num_workers=num_workers, prefetch=prefetch, auto_tune=auto_tune,
-            reader_mode=reader_mode, part_size=part_size, max_inflight_parts=max_inflight_parts,
+            batch_size=batch_size,
+            drop_last=drop_last,
+            shuffle=shuffle,
+            seed=seed,
+            num_workers=num_workers,
+            prefetch=prefetch,
+            auto_tune=auto_tune,
+            reader_mode=reader_mode,
+            part_size=part_size,
+            max_inflight_parts=max_inflight_parts,
         )
         return cls(
             uri,
@@ -277,12 +285,14 @@ class ObjectStoreIterableDataset(IterableDataset):
             wi = get_worker_info()
             worker_id = 0 if wi is None else wi.id
             num_workers = 1 if wi is None else wi.num_workers
-            opts.update({
-                "shard_rank": rank,
-                "shard_world_size": max(1, world),
-                "worker_id": worker_id,
-                "num_workers_pytorch": max(1, num_workers),
-            })
+            opts.update(
+                {
+                    "shard_rank": rank,
+                    "shard_world_size": max(1, world),
+                    "worker_id": worker_id,
+                    "num_workers_pytorch": max(1, num_workers),
+                }
+            )
 
         src = _AsyncBytesSource(self._uri, opts).start()
         try:
@@ -303,6 +313,7 @@ class ObjectStoreIterableDataset(IterableDataset):
                     mv = memoryview(b)  # zero-copy, read-only
                     if self._suppress_nonwritable_warning:
                         import warnings
+
                         with warnings.catch_warnings():
                             warnings.filterwarnings(
                                 "ignore",
@@ -325,7 +336,7 @@ class ObjectStoreIterableDataset(IterableDataset):
 class ObjectStoreMapDataset(Dataset):
     """
     Map-style Dataset over objects under a URI prefix.
-    
+
     Supports all URI schemes: file://, s3://, az://, gs://, direct://
 
     Yields:
@@ -336,6 +347,7 @@ class ObjectStoreMapDataset(Dataset):
     By default returns 1-D uint8 tensors backed by a read-only buffer. To make
     them writable in tensor mode, set `writable=True` (incurs one copy per item).
     """
+
     def __init__(
         self,
         uri: str,
@@ -349,7 +361,9 @@ class ObjectStoreMapDataset(Dataset):
     ) -> None:
         self._uri = uri
         self._opts = _normalize_opts(
-            reader_mode=reader_mode, part_size=part_size, max_inflight_parts=max_inflight_parts
+            reader_mode=reader_mode,
+            part_size=part_size,
+            max_inflight_parts=max_inflight_parts,
         )
         self._writable = writable
         self._suppress_nonwritable_warning = suppress_nonwritable_warning
@@ -357,7 +371,7 @@ class ObjectStoreMapDataset(Dataset):
         if rt not in ("tensor", "bytes", "reader"):
             raise ValueError("return_type must be 'tensor', 'bytes', or 'reader'")
         self._return_type = rt
-        
+
         # Parse URI to extract scheme and base path for later reconstruction
         if "://" in uri:
             self._scheme, rest = uri.split("://", 1)
@@ -366,7 +380,7 @@ class ObjectStoreMapDataset(Dataset):
         else:
             self._scheme = "file"
             self._base = uri.rstrip("/")
-        
+
         # Use the generic Rust dataset - works with any URI scheme
         self._core_ds = _core.create_dataset(uri, self._opts)
         self._keys: Sequence[str] = self._core_ds.keys()
@@ -382,11 +396,11 @@ class ObjectStoreMapDataset(Dataset):
         if index < 0 or index >= len(self._keys):
             raise IndexError(index)
         from . import _pymod as _core_mod
-        
+
         # Reconstruct full URI preserving the original scheme
         key = self._keys[index]
         full_uri = f"{self._scheme}://{self._base}/{key}"
-        
+
         # get() returns BytesView which supports zero-copy memoryview()
         bytesview = _core_mod.get(full_uri)
 
@@ -399,14 +413,15 @@ class ObjectStoreMapDataset(Dataset):
 
         # Tensor mode - use zero-copy memoryview from BytesView
         mv = bytesview.memoryview()  # TRUE zero-copy!
-        
+
         if self._writable:
             # If writable is requested, we must copy to a bytearray
             buf = bytearray(mv)
             return torch.frombuffer(memoryview(buf), dtype=torch.uint8)
-        
+
         # Zero-copy path: memoryview directly to tensor
         import warnings
+
         if self._suppress_nonwritable_warning:
             with warnings.catch_warnings():
                 warnings.filterwarnings(
@@ -424,20 +439,22 @@ class ObjectStoreMapDataset(Dataset):
 # -----------------------------------------------------------------------------
 # Deprecated aliases for backward compatibility
 # -----------------------------------------------------------------------------
-import warnings as _warnings
+import warnings as _warnings  # noqa: E402 -- deliberately placed next to the deprecated aliases that use it, not at top of file
+
 
 class S3IterableDataset(ObjectStoreIterableDataset):
     """
-    DEPRECATED: Use ObjectStoreIterableDataset instead. 
-    
-    This alias exists for backward compatibility. ObjectStoreIterableDataset 
+    DEPRECATED: Use ObjectStoreIterableDataset instead.
+
+    This alias exists for backward compatibility. ObjectStoreIterableDataset
     supports all URI schemes (file://, s3://, az://, gs://, direct://).
     """
+
     def __init__(self, *args, **kwargs):
         _warnings.warn(
             "S3IterableDataset is deprecated. Use ObjectStoreIterableDataset instead - it supports all URI schemes.",
             DeprecationWarning,
-            stacklevel=2
+            stacklevel=2,
         )
         super().__init__(*args, **kwargs)
 
@@ -445,16 +462,15 @@ class S3IterableDataset(ObjectStoreIterableDataset):
 class S3MapDataset(ObjectStoreMapDataset):
     """
     DEPRECATED: Use ObjectStoreMapDataset instead.
-    
+
     This alias exists for backward compatibility. ObjectStoreMapDataset
     supports all URI schemes (file://, s3://, az://, gs://, direct://).
     """
+
     def __init__(self, *args, **kwargs):
         _warnings.warn(
             "S3MapDataset is deprecated. Use ObjectStoreMapDataset instead - it supports all URI schemes.",
             DeprecationWarning,
-            stacklevel=2
+            stacklevel=2,
         )
         super().__init__(*args, **kwargs)
-
-

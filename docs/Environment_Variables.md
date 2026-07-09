@@ -203,6 +203,32 @@ For any single object write, exactly one path is active — the two are mutually
 
 There is no double-retry: if the multipart path is active, the single-part Rust retry path is not, and vice versa.  Verification is independently configurable per path — for example, enabling `S3DLIO_MPU_PUT_VERIFY` for large checkpoint objects while leaving `S3DLIO_PUT_VERIFY` off for the high-volume small-object datagen path.
 
+### Multipart Upload threshold — s3dlio-native DLIO integration (v0.9.109+)
+
+The variables above apply to `ObjStoreLibStorage` (`dlio_benchmark/storage/obj_store_lib.py`, a separate file living in the DLIO_local_changes repo).  s3dlio also ships its own DLIO storage backends directly — `S3dlioStorage` (`python/s3dlio/integrations/dlio/s3dlio_storage.py`) and `S3PyTorchConnectorStorage` (`python/s3dlio/integrations/dlio/s3_torch_storage.py`) — which had their own, separately hardcoded multipart threshold with no env var override at all (mlcommons/storage#715; s3dlio issue #153 bug 3.1 / B10).  As of v0.9.109 both backends read the following, via the shared `python/s3dlio/integrations/dlio/_multipart_config.py` module:
+
+| Variable | Default | Allowable values | Description |
+|----------|---------|-----------------|-------------|
+| `S3DLIO_MULTIPART_THRESHOLD_MB` | `32` | Integer ≥ 0 (MiB) | **Reuses the same variable name as `ObjStoreLibStorage` above** (different default here — 32 MiB, matching s3dlio's Rust-side `DEFAULT_S3_MULTIPART_THRESHOLD`, vs 16 MiB there — but the same env var controls both if you set it, since both backends read the identical name).  `0` = always use multipart.  Non-numeric or negative values fall back to the default. |
+| `S3DLIO_MULTIPART_PART_SIZE_MB` | `32` | Integer ≥ 1 (MiB) | Part size used when the multipart path is taken.  Unlike the threshold, `0` has no valid meaning here (the upload loop would never advance) and falls back to the default, same as non-numeric or negative values. |
+| `S3DLIO_MULTIPART_MAX_IN_FLIGHT` | `8` | Integer ≥ 1 | Concurrent in-flight parts per object during multipart upload.  Non-numeric or non-positive values fall back to the default. |
+| `S3DLIO_DISABLE_MULTIPART` | `false` | `1`/`true`/`yes`/`on` (case-insensitive) = disabled; anything else / unset = normal threshold-based behavior | Explicit switch that forces every write through `put_bytes()` regardless of size or the threshold setting — an alternative to setting `S3DLIO_MULTIPART_THRESHOLD_MB` to an implausibly large value. |
+
+```bash
+# Lower the threshold so more objects go through multipart (e.g. for benchmarking MPU throughput).
+export S3DLIO_MULTIPART_THRESHOLD_MB=8
+
+# Always use multipart, even for tiny objects.
+export S3DLIO_MULTIPART_THRESHOLD_MB=0
+
+# Force single-PUT-only behavior regardless of object size.
+export S3DLIO_DISABLE_MULTIPART=true
+
+# Tune part size and concurrency for a high-bandwidth link.
+export S3DLIO_MULTIPART_PART_SIZE_MB=64
+export S3DLIO_MULTIPART_MAX_IN_FLIGHT=16
+```
+
 ## Range GET Optimization
 
 | Variable | Default | Description |
@@ -291,8 +317,8 @@ export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `S3DLIO_OPLOG_LOSSLESS` | `false` | Enable lossless operation logging (higher memory usage) |
-| `S3DLIO_OPLOG_BUF` | `8192` | Operation log buffer capacity |
-| `S3DLIO_OPLOG_WBUFCAP` | `4096` | Write buffer capacity for operation logging |
+| `S3DLIO_OPLOG_BUF` | `8192` | Bounded channel capacity, in log *entries*, between the calling thread and the background writer thread. Entries are dropped (with an stderr warning) once full, unless `S3DLIO_OPLOG_LOSSLESS=true`. |
+| `S3DLIO_OPLOG_WBUFCAP` | `262144` | `BufWriter` capacity, in *bytes*, for the op-log output file. A larger buffer flushes to disk less often. (v0.9.110: corrected from a previously-documented `4096`, which never matched the code default — see Version History.) |
 | `S3DLIO_OPLOG_LEVEL` | `1` | Operation logging level (0=off, 1=basic, 2=verbose) |
 
 ## AWS Configuration
@@ -307,6 +333,24 @@ Standard AWS environment variables are also supported:
 | `AWS_REGION` | AWS region (e.g., `us-east-1`) |
 | `AWS_ENDPOINT_URL` | Custom S3 endpoint URL (for MinIO or other S3-compatible storage) |
 | `AWS_CA_BUNDLE` | Path to custom CA certificate bundle (standard AWS SDK name) |
+
+### `s3://host/bucket/key` endpoint-in-URI detection (v0.9.109+)
+
+`parse_s3_uri_full` (used when a URI's first path segment might be a custom endpoint hostname rather than a bucket, e.g. for MinIO/Ceph clusters addressed directly in the URI) decides bucket-vs-endpoint using: a colon (port) present, the segment is a dotted-quad IPv4 address, or the segment contains a dot and its last label matches a known hostname-like suffix.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_S3_ENDPOINT_HINT_TLDS` | (unset) | Comma-separated list of additional suffixes (case-insensitive, no leading dot) to recognize as hostname-like when a URI's first path segment has no port — e.g. `export S3DLIO_S3_ENDPOINT_HINT_TLDS=storagegrid,mynas` lets `s3://cluster.storagegrid/bucket/key` route as an endpoint. Extends, does not replace, the built-in default list (`com`, `net`, `org`, `io`, `co`, `dev`, `cloud`, `app`, `biz`, `info`, `local`, `internal`, `lan`, `corp`, `home`, `cluster`, `svc`, `network`). |
+
+> **Behavior change (v0.9.109).** Before this release, ANY first-path-segment with 2+ dots, a leading digit, or containing `minio`/`ceph`/`localhost` as a substring was misrouted as an endpoint — even though all of those are legal S3 bucket name shapes (e.g. `mycompany.data.backups`, `2024-training-data`, `minio-tenant-a`). Those now correctly parse as bucket names. If you relied on the old broader heuristic to route a no-port, unusual-suffix endpoint hostname, either add a port to the URI or add your hostname's suffix to `S3DLIO_S3_ENDPOINT_HINT_TLDS`.
+
+### `s3://host:port/bucket/key` per-endpoint TLS detection (v0.9.110+)
+
+When a URI's authority contains an explicit `host:port`, s3dlio creates a dedicated per-endpoint S3 client (see above) and must guess `http` vs `https` from the port alone, since no other scheme hint is available in an `s3://` URI. Port 443 always uses `https`; every other port defaults to `http`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_S3_ENDPOINT_TLS_PORTS` | (unset) | Comma-separated list of additional port numbers to treat as TLS-terminated (`https`) — e.g. `export S3DLIO_S3_ENDPOINT_TLS_PORTS=9001,9443` makes `s3://minio.example:9001/bucket/key` use `https://minio.example:9001`. Useful when a load balancer or reverse proxy terminates TLS on a non-standard port. |
 
 ## Azure Blob Storage Configuration
 
@@ -481,30 +525,37 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 > `S3DLIO_MAX_HTTP_CONNECTIONS`, `S3DLIO_HTTP_IDLE_TIMEOUT_MS`,
 > `S3DLIO_MAX_CONCURRENCY`, `S3DLIO_CONNECTION_TIMEOUT`,
 > `S3DLIO_READ_TIMEOUT`, `S3DLIO_MULTIPART_THRESHOLD`, or
-> `S3DLIO_PART_SIZE`.  **None of these are read by s3dlio source code as of
-> v0.9.102.**  Use the wired equivalents above
-> (`S3DLIO_POOL_MAX_IDLE_PER_HOST`, `S3DLIO_POOL_IDLE_TIMEOUT_SECS`,
+> `S3DLIO_PART_SIZE` as env vars to export directly. **None of these are
+> read as env vars by s3dlio source code.** (v0.9.110: the Rust-only
+> `mp::Runner` builder API's `.max_http_connections()`/`.optimized_http()`
+> methods now translate to the real wired vars below when spawning worker
+> processes — see Changelog — but exporting `S3DLIO_MAX_HTTP_CONNECTIONS`
+> or `S3DLIO_USE_OPTIMIZED_HTTP` yourself still has no effect for `s3-cli`,
+> Python, or any other direct usage.) Use the wired equivalents below
+> instead: `S3DLIO_POOL_MAX_IDLE_PER_HOST`, `S3DLIO_POOL_IDLE_TIMEOUT_SECS`,
 > `S3DLIO_CONNECT_TIMEOUT_SECS`, `S3DLIO_OPERATION_TIMEOUT_SECS`,
-> `S3DLIO_RANGE_CONCURRENCY`) instead.
+> `S3DLIO_RANGE_CONCURRENCY`, `S3DLIO_ENABLE_HTTP2`.
 
 ### For Many Small Objects
 - **Disable range optimization**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` (enabled by default since v0.9.60)
-- Use `S3DLIO_USE_OPTIMIZED_HTTP=true` 
-- Set `S3DLIO_MAX_HTTP_CONNECTIONS=200-400`
+- Enable `S3DLIO_ENABLE_HTTP2=1` for HTTP/2 multiplexing over one connection
+- Set `S3DLIO_POOL_MAX_IDLE_PER_HOST=200-400`
 - Increase `S3DLIO_RT_THREADS` for better parallelism
 
 ### For Bandwidth-Limited Networks
 - Reduce `S3DLIO_RANGE_CONCURRENCY` to 8-16
-- Increase `S3DLIO_HTTP_IDLE_TIMEOUT_MS` to 2000-5000
-- Use moderate `S3DLIO_MAX_HTTP_CONNECTIONS=100`
+- Increase `S3DLIO_POOL_IDLE_TIMEOUT_SECS` to 60-120
+- Use moderate `S3DLIO_POOL_MAX_IDLE_PER_HOST=100`
 
 ### For High-Latency Networks
 - Increase `S3DLIO_OPERATION_TIMEOUT_SECS` to 300-600
-- Use `S3DLIO_HTTP_IDLE_TIMEOUT_MS=5000` or higher
-- Enable `S3DLIO_USE_OPTIMIZED_HTTP=true` for better connection reuse
+- Use `S3DLIO_POOL_IDLE_TIMEOUT_SECS=120` or higher
+- Enable `S3DLIO_ENABLE_HTTP2=1` for better connection reuse
 
 ## Version History
 
+- **v0.9.110** *(corrected `S3DLIO_OPLOG_BUF`/`S3DLIO_OPLOG_WBUFCAP` defaults; `mp::Runner` HTTP-tuning builder methods now take effect)*: multi-agent bug audit fix release (issues #151–#157, Phase D+E+F, 17 bugs) — closes out the audit scope opened by v0.9.109. Added `S3DLIO_S3_ENDPOINT_TLS_PORTS` (marks additional ports as TLS-terminated for per-endpoint S3 clients addressed via `s3://host:port/...` — see "`s3://host:port/bucket/key` per-endpoint TLS detection" above). Corrected `S3DLIO_OPLOG_BUF`'s code default (256 → 8192, matching the docs) and `S3DLIO_OPLOG_WBUFCAP`'s documented default (4096 → 262144, matching the code). `mp::Runner.max_http_connections()`/`.optimized_http()` now write the real, wired `S3DLIO_POOL_MAX_IDLE_PER_HOST`/`S3DLIO_ENABLE_HTTP2` vars into spawned workers instead of two names nothing ever read. `S3DLIO_PUT_MAX_RETRIES=0` now correctly falls back to the documented default of 3 instead of producing a 0-iteration retry loop. Performance Tuning Guidelines corrected to recommend real wired vars instead of dead ones. Full changelog: [`docs/Changelog.md`](Changelog.md).
+- **v0.9.109** *(behavior changes for endpoint-in-URI and DLIO round_robin)*: multi-agent bug audit fix release (issues #151–#157, 22 bugs). Added `S3DLIO_S3_ENDPOINT_HINT_TLDS` (narrows the `parse_s3_uri_full` endpoint-vs-bucket heuristic — see "`s3://host/bucket/key` endpoint-in-URI detection" above), `S3DLIO_MULTIPART_THRESHOLD_MB`/`S3DLIO_MULTIPART_PART_SIZE_MB`/`S3DLIO_MULTIPART_MAX_IN_FLIGHT`/`S3DLIO_DISABLE_MULTIPART` (both DLIO storage integrations now honor a shared, configurable multipart threshold instead of a hardcoded constant — see "Multipart Upload threshold — s3dlio-native DLIO integration" above). DLIO's `round_robin` endpoint-selection strategy now uses MPI/SLURM/PMI rank instead of a static per-process PID hash. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.108** *(BREAKING for `https://`)*: complete issue #148 performance/concurrency audit — all 17 in-scope items landed.
   - **Phase 3 (HTTP protocol default reversed):** `S3DLIO_HTTPS_H2` and `S3DLIO_ENABLE_HTTP2` (master switch) added; `S3DLIO_H2C` unchanged. Previously `https://` unconditionally negotiated HTTP/2 via TLS ALPN; now `https://` uses HTTP/1.1 unless `S3DLIO_HTTPS_H2=1` or `S3DLIO_ENABLE_HTTP2=1` is set. `S3DLIO_H2_ADAPTIVE_WINDOW`/`S3DLIO_H2_STREAM_WINDOW_MB`/`S3DLIO_H2_CONN_WINDOW_MB` now apply whenever HTTP/2 is on (either scheme), not just h2c.
   - **Phase 1 (peak memory):** range-assembly path pre-allocates the output buffer, cutting peak memory during concurrent range downloads from ~2× total_size to ~1× total_size at all 4 sites (S3 `concurrent_range_get_impl`, shared `range_engine_generic`, `s3_bytes::ReaderMode::Range`, `file_store_direct` capacity hint). No new env vars.

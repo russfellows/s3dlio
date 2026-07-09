@@ -231,3 +231,105 @@ fn test_component_struct_debug() {
     assert!(debug_str.contains("bucket"));
     assert!(debug_str.contains("key"));
 }
+
+// RED-then-GREEN regression tests for s3dlio issue #154 bug 4.1 (B8).
+//
+// Bug: the endpoint-detection heuristic fired on ANY name with >= 2 dots,
+// a digit prefix, or a "minio"/"ceph"/"localhost" substring prefix --
+// misrouting legitimate S3 bucket names that happen to use dots (a
+// common naming convention) or start with a digit (explicitly legal per
+// S3 bucket naming rules) or merely contain those cluster-software names
+// as a prefix of an otherwise-unrelated bucket name.
+//
+// Locked contract (docs/implementation-plans/v0.9.109-audit-fix-plan.md
+// Sec 4, bug B8): narrow the heuristic to fire only on strings that
+// grammatically look like hostnames -- contain a colon (port), are a
+// dotted-quad IPv4 address, or end in a known endpoint-hint TLD/suffix
+// (configurable via S3DLIO_S3_ENDPOINT_HINT_TLDS). "Bucket with dots" and
+// "bucket starting with a digit" no longer misroute; genuine
+// endpoint-in-URI usage (with a port, or a recognizable hostname suffix)
+// still works.
+
+#[test]
+fn test_dotted_bucket_names_no_longer_misroute_as_endpoints() {
+    // audit f24 / B8: >= 2 dots alone used to force endpoint routing.
+    let result = parse_s3_uri_full("s3://mycompany.data.backups/mykey.dat").unwrap();
+    assert_eq!(
+        result.endpoint, None,
+        "dotted bucket name must not be misrouted as an endpoint"
+    );
+    assert_eq!(result.bucket, "mycompany.data.backups");
+    assert_eq!(result.key, "mykey.dat");
+}
+
+#[test]
+fn test_digit_prefixed_bucket_names_no_longer_misroute_as_endpoints() {
+    // S3 bucket naming rules explicitly permit a leading digit.
+    let result = parse_s3_uri_full("s3://123-logs/2024/foo.dat").unwrap();
+    assert_eq!(result.endpoint, None);
+    assert_eq!(result.bucket, "123-logs");
+    assert_eq!(result.key, "2024/foo.dat");
+}
+
+#[test]
+fn test_minio_prefixed_bucket_name_no_longer_misroutes_as_endpoint() {
+    let result = parse_s3_uri_full("s3://minio-data/foo").unwrap();
+    assert_eq!(result.endpoint, None);
+    assert_eq!(result.bucket, "minio-data");
+    assert_eq!(result.key, "foo");
+}
+
+#[test]
+fn test_ceph_prefixed_bucket_name_no_longer_misroutes_as_endpoint() {
+    let result = parse_s3_uri_full("s3://cephcluster1/bar").unwrap();
+    assert_eq!(result.endpoint, None);
+    assert_eq!(result.bucket, "cephcluster1");
+    assert_eq!(result.key, "bar");
+}
+
+#[test]
+fn test_localhost_prefixed_bucket_name_no_longer_misroutes_as_endpoint() {
+    let result = parse_s3_uri_full("s3://localhost-shard/x").unwrap();
+    assert_eq!(result.endpoint, None);
+    assert_eq!(result.bucket, "localhost-shard");
+    assert_eq!(result.key, "x");
+}
+
+#[test]
+fn test_hostname_like_dotted_names_still_route_as_endpoints() {
+    // Genuine hostnames (recognizable TLD-like suffix) without a port
+    // must still be detected as endpoints -- the narrowing must not
+    // regress the endpoint-in-URI workflow for its typical form.
+    let result = parse_s3_uri_full("s3://minio.example.com/bucket/key").unwrap();
+    assert_eq!(result.endpoint, Some("minio.example.com".to_string()));
+    assert_eq!(result.bucket, "bucket");
+    assert_eq!(result.key, "key");
+
+    let result2 = parse_s3_uri_full("s3://s3.company.internal/bucket/key").unwrap();
+    assert_eq!(result2.endpoint, Some("s3.company.internal".to_string()));
+    assert_eq!(result2.bucket, "bucket");
+    assert_eq!(result2.key, "key");
+}
+
+#[test]
+fn test_endpoint_hint_tld_env_var_extends_the_default_list() {
+    // A bucket-shaped-but-dotted name with a suffix NOT in the default
+    // list stays a bucket by default...
+    let uri = "s3://s3.mycorp.storagegrid/bucket/key";
+    let result = parse_s3_uri_full(uri).unwrap();
+    assert_eq!(
+        result.endpoint, None,
+        "unrecognized suffix must not be treated as an endpoint hint by default"
+    );
+
+    // ...but adding it via the env var makes the same URI route as an endpoint.
+    std::env::set_var("S3DLIO_S3_ENDPOINT_HINT_TLDS", "storagegrid");
+    let result2 = parse_s3_uri_full(uri).unwrap();
+    std::env::remove_var("S3DLIO_S3_ENDPOINT_HINT_TLDS");
+    assert_eq!(
+        result2.endpoint,
+        Some("s3.mycorp.storagegrid".to_string()),
+        "S3DLIO_S3_ENDPOINT_HINT_TLDS must extend the default suffix list"
+    );
+    assert_eq!(result2.bucket, "bucket");
+}
