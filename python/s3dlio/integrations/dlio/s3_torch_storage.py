@@ -188,7 +188,15 @@ class S3PyTorchConnectorStorage(S3Storage):
                     prefix += "/"
                 full_uri = f"{parsed.scheme}://{bucket}/{prefix}"
 
-            # s3dlio.list returns keys (not full URIs)
+            # s3dlio.list returns full URIs (e.g. "s3://bucket/train/a/x"),
+            # NOT bare keys -- this comment used to claim the opposite,
+            # which was the bug (audit #153 bug 3.8 / D7): comparing each
+            # returned full URI against the bare relative `prefix` (e.g.
+            # "train/") never matched, so every call fell through to the
+            # os.path.basename() branch below, silently dropping any
+            # subdirectory structure ("train/a/x" became just "x" instead
+            # of "a/x"). Compare against `full_uri` instead, matching the
+            # sibling s3dlio_storage.py::walk_node implementation.
             keys = s3dlio.list(full_uri)
 
             # Convert to relative paths (just filenames)
@@ -196,8 +204,8 @@ class S3PyTorchConnectorStorage(S3Storage):
             paths = []
             for key in keys:
                 # Strip the prefix to get relative path
-                if key.startswith(prefix):
-                    relative = key[len(prefix) :]
+                if key.startswith(full_uri):
+                    relative = key[len(full_uri) :]
                 else:
                     relative = os.path.basename(key)
 
