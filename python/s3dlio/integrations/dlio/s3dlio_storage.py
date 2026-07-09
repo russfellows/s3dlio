@@ -435,12 +435,23 @@ class S3dlioStorage(DataStorage):
                     max_in_flight=_multipart_config.multipart_max_in_flight(),
                     abort_on_drop=True,
                 )
-                offset_pos = 0
-                while offset_pos < size:
-                    n = min(part_size, size - offset_pos)
-                    writer.write(content[offset_pos : offset_pos + n])
-                    offset_pos += n
-                writer.close()
+                try:
+                    offset_pos = 0
+                    while offset_pos < size:
+                        n = min(part_size, size - offset_pos)
+                        writer.write(content[offset_pos : offset_pos + n])
+                        offset_pos += n
+                    writer.close()
+                except Exception:
+                    # Audit #153 bug 3.7 (D6): previously relied on
+                    # abort_on_drop=True firing when `writer` goes out of
+                    # scope (implicit GC/refcount-timing-dependent
+                    # cleanup on the Rust side) instead of aborting
+                    # deterministically and immediately here. A failure
+                    # partway through a large multi-part write left the
+                    # in-progress upload's cleanup timing unspecified.
+                    writer.abort()
+                    raise
             return None
         except Exception as e:
             print(f"[s3dlio] Error writing to {uri}: {e}")

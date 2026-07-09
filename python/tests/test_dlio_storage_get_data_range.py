@@ -33,7 +33,7 @@ import types
 import pytest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
 def _install_fake_dlio_benchmark():

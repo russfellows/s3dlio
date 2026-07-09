@@ -11,7 +11,7 @@ import asyncio
 from pathlib import Path
 
 # Add the project root to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 class TestResults:
     """Track test results for reporting."""

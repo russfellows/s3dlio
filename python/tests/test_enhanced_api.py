@@ -11,7 +11,7 @@ import asyncio
 from pathlib import Path
 
 # Add the project root to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 def test_basic_functionality():
     """Test basic s3dlio functionality."""
