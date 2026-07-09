@@ -1,5 +1,143 @@
 # s3dlio Changelog
 
+## Version 0.9.110 — Multi-agent bug audit fix release (issues #151–#157, Phase D+E+F, 17 bugs)
+
+Closes out the remaining scope of the audit that shipped Phase A/B/C in v0.9.109:
+Phase D (backend correctness/hygiene, 9 bugs), Phase E (edge cases / low severity,
+4 bugs), and Phase F (env-var/config-ignored plus one docs-only fix, 4 bugs) — 17
+bugs in total, none release-blocking, all still real defects worth fixing before
+1.0.
+
+Full plan and locked contracts:
+[`docs/implementation-plans/v0.9.109-audit-fix-plan.md`](implementation-plans/v0.9.109-audit-fix-plan.md).
+Every fix below landed with a RED-then-GREEN regression test, verified to fail
+against the unmodified code for the exact reason the bug describes, then pass after
+the fix (parent CLAUDE.md §6).
+
+### New environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `S3DLIO_S3_ENDPOINT_TLS_PORTS` | Comma-separated additional ports to treat as TLS-terminated (`https`) for per-endpoint S3 clients addressed via `s3://host:port/...` — e.g. a load balancer terminating TLS on a non-standard port (E2). |
+
+See `docs/Environment_Variables.md` for defaults and full semantics.
+
+### Behavior changes — read before upgrading
+
+- **`S3DLIO_OPLOG_BUF`'s code default corrected from 256 to the documented 8192
+  (F3, issue #157).** Under a moderately fast burst of ops, the previous 256-slot
+  channel filled and began silently dropping op-log entries far below the load the
+  docs promised. If you were relying on the (undocumented, buggy) 256-slot behavior
+  for some reason, set `S3DLIO_OPLOG_BUF=256` explicitly to keep it.
+- **`S3DLIO_OPLOG_WBUFCAP`'s documented default corrected from 4096 to the actual
+  code value, 262144 (256 KiB) (F3, issue #157).** No code behavior changed; only
+  the docs were wrong.
+- **`mp::Runner.max_http_connections()`/`.optimized_http()` now actually take
+  effect (F1, issue #157).** These builder methods previously wrote
+  `S3DLIO_MAX_HTTP_CONNECTIONS`/`S3DLIO_USE_OPTIMIZED_HTTP` into spawned workers'
+  env — names no code anywhere in the crate read, so both methods were silent
+  no-ops. They now write `S3DLIO_POOL_MAX_IDLE_PER_HOST`/`S3DLIO_ENABLE_HTTP2`
+  instead, which are real, wired knobs. If you were calling these builder methods
+  expecting no effect, spawned workers will now actually pick up the configured
+  pool size / HTTP2 setting.
+- **Performance Tuning Guidelines corrected (F4, issue #157).** The doc
+  previously recommended exporting `S3DLIO_USE_OPTIMIZED_HTTP` /
+  `S3DLIO_MAX_HTTP_CONNECTIONS` / `S3DLIO_HTTP_IDLE_TIMEOUT_MS` directly — none of
+  which are read as env vars by s3dlio (only F1's `mp::Runner` builder API
+  translates the first two into real vars, and only for its own spawned workers).
+  The guidelines now recommend the real wired vars (`S3DLIO_ENABLE_HTTP2`,
+  `S3DLIO_POOL_MAX_IDLE_PER_HOST`, `S3DLIO_POOL_IDLE_TIMEOUT_SECS`) instead.
+
+### Phase D — Backend correctness / hygiene (9 bugs, issues #151–#153/#155)
+
+- **D1 (5.1)** GCS's `get_object_via_grpc` full-read retry loop retried
+  immediately with no backoff, hammering a struggling backend. Added
+  exponential backoff (100ms → 200 → 400 → 800 → 1600, capped at 2000ms) via a
+  generic `retry_with_backoff` helper.
+- **D2 (5.2)** `is_rapid_bucket`'s `OnceCell::get_or_init` cached the result of
+  `detect_rapid_bucket` even when the detection call itself failed, permanently
+  poisoning the cache with a wrong answer after one transient error. Switched to
+  `get_or_try_init`, which does not cache on `Err`.
+- **D3 (1.3)** The `S3DLIO_MPU_PUT_VERIFY` opt-in HEAD-verification step hard-failed
+  the whole multipart upload if the post-upload HEAD request itself failed
+  transiently (network blip), even though the upload had already succeeded. Now
+  logs a warning and falls back to the known `total_bytes`, treating the HEAD
+  failure as soft.
+- **D4 (1.5)** Azure's `upload_multipart_stream` returned a bare `Err` with no log
+  at all on a mid-stream `stage_block` failure — an operator had no way to tell an
+  Azure multipart upload failed, or how many blocks were staged (and left for
+  Azure's automatic GC) before it did. Now logs a warning naming the container,
+  blob key, and staged-block count.
+- **D5 (5.4)** The community-GCS client's `put_object_multipart` was a byte-for-byte
+  duplicate of `put_object` that silently ignored its `chunk_size` parameter —
+  a real chunked-upload feature was never implemented, just a misleadingly-named
+  stub. Removed; both GCS multipart call sites now use the real `put_object`
+  directly, with `part_size` unused/no-op for this backend (documented in place).
+- **D6 (3.7)** `S3dlioStorage.put_data()`'s multipart branch had no
+  try/except — a failure partway through `writer.write()` left the
+  in-progress multipart upload dangling (never aborted, never completed). Now
+  wrapped so any exception calls `writer.abort()` before re-raising.
+- **D7 (3.8)** `S3PyTorchConnectorStorage.walk_node()` compared each full URI
+  returned by `s3dlio.list()` against a bare relative `prefix`, which never
+  matched (a full URI never starts with a relative path) — every call fell
+  through to `os.path.basename()`, silently dropping subdirectory structure
+  (`"train/a/x"` became just `"x"`). Fixed to compare against the full URI,
+  matching the sibling `S3dlioStorage` implementation.
+- **D8 (3.9)** `S3dlioStorage.__init__` set `AWS_ENDPOINT_URL` via an unconditional
+  assignment, clobbering any value the user had already set in their own
+  environment — inconsistent with the `setdefault` (don't-overwrite) contract used
+  for the other AWS env vars in the same constructor. Now uses `setdefault`, with a
+  warning logged when the selected/configured endpoint differs from a pre-existing
+  value.
+- **D9 (2.8)** `RangeEngine::download()` unconditionally `bail!`-ed on
+  `object_size == 0`, treating a legitimate empty object as an error instead of
+  succeeding with zero bytes.
+
+### Phase E — Edge cases / low severity (4 bugs, issues #151/#154/#156)
+
+- **E1 (4.2)** `infer_scheme()`'s Azure-hostname check was
+  `uri.contains(".blob.core.windows.net/")` — a substring match against the
+  *entire* URI, not just the host. A `gs://` URI whose key happened to contain
+  that literal text was misrouted to Azure (the Azure check ran before the `gs://`
+  check in the if/else chain). Restricted to the authority component, checked as a
+  suffix. Also fixed `parse_azure_uri()`, which `infer_scheme()` correctly routed
+  an `http://...blob.core.windows.net/...` URL to, but which then hard-required a
+  `https://` prefix and bailed with a confusing error instead of parsing it.
+- **E2 (4.3)** `s3_endpoint_url_from_uri()` picked `https` only for port `443`,
+  with no way to mark a TLS-terminated S3-compatible endpoint on a non-standard
+  port (e.g. a load balancer terminating TLS on `:9001`) as such. Added
+  `S3DLIO_S3_ENDPOINT_TLS_PORTS` (see "New environment variables"). Also replaced
+  the IPv6 port-extraction logic (`contains(':')` + `rsplit(':').next()`, which only
+  produced correct results for bracketed IPv6 by coincidence) with explicit
+  bracketed-IPv6-aware parsing.
+- **E3 (1.6)** Azure's `upload_multipart_stream` never checked Azure's documented
+  50,000-block-per-blob limit — an object whose `part_size` was too small for its
+  size would stage tens of thousands of blocks over the network only to have
+  `commit_block_list` reject the blob server-side, wasting every staged block. Now
+  fails fast with a clear, actionable error before the block that would exceed the
+  cap is ever staged.
+- **E4 (6.2)** `ConfigurableFileSystemObjectStore::path_to_uri()` hardcoded the
+  `file://` scheme unconditionally, so `list()` on a store addressed via
+  `direct://` returned `file://` URIs for every entry. Round-tripping one of those
+  URIs back through `store_for_uri()` silently routed to the buffered `file://`
+  store instead of the O_DIRECT store the caller was actually using. Now threads
+  the caller's original scheme through to every returned URI.
+
+### Phase F — Env vars / config-ignored, plus one docs fix (4 bugs, issue #157)
+
+- **F1 (7.1)**, **F2 (7.4)**, **F3 (7.3)**, **F4 (7.2)** — see "New environment
+  variables" and "Behavior changes" above.
+
+### Quality gate
+
+Every fix above: `cargo fmt --check`, `cargo clippy --lib --bins --examples -- -D
+warnings` (CI's invocation) plus `cargo clippy --lib --tests --features
+backend-azure,backend-gcs,gcs-community -- -D warnings` and `cargo clippy --lib
+--tests --features extension-module -- -D warnings` for the feature-gated fixes,
+`cargo test --lib` (368 passing default features / 453 with
+backend-azure,backend-gcs,gcs-community / 372 with extension-module, up from 349 at
+the start of this phase), plus the relevant targeted integration test(s) all clean.
+
 ## Version 0.9.109 — Multi-agent bug audit fix release (issues #151–#157, Phase A+B+C, 22 bugs)
 
 A follow-up multi-agent code audit (triggered by mlcommons/storage#715) found 39 bugs
