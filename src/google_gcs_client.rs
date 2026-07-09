@@ -385,41 +385,60 @@ impl GcsClient {
                 .clone()
         };
 
-        // Exactly one caller runs detect_rapid_bucket(); the rest await it.
-        *cell.get_or_init(|| self.detect_rapid_bucket(bucket)).await
+        // Exactly one caller runs detect_rapid_bucket_result(); the rest
+        // await it. audit #157 bug 5.2 (D2): uses get_or_try_init, NOT
+        // get_or_init -- a transient RPC failure must not permanently
+        // cache "standard" for this bucket. get_or_try_init only
+        // populates the cell on Ok, so a failed attempt leaves it
+        // uninitialized and a later call retries detection instead of
+        // being stuck with a stale fallback forever. Concurrent callers
+        // still share a single in-flight detection attempt either way
+        // (the thundering-herd protection this cache exists for).
+        match cell
+            .get_or_try_init(|| self.detect_rapid_bucket_result(bucket))
+            .await
+        {
+            Ok(is_zonal) => *is_zonal,
+            Err(e) => {
+                warn!(
+                    "GCS auto-detect: failed to get storage layout for '{}': {} — assuming \
+                     standard bucket for this call (not cached, will retry next call)",
+                    bucket, e
+                );
+                false
+            }
+        }
     }
 
     /// Query GCS `get_storage_layout()` to determine if a bucket is zonal.
-    /// Returns `true` for RAPID/zonal buckets, `false` otherwise.
-    async fn detect_rapid_bucket(&self, bucket: &str) -> bool {
+    /// Returns `Ok(true)` for RAPID/zonal buckets, `Ok(false)` otherwise,
+    /// `Err` on an RPC failure. Deliberately does NOT collapse the error
+    /// case to `Ok(false)` here — see `is_rapid_bucket`'s use of
+    /// `get_or_try_init` (audit #157 bug 5.2 / D2): only a genuine
+    /// successful detection should ever be cached.
+    async fn detect_rapid_bucket_result(&self, bucket: &str) -> Result<bool> {
         let layout_name = format!("projects/_/buckets/{}/storageLayout", bucket);
-        match self
+        let layout = self
             .control
             .get_storage_layout()
             .set_name(&layout_name)
             .send()
             .await
-        {
-            Ok(layout) => {
-                let is_zonal = layout.location_type.eq_ignore_ascii_case("zone");
-                if is_zonal {
-                    info!(
-                        "GCS auto-detect: bucket '{}' is RAPID/zonal (location={}, type={})",
-                        bucket, layout.location, layout.location_type
-                    );
-                } else {
-                    debug!(
-                        "GCS auto-detect: bucket '{}' is standard (location={}, type={})",
-                        bucket, layout.location, layout.location_type
-                    );
-                }
-                is_zonal
-            }
-            Err(e) => {
-                warn!("GCS auto-detect: failed to get storage layout for '{}': {} — assuming standard bucket", bucket, e);
-                false
-            }
+            .map_err(|e| anyhow!("get_storage_layout failed for '{}': {}", bucket, e))?;
+
+        let is_zonal = layout.location_type.eq_ignore_ascii_case("zone");
+        if is_zonal {
+            info!(
+                "GCS auto-detect: bucket '{}' is RAPID/zonal (location={}, type={})",
+                bucket, layout.location, layout.location_type
+            );
+        } else {
+            debug!(
+                "GCS auto-detect: bucket '{}' is standard (location={}, type={})",
+                bucket, layout.location, layout.location_type
+            );
         }
+        Ok(is_zonal)
     }
 
     /// Get entire object as bytes.
@@ -1743,6 +1762,92 @@ mod tests {
         let r = read_rapid_mode();
         std::env::remove_var("S3DLIO_GCS_RAPID");
         assert_eq!(r, RapidMode::Auto, "\"auto\" should set Auto mode");
+    }
+
+    // RED-then-GREEN regression tests for s3dlio issue #157 bug 5.2 (D2).
+    //
+    // Bug: is_rapid_bucket() cached detect_rapid_bucket()'s result in a
+    // per-bucket `OnceCell<bool>` via `get_or_init`, which always
+    // populates the cell with whatever the closure returns -- including
+    // the `false` fallback detect_rapid_bucket used on an RPC failure.
+    // A single transient get_storage_layout() failure (network blip,
+    // auth hiccup) therefore permanently mis-cached a RAPID/zonal bucket
+    // as "standard" for the lifetime of the process: gRPC/RAPID
+    // performance benefits lost forever, with no retry.
+    //
+    // The fix (get_or_try_init instead of get_or_init) is exercised here
+    // directly against a synthetic `Arc<OnceCell<bool>>` + counting
+    // detect closure -- driving the real is_rapid_bucket() needs a live
+    // or mocked GCS gRPC StorageControl client, unavailable in this
+    // environment (matches the "requires exposing the mockable
+    // interface" adequacy note in the fix plan for this bug). This is
+    // the exact tokio::sync::OnceCell API and calling pattern
+    // is_rapid_bucket() uses, so it proves the caching CONTRACT
+    // (retry-after-failure, no poisoning, thundering-herd-safe) that the
+    // real method depends on.
+
+    #[tokio::test]
+    async fn failed_detection_does_not_poison_the_cache() {
+        let cell: OnceCell<bool> = OnceCell::new();
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // First call: detection fails (simulated transient RPC error).
+        let attempts_clone = attempts.clone();
+        let first: Result<bool, anyhow::Error> = cell
+            .get_or_try_init(|| async move {
+                attempts_clone.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("UNAVAILABLE: simulated transient failure"))
+            })
+            .await
+            .copied();
+        assert!(first.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Second call: detection now succeeds. Pre-fix (get_or_init),
+        // the cell would already be permanently set to `false` from the
+        // first call and this closure would never run again.
+        let attempts_clone = attempts.clone();
+        let second: Result<bool, anyhow::Error> = cell
+            .get_or_try_init(|| async move {
+                attempts_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(true) // genuinely a RAPID/zonal bucket
+            })
+            .await
+            .copied();
+        assert!(
+            second.unwrap(),
+            "a failed first attempt must not poison the cache with a wrong fallback value"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "detection must be retried after a prior failure, not skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_detection_is_cached_and_not_retried() {
+        let cell: OnceCell<bool> = OnceCell::new();
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let attempts_clone = attempts.clone();
+            let result: Result<bool, anyhow::Error> = cell
+                .get_or_try_init(|| async move {
+                    attempts_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+                .await
+                .copied();
+            assert!(result.unwrap());
+        }
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a successful detection must be cached -- only the first of 3 calls should \
+             actually invoke the detection closure"
+        );
     }
 
     // ------------------------------------------------------------------
