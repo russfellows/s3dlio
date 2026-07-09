@@ -31,6 +31,35 @@ dlp = Profile(MODULE_STORAGE)
 _logger = logging.getLogger(__name__)
 
 
+def _apply_selected_endpoint_env(selected_endpoint):
+    """Set AWS_ENDPOINT_URL from the selected/configured endpoint, without
+    ever clobbering a value the user already set in their own environment.
+
+    Audit #153 bug 3.9 (D8): previously this was an unconditional
+    `os.environ["AWS_ENDPOINT_URL"] = selected_endpoint` -- inconsistent
+    with the `setdefault` (don't-overwrite) contract already used for
+    AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_REGION in the same
+    constructor, and surprising for a caller who explicitly set
+    AWS_ENDPOINT_URL before launching DLIO. Warns when a pre-existing
+    value differs from the selected one, since silently keeping the old
+    value could otherwise look like the endpoint_uris/multi-endpoint
+    config had no effect, with no clue why.
+    """
+    if not selected_endpoint:
+        return
+    existing = os.environ.get("AWS_ENDPOINT_URL")
+    if existing and existing != selected_endpoint:
+        _logger.warning(
+            "[s3dlio] AWS_ENDPOINT_URL is already set to %r in the environment; "
+            "keeping it instead of overriding with the configured/selected "
+            "endpoint %r. Unset AWS_ENDPOINT_URL if you want s3dlio's "
+            "endpoint_uris/multi-endpoint selection to take effect.",
+            existing,
+            selected_endpoint,
+        )
+    os.environ.setdefault("AWS_ENDPOINT_URL", selected_endpoint)
+
+
 def _rank_from_env():
     """Return the current process's rank from the first available of
     OMPI_COMM_WORLD_RANK / SLURM_PROCID / PMI_RANK -- the same env var
@@ -167,8 +196,7 @@ class S3dlioStorage(DataStorage):
             os.environ.setdefault("AWS_REGION", storage_options["region"])
 
         # Set selected endpoint
-        if selected_endpoint:
-            os.environ["AWS_ENDPOINT_URL"] = selected_endpoint
+        _apply_selected_endpoint_env(selected_endpoint)
 
     def _select_endpoint_via_mpi(self, endpoint_uris):
         """
