@@ -448,3 +448,26 @@ pub async fn create_s3_client_for_endpoint(
     );
     Ok(Client::from_conf(s3_config))
 }
+
+#[cfg(test)]
+mod tier4_reentrancy_tests {
+    use super::*;
+
+    /// Reproduces the exact hazard described in
+    /// docs/DESIGN_TIER4_FFI_HARDENING.md item 3: 7 call sites in
+    /// `python_core_api.rs` used to call `.block_on()` directly instead of
+    /// `run_on_global_rt`, which panics with "Cannot start a runtime from
+    /// within a runtime" if invoked from a call stack already executing
+    /// inside a Tokio runtime. `run_on_global_rt` (the pattern those 7
+    /// sites were migrated to) must survive the identical nested condition.
+    #[test]
+    fn run_on_global_rt_survives_nested_runtime_context() {
+        let outer_rt = tokio::runtime::Runtime::new().unwrap();
+        let result: Result<i32> = outer_rt.block_on(async {
+            // We're now executing on an OS thread that already has a Tokio
+            // runtime context entered -- the exact "reentrant" condition.
+            run_on_global_rt(async { Ok(42) })
+        });
+        assert_eq!(result.unwrap(), 42);
+    }
+}

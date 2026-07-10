@@ -476,8 +476,21 @@ impl PyBytesView {
     }
 }
 
+/// Format an error for the Python-visible message, preserving the full
+/// `anyhow` cause chain rather than just the outermost context label.
+///
+/// Plain `Display` (`{}`) on an `anyhow::Error` — or anything transparently
+/// wrapping one, like `DatasetError::Backend` — shows only the outermost
+/// `.context(...)` message. The alternate-flag `{:#}` walks the full chain
+/// (storage#755 / s3dlio#161: a chained SDK/timeout/TLS error was reduced to
+/// the bare label "concurrent range chunk failed" by the time it reached
+/// Python).
+pub(crate) fn error_chain_message<E: std::fmt::Display>(error: &E) -> String {
+    format!("{:#}", error)
+}
+
 pub fn py_err<E: std::fmt::Display>(error: E) -> PyErr {
-    PyRuntimeError::new_err(format!("{}", error))
+    PyRuntimeError::new_err(error_chain_message(&error))
 }
 
 /// Multi-process GET for maximum throughput (Python API)
@@ -827,7 +840,9 @@ pub fn put(
         .with_chunk_size(chunk_size);
     py.detach(|| {
         if should_create_bucket {
-            let _ = create_bucket_rs(&bucket);
+            if let Err(e) = create_bucket_rs(&bucket) {
+                warn!("Failed to create bucket {}: {}", bucket, e);
+            }
         }
         put_objects_with_random_data_and_type(&uris, sz, jobs, config).map_err(py_err)
     })
@@ -872,7 +887,9 @@ pub(crate) fn put_async_py<'p>(
     future_into_py(py, async move {
         task::spawn_blocking(move || {
             if should_create_bucket {
-                let _ = create_bucket_rs(&bucket);
+                if let Err(e) = create_bucket_rs(&bucket) {
+                    warn!("Failed to create bucket {}: {}", bucket, e);
+                }
             }
             put_objects_with_random_data_and_type(&uris, sz, jobs, config).map_err(py_err)
         })
@@ -1058,6 +1075,18 @@ fn stat_to_pydict<'py>(
 /// Check if an object exists at the given URI.
 /// Returns True if the object exists, False otherwise.
 /// Works with all backends: S3, GCS, Azure, file://, direct://
+///
+/// **Important**: this function returns `False` both when the object
+/// genuinely does not exist *and* when existence could not be determined
+/// for any other reason (a malformed URI, invalid/missing credentials, a
+/// network partition, a TLS handshake failure, an unreachable endpoint,
+/// etc.) — every failure collapses to `False`, by design, the same way
+/// Python's own `os.path.exists()` / `pathlib.Path.exists()` swallow
+/// `PermissionError`. If you need to tell "definitely not there" apart
+/// from "could not check," use [`stat()`] instead — it raises on *any*
+/// failure (including not-found), but with the full underlying cause in
+/// the exception message, so the caller can distinguish "not found" from
+/// a real connectivity/auth/permissions problem by inspecting it.
 #[pyfunction]
 pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
     let uri_owned = uri.to_owned();
@@ -1080,6 +1109,15 @@ pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
 
 /// Async version of exists()
 /// Works with all backends: S3, GCS, Azure, file://, direct://
+///
+/// Same `False`-on-any-failure caveat as [`exists()`] applies to the
+/// `stat()` check itself — see that docstring. Note the one asymmetry
+/// between the two: this async version *does* raise on a failure to open
+/// the store for the given URI (e.g. an unparseable URI), before it ever
+/// gets to the `stat()` call; the sync `exists()` swallows that same
+/// failure into `False` too. If you need fully consistent behavior
+/// between the sync and async paths, use [`stat()`]/`stat_async()`
+/// instead, which raise uniformly on every failure.
 #[pyfunction]
 fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
@@ -1700,30 +1738,41 @@ pub fn upload(
 
             // Handle bucket creation ONLY if explicitly requested
             if create_bucket {
-                if let Ok(store) = store_for_uri_with_logger(&dest_prefix_owned, logger.clone()) {
-                    // Extract bucket/container name from URI
-                    if dest_prefix_owned.starts_with("s3://") {
-                        if let Ok((bucket, _)) = parse_s3_uri(&dest_prefix_owned) {
-                            if let Err(e) = store.create_container(&bucket).await {
-                                warn!("Failed to create bucket {}: {}", bucket, e);
+                match store_for_uri_with_logger(&dest_prefix_owned, logger.clone()) {
+                    Ok(store) => {
+                        // Extract bucket/container name from URI
+                        if dest_prefix_owned.starts_with("s3://") {
+                            match parse_s3_uri(&dest_prefix_owned) {
+                                Ok((bucket, _)) => {
+                                    if let Err(e) = store.create_container(&bucket).await {
+                                        warn!("Failed to create bucket {}: {}", bucket, e);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse S3 URI {}: {}", dest_prefix_owned, e)
+                                }
+                            }
+                        } else if dest_prefix_owned.starts_with("az://")
+                            || dest_prefix_owned.starts_with("azure://")
+                        {
+                            // For Azure, extract container name
+                            let parts: Vec<&str> = dest_prefix_owned
+                                .trim_start_matches("az://")
+                                .trim_start_matches("azure://")
+                                .split('/')
+                                .collect();
+                            if let Some(container) = parts.first() {
+                                if let Err(e) = store.create_container(container).await {
+                                    warn!("Failed to create container {}: {}", container, e);
+                                }
                             }
                         }
-                    } else if dest_prefix_owned.starts_with("az://")
-                        || dest_prefix_owned.starts_with("azure://")
-                    {
-                        // For Azure, extract container name
-                        let parts: Vec<&str> = dest_prefix_owned
-                            .trim_start_matches("az://")
-                            .trim_start_matches("azure://")
-                            .split('/')
-                            .collect();
-                        if let Some(container) = parts.first() {
-                            if let Err(e) = store.create_container(container).await {
-                                warn!("Failed to create container {}: {}", container, e);
-                            }
-                        }
+                        // File backends don't need bucket creation, directories are created automatically
                     }
-                    // File backends don't need bucket creation, directories are created automatically
+                    Err(e) => warn!(
+                        "Failed to open store for bucket creation at {}: {}",
+                        dest_prefix_owned, e
+                    ),
                 }
             }
 
@@ -1890,10 +1939,28 @@ impl PyWriterOptions {
     }
 }
 
+/// Snapshot a writer's (bytes_written, compressed_bytes, checksum) via
+/// shared reference, before any consuming call (e.g. `finalize()`, which
+/// takes `self: Box<Self>`). Safe to call at this point because
+/// `ObjectWriter::checksum()` is documented and implemented as an
+/// incremental "written so far" rolling-hash value, not something only
+/// computed inside `finalize()` — see docs/DESIGN_FFI_BOUNDARY_HARDENING.md
+/// §4.1 for the verified evidence. If a future `ObjectWriter` impl ever
+/// violated that (computed checksum only during `finalize()`), this
+/// snapshot would silently capture `None` — `checksum_survives_finalize_tests`
+/// below guards the current contract.
+fn snapshot_final_writer_stats(writer: &dyn ObjectWriter) -> (u64, u64, Option<String>) {
+    (
+        writer.bytes_written(),
+        writer.compressed_bytes(),
+        writer.checksum(),
+    )
+}
+
 /// Python wrapper for ObjectWriter
 #[pyclass]
 pub struct PyObjectWriter {
-    finalized_stats: Option<(u64, u64)>, // (bytes_written, compressed_bytes)
+    finalized_stats: Option<(u64, u64, Option<String>)>, // (bytes_written, compressed_bytes, checksum)
     inner: Option<Box<dyn ObjectWriter>>,
 }
 
@@ -1928,7 +1995,7 @@ impl PyObjectWriter {
                 writer
                     .write_chunk(slice)
                     .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to write chunk: {}", e)))
+                    .map_err(|e| py_err(e.context("Failed to write chunk")))
             });
         }
 
@@ -1939,7 +2006,7 @@ impl PyObjectWriter {
                 writer
                     .write_chunk(slice)
                     .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to write chunk: {}", e)))
+                    .map_err(|e| py_err(e.context("Failed to write chunk")))
             });
         }
 
@@ -1952,37 +2019,60 @@ impl PyObjectWriter {
     ///
     /// This method copies data but takes ownership, useful when the caller
     /// doesn't need the buffer anymore. For true zero-copy, use write_chunk().
+    ///
+    /// Implementation note: unlike `write_chunk()` (whose zero-copy fast path
+    /// keeps a borrowed buffer pointer alive across a synchronous `block_on`,
+    /// see docs/DESIGN_TIER4_FFI_HARDENING.md item 3), this method's input
+    /// data is already fully owned by the time it crosses the async
+    /// boundary — but `self.inner`'s writer itself is normally only
+    /// *borrowed* (`&mut`) here, not owned, which would still block a
+    /// migration to the `'static`-future-requiring `submit_io`. To resolve
+    /// that, the writer is temporarily `.take()`n (so it can be moved into
+    /// the future) and always restored to `self.inner` afterward regardless
+    /// of whether the write succeeded — preserving the existing contract
+    /// that a failed `write_owned_bytes()` call leaves the writer usable for
+    /// a retry or a clean `abort()`/`finalize()`, exactly as before this
+    /// migration.
     fn write_owned_bytes(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let writer = self
+        let mut writer = self
             .inner
-            .as_mut()
+            .take()
             .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
 
         // Try buffer protocol
         if let Ok(buffer) = PyBuffer::<u8>::get(data) {
             let len = buffer.len_bytes();
             let mut vec = vec![0u8; len];
-            buffer
-                .copy_to_slice(data.py(), &mut vec[..])
-                .map_err(|e| PyRuntimeError::new_err(format!("Buffer copy failed: {}", e)))?;
+            if let Err(e) = buffer.copy_to_slice(data.py(), &mut vec[..]) {
+                self.inner = Some(writer); // restore -- this call never touched it
+                return Err(PyRuntimeError::new_err(format!(
+                    "Buffer copy failed: {}",
+                    e
+                )));
+            }
 
-            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer.write_owned_bytes(vec).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e))
-                })
-            });
+            let (writer_back, write_result) = submit_io(async move {
+                let r = writer.write_owned_bytes(vec).await;
+                Ok::<_, anyhow::Error>((writer, r))
+            })?;
+            self.inner = Some(writer_back);
+            return write_result.map_err(|e| py_err(e.context("Failed to write owned bytes")));
         }
 
         // Fallback for PyBytes
         if let Ok(bytes) = data.cast::<PyBytes>() {
             let vec = bytes.as_bytes().to_vec();
-            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer.write_owned_bytes(vec).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Failed to write owned bytes: {}", e))
-                })
-            });
+            let (writer_back, write_result) = submit_io(async move {
+                let r = writer.write_owned_bytes(vec).await;
+                Ok::<_, anyhow::Error>((writer, r))
+            })?;
+            self.inner = Some(writer_back);
+            return write_result.map_err(|e| py_err(e.context("Failed to write owned bytes")));
         }
 
+        // Neither buffer protocol nor PyBytes matched -- restore the writer
+        // (this call never touched it) before reporting the type error.
+        self.inner = Some(writer);
         Err(PyRuntimeError::new_err(
             "write_owned_bytes requires bytes-like object",
         ))
@@ -1992,15 +2082,16 @@ impl PyObjectWriter {
     fn finalize(&mut self, py: Python<'_>) -> PyResult<(u64, u64)> {
         if let Some(writer) = self.inner.take() {
             py.detach(|| {
-                pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
-                    let stats = (writer.bytes_written(), writer.compressed_bytes());
-                    writer.finalize().await.map_err(py_err)?;
-                    Ok::<(u64, u64), PyErr>(stats)
+                submit_io(async move {
+                    let stats = snapshot_final_writer_stats(writer.as_ref());
+                    writer.finalize().await?;
+                    Ok::<(u64, u64, Option<String>), anyhow::Error>(stats)
                 })
             })
-            .inspect(|&stats| {
-                self.finalized_stats = Some(stats);
+            .inspect(|stats| {
+                self.finalized_stats = Some(stats.clone());
             })
+            .map(|(bytes_written, compressed_bytes, _checksum)| (bytes_written, compressed_bytes))
         } else {
             Err(PyRuntimeError::new_err("Writer already finalized"))
         }
@@ -2008,7 +2099,7 @@ impl PyObjectWriter {
 
     /// Get the number of bytes written so far
     fn bytes_written(&self) -> PyResult<u64> {
-        if let Some((bytes_written, _)) = self.finalized_stats {
+        if let Some((bytes_written, _, _)) = self.finalized_stats {
             Ok(bytes_written)
         } else if let Some(writer) = &self.inner {
             Ok(writer.bytes_written())
@@ -2019,12 +2110,16 @@ impl PyObjectWriter {
 
     /// Get the checksum of the data written (if available)
     fn checksum(&self) -> Option<String> {
-        self.inner.as_ref().and_then(|w| w.checksum())
+        if let Some((_, _, checksum)) = &self.finalized_stats {
+            checksum.clone()
+        } else {
+            self.inner.as_ref().and_then(|w| w.checksum())
+        }
     }
 
     /// Get the number of compressed bytes (if compression is enabled)
     fn compressed_bytes(&self) -> PyResult<u64> {
-        if let Some((_, compressed)) = self.finalized_stats {
+        if let Some((_, compressed, _)) = self.finalized_stats {
             Ok(compressed)
         } else if let Some(writer) = &self.inner {
             Ok(writer.compressed_bytes())
@@ -2044,11 +2139,12 @@ pub fn create_s3_writer(
     let opts = options.map(|o| o.inner.clone()).unwrap_or_default();
 
     py.detach(|| {
-        pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
+        submit_io(async move {
             let store = S3ObjectStore::new();
-            let writer = store.create_writer(&uri, opts).await.map_err(|e| {
-                PyRuntimeError::new_err(format!("Failed to create S3 writer: {}", e))
-            })?;
+            let writer = store
+                .create_writer(&uri, opts)
+                .await
+                .map_err(|e| e.context("Failed to create S3 writer"))?;
 
             Ok(PyObjectWriter {
                 inner: Some(writer),
@@ -2069,11 +2165,12 @@ pub fn create_azure_writer(
     let opts = options.map(|o| o.inner.clone()).unwrap_or_default();
 
     py.detach(|| {
-        pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
+        submit_io(async move {
             let store = AzureObjectStore::new();
-            let writer = store.create_writer(&uri, opts).await.map_err(|e| {
-                PyRuntimeError::new_err(format!("Failed to create Azure writer: {}", e))
-            })?;
+            let writer = store
+                .create_writer(&uri, opts)
+                .await
+                .map_err(|e| e.context("Failed to create Azure writer"))?;
 
             Ok(PyObjectWriter {
                 inner: Some(writer),
@@ -2106,11 +2203,12 @@ pub fn create_filesystem_writer(
     let opts = options.map(|o| o.inner.clone()).unwrap_or_default();
 
     py.detach(|| {
-        pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
+        submit_io(async move {
             let store = FileSystemObjectStore::new();
-            let writer = store.create_writer(&uri, opts).await.map_err(|e| {
-                PyRuntimeError::new_err(format!("Failed to create filesystem writer: {}", e))
-            })?;
+            let writer = store
+                .create_writer(&uri, opts)
+                .await
+                .map_err(|e| e.context("Failed to create filesystem writer"))?;
 
             Ok(PyObjectWriter {
                 inner: Some(writer),
@@ -2130,11 +2228,12 @@ pub fn create_direct_filesystem_writer(
     let opts = options.map(|o| o.inner.clone()).unwrap_or_default();
 
     py.detach(|| {
-        pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
+        submit_io(async move {
             let store = ConfigurableFileSystemObjectStore::new(Default::default());
-            let writer = store.create_writer(&uri, opts).await.map_err(|e| {
-                PyRuntimeError::new_err(format!("Failed to create direct filesystem writer: {}", e))
-            })?;
+            let writer = store
+                .create_writer(&uri, opts)
+                .await
+                .map_err(|e| e.context("Failed to create direct filesystem writer"))?;
 
             Ok(PyObjectWriter {
                 inner: Some(writer),
@@ -2168,7 +2267,7 @@ impl PyMultiEndpointStore {
             let data = store
                 .get(&uri)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Get failed: {}", e)))?;
+                .map_err(|e| py_err(e.context("Get failed")))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
             Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
         })
@@ -2189,7 +2288,7 @@ impl PyMultiEndpointStore {
             let data = store
                 .get_range(&uri, offset, length)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Get range failed: {}", e)))?;
+                .map_err(|e| py_err(e.context("Get range failed")))?;
             // Return zero-copy BytesView wrapper (maintains Arc-counted Bytes)
             Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
         })
@@ -2205,7 +2304,7 @@ impl PyMultiEndpointStore {
             store
                 .put(&uri, data)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Put failed: {}", e)))?;
+                .map_err(|e| py_err(e.context("Put failed")))?;
             Ok(())
         })
     }
@@ -2224,7 +2323,7 @@ impl PyMultiEndpointStore {
             let objects = store
                 .list(&prefix, recursive)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("List failed: {}", e)))?;
+                .map_err(|e| py_err(e.context("List failed")))?;
             // Return Vec<String> - PyO3 automatically converts to Python list
             Ok(objects)
         })
@@ -2239,7 +2338,7 @@ impl PyMultiEndpointStore {
             store
                 .delete(&uri)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Delete failed: {}", e)))?;
+                .map_err(|e| py_err(e.context("Delete failed")))?;
             Ok(())
         })
     }
@@ -2324,9 +2423,8 @@ fn create_multi_endpoint_store(
         }
     };
 
-    let store = MultiEndpointStore::new(uris, strategy, None).map_err(|e| {
-        PyRuntimeError::new_err(format!("Failed to create multi-endpoint store: {}", e))
-    })?;
+    let store = MultiEndpointStore::new(uris, strategy, None)
+        .map_err(|e| py_err(e.context("Failed to create multi-endpoint store")))?;
 
     Ok(PyMultiEndpointStore {
         store: Arc::new(store),
@@ -2357,7 +2455,7 @@ fn create_multi_endpoint_store_from_template(
     strategy: Option<&str>,
 ) -> PyResult<PyMultiEndpointStore> {
     let uris = uri_utils::expand_uri_template(uri_template)
-        .map_err(|e| PyRuntimeError::new_err(format!("Template expansion failed: {}", e)))?;
+        .map_err(|e| py_err(e.context("Template expansion failed")))?;
 
     create_multi_endpoint_store(uris, strategy)
 }
@@ -2390,7 +2488,7 @@ fn create_multi_endpoint_store_from_file(
 ) -> PyResult<PyMultiEndpointStore> {
     let path = std::path::Path::new(file_path);
     let uris = uri_utils::load_uris_from_file(path)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load URIs from file: {}", e)))?;
+        .map_err(|e| py_err(e.context("Failed to load URIs from file")))?;
 
     create_multi_endpoint_store(uris, strategy)
 }
@@ -2428,10 +2526,7 @@ fn create_multi_endpoint_store_from_env(strategy: Option<&str>) -> PyResult<PyMu
         }
     };
     let store = MultiEndpointStore::from_env(lb_strategy, None).map_err(|e| {
-        PyRuntimeError::new_err(format!(
-            "Failed to create multi-endpoint store from S3_ENDPOINT_URIS: {}",
-            e
-        ))
+        py_err(e.context("Failed to create multi-endpoint store from S3_ENDPOINT_URIS"))
     })?;
     Ok(PyMultiEndpointStore {
         store: Arc::new(store),
@@ -2670,6 +2765,112 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 //   cargo test --lib --features extension-module -- --ignored --test-threads=1 put_verify_tests
 // `--test-threads=1` is required: both tests mutate the shared process-wide
 // `S3DLIO_PUT_VERIFY` env var and would otherwise race if run concurrently.
+// ---------------------------------------------------------------------------
+// Tests — error chain preserved across the PyO3 boundary
+// (storage#755 / s3dlio#161, v0.9.111)
+// ---------------------------------------------------------------------------
+//
+// A user's DLIO training run against S3 died with only
+// `RuntimeError: concurrent range chunk failed` — the real cause (a chained
+// `anyhow::Error`, e.g. an SDK/timeout/TLS failure under `.context(...)`) was
+// discarded at the PyO3 boundary. Root cause: `py_err()` formatted the error
+// with plain `Display` (`{}`), which for `anyhow::Error` (and anything
+// wrapping it, like `DatasetError::Backend`) prints only the outermost
+// context message. `{:#}` (alternate Display) prints the full cause chain.
+#[cfg(test)]
+mod error_chain_preservation_tests {
+    use super::*;
+
+    fn chained_error() -> anyhow::Error {
+        // Mirrors the real shape from src/s3_utils.rs:
+        // an SDK-level cause wrapped by a higher-level `.context(...)` label.
+        let inner = anyhow::anyhow!("HEAD failed: connection reset by peer");
+        inner.context("concurrent range chunk failed")
+    }
+
+    #[test]
+    fn error_chain_message_preserves_the_full_cause_chain() {
+        let msg = error_chain_message(&chained_error());
+        assert!(
+            msg.contains("connection reset by peer"),
+            "error message reaching Python must include the underlying cause, \
+             not just the outer context label — got: {msg:?}"
+        );
+        assert!(
+            msg.contains("concurrent range chunk failed"),
+            "the outer context label should still be present too — got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn error_chain_message_preserves_chain_through_dataset_error_wrapper() {
+        // `DatasetError::Backend` is `#[error(transparent)]` over `anyhow::Error`
+        // — this is the exact wrapper collect_batch()/`__next__()` see.
+        use crate::data_loader::dataset::DatasetError;
+        let wrapped: DatasetError = chained_error().into();
+        let msg = error_chain_message(&wrapped);
+        assert!(
+            msg.contains("connection reset by peer"),
+            "chain must survive the DatasetError wrapper too — got: {msg:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — PyObjectWriter::checksum() survives finalize() (design doc §4.1)
+// ---------------------------------------------------------------------------
+//
+// `finalize()` used to snapshot only (bytes_written, compressed_bytes) into
+// `finalized_stats` before consuming the writer, so `checksum()` always
+// returned `None` afterward even though the real, fully-computed checksum
+// was briefly reachable right before consumption. `ObjectWriter::checksum()`
+// is documented and implemented (see docs/DESIGN_FFI_BOUNDARY_HARDENING.md
+// §4.1) as an incremental "written so far" rolling-hash value, so it's safe
+// to snapshot it alongside the other two stats at the same point.
+#[cfg(test)]
+mod checksum_survives_finalize_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    /// Minimal `ObjectWriter` double: a fixed checksum, available at any
+    /// point (mirrors every real implementation's rolling-hasher behavior).
+    struct StubWriter {
+        checksum: String,
+    }
+
+    #[async_trait]
+    impl ObjectWriter for StubWriter {
+        async fn write_chunk(&mut self, _chunk: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn finalize(self: Box<Self>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn bytes_written(&self) -> u64 {
+            42
+        }
+        fn checksum(&self) -> Option<String> {
+            Some(self.checksum.clone())
+        }
+    }
+
+    #[test]
+    fn snapshot_captures_checksum_before_finalize_consumes_the_writer() {
+        let writer: Box<dyn ObjectWriter> = Box::new(StubWriter {
+            checksum: "crc32c:deadbeef".to_string(),
+        });
+        let (bytes_written, _compressed_bytes, checksum) =
+            snapshot_final_writer_stats(writer.as_ref());
+        assert_eq!(bytes_written, 42);
+        assert_eq!(
+            checksum,
+            Some("crc32c:deadbeef".to_string()),
+            "checksum must be captured in the pre-finalize snapshot, not \
+             lost once the writer is consumed by finalize()"
+        );
+    }
+}
+
 #[cfg(test)]
 mod parse_put_max_retries_tests {
     use super::*;

@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
-use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyStopIteration};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyDictMethods, PyList};
 use pyo3::Bound;
@@ -28,7 +28,7 @@ use crate::api::dataset_for_uri_with_options;
 #[cfg(feature = "extension-module")]
 use crate::checkpoint::{CheckpointConfig, CheckpointInfo, CheckpointStore, Strategy};
 use crate::data_loader::{
-    dataset::{Dataset, DatasetError},
+    dataset::{blocking_recv_locked, require_known_length, Dataset, DatasetError},
     options::{LoaderOptions, ReaderMode},
     parallel_fetch::DropCancel,
     s3_bytes::S3BytesDataset,
@@ -44,10 +44,11 @@ use tokio_util::sync::CancellationToken;
 // Import io_uring-style submit from s3_client (never calls block_on)
 use crate::s3_client::run_on_global_rt;
 
-// Helper function to convert errors
-fn py_err<E: std::fmt::Display>(e: E) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
-}
+// Error-to-PyErr conversion, shared with python_core_api.rs — see
+// error_chain_message() there for why this preserves the anyhow cause
+// chain instead of just the outermost context label (storage#755 /
+// s3dlio#161).
+use crate::python_api::python_core_api::py_err;
 
 #[pyclass]
 #[derive(Clone)]
@@ -63,7 +64,7 @@ impl PyS3Dataset {
         let o = opts_from_dict(opts);
         let ds = S3BytesDataset::from_prefix_with_opts(uri, &o)
             //.map_err(|e| PyRuntimeError::new_err(e))?;
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(py_err)?;
         Ok(Self { inner: ds })
     }
     /// Optional: expose keys for debugging
@@ -83,16 +84,20 @@ impl PyDataset {
     #[new]
     fn new(uri: &str, opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
         let o = opts_from_dict(opts);
-        let dataset = dataset_for_uri_with_options(uri, &o)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let dataset = dataset_for_uri_with_options(uri, &o).map_err(py_err)?;
         Ok(Self {
             inner: Arc::from(dataset),
         })
     }
 
-    /// Get the number of items in the dataset
+    /// Get the number of items in the dataset.
+    ///
+    /// Raises `TypeError` for iterable-style datasets whose length is not
+    /// known up front (matches Python convention: a `__len__` that can't
+    /// answer should raise, not lie with 0 — design doc
+    /// docs/DESIGN_TIER4_FFI_HARDENING.md item 2).
     fn __len__(&self) -> PyResult<usize> {
-        Ok(self.inner.len().unwrap_or(0))
+        require_known_length(self.inner.len()).map_err(PyTypeError::new_err)
     }
 
     /// Get an item by index (for map-style datasets)
@@ -100,10 +105,7 @@ impl PyDataset {
     fn get_item<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Py<PyAny>> {
         let inner = Arc::clone(&self.inner);
         let bound_result = future_into_py(py, async move {
-            let data = inner
-                .get(index)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let data = inner.get(index).await.map_err(py_err)?;
             Python::attach(|py| {
                 // Return PyBytesView for zero-copy access
                 let view = PyBytesView::new(data);
@@ -151,8 +153,7 @@ impl PyDataset {
     #[staticmethod]
     #[pyo3(signature = (uris, _opts=None))]
     fn from_uris(uris: Vec<String>, _opts: Option<Bound<'_, PyDict>>) -> PyResult<Self> {
-        let ds = crate::api::dataset_from_uris(uris)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let ds = crate::api::dataset_from_uris(uris).map_err(py_err)?;
         Ok(Self {
             inner: Arc::from(ds),
         })
@@ -207,6 +208,11 @@ impl PyBytesAsyncDataLoader {
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<PyBytesDataLoaderSyncIter>> {
         let prefetch = slf.opts.prefetch.max(1);
         let dataset = slf.dataset.clone();
+
+        // Fail loudly rather than silently yielding zero items -- see
+        // docs/DESIGN_TIER4_FFI_HARDENING.md item 2. There is currently no
+        // Python-exposed streaming path for unknown-length datasets.
+        require_known_length(dataset.inner.len()).map_err(PyTypeError::new_err)?;
 
         // Activate process-wide HEAD-skip latch if requested.
         if slf.opts.skip_head {
@@ -332,7 +338,7 @@ impl PyBytesAsyncDataLoader {
         Py::new(
             slf.py(),
             PyBytesDataLoaderSyncIter {
-                rx: std::sync::Mutex::new(rx),
+                rx: parking_lot::Mutex::new(rx),
             },
         )
     }
@@ -371,6 +377,11 @@ impl PyBytesAsyncDataLoader {
 
         let prefetch = slf.opts.prefetch.max(1);
         let dataset = slf.dataset.clone();
+
+        // Fail loudly rather than silently yielding zero items -- see
+        // docs/DESIGN_TIER4_FFI_HARDENING.md item 2. There is currently no
+        // Python-exposed streaming path for unknown-length datasets.
+        require_known_length(dataset.inner.len()).map_err(PyTypeError::new_err)?;
 
         // Activate process-wide HEAD-skip latch if requested.
         if slf.opts.skip_head {
@@ -485,7 +496,7 @@ impl PyBytesAsyncDataLoader {
         Py::new(
             slf.py(),
             PyObjectDataLoaderSyncIter {
-                rx: std::sync::Mutex::new(rx),
+                rx: parking_lot::Mutex::new(rx),
             },
         )
     }
@@ -546,7 +557,7 @@ impl PyObjectItem {
 /// run freely during that wait.
 #[pyclass]
 pub struct PyObjectDataLoaderSyncIter {
-    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<(String, Bytes), DatasetError>>>,
+    rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Result<(String, Bytes), DatasetError>>>,
 }
 
 #[pymethods]
@@ -557,16 +568,11 @@ impl PyObjectDataLoaderSyncIter {
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyObjectItem>> {
         // Release GIL while the channel is empty (Tokio GETs in flight).
-        let result = py.detach(|| {
-            self.rx
-                .lock()
-                .expect("PyObjectDataLoaderSyncIter rx mutex poisoned")
-                .blocking_recv()
-        });
+        let result = py.detach(|| blocking_recv_locked(&self.rx));
 
         match result {
             Some(Ok((uri, data))) => Py::new(py, PyObjectItem { uri, data }),
-            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            Some(Err(e)) => Err(py_err(e)),
             None => Err(PyStopIteration::new_err("end of dataset")),
         }
     }
@@ -609,10 +615,7 @@ impl PyObjectDataLoaderSyncIter {
 
         // Release GIL for the entire drain loop — no Python objects created here.
         let raw: Vec<Result<(String, Bytes), DatasetError>> = py.detach(|| {
-            let mut rx = self
-                .rx
-                .lock()
-                .expect("PyObjectDataLoaderSyncIter rx mutex poisoned");
+            let mut rx = self.rx.lock();
             let mut buf = Vec::with_capacity(n);
             for _ in 0..n {
                 match rx.blocking_recv() {
@@ -629,7 +632,7 @@ impl PyObjectDataLoaderSyncIter {
         for result in raw {
             match result {
                 Ok((uri, data)) => items.push(Py::new(py, PyObjectItem { uri, data })?),
-                Err(e) => return Err(PyRuntimeError::new_err(e.to_string())),
+                Err(e) => return Err(py_err(e)),
             }
         }
         Ok(items)
@@ -646,7 +649,7 @@ impl PyObjectDataLoaderSyncIter {
 /// object's bytes (when using the default S3 bytes format).
 #[pyclass]
 pub struct PyBytesDataLoaderSyncIter {
-    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<Bytes, DatasetError>>>,
+    rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Result<Bytes, DatasetError>>>,
 }
 
 #[pymethods]
@@ -659,16 +662,11 @@ impl PyBytesDataLoaderSyncIter {
         // Release the GIL while the Tokio channel is empty (network I/O in flight).
         // When the next item arrives the GIL is re-acquired automatically and `py`
         // is valid again — no Python::attach / Python::with_gil needed.
-        let result = py.detach(|| {
-            self.rx
-                .lock()
-                .expect("sync iter rx mutex poisoned")
-                .blocking_recv()
-        });
+        let result = py.detach(|| blocking_recv_locked(&self.rx));
 
         match result {
             Some(Ok(item)) => Py::new(py, PyBytesView::new(item))?.into_py_any(py),
-            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            Some(Err(e)) => Err(py_err(e)),
             None => Err(PyStopIteration::new_err("end of dataset")),
         }
     }
@@ -682,6 +680,11 @@ pub struct PyBytesAsyncDataLoaderIter {
 
 impl PyBytesAsyncDataLoaderIter {
     fn spawn_stream(py: Python<'_>, dataset: PyDataset, opts: LoaderOptions) -> PyResult<Py<Self>> {
+        // Fail loudly rather than silently yielding zero items -- see
+        // docs/DESIGN_TIER4_FFI_HARDENING.md item 2. There is currently no
+        // Python-exposed streaming path for unknown-length datasets.
+        require_known_length(dataset.inner.len()).map_err(PyTypeError::new_err)?;
+
         let (tx, rx) = mpsc::channel::<Result<Vec<Bytes>, DatasetError>>(opts.prefetch.max(1));
 
         // Extract concurrency setting for concurrent batch fetching
@@ -788,7 +791,7 @@ impl PyBytesAsyncDataLoaderIter {
                         Ok(py_list.into_any().unbind())
                     })
                 }
-                Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+                Some(Err(e)) => Err(py_err(e)),
                 None => Err(PyStopAsyncIteration::new_err("StopAsyncIteration")),
             }
         })?;
@@ -814,8 +817,7 @@ impl PyS3AsyncDataLoader {
             .max_inflight_parts(4);
 
         // Build the dataset with the SAME options (reader_mode, part_size, etc.)
-        let ds = S3BytesDataset::from_prefix_with_opts(uri, &o)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let ds = S3BytesDataset::from_prefix_with_opts(uri, &o).map_err(py_err)?;
 
         // Use the SAME options for DataLoader and for channel capacity.
         let (tx, rx) = mpsc::channel::<Result<Vec<Bytes>, DatasetError>>(o.prefetch.max(1));
@@ -855,7 +857,7 @@ impl PyS3AsyncDataLoader {
                         .collect::<PyResult<Vec<_>>>()?;
                     out.into_py_any(py)
                 }),
-                Some(Err(e)) => Err(PyRuntimeError::new_err(format!("{:?}", e))),
+                Some(Err(e)) => Err(py_err(e)),
                 None => Err(PyStopAsyncIteration::new_err("end of stream")),
             }
         })?;
@@ -1362,7 +1364,7 @@ impl PyAsyncDataLoaderIter {
             let mut guard = rx.lock().await;
             match guard.recv().await {
                 Some(Ok(batch)) => Python::attach(|py| batch.into_py_any(py)),
-                Some(Err(e)) => Err(PyRuntimeError::new_err(format!("{:?}", e))),
+                Some(Err(e)) => Err(py_err(e)),
                 None => Err(PyStopAsyncIteration::new_err("end of loader")),
             }
         })?;
@@ -1396,7 +1398,7 @@ impl PyCheckpointStore {
 
         if let Some(strat_str) = strategy {
             let strat = Strategy::from_str(&strat_str)
-                .map_err(|e| PyRuntimeError::new_err(format!("Invalid strategy: {}", e)))?;
+                .map_err(|e| py_err(format!("Invalid strategy: {}", e)))?;
             config = config.with_strategy(strat);
         }
 
@@ -1411,14 +1413,13 @@ impl PyCheckpointStore {
             config = config.with_compression(compression_config);
         }
 
-        let store = CheckpointStore::open_with_config(&uri, config).map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to open checkpoint store: {}", e))
-        })?;
+        let store = CheckpointStore::open_with_config(&uri, config)
+            .map_err(|e| py_err(e.context("Failed to open checkpoint store")))?;
 
-        let runtime =
-            Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
-                PyRuntimeError::new_err(format!("Failed to create runtime: {}", e))
-            })?);
+        let runtime = Arc::new(
+            tokio::runtime::Runtime::new()
+                .map_err(|e| py_err(format!("Failed to create runtime: {}", e)))?,
+        );
 
         Ok(Self {
             inner: Arc::new(Mutex::new(store)),
@@ -1452,7 +1453,7 @@ impl PyCheckpointStore {
                 store.save(step, epoch, &framework, &data, user_meta).await
             })
         })
-        .map_err(|e| PyRuntimeError::new_err(format!("Save failed: {}", e)))
+        .map_err(|e| py_err(e.context("Save failed")))
     }
 
     /// Load the latest checkpoint
@@ -1466,7 +1467,7 @@ impl PyCheckpointStore {
                 store.load_latest().await
             })
         })
-        .map_err(|e| PyRuntimeError::new_err(format!("Load failed: {}", e)))
+        .map_err(|e| py_err(e.context("Load failed")))
         .map(|opt_data| {
             opt_data
                 .map(|data| Python::attach(|py| PyBytesView::new(data).into_py_any(py).unwrap()))
@@ -1485,7 +1486,7 @@ impl PyCheckpointStore {
                     store.list_checkpoints().await
                 })
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("List failed: {}", e)))?;
+            .map_err(|e| py_err(e.context("List failed")))?;
 
         Ok(infos
             .into_iter()
@@ -1504,7 +1505,7 @@ impl PyCheckpointStore {
                 store.delete_checkpoint(step).await
             })
         })
-        .map_err(|e| PyRuntimeError::new_err(format!("Delete failed: {}", e)))
+        .map_err(|e| py_err(e.context("Delete failed")))
     }
 
     /// Get a writer for distributed checkpointing
@@ -1575,7 +1576,7 @@ impl PyCheckpointStream {
                         ckpt_writer.get_shard_writer(&layout).await
                     })
                 })
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create writer: {}", e)))?;
+                .map_err(|e| py_err(e.context("Failed to create writer")))?;
 
             self.writer = Some(writer);
             self.key = Some(key);
@@ -1587,7 +1588,7 @@ impl PyCheckpointStream {
                 self.runtime
                     .block_on(async { writer.write_chunk(data).await })
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("Write failed: {}", e)))?;
+            .map_err(|e| py_err(e.context("Write failed")))?;
 
             Ok(data.len())
         } else {
@@ -1631,7 +1632,7 @@ impl PyCheckpointStream {
                         ckpt_writer.finalize_shard_meta(&layout, key).await
                     })
                 })
-                .map_err(|e| PyRuntimeError::new_err(format!("Finalize failed: {}", e)))?;
+                .map_err(|e| py_err(e.context("Finalize failed")))?;
 
             self.finalized = true;
 
@@ -1656,7 +1657,7 @@ impl PyCheckpointStream {
     fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(writer) = self.writer.take() {
             py.detach(|| self.runtime.block_on(async { writer.cancel().await }))
-                .map_err(|e| PyRuntimeError::new_err(format!("Cancel failed: {}", e)))?;
+                .map_err(|e| py_err(e.context("Cancel failed")))?;
         }
 
         self.finalized = true;
@@ -1701,7 +1702,7 @@ impl PyCheckpointWriter {
                     .await
             })
         })
-        .map_err(|e| PyRuntimeError::new_err(format!("Save shard failed: {}", e)))
+        .map_err(|e| py_err(e.context("Save shard failed")))
         .map(|(layout, shard_meta)| {
             let dict = PyDict::new(py);
             dict.set_item("step", layout.step).ok();
@@ -1811,7 +1812,7 @@ impl PyCheckpointWriter {
                     .await
             })
         })
-        .map_err(|e| PyRuntimeError::new_err(format!("Finalize failed: {}", e)))
+        .map_err(|e| py_err(e.context("Finalize failed")))
     }
 }
 
@@ -1837,7 +1838,7 @@ impl PyCheckpointReader {
                 reader.load_latest_manifest().await
             })
         })
-        .map_err(|e| PyRuntimeError::new_err(format!("Load manifest failed: {}", e)))
+        .map_err(|e| py_err(e.context("Load manifest failed")))
         .map(|opt_manifest| {
             opt_manifest.map(|manifest| {
                 let dict = PyDict::new(py);
@@ -1920,7 +1921,7 @@ impl PyCheckpointReader {
                     reader.read_shard(&key).await
                 })
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("Read shard failed: {}", e)))?;
+            .map_err(|e| py_err(e.context("Read shard failed")))?;
 
         // Return zero-copy BytesView as PyObject
         PyBytesView::new(data).into_py_any(py)
@@ -2189,7 +2190,7 @@ impl PyParquetItem {
 /// bytes — enough for the Python consumer to cache by `(file_uri, rg_idx)`.
 #[pyclass]
 pub struct ParquetStreamIter {
-    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<(usize, Bytes), DatasetError>>>,
+    rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Result<(usize, Bytes), DatasetError>>>,
     /// global_rg_idx → (file_uri_idx, rg_idx_in_file)
     rg_info: Arc<Vec<(usize, usize)>>,
     file_uris: Arc<Vec<String>>,
@@ -2203,12 +2204,7 @@ impl ParquetStreamIter {
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Release the GIL while waiting — other Python threads continue freely.
-        let result = py.detach(|| {
-            self.rx
-                .lock()
-                .expect("ParquetStreamIter rx mutex poisoned")
-                .blocking_recv()
-        });
+        let result = py.detach(|| blocking_recv_locked(&self.rx));
 
         match result {
             Some(Ok((global_idx, bytes))) => {
@@ -2221,7 +2217,7 @@ impl ParquetStreamIter {
                 };
                 Py::new(py, item)?.into_py_any(py)
             }
-            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            Some(Err(e)) => Err(py_err(e)),
             None => Err(PyStopIteration::new_err("parquet stream exhausted")),
         }
     }
@@ -2364,7 +2360,7 @@ impl PyParquetStreamLoader {
         Py::new(
             slf.py(),
             ParquetStreamIter {
-                rx: std::sync::Mutex::new(rx),
+                rx: parking_lot::Mutex::new(rx),
                 rg_info,
                 file_uris,
             },
@@ -2407,7 +2403,7 @@ pub fn generate_parquet_bytes(
 
     let bytes = py
         .detach(|| parquet_gen::generate_parquet_bytes(num_cols, rows_per_rg, num_row_groups))
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(py_err)?;
 
     Ok(PyBytesView::new(bytes))
 }
@@ -2457,7 +2453,7 @@ pub fn generate_and_write_parquet(
             .await
         })
     })
-    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    .map_err(py_err)
 }
 
 /// Generate a Parquet file in memory with a named, schema-flexible column layout.
@@ -2494,7 +2490,7 @@ pub fn generate_parquet_bytes_schema(
         .detach(|| {
             parquet_gen::generate_parquet_bytes_schema(&columns, rows_per_rg, num_row_groups)
         })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(py_err)?;
 
     Ok(PyBytesView::new(bytes))
 }
@@ -2540,7 +2536,7 @@ pub fn generate_and_write_parquet_schema(
             .await
         })
     })
-    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    .map_err(py_err)
 }
 
 /// Generate a Parquet file with a named schema and stream it to an S3 URI,
@@ -2591,7 +2587,7 @@ pub fn generate_and_write_parquet_schema_streaming(
             .await
         })
     })
-    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    .map_err(py_err)
 }
 
 /// Fetch a single Parquet row group and optionally decode it to Arrow IPC.
@@ -2721,7 +2717,7 @@ pub fn parquet_get_rg(
                 store.get_range(&uri_owned, offset, Some(length)).await
             })
         })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(py_err)?;
 
     Ok(PyBytesView::new(bytes))
 }
@@ -2788,7 +2784,7 @@ pub fn create_async_loader(
 
             let pq_dataset =
                 ParquetRowGroupDataset::new(uri, col_indices.as_deref(), footer_cap, decode_mode)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    .map_err(py_err)?;
 
             // max_threads: configure the pyo3 Tokio runtime thread count
             // BEFORE the first spawn.  Only takes effect if the runtime has
@@ -3082,13 +3078,12 @@ pub fn parquet_rg_row_offsets(uri: &str) -> PyResult<Vec<i64>> {
     use crate::data_loader::parquet_file_cache;
     use crate::data_loader::parquet_rg::DEFAULT_FOOTER_CAP;
     use crate::s3_client::run_on_global_rt;
-    use pyo3::exceptions::PyRuntimeError;
 
     let uri_owned = uri.to_owned();
     let cached = run_on_global_rt(async move {
         parquet_file_cache::get_or_fetch(&uri_owned, DEFAULT_FOOTER_CAP as u64).await
     })
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    .map_err(py_err)?;
 
     Ok(cached.rg_row_offsets.clone())
 }
@@ -3201,7 +3196,7 @@ impl PyParquetIndex {
         py.detach(|| {
             inner
                 .ensure_indexed(&uris, epoch, batch_size)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                .map_err(py_err)
         })
     }
 
@@ -3210,16 +3205,12 @@ impl PyParquetIndex {
     /// Returns the row-group index.  Raises ``RuntimeError`` if the URI is not
     /// yet indexed.
     fn rg_for_sample(&self, uri: &str, sample_idx: i64) -> PyResult<u32> {
-        self.inner
-            .rg_for_sample(uri, sample_idx)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        self.inner.rg_for_sample(uri, sample_idx).map_err(py_err)
     }
 
     /// Return ``(byte_offset, byte_length)`` for ``(uri, rg_idx)``.
     fn rg_range(&self, uri: &str, rg_idx: u32) -> PyResult<(u64, u64)> {
-        self.inner
-            .rg_range(uri, rg_idx)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        self.inner.rg_range(uri, rg_idx).map_err(py_err)
     }
 
     /// Combined lookup: sample → ``(rg_idx, byte_offset, byte_length)``.
@@ -3227,9 +3218,7 @@ impl PyParquetIndex {
     /// Combines ``rg_for_sample`` + ``rg_range`` into one PyO3 call, halving
     /// FFI overhead on the per-sample hot path.
     fn rg_lookup(&self, uri: &str, sample_idx: i64) -> PyResult<(u32, u64, u64)> {
-        self.inner
-            .rg_lookup(uri, sample_idx)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        self.inner.rg_lookup(uri, sample_idx).map_err(py_err)
     }
 
     /// ``True`` if ``(uri, rg_idx)`` was fetched during epoch ``epoch``.
