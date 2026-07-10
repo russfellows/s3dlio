@@ -106,12 +106,63 @@ Before pushing any code change, run in this order and only push if all three
 are clean:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy --all-targets --all-features -- -D warnings`
+2. `cargo clippy --lib --bins --examples -- -D warnings` (matches
+   `.github/workflows/ci.yml`'s Lint job exactly — default features, no
+   `--all-features`; tests/benches are covered by the Test job's `cargo test`,
+   not by this clippy pass)
 3. `cargo test --lib` (unit tests) — plus any integration tests specifically
    touching the changed area.
 
+For any change touching `src/python_api/` (i.e. anything gated behind
+`#[cfg(feature = "extension-module")]`), also run steps 2 and 3 with
+`--features extension-module` added — CI's own Lint/Test jobs above do
+**not** enable this feature (only the wheel-build step does), so it is the
+only way to actually compile-check or test that code locally:
+`cargo clippy --lib --bins --examples --features extension-module -- -D warnings`
+and `cargo test --lib --features extension-module`.
+
+**Never run `cargo build`/`test`/`clippy` with `--all-features`.** It cannot
+work, by design: `native-backends` and `arrow-backend` are two alternative,
+mutually exclusive object-store implementations, and `--all-features` turns
+both on at once, which trips the `compile_error!` guard at the top of
+`src/lib.rs` every time. This is not a bug to fix — do not touch the guard.
+See the note above `[features]` in `Cargo.toml` for the full explanation. If
+you need to validate the `arrow-backend` path specifically, do it in
+isolation: `cargo clippy --no-default-features --features arrow-backend -- -D warnings`.
+
 For Python wheel changes, additionally rebuild via `./build_pyo3.sh` (see
 above) and smoke-test against the wheel via `uv run pytest`.
+
+### Required before opening any PR: wheel build + live smoke test
+
+`cargo test` passing is **not sufficient signal to open a PR** — three
+separate rounds of s3dlio bugs (storage#699, #689, and #755/#161, the
+error-chain-loss fix) were all found by downstream consumers
+(DLIO_local_changes / mlp-storage) days after `cargo test` was clean, because
+the unit suite never exercises the actual compiled wheel against a real
+FFI/wire boundary the way a live training run does. Before opening a PR:
+
+1. `./build_pyo3.sh` — build the actual Python wheel (not `cargo build`
+   alone; the wheel is what ships to PyPI and exercises the PyO3 boundary
+   that `cargo test --lib` mostly does not, since CI's own Lint/Test jobs
+   don't enable `extension-module` — see above).
+2. `uv run pytest tests/...` against the freshly built wheel — the existing
+   in-repo Python test suite, not skipped.
+3. **Strongly recommended for anything touching data-loading, error
+   handling, or the FFI/PyO3 boundary** (i.e. most of `src/python_api/`):
+   drive a real `mlp-storage` benchmark against a live S3-compatible target
+   using `storage_library=s3dlio`, installing the wheel from step 1 first
+   (not whatever version is already pinned in mlp-storage's
+   `pyproject.toml`). This is what would have caught #755/#161 before it
+   reached a user. See `mlp-storage/tests/object-store/README.md` for setup
+   (credentials via `.env`, `STORAGE_LIBRARY=s3dlio`) and
+   `mlp-storage/tests/object-store/test_unet3d.sh` /
+   `mlp-storage/tests/configs/s3_workload_unet3d.yaml` for a
+   ready-to-run — the latter is the much smaller/faster config (168 files,
+   ~24 GB) suited to per-change validation; the full `gen_unet3d_npz.sh` /
+   `test_unet3d.sh` combo (7,200 files, ~984 GiB) is too slow to run on
+   every PR. A local high-throughput S3-compatible target (e.g. s3-ultra,
+   see reference memory) keeps this fast enough to actually run every time.
 
 For any change touching `python/` (including `python/s3dlio/...` and
 `python/tests/...`), additionally run (per the parent CLAUDE.md rule #7):
