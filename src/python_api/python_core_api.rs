@@ -2343,6 +2343,125 @@ impl PyMultiEndpointStore {
         })
     }
 
+    /// List objects from ALL endpoints and merge results (deduplicated).
+    ///
+    /// Unlike ``list()``, which only queries one load-balanced endpoint, this
+    /// queries every configured endpoint in parallel. For true-replication
+    /// deployments (see the ``MultiEndpointStore`` replication-assumption note in
+    /// the Rust docs / issue #162) this is the reliable way to discover objects
+    /// regardless of round-robin state.
+    fn list_all_endpoints<'py>(
+        &self,
+        py: Python<'py>,
+        prefix: &str,
+        recursive: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let prefix = prefix.to_string();
+        let store = self.store.clone();
+
+        future_into_py(py, async move {
+            let objects = store
+                .list_all_endpoints(&prefix, recursive)
+                .await
+                .map_err(|e| py_err(e.context("List-all-endpoints failed")))?;
+            Ok(objects)
+        })
+    }
+
+    /// Get an object from a specific configured endpoint, bypassing load
+    /// balancing entirely. Use this for sharded (non-replicated) deployments --
+    /// see the replication-assumption note on ``MultiEndpointStore`` / issue #162.
+    ///
+    /// Raises if ``index`` is out of range for the configured endpoint count.
+    fn get_from_endpoint<'py>(
+        &self,
+        py: Python<'py>,
+        index: usize,
+        uri: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let uri = uri.to_string();
+        let store = self.store.clone();
+
+        future_into_py(py, async move {
+            let data = store
+                .get_from_endpoint(index, &uri)
+                .await
+                .map_err(|e| py_err(e.context("Get from endpoint failed")))?;
+            Python::attach(|py| Ok(Py::new(py, PyBytesView::new(data))?.into_any()))
+        })
+    }
+
+    /// Put an object to a specific configured endpoint, bypassing load
+    /// balancing entirely. See ``get_from_endpoint``.
+    ///
+    /// Raises if ``index`` is out of range for the configured endpoint count.
+    fn put_to_endpoint<'py>(
+        &self,
+        py: Python<'py>,
+        index: usize,
+        uri: &str,
+        data: &[u8],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let uri = uri.to_string();
+        let data = Bytes::copy_from_slice(data);
+        let store = self.store.clone();
+
+        future_into_py(py, async move {
+            store
+                .put_to_endpoint(index, &uri, data)
+                .await
+                .map_err(|e| py_err(e.context("Put to endpoint failed")))?;
+            Ok(())
+        })
+    }
+
+    /// Delete an object from a specific configured endpoint, bypassing load
+    /// balancing entirely. See ``get_from_endpoint``.
+    ///
+    /// Raises if ``index`` is out of range for the configured endpoint count.
+    fn delete_from_endpoint<'py>(
+        &self,
+        py: Python<'py>,
+        index: usize,
+        uri: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let uri = uri.to_string();
+        let store = self.store.clone();
+
+        future_into_py(py, async move {
+            store
+                .delete_from_endpoint(index, &uri)
+                .await
+                .map_err(|e| py_err(e.context("Delete from endpoint failed")))?;
+            Ok(())
+        })
+    }
+
+    /// Put the same object to every configured endpoint (fan-out write), for
+    /// true-replication deployments that want a guaranteed-consistent write
+    /// instead of relying on independent round-robin ``put()`` calls to
+    /// eventually cover every endpoint. Mirrors ``list_all_endpoints`` for
+    /// the write side. Raises if the write failed on any endpoint (not
+    /// transactional -- some endpoints may already hold the write).
+    fn put_all_endpoints<'py>(
+        &self,
+        py: Python<'py>,
+        uri: &str,
+        data: &[u8],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let uri = uri.to_string();
+        let data = Bytes::copy_from_slice(data);
+        let store = self.store.clone();
+
+        future_into_py(py, async move {
+            store
+                .put_all_endpoints(&uri, data)
+                .await
+                .map_err(|e| py_err(e.context("Put-all-endpoints failed")))?;
+            Ok(())
+        })
+    }
+
     /// Get per-endpoint statistics
     fn get_endpoint_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let stats = self.store.get_all_stats();

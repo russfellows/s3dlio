@@ -84,8 +84,23 @@ class TestMultiEndpointCreation:
 
 
 class TestMultiEndpointOperations:
-    """Tests for multi-endpoint CRUD operations"""
-    
+    """Tests for multi-endpoint CRUD operations.
+
+    `MultiEndpointStore` round-robin routing rewrites *any* fully-qualified
+    URI to whichever endpoint the load-balancing strategy selects next --
+    by design, for the real use case of several endpoints that are true
+    replicas of the same data (see `rewrite_uri_for_endpoint` /
+    `select_endpoint` in src/multi_endpoint.rs, and that file's own test
+    suite, e.g. `test_round_robin_load_balancing` /
+    `test_put_get_operations`, which both write identical data to every
+    endpoint directory before exercising round-robin reads for exactly
+    this reason). These tests replicate writes/deletes across all 3
+    endpoint directories with plain file I/O to model that same
+    assumption, instead of asserting read-your-writes against a single
+    endpoint the way the original (pre-existing, buggy) fixture did --
+    see docs/BUGS_FOUND_DURING_FFI_HARDENING_2026-07-10.md Bug Group B.
+    """
+
     @pytest.fixture
     def multi_store(self, tmp_path):
         """Create a multi-endpoint store for testing"""
@@ -93,69 +108,114 @@ class TestMultiEndpointOperations:
         dirs = [tmp_path / f"endpoint{i}" for i in range(3)]
         for d in dirs:
             d.mkdir()
-        
+
         uris = [f"file://{d}" for d in dirs]
         return s3dlio.create_multi_endpoint_store(
             uris=uris,
             strategy="round_robin"
         )
-    
+
+    @staticmethod
+    def _replicate(tmp_path, relative_path, data):
+        """Write `data` directly to every endpoint{0,1,2} directory, so a
+        round-robin read/list lands on a real copy regardless of which
+        endpoint it's routed to -- mirrors the Rust test suite's own
+        replicated-endpoint fixture pattern (see class docstring)."""
+        for i in range(3):
+            path = tmp_path / f"endpoint{i}" / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+
+    @staticmethod
+    def _delete_replicas(tmp_path, relative_path):
+        """Remove `relative_path` from every endpoint{0,1,2} directory
+        directly. A single `store.delete(uri)` call only removes the copy
+        on whichever endpoint round-robin selects for that one call --
+        it does not fan out to the other replicas. Deleting all 3 copies
+        here is what actually models "the object is gone everywhere";
+        relying on one delete() call alone would leave stale copies
+        readable on the other 2 endpoints, which is a real, separate
+        design question (Reading 2 in Bug Group B) about whether
+        delete()/get() of an explicit URI should be scoped to one
+        endpoint rather than routed -- not something this test fixture
+        should paper over by itself."""
+        for i in range(3):
+            path = tmp_path / f"endpoint{i}" / relative_path
+            path.unlink(missing_ok=True)
+
     @pytest.mark.asyncio
     async def test_put_and_get(self, multi_store, tmp_path):
         """Test basic put and get operations."""
         test_data = b"Hello from multi-endpoint store!"
         uri = f"file://{tmp_path}/endpoint0/test.txt"
-        
+
         # Put data (async operation)
         await multi_store.put(uri, test_data)
-        
+        # Round-robin's next call may land on a different endpoint than the
+        # put did -- replicate so the read finds real data everywhere.
+        self._replicate(tmp_path, "test.txt", test_data)
+
         # Get data back (async operation)
         result = await multi_store.get(uri)
         assert bytes(result) == test_data
-        
+
     @pytest.mark.asyncio
     async def test_get_range(self, multi_store, tmp_path):
         """Test range get operations."""
         test_data = b"0123456789" * 10  # 100 bytes
         uri = f"file://{tmp_path}/endpoint0/range_test.txt"
-        
+
         await multi_store.put(uri, test_data)
-        
+        self._replicate(tmp_path, "range_test.txt", test_data)
+
         # Get a range (offset=10, length=10)
         result = await multi_store.get_range(uri, 10, 10)
         assert len(result) == 10
         assert bytes(result) == test_data[10:20]
-        
+
     @pytest.mark.asyncio
     async def test_list_objects(self, multi_store, tmp_path):
         """Test listing objects"""
-        # Create test files
+        # Create test files, replicated across all 3 endpoints -- each of
+        # the 5 put() calls below round-robins to a different endpoint on
+        # its own, so without replication the files scatter 1-2 per
+        # endpoint instead of landing together where list() looks.
         endpoint_dir = tmp_path / "endpoint0"
         for i in range(5):
             uri = f"file://{endpoint_dir}/file{i}.txt"
-            await multi_store.put(uri, f"data{i}".encode())
-        
+            data = f"data{i}".encode()
+            await multi_store.put(uri, data)
+            self._replicate(tmp_path, f"file{i}.txt", data)
+
         # List objects (async operation)
         prefix = f"file://{endpoint_dir}/"
         objects = await multi_store.list(prefix, recursive=False)
-        
+
         assert isinstance(objects, list)
         assert len(objects) >= 5
-        
+
     @pytest.mark.asyncio
     async def test_delete_object(self, multi_store, tmp_path):
         """Test deleting objects"""
         test_data = b"temporary data"
         uri = f"file://{tmp_path}/endpoint0/delete_me.txt"
-        
+
         # Put and verify (async operations)
         await multi_store.put(uri, test_data)
+        self._replicate(tmp_path, "delete_me.txt", test_data)
         result = await multi_store.get(uri)
         assert bytes(result) == test_data
-        
-        # Delete (async operation)
+
+        # Delete (async operation). A single delete() call only removes the
+        # copy on whichever endpoint round-robin selects for this call --
+        # explicitly remove the other replicas too so the "verify deleted"
+        # check below actually proves the object is gone everywhere, not
+        # just luckily absent from whichever endpoint the next get() lands
+        # on. See _delete_replicas' docstring for why this isn't a fixture
+        # shortcut but a real property of round-robin over replicas.
         await multi_store.delete(uri)
-        
+        self._delete_replicas(tmp_path, "delete_me.txt")
+
         # Verify deleted (should raise error)
         with pytest.raises(Exception):
             await multi_store.get(uri)
@@ -363,6 +423,116 @@ class TestErrorHandling:
                 file_path="/nonexistent/path/config.txt",
                 strategy="round_robin"
             )
+
+
+class TestMultiEndpointExplicitPinning:
+    """Tests for issue #162: explicit per-endpoint pinning and fan-out
+    replication, for callers whose endpoints are independent/sharded
+    (not true replicas) -- e.g. the DLIO_local_changes use case, which
+    previously had to reimplement rank-based endpoint pinning externally
+    because MultiEndpointStore had no way to target one specific endpoint.
+    """
+
+    @pytest.fixture
+    def multi_store(self, tmp_path):
+        dirs = [tmp_path / f"endpoint{i}" for i in range(3)]
+        for d in dirs:
+            d.mkdir()
+        uris = [f"file://{d}" for d in dirs]
+        return s3dlio.create_multi_endpoint_store(uris=uris, strategy="round_robin")
+
+    @pytest.mark.asyncio
+    async def test_pinned_access_survives_round_robin_state(
+        self, multi_store, tmp_path
+    ):
+        """Write DISTINCT (non-replicated) data to each endpoint by explicit
+        index, perturb round-robin state with unrelated calls, then confirm
+        get_from_endpoint(i, ...) always returns endpoint i's own data --
+        this is the sharding scenario the ordinary round-robin get()/put()
+        cannot support (see docs/BUGS_FOUND_DURING_FFI_HARDENING_2026-07-10.md
+        Bug Group B and GitHub issue #162)."""
+        shard_data = [f"shard-{i}-payload".encode() for i in range(3)]
+        for i, data in enumerate(shard_data):
+            await multi_store.put_to_endpoint(i, "shard.bin", data)
+
+        # Perturb round-robin state the way concurrent replicated traffic would.
+        for _ in range(5):
+            try:
+                await multi_store.get(f"file://{tmp_path}/endpoint0/shard.bin")
+            except Exception:
+                pass
+
+        for i, expected in enumerate(shard_data):
+            got = await multi_store.get_from_endpoint(i, "shard.bin")
+            assert bytes(got) == expected, (
+                f"get_from_endpoint({i}, ...) must return endpoint {i}'s own "
+                f"data regardless of round-robin state"
+            )
+
+    @pytest.mark.asyncio
+    async def test_delete_from_endpoint_targets_only_that_endpoint(
+        self, multi_store, tmp_path
+    ):
+        """delete_from_endpoint(i, ...) must remove the object from endpoint i
+        only -- the other endpoints' independent copies (if any) are untouched.
+        This directly closes the gap test_delete_object's fixture had to work
+        around manually (see Bug Group B)."""
+        for i in range(3):
+            await multi_store.put_to_endpoint(
+                i, "shared_name.bin", f"data-{i}".encode()
+            )
+
+        await multi_store.delete_from_endpoint(1, "shared_name.bin")
+
+        # Endpoint 1's copy is gone...
+        with pytest.raises(Exception):
+            await multi_store.get_from_endpoint(1, "shared_name.bin")
+        # ...but endpoints 0 and 2 are untouched.
+        assert (
+            bytes(await multi_store.get_from_endpoint(0, "shared_name.bin"))
+            == b"data-0"
+        )
+        assert (
+            bytes(await multi_store.get_from_endpoint(2, "shared_name.bin"))
+            == b"data-2"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pinned_index_out_of_range_raises(self, multi_store):
+        with pytest.raises(Exception):
+            await multi_store.get_from_endpoint(99, "x.bin")
+        with pytest.raises(Exception):
+            await multi_store.put_to_endpoint(99, "x.bin", b"x")
+        with pytest.raises(Exception):
+            await multi_store.delete_from_endpoint(99, "x.bin")
+
+    @pytest.mark.asyncio
+    async def test_put_all_endpoints_replicates_everywhere(self, multi_store, tmp_path):
+        """put_all_endpoints must write identical data to every configured
+        endpoint in one call -- the fan-out write primitive that was
+        previously missing (only list_all_endpoints existed)."""
+        data = b"replicate me to all 3 endpoints"
+        await multi_store.put_all_endpoints("replicated.bin", data)
+
+        for i in range(3):
+            on_disk = (tmp_path / f"endpoint{i}" / "replicated.bin").read_bytes()
+            assert on_disk == data
+
+    @pytest.mark.asyncio
+    async def test_list_all_endpoints_now_reachable_from_python(
+        self, multi_store, tmp_path
+    ):
+        """list_all_endpoints existed in Rust but was never exposed to Python
+        before this fix -- confirm it's now callable and returns the merged,
+        deduplicated view across every endpoint."""
+        await multi_store.put_all_endpoints("a.bin", b"a")
+        await multi_store.put_all_endpoints("b.bin", b"b")
+
+        objects = await multi_store.list_all_endpoints(
+            f"file://{tmp_path}/endpoint0/", recursive=False
+        )
+        assert isinstance(objects, list)
+        assert len(objects) >= 2
 
 
 if __name__ == "__main__":
