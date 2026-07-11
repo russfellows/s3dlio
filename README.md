@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-748-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.110-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-762-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.112-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -10,9 +10,11 @@
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
-> **v0.9.110 — Multi-agent bug audit fix release — 39 fixes across 6 phases (issues #151–#157)**
+> **v0.9.112 — Tokio-runtime sanity clamp + MPI-aware thread pools + FFI-boundary hardening**
 >
-> Closes a coordinated 7-issue, 39-bug audit of s3dlio HEAD, fanning out specialized reviewers by subsystem then adversarially verifying every finding: silent data corruption in range/multipart paths (Phase A), wrong-data-returned bugs reachable from the public API (Phase B), silent exception-swallowing (Phase C), backend correctness/hygiene across S3/Azure/GCS (Phase D), URI-parsing and scheme-detection edge cases (Phase E), and dead/mismatched env-var knobs (Phase F). Every fix landed with a RED-then-GREEN regression test that fails against unmodified code and passes after the fix. Full bug-by-bug table and per-commit list: [docs/Changelog.md](docs/Changelog.md).
+> Three independent hardening changes in one release. **(1) Tokio-runtime sanity clamp on `S3DLIO_RT_THREADS`:** DLIO's `ObjStoreLibStorage.__init__` computes `S3DLIO_RT_THREADS = write_threads * 3 // 2`, and with Hydra's default `write_threads=1` that resolves to `S3DLIO_RT_THREADS=1` — which pre-0.9.112 s3dlio faithfully obeyed by building a 1-worker Tokio runtime, then serialized every concurrent multipart-upload part on it (10× throughput loss on unet3d datagen: 214 MB/s → 1928 MB/s live-measured after fix). s3dlio now clamps env-var values below `RT_THREADS_LIMIT/4` back up to the configured target with a stderr warning; `S3DLIO_RT_THREADS_UNSAFE=1` bypasses for legitimate low-thread scenarios. **(2) MPI-aware thread pool auto-init:** every s3dlio-owned pool (Tokio runtime, checkpoint runtime, Rayon global, dgen-rs) is now sized to `num_cpus / world_size` at import time via `_pymod`'s auto-call to `configure_thread_pools(0)`, closing the CPU-oversubscription class of bug where N ranks on the same host each independently claim the full core count. **(3) FFI-boundary hardening (storage#755, s3dlio#161, s3dlio#162):** error conversion at the PyO3 boundary previously discarded the full `anyhow` cause chain; fixed at 25+ sites so a DLIO run that died with only `RuntimeError: concurrent range chunk failed` now surfaces the real underlying cause. Also: unknown-length dataset iteration raises instead of silently yielding nothing; 7 of 9 writer `block_on()` call sites migrated off a reentrancy-panic risk; 3 sync-iterator classes switched to a non-poisoning mutex; `MultiEndpointStore` gained explicit per-endpoint pinning. Full details: [docs/Changelog.md](docs/Changelog.md) + [docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md](docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md).
+>
+> **v0.9.110 (prior):** Multi-agent bug audit fix release — 39 fixes across 6 phases (issues #151–#157). Closes a coordinated 7-issue, 39-bug audit of s3dlio HEAD, fanning out specialized reviewers by subsystem then adversarially verifying every finding: silent data corruption in range/multipart paths (Phase A), wrong-data-returned bugs reachable from the public API (Phase B), silent exception-swallowing (Phase C), backend correctness/hygiene across S3/Azure/GCS (Phase D), URI-parsing and scheme-detection edge cases (Phase E), and dead/mismatched env-var knobs (Phase F).
 >
 > **v0.9.108 (prior):** Performance & concurrency audit — 17 fixes across 4 phases (issue #148). **BREAKING for `https://`:** no longer negotiates HTTP/2 by default (now matches `http://` — HTTP/1.1 unless opted in via `S3DLIO_HTTPS_H2=1`/`S3DLIO_ENABLE_HTTP2=1`).
 >
@@ -222,9 +224,10 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.110** — Multi-agent bug audit fix release: 39 fixes across 6 phases, 7 issues (#151–#157). See [docs/Changelog.md](docs/Changelog.md).
+**v0.9.112** — Tokio-runtime sanity clamp on `S3DLIO_RT_THREADS` + MPI-aware thread pool auto-init + FFI-boundary hardening (storage#755, #161, #162). See [docs/Changelog.md](docs/Changelog.md) and [docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md](docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md).
 
 **Recent highlights:**
+- **v0.9.112** — Three independent hardening changes: (1) sanity clamp on `S3DLIO_RT_THREADS` — values below `RT_THREADS_LIMIT/4` are treated as downstream miscomputation and clamped up (live-measured 9× throughput recovery on the DLIO unet3d datagen bottleneck: 214 → 1928 MB/s at NP=1); new `S3DLIO_RT_THREADS_UNSAFE=1` escape hatch. (2) MPI-aware thread pool auto-init at import time — every s3dlio-owned pool (Tokio runtime, checkpoint runtime, Rayon global, dgen-rs) is now sized to `num_cpus / world_size` without any opt-in. (3) FFI-boundary hardening (storage#755, #161, #162): error-chain preservation across 25+ PyO3 boundary sites, unknown-length dataset iteration raises instead of silently yielding nothing, 7 of 9 writer `block_on()` sites migrated off a reentrancy-panic risk, 3 sync-iterator classes switched to a non-poisoning mutex, `MultiEndpointStore` explicit per-endpoint pinning + fan-out replication; 762 tests passing
 - **v0.9.110** - Phase D+E+F of the audit (17 bugs): backend correctness/hygiene (GCS retry backoff, RAPID-bucket cache poisoning, Azure 50K-block cap, community-GCS multipart stub), URI/scheme-detection edge cases, dead/mismatched env-var knobs; new `S3DLIO_S3_ENDPOINT_TLS_PORTS`; 748 tests passing
 - **v0.9.109** - Phase A+B+C of the audit (22 bugs): silent data corruption in range/multipart paths, wrong-data-returned bugs, silent exception-swallowing; new `S3DLIO_S3_ENDPOINT_HINT_TLDS` + DLIO multipart env vars
 - **v0.9.98** - **Parquet DataLoader** (`ParquetRowGroupDataset`): per-row-group Dataset, epoch-2 zero-re-fetch (2.5× speedup proven), Raw + ArrowIpc decode modes, 8-worker shared caches; 648 tests passing

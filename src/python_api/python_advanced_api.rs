@@ -14,7 +14,7 @@ use std::os::raw::c_char;
 
 // Project crates
 use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
-use crate::python_api::python_core_api::PyBytesView;
+use crate::python_api::python_core_api::{py_err, PyBytesView};
 
 // ---------------------------------------------------------------------------
 // Multipart upload code
@@ -31,6 +31,43 @@ use crate::python_api::python_core_api::PyBytesView;
 pub struct PyMultipartUploadWriter {
     inner: Option<MultipartUploadSink>,
     pending_buf: Option<Vec<u8>>, // Rust-owned buffer between reserve() and commit()
+    // Self-referencing strong handle, held only while `pending_buf` is `Some`
+    // (i.e. between reserve() and commit()/abort()/close()/__exit__()).
+    //
+    // reserve() hands Python a memoryview built via `PyMemoryView_FromMemory`,
+    // which — unlike `PyMemoryView_FromObject` routed through the buffer
+    // protocol (see `PyBytesView::__getbuffer__`'s doc comment for the same
+    // class of bug, already fixed there once) — never sets `view.obj` and so
+    // carries **no reference** back to this writer. Without this field,
+    // dropping the last Python reference to the writer while its memoryview
+    // is still held frees `pending_buf`'s heap allocation out from under a
+    // live memoryview: a use-after-free. Holding an extra `Py<Self>` here
+    // keeps the writer (and thus `pending_buf`) alive for the whole
+    // reserve()..commit() window regardless of what the caller does with the
+    // writer's own Python reference. Cleared via `clear_pending_reservation`
+    // wherever `pending_buf` is cleared, so it never outlives the reservation
+    // it protects.
+    //
+    // Trade-off: if a caller calls reserve() and then abandons the writer
+    // without ever calling commit()/abort()/close()/using it as a context
+    // manager, this self-reference is never cleared and the writer leaks for
+    // the life of the process (PyMultipartUploadWriter does not implement
+    // PyO3's GC protocol, so Python's cyclic collector cannot break this
+    // cycle). A leak is a strict improvement over the use-after-free it
+    // replaces, and the existing docstring already documents reserve() as
+    // requiring a paired commit() call.
+    self_pin_while_pending: Option<Py<PyMultipartUploadWriter>>,
+}
+
+impl PyMultipartUploadWriter {
+    /// Clear any pending reserve() buffer and the self-pin that keeps this
+    /// writer alive while a reservation is outstanding. Idempotent. Must be
+    /// called wherever `pending_buf` is consumed or the writer is closed, so
+    /// `self_pin_while_pending` never leaks past the reservation it guards.
+    fn clear_pending_reservation(&mut self) {
+        self.pending_buf = None;
+        self.self_pin_while_pending = None;
+    }
 }
 
 #[pymethods]
@@ -74,12 +111,11 @@ impl PyMultipartUploadWriter {
         let key_s = key.to_string();
         let inner = py
             .detach(move || MultipartUploadSink::new(&bucket_s, &key_s, cfg))
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Multipart init failed: {e}"))
-            })?;
+            .map_err(|e| py_err(e.context("Multipart init failed")))?;
         Ok(Self {
             inner: Some(inner),
             pending_buf: None,
+            self_pin_while_pending: None,
         })
     }
 
@@ -116,12 +152,11 @@ impl PyMultipartUploadWriter {
         let uri_s = uri.to_string();
         let inner = py
             .detach(move || MultipartUploadSink::from_uri(&uri_s, cfg))
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Multipart init failed: {e}"))
-            })?;
+            .map_err(|e| py_err(e.context("Multipart init failed")))?;
         Ok(Self {
             inner: Some(inner),
             pending_buf: None,
+            self_pin_while_pending: None,
         })
     }
 
@@ -154,7 +189,7 @@ impl PyMultipartUploadWriter {
             };
             return res
                 .map(|_| len)
-                .map_err(|e| PyRuntimeError::new_err(format!("write failed: {e}")));
+                .map_err(|e| py_err(e.context("write failed")));
         }
 
         // 1) Fast path for any buffer-protocol object (NumPy, memoryview, bytearray, etc.)
@@ -171,7 +206,7 @@ impl PyMultipartUploadWriter {
             };
             return res
                 .map(|_| len)
-                .map_err(|e| PyRuntimeError::new_err(format!("write failed: {e}")));
+                .map_err(|e| py_err(e.context("write failed")));
         }
 
         // 2) Fallback for plain bytes objects
@@ -183,12 +218,12 @@ impl PyMultipartUploadWriter {
                 let res = py.detach(|| inner.write_owned_blocking(vec));
                 return res
                     .map(|_| len)
-                    .map_err(|e| PyRuntimeError::new_err(format!("write failed: {e}")));
+                    .map_err(|e| py_err(e.context("write failed")));
             } else {
                 let res = py.detach(|| inner.write_blocking(slice));
                 return res
                     .map(|_| len)
-                    .map_err(|e| PyRuntimeError::new_err(format!("write failed: {e}")));
+                    .map_err(|e| py_err(e.context("write failed")));
             }
         }
 
@@ -208,22 +243,31 @@ impl PyMultipartUploadWriter {
     /// Returns:
     ///     memoryview: writable view into the reserved buffer
     #[pyo3(text_signature = "(self, size, /)")]
-    fn reserve(&mut self, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {
+    fn reserve(mut slf: PyRefMut<'_, Self>, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {
         // Disallow overlapping reserves
-        if self.pending_buf.is_some() {
+        if slf.pending_buf.is_some() {
             return Err(PyRuntimeError::new_err(
                 "reserve() called while a previous buffer is pending; call commit() first",
             ));
         }
 
+        // Pin ourselves alive for the whole reserve()..commit() window — see
+        // `self_pin_while_pending`'s field doc for why this is required for
+        // memory safety, not just cleanliness. Built from a borrowed pointer
+        // (Py_INCREF under the hood), so this is zero-copy: no data is
+        // duplicated, only a Python reference count changes.
+        let self_pin: Py<Self> = unsafe { Py::from_borrowed_ptr(py, slf.as_ptr()) };
+
         // reserve(): treat size==0 as no-op (avoids odd memoryviews)
         if size == 0 {
-            self.pending_buf = Some(Vec::new());
+            slf.pending_buf = Some(Vec::new());
+            slf.self_pin_while_pending = Some(self_pin);
             // Return a 0-length memoryview (still legal)
             let ptr = std::ptr::null_mut::<std::os::raw::c_char>();
             let mv_ptr =
                 unsafe { pyo3::ffi::PyMemoryView_FromMemory(ptr, 0, pyo3::ffi::PyBUF_WRITE) };
             if mv_ptr.is_null() {
+                slf.clear_pending_reservation();
                 return Err(PyErr::fetch(py));
             }
             return Ok(unsafe { Py::<PyAny>::from_owned_ptr(py, mv_ptr) });
@@ -238,6 +282,9 @@ impl PyMultipartUploadWriter {
         // - We pass a valid pointer/length for the Vec.
         // - We keep the Vec alive (self.pending_buf = Some(buf)) so the memory doesn't move.
         // - We won't reallocate this Vec (we never push; commit() only shrinks len).
+        // - We keep `self` (the writer) alive via `self_pin_while_pending` so the
+        //   above holds even if the caller drops every other Python reference
+        //   to the writer before calling commit() — see the field doc comment.
         let ptr = buf.as_mut_ptr() as *mut c_char;
         let len = buf.len() as ffi::Py_ssize_t;
         let flags = ffi::PyBUF_WRITE; // writable view
@@ -251,8 +298,10 @@ impl PyMultipartUploadWriter {
         // Convert the owned PyObject* into a safe PyObject handle.
         let mv = unsafe { Py::<PyAny>::from_owned_ptr(py, mv_ptr) };
 
-        // Stash the Vec; this guarantees the pointer remains valid until commit().
-        self.pending_buf = Some(buf);
+        // Stash the Vec and the self-pin; this guarantees both the pointer
+        // and the writer object itself remain valid until commit().
+        slf.pending_buf = Some(buf);
+        slf.self_pin_while_pending = Some(self_pin);
         Ok(mv)
     }
 
@@ -271,6 +320,9 @@ impl PyMultipartUploadWriter {
         let mut buf = self.pending_buf.take().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("no pending buffer; call reserve() first")
         })?;
+        // The reservation window is over now that pending_buf is taken —
+        // release the self-pin (see `self_pin_while_pending`'s field doc).
+        self.self_pin_while_pending = None;
         if nbytes > buf.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "commit(nbytes={nbytes}) exceeds reserved size {}",
@@ -281,7 +333,7 @@ impl PyMultipartUploadWriter {
             buf.set_len(nbytes);
         }
         py.detach(|| inner.write_owned_blocking(buf))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("commit failed: {e}")))
+            .map_err(|e| py_err(e.context("commit failed")))
     }
 
     /// Flush any buffered bytes as a (possibly short) part without finishing.
@@ -294,7 +346,7 @@ impl PyMultipartUploadWriter {
             .as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("writer is closed"))?;
         py.detach(|| inner.flush_blocking())
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("flush failed: {e}")))
+            .map_err(|e| py_err(e.context("flush failed")))
     }
 
     /// Complete the multipart upload and close the writer.
@@ -309,6 +361,10 @@ impl PyMultipartUploadWriter {
     ///     }
     #[pyo3(text_signature = "(self)")]
     fn close(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Release any outstanding reserve() buffer and its self-pin (see
+        // `self_pin_while_pending`'s field doc) — otherwise a reserve()
+        // that was never commit()'d would leak the writer permanently.
+        self.clear_pending_reservation();
         let inner = self
             .inner
             .take()
@@ -318,13 +374,15 @@ impl PyMultipartUploadWriter {
                 let mut owned = inner;
                 owned.finish_blocking()
             })
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("finish failed: {e}"))
-            })?;
+            .map_err(|e| py_err(e.context("finish failed")))?;
         let dict = PyDict::new(py);
-        if let Some(etag) = info.e_tag {
-            dict.set_item("etag", etag).ok();
-        }
+        // Always set the key, even when there is no etag (info.e_tag is
+        // None) -- PyO3 converts Option<String> to None/str automatically.
+        // The docstring above promises 'etag': str or None; omitting the
+        // key entirely in the None case (as the old `if let` guard did)
+        // made result['etag'] raise KeyError instead of returning None
+        // (design doc §4.3).
+        dict.set_item("etag", info.e_tag).ok();
         dict.set_item("total_bytes", info.total_bytes).ok();
         dict.set_item("parts", info.parts).ok();
         let started = info
@@ -348,10 +406,13 @@ impl PyMultipartUploadWriter {
     /// After abort, the writer is unusable.
     #[pyo3(text_signature = "(self)")]
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Release any outstanding reserve() buffer and its self-pin (see
+        // `self_pin_while_pending`'s field doc) — otherwise a reserve()
+        // that was never commit()'d would leak the writer permanently.
+        self.clear_pending_reservation();
         if let Some(mut inner) = self.inner.take() {
-            py.detach(|| inner.abort_blocking()).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("abort failed: {e}"))
-            })?;
+            py.detach(|| inner.abort_blocking())
+                .map_err(|e| py_err(e.context("abort failed")))?;
         }
         Ok(())
     }
@@ -389,6 +450,10 @@ impl PyMultipartUploadWriter {
         _v: Py<PyAny>,
         _tb: Py<PyAny>,
     ) -> PyResult<()> {
+        // Release any outstanding reserve() buffer and its self-pin (see
+        // `self_pin_while_pending`'s field doc) — otherwise a reserve()
+        // that was never commit()'d would leak the writer permanently.
+        self.clear_pending_reservation();
         if let Some(mut inner) = self.inner.take() {
             if !_t.bind(py).is_none() {
                 // An exception propagated from inside the `with` block — abort the
@@ -401,9 +466,7 @@ impl PyMultipartUploadWriter {
                 // Best-effort cleanup after a failed finish; safe to
                 // discard for the same reason as above.
                 let _ = py.detach(|| inner.abort_blocking());
-                return Err(PyRuntimeError::new_err(format!(
-                    "multipart upload failed: {e}"
-                )));
+                return Err(py_err(e.context("multipart upload failed")));
             }
         }
         Ok(())

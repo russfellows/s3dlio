@@ -1,5 +1,239 @@
 # s3dlio Changelog
 
+## Version 0.9.112 — Tokio-runtime sanity clamp + MPI-aware thread pools + FFI-boundary hardening
+
+This release bundles three independent hardening changes: (1) a sanity
+clamp on the `S3DLIO_RT_THREADS` env var that closes a runtime-starvation
+class of bug found while chasing the DLIO unet3d datagen slowdown,
+(2) MPI-aware auto-sizing of every s3dlio-owned thread pool at import
+time, and (3) an FFI-boundary hardening pass motivated by
+[mlcommons/storage#755](https://github.com/mlcommons/storage/issues/755).
+The three did not share a common root cause; they landed together because
+each individually was small enough that a mid-release cut would have felt
+worse than a slightly larger release.
+
+## Tokio-runtime sanity clamp on `S3DLIO_RT_THREADS`
+
+### Root cause (docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md)
+
+DLIO's `dlio_benchmark/storage/obj_store_lib.py` `ObjStoreLibStorage.__init__`
+computes:
+
+```python
+_rt_threads = min(_write_threads * 3 // 2, 128)
+os.environ["S3DLIO_RT_THREADS"] = str(_rt_threads)
+```
+
+With Hydra's default `write_threads: int = 1` (unet3d_datagen workload does
+not override), that resolves to `S3DLIO_RT_THREADS=1`.  Pre-0.9.112 s3dlio
+faithfully obeyed the env var and built the global Tokio runtime with **one**
+worker.  Every concurrent MPU part upload then serialized through that one
+worker: p50 `close()` latency = 22 843 ms per file, aggregate throughput
+~214 MB/s per rank vs. an isolated benchmark's 1928–2557 MB/s on the same
+s3-ultra target.
+
+### The fix
+
+`get_runtime_threads()` (`src/s3_client.rs`) and `effective_thread_budget()`
+(`src/constants.rs`, used by the checkpoint runtime and dgen-rs paths) now
+share `clamped_env_rt_threads()`: if `S3DLIO_RT_THREADS` is set and is
+below `RT_THREADS_LIMIT / 4` (where `RT_THREADS_LIMIT` is the per-process
+target set by `configure_thread_pools`, auto-called at import time to the
+MPI-aware budget), the env var is treated as downstream miscomputation and
+replaced with `RT_THREADS_LIMIT`.  A stderr warning is printed the first
+time the clamp fires so operators can spot the underlying miscomputation.
+`S3DLIO_RT_THREADS_UNSAFE=1` bypasses the clamp for legitimate low-thread
+scenarios (single-threaded test suites, fault injection).
+
+### Live verification (RED → GREEN, real s3-ultra target)
+
+DLIO `unet3d_datagen`, 40 files × 146 MB, NP=1 on a 28-core host:
+
+| Metric               | Pre-fix (0.9.110)         | Post-fix (this release) |
+| -------------------- | ------------------------- | ----------------------- |
+| Wall time            | 27.4 s                    | **2.9 s**               |
+| Throughput           | 214 MB/s                  | **~1928 MB/s** (9×)     |
+| Upload `close()` p50 | 22 843 ms                 | **309 ms** (77×)        |
+| Upload `close()` p99 | 26 368 ms                 | 529 ms                  |
+| Rt-worker threads    | 1                         | 28 (== RT_THREADS_LIMIT)|
+
+Cross-backend live smoke (all under `S3DLIO_RT_THREADS=1`, all clamped
+to 28 workers): `file://` 397 MB/s, `direct://` (on `/mnt/nvme_data`)
+655 MB/s, `s3://` (s3-ultra) 919 MB/s.  `S3DLIO_RT_THREADS_UNSAFE=1`
+correctly disables the clamp (throughput drops back to 130 MB/s at
+5 files, confirming single-worker serialization is restored).
+Sane values (e.g. `S3DLIO_RT_THREADS=16`) pass through unchanged, no
+warning, 1.1 GB/s.
+
+### Test coverage — RED-then-GREEN
+
+`src/s3_client.rs` `mpi_aware_runtime_sizing_tests`:
+`get_runtime_threads_clamps_grossly_underprovisioned_env_var_up_to_limit`
+(clamp fires), `_env_var_at_or_above_quarter_of_limit_is_honored_verbatim`
+(exact threshold + comfortable value pass through), `_unsafe_env_bypasses_the_clamp`
+(escape hatch), `_env_var_low_with_no_limit_set_is_honored`
+(pure-Rust programmatic use, no `RT_THREADS_LIMIT`, no clamp).
+
+`src/constants.rs` `effective_thread_budget_tests`:
+`test_effective_budget_clamps_grossly_underprovisioned_env_var`,
+`test_effective_budget_unsafe_bypass_respects_low_env_var` — same shape
+for the checkpoint-runtime / dgen-rs path.
+
+All four were RED (asserted against unmodified `get_runtime_threads()` /
+`effective_thread_budget()`) before the fix; all four are GREEN under
+the fix.  Full pre-push gate (`cargo fmt --check`, `cargo clippy --lib
+--bins --examples -- -D warnings` under both default features and
+`--features extension-module`, `cargo test --lib`) passes: 404 tests
+default, 412 tests extension-module.
+
+## MPI-aware thread pool auto-init (import-time `configure_thread_pools(0)`)
+
+The `_pymod` init hook now calls `s3_client::configure_thread_pools(0)`
+before registering any Python functions.  This sets `RT_THREADS_LIMIT`
+to the MPI-aware per-process budget (`num_cpus / world_size`, floor 1)
+and builds Rayon's global pool at the same target — every `s3dlio`
+Python import, no explicit call needed.  Fixes the CPU-oversubscription
+class of bug where N ranks on the same host each independently defaulted
+to `num_cpus` threads.
+
+New helpers in `src/constants.rs`: `mpi_world_size()` (reads
+`OMPI_COMM_WORLD_SIZE` / `PMI_SIZE` / `WORLD_SIZE`),
+`mpi_aware_thread_budget()`, `effective_thread_budget()` (single-knob
+sizing used by the checkpoint runtime and `hardware::recommended_data_gen_threads()`).
+`get_runtime_threads()` folds MPI-awareness into its default fallback;
+`configure_thread_pools()` is the single choke point for setting
+`RT_THREADS_LIMIT`, the pyo3-async-runtimes Tokio init, and Rayon's
+global pool.
+
+## Version 0.9.112 — FFI-boundary hardening (mlcommons/storage#755, s3dlio#161, s3dlio#162)
+
+Prompted by [mlcommons/storage#755](https://github.com/mlcommons/storage/issues/755):
+a DLIO training run against S3 died with only `RuntimeError: concurrent range
+chunk failed` — no indication of the actual underlying cause. Root cause,
+filed as [s3dlio#161](https://github.com/russfellows/s3dlio/issues/161): error
+conversion at the PyO3 boundary used `Display` (`{}`) on `anyhow::Error`
+values, which shows only the outermost `.context(...)` label and discards the
+full cause chain. This release fixes that everywhere, plus a broader FFI
+audit that surfaced along the way. **Note**: this release improves
+diagnosability, not resilience — it does not change retry/failure behavior,
+so a run that previously failed under the same conditions will still fail,
+just with the real cause now visible in the exception message. See
+`docs/DESIGN_FFI_BOUNDARY_HARDENING.md` and `docs/DESIGN_TIER4_FFI_HARDENING.md`
+for the full design rationale and per-item decisions.
+
+### Tier 1 — error-chain preservation (storage#755 / s3dlio#161)
+
+All error-conversion sites across `python_core_api.rs` (19 sites),
+`python_aiml_api.rs` (checkpoint sites), `python_advanced_api.rs`
+(`MultipartUploadWriter`), and `python_datagen_api.rs` (1 site, the last
+holdout — previously hand-rolled `{:#}` formatting, now routed through the
+same shared `py_err()` helper for consistency) now preserve the full `anyhow`
+cause chain (`error_chain_message()`, `{:#}` alternate `Display`) instead of
+collapsing to the top-level context label. This is the direct fix for #755's
+reported symptom — the same `RuntimeError: concurrent range chunk failed`
+failure will now include the real SDK/timeout/TLS/etc. cause in its message.
+
+### Tier 2 — `checksum()` fix
+
+Extracted `snapshot_final_writer_stats()` as a pure, GIL-free helper so the
+checksum-after-finalize behavior is unit-testable.
+
+### Tier 3 — bucket-swallow + etag fixes, multipart writer pinning
+
+- `MultipartUploadWriter.reserve()` now takes `PyRefMut<'_, Self>` instead of
+  `&mut self` so the writer object itself is pinned alive for the duration of
+  a `reserve()`...`commit()` cycle.
+- `close()` always populates the `"etag"` key in its result dict, even on the
+  no-op / already-closed path.
+
+### Tier 4 — second-round FFI hardening (design doc review, 5 items)
+
+1. `exists()`/`exists_async()` docstrings now explain that both collapse
+   every failure mode to `False` by design (mirrors `os.path.exists()`), and
+   point callers who need to distinguish "not found" from "couldn't check"
+   at `stat()`. No logic change.
+2. Unknown-length ("iterable-style") datasets now raise `TypeError` from
+   `PyDataset.__len__`, `PyBytesAsyncDataLoader.__iter__`/`.items()`, and
+   `PyBytesAsyncDataLoaderIter.spawn_stream` instead of silently defaulting
+   to empty/0. No currently Python-constructible dataset type can trigger
+   this path today — closes a latent trap, not a live behavior break.
+3. Migrated the 7 "easy bucket" `block_on()` call sites (all 4
+   `create_*_writer` functions, `finalize()`, `write_owned_bytes()`) to the
+   established `submit_io()`/`run_on_global_rt()` pattern, closing a
+   reentrancy-panic risk. `write_chunk()`'s 2 sites are deliberately left on
+   `block_on()` — its zero-copy fast path holds a borrowed `PyBuffer` slice
+   that can't cross a `'static`-future boundary without a copy or a much
+   bigger lifetime redesign.
+4. `PyObjectDataLoaderSyncIter`, `PyBytesDataLoaderSyncIter`, and
+   `ParquetStreamIter`'s `rx` channel fields switched from `std::sync::Mutex`
+   to `parking_lot::Mutex` (already a dependency) — `std::sync::Mutex`
+   poisons itself if any thread panics while the lock is held, permanently
+   wedging that iterator's `__next__` for the rest of its lifetime;
+   `parking_lot::Mutex` never poisons.
+5. `python_datagen_api.rs`'s lone manual `{:#}`-format site standardized onto
+   `py_err()` — folded into Tier 1 above.
+
+### Tier 5 — dead code removal
+
+Deleted `src/python_api/zero_copy_api.rs` (286 lines, never registered/
+compiled).
+
+### `MultiEndpointStore`: explicit per-endpoint pinning + fan-out replication (fixes s3dlio#162)
+
+Investigating Tier 4 item 4's original test fixture surfaced an undocumented
+design assumption: `MultiEndpointStore`'s round-robin/least-connections
+load balancing assumes every configured endpoint is a true replica holding
+the same object under the same key — correct for mlp-storage's real usage,
+but silently wrong for anything that expects `put(uri)` then `get(uri)` to
+be read-your-writes against a *specific* endpoint. Filed as
+[s3dlio#162](https://github.com/russfellows/s3dlio/issues/162) and fixed,
+fully additive (zero change to default load-balancing behavior):
+
+- `endpoint_at(index)` — bounds-checked accessor, no load-balancer state
+  touched.
+- `get_from_endpoint`/`put_to_endpoint`/`delete_from_endpoint` — bypass
+  `select_endpoint()` entirely, pin to a specific endpoint by index.
+- `put_all_endpoints` — fan-out write to every configured endpoint.
+- `list_all_endpoints` — was implemented in Rust but never exposed to
+  Python; now is.
+- Crate-level docs on `MultiEndpointStore` make the replication-only
+  assumption of round-robin/least-connections explicit.
+
+### Test-suite hardening: eliminated the return-True/False masking anti-pattern (27 files)
+
+While live-testing the above, found that many files under `python/tests/`
+used `print(...); return True/False` instead of `assert` — pytest treats any
+function that returns without raising as **passed**, regardless of the
+returned value, so these tests could never actually fail. Fixed across 27
+files (~75 test functions converted to real assertions), which unmasked
+~8 genuine pre-existing bugs, since fixed:
+
+- `BytesView` vs `bytes` comparison always `False` (no `__eq__` override) —
+  4+ locations across checkpoint/compression/multi-endpoint tests, fixed by
+  wrapping with `bytes(...)`.
+- `test_streaming_python_old.py` couldn't even be *collected* by pytest
+  (`SyntaxError: 'await' outside async function` — awaiting synchronous
+  PyO3 APIs).
+- Stale `s3dlio.torch.S3DataLoader` references (API removed) across 3 files
+  — fixed to use `S3IterableDataset.from_prefix(uri)`.
+- `test_multi_endpoint.py`'s `run_async` masking (undefined name silently
+  accepted by `pytest.raises(Exception)`).
+- A CLI test referencing a Cargo binary name (`s3dlio`) that was never real
+  — the actual binary is `s3-cli`.
+
+### Verification
+
+`cargo fmt --check` / `cargo clippy -D warnings` (default and
+`--features extension-module`) clean. `cargo test --lib`: 376 passed
+(default), 383 passed (extension-module), 0 failed. Full `cargo test`
+(all lib + integration binaries + doctests): 756 passed, 0 failed. Combined
+`uv run pytest` across all touched Python files: 105 passed, 10 skipped (all
+legitimate — missing live S3/Azure/GCS credentials, GCS backend not compiled
+into this wheel, missing `cargo script`), 0 failed. Wheel rebuilt via
+`./build_pyo3.sh` and smoke-tested live.
+
+---
+
 ## Version 0.9.110 — Multi-agent bug audit fix release (issues #151–#157, Phase D+E+F, 17 bugs)
 
 Closes out the remaining scope of the audit that shipped Phase A/B/C in v0.9.109:

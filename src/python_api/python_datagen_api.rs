@@ -15,7 +15,7 @@ use dgen_data::{
     generate_data as dgen_generate_data, DataBuffer, DataGenerator, GeneratorConfig, NumaMode,
 };
 
-use super::python_core_api::PyBytesView;
+use super::python_core_api::{py_err, PyBytesView};
 use crate::hardware::{recommended_data_gen_threads, total_cpus};
 
 // =============================================================================
@@ -407,7 +407,7 @@ fn generate_npz_bytes(
         .detach(|| {
             crate::data_formats::npz::generate_npz_bytes_raw(&shape, &dtype_owned, num_samples)
         })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))?;
+        .map_err(py_err)?;
 
     let bytes = bytes::Bytes::from(vec); // zero-copy: wraps Vec<u8> in Arc
     Py::new(py, PyBytesView::new(bytes))

@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.110"
+version = "0.9.112"
 edition = "2021"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
@@ -192,15 +192,27 @@ hyper-util   = { version = "0.1", features = ["server", "server-auto", "tokio"] 
 # - 'numa' requires the hwloc2 C library (not available on WSL/minimal systems)
 # - 'hdf5' requires libhdf5 (not available on WSL/minimal systems)
 # Enable these manually: cargo build --features numa,hdf5
+#
+# `cargo build/test/clippy --all-features` CANNOT WORK, BY DESIGN, AND MUST
+# NEVER BE RUN. `native-backends` and `arrow-backend` are two alternative,
+# mutually exclusive object-store implementations -- exactly one must be
+# enabled, never both, never neither. This is enforced at compile time by
+# the `compile_error!` guard at the top of src/lib.rs, so `--all-features`
+# (which turns every feature on simultaneously) always fails the build.
+# There is no valid feature combination that includes both backends; do not
+# attempt to fix this by changing the guard. For a full local build/test/lint
+# pass, run each backend's checks separately with its own explicit
+# `--features`/`--no-default-features` selection (see CLAUDE.md's pre-push
+# quality gate) instead of `--all-features`.
 default = ["s3", "native-backends", "thread-pinning", "backend-aws"]
 s3 = []
-native-backends = []                    # Current AWS/Azure implementations
+native-backends = []                    # Current AWS/Azure implementations -- mutually exclusive with arrow-backend, see note above
 backend-aws = []
 backend-azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_blob"]
 backend-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-gax-internal"]
 full-backends = ["backend-aws", "backend-azure", "backend-gcs"]
 gcs-community = ["backend-gcs", "dep:gcloud-storage"]  # Legacy community GCS client (JSON API, no RAPID support; conflicts with official GCS client)
-arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend
+arrow-backend = ["dep:object_store", "dep:url"]  # Apache Arrow object_store backend -- mutually exclusive with native-backends, see note above
 parquet       = []  # no-op: always compiled; kept for backward compatibility
 parquet-arrow = []  # no-op: always compiled; kept for backward compatibility
 h2c = []                             # Enable HTTP/2 cleartext (h2c) transport for high-throughput PUT workloads

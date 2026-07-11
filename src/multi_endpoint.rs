@@ -238,6 +238,34 @@ struct EndpointInfo {
 /// This wrapper implements the ObjectStore trait and distributes requests across
 /// multiple backend storage endpoints according to the configured load balancing strategy.
 ///
+/// ## Replication assumption (see issue #162)
+///
+/// **`RoundRobin` and `LeastConnections` assume every configured endpoint is a true
+/// replica exposing the same object namespace** -- e.g. several gateways or network
+/// paths in front of one shared backend cluster, where any endpoint can serve any
+/// object. This is a real, confirmed production usage pattern (mlp-storage's
+/// `S3DLIOStorageWriter` uses it exactly this way, and its own
+/// `docs/MULTI_ENDPOINT_GUIDE.md` states the same requirement explicitly: "All
+/// endpoints must expose the same bucket and object namespace, or the workload will
+/// see missing objects").
+///
+/// **This is *not* a sharding mechanism.** If your endpoints are independent,
+/// non-replicated storage pools (each object lives on exactly one endpoint, used to
+/// scale out capacity rather than throughput), `get`/`put`/`delete` on the standard
+/// `ObjectStore` trait methods will silently route to whichever endpoint the
+/// load-balancing strategy selects for *that specific call* -- which is very likely
+/// not the endpoint that holds (or should hold) the object, since there is no
+/// consistent/deterministic routing tied to the key. A caller in this situation must
+/// either replicate every write (see [`MultiEndpointStore::put_all_endpoints`]) or
+/// pin operations to a specific endpoint explicitly (see
+/// [`MultiEndpointStore::get_from_endpoint`], [`MultiEndpointStore::put_to_endpoint`],
+/// [`MultiEndpointStore::delete_from_endpoint`]) -- do not rely on the round-robin
+/// `get`/`put`/`delete` methods for sharded, non-replicated data. (A prior consumer,
+/// DLIO's `dlio_benchmark/storage/obj_store_lib.py`, worked around exactly this gap by
+/// implementing its own external rank-based endpoint pinning rather than using
+/// `MultiEndpointStore` at all -- the explicit pinning methods above are the native
+/// equivalent of that workaround.)
+///
 /// ## URI Handling (v0.9.31+)
 ///
 /// The store supports automatic URI rewriting for transparent load balancing:
@@ -482,7 +510,25 @@ impl MultiEndpointStore {
         uri.to_string()
     }
 
+    /// Bounds-checked accessor for explicit per-endpoint pinning (issue #162).
+    /// Unlike `select_endpoint`, this never consults or advances load-balancer
+    /// state -- the caller names the endpoint directly.
+    fn endpoint_at(&self, index: usize) -> Result<&EndpointInfo> {
+        self.endpoints.get(index).ok_or_else(|| {
+            anyhow!(
+                "endpoint index {index} out of range: {} endpoint(s) configured",
+                self.endpoints.len()
+            )
+        })
+    }
+
     /// Select the next endpoint to use based on load balancing strategy.
+    ///
+    /// Every call advances shared load-balancer state (the round-robin counter, or
+    /// the least-connections snapshot) independently of any previous call -- there is
+    /// no per-key affinity. Two calls for the *same* URI can land on two *different*
+    /// endpoints. See the "Replication assumption" section on [`MultiEndpointStore`]
+    /// for why this is safe only when endpoints are true replicas.
     fn select_endpoint(&self) -> &EndpointInfo {
         match self.strategy {
             LoadBalanceStrategy::RoundRobin => {
@@ -661,6 +707,178 @@ impl MultiEndpointStore {
         let mut uris: Vec<String> = all_uris.into_iter().collect();
         uris.sort(); // Consistent ordering
         Ok(uris)
+    }
+
+    /// Get an object from a specific configured endpoint, bypassing load balancing
+    /// entirely. See the "Replication assumption" section on [`MultiEndpointStore`]
+    /// and issue #162 -- this is the native equivalent of the external per-rank
+    /// endpoint pinning a sharding-style caller would otherwise have to build itself.
+    ///
+    /// # Errors
+    /// Returns an error if `index >= self.endpoint_count()`.
+    pub async fn get_from_endpoint(&self, index: usize, uri: &str) -> Result<Bytes> {
+        let endpoint = self.endpoint_at(index)?;
+        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+        endpoint
+            .stats
+            .total_requests
+            .fetch_add(1, Ordering::Relaxed);
+        endpoint
+            .stats
+            .active_requests
+            .fetch_add(1, Ordering::AcqRel);
+
+        let result = endpoint.store.get(&effective_uri).await;
+
+        endpoint
+            .stats
+            .active_requests
+            .fetch_sub(1, Ordering::AcqRel);
+
+        match &result {
+            Ok(data) => {
+                endpoint
+                    .stats
+                    .bytes_read
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        result
+    }
+
+    /// Put an object to a specific configured endpoint, bypassing load balancing
+    /// entirely. See [`MultiEndpointStore::get_from_endpoint`] and issue #162.
+    ///
+    /// # Errors
+    /// Returns an error if `index >= self.endpoint_count()`.
+    pub async fn put_to_endpoint(&self, index: usize, uri: &str, data: Bytes) -> Result<()> {
+        let endpoint = self.endpoint_at(index)?;
+        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+        let len = data.len() as u64;
+        endpoint
+            .stats
+            .total_requests
+            .fetch_add(1, Ordering::Relaxed);
+        endpoint
+            .stats
+            .active_requests
+            .fetch_add(1, Ordering::AcqRel);
+
+        let result = endpoint.store.put(&effective_uri, data).await;
+
+        endpoint
+            .stats
+            .active_requests
+            .fetch_sub(1, Ordering::AcqRel);
+
+        match &result {
+            Ok(()) => {
+                endpoint
+                    .stats
+                    .bytes_written
+                    .fetch_add(len, Ordering::Relaxed);
+            }
+            Err(_) => {
+                endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        result
+    }
+
+    /// Delete an object from a specific configured endpoint, bypassing load
+    /// balancing entirely. See [`MultiEndpointStore::get_from_endpoint`] and issue
+    /// #162.
+    ///
+    /// # Errors
+    /// Returns an error if `index >= self.endpoint_count()`.
+    pub async fn delete_from_endpoint(&self, index: usize, uri: &str) -> Result<()> {
+        let endpoint = self.endpoint_at(index)?;
+        let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+        endpoint
+            .stats
+            .total_requests
+            .fetch_add(1, Ordering::Relaxed);
+        endpoint
+            .stats
+            .active_requests
+            .fetch_add(1, Ordering::AcqRel);
+
+        let result = endpoint.store.delete(&effective_uri).await;
+
+        endpoint
+            .stats
+            .active_requests
+            .fetch_sub(1, Ordering::AcqRel);
+
+        if result.is_err() {
+            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        result
+    }
+
+    /// Put the same object to every configured endpoint (fan-out write), for
+    /// true-replication callers who want a guaranteed-consistent write instead of
+    /// relying on independent round-robin calls to eventually cover every endpoint.
+    /// Mirrors [`MultiEndpointStore::list_all_endpoints`] for the write side.
+    ///
+    /// # Errors
+    /// Returns an error if the write failed on **any** endpoint (partial failure is
+    /// possible -- some endpoints may have received the write before a later one
+    /// failed; this is not transactional).
+    pub async fn put_all_endpoints(&self, uri: &str, data: Bytes) -> Result<()> {
+        use futures::future::join_all;
+
+        let futures: Vec<_> = self
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                let effective_uri = self.rewrite_uri_for_endpoint(uri, endpoint);
+                let data = data.clone();
+                let len = data.len() as u64;
+                async move {
+                    endpoint
+                        .stats
+                        .total_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                    endpoint
+                        .stats
+                        .active_requests
+                        .fetch_add(1, Ordering::AcqRel);
+
+                    let result = endpoint.store.put(&effective_uri, data).await;
+
+                    endpoint
+                        .stats
+                        .active_requests
+                        .fetch_sub(1, Ordering::AcqRel);
+
+                    match &result {
+                        Ok(()) => {
+                            endpoint
+                                .stats
+                                .bytes_written
+                                .fetch_add(len, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            endpoint.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    result
+                }
+            })
+            .collect();
+
+        for result in join_all(futures).await {
+            result?;
+        }
+        Ok(())
     }
 }
 
@@ -2689,5 +2907,101 @@ mod tests {
         }
 
         restore_env("S3_ENDPOINT_URIS", saved);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #162: explicit per-endpoint pinning + fan-out replication
+    // -----------------------------------------------------------------
+
+    /// The core property `get_from_endpoint`/`put_to_endpoint` must have: with 3
+    /// genuinely independent (non-replicated) endpoints, writing distinct data to
+    /// each via an explicit index and reading it back via the same index must
+    /// always return the right shard's data -- regardless of how many ordinary
+    /// round-robin `get()`/`put()` calls have run in between (which would otherwise
+    /// perturb `select_endpoint()`'s internal counter).
+    #[tokio::test]
+    async fn test_pinned_endpoint_access_bypasses_round_robin_state() {
+        let tmp0 = TempDir::new().unwrap();
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let dirs = [&tmp0, &tmp1, &tmp2];
+
+        let uris: Vec<String> = dirs
+            .iter()
+            .map(|d| format!("file://{}/", d.path().display()))
+            .collect();
+        let store =
+            MultiEndpointStore::new(uris.clone(), LoadBalanceStrategy::RoundRobin, None).unwrap();
+
+        // Write DISTINCT data to each endpoint via explicit index -- a sharding
+        // scenario, not replication.
+        let shard_data: Vec<Bytes> = (0..3)
+            .map(|i| Bytes::from(format!("shard-{i}-payload")))
+            .collect();
+        for (i, data) in shard_data.iter().enumerate() {
+            store
+                .put_to_endpoint(i, "shard.bin", data.clone())
+                .await
+                .unwrap();
+        }
+
+        // Perturb the round-robin counter with unrelated ordinary calls, the way a
+        // concurrent caller using the same store for replicated traffic would.
+        for _ in 0..5 {
+            let _ = store
+                .get(&format!("file://{}/shard.bin", tmp0.path().display()))
+                .await;
+        }
+
+        // Pinned reads must still return the correct shard's data for every index,
+        // regardless of the round-robin counter's current state.
+        for (i, expected) in shard_data.iter().enumerate() {
+            let got = store.get_from_endpoint(i, "shard.bin").await.unwrap();
+            assert_eq!(
+                &got[..],
+                &expected[..],
+                "get_from_endpoint({i}, ..) must return endpoint {i}'s own data, not \
+                 whichever endpoint round-robin would have picked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pinned_endpoint_index_out_of_bounds_errors_not_panics() {
+        let tmp0 = TempDir::new().unwrap();
+        let uris = vec![format!("file://{}/", tmp0.path().display())];
+        let store = MultiEndpointStore::new(uris, LoadBalanceStrategy::RoundRobin, None).unwrap();
+
+        assert!(store.get_from_endpoint(1, "x.bin").await.is_err());
+        assert!(store
+            .put_to_endpoint(1, "x.bin", Bytes::from_static(b"x"))
+            .await
+            .is_err());
+        assert!(store.delete_from_endpoint(1, "x.bin").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_put_all_endpoints_replicates_to_every_endpoint() {
+        let tmp0 = TempDir::new().unwrap();
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let dirs = [&tmp0, &tmp1, &tmp2];
+
+        let uris: Vec<String> = dirs
+            .iter()
+            .map(|d| format!("file://{}/", d.path().display()))
+            .collect();
+        let store = MultiEndpointStore::new(uris, LoadBalanceStrategy::RoundRobin, None).unwrap();
+
+        let data = Bytes::from_static(b"replicate me everywhere");
+        store
+            .put_all_endpoints("replicated.bin", data.clone())
+            .await
+            .unwrap();
+
+        for d in dirs {
+            let on_disk = fs::read(d.path().join("replicated.bin")).unwrap();
+            assert_eq!(on_disk, data.to_vec());
+        }
     }
 }

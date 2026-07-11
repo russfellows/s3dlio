@@ -1073,7 +1073,7 @@ wheels = [
 
 [[package]]
 name = "s3dlio"
-version = "0.9.110"
+version = "0.9.112"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },

@@ -228,8 +228,10 @@ verify_deps() {
             echo -e "     ${BLUE}cargo build --release${NC}"
             echo -e "  ${BLUE}2.${NC} Run tests:"
             echo -e "     ${BLUE}cargo test${NC}"
-            echo -e "  ${BLUE}3.${NC} Build with all features:"
-            echo -e "     ${BLUE}cargo build --release --all-features${NC}"
+            echo -e "  ${BLUE}3.${NC} Build with all native backends (AWS+Azure+GCS):"
+            echo -e "     ${BLUE}cargo build --release --features full-backends${NC}"
+            echo -e "     ${YELLOW}(never use --all-features: native-backends and${NC}"
+            echo -e "     ${YELLOW}arrow-backend are mutually exclusive by design)${NC}"
         fi
     else
         echo -e "${RED}========================================${NC}"

@@ -100,8 +100,13 @@ cargo build --release 2>&1 | grep -i warning
 cargo build --release 2>&1 | grep -A 10 warning
 
 # For clippy suggestions
-cargo clippy --all-targets --all-features
+cargo clippy --lib --bins --examples -- -D warnings
 ```
+
+**Never pass `--all-features`.** `native-backends` and `arrow-backend` are
+mutually exclusive by design (guarded by a `compile_error!` in `src/lib.rs`)
+— `--all-features` enables both at once and can never build. See the note
+above `[features]` in `Cargo.toml`.
 
 **Common Warning Anti-Patterns** (DO NOT DO):
 - ❌ Adding `_` prefix to silence unused variable warnings
