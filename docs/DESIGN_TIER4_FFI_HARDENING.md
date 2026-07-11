@@ -1,12 +1,13 @@
 # Tier 4 — design questions for independent review
 
-> **Status: DRAFT — for independent review. No implementation should start
-> from this document until the reviewer weighs in.** This is a companion
-> to `docs/DESIGN_FFI_BOUNDARY_HARDENING.md` (Tier 1-3, already implemented
-> and merged into the working tree; Tier 5 also implemented — see that
-> document's §5). Tier 4 was explicitly deferred out of that pass because
-> each item is a **design decision**, not a mechanical bug fix — this
-> document exists to get that decision made before any code changes.
+> **Status: IMPLEMENTED.** Items 1-4 were decided and implemented in
+> commit `d7d0a06` ("fix(python_api): FFI-boundary hardening Tiers 1-5").
+> Item 5 was deliberately left as Option A (no change) — see its section
+> below. Each item's "Decision & implementation" subsection records what
+> was chosen and why, with file/line and test evidence. This is a
+> companion to `docs/DESIGN_FFI_BOUNDARY_HARDENING.md` (Tier 1-3, already
+> implemented and merged into the working tree; Tier 5 — dead code
+> removal — also implemented, same commit).
 
 Each item below is presented with the trade-offs on both sides, not a
 recommendation. Several of these could reasonably be answered "leave it,
@@ -98,6 +99,22 @@ changes `exists()`'s exception behavior (new: can raise) without changing
 its return type in the non-raising case — flag for constraint-#1-style
 sign-off if C is chosen, same spirit as Tier 1-3's §4.1/§4.3 exceptions.
 
+**Decision & implementation: Option B.** `exists()`/`exists_async()`'s
+logic in `src/python_api/python_core_api.rs` is unchanged — both still
+collapse every failure to `False`. What changed is the docstrings: each
+now states explicitly that `False` means either "not found" or "could
+not check" (malformed URI, bad credentials, network partition, TLS
+failure, unreachable endpoint), names the `os.path.exists()` /
+`pathlib.Path.exists()` precedent for why that's the deliberate shape,
+and points callers who need to distinguish the two cases at `stat()`
+(which already propagates real errors — no new Rust surface needed). The
+docstring also now calls out the one asymmetry between the sync and
+async versions: `exists_async()` raises on a store-creation failure
+(bad URI) before it ever reaches the swallowed `stat()` call, while sync
+`exists()` swallows that case too — flagged as a "use `stat()`/
+`stat_async()` for fully consistent behavior" note rather than silently
+left undocumented. No test changes — no logic changed to test.
+
 ---
 
 ## 2. Unknown-length dataset iteration silently yields zero items
@@ -172,6 +189,37 @@ combined with B.
 **Zero-copy / API-shape note**: A is a no-op. B and C both add new raise
 paths where today there's silent success — flag for sign-off, same
 pattern as Tier 1-3's checksum/etag exceptions, if either is chosen.
+
+**Decision & implementation: Option B + Option C, combined.** Both fixes
+landed together rather than choosing one over the other, since they're
+independent (B fixes the 3 producer call sites, C fixes `__len__` itself)
+and the doc noted they "could be done alone or combined."
+
+A new pure, GIL-free helper was extracted rather than inlining the check
+at each of the 4 call sites: `require_known_length(len: Option<usize>)
+-> Result<usize, &'static str>` in `src/data_loader/dataset.rs:100-102`,
+returning `Err(UNKNOWN_LENGTH_MSG)` — *"this dataset has unknown length —
+no streaming iteration path is currently exposed to Python"* — when
+`len` is `None`. Unit-tested directly (`tier4_length_guard_tests`,
+`dataset.rs:104-118`): `known_length_passes_through` and
+`unknown_length_is_rejected_not_defaulted_to_zero`, both pure `cargo
+test --lib` (no `extension-module` feature needed, since the helper
+never touches PyO3 types).
+
+Wired into all 4 sites in `src/python_api/python_aiml_api.rs`, each
+converting the `&'static str` into `PyTypeError`:
+- `PyDataset::__len__` (`:99-100`) — Option C: raises instead of
+  returning `0`.
+- `PyBytesAsyncDataLoader::__iter__` (`:215`), `.items()` (`:384`), and
+  `PyBytesAsyncDataLoaderIter::spawn_stream` (`:686`) — Option B: raise
+  `TypeError` instead of silently producing an empty iterator.
+
+Verified (per the commit message) that no currently Python-constructible
+dataset type (`S3BytesDataset`, `FileSystemBytesDataset`,
+`DirectIOBytesDataset`, `PyVecDataset`, `TransformDataset`) can trigger
+this path today — this closes a latent trap for a future streaming
+dataset type, not a live caller-facing behavior break for any dataset
+that works today.
 
 ---
 
@@ -283,6 +331,41 @@ implications either way — `run_on_global_rt`/`submit_io` already carries
 zero-copy `Bytes` through channels per the same architecture comment
 quoted above.
 
+**Decision & implementation: Option C — easy-bucket-only (7 of 9 sites
+migrated).** All 4 `create_*_writer` functions, `finalize()`, and both
+`write_owned_bytes()` call sites in
+`src/python_api/python_core_api.rs` now go through `submit_io`
+(the `run_on_global_rt`/channel-recv pattern), matching the rest of the
+file. `write_owned_bytes()` needed a take-then-restore rewrite —
+`self.inner` is only borrowed (`&mut self`), not owned, so the writer is
+`.take()`n out, moved into the `submit_io` future, and unconditionally
+restored afterward, preserving the existing "writer stays usable after a
+failed write" contract.
+
+`write_chunk()`'s 2 call sites (now at `:1994` and `:2005`) are
+**deliberately left on raw `block_on()`**, exactly as the doc's "hard
+bucket" analysis anticipated: its zero-copy fast path holds a
+`PyBuffer`-derived raw slice for the exact duration of a synchronous,
+GIL-held `block_on()`, and `submit_io`'s spawn-based model requires
+`'static` futures, which can't hold a borrowed slice without either
+copying the data (defeating the point of `write_chunk` existing as a
+separate path from `write_owned_bytes()`) or a materially more complex
+lifetime-pinning redesign. That redesign was explicitly not attempted in
+this pass.
+
+Regression test: `src/s3_client.rs:452-473`,
+`tier4_reentrancy_tests::run_on_global_rt_survives_nested_runtime_context`
+— nests a `run_on_global_rt(...)` call inside an already-running Tokio
+runtime (the exact "Cannot start a runtime from within a runtime"
+condition) and asserts it returns cleanly instead of panicking. RED was
+confirmed by temporarily reintroducing a raw `block_on()` inside
+`run_on_global_rt()` itself and observing the real panic; GREEN after
+restoring the real implementation. Live-verified: all 4 tests in
+`python/tests/test_multipart_writer.py` (including
+`test_reserve_pins_writer_alive_until_commit` and
+`test_close_always_has_etag_key`) pass against a real MinIO endpoint
+with the rebuilt wheel, exercising the migrated writer paths.
+
 ---
 
 ## 4. Mutex-poisoning panics wedge 4 hot-path iterators permanently
@@ -366,6 +449,34 @@ sign-off if chosen, though arguably strictly an improvement (catchable
 `RuntimeError` vs. opaque `PanicException`). Option C is a bigger,
 separate investigation. Neither touches the actual data-transfer path.
 
+**Decision & implementation: Option C — `parking_lot::Mutex`.** Went
+straight to eliminating the hazard class rather than just improving its
+diagnostics (which is all Option B would have bought). The `rx` channel
+field on `PyObjectDataLoaderSyncIter`, `PyBytesDataLoaderSyncIter`, and
+`ParquetStreamIter` (`src/python_api/python_aiml_api.rs`) switched from
+`std::sync::Mutex` to `parking_lot::Mutex` — already a workspace
+dependency (`Cargo.toml:128`), so no new dependency was introduced.
+`parking_lot::Mutex` never poisons, so a single unrelated panic while
+the lock happens to be held no longer wedges that iterator's `__next__`
+for the rest of its lifetime.
+
+The lock-then-blocking-receive pattern was centralized into a new pure,
+GIL-free helper, `blocking_recv_locked<T>(mtx: &parking_lot::Mutex<...>)
+-> Option<T>` (`src/data_loader/dataset.rs:129-133`) — safe to call this
+way because the mutex is only ever locked inside a fully synchronous
+`py.detach(|| ...)` closure, never across an `.await` point, so there's
+no `Send`/async hazard from the type swap. Unit-tested
+(`tier4_mutex_poisoning_tests`, `dataset.rs:135-182`):
+`std_mutex_poisons_and_wedges_after_panic` characterizes the original
+hazard (panic while held → all subsequent `.lock()` calls fail forever);
+`blocking_recv_locked_survives_panic_while_held` proves the replacement
+survives the identical scenario — a panic on another thread while the
+`parking_lot::Mutex` is held does not wedge a later
+`blocking_recv_locked` call. RED was confirmed by temporarily reverting
+`blocking_recv_locked` itself back to `std::sync::Mutex` +
+`.expect(...)` and observing the real "rx mutex poisoned" panic; GREEN
+after restoring `parking_lot::Mutex`.
+
 ---
 
 ## 5. (Carried over from Tier 1-3's §3.4, per instruction) `python_datagen_api.rs`'s one inconsistent-but-correct site
@@ -409,18 +520,32 @@ one already and is deliberately withholding it until the independent
 review is complete, so this section should stay options-only rather than
 staking out a lean.
 
+**Decision & implementation: Option A — left alone.** `python_datagen_api.rs:410`
+is untouched — still the lone manual `format!("{e:#}")` site, no
+`py_err` call anywhere in the file. This was the one item of the five
+explicitly *not* addressed in the Tier 4 implementation pass (the commit
+message scopes itself to "all 4 addressed items," naming items 1-4
+only). The footgun risk described above (a future contributor "fixing"
+this site back to `{}`, silently reintroducing the chain-loss bug) is
+still live and undecided — it remains open for a future pass if the
+reviewer wants Option B after all.
+
 ---
 
 ## Summary table
 
-| # | Item | Files/lines | Effort if fixed | Sign-off needed if fixed? |
-| --- | ------ | ------------- | ------------------ | --------------------------- |
-| 1 | `exists()`/`exists_async()` swallow all errors | `python_core_api.rs:1079-1112` | Low (B) / Medium (C) | Only if Option C |
-| 2 | Unknown-length iteration silently empty | `python_aiml_api.rs:94-96,217,380,696` | Low (A/C) / Medium (B) | If B or C |
-| 3 | `block_on()` reentrancy risk, 9 sites | `python_core_api.rs:1973-2189` | Low (A) / High (B) / Medium (C) | No (internal pattern only) |
-| 4 | Mutex-poisoning panics, 4 sites | `python_aiml_api.rs:558-2203` | Low (A/B) / Medium (C) | If B |
-| 5 | `datagen_api.rs` style consistency | `python_datagen_api.rs:410` | Trivial | No |
+| # | Item | Files/lines | Effort if fixed | Sign-off needed if fixed? | Decision |
+| --- | ------ | ------------- | ------------------ | --------------------------- | --- |
+| 1 | `exists()`/`exists_async()` swallow all errors | `python_core_api.rs:1079-1112` | Low (B) / Medium (C) | Only if Option C | **B** — docstring only, no logic change |
+| 2 | Unknown-length iteration silently empty | `python_aiml_api.rs:94-96,217,380,696` | Low (A/C) / Medium (B) | If B or C | **B+C** — `require_known_length()` raises `TypeError` at all 4 sites |
+| 3 | `block_on()` reentrancy risk, 9 sites | `python_core_api.rs:1973-2189` | Low (A) / High (B) / Medium (C) | No (internal pattern only) | **C** — 7 easy-bucket sites migrated to `submit_io`; `write_chunk()`'s 2 sites deliberately left on `block_on()` |
+| 4 | Mutex-poisoning panics, 4 sites | `python_aiml_api.rs:558-2203` | Low (A/B) / Medium (C) | If B | **C** — switched to `parking_lot::Mutex` (no poisoning) |
+| 5 | `datagen_api.rs` style consistency | `python_datagen_api.rs:410` | Trivial | No | **A** — left alone, still open |
 
-No item here is proposed as decided. This document's only job is to lay
-out the options accurately enough that the reviewer can pick, without
-having to re-derive the tradeoffs from scratch.
+Implemented in commit `d7d0a06` (items 1-4); item 5 remains undecided —
+still Option A by default, per the commit's explicit "4 addressed
+items" scope. See that commit's message for the full RED/GREEN
+verification narrative, and `src/data_loader/dataset.rs`'s
+`tier4_length_guard_tests` / `tier4_mutex_poisoning_tests`, and
+`src/s3_client.rs`'s `tier4_reentrancy_tests`, for the unit-test
+evidence backing items 2, 3, and 4.
