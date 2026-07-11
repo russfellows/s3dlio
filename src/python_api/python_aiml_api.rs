@@ -1376,6 +1376,27 @@ impl PyAsyncDataLoaderIter {
 // Checkpoint Python bindings
 // ---------------------------------------------------------------------------
 
+/// Build the dedicated Tokio multi-thread runtime backing a
+/// `PyCheckpointStore`. Checkpointing intentionally uses its own runtime
+/// rather than s3dlio's shared global one (so long checkpoint I/O can't
+/// starve the data-loading pipeline's runtime, or vice versa); this
+/// function is the one place that decides how many worker threads it gets.
+///
+/// Sized via [`crate::constants::effective_thread_budget`] -- the same
+/// MPI-aware, `S3DLIO_RT_THREADS`-overridable budget used by
+/// [`crate::s3_client::configure_thread_pools`] -- instead of Tokio's own
+/// unconstrained `num_cpus` default, so N MPI ranks checkpointing
+/// concurrently on one host split the available cores instead of each
+/// independently claiming all of them.
+#[cfg(feature = "extension-module")]
+fn build_checkpoint_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(crate::constants::effective_thread_budget())
+        .enable_all()
+        .thread_name("s3dlio-checkpoint")
+        .build()
+}
+
 #[cfg(feature = "extension-module")]
 #[pyclass]
 pub struct PyCheckpointStore {
@@ -1417,7 +1438,7 @@ impl PyCheckpointStore {
             .map_err(|e| py_err(e.context("Failed to open checkpoint store")))?;
 
         let runtime = Arc::new(
-            tokio::runtime::Runtime::new()
+            build_checkpoint_runtime()
                 .map_err(|e| py_err(format!("Failed to create runtime: {}", e)))?,
         );
 
@@ -3317,40 +3338,18 @@ impl PyParquetIndex {
 ///
 /// ## Arguments
 /// * `n` — worker thread count.  `0` (default) = auto from MPI env vars.
+///
+/// Since v0.9.113 this also sizes Rayon's global thread pool (used by the
+/// NPZ/data-gen `par_chunks_mut` hot paths) with the same budget — see
+/// [`crate::s3_client::configure_thread_pools`], which this function now
+/// delegates to. Note that as of v0.9.113 `s3dlio` also calls this
+/// automatically (with `n=0`, i.e. auto-detect) once at import time, so
+/// explicitly calling it is only needed to override the auto-detected
+/// budget.
 #[pyfunction]
 #[pyo3(signature = (n=0))]
 pub fn configure_tokio_threads(n: usize) {
-    use crate::s3_client::RT_THREADS_LIMIT;
-    use std::sync::atomic::Ordering;
-
-    let thread_count = if n > 0 {
-        n
-    } else {
-        // Auto-detect from standard MPI / distributed-training env vars.
-        let world_size: usize = std::env::var("OMPI_COMM_WORLD_SIZE")
-            .or_else(|_| std::env::var("PMI_SIZE"))
-            .or_else(|_| std::env::var("WORLD_SIZE"))
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1);
-        let cpus = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
-        (cpus / world_size).max(1)
-    };
-
-    // Constrain the global rt (used by generate_and_write_parquet, parquet_get_rg,
-    // put_bytes, etc.) with the same budget.  Must be set before the first
-    // run_on_global_rt call to take effect (the global rt is a OnceLock).
-    RT_THREADS_LIMIT.store(thread_count, Ordering::Relaxed);
-
-    // Constrain the pyo3-async-runtimes rt (used by create_async_loader).
-    let mut builder = ::tokio::runtime::Builder::new_multi_thread();
-    builder.worker_threads(thread_count);
-    builder.enable_all();
-    builder.thread_name("s3dlio-decode");
-    pyo3_async_runtimes::tokio::init(builder);
+    crate::s3_client::configure_thread_pools(n);
 }
 
 // ---------------------------------------------------------------------------
@@ -3436,4 +3435,73 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "extension-module"))]
+mod checkpoint_runtime_sizing_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use std::time::{Duration, Instant};
+
+    // build_checkpoint_runtime() reads S3DLIO_RT_THREADS; serialize against
+    // any other test in this binary that touches the same env var.
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Reproduces the CPU-oversubscription bug found while chasing the DLIO
+    /// unet3d npz-datagen slowdown, applied to checkpointing specifically:
+    /// `PyCheckpointStore` builds its own dedicated Tokio runtime (separate
+    /// from s3dlio's shared global one), and it used to do so via a bare
+    /// `tokio::runtime::Runtime::new()` -- Tokio's own unconstrained
+    /// `num_cpus`-worker default, completely bypassing
+    /// `configure_thread_pools()` / `effective_thread_budget()`. Under
+    /// `mpirun -n N`, N ranks checkpointing concurrently on one host would
+    /// each independently claim the full core count.
+    ///
+    /// This proves the checkpoint runtime is actually CAPPED to the
+    /// requested worker count (2, via `S3DLIO_RT_THREADS=2`) rather than
+    /// defaulting to the host's full core count: 3 synchronous (non-
+    /// yielding) blocking tasks on a 2-worker runtime must run in two
+    /// waves, taking measurably longer than one wave would. An
+    /// unconstrained runtime (e.g. this host's `num_cpus` >> 3) would run
+    /// all 3 concurrently in a single wave and finish much faster.
+    #[test]
+    fn build_checkpoint_runtime_honors_explicit_thread_budget() {
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let prev = std::env::var("S3DLIO_RT_THREADS").ok();
+        std::env::set_var("S3DLIO_RT_THREADS", "2");
+
+        let rt = build_checkpoint_runtime().expect("build checkpoint runtime");
+        const SLEEP: Duration = Duration::from_millis(150);
+        const TASKS: usize = 3;
+
+        let start = Instant::now();
+        rt.block_on(async {
+            let mut set = tokio::task::JoinSet::new();
+            for _ in 0..TASKS {
+                // A synchronous, non-yielding sleep genuinely occupies an
+                // OS worker thread -- unlike tokio::time::sleep().await,
+                // which would free the thread for other tasks and defeat
+                // the whole point of this test.
+                set.spawn(async move { std::thread::sleep(SLEEP) });
+            }
+            while set.join_next().await.is_some() {}
+        });
+        let elapsed = start.elapsed();
+
+        match prev {
+            Some(v) => std::env::set_var("S3DLIO_RT_THREADS", v),
+            None => std::env::remove_var("S3DLIO_RT_THREADS"),
+        }
+
+        // 2 workers, 3 tasks of 150ms each -> 2 waves -> >= ~300ms. An
+        // unconstrained pool (this host's real core count) would run all 3
+        // concurrently in ~150ms. 250ms sits safely between the two.
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "checkpoint runtime finished 3x150ms blocking tasks in {elapsed:?} -- \
+             too fast for a 2-worker-thread pool, meaning S3DLIO_RT_THREADS=2 \
+             was not applied and the runtime is still using an unconstrained \
+             (full-core-count) default"
+        );
+    }
 }

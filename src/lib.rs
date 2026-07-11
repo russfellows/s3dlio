@@ -266,6 +266,16 @@ mod python_api;
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     Python::initialize();
 
+    // Auto-size every process-wide thread pool (global Tokio runtime,
+    // pyo3-async-runtimes runtime, Rayon global pool) from MPI/distributed-
+    // training env vars, unconditionally -- so every caller gets a
+    // correctly-sized pool under `mpirun -n N` without needing to opt in.
+    // Must happen before any S3 I/O or `create_async_loader` call; module
+    // import is always first. See `s3_client::configure_thread_pools` and
+    // `python_api::python_aiml_api::configure_tokio_threads` (the explicit,
+    // still-fully-functional override).
+    s3_client::configure_thread_pools(0);
+
     // Register all functions from modular API
     python_api::register_all_functions(m)?;
 

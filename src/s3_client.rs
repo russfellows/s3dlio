@@ -67,6 +67,64 @@ pub fn configure_for_concurrency(n: usize) {
     CONCURRENCY_HINT.store(n, Ordering::Relaxed);
 }
 
+/// Auto-configure every process-wide thread pool s3dlio owns: the global
+/// s3dlio Tokio runtime, the `pyo3_async_runtimes` Tokio runtime (Python
+/// extension builds only), and Rayon's global pool.
+///
+/// `threads = 0` means "auto-detect from MPI/distributed-training env vars"
+/// (see [`crate::constants::mpi_aware_thread_budget`]); a positive value is
+/// an explicit per-process worker-thread count.
+///
+/// This is the single choke point for the whole class of CPU-oversubscription
+/// bugs found while chasing the DLIO unet3d npz-datagen slowdown: previously
+/// only 2 of 16 s3dlio-touching call sites in DLIO_local_changes called
+/// `configure_tokio_threads()`, and Rayon (used by NPZ/data-gen's
+/// `par_chunks_mut` hot paths) had no MPI-awareness or explicit sizing
+/// anywhere in s3dlio at all. Calling this unconditionally once at
+/// `s3dlio` import time (see `_pymod` in `lib.rs`) means every current and
+/// future call site — any data format, reading or writing, Python or
+/// pure-Rust — gets a correctly-sized pool without needing to opt in.
+///
+/// Idempotent / safe to call more than once: the global s3dlio Tokio runtime
+/// (`RT_HANDLE`) and Rayon's global pool are each backed by a `OnceLock`-style
+/// cell that only takes effect on first build, and `pyo3_async_runtimes::
+/// tokio::init()` merely stores the pending builder in a mutex — it does not
+/// build the runtime until first use — so a later explicit
+/// `configure_tokio_threads(n)` call from Python still fully overrides an
+/// earlier automatic call, as long as it happens before the first actual S3
+/// operation / `create_async_loader` call, exactly as already documented.
+pub fn configure_thread_pools(threads: usize) {
+    let threads = if threads > 0 {
+        threads
+    } else {
+        crate::constants::mpi_aware_thread_budget()
+    };
+
+    // Global s3dlio Tokio runtime (blocking/sync + Python callers).
+    RT_THREADS_LIMIT.store(threads, Ordering::Relaxed);
+
+    // pyo3-async-runtimes Tokio runtime (create_async_loader / Arrow decode
+    // streaming pipeline) -- only present in Python extension builds.
+    #[cfg(feature = "extension-module")]
+    {
+        let mut builder = TokioBuilder::new_multi_thread();
+        builder.worker_threads(threads);
+        builder.enable_all();
+        builder.thread_name("s3dlio-decode");
+        pyo3_async_runtimes::tokio::init(builder);
+    }
+
+    // Rayon global pool (NPZ/data-gen par_chunks_mut hot paths). Ignore the
+    // Err case: it just means the pool was already built (e.g. by a prior
+    // call to this function, or by Rayon's own lazy default racing ahead of
+    // us) -- there is no way to resize an already-built global pool, and
+    // that's fine, since whichever call won still sized it correctly.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("s3dlio-rayon-{i}"))
+        .build_global();
+}
+
 /// Returns `true` when `S3DLIO_UNSIGNED_PAYLOAD=1` (or `true`/`yes`/`on`/`enable`).
 ///
 /// When enabled, S3 PUT requests send `x-amz-content-sha256: UNSIGNED-PAYLOAD`
@@ -124,28 +182,79 @@ pub(crate) fn global_rt_handle() -> &'static Handle {
     })
 }
 
+/// Read `S3DLIO_RT_THREADS` from the environment and apply the sanity
+/// clamp against [`RT_THREADS_LIMIT`] shared by every s3dlio-owned thread
+/// pool.  Returns `None` if the env var is unset or unparseable.
+///
+/// See [`get_runtime_threads`] for the full rationale of the clamp and
+/// the `S3DLIO_RT_THREADS_UNSAFE=1` escape hatch.
+pub(crate) fn clamped_env_rt_threads() -> Option<usize> {
+    let n = std::env::var("S3DLIO_RT_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())?;
+    let limit = RT_THREADS_LIMIT.load(Ordering::Relaxed);
+    let unsafe_bypass = std::env::var("S3DLIO_RT_THREADS_UNSAFE")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if limit > 0 && !unsafe_bypass && n.saturating_mul(4) < limit {
+        eprintln!(
+            "s3dlio: S3DLIO_RT_THREADS={} is < RT_THREADS_LIMIT/4 (limit={}); \
+             using {} instead to avoid Tokio-runtime starvation. Set \
+             S3DLIO_RT_THREADS_UNSAFE=1 to bypass this safeguard.",
+            n, limit, limit,
+        );
+        return Some(limit.max(1));
+    }
+    Some(n.max(1))
+}
+
 /// Get optimal number of runtime threads with environment override.
 ///
 /// Resolution order (first match wins):
-/// 1. `S3DLIO_RT_THREADS` env var (explicit override)
+/// 1. `S3DLIO_RT_THREADS` env var (user override), subject to a sanity
+///    clamp against `RT_THREADS_LIMIT` — values below `LIMIT/4` are
+///    treated as downstream miscomputation and replaced with `LIMIT`.
+///    Set `S3DLIO_RT_THREADS_UNSAFE=1` to bypass the clamp.
 /// 2. Concurrency hint from [`configure_for_concurrency`], if > CPU baseline
-/// 3. `max(4, num_cpus)` — scales with hardware, floor at 4 for tiny VMs
+/// 3. MPI-aware default: when `mpi_world_size() > 1` (i.e. running under
+///    `mpirun -n N` / `torchrun --nproc-per-node=N`), `num_cpus / world_size`
+///    — otherwise `max(4, num_cpus)`, unchanged from before.
+///
+/// Folding MPI-awareness into the *default* (rather than requiring every
+/// caller to explicitly call `configure_tokio_threads()` first) closes an
+/// entire class of CPU-oversubscription bugs: N ranks on the same host each
+/// independently claiming the full core count. See
+/// [`crate::constants::mpi_aware_thread_budget`] for the shared formula.
+///
+/// The env-var sanity clamp closes a symmetric class of runtime-starvation
+/// bugs: a downstream library (e.g. DLIO's `ObjStoreLibStorage`) that
+/// derives `S3DLIO_RT_THREADS` from its own not-yet-finalized state can
+/// end up setting it to `1`, which — without the clamp — would build the
+/// s3dlio global Tokio runtime with a single worker and force every
+/// concurrent MPU part upload to serialize on it (~10x throughput loss
+/// on real workloads).  See
+/// `docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md`.
 ///
 /// The old `min(cores×2, 32)` hard cap has been removed.  On a 96-core host
 /// it capped at 32, wasting 64 cores for Python/sync callers.  Tokio I/O
 /// threads sit in epoll/io_uring when idle — no CPU cost.
 fn get_runtime_threads() -> usize {
-    // Env var always wins.
-    if let Some(n) = std::env::var("S3DLIO_RT_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
+    // Env var wins, subject to a sanity clamp against the configured
+    // per-process target (RT_THREADS_LIMIT, set by configure_thread_pools;
+    // at s3dlio import time _pymod calls configure_thread_pools(0) which
+    // sets it to the MPI-aware auto-budget).
+    if let Some(n) = clamped_env_rt_threads() {
         return n;
     }
 
     let cores = num_cpus::get();
-    // Floor at 4 for single/dual-core VMs.
-    let base = std::cmp::max(4, cores);
+    let base = if crate::constants::mpi_world_size() > 1 {
+        crate::constants::mpi_aware_thread_budget()
+    } else {
+        // Floor at 4 for single/dual-core VMs.
+        std::cmp::max(4, cores)
+    };
 
     // Respect a concurrency hint (e.g. configure_for_concurrency(128) on a
     // 4-core machine should give the runtime enough threads to interleave I/O
@@ -447,6 +556,212 @@ pub async fn create_s3_client_for_endpoint(
         endpoint_url
     );
     Ok(Client::from_conf(s3_config))
+}
+
+#[cfg(test)]
+mod mpi_aware_runtime_sizing_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // get_runtime_threads() reads process-global env vars and atomics
+    // (CONCURRENCY_HINT, RT_THREADS_LIMIT); serialize these tests both
+    // against each other and reset the atomics we touch so we don't leak
+    // state into other tests in this binary.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const VARS: [&str; 5] = [
+        "S3DLIO_RT_THREADS",
+        "S3DLIO_RT_THREADS_UNSAFE",
+        "OMPI_COMM_WORLD_SIZE",
+        "PMI_SIZE",
+        "WORLD_SIZE",
+    ];
+
+    fn with_clean_state<F: FnOnce()>(body: F) {
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let prev: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+        for v in VARS {
+            std::env::remove_var(v);
+        }
+        let prev_hint = CONCURRENCY_HINT.swap(0, Ordering::Relaxed);
+        let prev_limit = RT_THREADS_LIMIT.swap(0, Ordering::Relaxed);
+
+        body();
+
+        for (v, p) in VARS.iter().zip(prev) {
+            match p {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
+        CONCURRENCY_HINT.store(prev_hint, Ordering::Relaxed);
+        RT_THREADS_LIMIT.store(prev_limit, Ordering::Relaxed);
+    }
+
+    /// Reproduces the CPU-oversubscription bug found while chasing the DLIO
+    /// unet3d npz-datagen slowdown: under `mpirun -n N`, every rank's
+    /// `s3dlio` process independently defaults `get_runtime_threads()` to
+    /// `max(4, num_cpus)` -- N ranks all claim the FULL core count instead
+    /// of splitting it, unless something explicitly calls
+    /// `configure_tokio_threads()` first (which, in DLIO_local_changes, only
+    /// 2 of 16 s3dlio-touching call sites do). The global Tokio runtime
+    /// (`get_runtime_threads()`'s caller) must instead default to an
+    /// MPI-aware per-process budget whenever MPI env vars are present, with
+    /// zero opt-in required.
+    #[test]
+    fn get_runtime_threads_is_mpi_aware_by_default_without_configure_call() {
+        with_clean_state(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            let cpus = num_cpus::get();
+            let expected = (cpus / 4).max(1);
+            assert_eq!(
+                get_runtime_threads(),
+                expected,
+                "get_runtime_threads() must divide available CPUs across the \
+                 MPI world size by default -- it ignored OMPI_COMM_WORLD_SIZE=4 \
+                 and returned an unconstrained per-process thread count"
+            );
+        });
+    }
+
+    #[test]
+    fn get_runtime_threads_single_process_unchanged_behavior() {
+        // world_size=1 (no MPI env vars) must reduce to the pre-existing
+        // max(4, num_cpus) default -- zero behavior change for the common
+        // single-process case.
+        with_clean_state(|| {
+            let cpus = num_cpus::get();
+            assert_eq!(get_runtime_threads(), std::cmp::max(4, cpus));
+        });
+    }
+
+    #[test]
+    fn get_runtime_threads_explicit_env_var_still_wins_over_mpi_default() {
+        with_clean_state(|| {
+            std::env::set_var("S3DLIO_RT_THREADS", "7");
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            assert_eq!(get_runtime_threads(), 7);
+        });
+    }
+
+    #[test]
+    fn get_runtime_threads_explicit_limit_still_caps_mpi_default() {
+        // The configure_tokio_threads() escape hatch (RT_THREADS_LIMIT) must
+        // still be able to further constrain the MPI-aware default.
+        with_clean_state(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            RT_THREADS_LIMIT.store(1, Ordering::Relaxed);
+            assert_eq!(get_runtime_threads(), 1);
+        });
+    }
+
+    #[test]
+    fn configure_thread_pools_auto_sets_rt_threads_limit_from_mpi_env() {
+        with_clean_state(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            let cpus = num_cpus::get();
+            let expected = (cpus / 4).max(1);
+            configure_thread_pools(0);
+            assert_eq!(RT_THREADS_LIMIT.load(Ordering::Relaxed), expected);
+        });
+    }
+
+    #[test]
+    fn configure_thread_pools_explicit_count_overrides_mpi_default() {
+        with_clean_state(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            configure_thread_pools(3);
+            assert_eq!(RT_THREADS_LIMIT.load(Ordering::Relaxed), 3);
+        });
+    }
+
+    #[test]
+    fn configure_thread_pools_is_idempotent_does_not_panic_on_repeat_calls() {
+        // Rayon's global pool can only be *built* once per process; calling
+        // this twice (e.g. an automatic call at import followed by an
+        // explicit user override) must not panic even though the second
+        // build_global() call is necessarily a no-op.
+        with_clean_state(|| {
+            configure_thread_pools(2);
+            configure_thread_pools(4);
+            assert_eq!(RT_THREADS_LIMIT.load(Ordering::Relaxed), 4);
+        });
+    }
+
+    /// RED-then-GREEN regression for the DLIO unet3d datagen bug (found
+    /// 2026-07-10, docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_
+    /// INVESTIGATION_2026-07-10.md): DLIO's `ObjStoreLibStorage.__init__`
+    /// computes `S3DLIO_RT_THREADS = write_threads * 3 // 2`, and with
+    /// Hydra's default `write_threads = 1` that resolves to
+    /// `S3DLIO_RT_THREADS=1`, which s3dlio then faithfully obeys by
+    /// building a Tokio runtime with ONE worker.  All concurrent MPU part
+    /// uploads then serialize on that single worker (~10x throughput
+    /// loss).  Fix: env-var values that are far below the configured
+    /// per-process target (`RT_THREADS_LIMIT`, set by
+    /// `configure_thread_pools(0)` at import time to the MPI-aware
+    /// auto-budget) are treated as downstream miscomputation and clamped
+    /// up to the target instead of starving the runtime.
+    #[test]
+    fn get_runtime_threads_clamps_grossly_underprovisioned_env_var_up_to_limit() {
+        with_clean_state(|| {
+            std::env::set_var("S3DLIO_RT_THREADS", "1");
+            RT_THREADS_LIMIT.store(28, Ordering::Relaxed);
+            assert_eq!(
+                get_runtime_threads(),
+                28,
+                "S3DLIO_RT_THREADS=1 with RT_THREADS_LIMIT=28 must clamp up \
+                 to the configured target (1 is < LIMIT/4 = 7).  Under-\
+                 provisioned env var almost always means downstream code \
+                 miscomputed the value (e.g. DLIO's write_threads*1.5 with \
+                 write_threads defaulted to 1)."
+            );
+        });
+    }
+
+    #[test]
+    fn get_runtime_threads_env_var_at_or_above_quarter_of_limit_is_honored_verbatim() {
+        // Values above LIMIT/4 are honored as-is -- the sanity clamp is
+        // strictly for grossly-wrong values.  User's ability to override
+        // downward within a reasonable range is preserved.
+        with_clean_state(|| {
+            RT_THREADS_LIMIT.store(28, Ordering::Relaxed);
+            // Exactly the boundary: LIMIT/4 = 7.  7 >= 7, so honored.
+            std::env::set_var("S3DLIO_RT_THREADS", "7");
+            assert_eq!(get_runtime_threads(), 7);
+        });
+        with_clean_state(|| {
+            RT_THREADS_LIMIT.store(28, Ordering::Relaxed);
+            std::env::set_var("S3DLIO_RT_THREADS", "12");
+            assert_eq!(get_runtime_threads(), 12);
+        });
+    }
+
+    #[test]
+    fn get_runtime_threads_unsafe_env_bypasses_the_clamp() {
+        // Escape hatch: users who genuinely want a low thread count (e.g.
+        // running s3dlio's own single-threaded test suite, or testing
+        // fault-injection scenarios) can set S3DLIO_RT_THREADS_UNSAFE=1
+        // to bypass the sanity clamp.
+        with_clean_state(|| {
+            RT_THREADS_LIMIT.store(28, Ordering::Relaxed);
+            std::env::set_var("S3DLIO_RT_THREADS", "1");
+            std::env::set_var("S3DLIO_RT_THREADS_UNSAFE", "1");
+            assert_eq!(get_runtime_threads(), 1);
+        });
+    }
+
+    #[test]
+    fn get_runtime_threads_env_var_low_with_no_limit_set_is_honored() {
+        // When configure_thread_pools has not been called (RT_THREADS_LIMIT
+        // == 0), there is no target to compare against, so the clamp is
+        // inactive and the env var wins verbatim.  This keeps the pure-
+        // Rust `use s3dlio::…` path (no _pymod, no auto-configure) fully
+        // backward-compatible with any programmatic env-var use.
+        with_clean_state(|| {
+            std::env::set_var("S3DLIO_RT_THREADS", "1");
+            // RT_THREADS_LIMIT stays 0 from with_clean_state.
+            assert_eq!(get_runtime_threads(), 1);
+        });
+    }
 }
 
 #[cfg(test)]

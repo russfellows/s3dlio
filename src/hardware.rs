@@ -289,8 +289,12 @@ pub fn recommended_data_gen_threads(numa_node: Option<usize>, max_threads: Optio
         // NUMA node requested but not available, use affinity
         max_threads.unwrap_or_else(get_affinity_cpu_count)
     } else {
-        // No specific NUMA node, use all cores
-        max_threads.unwrap_or_else(num_cpus::get)
+        // No specific NUMA node: use the same MPI-aware, S3DLIO_RT_THREADS-
+        // overridable per-process budget as every other s3dlio thread pool
+        // (see crate::constants::effective_thread_budget), instead of a raw
+        // num_cpus::get() that would let N MPI ranks on one host each
+        // independently claim the full core count.
+        max_threads.unwrap_or_else(crate::constants::effective_thread_budget)
     }
 }
 
@@ -299,8 +303,10 @@ pub fn recommended_data_gen_threads(
     _numa_node: Option<usize>,
     max_threads: Option<usize>,
 ) -> usize {
-    // Without NUMA feature, ignore numa_node parameter
-    max_threads.unwrap_or_else(get_affinity_cpu_count)
+    // Without NUMA feature, ignore numa_node parameter. Falls back to the
+    // same MPI-aware per-process budget as every other s3dlio thread pool
+    // -- see crate::constants::effective_thread_budget.
+    max_threads.unwrap_or_else(crate::constants::effective_thread_budget)
 }
 
 #[cfg(test)]
@@ -319,6 +325,61 @@ mod tests {
         let cpus = get_affinity_cpu_count();
         assert!(cpus > 0, "Should detect at least 1 CPU");
         assert!(cpus <= total_cpus(), "Affinity CPUs shouldn't exceed total");
+    }
+
+    // recommended_data_gen_threads() reads S3DLIO_RT_THREADS (via
+    // crate::constants::effective_thread_budget); serialize against other
+    // tests touching the same var.
+    use std::sync::Mutex as StdMutex;
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Reproduces the CPU-oversubscription bug class for the third data-
+    /// generation path: `s3dlio.generate_data()` / `generate_data_with_threads()`
+    /// (the dgen-rs `GeneratorConfig.max_threads` field) call this function
+    /// with no explicit `max_threads` override, so its fallback IS the
+    /// effective per-process thread count. Before this fix that fallback was
+    /// a raw, MPI-unaware `num_cpus::get()` / `get_affinity_cpu_count()` --
+    /// under `mpirun -n N`, N ranks generating data concurrently on one host
+    /// would each independently claim the full core count, same class of bug
+    /// already fixed for the global Tokio runtime, Rayon's global pool, and
+    /// the checkpoint runtime.
+    #[test]
+    fn recommended_data_gen_threads_honors_explicit_thread_budget_when_no_override() {
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let prev = std::env::var("S3DLIO_RT_THREADS").ok();
+        std::env::set_var("S3DLIO_RT_THREADS", "2");
+
+        let threads = recommended_data_gen_threads(None, None);
+
+        match prev {
+            Some(v) => std::env::set_var("S3DLIO_RT_THREADS", v),
+            None => std::env::remove_var("S3DLIO_RT_THREADS"),
+        }
+
+        assert_eq!(
+            threads, 2,
+            "recommended_data_gen_threads(None, None) ignored S3DLIO_RT_THREADS=2 \
+             and fell back to the raw (MPI-unaware) host core count instead of \
+             crate::constants::effective_thread_budget()"
+        );
+    }
+
+    #[test]
+    fn recommended_data_gen_threads_explicit_override_still_wins() {
+        // max_threads=Some(n) must still be an unconditional override,
+        // regardless of S3DLIO_RT_THREADS.
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let prev = std::env::var("S3DLIO_RT_THREADS").ok();
+        std::env::set_var("S3DLIO_RT_THREADS", "2");
+
+        let threads = recommended_data_gen_threads(None, Some(5));
+
+        match prev {
+            Some(v) => std::env::set_var("S3DLIO_RT_THREADS", v),
+            None => std::env::remove_var("S3DLIO_RT_THREADS"),
+        }
+
+        assert_eq!(threads, 5);
     }
 
     #[cfg(target_os = "linux")]

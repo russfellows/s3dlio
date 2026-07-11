@@ -2886,7 +2886,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // `S3DLIO_PUT_VERIFY` env var and would otherwise race if run concurrently.
 // ---------------------------------------------------------------------------
 // Tests — error chain preserved across the PyO3 boundary
-// (storage#755 / s3dlio#161, v0.9.111)
+// (storage#755 / s3dlio#161, v0.9.112)
 // ---------------------------------------------------------------------------
 //
 // A user's DLIO training run against S3 died with only

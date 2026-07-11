@@ -104,6 +104,75 @@ pub fn max_retry_attempts() -> u32 {
         .max(1)
 }
 
+/// Resolve the MPI/distributed-training world size for this process.
+///
+/// Checked env vars (first one found wins):
+///   - `OMPI_COMM_WORLD_SIZE` — Open MPI
+///   - `PMI_SIZE`             — MPICH / Slurm PMI
+///   - `WORLD_SIZE`           — PyTorch distributed / torchrun
+///
+/// Falls back to `1` (single process, i.e. "no MPI detected") when none are
+/// set or unparseable. Never returns 0.
+pub fn mpi_world_size() -> usize {
+    std::env::var("OMPI_COMM_WORLD_SIZE")
+        .or_else(|_| std::env::var("PMI_SIZE"))
+        .or_else(|_| std::env::var("WORLD_SIZE"))
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Per-process worker-thread budget: available CPUs divided evenly across
+/// the MPI/distributed-training world size (see [`mpi_world_size`]), floor 1.
+///
+/// This is the single source of truth for "how many Tokio/Rayon worker
+/// threads should THIS process claim" under `mpirun -n N` / `torchrun
+/// --nproc-per-node=N` launches, where every rank shares the same host and
+/// an unconstrained per-process `num_cpus::get()` default causes N-way CPU
+/// oversubscription. Used by both [`crate::s3_client::get_runtime_threads`]'s
+/// default fallback and [`crate::s3_client::configure_thread_pools`], so a
+/// caller gets the same budget whether or not it opts in explicitly.
+pub fn mpi_aware_thread_budget() -> usize {
+    let world_size = mpi_world_size();
+    let cpus = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    (cpus / world_size).max(1)
+}
+
+/// Resolve the effective per-process worker-thread budget for any s3dlio
+/// thread pool: `S3DLIO_RT_THREADS` env var override (subject to the
+/// [`crate::s3_client::clamped_env_rt_threads`] sanity clamp), else the
+/// MPI-aware default, else the pre-MPI-awareness `max(4, num_cpus)` floor.
+///
+/// This is the same precedence [`crate::s3_client::get_runtime_threads`]
+/// applies to the global s3dlio Tokio runtime, factored out here so any
+/// *other* dedicated pool s3dlio owns (e.g. checkpointing's own runtime --
+/// see `build_checkpoint_runtime` in `python_api/python_aiml_api.rs`) can
+/// get identical, single-env-knob sizing without duplicating the logic.
+///
+/// # Resolution order (first match wins)
+/// 1. `S3DLIO_RT_THREADS` — user override, applies to every pool.  Values
+///    below `RT_THREADS_LIMIT/4` are clamped up to `RT_THREADS_LIMIT` to
+///    defend against downstream miscomputation (e.g. DLIO's
+///    `write_threads * 1.5` with `write_threads` defaulted to 1); set
+///    `S3DLIO_RT_THREADS_UNSAFE=1` to bypass the clamp.
+/// 2. [`mpi_aware_thread_budget`] when `mpi_world_size() > 1`
+/// 3. `max(4, num_cpus)` — floor at 4 for tiny single/dual-core VMs
+pub fn effective_thread_budget() -> usize {
+    if let Some(n) = crate::s3_client::clamped_env_rt_threads() {
+        return n;
+    }
+    if mpi_world_size() > 1 {
+        return mpi_aware_thread_budget();
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    std::cmp::max(4, cpus)
+}
+
 /// Default concurrent upload limit for multipart operations
 pub const DEFAULT_CONCURRENT_UPLOADS: usize = 32;
 
@@ -933,6 +1002,214 @@ mod max_retry_tests {
     fn test_max_retry_unparseable_falls_back_to_default() {
         with_var(Some("not-a-number"), || {
             assert_eq!(max_retry_attempts(), DEFAULT_MAX_RETRY_ATTEMPTS);
+        });
+    }
+}
+
+#[cfg(test)]
+mod mpi_thread_budget_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // mpi_world_size() checks 3 env vars; these tests mutate all of them and
+    // must run serially both against each other and against any other test
+    // in this binary that touches the same vars (none currently do).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const VARS: [&str; 3] = ["OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "WORLD_SIZE"];
+
+    fn with_clean_env<F: FnOnce()>(body: F) {
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let prev: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+        for v in VARS {
+            std::env::remove_var(v);
+        }
+        body();
+        for (v, p) in VARS.iter().zip(prev) {
+            match p {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
+    }
+
+    #[test]
+    fn test_mpi_world_size_defaults_to_one_when_unset() {
+        with_clean_env(|| {
+            assert_eq!(mpi_world_size(), 1);
+        });
+    }
+
+    #[test]
+    fn test_mpi_world_size_honors_ompi_var() {
+        with_clean_env(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            assert_eq!(mpi_world_size(), 4);
+        });
+    }
+
+    #[test]
+    fn test_mpi_world_size_honors_pmi_var() {
+        with_clean_env(|| {
+            std::env::set_var("PMI_SIZE", "8");
+            assert_eq!(mpi_world_size(), 8);
+        });
+    }
+
+    #[test]
+    fn test_mpi_world_size_honors_torchrun_var() {
+        with_clean_env(|| {
+            std::env::set_var("WORLD_SIZE", "2");
+            assert_eq!(mpi_world_size(), 2);
+        });
+    }
+
+    #[test]
+    fn test_mpi_world_size_ompi_wins_over_others() {
+        with_clean_env(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            std::env::set_var("PMI_SIZE", "16");
+            std::env::set_var("WORLD_SIZE", "32");
+            assert_eq!(mpi_world_size(), 4);
+        });
+    }
+
+    #[test]
+    fn test_mpi_world_size_zero_clamped_to_one() {
+        // A malformed/zero world size must never divide a thread budget by 0.
+        with_clean_env(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "0");
+            assert_eq!(mpi_world_size(), 1);
+        });
+    }
+
+    #[test]
+    fn test_mpi_world_size_unparseable_falls_back_to_one() {
+        with_clean_env(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "not-a-number");
+            assert_eq!(mpi_world_size(), 1);
+        });
+    }
+
+    #[test]
+    fn test_mpi_aware_thread_budget_matches_manual_formula() {
+        with_clean_env(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            let cpus = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            assert_eq!(mpi_aware_thread_budget(), (cpus / 4).max(1));
+        });
+    }
+
+    #[test]
+    fn test_mpi_aware_thread_budget_single_process_equals_cpu_count() {
+        with_clean_env(|| {
+            let cpus = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            assert_eq!(mpi_aware_thread_budget(), cpus);
+        });
+    }
+
+    #[test]
+    fn test_mpi_aware_thread_budget_never_zero_even_with_huge_world_size() {
+        with_clean_env(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "999999");
+            assert_eq!(mpi_aware_thread_budget(), 1);
+        });
+    }
+}
+
+#[cfg(test)]
+mod effective_thread_budget_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const VARS: [&str; 5] = [
+        "S3DLIO_RT_THREADS",
+        "S3DLIO_RT_THREADS_UNSAFE",
+        "OMPI_COMM_WORLD_SIZE",
+        "PMI_SIZE",
+        "WORLD_SIZE",
+    ];
+
+    fn with_clean_env<F: FnOnce()>(body: F) {
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let prev: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+        for v in VARS {
+            std::env::remove_var(v);
+        }
+        // effective_thread_budget delegates to clamped_env_rt_threads, which
+        // reads RT_THREADS_LIMIT.  Reset it so a prior test in the same
+        // binary doesn't leak a nonzero limit into these assertions.
+        let prev_limit = crate::s3_client::RT_THREADS_LIMIT.swap(0, Ordering::Relaxed);
+
+        body();
+
+        for (v, p) in VARS.iter().zip(prev) {
+            match p {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
+        crate::s3_client::RT_THREADS_LIMIT.store(prev_limit, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_effective_budget_single_process_matches_max_4_cores_floor() {
+        with_clean_env(|| {
+            let cpus = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            assert_eq!(effective_thread_budget(), std::cmp::max(4, cpus));
+        });
+    }
+
+    #[test]
+    fn test_effective_budget_mpi_aware_when_world_size_set() {
+        with_clean_env(|| {
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            let cpus = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            assert_eq!(effective_thread_budget(), (cpus / 4).max(1));
+        });
+    }
+
+    #[test]
+    fn test_effective_budget_explicit_env_var_wins_over_everything() {
+        with_clean_env(|| {
+            std::env::set_var("S3DLIO_RT_THREADS", "2");
+            std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+            assert_eq!(effective_thread_budget(), 2);
+        });
+    }
+
+    /// RED-then-GREEN regression for the DLIO unet3d datagen bottleneck:
+    /// with `RT_THREADS_LIMIT=28` (auto-set at import) and
+    /// `S3DLIO_RT_THREADS=1` (miscomputed by DLIO's
+    /// `write_threads * 1.5` at write_threads=1),
+    /// `effective_thread_budget()` must clamp the env-var value up to the
+    /// configured target rather than starve every downstream pool it
+    /// sizes (including the checkpoint runtime).
+    #[test]
+    fn test_effective_budget_clamps_grossly_underprovisioned_env_var() {
+        with_clean_env(|| {
+            std::env::set_var("S3DLIO_RT_THREADS", "1");
+            crate::s3_client::RT_THREADS_LIMIT.store(28, Ordering::Relaxed);
+            assert_eq!(effective_thread_budget(), 28);
+        });
+    }
+
+    #[test]
+    fn test_effective_budget_unsafe_bypass_respects_low_env_var() {
+        with_clean_env(|| {
+            std::env::set_var("S3DLIO_RT_THREADS", "1");
+            std::env::set_var("S3DLIO_RT_THREADS_UNSAFE", "1");
+            crate::s3_client::RT_THREADS_LIMIT.store(28, Ordering::Relaxed);
+            assert_eq!(effective_thread_budget(), 1);
         });
     }
 }
