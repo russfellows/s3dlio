@@ -1,12 +1,26 @@
 # 7 test failures found during FFI-boundary hardening live-testing (2026-07-10)
 
-> **Status: confirmed pre-existing, NOT caused by the Tier 1-3 FFI-boundary
-> hardening work** (docs/DESIGN_FFI_BOUNDARY_HARDENING.md). Verified by
-> re-running the identical test files against the pristine pre-session
-> `main` (commit `383f0d7`, before any change in this session) — same 7
-> failures, same error text, same line numbers. **Not yet fixed. Tracked
-> here so they are not lost; come back to this document before the next
-> release.**
+> **Status: RESOLVED.** Both groups were confirmed pre-existing, NOT caused
+> by the Tier 1-3 FFI-boundary hardening work
+> (docs/DESIGN_FFI_BOUNDARY_HARDENING.md) — verified by re-running the
+> identical test files against the pristine pre-session `main` (commit
+> `383f0d7`, before any change in this session), same 7 failures, same
+> error text, same line numbers. Both are now fixed, same session:
+>
+> - **Group A**: `test_checkpoint_basic.py` deleted as a superseded
+>   duplicate (commit `d76fec2`) — `test_checkpoint_basic_python.py`
+>   already covers the same scenarios against the real, current API.
+> - **Group B**: the test fixture was fixed to model true endpoint
+>   replication (matching `multi_endpoint.rs`'s own Rust test suite), and
+>   the underlying design gap it exposed was investigated, filed as
+>   [GitHub issue #162](https://github.com/russfellows/s3dlio/issues/162),
+>   and fixed — `MultiEndpointStore` gained explicit per-endpoint pinning
+>   (`get_from_endpoint`/`put_to_endpoint`/`delete_from_endpoint`) and
+>   fan-out replication (`put_all_endpoints`), plus crate-level docs making
+>   the replication-only assumption of round-robin/least-connections
+>   explicit. See commit `f1c4518`.
+>
+> Kept below as the original incident record.
 
 ## How these were found
 
@@ -153,11 +167,11 @@ Reading 1 and Reading 2 above before touching any code.
 
 ## Disposition
 
-Both groups are tracked here per explicit instruction: **do not fix now,
-do not forget, come back to them**. Neither blocks the Tier 1-3
-FFI-boundary hardening release — both are demonstrated pre-existing on the
-unmodified `main` baseline. When picked up, Group A is a quick, low-risk
-test-hygiene fix; Group B needs a design decision first (see Reading 1 vs
-Reading 2) before any code changes, and should probably get its own
-GitHub issue once that decision is made, following this repo's existing
-convention (e.g. issues #151-157 for the prior audit).
+Both groups are now resolved, same session. Group A: `test_checkpoint_basic.py`
+deleted (superseded duplicate). Group B: Reading 1 (test fixture bug) fixed
+directly; Reading 2 (the design gap) investigated against real usage in
+DLIO_local_changes and mlp-storage, filed as
+[GitHub issue #162](https://github.com/russfellows/s3dlio/issues/162)
+following this repo's convention (e.g. issues #151-157 for the prior audit),
+and fixed via explicit per-endpoint pinning + fan-out replication APIs. See
+the status note at the top of this document for commit references.
