@@ -7,7 +7,6 @@ AWS_ENDPOINT_URL is not set or the server is unreachable.
 Run:
   cd ~/Documents/Code/s3dlio && source .venv/bin/activate
   set -a && source .env && set +a
-  AWS_CA_BUNDLE=/home/eval/Documents/Code/mlp-storage/.certs/public.crt \\
   S3DLIO_TEST_BUCKET=perf-s3dlio \\
   python python/tests/test_mpu_throughput.py
 

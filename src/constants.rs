@@ -25,6 +25,27 @@ pub const DEFAULT_S3_MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 /// Default multipart upload part size for Azure (16 MB)
 pub const DEFAULT_AZURE_MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 
+/// Default Azure SDK managed-download partition size (32 MiB).
+pub const DEFAULT_AZURE_DOWNLOAD_PART_SIZE: usize = 32 * 1024 * 1024;
+
+/// Default Azure SDK managed-download concurrency.
+pub const DEFAULT_AZURE_DOWNLOAD_CONCURRENCY: usize = 16;
+
+/// Selects `auto`, `azure-sdk`, `s3dlio`, or `sequential` Azure downloads.
+pub const ENV_AZURE_DOWNLOAD_MODE: &str = "S3DLIO_AZURE_DOWNLOAD_MODE";
+
+/// Selects the concurrent engine used by Azure `auto` mode.
+pub const ENV_AZURE_CONCURRENT_ENGINE: &str = "S3DLIO_AZURE_CONCURRENT_ENGINE";
+
+/// Azure object-size threshold in MiB for switching `auto` mode to concurrency.
+pub const ENV_AZURE_DOWNLOAD_THRESHOLD_MB: &str = "S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB";
+
+/// Azure SDK managed-download request concurrency.
+pub const ENV_AZURE_DOWNLOAD_CONCURRENCY: &str = "S3DLIO_AZURE_DOWNLOAD_CONCURRENCY";
+
+/// Azure SDK managed-download partition size in MiB.
+pub const ENV_AZURE_DOWNLOAD_PART_SIZE_MB: &str = "S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB";
+
 /// Maximum number of parts in a multipart upload
 pub const MAX_MULTIPART_PARTS: usize = 10000;
 

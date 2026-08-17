@@ -3,8 +3,9 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.112"
+version = "0.9.114"
 edition = "2021"
+rust-version = "1.88"
 authors = ["Russ Fellows"]
 license = "Apache-2.0"
 
@@ -12,6 +13,7 @@ license = "Apache-2.0"
 name = "s3dlio"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "s3dlio"
@@ -31,13 +33,10 @@ path = "src/bin/cli.rs"
 aws-config         = "1"
 aws-sdk-s3         = "1"
 
-# Azure SDK crates - kept at exact 0.31 / 0.8 pins. These three reached 1.0
-# in early 2026, but that upgrade is deliberately deferred (Azure API surface
-# has non-trivial breaking changes at 0.x → 1.0; will be tackled as its own
-# task, separately from the AWS-side updates above).
-azure_core = { version = "=0.31.0", optional = true }          # Response/Body, paging, errors
-azure_identity = { version = "=0.31.0", optional = true }      # DefaultAzureCredential
-azure_storage_blob = { version = "=0.8.0", optional = true }   # Blob/Container/BlockBlob clients
+# Azure SDK stable 1.x line. Pre-release versions are intentionally excluded.
+azure_core = { version = "1", optional = true }
+azure_identity = { version = "1", optional = true }
+azure_storage_blob = { version = "1", optional = true }
 
 # Google Cloud Storage SDK
 # 'backend-gcs' enables official gRPC GCS support (google-cloud-rust).

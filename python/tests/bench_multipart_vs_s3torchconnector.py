@@ -15,7 +15,6 @@ to confirm s3dlio is competitive.
 Run against real MinIO (from s3dlio/.env):
   cd ~/Documents/Code/s3dlio && source .venv/bin/activate
   set -a && source .env && set +a
-  AWS_CA_BUNDLE=/home/eval/Documents/Code/mlp-storage/.certs/public.crt \\
   S3DLIO_TEST_BUCKET=perf-s3dlio \\
   python python/tests/bench_multipart_vs_s3torchconnector.py
 """
