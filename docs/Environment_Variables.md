@@ -355,15 +355,25 @@ When a URI's authority contains an explicit `host:port`, s3dlio creates a dedica
 
 ## Azure Blob Storage Configuration
 
-| Variable | Description |
-|----------|-------------|
-| `AZURE_STORAGE_ACCOUNT` | Azure storage account name |
-| `AZURE_STORAGE_KEY` | Azure storage account key |
-| `AZURE_CLIENT_ID` | Azure AD client ID (for service principal auth) |
-| `AZURE_CLIENT_SECRET` | Azure AD client secret |
-| `AZURE_TENANT_ID` | Azure AD tenant ID |
-| `AZURE_STORAGE_ENDPOINT` | **Custom Azure endpoint** (e.g., `http://localhost:10000` for Azurite) |
-| `AZURE_BLOB_ENDPOINT_URL` | Alternative for `AZURE_STORAGE_ENDPOINT` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AZURE_STORAGE_ACCOUNT` | (unset) | Azure storage account name |
+| `AZURE_STORAGE_KEY` | (unset) | Azure storage account key |
+| `AZURE_CLIENT_ID` | (unset) | Azure AD client ID (for service principal auth) |
+| `AZURE_CLIENT_SECRET` | (unset) | Azure AD client secret |
+| `AZURE_TENANT_ID` | (unset) | Azure AD tenant ID |
+| `AZURE_STORAGE_ENDPOINT` | (unset) | **Custom Azure endpoint** (e.g., `http://localhost:10000` for Azurite) |
+| `AZURE_BLOB_ENDPOINT_URL` | (unset) | Alternative for `AZURE_STORAGE_ENDPOINT` |
+| `S3DLIO_AZURE_DOWNLOAD_MODE` | `auto` | Download strategy: `auto`, `azure-sdk`, `s3dlio`, or `sequential` |
+| `S3DLIO_AZURE_CONCURRENT_ENGINE` | `azure-sdk` | Concurrent engine selected by `auto`: `azure-sdk` or `s3dlio` |
+| `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB` | `32` | Object size at which `auto` enables its concurrent engine |
+| `S3DLIO_AZURE_DOWNLOAD_CONCURRENCY` | `16` | Parallel requests used by Azure SDK managed downloads |
+| `S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB` | `32` | Partition size used by Azure SDK managed downloads |
+
+Explicit fields supplied through Rust `AzureConfig` take precedence over these
+environment-derived defaults. The legacy `AzureConfig.enable_range_engine=true`
+setting remains supported and forces the s3dlio RangeEngine above its configured
+threshold.
 
 ### Azure Custom Endpoint Examples
 
@@ -555,6 +565,7 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 
 ## Version History
 
+- **v0.9.114** *(Azure SDK stable 1.x migration)*: Updated Azure Blob Storage and identity clients to the stable 1.x SDK line. Added `S3DLIO_AZURE_DOWNLOAD_MODE`, `S3DLIO_AZURE_CONCURRENT_ENGINE`, `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB`, `S3DLIO_AZURE_DOWNLOAD_CONCURRENCY`, and `S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB` for selecting and tuning Azure SDK managed downloads, s3dlio RangeEngine downloads, or sequential transfers. Raised the Rust MSRV to 1.88. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.112** *(new: `S3DLIO_RT_THREADS_UNSAFE`; behavior change: `S3DLIO_RT_THREADS` sanity clamp)*: Added a sanity clamp to `S3DLIO_RT_THREADS` — values below `RT_THREADS_LIMIT/4` are treated as downstream miscomputation and clamped up to `RT_THREADS_LIMIT`, with a stderr warning the first time it fires.  Rationale: the DLIO unet3d datagen bottleneck (2026-07-10, `docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md`) was caused by DLIO's `ObjStoreLibStorage.__init__` computing `S3DLIO_RT_THREADS = write_threads * 1.5` with Hydra's default `write_threads=1`, giving `S3DLIO_RT_THREADS=1` and building a 1-worker Tokio runtime that serialized every concurrent multipart upload part (10× throughput loss, live-measured 214 MB/s vs 1928 MB/s after fix on a 28-core host with s3-ultra).  `S3DLIO_RT_THREADS_UNSAFE=1` bypasses the clamp for legitimate low-thread scenarios (single-threaded test suites, fault-injection).  The clamp is inactive when `configure_thread_pools` was never called (`RT_THREADS_LIMIT=0`), preserving pure-Rust programmatic use.  Also in v0.9.112: FFI-boundary
   hardening (mlcommons/storage#755, s3dlio#161, s3dlio#162). Error conversion at
   the PyO3 boundary now preserves the full `anyhow` cause chain instead of just

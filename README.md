@@ -2,13 +2,15 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-762-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.112-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Version](https://img.shields.io/badge/version-0.9.114-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
+
+Full-backend builds support the stable Azure Blob Storage Rust SDK 1.0 API.
 
 > **v0.9.112 — Tokio-runtime sanity clamp + MPI-aware thread pools + FFI-boundary hardening**
 >
@@ -657,7 +659,7 @@ See [S3DLIO OpLog Implementation](docs/S3DLIO_OPLOG_IMPLEMENTATION_SUMMARY.md) f
 ## Building from Source
 
 ### Prerequisites
-- **Rust**: [Install Rust toolchain](https://www.rust-lang.org/tools/install)
+- **Rust 1.88+**: [Install Rust toolchain](https://www.rust-lang.org/tools/install)
 - **Python 3.12+**: For Python library development
 - **UV** (recommended): [Install UV](https://docs.astral.sh/uv/getting-started/installation/)
 - **OpenSSL**: Required (`libssl-dev` on Ubuntu)

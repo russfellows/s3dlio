@@ -6,6 +6,7 @@
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
@@ -14,18 +15,17 @@ use tokio_util::sync::CancellationToken;
 use crate::data_loader::parallel_fetch::DropCancel;
 
 use azure_core::credentials::TokenCredential;
-use azure_core::http::{Body, NoFormat, RequestContent, XmlFormat};
+use azure_core::http::{NoFormat, RequestContent, Url, XmlFormat};
 use azure_identity::DeveloperToolsCredential;
 
 use azure_storage_blob::clients::{
-    BlobClient, BlobClientOptions, BlobContainerClient, BlobContainerClientOptions,
-    BlobServiceClient, BlobServiceClientOptions, BlockBlobClient,
+    BlobClient, BlobContainerClient, BlobServiceClient, BlobServiceClientOptions, BlockBlobClient,
 };
 use azure_storage_blob::models::{
     BlobClientDownloadOptions, BlobClientGetPropertiesOptions,
-    BlobClientGetPropertiesResultHeaders, BlobContainerClientListBlobFlatSegmentOptions,
-    BlockBlobClientCommitBlockListOptions, BlockBlobClientStageBlockOptions,
-    BlockBlobClientUploadOptions, BlockList, BlockListType, BlockLookupList,
+    BlobClientGetPropertiesResultHeaders, BlobClientUploadOptions,
+    BlobContainerClientListBlobsOptions, BlockBlobClientCommitBlockListOptions,
+    BlockBlobClientStageBlockOptions, BlockList, BlockListType, BlockLookupList, HttpRange,
 };
 use tracing::{debug, warn};
 
@@ -41,6 +41,10 @@ static AZURE_CREDENTIAL: OnceCell<Arc<dyn TokenCredential>> = OnceCell::const_ne
 /// fail server-side, with all staged blocks wasted.
 const AZURE_MAX_BLOCK_COUNT: usize = 50_000;
 
+fn request_content_from_bytes(body: Bytes) -> RequestContent<Bytes, NoFormat> {
+    body.into()
+}
+
 /// Minimal properties surfaced by `stat`.
 #[derive(Debug, Clone)]
 pub struct AzureBlobProperties {
@@ -51,9 +55,8 @@ pub struct AzureBlobProperties {
 
 /// High-level client bound to one container.
 pub struct AzureBlob {
-    account_url: String, // e.g. https://{account}.blob.core.windows.net
+    service_client: Arc<BlobServiceClient>,
     pub container: String,
-    credential: Arc<dyn TokenCredential>,
 }
 
 impl AzureBlob {
@@ -92,81 +95,54 @@ impl AzureBlob {
             return Self::with_default_credential_from_url(&account_url, container);
         }
 
-        // Default: public Azure endpoint
-        let account_url = Self::account_url_from_account(account);
-
-        // Get or initialize the global credential (only authenticates once per process)
-        let credential = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                AZURE_CREDENTIAL
-                    .get_or_try_init(|| async {
-                        let credential_arc = DeveloperToolsCredential::new(None)?;
-                        let credential: Arc<dyn TokenCredential> = credential_arc;
-                        Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
-                    })
-                    .await
-            })
-        })?;
-
-        Ok(Self {
-            account_url,
-            container: container.to_string(),
-            credential: Arc::clone(credential),
-        })
+        Self::with_default_credential_from_url(&Self::account_url_from_account(account), container)
     }
 
     /// Same, when a full endpoint URL (possibly emulator) is provided.
     pub fn with_default_credential_from_url(account_url: &str, container: &str) -> Result<Self> {
-        // Get or initialize the global credential (only authenticates once per process)
-        let credential = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                AZURE_CREDENTIAL
-                    .get_or_try_init(|| async {
-                        let credential_arc = DeveloperToolsCredential::new(None)?;
-                        let credential: Arc<dyn TokenCredential> = credential_arc;
-                        Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
-                    })
-                    .await
-            })
-        })?;
+        let service_url = Url::parse(account_url)
+            .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?;
+        let credential = if service_url.scheme() == "https" {
+            Some(tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    AZURE_CREDENTIAL
+                        .get_or_try_init(|| async {
+                            let credential_arc = DeveloperToolsCredential::new(None)?;
+                            let credential: Arc<dyn TokenCredential> = credential_arc;
+                            Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
+                        })
+                        .await
+                        .map(Arc::clone)
+                })
+            })?)
+        } else {
+            None
+        };
+        let service_client = BlobServiceClient::new(
+            service_url,
+            credential,
+            Some(BlobServiceClientOptions::default()),
+        )
+        .map_err(|e| anyhow!(e))?;
 
         Ok(Self {
-            account_url: account_url.to_string(),
+            service_client: Arc::new(service_client),
             container: container.to_string(),
-            credential: Arc::clone(credential),
         })
     }
 
     /// Blob service (rarely needed directly).
     #[allow(dead_code)]
-    fn service_client(&self) -> Result<BlobServiceClient> {
-        BlobServiceClient::new(
-            &self.account_url,
-            Some(self.credential.clone()),
-            Some(BlobServiceClientOptions::default()),
-        )
-        .map_err(|e| anyhow!(e))
+    fn service_client(&self) -> Result<Arc<BlobServiceClient>> {
+        Ok(Arc::clone(&self.service_client))
     }
 
     fn container_client(&self) -> Result<BlobContainerClient> {
-        BlobContainerClient::new(
-            &self.account_url,
-            &self.container,
-            Some(self.credential.clone()),
-            Some(BlobContainerClientOptions::default()),
-        )
-        .map_err(|e| anyhow!(e))
+        Ok(self.service_client.blob_container_client(&self.container))
     }
 
     fn blob_client(&self, blob: &str) -> Result<BlobClient> {
-        BlobClient::new(
-            &self.account_url,
-            &self.container,
-            blob,
-            Some(self.credential.clone()),
-            Some(BlobClientOptions::default()),
-        )
-        .map_err(|e| anyhow!(e))
+        Ok(self.service_client.blob_client(&self.container, blob))
     }
 
     fn block_blob_client(&self, blob: &str) -> Result<BlockBlobClient> {
@@ -187,17 +163,9 @@ impl AzureBlob {
             overwrite
         );
         let blob = self.blob_client(key)?;
-        // Convert Bytes -> Body -> RequestContent<Bytes, NoFormat>
-        let content_len = body.len() as u64;
-        let data: RequestContent<Bytes, NoFormat> = Body::from(body).into();
-        let _resp = blob
-            .upload(
-                data,
-                overwrite,
-                content_len,
-                Some(BlockBlobClientUploadOptions::default()),
-            )
-            .await?;
+        let data = request_content_from_bytes(body);
+        let options = (!overwrite).then(|| BlobClientUploadOptions::default().if_not_exists());
+        let _resp = blob.upload(data, options).await?;
         Ok(())
     }
 
@@ -208,14 +176,18 @@ impl AzureBlob {
             self.container, key, start, end
         );
         let blob = self.blob_client(key)?;
-        let mut opts = BlobClientDownloadOptions::default();
         let range = match end {
-            Some(e) => format!("bytes={}-{}", start, e),
-            None => format!("bytes={}-", start),
+            Some(e) if e >= start => HttpRange::new(start, e - start + 1),
+            Some(e) => bail!("invalid Azure byte range: end {e} precedes start {start}"),
+            None => HttpRange::from_offset(start),
         };
-        opts.range = Some(range);
+        let opts = BlobClientDownloadOptions {
+            range: Some(range),
+            parallel: NonZeroUsize::new(1),
+            ..Default::default()
+        };
         let resp = blob.download(Some(opts)).await?;
-        let body = resp.into_body().collect().await?;
+        let body = resp.body.collect().await?;
         debug!(
             "AzureBlob::get_range success: key='{}', {} bytes",
             key,
@@ -226,15 +198,33 @@ impl AzureBlob {
 
     /// Full GET (single buffer).
     pub async fn get(&self, key: &str) -> Result<Bytes> {
+        self.get_with_sdk_concurrency(key, None, None).await
+    }
+
+    pub async fn get_sequential(&self, key: &str, object_size: u64) -> Result<Bytes> {
+        let partition_size = usize::try_from(object_size).unwrap_or(usize::MAX).max(1);
+        self.get_with_sdk_concurrency(key, Some(1), Some(partition_size))
+            .await
+    }
+
+    pub async fn get_with_sdk_concurrency(
+        &self,
+        key: &str,
+        concurrency: Option<usize>,
+        partition_size: Option<usize>,
+    ) -> Result<Bytes> {
         debug!(
             "AzureBlob::get container='{}', key='{}'",
             self.container, key
         );
         let blob = self.blob_client(key)?;
-        let resp = blob
-            .download(Some(BlobClientDownloadOptions::default()))
-            .await?;
-        let body = resp.into_body().collect().await?;
+        let options = BlobClientDownloadOptions {
+            parallel: concurrency.and_then(NonZeroUsize::new),
+            partition_size: partition_size.and_then(NonZeroUsize::new),
+            ..Default::default()
+        };
+        let resp = blob.download(Some(options)).await?;
+        let body = resp.body.collect().await?;
         debug!(
             "AzureBlob::get success: key='{}', {} bytes",
             key,
@@ -275,7 +265,7 @@ impl AzureBlob {
             self.container, prefix
         );
         let container = self.container_client()?;
-        let mut opts = BlobContainerClientListBlobFlatSegmentOptions::default();
+        let mut opts = BlobContainerClientListBlobsOptions::default();
         if let Some(p) = prefix {
             if !p.is_empty() {
                 opts.prefix = Some(p.to_string());
@@ -287,8 +277,7 @@ impl AzureBlob {
         // In 0.7.0, pager yields Result<BlobItemInternal> directly
         while let Some(item_result) = pager.next().await {
             let item = item_result?;
-            // `name` is Option<BlobName>, and BlobName.content is Option<String>
-            if let Some(name) = item.name.and_then(|bn| bn.content) {
+            if let Some(name) = item.name {
                 out.push(name);
             }
         }
@@ -311,7 +300,7 @@ impl AzureBlob {
                 }
             };
 
-            let mut opts = BlobContainerClientListBlobFlatSegmentOptions::default();
+            let mut opts = BlobContainerClientListBlobsOptions::default();
             if let Some(p) = prefix {
                 if !p.is_empty() { opts.prefix = Some(p.to_string()); }
             }
@@ -334,7 +323,7 @@ impl AzureBlob {
                     }
                 };
 
-                if let Some(name) = item.name.and_then(|bn| bn.content) {
+                if let Some(name) = item.name {
                     yield Ok(name);
                 }
             }
@@ -371,7 +360,7 @@ impl AzureBlob {
         );
         let bb = self.block_blob_client(key)?;
         let content_len = chunk.len() as u64;
-        let body: RequestContent<Bytes, NoFormat> = Body::from(chunk).into();
+        let body = request_content_from_bytes(chunk);
         let _resp = bb
             .stage_block(
                 block_id,
@@ -545,9 +534,8 @@ impl AzureBlob {
 
     fn clone_for_upload(&self) -> Self {
         Self {
-            account_url: self.account_url.clone(),
+            service_client: Arc::clone(&self.service_client),
             container: self.container.clone(),
-            credential: self.credential.clone(),
         }
     }
 }
@@ -634,18 +622,19 @@ impl AzureBlob {
     // Container helpers (optional)
     // ----------------------------------------------------------------------
 
-    /// Container creation not supported in newer Azure SDK versions.
-    /// Use Azure CLI, portal, or SDK v0.7 for container management.
     #[allow(dead_code)]
     pub async fn create_container_if_missing(&self) -> Result<()> {
-        bail!("Container creation not supported in Azure SDK v0.8+. Use Azure CLI: az storage container create")
+        let container = self.container_client()?;
+        if !container.exists().await? {
+            container.create(None).await?;
+        }
+        Ok(())
     }
 
-    /// Container deletion not supported in newer Azure SDK versions.
-    /// Use Azure CLI, portal, or SDK v0.7 for container management.
     #[allow(dead_code)]
     pub async fn delete_container(&self) -> Result<()> {
-        bail!("Container deletion not supported in Azure SDK v0.8+. Use Azure CLI: az storage container delete")
+        self.container_client()?.delete(None).await?;
+        Ok(())
     }
 }
 
@@ -697,7 +686,8 @@ pub async fn list_account_containers(account: &str) -> Result<Vec<(String, Optio
         .await?;
 
     let service_client = BlobServiceClient::new(
-        &account_url,
+        Url::parse(&account_url)
+            .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?,
         Some(Arc::clone(credential)),
         Some(BlobServiceClientOptions::default()),
     )
@@ -706,23 +696,16 @@ pub async fn list_account_containers(account: &str) -> Result<Vec<(String, Optio
     let mut containers: Vec<(String, Option<String>)> = Vec::new();
     let mut pager = service_client
         .list_containers(None)
-        .map_err(|e| anyhow!("Azure list_containers failed: {}", e))?
-        .into_pages();
+        .map_err(|e| anyhow!("Azure list_containers failed: {}", e))?;
 
-    while let Some(page) = pager.next().await {
-        let current_page = page
-            .map_err(|e| anyhow!("Azure list_containers page error: {}", e))?
-            .into_model()
-            .map_err(|e| anyhow!("Azure container model deserialisation: {}", e))?;
-
-        for item in current_page.container_items {
-            let name = item.name.unwrap_or_default();
-            let date = item
-                .properties
-                .and_then(|p| p.last_modified)
-                .map(|t| t.to_string());
-            containers.push((name, date));
-        }
+    while let Some(item) = pager.next().await {
+        let item = item.map_err(|e| anyhow!("Azure list_containers item error: {e}"))?;
+        let name = item.name.unwrap_or_default();
+        let date = item
+            .properties
+            .and_then(|p| p.last_modified)
+            .map(|t| t.to_string());
+        containers.push((name, date));
     }
 
     Ok(containers)
@@ -739,6 +722,26 @@ mod tests {
 
     // Mutex to serialize tests that modify environment variables
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn request_content_from_bytes_preserves_sliced_allocation() {
+        let source = Bytes::from(vec![7_u8; 4096]);
+        let slice = source.slice(128..3968);
+        let expected_ptr = slice.as_ptr();
+        let expected_len = slice.len();
+
+        let content = request_content_from_bytes(slice);
+        let azure_core::http::Body::Bytes(actual) = content.body() else {
+            panic!("Bytes conversion must produce an in-memory Azure request body");
+        };
+
+        assert_eq!(
+            actual.as_ptr(),
+            expected_ptr,
+            "upload conversion copied data"
+        );
+        assert_eq!(actual.len(), expected_len);
+    }
 
     // RED-then-GREEN regression tests for s3dlio issue #151 bug 1.5 (D4).
     //

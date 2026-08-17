@@ -396,12 +396,20 @@ mod tests {
     }
 
     #[test]
-    fn test_list_containers_s3_scheme_not_unsupported() {
-        let result = list_containers("s3://");
-        if let Err(e) = result {
+    #[cfg(feature = "backend-azure")]
+    #[ignore = "requires AZURE_BLOB_ACCOUNT, live Azure credentials, and network access"]
+    fn test_list_containers_azure_live() {
+        let account = std::env::var("AZURE_BLOB_ACCOUNT")
+            .expect("AZURE_BLOB_ACCOUNT must be set for the ignored live Azure test");
+        let containers = list_containers(&format!("az://{account}"))
+            .expect("live Azure container listing should succeed");
+        let expected_prefix = format!("az://{account}/");
+        for container in containers {
             assert!(
-                !e.to_string().contains("Unsupported URI scheme"),
-                "s3:// must not hit unsupported-scheme error"
+                container.uri.starts_with(&expected_prefix),
+                "Azure container URI '{}' must use account prefix '{}'",
+                container.uri,
+                expected_prefix
             );
         }
     }
@@ -447,14 +455,13 @@ mod tests {
 
     #[test]
     fn test_list_containers_file_scheme() {
-        // file:// with a real path should successfully list or fail with a path error, not scheme error.
-        let result = list_containers("file:///tmp");
-        if let Err(e) = result {
-            assert!(
-                !e.to_string().contains("Unsupported URI scheme"),
-                "file:// must not hit unsupported-scheme error"
-            );
-        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("container")).unwrap();
+        let uri = format!("file://{}", tmp.path().display());
+
+        let containers = list_containers(&uri).expect("file:// URI should list directories");
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].name, "container");
     }
 
     // ------------------------------------------------------------------

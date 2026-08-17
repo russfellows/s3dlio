@@ -1,5 +1,26 @@
 # s3dlio Changelog
 
+## Version 0.9.114 — Azure SDK stable 1.x migration
+
+- Updated `azure_storage_blob` and `azure_identity` from pre-release APIs to
+  stable 1.0, with `azure_core` on the compatible stable 1.x line.
+- Added configurable Azure download strategies: `auto`, `azure-sdk`, `s3dlio`,
+  and `sequential`. `auto` uses sequential transfer below the configured
+  threshold and selects either Azure SDK managed partitioning or s3dlio's
+  RangeEngine above it.
+- Added Azure SDK partition concurrency and size controls. Explicit Rust
+  `AzureConfig` values override environment-derived defaults.
+- Reused one `BlobServiceClient` pipeline per `AzureBlob` instead of rebuilding
+  a client pipeline for each operation and staged block.
+- Preserved zero-copy upload bodies by using Azure Core's `From<Bytes>` request
+  conversion. A pointer-identity regression test covers sliced `Bytes` values.
+- Restored container create/delete support exposed by the stable SDK.
+- Custom Azure-compatible endpoints remain supported structurally. Additional
+  generic-target authentication and live endpoint validation are tracked as a
+  follow-up after real Azure Blob validation; this migration does not remove
+  the custom endpoint settings.
+- Raised the Rust MSRV to 1.88, required by Azure Storage Blob 1.0.
+
 ## Version 0.9.112 — Tokio-runtime sanity clamp + MPI-aware thread pools + FFI-boundary hardening
 
 This release bundles three independent hardening changes: (1) a sanity

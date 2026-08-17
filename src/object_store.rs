@@ -56,6 +56,12 @@ use crate::file_store_direct::ConfigurableFileSystemObjectStore;
 // --- Azure ---------------------------------------------------
 #[cfg(feature = "backend-azure")]
 use crate::azure_client::{AzureBlob, AzureBlobProperties};
+#[cfg(feature = "backend-azure")]
+use crate::constants::{
+    DEFAULT_AZURE_DOWNLOAD_CONCURRENCY, DEFAULT_AZURE_DOWNLOAD_PART_SIZE,
+    ENV_AZURE_CONCURRENT_ENGINE, ENV_AZURE_DOWNLOAD_CONCURRENCY, ENV_AZURE_DOWNLOAD_MODE,
+    ENV_AZURE_DOWNLOAD_PART_SIZE_MB, ENV_AZURE_DOWNLOAD_THRESHOLD_MB,
+};
 use crate::constants::{
     DEFAULT_RANGE_ENGINE_CHUNK_SIZE, DEFAULT_RANGE_ENGINE_MAX_CONCURRENT,
     DEFAULT_RANGE_ENGINE_THRESHOLD, DEFAULT_RANGE_TIMEOUT_SECS,
@@ -1985,17 +1991,94 @@ fn az_props_to_meta(p: &AzureBlobProperties) -> ObjectMetadata {
     }
 }
 
-/// Configuration for Azure Blob Storage backend with RangeEngine support
+/// Configuration for Azure Blob Storage download behavior.
 ///
-/// Azure benefits significantly from concurrent range downloads due to network latency.
-/// RangeEngine is **disabled by default** — enable explicitly for large-file workloads
-/// where the benefit outweighs the HEAD request cost. Unlike S3, there is no
-/// env-var default for Azure; this config field must be set explicitly.
+/// The default `auto` mode uses sequential transfer below the configured size
+/// threshold and Azure SDK managed concurrency above it. Callers can instead
+/// select s3dlio's RangeEngine or fully sequential downloads through explicit
+/// configuration or the documented Azure environment variables.
+#[cfg(feature = "backend-azure")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AzureDownloadMode {
+    Auto,
+    AzureSdk,
+    S3dlio,
+    Sequential,
+}
+
+#[cfg(feature = "backend-azure")]
+impl std::str::FromStr for AzureDownloadMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "auto" => Ok(Self::Auto),
+            "azure-sdk" | "sdk" | "azure" => Ok(Self::AzureSdk),
+            "s3dlio" | "range-engine" => Ok(Self::S3dlio),
+            "sequential" | "single" => Ok(Self::Sequential),
+            _ => Err(format!(
+                "invalid Azure download mode '{value}'; expected auto, azure-sdk, s3dlio, or sequential"
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "backend-azure")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AzureConcurrentEngine {
+    AzureSdk,
+    S3dlio,
+}
+
+#[cfg(feature = "backend-azure")]
+impl std::str::FromStr for AzureConcurrentEngine {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "azure-sdk" | "sdk" | "azure" => Ok(Self::AzureSdk),
+            "s3dlio" | "range-engine" => Ok(Self::S3dlio),
+            _ => Err(format!(
+                "invalid Azure concurrent engine '{value}'; expected azure-sdk or s3dlio"
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "backend-azure")]
+fn azure_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "backend-azure")]
+fn azure_env_mib(name: &str, default_bytes: usize) -> usize {
+    azure_env_usize(name, default_bytes / (1024 * 1024))
+        .checked_mul(1024 * 1024)
+        .unwrap_or(default_bytes)
+}
+
 #[cfg(feature = "backend-azure")]
 #[derive(Debug, Clone)]
 pub struct AzureConfig {
+    /// Download strategy. Explicit config values override environment-derived defaults.
+    pub download_mode: AzureDownloadMode,
+
+    /// Concurrent engine selected by [`AzureDownloadMode::Auto`].
+    pub auto_concurrent_engine: AzureConcurrentEngine,
+
+    /// Azure SDK managed-download concurrency.
+    pub sdk_download_concurrency: usize,
+
+    /// Azure SDK managed-download partition size in bytes.
+    pub sdk_download_part_size: usize,
+
     /// Enable RangeEngine for concurrent range downloads
-    /// Default: false — must be set explicitly for large-file workloads
+    /// Legacy compatibility switch. When true, it selects s3dlio RangeEngine
+    /// above `range_engine.min_split_size` regardless of `download_mode`.
     pub enable_range_engine: bool,
 
     /// RangeEngine configuration
@@ -2013,12 +2096,35 @@ pub struct AzureConfig {
 #[cfg(feature = "backend-azure")]
 impl Default for AzureConfig {
     fn default() -> Self {
+        let download_mode = std::env::var(ENV_AZURE_DOWNLOAD_MODE)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(AzureDownloadMode::Auto);
+        let auto_concurrent_engine = std::env::var(ENV_AZURE_CONCURRENT_ENGINE)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(AzureConcurrentEngine::AzureSdk);
+        let range_threshold = azure_env_mib(
+            ENV_AZURE_DOWNLOAD_THRESHOLD_MB,
+            DEFAULT_RANGE_ENGINE_THRESHOLD as usize,
+        ) as u64;
+
         Self {
-            enable_range_engine: false, // Disabled by default; must be set explicitly for Azure large-file workloads
+            download_mode,
+            auto_concurrent_engine,
+            sdk_download_concurrency: azure_env_usize(
+                ENV_AZURE_DOWNLOAD_CONCURRENCY,
+                DEFAULT_AZURE_DOWNLOAD_CONCURRENCY,
+            ),
+            sdk_download_part_size: azure_env_mib(
+                ENV_AZURE_DOWNLOAD_PART_SIZE_MB,
+                DEFAULT_AZURE_DOWNLOAD_PART_SIZE,
+            ),
+            enable_range_engine: false,
             range_engine: RangeEngineConfig {
                 chunk_size: DEFAULT_RANGE_ENGINE_CHUNK_SIZE, // 64 MiB chunks
                 max_concurrent_ranges: DEFAULT_RANGE_ENGINE_MAX_CONCURRENT, // 32 parallel
-                min_split_size: DEFAULT_RANGE_ENGINE_THRESHOLD, // 32 MiB threshold (v0.9.60+)
+                min_split_size: range_threshold,
                 range_timeout: Duration::from_secs(DEFAULT_RANGE_TIMEOUT_SECS), // 30s
             },
             size_cache_ttl_secs: 60, // 60 second TTL for size cache
@@ -2078,6 +2184,27 @@ impl AzureObjectStore {
         let metadata = self.stat(uri).await?;
         self.size_cache.put(uri.to_string(), metadata.size).await;
         Ok(metadata.size)
+    }
+
+    fn download_mode_for_size(&self, object_size: u64) -> AzureDownloadMode {
+        if self.config.enable_range_engine {
+            return if object_size >= self.config.range_engine.min_split_size {
+                AzureDownloadMode::S3dlio
+            } else {
+                AzureDownloadMode::Sequential
+            };
+        }
+
+        match self.config.download_mode {
+            AzureDownloadMode::Auto if object_size < self.config.range_engine.min_split_size => {
+                AzureDownloadMode::Sequential
+            }
+            AzureDownloadMode::Auto => match self.config.auto_concurrent_engine {
+                AzureConcurrentEngine::AzureSdk => AzureDownloadMode::AzureSdk,
+                AzureConcurrentEngine::S3dlio => AzureDownloadMode::S3dlio,
+            },
+            mode => mode,
+        }
     }
 
     fn client_for_uri(uri: &str) -> Result<(AzureBlob, String, String, String)> {
@@ -2140,24 +2267,19 @@ impl ObjectStore for AzureObjectStore {
         // Get blob size from cache or stat (v0.9.10: cache optimization)
         let object_size = self.get_object_size(uri).await?;
 
-        // Use RangeEngine for large blobs if enabled
-        if self.config.enable_range_engine && object_size >= self.config.range_engine.min_split_size
-        {
-            debug!(
-                "Azure blob size {} >= threshold {}, using RangeEngine for {}",
-                object_size, self.config.range_engine.min_split_size, uri
-            );
-            return self.get_with_range_engine(uri, object_size).await;
+        match self.download_mode_for_size(object_size) {
+            AzureDownloadMode::S3dlio => self.get_with_range_engine(uri, object_size).await,
+            AzureDownloadMode::AzureSdk => {
+                cli.get_with_sdk_concurrency(
+                    &key,
+                    Some(self.config.sdk_download_concurrency),
+                    Some(self.config.sdk_download_part_size),
+                )
+                .await
+            }
+            AzureDownloadMode::Sequential => cli.get_sequential(&key, object_size).await,
+            AzureDownloadMode::Auto => unreachable!("auto mode must resolve before download"),
         }
-
-        // Simple sequential download for small blobs
-        debug!(
-            "Azure blob size {} < threshold {}, using simple download for {}",
-            object_size, self.config.range_engine.min_split_size, uri
-        );
-
-        let b = cli.get(&key).await?; // Bytes - return directly for zero-copy
-        Ok(b)
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
@@ -3988,6 +4110,77 @@ pub async fn generic_download_objects_with_summary(
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit tests for S3ObjectStore per-endpoint isolation
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "backend-azure"))]
+mod azure_download_mode_tests {
+    use super::*;
+
+    #[test]
+    fn parses_all_azure_download_modes_and_aliases() {
+        assert_eq!("auto".parse(), Ok(AzureDownloadMode::Auto));
+        assert_eq!("azure-sdk".parse(), Ok(AzureDownloadMode::AzureSdk));
+        assert_eq!("sdk".parse(), Ok(AzureDownloadMode::AzureSdk));
+        assert_eq!("s3dlio".parse(), Ok(AzureDownloadMode::S3dlio));
+        assert_eq!("range_engine".parse(), Ok(AzureDownloadMode::S3dlio));
+        assert_eq!("sequential".parse(), Ok(AzureDownloadMode::Sequential));
+        assert!("invalid".parse::<AzureDownloadMode>().is_err());
+    }
+
+    #[test]
+    fn auto_mode_uses_threshold_and_selected_concurrent_engine() {
+        let mut config = AzureConfig::default();
+        config.download_mode = AzureDownloadMode::Auto;
+        config.auto_concurrent_engine = AzureConcurrentEngine::AzureSdk;
+        config.range_engine.min_split_size = 32 * 1024 * 1024;
+        let store = AzureObjectStore::with_config(config.clone());
+
+        assert_eq!(
+            store.download_mode_for_size(1024),
+            AzureDownloadMode::Sequential
+        );
+        assert_eq!(
+            store.download_mode_for_size(32 * 1024 * 1024),
+            AzureDownloadMode::AzureSdk
+        );
+
+        config.auto_concurrent_engine = AzureConcurrentEngine::S3dlio;
+        let store = AzureObjectStore::with_config(config);
+        assert_eq!(
+            store.download_mode_for_size(32 * 1024 * 1024),
+            AzureDownloadMode::S3dlio
+        );
+    }
+
+    #[test]
+    fn explicit_mode_bypasses_auto_threshold() {
+        let config = AzureConfig {
+            download_mode: AzureDownloadMode::AzureSdk,
+            ..AzureConfig::default()
+        };
+        let store = AzureObjectStore::with_config(config);
+        assert_eq!(store.download_mode_for_size(1), AzureDownloadMode::AzureSdk);
+    }
+
+    #[test]
+    fn legacy_range_engine_switch_remains_compatible() {
+        let mut config = AzureConfig {
+            download_mode: AzureDownloadMode::AzureSdk,
+            enable_range_engine: true,
+            ..AzureConfig::default()
+        };
+        config.range_engine.min_split_size = 1024;
+        let store = AzureObjectStore::with_config(config);
+
+        assert_eq!(
+            store.download_mode_for_size(1023),
+            AzureDownloadMode::Sequential
+        );
+        assert_eq!(
+            store.download_mode_for_size(1024),
+            AzureDownloadMode::S3dlio
+        );
+    }
+}
 
 #[cfg(test)]
 mod s3_object_store_tests {
