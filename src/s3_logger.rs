@@ -302,12 +302,22 @@ impl Clone for Logger {
     }
 }
 
+/// True if `s` is a valid RFC 3986 URI scheme: an ASCII letter followed by
+/// ASCII letters, digits, `+`, `-` or `.`.
+fn is_rfc3986_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 /// Resolve a user-supplied op-log destination to a local filesystem path.
 ///
 /// Accepts a plain path (`/tmp/ops.tsv.zst`) or a `file://` URI
 /// (`file:///tmp/ops.tsv.zst`). Any other `scheme://` URI is rejected with
 /// `ErrorKind::InvalidInput` and a message naming the path, rather than being
-/// passed to `File::create` as a bogus relative path (issue #168).
+/// passed to `File::create` as a bogus relative path (issue #168). The text
+/// before the first `://` counts as a scheme only if it is a valid RFC 3986
+/// scheme; a local path that merely contains `://` stays a path.
 fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
     if let Some(local) = path.strip_prefix("file://") {
         if local.is_empty() {
@@ -318,7 +328,13 @@ fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
         }
         return Ok(local);
     }
-    if let Some((scheme, _)) = path.split_once("://") {
+    // Only text that is a syntactically valid RFC 3986 scheme before the first
+    // "://" makes this a URI. A local path such as "<dir>/a://b.log" (which the
+    // OS resolves to "<dir>/a:/b.log") merely contains "://" and stays a path.
+    if let Some((scheme, _)) = path
+        .split_once("://")
+        .filter(|(scheme, _)| is_rfc3986_scheme(scheme))
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -591,6 +607,65 @@ mod oplog_path_tests {
                 msg.contains(uri) && msg.contains("local"),
                 "{uri}: error must name the path and say it must be local; got: {msg}"
             );
+        }
+    }
+
+    // Issue #168 follow-up: only a syntactically valid RFC 3986 scheme makes
+    // the text before the first "://" a URI scheme. Anything else is a local
+    // path -- `<dir>/a://b.log` is the valid POSIX path `<dir>/a:/b.log`.
+
+    #[test]
+    fn path_with_colon_slash_slash_inside_a_directory_name_is_a_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a:")).unwrap();
+        let path = format!("{}/a://b.log", dir.path().display());
+
+        let logger = Logger::new(&path)
+            .unwrap_or_else(|e| panic!("'{path}' is a valid local path but was rejected: {e}"));
+        drop(logger);
+
+        assert!(
+            dir.path().join("a:").join("b.log").exists(),
+            "op-log must be created at <dir>/a:/b.log"
+        );
+    }
+
+    #[test]
+    fn text_before_separator_containing_a_slash_is_not_a_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("x").join("y:")).unwrap();
+        let path = format!("{}/x/y://z.log", dir.path().display());
+
+        let logger = Logger::new(&path)
+            .unwrap_or_else(|e| panic!("'{path}' is a valid local path but was rejected: {e}"));
+        drop(logger);
+
+        assert!(dir.path().join("x").join("y:").join("z.log").exists());
+    }
+
+    #[test]
+    fn only_rfc3986_schemes_are_treated_as_uris() {
+        // Not valid schemes -> plain paths, returned unchanged.
+        for path in [
+            "dir/a://b.log",     // '/' is not a scheme character
+            "my dir://b.log",    // space
+            "1abc://b.log",      // must start with a letter
+            "://b.log",          // empty scheme
+            "-x://b.log",        // must start with a letter
+            "a_b://b.log",       // '_' is not allowed
+            "caf\u{e9}://b.log", // non-ASCII letter
+        ] {
+            assert_eq!(
+                resolve_local_oplog_path(path).unwrap_or_else(|e| panic!("{path}: {e}")),
+                path
+            );
+        }
+        // Valid schemes (including +, -, . and digits after the first char).
+        for uri in ["s3://b/k", "az://c/k", "a://b.log", "x+y-z.1://p"] {
+            let err = resolve_local_oplog_path(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
         }
     }
 }
