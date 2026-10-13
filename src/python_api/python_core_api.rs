@@ -685,12 +685,15 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// A process supports exactly ONE op-log session (init -> finalize, no restart).
 ///
 /// Args:
-///     path: Local filesystem path (e.g. "/tmp/ops.tsv.zst") or file:// URI
-///         (e.g. "file:///tmp/ops.tsv.zst"). The parent directory must exist.
-///         Remote URIs such as s3:// are not supported. Schemes are
-///         case-insensitive; a file:// URI may have only an empty or
-///         "localhost" authority (file://otherhost/x is rejected) and its
-///         path is used as written, without percent-decoding.
+///     path: Local filesystem path (e.g. "/tmp/ops.tsv.zst") or a file://
+///         destination (e.g. "file:///tmp/ops.tsv.zst"). The parent directory
+///         must exist. file:// follows s3dlio's file:// convention (the same
+///         as the file:// object store); it is not full RFC 8089: only the
+///         lowercase prefix "file://" is recognised, it is removed, and the
+///         rest is the path, used literally ("file://localhost/x" is the
+///         relative path "localhost/x"; "%20" is not decoded; "file://" alone
+///         is an error). Any other scheme, including "FILE://", "direct://"
+///         and s3://, is rejected as unsupported.
 ///
 /// Behaviour:
 ///     - First call: creates the file and starts logging. A call that fails

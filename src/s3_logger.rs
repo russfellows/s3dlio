@@ -101,7 +101,8 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
 /// A process supports **exactly one** op-log session:
 /// `Uninitialized` -> `Active` -> `Finalized` (terminal).
 ///
-/// - Uninitialized: resolves `path` (plain local path or `file://` URI), creates
+/// - Uninitialized: resolves `path` (plain local path or `file://` destination,
+///   s3dlio's file-store convention, not full RFC 8089), creates
 ///   the file and becomes Active. A failed init (bad path, unsupported scheme,
 ///   I/O error) leaves the op-log Uninitialized, so a corrected call can succeed.
 /// - Active: a no-op returning `Ok(())`. The new `path` is **not** created or
@@ -486,43 +487,28 @@ fn is_rfc3986_scheme(s: &str) -> bool {
 
 /// Resolve a user-supplied op-log destination to a local filesystem path.
 ///
-/// Accepts a plain path (`/tmp/ops.tsv.zst`) or a `file://` URI
-/// (`file:///tmp/ops.tsv.zst`). Any other `scheme://` URI is rejected with
-/// `ErrorKind::InvalidInput` and a message naming the path, rather than being
-/// passed to `File::create` as a bogus relative path (issue #168). The text
-/// before the first `://` counts as a scheme only if it is a valid RFC 3986
-/// scheme; a local path that merely contains `://` stays a path.
+/// This is **s3dlio's `file://` convention**, the same as the `file://` object
+/// store (`FileSystemObjectStore::uri_to_path` in `file_store.rs`); it is **not**
+/// full RFC 8089:
 ///
-/// - Schemes are case-insensitive (RFC 3986 section 3.1): `FILE:///tmp/x` is
-///   the same as `file:///tmp/x`. A rejected scheme is shown as written.
-/// - `file://` follows RFC 8089, `file://[authority]/path`: an empty authority
-///   or `localhost` (any case) means this machine and is stripped
-///   (`file://localhost/tmp/x` is `/tmp/x`); any other non-empty authority names
-///   another host and is rejected, so `file://otherhost/x` or `file://rel/x`
-///   never silently becomes a relative path.
-/// - The path after the authority is used as written: no percent-decoding,
-///   matching `FileSystemObjectStore::uri_to_path` in `file_store.rs`.
+/// - A destination that starts with the lowercase prefix `file://` has that
+///   prefix removed and the remainder is the path, used **literally**:
+///   `file:///tmp/x` is `/tmp/x`, but `file://localhost/x` is the *relative*
+///   path `localhost/x`, `file://relative/x` is the relative path `relative/x`,
+///   and percent sequences are not decoded (`file:///tmp/a%20b` is
+///   `/tmp/a%20b`). An empty remainder (`file://`) is `InvalidInput`.
+/// - Any other destination whose text before the first `://` is a valid
+///   RFC 3986 scheme (a letter, then letters, digits, `+`, `-` or `.`) is
+///   rejected with `ErrorKind::InvalidInput` and a message naming the
+///   destination: `s3://`, `az://`, `gs://`, `direct://` and also `FILE://` or
+///   `File://` (the file store requires the lowercase prefix, so the op-log does
+///   too). The scheme is shown as written. Without this check such a string
+///   would be passed to `File::create` as a bogus relative path (issue #168).
+/// - Text before `://` that is not a valid scheme leaves the destination a plain
+///   path: `<dir>/a://b.log` is the local path `<dir>/a:/b.log`.
 fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
     const FILE_PREFIX: &str = "file://";
-    if let Some(rest) = path
-        .get(..FILE_PREFIX.len())
-        .filter(|p| p.eq_ignore_ascii_case(FILE_PREFIX))
-        .map(|_| &path[FILE_PREFIX.len()..])
-    {
-        let (authority, local) = match rest.find('/') {
-            Some(i) => rest.split_at(i),
-            None => (rest, ""),
-        };
-        if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "op-log path '{path}' names host '{authority}'; the op-log must be written to \
-                     a local filesystem path, so a file:// URI may have only an empty or \
-                     'localhost' authority, e.g. 'file:///tmp/ops.tsv.zst'"
-                ),
-            ));
-        }
+    if let Some(local) = path.strip_prefix(FILE_PREFIX) {
         if local.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -532,7 +518,7 @@ fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
         return Ok(local);
     }
     // Only text that is a syntactically valid RFC 3986 scheme before the first
-    // "://" makes this a URI. A local path such as "<dir>/a://b.log" (which the
+    // "://" makes this a URI (any case: "FILE://" is not our "file://"). A local path such as "<dir>/a://b.log" (which the
     // OS resolves to "<dir>/a:/b.log") merely contains "://" and stays a path.
     if let Some((scheme, _)) = path
         .split_once("://")
@@ -543,7 +529,7 @@ fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
             format!(
                 "op-log path '{path}' uses unsupported scheme '{scheme}://'; the op-log must be \
                  written to a local filesystem path, e.g. '/tmp/ops.tsv.zst' or \
-                 'file:///tmp/ops.tsv.zst'"
+                 'file:///tmp/ops.tsv.zst' (lowercase 'file://')"
             ),
         ));
     }
@@ -554,7 +540,9 @@ fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
 impl Logger {
     /// Creates a new logger and spawns the background thread to handle writing.
     ///
-    /// `log_file_path` may be a plain local path or a `file://` URI. Queue size,
+    /// `log_file_path` may be a plain local path or a `file://` destination
+    /// (s3dlio's file-store convention, not full RFC 8089: the text after
+    /// `file://` is the path, literally). Queue size,
     /// lossless mode, buffer size and compression level come from the
     /// `S3DLIO_OPLOG_*` environment variables, read once here.
     pub fn new(log_file_path: &str) -> std::io::Result<Self> {
@@ -1005,8 +993,8 @@ mod oplog_path_tests {
         }
     }
 
-    // Pins (these held before the RFC 8089 / case-insensitivity change too):
-    // the text before the FIRST "://" decides, and it must be a valid scheme.
+    // Pins that held before the file:// convention change too: the text before the
+    // FIRST "://" decides, and it must be a valid scheme.
 
     #[test]
     fn non_ascii_first_char_is_a_path_and_first_separator_decides() {
@@ -1025,16 +1013,29 @@ mod oplog_path_tests {
         assert!(err.to_string().contains("s3://bucket/a://b"));
     }
 
-    // RFC 8089: file://[authority]/path. An empty authority or "localhost"
-    // means this machine; any other authority is a different host and is
-    // refused rather than silently turned into a relative path.
+    // s3dlio's file:// convention (the same as the file:// object store, see
+    // FileSystemObjectStore::uri_to_path): a destination that starts with the
+    // lowercase prefix "file://" has that prefix stripped and the remainder is
+    // the path, LITERALLY. This is not full RFC 8089: "file://localhost/x" is the
+    // relative path "localhost/x", not "/x", and nothing is percent-decoded.
 
     #[test]
-    fn file_uri_empty_or_localhost_authority_is_stripped() {
+    fn file_prefix_is_stripped_and_the_remainder_is_used_literally() {
         for (uri, want) in [
             ("file:///tmp/x", "/tmp/x"),
-            ("file://localhost/tmp/x", "/tmp/x"),
-            ("file://LocalHost/tmp/x", "/tmp/x"),
+            ("file://localhost/x", "localhost/x"),
+            ("file://localhost/tmp/x", "localhost/tmp/x"),
+            ("file://LocalHost/tmp/x", "LocalHost/tmp/x"),
+            ("file://relative/x", "relative/x"),
+            ("file://otherhost/tmp/x", "otherhost/tmp/x"),
+            ("file://a", "a"),
+            ("file:////tmp/x", "//tmp/x"),
+            ("file://./x", "./x"),
+            // Percent sequences are NOT decoded.
+            ("file:///tmp/a%20b", "/tmp/a%20b"),
+            ("file://rel%2Fx", "rel%2Fx"),
+            // Only the FIRST "file://" is a prefix.
+            ("file://file:///x", "file:///x"),
         ] {
             assert_eq!(
                 resolve_local_oplog_path(uri).unwrap_or_else(|e| panic!("{uri}: {e}")),
@@ -1042,69 +1043,26 @@ mod oplog_path_tests {
                 "{uri}"
             );
         }
-        // No percent-decoding, matching file_store.rs `uri_to_path`.
-        assert_eq!(
-            resolve_local_oplog_path("file:///tmp/a%20b").unwrap(),
-            "/tmp/a%20b"
-        );
     }
 
     #[test]
-    fn file_uri_localhost_authority_creates_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("ops.tsv.zst");
-        let uri = format!("file://localhost{}", local.display());
-        let logger = Logger::new(&uri).unwrap_or_else(|e| panic!("{uri}: {e}"));
-        drop(logger);
-        assert!(local.exists(), "op-log must be created at {local:?}");
-    }
-
-    #[test]
-    fn file_uri_with_another_host_is_rejected_and_names_the_input() {
-        for uri in [
-            "file://otherhost/tmp/x",
-            "file://relative/path",
-            "file://localhost.example/tmp/x",
-            "file://otherhost",
-        ] {
-            let err = resolve_local_oplog_path(uri)
-                .err()
-                .unwrap_or_else(|| panic!("{uri} must be rejected"));
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
-            assert!(err.to_string().contains(uri), "{uri}: {err}");
-        }
-        // Nothing may be created for a rejected host.
-        let err = Logger::new("file://otherhost/tmp/x").expect_err("must be rejected");
+    fn empty_remainder_after_file_prefix_is_rejected_and_names_the_input() {
+        let err = resolve_local_oplog_path("file://").expect_err("file:// alone must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(msg.contains("file://") && msg.contains("empty"), "{msg}");
+        let err = Logger::new("file://").expect_err("file:// alone must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
-    fn file_uri_without_a_path_is_rejected() {
-        for uri in ["file://", "file://localhost", "FILE://"] {
-            let err = resolve_local_oplog_path(uri)
-                .err()
-                .unwrap_or_else(|| panic!("{uri} must be rejected"));
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
-            assert!(err.to_string().contains(uri), "{uri}: {err}");
-        }
-    }
-
-    #[test]
-    fn schemes_are_case_insensitive() {
-        // "FILE://" is the file scheme (RFC 3986 section 3.1).
-        for (uri, want) in [
-            ("FILE:///tmp/x", "/tmp/x"),
-            ("File:///tmp/x", "/tmp/x"),
-            ("FILE://localhost/tmp/x", "/tmp/x"),
-        ] {
-            assert_eq!(
-                resolve_local_oplog_path(uri).unwrap_or_else(|e| panic!("{uri}: {e}")),
-                want,
-                "{uri}"
-            );
-        }
-        // Other schemes stay rejected, and the message shows the scheme as written.
+    fn only_the_lowercase_file_prefix_is_the_file_scheme() {
+        // The file store requires lowercase "file://", so the op-log does too:
+        // any other spelling is an unsupported scheme, shown as written.
         for (uri, shown) in [
+            ("FILE:///tmp/x", "'FILE://'"),
+            ("File:///tmp/x", "'File://'"),
+            ("FILE://localhost/tmp/x", "'FILE://'"),
             ("S3://bucket/k", "'S3://'"),
             ("Az://c/k", "'Az://'"),
             ("DIRECT:///tmp/x", "'DIRECT://'"),
@@ -1116,6 +1074,67 @@ mod oplog_path_tests {
             assert!(err.to_string().contains(uri), "{uri}: {err}");
             assert!(err.to_string().contains(shown), "{uri}: {err}");
         }
+    }
+
+    #[test]
+    fn direct_and_s3_schemes_are_rejected_as_unsupported() {
+        for (uri, shown) in [
+            ("direct:///tmp/x", "'direct://'"),
+            ("direct://relative/x", "'direct://'"),
+            ("s3://bucket/ops.tsv.zst", "'s3://'"),
+        ] {
+            let err = resolve_local_oplog_path(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(uri) && msg.contains("unsupported scheme"),
+                "{msg}"
+            );
+            assert!(msg.contains(shown), "{msg}");
+        }
+    }
+
+    // The op-log resolver and the file:// object store must agree on the path
+    // for every file:// input, because users pass the same string to both. The
+    // store's conversion is called directly (it is pub(crate) for this test).
+    #[test]
+    fn file_uri_resolves_to_the_same_path_as_the_file_store() {
+        use crate::file_store::FileSystemObjectStore;
+        use std::path::PathBuf;
+        for uri in [
+            "file:///tmp/x",
+            "file:///tmp/a%20b",
+            "file://localhost/x",
+            "file://localhost/tmp/x",
+            "file://LocalHost/tmp/x",
+            "file://relative/x",
+            "file://otherhost/tmp/x",
+            "file://a",
+            "file:////tmp/x",
+            "file://./x",
+            "file://rel%2Fx",
+            "file://file:///x",
+        ] {
+            let store = FileSystemObjectStore::uri_to_path(uri)
+                .unwrap_or_else(|e| panic!("file store rejected {uri}: {e}"));
+            let oplog = resolve_local_oplog_path(uri).unwrap_or_else(|e| panic!("{uri}: {e}"));
+            assert_eq!(PathBuf::from(oplog), store, "{uri}");
+        }
+        // Where the store refuses a destination (it requires the lowercase
+        // "file://" prefix), the op-log refuses it too.
+        for uri in ["FILE:///tmp/x", "direct:///tmp/x", "s3://bucket/k"] {
+            assert!(FileSystemObjectStore::uri_to_path(uri).is_err(), "{uri}");
+            assert!(resolve_local_oplog_path(uri).is_err(), "{uri}");
+        }
+        // The one deliberate difference: the store turns "file://" into the
+        // empty path, the op-log rejects it (it cannot create a file named "").
+        assert_eq!(
+            FileSystemObjectStore::uri_to_path("file://").unwrap(),
+            PathBuf::new()
+        );
+        assert!(resolve_local_oplog_path("file://").is_err());
     }
 }
 
@@ -1546,26 +1565,24 @@ mod oplog_golden_format_tests {
         zstd::decode_all(std::fs::read(local).unwrap().as_slice()).unwrap()
     }
 
-    // A plain path and the equivalent file:// URI (empty or "localhost"
-    // authority) must produce byte-identical header + rows for identical
-    // fixed-timestamp entries.
+    // A plain path and the equivalent file:// URIs must produce byte-identical
+    // header + rows for identical fixed-timestamp entries.
     #[test]
     fn plain_path_and_equivalent_file_uris_write_identical_content() {
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("plain.tsv.zst");
         let uri = dir.path().join("uri.tsv.zst");
-        let localhost = dir.path().join("localhost.tsv.zst");
+        let slashes = dir.path().join("slashes.tsv.zst");
         let from_plain = decompressed_after_logging(plain.to_str().unwrap(), &plain);
         let from_uri = decompressed_after_logging(&format!("file://{}", uri.display()), &uri);
-        let from_localhost = decompressed_after_logging(
-            &format!("FILE://localhost{}", localhost.display()),
-            &localhost,
-        );
+        // "file:////dir/x" resolves to "//dir/x", the same file on Linux.
+        let from_slashes =
+            decompressed_after_logging(&format!("file:///{}", slashes.display()), &slashes);
         let mut expected = EXPECTED_HEADER.to_string();
         expected.extend(EXPECTED_ROWS);
         assert_eq!(String::from_utf8(from_plain.clone()).unwrap(), expected);
         assert_eq!(from_plain, from_uri);
-        assert_eq!(from_plain, from_localhost);
+        assert_eq!(from_plain, from_slashes);
     }
 
     #[test]

@@ -972,12 +972,17 @@ s3dlio.finalize_op_log()
 ```
 
 The op-log is written to the local filesystem as a zstd-compressed TSV. The
-path may be a plain path (`/tmp/operations.tsv.zst`) or a `file://` URI
+path may be a plain path (`/tmp/operations.tsv.zst`) or a `file://` destination
 (`file:///tmp/operations.tsv.zst`); the parent directory must already exist.
-Schemes are case-insensitive (`FILE:///...` works). A `file://` URI may have an
-empty or `localhost` authority only (`file://localhost/tmp/x` is `/tmp/x`);
-`file://otherhost/x` is rejected, and the path is used as written (no
-percent-decoding). Remote URIs such as `s3://` are rejected with an error.
+`file://` follows **s3dlio's `file://` convention** (the same as the `file://`
+object store); it is **not** full RFC 8089. Only the lowercase prefix `file://`
+is recognised: it is removed and the rest is the path, used literally, so
+`file:///tmp/x` is `/tmp/x`, but `file://localhost/x` is the *relative* path
+`localhost/x`, `file://relative/x` is the relative path `relative/x`, and
+percent sequences are not decoded. `file://` with nothing after it is an error.
+Every other scheme is rejected as unsupported, shown as written: `s3://`,
+`direct://` and also `FILE://` (uppercase). Text before `://` that is not a valid
+URI scheme (for example `dir/a://b.log`) is a plain path.
 
 A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
 `init_op_log` while already active is a no-op; after `finalize_op_log` it raises

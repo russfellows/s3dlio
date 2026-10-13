@@ -215,8 +215,21 @@ entries racing with it, unless the writer fails with an I/O error (after which
 
 After finalize, `set_clock_offset` / `get_clock_offset` return an error of kind
 `Unsupported` saying the op-log was already finalized (before any init the kind
-is `NotFound`, "Logger not initialized"). A `file://` op-log path may have only
-an empty or `localhost` authority; schemes are case-insensitive.
+is `NotFound`, "Logger not initialized").
+
+### Op-log destinations
+
+The destination is a local file. A plain path is used as given. A destination
+starting with the lowercase prefix `file://` follows **s3dlio's `file://`
+convention** (the same as the `file://` object store; not full RFC 8089): the
+prefix is removed and the rest is the path, used literally. `file:///tmp/x` is
+`/tmp/x`; `file://localhost/x` is the *relative* path `localhost/x`;
+`file://relative/x` is the relative path `relative/x`; percent sequences are not
+decoded; `file://` alone is an `InvalidInput` error. Any other string whose text
+before the first `://` is a valid URI scheme (`s3://`, `az://`, `gs://`,
+`direct://`, and also uppercase `FILE://`) is rejected as an unsupported scheme,
+with the scheme shown as written. Text before `://` that is not a valid scheme
+(for example `dir/a://b.log`) is a plain path.
 
 ## Example Usage
 
