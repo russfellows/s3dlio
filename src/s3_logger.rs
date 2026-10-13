@@ -302,10 +302,43 @@ impl Clone for Logger {
     }
 }
 
+/// Resolve a user-supplied op-log destination to a local filesystem path.
+///
+/// Accepts a plain path (`/tmp/ops.tsv.zst`) or a `file://` URI
+/// (`file:///tmp/ops.tsv.zst`). Any other `scheme://` URI is rejected with
+/// `ErrorKind::InvalidInput` and a message naming the path, rather than being
+/// passed to `File::create` as a bogus relative path (issue #168).
+fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
+    if let Some(local) = path.strip_prefix("file://") {
+        if local.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("op-log path '{path}' has an empty file path after 'file://'"),
+            ));
+        }
+        return Ok(local);
+    }
+    if let Some((scheme, _)) = path.split_once("://") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "op-log path '{path}' uses unsupported scheme '{scheme}://'; the op-log must be \
+                 written to a local filesystem path, e.g. '/tmp/ops.tsv.zst' or \
+                 'file:///tmp/ops.tsv.zst'"
+            ),
+        ));
+    }
+    Ok(path)
+}
+
 // Logger methods
 impl Logger {
     /// Creates a new logger and spawns the background thread to handle writing.
+    ///
+    /// `log_file_path` may be a plain local path or a `file://` URI.
     pub fn new(log_file_path: &str) -> std::io::Result<Self> {
+        let local_path = resolve_local_oplog_path(log_file_path)?;
+
         //
         // Check to see if the LOSSLESS env variable is set
         let _ = LOSSLESS.set(
@@ -336,7 +369,19 @@ impl Logger {
         let (done_tx, done_rx) = channel::<()>();
 
         // Prepare compressed writer.
-        let file = File::create(log_file_path)?;
+        // Include the path in the error: a bare "No such file or directory
+        // (os error 2)" gives the user nothing to act on (issue #168).
+        let file = File::create(local_path).map_err(|e| {
+            let shown = if local_path == log_file_path {
+                format!("'{local_path}'")
+            } else {
+                format!("'{local_path}' (from '{log_file_path}')")
+            };
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to create op-log file {shown}: {e}"),
+            )
+        })?;
 
         // Old, we didn't set a buffer capacity
         //let writer = BufWriter::new(file);
@@ -466,5 +511,86 @@ mod oplog_buffer_default_tests {
         #[allow(deprecated)]
         std::env::remove_var("S3DLIO_OPLOG_BUF");
         assert_eq!(result, 42);
+    }
+}
+
+#[cfg(test)]
+mod oplog_path_tests {
+    use super::*;
+
+    // RED-then-GREEN regression tests for s3dlio issue #168.
+    //
+    // Bug: `init_op_log("file:///tmp/operations.log")` (the form shown in
+    // docs/PYTHON_API_GUIDE.md) passed the URI straight to `File::create`,
+    // which treated it as a relative path under a non-existent `file:`
+    // directory and failed with a bare "No such file or directory
+    // (os error 2)" that did not name the path.
+
+    #[test]
+    fn file_uri_is_accepted_and_written_to_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("operations.log");
+        let uri = format!("file://{}", local.display());
+
+        let logger = Logger::new(&uri).expect("file:// URI must be accepted for the op-log path");
+        drop(logger);
+
+        assert!(
+            local.exists(),
+            "op-log must be created at the local path the file:// URI points to"
+        );
+    }
+
+    #[test]
+    fn plain_local_path_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("operations.log");
+
+        let logger = Logger::new(local.to_str().unwrap()).expect("plain path must work");
+        drop(logger);
+
+        assert!(local.exists());
+    }
+
+    #[test]
+    fn create_failure_error_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("no-such-subdir").join("operations.log");
+        let bad = bad.to_str().unwrap();
+
+        let err = Logger::new(bad)
+            .err()
+            .expect("creating a log in a missing directory must fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(bad),
+            "error must name the op-log path so users can see what went wrong; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn remote_uri_is_rejected_with_clear_error() {
+        for uri in [
+            "s3://bucket/operations.log",
+            "az://container/operations.log",
+            "gs://bucket/operations.log",
+            "direct:///tmp/operations.log",
+        ] {
+            let err = Logger::new(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected as an op-log path"));
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{uri}: wrong error kind ({err})"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(uri) && msg.contains("local"),
+                "{uri}: error must name the path and say it must be local; got: {msg}"
+            );
+        }
     }
 }

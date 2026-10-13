@@ -680,6 +680,12 @@ pub fn init_logging(level: &str) -> PyResult<()> {
     Ok(())
 }
 
+/// Enable operation logging to a local zstd-compressed TSV file.
+///
+/// Args:
+///     path: Local filesystem path (e.g. "/tmp/ops.tsv.zst") or file:// URI
+///         (e.g. "file:///tmp/ops.tsv.zst"). The parent directory must exist.
+///         Remote URIs such as s3:// are not supported.
 #[pyfunction]
 pub fn init_op_log(path: &str) -> PyResult<()> {
     init_op_logger(path).map_err(py_err)

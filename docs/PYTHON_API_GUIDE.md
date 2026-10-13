@@ -966,10 +966,15 @@ s3dlio.create_tfrecord_index(
 ### Operation Logging
 
 ```python
-s3dlio.init_op_log("file:///tmp/operations.log")
+s3dlio.init_op_log("/tmp/operations.tsv.zst")
 # ... operations are automatically logged ...
 s3dlio.finalize_op_log()
 ```
+
+The op-log is written to the local filesystem as a zstd-compressed TSV. The
+path may be a plain path (`/tmp/operations.tsv.zst`) or a `file://` URI
+(`file:///tmp/operations.tsv.zst`); the parent directory must already exist.
+Remote URIs such as `s3://` are rejected with an error.
 
 ### Python Convenience Helpers
 
@@ -1101,7 +1106,7 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | Function | Description |
 |----------|-------------|
 | `init_logging(level)` | Set log level: trace, debug, info, warn, error |
-| `init_op_log(path)` | Enable operation logging to file |
+| `init_op_log(path)` | Enable operation logging to a local file (plain path or `file://` URI) |
 | `finalize_op_log()` | Flush and close operation log |
 | `is_op_log_active()` | Check if operation logging is active |
 
