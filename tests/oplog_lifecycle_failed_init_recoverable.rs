@@ -83,7 +83,7 @@ fn failed_init_can_be_retried() {
     let good = dir.path().join("ops.tsv.zst");
     init_op_logger(good.to_str().unwrap()).expect("corrected init must succeed");
     let logger = global_logger().expect("active after corrected init");
-    assert_eq!(logger.log(entry("ok")), LogOutcome::Accepted);
+    assert_eq!(logger.try_log(entry("ok")), LogOutcome::Accepted);
     finalize_op_logger();
     assert_eq!(logged_tags(&good), vec!["ok".to_string()]);
 }

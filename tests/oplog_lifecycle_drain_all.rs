@@ -80,7 +80,7 @@ fn finalize_drains_every_accepted_entry() {
     let mut accepted = Vec::new();
     for i in 0..N {
         let tag = format!("e{i}");
-        match logger.log(entry(&tag)) {
+        match logger.try_log(entry(&tag)) {
             LogOutcome::Accepted => accepted.push(tag),
             other => panic!("entry {i}: unexpected outcome {other:?}"),
         }

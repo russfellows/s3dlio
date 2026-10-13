@@ -77,7 +77,10 @@ fn init_after_finalize_errors_and_touches_no_file() {
     init_op_logger(first.to_str().unwrap()).unwrap();
     let logger = global_logger().unwrap();
     for i in 0..5 {
-        assert_eq!(logger.log(entry(&format!("e{i}"))), LogOutcome::Accepted);
+        assert_eq!(
+            logger.try_log(entry(&format!("e{i}"))),
+            LogOutcome::Accepted
+        );
     }
     finalize_op_logger();
     let first_bytes = std::fs::read(&first).unwrap();

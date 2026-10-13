@@ -82,7 +82,7 @@ fn init_while_active_is_a_noop() {
     );
 
     let logger = global_logger().unwrap();
-    assert_eq!(logger.log(entry("only")), LogOutcome::Accepted);
+    assert_eq!(logger.try_log(entry("only")), LogOutcome::Accepted);
     finalize_op_logger();
     assert_eq!(logged_tags(&first), vec!["only".to_string()]);
     assert!(!second.exists());

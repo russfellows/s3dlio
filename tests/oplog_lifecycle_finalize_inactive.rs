@@ -93,7 +93,7 @@ fn finalize_makes_the_oplog_inactive_and_closes_captured_loggers() {
     let captured = global_logger().expect("logger active after init");
     for i in 0..10 {
         assert_eq!(
-            captured.log(entry(&format!("pre-{i}"))),
+            captured.try_log(entry(&format!("pre-{i}"))),
             LogOutcome::Accepted
         );
     }
@@ -125,7 +125,7 @@ fn finalize_makes_the_oplog_inactive_and_closes_captured_loggers() {
     // submits may reach the file.
     for i in 0..100 {
         assert_eq!(
-            captured.log(entry(&format!("post-{i}"))),
+            captured.try_log(entry(&format!("post-{i}"))),
             LogOutcome::Closed,
             "logging to a finalized Logger must report Closed"
         );

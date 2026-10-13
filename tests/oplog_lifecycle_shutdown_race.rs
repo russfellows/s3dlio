@@ -91,7 +91,7 @@ fn accepted_entries_are_exactly_the_written_entries_under_race() {
                 let (mut full, mut saw_closed) = (0_usize, false);
                 for n in 0_u64.. {
                     let tag = format!("t{t}-{n}");
-                    match logger.log(entry(&tag)) {
+                    match logger.try_log(entry(&tag)) {
                         LogOutcome::Accepted => {
                             assert!(!saw_closed, "Accepted after Closed");
                             accepted.push(tag);

@@ -207,10 +207,11 @@ Stores capture the logger when they are constructed
   later entries are rejected with `LogOutcome::Closed`, not written);
 - stores created **after** finalize are unlogged.
 
-`Logger::log` returns a `LogOutcome` (`Accepted`, `Full`, `Closed`,
+`Logger::log(entry)` returns `()`, as it always has. `Logger::try_log(entry)`
+does the same work and returns a `LogOutcome` (`Accepted`, `Full`, `Closed`,
 `WriterFailed`). Every `Accepted` entry is written by finalize, including
 entries racing with it, unless the writer fails with an I/O error (after which
-`log` returns `WriterFailed`); the file format is unchanged.
+`try_log` returns `WriterFailed`); the file format is unchanged.
 
 After finalize, `set_clock_offset` / `get_clock_offset` return an error of kind
 `Unsupported` saying the op-log was already finalized (before any init the kind

@@ -48,11 +48,11 @@ fn child_scenario() {
     let path = dir.path().join("ops.tsv.zst");
     init_op_logger(path.to_str().unwrap()).unwrap();
     let captured = global_logger().expect("active after init");
-    assert_eq!(captured.log(entry("pre")), LogOutcome::Accepted);
+    assert_eq!(captured.try_log(entry("pre")), LogOutcome::Accepted);
     finalize_op_logger();
     for i in 0..100 {
         assert_eq!(
-            captured.log(entry(&format!("post-{i}"))),
+            captured.try_log(entry(&format!("post-{i}"))),
             LogOutcome::Closed
         );
     }

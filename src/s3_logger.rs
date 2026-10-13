@@ -37,13 +37,13 @@ static OP_LOG_STATE: Mutex<OpLogState> = Mutex::new(OpLogState::Uninitialized);
 static GLOBAL_CLIENT_ID: OnceCell<Mutex<String>> = OnceCell::new();
 
 /// Top bit of `Shared::gate`: set once finalize has begun. The low bits count
-/// `Logger::log` calls currently between "gate entered" and "outcome decided".
+/// `Logger::try_log` calls currently between "gate entered" and "outcome decided".
 const GATE_CLOSED: u64 = 1 << 63;
 /// Name of the background writer thread (visible in debuggers and `ps -T`).
 const WRITER_THREAD_NAME: &str = "s3dlio-oplog-writer";
 const HEADER: &str = "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns\n";
 
-/// Test-only scheduling noise injected at the two points of [`Logger::log`]
+/// Test-only scheduling noise injected at the two points of [`Logger::try_log`]
 /// where a race with `shutdown` can matter: between the closed-bit hint and the
 /// gate increment, and between entering the gate and sending. Enabled per
 /// thread, so it never affects other tests; compiled out of non-test builds.
@@ -257,10 +257,10 @@ pub fn get_client_id() -> String {
         .unwrap_or_default()
 }
 
-/// Finish the process's op-log session: every record whose [`Logger::log`] call
-/// was accepted is written (unless the writer failed with an I/O error), and the
-/// writer has finished the zstd stream and signalled completion before this
-/// returns.
+/// Finish the process's op-log session: every record whose [`Logger::try_log`]
+/// (or `log`) call was accepted is written (unless the writer failed with an
+/// I/O error), and the writer has finished the zstd stream and signalled
+/// completion before this returns.
 ///
 /// Finalize is terminal and idempotent. Entries submitted once it has begun are
 /// rejected (`LogOutcome::Closed`), [`global_logger`] returns `None` and the
@@ -398,7 +398,7 @@ fn oplog_write_buffer_capacity() -> usize {
         .unwrap_or(256 * 1024)
 }
 
-/// Result of [`Logger::log`]. Only `Accepted` entries can be in the file once
+/// Result of [`Logger::try_log`]. Only `Accepted` entries can be in the file once
 /// the session is finalized, and they will be unless the writer fails with an
 /// I/O error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,7 +427,7 @@ enum Message {
 struct Shared {
     sender: SyncSender<Message>,
     /// `GATE_CLOSED` bit plus the number of `log()` calls in flight. See
-    /// [`Logger::log`] and [`Logger::shutdown`] for the drain protocol.
+    /// [`Logger::try_log`] and [`Logger::shutdown`] for the drain protocol.
     gate: AtomicU64,
     /// Completion signal from the writer thread; taken by the first shutdown.
     /// The mutex is held for the whole shutdown so later callers wait for it.
@@ -690,6 +690,16 @@ impl Logger {
         self.shared.clock_offset_nanos.load(Ordering::Relaxed)
     }
 
+    /// Submit a log entry, ignoring what happened to it.
+    ///
+    /// This is the original, fire-and-forget API and returns `()`, exactly as
+    /// before the op-log lifecycle work. It is [`Logger::try_log`] with the
+    /// [`LogOutcome`] discarded; use `try_log` to learn whether the entry was
+    /// queued, dropped or rejected.
+    pub fn log(&self, entry: LogEntry) {
+        let _ = self.try_log(entry);
+    }
+
     /// Submit a log entry and report what happened to it.
     ///
     /// Non-blocking by default (`try_send`): when the queue is full the entry is
@@ -702,9 +712,9 @@ impl Logger {
     /// [`LogOutcome::Closed`] (never `Full`) and write nothing; at most one
     /// diagnostic is printed for the whole closed logger.
     ///
-    /// The return value may be ignored (it is deliberately not `#[must_use]`:
-    /// the store wrappers fire-and-forget); tests use it to prove drain exactness.
-    pub fn log(&self, entry: LogEntry) -> LogOutcome {
+    /// [`Logger::log`] is this method with the outcome discarded; the store
+    /// wrappers use it. Tests use the outcome to prove drain exactness.
+    pub fn try_log(&self, entry: LogEntry) -> LogOutcome {
         let shared = &*self.shared;
 
         // Fast path: once the logger is closed, a caller must not touch the
@@ -1170,11 +1180,11 @@ mod oplog_shutdown_tests {
         let path = dir.path().join("ops.tsv.zst");
         let logger = Logger::new(path.to_str().unwrap()).unwrap();
 
-        assert_eq!(logger.log(entry("a")), LogOutcome::Accepted);
-        assert_eq!(logger.log(entry("b")), LogOutcome::Accepted);
+        assert_eq!(logger.try_log(entry("a")), LogOutcome::Accepted);
+        assert_eq!(logger.try_log(entry("b")), LogOutcome::Accepted);
         logger.shutdown();
         logger.shutdown();
-        assert_eq!(logger.clone().log(entry("c")), LogOutcome::Closed);
+        assert_eq!(logger.clone().try_log(entry("c")), LogOutcome::Closed);
 
         assert_eq!(read_tags(&path).unwrap(), ["a", "b"]);
     }
@@ -1191,7 +1201,7 @@ mod oplog_shutdown_tests {
 
         let entered_before = race_hooks::entered();
         for _ in 0..1000 {
-            assert_eq!(logger.log(entry("late")), LogOutcome::Closed);
+            assert_eq!(logger.try_log(entry("late")), LogOutcome::Closed);
         }
         assert_eq!(
             race_hooks::entered() - entered_before,
@@ -1218,7 +1228,7 @@ mod oplog_shutdown_tests {
                 let (logger, stop) = (logger.clone(), Arc::clone(&stop));
                 thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        let _ = logger.log(entry("hot"));
+                        logger.log(entry("hot"));
                     }
                 })
             })
@@ -1277,7 +1287,7 @@ mod oplog_shutdown_tests {
                     let mut problems = Vec::new();
                     for n in 0_u64.. {
                         let tag = format!("t{t}-{n}");
-                        match logger.log(entry(&tag)) {
+                        match logger.try_log(entry(&tag)) {
                             LogOutcome::Accepted => accepted.push(tag),
                             LogOutcome::Full => {
                                 if lossless {
@@ -1289,7 +1299,7 @@ mod oplog_shutdown_tests {
                             LogOutcome::Closed => {
                                 // Closed is final: nothing later may be accepted.
                                 for _ in 0..3 {
-                                    if logger.log(entry("late")) != LogOutcome::Closed {
+                                    if logger.try_log(entry("late")) != LogOutcome::Closed {
                                         problems.push("outcome after Closed".to_string());
                                     }
                                 }
@@ -1426,12 +1436,12 @@ mod oplog_shutdown_tests {
                 "s3dlio-oplog-test-writer",
             )
             .unwrap();
-            assert_eq!(logger.log(entry("before")), LogOutcome::Accepted);
+            assert_eq!(logger.try_log(entry("before")), LogOutcome::Accepted);
             armed.store(true, Ordering::SeqCst);
 
             let mut seen_failed = false;
             for i in 0..200_u64 {
-                match logger.log(big_entry(i)) {
+                match logger.try_log(big_entry(i)) {
                     LogOutcome::Accepted => thread::sleep(Duration::from_millis(20)),
                     LogOutcome::WriterFailed => {
                         seen_failed = true;
@@ -1445,10 +1455,10 @@ mod oplog_shutdown_tests {
                 "lossless={lossless}: writer I/O error never surfaced"
             );
             for _ in 0..5 {
-                assert_eq!(logger.log(entry("after")), LogOutcome::WriterFailed);
+                assert_eq!(logger.try_log(entry("after")), LogOutcome::WriterFailed);
             }
             logger.shutdown(); // must return even though the writer is gone
-            assert_eq!(logger.log(entry("closed")), LogOutcome::Closed);
+            assert_eq!(logger.try_log(entry("closed")), LogOutcome::Closed);
         }
     }
 }
@@ -1530,7 +1540,7 @@ mod oplog_golden_format_tests {
     fn decompressed_after_logging(destination: &str, local: &std::path::Path) -> Vec<u8> {
         let logger = Logger::new(destination).unwrap();
         for e in entries() {
-            assert_eq!(logger.log(e), LogOutcome::Accepted);
+            assert_eq!(logger.try_log(e), LogOutcome::Accepted);
         }
         logger.shutdown();
         zstd::decode_all(std::fs::read(local).unwrap().as_slice()).unwrap()
@@ -1565,7 +1575,7 @@ mod oplog_golden_format_tests {
         let logger = Logger::new(path.to_str().unwrap()).unwrap();
         assert_eq!(logger.get_clock_offset(), 0, "golden test needs offset 0");
         for e in entries() {
-            assert_eq!(logger.log(e), LogOutcome::Accepted);
+            assert_eq!(logger.try_log(e), LogOutcome::Accepted);
         }
         logger.shutdown();
 

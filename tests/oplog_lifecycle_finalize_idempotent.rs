@@ -83,7 +83,10 @@ fn finalize_is_idempotent_and_safe_before_init() {
         .expect("finalize before init must not prevent a later init");
     let logger = global_logger().unwrap();
     for i in 0..50 {
-        assert_eq!(logger.log(entry(&format!("e{i}"))), LogOutcome::Accepted);
+        assert_eq!(
+            logger.try_log(entry(&format!("e{i}"))),
+            LogOutcome::Accepted
+        );
     }
 
     // Concurrent finalizers: each must return only after the log is complete.
