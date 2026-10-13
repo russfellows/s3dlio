@@ -687,7 +687,10 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 /// Args:
 ///     path: Local filesystem path (e.g. "/tmp/ops.tsv.zst") or file:// URI
 ///         (e.g. "file:///tmp/ops.tsv.zst"). The parent directory must exist.
-///         Remote URIs such as s3:// are not supported.
+///         Remote URIs such as s3:// are not supported. Schemes are
+///         case-insensitive; a file:// URI may have only an empty or
+///         "localhost" authority (file://otherhost/x is rejected) and its
+///         path is used as written, without percent-decoding.
 ///
 /// Behaviour:
 ///     - First call: creates the file and starts logging. A call that fails

@@ -401,8 +401,37 @@ fn is_rfc3986_scheme(s: &str) -> bool {
 /// passed to `File::create` as a bogus relative path (issue #168). The text
 /// before the first `://` counts as a scheme only if it is a valid RFC 3986
 /// scheme; a local path that merely contains `://` stays a path.
+///
+/// - Schemes are case-insensitive (RFC 3986 section 3.1): `FILE:///tmp/x` is
+///   the same as `file:///tmp/x`. A rejected scheme is shown as written.
+/// - `file://` follows RFC 8089, `file://[authority]/path`: an empty authority
+///   or `localhost` (any case) means this machine and is stripped
+///   (`file://localhost/tmp/x` is `/tmp/x`); any other non-empty authority names
+///   another host and is rejected, so `file://otherhost/x` or `file://rel/x`
+///   never silently becomes a relative path.
+/// - The path after the authority is used as written: no percent-decoding,
+///   matching `FileSystemObjectStore::uri_to_path` in `file_store.rs`.
 fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
-    if let Some(local) = path.strip_prefix("file://") {
+    const FILE_PREFIX: &str = "file://";
+    if let Some(rest) = path
+        .get(..FILE_PREFIX.len())
+        .filter(|p| p.eq_ignore_ascii_case(FILE_PREFIX))
+        .map(|_| &path[FILE_PREFIX.len()..])
+    {
+        let (authority, local) = match rest.find('/') {
+            Some(i) => rest.split_at(i),
+            None => (rest, ""),
+        };
+        if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "op-log path '{path}' names host '{authority}'; the op-log must be written to \
+                     a local filesystem path, so a file:// URI may have only an empty or \
+                     'localhost' authority, e.g. 'file:///tmp/ops.tsv.zst'"
+                ),
+            ));
+        }
         if local.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -837,6 +866,119 @@ mod oplog_path_tests {
                 .err()
                 .unwrap_or_else(|| panic!("{uri} must be rejected"));
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
+        }
+    }
+
+    // Pins (these held before the RFC 8089 / case-insensitivity change too):
+    // the text before the FIRST "://" decides, and it must be a valid scheme.
+
+    #[test]
+    fn non_ascii_first_char_is_a_path_and_first_separator_decides() {
+        // 'é' is not an ASCII letter, so "é a" is not a scheme.
+        for path in ["\u{e9} a://b.log", "dir/a://b://c"] {
+            assert_eq!(
+                resolve_local_oplog_path(path).unwrap_or_else(|e| panic!("{path}: {e}")),
+                path
+            );
+        }
+        // The first "://" is preceded by the valid scheme "s3": a URI, rejected,
+        // even though a later "://" exists.
+        let err =
+            resolve_local_oplog_path("s3://bucket/a://b").expect_err("s3:// must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("s3://bucket/a://b"));
+    }
+
+    // RFC 8089: file://[authority]/path. An empty authority or "localhost"
+    // means this machine; any other authority is a different host and is
+    // refused rather than silently turned into a relative path.
+
+    #[test]
+    fn file_uri_empty_or_localhost_authority_is_stripped() {
+        for (uri, want) in [
+            ("file:///tmp/x", "/tmp/x"),
+            ("file://localhost/tmp/x", "/tmp/x"),
+            ("file://LocalHost/tmp/x", "/tmp/x"),
+        ] {
+            assert_eq!(
+                resolve_local_oplog_path(uri).unwrap_or_else(|e| panic!("{uri}: {e}")),
+                want,
+                "{uri}"
+            );
+        }
+        // No percent-decoding, matching file_store.rs `uri_to_path`.
+        assert_eq!(
+            resolve_local_oplog_path("file:///tmp/a%20b").unwrap(),
+            "/tmp/a%20b"
+        );
+    }
+
+    #[test]
+    fn file_uri_localhost_authority_creates_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("ops.tsv.zst");
+        let uri = format!("file://localhost{}", local.display());
+        let logger = Logger::new(&uri).unwrap_or_else(|e| panic!("{uri}: {e}"));
+        drop(logger);
+        assert!(local.exists(), "op-log must be created at {local:?}");
+    }
+
+    #[test]
+    fn file_uri_with_another_host_is_rejected_and_names_the_input() {
+        for uri in [
+            "file://otherhost/tmp/x",
+            "file://relative/path",
+            "file://localhost.example/tmp/x",
+            "file://otherhost",
+        ] {
+            let err = resolve_local_oplog_path(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
+            assert!(err.to_string().contains(uri), "{uri}: {err}");
+        }
+        // Nothing may be created for a rejected host.
+        let err = Logger::new("file://otherhost/tmp/x").expect_err("must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn file_uri_without_a_path_is_rejected() {
+        for uri in ["file://", "file://localhost", "FILE://"] {
+            let err = resolve_local_oplog_path(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
+            assert!(err.to_string().contains(uri), "{uri}: {err}");
+        }
+    }
+
+    #[test]
+    fn schemes_are_case_insensitive() {
+        // "FILE://" is the file scheme (RFC 3986 section 3.1).
+        for (uri, want) in [
+            ("FILE:///tmp/x", "/tmp/x"),
+            ("File:///tmp/x", "/tmp/x"),
+            ("FILE://localhost/tmp/x", "/tmp/x"),
+        ] {
+            assert_eq!(
+                resolve_local_oplog_path(uri).unwrap_or_else(|e| panic!("{uri}: {e}")),
+                want,
+                "{uri}"
+            );
+        }
+        // Other schemes stay rejected, and the message shows the scheme as written.
+        for (uri, shown) in [
+            ("S3://bucket/k", "'S3://'"),
+            ("Az://c/k", "'Az://'"),
+            ("DIRECT:///tmp/x", "'DIRECT://'"),
+        ] {
+            let err = resolve_local_oplog_path(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
+            assert!(err.to_string().contains(uri), "{uri}: {err}");
+            assert!(err.to_string().contains(shown), "{uri}: {err}");
         }
     }
 }

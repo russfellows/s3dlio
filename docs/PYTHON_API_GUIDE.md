@@ -974,7 +974,10 @@ s3dlio.finalize_op_log()
 The op-log is written to the local filesystem as a zstd-compressed TSV. The
 path may be a plain path (`/tmp/operations.tsv.zst`) or a `file://` URI
 (`file:///tmp/operations.tsv.zst`); the parent directory must already exist.
-Remote URIs such as `s3://` are rejected with an error.
+Schemes are case-insensitive (`FILE:///...` works). A `file://` URI may have an
+empty or `localhost` authority only (`file://localhost/tmp/x` is `/tmp/x`);
+`file://otherhost/x` is rejected, and the path is used as written (no
+percent-decoding). Remote URIs such as `s3://` are rejected with an error.
 
 A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
 `init_op_log` while already active is a no-op; after `finalize_op_log` it raises
