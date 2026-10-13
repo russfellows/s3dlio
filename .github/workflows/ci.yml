@@ -86,6 +86,44 @@ jobs:
       - name: Test (Rust - delete_batch GCS/Azure grouping)
         run: cargo test --release --lib --offline --features backend-gcs,backend-azure delete_batch
 
+      # Op-log (#168, #170): targeted, no cloud access. The zstd command-line
+      # tool is what the op-log tests use to prove a finished log is a complete
+      # zstd stream; the Python op-log tests below skip without it, so fail here
+      # if it is missing instead.
+      - name: Install zstd CLI (op-log tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          zstd --version
+
+      # Every tests/oplog_lifecycle_*.rs is its own binary (= its own process,
+      # because the op-log is process-global), run explicitly by name. Must run
+      # as the default non-root runner user: the spawn-failure test lowers
+      # RLIMIT_NPROC, which root / CAP_SYS_RESOURCE ignore. With
+      # S3DLIO_REQUIRE_SPAWN_FAILURE_TEST=1 that test FAILS instead of quietly
+      # returning when it cannot produce the failure.
+      - name: Test (Rust - op-log lifecycle)
+        env:
+          S3DLIO_REQUIRE_SPAWN_FAILURE_TEST: "1"
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" = "0" ]; then
+            echo "op-log lifecycle tests must run as a non-root user" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          files=(tests/oplog_lifecycle_*.rs)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no tests/oplog_lifecycle_*.rs found" >&2
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            name="$(basename "$f" .rs)"
+            echo "::group::$name"
+            cargo test --release --offline --test "$name"
+            echo "::endgroup::"
+          done
+
       - name: Build (Python)
         run: |
           pip install maturin
@@ -101,6 +139,17 @@ jobs:
         run: |
           python -c "import s3dlio; data = s3dlio.generate_data(1024*1024); view = memoryview(data); print(f'✓ Zero-copy memoryview: {len(view)} bytes')"
           python -c "import s3dlio; buf = bytearray(1024); n = s3dlio.generate_into_buffer(buf); print(f'✓ Zero-copy write: {n} bytes')"
+
+      # Op-log Python tests against the wheel built and installed above (the
+      # wheel is the artifact that exercises the PyO3 boundary: init/finalize,
+      # the GIL release in finalize_op_log, destination errors). Each scenario
+      # runs in a fresh interpreter; they need the zstd CLI installed earlier.
+      # NOTE: written without being able to run GitHub Actions; see the commit
+      # message for what was and was not verified locally.
+      - name: Test (Python - op-log)
+        run: |
+          pip install pytest
+          python -m pytest -q tests/test_oplog_lifecycle.py tests/test_python_oplog.py
 
   lint:
     name: Lint

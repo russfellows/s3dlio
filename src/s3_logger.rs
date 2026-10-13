@@ -39,8 +39,10 @@ static GLOBAL_CLIENT_ID: OnceCell<Mutex<String>> = OnceCell::new();
 /// Top bit of `Shared::gate`: set once finalize has begun. The low bits count
 /// `Logger::try_log` calls currently between "gate entered" and "outcome decided".
 const GATE_CLOSED: u64 = 1 << 63;
-/// Name of the background writer thread (visible in debuggers and `ps -T`).
-const WRITER_THREAD_NAME: &str = "s3dlio-oplog-writer";
+/// Name of the background writer thread. Linux keeps at most 15 bytes of a
+/// thread name (longer names are cut), so this stays within 15; it shows in
+/// debuggers and in `/proc/<pid>/task/<tid>/comm` (`ps -T -o comm`).
+const WRITER_THREAD_NAME: &str = "s3dlio-oplog";
 const HEADER: &str = "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns\n";
 
 /// Test-only scheduling noise injected at the two points of [`Logger::try_log`]
@@ -1196,7 +1198,8 @@ mod oplog_shutdown_tests {
     fn shutdown_drains_is_idempotent_and_rejects_later_entries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ops.tsv.zst");
-        let logger = Logger::new(path.to_str().unwrap()).unwrap();
+        // Explicit capacity: independent of S3DLIO_OPLOG_BUF / _LOSSLESS.
+        let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
 
         assert_eq!(logger.try_log(entry("a")), LogOutcome::Accepted);
         assert_eq!(logger.try_log(entry("b")), LogOutcome::Accepted);
@@ -1205,6 +1208,31 @@ mod oplog_shutdown_tests {
         assert_eq!(logger.clone().try_log(entry("c")), LogOutcome::Closed);
 
         assert_eq!(read_tags(&path).unwrap(), ["a", "b"]);
+    }
+
+    // The writer thread's name must fit the 15 bytes Linux keeps (a longer name
+    // is silently cut), and must really be the name the thread runs under.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_thread_name_fits_the_linux_limit_and_is_applied() {
+        assert!(
+            WRITER_THREAD_NAME.len() <= 15,
+            "'{WRITER_THREAD_NAME}' is {} bytes; Linux keeps 15",
+            WRITER_THREAD_NAME.len()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ops.tsv.zst");
+        let logger = Logger::open(path.to_str().unwrap(), 8, false).unwrap();
+        let comms: Vec<String> = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+            .map(|c| c.trim_end().to_string())
+            .collect();
+        logger.shutdown();
+        assert!(
+            comms.iter().any(|c| c == WRITER_THREAD_NAME),
+            "no thread is named '{WRITER_THREAD_NAME}'; thread names: {comms:?}"
+        );
     }
 
     // Finding 1: a caller that finds the logger closed must not touch the
@@ -1451,7 +1479,7 @@ mod oplog_shutdown_tests {
                 1024,
                 lossless,
                 1,
-                "s3dlio-oplog-test-writer",
+                "oplog-test",
             )
             .unwrap();
             assert_eq!(logger.try_log(entry("before")), LogOutcome::Accepted);
@@ -1481,10 +1509,15 @@ mod oplog_shutdown_tests {
     }
 }
 
-// Golden test: pins the EXACT bytes of the op-log format that external tools
-// (sai3-bench, polarWarp) parse. Expected strings are written out literally --
-// they are NOT derived from HEADER or to_log_line -- so a renamed or reordered
-// column, a changed timestamp layout or a wrong idx fails here.
+// Golden test: pins the serializer's output (header plus rows, written out as
+// literal strings, not derived from HEADER or to_log_line) for THREE fixed
+// entries at clock offset 0: a GET with a first-byte time (caller idx 777 is
+// replaced by 0); a PUT with an error text and no first-byte time; a LIST with
+// an empty client id, 25 objects, 123456789012 bytes and a first-byte time 1 ns
+// after the start. A renamed or reordered column, a changed timestamp layout or
+// a wrong idx fails here. It does NOT establish what any operation puts in its
+// fields, when its times are taken, other clock offsets (see
+// oplog_clock_offset_tests) or that any consumer parses the output.
 #[cfg(test)]
 mod oplog_golden_format_tests {
     use super::*;
@@ -1556,7 +1589,9 @@ mod oplog_golden_format_tests {
     /// Write `entries()` through a standalone Logger at `destination` and return
     /// the raw, decompressed bytes of the resulting file at `local`.
     fn decompressed_after_logging(destination: &str, local: &std::path::Path) -> Vec<u8> {
-        let logger = Logger::new(destination).unwrap();
+        // Explicit capacity: the S3DLIO_OPLOG_BUF / S3DLIO_OPLOG_LOSSLESS
+        // environment must not be able to change this test.
+        let logger = Logger::open(destination, 64, false).unwrap();
         for e in entries() {
             assert_eq!(logger.try_log(e), LogOutcome::Accepted);
         }
@@ -1588,7 +1623,8 @@ mod oplog_golden_format_tests {
     fn written_file_matches_the_frozen_format_byte_for_byte() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("golden.tsv.zst");
-        let logger = Logger::new(path.to_str().unwrap()).unwrap();
+        // Explicit capacity, as in decompressed_after_logging above.
+        let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
         assert_eq!(logger.get_clock_offset(), 0, "golden test needs offset 0");
         for e in entries() {
             assert_eq!(logger.try_log(e), LogOutcome::Accepted);

@@ -1120,7 +1120,7 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | Function | Description |
 |----------|-------------|
 | `init_logging(level)` | Set log level: trace, debug, info, warn, error |
-| `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` URI); `RuntimeError` after finalize |
+| `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089); `RuntimeError` after finalize |
 | `finalize_op_log()` | Write all accepted records (unless the writer fails with an I/O error) and close the log; releases the GIL while draining; terminal and idempotent |
 | `is_op_log_active()` | True between init and finalize only |
 

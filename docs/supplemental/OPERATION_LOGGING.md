@@ -211,7 +211,9 @@ Stores capture the logger when they are constructed
 does the same work and returns a `LogOutcome` (`Accepted`, `Full`, `Closed`,
 `WriterFailed`). Every `Accepted` entry is written by finalize, including
 entries racing with it, unless the writer fails with an I/O error (after which
-`try_log` returns `WriterFailed`); the file format is unchanged.
+`try_log` returns `WriterFailed`). The serializer itself was not changed by the
+lifecycle work (header, column order, idx numbering, operation names, zstd
+framing); see "What the format tests establish" below for what is checked.
 
 After finalize, `set_clock_offset` / `get_clock_offset` return an error of kind
 `Unsupported` saying the op-log was already finalized (before any init the kind
@@ -230,6 +232,54 @@ before the first `://` is a valid URI scheme (`s3://`, `az://`, `gs://`,
 `direct://`, and also uppercase `FILE://`) is rejected as an unsupported scheme,
 with the scheme shown as written. Text before `://` that is not a valid scheme
 (for example `dir/a://b.log`) is a plain path.
+
+### Behaviour changes for users of the op-log API
+
+Compared with the previous release (4542f82), the changes a user can observe
+are exactly these:
+
+- `init_op_logger` / `init_op_log` after `finalize_op_logger` / `finalize_op_log`
+  now fails (`ErrorKind::Unsupported`; Python `RuntimeError`) and touches no file.
+  Before, it returned `Ok` and did nothing.
+- After finalize, `global_logger()` is `None` and `is_op_log_active()` is `False`.
+  Before, both still reported the dead logger.
+- After finalize, entries from a `Logger` that was captured earlier are rejected
+  quietly: one "op-log finalized" line on stderr per logger. Before, every entry
+  printed "op-log channel full; dropping entry: sending on a closed channel".
+- `set_clock_offset` / `get_clock_offset` after finalize now return
+  `Err(Unsupported)`; before, they succeeded on the dead logger. Before any init
+  they still return `NotFound`, but the message now starts with the function name.
+- Finalize now drains exactly what was accepted (see the table above), is
+  idempotent, and a repeated or concurrent call waits for the first to finish.
+- `S3DLIO_OPLOG_LOSSLESS` is read each time a `Logger` is created. Before, the
+  first read was kept for the whole process. For the single global session this
+  is the same unless the variable changes between two `Logger::new` calls.
+- The queue-full message no longer appends the channel error text
+  ("op-log channel full; dropping entry").
+- A refused writer thread is an `io::Error` from init instead of a panic; the
+  writer thread is named `s3dlio-oplog`.
+- A destination is resolved as described under "Op-log destinations": `file://`
+  paths work, other schemes are rejected instead of becoming relative paths, and
+  create errors name the path.
+- `Logger::log` still returns `()`; `Logger::try_log` and `LogOutcome` are new.
+- A clock offset of `i64::MIN` no longer panics the writer thread in builds with
+  overflow checks. A corrected timestamp before the epoch (or at or after year
+  9999) still panics inside the timestamp formatter, as before.
+
+### What the format tests establish
+
+The golden test (`oplog_golden_format_tests` in `src/s3_logger.rs`) pins the
+serializer's output, header plus rows, for three fixed entries and clock offset 0:
+a GET that succeeded with a first-byte time (caller-supplied idx 777 is replaced
+by 0); a PUT with an error text and no first-byte time (idx 1); and a LIST with an
+empty client id, 25 objects, 123456789012 bytes and a first-byte time 1 ns after
+the start (idx 2). A second test checks that a plain path and the equivalent
+`file://` destinations write identical content for those entries.
+`oplog_clock_offset_tests` adds fixed rows for offsets of +1.5 s, 0, -2.25 s,
+`i64::MAX` and `i64::MIN`. They do **not** establish what each operation puts in
+its fields (endpoint, file, bytes, object counts), when its start, first-byte and
+end times are taken, or that any consumer (sai3-bench, polarWarp, warp-replay)
+parses the output.
 
 ## Example Usage
 

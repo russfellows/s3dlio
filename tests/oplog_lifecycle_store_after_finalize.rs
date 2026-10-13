@@ -107,12 +107,12 @@ fn store_built_before_finalize_is_inert_after_it() {
             "unexpected '{unwanted}' on stderr\nstderr={stderr}"
         );
     }
-    assert!(
+    assert_eq!(
         stderr
             .lines()
             .filter(|l| l.contains("op-log finalized"))
-            .count()
-            <= 1,
-        "at most one finalized note\nstderr={stderr}"
+            .count(),
+        1,
+        "exactly one finalized note (the store's first post-finalize call prints it)\nstderr={stderr}"
     );
 }

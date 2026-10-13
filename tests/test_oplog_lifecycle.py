@@ -22,13 +22,33 @@ VOLATILE = {"thread", "start", "first_byte", "end", "duration_ns"}
 COLUMNS = HEADER.split("\t")
 
 
-def run_scenario(body: str, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+def zstd_cli() -> str:
+    """Path of the zstd command-line tool, or skip the test with the reason.
+
+    The tool is what proves a finished op-log is a COMPLETE zstd stream. CI
+    installs it (apt-get install zstd), so a skip there would be a CI defect.
+    """
+    path = shutil.which("zstd")
+    if path is None:
+        pytest.skip(
+            "the zstd command-line tool is not installed; it is needed to verify "
+            "op-log files (install it, e.g. `apt-get install zstd`)"
+        )
+    return path
+
+
+def run_scenario(
+    body: str, *args: str, timeout: int = 120, cwd=None
+) -> subprocess.CompletedProcess:
+    """Run `body` in a fresh interpreter whose working directory is `cwd` (or the
+    caller's if None), so tests can see what a relative path would create."""
     code = "import sys, os, s3dlio\n" + textwrap.dedent(body)
     proc = subprocess.Popen(
         [sys.executable, "-c", code, *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        cwd=None if cwd is None else str(cwd),
     )
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -48,8 +68,7 @@ def assert_ok(proc: subprocess.CompletedProcess) -> None:
 
 def assert_complete_zstd_stream(path) -> None:
     """`zstd -t` fails on a truncated stream, so this proves finalize finished it."""
-    zstd = shutil.which("zstd")
-    assert zstd, "the zstd command-line tool is required to verify op-log files"
+    zstd = zstd_cli()
     proc = subprocess.run([zstd, "-t", str(path)], capture_output=True, text=True, check=False)
     assert proc.returncode == 0, f"{path} is not a complete zstd stream: {proc.stderr}"
 
@@ -58,7 +77,7 @@ def read_rows(path) -> list:
     """Decompress an op-log; check the exact header and 13 columns; return the rows."""
     assert_complete_zstd_stream(path)
     proc = subprocess.run(
-        [shutil.which("zstd"), "-dc", str(path)], capture_output=True, check=True
+        [zstd_cli(), "-dc", str(path)], capture_output=True, check=True
     )
     lines = proc.stdout.decode("utf-8").split("\n")
     assert lines[-1] == "", "op-log must end with a newline"
@@ -208,6 +227,8 @@ def test_oplog_never_records_its_own_io(tmp_path, form):
 
 
 def test_remote_scheme_is_rejected_and_creates_no_file(tmp_path):
+    child_cwd = tmp_path / "child-cwd"
+    child_cwd.mkdir()
     proc = run_scenario(
         """
         try:
@@ -224,9 +245,77 @@ def test_remote_scheme_is_rejected_and_creates_no_file(tmp_path):
         s3dlio.finalize_op_log()
         """,
         str(tmp_path / "ok.tsv.zst"),
+        cwd=child_cwd,
     )
     assert_ok(proc)
-    # Nothing named after the rejected URI was created, here or in the cwd of the child.
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["ok.tsv.zst"]
-    assert not (tmp_path / "some-bucket").exists()
+    # Nothing named after the rejected URI was created, here or in the child's cwd.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["child-cwd", "ok.tsv.zst"]
+    assert sorted(child_cwd.iterdir()) == [], "the child's cwd must still be empty"
     read_rows(tmp_path / "ok.tsv.zst")
+
+
+@pytest.mark.parametrize("scheme", ["FILE", "File", "direct", "DIRECT"])
+def test_other_spellings_and_schemes_are_unsupported(tmp_path, scheme):
+    """Only the lowercase `file://` prefix is the file scheme (s3dlio's file-store
+    convention); every other scheme is rejected, shown as written, and creates nothing."""
+    child_cwd = tmp_path / "child-cwd"
+    child_cwd.mkdir()
+    target = tmp_path / "target.tsv.zst"
+    proc = run_scenario(
+        """
+        scheme, target = sys.argv[1:3]
+        try:
+            s3dlio.init_op_log(scheme + "://" + target)
+        except RuntimeError as e:
+            msg = str(e)
+            assert "unsupported scheme '" + scheme + "://'" in msg, msg
+        else:
+            raise SystemExit(scheme + ":// op-log path was accepted")
+        assert s3dlio.is_op_log_active() is False
+        """,
+        scheme,
+        str(target),
+        cwd=child_cwd,
+    )
+    assert_ok(proc)
+    assert not target.exists()
+    assert sorted(child_cwd.iterdir()) == [], "the child's cwd must still be empty"
+
+
+@pytest.mark.parametrize("first_component", ["localhost", "relative", "pct%20dir"])
+def test_file_uri_remainder_is_a_literal_relative_path(tmp_path, first_component):
+    """s3dlio's file:// convention, not RFC 8089: `file://localhost/x` is the RELATIVE
+    path `localhost/x` (under the child's cwd), and `%20` is not decoded."""
+    child_cwd = tmp_path / "child-cwd"
+    (child_cwd / first_component).mkdir(parents=True)
+    proc = run_scenario(
+        """
+        s3dlio.init_op_log("file://" + sys.argv[1] + "/ops.tsv.zst")
+        assert s3dlio.is_op_log_active() is True
+        s3dlio.finalize_op_log()
+        """,
+        first_component,
+        cwd=child_cwd,
+    )
+    assert_ok(proc)
+    assert read_rows(child_cwd / first_component / "ops.tsv.zst") == []
+    # It went nowhere else.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["child-cwd"]
+    assert sorted(p.name for p in child_cwd.iterdir()) == [first_component]
+
+
+def test_file_uri_with_nothing_after_it_is_rejected(tmp_path):
+    proc = run_scenario(
+        """
+        try:
+            s3dlio.init_op_log("file://")
+        except RuntimeError as e:
+            assert "empty" in str(e), str(e)
+        else:
+            raise SystemExit("file:// alone was accepted")
+        assert s3dlio.is_op_log_active() is False
+        """,
+        cwd=tmp_path,
+    )
+    assert_ok(proc)
+    assert sorted(tmp_path.iterdir()) == []
