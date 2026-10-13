@@ -404,6 +404,7 @@ fn oplog_write_buffer_capacity() -> usize {
 /// the session is finalized, and they will be unless the writer fails with an
 /// I/O error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogOutcome {
     /// Queued for the writer; it will be written, even if finalize runs next,
     /// unless the writer fails with an I/O error before reaching it.
@@ -519,8 +520,9 @@ fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
         return Ok(local);
     }
     // Only text that is a syntactically valid RFC 3986 scheme before the first
-    // "://" makes this a URI (any case: "FILE://" is not our "file://"). A local path such as "<dir>/a://b.log" (which the
-    // OS resolves to "<dir>/a:/b.log") merely contains "://" and stays a path.
+    // "://" makes this a URI (any case: "FILE://" is not our "file://"). A local
+    // path such as "<dir>/a://b.log" (which the OS resolves to "<dir>/a:/b.log")
+    // merely contains "://" and stays a path.
     if let Some((scheme, _)) = path
         .split_once("://")
         .filter(|(scheme, _)| is_rfc3986_scheme(scheme))
@@ -1223,11 +1225,22 @@ mod oplog_shutdown_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ops.tsv.zst");
         let logger = Logger::open(path.to_str().unwrap(), 8, false).unwrap();
-        let comms: Vec<String> = std::fs::read_dir("/proc/self/task")
-            .unwrap()
-            .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
-            .map(|c| c.trim_end().to_string())
-            .collect();
+        // std names a thread from inside the new thread, so the name can appear
+        // after `open` returns: poll until it does, up to a deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let comms = loop {
+            let comms: Vec<String> = std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+                .map(|c| c.trim_end().to_string())
+                .collect();
+            if comms.iter().any(|c| c == WRITER_THREAD_NAME)
+                || std::time::Instant::now() >= deadline
+            {
+                break comms;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         logger.shutdown();
         assert!(
             comms.iter().any(|c| c == WRITER_THREAD_NAME),

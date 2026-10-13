@@ -105,6 +105,7 @@ fn lossless_accepted_entries_are_exactly_the_written_entries_under_race() {
                             break;
                         }
                         LogOutcome::WriterFailed => panic!("writer thread failed"),
+                        other => panic!("unexpected outcome {other:?}"),
                     }
                     if Instant::now() > deadline {
                         break;

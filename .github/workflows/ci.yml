@@ -92,8 +92,17 @@ jobs:
       # if it is missing instead.
       - name: Install zstd CLI (op-log tests)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y zstd
+          for i in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y zstd; then
+              break
+            fi
+            if [ "$i" = "3" ]; then
+              echo "apt-get update/install failed after 3 attempts" >&2
+              exit 1
+            fi
+            echo "apt-get failed (attempt $i); retrying..."
+            sleep $((i * 5))
+          done
           zstd --version
 
       # Every tests/oplog_lifecycle_*.rs is its own binary (= its own process,
@@ -120,8 +129,12 @@ jobs:
           for f in "${files[@]}"; do
             name="$(basename "$f" .rs)"
             echo "::group::$name"
-            cargo test --release --offline --test "$name"
+            status=0
+            cargo test --release --offline --test "$name" || status=$?
             echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              exit "$status"
+            fi
           done
 
       - name: Build (Python)

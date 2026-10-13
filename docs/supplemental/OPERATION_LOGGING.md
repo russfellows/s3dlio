@@ -235,8 +235,9 @@ with the scheme shown as written. Text before `://` that is not a valid scheme
 
 ### Behaviour changes for users of the op-log API
 
-Compared with the previous release (4542f82), the changes a user can observe
-are exactly these:
+Compared with the previous release (4542f82), these are the changes a user can
+observe that are known and recorded here; the list is maintained by hand and is
+not a machine-checked inventory:
 
 - `init_op_logger` / `init_op_log` after `finalize_op_logger` / `finalize_op_log`
   now fails (`ErrorKind::Unsupported`; Python `RuntimeError`) and touches no file.
@@ -244,8 +245,10 @@ are exactly these:
 - After finalize, `global_logger()` is `None` and `is_op_log_active()` is `False`.
   Before, both still reported the dead logger.
 - After finalize, entries from a `Logger` that was captured earlier are rejected
-  quietly: one "op-log finalized" line on stderr per logger. Before, every entry
-  printed "op-log channel full; dropping entry: sending on a closed channel".
+  quietly: one "op-log finalized" line on stderr per logger. Before, in the
+  default (non-lossless) mode every entry printed "op-log channel full; dropping
+  entry: sending on a closed channel"; in lossless mode
+  (`S3DLIO_OPLOG_LOSSLESS=1`) the failed send was silent.
 - `set_clock_offset` / `get_clock_offset` after finalize now return
   `Err(Unsupported)`; before, they succeeded on the dead logger. Before any init
   they still return `NotFound`, but the message now starts with the function name.
@@ -262,6 +265,18 @@ are exactly these:
   paths work, other schemes are rejected instead of becoming relative paths, and
   create errors name the path.
 - `Logger::log` still returns `()`; `Logger::try_log` and `LogOutcome` are new.
+- An entry whose `operation` is `"__SHUTDOWN__"` used to be the writer's stop
+  signal and ended the log (later entries were not written). It is now written as an
+  ordinary row; the log ends only through finalize.
+- A file-create error is rebuilt with `io::Error::new(kind, message)` so that it
+  can name the path. The `ErrorKind` is kept, but `raw_os_error()` and the
+  original source error are no longer available from it.
+- Python `finalize_op_log` releases the GIL while it drains the queue, so other
+  Python threads can run during a long drain.
+- Every `try_log` / `log` call now performs one atomic `fetch_add` and one
+  `fetch_sub` on a single gate counter shared by all threads. This is a new
+  per-entry cost, and it is contended when many threads log at once. It has not
+  been benchmarked.
 - A clock offset of `i64::MIN` no longer panics the writer thread in builds with
   overflow checks. A corrected timestamp before the epoch (or at or after year
   9999) still panics inside the timestamp formatter, as before.

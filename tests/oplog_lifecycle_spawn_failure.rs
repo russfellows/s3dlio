@@ -19,8 +19,9 @@
 // CAP_SYS_RESOURCE / CAP_SYS_ADMIN. There the scenario cannot be produced. The
 // test then joins its probe thread, prints
 //   SPAWN-FAILURE SCENARIO NOT EXERCISED: <reason>
-// and returns, unless S3DLIO_REQUIRE_SPAWN_FAILURE_TEST=1 is set, in which case
-// it FAILS, so CI (which runs as an unprivileged user) cannot silently skip it.
+// and returns, unless S3DLIO_REQUIRE_SPAWN_FAILURE_TEST is "1", "true" or "yes"
+// (any case) is set, in which case it FAILS, so CI (which runs as an unprivileged
+// user) cannot silently skip it.
 // On an unprivileged run the precondition (the probe thread fails to start) is
 // asserted before init's behaviour is. Own process (the limit is process-wide
 // and so is the op-log).
@@ -57,7 +58,8 @@ fn init_returns_an_error_when_the_os_refuses_a_thread() {
     assert_eq!(decide(true, false), Probe::NotExercised);
     assert_eq!(decide(true, true), Probe::FailBecauseRequired);
 
-    let required = std::env::var(REQUIRE_ENV).as_deref() == Ok("1");
+    let required = std::env::var(REQUIRE_ENV)
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ops.tsv.zst");
 
