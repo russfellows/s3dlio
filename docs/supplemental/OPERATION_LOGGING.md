@@ -196,7 +196,7 @@ The op-log moves through `Uninitialized` -> `Active` -> `Finalized`, and
 | Call | Uninitialized | Active | Finalized |
 |---|---|---|---|
 | `init_op_logger(path)` (`init_op_log`) | creates the file, becomes Active (a failed init stays Uninitialized, so it can be retried) | returns `Ok`; the new path is **not** created or truncated | **error** (Python: `RuntimeError`); no file is created or truncated |
-| `finalize_op_logger()` (`finalize_op_log`) | no-op | writes every accepted record, finishes the zstd stream, waits for the writer, becomes Finalized | no-op (waits if another finalize is still draining) |
+| `finalize_op_logger()` (`finalize_op_log`) | no-op | writes every accepted record (unless the writer fails with an I/O error), finishes the zstd stream, waits until the writer signals it has finished, becomes Finalized | no-op (waits if another finalize is still draining) |
 | `global_logger()` / `is_op_log_active()` | `None` / `False` | `Some` / `True` | `None` / `False` |
 
 Stores capture the logger when they are constructed
@@ -209,7 +209,13 @@ Stores capture the logger when they are constructed
 
 `Logger::log` returns a `LogOutcome` (`Accepted`, `Full`, `Closed`,
 `WriterFailed`). Every `Accepted` entry is written by finalize, including
-entries racing with it; the file format is unchanged.
+entries racing with it, unless the writer fails with an I/O error (after which
+`log` returns `WriterFailed`); the file format is unchanged.
+
+After finalize, `set_clock_offset` / `get_clock_offset` return an error of kind
+`Unsupported` saying the op-log was already finalized (before any init the kind
+is `NotFound`, "Logger not initialized"). A `file://` op-log path may have only
+an empty or `localhost` authority; schemes are case-insensitive.
 
 ## Example Usage
 

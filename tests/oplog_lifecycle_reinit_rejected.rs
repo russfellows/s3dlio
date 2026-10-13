@@ -37,25 +37,41 @@ fn entry(tag: &str) -> LogEntry {
     }
 }
 
-/// Decompress an op-log and return the `file` column of every data row.
+const HEADER_LINE: &str = "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns";
+
+/// Decompress an op-log (it must be a complete zstd stream), check the full
+/// header line, 13 columns and sequential idx on every row, and return the
+/// `file` column of every data row.
 fn logged_tags(path: &Path) -> Vec<String> {
     let raw = std::fs::read(path).expect("read op-log");
     let text = zstd::decode_all(raw.as_slice()).expect("op-log must be a complete zstd stream");
     let text = String::from_utf8(text).expect("op-log must be UTF-8");
     let mut lines = text.lines();
-    assert!(
-        lines
-            .next()
-            .is_some_and(|h| h.starts_with("idx\tthread\top\t")),
-        "op-log must start with the header row"
+    assert_eq!(
+        lines.next(),
+        Some(HEADER_LINE),
+        "op-log must start with the exact header row"
     );
     lines
-        .map(|l| l.split('\t').nth(7).expect("file column").to_string())
+        .enumerate()
+        .map(|(i, l)| {
+            let cols: Vec<&str> = l.split('\t').collect();
+            assert_eq!(cols.len(), 13, "row {i} must have 13 columns: {l:?}");
+            assert_eq!(cols[0], i.to_string(), "row {i} must carry idx {i}");
+            cols[7].to_string()
+        })
         .collect()
 }
 
 #[test]
 fn init_after_finalize_errors_and_touches_no_file() {
+    // Do not depend on the caller's environment: the default queue (8192) and
+    // non-lossless mode are what this scenario is written for.
+    #[allow(deprecated)]
+    {
+        std::env::remove_var("S3DLIO_OPLOG_BUF");
+        std::env::remove_var("S3DLIO_OPLOG_LOSSLESS");
+    }
     let dir = tempfile::tempdir().unwrap();
     let first = dir.path().join("first.tsv.zst");
     init_op_logger(first.to_str().unwrap()).unwrap();
@@ -77,6 +93,7 @@ fn init_after_finalize_errors_and_touches_no_file() {
     for requested in [&existing, &fresh, &first] {
         let err =
             init_op_logger(requested.to_str().unwrap()).expect_err("init after finalize must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
         let msg = err.to_string();
         assert!(
             msg.contains("finalized") && msg.contains("one op-log session"),

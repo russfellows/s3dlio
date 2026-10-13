@@ -34,13 +34,61 @@ enum OpLogState {
 
 // Global variables
 static OP_LOG_STATE: Mutex<OpLogState> = Mutex::new(OpLogState::Uninitialized);
-static LOSSLESS: OnceCell<bool> = OnceCell::new();
 static GLOBAL_CLIENT_ID: OnceCell<Mutex<String>> = OnceCell::new();
 
 /// Top bit of `Shared::gate`: set once finalize has begun. The low bits count
 /// `Logger::log` calls currently between "gate entered" and "outcome decided".
 const GATE_CLOSED: u64 = 1 << 63;
+/// Name of the background writer thread (visible in debuggers and `ps -T`).
+const WRITER_THREAD_NAME: &str = "s3dlio-oplog-writer";
 const HEADER: &str = "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns\n";
+
+/// Test-only scheduling noise injected at the two points of [`Logger::log`]
+/// where a race with `shutdown` can matter: between the closed-bit hint and the
+/// gate increment, and between entering the gate and sending. Enabled per
+/// thread, so it never affects other tests; compiled out of non-test builds.
+#[cfg(test)]
+mod race_hooks {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static STATE: Cell<Option<u64>> = const { Cell::new(None) };
+        static ENTERED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Record that the current thread just incremented the in-flight count.
+    pub(super) fn count_entry() {
+        ENTERED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// How many times the current thread has incremented the in-flight count.
+    pub(super) fn entered() -> u64 {
+        ENTERED.with(Cell::get)
+    }
+
+    /// Turn the noise on for the current thread (xorshift state from `seed`).
+    pub(super) fn enable(seed: u64) {
+        STATE.with(|s| s.set(Some(seed | 1)));
+    }
+
+    /// Possibly pause the current thread for a pseudo-random moment.
+    pub(super) fn point() {
+        STATE.with(|s| {
+            let Some(mut x) = s.get() else { return };
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            s.set(Some(x));
+            match x % 4 {
+                0 => {}
+                1 => std::thread::yield_now(),
+                2 => (0..(x >> 8) % 3000).for_each(|_| std::hint::spin_loop()),
+                _ => std::thread::sleep(Duration::from_micros((x >> 8) % 150)),
+            }
+        });
+    }
+}
 
 /// Lock the lifecycle state, recovering from a poisoned lock: every transition
 /// is a single assignment, so the state is consistent even if a holder panicked.
@@ -66,25 +114,30 @@ fn lock_state() -> MutexGuard<'static, OpLogState> {
 /// created before finalize stop recording when it runs.
 pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
     let path = path.as_ref();
-    let mut state = lock_state();
-    match &*state {
-        OpLogState::Active(_) => return Ok(()),
-        // Checked before any filesystem action: must not create or truncate `path`.
-        OpLogState::Finalized(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!(
-                    "op-log was already finalized and cannot be restarted; a process supports \
-                     only one op-log session, so '{path}' was not opened"
-                ),
-            ))
+    {
+        let mut state = lock_state();
+        match &*state {
+            OpLogState::Active(_) => return Ok(()),
+            // Checked before any filesystem action: must not create or truncate `path`.
+            OpLogState::Finalized(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "op-log was already finalized and cannot be restarted; a process \
+                         supports only one op-log session, so '{path}' was not opened"
+                    ),
+                ))
+            }
+            OpLogState::Uninitialized => {}
         }
-        OpLogState::Uninitialized => {}
+        // Created while the lifecycle lock is held, so concurrent inits cannot
+        // both create a file.
+        let logger = Logger::new(path)?;
+        *state = OpLogState::Active(logger);
     }
-    let logger = Logger::new(path)?;
-    *state = OpLogState::Active(logger);
 
-    // Print out some info if info logging set
+    // Logged after the lifecycle lock is released: a tracing subscriber may be
+    // slow, or may itself touch the op-log.
     info!("Intialized S3 operation logging to file: {}", path);
 
     Ok(())
@@ -109,8 +162,10 @@ pub fn global_logger() -> Option<Logger> {
 /// - `offset_nanos`: Nanoseconds to subtract from local timestamps for distributed sync
 ///
 /// # Returns
-/// - `Ok(())` if logger is initialized and offset was set
-/// - `Err` if logger is not initialized
+/// - `Ok(())` if the op-log is Active and the offset was set
+/// - `Err(NotFound)` if the op-log was never initialised
+/// - `Err(Unsupported)` if the op-log was already finalized: the session is over,
+///   so there is nothing left to configure (see [`finalize_op_logger`])
 ///
 /// # Example
 /// ```ignore
@@ -124,26 +179,36 @@ pub fn global_logger() -> Option<Logger> {
 /// s3dlio::set_clock_offset(offset)?;
 /// ```
 pub fn set_clock_offset(offset_nanos: i64) -> std::io::Result<()> {
-    if let Some(logger) = global_logger() {
-        logger.set_clock_offset(offset_nanos);
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Logger not initialized - call init_op_logger() first",
-        ))
-    }
+    with_active_logger("set_clock_offset", |logger| {
+        logger.set_clock_offset(offset_nanos)
+    })
 }
 
 /// Get the current clock offset from the global logger.
+///
+/// Errors exactly like [`set_clock_offset`]: `NotFound` before
+/// [`init_op_logger`], `Unsupported` after [`finalize_op_logger`].
 pub fn get_clock_offset() -> std::io::Result<i64> {
-    if let Some(logger) = global_logger() {
-        Ok(logger.get_clock_offset())
-    } else {
-        Err(std::io::Error::new(
+    with_active_logger("get_clock_offset", |logger| logger.get_clock_offset())
+}
+
+/// Run `f` on the Active global logger, or explain why there is none. The two
+/// failure states are told apart because the remedy differs: a logger that was
+/// never initialised needs `init_op_logger()`, a finalized one can never come back.
+fn with_active_logger<T>(what: &str, f: impl FnOnce(&Logger) -> T) -> std::io::Result<T> {
+    match &*lock_state() {
+        OpLogState::Active(logger) => Ok(f(logger)),
+        OpLogState::Uninitialized => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Logger not initialized",
-        ))
+            format!("{what}: Logger not initialized - call init_op_logger() first"),
+        )),
+        OpLogState::Finalized(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "{what}: the op-log was already finalized (a process supports only one \
+                 op-log session), so there is no active logger"
+            ),
+        )),
     }
 }
 
@@ -192,9 +257,10 @@ pub fn get_client_id() -> String {
         .unwrap_or_default()
 }
 
-/// Finish the process's op-log session: every record whose
-/// [`Logger::log`] call was accepted is written, the zstd stream is finished and
-/// the writer thread has exited before this returns.
+/// Finish the process's op-log session: every record whose [`Logger::log`] call
+/// was accepted is written (unless the writer failed with an I/O error), and the
+/// writer has finished the zstd stream and signalled completion before this
+/// returns.
 ///
 /// Finalize is terminal and idempotent. Entries submitted once it has begun are
 /// rejected (`LogOutcome::Closed`), [`global_logger`] returns `None` and the
@@ -332,17 +398,19 @@ fn oplog_write_buffer_capacity() -> usize {
         .unwrap_or(256 * 1024)
 }
 
-/// Result of [`Logger::log`]. Only `Accepted` entries are guaranteed to be in
-/// the file once the session is finalized.
+/// Result of [`Logger::log`]. Only `Accepted` entries can be in the file once
+/// the session is finalized, and they will be unless the writer fails with an
+/// I/O error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogOutcome {
-    /// Queued for the writer; it will be written, even if finalize runs next.
+    /// Queued for the writer; it will be written, even if finalize runs next,
+    /// unless the writer fails with an I/O error before reaching it.
     Accepted,
     /// The queue was full (non-lossless mode): the entry was dropped.
     Full,
     /// The session is finalizing or finalized: the entry was rejected, not written.
     Closed,
-    /// The writer thread stopped after an I/O error: the entry was not written.
+    /// The writer stopped after an I/O error: the entry was not written.
     WriterFailed,
 }
 
@@ -365,11 +433,34 @@ struct Shared {
     /// The mutex is held for the whole shutdown so later callers wait for it.
     done_rx: Mutex<Option<Receiver<()>>>,
     clock_offset_nanos: Arc<AtomicI64>, // Nanoseconds to adjust timestamps for distributed sync
+    /// Block on a full queue instead of dropping (`S3DLIO_OPLOG_LOSSLESS`).
+    /// Fixed per logger when it is built.
+    lossless: bool,
     closed_noted: AtomicBool,
     writer_failure_noted: AtomicBool,
 }
 
+impl Shared {
+    /// Outcome for a call that found the logger closed; prints the single
+    /// "finalized" diagnostic for the whole logger the first time.
+    fn reject_closed(&self) -> LogOutcome {
+        if !self.closed_noted.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "op-log finalized: entries from stores created before finalize are no \
+                 longer recorded"
+            );
+        }
+        LogOutcome::Closed
+    }
+}
+
 /// Handle for sending log entries. Clones share one writer thread.
+///
+/// Invariant: the op-log never records its own I/O, whatever form the
+/// destination takes (plain path or `file://` URI). The writer thread writes
+/// with `std::fs` and `zstd` directly and must NEVER go through an
+/// `ObjectStore` or any other logged path: doing so would add a row for every
+/// row written. Tests `oplog_lifecycle_no_self_log_*` pin this.
 #[derive(Debug, Clone)]
 pub struct Logger {
     shared: Arc<Shared>,
@@ -463,38 +554,27 @@ fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
 impl Logger {
     /// Creates a new logger and spawns the background thread to handle writing.
     ///
-    /// `log_file_path` may be a plain local path or a `file://` URI.
+    /// `log_file_path` may be a plain local path or a `file://` URI. Queue size,
+    /// lossless mode, buffer size and compression level come from the
+    /// `S3DLIO_OPLOG_*` environment variables, read once here.
     pub fn new(log_file_path: &str) -> std::io::Result<Self> {
+        let lossless = std::env::var("S3DLIO_OPLOG_LOSSLESS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        Self::open(log_file_path, oplog_channel_capacity(), lossless)
+    }
+
+    /// [`Logger::new`] with the queue capacity and lossless mode given explicitly
+    /// (the environment is not consulted for these two).
+    fn open(log_file_path: &str, cap: usize, lossless: bool) -> std::io::Result<Self> {
         let local_path = resolve_local_oplog_path(log_file_path)?;
 
-        //
-        // Check to see if the LOSSLESS env variable is set
-        let _ = LOSSLESS.set(
-            std::env::var("S3DLIO_OPLOG_LOSSLESS")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
-        );
-
-        /*
-         * Instead of a Bounded channel with set size, check ENV variables to optionally use different
-         * sizes
-         *
-                // Bounded channel for log entries (drop on overflow in `log()` via try_send).
-                let (sender, receiver): (SyncSender<LogEntry>, Receiver<LogEntry>) = sync_channel(256);
-        */
         // Tunable buffer sizes via (env) variables:
-        let cap: usize = oplog_channel_capacity();
         let wbuf: usize = oplog_write_buffer_capacity();
         let level: i32 = std::env::var("S3DLIO_OPLOG_LEVEL")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1); // bias to fast
-
-        // Bounded channel for log entries (drop on overflow in `log()` via try_send).
-        let (sender, receiver): (SyncSender<Message>, Receiver<Message>) = sync_channel(cap);
-
-        // One-shot channel to signal that the background thread finished.
-        let (done_tx, done_rx) = channel::<()>();
 
         // Prepare compressed writer.
         // Include the path in the error: a bare "No such file or directory
@@ -514,8 +594,27 @@ impl Logger {
         // Old, we didn't set a buffer capacity
         //let writer = BufWriter::new(file);
         let writer = BufWriter::with_capacity(wbuf, file);
+        Self::start(writer, cap, lossless, level, WRITER_THREAD_NAME)
+    }
 
-        let mut encoder = Encoder::new(writer, level)?.auto_finish();
+    /// Write the header to `sink`, then start the background writer thread that
+    /// compresses entries into it. Fails (instead of panicking) if the header
+    /// cannot be written or the OS refuses to start a thread; the file, if any,
+    /// has already been created by the caller and is left as it is.
+    fn start<W: Write + Send + 'static>(
+        sink: W,
+        cap: usize,
+        lossless: bool,
+        level: i32,
+        thread_name: &str,
+    ) -> std::io::Result<Self> {
+        // Bounded channel for log entries (drop on overflow in `log()` via try_send).
+        let (sender, receiver): (SyncSender<Message>, Receiver<Message>) = sync_channel(cap);
+
+        // One-shot channel to signal that the background thread finished.
+        let (done_tx, done_rx) = channel::<()>();
+
+        let mut encoder = Encoder::new(sink, level)?.auto_finish();
 
         // Write header now so even empty logs have the header.
         encoder.write_all(HEADER.as_bytes())?;
@@ -524,24 +623,32 @@ impl Logger {
         // Background writer thread.
         let clock_offset = Arc::new(AtomicI64::new(0));
         let clock_offset_clone = Arc::clone(&clock_offset);
-        thread::spawn(move || {
-            for (idx, message) in (0_u64..).zip(receiver) {
-                let mut entry = match message {
-                    Message::Entry(entry) => entry,
-                    Message::Shutdown => break,
-                };
-                entry.idx = idx;
-                let offset = clock_offset_clone.load(Ordering::Relaxed);
-                let line = entry.to_log_line(offset);
-                if let Err(e) = encoder.write_all(line.as_bytes()) {
-                    eprintln!("Error writing to op-log: {e}");
-                    break;
+        thread::Builder::new()
+            .name(thread_name.to_string())
+            .spawn(move || {
+                for (idx, message) in (0_u64..).zip(receiver) {
+                    let mut entry = match message {
+                        Message::Entry(entry) => entry,
+                        Message::Shutdown => break,
+                    };
+                    entry.idx = idx;
+                    let offset = clock_offset_clone.load(Ordering::Relaxed);
+                    let line = entry.to_log_line(offset);
+                    if let Err(e) = encoder.write_all(line.as_bytes()) {
+                        eprintln!("Error writing to op-log: {e}");
+                        break;
+                    }
                 }
-            }
-            // Drop encoder here to finish the zstd stream.
-            drop(encoder);
-            let _ = done_tx.send(());
-        });
+                // Drop encoder here to finish the zstd stream.
+                drop(encoder);
+                let _ = done_tx.send(());
+            })
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("failed to start the op-log writer thread: {e}"),
+                )
+            })?;
 
         Ok(Logger {
             shared: Arc::new(Shared {
@@ -549,6 +656,7 @@ impl Logger {
                 gate: AtomicU64::new(0),
                 done_rx: Mutex::new(Some(done_rx)),
                 clock_offset_nanos: clock_offset,
+                lossless,
                 closed_noted: AtomicBool::new(false),
                 writer_failure_noted: AtomicBool::new(false),
             }),
@@ -588,31 +696,48 @@ impl Logger {
     /// dropped and [`LogOutcome::Full`] is returned. With `S3DLIO_OPLOG_LOSSLESS=1`
     /// the call blocks instead of dropping.
     ///
-    /// `Accepted` is a promise: the entry is on the writer's queue and
-    /// [`finalize_op_logger`] will write it. Once finalize has begun, calls
-    /// return [`LogOutcome::Closed`] (never `Full`) and write nothing; at most
-    /// one diagnostic is printed for the whole closed logger.
+    /// `Accepted` means the entry is on the writer's queue, ahead of the shutdown
+    /// marker, so [`finalize_op_logger`] will write it unless the writer fails
+    /// with an I/O error. Once finalize has begun, calls return
+    /// [`LogOutcome::Closed`] (never `Full`) and write nothing; at most one
+    /// diagnostic is printed for the whole closed logger.
     ///
     /// The return value may be ignored (it is deliberately not `#[must_use]`:
     /// the store wrappers fire-and-forget); tests use it to prove drain exactness.
     pub fn log(&self, entry: LogEntry) -> LogOutcome {
         let shared = &*self.shared;
-        // Enter the gate. The increment is visible to shutdown's wait-for-zero
-        // even if it loses the race with the close, so shutdown cannot send its
-        // sentinel while any call that passed the closed check is still sending.
+
+        // Fast path: once the logger is closed, a caller must not touch the
+        // in-flight count at all, or a hot loop of post-close callers could keep
+        // the count above zero and starve `shutdown`'s wait-for-zero. This load
+        // is only a hint and never admits anything: the authoritative check is
+        // the value returned by the `fetch_add` below.
+        if shared.gate.load(Ordering::Acquire) & GATE_CLOSED != 0 {
+            return shared.reject_closed();
+        }
+        #[cfg(test)]
+        race_hooks::point();
+
+        // Enter the gate. All updates to `gate` are totally ordered. If our add
+        // comes before shutdown's `fetch_or(GATE_CLOSED)` in that order, shutdown's
+        // wait-for-zero sees our count and cannot send the sentinel until our
+        // guard drops, i.e. until our send has finished. If it comes after, the
+        // returned `before` carries the closed bit and we send nothing. So a
+        // caller that lost the race with the hint above is rejected here, it only
+        // holds the count for the instant it takes to notice (at most once per
+        // call, and only for calls that read the gate before the close), and
+        // nothing can be accepted behind the sentinel.
         let before = shared.gate.fetch_add(1, Ordering::Acquire);
+        #[cfg(test)]
+        race_hooks::count_entry();
         let _in_flight = InFlight(&shared.gate);
         if before & GATE_CLOSED != 0 {
-            if !shared.closed_noted.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "op-log finalized: entries from stores created before finalize are no \
-                     longer recorded"
-                );
-            }
-            return LogOutcome::Closed;
+            return shared.reject_closed();
         }
+        #[cfg(test)]
+        race_hooks::point();
 
-        let outcome = if *LOSSLESS.get().unwrap_or(&false) {
+        let outcome = if shared.lossless {
             // Blocking: guarantees no drops (may stall if writer can’t keep up).
             match shared.sender.send(Message::Entry(entry)) {
                 Ok(()) => LogOutcome::Accepted,
@@ -642,7 +767,8 @@ impl Logger {
     /// Exactness: (1) set `GATE_CLOSED`, so every later `log()` is rejected;
     /// (2) wait until the in-flight count reaches zero, i.e. every `log()` that
     /// entered before the close has finished its send, so everything accepted is
-    /// already on the queue; (3) send `Shutdown`, which the FIFO channel delivers
+    /// already on the queue (and is written unless the writer fails with an I/O
+    /// error); (3) send `Shutdown`, which the FIFO channel delivers
     /// after all of those entries; (4) wait for the writer to finish the zstd
     /// stream. Idempotent; concurrent callers block until the first finishes.
     fn shutdown(&self) {
@@ -986,6 +1112,11 @@ mod oplog_path_tests {
 #[cfg(test)]
 mod oplog_shutdown_tests {
     use super::*;
+    use std::path::Path;
+    use std::sync::Barrier;
+    use std::time::Instant;
+
+    const HEADER_LINE: &str = "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns";
 
     fn entry(tag: &str) -> LogEntry {
         let now = SystemTime::now();
@@ -1005,6 +1136,32 @@ mod oplog_shutdown_tests {
         }
     }
 
+    /// Decompress an op-log (it must be a complete zstd stream), check the full
+    /// header line, 13 columns and sequential idx on every row, and return the
+    /// `file` column of each row.
+    fn read_tags(path: &Path) -> Result<Vec<String>, String> {
+        let raw = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
+        let text = zstd::decode_all(raw.as_slice())
+            .map_err(|e| format!("not a complete zstd stream: {e}"))?;
+        let text = String::from_utf8(text).map_err(|e| format!("not UTF-8: {e}"))?;
+        let mut lines = text.lines();
+        if lines.next() != Some(HEADER_LINE) {
+            return Err("header line differs from the frozen header".to_string());
+        }
+        let mut tags = Vec::new();
+        for (i, line) in lines.enumerate() {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() != 13 {
+                return Err(format!("row {i} has {} columns: {line:?}", cols.len()));
+            }
+            if cols[0] != i.to_string() {
+                return Err(format!("row {i} has idx {}", cols[0]));
+            }
+            tags.push(cols[7].to_string());
+        }
+        Ok(tags)
+    }
+
     // A standalone Logger (not the process-global one) can be shut down
     // repeatedly; once closed it reports Closed, never Full.
     #[test]
@@ -1019,15 +1176,280 @@ mod oplog_shutdown_tests {
         logger.shutdown();
         assert_eq!(logger.clone().log(entry("c")), LogOutcome::Closed);
 
-        let text =
-            String::from_utf8(zstd::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap())
-                .unwrap();
-        let files: Vec<&str> = text
-            .lines()
-            .skip(1)
-            .map(|l| l.split('\t').nth(7).unwrap())
+        assert_eq!(read_tags(&path).unwrap(), ["a", "b"]);
+    }
+
+    // Finding 1: a caller that finds the logger closed must not touch the
+    // in-flight count at all (otherwise a hot loop of post-close callers can keep
+    // the count above zero and starve shutdown's wait-for-zero).
+    #[test]
+    fn post_close_callers_never_enter_the_in_flight_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ops.tsv.zst");
+        let logger = Logger::open(path.to_str().unwrap(), 8, false).unwrap();
+        logger.shutdown();
+
+        let entered_before = race_hooks::entered();
+        for _ in 0..1000 {
+            assert_eq!(logger.log(entry("late")), LogOutcome::Closed);
+        }
+        assert_eq!(
+            race_hooks::entered() - entered_before,
+            0,
+            "log() on a closed logger incremented the in-flight count"
+        );
+        assert_eq!(
+            logger.shared.gate.load(Ordering::SeqCst),
+            GATE_CLOSED,
+            "closed logger must have an empty in-flight count"
+        );
+    }
+
+    // Finding 1, behavioural form: shutdown completes while other threads hammer
+    // log() on the closed logger.
+    #[test]
+    fn shutdown_is_not_starved_by_a_hot_loop_of_post_close_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ops.tsv.zst");
+        let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let hammers: Vec<_> = (0..8)
+            .map(|_| {
+                let (logger, stop) = (logger.clone(), Arc::clone(&stop));
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = logger.log(entry("hot"));
+                    }
+                })
+            })
             .collect();
-        assert_eq!(files, ["a", "b"]);
+        thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        logger.shutdown();
+        let took = started.elapsed();
+        // Keep hammering the closed logger for a moment after shutdown returned.
+        thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        for h in hammers {
+            h.join().unwrap();
+        }
+        assert!(
+            took < Duration::from_secs(5),
+            "shutdown took {took:?} under a hot loop of callers"
+        );
+        read_tags(&path).unwrap();
+    }
+
+    fn xorshift(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    /// One randomised producers-versus-shutdown round on a standalone logger.
+    /// `Err` describes the first exactness violation found.
+    fn race_round(round: u64, dir: &Path) -> Result<(), String> {
+        let mut rng = (round + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let producers = 2 + (xorshift(&mut rng) % 3) as usize;
+        let lossless = round & 1 == 0;
+        let cap = if lossless {
+            [1_usize, 2, 4][(xorshift(&mut rng) % 3) as usize]
+        } else {
+            [2_usize, 8, 64][(xorshift(&mut rng) % 3) as usize]
+        };
+        let delay_us = xorshift(&mut rng) % 700;
+        let path = dir.join(format!("race-{round}.tsv.zst"));
+        let logger = Logger::open(path.to_str().ok_or("non-UTF-8 temp path")?, cap, lossless)
+            .map_err(|e| format!("Logger::open: {e}"))?;
+
+        let barrier = Arc::new(Barrier::new(producers + 1));
+        let handles: Vec<_> = (0..producers)
+            .map(|t| {
+                let logger = logger.clone();
+                let barrier = Arc::clone(&barrier);
+                let seed = xorshift(&mut rng);
+                thread::spawn(move || {
+                    race_hooks::enable(seed);
+                    barrier.wait();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let mut accepted = Vec::new();
+                    let mut problems = Vec::new();
+                    for n in 0_u64.. {
+                        let tag = format!("t{t}-{n}");
+                        match logger.log(entry(&tag)) {
+                            LogOutcome::Accepted => accepted.push(tag),
+                            LogOutcome::Full => {
+                                if lossless {
+                                    problems.push("Full in lossless mode".to_string());
+                                    break;
+                                }
+                                thread::sleep(Duration::from_micros(50));
+                            }
+                            LogOutcome::Closed => {
+                                // Closed is final: nothing later may be accepted.
+                                for _ in 0..3 {
+                                    if logger.log(entry("late")) != LogOutcome::Closed {
+                                        problems.push("outcome after Closed".to_string());
+                                    }
+                                }
+                                return (accepted, problems);
+                            }
+                            LogOutcome::WriterFailed => {
+                                problems.push(format!(
+                                    "WriterFailed for {tag} (sent after the sentinel?)"
+                                ));
+                                break;
+                            }
+                        }
+                        if Instant::now() > deadline {
+                            problems.push("never saw Closed".to_string());
+                            break;
+                        }
+                    }
+                    (accepted, problems)
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        if delay_us > 0 {
+            thread::sleep(Duration::from_micros(delay_us));
+        }
+        logger.shutdown();
+
+        let mut accepted = std::collections::BTreeSet::new();
+        let mut accepted_count = 0;
+        let mut problems = Vec::new();
+        for h in handles {
+            match h.join() {
+                Ok((a, p)) => {
+                    accepted_count += a.len();
+                    accepted.extend(a);
+                    problems.extend(p);
+                }
+                Err(_) => problems.push("producer thread panicked".to_string()),
+            }
+        }
+        if !problems.is_empty() {
+            return Err(format!("cap={cap} lossless={lossless}: {problems:?}"));
+        }
+        let gate = logger.shared.gate.load(Ordering::SeqCst);
+        if gate != GATE_CLOSED {
+            return Err(format!("gate not empty after shutdown: {gate:#x}"));
+        }
+        let tags = read_tags(&path)?;
+        let written: std::collections::BTreeSet<String> = tags.iter().cloned().collect();
+        if written.len() != tags.len() {
+            return Err("an entry was written twice".to_string());
+        }
+        if accepted.len() != accepted_count {
+            return Err("duplicate tags among accepted entries".to_string());
+        }
+        let lost: Vec<_> = accepted.difference(&written).take(3).collect();
+        let phantom: Vec<_> = written.difference(&accepted).take(3).collect();
+        if !lost.is_empty() || !phantom.is_empty() {
+            return Err(format!(
+                "cap={cap} lossless={lossless} producers={producers}: accepted but not \
+                 written {lost:?}; written but not accepted {phantom:?} \
+                 ({accepted_count} accepted, {} written)",
+                tags.len()
+            ));
+        }
+        std::fs::remove_file(&path).map_err(|e| format!("cleanup: {e}"))?;
+        Ok(())
+    }
+
+    // Finding 10: the written set must equal the Accepted set no matter where
+    // shutdown lands. Scheduling noise (race_hooks) is injected at the two
+    // points where log() and shutdown can interleave, which is what lets this
+    // fail reliably when the drain protocol is broken (see the commit message
+    // for the mutants it kills).
+    #[test]
+    fn written_set_equals_accepted_set_across_randomised_shutdown_races() {
+        const ROUNDS: u64 = 1500;
+        let dir = tempfile::tempdir().unwrap();
+        let mut failures = Vec::new();
+        for round in 0..ROUNDS {
+            if let Err(e) = race_round(round, dir.path()) {
+                failures.push(format!("round {round}: {e}"));
+            }
+        }
+        println!("race rounds failed: {}/{ROUNDS}", failures.len());
+        assert!(
+            failures.is_empty(),
+            "{}/{ROUNDS} rounds violated exactness; first: {:?}",
+            failures.len(),
+            failures.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+
+    /// A sink that accepts everything until armed, then fails every write.
+    struct ArmedFailSink(Arc<AtomicBool>);
+
+    impl Write for ArmedFailSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0.load(Ordering::SeqCst) {
+                Err(std::io::Error::other("injected: no space left on device"))
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// ~400 KB of incompressible-ish text in the `file` column, so that one
+    /// entry forces zstd to hand output to the sink.
+    fn big_entry(seed: u64) -> LogEntry {
+        let mut x = seed | 1;
+        let mut file = String::with_capacity(400_000);
+        while file.len() < 400_000 {
+            file.push_str(&format!("{:016x}", xorshift(&mut x)));
+        }
+        entry(&file)
+    }
+
+    // Finding 11: after the writer fails with an I/O error, log() reports
+    // WriterFailed -- never Full -- in both queue modes, and shutdown returns.
+    #[test]
+    fn writer_io_error_surfaces_as_writer_failed_never_full() {
+        for lossless in [false, true] {
+            let armed = Arc::new(AtomicBool::new(false));
+            let logger = Logger::start(
+                ArmedFailSink(Arc::clone(&armed)),
+                1024,
+                lossless,
+                1,
+                "s3dlio-oplog-test-writer",
+            )
+            .unwrap();
+            assert_eq!(logger.log(entry("before")), LogOutcome::Accepted);
+            armed.store(true, Ordering::SeqCst);
+
+            let mut seen_failed = false;
+            for i in 0..200_u64 {
+                match logger.log(big_entry(i)) {
+                    LogOutcome::Accepted => thread::sleep(Duration::from_millis(20)),
+                    LogOutcome::WriterFailed => {
+                        seen_failed = true;
+                        break;
+                    }
+                    other => panic!("lossless={lossless}: unexpected {other:?} (never Full)"),
+                }
+            }
+            assert!(
+                seen_failed,
+                "lossless={lossless}: writer I/O error never surfaced"
+            );
+            for _ in 0..5 {
+                assert_eq!(logger.log(entry("after")), LogOutcome::WriterFailed);
+            }
+            logger.shutdown(); // must return even though the writer is gone
+            assert_eq!(logger.log(entry("closed")), LogOutcome::Closed);
+        }
     }
 }
 
@@ -1102,6 +1524,39 @@ mod oplog_golden_format_tests {
         "1\t8\tPUT\tclient-b\t1\t0\tfile://\tdir/obj1\t403 Forbidden: access denied\t2023-11-14T22:13:30.123456789Z\t\t2023-11-14T22:13:30.123706789Z\t250000\n",
         "2\t0\tLIST\t\t25\t123456789012\taz://container\tprefix/\t\t2023-11-14T22:13:40.123456789Z\t2023-11-14T22:13:40.123456790Z\t2023-11-14T22:13:41.123456789Z\t1000000000\n",
     ];
+
+    /// Write `entries()` through a standalone Logger at `destination` and return
+    /// the raw, decompressed bytes of the resulting file at `local`.
+    fn decompressed_after_logging(destination: &str, local: &std::path::Path) -> Vec<u8> {
+        let logger = Logger::new(destination).unwrap();
+        for e in entries() {
+            assert_eq!(logger.log(e), LogOutcome::Accepted);
+        }
+        logger.shutdown();
+        zstd::decode_all(std::fs::read(local).unwrap().as_slice()).unwrap()
+    }
+
+    // A plain path and the equivalent file:// URI (empty or "localhost"
+    // authority) must produce byte-identical header + rows for identical
+    // fixed-timestamp entries.
+    #[test]
+    fn plain_path_and_equivalent_file_uris_write_identical_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.tsv.zst");
+        let uri = dir.path().join("uri.tsv.zst");
+        let localhost = dir.path().join("localhost.tsv.zst");
+        let from_plain = decompressed_after_logging(plain.to_str().unwrap(), &plain);
+        let from_uri = decompressed_after_logging(&format!("file://{}", uri.display()), &uri);
+        let from_localhost = decompressed_after_logging(
+            &format!("FILE://localhost{}", localhost.display()),
+            &localhost,
+        );
+        let mut expected = EXPECTED_HEADER.to_string();
+        expected.extend(EXPECTED_ROWS);
+        assert_eq!(String::from_utf8(from_plain.clone()).unwrap(), expected);
+        assert_eq!(from_plain, from_uri);
+        assert_eq!(from_plain, from_localhost);
+    }
 
     #[test]
     fn written_file_matches_the_frozen_format_byte_for_byte() {

@@ -23,6 +23,7 @@ def main():
     dest_file_dir = tempfile.mkdtemp(prefix="s3dlio_dest_file_")
     dest_direct_dir = tempfile.mkdtemp(prefix="s3dlio_dest_direct_")
     download_dir = tempfile.mkdtemp(prefix="s3dlio_download_")
+    log_dir = tempfile.mkdtemp(prefix="s3dlio_oplog_")
     
     print(f"\n1. Creating test environment...")
     print(f"   Source: {src_dir}")
@@ -41,9 +42,7 @@ def main():
         print(f"   Created 10 test files (10KB each)")
         
         # Initialize op-log
-        log_path = "/tmp/test_op_log_python.tsv.zst"
-        if os.path.exists(log_path):
-            os.remove(log_path)
+        log_path = os.path.join(log_dir, "test_op_log_python.tsv.zst")
         
         print(f"\n3. Initializing op-log: {log_path}")
         s3dlio.init_op_log(log_path)
@@ -122,9 +121,15 @@ def main():
         file_size = os.path.getsize(log_path)
         print(f"   ✓ Log file created: {log_path} ({file_size} bytes)")
         
+        # The file must be a COMPLETE zstd stream (finalize finished it).
+        import subprocess
+        tested = subprocess.run(['zstd', '-t', log_path], capture_output=True, text=True)
+        if tested.returncode != 0:
+            print(f"   ✗ Not a complete zstd stream: {tested.stderr}")
+            return 1
+
         # Decompress and show sample entries
         print("\n11. Sample log entries:")
-        import subprocess
         result = subprocess.run(
             ['zstdcat', log_path],
             capture_output=True,
@@ -133,6 +138,20 @@ def main():
         
         if result.returncode == 0:
             lines = result.stdout.strip().split('\n')
+            expected_header = (
+                "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror"
+                "\tstart\tfirst_byte\tend\tduration_ns"
+            )
+            if lines[0] != expected_header:
+                print(f"   ✗ Unexpected header: {lines[0]!r}")
+                return 1
+            bad = [l for l in lines[1:] if len(l.split('\t')) != 13]
+            ops = [l.split('\t')[2] for l in lines[1:]]
+            expected_ops = {'PUT': 20, 'GET': 20, 'LIST': 2}
+            actual_ops = {op: ops.count(op) for op in expected_ops}
+            if bad or actual_ops != expected_ops or len(ops) != sum(expected_ops.values()):
+                print(f"   ✗ Expected {expected_ops} (13 columns each); got {actual_ops} of {len(ops)} rows, {len(bad)} malformed")
+                return 1
             print(f"   Total log entries: {len(lines)}")
             
             # Show header
@@ -180,7 +199,7 @@ def main():
     finally:
         # Cleanup
         print(f"\n12. Cleaning up temporary directories...")
-        for d in [src_dir, dest_file_dir, dest_direct_dir, download_dir]:
+        for d in [src_dir, dest_file_dir, dest_direct_dir, download_dir, log_dir]:
             if os.path.exists(d):
                 shutil.rmtree(d)
         print("   ✓ Cleanup complete")

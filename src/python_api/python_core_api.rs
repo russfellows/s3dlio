@@ -708,14 +708,16 @@ pub fn init_op_log(path: &str) -> PyResult<()> {
     init_op_logger(path).map_err(py_err)
 }
 
-/// Finish operation logging: write every accepted record, close the zstd
-/// stream and stop the writer thread. Terminal for this process (see
+/// Finish operation logging: write every accepted record (unless the writer
+/// fails with an I/O error), close the zstd stream and wait until the writer has
+/// finished and signalled completion. Terminal for this process (see
 /// init_op_log). Safe to call repeatedly, or before init_op_log() (no effect).
 /// After it returns is_op_log_active() is False and operations on objects
-/// created earlier are no longer recorded.
+/// created earlier are no longer recorded. The GIL is released while the
+/// pending records are drained, so other Python threads keep running.
 #[pyfunction]
-pub fn finalize_op_log() -> PyResult<()> {
-    finalize_op_logger();
+pub fn finalize_op_log(py: Python<'_>) -> PyResult<()> {
+    py.detach(finalize_op_logger);
     Ok(())
 }
 
