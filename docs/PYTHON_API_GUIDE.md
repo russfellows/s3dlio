@@ -976,6 +976,12 @@ path may be a plain path (`/tmp/operations.tsv.zst`) or a `file://` URI
 (`file:///tmp/operations.tsv.zst`); the parent directory must already exist.
 Remote URIs such as `s3://` are rejected with an error.
 
+A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
+`init_op_log` while already active is a no-op; after `finalize_op_log` it raises
+`RuntimeError` and touches no file. `finalize_op_log` is safe to repeat. Stores
+capture the logger at construction: those created before `init_op_log` are never
+logged, and those created before `finalize_op_log` stop recording when it runs.
+
 ### Python Convenience Helpers
 
 ```python
@@ -1106,9 +1112,9 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | Function | Description |
 |----------|-------------|
 | `init_logging(level)` | Set log level: trace, debug, info, warn, error |
-| `init_op_log(path)` | Enable operation logging to a local file (plain path or `file://` URI) |
-| `finalize_op_log()` | Flush and close operation log |
-| `is_op_log_active()` | Check if operation logging is active |
+| `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` URI); `RuntimeError` after finalize |
+| `finalize_op_log()` | Write all accepted records and close the log; terminal and idempotent |
+| `is_op_log_active()` | True between init and finalize only |
 
 ---
 

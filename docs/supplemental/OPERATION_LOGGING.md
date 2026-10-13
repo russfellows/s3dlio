@@ -188,6 +188,29 @@ To achieve true first-byte tracking, we would need:
 - Use RangeEngine for per-chunk timing (requires large_object_threshold config)
 - Consider object_store crate's get_range() for manual chunking
 
+## Lifecycle: one op-log session per process
+
+The op-log moves through `Uninitialized` -> `Active` -> `Finalized`, and
+`Finalized` is terminal: a process supports **exactly one** op-log session.
+
+| Call | Uninitialized | Active | Finalized |
+|---|---|---|---|
+| `init_op_logger(path)` (`init_op_log`) | creates the file, becomes Active (a failed init stays Uninitialized, so it can be retried) | returns `Ok`; the new path is **not** created or truncated | **error** (Python: `RuntimeError`); no file is created or truncated |
+| `finalize_op_logger()` (`finalize_op_log`) | no-op | writes every accepted record, finishes the zstd stream, waits for the writer, becomes Finalized | no-op (waits if another finalize is still draining) |
+| `global_logger()` / `is_op_log_active()` | `None` / `False` | `Some` / `True` | `None` / `False` |
+
+Stores capture the logger when they are constructed
+(`store_for_uri_with_logger(uri, global_logger())`):
+
+- stores created **before** init are unlogged for their whole life;
+- stores created **before** finalize stop recording when finalize runs (their
+  later entries are rejected with `LogOutcome::Closed`, not written);
+- stores created **after** finalize are unlogged.
+
+`Logger::log` returns a `LogOutcome` (`Accepted`, `Full`, `Closed`,
+`WriterFailed`). Every `Accepted` entry is written by finalize, including
+entries racing with it; the file format is unchanged.
+
 ## Example Usage
 
 ### Standalone Application

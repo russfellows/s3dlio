@@ -682,21 +682,41 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 
 /// Enable operation logging to a local zstd-compressed TSV file.
 ///
+/// A process supports exactly ONE op-log session (init -> finalize, no restart).
+///
 /// Args:
 ///     path: Local filesystem path (e.g. "/tmp/ops.tsv.zst") or file:// URI
 ///         (e.g. "file:///tmp/ops.tsv.zst"). The parent directory must exist.
 ///         Remote URIs such as s3:// are not supported.
+///
+/// Behaviour:
+///     - First call: creates the file and starts logging. A call that fails
+///       (bad path, unsupported scheme) leaves logging uninitialized, so a
+///       corrected call can succeed.
+///     - Call while logging is already active: returns without effect; the new
+///       path is not created or truncated.
+///     - Call after finalize_op_log(): raises RuntimeError and touches no file.
+///
+/// Stores/readers capture the logger when they are constructed: objects created
+/// before init_op_log() are never logged; objects created before
+/// finalize_op_log() stop recording when it runs.
 #[pyfunction]
 pub fn init_op_log(path: &str) -> PyResult<()> {
     init_op_logger(path).map_err(py_err)
 }
 
+/// Finish operation logging: write every accepted record, close the zstd
+/// stream and stop the writer thread. Terminal for this process (see
+/// init_op_log). Safe to call repeatedly, or before init_op_log() (no effect).
+/// After it returns is_op_log_active() is False and operations on objects
+/// created earlier are no longer recorded.
 #[pyfunction]
 pub fn finalize_op_log() -> PyResult<()> {
     finalize_op_logger();
     Ok(())
 }
 
+/// True only between a successful init_op_log() and finalize_op_log().
 #[pyfunction]
 pub fn is_op_log_active() -> PyResult<bool> {
     Ok(global_logger().is_some())

@@ -11,42 +11,96 @@
 use once_cell::sync::OnceCell;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{
-    mpsc::{channel, sync_channel, Receiver, SyncSender},
-    Arc, Mutex,
+    mpsc::{channel, sync_channel, Receiver, SyncSender, TrySendError},
+    Arc, Mutex, MutexGuard, PoisonError,
 };
 use std::thread;
 use std::time::{Duration, SystemTime};
 use tracing::info;
 use zstd::stream::write::Encoder;
 
+/// Process-wide op-log lifecycle: `Uninitialized` -> `Active` -> `Finalized`.
+///
+/// `Finalized` is terminal: a process supports exactly one op-log session
+/// (issue #170). It keeps the (closed) logger only so that a repeated or
+/// concurrent finalize can wait for the first one to finish draining.
+enum OpLogState {
+    Uninitialized,
+    Active(Logger),
+    Finalized(Logger),
+}
+
 // Global variables
-static GLOBAL_LOGGER: OnceCell<Logger> = OnceCell::new();
+static OP_LOG_STATE: Mutex<OpLogState> = Mutex::new(OpLogState::Uninitialized);
 static LOSSLESS: OnceCell<bool> = OnceCell::new();
 static GLOBAL_CLIENT_ID: OnceCell<Mutex<String>> = OnceCell::new();
 
-const SHUTDOWN_OP: &str = "__SHUTDOWN__";
+/// Top bit of `Shared::gate`: set once finalize has begun. The low bits count
+/// `Logger::log` calls currently between "gate entered" and "outcome decided".
+const GATE_CLOSED: u64 = 1 << 63;
 const HEADER: &str = "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns\n";
 
-/// Initialise the op‑log *once per process*.
-/// Subsequent calls are ignored (they return `Ok(())`).
+/// Lock the lifecycle state, recovering from a poisoned lock: every transition
+/// is a single assignment, so the state is consistent even if a holder panicked.
+fn lock_state() -> MutexGuard<'static, OpLogState> {
+    OP_LOG_STATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Start the process's op-log session, writing to `path`.
+///
+/// A process supports **exactly one** op-log session:
+/// `Uninitialized` -> `Active` -> `Finalized` (terminal).
+///
+/// - Uninitialized: resolves `path` (plain local path or `file://` URI), creates
+///   the file and becomes Active. A failed init (bad path, unsupported scheme,
+///   I/O error) leaves the op-log Uninitialized, so a corrected call can succeed.
+/// - Active: a no-op returning `Ok(())`. The new `path` is **not** created or
+///   truncated and the session keeps writing to the original file.
+/// - Finalized: returns an error and performs no filesystem action. The
+///   op-log cannot be restarted after [`finalize_op_logger`].
+///
+/// Stores capture the logger at construction (`store_for_uri_with_logger(uri,
+/// global_logger())`): stores created before init are unlogged, and stores
+/// created before finalize stop recording when it runs.
 pub fn init_op_logger<P: AsRef<str>>(path: P) -> std::io::Result<()> {
-    if GLOBAL_LOGGER.get().is_some() {
-        return Ok(());
+    let path = path.as_ref();
+    let mut state = lock_state();
+    match &*state {
+        OpLogState::Active(_) => return Ok(()),
+        // Checked before any filesystem action: must not create or truncate `path`.
+        OpLogState::Finalized(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "op-log was already finalized and cannot be restarted; a process supports \
+                     only one op-log session, so '{path}' was not opened"
+                ),
+            ))
+        }
+        OpLogState::Uninitialized => {}
     }
-    let logger = Logger::new(path.as_ref())?;
-    let _ = GLOBAL_LOGGER.set(logger);
+    let logger = Logger::new(path)?;
+    *state = OpLogState::Active(logger);
 
     // Print out some info if info logging set
-    info!("Intialized S3 operation logging to file: {}", path.as_ref());
+    info!("Intialized S3 operation logging to file: {}", path);
 
     Ok(())
 }
 
-/// Fetch the global logger (if initialised).
+/// Fetch the global logger. `Some` only while the op-log is Active: `None`
+/// before [`init_op_logger`] and again after [`finalize_op_logger`].
+///
+/// Stores capture the returned logger when they are constructed. A store built
+/// before init is unlogged forever; a store built before finalize keeps its
+/// clone, but its entries are rejected (`LogOutcome::Closed`) once finalize runs.
 pub fn global_logger() -> Option<Logger> {
-    GLOBAL_LOGGER.get().cloned()
+    match &*lock_state() {
+        OpLogState::Active(logger) => Some(logger.clone()),
+        OpLogState::Uninitialized | OpLogState::Finalized(_) => None,
+    }
 }
 
 /// Set clock offset for the global logger (convenience function).
@@ -70,7 +124,7 @@ pub fn global_logger() -> Option<Logger> {
 /// s3dlio::set_clock_offset(offset)?;
 /// ```
 pub fn set_clock_offset(offset_nanos: i64) -> std::io::Result<()> {
-    if let Some(logger) = GLOBAL_LOGGER.get() {
+    if let Some(logger) = global_logger() {
         logger.set_clock_offset(offset_nanos);
         Ok(())
     } else {
@@ -83,7 +137,7 @@ pub fn set_clock_offset(offset_nanos: i64) -> std::io::Result<()> {
 
 /// Get the current clock offset from the global logger.
 pub fn get_clock_offset() -> std::io::Result<i64> {
-    if let Some(logger) = GLOBAL_LOGGER.get() {
+    if let Some(logger) = global_logger() {
         Ok(logger.get_clock_offset())
     } else {
         Err(std::io::Error::new(
@@ -138,34 +192,28 @@ pub fn get_client_id() -> String {
         .unwrap_or_default()
 }
 
-/// Signal the background logger to finish and wait for it to flush.
-/// This uses a blocking send of a shutdown sentinel so it cannot be dropped.
+/// Finish the process's op-log session: every record whose
+/// [`Logger::log`] call was accepted is written, the zstd stream is finished and
+/// the writer thread has exited before this returns.
+///
+/// Finalize is terminal and idempotent. Entries submitted once it has begun are
+/// rejected (`LogOutcome::Closed`), [`global_logger`] returns `None` and the
+/// op-log cannot be initialised again in this process. Called while
+/// Uninitialized it is a no-op; called again (or concurrently) after
+/// finalization it waits for the first call to finish and returns.
 pub fn finalize_op_logger() {
-    if let Some(logger) = GLOBAL_LOGGER.get() {
-        // Send a shutdown entry using blocking `send` so it cannot be lost if the buffer is full.
-        let _ = logger.sender.send(LogEntry {
-            idx: 0,
-            thread_id: 0,
-            operation: SHUTDOWN_OP.to_string(),
-            client_id: String::new(),
-            num_objects: 0,
-            bytes: 0,
-            endpoint: String::new(),
-            file: String::new(),
-            error: None,
-            start_time: SystemTime::now(),
-            first_byte_time: None,
-            end_time: SystemTime::now(),
-        });
-
-        // Print info if info set
-        info!("Shutting down S3 operation logging");
-
-        // Wait for the background thread to finish (encoder flushes on drop).
-        if let Some(done_rx) = logger.done_rx.lock().unwrap().take() {
-            let _ = done_rx.recv();
+    let logger = {
+        let mut state = lock_state();
+        match std::mem::replace(&mut *state, OpLogState::Uninitialized) {
+            OpLogState::Uninitialized => return,
+            OpLogState::Active(logger) | OpLogState::Finalized(logger) => {
+                *state = OpLogState::Finalized(logger.clone());
+                logger
+            }
         }
-    }
+    };
+    // The state lock is released: global_logger() already reports None while we drain.
+    logger.shutdown();
 }
 
 /// A record of one S3 operation (GET, PUT, LIST, DELETE, HEAD).
@@ -284,21 +332,56 @@ fn oplog_write_buffer_capacity() -> usize {
         .unwrap_or(256 * 1024)
 }
 
-/// Handle for sending log entries and waiting on shutdown.
-#[derive(Debug)]
-pub struct Logger {
-    sender: SyncSender<LogEntry>,
-    done_rx: Mutex<Option<Receiver<()>>>,
-    clock_offset_nanos: Arc<AtomicI64>, // Nanoseconds to adjust timestamps for distributed sync
+/// Result of [`Logger::log`]. Only `Accepted` entries are guaranteed to be in
+/// the file once the session is finalized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogOutcome {
+    /// Queued for the writer; it will be written, even if finalize runs next.
+    Accepted,
+    /// The queue was full (non-lossless mode): the entry was dropped.
+    Full,
+    /// The session is finalizing or finalized: the entry was rejected, not written.
+    Closed,
+    /// The writer thread stopped after an I/O error: the entry was not written.
+    WriterFailed,
 }
 
-impl Clone for Logger {
-    fn clone(&self) -> Self {
-        Logger {
-            sender: self.sender.clone(),
-            done_rx: Mutex::new(None),
-            clock_offset_nanos: Arc::clone(&self.clock_offset_nanos),
-        }
+/// What the writer thread receives. A dedicated variant (rather than a magic
+/// operation name) ends the session, so no real entry can be mistaken for it.
+#[derive(Debug)]
+enum Message {
+    Entry(LogEntry),
+    Shutdown,
+}
+
+/// State shared by every clone of a [`Logger`].
+#[derive(Debug)]
+struct Shared {
+    sender: SyncSender<Message>,
+    /// `GATE_CLOSED` bit plus the number of `log()` calls in flight. See
+    /// [`Logger::log`] and [`Logger::shutdown`] for the drain protocol.
+    gate: AtomicU64,
+    /// Completion signal from the writer thread; taken by the first shutdown.
+    /// The mutex is held for the whole shutdown so later callers wait for it.
+    done_rx: Mutex<Option<Receiver<()>>>,
+    clock_offset_nanos: Arc<AtomicI64>, // Nanoseconds to adjust timestamps for distributed sync
+    closed_noted: AtomicBool,
+    writer_failure_noted: AtomicBool,
+}
+
+/// Handle for sending log entries. Clones share one writer thread.
+#[derive(Debug, Clone)]
+pub struct Logger {
+    shared: Arc<Shared>,
+}
+
+/// Decrements the in-flight count when a `log()` call ends, including by unwinding.
+struct InFlight<'a>(&'a AtomicU64);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        // Release: our send (if any) happens-before shutdown observes the count drop.
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -379,7 +462,7 @@ impl Logger {
             .unwrap_or(1); // bias to fast
 
         // Bounded channel for log entries (drop on overflow in `log()` via try_send).
-        let (sender, receiver): (SyncSender<LogEntry>, Receiver<LogEntry>) = sync_channel(cap);
+        let (sender, receiver): (SyncSender<Message>, Receiver<Message>) = sync_channel(cap);
 
         // One-shot channel to signal that the background thread finished.
         let (done_tx, done_rx) = channel::<()>();
@@ -413,10 +496,11 @@ impl Logger {
         let clock_offset = Arc::new(AtomicI64::new(0));
         let clock_offset_clone = Arc::clone(&clock_offset);
         thread::spawn(move || {
-            for (idx, mut entry) in (0_u64..).zip(receiver) {
-                if entry.operation == SHUTDOWN_OP {
-                    break;
-                }
+            for (idx, message) in (0_u64..).zip(receiver) {
+                let mut entry = match message {
+                    Message::Entry(entry) => entry,
+                    Message::Shutdown => break,
+                };
                 entry.idx = idx;
                 let offset = clock_offset_clone.load(Ordering::Relaxed);
                 let line = entry.to_log_line(offset);
@@ -431,9 +515,14 @@ impl Logger {
         });
 
         Ok(Logger {
-            sender,
-            done_rx: Mutex::new(Some(done_rx)),
-            clock_offset_nanos: clock_offset,
+            shared: Arc::new(Shared {
+                sender,
+                gate: AtomicU64::new(0),
+                done_rx: Mutex::new(Some(done_rx)),
+                clock_offset_nanos: clock_offset,
+                closed_noted: AtomicBool::new(false),
+                writer_failure_noted: AtomicBool::new(false),
+            }),
         })
     }
 
@@ -454,27 +543,111 @@ impl Logger {
     /// logger.set_clock_offset(clock_offset_nanos);
     /// ```
     pub fn set_clock_offset(&self, offset_nanos: i64) {
-        self.clock_offset_nanos
+        self.shared
+            .clock_offset_nanos
             .store(offset_nanos, Ordering::Relaxed);
     }
 
     /// Get the current clock offset value.
     pub fn get_clock_offset(&self) -> i64 {
-        self.clock_offset_nanos.load(Ordering::Relaxed)
+        self.shared.clock_offset_nanos.load(Ordering::Relaxed)
     }
 
-    /// Submit a log entry. Use try_send to avoid blocking; drop if channel is full.
-    /// if our LOSSLESS env is set, then we do block instead of dropping
-    pub fn log(&self, entry: LogEntry) {
-        if *LOSSLESS.get().unwrap_or(&false) {
+    /// Submit a log entry and report what happened to it.
+    ///
+    /// Non-blocking by default (`try_send`): when the queue is full the entry is
+    /// dropped and [`LogOutcome::Full`] is returned. With `S3DLIO_OPLOG_LOSSLESS=1`
+    /// the call blocks instead of dropping.
+    ///
+    /// `Accepted` is a promise: the entry is on the writer's queue and
+    /// [`finalize_op_logger`] will write it. Once finalize has begun, calls
+    /// return [`LogOutcome::Closed`] (never `Full`) and write nothing; at most
+    /// one diagnostic is printed for the whole closed logger.
+    ///
+    /// The return value may be ignored (it is deliberately not `#[must_use]`:
+    /// the store wrappers fire-and-forget); tests use it to prove drain exactness.
+    pub fn log(&self, entry: LogEntry) -> LogOutcome {
+        let shared = &*self.shared;
+        // Enter the gate. The increment is visible to shutdown's wait-for-zero
+        // even if it loses the race with the close, so shutdown cannot send its
+        // sentinel while any call that passed the closed check is still sending.
+        let before = shared.gate.fetch_add(1, Ordering::Acquire);
+        let _in_flight = InFlight(&shared.gate);
+        if before & GATE_CLOSED != 0 {
+            if !shared.closed_noted.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "op-log finalized: entries from stores created before finalize are no \
+                     longer recorded"
+                );
+            }
+            return LogOutcome::Closed;
+        }
+
+        let outcome = if *LOSSLESS.get().unwrap_or(&false) {
             // Blocking: guarantees no drops (may stall if writer can’t keep up).
-            let _ = self.sender.send(entry);
+            match shared.sender.send(Message::Entry(entry)) {
+                Ok(()) => LogOutcome::Accepted,
+                Err(_) => LogOutcome::WriterFailed,
+            }
         } else {
             // Non‑blocking: preserves I/O throughput; may drop under burst.
-            if let Err(e) = self.sender.try_send(entry) {
-                eprintln!("op-log channel full; dropping entry: {e}");
+            match shared.sender.try_send(Message::Entry(entry)) {
+                Ok(()) => LogOutcome::Accepted,
+                Err(TrySendError::Full(_)) => {
+                    eprintln!("op-log channel full; dropping entry");
+                    LogOutcome::Full
+                }
+                Err(TrySendError::Disconnected(_)) => LogOutcome::WriterFailed,
             }
+        };
+        if outcome == LogOutcome::WriterFailed
+            && !shared.writer_failure_noted.swap(true, Ordering::Relaxed)
+        {
+            eprintln!("op-log writer has stopped after an error; entries are being dropped");
         }
+        outcome
+    }
+
+    /// Close the logger, drain every accepted entry and wait for the writer.
+    ///
+    /// Exactness: (1) set `GATE_CLOSED`, so every later `log()` is rejected;
+    /// (2) wait until the in-flight count reaches zero, i.e. every `log()` that
+    /// entered before the close has finished its send, so everything accepted is
+    /// already on the queue; (3) send `Shutdown`, which the FIFO channel delivers
+    /// after all of those entries; (4) wait for the writer to finish the zstd
+    /// stream. Idempotent; concurrent callers block until the first finishes.
+    fn shutdown(&self) {
+        let shared = &*self.shared;
+        let mut done_rx = shared
+            .done_rx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(done) = done_rx.take() else {
+            return;
+        };
+
+        shared.gate.fetch_or(GATE_CLOSED, Ordering::AcqRel);
+        let mut spins = 0_u32;
+        while shared.gate.load(Ordering::Acquire) & !GATE_CLOSED != 0 {
+            // In-flight calls only wait for the writer (LOSSLESS) or finish at
+            // once, so this is short; back off from yielding to sleeping.
+            if spins < 100 {
+                thread::yield_now();
+            } else {
+                thread::sleep(Duration::from_micros(50));
+            }
+            spins = spins.saturating_add(1);
+        }
+
+        // Blocking send so the sentinel cannot be lost on a full queue. If the
+        // writer already stopped the send fails, which is fine.
+        let _ = shared.sender.send(Message::Shutdown);
+
+        // Print info if info set
+        info!("Shutting down S3 operation logging");
+
+        // Wait for the background thread to finish (encoder flushes on drop).
+        let _ = done.recv();
     }
 }
 
@@ -574,9 +747,7 @@ mod oplog_path_tests {
         let bad = dir.path().join("no-such-subdir").join("operations.log");
         let bad = bad.to_str().unwrap();
 
-        let err = Logger::new(bad)
-            .err()
-            .expect("creating a log in a missing directory must fail");
+        let err = Logger::new(bad).expect_err("creating a log in a missing directory must fail");
 
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         let msg = err.to_string();
@@ -667,5 +838,53 @@ mod oplog_path_tests {
                 .unwrap_or_else(|| panic!("{uri} must be rejected"));
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
         }
+    }
+}
+
+#[cfg(test)]
+mod oplog_shutdown_tests {
+    use super::*;
+
+    fn entry(tag: &str) -> LogEntry {
+        let now = SystemTime::now();
+        LogEntry {
+            idx: 0,
+            thread_id: 0,
+            operation: "GET".to_string(),
+            client_id: String::new(),
+            num_objects: 1,
+            bytes: 1,
+            endpoint: String::new(),
+            file: tag.to_string(),
+            error: None,
+            start_time: now,
+            first_byte_time: None,
+            end_time: now,
+        }
+    }
+
+    // A standalone Logger (not the process-global one) can be shut down
+    // repeatedly; once closed it reports Closed, never Full.
+    #[test]
+    fn shutdown_drains_is_idempotent_and_rejects_later_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ops.tsv.zst");
+        let logger = Logger::new(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(logger.log(entry("a")), LogOutcome::Accepted);
+        assert_eq!(logger.log(entry("b")), LogOutcome::Accepted);
+        logger.shutdown();
+        logger.shutdown();
+        assert_eq!(logger.clone().log(entry("c")), LogOutcome::Closed);
+
+        let text =
+            String::from_utf8(zstd::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap())
+                .unwrap();
+        let files: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .map(|l| l.split('\t').nth(7).unwrap())
+            .collect();
+        assert_eq!(files, ["a", "b"]);
     }
 }
