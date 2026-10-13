@@ -888,3 +888,109 @@ mod oplog_shutdown_tests {
         assert_eq!(files, ["a", "b"]);
     }
 }
+
+// Golden test: pins the EXACT bytes of the op-log format that external tools
+// (sai3-bench, polarWarp) parse. Expected strings are written out literally --
+// they are NOT derived from HEADER or to_log_line -- so a renamed or reordered
+// column, a changed timestamp layout or a wrong idx fails here.
+#[cfg(test)]
+mod oplog_golden_format_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    /// 2023-11-14T22:13:20.123456789Z
+    fn base() -> SystemTime {
+        UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)
+    }
+
+    fn entries() -> Vec<LogEntry> {
+        vec![
+            // Success row with a first-byte time. The caller-supplied idx (777)
+            // must be ignored: the writer numbers rows 0..N-1.
+            LogEntry {
+                idx: 777,
+                thread_id: 7,
+                operation: "GET".to_string(),
+                client_id: "client-a".to_string(),
+                num_objects: 1,
+                bytes: 4096,
+                endpoint: "s3://bucket".to_string(),
+                file: "obj/key0".to_string(),
+                error: None,
+                start_time: base(),
+                first_byte_time: Some(base() + Duration::from_nanos(1_500_000)),
+                end_time: base() + Duration::from_nanos(4_000_000),
+            },
+            // Error row without a first-byte time.
+            LogEntry {
+                idx: 0,
+                thread_id: 8,
+                operation: "PUT".to_string(),
+                client_id: "client-b".to_string(),
+                num_objects: 1,
+                bytes: 0,
+                endpoint: "file://".to_string(),
+                file: "dir/obj1".to_string(),
+                error: Some("403 Forbidden: access denied".to_string()),
+                start_time: base() + Duration::from_secs(10),
+                first_byte_time: None,
+                end_time: base() + Duration::from_secs(10) + Duration::from_nanos(250_000),
+            },
+            // Empty client_id, many objects, first-byte time present.
+            LogEntry {
+                idx: 5,
+                thread_id: 0,
+                operation: "LIST".to_string(),
+                client_id: String::new(),
+                num_objects: 25,
+                bytes: 123_456_789_012,
+                endpoint: "az://container".to_string(),
+                file: "prefix/".to_string(),
+                error: None,
+                start_time: base() + Duration::from_secs(20),
+                first_byte_time: Some(base() + Duration::from_secs(20) + Duration::from_nanos(1)),
+                end_time: base() + Duration::from_secs(21),
+            },
+        ]
+    }
+
+    const EXPECTED_HEADER: &str = "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns\n";
+    const EXPECTED_ROWS: [&str; 3] = [
+        "0\t7\tGET\tclient-a\t1\t4096\ts3://bucket\tobj/key0\t\t2023-11-14T22:13:20.123456789Z\t2023-11-14T22:13:20.124956789Z\t2023-11-14T22:13:20.127456789Z\t4000000\n",
+        "1\t8\tPUT\tclient-b\t1\t0\tfile://\tdir/obj1\t403 Forbidden: access denied\t2023-11-14T22:13:30.123456789Z\t\t2023-11-14T22:13:30.123706789Z\t250000\n",
+        "2\t0\tLIST\t\t25\t123456789012\taz://container\tprefix/\t\t2023-11-14T22:13:40.123456789Z\t2023-11-14T22:13:40.123456790Z\t2023-11-14T22:13:41.123456789Z\t1000000000\n",
+    ];
+
+    #[test]
+    fn written_file_matches_the_frozen_format_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("golden.tsv.zst");
+        let logger = Logger::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(logger.get_clock_offset(), 0, "golden test needs offset 0");
+        for e in entries() {
+            assert_eq!(logger.log(e), LogOutcome::Accepted);
+        }
+        logger.shutdown();
+
+        let text =
+            String::from_utf8(zstd::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap())
+                .unwrap();
+
+        // Exact full text, then line by line for a readable failure message.
+        let mut expected = EXPECTED_HEADER.to_string();
+        expected.extend(EXPECTED_ROWS);
+        assert_eq!(text, expected, "op-log text differs from the frozen format");
+
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        assert_eq!(lines.len(), 1 + EXPECTED_ROWS.len());
+        assert_eq!(lines[0], EXPECTED_HEADER);
+        for (i, row) in EXPECTED_ROWS.iter().enumerate() {
+            assert_eq!(lines[i + 1], *row, "row {i}");
+            assert_eq!(
+                lines[i + 1].trim_end_matches('\n').split('\t').count(),
+                13,
+                "row {i} must have 13 tab-separated columns"
+            );
+        }
+    }
+}
