@@ -304,11 +304,10 @@ impl LogEntry {
     fn to_log_line(&self, clock_offset_nanos: i64) -> String {
         // Apply clock offset correction for distributed systems
         // Positive offset means local clock is ahead, so we subtract to align with reference time
-        let offset_duration = if clock_offset_nanos >= 0 {
-            Duration::from_nanos(clock_offset_nanos as u64)
-        } else {
-            Duration::from_nanos((-clock_offset_nanos) as u64)
-        };
+        // `unsigned_abs` instead of negation: `-i64::MIN` overflows (a panic in
+        // the writer thread when overflow checks are on). For every other offset
+        // the magnitude is the same value as before.
+        let offset_duration = Duration::from_nanos(clock_offset_nanos.unsigned_abs());
 
         let corrected_start = if clock_offset_nanos >= 0 {
             self.start_time
@@ -1615,6 +1614,274 @@ mod oplog_golden_format_tests {
                 13,
                 "row {i} must have 13 tab-separated columns"
             );
+        }
+    }
+}
+
+// Clock-offset arithmetic in `LogEntry::to_log_line`. Expected strings are
+// written out literally (computed independently of the code under test).
+#[cfg(test)]
+mod oplog_clock_offset_tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::time::UNIX_EPOCH;
+
+    fn entry_at(start: SystemTime) -> LogEntry {
+        LogEntry {
+            idx: 3,
+            thread_id: 1,
+            operation: "GET".to_string(),
+            client_id: "c".to_string(),
+            num_objects: 1,
+            bytes: 10,
+            endpoint: "e".to_string(),
+            file: "f".to_string(),
+            error: None,
+            start_time: start,
+            first_byte_time: Some(start + Duration::from_nanos(1_500_000)),
+            end_time: start + Duration::from_nanos(4_000_000),
+        }
+    }
+
+    /// 2023-11-14T22:13:20.123456789Z
+    fn base() -> SystemTime {
+        UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)
+    }
+
+    /// 2286-11-20T17:46:40.123456789Z: far enough from the epoch that even an
+    /// offset of i64::MAX nanoseconds (about 292 years) keeps every time after it.
+    fn far() -> SystemTime {
+        UNIX_EPOCH + Duration::new(10_000_000_000, 123_456_789)
+    }
+
+    fn row(idx: u64, start: &str, first_byte: &str, end: &str) -> String {
+        format!("{idx}\t1\tGET\tc\t1\t10\te\tf\t\t{start}\t{first_byte}\t{end}\t4000000\n")
+    }
+
+    /// The arithmetic of `to_log_line` exactly as it was before the i64::MIN fix
+    /// (negation `-clock_offset_nanos`), copied here as the reference.
+    fn to_log_line_before_the_fix(e: &LogEntry, clock_offset_nanos: i64) -> String {
+        let offset_duration = if clock_offset_nanos >= 0 {
+            Duration::from_nanos(clock_offset_nanos as u64)
+        } else {
+            Duration::from_nanos((-clock_offset_nanos) as u64)
+        };
+        let corrected_start = if clock_offset_nanos >= 0 {
+            e.start_time
+                .checked_sub(offset_duration)
+                .unwrap_or(e.start_time)
+        } else {
+            e.start_time
+                .checked_add(offset_duration)
+                .unwrap_or(e.start_time)
+        };
+        let corrected_end = if clock_offset_nanos >= 0 {
+            e.end_time
+                .checked_sub(offset_duration)
+                .unwrap_or(e.end_time)
+        } else {
+            e.end_time
+                .checked_add(offset_duration)
+                .unwrap_or(e.end_time)
+        };
+        let corrected_first_byte = e.first_byte_time.and_then(|t| {
+            if clock_offset_nanos >= 0 {
+                t.checked_sub(offset_duration)
+            } else {
+                t.checked_add(offset_duration)
+            }
+        });
+        let duration_ns = corrected_end
+            .duration_since(corrected_start)
+            .unwrap_or_default()
+            .as_nanos();
+        let start_ts = humantime::format_rfc3339_nanos(corrected_start).to_string();
+        let end_ts = humantime::format_rfc3339_nanos(corrected_end).to_string();
+        let first_byte_ts = corrected_first_byte
+            .map(|t| humantime::format_rfc3339_nanos(t).to_string())
+            .unwrap_or_default();
+        let error_str = e.error.as_deref().unwrap_or_default();
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            e.idx,
+            e.thread_id,
+            e.operation,
+            e.client_id,
+            e.num_objects,
+            e.bytes,
+            e.endpoint,
+            e.file,
+            error_str,
+            start_ts,
+            first_byte_ts,
+            end_ts,
+            duration_ns
+        )
+    }
+
+    // Golden rows for the ordinary offsets (positive subtracts, negative adds).
+    #[test]
+    fn positive_zero_and_negative_offsets_have_these_exact_rows() {
+        let e = entry_at(base());
+        for (offset, want) in [
+            (
+                1_500_000_000_i64,
+                row(
+                    3,
+                    "2023-11-14T22:13:18.623456789Z",
+                    "2023-11-14T22:13:18.624956789Z",
+                    "2023-11-14T22:13:18.627456789Z",
+                ),
+            ),
+            (
+                0,
+                row(
+                    3,
+                    "2023-11-14T22:13:20.123456789Z",
+                    "2023-11-14T22:13:20.124956789Z",
+                    "2023-11-14T22:13:20.127456789Z",
+                ),
+            ),
+            (
+                -2_250_000_000,
+                row(
+                    3,
+                    "2023-11-14T22:13:22.373456789Z",
+                    "2023-11-14T22:13:22.374956789Z",
+                    "2023-11-14T22:13:22.377456789Z",
+                ),
+            ),
+        ] {
+            assert_eq!(e.to_log_line(offset), want, "offset {offset}");
+        }
+    }
+
+    // The extremes. i64::MAX subtracts about 292 years; i64::MIN adds 2^63 ns
+    // (about 292 years), which is also what release builds of the old code
+    // produced (the old negation wrapped to 2^63); debug builds panicked.
+    #[test]
+    fn extreme_offsets_do_not_panic_and_have_these_exact_rows() {
+        let e = entry_at(far());
+        assert_eq!(
+            e.to_log_line(i64::MAX),
+            row(
+                3,
+                "1994-08-11T17:59:23.268680982Z",
+                "1994-08-11T17:59:23.270180982Z",
+                "1994-08-11T17:59:23.272680982Z",
+            )
+        );
+        assert_eq!(
+            e.to_log_line(i64::MIN),
+            row(
+                3,
+                "2579-03-01T17:33:56.978232597Z",
+                "2579-03-01T17:33:56.979732597Z",
+                "2579-03-01T17:33:56.982232597Z",
+            )
+        );
+    }
+
+    // End to end: the writer thread must survive an i64::MIN offset and write
+    // the row (before the fix a debug build panicked in the writer thread).
+    #[test]
+    fn writer_thread_survives_an_i64_min_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("min.tsv.zst");
+        let logger = Logger::open(path.to_str().unwrap(), 8, false).unwrap();
+        logger.set_clock_offset(i64::MIN);
+        assert_eq!(logger.try_log(entry_at(far())), LogOutcome::Accepted);
+        logger.shutdown();
+        let text =
+            String::from_utf8(zstd::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap())
+                .unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some(HEADER.trim_end_matches('\n')));
+        let want = row(
+            0,
+            "2579-03-01T17:33:56.978232597Z",
+            "2579-03-01T17:33:56.979732597Z",
+            "2579-03-01T17:33:56.982232597Z",
+        );
+        assert_eq!(lines.next().map(|l| format!("{l}\n")), Some(want));
+        assert_eq!(lines.next(), None);
+    }
+
+    // The fix must not change any output: compare against a copy of the old
+    // arithmetic for a sweep of offsets (everything but i64::MIN, where the old
+    // code panics in debug builds).
+    #[test]
+    fn output_is_identical_to_the_old_arithmetic_for_every_offset_but_i64_min() {
+        let mut offsets: Vec<i64> = vec![i64::MIN + 1, i64::MAX, i64::MAX - 1, -1, 0, 1];
+        for exp in 0..18_u32 {
+            let p = 10_i64.pow(exp);
+            offsets.extend([p, -p, p + 1, -(p + 1), 3 * p, -3 * p]);
+        }
+        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+        for _ in 0..4000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            offsets.push(x as i64);
+            offsets.push(((x >> 1) as i64) >> (x % 40)); // smaller magnitudes too
+        }
+        offsets.retain(|o| *o != i64::MIN);
+
+        let mut with_error = entry_at(far());
+        with_error.error = Some("boom".to_string());
+        with_error.first_byte_time = None;
+        let entries = [entry_at(far()), with_error];
+        for e in &entries {
+            for &o in &offsets {
+                assert_eq!(
+                    e.to_log_line(o),
+                    to_log_line_before_the_fix(e, o),
+                    "offset {o}"
+                );
+            }
+        }
+        assert!(offsets.len() > 8000);
+    }
+
+    // Today's behaviour at the edge of the representable range, pinned (not
+    // changed by the overflow fix):
+    // - a first_byte that the offset pushes out of SystemTime's range is an
+    //   empty first_byte column;
+    // - a corrected time BEFORE the epoch panics inside humantime's formatter
+    //   ("all times should be after the epoch"), which in the writer thread
+    //   ends the log. That is a pre-existing limit, recorded in the report.
+    #[test]
+    fn unrepresentable_first_byte_is_empty() {
+        let mut e = entry_at(base());
+        e.first_byte_time = Some(UNIX_EPOCH + Duration::new(i64::MAX as u64, 0));
+        assert_eq!(
+            e.to_log_line(-1_500_000_000),
+            "3\t1\tGET\tc\t1\t10\te\tf\t\t2023-11-14T22:13:21.623456789Z\t\t2023-11-14T22:13:21.627456789Z\t4000000\n"
+        );
+    }
+
+    fn panic_text(f: impl FnOnce() -> String) -> Option<String> {
+        catch_unwind(AssertUnwindSafe(f)).err().map(|p| {
+            p.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        })
+    }
+
+    #[test]
+    fn times_pushed_before_the_epoch_panic_in_the_formatter_as_they_always_did() {
+        // start/end pushed below the epoch.
+        let near_epoch = entry_at(UNIX_EPOCH + Duration::from_secs(1));
+        // Only first_byte (earlier than start in this contrived entry) is pushed below.
+        let mut only_first_byte = entry_at(UNIX_EPOCH + Duration::from_secs(10));
+        only_first_byte.first_byte_time = Some(UNIX_EPOCH + Duration::from_secs(1));
+        for (name, e) in [("start", near_epoch), ("first_byte", only_first_byte)] {
+            let new = panic_text(|| e.to_log_line(2_000_000_000));
+            let old = panic_text(|| to_log_line_before_the_fix(&e, 2_000_000_000));
+            let new = new.unwrap_or_else(|| panic!("{name}: expected the formatter to panic"));
+            assert!(new.contains("all times should be after the epoch"), "{new}");
+            assert_eq!(Some(new), old, "{name}: old and new panic identically");
         }
     }
 }
