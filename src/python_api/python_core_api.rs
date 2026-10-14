@@ -1128,14 +1128,22 @@ pub fn configure_s3(
 // --- `list` function
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false, pattern = None))]
-pub fn list(uri: &str, recursive: bool, pattern: Option<&str>) -> PyResult<Vec<String>> {
+pub fn list(
+    py: Python<'_>,
+    uri: &str,
+    recursive: bool,
+    pattern: Option<&str>,
+) -> PyResult<Vec<String>> {
     // Universal list using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
-    let logger = global_logger();
-    let store = get_or_create_store(uri, logger).map_err(py_err)?;
     let uri_owned = uri.to_owned();
 
-    // Submit to global runtime (io_uring pattern — never calls block_on)
-    let mut keys = submit_io(async move { store.list(&uri_owned, recursive).await })?;
+    // The GIL is released for the whole blocking part -- store creation (credential
+    // loading) and the network listing -- so other Python threads keep running (issue #201).
+    let mut keys = py.detach(|| {
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        // Submit to global runtime (io_uring pattern — never calls block_on)
+        submit_io(async move { store.list(&uri_owned, recursive).await })
+    })?;
 
     // Apply client-side regex filtering against the relative path (after the listing prefix).
     // Pattern sees only the key portion after the URI prefix, e.g. "llama3-8b/" not the full URI.
@@ -1161,12 +1169,14 @@ pub fn list(uri: &str, recursive: bool, pattern: Option<&str>) -> PyResult<Vec<S
 #[pyfunction]
 pub fn stat(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
     // Universal stat using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
-    let logger = global_logger();
-    let store = get_or_create_store(uri, logger).map_err(py_err)?;
     let uri_owned = uri.to_owned();
 
-    // Submit to global runtime (io_uring pattern — never calls block_on)
-    let os = submit_io(async move { store.stat(&uri_owned).await })?;
+    // GIL released across store creation and the network request (issue #201).
+    let os = py.detach(|| {
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        // Submit to global runtime (io_uring pattern — never calls block_on)
+        submit_io(async move { store.stat(&uri_owned).await })
+    })?;
 
     let d = stat_to_pydict(py, os)?;
     Ok(d.unbind().into())
@@ -2166,7 +2176,12 @@ impl PyObjectWriter {
     ///
     /// This method avoids copying data from Python to Rust by using PyBuffer
     /// to get a direct view of Python's memory during the synchronous write.
-    fn write_chunk(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
+    ///
+    /// The GIL is released for the blocking write (issue #201), so other Python
+    /// threads keep running. The borrowed memory stays valid without it: the
+    /// `PyBuffer` export is held until the write has returned, and a `bytes`
+    /// fallback is kept alive by `data`. Nothing is copied.
+    fn write_chunk(&mut self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let writer = self
             .inner
             .as_mut()
@@ -2176,28 +2191,38 @@ impl PyObjectWriter {
         if let Ok(buffer) = PyBuffer::<u8>::get(data) {
             // Get readonly slice - no copy!
             let slice = unsafe {
-                // SAFETY: We hold the buffer for the entire duration of block_on,
-                // so the memory remains valid. The GIL is held during block_on.
+                // SAFETY: `buffer` is a live Py_buffer export, released only after the
+                // write below has returned, so the exporter cannot free or resize the
+                // memory (a bytearray refuses to resize while exported) while the GIL
+                // is released. The write only reads from the slice.
                 std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
             };
 
-            // Synchronous write while buffer is alive
-            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer
-                    .write_chunk(slice)
-                    .await
-                    .map_err(|e| py_err(e.context("Failed to write chunk")))
+            // Synchronous write while buffer is alive, GIL released.
+            let result = py.detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                    writer
+                        .write_chunk(slice)
+                        .await
+                        .map_err(|e| py_err(e.context("Failed to write chunk")))
+                })
             });
+            // Release the export only now, with the GIL held again.
+            drop(buffer);
+            return result;
         }
 
         // Fallback for PyBytes (shouldn't happen, but safe)
         if let Ok(bytes) = data.cast::<PyBytes>() {
+            // `bytes` is immutable and `data` keeps it alive across the detached write.
             let slice = bytes.as_bytes();
-            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer
-                    .write_chunk(slice)
-                    .await
-                    .map_err(|e| py_err(e.context("Failed to write chunk")))
+            return py.detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                    writer
+                        .write_chunk(slice)
+                        .await
+                        .map_err(|e| py_err(e.context("Failed to write chunk")))
+                })
             });
         }
 
@@ -2224,7 +2249,7 @@ impl PyObjectWriter {
     /// that a failed `write_owned_bytes()` call leaves the writer usable for
     /// a retry or a clean `abort()`/`finalize()`, exactly as before this
     /// migration.
-    fn write_owned_bytes(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn write_owned_bytes(&mut self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let mut writer = self
             .inner
             .take()
@@ -2234,7 +2259,7 @@ impl PyObjectWriter {
         if let Ok(buffer) = PyBuffer::<u8>::get(data) {
             let len = buffer.len_bytes();
             let mut vec = vec![0u8; len];
-            if let Err(e) = buffer.copy_to_slice(data.py(), &mut vec[..]) {
+            if let Err(e) = buffer.copy_to_slice(py, &mut vec[..]) {
                 self.inner = Some(writer); // restore -- this call never touched it
                 return Err(PyRuntimeError::new_err(format!(
                     "Buffer copy failed: {}",
@@ -2242,9 +2267,11 @@ impl PyObjectWriter {
                 )));
             }
 
-            let (writer_back, write_result) = submit_io(async move {
-                let r = writer.write_owned_bytes(vec).await;
-                Ok::<_, anyhow::Error>((writer, r))
+            let (writer_back, write_result) = py.detach(|| {
+                submit_io(async move {
+                    let r = writer.write_owned_bytes(vec).await;
+                    Ok::<_, anyhow::Error>((writer, r))
+                })
             })?;
             self.inner = Some(writer_back);
             return write_result.map_err(|e| py_err(e.context("Failed to write owned bytes")));
@@ -2253,9 +2280,11 @@ impl PyObjectWriter {
         // Fallback for PyBytes
         if let Ok(bytes) = data.cast::<PyBytes>() {
             let vec = bytes.as_bytes().to_vec();
-            let (writer_back, write_result) = submit_io(async move {
-                let r = writer.write_owned_bytes(vec).await;
-                Ok::<_, anyhow::Error>((writer, r))
+            let (writer_back, write_result) = py.detach(|| {
+                submit_io(async move {
+                    let r = writer.write_owned_bytes(vec).await;
+                    Ok::<_, anyhow::Error>((writer, r))
+                })
             })?;
             self.inner = Some(writer_back);
             return write_result.map_err(|e| py_err(e.context("Failed to write owned bytes")));
@@ -2938,10 +2967,15 @@ fn gcs_get_rapid_mode() -> Option<bool> {
 /// True
 #[pyfunction]
 #[cfg(feature = "backend-gcs")]
-fn gcs_query_rapid_bucket(bucket_or_uri: &str) -> PyResult<bool> {
+fn gcs_query_rapid_bucket(py: Python<'_>, bucket_or_uri: &str) -> PyResult<bool> {
     let owned = bucket_or_uri.to_owned();
-    submit_io(async move {
-        Ok::<bool, anyhow::Error>(crate::google_gcs_client::query_gcs_rapid_bucket(&owned).await)
+    // GIL released while the bucket is queried (issue #201).
+    py.detach(|| {
+        submit_io(async move {
+            Ok::<bool, anyhow::Error>(
+                crate::google_gcs_client::query_gcs_rapid_bucket(&owned).await,
+            )
+        })
     })
 }
 
