@@ -85,9 +85,13 @@ trace is not trusted for more than it holds.
   before it runs anything (`OpLogReader::from_file`, used by `replay_workload`). The first row
   with an op name it does not model, or one it cannot parse, aborts the load and nothing is
   executed. `continue_on_error` only governs failures while executing operations; it does not
-  bypass load errors. The error now names the file line, the row index and the op, for example
-  `line 17 (row index 15): operation GET_RANGE is not supported for exact replay ...`.
-  `OpLogStreamReader` reports the same error per row and continues with the next row.
+  bypass load errors. For an unsupported or unknown op name the error now names the file line,
+  the row index and the op, for example
+  `line 17 (row index 15): operation GET_RANGE is not supported for exact replay ...` (the row
+  index is the 0-based count of lines after the header, all lines for JSONL, and it also counts
+  skipped blank and comment lines). Other malformed rows give different errors that do not all
+  carry a line. `OpLogStreamReader` yields the same error for that row and then yields the rows
+  after it; replay does not use it to skip such rows, and no row is filtered out.
 - **Mixed traces cannot be replayed exactly yet.** A trace that contains compound-operation rows
   (for example a `direct://` workload whose large files are read as ranged reads, which are
   logged as `GET_RANGE`) cannot be replayed exactly with the current format and reader.

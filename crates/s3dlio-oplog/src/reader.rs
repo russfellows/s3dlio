@@ -345,7 +345,8 @@ const UNMODELLED_WRITER_OPS: &[&str] = &[
 const UNSUPPORTED_OP_DOC: &str = "docs/supplemental/OPERATION_LOGGING.md (Known gaps)";
 
 /// The outermost error context for a row whose op name `OpType` does not parse. Names the
-/// 1-based file line and the 0-based data row index. A known writer op is reported as
+/// 1-based file line and the 0-based row index (lines after the header, all lines for JSONL;
+/// blank and comment lines that are skipped still count). A known writer op is reported as
 /// unsupported for exact replay; any other name as unknown. The error is only ever reported;
 /// no row is skipped or filtered.
 fn unsupported_op_context(op_str: &str, file_line: usize, row_index: usize) -> String {

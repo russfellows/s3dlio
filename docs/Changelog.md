@@ -6,7 +6,8 @@
 
 - `s3dlio-oplog` readers: a row whose op name the reader does not model (`GET_RANGE`,
   `DELETE_BATCH`, `DELETE_PREFIX`, `CREATE_CONTAINER`, `DELETE_CONTAINER`) now fails with an error
-  that names the file line, the data row index and the op, and says the operation is not
+  that names the file line, the row index (a 0-based count of lines after the header that also counts
+  skipped blank and comment lines) and the op, and says the operation is not
   supported for exact replay; any other unrecognised name is reported as unknown. Replay behaviour
   is unchanged: `OpType` still has five variants, the full-file load still aborts at the first such
   row, `continue_on_error` still applies only to execution, and nothing is skipped or filtered.

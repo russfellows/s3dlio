@@ -104,7 +104,8 @@ pub enum OpType {
 `OpType` has exactly these five variants (`HEAD` is read as `STAT`). Other op names that s3dlio
 writes (`GET_RANGE`, `DELETE_BATCH`, `DELETE_PREFIX`, `CREATE_CONTAINER`, `DELETE_CONTAINER`) are
 not modelled: their rows do not record the parameters needed for an exact replay (#176). The
-reader reports such a row as an error naming the file line, the row index and the op, and
+reader reports such a row as an error naming the file line, the row index (the 0-based count of
+lines after the header; it also counts skipped blank and comment lines) and the op, and
 `replay_workload` aborts at load time on the first one; `continue_on_error` does not bypass load
 errors. See "Known gaps" in [OPERATION_LOGGING.md](OPERATION_LOGGING.md).
 
@@ -349,7 +350,7 @@ idx	op	bytes	endpoint	file	start	duration_ns	error
 ```
 
 ### Required Fields
-- `op` (or `operation`): Operation type (GET, PUT, DELETE, LIST, STAT/HEAD). Any other name is a load error that names the line (see above)
+- `op` (or `operation`): Operation type (GET, PUT, DELETE, LIST, STAT/HEAD). Any other op name is a load error that names the line (see above); other malformed rows give different errors
 - `file` (or `path`): Object URI or path
 - `start` (or `timestamp`): ISO 8601 timestamp with timezone
 

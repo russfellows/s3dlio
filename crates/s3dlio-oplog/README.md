@@ -90,12 +90,16 @@ not record the parameters needed for an exact replay (offset and length, the ful
 s3dlio issue #176), so recognising the names would not make them replayable. Replay is strict:
 
 - a row with any other op name, or a malformed row, makes `OpLogReader::from_file` (and so
-  `replay_workload`) fail at load time, before any operation runs. The error names the file
-  line, the row index and the op, e.g.
-  `line 17 (row index 15): operation GET_RANGE is not supported for exact replay ...`;
+  `replay_workload`) fail at load time, before any operation runs. For an unsupported or unknown
+  op name the error names the file line, the row index and the op, e.g.
+  `line 17 (row index 15): operation GET_RANGE is not supported for exact replay ...` (the row
+  index is the 0-based count of lines after the header, all lines for JSONL, and it also counts
+  skipped blank and comment lines). Other malformed rows give different errors that do not all
+  carry a line;
 - `continue_on_error` only affects operations that fail while executing; it does not bypass load
   errors;
-- `OpLogStreamReader` yields that error for the row and continues with the next one;
+- `OpLogStreamReader` yields that error for the row and then yields the rows after it; replay
+  does not use it to skip such rows, and no row is filtered out;
 - a trace that mixes in such rows (for example a `direct://` workload with ranged reads) cannot be
   replayed exactly yet.
 
