@@ -65,3 +65,35 @@ The inner writer did not cover these, so W2 neither adds nor removes a row. They
 | Python `create_s3_writer` and the other writers | no row (writes are not recorded) | writer logging is a separate gap |
 | Parquet readers (`parquet_rg`, `parquet_file_cache`), `parquet_gen` | no row | built with `store_for_uri` (silent); only `get_range`, `stat`, `list`, `put_multipart` are used, which the inner writer never covered |
 | `S3BytesDataset` range mode | no row | uses `get_object_range_uri_async` |
+
+## 4. Validation (ground-truth harness on Google Cloud Storage)
+
+`tests/oplog_accuracy/` (see its README), one run per wheel, same cases, GCS S3-interop endpoint,
+native `gcloud storage` as ground truth, 83 calls, `delete_batch` skipped (no probe given). Evidence:
+`evidence/w2/` (bucket names replaced by the roles B1/B2).
+
+| | parent wheel (9473d2c build, sha256 d3a9ef0c...) | final wheel (W2, sha256 10238517...) |
+|---|---|---|
+| calls | 83 | 83 |
+| RECORD `DUPLICATE` | 20 | **0** |
+| RECORD `MISSING` | 7 | 6 |
+| RECORD `WRONG-FIELD` | 5 | 7 |
+| PASS (OK/OK) | 49 | 47 (against the parent's known.json), 68 (against the updated one) |
+| KNOWN | 34 | 9 / 15 |
+| NEW / CHANGED / FIXED | 0 / 0 / 0 | 2 / 4 / 21 (against the parent's known.json) |
+
+Against the parent's `known.json` the final run reports 21 FIXED, 2 NEW and 4 CHANGED:
+
+- FIXED, #169: 18 calls (every S3 `get`/`put_bytes`/`put_bytes_async`, including the missing-key `get`, in
+  `core`, `repeat`, `two_buckets`, `leading_slash`, `async` and `s3_dest_reject`) are one correct row.
+- FIXED, #174: 3 calls (`async` `delete`, `host443_get_async`, `host443_decoydefault_get_async`) now have their row.
+- NEW, 2: `multi_endpoint` `get` and `put` are now MISSING. Their accidental legacy row is gone (section 2; #175).
+- CHANGED, 2: `host443_decoydefault_get_many` (`m1`, `m2`) record `OK` -> `WRONG-FIELD:server`. The call
+  still goes to the `AWS_ENDPOINT_URL` server (#171); the legacy row used to carry that server by accident, the
+  one row now written has the endpoint the URI asked for.
+- CHANGED, 2: `portless_get`, `portless_put` record `DUPLICATE+WRONG-FIELD:server` -> `WRONG-FIELD:server`.
+
+`known.json` was updated to the new expectations (entries for #169 and #174 removed; #175 now lists
+`get` and `put`; the two CHANGED entries restated). Re-evaluating the final run against it gives
+PASS 68, KNOWN 15, NEW 0, CHANGED 0, FIXED 0. Both runs cleaned up: the three namespaces were empty
+afterwards.

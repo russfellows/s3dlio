@@ -29,6 +29,26 @@ idx  thread  op  client_id  n_objects  bytes  endpoint  file  error  start  firs
 - `end`: ISO 8601 timestamp when operation completed
 - `duration_ns`: Operation duration in nanoseconds (end - start)
 
+### One call, one row
+
+Each call you make is recorded **once**, by exactly one layer, whatever the backend:
+
+- a store built with a logger (`store_for_uri_with_logger(uri, global_logger())`)
+  records every call through it;
+- the public S3 helper functions (`s3_utils::get_object`, `get_object_uri*`,
+  `put_object_async`, `put_object_uri_async`, `delete_objects`, `get_objects_parallel*`)
+  record their own call, in the same row shape (endpoint `s3://<bucket>`, file
+  `<bucket>/<key>`, `client_id` from `set_client_id()`);
+- a store built without a logger (`store_for_uri`) records nothing, even while the
+  op-log is active; library entry points that build their own store (checkpoint,
+  the async-pool dataloader) ask for a logged one;
+- the S3 backend never writes a row of its own.
+
+`docs/design/oplog-record-contract/W2-ownership-audit.md` lists every entry point and
+who records it. Operations with no op name in the format (`mkdir`, `rmdir`, `copy`,
+`rename`, `update_metadata`, `update_properties`, bulk `pre_stat_*`) are forwarded
+by a logged store without a row.
+
 ### Global Configuration Functions
 
 #### Clock Offset Synchronization
