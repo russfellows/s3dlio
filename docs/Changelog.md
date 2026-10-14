@@ -1,5 +1,48 @@
 # s3dlio Changelog
 
+## Unreleased
+
+Fixes #213.
+
+### Changed — a storage URI is a LITERAL key prefix, never a regex (INTENTIONAL BEHAVIOUR CHANGE) (#213)
+
+**Read this before upgrading.** On S3, `list`, `list_stream`, `s3-cli ls`, `s3-cli get`,
+`s3-cli download` / `cp` (S3 to local), `s3_copy::download_objects` and `S3BytesDataset::from_prefix`
+used to split the URI at its last `/`, send only the left part to the server and compile the right
+part as an UNANCHORED regular expression over the keys that came back; in non-recursive mode every
+common prefix was added unfiltered. So `s3://b/data/run.1` also matched `data/run_1` and
+`data/prerun.1`, `s3://b/foo` listed `afoo` and every top-level folder, and a key containing `(` or
+`[` failed with "Invalid regex pattern". (`file://`, `direct://`, `gs://` and `az://` were already
+literal.)
+
+Now the whole key part of the URI is the S3 prefix:
+
+- `s3://b/data/run.1` lists `data/run.1`, `data/run.1.old` and `data/run.1/...` (every key that
+  STARTS WITH the prefix: literal prefix is not exact matching) and not `data/run_1` or
+  `data/prerun.1`. `.`, `(`, `)`, `[`, `+`, `$`, `?` in a URI are ordinary characters and never
+  fail to parse.
+- Non-recursive: `s3://b/foo` returns `foo`, `foobar` and the directory `foo/`, not `afoo`
+  and not unrelated folders. S3 filters both objects and common prefixes by the prefix.
+- **To select with a regex use the explicit option**: Python `list(uri, recursive, pattern=...)`
+  and `s3-cli ls --pattern`. The regex feature is unchanged: a Rust regex matched against the entry
+  relative to the listing base. One shared implementation (`s3dlio::list_pattern::ListPattern`) now
+  serves Python, the CLI and the new `s3_copy::download_objects_matching(src_uri, pattern, ...)`.
+  An invalid pattern fails before any request. (Python `list()` raised the raw regex error and
+  compiled the pattern after listing; it now raises `Invalid regex pattern: '...'` first.)
+- `s3_copy::download_objects` no longer appends `.*` to a URI ending in `/`; it downloads the
+  literal prefix. A URI that used to be a regex or glob in the last segment (for example
+  `s3://b/dir/.*\.npz`) is now a literal prefix: split it into the prefix and a pattern
+  (`download_objects_matching("s3://b/dir/", Some(r"\.npz$"), ...)`). `s3-cli download` and
+  `s3-cli get` have no pattern option; their URIs are literal prefixes (their `--help` text no longer
+  promises globs and regexes).
+- Callers that passed a bare key prefix without a trailing `/` now get the keys that start with it
+  (`dl` also matches `dl2/x`, as in `aws s3 ls s3://b/dl`), not the directory-regex behaviour.
+
+Tests: `tests/test_list_literal_prefix_213.rs`, `tests/s3_cli_ls_literal_prefix_213.rs`,
+`tests/test_python_list_literal_213.py`, and the rewritten `tests/test_object_store_list_filter.rs`
+(it pinned the #154 regex contract). The in-process mock S3 can now be seeded with a bucket catalog
+that honours prefix, delimiter and paging.
+
 ## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
 
 Fixes 12 issues: #167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215.

@@ -1397,27 +1397,18 @@ impl S3ObjectStore {
     }
 
     /// List objects using a given client (shared implementation for list() and list_stream()).
+    ///
+    /// `key_prefix` is the whole key part of the URI and is a LITERAL S3 key prefix
+    /// (issue #213): never split at its last `/`, never read as a regular expression.
+    /// S3 applies it to the objects AND (non-recursive) to the common prefixes, so
+    /// there is no client-side filtering here. An explicit regex is applied by the
+    /// caller (`ListPattern`).
     async fn list_with_client(
         client: &aws_sdk_s3::Client,
         bucket: &str,
         key_prefix: &str,
         recursive: bool,
     ) -> Result<Vec<String>> {
-        use regex::Regex;
-        let (prefix_str, pattern_str) = match key_prefix.rfind('/') {
-            Some(idx) => {
-                let (p, pat) = key_prefix.split_at(idx + 1);
-                (p.to_string(), pat.to_string())
-            }
-            None => (String::new(), key_prefix.to_string()),
-        };
-        let final_pattern = if pattern_str.is_empty() {
-            ".*".to_string()
-        } else {
-            pattern_str
-        };
-        let re = Regex::new(&final_pattern)
-            .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
         let delimiter = if recursive {
             None
         } else {
@@ -1427,10 +1418,7 @@ impl S3ObjectStore {
         let mut keys = Vec::new();
         let mut cont: Option<String> = None;
         loop {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix_str.as_str());
+            let mut req = client.list_objects_v2().bucket(bucket).prefix(key_prefix);
             if let Some(ref d) = delimiter {
                 req = req.delimiter(d.as_str());
             }
@@ -1446,21 +1434,7 @@ impl S3ObjectStore {
             })?;
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
-                    // Locked contract (audit #154 f24, docs/implementation-plans/
-                    // v0.9.109-audit-fix-plan.md bug B7): the regex must match
-                    // against the key's tail PAST the prefix, not the whole
-                    // key. `key.starts_with(&prefix_str)` was always true here
-                    // (S3 was already queried with `prefix(prefix_str)`), which
-                    // made the `||` a vacuous OR and the regex dead code —
-                    // every key under the prefix passed regardless of whether
-                    // it matched `final_pattern`.
-                    let tail_matches = key
-                        .strip_prefix(prefix_str.as_str())
-                        .map(|rest| re.is_match(rest))
-                        .unwrap_or(false);
-                    if tail_matches {
-                        keys.push(format!("s3://{}/{}", bucket, key));
-                    }
+                    keys.push(format!("s3://{}/{}", bucket, key));
                 }
             }
             // In non-recursive mode, include common prefixes (virtual directories).

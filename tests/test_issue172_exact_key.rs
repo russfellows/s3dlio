@@ -484,10 +484,11 @@ async fn batch_delete_names_the_exact_key(slash: bool) {
 
 // ----- F7: list ------------------------------------------------------------
 
-/// The mock answers every ListObjectsV2 with `{prefix}bar` and
-/// `{prefix}other/deep.dat`. With the URI prefix `s3://b/<key-prefix>/foo/bar`
-/// the request prefix must be `<key-prefix>/foo/` verbatim (leading '/' kept),
-/// and the returned URIs must carry the real, slash-bearing key.
+/// The mock answers every ListObjectsV2 on an unseeded bucket with `{prefix}bar`
+/// and `{prefix}other/deep.dat`. With the URI prefix `s3://b/<key-prefix>/foo/bar`
+/// the request prefix must be the WHOLE key part, `<key-prefix>/foo/bar`, verbatim
+/// (leading '/' kept; the URI is a literal prefix, issue #213), and the returned
+/// URIs must carry the real, slash-bearing key.
 async fn list_uses_the_prefix_verbatim_and_returns_real_keys(slash: bool) {
     let (port, state) = init();
     let tag = unique_key("list", false);
@@ -498,10 +499,14 @@ async fn list_uses_the_prefix_verbatim_and_returns_real_keys(slash: bool) {
         format!("{tag}/foo/")
     };
     let uri_prefix = format!("s3://{BUCKET}/{key_prefix}bar");
-    let want_uri = format!("s3://{BUCKET}/{key_prefix}bar");
+    // the mock echoes the request prefix: `{prefix}bar` and `{prefix}other/deep.dat`
+    let want_uris = vec![
+        format!("s3://{BUCKET}/{key_prefix}barbar"),
+        format!("s3://{BUCKET}/{key_prefix}barother/deep.dat"),
+    ];
     let want_query_prefix = format!(
         "prefix={}",
-        encode_key_path(&key_prefix).replace('/', "%2F")
+        encode_key_path(&format!("{key_prefix}bar")).replace('/', "%2F")
     );
 
     // client-present path
@@ -510,8 +515,7 @@ async fn list_uses_the_prefix_verbatim_and_returns_real_keys(slash: bool) {
         .expect("for_endpoint");
     let listed = with_client.list(&uri_prefix, true).await.expect("list");
     assert_eq!(
-        listed,
-        vec![want_uri.clone()],
+        listed, want_uris,
         "list (client) returned URIs that do not carry the real key"
     );
     // global-client path (list_objects_stream)
@@ -520,8 +524,7 @@ async fn list_uses_the_prefix_verbatim_and_returns_real_keys(slash: bool) {
         .await
         .expect("list");
     assert_eq!(
-        listed,
-        vec![want_uri],
+        listed, want_uris,
         "list (global client) returned URIs that do not carry the real key"
     );
 

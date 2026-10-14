@@ -1226,6 +1226,11 @@ pub fn configure_s3(
 }
 
 // --- `list` function
+//
+// `uri` is a LITERAL key prefix, never a regular expression (issue #213): `.`, `(`, `[`,
+// `+`, `$` and `?` in it are ordinary characters. `pattern` is the one explicit way to
+// select by regular expression; it is matched against each listed entry relative to the
+// listing base (`crate::list_pattern`), the same rule `s3-cli ls --pattern` uses.
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false, pattern = None))]
 pub fn list(
@@ -1234,6 +1239,12 @@ pub fn list(
     recursive: bool,
     pattern: Option<&str>,
 ) -> PyResult<Vec<String>> {
+    // Compile an explicit pattern first: an invalid one fails before any request is made.
+    let filter = pattern
+        .map(crate::list_pattern::ListPattern::new)
+        .transpose()
+        .map_err(py_err)?;
+
     // Universal list using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
     let uri_owned = uri.to_owned();
 
@@ -1245,20 +1256,9 @@ pub fn list(
         submit_io(async move { store.list(&uri_owned, recursive).await })
     })?;
 
-    // Apply client-side regex filtering against the relative path (after the listing prefix).
-    // Pattern sees only the key portion after the URI prefix, e.g. "llama3-8b/" not the full URI.
-    if let Some(pat) = pattern {
-        use regex::Regex;
-        let re = Regex::new(pat).map_err(py_err)?;
-        let base = if uri.ends_with('/') {
-            uri.to_owned()
-        } else {
-            format!("{}/", uri)
-        };
-        keys.retain(|k| {
-            let relative = k.strip_prefix(base.as_str()).unwrap_or(k.as_str());
-            re.is_match(relative)
-        });
+    // Apply the explicit client-side regex against the path relative to the listing base.
+    if let Some(filter) = &filter {
+        filter.retain(uri, &mut keys);
     }
 
     Ok(keys)

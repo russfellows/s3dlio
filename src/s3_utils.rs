@@ -13,7 +13,6 @@ use aws_smithy_runtime_api::client::result::SdkError;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 #[cfg(feature = "extension-module")]
 use pyo3::{FromPyObject, PyAny};
-use regex::Regex;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +34,7 @@ use tracing::{debug, info};
 use crate::config::Config;
 use crate::config::ObjectType;
 use crate::data_gen::generate_object;
+use crate::list_pattern::ListPattern;
 
 // S3 client creation
 use crate::retry::retry_get_body;
@@ -1131,48 +1131,39 @@ pub struct BucketInfo {
     pub creation_date: String,
 }
 
-/// List keys under a path, with regex matching on the final path component.
-/// Handles S3 pagination automatically.
+/// List the keys under a LITERAL key prefix (issue #213). Handles S3 pagination
+/// automatically.
+///
+/// `path` is the whole key part of the URI, used verbatim as the S3 `prefix`: it is
+/// never split at its last `/` and never read as a regular expression, so `.`, `(`,
+/// `[`, `+`, `$` and `?` are ordinary characters. S3 applies the prefix itself,
+/// including to the common prefixes it returns in non-recursive mode.
 ///
 /// **DEPRECATED**: This S3-specific function will be removed in v1.0.0.
 /// For backend-agnostic code, use `ObjectStore::list()` via `store_for_uri()`.
-///
-/// # Migration
-/// ```ignore
-/// // Old (S3-specific):
-/// let objects = list_objects("bucket", "prefix/", true)?;
-///
-/// // New (Universal):
-/// use s3dlio::api::{store_for_uri, ObjectStore};
-/// let store = store_for_uri("s3://bucket/prefix/")?;
-/// let objects = store.list("", true, None).await?;
-/// ```
 pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<String>> {
+    list_objects_with_pattern(bucket, path, None, recursive)
+}
+
+/// [`list_objects`] narrowed by an EXPLICIT client-side regex (issue #213).
+///
+/// `prefix` is the literal S3 key prefix; `pattern`, if any, is matched against each
+/// returned key relative to the listing base (see [`crate::list_pattern`]). An
+/// invalid pattern is an error before any request is sent.
+pub(crate) fn list_objects_with_pattern(
+    bucket: &str,
+    prefix: &str,
+    pattern: Option<&str>,
+    recursive: bool,
+) -> Result<Vec<String>> {
+    // Compile before anything is sent.
+    let filter = pattern.map(ListPattern::new).transpose()?;
     // Clone inputs to move them into the async block
     let bucket = bucket.to_string();
-    let path = path.to_string();
+    let prefix = prefix.to_string();
 
     // Use the new tokio runtime framework
     run_on_global_rt(async move {
-        // 1. Determine the S3 prefix and the regex pattern from the input path.
-        let (prefix, pattern) = match path.rfind('/') {
-            Some(index) => {
-                let (p, pat) = path.split_at(index + 1);
-                (p, pat)
-            }
-            None => ("", path.as_str()),
-        };
-
-        // If the pattern is empty (e.g., path ends in "/"), default to matching everything.
-        let final_pattern = if pattern.is_empty() { ".*" } else { pattern };
-
-        // Use the recursive flag as-is - don't auto-enable recursion
-        let effective_recursive = recursive;
-
-        // 2. Compile the regex.
-        let re = Regex::new(final_pattern)
-            .with_context(|| format!("Invalid regex pattern: '{}'", final_pattern))?;
-
         // NOTE: Legacy S3Ops logging call removed here (was: `let _ = build_ops_async()...`)
         // It caused all Python list() calls to hang on non-AWS endpoints (IMDSv2 timeout).
         // See docs/bugs/PYTHON_LIST_HANG_BUG_REPORT.md for full root cause analysis.
@@ -1181,16 +1172,19 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
         let mut keys = Vec::new();
         let mut cont: Option<String> = None;
 
-        // 3. Set the delimiter for the S3 API call based on the effective recursive flag.
-        let delimiter = if effective_recursive { None } else { Some("/") };
+        // The delimiter follows the recursive flag as-is -- recursion is never auto-enabled.
+        let delimiter = if recursive { None } else { Some("/") };
 
         debug!(
-            "list_objects: bucket='{}', prefix='{}', pattern='{}', recursive={}, effective_recursive={}",
-            bucket, prefix, final_pattern, recursive, effective_recursive
+            "list_objects: bucket='{}', prefix='{}', recursive={}",
+            bucket, prefix, recursive
         );
 
         loop {
-            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix);
+            let mut req_builder = client
+                .list_objects_v2()
+                .bucket(&bucket)
+                .prefix(prefix.as_str());
 
             if let Some(d) = delimiter {
                 req_builder = req_builder.delimiter(d);
@@ -1211,22 +1205,15 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
                 resp.common_prefixes().len()
             );
 
-            // 4. Filter and collect results based on the regex.
-
-            // Handle objects (files)
+            // Objects: S3 already applied the literal prefix.
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
-                    if let Some(basename) = key.strip_prefix(prefix) {
-                        if re.is_match(basename) {
-                            debug!("    matched key: '{}'", key);
-                            keys.push(key.to_string());
-                        }
-                    }
+                    keys.push(key.to_string());
                 }
             }
 
-            // In non-recursive mode, yield common prefixes as directory entries.
-            if !effective_recursive {
+            // In non-recursive mode, the common prefixes (directories) are entries too.
+            if !recursive {
                 for common_prefix in resp.common_prefixes() {
                     if let Some(prefix_key) = common_prefix.prefix() {
                         debug!("    common prefix (directory): '{}'", prefix_key);
@@ -1237,13 +1224,16 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
 
             if let Some(next) = resp.next_continuation_token() {
                 cont = Some(next.to_string());
-                debug!("  next_continuation_token='{}'", cont.as_ref().unwrap());
+                debug!("  next_continuation_token='{}'", next);
             } else {
                 debug!("  no more pages, breaking");
                 break;
             }
         }
 
+        if let Some(filter) = &filter {
+            filter.retain(&prefix, &mut keys);
+        }
         info!("list_objects result: {} total keys", keys.len());
         keys.sort(); // Sort for consistent output
         Ok(keys)
@@ -1253,6 +1243,9 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
 /// Streaming version of list_objects that yields results as they arrive.
 /// Returns a stream of keys (without the s3:// prefix) for memory efficiency.
 /// Callers can format URIs as needed: format!("s3://{}/{}", bucket, key)
+///
+/// `path` is the whole key part of the URI, used as a LITERAL S3 key prefix (issue
+/// #213): it is never split at its last `/` and never read as a regular expression.
 ///
 /// **Implementation note**: Uses an inline `async_stream::stream!` (no `tokio::spawn`)
 /// so all S3 and tracing calls run on the caller's task. This avoids the tracing-subscriber
@@ -1267,23 +1260,6 @@ pub async fn list_objects_stream(
         bucket, path, recursive
     );
 
-    // Determine the S3 prefix and regex pattern from the input path.
-    // Do this eagerly (before returning the stream) so callers get parse errors immediately.
-    let (prefix_str, pattern_str) = match path.rfind('/') {
-        Some(index) => {
-            let (p, pat) = path.split_at(index + 1);
-            (p.to_string(), pat.to_string())
-        }
-        None => (String::new(), path.clone()),
-    };
-    let final_pattern = if pattern_str.is_empty() {
-        ".*".to_string()
-    } else {
-        pattern_str
-    };
-    let re = Regex::new(&final_pattern)
-        .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
-
     let delimiter = if recursive {
         None
     } else {
@@ -1291,8 +1267,8 @@ pub async fn list_objects_stream(
     };
 
     debug!(
-        "list_objects_stream: prefix='{}', pattern='{}', recursive={}, delimiter={:?}",
-        prefix_str, final_pattern, recursive, delimiter
+        "list_objects_stream: prefix='{}', recursive={}, delimiter={:?}",
+        path, recursive, delimiter
     );
 
     // Build the client eagerly too — any credential errors surface before the stream starts.
@@ -1306,7 +1282,7 @@ pub async fn list_objects_stream(
         let mut total_keys: u64 = 0;
 
         loop {
-            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix_str.as_str());
+            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(path.as_str());
 
             if let Some(ref d) = delimiter {
                 req_builder = req_builder.delimiter(d.as_str());
@@ -1330,14 +1306,10 @@ pub async fn list_objects_stream(
                 page_count, resp.contents().len(), resp.common_prefixes().len()
             );
 
-            // Yield matching objects from this page.
+            // Yield the objects of this page (S3 already applied the literal prefix).
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
-                    if let Some(basename) = key.strip_prefix(prefix_str.as_str()) {
-                        if re.is_match(basename) {
-                            yield Ok(key.to_string());
-                        }
-                    }
+                    yield Ok(key.to_string());
                 }
             }
 

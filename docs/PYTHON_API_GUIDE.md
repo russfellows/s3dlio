@@ -291,9 +291,25 @@ uris = s3dlio.list("s3://bucket/prefix/")
 # Recursive listing
 uris = s3dlio.list("s3://bucket/prefix/", recursive=True)
 
-# With glob pattern filter
-uris = s3dlio.list("s3://bucket/prefix/", pattern="*.npz")
+# With an explicit regex filter (a Rust regex, NOT a glob; see below)
+uris = s3dlio.list("s3://bucket/prefix/", recursive=True, pattern=r"\.npz$")
 ```
+
+**The URI is a literal key prefix, never a regex (v0.9.125, #213).** `list("s3://b/data/run.1")`
+returns every key that STARTS WITH `data/run.1` (`data/run.1`, `data/run.1.old`, `data/run.1/...`)
+and nothing else: not `data/run_1`, not `data/prerun.1`. Literal prefix is not exact matching. The
+characters `.`, `(`, `)`, `[`, `+`, `$`, `?` in the URI are ordinary characters and never fail to
+parse. With `recursive=False` the matching objects AND the matching "directories" (common prefixes,
+returned with a trailing `/`) come back: `list("s3://b/foo")` returns `foo`, `foobar` and `foo/`,
+not `afoo` and not unrelated top-level folders. Earlier versions split the URI at its last `/` and
+compiled the rest as an unanchored regex.
+
+**`pattern=` is the one way to select by regular expression.** It is a Rust `regex` (not a glob)
+matched, unanchored, against each returned URI *relative to the listing base*: the prefix itself
+when it ends with `/` (`s3://b/dl/` and `s3://b/dl/sub/c.npz` -> `sub/c.npz`), the directory when
+the prefix names one (`s3://b/dl` -> `sub/c.npz`), otherwise the prefix's parent directory
+(`s3://b/data/run.1` and `s3://b/data/run.1.old` -> `run.1.old`). An invalid pattern raises before
+any request is made. `s3-cli ls --pattern` uses the same rule.
 
 ### stat() — Get Metadata
 

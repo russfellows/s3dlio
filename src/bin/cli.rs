@@ -46,6 +46,7 @@ use s3dlio::{
     ContainerInfo, ObjectType, DEFAULT_OBJECT_SIZE,
 };
 
+use s3dlio::list_pattern::ListPattern;
 use s3dlio::progress::{ProgressCallback, S3ProgressTracker};
 use s3dlio::{finalize_op_logger, global_logger, init_op_logger};
 use s3dlio::{generic_download_objects_with_summary, generic_upload_files_with_summary};
@@ -223,7 +224,7 @@ enum Command {
     },
     /// Download one or many objects concurrently.
     Get {
-        /// S3 URI – can be a full key or a prefix ending with `/`.
+        /// S3 URI – a literal key prefix: a full key, or a prefix ending with `/` (never a glob or regex).
         uri: Option<String>,
 
         /// Maximum concurrent GET requests (default 64, max 4096).
@@ -329,9 +330,9 @@ enum Command {
         #[arg(short = 'c', long = "create-bucket")]
         create_bucket: bool,
     },
-    /// Download objects from any storage backend (S3, Azure, GCS, file://, direct://), supports glob and regex patterns
+    /// Download objects from any storage backend (S3, Azure, GCS, file://, direct://)
     Download {
-        /// Source URI with optional patterns – supports full URIs, prefixes, globs ('*','?'), and regex patterns
+        /// Source URI: a literal key prefix (a full key, or a prefix ending with '/'); never a glob or regex
         src: String,
         /// Local directory to write into
         dest_dir: PathBuf,
@@ -369,14 +370,16 @@ enum Command {
     /// List objects at a storage URI (s3://, az://, gs://, file://, direct://)
     #[clap(name = "list", visible_alias = "ls")]
     GenericList {
-        /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, gs://bucket/prefix/, file:///path/)
+        /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, gs://bucket/prefix/, file:///path/);
+        /// a literal key prefix, never a regex (use --pattern to filter)
         uri: String,
 
         /// List objects recursively
         #[clap(short, long)]
         recursive: bool,
 
-        /// Optional regex pattern to filter results (applied client-side, works with all backends)
+        /// Optional regex pattern to filter results (applied client-side, works with all backends),
+        /// matched against each entry relative to the listing base
         /// Example: '.*\.txt$' to match only .txt files
         #[clap(short, long)]
         pattern: Option<String>,
@@ -1194,8 +1197,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Generic list command that works with any storage backend
-/// Supports optional client-side regex filtering
+/// Generic list command that works with any storage backend.
+/// The URI is a literal key prefix; an explicit `--pattern` regex filters the result client-side.
 /// Uses streaming for memory efficiency and visible progress
 async fn generic_list_cmd(
     uri: &str,
@@ -1204,7 +1207,6 @@ async fn generic_list_cmd(
     count_only: bool,
 ) -> Result<()> {
     use futures::stream::StreamExt;
-    use regex::Regex;
 
     debug!(
         "generic_list_cmd: uri='{}', recursive={}, pattern={:?}, count_only={}",
@@ -1227,21 +1229,14 @@ async fn generic_list_cmd(
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger)?;
 
-    // Compile regex pattern if provided.
-    // Pattern is matched against the relative path (key portion after the listing prefix),
-    // e.g. listing s3://bucket/prefix/ and key s3://bucket/prefix/foo/bar → pattern sees "foo/bar".
-    let re = pattern
-        .map(|pat| Regex::new(pat).with_context(|| format!("Invalid regex pattern: '{}'", pat)))
-        .transpose()?;
-    // Normalise the prefix for stripping: ensure it ends with '/'
-    let base = if uri.ends_with('/') {
-        uri.to_owned()
-    } else {
-        format!("{}/", uri)
-    };
+    // Compile the explicit --pattern, if any, before anything is listed. The URI itself is a
+    // LITERAL key prefix, never a regex (issue #213). The pattern is matched against the
+    // entry relative to the listing base (see `s3dlio::list_pattern`), e.g. listing
+    // s3://bucket/prefix/ and key s3://bucket/prefix/foo/bar -> the pattern sees "foo/bar".
+    let filter = pattern.map(ListPattern::new).transpose()?;
     debug!(
-        "generic_list_cmd: cli pattern={:?} (matched against relative path after '{}')",
-        pattern, base
+        "generic_list_cmd: cli pattern={:?} (matched against the path relative to the listing base of '{}')",
+        pattern, uri
     );
 
     let mut stream = store.list_stream(uri, recursive);
@@ -1291,10 +1286,9 @@ async fn generic_list_cmd(
     while let Some(result) = stream.next().await {
         let key = result?;
 
-        // Apply client-side regex filtering against the relative path (after the listing prefix)
-        if let Some(ref regex) = re {
-            let relative = key.strip_prefix(base.as_str()).unwrap_or(&key);
-            if !regex.is_match(relative) {
+        // Apply the explicit client-side regex to the path relative to the listing base
+        if let Some(ref filter) = filter {
+            if !filter.is_match(uri, &key) {
                 continue;
             }
         }
@@ -1793,7 +1787,7 @@ async fn get_cmd(
     if keys_seen == 0 {
         updater.abort();
         pb.finish_and_clear();
-        bail!("No objects match pattern '{}'", uri_str);
+        bail!("No objects found under the key prefix '{}'", uri_str);
     }
 
     // Phase 2: drain all in-flight downloads and collect errors.

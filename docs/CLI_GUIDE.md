@@ -111,6 +111,13 @@ All commands use consistent URI formats across backends:
 
 List objects in any storage backend with optional filtering and counting.
 
+The URI is a **literal key prefix**, never a regex (v0.9.125, #213): `s3-cli ls s3://b/data/run.1`
+lists `data/run.1`, `data/run.1.old` and `data/run.1/` (everything that starts with `data/run.1`),
+but not `data/run_1` or `data/prerun.1`; `.`, `(`, `[`, `+`, `$`, `?` in the URI are ordinary
+characters. Without `-r`, matching objects and matching "directories" are listed:
+`s3-cli ls s3://b/foo` shows `foo`, `foobar` and `foo/`, not `afoo` and not unrelated folders. To
+filter with a regex use `-p/--pattern` (see [Regex Pattern Filtering](#regex-pattern-filtering)).
+
 ```bash
 s3-cli ls [OPTIONS] <URI>
 ```
@@ -120,7 +127,7 @@ s3-cli ls [OPTIONS] <URI>
 |--------|-------------|
 | `-r, --recursive` | List objects recursively (traverse subdirectories) |
 | `-c, --count-only` | Count objects only, don't print URIs (faster for large sets) |
-| `-p, --pattern <REGEX>` | Regex pattern to filter results (client-side) |
+| `-p, --pattern <REGEX>` | Regex pattern to filter results (client-side), matched against each entry relative to the listing base |
 
 **Examples:**
 
@@ -213,7 +220,8 @@ s3-cli download <SOURCE_URI> <LOCAL_PATH>
 **Examples:**
 
 ```bash
-# Download single object
+# Download one object (the URI is a literal key prefix: any other key that starts
+# with "file.txt" is downloaded too, e.g. file.txt.bak)
 s3-cli download s3://bucket/file.txt ./local/
 
 # Download entire prefix
@@ -357,6 +365,16 @@ s3-cli put [OPTIONS] <URI>
 ## Regex Pattern Filtering
 
 The `-p/--pattern` option accepts standard Rust regex patterns. Patterns are applied **client-side** after listing, so they work with all backends.
+
+A regex only ever comes from `-p/--pattern`: the URI itself is always a literal key prefix (v0.9.125,
+#213; earlier versions read the last segment of an S3 URI as a regex). The pattern is matched
+(unanchored) against each entry **relative to the listing base**, not against the whole URI:
+
+| Listed URI | Entry | What the pattern sees |
+|------------|-------|-----------------------|
+| `s3://b/dl/` | `s3://b/dl/sub/c.npz` | `sub/c.npz` |
+| `s3://b/dl` | `s3://b/dl/sub/c.npz` (under the directory `dl`) | `sub/c.npz` |
+| `s3://b/data/run.1` | `s3://b/data/run.1.old` (merely starts with the prefix) | `run.1.old` (relative to the parent directory) |
 
 ### Pattern Syntax
 
