@@ -61,7 +61,10 @@ async fn logged_store_records_each_s3_call_exactly_once() {
         .await
         .unwrap();
     store.delete(&uri).await.unwrap();
-    store.delete_batch(&[uri.clone()]).await.unwrap();
+    store
+        .delete_batch(std::slice::from_ref(&uri))
+        .await
+        .unwrap();
     assert!(store.stat(&missing_uri).await.is_err());
     const CALLS: usize = 8;
 

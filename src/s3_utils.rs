@@ -2007,7 +2007,7 @@ pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
             || first_uri,
             num_objects,
             FirstByte::None,
-            result.as_ref().map(|_| 0).map_err(|e| e),
+            result.as_ref().map(|_| 0),
         );
     }
     result

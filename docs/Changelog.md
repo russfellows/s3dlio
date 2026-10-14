@@ -179,6 +179,15 @@ The op-log TSV format (13 columns, header, the values each column gets from
   `CheckpointStore::open*`, the concurrent shard reader, `MultiBackendDataset` and
   Python `load_checkpoint_with_validation` ask for a logged store, so they are
   recorded on every backend (they were recorded by accident, S3 only).
+- **Python store cache no longer decides whether a call is recorded (#174).**
+  The module-level functions share a cache of stores; it kept the logger of
+  whichever call built an entry first, `get_async`/`get_range_async` passed no
+  logger, `init_op_log` did not clear it and a cached store kept a finalized
+  logger. The cache now holds only unlogged stores and each call wraps its store
+  with the logger it reads (`global_logger()`) when it is made, so a call made while
+  the op-log is active is recorded once and a call made when it is not is neither
+  recorded nor counted, whatever the cache history. `get_async` and
+  `get_range_async` are recorded.
 - **Known consequence:** `MultiEndpointStore` `get`/`put` on bucket-form endpoints
   and the `s3dlio-oplog` replayer no longer write the accidental inner row (#175).
   See `docs/design/oplog-record-contract/W2-ownership-audit.md`.

@@ -120,6 +120,22 @@ static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<dyn ObjectStore>>> = Lazy::new(Da
 /// store_for_uri_with_logger() is synchronous — no runtime needed for creation.
 /// The store is cached by (scheme, endpoint, region, per-endpoint route) for
 /// >99% cache hit rate; see [`StoreKey`].
+///
+/// The cache holds only the UNLOGGED store, never a logger. `logger` is the
+/// caller's snapshot of `global_logger()` taken for THIS call, and a call that
+/// has one gets the cached store wrapped in a `LoggedObjectStore` for that
+/// logger. So whether a call is recorded depends only on whether the op-log is
+/// active when the call is made, never on which call populated the cache first
+/// or on a logger that has since been finalized (issue #174).
+///
+/// Why this is race-free: there is no logger state in the cache to invalidate,
+/// so `init_op_log` / `finalize_op_log` have nothing to clear and no window in
+/// which a concurrent call can pick up a stale or half-updated entry. A call
+/// racing with init or finalize is either wholly unlogged or wholly logged on
+/// the logger it snapshotted; if that logger has been finalized meanwhile its
+/// entry is refused and counted (`rejected_closed`), as for any other store.
+/// The wrapper is one `Arc` allocation per call while the op-log is active and
+/// nothing while it is not.
 fn get_or_create_store(
     uri: &str,
     logger: Option<crate::s3_logger::Logger>,
@@ -128,19 +144,28 @@ fn get_or_create_store(
     let key = StoreKey::from_uri(uri)?;
 
     // Fast path: Store already exists (cache hit >99% in typical workloads)
-    if let Some(store) = STORE_CACHE.get(&key) {
-        return Ok(store.clone());
-    }
+    let cached = STORE_CACHE.get(&key).map(|store| store.clone());
+    let store = match cached {
+        Some(store) => store,
+        None => {
+            // Slow path: Create new store — store_for_uri_with_logger is SYNC,
+            // no runtime needed. The store itself is Send + Sync and will use
+            // the global runtime's I/O reactor when async methods are called.
+            // Built without a logger: the cache must stay logger-free.
+            let store_box: Box<dyn ObjectStore> = store_for_uri_with_logger(uri, None)?;
+            let store_arc: Arc<dyn ObjectStore> = Arc::from(store_box);
+            // Two callers may build concurrently; both stores are equivalent, so
+            // keep whichever was inserted first.
+            STORE_CACHE.entry(key).or_insert(store_arc).value().clone()
+        }
+    };
 
-    // Slow path: Create new store — store_for_uri_with_logger is SYNC,
-    // no runtime needed. The store itself is Send + Sync and will use
-    // the global runtime's I/O reactor when async methods are called.
-    let store_box: Box<dyn ObjectStore> = store_for_uri_with_logger(uri, logger)?;
-
-    let store_arc: Arc<dyn ObjectStore> = Arc::from(store_box);
-    STORE_CACHE.insert(key, store_arc.clone());
-
-    Ok(store_arc)
+    Ok(match logger {
+        Some(logger) => Arc::new(crate::object_store_logger::LoggedObjectStore::new(
+            store, logger,
+        )),
+        None => store,
+    })
 }
 
 /// Submit async work to the global runtime (io_uring pattern).
@@ -703,9 +728,13 @@ pub fn init_logging(level: &str) -> PyResult<()> {
 ///       path is not created or truncated.
 ///     - Call after finalize_op_log(): raises RuntimeError and touches no file.
 ///
-/// Stores/readers capture the logger when they are constructed: objects created
-/// before init_op_log() are never logged; objects created before
-/// finalize_op_log() stop recording when it runs.
+/// The module-level functions (get, put_bytes, stat, list, delete, get_async,
+/// ...) look the op-log up on every call: a call made while logging is active is
+/// recorded once, and a call made before init_op_log() or after
+/// finalize_op_log() is not, whichever call first used a given scheme. Objects
+/// you construct yourself (stores, readers, writers) capture the logger when
+/// they are constructed: those created before init_op_log() are never logged;
+/// those created before finalize_op_log() stop recording when it runs.
 #[pyfunction]
 pub fn init_op_log(path: &str) -> PyResult<()> {
     init_op_logger(path).map_err(py_err)
@@ -1581,7 +1610,7 @@ pub fn get_range_py(
 pub fn get_async_py<'p>(py: Python<'p>, uri: &str) -> PyResult<Bound<'p, PyAny>> {
     let uri_owned = uri.to_owned();
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri_owned, None).map_err(py_err)?;
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
         let bytes = store.get(&uri_owned).await.map_err(py_err)?;
         Python::attach(|py| Ok(Py::new(py, PyBytesView::new(bytes))?.into_any()))
     })
@@ -1598,7 +1627,7 @@ pub fn get_range_async_py<'p>(
 ) -> PyResult<Bound<'p, PyAny>> {
     let uri_owned = uri.to_owned();
     future_into_py(py, async move {
-        let store = get_or_create_store(&uri_owned, None).map_err(py_err)?;
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
         let bytes = store
             .get_range(&uri_owned, offset, length)
             .await
@@ -3497,5 +3526,51 @@ mod issue171_store_cache_routing_tests {
         assert!(Arc::ptr_eq(&again, &warm_global));
         let host_again = get_or_create_store(&host_form(35, "bucket2"), None).expect("host-form");
         assert!(Arc::ptr_eq(&host_again, &warm_host));
+    }
+}
+
+#[cfg(test)]
+mod store_cache_logger_tests {
+    use super::*;
+    use crate::s3_logger::Logger;
+
+    /// Issue #174: the process-wide store cache must not decide whether a call
+    /// is recorded. Whoever builds the cached entry first (with or without a
+    /// logger), each call is recorded exactly when ITS caller passes a logger
+    /// (the caller passes `global_logger()`, i.e. "the op-log is active now"),
+    /// and recorded on that caller's logger only.
+    #[test]
+    fn a_call_is_recorded_exactly_when_its_caller_passes_a_logger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let first = Logger::new(&path("first.tsv.zst")).unwrap();
+        let second = Logger::new(&path("second.tsv.zst")).unwrap();
+        let file = path("data.bin");
+        std::fs::write(&file, b"data").unwrap();
+        let uri = format!("file://{file}");
+        let accepted = |l: &Logger| l.stats().accepted;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 1. Cache miss, built by a call that has a logger: recorded on it.
+            let store = get_or_create_store(&uri, Some(first.clone())).unwrap();
+            store.get(&uri).await.unwrap();
+            assert_eq!(accepted(&first), 1, "logged call on a cache miss");
+
+            // 2. Cache hit, caller has no logger (op-log inactive): not recorded,
+            //    even though the first caller's logger built the cached store.
+            let store = get_or_create_store(&uri, None).unwrap();
+            store.get(&uri).await.unwrap();
+            store.stat(&uri).await.unwrap();
+            assert_eq!(accepted(&first), 1, "unlogged call on a cache hit");
+
+            // 3. Cache hit, caller has a different logger: recorded there only.
+            let store = get_or_create_store(&uri, Some(second.clone())).unwrap();
+            store.get(&uri).await.unwrap();
+            assert_eq!(accepted(&second), 1, "logged call on a cache hit");
+            assert_eq!(accepted(&first), 1, "the first logger is not used again");
+        });
     }
 }
