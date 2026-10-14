@@ -12,9 +12,17 @@ scope.  When that thread tries to retake the GIL, CPython force-exits it
 (``PyThread_exit_thread``) and the unwind frees Python objects without a thread
 state -> SIGSEGV.  Timing dependent: roughly 0-25 percent of runs.
 
-The fix registers an ``atexit`` hook that first closes a delivery gate (a late
-delivery is dropped unrun, never entering Python) and then, with the GIL released, waits
-(bounded) for in-flight result deliveries to finish before finalization.
+The fix registers an ``atexit`` hook that first closes a delivery gate (after
+the close no NEW delivery is admitted: a delivery scheduled later is dropped
+unrun) and then, with the GIL released, waits (bounded, 2 s) for the deliveries
+admitted BEFORE the close to finish.  Those may still attach to Python during
+the wait; a successful drain means they all finished before finalization begins.
+Attachment paths outside the awaitable delivery (any other ``Python::attach``)
+are not covered.  Known limit: an awaitable whose delivery arrives after the
+close is never resolved, so an ``atexit`` handler registered before
+``import s3dlio`` (it runs after the drain, LIFO) that awaits one can hang.
+This is a targeted fix for the observed crash, not a guarantee for every
+teardown pattern.
 
 Each scenario runs in a FRESH subprocess, K times, sequentially; every run must
 exit with code 0.  Processes are only ever stopped with SIGTERM (never SIGKILL).
@@ -182,8 +190,9 @@ def test_late_delivery_after_exit_drain_never_enters_python(child_env):
     s3dlio's drain (LIFO), so it sleeps with the GIL released once the delivery
     gate has closed.  The abandoned ``get_async`` gets its HTTP 404 during that
     sleep.  With the gate closed the Rust side must drop the delivery without
-    calling ``loop.call_soon_threadsafe`` (i.e. without entering Python), and
-    the process must still exit 0.
+    calling ``loop.call_soon_threadsafe`` (i.e. without entering Python).  The
+    handler never awaits the abandoned awaitable (such an await would never be
+    resolved), and the process exits 0.
     """
     script = textwrap.dedent(
         """

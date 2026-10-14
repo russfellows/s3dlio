@@ -62,13 +62,19 @@
 //!   pointer to `register_decref`, which only pushes it onto a Rust-side
 //!   `Mutex<Vec>` and never calls into CPython.  Leaking those few references
 //!   during interpreter teardown is harmless.  The Python awaitable is never
-//!   completed, which is correct: the event loop that was awaiting it is gone.
+//!   resolved (see the known limits below for what that means to a waiter).
 //!
-//! No path calls `Python::attach` after the gate closes, so no s3dlio delivery
-//! can be inside an attach scope when `Py_FinalizeEx` begins.  Ticket
-//! accounting stays exactly-once: a closure that ran, panicked or was dropped
-//! unrun by the runtime releases its single ticket through the RAII guard; a
-//! refused delivery never held one.
+//! What the gate guarantees, exactly: after `close()`, no *new* delivery is
+//! admitted (a delivery closure scheduled after the close is dropped unrun).
+//! Deliveries admitted *before* the close may still attach to Python while the
+//! drain waits for them.  If the drain succeeds (within the bound), every
+//! admitted delivery has finished before interpreter finalization begins, so
+//! no s3dlio delivery can be inside an attach scope when `Py_FinalizeEx`
+//! starts.  Attachment paths outside [`future_into_py`] delivery (any other
+//! `Python::attach` in s3dlio or in user code) are not covered by this gate.
+//! Ticket accounting stays exactly-once: a closure that ran, panicked or was
+//! dropped unrun by the runtime releases its single ticket through the RAII
+//! guard; a refused delivery never held one.
 //!
 //! A future that has not yet completed on the Rust side holds no ticket and is
 //! never waited for, so a task that never completes cannot delay or hang exit.
@@ -79,16 +85,20 @@
 //!   [`crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT`] expires (a wedged
 //!   `call_soon_threadsafe`, for example) was admitted before the close and
 //!   can therefore still be inside `Python::attach` at finalization; the
-//!   timeout is logged.  That is the same crash as before, now reachable only
-//!   when a single delivery fails to finish within the timeout.
+//!   timeout is logged.  That is the same crash as before, a residual risk
+//!   reachable only when a single delivery fails to finish within the timeout.
 //! * The gate covers deliveries made through [`future_into_py`].  Any other
-//!   `Python::attach` on a non-Python thread during teardown is outside this
-//!   module.
+//!   `Python::attach` (elsewhere in s3dlio, or in user code) on a non-Python
+//!   thread during teardown is outside this module and not covered.
 //! * The gate never reopens: it closes at `atexit` and the process is ending.
-//!   A script that keeps using s3dlio async APIs from *other* `atexit`
-//!   handlers registered after this one (they run first, LIFO) is unaffected;
-//!   handlers registered before it run after the close and their s3dlio
-//!   awaitables will not complete.
+//!   An awaitable whose delivery arrives after the close is **never
+//!   resolved**.  `atexit` is LIFO, so a handler registered *before*
+//!   `import s3dlio` runs after s3dlio's drain; if such a handler awaits an
+//!   s3dlio awaitable whose delivery arrives after the close, that await never
+//!   completes and the process can hang.  Handlers registered after the import
+//!   run before the drain and are unaffected.
+//! * This is a targeted shutdown fix for the observed crash, not a guarantee
+//!   covering every teardown pattern.
 
 use std::cell::OnceCell;
 use std::future::Future;
