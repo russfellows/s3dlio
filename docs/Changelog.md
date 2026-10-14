@@ -198,6 +198,9 @@ The op-log TSV format (13 columns, header, the values each column gets from
   `pre_stat_objects` and `pre_stat_and_cache` have no op name in the format and
   are forwarded without a row (`pre_stat_*` used to write one `HEAD` row per
   object through the trait default).
+- **Streamed `LIST` rows carry the client id (#181).** The row written when a
+  `list_stream()` stream completes had an empty `client_id`; it now goes through the
+  same row builder as every other call, so it equals `list()`'s row.
 - **Known consequence:** `MultiEndpointStore` `get`/`put` on bucket-form endpoints
   and the `s3dlio-oplog` replayer no longer write the accidental inner row (#175).
   See `docs/design/oplog-record-contract/W2-ownership-audit.md`.

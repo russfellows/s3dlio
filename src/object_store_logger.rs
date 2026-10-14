@@ -330,24 +330,19 @@ impl ObjectStore for LoggedObjectStore {
                 }
             }
 
-            // Log the complete operation
-            let end_time = SystemTime::now();
-            let entry = LogEntry {
-                idx: 0, // Set by logger
-                thread_id: get_thread_id(),
-                operation: "LIST".to_string(),
-                client_id: String::new(),
-                num_objects: count,
-                bytes: 0,
-                endpoint: extract_endpoint(&uri_str),
-                file: strip_uri_scheme(&uri_str),
-                error: stream_error,
+            // Log the complete operation: the same row builder as every other
+            // call, so this row cannot differ from list()'s (issue #181).
+            record_call(
+                &logger,
+                "LIST",
+                &uri_str,
+                0,
+                count,
                 start_time,
-                first_byte_time: None,
-                end_time,
-            };
-
-            logger.log(entry);
+                None,
+                SystemTime::now(),
+                stream_error,
+            );
         })
     }
 
