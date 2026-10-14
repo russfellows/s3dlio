@@ -3554,6 +3554,27 @@ fn s3_endpoint_tls_ports_from_env() -> std::collections::HashSet<u16> {
         .unwrap_or_default()
 }
 
+/// The per-endpoint routing decision the `store_for_uri*` factories make for
+/// `uri`: `Some(endpoint_url)` when they build a dedicated client for the
+/// server the URI names, `None` when they use the process-global client (or a
+/// non-S3 backend).
+///
+/// This is the single source of that decision.  The factories call it to pick
+/// the client, and any cache of stores built by the factories (the Python
+/// `STORE_CACHE`, issue #171) must key on its result, so that the cache and the
+/// factories cannot disagree about which server a URI reaches.
+///
+/// A URI whose first segment is an invalid server (for example a portless IP,
+/// issue #178) is an `Err`, never `Ok(None)`: callers must propagate it before
+/// consulting or populating any cache, so a bad URI can never be served by a
+/// store cached for a valid one.
+pub(crate) fn store_routing_endpoint_for_uri(uri: &str) -> Result<Option<String>> {
+    match infer_scheme(uri) {
+        Scheme::S3 => s3_endpoint_url_from_uri(uri),
+        _ => Ok(None),
+    }
+}
+
 /// Serialises every test that reads or writes `S3DLIO_S3_ENDPOINT_TLS_PORTS`
 /// (shared with the multi-endpoint tests, which decide URL schemes the same way).
 #[cfg(test)]
@@ -3600,7 +3621,7 @@ pub fn store_for_uri_with_logger(
         Scheme::File => FileSystemObjectStore::boxed(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => {
-            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri)? {
+            if let Some(endpoint_url) = store_routing_endpoint_for_uri(uri)? {
                 // Per-endpoint store: dedicated connection pool, ignores AWS_ENDPOINT_URL.
                 crate::s3_client::run_on_global_rt(async move {
                     S3ObjectStore::for_endpoint(&endpoint_url)
@@ -3677,7 +3698,7 @@ pub fn store_for_uri_with_config_and_logger(
             )
         }
         (Scheme::S3, _) => {
-            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri)? {
+            if let Some(endpoint_url) = store_routing_endpoint_for_uri(uri)? {
                 // Per-endpoint store: dedicated connection pool, ignores AWS_ENDPOINT_URL.
                 crate::s3_client::run_on_global_rt(async move {
                     S3ObjectStore::for_endpoint(&endpoint_url)

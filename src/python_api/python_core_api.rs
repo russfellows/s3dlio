@@ -22,7 +22,9 @@ use tracing::{debug, warn, Level};
 // Project crates
 use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
 use crate::list_containers::list_containers as list_containers_rs;
-use crate::object_store::{store_for_uri, store_for_uri_with_logger};
+use crate::object_store::{
+    store_for_uri, store_for_uri_with_logger, store_routing_endpoint_for_uri,
+};
 use crate::s3_client::run_on_global_rt;
 use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger};
 use crate::s3_utils::{
@@ -71,24 +73,37 @@ use std::sync::Arc;
 ///
 /// Note: We DON'T include bucket in the key because AWS clients work across
 /// all buckets in a region/endpoint. This maximizes cache hit rate.
+///
+/// `route` is the server the factory would pick for the URI: it is taken from
+/// [`store_routing_endpoint_for_uri`], the same function
+/// `store_for_uri_with_logger` calls, so a host-form URI
+/// (`s3://host:port/bucket/key`) is cached per server and a bucket URI
+/// (`None`) is cached per `AWS_ENDPOINT_URL` (issue #171).  The cache never
+/// calls the factory on a hit, so anything the factory routes on must be in
+/// the key.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct StoreKey {
-    scheme: String,   // "s3", "az", "gs", "file", "direct"
-    endpoint: String, // AWS_ENDPOINT_URL or default
-    region: String,   // AWS_REGION or default
+    scheme: String,        // "s3", "az", "gs", "file", "direct"
+    endpoint: String,      // AWS_ENDPOINT_URL or default
+    region: String,        // AWS_REGION or default
+    route: Option<String>, // per-endpoint URL the factory routes this URI to, if any
 }
 
 impl StoreKey {
-    fn from_uri(uri: &str) -> Self {
+    /// Errors when the routing decision does (an invalid server in the URI,
+    /// issue #178): never mapped to "no route", which would alias the URI onto
+    /// the global-client cache entry.
+    fn from_uri(uri: &str) -> anyhow::Result<Self> {
         let scheme = uri.split("://").next().unwrap_or("s3");
         let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
-        StoreKey {
+        Ok(StoreKey {
             scheme: scheme.to_string(),
             endpoint,
             region,
-        }
+            route: store_routing_endpoint_for_uri(uri)?,
+        })
     }
 }
 
@@ -103,12 +118,14 @@ static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<dyn ObjectStore>>> = Lazy::new(Da
 /// Get or create a cached ObjectStore instance.
 ///
 /// store_for_uri_with_logger() is synchronous — no runtime needed for creation.
-/// The store is cached by (scheme, endpoint, region) for >99% cache hit rate.
+/// The store is cached by (scheme, endpoint, region, per-endpoint route) for
+/// >99% cache hit rate; see [`StoreKey`].
 fn get_or_create_store(
     uri: &str,
     logger: Option<crate::s3_logger::Logger>,
 ) -> anyhow::Result<Arc<dyn ObjectStore>> {
-    let key = StoreKey::from_uri(uri);
+    // Routing errors propagate BEFORE the cache is consulted or populated.
+    let key = StoreKey::from_uri(uri)?;
 
     // Fast path: Store already exists (cache hit >99% in typical workloads)
     if let Some(store) = STORE_CACHE.get(&key) {
@@ -3160,7 +3177,7 @@ mod issue173_store_creation_tests {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
         // Force the slow (creating) path of get_or_create_store.
-        STORE_CACHE.remove(&StoreKey::from_uri(HOST_FORM_URI));
+        STORE_CACHE.remove(&StoreKey::from_uri(HOST_FORM_URI).expect("valid URI"));
     }
 
     /// The exact shape of the old `get`/`get_range`/`put_bytes` bodies:
@@ -3205,5 +3222,182 @@ mod issue173_store_creation_tests {
                 "caller-thread store creation + submit_io did not return within {WATCHDOG:?}"
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- issue #171: the store cache must key on the server a URI names.
+//
+// Before the fix `StoreKey` was (scheme, AWS_ENDPOINT_URL, region), so a
+// cache hit for `s3://hostB:9000/b/k` returned the store built for hostA (or
+// for the global AWS_ENDPOINT_URL client) and the request went to the wrong
+// server.  These tests need no network: store creation never connects.
+//
+// STORE_CACHE is process-global and `get_or_create_store` is check-then-insert
+// (two racing misses on one key can each insert, last writer wins), so these
+// tests serialise on TEST_LOCK and never remove entries.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod issue171_store_cache_routing_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serialise() -> MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    const GLOBAL_BUCKET_URI: &str = "s3://plain-bucket-171/key";
+    const GLOBAL_BUCKET_URI_2: &str = "s3://another-plain-bucket-171/key";
+
+    fn host_form(port: u16, bucket: &str) -> String {
+        format!("s3://127.0.0.1:{port}/{bucket}/some/key")
+    }
+
+    fn prepare_environment() {
+        // for_endpoint requires credentials to exist; none are ever used.
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+    }
+
+    #[test]
+    fn host_form_uris_on_different_servers_have_different_keys() {
+        let _guard = serialise();
+        assert!(
+            StoreKey::from_uri(&host_form(19, "b")).expect("valid URI")
+                != StoreKey::from_uri(&host_form(20, "b")).expect("valid URI"),
+            "RED: two host-form URIs on different host:port share one StoreKey"
+        );
+    }
+
+    #[test]
+    fn host_form_and_bucket_form_uris_have_different_keys() {
+        let _guard = serialise();
+        assert!(
+            StoreKey::from_uri(&host_form(19, "b")).expect("valid URI")
+                != StoreKey::from_uri(GLOBAL_BUCKET_URI).expect("valid URI"),
+            "RED: a host-form URI and a bucket URI share one StoreKey"
+        );
+    }
+
+    #[test]
+    fn same_server_different_buckets_share_a_key() {
+        let _guard = serialise();
+        assert!(
+            StoreKey::from_uri(&host_form(19, "bucket1")).expect("valid URI")
+                == StoreKey::from_uri(&host_form(19, "bucket2")).expect("valid URI"),
+            "buckets on one server must share a StoreKey or the cache never hits"
+        );
+        assert!(
+            StoreKey::from_uri(GLOBAL_BUCKET_URI).expect("valid URI")
+                == StoreKey::from_uri(GLOBAL_BUCKET_URI_2).expect("valid URI"),
+            "bucket URIs on the global endpoint must share a StoreKey"
+        );
+    }
+
+    #[test]
+    fn different_servers_get_distinct_stores_from_the_cache() {
+        let _guard = serialise();
+        prepare_environment();
+        let a = get_or_create_store(&host_form(31, "bucket1"), None).expect("store for server A");
+        // Warm-cache hit for A, then ask for B: the old key returned A's store.
+        let b = get_or_create_store(&host_form(32, "bucket1"), None).expect("store for server B");
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "RED: get_or_create_store returned server A's store for a server B URI"
+        );
+    }
+
+    #[test]
+    fn host_form_and_bucket_form_get_distinct_stores_from_the_cache() {
+        let _guard = serialise();
+        prepare_environment();
+        let host = get_or_create_store(&host_form(33, "bucket1"), None).expect("host-form store");
+        let global = get_or_create_store(GLOBAL_BUCKET_URI, None).expect("global store");
+        assert!(
+            !Arc::ptr_eq(&global, &host),
+            "RED: a host-form URI was served by the global-endpoint store"
+        );
+    }
+
+    #[test]
+    fn same_server_different_buckets_reuse_one_cached_store() {
+        let _guard = serialise();
+        prepare_environment();
+        let first = get_or_create_store(&host_form(34, "bucket1"), None).expect("bucket1 store");
+        let second = get_or_create_store(&host_form(34, "bucket2"), None).expect("bucket2 store");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two buckets on one server must hit the same cached store"
+        );
+        let g1 = get_or_create_store(GLOBAL_BUCKET_URI, None).expect("global store 1");
+        let g2 = get_or_create_store(GLOBAL_BUCKET_URI_2, None).expect("global store 2");
+        assert!(
+            Arc::ptr_eq(&g1, &g2),
+            "two buckets on the global endpoint must hit the same cached store"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #171 x #178: a routing error must reach the caller BEFORE the cache is
+    // consulted or populated. If `StoreKey::from_uri` mapped the #178 error to
+    // "no route" (`None`), an invalid server URI would hash to the global-client
+    // key and be served by the store cached for a perfectly valid bucket URI.
+    // -----------------------------------------------------------------------
+
+    /// How many cache entries sit under the global-client key (route `None`).
+    fn global_route_entries() -> usize {
+        let want = StoreKey::from_uri(GLOBAL_BUCKET_URI).expect("valid URI");
+        STORE_CACHE.iter().filter(|e| *e.key() == want).count()
+    }
+
+    #[test]
+    fn invalid_server_uri_errors_instead_of_hitting_a_warm_cache() {
+        let _guard = serialise();
+        prepare_environment();
+        let warm_global = get_or_create_store(GLOBAL_BUCKET_URI, None).expect("warm global store");
+        let warm_host =
+            get_or_create_store(&host_form(35, "bucket1"), None).expect("warm host-form");
+        let entries_before = global_route_entries();
+        assert_eq!(
+            entries_before, 1,
+            "exactly one global-route entry is cached"
+        );
+
+        for bad in [
+            "s3://10.0.0.5/bkt/key",        // portless IP literal
+            "s3://node%x:9000/bkt/key",     // invalid host character
+            "s3://127.0.0.1:99999/bkt/key", // port out of range
+            "s3://[::1]/bkt/key",           // IPv6 without a port
+        ] {
+            assert!(
+                StoreKey::from_uri(bad).is_err(),
+                "RED: StoreKey::from_uri({bad}) must be an error, not a key"
+            );
+            match get_or_create_store(bad, None) {
+                Ok(store) => panic!(
+                    "RED: get_or_create_store({bad}) returned a store (global cached store: {}, \
+                     host-form cached store: {})",
+                    Arc::ptr_eq(&store, &warm_global),
+                    Arc::ptr_eq(&store, &warm_host)
+                ),
+                Err(e) => assert!(
+                    format!("{e:#}").contains(bad),
+                    "the error must name the URI: {e:#}"
+                ),
+            }
+        }
+
+        assert_eq!(
+            global_route_entries(),
+            entries_before,
+            "a failed lookup must not populate the cache"
+        );
+        // The warm entries are untouched and still served for valid URIs.
+        let again = get_or_create_store(GLOBAL_BUCKET_URI_2, None).expect("global store");
+        assert!(Arc::ptr_eq(&again, &warm_global));
+        let host_again = get_or_create_store(&host_form(35, "bucket2"), None).expect("host-form");
+        assert!(Arc::ptr_eq(&host_again, &warm_host));
     }
 }
