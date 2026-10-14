@@ -196,6 +196,9 @@ jobs:
       - name: Clippy (Rust - arrow-backend)
         run: cargo clippy --no-default-features --features arrow-backend --offline -- -D warnings
 
+      - name: Test (Rust - arrow-backend)
+        run: cargo test --no-default-features --features arrow-backend --offline --lib
+
       # Op-log (#168, #170): the zstd command-line tool is what the op-log
       # tests use to prove a finished log is a complete zstd stream.
       - name: Install zstd CLI (op-log tests)
