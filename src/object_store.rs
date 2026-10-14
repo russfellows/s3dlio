@@ -27,7 +27,8 @@ fn compute_checksum(data: &[u8]) -> String {
 
 // --- S3 ----------------------------------------------------------------------
 use crate::delete_batch_plan::{
-    aggregate_failures, group_uris_by_bucket, BucketGroup, GroupFailure,
+    aggregate_failures, group_uris_by_bucket, parse_s3_uri_for_server, BucketGroup, GroupFailure,
+    StoreServer,
 };
 use crate::s3_utils::{
     create_bucket_async as s3_create_bucket_async,
@@ -355,6 +356,27 @@ pub trait ObjectStore: Send + Sync {
 
     /// Delete multiple objects efficiently (batched when backend supports it).
     /// Backends should override for optimal batch delete (e.g., S3 DeleteObjects API).
+    ///
+    /// # Semantics (S3, GCS and Azure stores; issue #179)
+    ///
+    /// - The batch may name objects in several buckets / containers; each URI is
+    ///   deleted in the bucket (Azure: account + container) it names, never in
+    ///   the bucket of the first URI.
+    /// - **Every URI is validated before anything is deleted.**  A batch that
+    ///   contains a URI the store cannot use fails as a whole, naming each such
+    ///   URI, and deletes nothing.  This is a behaviour change: an unparseable
+    ///   URI past the first used to be silently skipped while the rest of the
+    ///   batch was deleted and `Ok(())` returned.
+    /// - A store talks to exactly one server.  For S3, a URI of the host form
+    ///   (`s3://host:port/bucket/key`) names a server; if it is not the
+    ///   store's own server (a per-endpoint store: its endpoint host:port,
+    ///   compared case-insensitively, with the scheme's default port filled in
+    ///   and no DNS resolution; a store on the process-wide client: any
+    ///   server-naming URI) the whole batch is rejected before any request.
+    /// - Buckets are processed in order of first appearance, keys in caller
+    ///   order within a bucket.  A failure in one bucket does not stop the
+    ///   others; the returned error names the URIs not confirmed deleted, and
+    ///   the first failure's cause chain is its source.
     async fn delete_batch(&self, uris: &[String]) -> Result<()>;
 
     /// Delete all objects under a prefix.
@@ -1140,6 +1162,26 @@ impl S3ObjectStore {
         Ok(metadata.size)
     }
 
+    /// The one server this store talks to, for comparison with the server a
+    /// URI names: `Some` for a per-endpoint store, `None` for a store on the
+    /// process-wide client (whose server comes from the environment).
+    fn server_identity(&self) -> Result<Option<StoreServer>> {
+        self.endpoint_url
+            .as_deref()
+            .map(StoreServer::from_endpoint_url)
+            .transpose()
+            .context("S3ObjectStore endpoint URL is not usable")
+    }
+
+    /// `parse_s3_uri` for this store: additionally rejects a URI that names a
+    /// server other than the store's own (issue #179, round 2).  The store
+    /// would otherwise apply that URI's bucket/key to ITS server.
+    fn parse_uri_for_this_store(&self, uri: &str) -> Result<(String, String)> {
+        let server = self.server_identity()?;
+        parse_s3_uri_for_server(uri, server.as_ref())
+            .with_context(|| format!("S3 URI '{uri}' cannot be used with this store"))
+    }
+
     /// Delete every key of one bucket group (issue #179).
     ///
     /// On failure returns the index (into `group.uris`) of the first URI that
@@ -1176,15 +1218,17 @@ impl S3ObjectStore {
         bucket: &str,
         keys: &[String],
     ) -> Result<()> {
-        let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = keys
+        // Fallible collect: a key that cannot be turned into an identifier is
+        // an error, never silently left out of the request.
+        let objects = keys
             .iter()
-            .filter_map(|k| {
+            .map(|k| {
                 aws_sdk_s3::types::ObjectIdentifier::builder()
                     .key(k)
                     .build()
-                    .ok()
+                    .with_context(|| format!("Failed to build DeleteObjects entry for key '{k}'"))
             })
-            .collect();
+            .collect::<Result<Vec<aws_sdk_s3::types::ObjectIdentifier>>>()?;
         let delete = aws_sdk_s3::types::Delete::builder()
             .set_objects(Some(objects))
             .build()
@@ -1579,8 +1623,11 @@ impl ObjectStore for S3ObjectStore {
         }
         debug!("S3ObjectStore::delete uri='{}'", uri);
 
+        // A URI naming a server other than this store's own is an error, not
+        // a delete of the same bucket/key on this store's server (#179).
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+
         if let Some(client) = &self.client {
-            let (bucket, key) = parse_s3_uri(uri)?;
             client
                 .delete_object()
                 .bucket(&bucket)
@@ -1591,7 +1638,6 @@ impl ObjectStore for S3ObjectStore {
             return Ok(());
         }
 
-        let (bucket, key) = parse_s3_uri(uri)?;
         s3_delete_objects_async(&bucket, &[key]).await
     }
 
@@ -1605,8 +1651,10 @@ impl ObjectStore for S3ObjectStore {
         // addresses exactly one.  Group by bucket (validating every URI first,
         // so a batch we cannot fully interpret deletes nothing), then issue
         // the requests per bucket.  A single-bucket batch is one group and
-        // behaves exactly as before.
-        let groups = group_uris_by_bucket(uris, parse_s3_uri)?;
+        // behaves exactly as before.  A store talks to ONE server, so a URI
+        // naming any other server is rejected in the same up-front pass.
+        let server = self.server_identity()?;
+        let groups = group_uris_by_bucket(uris, |u| parse_s3_uri_for_server(u, server.as_ref()))?;
         let mut failures: Vec<GroupFailure> = Vec::new();
         for group in &groups {
             if let Err((first_undeleted, error)) = self.delete_bucket_group(group).await {

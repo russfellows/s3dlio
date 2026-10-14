@@ -1,5 +1,35 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed — `delete_batch` deleted in the wrong bucket / on the wrong server (#179)
+
+- `ObjectStore::delete_batch` on the S3, GCS and Azure stores took the bucket
+  (container) of the first URI and sent every key there. A batch naming several
+  buckets deleted objects the caller never named, left the requested ones, and
+  returned `Ok`. URIs are now grouped by bucket (Azure: account + container);
+  each group is deleted in its own bucket. S3 issues `DeleteObjects` per bucket
+  in chunks of 1000.
+- An S3 URI of the host form (`s3://host:port/bucket/key`) names a server. A
+  store talks to exactly one server, so a batch (or a single `delete()`) that
+  names a different server is now an error and deletes nothing, instead of
+  applying that URI's bucket and key to the store's own server. A per-endpoint
+  store compares `host:port` case-insensitively, filling in 80/443 from the
+  endpoint scheme, with no DNS resolution (`localhost` and `127.0.0.1` are
+  different servers). A store on the process-wide client rejects every URI that
+  names a server.
+- The per-endpoint S3 path now checks the per-key errors that S3 reports inside
+  an HTTP 200 `DeleteObjects` response; it used to discard them.
+- When several buckets fail, the first failure's cause chain is the error
+  source and the others are listed in the message.
+
+### Behaviour change
+
+- A batch containing an unparseable URI now **fails before deleting anything**,
+  naming the URI. Previously URIs past the first that failed to parse were
+  silently skipped, the rest were deleted, and the call returned `Ok`. Callers
+  that relied on the skip must filter their URI list first.
+
 ## Version 0.9.114 — Azure SDK stable 1.x migration
 
 - Updated `azure_storage_blob` and `azure_identity` from pre-release APIs to

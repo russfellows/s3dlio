@@ -23,6 +23,9 @@ enum Reply {
     Denied,
     /// HTTP 200 whose body reports every key as an individual `<Error>`.
     PerKeyError,
+    /// The first `n` requests for the bucket succeed, every later one is a
+    /// 403 AccessDenied (used to fail the second chunk of a large batch).
+    DeniedAfter(usize),
 }
 
 /// One recorded DeleteObjects request.
@@ -35,11 +38,18 @@ struct Seen {
 struct MockS3 {
     endpoint: String,
     seen: Arc<Mutex<Vec<Seen>>>,
+    /// Request paths of single-object `DELETE /<bucket>/<key>` calls.
+    singles: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockS3 {
     fn requests(&self) -> Vec<Seen> {
         self.seen.lock().expect("seen lock").clone()
+    }
+
+    /// Paths of single-object DELETE requests received.
+    fn single_deletes(&self) -> Vec<String> {
+        self.singles.lock().expect("singles lock").clone()
     }
 
     /// Keys received, per bucket, in arrival order.
@@ -54,14 +64,26 @@ impl MockS3 {
 
 static ENV: Once = Once::new();
 
+/// Listener reserved for the process-wide (global) S3 client's mock endpoint.
+/// `init_env` binds it and points `AWS_ENDPOINT_URL` at it; only the one test
+/// that exercises the global-client path takes it and serves on it.
+static GLOBAL_LISTENER: Mutex<Option<std::net::TcpListener>> = Mutex::new(None);
+
 /// Fake credentials/region for the SDK; the mock never validates signatures.
+/// Also routes the global client (never the per-endpoint ones) to a local
+/// port, so a test of the global path can never reach a real endpoint.
 fn init_env() {
     ENV.call_once(|| {
+        let global = std::net::TcpListener::bind("127.0.0.1:0").expect("bind global mock");
+        global.set_nonblocking(true).expect("nonblocking");
+        let addr = global.local_addr().expect("global mock addr");
+        *GLOBAL_LISTENER.lock().expect("listener lock") = Some(global);
         #[allow(deprecated)]
         {
             std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
             std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ENDPOINT_URL", format!("http://{addr}"));
         }
     });
 }
@@ -70,7 +92,16 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Extract every `<Key>..</Key>` value from a request body.
+/// Undo the XML escaping of an element's text.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Extract every `<Key>..</Key>` value from a request body (XML-unescaped).
 fn keys_in_body(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = body;
@@ -78,7 +109,7 @@ fn keys_in_body(body: &str) -> Vec<String> {
         let after = &rest[s + "<Key>".len()..];
         match after.find("</Key>") {
             Some(e) => {
-                out.push(after[..e].to_string());
+                out.push(xml_unescape(&after[..e]));
                 rest = &after[e + "</Key>".len()..];
             }
             None => break,
@@ -90,6 +121,7 @@ fn keys_in_body(body: &str) -> Vec<String> {
 async fn serve_conn(
     mut sock: TcpStream,
     seen: Arc<Mutex<Vec<Seen>>>,
+    singles: Arc<Mutex<Vec<String>>>,
     replies: Arc<HashMap<String, Reply>>,
 ) {
     let mut buf: Vec<u8> = Vec::new();
@@ -108,6 +140,7 @@ async fn serve_conn(
         let head = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
         let mut lines = head.split("\r\n");
         let request_line = lines.next().unwrap_or("").to_string();
+        let method = request_line.split(' ').next().unwrap_or("").to_string();
         let path = request_line.split(' ').nth(1).unwrap_or("/").to_string();
         let mut content_length = 0usize;
         let mut chunked = false;
@@ -155,6 +188,17 @@ async fn serve_conn(
         }
         let body = String::from_utf8_lossy(&body_bytes).to_string();
 
+        // Single-object delete: DELETE /<bucket>/<key> -> 204 No Content.
+        if method == "DELETE" {
+            let object_path = path.split('?').next().unwrap_or("").to_string();
+            singles.lock().expect("singles lock").push(object_path);
+            let resp = "HTTP/1.1 204 No Content\r\nx-amz-request-id: 1\r\n\r\n";
+            if sock.write_all(resp.as_bytes()).await.is_err() {
+                return;
+            }
+            continue;
+        }
+
         // Path-style: /<bucket>?delete  or  /<bucket>/?delete
         let bucket = path
             .trim_start_matches('/')
@@ -163,12 +207,22 @@ async fn serve_conn(
             .unwrap_or("")
             .to_string();
         let keys = keys_in_body(&body);
-        seen.lock().expect("seen lock").push(Seen {
-            bucket: bucket.clone(),
-            keys: keys.clone(),
-        });
+        // Number of earlier requests for this bucket (for `DeniedAfter`).
+        let earlier = {
+            let mut g = seen.lock().expect("seen lock");
+            let n = g.iter().filter(|s| s.bucket == bucket).count();
+            g.push(Seen {
+                bucket: bucket.clone(),
+                keys: keys.clone(),
+            });
+            n
+        };
 
-        let reply = replies.get(&bucket).cloned().unwrap_or(Reply::Ok);
+        let reply = match replies.get(&bucket).cloned().unwrap_or(Reply::Ok) {
+            Reply::DeniedAfter(n) if earlier < n => Reply::Ok,
+            Reply::DeniedAfter(_) => Reply::Denied,
+            other => other,
+        };
         let (status, payload) = match reply {
             Reply::Ok => (
                 "200 OK",
@@ -176,7 +230,7 @@ async fn serve_conn(
                  xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></DeleteResult>"
                     .to_string(),
             ),
-            Reply::Denied => (
+            Reply::Denied | Reply::DeniedAfter(_) => (
                 "403 Forbidden",
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code>\
                  <Message>mock denied</Message><RequestId>1</RequestId></Error>"
@@ -214,15 +268,27 @@ async fn serve_conn(
 
 async fn start_mock(replies: HashMap<String, Reply>) -> MockS3 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    serve_mock(listener, replies)
+}
+
+/// Start serving the mock on an already-bound listener.
+fn serve_mock(listener: TcpListener, replies: HashMap<String, Reply>) -> MockS3 {
     let addr = listener.local_addr().expect("mock addr");
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
     let replies = Arc::new(replies);
+    let singles: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_srv = seen.clone();
+    let singles_srv = singles.clone();
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((sock, _)) => {
-                    tokio::spawn(serve_conn(sock, seen_srv.clone(), replies.clone()));
+                    tokio::spawn(serve_conn(
+                        sock,
+                        seen_srv.clone(),
+                        singles_srv.clone(),
+                        replies.clone(),
+                    ));
                 }
                 Err(_) => return,
             }
@@ -231,6 +297,7 @@ async fn start_mock(replies: HashMap<String, Reply>) -> MockS3 {
     MockS3 {
         endpoint: format!("http://{addr}"),
         seen,
+        singles,
     }
 }
 
@@ -400,4 +467,254 @@ async fn empty_batch_is_a_noop() {
     let store = store_for(&mock).await;
     store.delete_batch(&[]).await.expect("empty batch");
     assert!(mock.requests().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Second round (#179): server identity, chunk offsets, key shapes, sizes.
+// ---------------------------------------------------------------------------
+
+/// `host:port` of a mock (the authority a URI uses to name it).
+fn authority(mock: &MockS3) -> String {
+    mock.endpoint.trim_start_matches("http://").to_string()
+}
+
+/// A batch that also names ANOTHER server must delete nothing at all.  The
+/// pre-round-2 code ignored the host and sent both keys to this store's
+/// server: it deleted `data/k` here twice and never touched the other server
+/// (a data-loss bug of the same class as the bucket one).
+#[tokio::test]
+async fn uri_naming_a_different_server_fails_the_batch_and_deletes_nothing() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+    let here = authority(&mock);
+    let elsewhere = "s3://127.0.0.1:9/bkt-a/data/k";
+
+    let outcome = store
+        .delete_batch(&uris(&[&format!("s3://{here}/bkt-a/data/k"), elsewhere]))
+        .await;
+    assert!(
+        mock.requests().is_empty(),
+        "no request may be sent for a batch naming another server (outcome {outcome:?}): {:?}",
+        mock.requests()
+    );
+    let err = outcome.expect_err("a URI naming another server must fail the batch");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(elsewhere), "error must name the URI: {msg}");
+    assert!(
+        !msg.contains(&format!("s3://{here}/bkt-a/data/k")),
+        "the URI naming THIS server is fine and must not be blamed: {msg}"
+    );
+}
+
+/// Same-host-different-port is a different server too.
+#[tokio::test]
+async fn same_host_other_port_is_a_different_server() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+    let addr = mock.endpoint.trim_start_matches("http://");
+    let port: u16 = addr.rsplit(':').next().expect("port").parse().expect("u16");
+    let other = format!("s3://127.0.0.1:{}/bkt-a/k", port.wrapping_add(1));
+
+    let outcome = store.delete_batch(&uris(&[&other])).await;
+    assert!(
+        mock.requests().is_empty(),
+        "nothing may be sent (outcome {outcome:?}): {:?}",
+        mock.requests()
+    );
+    let err = outcome.expect_err("another port is another server");
+    assert!(format!("{err:#}").contains(&other));
+}
+
+/// URIs that name this store's own server (explicit host:port, any host-name
+/// case) are accepted, group by bucket, and mix freely with bucket-form URIs.
+#[tokio::test]
+async fn uris_naming_this_stores_own_server_are_accepted() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+    let here = authority(&mock);
+
+    store
+        .delete_batch(&uris(&[
+            &format!("s3://{here}/bkt-a/1"),
+            "s3://bkt-b/2",
+            &format!("s3://{here}/bkt-b/3"),
+            "s3://bkt-a/4",
+        ]))
+        .await
+        .expect("URIs naming this server are valid");
+
+    let by_bucket = mock.keys_by_bucket();
+    assert_eq!(by_bucket["bkt-a"], vec!["1", "4"]);
+    assert_eq!(by_bucket["bkt-b"], vec!["2", "3"]);
+    assert_eq!(by_bucket.len(), 2);
+}
+
+/// A store built on the process-wide client talks to the server named by the
+/// environment, never to one a URI names: such a URI is an error, and nothing
+/// is sent.  (The env points the global client at a local mock, so the unfixed
+/// code is observable as requests received instead of an error.)
+#[tokio::test]
+async fn global_client_store_rejects_a_uri_naming_a_server() {
+    init_env();
+    let listener = GLOBAL_LISTENER
+        .lock()
+        .expect("listener lock")
+        .take()
+        .expect("global listener is taken by exactly one test");
+    let global_mock = serve_mock(
+        TcpListener::from_std(listener).expect("tokio listener"),
+        HashMap::new(),
+    );
+    let store = S3ObjectStore::new();
+    let named = "s3://127.0.0.1:9/bkt-a/data/k";
+
+    let outcome = store.delete_batch(&uris(&["s3://bkt-a/ok", named])).await;
+    assert!(
+        global_mock.requests().is_empty(),
+        "nothing may be sent (outcome {outcome:?}): {:?}",
+        global_mock.requests()
+    );
+    let err = outcome.expect_err("a global-client store cannot honour a URI-named server");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(named), "error must name the URI: {msg}");
+}
+
+/// Single-object delete has the same blindness and gets the same check.
+#[tokio::test]
+async fn single_delete_of_a_uri_naming_another_server_is_an_error() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+    let elsewhere = "s3://127.0.0.1:9/bkt-a/data/k";
+
+    let outcome = store.delete(elsewhere).await;
+    assert!(
+        mock.requests().is_empty() && mock.single_deletes().is_empty(),
+        "no request of any kind may be sent (outcome {outcome:?}): singles {:?}",
+        mock.single_deletes()
+    );
+    let err = outcome.expect_err("delete() of a URI naming another server must fail");
+    assert!(format!("{err:#}").contains(elsewhere));
+
+    // ...while the URI naming this very server is deleted normally.
+    store
+        .delete(&format!("s3://{}/bkt-a/data/k", authority(&mock)))
+        .await
+        .expect("own-server single delete");
+    assert_eq!(mock.single_deletes(), vec!["/bkt-a/data/k".to_string()]);
+}
+
+/// The second DeleteObjects request fails: only the URIs of that chunk and
+/// later are reported as not deleted, never the 1000 already confirmed.
+#[tokio::test]
+async fn failure_in_the_second_chunk_reports_only_unconfirmed_uris() {
+    let mut replies = HashMap::new();
+    replies.insert("bkt-a".to_string(), Reply::DeniedAfter(1));
+    let mock = start_mock(replies).await;
+    let store = store_for(&mock).await;
+
+    let all: Vec<String> = (0..1500).map(|i| format!("s3://bkt-a/k{i:04}")).collect();
+    let err = store
+        .delete_batch(&all)
+        .await
+        .expect_err("chunk 2 is denied");
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("500 of 1500"), "offset arithmetic: {msg}");
+    assert!(
+        msg.contains("s3://bkt-a/k1000"),
+        "first unconfirmed URI named: {msg}"
+    );
+    assert!(
+        !msg.contains("s3://bkt-a/k0999"),
+        "a confirmed URI must not be reported: {msg}"
+    );
+    let sizes: Vec<usize> = mock.requests().iter().map(|r| r.keys.len()).collect();
+    assert_eq!(sizes, vec![1000, 500], "two requests, then stop");
+}
+
+/// Keys with spaces, unicode, XML metacharacters, '%' and a leading slash
+/// reach the server byte-for-byte, in the bucket the URI names.
+#[tokio::test]
+async fn awkward_key_shapes_are_sent_verbatim() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+
+    let keys = [
+        "dir with spaces/file name.bin",
+        "unicode/\u{00e9}\u{4e2d}\u{6587}/\u{1f600}.dat",
+        "amp&lt;ersand/<tag>\"q\"'a'.txt",
+        "percent/100%/a%20b%2Fc",
+        "/leading-slash",
+    ];
+    let batch: Vec<String> = keys.iter().map(|k| format!("s3://bkt-a/{k}")).collect();
+    store.delete_batch(&batch).await.expect("delete_batch");
+
+    let got = mock.keys_by_bucket();
+    let expect: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    assert_eq!(got["bkt-a"], expect);
+    assert_eq!(got.len(), 1);
+}
+
+/// Duplicate URIs are passed through unchanged (the pre-#179 behaviour; S3
+/// treats a repeated delete as idempotent) -- nothing is dropped or merged.
+#[tokio::test]
+async fn duplicate_uris_are_passed_through() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+
+    store
+        .delete_batch(&uris(&["s3://bkt-a/x", "s3://bkt-b/y", "s3://bkt-a/x"]))
+        .await
+        .expect("duplicates are not an error");
+    let by_bucket = mock.keys_by_bucket();
+    assert_eq!(by_bucket["bkt-a"], vec!["x", "x"]);
+    assert_eq!(by_bucket["bkt-b"], vec!["y"]);
+}
+
+/// Exactly 1000 keys is one request; 1001 is two (1000 + 1).
+#[tokio::test]
+async fn chunk_boundaries_1000_and_1001() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+
+    let exactly: Vec<String> = (0..1000).map(|i| format!("s3://bkt-a/e{i}")).collect();
+    store.delete_batch(&exactly).await.expect("1000");
+    let sizes: Vec<usize> = mock.requests().iter().map(|r| r.keys.len()).collect();
+    assert_eq!(sizes, vec![1000]);
+
+    let over: Vec<String> = (0..1001).map(|i| format!("s3://bkt-b/o{i}")).collect();
+    store.delete_batch(&over).await.expect("1001");
+    let sizes: Vec<usize> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.bucket == "bkt-b")
+        .map(|r| r.keys.len())
+        .collect();
+    assert_eq!(sizes, vec![1000, 1]);
+}
+
+/// When several buckets fail, the first failure's cause chain is kept as the
+/// error source (not flattened to text) and the others are listed.
+#[tokio::test]
+async fn several_failing_buckets_keep_the_first_cause_chain() {
+    let mut replies = HashMap::new();
+    replies.insert("bkt-x".to_string(), Reply::Denied);
+    replies.insert("bkt-y".to_string(), Reply::Denied);
+    let mock = start_mock(replies).await;
+    let store = store_for(&mock).await;
+
+    let err = store
+        .delete_batch(&uris(&["s3://bkt-x/1", "s3://bkt-y/2"]))
+        .await
+        .expect_err("both buckets are denied");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("s3://bkt-x/1") && msg.contains("s3://bkt-y/2"),
+        "{msg}"
+    );
+    assert!(
+        err.chain().count() >= 3,
+        "the first failure's SDK cause chain must survive as the source, got {} link(s): {msg}",
+        err.chain().count()
+    );
 }

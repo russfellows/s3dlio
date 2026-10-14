@@ -75,7 +75,17 @@ jobs:
 
       - name: Test (Rust)
         run: cargo test --release --lib --offline
-      
+
+      # delete_batch bucket/server grouping (#179).  The integration test runs
+      # against an in-process mock S3 endpoint (no network, no credentials).
+      - name: Test (Rust - delete_batch bucket grouping)
+        run: cargo test --release --offline --test test_delete_batch_buckets
+
+      # The GCS and Azure adapters' delete_batch grouping is feature-gated, so
+      # the plain `--lib` run above does not compile or run it.
+      - name: Test (Rust - delete_batch GCS/Azure grouping)
+        run: cargo test --release --lib --offline --features backend-gcs,backend-azure delete_batch
+
       - name: Build (Python)
         run: |
           pip install maturin
