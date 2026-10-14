@@ -73,6 +73,22 @@ struct State {
     delete_error_keys: BTreeSet<String>,
     /// When set, delimiter-less listings are paged this many keys at a time.
     page_size: Option<usize>,
+    /// Answer delimiter-less listings with 403 (all of them, or from page 2 on).
+    list_failure: ListFailure,
+    /// A truncated page that carries no continuation token.
+    truncate_without_token: bool,
+    /// Delay (ms) before answering any DeleteObjects.
+    delete_delay_ms: u64,
+    /// Delay (ms) before answering a delimiter-less listing page.
+    list_delay_ms: u64,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum ListFailure {
+    #[default]
+    Never,
+    EveryList,
+    AfterFirstPage,
 }
 
 struct Mock {
@@ -174,9 +190,28 @@ fn serve(mut s: TcpStream, st: Arc<Mutex<State>>) {
         query: query.to_string(),
         body_keys: body_keys.clone(),
     });
-    let (status, resp) = if method == "GET" && get("list-type").is_some() {
+    let mut delay_ms = 0u64;
+    let fails_list = method == "GET"
+        && get("list-type").is_some()
+        && get("delimiter").is_none()
+        && match st.list_failure {
+            ListFailure::Never => false,
+            ListFailure::EveryList => true,
+            ListFailure::AfterFirstPage => get("continuation-token").is_some(),
+        };
+    let (status, resp) = if fails_list {
+        (
+            403,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code>\
+             <Message>mock refuses to list</Message></Error>"
+                .to_string(),
+        )
+    } else if method == "GET" && get("list-type").is_some() {
         let prefix = get("prefix").unwrap_or_default();
         let delim = get("delimiter");
+        if delim.is_none() {
+            delay_ms = st.list_delay_ms;
+        }
         let mut content_keys: Vec<String> = Vec::new();
         let mut cps: BTreeSet<String> = BTreeSet::new();
         for k in st.keys.iter().filter(|k| k.starts_with(&prefix)) {
@@ -202,7 +237,7 @@ fn serve(mut s: TcpStream, st: Arc<Mutex<State>>) {
         };
         let truncated = rest_keys.len() > page;
         let page_keys: Vec<&String> = rest_keys.into_iter().take(page).collect();
-        let token = match (truncated, page_keys.last()) {
+        let token = match (truncated && !st.truncate_without_token, page_keys.last()) {
             (true, Some(last)) => format!("<NextContinuationToken>{last}</NextContinuationToken>"),
             _ => String::new(),
         };
@@ -229,6 +264,7 @@ fn serve(mut s: TcpStream, st: Arc<Mutex<State>>) {
             ),
         )
     } else if method == "POST" && query.contains("delete") {
+        delay_ms = st.delete_delay_ms;
         let mut del = String::new();
         for k in &body_keys {
             if st.delete_error_keys.contains(k) {
@@ -261,6 +297,9 @@ fn serve(mut s: TcpStream, st: Arc<Mutex<State>>) {
         (200, String::new())
     };
     drop(st);
+    if delay_ms > 0 {
+        thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
     let _ = write!(
         s,
         "HTTP/1.1 {status} X\r\ncontent-type: application/xml\r\ncontent-length: {}\r\n\
@@ -344,7 +383,10 @@ impl Fixture {
     }
 
     fn run(&self, flags: &[&str], key: &str) -> Run {
-        let uri = self.uri(key);
+        self.run_uri(flags, &self.uri(key))
+    }
+
+    fn run_uri(&self, flags: &[&str], uri: &str) -> Run {
         let endpoint = match self.mode {
             Mode::Global => self.mock.url(),
             Mode::Endpoint => self.decoy.url(),
@@ -352,7 +394,7 @@ impl Fixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-cli"));
         cmd.arg("delete")
             .args(flags)
-            .arg(&uri)
+            .arg(uri)
             .current_dir(env!("CARGO_TARGET_TMPDIR"))
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -410,6 +452,22 @@ fn deleted_request_keys(f: &Fixture) -> BTreeSet<String> {
         } else if r.is_delete_one() {
             if let Some((_, k)) = r.path.trim_start_matches('/').split_once('/') {
                 out.insert(k.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Every key named in any delete request, one entry per occurrence (a key sent
+/// twice appears twice).
+fn deleted_request_key_list(f: &Fixture) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in f.mock.log() {
+        if r.is_delete_objects() {
+            out.extend(r.body_keys.iter().cloned());
+        } else if r.is_delete_one() {
+            if let Some((_, k)) = r.path.trim_start_matches('/').split_once('/') {
+                out.push(k.to_string());
             }
         }
     }
@@ -669,6 +727,14 @@ both_modes!(t8b_pattern_filters_the_recursive_selection, |mode| {
     );
     let r = f.run(&["-r", "-p", "\\.log$"], "logs/");
     assert_eq!(r.code, 0, "{}", f.ctx(&r));
+    assert!(
+        r.out
+            .contains("Sent delete requests for 2 objects selected under prefix")
+            && r.out.contains("by pattern '\\.log$'")
+            && r.out.contains("(3 listed, 2 selected; 0 reported errors)"),
+        "{}",
+        f.ctx(&r)
+    );
     assert_eq!(
         deleted_request_keys(&f),
         set(&["logs/a.log", "logs/sub/c.log"]),
@@ -733,7 +799,192 @@ both_modes!(t10_recursive_pages_and_batches_cover_every_object, |mode| {
     let bodies: Vec<&Req> = log.iter().filter(|q| q.is_delete_objects()).collect();
     assert_eq!(bodies.len(), 3, "2500 keys = 1000 + 1000 + 500");
     assert!(bodies.iter().all(|q| q.body_keys.len() <= 1000));
-    assert_eq!(deleted_request_keys(&f), big.iter().cloned().collect());
+    let mut sent = deleted_request_key_list(&f);
+    assert_eq!(sent.len(), 2500, "each key must be sent exactly once");
+    sent.sort();
+    assert_eq!(sent, big, "each key must be sent exactly once");
     assert_eq!(f.mock.keys(), set(&["bigger", "other/x"]));
     f.assert_decoy_untouched();
 });
+
+// ----------------------------------------------------------------------------
+// 11. After a failure no further DeleteObjects request is SENT, not even for a
+//     partial `chunks(1000)` buffer that the end of the stream flushes.
+//
+//     Timing (ms): listing pages of 500 keys arrive every 100; the first batch
+//     (1000 keys: pages 1+2) is sent at 200 and its answer, a per-key error,
+//     arrives at 350. Page 3 (the start of batch 2) is buffered at 300, page 4
+//     would complete it at 400 -- but the failure at 350 ends the stream, which
+//     flushes the 500 buffered keys. They must be counted as not attempted and
+//     never sent.
+// ----------------------------------------------------------------------------
+both_modes!(t11_no_delete_request_is_sent_after_a_failure, |mode| {
+    let keys: Vec<String> = (0..3000).map(|i| format!("many/{i:05}")).collect();
+    let seed: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let f = Fixture::new(mode, &seed);
+    {
+        let mut st = f.mock.state.lock().expect("state");
+        st.page_size = Some(500);
+        st.list_delay_ms = 100;
+        st.delete_delay_ms = 150;
+        st.delete_error_keys.insert("many/00000".to_string());
+    }
+    let r = f.run(&["-r"], "many/");
+    assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
+    let sent = deleted_request_key_list(&f);
+    assert_eq!(
+        sent.len(),
+        1000,
+        "only the first batch may be sent, got {}: {:?}",
+        sent.len(),
+        r.out
+    );
+    assert!(
+        r.out
+            .contains("Sent delete requests for 1000 of the 1500 listed")
+            && r.out.contains("500 selected objects were NOT attempted"),
+        "message must report what was and was not attempted: {:?}",
+        r.out
+    );
+    assert!(r.out.contains("many/00000"), "{:?}", r.out);
+    f.assert_decoy_untouched();
+});
+
+// ----------------------------------------------------------------------------
+// 12. A truncated page with no continuation token is an error
+// ----------------------------------------------------------------------------
+both_modes!(t12_truncated_page_without_token_is_an_error, |mode| {
+    let f = Fixture::new(
+        mode,
+        &["foo/a", "foo/b", "foo/c", "foo/d", "foo/e", "other/x"],
+    );
+    {
+        let mut st = f.mock.state.lock().expect("state");
+        st.page_size = Some(3);
+        st.truncate_without_token = true;
+    }
+    let r = f.run(&["-r"], "foo/");
+    assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
+    assert!(
+        r.out.contains("truncated") && r.out.contains("listing failed"),
+        "{}",
+        f.ctx(&r)
+    );
+    // Only the three keys the first page returned may have been sent.
+    assert_eq!(
+        deleted_request_key_list(&f),
+        ["foo/a", "foo/b", "foo/c"],
+        "{}",
+        f.ctx(&r)
+    );
+    assert_eq!(f.mock.keys(), set(&["foo/d", "foo/e", "other/x"]));
+    assert_eq!(
+        f.mock
+            .log()
+            .iter()
+            .filter(|q| q.is_delete_objects())
+            .count(),
+        1,
+        "{}",
+        f.ctx(&r)
+    );
+    f.assert_decoy_untouched();
+});
+
+// ----------------------------------------------------------------------------
+// 13. A listing error part-way: non-zero, accurate message, nothing after it
+// ----------------------------------------------------------------------------
+both_modes!(t13_listing_error_midway_is_reported_accurately, |mode| {
+    let f = Fixture::new(mode, &["foo/a", "foo/b", "foo/c", "foo/d", "foo/e"]);
+    {
+        let mut st = f.mock.state.lock().expect("state");
+        st.page_size = Some(2);
+        st.list_failure = ListFailure::AfterFirstPage;
+    }
+    let r = f.run(&["-r"], "foo/");
+    assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
+    assert!(
+        r.out.contains("Sent delete requests for 2 of the 2 listed")
+            && r.out.contains("no delete request reported an error")
+            && r.out.contains("listing failed")
+            && r.out.contains("mock refuses to list"),
+        "{}",
+        f.ctx(&r)
+    );
+    assert!(!r.out.contains("0 reported errors"), "{}", f.ctx(&r));
+    assert_eq!(
+        deleted_request_key_list(&f),
+        ["foo/a", "foo/b"],
+        "{}",
+        f.ctx(&r)
+    );
+    assert_eq!(f.mock.keys(), set(&["foo/c", "foo/d", "foo/e"]));
+    f.assert_decoy_untouched();
+});
+
+// ----------------------------------------------------------------------------
+// 14. A listing that fails at once reports the listing error, not a delete summary
+// ----------------------------------------------------------------------------
+both_modes!(
+    t14_first_page_listing_failure_is_reported_directly,
+    |mode| {
+        let f = Fixture::new(mode, &["foo/a", "foo/b"]);
+        f.mock.state.lock().expect("state").list_failure = ListFailure::EveryList;
+        let r = f.run(&["-r"], "foo/");
+        assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
+        assert!(
+            r.out.contains("cannot list objects under prefix")
+                && r.out.contains("nothing was deleted")
+                && r.out.contains("mock refuses to list"),
+            "{}",
+            f.ctx(&r)
+        );
+        assert!(
+            !r.out.contains("Sent delete requests"),
+            "no delete summary for a listing failure:\n{}",
+            f.ctx(&r)
+        );
+        assert!(deleted_request_key_list(&f).is_empty(), "{}", f.ctx(&r));
+        assert_eq!(f.mock.keys(), set(&["foo/a", "foo/b"]));
+        f.assert_decoy_untouched();
+    }
+);
+
+// ----------------------------------------------------------------------------
+// 15. -p matching nothing: said plainly, exit 0, nothing sent
+// ----------------------------------------------------------------------------
+both_modes!(t15_pattern_matching_nothing_is_reported, |mode| {
+    let f = Fixture::new(mode, &["logs/a.log", "logs/b.txt", "logs/c.txt"]);
+    let r = f.run(&["-r", "-p", "zzz"], "logs/");
+    assert_eq!(r.code, 0, "{}", f.ctx(&r));
+    assert!(
+        r.out.contains("No objects under prefix")
+            && r.out.contains("match pattern 'zzz'")
+            && r.out.contains("(3 listed)"),
+        "{}",
+        f.ctx(&r)
+    );
+    assert!(deleted_request_key_list(&f).is_empty(), "{}", f.ctx(&r));
+    assert_eq!(f.mock.keys().len(), 3);
+    f.assert_decoy_untouched();
+});
+
+// ----------------------------------------------------------------------------
+// 16. A URI the store cannot use (`-r s3://bkt`, no key separator) is reported
+//     as the listing error it is
+// ----------------------------------------------------------------------------
+#[test]
+fn t16_recursive_on_a_malformed_uri_reports_the_listing_error() {
+    let f = Fixture::new(Mode::Global, &["a", "b/c"]);
+    let r = f.run_uri(&["-r"], "s3://bkt");
+    assert_ne!(r.code, 0, "{}", f.ctx(&r));
+    assert!(
+        r.out.contains("cannot list objects under prefix s3://bkt")
+            && r.out.contains("nothing was deleted")
+            && !r.out.contains("Sent delete requests"),
+        "{}",
+        f.ctx(&r)
+    );
+    assert!(f.mock.log().is_empty(), "{}", f.ctx(&r));
+    assert_eq!(f.mock.keys(), set(&["a", "b/c"]));
+}

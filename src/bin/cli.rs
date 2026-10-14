@@ -206,8 +206,8 @@ enum Command {
         /// S3 URI of the exact object, or with -r the literal key prefix.
         uri: String,
 
-        /// Batch size (number of keys per DeleteObjects API call).
-        /// The S3 API accepts up to 1,000 keys per batch request.
+        /// Accepted for compatibility but currently unused: DeleteObjects requests
+        /// always carry up to 1,000 keys.
         #[arg(short = 'j', long = "jobs", default_value_t = 1000, value_parser = parse_jobs)]
         jobs: usize,
 
@@ -1869,10 +1869,12 @@ const DELETE_REQUEST_KEYS: usize = 1000;
 /// DeleteObjects requests kept in flight at once by `delete -r`.
 const DELETE_REQUESTS_IN_FLIGHT: usize = 10;
 
-/// What one DeleteObjects request (or one listing failure) came back with.
+/// What one batch of selected keys came back with.
 struct DeleteBatchOutcome {
-    /// Keys this request named.
+    /// Keys a DeleteObjects request was sent for.
     requested: usize,
+    /// Keys NOT sent because an earlier request or the listing had failed.
+    skipped: usize,
     /// `Err` when the request, or any key in it, failed.
     result: Result<()>,
     /// The listing failed while this batch was being filled.
@@ -1916,7 +1918,8 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
     let store = store_for_uri_with_logger(uri, logger)?;
 
     if recursive {
-        delete_prefix_objects(store.as_ref(), uri, re.as_ref()).await
+        let filter = pattern.zip(re.as_ref());
+        delete_prefix_objects(store.as_ref(), uri, filter).await
     } else {
         delete_exact_object(store.as_ref(), uri).await
     }
@@ -1944,14 +1947,19 @@ async fn delete_exact_object(
 }
 
 /// `delete -r <uri>`: delete the real objects under the literal prefix, listed
-/// recursively (no delimiter), optionally narrowed by `re` (matched against the
-/// listed object URI).
+/// recursively (no delimiter), optionally narrowed by `filter` (the pattern text
+/// and its compiled regex, matched against the listed object URI).
+///
+/// After any failure (a delete request, a per-key error, the listing) no
+/// further DeleteObjects request is SENT: the check is made immediately before
+/// each send, so a batch that was only filled after the failure is skipped and
+/// counted as not attempted. Requests already in flight finish.
 async fn delete_prefix_objects(
     store: &dyn s3dlio::object_store::ObjectStore,
     uri: &str,
-    re: Option<&regex::Regex>,
+    filter: Option<(&str, &regex::Regex)>,
 ) -> Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     info!("Deleting objects under literal prefix: {}", uri);
     let pb = ProgressBar::new_spinner();
@@ -1963,28 +1971,37 @@ async fn delete_prefix_objects(
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message("listing...");
 
-    // Set once a request or the listing has failed: no further batches are
-    // started, those already in flight are allowed to finish.
     let stop = AtomicBool::new(false);
-    let listed = std::sync::atomic::AtomicU64::new(0);
+    // `listed`: objects the listing returned, counted BEFORE the pattern filter.
+    // `selected`: objects that passed the filter, i.e. were handed to deletion.
+    let listed = AtomicU64::new(0);
+    let selected = AtomicU64::new(0);
 
-    let selected = store
+    let selection = store
         .list_objects_with_prefix(uri)
-        .filter(|item| {
-            let keep = match (item, re) {
-                (Ok(u), Some(re)) => re.is_match(u),
-                _ => true,
-            };
-            std::future::ready(keep)
-        })
+        // Stop listing once a failure is known; the item that finds the flag
+        // set is dropped before it is counted, so the counts add up.
         .take_while(|_| std::future::ready(!stop.load(Ordering::Relaxed)))
         .inspect(|item| {
             if item.is_ok() {
                 listed.fetch_add(1, Ordering::Relaxed);
             }
+        })
+        .filter(|item| {
+            let keep = match (item, filter) {
+                (Ok(u), Some((_, re))) => re.is_match(u),
+                _ => true,
+            };
+            std::future::ready(keep)
+        })
+        .inspect(|item| {
+            if item.is_ok() {
+                selected.fetch_add(1, Ordering::Relaxed);
+            }
         });
 
-    let outcomes = selected
+    let stop_ref = &stop;
+    let outcomes = selection
         .chunks(DELETE_REQUEST_KEYS)
         .map(|chunk| async move {
             let mut uris = Vec::with_capacity(chunk.len());
@@ -1998,13 +2015,28 @@ async fn delete_prefix_objects(
                     }
                 }
             }
-            let result = if uris.is_empty() {
-                Ok(())
-            } else {
-                store.delete_batch(&uris).await
-            };
+            // The last look before sending: a batch filled after a failure is
+            // not sent. (A listing error in this very batch does not stop its
+            // own, already listed keys.)
+            let stopped = stop_ref.load(Ordering::Relaxed);
+            if list_error.is_some() {
+                stop_ref.store(true, Ordering::Relaxed);
+            }
+            if stopped || uris.is_empty() {
+                return DeleteBatchOutcome {
+                    requested: 0,
+                    skipped: if stopped { uris.len() } else { 0 },
+                    result: Ok(()),
+                    list_error,
+                };
+            }
+            let result = store.delete_batch(&uris).await;
+            if result.is_err() {
+                stop_ref.store(true, Ordering::Relaxed);
+            }
             DeleteBatchOutcome {
                 requested: uris.len(),
+                skipped: 0,
                 result,
                 list_error,
             }
@@ -2013,18 +2045,19 @@ async fn delete_prefix_objects(
     tokio::pin!(outcomes);
 
     let mut requested = 0usize;
+    let mut skipped = 0usize;
     let mut failed_requests = 0usize;
-    let mut problems: Vec<String> = Vec::new();
+    let mut delete_problems: Vec<String> = Vec::new();
+    let mut list_problems: Vec<String> = Vec::new();
     while let Some(outcome) = outcomes.next().await {
         requested += outcome.requested;
+        skipped += outcome.skipped;
         if let Err(e) = outcome.result {
             failed_requests += 1;
-            problems.push(format!("{e:#}"));
-            stop.store(true, Ordering::Relaxed);
+            delete_problems.push(format!("{e:#}"));
         }
         if let Some(e) = outcome.list_error {
-            problems.push(format!("listing failed: {e:#}"));
-            stop.store(true, Ordering::Relaxed);
+            list_problems.push(format!("{e:#}"));
         }
         pb.set_message(format!(
             "listed {} | delete requests sent for {}",
@@ -2033,25 +2066,71 @@ async fn delete_prefix_objects(
         ));
     }
     let listed = listed.load(Ordering::Relaxed);
+    let selected = selected.load(Ordering::Relaxed);
     pb.finish_and_clear();
 
-    if !problems.is_empty() {
+    // A listing that failed before anything was sent: report the listing error
+    // itself, not a delete summary for zero objects.
+    if requested == 0 && skipped == 0 && delete_problems.is_empty() && !list_problems.is_empty() {
         bail!(
-            "Sent delete requests for {requested} objects found under prefix {uri} \
-             ({listed} listed; {failed_requests} delete request(s) reported errors); \
-             the command stopped at the first failure and may not have reached every \
-             listed object:\n  {}",
-            problems.join("\n  ")
+            "cannot list objects under prefix {uri}; nothing was deleted: {}",
+            list_problems.join("; ")
         );
+    }
+    let scope = match filter {
+        Some((pat, _)) => {
+            format!("{selected} selected (pattern '{pat}') of {listed} listed under prefix {uri}")
+        }
+        None => format!("{listed} listed under prefix {uri}"),
+    };
+    if !delete_problems.is_empty() || !list_problems.is_empty() {
+        let mut msg = format!("Sent delete requests for {requested} of the {scope}");
+        if failed_requests > 0 {
+            msg.push_str(&format!(
+                "; {failed_requests} delete request(s) reported errors"
+            ));
+        } else {
+            msg.push_str("; no delete request reported an error");
+        }
+        if skipped > 0 {
+            msg.push_str(&format!(
+                "; {skipped} selected objects were NOT attempted because an earlier request \
+                 or the listing failed"
+            ));
+        }
+        if !list_problems.is_empty() {
+            msg.push_str("; the listing then failed, so later objects were not seen");
+        }
+        if !delete_problems.is_empty() || skipped > 0 {
+            msg.push_str("; the rest of the prefix was not listed");
+        }
+        let details: Vec<String> = delete_problems
+            .into_iter()
+            .chain(
+                list_problems
+                    .into_iter()
+                    .map(|e| format!("listing failed: {e}")),
+            )
+            .collect();
+        bail!("{msg}:\n  {}", details.join("\n  "));
     }
     if listed == 0 {
         eprintln!("No objects found under prefix: {uri}");
         return Ok(());
     }
-    eprintln!(
-        "Sent delete requests for {requested} objects found under prefix {uri} \
-         ({listed} listed; 0 reported errors)"
-    );
+    match filter {
+        Some((pat, _)) if selected == 0 => {
+            eprintln!("No objects under prefix {uri} match pattern '{pat}' ({listed} listed)");
+        }
+        Some((pat, _)) => eprintln!(
+            "Sent delete requests for {selected} objects selected under prefix {uri} by pattern \
+             '{pat}' ({listed} listed, {selected} selected; 0 reported errors)"
+        ),
+        None => eprintln!(
+            "Sent delete requests for {requested} objects found under prefix {uri} \
+             ({listed} listed; 0 reported errors)"
+        ),
+    }
     Ok(())
 }
 
