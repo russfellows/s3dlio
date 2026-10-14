@@ -528,3 +528,106 @@ fn host_form_uri_download_matching_agrees_with_list_on_the_pattern() {
     .expect("download");
     assert_eq!(downloaded_names(out.path()), vec!["d.npz"]);
 }
+
+// ----------------------------------------------------------------------------
+// Edge shapes of the prefix: empty, a space, non-ASCII, non-slash prefix + pattern
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_prefix_lists_the_whole_bucket_top_level_or_recursively() {
+    let (port, _state, b) = seeded_bucket();
+    // `s3://b/`: non-recursive = the top-level objects plus one entry per top-level folder
+    assert_lists(
+        port,
+        &format!("s3://{b}/"),
+        false,
+        uris(
+            &b,
+            &[
+                "afoo", "data/", "dl/", "foo", "foo/", "foobar", "other/", "weird/", "zeta/",
+            ],
+        ),
+    )
+    .await;
+    // recursive = every key of the bucket
+    assert_lists(port, &format!("s3://{b}/"), true, uris(&b, CATALOG)).await;
+}
+
+#[tokio::test]
+async fn a_space_and_a_non_ascii_character_in_a_key_are_literal() {
+    let (port, state, b) = seeded_bucket();
+    let keys: &[&str] = &[
+        "sp ace/a b.txt",
+        "sp ace/c.txt",
+        "sp acer",
+        "sp_ace/x",
+        "uni/caf\u{e9}-\u{65e5}\u{672c}.dat",
+        "uni/caf\u{e9}.dat",
+        "uni/cafe.dat",
+    ];
+    state.seed_bucket(&b, keys);
+    assert_lists(
+        port,
+        &format!("s3://{b}/sp ace"),
+        true,
+        uris(&b, &["sp ace/a b.txt", "sp ace/c.txt", "sp acer"]),
+    )
+    .await;
+    assert_lists(
+        port,
+        &format!("s3://{b}/sp ace/"),
+        false,
+        uris(&b, &["sp ace/a b.txt", "sp ace/c.txt"]),
+    )
+    .await;
+    // `caf\u{e9}` is a prefix of both non-ASCII keys, not of `cafe.dat`
+    assert_lists(
+        port,
+        &format!("s3://{b}/uni/caf\u{e9}"),
+        true,
+        uris(
+            &b,
+            &["uni/caf\u{e9}-\u{65e5}\u{672c}.dat", "uni/caf\u{e9}.dat"],
+        ),
+    )
+    .await;
+    assert_lists(
+        port,
+        &format!("s3://{b}/uni/caf\u{e9}-\u{65e5}"),
+        false,
+        uris(&b, &["uni/caf\u{e9}-\u{65e5}\u{672c}.dat"]),
+    )
+    .await;
+}
+
+#[test]
+fn download_matching_with_a_non_slash_prefix_and_a_pattern() {
+    let (_port, _state, b) = seeded_bucket();
+    // prefix `data/run.1` (no trailing slash): the literal prefix selects run.1, run.1.old,
+    // run.1/child; the pattern is matched against the entry relative to the listing base.
+    let cases: &[(&str, &[&str])] = &[
+        // `run.1.old` lies beside `run.1`: relative to the parent `data/`
+        (r"^run\.1\.old$", &["run.1.old"]),
+        // `run.1/child` lies under the directory `run.1/`: relative to it
+        (r"^child$", &["child"]),
+        // nothing outside the literal prefix is ever offered to the pattern
+        (r"run_1|prerun", &[]),
+    ];
+    for (pattern, want) in cases {
+        let out = tempfile::tempdir().expect("tempdir");
+        let res = on_fresh_runtime(s3dlio::s3_copy::download_objects_matching(
+            &format!("s3://{b}/data/run.1"),
+            Some(pattern),
+            out.path(),
+            4,
+            true,
+            None,
+        ));
+        if want.is_empty() {
+            assert!(res.is_err(), "pattern {pattern}: nothing may match");
+        } else {
+            res.unwrap_or_else(|e| panic!("pattern {pattern}: {e:#}"));
+        }
+        assert_eq!(downloaded_names(out.path()), *want, "pattern {pattern}");
+    }
+}
