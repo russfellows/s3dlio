@@ -1,6 +1,44 @@
 # s3dlio Changelog
 
-## Unreleased
+## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
+
+Fixes 12 issues: #167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215.
+**Read the behaviour changes before upgrading:**
+- **Delete contract (#210, #167, #212).** An exact `s3-cli delete` / Python `delete()` is ONE
+  DELETE request, with no HEAD and no listing; a missing object is success; a trailing `/` never
+  makes a delete recursive; `-r` / `recursive=True` deletes the real objects under the LITERAL
+  prefix (`foo` also matches `foobar`; `*` and `?` are ordinary characters); on `file://` and
+  `direct://` a directory is refused without `-r`. Scripts that relied on the old implicit
+  expansion now delete less. Python `delete()` no longer raises `FileNotFoundError`.
+- **Op-log destination (#191).** `file:` followed by anything but `//` (`file:x`) is rejected as an
+  op-log destination (it used to create a file literally named `file:x`).
+- **Op-log row safety (#186, #190).** A record whose `op`, `client_id`, `endpoint` or `file` holds
+  a TAB, LF or CR is rejected (not written) and counted; a TAB, LF or CR in `error` is replaced by
+  a space; a row with an unformattable timestamp is rejected and counted instead of ending the log.
+  `op_log_stats()` (and Rust `OpLogStats`) gain `rejected_unformattable`, `rejected_unsafe_field`
+  and `normalized_error_text`.
+- **Build (#188).** `build_pyo3.sh` now fails loudly (non-zero exit) if maturin is missing or a
+  build fails, and requires BOTH a cp312 and a cp313 wheel to be freshly built.
+
+Also in this release: Python `list()`, `stat()`, writer writes and two other calls release the GIL
+while blocking on I/O, `write_chunk()` of a strided view writes the right bytes, and the async
+entry points reuse the shared store cache (#201, #204); `list_keys` returns keys exactly as written
+(#198, `list_keys` only); the arrow-backend `ObjectStore` implementation compiles again, handles a
+zero-length / overflowing range read, and is checked in CI (#207); the never-compiled
+`src/prefetch.rs` sketch is removed and the docs that cited it corrected (#203); the op-log reader's
+unsupported-operation error names the line, row and op (#176, documentation and error text only);
+the #170 shutdown-panic test is bounded and race-free (#215).
+
+### Known limitations / deferred
+
+- #198 is only partly fixed: `list_keys` uses keys as written; the DLIO and `s3torchconnector`
+  adapters, the Azure https URI form, the arrow backend and op-log replay URIs are not changed.
+- #175 and #176 stay OPEN: only documentation and a clearer reader error were added; the op-log
+  gaps are listed under "Known gaps" in `docs/supplemental/OPERATION_LOGGING.md`.
+- #205 remains a documented gap.
+- #208, #211, #213 and #216 are open and not addressed by this release.
+- Python `delete(..., recursive=True)` deletes one request per object (up to 10 in flight);
+  batching is deferred.
 
 ### Fixed — Python API (#198, #201, #204)
 
