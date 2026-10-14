@@ -619,7 +619,8 @@ async fn copy_and_multipart_entry_points_reject_a_uri_naming_another_server() {
     let file = dir.join("f.bin");
     std::fs::write(&file, b"payload").expect("scratch file");
 
-    let r = s3dlio::s3_copy::upload_files(&prefix, &[file.clone()], 2, true, None).await;
+    let r =
+        s3dlio::s3_copy::upload_files(&prefix, std::slice::from_ref(&file), 2, true, None).await;
     assert_names(&r.expect_err("upload_files"), &prefix, &servers);
 
     let r = s3dlio::s3_copy::download_objects(&prefix, &dir.join("out"), 2, true, None).await;

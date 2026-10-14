@@ -2336,7 +2336,7 @@ pub fn get_objects_parallel_with_progress(
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<Vec<(String, Bytes)>> {
     // Issue #197: refuse the whole batch up front if any URI names another server.
-    crate::delete_batch_plan::validate_uris_for_global_client(&uris)?;
+    crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec(); // own for 'static
     run_on_global_rt(async move {
         // Build position index once (O(N)) for O(N log N) sort later.
