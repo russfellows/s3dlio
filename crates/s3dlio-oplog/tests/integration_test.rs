@@ -67,8 +67,8 @@ async fn test_replay_with_custom_executor() -> Result<()> {
         file,
         "idx\top\tbytes\tendpoint\tfile\tstart\tduration_ns\terror"
     )?;
-    writeln!(file, "0\tGET\t1048576\thttp://10.0.0.1:8000\t/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
-    writeln!(file, "1\tPUT\t2097152\thttp://10.0.0.1:8000\t/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
+    writeln!(file, "0\tGET\t1048576\ts3://src-bucket\tsrc-bucket/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
+    writeln!(file, "1\tPUT\t2097152\ts3://src-bucket\tsrc-bucket/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
     file.flush()?;
 
     let operations = Arc::new(Mutex::new(Vec::new()));
@@ -102,9 +102,9 @@ async fn test_operation_filtering() -> Result<()> {
         file,
         "idx\top\tbytes\tendpoint\tfile\tstart\tduration_ns\terror"
     )?;
-    writeln!(file, "0\tGET\t1048576\thttp://10.0.0.1:8000\t/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
-    writeln!(file, "1\tPUT\t2097152\thttp://10.0.0.1:8000\t/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
-    writeln!(file, "2\tGET\t524288\thttp://10.0.0.1:8000\t/data/file3.bin\t2024-01-15T10:30:45.323456Z\t500000\t")?;
+    writeln!(file, "0\tGET\t1048576\ts3://src-bucket\tsrc-bucket/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
+    writeln!(file, "1\tPUT\t2097152\ts3://src-bucket\tsrc-bucket/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
+    writeln!(file, "2\tGET\t524288\ts3://src-bucket\tsrc-bucket/data/file3.bin\t2024-01-15T10:30:45.323456Z\t500000\t")?;
     file.flush()?;
 
     let operations = Arc::new(Mutex::new(Vec::new()));
@@ -169,8 +169,8 @@ fn test_oplog_reader_tsv() -> Result<()> {
         file,
         "idx\top\tbytes\tendpoint\tfile\tstart\tduration_ns\terror"
     )?;
-    writeln!(file, "0\tGET\t1048576\thttp://10.0.0.1:8000\t/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
-    writeln!(file, "1\tPUT\t2097152\thttp://10.0.0.1:8000\t/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
+    writeln!(file, "0\tGET\t1048576\ts3://src-bucket\tsrc-bucket/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
+    writeln!(file, "1\tPUT\t2097152\ts3://src-bucket\tsrc-bucket/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
     file.flush()?;
 
     let reader = OpLogReader::from_file(file.path().to_path_buf())?;
@@ -193,9 +193,9 @@ fn test_oplog_reader_filtering() -> Result<()> {
         file,
         "idx\top\tbytes\tendpoint\tfile\tstart\tduration_ns\terror"
     )?;
-    writeln!(file, "0\tGET\t1048576\thttp://10.0.0.1:8000\t/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
-    writeln!(file, "1\tPUT\t2097152\thttp://10.0.0.1:8000\t/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
-    writeln!(file, "2\tDELETE\t0\thttp://10.0.0.1:8000\t/data/file3.bin\t2024-01-15T10:30:45.323456Z\t500000\t")?;
+    writeln!(file, "0\tGET\t1048576\ts3://src-bucket\tsrc-bucket/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
+    writeln!(file, "1\tPUT\t2097152\ts3://src-bucket\tsrc-bucket/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
+    writeln!(file, "2\tDELETE\t0\ts3://src-bucket\tsrc-bucket/data/file3.bin\t2024-01-15T10:30:45.323456Z\t500000\t")?;
     file.flush()?;
 
     let reader = OpLogReader::from_file(file.path().to_path_buf())?;
@@ -269,9 +269,9 @@ async fn test_continue_on_error() -> Result<()> {
         file,
         "idx\top\tbytes\tendpoint\tfile\tstart\tduration_ns\terror"
     )?;
-    writeln!(file, "0\tGET\t1048576\thttp://10.0.0.1:8000\t/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
-    writeln!(file, "1\tPUT\t2097152\thttp://10.0.0.1:8000\t/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
-    writeln!(file, "2\tGET\t524288\thttp://10.0.0.1:8000\t/data/file3.bin\t2024-01-15T10:30:45.323456Z\t500000\t")?;
+    writeln!(file, "0\tGET\t1048576\ts3://src-bucket\tsrc-bucket/data/file1.bin\t2024-01-15T10:30:45.123456Z\t1000000\t")?;
+    writeln!(file, "1\tPUT\t2097152\ts3://src-bucket\tsrc-bucket/data/file2.bin\t2024-01-15T10:30:45.223456Z\t2000000\t")?;
+    writeln!(file, "2\tGET\t524288\ts3://src-bucket\tsrc-bucket/data/file3.bin\t2024-01-15T10:30:45.323456Z\t500000\t")?;
     file.flush()?;
 
     let operations = Arc::new(Mutex::new(Vec::new()));
@@ -399,7 +399,7 @@ async fn test_head_to_stat_alias() -> Result<()> {
     )?;
     writeln!(
         file,
-        "0\tHEAD\t0\thttp://s3.local\t/bucket/object.bin\t1000000000\t5000000\t"
+        "0\tHEAD\t0\ts3://bucket\tbucket/object.bin\t1000000000\t5000000\t"
     )?;
     file.flush()?;
 
