@@ -492,15 +492,24 @@ impl ObjectStore for LoggedObjectStore {
 
     async fn exists(&self, uri: &str) -> Result<bool> {
         let start = SystemTime::now();
-        let result = self.inner.exists(uri).await;
+        // `exists` is defined as "stat() succeeds" (the trait default, and no store
+        // overrides it). Ask the inner store's stat so that a negative answer can be
+        // recorded the way the same failed HEAD is recorded by `stat`: the error
+        // column holds the error the HEAD returned (issue #189). Calling
+        // `inner.exists()` would hide that error, and probing again to recover it
+        // would add a request the op-log does not show.
+        let stat = self.inner.stat(uri).await;
         let end = SystemTime::now();
 
-        let error = result.as_ref().err().map(|e| e.to_string());
+        let (exists, error) = match stat {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
 
         // Log as HEAD operation (existence check, metadata-only)
         self.log_operation("HEAD", uri, 0, 1, start, None, end, error);
 
-        result
+        Ok(exists)
     }
 
     async fn get_with_validation(

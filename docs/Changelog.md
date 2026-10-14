@@ -208,6 +208,12 @@ The op-log TSV format (13 columns, header, the values each column gets from
   store's other rows: `s3://bkt` + `bkt`, `file://` + `/dir`. A hand-wrapped store
   (`LoggedObjectStore::new`) keeps the old behaviour; `with_container_prefix`
   supplies the prefix. Python `create_bucket` / `delete_bucket` still write no row.
+- **`exists()` == false is a failed `HEAD` row (#189).** It was a `HEAD` row with
+  an empty error, indistinguishable from a successful HEAD. The wrapper now answers
+  `exists` through the inner store's `stat` (the trait's definition of `exists`;
+  no store overrides it) and writes the error column of the failed HEAD, exactly
+  as `stat` does for the same URI (backend-specific text). A present object is still
+  a `HEAD` row without an error.
 - **Known consequence:** `MultiEndpointStore` `get`/`put` on bucket-form endpoints
   and the `s3dlio-oplog` replayer no longer write the accidental inner row (#175).
   See `docs/design/oplog-record-contract/W2-ownership-audit.md`.

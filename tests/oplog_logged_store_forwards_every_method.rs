@@ -61,7 +61,8 @@ const METHODS: &[(&str, Option<&str>, &str)] = &[
         Some("DELETE_CONTAINER"),
         "delete_container",
     ),
-    ("exists", Some("HEAD"), "exists"),
+    // exists is answered through the inner store's stat (see #189).
+    ("exists", Some("HEAD"), "stat"),
     ("get_with_validation", Some("GET"), "get_with_validation"),
     (
         "get_range_with_validation",
