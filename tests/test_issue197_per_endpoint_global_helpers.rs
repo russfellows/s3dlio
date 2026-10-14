@@ -6,9 +6,15 @@
 // `S3ObjectStore` bound to server B must never hand an operation to a helper that
 // uses the process-wide client (server A, `AWS_ENDPOINT_URL`) -- not even for a
 // bucket-form URI (`s3://bucket/key`), which names no server and so passes the URI
-// check. Per-endpoint multipart / concurrent-range support is issue #208; until then
-// those operations are REJECTED, with an error naming the store's server, and no
-// server receives a request.
+// check.
+//
+// Issue #197 first made multipart / concurrent-range / buffered-writer operations
+// on such a store REJECT (they used the process-wide client).  Issue #208 made them
+// ROUTE: they now run on the store's own client, so these tests assert that every
+// request goes to B and none to A.  (`tests/test_issue208_per_endpoint_client.rs`
+// uses a mock that really serves objects and multipart and checks the bytes; this
+// file's mock answers every request with an empty 200, so the uploads themselves
+// cannot complete -- the tests here pin WHERE the requests go.)
 //
 // A store bound to the global server (or the default store) is unaffected.
 //
@@ -70,79 +76,87 @@ async fn store_for(server: &MockS3) -> S3ObjectStore {
         .expect("for_endpoint with fake credentials")
 }
 
-/// The error must say what is wrong: whose server, and that it is not supported yet.
-fn assert_unsupported_per_endpoint(err: &anyhow::Error, b: &MockS3) {
-    let text = format!("{err:#}");
-    assert!(
-        text.contains(&format!("127.0.0.1:{}", b.port)),
-        "the error must name the store's server, got: {text}"
+/// The operation must have run on the store's server (issue #208), not been refused:
+/// whatever else went wrong, the error is not the old "not yet supported" rejection.
+fn assert_not_rejected(what: &str, result: &Result<(), anyhow::Error>) {
+    if let Err(err) = result {
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("not yet supported") && !text.contains("#208"),
+            "{what} must run on the store's own server, not be rejected, got: {text}"
+        );
+    }
+}
+
+/// B received a request for `bucket` that matches `pred`; A received none for it.
+fn assert_routed_to_b_only(a: &MockS3, b: &MockS3, bucket: &str, pred: impl Fn(&str) -> bool) {
+    assert_eq!(
+        mentioning(a, bucket),
+        Vec::<String>::new(),
+        "A got a request"
     );
+    let on_b = mentioning(b, bucket);
     assert!(
-        text.contains("not yet supported") && text.contains("#208"),
-        "the error must say the operation is not yet supported per-endpoint (#208), got: {text}"
+        on_b.iter().any(|r| pred(r)),
+        "B must get the request, got {on_b:?}"
     );
 }
 
 #[tokio::test]
-async fn per_endpoint_put_multipart_bucket_form_is_rejected_and_sends_nothing() {
+async fn per_endpoint_put_multipart_bucket_form_runs_on_the_stores_server() {
     let a = global_a();
     let b = MockS3::start(&[]);
     let store = store_for(&b).await;
     let bucket = unique_bucket("mp-bucket");
 
-    let err = store
+    // The mock answers CreateMultipartUpload with an empty 200, so the upload itself
+    // cannot complete -- but CreateMultipartUpload must reach B and nothing reach A.
+    let result = store
         .put_multipart(
             &format!("s3://{bucket}/key"),
             Bytes::from_static(b"x"),
             None,
         )
-        .await
-        .expect_err("a per-endpoint store must not run multipart on the global server");
+        .await;
 
-    assert_unsupported_per_endpoint(&err, &b);
-    assert_eq!(
-        mentioning(a, &bucket),
-        Vec::<String>::new(),
-        "A got a request"
-    );
-    assert_eq!(b.requests(), Vec::<String>::new(), "B got a request");
+    assert_not_rejected("multipart upload", &result);
+    assert_routed_to_b_only(a, &b, &bucket, |r| {
+        r.starts_with("POST ") && r.contains(&bucket)
+    });
 }
 
 #[tokio::test]
-async fn per_endpoint_put_multipart_host_form_is_rejected_and_sends_nothing() {
+async fn per_endpoint_put_multipart_host_form_runs_on_the_stores_server() {
     let a = global_a();
     let b = MockS3::start(&[]);
     let store = store_for(&b).await;
     let bucket = unique_bucket("mp-host");
 
-    let err = store
+    let result = store
         .put_multipart(
             &format!("s3://127.0.0.1:{}/{bucket}/key", b.port),
             Bytes::from_static(b"x"),
             None,
         )
-        .await
-        .expect_err("multipart is not supported per-endpoint");
+        .await;
 
-    assert_unsupported_per_endpoint(&err, &b);
-    assert_eq!(
-        mentioning(a, &bucket),
-        Vec::<String>::new(),
-        "A got a request"
-    );
-    assert_eq!(b.requests(), Vec::<String>::new(), "B got a request");
+    assert_not_rejected("multipart upload", &result);
+    assert_routed_to_b_only(a, &b, &bucket, |r| {
+        r.starts_with("POST ") && r.contains(&bucket)
+    });
 }
 
 #[tokio::test]
-async fn per_endpoint_get_range_optimized_large_is_rejected_and_sends_nothing() {
+async fn per_endpoint_get_range_optimized_large_runs_on_the_stores_server() {
     let a = global_a();
     let b = MockS3::start(&[]);
     let store = store_for(&b).await;
     let bucket = unique_bucket("rng");
 
     // An explicit length: no stat, so the concurrent-range path is chosen from the
-    // length alone.
-    let err = store
+    // length alone.  Its size lookup (HEAD) must go to B.  The mock reports size 0,
+    // so there is nothing to fetch.
+    let result = store
         .get_range_optimized(
             &format!("s3://{bucket}/key"),
             0,
@@ -151,81 +165,65 @@ async fn per_endpoint_get_range_optimized_large_is_rejected_and_sends_nothing() 
             None,
         )
         .await
-        .expect_err("concurrent range GET is not supported per-endpoint");
+        .map(|_| ());
 
-    assert_unsupported_per_endpoint(&err, &b);
-    assert_eq!(
-        mentioning(a, &bucket),
-        Vec::<String>::new(),
-        "A got a request"
-    );
-    assert_eq!(b.requests(), Vec::<String>::new(), "B got a request");
+    assert_not_rejected("concurrent range GET", &result);
+    assert_routed_to_b_only(a, &b, &bucket, |r| r.starts_with("HEAD "));
 }
 
 #[tokio::test]
-async fn per_endpoint_get_optimized_large_is_rejected_and_never_reaches_a() {
+async fn per_endpoint_get_optimized_large_runs_on_the_stores_server() {
     let a = global_a();
     let b = MockS3::start(&[]);
     let store = store_for(&b).await;
     let bucket = unique_bucket("get");
 
-    // S3DLIO_CONCURRENT_THRESHOLD=0: the object is "large". The size lookup (HEAD)
-    // legitimately goes to B through the store's own client; the data fetch must not.
-    let err = store
+    // S3DLIO_CONCURRENT_THRESHOLD=0: the object is "large".  The size lookups (HEAD)
+    // and the data fetch all go through the store's own client, to B.
+    let result = store
         .get_optimized(&format!("s3://{bucket}/key"))
         .await
-        .expect_err("concurrent range GET is not supported per-endpoint");
+        .map(|_| ());
 
-    assert_unsupported_per_endpoint(&err, &b);
-    assert_eq!(
-        mentioning(a, &bucket),
-        Vec::<String>::new(),
-        "A got a request"
-    );
-    assert!(
-        b.requests().iter().all(|r| r.starts_with("HEAD ")),
-        "B may only see the size lookup, got {:?}",
-        b.requests()
-    );
+    assert_not_rejected("concurrent range GET", &result);
+    assert_routed_to_b_only(a, &b, &bucket, |r| r.starts_with("HEAD "));
 }
 
 #[tokio::test]
-async fn per_endpoint_writers_are_rejected_when_created_and_send_nothing() {
+async fn per_endpoint_writers_upload_on_the_stores_server() {
     let a = global_a();
     let b = MockS3::start(&[]);
     let store = store_for(&b).await;
-    let bucket = unique_bucket("wr");
-    let uri = format!("s3://{bucket}/key");
 
-    // `Box<dyn ObjectWriter>` is not Debug, so no `expect_err`.
-    let results = [
-        ("get_writer", store.get_writer(&uri).await),
-        (
-            "get_writer_with_compression",
-            store
-                .get_writer_with_compression(&uri, CompressionConfig::zstd_default())
-                .await,
-        ),
-        (
-            "create_writer",
-            store.create_writer(&uri, WriterOptions::default()).await,
-        ),
-    ];
-    for (name, result) in results {
-        match result {
-            Ok(_) => {
-                panic!("{name}: the writer finalizes through the global client; must be rejected")
+    // `Box<dyn ObjectWriter>` is not Debug, so no `expect`.  The writer is created
+    // (it used to be refused here) and its final upload goes to B.
+    for name in ["get_writer", "get_writer_with_compression", "create_writer"] {
+        let bucket = unique_bucket(name);
+        let uri = format!("s3://{bucket}/key");
+        let created = match name {
+            "get_writer" => store.get_writer(&uri).await,
+            "get_writer_with_compression" => {
+                store
+                    .get_writer_with_compression(&uri, CompressionConfig::zstd_default())
+                    .await
             }
-            Err(err) => assert_unsupported_per_endpoint(&err, &b),
-        }
-    }
+            _ => store.create_writer(&uri, WriterOptions::default()).await,
+        };
+        let mut writer = match created {
+            Ok(w) => w,
+            Err(err) => panic!("{name}: the writer must be created, got: {err:#}"),
+        };
+        writer.write_chunk(b"hello").await.expect("buffered");
 
-    assert_eq!(
-        mentioning(a, &bucket),
-        Vec::<String>::new(),
-        "A got a request"
-    );
-    assert_eq!(b.requests(), Vec::<String>::new(), "B got a request");
+        // The mock cannot complete a multipart upload, so finalize fails -- but only
+        // after CreateMultipartUpload reached B.
+        let result = writer.finalize().await;
+
+        assert_not_rejected(name, &result);
+        assert_routed_to_b_only(a, &b, &bucket, |r| {
+            r.starts_with("POST ") && r.contains(&bucket)
+        });
+    }
 }
 
 #[tokio::test]
