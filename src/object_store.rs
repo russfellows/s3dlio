@@ -2160,6 +2160,18 @@ impl S3BufferedWriter {
         });
         self
     }
+
+    /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
+    /// header and every block the encoder already emitted during `write_chunk` are in
+    /// `buffer`; the encoder's final output is appended to them (issue #218).
+    fn seal_compression(&mut self) -> Result<()> {
+        if let Some(compressor) = self.compressor.take() {
+            let compressed_data = compressor.finish()?;
+            self.buffer = compressed_data;
+        }
+        self.compressed_bytes = self.buffer.len() as u64;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2192,13 +2204,7 @@ impl ObjectWriter for S3BufferedWriter {
         }
         self.finalized = true;
 
-        // Finalize compression if enabled
-        if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
-        }
-
-        self.compressed_bytes = self.buffer.len() as u64;
+        self.seal_compression()?;
 
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
@@ -2991,6 +2997,18 @@ impl AzureBufferedWriter {
             compressed_bytes: 0,
         }
     }
+
+    /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
+    /// header and every block the encoder already emitted during `write_chunk` are in
+    /// `buffer`; the encoder's final output is appended to them (issue #218).
+    fn seal_compression(&mut self) -> Result<()> {
+        if let Some(compressor) = self.compressor.take() {
+            let compressed_data = compressor.finish()?;
+            self.buffer = compressed_data;
+        }
+        self.compressed_bytes = self.buffer.len() as u64;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -3024,13 +3042,7 @@ impl ObjectWriter for AzureBufferedWriter {
         }
         self.finalized = true;
 
-        // Finalize compression if enabled
-        if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
-        }
-
-        self.compressed_bytes = self.buffer.len() as u64;
+        self.seal_compression()?;
 
         // Append compression extension if needed
         let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
@@ -3582,6 +3594,18 @@ impl GcsBufferedWriter {
             compressed_bytes: 0,
         }
     }
+
+    /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
+    /// header and every block the encoder already emitted during `write_chunk` are in
+    /// `buffer`; the encoder's final output is appended to them (issue #218).
+    fn seal_compression(&mut self) -> Result<()> {
+        if let Some(compressor) = self.compressor.take() {
+            let compressed_data = compressor.finish()?;
+            self.buffer = compressed_data;
+        }
+        self.compressed_bytes = self.buffer.len() as u64;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -3615,13 +3639,7 @@ impl ObjectWriter for GcsBufferedWriter {
         }
         self.finalized = true;
 
-        // Finalize compression if enabled
-        if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
-        }
-
-        self.compressed_bytes = self.buffer.len() as u64;
+        self.seal_compression()?;
 
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
@@ -5211,4 +5229,87 @@ mod delete_batch_grouping_tests {
         let err = group_uris_by_bucket(&uris, azure_group_key).unwrap_err();
         assert!(format!("{err:#}").contains("s3://nope/b"));
     }
+}
+
+// ============================================================================
+// Issue #218: closing a compressed buffered writer must keep what the encoder
+// already emitted.  The S3, Azure and GCS writers share the same shape: write_chunk
+// moves the encoder's output into `buffer`, and the frame is closed before upload.
+// The cloud upload itself needs a server (S3 is covered end to end in
+// tests/test_issue208_per_endpoint_client.rs), so these check the bytes the writer
+// would upload.
+// ============================================================================
+#[cfg(test)]
+mod compressed_writer_seal_tests_218 {
+    use super::*;
+
+    /// 64 KiB stretches alternating incompressible and compressible bytes.
+    fn mixed_payload(n: usize) -> Vec<u8> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(n);
+        let mut random = true;
+        while out.len() < n {
+            let stretch = (64 * 1024).min(n - out.len());
+            if random {
+                for _ in 0..stretch {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    out.push((state >> 24) as u8);
+                }
+            } else {
+                out.extend(b"the quick brown fox; ".iter().cycle().take(stretch));
+            }
+            random = !random;
+        }
+        out
+    }
+
+    /// One complete zstd frame that decodes to `data`.
+    fn assert_complete_frame_of(sealed: &[u8], data: &[u8]) {
+        let frame = zstd::zstd_safe::find_frame_compressed_size(sealed).unwrap_or_else(|e| {
+            panic!(
+                "the {} sealed bytes are not a complete zstd frame: {}",
+                sealed.len(),
+                zstd::zstd_safe::get_error_name(e)
+            )
+        });
+        assert_eq!(frame, sealed.len(), "the frame must be the whole buffer");
+        let plain = zstd::decode_all(sealed).expect("the sealed bytes decode");
+        assert!(plain == data, "decoded bytes differ from the written bytes");
+    }
+
+    macro_rules! seal_test {
+        ($name:ident, $writer:ty, $($cfg:meta),*) => {
+            $(#[$cfg])*
+            #[tokio::test]
+            async fn $name() {
+                for len in [32 * 1024, 6 * 1024 * 1024 + 123] {
+                    let data = mixed_payload(len);
+                    let mut w = <$writer>::new_with_compression(
+                        "unused://bucket/key".to_string(),
+                        CompressionConfig::zstd_default(),
+                    );
+                    for chunk in data.chunks(64 * 1024) {
+                        w.write_chunk(chunk).await.expect("write_chunk");
+                    }
+                    w.seal_compression().expect("seal");
+                    assert_complete_frame_of(&w.buffer, &data);
+                    assert_eq!(w.compressed_bytes, w.buffer.len() as u64, "{len}");
+                }
+            }
+        };
+    }
+
+    seal_test!(s3_writer_seal_keeps_the_early_blocks, S3BufferedWriter, cfg(all()));
+    seal_test!(
+        azure_writer_seal_keeps_the_early_blocks,
+        AzureBufferedWriter,
+        cfg(feature = "backend-azure")
+    );
+    seal_test!(
+        gcs_writer_seal_keeps_the_early_blocks,
+        GcsBufferedWriter,
+        cfg(feature = "backend-gcs")
+    );
 }
