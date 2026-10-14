@@ -40,7 +40,7 @@ Each call now has one owner:
 | `client_id` | `AWS_ACCESS_KEY_ID` (NOT `set_client_id()`) | same |
 | `n_objects` | 1 (batch: keys in that chunk) | same |
 | `bytes` | GET: body length. PUT: payload length. | **0** |
-| `endpoint` | `AWS_ENDPOINT_URL` (the server contacted; empty if unset) | same |
+| `endpoint` | the effective endpoint: `AWS_ENDPOINT_URL_S3` if set, otherwise `AWS_ENDPOINT_URL` (#183; the server contacted; empty if neither is set) | same |
 | `file` | the bare key (batch: `(batch)`) | same |
 | `error` | empty | GET: `{:#}` of the error chain. PUT: `format_sdk_error` detail. Batch DELETE: the per-key failure list or the SDK detail |
 | `first_byte` | GET: time the response headers arrived. PUT, DELETE: empty | empty |

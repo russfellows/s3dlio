@@ -28,9 +28,11 @@ not the raw files byte for byte.
 
 - The replay URI is rebuilt from the rows s3dlio writes; rows that cannot be rebuilt are an error
   (legacy and unrecognised rows still translate onto an explicit target as before). An unparsable
-  start time is an error and every op name the writer emits is parsed (`OpType` keeps its five
-  variants). The Azure https credential is created with `await`, not `block_in_place`; the public
-  constructors stay synchronous and cache the credential in a `OnceLock` (#202).
+  start time is an error. `OpType` keeps its five variants, so op names it does not model
+  (`GET_RANGE`, `DELETE_BATCH`, `DELETE_PREFIX`, `CREATE_CONTAINER`, `DELETE_CONTAINER`) are still
+  rejected with a clear error, as before. The Azure https credential is created synchronously (no
+  `block_in_place` or `block_on`); the public constructors stay synchronous and cache the credential
+  in a `OnceLock` (#202).
 
 ### Fixed — bucket create/delete ignored a server named in the URI (#199)
 
@@ -94,7 +96,8 @@ S3 helper functions have always written; the golden tests pin both (they compare
   `get_object_uri_optimized_async`, `get_objects_parallel*` (Python `get_many` on
   `s3://`), `get_range`, `put_object_async`, `put_object_uri_async`, the sync
   `delete_objects`, `S3BytesDataset` (sequential) and `s3_copy` still write the row
-  `S3Ops` writes: `endpoint` = `AWS_ENDPOINT_URL`, `file` = the bare key, `client_id`
+  `S3Ops` writes: `endpoint` = the effective endpoint (`AWS_ENDPOINT_URL_S3` if set, otherwise
+  `AWS_ENDPOINT_URL`; #183), `file` = the bare key, `client_id`
   = `AWS_ACCESS_KEY_ID`, `bytes` = the data size (0 on failure), the measured
   first-byte time for a GET, one `DELETE` row with `file` `(batch)` per 1000 keys
   for `delete_objects`. `S3Ops::new(client, logger, client_id, endpoint)` is
