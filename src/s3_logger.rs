@@ -1184,6 +1184,15 @@ fn is_rfc3986_scheme(s: &str) -> bool {
 ///   would be passed to `File::create` as a bogus relative path (issue #168).
 /// - Text before `://` that is not a valid scheme leaves the destination a plain
 ///   path: `<dir>/a://b.log` is the local path `<dir>/a:/b.log`.
+/// - `file:` (any case) followed by anything but `//` (`file:x`,
+///   `file:/tmp/x`) is a file URI in a form s3dlio does not accept (the file
+///   store refuses it too), so it is rejected with `ErrorKind::InvalidInput`
+///   rather than creating a file whose name begins with `file:` (issue #191).
+///   A local file really named `file:x` is written `./file:x`. Other text with a
+///   colon (`ops-12:30.tsv.zst`, `C:\logs\x`, `C:/logs/x`) is a plain path.
+/// - A single-letter scheme before `://` (`c://x`) is a valid RFC 3986 scheme
+///   and is rejected like any other, on every platform; the message says how to
+///   write a Windows drive path (`C:/dir/file` or `C:\dir\file`, issue #191).
 fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
     const FILE_PREFIX: &str = "file://";
     if let Some(local) = path.strip_prefix(FILE_PREFIX) {
@@ -1203,12 +1212,48 @@ fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
         .split_once("://")
         .filter(|(scheme, _)| is_rfc3986_scheme(scheme))
     {
+        // "c://x" is not a Windows drive path here: the scheme rule is the same
+        // on every platform. Say how to spell the drive instead.
+        let drive_hint = if scheme.len() == 1 {
+            format!(
+                "; for a Windows drive write '{scheme}:/dir/file' or '{scheme}:\\dir\\file' \
+                 (one slash or a backslash after the colon)"
+            )
+        } else {
+            String::new()
+        };
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "op-log path '{path}' uses unsupported scheme '{scheme}://'; the op-log must be \
                  written to a local filesystem path, e.g. '/tmp/ops.tsv.zst' or \
-                 'file:///tmp/ops.tsv.zst' (lowercase 'file://')"
+                 'file:///tmp/ops.tsv.zst' (lowercase 'file://'){drive_hint}"
+            ),
+        ));
+    }
+    if let Some(rest) = path
+        .get(..5)
+        .filter(|head| head.eq_ignore_ascii_case("file:"))
+        .map(|_| &path[5..])
+    {
+        // Suggest only spellings that mean what the user most likely meant:
+        // `file://` + the text for any rest, and `./` + the path only for a bare
+        // relative name ("./file:/abs" would be a path under a directory "file:").
+        let fix = if rest.is_empty() {
+            "write 'file:///tmp/ops.tsv.zst' (lowercase 'file://' and the path)".to_string()
+        } else if rest.starts_with('/') {
+            format!("write 'file://{rest}' (lowercase 'file://' and the path)")
+        } else {
+            format!(
+                "write 'file://{rest}' (lowercase 'file://' and the path), or './{path}' for a \
+                 local file whose name really begins with 'file:'"
+            )
+        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "op-log path '{path}' is a 'file:' URI without '//', which s3dlio does not \
+                 accept; {fix}"
             ),
         ));
     }
@@ -1630,6 +1675,42 @@ mod oplog_buffer_default_tests {
     }
 }
 
+/// Test support: run a test body in a fresh copy of this test binary, so it sees
+/// process-global state (the `tracing` callsite registry, the current directory)
+/// untouched by the other tests in the suite.
+#[cfg(test)]
+mod fresh_process {
+    const CHILD_ENV: &str = "S3DLIO_TEST_FRESH_PROCESS_CHILD";
+    const CHILD_OK: &str = "fresh-process child finished";
+
+    /// In the parent: spawn the test binary with `--exact <module>::<name>` and
+    /// the child flag, and assert that the child succeeded and ran its body (a
+    /// filtered-out child cannot pass vacuously). In the child: run `body`.
+    /// `module` is the caller's `module_path!()`.
+    pub(super) fn run(module: &str, name: &str, body: impl FnOnce()) {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            body();
+            println!("{CHILD_OK}");
+            return;
+        }
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args(["--exact", &format!("{module}::{name}")])
+            .args(["--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(CHILD_OK),
+            "the fresh-process child failed or never ran its body ({}):\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[cfg(test)]
 mod oplog_path_tests {
     use super::*;
@@ -1847,6 +1928,161 @@ mod oplog_path_tests {
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
             assert!(err.to_string().contains(uri), "{uri}: {err}");
             assert!(err.to_string().contains(shown), "{uri}: {err}");
+        }
+    }
+
+    // Issue #191, decision 1: "file:" followed by anything but "//" is a file
+    // URI in a form s3dlio does not accept (the file store refuses it too), so
+    // it is rejected with a pointer to "file:///path" instead of silently
+    // creating a file whose name starts with "file:". The scheme match is
+    // case-insensitive, like the "FILE://" rejection above. A local file that
+    // really is named "file:x" is written "./file:x".
+
+    #[test]
+    fn file_colon_without_double_slash_is_rejected_and_names_the_fix() {
+        // (destination, texts the message must contain, texts it must not)
+        let cases: [(&str, &[&str], &[&str]); 6] = [
+            // A bare name: the file:// spelling, or ./ for a literal name.
+            ("file:x", &["'file://x'", "'./file:x'"], &[]),
+            (
+                "file:ops.tsv.zst",
+                &["'file://ops.tsv.zst'", "'./file:ops.tsv.zst'"],
+                &[],
+            ),
+            ("FILE:x", &["'file://x'", "'./FILE:x'"], &[]),
+            // An absolute path: only the file:///abs spelling ("./file:/abs"
+            // would be a path under a directory named "file:").
+            (
+                "file:/tmp/ops.tsv.zst",
+                &["'file:///tmp/ops.tsv.zst'"],
+                &["'./", "begins with"],
+            ),
+            (
+                "File:/tmp/ops.tsv.zst",
+                &["'file:///tmp/ops.tsv.zst'"],
+                &["'./", "begins with"],
+            ),
+            // Nothing after the colon: the generic example only.
+            ("file:", &["'file:///"], &["'./", "begins with"]),
+        ];
+        for (uri, wants, unwanted) in cases {
+            let err = resolve_local_oplog_path(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("op-log path '{uri}'")),
+                "{uri}: {msg}"
+            );
+            for want in wants {
+                assert!(msg.contains(want), "{uri}: missing {want}: {msg}");
+            }
+            for not in unwanted {
+                assert!(!msg.contains(not), "{uri}: must not contain {not}: {msg}");
+            }
+        }
+    }
+
+    // The case that really created a file before the fix: `file:x`, one colon,
+    // no slashes, relative to the current directory. Run in a fresh process so
+    // changing the current directory cannot disturb other tests.
+    #[test]
+    fn bare_file_colon_name_creates_no_file_in_the_current_directory() {
+        super::fresh_process::run(
+            module_path!(),
+            "bare_file_colon_name_creates_no_file_in_the_current_directory",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                std::env::set_current_dir(dir.path()).unwrap();
+                for uri in ["file:x", "file:ops.tsv.zst", "FILE:x"] {
+                    let err = Logger::new(uri)
+                        .err()
+                        .unwrap_or_else(|| panic!("{uri} must be rejected"));
+                    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}: {err}");
+                }
+                let left: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                assert!(
+                    left.is_empty(),
+                    "a rejected destination left files: {left:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn file_colon_absolute_destination_creates_nothing() {
+        // "file:/<dir>/ops": before the fix this was a relative path under a
+        // directory named "file:" ("No such file or directory"). It must be
+        // rejected up front, not fail inside File::create.
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("ops.tsv.zst");
+        let uri = format!("file:{}", abs.display());
+        let err = Logger::new(&uri).expect_err("file:/abs must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert!(!abs.exists());
+    }
+
+    #[test]
+    fn a_colon_name_stays_reachable_as_a_plain_path() {
+        // "./file:x" is a relative path, not a URI; other names with a colon too.
+        for path in [
+            "./file:x",
+            "dir/file:x",
+            "/tmp/file:x",
+            "filex:y",
+            "ops-12:30.tsv.zst",
+        ] {
+            assert_eq!(
+                resolve_local_oplog_path(path).unwrap_or_else(|e| panic!("{path}: {e}")),
+                path
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("file:x");
+        drop(Logger::new(named.to_str().unwrap()).expect("an absolute path with a colon works"));
+        assert!(named.exists());
+    }
+
+    // Issue #191, decision 2: a one-letter scheme is still an RFC 3986 scheme,
+    // so "c://x" is rejected on every platform (the convention does not change
+    // by operating system); the message says how to write a Windows drive path.
+    // "C:\x" and "C:/x" contain no "://" and are plain paths, as before.
+
+    #[test]
+    fn single_letter_scheme_with_double_slash_is_rejected_with_a_drive_hint() {
+        for uri in ["c://x", "C://logs/ops.tsv.zst"] {
+            let err = resolve_local_oplog_path(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
+            let msg = err.to_string();
+            assert!(msg.contains("unsupported scheme"), "{uri}: {msg}");
+            assert!(
+                msg.contains("drive") && msg.contains(":/dir/file") && msg.contains(":\\dir\\file"),
+                "{uri}: the message must say how to write a drive path: {msg}"
+            );
+        }
+        // Longer schemes do not get the drive hint.
+        let msg = resolve_local_oplog_path("ab://x").unwrap_err().to_string();
+        assert!(!msg.contains("drive"), "{msg}");
+    }
+
+    #[test]
+    fn windows_drive_paths_without_a_doubled_slash_are_plain_paths() {
+        for path in [
+            r"C:\x",
+            "C:/x",
+            r"C:\logs\ops.tsv.zst",
+            "c:/logs/ops.tsv.zst",
+        ] {
+            assert_eq!(
+                resolve_local_oplog_path(path).unwrap_or_else(|e| panic!("{path}: {e}")),
+                path
+            );
         }
     }
 
@@ -2916,15 +3152,13 @@ mod oplog_stats_tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    // The first shutdown panics (in the tracing call it makes) while the writer is
-    // still running. Before the fix it had already taken the completion receiver
-    // out of the mutex, so the panic lost it and every later finalize returned at
-    // once, before the writer was done, and the incomplete-log warning never ran.
-    #[test]
-    fn a_panic_in_the_first_shutdown_does_not_let_a_later_one_return_early() {
+    /// A logger whose writer thread is stuck inside the sink (holding one big
+    /// entry), so `shutdown` has a running writer to wait for until
+    /// `sink.release()`.
+    fn logger_with_a_stalled_writer(name: &str) -> (Logger, StallingSink) {
         let sink = StallingSink::default();
         sink.lock().released = true; // the header is written by `start` itself
-        let logger = Logger::start(sink.clone(), 8, false, 1, "oplog-ps").unwrap();
+        let logger = Logger::start(sink.clone(), 8, false, 1, name).unwrap();
         {
             let mut st = sink.lock();
             st.released = false;
@@ -2932,17 +3166,116 @@ mod oplog_stats_tests {
         }
         assert_eq!(logger.try_log(big_entry(1)), LogOutcome::Accepted);
         sink.wait_until_blocked(); // the writer is stuck inside the sink
+        (logger, sink)
+    }
 
+    /// Releases the sink when dropped, so a failed assertion in the test body
+    /// never leaves the writer thread stuck inside the sink.
+    struct ReleaseOnDrop(StallingSink);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// Run `logger.shutdown()` on a fresh thread under [`PanickingSubscriber`]
+    /// and report whether the injected panic reached it. `while_installed` runs
+    /// on that thread after the subscriber is installed, before `shutdown`.
+    ///
+    /// Without the panic, `shutdown` would wait for the stalled writer until the
+    /// sink is released, so the wait here is bounded: on timeout the sink is
+    /// released (the thread then finishes) and the call returns `false`. When the
+    /// panic fires the sink is left stalled, so the caller can start a later
+    /// shutdown against the still-running writer.
+    fn first_shutdown_under_panicking_subscriber(
+        logger: &Logger,
+        sink: &StallingSink,
+        while_installed: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        // Keep two extra dispatchers registered for the whole call, and create
+        // them BEFORE the panicking one is installed. `tracing` computes the
+        // interest of a callsite that is registered for the first time from the
+        // registering thread's own subscriber, ignoring every other dispatcher,
+        // whenever it counts at most one live registered dispatcher
+        // (tracing-core `Rebuilder::JustOne`); that can cache "never" for the
+        // `info!` in `shutdown`. With two pins alive the count is already 2
+        // before the panicking dispatcher registers and 3 after, so there is no
+        // moment with a count of one.
+        let _pins: [tracing::Dispatch; 2] = std::array::from_fn(|_| {
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+        });
         let first = logger.clone();
-        let outcome = thread::spawn(move || {
-            tracing::subscriber::with_default(PanickingSubscriber, || {
+        let (tx, rx) = channel::<bool>();
+        let handle = thread::spawn(move || {
+            let panicked = tracing::subscriber::with_default(PanickingSubscriber, || {
+                while_installed();
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| first.shutdown()))
             })
-        })
-        .join()
-        .unwrap();
+            .is_err();
+            let _ = tx.send(panicked);
+        });
+        let panicked = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                // No panic: `shutdown` is waiting for the writer. Unblock it so the
+                // thread ends, then report that the injection did not happen.
+                sink.release();
+                false
+            });
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("the shutdown thread died outside the injected panic"));
+        panicked
+    }
+
+    // The injected panic comes from the `info!` inside `shutdown`. Its callsite
+    // is registered with `tracing` the first time any thread runs it; when that
+    // thread has no subscriber of its own, `tracing` can cache "never" for it and
+    // the scoped subscriber of the test thread is never asked. This test forces
+    // that order: another thread runs a whole session (the first `info!` in the
+    // process) while the subscriber is installed.
+    //
+    // It only discriminates in a process where nothing has run that `info!` yet,
+    // so the body runs in a fresh copy of the test binary (`fresh_process`), which
+    // makes it work the same alone and inside the full suite.
+    #[test]
+    fn the_injected_panic_fires_even_if_another_thread_ran_shutdown_first() {
+        super::fresh_process::run(
+            module_path!(),
+            "the_injected_panic_fires_even_if_another_thread_ran_shutdown_first",
+            || {
+                let (logger, sink) = logger_with_a_stalled_writer("oplog-ps-race");
+                let _release = ReleaseOnDrop(sink.clone());
+                let panicked = first_shutdown_under_panicking_subscriber(&logger, &sink, || {
+                    thread::spawn(|| {
+                        let sink = StallingSink::default();
+                        sink.lock().released = true;
+                        Logger::start(sink, 8, false, 1, "oplog-ps-other")
+                            .unwrap()
+                            .shutdown();
+                    })
+                    .join()
+                    .unwrap();
+                });
+                sink.release();
+                assert!(panicked, "the injected panic never reached shutdown");
+                logger.shutdown();
+            },
+        );
+    }
+
+    // The first shutdown panics (in the tracing call it makes) while the writer is
+    // still running. Before the fix it had already taken the completion receiver
+    // out of the mutex, so the panic lost it and every later finalize returned at
+    // once, before the writer was done, and the incomplete-log warning never ran.
+    #[test]
+    fn a_panic_in_the_first_shutdown_does_not_let_a_later_one_return_early() {
+        let (logger, sink) = logger_with_a_stalled_writer("oplog-ps");
+        let _release = ReleaseOnDrop(sink.clone());
+
         assert!(
-            outcome.is_err(),
+            first_shutdown_under_panicking_subscriber(&logger, &sink, || {}),
             "the injected panic never reached shutdown"
         );
 

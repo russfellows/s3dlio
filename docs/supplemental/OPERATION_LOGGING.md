@@ -475,6 +475,26 @@ before the first `://` is a valid URI scheme (`s3://`, `az://`, `gs://`,
 with the scheme shown as written. Text before `://` that is not a valid scheme
 (for example `dir/a://b.log`) is a plain path.
 
+Edge cases (issue #191), all following that convention:
+
+| Destination | Result |
+| --- | --- |
+| `/tmp/ops.tsv.zst`, `ops.tsv.zst` | plain path, used as given |
+| `file:///tmp/ops.tsv.zst` | `/tmp/ops.tsv.zst` |
+| `file:x`, `file:/tmp/ops.tsv.zst`, `FILE:x` | **rejected** (`InvalidInput`): `file:` (any case) not followed by `//` is a file URI in a form s3dlio does not accept (the `file://` object store refuses it too). Before, `file:x` silently created a file literally named `file:x`. |
+| `./file:x` | plain relative path: how to name a local file that really begins with `file:` |
+| `FILE://x` | rejected: unsupported scheme `FILE://` (lowercase only) |
+| `direct://x`, `s3://b/k` | rejected: unsupported scheme |
+| `c://x`, `C://logs/ops.tsv.zst` | rejected on every platform: a one-letter scheme is still a scheme. The message tells you to write the drive as `C:/logs/ops.tsv.zst` or `C:\logs\ops.tsv.zst`. |
+| `C:\logs\ops.tsv.zst`, `C:/logs/ops.tsv.zst` | plain paths (no `://`): a drive path on Windows |
+| `ops-12:30.tsv.zst` | plain path (a colon alone does not make a URI) |
+| `s3:bucket/key`, `gs:x`, `az:c/k` (a scheme and a colon, no `//`) | plain path: a **literal local file name** (here `s3:bucket/key` is the file `key` in a directory named `s3:bucket`), not a cloud destination. Only `file:` is special-cased. |
+
+**The op-log destination must be a local path or a `file://` URI.** Cloud and other
+non-local destinations (`s3://`, `gs://`, `az://`, `direct://`, ...) are not
+supported and are rejected. A string such as `s3:bucket/key` (no `//`) is not
+recognised as a URI and is treated as a literal local file name.
+
 ### Behaviour changes for users of the op-log API
 
 Compared with the previous release (4542f82), these are the changes a user can
@@ -510,6 +530,13 @@ not a machine-checked inventory:
 - A destination is resolved as described under "Op-log destinations": `file://`
   paths work, other schemes are rejected instead of becoming relative paths, and
   create errors name the path.
+- `file:x` and `file:/tmp/x` (`file:` in any case, not followed by `//`) are now
+  rejected with `InvalidInput` (issue #191). Before, `file:x` was accepted and
+  silently created a file literally named `file:x`, and `file:/tmp/x` was treated
+  as the relative path `file:/tmp/x` (it failed with "No such file or directory"
+  unless a directory named `file:` existed). `./file:x` is the plain-path spelling.
+  `c://x` stays rejected (as unsupported scheme `c://`) and its error now says how
+  to write a Windows drive.
 - `Logger::log` still returns `()`; `Logger::try_log` and `LogOutcome` are new.
 - An entry whose `operation` is `"__SHUTDOWN__"` used to be the writer's stop
   signal and ended the log (later entries were not written). It is now written as an
