@@ -793,6 +793,43 @@ mod tests {
         }
     }
 
+    // The prefix/object split reaches the parser: `s3://b/dir/` is a valid LISTING prefix
+    // (the most common call shape for `list` / `delete_prefix`) and an invalid OBJECT key.
+    // The refusal tests above only prove errors; this one proves the success side of the
+    // `parse_prefix` -> `parse_as(.., true)` wiring. Building the client needs credentials
+    // but makes no request. Env use is serialised by ENV_LOCK and restored afterwards.
+    #[test]
+    fn parse_prefix_accepts_a_trailing_slash_that_parse_refuses() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let names = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"];
+        let saved: Vec<Option<String>> = names.iter().map(|n| std::env::var(n).ok()).collect();
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test-access-key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+        }
+
+        let prefix = ArrowObjectStore::parse_prefix("s3://b/dir/");
+        let object = ArrowObjectStore::parse("s3://b/dir/");
+
+        for (name, value) in names.iter().zip(saved) {
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        let (_store, path, _url) = prefix.expect("`s3://b/dir/` is a valid listing prefix");
+        assert_eq!(path, Path::from("dir"));
+        let err = object.err().expect("`s3://b/dir/` is not an object key");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty path segment"), "{msg}");
+        assert!(msg.contains("s3://b/dir/"), "{msg}");
+    }
+
     // list_stream reports a listing failure as a single Err item, like `list`.
     #[tokio::test]
     async fn list_stream_yields_error_for_unusable_prefix() {
