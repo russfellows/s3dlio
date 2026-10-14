@@ -1799,6 +1799,10 @@ pub fn upload(
 // put_many() - Batch put for maximum throughput (Python API)
 // ---------------------------------------------------------------------------
 
+/// One `put_many` item with its store already resolved (or the resolution
+/// error, surfaced from that item's task): (uri, data, store).
+type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
+
 /// Put multiple objects in parallel from Python.
 ///
 /// Accepts a list of (uri, data) tuples where data is Python bytes.
@@ -1826,10 +1830,6 @@ pub fn upload(
 /// ]
 /// s3dlio.put_many(items, max_in_flight=64)
 /// ```
-/// One `put_many` item with its store already resolved (or the resolution
-/// error, surfaced from that item's task): (uri, data, store).
-type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
-
 #[pyfunction]
 #[pyo3(signature = (items, max_in_flight = 64))]
 pub fn put_many(
