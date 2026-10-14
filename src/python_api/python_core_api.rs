@@ -1107,8 +1107,9 @@ pub fn configure_s3(
     region: Option<&str>,
     ca_bundle: Option<&str>,
 ) -> PyResult<()> {
-    // SAFETY: Python is single-threaded at this call site (GIL held); no S3
-    // client or store has been created yet in the expected call pattern.
+    // The GIL does not make this single-threaded (s3dlio's runtimes and native
+    // threads may be running); see the limitations on `set_s3_endpoint_override`.
+    // Call `configure_s3` at start-up, before the first S3 operation.
     if let Some(url) = endpoint_url {
         crate::s3_client::set_s3_endpoint_override(url);
     }

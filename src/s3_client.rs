@@ -72,11 +72,31 @@ pub fn s3_endpoint_url_from_env() -> Option<String> {
 /// otherwise the service-specific variable, which has precedence (issue #183),
 /// would silently override what the caller just asked for.
 ///
-/// Call it before any S3 client is created, while no other thread reads or
-/// writes the environment (process start, or `configure_s3` under the GIL).
+/// # Limitations (not a redesign -- known and accepted)
+///
+/// * **Process-environment mutation is not thread-safe against non-Rust
+///   readers.** `std::env::set_var` is `unsafe` because POSIX `setenv` can free
+///   or move the `environ` block while another thread is inside C `getenv`.
+///   Rust's own `std::env` readers (all of s3dlio, Tokio, Rayon) are serialised
+///   with `set_var` by an internal lock, so they are safe; code that calls C
+///   `getenv` directly (libc, native libraries, other Python extension modules
+///   and their threads) is *not* covered by that lock.
+/// * **Other threads may exist.** Neither caller is single-threaded: the CLI
+///   runs under `#[tokio::main]` (worker threads already started), and Python
+///   `configure_s3` can run after s3dlio's Tokio/Rayon runtimes and arbitrary
+///   Python or native threads have started -- the GIL does not stop non-Python
+///   threads. The call must therefore be made at start-up, before S3 work or
+///   native threads that read the environment are running; nothing enforces it.
+/// * **Before the first S3 operation.** The process-wide client is built once
+///   from the environment; an override made afterwards does not move that
+///   client (while the routing checks, which read the environment, would follow
+///   the new value).
 pub fn set_s3_endpoint_override(url: &str) {
-    // SAFETY: documented precondition above: called before any S3 client or
-    // worker thread exists, so nothing reads the environment concurrently.
+    // SAFETY: `set_var` is unsafe only because of concurrent C `getenv` readers
+    // (see "Limitations" above). All Rust-side readers are synchronised by std's
+    // environment lock. This function cannot guarantee that no native thread
+    // reads the environment at the same moment; callers must invoke it at
+    // start-up, before such threads run.
     unsafe {
         env::set_var(ENV_ENDPOINT_URL, url);
         if env::var_os(ENV_ENDPOINT_URL_S3).is_some() {
