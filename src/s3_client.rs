@@ -684,13 +684,12 @@ pub async fn create_s3_client_for_endpoint(
 #[cfg(test)]
 mod mpi_aware_runtime_sizing_tests {
     use super::*;
-    use std::sync::Mutex;
 
     // get_runtime_threads() reads process-global env vars and atomics
-    // (CONCURRENCY_HINT, RT_THREADS_LIMIT); serialize these tests both
-    // against each other and reset the atomics we touch so we don't leak
-    // state into other tests in this binary.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // (CONCURRENCY_HINT, RT_THREADS_LIMIT); serialize these tests against every
+    // other test touching them via the crate-wide guard `crate::test_env`
+    // (issue #216) and reset the atomics we touch so we don't leak state into
+    // other tests in this binary.
     const VARS: [&str; 5] = [
         "S3DLIO_RT_THREADS",
         "S3DLIO_RT_THREADS_UNSAFE",
@@ -700,7 +699,7 @@ mod mpi_aware_runtime_sizing_tests {
     ];
 
     fn with_clean_state<F: FnOnce()>(body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let _guard = crate::test_env::lock();
         let prev: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
         for v in VARS {
             std::env::remove_var(v);

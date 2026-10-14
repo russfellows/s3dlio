@@ -927,14 +927,12 @@ mod h2_window_tests {
 mod connect_timeout_tests {
     use super::*;
 
-    // These tests mutate process-global env; they run serially within the
-    // same module (cargo's default per-thread test execution would race).
-    // We use a Mutex to enforce serial access across the few tests below.
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // These tests mutate process-global env, so each takes the crate-wide
+    // guard `crate::test_env` (issue #216): a lock private to this module
+    // cannot protect variables that tests in other modules also touch.
 
     fn with_var<F: FnOnce()>(value: Option<&str>, body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let _guard = crate::test_env::lock();
         let prev = std::env::var(ENV_CONNECT_TIMEOUT_SECS).ok();
         match value {
             Some(v) => std::env::set_var(ENV_CONNECT_TIMEOUT_SECS, v),
@@ -979,12 +977,9 @@ mod connect_timeout_tests {
 #[cfg(test)]
 mod max_retry_tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_var<F: FnOnce()>(value: Option<&str>, body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let _guard = crate::test_env::lock();
         let prev = std::env::var(ENV_MAX_RETRY_ATTEMPTS).ok();
         match value {
             Some(v) => std::env::set_var(ENV_MAX_RETRY_ATTEMPTS, v),
@@ -1039,16 +1034,16 @@ mod max_retry_tests {
 #[cfg(test)]
 mod mpi_thread_budget_tests {
     use super::*;
-    use std::sync::Mutex;
 
     // mpi_world_size() checks 3 env vars; these tests mutate all of them and
-    // must run serially both against each other and against any other test
-    // in this binary that touches the same vars (none currently do).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // must run serially both against each other and against every other test
+    // in this binary that touches the same vars (effective_thread_budget_tests
+    // and s3_client's mpi_aware_runtime_sizing_tests do).  That is why they take
+    // the crate-wide guard `crate::test_env`, not a lock of their own (#216).
     const VARS: [&str; 3] = ["OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "WORLD_SIZE"];
 
     fn with_clean_env<F: FnOnce()>(body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let _guard = crate::test_env::lock();
         let prev: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
         for v in VARS {
             std::env::remove_var(v);
@@ -1154,9 +1149,7 @@ mod mpi_thread_budget_tests {
 mod effective_thread_budget_tests {
     use super::*;
     use std::sync::atomic::Ordering;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
     const VARS: [&str; 5] = [
         "S3DLIO_RT_THREADS",
         "S3DLIO_RT_THREADS_UNSAFE",
@@ -1166,7 +1159,7 @@ mod effective_thread_budget_tests {
     ];
 
     fn with_clean_env<F: FnOnce()>(body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+        let _guard = crate::test_env::lock();
         let prev: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
         for v in VARS {
             std::env::remove_var(v);

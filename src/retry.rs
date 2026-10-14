@@ -94,26 +94,21 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use std::time::Instant;
-    use tokio::sync::Mutex as AsyncMutex;
 
-    /// Serializes tests in this module — cargo runs unit tests in a
-    /// binary concurrently, so any test that mutates the process-global
-    /// `S3DLIO_MAX_RETRY_ATTEMPTS` env var must hold this lock. Async
-    /// so it can be held across `retry_get_body(...).await` without
-    /// tripping clippy's `await_holding_lock`.
-    fn env_lock() -> &'static AsyncMutex<()> {
-        static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| AsyncMutex::new(()))
-    }
+    // Tests that mutate the process-global `S3DLIO_MAX_RETRY_ATTEMPTS` env var
+    // hold the crate-wide guard `crate::test_env` (issue #216): a lock private
+    // to this module could not exclude `constants::max_retry_tests`, which sets
+    // the same variable.  The guard is async-capable so it can be held across
+    // `retry_get_body(...).await` without tripping clippy's `await_holding_lock`.
 
     /// Phase 4a — budget is respected: after N failed attempts, the
     /// helper gives up and returns the last error rather than looping
     /// forever.
     #[tokio::test]
     async fn retry_respects_max_attempts_budget() {
-        let _guard = env_lock().lock().await;
+        let _guard = crate::test_env::lock_async().await;
         let call_count = Arc::new(AtomicUsize::new(0));
         // Force a known small budget.
         std::env::set_var(crate::constants::ENV_MAX_RETRY_ATTEMPTS, "3");
@@ -140,7 +135,7 @@ mod tests {
     /// invoking op() twice.
     #[tokio::test]
     async fn retry_returns_first_success_without_retrying() {
-        let _guard = env_lock().lock().await;
+        let _guard = crate::test_env::lock_async().await;
         let call_count = Arc::new(AtomicUsize::new(0));
         std::env::set_var(crate::constants::ENV_MAX_RETRY_ATTEMPTS, "5");
 
@@ -165,7 +160,7 @@ mod tests {
     /// Phase 4a — mid-loop success stops retrying at the first Ok.
     #[tokio::test]
     async fn retry_stops_on_first_success_mid_loop() {
-        let _guard = env_lock().lock().await;
+        let _guard = crate::test_env::lock_async().await;
         let call_count = Arc::new(AtomicUsize::new(0));
         std::env::set_var(crate::constants::ENV_MAX_RETRY_ATTEMPTS, "5");
 
@@ -196,7 +191,7 @@ mod tests {
     /// Total elapsed ≥ 300ms.
     #[tokio::test]
     async fn retry_applies_linear_backoff() {
-        let _guard = env_lock().lock().await;
+        let _guard = crate::test_env::lock_async().await;
         std::env::set_var(crate::constants::ENV_MAX_RETRY_ATTEMPTS, "5");
         let call_count = Arc::new(AtomicUsize::new(0));
         let start = Instant::now();
