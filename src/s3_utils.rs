@@ -1984,6 +1984,66 @@ pub async fn stat_object_uri_async(uri: &str) -> Result<ObjectStat> {
     stat_object(&bucket, &key).await
 }
 
+/// Stream the URIs (`s3://bucket/key`) of the REAL objects whose key starts
+/// with the literal `prefix`: no delimiter (so the server never answers with
+/// `CommonPrefixes`), no regex, no key rewriting.  Only the `Contents` entries
+/// of each page are yielded -- synthetic entries are never recognised by shape
+/// (a real object may end in `/` and have size 0), they simply never appear.
+///
+/// A truncated page without a continuation token is an error, never a silently
+/// short listing.
+pub(crate) fn list_object_uris_with_prefix_stream(
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    prefix: String,
+) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
+    Box::pin(async_stream::stream! {
+        let mut cont: Option<String> = None;
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(bucket.as_str())
+                .prefix(prefix.as_str());
+            if let Some(ref token) = cont {
+                req = req.continuation_token(token.as_str());
+            }
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(anyhow::anyhow!(
+                        "list_objects_v2 failed for bucket '{}' prefix '{}': {}",
+                        bucket,
+                        prefix,
+                        format_sdk_error(&e)
+                    ));
+                    return;
+                }
+            };
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    yield Ok(format!("s3://{bucket}/{key}"));
+                }
+            }
+            if resp.is_truncated().unwrap_or(false) {
+                match resp.next_continuation_token() {
+                    Some(next) => cont = Some(next.to_string()),
+                    None => {
+                        yield Err(anyhow::anyhow!(
+                            "list_objects_v2 for bucket '{}' prefix '{}' was truncated but gave \
+                             no continuation token; the listing is incomplete",
+                            bucket,
+                            prefix
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                return;
+            }
+        }
+    })
+}
+
 /*
  * Old ?
  *

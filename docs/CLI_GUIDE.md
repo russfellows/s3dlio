@@ -227,34 +227,104 @@ s3-cli download -j 128 s3://bucket/large-dataset/ ./dataset/
 
 ### delete - Delete Objects
 
-Delete one or more objects. Supports prefix deletion and regex filtering.
+Delete one exact object, or, with `-r`, every object under a literal key prefix. Alias: `rm`.
 
 ```bash
 s3-cli delete [OPTIONS] <URI>
 ```
 
+**The contract** (`bkt` is a bucket; `URI` may also be the host form `s3://host:port/bkt/...`,
+which is sent to that server):
+
+| Command | Behavior |
+|---------|----------|
+| `delete s3://bkt/foo` | Sends ONE delete request for exactly the key `foo`. Never `foobar`, never `foo/child`. |
+| `delete s3://bkt/foo/` | Sends ONE delete request for exactly the key `foo/` (a zero-byte "folder marker"). A trailing slash alone never means "recursive"; the output reminds you to use `-r`. |
+| either, object already missing | Success (exit 0), as with S3's own idempotent DELETE. Nothing is listed and nothing else is deleted. |
+| either, the delete request fails (403, 5xx, network) | Non-zero exit, `failed to delete <uri>: <cause>`. A failure is never read as "already absent". |
+| `delete -r s3://bkt/foo/` | Deletes the real objects whose key starts with `foo/`, nested ones included (`foo/a`, `foo/b/c`, and the marker `foo/` if present). Never `foobar`. |
+| `delete -r s3://bkt/foo` | Deletes the real objects whose key starts with the literal text `foo`. **This also matches `foobar` and `foo2/x`.** No `/` is appended for you. Write `foo/` to stay inside the folder. |
+
+How it works:
+
+- **Exact delete.** One delete request for the named key, with no HEAD, no listing and no parent
+  lookup, so it needs only delete permission. S3 reports success for a key that does not exist, so
+  the command cannot tell "deleted" from "was already gone" and does not claim to. On other
+  backends only the backend's own typed not-found error counts as success; every other error fails
+  the command. On a **versioned bucket** a plain delete adds a delete marker and does not erase
+  earlier versions.
+- **Directories.** On `file://` and `direct://`, an exact delete of a path that is a directory fails
+  with `<uri> is a directory; use -r / recursive=True to delete everything under it` and deletes
+  nothing (use `-r` with a trailing `/`). A regular file is deleted; a missing path is success.
+- **Recursive delete.** The prefix is listed with no delimiter, so only real objects are returned
+  (synthetic "directory" entries are never delete candidates), then deleted in batches of up to
+  1,000 keys. Characters in the key are literal: `*`, `.`, `[` and so on are never read as a pattern.
+- **`-p/--pattern`** is a client-side regex that narrows the `-r` selection (it is matched against
+  each listed object URI, `s3://bkt/key`). It is an error without `-r`.
+- **Reporting.** S3 reports a key that does not exist as "deleted", so the command never claims a
+  deleted count. The messages, exactly:
+  - exact delete: `Delete request succeeded: s3://bkt/foo (S3 does not report whether the object existed)`
+    (other backends: `this backend does not report ...`). When the URI ends in `/` and `-r` was not
+    given, the text continues `; only the object named by this exact URI was targeted, not what is
+    under it (use -r to delete everything under a prefix)`;
+  - `-r`, success: `Sent delete requests for N objects found under prefix <uri> (N listed; 0 reported errors)`;
+  - `-r -p <regex>`, success: `Sent delete requests for N objects selected under prefix <uri> by pattern '<regex>' (M listed, N selected; 0 reported errors)`
+    (`M` is counted before the pattern filter, `N` after it);
+  - `-r` and nothing under the prefix: `No objects found under prefix: <uri>` (exit 0);
+  - `-r -p <regex>` and nothing matches: `No objects under prefix <uri> match pattern '<regex>' (M listed)` (exit 0);
+  - a listing that fails before anything is sent (for example a malformed URI such as `-r s3://bkt`,
+    or a failing first page): `cannot list objects under prefix <uri>; nothing was deleted: <cause>`
+    (exit non-zero, no delete summary);
+  - a failure after requests were sent (a failed request, a per-key error inside a successful
+    HTTP response, or a listing error part-way):
+    `Sent delete requests for X of the L listed under prefix <uri>; ...` (with `-p`: `of the S selected
+    (pattern '<regex>') of L listed`), followed by the number of failed requests, the keys that failed,
+    and `K selected objects were NOT attempted` when batches were held back (a listing error also
+    holds back the partly filled batch in which it occurred). Exit non-zero.
+- **After a failure, nothing more is sent.** The check is made immediately before each DeleteObjects
+  request is sent. Requests already in flight finish; later batches (including a partly filled one)
+  are not sent and are counted as not attempted; the rest of the prefix is not listed.
+- **Other backends.** `file://`, `direct://`, `gs://` and `az://` use their own existing listing.
+  `-r` there requires a URI that ends in `/` and otherwise fails with an error (it never broadens
+  into a prefix match). Without `-r`, the same single delete request is made; an already-missing
+  object is success where the backend reports a typed not-found error (file backends, Azure
+  `BlobNotFound`, GCS NOT_FOUND). On GCS a missing bucket gives the same status as a missing
+  object, so it is not told apart.
+
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `-r, --recursive` | Delete all objects under prefix |
-| `-j, --jobs <N>` | Concurrent deletion jobs (default: 32) |
-| `-p, --pattern <REGEX>` | Only delete objects matching regex |
+| `-r, --recursive` | Delete every object under the literal key prefix (recursive listing) |
+| `-p, --pattern <REGEX>` | With `-r` only: narrow the selection to URIs matching the regex |
+| `-j, --jobs <N>` | Accepted for compatibility; currently not used (batches are 1,000 keys) |
 
 **Examples:**
 
 ```bash
-# Delete single object
-s3-cli delete s3://bucket/file.txt
+# Delete one object (one request; succeeds even if it was already gone)
+s3-cli delete s3://bucket/dir/file.txt
 
-# Delete all objects under prefix
+# Delete the folder-marker object "dir/" only; dir/file.txt is untouched
+s3-cli delete s3://bucket/dir/
+
+# Delete everything under the folder dir/
 s3-cli delete -r s3://bucket/temp-data/
 
-# Delete only .log files
-s3-cli delete -r s3://bucket/logs/ -p '.*\.log$'
+# CAUTION: the literal prefix "temp" also matches temp-data/..., temporary.txt, tempest/...
+s3-cli delete -r s3://bucket/temp
 
-# High-concurrency deletion
-s3-cli delete -r -j 100 gs://bucket/old-data/
+# Delete only .log objects under a folder
+s3-cli delete -r s3://bucket/logs/ -p '\.log$'
+
+# Same, against a specific server
+s3-cli delete -r s3://10.0.0.5:9000/bucket/logs/
 ```
+
+**Migrating from earlier versions.** `delete s3://bkt/prefix/` (no `-r`) and
+`delete s3://bkt/prefix` used to expand to the objects found under the name, with a fallback that
+listed the parent "directory" (issues #167, #210: it could delete objects that were never named, and
+it printed "Successfully deleted" when it deleted nothing). That behavior is gone. Add `-r` where you
+mean "everything under".
 
 ---
 

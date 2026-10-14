@@ -1935,6 +1935,49 @@ pub fn get_many(
 }
 
 // --- `delete` function
+//
+/// Delete an object, or with ``recursive=True`` every object under a prefix
+/// (delete contract A, issue #212; the same contract as ``s3-cli delete``).
+///
+/// ``delete(uri)`` sends ONE delete request for exactly the key named by
+/// ``uri`` and returns ``None``:
+///
+/// * There is no lookup first. Deleting an object that is already missing
+///   succeeds (S3's DELETE succeeds for a missing key; on other backends only
+///   the backend's own typed not-found error is treated as success). Success
+///   means the delete request succeeded, not that an existing object was
+///   removed: S3 does not say whether the key existed, and on a versioned
+///   bucket a delete adds a delete marker and erases no earlier version.
+/// * Any actual failure (permission denied, server error, network error, ...)
+///   raises ``RuntimeError`` naming the key; it is never read as "already
+///   absent".
+/// * ``/``, ``*`` and ``?`` are ordinary key characters: ``s3://b/dir/`` names
+///   the object ``dir/`` (not "everything under dir"), and ``s3://b/a*`` names
+///   the key ``a*``. Nothing is listed, globbed or expanded, no parent is
+///   consulted, and no ``/`` is added.
+///
+/// ``delete(uri, recursive=True)`` deletes the real objects whose key starts
+/// with the LITERAL prefix given: listed without a delimiter, objects only (a
+/// "directory" is never a deletion target), no ``/`` appended, so the prefix
+/// ``foo`` also matches ``foobar``; add the trailing ``/`` yourself to mean a
+/// directory. A prefix with no objects is a no-op. Each selected object gets
+/// its own delete request (several in flight at once), so the op-log records
+/// one ``LIST`` row and one ``DELETE`` row per object. If a delete request or
+/// the listing fails, no further delete request is sent (requests already in
+/// flight finish; keys listed but not yet sent are not sent) and
+/// ``RuntimeError`` names what was and was not attempted.
+///
+/// Other backends follow the same contract through the same store methods; on
+/// a backend without a literal-prefix listing, ``recursive=True`` requires a
+/// URI ending in ``/`` (otherwise ``RuntimeError``, nothing deleted).
+///
+/// ``recursive=True`` needs list permission in addition to delete. This
+/// replaced an earlier implicit expansion of a trailing ``/``, ``*`` or ``?``
+/// (issue #212).
+///
+/// Raises:
+///     RuntimeError: any failure. For ``recursive=True``, nothing is deleted
+///         when the first listing page fails.
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false))]
 pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
@@ -1944,29 +1987,25 @@ pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
         // Build the store on the caller thread BEFORE submit_io (issue #173).
         let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
 
-        // Submit to global runtime (io_uring pattern — never calls block_on)
+        // Submit to global runtime (io_uring pattern — never calls block_on).
+        // The selection and deletion are the library's `delete_contract`,
+        // shared with `s3-cli delete`.
         submit_io(async move {
-            // Check if URI contains wildcards or ends with / (pattern/directory)
-            let has_pattern =
-                uri_owned.contains('*') || uri_owned.contains('?') || uri_owned.ends_with('/');
-
-            if has_pattern || recursive {
-                // Need to list objects first, then delete them
-                let list_results = store.list(&uri_owned, recursive).await?;
-
-                if list_results.is_empty() {
-                    // No objects matched - this is OK
-                    return Ok(());
-                }
-
-                // Delete each object (list returns full URIs)
-                for obj_uri in list_results {
-                    store.delete(&obj_uri).await?;
-                }
-                Ok(())
+            if recursive {
+                crate::delete_contract::delete_objects_under_literal_prefix(
+                    store.as_ref(),
+                    &uri_owned,
+                    None,
+                    // One DELETE per object (as before #212): the op-log
+                    // records LIST + one DELETE row per object. Batching is
+                    // deferred.
+                    crate::delete_contract::DeleteMode::PerObject,
+                    None,
+                )
+                .await
+                .into_result(&uri_owned, None)
             } else {
-                // Simple single object deletion
-                store.delete(&uri_owned).await
+                crate::delete_contract::delete_exact_object(store.as_ref(), &uri_owned).await
             }
         })
     })

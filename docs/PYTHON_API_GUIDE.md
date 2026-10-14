@@ -320,11 +320,54 @@ if s3dlio.exists("s3://bucket/key"):
 found = await s3dlio.exists_async("s3://bucket/key")
 ```
 
-### delete() — Remove Object
+### delete() — Remove Object (or everything under a prefix)
 
 ```python
-s3dlio.delete("s3://bucket/key")
+s3dlio.delete("s3://bucket/key")                       # exactly this object
+s3dlio.delete("s3://bucket/logs/2026/", recursive=True)  # every object whose key starts with "logs/2026/"
 ```
+
+`delete(uri, recursive=False)` follows the same contract as `s3-cli delete` (issues #210, #167, #212):
+
+- **`delete(uri)` sends ONE delete request for exactly the key named by `uri`, and returns `None`.**
+  There is no lookup first (no HEAD), no listing, and no parent "directory" is consulted, so it needs
+  only delete permission.
+- **An already-missing object is success.** S3's DELETE succeeds for a key that does not exist, so
+  `delete()` cannot tell "deleted" from "was already gone", and success means only that the delete
+  request succeeded. On other backends only the backend's own typed not-found error counts as
+  success (file backends; Azure `BlobNotFound`; GCS NOT_FOUND, where a missing bucket gives the same
+  status). On a **versioned bucket** a delete adds a delete marker and does not erase earlier versions.
+- **Any actual failure raises `RuntimeError`** naming the key (`failed to delete s3://b/k: ...`): a
+  403, a 5xx, a network error. A failure is never read as "already absent". A bucket-only URI
+  (`s3://b/`) names no object and raises `RuntimeError` without sending anything.
+- **`/`, `*` and `?` are ordinary key characters.** `delete("s3://b/dir/")` deletes the object named
+  `dir/` (a folder marker) and nothing under it; `delete("s3://b/a*")` deletes the key `a*`, not every
+  key starting with `a`. A trailing slash never means "recursive".
+- **`delete(uri, recursive=True)` deletes the real objects under the LITERAL prefix.** The listing uses
+  no delimiter and only objects are deleted (never a synthetic "directory" entry); the prefix is used
+  exactly as given and no `/` is appended, so `recursive=True` on `s3://b/foo` also removes `foobar`.
+  Write `s3://b/foo/` to mean the directory. `*` and `?` are literal here too. A prefix with no objects
+  is a no-op. It needs list permission. **Each selected object gets its own delete request** (up to
+  10 in flight), as before; the batched DeleteObjects that `s3-cli delete -r` uses is deferred for the
+  Python API. If a delete request or the listing fails, no further delete request is sent (requests
+  already in flight finish) and `RuntimeError` reports how many requests were sent and how many
+  selected keys were not attempted. S3 reports a key that does not exist as deleted, so the call never
+  says how many objects it removed.
+- **A directory is never deleted without `recursive=True`.** On `file://` and `direct://`,
+  `delete("file:///d")` and `delete("file:///d/")` raise `RuntimeError` (`... is a directory; use -r /
+  recursive=True ...`) and delete nothing; a regular file is deleted and a missing path is success.
+  `recursive=True` with a trailing `/` deletes the files under it.
+- **Other backends** (`file://`, `direct://`, `gs://`, `az://`) use the same two store operations;
+  where a backend has no literal-prefix listing, `recursive=True` requires a URI ending in `/` and
+  raises `RuntimeError` otherwise (nothing is deleted).
+- The op-log records an exact delete as one `DELETE` row (no `HEAD` row), and `recursive=True` as
+  one `LIST` row plus one `DELETE` row per object (replayable; never `DELETE_BATCH`).
+
+**Compatibility change (intentional).** Earlier versions deleted every listed entry for a URI ending
+in `/` or containing `*` or `?` (including synthetic common-prefix entries) and treated the last
+segment of a recursive URI as a regex. Code that relied on that must now pass `recursive=True` (and a
+literal prefix) or name the object. The lower-level `ObjectStore.delete`, `delete_batch` and
+`delete_prefix` are unchanged.
 
 ### mkdir() — Create Directory / Prefix
 

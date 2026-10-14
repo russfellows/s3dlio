@@ -191,22 +191,32 @@ enum Command {
         /// Full S3 URI (e.g. s3://bucket/prefix/key)
         uri: String,
     },
-    /// Delete one object or every object that matches the prefix.
+    /// Delete one exact object, or with -r every object under a literal key prefix.
+    ///
+    /// Without -r, `delete s3://bkt/foo` and `delete s3://bkt/foo/` delete ONLY the
+    /// object with exactly that key (a trailing slash does not mean "recursive"). If
+    /// that object does not exist the command fails; it never lists or expands the
+    /// name. This needs HEAD (read) permission as well as delete permission.
+    ///
+    /// With -r, `delete -r s3://bkt/foo/` deletes every object whose key starts with
+    /// `foo/`, nested ones included. `delete -r s3://bkt/foo` uses the literal prefix
+    /// `foo`, so it ALSO deletes `foobar`; add the `/` to stay inside a folder.
     #[clap(visible_alias = "rm")]
     Delete {
-        /// S3 URI (single key or prefix ending with `/`).
+        /// S3 URI of the exact object, or with -r the literal key prefix.
         uri: String,
 
-        /// Batch size (number of keys per DeleteObjects API call).
-        /// The S3 API accepts up to 1,000 keys per batch request.
+        /// Accepted for compatibility but currently unused: DeleteObjects requests
+        /// always carry up to 1,000 keys.
         #[arg(short = 'j', long = "jobs", default_value_t = 1000, value_parser = parse_jobs)]
         jobs: usize,
 
-        /// Perform the operation recursively.
+        /// Delete every object under the literal key prefix (listed recursively).
         #[clap(short, long)]
         recursive: bool,
 
-        /// Optional regex pattern to filter objects to delete (applied client-side, works with all backends).
+        /// Regex (client-side) that narrows the -r selection; matched against each
+        /// listed object URI. Only valid together with -r.
         #[clap(short, long)]
         pattern: Option<String>,
     },
@@ -1854,320 +1864,135 @@ async fn get_cmd(
 //
 // For now: `s3dlio get s3://bucket/prefix/ -j 256 -r` is the recommended path.
 
-/// Delete command: deletes objects matching a key, prefix, or pattern.
+/// Delete command (issues #210 / #167).
+///
+/// The contract, in full:
+///
+/// * `delete s3://bkt/foo` and `delete s3://bkt/foo/` send ONE delete request
+///   for exactly that key.  There is no lookup first; an already-missing object
+///   is success (S3 deletes are idempotent) and any actual failure (403, 5xx,
+///   network) is an error.  Nothing is listed and nothing is expanded -- a
+///   trailing slash alone never authorizes a recursive delete.
+/// * `delete -r s3://bkt/foo/` deletes the real objects whose key starts with
+///   the literal prefix `foo/`, nested ones included.  `delete -r s3://bkt/foo`
+///   uses the literal prefix `foo` (so it also matches `foobar`; no `/` is
+///   appended).
+/// * `-p/--pattern` only filters the `-r` selection; it is an error without `-r`.
+///
+/// This is an intentional compatibility change from the earlier implicit
+/// expansion (prefix without `-r`, parent-listing fallback).
 async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&str>) -> Result<()> {
-    use indicatif::{ProgressBar, ProgressStyle};
     use regex::Regex;
     use s3dlio::object_store::store_for_uri_with_logger;
-    use std::sync::Arc;
 
-    // Use generic object store to delete objects (works with all backends)
-    let logger = global_logger();
-    let store = Arc::new(store_for_uri_with_logger(uri, logger)?);
-
-    // If recursive or URI ends with '/', delete prefix; otherwise check if it's a pattern
-    if recursive || uri.ends_with('/') {
-        if let Some(pat) = pattern {
-            // Delete with regex filter
-            let mut keys = store.list(uri, recursive).await?;
-            let re =
-                Regex::new(pat).with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
-            keys.retain(|k| re.is_match(k));
-
-            if keys.is_empty() {
-                eprintln!("No objects match pattern '{}' under prefix '{}'", pat, uri);
-                return Ok(());
-            }
-
-            let total = keys.len();
-            info!(
-                "Deleting {} objects matching pattern '{}' under prefix '{}'",
-                total, pat, uri
-            );
-            eprintln!(
-                "Found {} objects matching pattern '{}' (using adaptive concurrency: ~{})",
-                total,
-                pat,
-                if total < 10 {
-                    1
-                } else if total < 100 {
-                    10
-                } else {
-                    (total / 10).min(1000)
-                }
-            );
-
-            // Create progress bar for deletion
-            let pb = ProgressBar::new(total as u64);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("Deleting: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({per_sec}, ETA: {eta})")
-                    .unwrap()
-                    .progress_chars("█▉▊▋▌▍▎▏  ")
-            );
-
-            // Clone progress bar for the callback
-            let pb_clone = pb.clone();
-
-            // Use batch delete (backends optimize internally - S3 uses DeleteObjects API)
-            for chunk in keys.chunks(1000) {
-                store.delete_batch(chunk).await?;
-                pb_clone.inc(chunk.len() as u64);
-            }
-
-            pb.finish_with_message(format!("Deleted {} objects matching pattern", total));
-            eprintln!(
-                "\nSuccessfully deleted {} objects matching pattern '{}'",
-                total, pat
-            );
-        } else {
-            // Delete entire prefix without filter - use streaming pipeline with progress bar
-            info!(
-                "Starting streaming list+delete pipeline for prefix: {}",
-                uri
-            );
-
-            // Create indeterminate progress bar (we don't know total count yet)
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("Deleting: {spinner:.green} [{elapsed_precise}] {msg}")
-                    .unwrap(),
-            );
-            pb.enable_steady_tick(std::time::Duration::from_millis(100));
-            pb.set_message("Starting pipeline...");
-
-            // Channel for passing batches from lister to deleter (buffer 10 batches)
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(10);
-
-            // Spawn lister task - streams results and batches them
-            let store_list = store.clone();
-            let uri_list = uri.to_string();
-            let pb_list = pb.clone();
-            let lister = tokio::spawn(async move {
-                use futures::stream::StreamExt;
-
-                let mut stream = store_list.list_stream(&uri_list, recursive);
-                let mut batch = Vec::with_capacity(1000);
-                let mut total_listed = 0u64;
-
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(key) => {
-                            batch.push(key);
-                            total_listed += 1;
-
-                            // Send batch when it reaches 1000 objects
-                            if batch.len() >= 1000 {
-                                if tx.send(batch.clone()).await.is_err() {
-                                    // Receiver dropped (error in deleter)
-                                    break;
-                                }
-                                batch.clear();
-
-                                // Update progress bar with nice formatting
-                                if total_listed.is_multiple_of(1000) {
-                                    pb_list.set_message(format!(
-                                        "Listed: {} | Deleting in background...",
-                                        total_listed
-                                    ));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            pb_list.finish_with_message(format!("List error: {}", e));
-                            break;
-                        }
-                    }
-                }
-
-                // Send final partial batch if any
-                if !batch.is_empty() {
-                    let _ = tx.send(batch).await;
-                }
-
-                total_listed
-            });
-
-            // Deleter task - receives batches and deletes them IN PARALLEL
-            let store_delete = store.clone();
-            let pb_delete = pb.clone();
-            let deleter = tokio::spawn(async move {
-                use futures::stream::{FuturesUnordered, StreamExt};
-
-                let mut total_deleted = 0u64;
-                let delete_start = std::time::Instant::now();
-                let max_concurrent_deletes = 10; // Allow 10 concurrent DeleteObjects requests
-                let mut active_deletes = FuturesUnordered::new();
-
-                loop {
-                    // Try to receive batches while we have room for more concurrent deletes
-                    while active_deletes.len() < max_concurrent_deletes {
-                        match rx.try_recv() {
-                            Ok(batch) => {
-                                let store_clone = store_delete.clone();
-                                let batch_size = batch.len();
-
-                                // Spawn delete as a future
-                                active_deletes.push(tokio::spawn(async move {
-                                    store_clone.delete_batch(&batch).await.map(|_| batch_size)
-                                }));
-                            }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                // No more batches available right now
-                                break;
-                            }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                // Lister finished, process remaining deletes
-                                break;
-                            }
-                        }
-                    }
-
-                    // Wait for at least one delete to complete if we have any active
-                    if !active_deletes.is_empty() {
-                        match active_deletes.next().await {
-                            Some(Ok(Ok(batch_size))) => {
-                                total_deleted += batch_size as u64;
-
-                                // Update progress bar with rate information
-                                let elapsed = delete_start.elapsed().as_secs_f64().max(0.001);
-                                let rate = (total_deleted as f64 / elapsed) as u64;
-                                pb_delete.set_message(format!(
-                                    "Deleted: {} ({}/s, {} concurrent)",
-                                    total_deleted,
-                                    rate,
-                                    active_deletes.len() + 1
-                                ));
-                            }
-                            Some(Ok(Err(e))) => {
-                                pb_delete.finish_with_message(format!("Delete error: {}", e));
-                                return Err(e);
-                            }
-                            Some(Err(e)) => {
-                                pb_delete.finish_with_message(format!("Task error: {}", e));
-                                return Err(anyhow::anyhow!("Delete task failed: {}", e));
-                            }
-                            None => break, // No more active deletes
-                        }
-                    } else {
-                        // Check if lister is done
-                        match rx.try_recv() {
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                // Wait a bit for more work
-                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                            }
-                            Ok(batch) => {
-                                // Got a batch, process it
-                                let store_clone = store_delete.clone();
-                                let batch_size = batch.len();
-                                active_deletes.push(tokio::spawn(async move {
-                                    store_clone.delete_batch(&batch).await.map(|_| batch_size)
-                                }));
-                            }
-                        }
-                    }
-                }
-
-                // Wait for any remaining deletes to complete
-                while let Some(result) = active_deletes.next().await {
-                    match result {
-                        Ok(Ok(batch_size)) => {
-                            total_deleted += batch_size as u64;
-                            let elapsed = delete_start.elapsed().as_secs_f64().max(0.001);
-                            let rate = (total_deleted as f64 / elapsed) as u64;
-                            pb_delete
-                                .set_message(format!("Deleted: {} ({}/s)", total_deleted, rate));
-                        }
-                        Ok(Err(e)) => {
-                            pb_delete.finish_with_message(format!("Delete error: {}", e));
-                            return Err(e);
-                        }
-                        Err(e) => {
-                            pb_delete.finish_with_message(format!("Task error: {}", e));
-                            return Err(anyhow::anyhow!("Delete task failed: {}", e));
-                        }
-                    }
-                }
-
-                Ok::<u64, anyhow::Error>(total_deleted)
-            });
-
-            // Wait for both tasks to complete
-            let total_listed = lister.await?;
-            let total_deleted = deleter.await??;
-
-            if total_listed == 0 {
-                pb.finish_with_message("No objects found");
-                eprintln!("No objects found under prefix: {}", uri);
-                return Ok(());
-            }
-
-            pb.finish_with_message(format!("✓ Deleted {} objects", total_deleted));
-            eprintln!("Successfully deleted all objects under prefix: {}", uri);
-        }
-    } else {
-        // First, try to list objects with this URI as a prefix to see if it matches multiple objects
-        let mut keys = store.list(uri, false).await?;
-
-        // Apply regex filter if provided
-        if let Some(pat) = pattern {
-            let re =
-                Regex::new(pat).with_context(|| format!("Invalid regex pattern: '{}'", pat))?;
-            keys.retain(|k| re.is_match(k));
-        }
-
-        if keys.is_empty() {
-            // No objects found with this prefix, try as exact object name
-            info!("Deleting single object: {}", uri);
-            store.delete(uri).await?;
-            eprintln!("Successfully deleted 1 object: {}", uri);
-        } else if keys.len() == 1 && keys[0] == uri && pattern.is_none() {
-            // Exactly one object and it matches the URI exactly (no pattern filter)
-            info!("Deleting single object: {}", uri);
-            store.delete(uri).await?;
-            eprintln!("Successfully deleted 1 object: {}", uri);
-        } else {
-            // Multiple objects match the prefix (or pattern filter was applied)
-            let total_count = keys.len();
-            info!("Deleting {} objects matching prefix: {}", total_count, uri);
-            if let Some(pat) = pattern {
-                eprintln!(
-                    "Found {} objects matching prefix '{}' and pattern '{}'",
-                    total_count, uri, pat
-                );
-            } else {
-                eprintln!("Found {} objects matching prefix '{}'", total_count, uri);
-            }
-
-            // Create progress bar for deletion
-            let pb = ProgressBar::new(total_count as u64);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("Deleting: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({per_sec}, ETA: {eta})")
-                    .unwrap()
-                    .progress_chars("█▉▊▋▌▍▎▏  ")
-            );
-
-            for key in &keys {
-                store.delete(key).await?;
-                info!("Deleted: {}", key);
-                pb.inc(1);
-            }
-
-            pb.finish_with_message(format!("Completed deletion of {} objects", total_count));
-            if let Some(pat) = pattern {
-                eprintln!(
-                    "\nSuccessfully deleted {} objects matching pattern '{}'",
-                    total_count, pat
-                );
-            } else {
-                eprintln!("\nSuccessfully deleted {} objects", total_count);
-            }
-        }
+    if pattern.is_some() && !recursive {
+        bail!(
+            "-p/--pattern filters the objects selected by -r/--recursive; add -r, or drop -p to \
+             delete the one object {uri}"
+        );
     }
+    // Validate the pattern before anything is sent.
+    let re = pattern
+        .map(|pat| Regex::new(pat).with_context(|| format!("Invalid regex pattern: '{pat}'")))
+        .transpose()?;
 
+    let logger = global_logger();
+    let store = store_for_uri_with_logger(uri, logger)?;
+
+    if recursive {
+        let filter = pattern.zip(re.as_ref());
+        delete_prefix_objects(store.as_ref(), uri, filter).await
+    } else {
+        delete_exact_object(store.as_ref(), uri).await
+    }
+}
+
+/// `delete <uri>` without `-r`: send one delete request for exactly the named
+/// key (no lookup, no listing), via `s3dlio::delete_contract`, shared with the
+/// Python API.  An already-missing object is success; every other failure is an
+/// error.  The message says the request succeeded, never that an existing
+/// object was removed (S3 does not report whether the key existed).
+async fn delete_exact_object(
+    store: &dyn s3dlio::object_store::ObjectStore,
+    uri: &str,
+) -> Result<()> {
+    s3dlio::delete_contract::delete_exact_object(store, uri).await?;
+    info!("Delete request succeeded: {}", uri);
+    let who = if uri.starts_with("s3://") {
+        "S3"
+    } else {
+        "this backend"
+    };
+    let hint = if uri.ends_with('/') {
+        "; only the object named by this exact URI was targeted, not what is under it \
+         (use -r to delete everything under a prefix)"
+    } else {
+        ""
+    };
+    eprintln!(
+        "Delete request succeeded: {uri} ({who} does not report whether the object existed{hint})"
+    );
+    Ok(())
+}
+
+/// `delete -r <uri>`: delete the real objects under the literal prefix, listed
+/// recursively (no delimiter), optionally narrowed by `filter` (the pattern text
+/// and its compiled regex, matched against the listed object URI).
+///
+/// The selection, batching and stop-after-failure rule are
+/// `s3dlio::delete_contract::delete_objects_under_literal_prefix`, shared with
+/// the Python API; this function adds the progress bar and the wording.
+async fn delete_prefix_objects(
+    store: &dyn s3dlio::object_store::ObjectStore,
+    uri: &str,
+    filter: Option<(&str, &regex::Regex)>,
+) -> Result<()> {
+    info!("Deleting objects under literal prefix: {}", uri);
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("Deleting: {spinner:.green} [{elapsed_precise}] {msg}")
+            .context("invalid progress template")?,
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb.set_message("listing...");
+
+    let matches = |u: &str| filter.is_none_or(|(_, re)| re.is_match(u));
+    let progress = |listed: u64, requested: usize| {
+        pb.set_message(format!(
+            "listed {listed} | delete requests sent for {requested}"
+        ));
+    };
+    let report = s3dlio::delete_contract::delete_objects_under_literal_prefix(
+        store,
+        uri,
+        filter.map(|_| &matches as s3dlio::delete_contract::SelectionFilter<'_>),
+        s3dlio::delete_contract::DeleteMode::Batched,
+        Some(&progress),
+    )
+    .await;
+    pb.finish_and_clear();
+
+    let (listed, selected, requested) = (report.listed, report.selected, report.requested);
+    report.into_result(uri, filter.map(|(pat, _)| pat))?;
+
+    if listed == 0 {
+        eprintln!("No objects found under prefix: {uri}");
+        return Ok(());
+    }
+    match filter {
+        Some((pat, _)) if selected == 0 => {
+            eprintln!("No objects under prefix {uri} match pattern '{pat}' ({listed} listed)");
+        }
+        Some((pat, _)) => eprintln!(
+            "Sent delete requests for {selected} objects selected under prefix {uri} by pattern \
+             '{pat}' ({listed} listed, {selected} selected; 0 reported errors)"
+        ),
+        None => eprintln!(
+            "Sent delete requests for {requested} objects found under prefix {uri} \
+             ({listed} listed; 0 reported errors)"
+        ),
+    }
     Ok(())
 }
 
