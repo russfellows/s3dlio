@@ -508,6 +508,33 @@ def test_file_backend_exact_delete_is_exact_and_recursive_needs_a_trailing_slash
     assert not (d / "f2").exists() and not (d / "sub" / "g").exists()
 
 
+def test_file_backend_exact_delete_of_a_directory_is_refused_and_deletes_nothing(tmp_path, mock_factory):
+    """`delete(dir)` / `delete(dir/)` without recursive=True must not remove the
+    directory tree (recursion without recursive=True)."""
+    m = mock_factory()  # unused; keeps the helper signature
+    d = tmp_path / "d"
+    (d / "sub").mkdir(parents=True)
+    (d / "f1").write_bytes(b"1")
+    (d / "sub" / "g").write_bytes(b"3")
+
+    for uri in (f"file://{d}", f"file://{d}/"):
+        out = call_delete(m, uri)
+        assert_raises(out, "RuntimeError", m, "is a directory")
+        assert "recursive=True" in out["msg"], out
+        assert (d / "f1").exists() and (d / "sub" / "g").exists() and (d / "sub").is_dir()
+
+    # with recursive=True and a trailing '/', the existing -r contract applies
+    out = call_delete(m, f"file://{d}/", recursive=True)
+    assert_returned(out, m)
+    assert not (d / "f1").exists() and not (d / "sub" / "g").exists()
+
+    # a regular file is still deleted, a missing path is still success
+    (tmp_path / "plain").write_bytes(b"x")
+    assert_returned(call_delete(m, f"file://{tmp_path}/plain"), m)
+    assert not (tmp_path / "plain").exists()
+    assert_returned(call_delete(m, f"file://{tmp_path}/plain"), m)
+
+
 # ----------------------------------------------------------------------------
 # 4. Op-log: an exact delete is recorded as exactly one DELETE row (no HEAD row)
 # ----------------------------------------------------------------------------

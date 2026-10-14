@@ -1015,3 +1015,50 @@ fn t16_recursive_on_a_malformed_uri_reports_the_listing_error() {
     assert!(f.mock.log().is_empty(), "{}", f.ctx(&r));
     assert_eq!(f.mock.keys(), set(&["a", "b/c"]));
 }
+
+// ----------------------------------------------------------------------------
+// 17. file:// : an exact delete of a DIRECTORY is refused (it would otherwise be
+//     a recursive delete without -r); -r with a trailing '/' still works, a
+//     regular file is deleted, a missing path is success
+// ----------------------------------------------------------------------------
+#[test]
+fn t17_file_backend_exact_delete_of_a_directory_is_refused() {
+    let f = Fixture::new(Mode::Global, &[]);
+    let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("t17-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = base.join("d");
+    std::fs::create_dir_all(dir.join("sub")).expect("mkdir");
+    std::fs::write(dir.join("f1"), b"1").expect("write");
+    std::fs::write(dir.join("sub").join("g"), b"3").expect("write");
+    std::fs::write(base.join("plain"), b"x").expect("write");
+
+    for uri in [
+        format!("file://{}", dir.display()),
+        format!("file://{}/", dir.display()),
+    ] {
+        let r = f.run_uri(&[], &uri);
+        assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
+        assert!(
+            r.out.contains("is a directory") && r.out.contains("-r"),
+            "{}",
+            f.ctx(&r)
+        );
+        assert!(!r.out.contains("Delete request succeeded"), "{}", f.ctx(&r));
+        assert!(dir.join("f1").exists() && dir.join("sub").join("g").exists());
+    }
+
+    // -r with a trailing '/': the existing recursive contract
+    let r = f.run_uri(&["-r"], &format!("file://{}/", dir.display()));
+    assert_eq!(r.code, 0, "{}", f.ctx(&r));
+    assert!(!dir.join("f1").exists() && !dir.join("sub").join("g").exists());
+
+    // a regular file is deleted; a path that is already gone is success
+    let plain = format!("file://{}", base.join("plain").display());
+    let r = f.run_uri(&[], &plain);
+    assert_eq!(r.code, 0, "{}", f.ctx(&r));
+    assert!(!base.join("plain").exists());
+    let r = f.run_uri(&[], &plain);
+    assert_eq!(r.code, 0, "{}", f.ctx(&r));
+    let _ = std::fs::remove_dir_all(&base);
+}

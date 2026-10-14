@@ -20,6 +20,9 @@ entry). **Code that relied on the old implicit expansion will now delete less; p
   `delete_node`, which treats `FileNotFoundError` as "already gone", simply never sees it. A
   bucket-only URI (`s3://b/`) raises `RuntimeError` without sending a request.
 - On a **versioned bucket** a delete adds a delete marker and does not erase earlier versions.
+- On `file://` and `direct://`, `delete()` of a path that is a directory raises `RuntimeError`
+  (`... is a directory; use -r / recursive=True ...`) and deletes nothing, instead of removing the
+  whole tree; a regular file is deleted and a missing path is success.
 - The op-log records an exact delete as one `DELETE` row, as before; no `HEAD` row is added.
 - `delete(uri, recursive=True)` deletes the real objects under the literal prefix: listed with no
   delimiter, objects only, nothing appended (`foo` also matches `foobar`), `*` and `?` literal (the last
@@ -69,6 +72,8 @@ implicit expansion will now delete less; add `-r` where you mean "everything und
   says so (exit 0). `-j/--jobs` is accepted but currently unused.
 - Non-S3 backends (`file://`, `direct://`, `gs://`, `az://`): `-r` requires a URI ending in `/` and
   otherwise errors (no broadening).
+- On `file://` and `direct://`, an exact `delete` of a path that is a directory fails (`... is a
+  directory; use -r / recursive=True ...`) and deletes nothing; use `-r` with a trailing `/`.
 - Limitation: the op-log LIST row for `delete -r` is written only when the listing stream is read to
   its end, exactly like the existing `list_stream` wrapper; a listing abandoned after a failure
   (the command stops listing once a request has failed) writes no LIST row.

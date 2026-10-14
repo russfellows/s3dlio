@@ -350,6 +350,10 @@ s3dlio.delete("s3://bucket/logs/2026/", recursive=True)  # every object whose ke
   is a no-op. It needs list permission. If a delete request or the listing fails, no further delete
   request is sent and `RuntimeError` reports how many keys were and were not attempted. S3 reports a
   key that does not exist as deleted, so the call never says how many objects it removed.
+- **A directory is never deleted without `recursive=True`.** On `file://` and `direct://`,
+  `delete("file:///d")` and `delete("file:///d/")` raise `RuntimeError` (`... is a directory; use -r /
+  recursive=True ...`) and delete nothing; a regular file is deleted and a missing path is success.
+  `recursive=True` with a trailing `/` deletes the files under it.
 - **Other backends** (`file://`, `direct://`, `gs://`, `az://`) use the same two store operations;
   where a backend has no literal-prefix listing, `recursive=True` requires a URI ending in `/` and
   raises `RuntimeError` otherwise (nothing is deleted).

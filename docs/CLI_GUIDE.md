@@ -253,6 +253,9 @@ How it works:
   backends only the backend's own typed not-found error counts as success; every other error fails
   the command. On a **versioned bucket** a plain delete adds a delete marker and does not erase
   earlier versions.
+- **Directories.** On `file://` and `direct://`, an exact delete of a path that is a directory fails
+  with `<uri> is a directory; use -r / recursive=True to delete everything under it` and deletes
+  nothing (use `-r` with a trailing `/`). A regular file is deleted; a missing path is success.
 - **Recursive delete.** The prefix is listed with no delimiter, so only real objects are returned
   (synthetic "directory" entries are never delete candidates), then deleted in batches of up to
   1,000 keys. Characters in the key are literal: `*`, `.`, `[` and so on are never read as a pattern.

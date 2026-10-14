@@ -44,10 +44,41 @@ pub const DELETE_REQUESTS_IN_FLIGHT: usize = 10;
 /// failure is returned as "failed to delete ..." with the cause chained, so the
 /// URI is always named.
 pub async fn delete_exact_object(store: &dyn ObjectStore, uri: &str) -> Result<()> {
+    refuse_directory(uri).await?;
     match store.delete(uri).await {
         Ok(()) => Ok(()),
         Err(e) if is_not_found(&e) => Ok(()),
         Err(e) => Err(e.context(format!("failed to delete {uri}"))),
+    }
+}
+
+/// A `file://` or `direct://` store's `delete` removes a directory together with
+/// everything under it.  An exact delete must never be a recursive delete, so
+/// a path that is a directory is refused here (nothing is deleted) and the
+/// caller is pointed at the recursive form.  A path that does not exist is left
+/// to the store (already gone is success); a regular file is deleted as before.
+/// Any other failure to inspect the path is an error.
+///
+/// The check and the delete are separate steps, so a directory swapped in
+/// between is not caught; this guards against the caller's mistake, not against
+/// a concurrent writer.
+async fn refuse_directory(uri: &str) -> Result<()> {
+    let Some(path) = uri
+        .strip_prefix("file://")
+        .or_else(|| uri.strip_prefix("direct://"))
+    else {
+        return Ok(());
+    };
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => bail!(
+            "{uri} is a directory; use -r / recursive=True to delete everything under it \
+             (nothing was deleted)"
+        ),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(anyhow::Error::new(e).context(format!("cannot inspect {uri}; nothing was deleted")))
+        }
     }
 }
 
@@ -577,6 +608,44 @@ mod tests {
         assert!(is_not_found(&http(404)));
         assert!(!is_not_found(&http(403)));
         assert!(!is_not_found(&http(500)));
+    }
+
+    #[tokio::test]
+    async fn exact_delete_of_a_file_or_direct_directory_is_refused_before_the_store_is_called() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("g"), b"1").unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        let f = Fake::new(&[]);
+
+        for scheme in ["file", "direct"] {
+            for suffix in ["", "/"] {
+                let uri = format!("{scheme}://{}{suffix}", dir.display());
+                let err = delete_exact_object(&f, &uri).await.unwrap_err();
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("is a directory") && text.contains("-r"),
+                    "{text}"
+                );
+            }
+        }
+        assert!(
+            f.calls().is_empty(),
+            "the store must not be asked: {:?}",
+            f.calls()
+        );
+        assert!(dir.join("sub").join("g").exists());
+
+        // a regular file and a missing path reach the store, as before
+        delete_exact_object(&f, &format!("file://{}", plain.display()))
+            .await
+            .unwrap();
+        delete_exact_object(&f, &format!("file://{}/missing", tmp.path().display()))
+            .await
+            .unwrap();
+        assert_eq!(f.calls().len(), 2);
     }
 
     #[tokio::test]
