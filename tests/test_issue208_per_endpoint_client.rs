@@ -1017,3 +1017,170 @@ async fn a_uri_naming_a_different_server_is_still_rejected() {
     );
     assert_eq!(a.for_bucket(&bucket).len(), 0, "A got a request");
 }
+
+// ----------------------------------------------------------------------------
+// (6) issue #218: a compressed buffered writer must upload the WHOLE zstd frame
+// ----------------------------------------------------------------------------
+//
+// zstd emits compressed blocks while it is still being fed (once a block of input is
+// full), not only at `finish()`.  A writer that keeps only the encoder's final tail
+// uploads an object with no frame header and no early blocks: it cannot be decoded.
+// Small payloads hide that (nothing is emitted before finish), so these tests write
+// several MiB in many chunks, through the process-wide store and a per-endpoint
+// store, fetch the bytes the server really stored, and decode them.
+
+/// `n` bytes: alternating 64 KiB stretches of incompressible pseudo-random bytes and
+/// highly compressible repeated text, so zstd emits output of both kinds early.
+fn mixed_payload(n: usize, incompressible_only: bool) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let text = b"the quick brown fox jumps over the lazy dog; ";
+    let mut out = Vec::with_capacity(n);
+    let mut random_stretch = true;
+    while out.len() < n {
+        let stretch = (64 * 1024).min(n - out.len());
+        if random_stretch || incompressible_only {
+            out.extend((0..stretch).map(|_| (next() >> 24) as u8));
+        } else {
+            out.extend(text.iter().cycle().take(stretch));
+        }
+        random_stretch = !random_stretch;
+    }
+    out
+}
+
+/// `stored` must be exactly ONE complete zstd frame (no truncation, no trailing
+/// bytes) that decodes to `data`, byte for byte.
+fn assert_complete_frame_of(name: &str, stored: &[u8], data: &[u8]) {
+    let frame = zstd::zstd_safe::find_frame_compressed_size(stored).unwrap_or_else(|e| {
+        panic!(
+            "{name}: the {} stored bytes are not a complete zstd frame: {}",
+            stored.len(),
+            zstd::zstd_safe::get_error_name(e)
+        )
+    });
+    assert_eq!(
+        frame,
+        stored.len(),
+        "{name}: the first frame must be the whole stored object"
+    );
+    let plain = zstd::decode_all(stored)
+        .unwrap_or_else(|e| panic!("{name}: the stored object does not decode: {e}"));
+    assert_eq!(
+        plain.len(),
+        data.len(),
+        "{name}: decoded length differs from the written length"
+    );
+    assert!(
+        plain == data,
+        "{name}: the decoded bytes differ from the written bytes"
+    );
+}
+
+/// Write `data` in 64 KiB chunks through a compressed writer of `store` for `uri`, via
+/// the named API, and finalize it.
+async fn write_compressed(store: &S3ObjectStore, api: &str, uri: &str, data: &[u8]) {
+    let mut writer = match api {
+        "get_writer_with_compression" => {
+            store
+                .get_writer_with_compression(uri, CompressionConfig::zstd_default())
+                .await
+        }
+        _ => {
+            let options = WriterOptions {
+                compression: Some(CompressionConfig::zstd_default()),
+                ..WriterOptions::default()
+            };
+            store.create_writer(uri, options).await
+        }
+    }
+    .unwrap_or_else(|e| panic!("{api}: the writer must be created: {e:#}"));
+    for chunk in data.chunks(64 * 1024) {
+        writer
+            .write_chunk(chunk)
+            .await
+            .unwrap_or_else(|e| panic!("{api}: write_chunk: {e:#}"));
+    }
+    writer
+        .finalize()
+        .await
+        .unwrap_or_else(|e| panic!("{api}: finalize: {e:#}"));
+}
+
+/// (name, payload).  `small` is the control that always worked; `mixed` is far past the
+/// point where zstd emits output before finish; `multipart` is incompressible, so the
+/// compressed object is bigger than the writer's 16 MiB part size and the upload is
+/// two parts.
+fn issue218_payloads() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("small", mixed_payload(32 * 1024, false)),
+        ("mixed", mixed_payload(6 * 1024 * 1024 + 123, false)),
+        ("multipart", mixed_payload(18 * 1024 * 1024 + 7, true)),
+    ]
+}
+
+#[tokio::test]
+async fn compressed_writer_uploads_the_whole_frame_on_the_global_store() {
+    let a = global_a();
+    let store = S3ObjectStore::new();
+    for api in ["get_writer_with_compression", "create_writer"] {
+        for (size, data) in issue218_payloads() {
+            let name = format!("global/{api}/{size}");
+            let bucket = unique_bucket(&format!("c218-g-{size}"));
+            write_compressed(&store, api, &format!("s3://{bucket}/obj"), &data).await;
+
+            let reqs = a.for_bucket(&bucket);
+            assert_eq!(count(&reqs, "POST", "uploads"), 1, "{name}: {reqs:?}");
+            if size == "multipart" {
+                assert!(
+                    count(&reqs, "PUT", "partNumber") >= 2,
+                    "{name}: the compressed object must span parts: {reqs:?}"
+                );
+            }
+            let stored = a
+                .completed(&bucket, "obj.zst")
+                .unwrap_or_else(|| panic!("{name}: A has no completed /{bucket}/obj.zst"));
+            assert_complete_frame_of(&name, &stored, &data);
+        }
+    }
+}
+
+#[tokio::test]
+async fn compressed_writer_uploads_the_whole_frame_on_a_per_endpoint_store() {
+    let a = global_a();
+    let b = ObjMock::start(SEED_B, OBJECT_SIZE);
+    let store = store_for(&b).await;
+    for api in ["get_writer_with_compression", "create_writer"] {
+        for (size, data) in issue218_payloads() {
+            for form in ["bucket-form", "host-form"] {
+                let name = format!("endpoint/{api}/{size}/{form}");
+                let bucket = unique_bucket(&format!("c218-e-{size}"));
+                let uri = if form == "bucket-form" {
+                    format!("s3://{bucket}/obj")
+                } else {
+                    format!("s3://127.0.0.1:{}/{bucket}/obj", b.port)
+                };
+                write_compressed(&store, api, &uri, &data).await;
+
+                assert_eq!(a.for_bucket(&bucket).len(), 0, "{name}: A got a request");
+                let reqs = b.for_bucket(&bucket);
+                assert_eq!(count(&reqs, "POST", "uploads"), 1, "{name}: {reqs:?}");
+                if size == "multipart" {
+                    assert!(
+                        count(&reqs, "PUT", "partNumber") >= 2,
+                        "{name}: the compressed object must span parts: {reqs:?}"
+                    );
+                }
+                let stored = b
+                    .completed(&bucket, "obj.zst")
+                    .unwrap_or_else(|| panic!("{name}: B has no completed /{bucket}/obj.zst"));
+                assert_complete_frame_of(&name, &stored, &data);
+            }
+        }
+    }
+}
