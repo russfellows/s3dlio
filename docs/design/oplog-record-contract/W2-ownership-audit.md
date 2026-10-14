@@ -48,7 +48,7 @@ Each call now has one owner:
 **[TEST]** `oplog_helper_rows_golden` compares 25 helper rows (success, 403 failures, a retried 500 PUT,
 `delete_objects` of 0/1/1000/1001 keys and a per-key failure, `get_objects_parallel`, `get_range`,
 `S3BytesDataset`, `s3_copy` upload/download) with a fixture CAPTURED FROM THE PARENT (9473d2c) by running the
-same test there: byte-identical. The mock server's request log (method, path, host:port, retries) is checked
+same test there: identical in every NORMALISED field the test compares (timestamps reduced to the position of `first_byte`; thread id and mock port dropped), not the raw files byte for byte. The mock server's request log (method, path, host:port, retries) is checked
 alongside.
 
 ## 2. Entry points that were recorded by the inner writer

@@ -213,10 +213,11 @@ impl LoggedObjectStore {
 ///
 /// This is the single place that turns a call into a row: `client_id` from
 /// [`crate::s3_logger::get_client_id`], `endpoint`/`file` derived from the URI
-/// ([`extract_endpoint`], [`strip_uri_scheme`]), the calling thread. Every writer
-/// (this wrapper and the public S3 helper functions) goes through it, so the
-/// rows of one call cannot differ in shape depending on which layer wrote them
-/// (issue #169).
+/// ([`extract_endpoint`], [`strip_uri_scheme`]), the calling thread. The store
+/// wrappers (this one and the ones that build on it) go through it. The public S3
+/// helper functions do NOT: they keep their own serializer (`S3Ops::log_op`), whose
+/// row shape the golden tests pin separately, so one call writes one row whichever
+/// layer wrote it (issue #169).
 #[allow(clippy::too_many_arguments)] // one field per column of the row
 pub(crate) fn record_call(
     logger: &Logger,

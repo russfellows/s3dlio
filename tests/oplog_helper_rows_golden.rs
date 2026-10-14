@@ -19,9 +19,10 @@
 //
 // writes the rows the code under test produced, instead of comparing them. The
 // fixture `tests/fixtures/oplog_helper_rows_pre_w2.golden` is that capture; this
-// test then fails on any byte of difference. (The timestamps are normalized to
-// "where does first_byte sit between start and end"; the thread id and the mock
-// server's port are dropped.)
+// test then fails on any difference in the NORMALISED fields it compares, not in
+// the raw file byte for byte. (The timestamps are normalized to "where does
+// first_byte sit between start and end"; the thread id and the mock server's port
+// are dropped.)
 //
 // Alongside the rows, the test checks what the mock server actually received for
 // each call (method, path, host:port, number of attempts), so that "one row" is

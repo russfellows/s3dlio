@@ -333,7 +333,7 @@ fn get_size_cache() -> &'static Arc<ObjectSizeCache> {
 // * `build_ops_async` -- the public helper functions of this module that are
 //   user entry points (`get_object`, `put_object_async`, `delete_objects`, and
 //   everything built on them). Wired to the singleton logger exactly as before
-//   W2, so the row they write is byte-for-byte the row they always wrote.
+//   W2, so the row they write has the same fields as the row they always wrote.
 // * `Rows::Skip` -- the S3 backend of an `ObjectStore`. The store's
 //   caller records the call (a `LoggedObjectStore`), or deliberately does not (a
 //   store built without a logger), so the backend must not write a second row.
