@@ -110,7 +110,7 @@ fn put_ok() -> Bytes {
 }
 
 #[test]
-fn helper_rows_are_byte_identical_to_pre_w2() {
+fn helper_rows_match_pre_w2_in_normalised_fields() {
     #[allow(deprecated)]
     {
         std::env::remove_var("S3DLIO_OPLOG_BUF");
