@@ -5,8 +5,7 @@ use super::latest::{read_latest, Latest};
 use super::manifest::Manifest;
 use super::paths::KeyLayout;
 use crate::data_loader::parallel_fetch::DropCancel;
-use crate::object_store::{store_for_uri_with_logger, ObjectStore};
-use crate::s3_logger::global_logger;
+use crate::object_store::{store_for_uri_with_helper_rows, ObjectStore};
 use anyhow::Result;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -251,7 +250,7 @@ impl<'a> Reader<'a> {
     ///
     /// Because `Reader<'a>` borrows `&'a dyn ObjectStore` — non-`'static`,
     /// so `tokio::spawn` can't capture it — an owned `Arc<dyn ObjectStore>`
-    /// is looked up once via `store_for_uri_with_logger(&self.base_uri, ..)`
+    /// is looked up once via `store_for_uri_with_helper_rows(&self.base_uri)` (as before W2)
     /// and cloned into each spawn. The factory is deterministic for a given URI,
     /// so the freshly-looked-up store is functionally equivalent to the
     /// borrowed `self.store` for the read+decompress leaf operation.
@@ -262,7 +261,7 @@ impl<'a> Reader<'a> {
         let cancel = CancellationToken::new();
         let _drop_cancel = DropCancel(cancel.clone());
         let store_arc: Arc<dyn ObjectStore> =
-            Arc::from(store_for_uri_with_logger(&self.base_uri, global_logger())?);
+            Arc::from(store_for_uri_with_helper_rows(&self.base_uri)?);
         let base_uri = self.base_uri.clone();
 
         let handles: Vec<JoinHandle<Result<(u32, Bytes)>>> = manifest
@@ -326,7 +325,7 @@ impl<'a> Reader<'a> {
         let cancel = CancellationToken::new();
         let _drop_cancel = DropCancel(cancel.clone());
         let store_arc: Arc<dyn ObjectStore> =
-            Arc::from(store_for_uri_with_logger(&self.base_uri, global_logger())?);
+            Arc::from(store_for_uri_with_helper_rows(&self.base_uri)?);
         let base_uri = self.base_uri.clone();
 
         let handles: Vec<JoinHandle<Result<(u32, Bytes)>>> = manifest

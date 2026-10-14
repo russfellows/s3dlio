@@ -34,9 +34,8 @@ use crate::data_loader::{
     s3_bytes::S3BytesDataset,
     DataLoader,
 };
-use crate::object_store::store_for_uri_with_logger;
+use crate::object_store::store_for_uri_with_helper_rows;
 use crate::python_api::python_core_api::PyBytesView;
-use crate::s3_logger::global_logger;
 use crate::s3_utils::get_object_uri;
 use futures::stream::FuturesUnordered;
 use tokio::task::JoinHandle;
@@ -2093,7 +2092,7 @@ pub fn load_checkpoint_with_validation(
     uri: &str,
     validate_integrity: bool,
 ) -> PyResult<Py<PyAny>> {
-    let store = store_for_uri_with_logger(uri, global_logger()).map_err(py_err)?;
+    let store = store_for_uri_with_helper_rows(uri).map_err(py_err)?;
     let uri_owned = uri.to_owned();
 
     py.detach(|| {

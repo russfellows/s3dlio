@@ -45,11 +45,12 @@ Each call you make is recorded **once**, by exactly one layer:
   `DELETE` row per 1000 keys with file `(batch)`. An object fetched by concurrent
   ranges writes no such row;
 - a store built without a logger (`store_for_uri`) records nothing, even while the
-  op-log is active; library entry points that build their own store (checkpoint,
-  the async-pool dataloader) ask for a logged one;
-- the S3 backend of a store never writes a row of its own; a `MultiEndpointStore`
-  on bucket-form S3 endpoints is the one exception: its `get`/`put` write the helper
-  row, as they always did.
+  op-log is active;
+- the S3 backend of a store never writes a row of its own. Two exceptions, both as
+  before W2: a `MultiEndpointStore` on bucket-form S3 endpoints, and the library entry
+  points that build their own unlogged store (checkpoint, the shard reader, the
+  async-pool dataloader, Python `load_checkpoint_with_validation`): on a bucket-form S3
+  URI their `get`/`put` write the helper row, on every other backend they write no row.
 
 `docs/design/oplog-record-contract/W2-ownership-audit.md` lists every entry point, who
 records it, the rows and requests per operation, and the proposals for operations that

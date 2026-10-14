@@ -3666,6 +3666,23 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_logger(uri, None)
 }
 
+/// [`store_for_uri`] for the library entry points that always built an unlogged
+/// store and relied on the S3 backend's own row (checkpoint save/load, the
+/// concurrent shard reader, `MultiBackendDataset`, Python
+/// `load_checkpoint_with_validation`).
+///
+/// Identical to `store_for_uri` except for ONE case: a bucket-form S3 URI (the
+/// process-wide client) gets a store whose `get`/`put` write the S3 helper row
+/// (`S3Ops` shape) when the op-log is active, exactly the row they wrote before
+/// W2 (issue #169). Every other URI (host-form S3, `file://`, `direct://`,
+/// `az://`, `gs://`) gets the plain unlogged store and writes no row, as before.
+pub(crate) fn store_for_uri_with_helper_rows(uri: &str) -> Result<Box<dyn ObjectStore>> {
+    if infer_scheme(uri) == Scheme::S3 && store_routing_endpoint_for_uri(uri)?.is_none() {
+        return Ok(Box::new(S3ObjectStore::new().with_helper_rows()));
+    }
+    store_for_uri(uri)
+}
+
 /// The URI prefix a bare container name is joined to when a logged store records
 /// `create_container` / `delete_container`, so the row has the endpoint and file
 /// the same store's other rows have.

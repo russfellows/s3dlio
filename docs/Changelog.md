@@ -178,11 +178,11 @@ S3 helper functions have always written; the golden tests pin both.
   unchanged. A call writes one row whichever layer it went through: the S3 backend
   of a store is the only code that skips it. An object fetched by concurrent
   ranges writes no helper row, as before.
-- **Checkpoint and the async-pool dataloader record explicitly (#169).**
-  `CheckpointStore::open*`, the concurrent shard reader, `MultiBackendDataset` and
-  Python `load_checkpoint_with_validation` ask for a logged store, so they are
-  recorded on every backend in the store's row shape (they were recorded by
-  accident, S3 only, in the helper shape).
+- **Checkpoint, the shard reader, the async-pool dataloader and Python
+  `load_checkpoint_with_validation` write their rows exactly as before (#169).**
+  They build an unlogged store; on a bucket-form S3 URI its `get`/`put` write the
+  helper row (`S3Ops` shape) when the op-log is active, on every other backend they
+  write no row. Rows for those backends are a proposal in the audit file.
 - **Python store cache no longer decides whether a call is recorded (#174).**
   The module-level functions share a cache of stores; it kept the logger of
   whichever call built an entry first, `get_async`/`get_range_async` passed no

@@ -23,9 +23,10 @@ Each call now has one owner:
   `client_id` from `set_client_id()`.
 - **helper**: a public S3 helper function that is a user entry point records through `S3Ops`, with the
   global logger, in the shape `S3Ops` always wrote (section 1.1). Unchanged from before W2.
-- **explicit**: a library entry point that builds its own store asks for a logged one
-  (`store_for_uri_with_logger(uri, global_logger())`): checkpoint, the async-pool dataloader, Python
-  `load_checkpoint_with_validation`.
+- **explicit**: a library entry point that built an unlogged store (`store_for_uri`) and relied on the S3
+  backend's own row (checkpoint, `Reader::read_all_shards_concurrent*`, `MultiBackendDataset`, Python
+  `load_checkpoint_with_validation`) uses `store_for_uri_with_helper_rows`: a bucket-form S3 URI gets
+  `with_helper_rows()` (the helper row, as before), every other URI the plain unlogged store (no row, as before).
 - **silent**: the S3 backend of a store builds its `S3Ops` with no logger (`s3_utils::Rows::Skip`), so a
   store's own recording is the only one. A store built without a logger records nothing.
 - **MultiEndpointStore, bucket-form endpoint**: its endpoint store is built with `with_helper_rows()`, so its
@@ -66,15 +67,14 @@ alongside.
 | `s3_utils::delete_objects` (sync) | 1 `DELETE` row per 1000 keys, `file` = `(batch)`; none for an empty list | helper | same, **unchanged** | `oplog_helper_rows_golden` (0, 1, 1000, 1001 keys) |
 | `s3_copy::upload_files`, `s3_copy::download_objects` | 1 per object | helper | same, **unchanged** | `oplog_helper_rows_golden` |
 | `S3BytesDataset` sequential mode | 1 per object | helper | same, **unchanged** | `oplog_helper_rows_golden` |
-| Checkpoint `CheckpointStore::open*`, `Reader::read_all_shards_concurrent*` | S3: helper rows via the store's S3 backend; other backends: none | explicit | 1 per call, every backend, **store shape** | `oplog_exactly_once_callers` (file://) |
-| `MultiBackendDataset::from_prefix`, `from_uris` | S3: helper rows; other backends: none | explicit | 1 per call, every backend, **store shape** | same |
-| Python `load_checkpoint_with_validation` | S3: 1 helper row | explicit | 1 `GET`, **store shape** | [READ] |
+| Checkpoint `CheckpointStore::open*`, `Reader::read_all_shards_concurrent*` | bucket-form S3: helper rows via the store's S3 backend; other backends: none | explicit (unlogged store; bucket-form S3 gets `with_helper_rows`) | **unchanged**: bucket-form S3 helper rows, no row elsewhere | `oplog_explicit_callers_golden` |
+| `MultiBackendDataset::from_prefix`, `from_uris` | same | same | **unchanged** | same |
+| Python `load_checkpoint_with_validation` | S3: 1 helper row | same | **unchanged** | [READ] (same `store_for_uri_with_helper_rows`) |
 | `MultiEndpointStore` `get`/`put`, bucket-form endpoints | 1 helper row | helper (via `with_helper_rows`) | 1, **unchanged** | `oplog_multi_endpoint_rows` (also passes on the parent) |
 
-**Needs the architect's attention (changed shape, not in the round-2 rulings):** the "explicit" callers
-(checkpoint, `MultiBackendDataset`, Python `load_checkpoint_with_validation`) write the STORE shape now on S3
-(they wrote the helper shape, S3 only, before) and gained rows on file/direct/Azure/GCS. They were not on the
-not-approved list, so they are kept; reverting them to silent would lose their S3 rows entirely.
+`Reader::read_all_shards_concurrent*` looks up its own store from the base URI, as it did before W2 (the borrowed
+`&dyn ObjectStore` is not `'static`, so it cannot be moved into the spawned tasks); it does not substitute a
+logged store.
 
 ## 3. Rows that are gone (reported, not fixed here)
 
@@ -161,10 +161,12 @@ transferred). The two paths differ and each is kept as it was; they are not alig
 | host-form `get_many` endpoint column | `s3://<bucket>` (named no server) | `AWS_ENDPOINT_URL` (the server contacted) |
 | `MultiEndpointStore` get/put | 0 rows | 1 row each (as before) |
 | `LoggedObjectStore` copy / rename / pre_stat | forwarded, unrecorded (0 rows for real requests) | defaults recorded, native forwarded (section 5) |
+| checkpoint / shard reader / `MultiBackendDataset` / Python `load_checkpoint_with_validation` | store shape on every backend (S3 helper shape lost, rows added on file/direct/az/gs) | pre-W2 exactly: helper rows on bucket-form S3, no row elsewhere |
 
-Unavoidable serialization changes: **none were made.** Two behaviours change that are not serialization but
-should be seen: (1) a store built without a logger writes nothing on S3 (D4/O1, round 1, kept); (2) the
-explicit callers' shape (section 2).
+Unavoidable serialization changes: **none were made.** One behaviour changes that is not serialization but
+should be seen: a store built without a logger writes nothing on S3 (D4/O1, round 1, kept). The explicit
+callers (checkpoint, shard reader, `MultiBackendDataset`, Python `load_checkpoint_with_validation`) write
+exactly their pre-W2 rows again (section 2).
 
 ## 7. Proposals (NOT implemented; the architect approves or not)
 
@@ -194,6 +196,31 @@ unknown operation, so a `GET_RANGE` row would make a replay fail; it rebuilds th
 `tests/oplog_accuracy` judges every row against what happened; sai3-bench and warp-replay read the TSV.
 Decision needed: store shape or helper shape for these rows, and whether `GET_RANGE` rows are acceptable to the
 replayer.
+
+### P-explicit: rows for the checkpoint / dataset callers on file, direct, Azure and GCS
+
+Before W2 `CheckpointStore`, `Reader::read_all_shards_concurrent*`, `MultiBackendDataset` and Python
+`load_checkpoint_with_validation` wrote NO row on any backend except bucket-form S3 (where they write the helper
+row, restored). Proposal: record them on every backend through a logged store (round 1 did this). That is new
+serialization for previously unrecorded calls, so it is not done. Example rows (store shape; `c1` =
+`set_client_id()`; `idx`/`thread` and timestamps omitted; `-` = empty column), for a `file://` checkpoint
+save + load of `/ckpt`:
+
+```
+op   client_id n_objects bytes endpoint file                                    error first_byte
+Before (every row below):  no row
+PUT  c1        1         16    file://  /ckpt/shards/ckpt-1-<TS>/rank-0.bin     -     start
+PUT  c1        1         365   file://  /ckpt/manifests/ckpt-1-<TS>.json        -     start
+PUT  c1        1         108   file://  /ckpt/latest.json                       -     start
+GET  c1        1         108   file://  /ckpt/latest.json                       -     end
+GET  c1        1         365   file://  /ckpt/manifests/ckpt-1-<TS>.json        -     end
+GET  c1        1         16    file://  /ckpt/shards/ckpt-1-<TS>/rank-0.bin     -     end
+```
+
+(plus one `HEAD` after the shard PUT on file://). On S3 the same calls would change from the helper shape
+(restored) to the store shape (`endpoint s3://bkt`, `file bkt/key`, `client_id c1`) if the proposal and the
+P-MEP store-shape question are decided together. Consumers: the same as P-MEP (the replayer rejects no op here:
+only GET, PUT and HEAD appear).
 
 ### P-large: a row for range-split large-object reads
 

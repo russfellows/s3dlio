@@ -1,0 +1,24 @@
+# outcomes
+s3 save ok=true
+s3 load_latest ok=false
+s3 read_all_shards_concurrent ok=true n=1
+s3 dataset get ok=true
+s3 dataset get ok=true
+s3 from_prefix n=2
+s3 prefix dataset get ok=true
+s3 prefix dataset get ok=true
+file dataset get ok=true
+file dataset get ok=true
+file save ok=true
+file load_latest ok=true bytes=16
+file read_all_shards_concurrent ok=true n=1
+# rows
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden-explicit-ckpt/shards/golden-shard-0.bin error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden-explicit-list/bar error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden-explicit-list/other/deep.dat error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden-explicit/a.bin error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden-explicit/b.bin error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=<n> endpoint=http://MOCK file=golden-explicit-ckpt/latest.json error=[] first_byte=mid
+op=PUT client_id=mock-access-key n_objects=1 bytes=16 endpoint=http://MOCK file=golden-explicit-ckpt/shards/ckpt-1-<TS>/rank-0.bin error=[] first_byte=none
+op=PUT client_id=mock-access-key n_objects=1 bytes=<n> endpoint=http://MOCK file=golden-explicit-ckpt/latest.json error=[] first_byte=none
+op=PUT client_id=mock-access-key n_objects=1 bytes=<n> endpoint=http://MOCK file=golden-explicit-ckpt/manifests/ckpt-1-<TS>.json error=[] first_byte=none
