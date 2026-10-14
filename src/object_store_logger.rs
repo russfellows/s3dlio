@@ -606,17 +606,25 @@ impl ObjectStore for LoggedObjectStore {
 
     // ------------------------------------------------------------------
     // Methods with a trait default. The wrapper must never change what the
-    // inner store does (issue #177): each is forwarded, so the inner store's own
-    // implementation runs (an atomic `rename(2)`, a real `mkdir`, the S3
-    // size-cache fill, ...) instead of the trait default.
+    // inner store does (issue #177), AND must never hide a real request from the
+    // op-log. Which of the two applies depends on whether the inner store's
+    // implementation is a native backend operation or just the trait default:
     //
-    // Only `get_optimized` and `get_range_optimized` write a row: they are a GET
-    // and a GET_RANGE, ops that already exist, and they were recorded as such
-    // (through the default calling `get`/`get_range`) before. The others have no
-    // op name in the format, and adding one is a format change that needs the
-    // architect's approval, so they are forwarded SILENTLY: mkdir, rmdir,
-    // update_metadata, update_properties, copy, rename, pre_stat_objects,
-    // pre_stat_and_cache.
+    // * `get_optimized`, `get_range_optimized`: forwarded, and recorded as the GET
+    //   and GET_RANGE they are (they were recorded as such, through the default
+    //   calling `get`/`get_range`, before).
+    // * `copy`, `rename`: a NATIVE implementation (`has_native_copy`,
+    //   `has_native_rename`: today only the `rename(2)` of `file://` and
+    //   `direct://`) is forwarded and NOT recorded (no op name describes it). When
+    //   the inner store uses the trait default (every S3, Azure, GCS and
+    //   multi-endpoint copy and rename), the default algorithm runs over THIS
+    //   wrapper, so its real GET, PUT and DELETE requests are recorded, one row each.
+    // * `pre_stat_objects`: not overridden; the default stats through this wrapper
+    //   (one HEAD row per URI). `pre_stat_and_cache` additionally hands the sizes
+    //   to the inner store's cache (`seed_size_cache`) without a request.
+    // * `mkdir`, `rmdir`, `update_metadata`, `update_properties`: forwarded
+    //   SILENTLY. They have no op name in the format, and adding one is a format
+    //   change that needs the architect's approval.
     // ------------------------------------------------------------------
 
     async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
@@ -666,24 +674,53 @@ impl ObjectStore for LoggedObjectStore {
         result
     }
 
-    async fn pre_stat_objects(
-        &self,
-        uris: &[String],
-        max_concurrent: usize,
-    ) -> Result<std::collections::HashMap<String, u64>> {
-        self.inner.pre_stat_objects(uris, max_concurrent).await
-    }
+    // `pre_stat_objects` is NOT overridden: the trait default stats every URI through
+    // `self.stat`, i.e. through this wrapper, so each URI is one recorded `HEAD` row,
+    // exactly as before W2, and the inner store (whatever it is) answers each `stat`.
 
     async fn pre_stat_and_cache(&self, uris: &[String], max_concurrent: usize) -> Result<usize> {
-        self.inner.pre_stat_and_cache(uris, max_concurrent).await
+        // The stats go through this wrapper (one recorded HEAD per URI). Then the sizes
+        // they found are handed to the inner store's size cache, which is what the
+        // inner store's own `pre_stat_and_cache` would have filled (issue #177), with
+        // no further request.
+        let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
+        self.inner.seed_size_cache(&size_map).await;
+        Ok(size_map.len())
+    }
+
+    async fn seed_size_cache(&self, sizes: &std::collections::HashMap<String, u64>) {
+        self.inner.seed_size_cache(sizes).await
+    }
+
+    fn has_native_copy(&self) -> bool {
+        self.inner.has_native_copy()
+    }
+
+    fn has_native_rename(&self) -> bool {
+        self.inner.has_native_rename()
     }
 
     async fn copy(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
-        self.inner.copy(src_uri, dst_uri).await
+        if self.inner.has_native_copy() {
+            // A native copy is one backend call that no op name describes: forwarded,
+            // not recorded.
+            return self.inner.copy(src_uri, dst_uri).await;
+        }
+        // The trait default (`get` then `put`), run over THIS wrapper so that the real
+        // GET and PUT requests it makes are recorded, one row each.
+        let data = self.get(src_uri).await?;
+        self.put(dst_uri, data).await
     }
 
     async fn rename(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
-        self.inner.rename(src_uri, dst_uri).await
+        if self.inner.has_native_rename() {
+            // `rename(2)`: atomic, no op name describes it: forwarded, not recorded.
+            return self.inner.rename(src_uri, dst_uri).await;
+        }
+        // The trait default (`copy` then `delete`), run over THIS wrapper so that the
+        // GET + PUT (or the native copy) and the DELETE are recorded, one row each.
+        self.copy(src_uri, dst_uri).await?;
+        self.delete(src_uri).await
     }
 
     async fn mkdir(&self, uri: &str) -> Result<()> {

@@ -47,7 +47,6 @@ use crate::s3_utils::{
     stat_object_uri_async as s3_stat_object_uri_async,
     // Reuse existing S3 helpers
     ObjectStat as S3ObjectStat,
-    Rows,
     SdkResultExt,
 };
 
@@ -472,6 +471,40 @@ pub trait ObjectStore: Send + Sync {
 
         // Convert Bytes to Vec<u8> for backward compatibility
         Ok(data.to_vec())
+    }
+
+    /// `true` only when this store's [`ObjectStore::copy`] is a NATIVE operation of the
+    /// backend (a server-side copy, `copy_file_range`, ...) and not the trait default
+    /// (a `get` followed by a `put` on this same store).
+    ///
+    /// A wrapper that records calls (`LoggedObjectStore`) needs to know: a native
+    /// operation is one call to the backend that no op name describes, so the wrapper
+    /// forwards it; the default is made of real `get` and `put` calls, which the
+    /// wrapper must run over ITSELF so that each of them is recorded. A backend that
+    /// overrides `copy` with a native operation must return `true` here.
+    fn has_native_copy(&self) -> bool {
+        false
+    }
+
+    /// `true` only when this store's [`ObjectStore::rename`] is a NATIVE operation of
+    /// the backend (`rename(2)` on `file://` and `direct://`) and not the trait default
+    /// (`copy` then `delete`). See [`ObjectStore::has_native_copy`] for why a call
+    /// recorder needs to know. A backend that overrides `rename` natively must return
+    /// `true` here.
+    fn has_native_rename(&self) -> bool {
+        false
+    }
+
+    /// Record object sizes this store has ALREADY learned (the answers of `stat`
+    /// calls the caller made) in the store's size cache, without making any request.
+    /// Default: the store has no size cache, nothing happens.
+    ///
+    /// `pre_stat_and_cache` is "stat these objects, then cache the sizes". A call
+    /// recorder runs the stats through itself so that each HEAD is recorded, and then
+    /// hands the sizes to the store it wraps with this method, so the cache fill the
+    /// store's own `pre_stat_and_cache` would do still happens, with no extra request.
+    async fn seed_size_cache(&self, sizes: &HashMap<String, u64>) {
+        let _ = sizes;
     }
 
     /// Default copy reads then writes. Backends can override with server-side copy.
@@ -1934,11 +1967,17 @@ impl ObjectStore for S3ObjectStore {
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
 
         // Populate size cache with results
-        for (uri, size) in size_map.iter() {
-            self.size_cache.put(uri.clone(), *size).await;
-        }
+        self.seed_size_cache(&size_map).await;
 
         Ok(size_map.len())
+    }
+
+    /// Fill the size cache with sizes the caller already learned from `stat` calls
+    /// (no request is made); see [`ObjectStore::seed_size_cache`].
+    async fn seed_size_cache(&self, sizes: &HashMap<String, u64>) {
+        for (uri, size) in sizes.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
     }
 }
 
@@ -2737,11 +2776,17 @@ impl ObjectStore for AzureObjectStore {
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
 
         // Populate size cache with results
-        for (uri, size) in size_map.iter() {
-            self.size_cache.put(uri.clone(), *size).await;
-        }
+        self.seed_size_cache(&size_map).await;
 
         Ok(size_map.len())
+    }
+
+    /// Fill the size cache with sizes the caller already learned from `stat` calls
+    /// (no request is made); see [`ObjectStore::seed_size_cache`].
+    async fn seed_size_cache(&self, sizes: &HashMap<String, u64>) {
+        for (uri, size) in sizes.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
     }
 }
 
@@ -3319,11 +3364,17 @@ impl ObjectStore for GcsObjectStore {
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
 
         // Populate size cache with results
-        for (uri, size) in size_map.iter() {
-            self.size_cache.put(uri.clone(), *size).await;
-        }
+        self.seed_size_cache(&size_map).await;
 
         Ok(size_map.len())
+    }
+
+    /// Fill the size cache with sizes the caller already learned from `stat` calls
+    /// (no request is made); see [`ObjectStore::seed_size_cache`].
+    async fn seed_size_cache(&self, sizes: &HashMap<String, u64>) {
+        for (uri, size) in sizes.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
     }
 }
 

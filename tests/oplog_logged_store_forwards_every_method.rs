@@ -38,64 +38,87 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 /// Every method of the `ObjectStore` trait, in the order the test calls them,
-/// with the op name its row must carry (`None` = forwarded silently) and the
-/// inner method that must be reached.
-const METHODS: &[(&str, Option<&str>, &str)] = &[
-    ("get", Some("GET"), "get"),
-    ("get_range", Some("GET_RANGE"), "get_range"),
-    ("put", Some("PUT"), "put"),
-    ("put_multipart", Some("PUT"), "put_multipart"),
-    ("list", Some("LIST"), "list"),
-    ("list_stream", Some("LIST"), "list_stream"),
-    ("stat", Some("HEAD"), "stat"),
-    ("delete", Some("DELETE"), "delete"),
-    ("delete_batch", Some("DELETE_BATCH"), "delete_batch"),
-    ("delete_prefix", Some("DELETE_PREFIX"), "delete_prefix"),
+/// with the op names of the rows its call must write (empty = forwarded
+/// silently) and the inner methods that must be reached, in order.
+///
+/// `CountingStore` declares native `copy` and `rename` (`has_native_*` = true),
+/// as `file://` does for `rename`: such a call is forwarded and not recorded. A
+/// backend on the trait default (S3, Azure, GCS) is covered by
+/// `oplog_rows_copy_rename_prestat.rs`, where copy and rename are recorded.
+/// `pre_stat_objects` and `pre_stat_and_cache` are NOT forwarded: they stat every
+/// URI through the wrapper (one recorded HEAD each); `pre_stat_and_cache` then
+/// hands the sizes to the inner store's cache (`seed_size_cache`).
+type Expectation = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+const METHODS: &[Expectation] = &[
+    ("get", &["GET"], &["get"]),
+    ("get_range", &["GET_RANGE"], &["get_range"]),
+    ("put", &["PUT"], &["put"]),
+    ("put_multipart", &["PUT"], &["put_multipart"]),
+    ("list", &["LIST"], &["list"]),
+    ("list_stream", &["LIST"], &["list_stream"]),
+    ("stat", &["HEAD"], &["stat"]),
+    ("delete", &["DELETE"], &["delete"]),
+    ("delete_batch", &["DELETE_BATCH"], &["delete_batch"]),
+    ("delete_prefix", &["DELETE_PREFIX"], &["delete_prefix"]),
     (
         "create_container",
-        Some("CREATE_CONTAINER"),
-        "create_container",
+        &["CREATE_CONTAINER"],
+        &["create_container"],
     ),
     (
         "delete_container",
-        Some("DELETE_CONTAINER"),
-        "delete_container",
+        &["DELETE_CONTAINER"],
+        &["delete_container"],
     ),
     // exists is answered through the inner store's stat (see #189).
-    ("exists", Some("HEAD"), "stat"),
-    ("get_with_validation", Some("GET"), "get_with_validation"),
+    ("exists", &["HEAD"], &["stat"]),
+    ("get_with_validation", &["GET"], &["get_with_validation"]),
     (
         "get_range_with_validation",
-        Some("GET_RANGE"),
-        "get_range_with_validation",
+        &["GET_RANGE"],
+        &["get_range_with_validation"],
     ),
     (
         "load_checkpoint_with_validation",
-        Some("GET"),
-        "load_checkpoint_with_validation",
+        &["GET"],
+        &["load_checkpoint_with_validation"],
     ),
-    ("get_optimized", Some("GET"), "get_optimized"),
+    ("get_optimized", &["GET"], &["get_optimized"]),
     (
         "get_range_optimized",
-        Some("GET_RANGE"),
-        "get_range_optimized",
+        &["GET_RANGE"],
+        &["get_range_optimized"],
     ),
+    // A NATIVE copy / rename: no op name describes it, forwarded, not recorded.
+    ("copy", &[], &["copy"]),
+    ("rename", &[], &["rename"]),
+    // Answered by the inner store.
+    ("has_native_copy", &[], &[]),
+    ("has_native_rename", &[], &[]),
+    // pre_stat_*: real HEAD requests, recorded through the wrapper.
+    ("pre_stat_objects", &["HEAD", "HEAD"], &["stat", "stat"]),
+    (
+        "pre_stat_and_cache",
+        &["HEAD", "HEAD"],
+        &["stat", "stat", "seed_size_cache"],
+    ),
+    ("seed_size_cache", &[], &["seed_size_cache"]),
     // No op name exists for these: forwarded, not recorded.
-    ("copy", None, "copy"),
-    ("rename", None, "rename"),
-    ("mkdir", None, "mkdir"),
-    ("rmdir", None, "rmdir"),
-    ("update_metadata", None, "update_metadata"),
-    ("update_properties", None, "update_properties"),
-    ("pre_stat_objects", None, "pre_stat_objects"),
-    ("pre_stat_and_cache", None, "pre_stat_and_cache"),
-    ("get_writer", None, "get_writer"),
+    ("mkdir", &[], &["mkdir"]),
+    ("rmdir", &[], &["rmdir"]),
+    ("update_metadata", &[], &["update_metadata"]),
+    ("update_properties", &[], &["update_properties"]),
+    ("get_writer", &[], &["get_writer"]),
     (
         "get_writer_with_compression",
-        None,
-        "get_writer_with_compression",
+        &[],
+        &["get_writer_with_compression"],
     ),
-    ("create_writer", None, "create_writer"),
+    ("create_writer", &[], &["create_writer"]),
 ];
 
 type CallLog = Arc<Mutex<Vec<&'static str>>>;
@@ -276,17 +299,16 @@ impl ObjectStore for CountingStore {
         self.note("get_range_optimized");
         Ok(Bytes::from_static(b"ab"))
     }
-    async fn pre_stat_objects(
-        &self,
-        uris: &[String],
-        _max_concurrent: usize,
-    ) -> Result<HashMap<String, u64>> {
-        self.note("pre_stat_objects");
-        Ok(uris.iter().map(|u| (u.clone(), 3)).collect())
+    // pre_stat_objects / pre_stat_and_cache are deliberately NOT overridden: the
+    // wrapper must not forward them (its own default stats through the wrapper).
+    fn has_native_copy(&self) -> bool {
+        true
     }
-    async fn pre_stat_and_cache(&self, uris: &[String], _max_concurrent: usize) -> Result<usize> {
-        self.note("pre_stat_and_cache");
-        Ok(uris.len())
+    fn has_native_rename(&self) -> bool {
+        true
+    }
+    async fn seed_size_cache(&self, _sizes: &HashMap<String, u64>) {
+        self.note("seed_size_cache");
     }
     async fn mkdir(&self, _uri: &str) -> Result<()> {
         self.note("mkdir");
@@ -362,6 +384,13 @@ async fn call(store: &dyn ObjectStore, method: &str) {
             .update_properties(uri, &ObjectProperties::default())
             .await
             .unwrap(),
+        "has_native_copy" => assert!(store.has_native_copy(), "answered by the inner store"),
+        "has_native_rename" => assert!(store.has_native_rename(), "answered by the inner store"),
+        "seed_size_cache" => {
+            store
+                .seed_size_cache(&HashMap::from([(uri.to_string(), 3)]))
+                .await
+        }
         "pre_stat_objects" => drop(store.pre_stat_objects(&uris, 2).await.unwrap()),
         "pre_stat_and_cache" => assert_eq!(store.pre_stat_and_cache(&uris, 2).await.unwrap(), 2),
         "get_writer" => drop(store.get_writer(uri).await.unwrap()),
@@ -435,22 +464,20 @@ async fn logged_store_reaches_every_inner_method_and_records_only_named_ops() {
 
     let mut expected_rows = Vec::new();
     let mut not_forwarded = Vec::new();
-    for (method, row, inner) in METHODS {
+    for (method, rows_of_call, inner) in METHODS {
         calls.lock().unwrap().clear();
         // A default impl on the wrapper may call other wrapper methods and fail
         // (mkdir/rmdir bail): record that instead of stopping at the first one.
         let outcome = std::panic::AssertUnwindSafe(call(&store, method));
         let panicked = futures::FutureExt::catch_unwind(outcome).await.is_err();
         let reached = calls.lock().unwrap().clone();
-        if panicked || reached != vec![*inner] {
+        if panicked || reached != *inner {
             not_forwarded.push(format!(
-                "{method}: reached {reached:?}{}, expected [{inner:?}]",
+                "{method}: reached {reached:?}{}, expected {inner:?}",
                 if panicked { " and FAILED" } else { "" }
             ));
         }
-        if let Some(op) = row {
-            expected_rows.push(*op);
-        }
+        expected_rows.extend_from_slice(rows_of_call);
     }
     assert!(
         not_forwarded.is_empty(),
