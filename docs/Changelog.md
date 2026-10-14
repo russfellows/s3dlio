@@ -42,12 +42,30 @@ Now the whole key part of the URI is the S3 prefix:
   literal prefix. A URI that used to be a regex or glob in the last segment (for example
   `s3://b/dir/.*\.npz`) is now a literal prefix: split it into the prefix and a pattern
   (`download_objects_matching("s3://b/dir/", Some(r"\.npz$"), ...)`). `s3-cli download` and
-  `s3-cli get` have no pattern option; their URIs are literal prefixes (their `--help` text no longer
-  promises globs and regexes).
+  `s3-cli get` URIs are literal prefixes as well (their `--help` text no longer promises globs and
+  regexes) and now have the explicit option below.
 - Callers that passed a bare key prefix without a trailing `/` now get the keys that start with it
   (`dl` also matches `dl2/x`, as in `aws s3 ls s3://b/dl`), not the directory-regex behaviour.
+- **New: `s3-cli download -p/--pattern <REGEX>` and `s3-cli get -p/--pattern <REGEX>`.** The
+  explicit replacement for the regex those commands used to read from the URI. It reuses
+  `ListPattern` inside the existing backend-aware paths (so it also works on `file://`,
+  `direct://`, `gs://`, `az://`; it is not the S3-only `download_objects_matching`), is matched
+  against the entry relative to the listing base like `ls --pattern`, and is compiled before
+  anything is listed: an invalid regex exits non-zero with no request sent and no directory
+  created. `get --pattern` cannot be combined with `--keylist` or `--offset/--length`. Without
+  `--pattern` the behaviour is unchanged. Library: new
+  `generic_download_objects_matching_with_summary(..., pattern: Option<&ListPattern>, ...)`;
+  `generic_download_objects[_with_summary]` keep their signatures.
+- **Prefix behaviour is documented, deliberately, and kept.** On `s3://` a URI is a key PREFIX, not
+  an exact key and not "exact if present, otherwise prefix": `s3-cli ls|get|download s3://b/file.txt`
+  also selects `file.txt.bak`, and `s3://b/dl` also selects `dl2/...`. End the URI with `/` to
+  select a directory's contents only; use `--pattern` to filter by name. The `--help` text of `ls`,
+  `download` and `get`, `docs/CLI_GUIDE.md`, and the glob examples in `docs/testing/BACKEND-TESTING.md`
+  and `docs/supplemental/OPLOG-GUIDE.md` now say so. Other backends still do not follow the
+  literal-prefix rule (#220).
 
 Tests: `tests/test_list_literal_prefix_213.rs`, `tests/s3_cli_ls_literal_prefix_213.rs`,
+`tests/s3_cli_download_pattern_213.rs`,
 `tests/test_python_list_literal_213.py`, and the rewritten `tests/test_object_store_list_filter.rs`
 (it pinned the #154 regex contract). The in-process mock S3 can now be seeded with a bucket catalog
 that honours prefix, delimiter and paging.

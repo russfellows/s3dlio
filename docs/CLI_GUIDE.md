@@ -111,6 +111,11 @@ All commands use consistent URI formats across backends:
 
 List objects in any storage backend with optional filtering and counting.
 
+**On `s3://` a URI is a key PREFIX.** `s3://b/file.txt` selects `file.txt` and also `file.txt.bak`;
+`s3://b/dl` also selects `dl2/...`. End the URI with `/` (`s3://b/dl/`) to select a directory's
+contents only. Use `--pattern` to filter with a regex, matched against the name relative to the
+listing base.
+
 For `s3://` URIs the URI is a **literal key prefix**, never a regex (#213): `s3-cli ls s3://b/data/run.1`
 lists `data/run.1`, `data/run.1.old` and `data/run.1/` (everything that starts with `data/run.1`),
 but not `data/run_1` or `data/prerun.1`; `.`, `(`, `[`, `+`, `$`, `?` in the URI are ordinary
@@ -210,14 +215,26 @@ s3-cli upload -j 64 /data/*.npz gs://bucket/training/
 
 Download objects from any storage backend to local filesystem.
 
+**On `s3://` the source URI is a key PREFIX, never a glob or regex.** `s3-cli download s3://b/file.txt ./out/`
+downloads `file.txt` and also `file.txt.bak`; `s3://b/dl` also selects `dl2/...`. End the URI with `/`
+(`s3://b/dl/`) to select a directory's contents only. To filter with a regex use `-p/--pattern`
+(see [Regex Pattern Filtering](#regex-pattern-filtering)); it is matched against the name relative to
+the listing base, so for `s3://b/dl/` and the key `dl/sub/c.npz` the pattern sees `sub/c.npz`. The
+pattern is compiled before anything is listed: an invalid regex fails with nothing sent and no
+directory created. This works on every backend (`file://` and `direct://` included). The
+literal-prefix rule is implemented for `s3://` only; `file://`, `direct://`, `gs://` and `az://` do not
+yet follow it (tracked in #220).
+
 ```bash
-s3-cli download <SOURCE_URI> <LOCAL_PATH>
+s3-cli download [OPTIONS] <SOURCE_URI> <LOCAL_PATH>
 ```
 
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `-j, --jobs <N>` | Number of concurrent downloads (default: 32) |
+| `-j, --jobs <N>` | Number of concurrent downloads (default: 64) |
+| `-r, --recursive` | Download recursively |
+| `-p, --pattern <REGEX>` | Regex (client-side) that narrows the selection; matched against each entry relative to the listing base |
 
 **Examples:**
 
@@ -231,6 +248,9 @@ s3-cli download gs://bucket/data/ ./local-data/
 
 # Download with high concurrency
 s3-cli download -j 128 s3://bucket/large-dataset/ ./dataset/
+
+# Only the .npz objects under data/ (explicit regex; the URI itself is a literal prefix)
+s3-cli download -r -p '\.npz$' s3://bucket/data/ ./npz-only/
 ```
 
 ---
@@ -342,6 +362,14 @@ mean "everything under".
 
 Download objects with advanced options for maximum throughput.
 
+**On `s3://` the URI is a key PREFIX, never a glob or regex.** `s3-cli get s3://b/file.txt` downloads
+`file.txt` and also `file.txt.bak`; `s3://b/dl` also selects `dl2/...`. End the URI with `/`
+(`s3://b/dl/`) to select a directory's contents only. To filter with a regex use `-p/--pattern`,
+matched against the name relative to the listing base (for `s3://b/dl/` and the key `dl/sub/c.npz` the
+pattern sees `sub/c.npz`). An invalid pattern fails before any request is sent. `--pattern` cannot be
+combined with `--keylist` or `--offset/--length`. The literal-prefix rule is implemented for `s3://`
+only; the other backends do not yet follow it (tracked in #220).
+
 ```bash
 s3-cli get [OPTIONS] <URI>
 ```
@@ -349,8 +377,14 @@ s3-cli get [OPTIONS] <URI>
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `-j, --jobs <N>` | Concurrent downloads (default: 32) |
+| `-j, --jobs <N>` | Concurrent downloads (default: 64) |
+| `-p, --pattern <REGEX>` | Regex (client-side) that narrows the selection; matched against each entry relative to the listing base |
 | `-o, --output <PATH>` | Output path (default: current directory) |
+
+```bash
+# Only the .bin objects under data/
+s3-cli get s3://bucket/data/ -p '\.bin$'
+```
 
 ---
 
