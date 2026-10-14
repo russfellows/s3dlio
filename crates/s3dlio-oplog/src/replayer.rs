@@ -278,8 +278,9 @@ fn check_exactly_replayable(op: &OpLogEntry) -> Result<()> {
     )
 }
 
-/// URI an operation acts on: the exact original URI, or the translation of the row onto
-/// `target`. A row whose URI cannot be reconstructed unambiguously is an error naming the row
+/// URI an operation acts on: the translation of the row onto `target` (the target supplies the
+/// destination, so every row translates), or, with no target, the exact original URI. Without a
+/// target, a row whose URI cannot be reconstructed unambiguously is an error naming the row
 /// (never guessed, never silently dropped).
 fn row_target_uri(op: &OpLogEntry, target: Option<&str>) -> Result<String> {
     match target {

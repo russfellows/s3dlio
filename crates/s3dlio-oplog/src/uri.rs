@@ -198,7 +198,10 @@ pub fn row_uri(endpoint: &str, file: &str) -> Result<String, RowUriError> {
 /// For the shapes s3dlio writes (see the module documentation) the bucket, container and
 /// server are dropped and only the key is appended to the target. As in earlier versions,
 /// a hand-written row whose `file` literally starts with `endpoint` has `endpoint`
-/// stripped from it. Any other row is a [`RowUriError`] (never guessed).
+/// stripped from it. Any other row (for example a legacy `S3Ops` row, `endpoint =
+/// http://server`, `file = dir/key`) is translated exactly as earlier versions did: the
+/// target supplies the destination, so the original URI is not needed and the row is not an
+/// error. (Replay *without* a target does need the original URI; see [`row_uri`].)
 ///
 /// # Arguments
 /// * `file` - The row's `file` column
@@ -219,8 +222,13 @@ pub fn row_uri(endpoint: &str, file: &str) -> Result<String, RowUriError> {
 pub fn translate_uri(file: &str, endpoint: &str, target: &str) -> Result<String> {
     let relative = if !endpoint.is_empty() && starts_with_unit(file, endpoint) {
         &file[endpoint.len()..]
+    } else if let Ok(parts) = split_row(endpoint, file) {
+        parts.relative
     } else {
-        split_row(endpoint, file)?.relative
+        // Not a shape s3dlio writes (a legacy `S3Ops` row with no bucket, an empty or schemeless
+        // endpoint, ...). A target supplies the destination, so the original URI is not needed:
+        // translate exactly as every earlier version did.
+        file.strip_prefix(endpoint).unwrap_or(file)
     };
     let clean = relative.trim_start_matches('/');
 
@@ -246,11 +254,10 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_uri_no_prefix_match_is_an_error() {
-        // `file` does not start with `endpoint` and `endpoint` is not a writer shape:
-        // the row cannot be translated unambiguously, so it is an error (not "use file as-is").
-        let err = translate_uri("/other/path/file.bin", "/bucket/", "s3://newbucket").unwrap_err();
-        assert!(err.downcast_ref::<RowUriError>().is_some(), "{err}");
+    fn test_translate_uri_no_prefix_match() {
+        // When file doesn't start with endpoint, use file as-is (as in every earlier version)
+        let result = translate_uri("/other/path/file.bin", "/bucket/", "s3://newbucket").unwrap();
+        assert_eq!(result, "s3://newbucket/other/path/file.bin");
     }
 
     #[test]
@@ -284,10 +291,13 @@ mod tests {
     }
 
     #[test]
-    fn test_prefix_must_end_on_a_boundary() {
-        // `s3://bkt` is a string prefix of `s3://bkt2/x` but not a path prefix.
-        let err = translate_uri("s3://bkt2/x", "s3://bkt", "s3://t").unwrap_err();
-        assert!(err.downcast_ref::<RowUriError>().is_some(), "{err}");
+    fn test_prefix_must_end_on_a_boundary_for_row_uri() {
+        // `s3://bkt` is a string prefix of `s3://bkt2/x` but not a path prefix, so the full-URI
+        // shortcut does not apply and the inconsistent row cannot be rebuilt without a target.
+        assert!(matches!(
+            row_uri("s3://bkt", "s3://bkt2/x"),
+            Err(RowUriError::Inconsistent { .. })
+        ));
     }
 
     #[test]

@@ -8,6 +8,7 @@
 mod oplog_support;
 
 use oplog_support::{replay, row, tsv};
+use s3dlio_oplog::translate_uri;
 
 // ----------------------------------------------------------------------------
 // #184: URI reconstruction
@@ -106,9 +107,11 @@ async fn bucket_level_rows_rebuild() {
 }
 
 #[tokio::test]
-async fn inner_row_without_bucket_is_an_error_and_is_never_executed() {
-    // The legacy S3Ops row carries the server and the bare key, but not the bucket:
-    // the URI cannot be reconstructed, so the row must fail, not be guessed or dropped.
+async fn inner_row_without_bucket_needs_a_target_to_replay() {
+    // The legacy S3Ops row carries the server and the bare key, but not the bucket. Without a
+    // target the original URI cannot be rebuilt, so the row must fail (not be guessed or
+    // dropped). With a target the target supplies the bucket and the row translates exactly
+    // as it did before: `<target>/<key>`.
     let rows = [
         row(0, "PUT", "http://127.0.0.1:19750", "dir/obj1.bin"),
         row(1, "PUT", "s3://srcbkt", "srcbkt/dir/obj1.bin"),
@@ -119,20 +122,63 @@ async fn inner_row_without_bucket_is_an_error_and_is_never_executed() {
     assert!(res.is_ok(), "continue_on_error: {res:?}");
     assert_eq!(seen, vec!["PUT s3://srcbkt/dir/obj1.bin".to_string()]);
 
-    let (res, seen) = replay(&f, Some("s3://replaybkt/"), true, None).await;
-    assert!(res.is_ok(), "continue_on_error with target: {res:?}");
-    assert_eq!(seen, vec!["PUT s3://replaybkt/dir/obj1.bin".to_string()]);
-
     let (res, _) = replay(&f, None, false, None).await;
     let err = format!("{:#}", res.expect_err("an inner row must fail the replay"));
     assert!(
         err.contains("bucket") && err.contains("http://127.0.0.1:19750"),
         "error must say what is missing: {err}"
     );
+
+    // With a target, strict mode (no continue_on_error): both rows run.
+    let (res, seen) = replay(&f, Some("s3://replaybkt/"), false, None).await;
+    assert!(res.is_ok(), "legacy inner row with a target: {res:?}");
+    assert_eq!(
+        seen,
+        vec![
+            "PUT s3://replaybkt/dir/obj1.bin".to_string(),
+            "PUT s3://replaybkt/dir/obj1.bin".to_string(),
+        ]
+    );
+}
+
+/// The pre-#184 `translate_uri`, verbatim: the oracle for what a target did before.
+fn legacy_translate(file: &str, endpoint: &str, target: &str) -> String {
+    let relative = file.strip_prefix(endpoint).unwrap_or(file);
+    format!(
+        "{}/{}",
+        target.trim_end_matches('/'),
+        relative.trim_start_matches('/')
+    )
+}
+
+#[test]
+fn rows_that_are_not_writer_shapes_translate_to_a_target_exactly_as_before() {
+    // Every row shape that is not one of the recognised writer shapes keeps the pre-#184
+    // result when a target is given (even the shapes that cannot be rebuilt without one).
+    for (endpoint, file) in [
+        ("http://127.0.0.1:19750", "dir/obj1.bin"), // legacy S3Ops row
+        ("https://s3.example.com", "dir/obj1.bin"),
+        ("", "key"),                                 // AWS_ENDPOINT_URL unset
+        ("unknown", "mybucket"),                     // no scheme
+        ("s3://bkt", "other/key"),                   // file disagrees with endpoint
+        ("ftp://host", "host/key"),                  // scheme with no store
+        ("http://10.0.0.1:8000", "/data/file1.bin"), // pre-#184 test fixtures
+        ("/bucket/", "/bucket/data/file.bin"),       // hand-written prefix rows
+        ("/bucket/", "/other/path/file.bin"),
+        ("s3://bkt", "s3://bkt2/x"), // string prefix, not a path prefix
+    ] {
+        for target in ["s3://t", "s3://t/", "file:///tmp/dest/"] {
+            assert_eq!(
+                translate_uri(file, endpoint, target).expect("translates"),
+                legacy_translate(file, endpoint, target),
+                "{endpoint:?} {file:?} -> {target:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
-async fn inconsistent_or_unrecognised_rows_are_errors() {
+async fn unrecognised_rows_without_a_target_are_errors_and_never_executed() {
     for (endpoint, file) in [
         ("s3://bkt", "other/key"), // file does not start with the endpoint's authority
         ("s3://bkt", "bkt2/key"),  // prefix of the name only
@@ -147,11 +193,5 @@ async fn inconsistent_or_unrecognised_rows_are_errors() {
             seen.is_empty(),
             "{endpoint:?} {file:?} must not execute: {seen:?}"
         );
-        let (res, seen) = replay(&f, Some("s3://t/"), false, None).await;
-        assert!(
-            res.is_err(),
-            "{endpoint:?} {file:?} with target must be an error"
-        );
-        assert!(seen.is_empty());
     }
 }
