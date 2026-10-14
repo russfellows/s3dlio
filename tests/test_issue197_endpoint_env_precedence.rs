@@ -73,7 +73,11 @@ async fn host_form_naming_the_s3_endpoint_is_accepted_and_reaches_only_it() {
         .expect("B is the global server (AWS_ENDPOINT_URL_S3 wins): the URI must be accepted");
 
     assert_eq!(mentioning(b, &bucket), vec![format!("PUT /{bucket}/key")]);
-    assert_eq!(mentioning(a, &bucket), Vec::<String>::new(), "A got a request");
+    assert_eq!(
+        mentioning(a, &bucket),
+        Vec::<String>::new(),
+        "A got a request"
+    );
 }
 
 #[tokio::test]
@@ -92,7 +96,11 @@ async fn host_form_naming_the_losing_endpoint_is_rejected_and_sends_nothing() {
         "the error must name the URI's server, got: {text}"
     );
     assert_eq!(a.requests(), Vec::<String>::new(), "A got a request");
-    assert_eq!(mentioning(b, &bucket), Vec::<String>::new(), "B got a request");
+    assert_eq!(
+        mentioning(b, &bucket),
+        Vec::<String>::new(),
+        "B got a request"
+    );
 
     // The same rule for the batch-delete guard.
     let err = S3ObjectStore::new()
@@ -104,7 +112,11 @@ async fn host_form_naming_the_losing_endpoint_is_rejected_and_sends_nothing() {
         "got: {err:#}"
     );
     assert_eq!(a.requests(), Vec::<String>::new(), "A got a request");
-    assert_eq!(mentioning(b, &bucket), Vec::<String>::new(), "B got a request");
+    assert_eq!(
+        mentioning(b, &bucket),
+        Vec::<String>::new(),
+        "B got a request"
+    );
 }
 
 #[tokio::test]
@@ -118,5 +130,9 @@ async fn bucket_form_goes_to_the_s3_endpoint_only() {
         .expect("bucket-form put to the global server");
 
     assert_eq!(mentioning(b, &bucket), vec![format!("PUT /{bucket}/key")]);
-    assert_eq!(mentioning(a, &bucket), Vec::<String>::new(), "A got a request");
+    assert_eq!(
+        mentioning(a, &bucket),
+        Vec::<String>::new(),
+        "A got a request"
+    );
 }

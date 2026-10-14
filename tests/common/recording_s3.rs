@@ -127,6 +127,8 @@ fn serve_one(mut stream: TcpStream, seen: Arc<Mutex<Vec<String>>>, list_body: &s
 /// Run the real `s3-cli <args>` in a scrubbed environment. `env` is added on top
 /// of the credentials/region. The working directory is a cargo scratch dir so no
 /// stray `.env` is read.
+// Not used by the library-only test binaries that include this file for `MockS3`.
+#[allow(dead_code)]
 pub fn run_s3_cli(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-cli"));
     cmd.args(args)
@@ -142,6 +144,8 @@ pub fn run_s3_cli(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     cmd.output().expect("run s3-cli")
 }
 
+// Not used by the library-only test binaries that include this file for `MockS3`.
+#[allow(dead_code)]
 pub fn text(out: &std::process::Output) -> String {
     format!(
         "stdout: {}; stderr: {}",

@@ -53,10 +53,7 @@ fn global_a() -> &'static MockS3 {
 }
 
 fn unique_bucket(tag: &str) -> String {
-    format!(
-        "b197d-{tag}-{}",
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+    format!("b197d-{tag}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 fn mentioning(m: &MockS3, needle: &str) -> Vec<String> {
@@ -103,7 +100,11 @@ async fn per_endpoint_put_multipart_bucket_form_is_rejected_and_sends_nothing() 
         .expect_err("a per-endpoint store must not run multipart on the global server");
 
     assert_unsupported_per_endpoint(&err, &b);
-    assert_eq!(mentioning(a, &bucket), Vec::<String>::new(), "A got a request");
+    assert_eq!(
+        mentioning(a, &bucket),
+        Vec::<String>::new(),
+        "A got a request"
+    );
     assert_eq!(b.requests(), Vec::<String>::new(), "B got a request");
 }
 
@@ -124,7 +125,11 @@ async fn per_endpoint_put_multipart_host_form_is_rejected_and_sends_nothing() {
         .expect_err("multipart is not supported per-endpoint");
 
     assert_unsupported_per_endpoint(&err, &b);
-    assert_eq!(mentioning(a, &bucket), Vec::<String>::new(), "A got a request");
+    assert_eq!(
+        mentioning(a, &bucket),
+        Vec::<String>::new(),
+        "A got a request"
+    );
     assert_eq!(b.requests(), Vec::<String>::new(), "B got a request");
 }
 
@@ -149,7 +154,11 @@ async fn per_endpoint_get_range_optimized_large_is_rejected_and_sends_nothing() 
         .expect_err("concurrent range GET is not supported per-endpoint");
 
     assert_unsupported_per_endpoint(&err, &b);
-    assert_eq!(mentioning(a, &bucket), Vec::<String>::new(), "A got a request");
+    assert_eq!(
+        mentioning(a, &bucket),
+        Vec::<String>::new(),
+        "A got a request"
+    );
     assert_eq!(b.requests(), Vec::<String>::new(), "B got a request");
 }
 
@@ -168,7 +177,11 @@ async fn per_endpoint_get_optimized_large_is_rejected_and_never_reaches_a() {
         .expect_err("concurrent range GET is not supported per-endpoint");
 
     assert_unsupported_per_endpoint(&err, &b);
-    assert_eq!(mentioning(a, &bucket), Vec::<String>::new(), "A got a request");
+    assert_eq!(
+        mentioning(a, &bucket),
+        Vec::<String>::new(),
+        "A got a request"
+    );
     assert!(
         b.requests().iter().all(|r| r.starts_with("HEAD ")),
         "B may only see the size lookup, got {:?}",
@@ -200,12 +213,18 @@ async fn per_endpoint_writers_are_rejected_when_created_and_send_nothing() {
     ];
     for (name, result) in results {
         match result {
-            Ok(_) => panic!("{name}: the writer finalizes through the global client; must be rejected"),
+            Ok(_) => {
+                panic!("{name}: the writer finalizes through the global client; must be rejected")
+            }
             Err(err) => assert_unsupported_per_endpoint(&err, &b),
         }
     }
 
-    assert_eq!(mentioning(a, &bucket), Vec::<String>::new(), "A got a request");
+    assert_eq!(
+        mentioning(a, &bucket),
+        Vec::<String>::new(),
+        "A got a request"
+    );
     assert_eq!(b.requests(), Vec::<String>::new(), "B got a request");
 }
 
