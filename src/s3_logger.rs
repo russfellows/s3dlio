@@ -686,6 +686,9 @@ struct Shared {
     lossless: bool,
     closed_noted: AtomicBool,
     writer_failure_noted: AtomicBool,
+    /// Set by the first dropped entry, which prints the session's one queue-full
+    /// note; later drops are only counted (`dropped_full`) and reported at finalize.
+    full_noted: AtomicBool,
     /// Outcome counters behind [`Logger::stats`]. Each is bumped only on the
     /// path it names, with a relaxed `fetch_add`.
     accepted: AtomicU64,
@@ -1094,6 +1097,7 @@ impl Logger {
                 lossless,
                 closed_noted: AtomicBool::new(false),
                 writer_failure_noted: AtomicBool::new(false),
+                full_noted: AtomicBool::new(false),
                 accepted: AtomicU64::new(0),
                 dropped_full: AtomicU64::new(0),
                 rejected_closed: AtomicU64::new(0),
@@ -1241,7 +1245,15 @@ impl Logger {
                 }
                 Err(TrySendError::Full(_)) => {
                     shared.dropped_full.fetch_add(1, Ordering::Relaxed);
-                    stderr_note("op-log channel full; dropping entry");
+                    // One note per session, not per entry: a drop storm would
+                    // otherwise print a line for every dropped row. The exact
+                    // total is in the warning finalize prints.
+                    if !shared.full_noted.swap(true, Ordering::Relaxed) {
+                        stderr_note(
+                            "op-log channel full; dropping entry (further drops are \
+                             counted and reported when the op-log is finalized)",
+                        );
+                    }
                     LogOutcome::Full
                 }
                 Err(TrySendError::Disconnected(_)) => {
@@ -2485,7 +2497,7 @@ mod oplog_stats_tests {
             assert_eq!(logger.try_log(big_entry(1)), LogOutcome::Accepted);
             sink.wait_until_blocked(); // the writer holds the big entry; the queue is empty
             assert_eq!(logger.try_log(entry("queued")), LogOutcome::Accepted);
-            // Every one of these prints a "channel full" line.
+            // The first of these prints the session's one "channel full" note.
             for i in 0..3 {
                 assert_eq!(logger.try_log(entry(&format!("d{i}"))), LogOutcome::Full);
             }
@@ -2493,6 +2505,114 @@ mod oplog_stats_tests {
             logger.shutdown();
             assert_eq!(logger.stats().dropped_full, 3);
         });
+    }
+
+    // ---- one queue-full note per session; the exact total at finalize (#170) ----
+
+    /// Run `body` in a child copy of this test binary whose stderr goes to a
+    /// file, then hand that stderr to `check` in the parent. The child proves it
+    /// ran the body by printing `CHILD_OK`, so a filtered-out child cannot pass
+    /// vacuously.
+    #[cfg(target_os = "linux")]
+    fn with_captured_stderr(test: &str, body: impl FnOnce(), check: impl FnOnce(&str)) {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            body();
+            println!("{CHILD_OK}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("child-stderr.txt");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .stderr(std::process::Stdio::from(File::create(&path).unwrap()))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.status.success() && stdout.contains(CHILD_OK),
+            "the child died or never ran its body ({}): {stdout}\n{stderr}",
+            out.status
+        );
+        check(&stderr);
+    }
+
+    /// One logger session whose writer is stalled: `drops` entries are refused
+    /// with `Full`, then the session is finalized (which prints its warning).
+    #[cfg(target_os = "linux")]
+    fn drop_storm(thread_name: &str, drops: usize) -> OpLogStats {
+        let sink = StallingSink::default();
+        sink.lock().released = true; // the header is written by `start` itself
+        let logger = Logger::start(sink.clone(), 1, false, 1, thread_name).unwrap();
+        {
+            let mut st = sink.lock();
+            st.released = false;
+            st.blocked = false;
+        }
+        assert_eq!(logger.try_log(big_entry(1)), LogOutcome::Accepted);
+        sink.wait_until_blocked(); // the writer holds the big entry; the queue is empty
+        assert_eq!(logger.try_log(entry("queued")), LogOutcome::Accepted);
+        for i in 0..drops {
+            assert_eq!(logger.try_log(entry(&format!("d{i}"))), LogOutcome::Full);
+        }
+        sink.release();
+        logger.shutdown();
+        logger.stats()
+    }
+
+    // A drop storm prints ONE "channel full" note, immediately (before the
+    // finalize warning), and the finalize warning carries the exact total. A
+    // second session gets its own single note and its own exact total, so the
+    // once-flag is per logger, not per process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_drop_storm_prints_one_queue_full_note_per_session() {
+        const FIRST: usize = 700;
+        const SECOND: usize = 5;
+        with_captured_stderr(
+            &test_path("a_drop_storm_prints_one_queue_full_note_per_session"),
+            || {
+                assert_eq!(drop_storm("oplog-once-a", FIRST).dropped_full, FIRST as u64);
+                assert_eq!(
+                    drop_storm("oplog-once-b", SECOND).dropped_full,
+                    SECOND as u64
+                );
+            },
+            |stderr| {
+                // The order of the two kinds of line: note, warning, note, warning.
+                let kinds: Vec<&str> = stderr
+                    .lines()
+                    .filter_map(|l| {
+                        if l.contains("channel full") {
+                            Some("note")
+                        } else if l.contains("op-log is INCOMPLETE") {
+                            Some("warning")
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    kinds,
+                    ["note", "warning", "note", "warning"],
+                    "one note per session, before its warning\n{stderr}"
+                );
+                let note = stderr.lines().find(|l| l.contains("channel full")).unwrap();
+                assert!(
+                    note.contains("counted") && note.contains("finalize"),
+                    "the note says further drops are counted and reported at finalize: {note}"
+                );
+                for total in [FIRST, SECOND] {
+                    let line = format!("{total} entries were dropped because the queue was full");
+                    assert_eq!(
+                        stderr.lines().filter(|l| l.contains(&line)).count(),
+                        1,
+                        "the finalize warning states the exact total {total}\n{stderr}"
+                    );
+                }
+            },
+        );
     }
 
     #[cfg(target_os = "linux")]

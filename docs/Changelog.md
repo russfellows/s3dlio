@@ -171,6 +171,12 @@ framing) is unchanged; a golden test pins it.
   lets a later `finalize` return before the writer is done. The finalize warning
   names a writer-thread panic as a defect rather than sending the reader to the
   disk.
+- **One queue-full note per session (#170).** In the default (lossy) mode the
+  op-log used to print "op-log channel full; dropping entry" for every dropped
+  entry, so a drop storm printed hundreds or thousands of stderr lines. It now
+  prints one note, on the first drop of the session, saying that further drops
+  are counted and reported at finalize; the `finalize_op_log()` warning states the
+  exact `dropped_full` total.
 
 ## Version 0.9.114 — Azure SDK stable 1.x migration
 

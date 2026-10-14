@@ -1034,9 +1034,11 @@ workers stop and check `rejected_closed == 0` too.
 
 `op_log_stats()` works while logging is active and after `finalize_op_log()`
 (while active, `accepted > written` is normal). `finalize_op_log()` prints one
-warning on stderr if any record was lost, naming only the non-zero counts. To
-avoid queue-full drops set `S3DLIO_OPLOG_LOSSLESS=1` (callers wait instead of
-dropping) and/or raise `S3DLIO_OPLOG_BUF`.
+warning on stderr if any record was lost, naming only the non-zero counts (the
+exact number of queue-full drops included). In the default mode the first
+queue-full drop also prints one stderr note per session; later drops are only
+counted. To avoid queue-full drops set `S3DLIO_OPLOG_LOSSLESS=1` (callers wait
+instead of dropping) and/or raise `S3DLIO_OPLOG_BUF`.
 
 ### Python Convenience Helpers
 

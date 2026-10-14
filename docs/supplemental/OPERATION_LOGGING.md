@@ -329,6 +329,13 @@ writer-thread panic says it is a defect to report, not a disk problem. A
 per-call `try_log` outcome is still available when you need to know about one
 entry.
 
+In the default (lossy) mode the first dropped entry of a session also prints one
+immediate stderr note, `op-log channel full; dropping entry (further drops are
+counted and reported when the op-log is finalized)`. It is printed once per
+session, never per dropped entry; the exact number dropped is `dropped_full` and
+the line `N entries were dropped because the queue was full` in the finalize
+warning.
+
 Cost: one relaxed `fetch_add` per call, on the path that matches its outcome.
 The writer thread keeps its own `written` counter (one plain store per row, in
 its own cache line), so the hot path has nothing added.
@@ -372,7 +379,11 @@ not a machine-checked inventory:
   first read was kept for the whole process. For the single global session this
   is the same unless the variable changes between two `Logger::new` calls.
 - The queue-full message no longer appends the channel error text
-  ("op-log channel full; dropping entry").
+  ("op-log channel full; dropping entry"), and it is printed **once per op-log
+  session**, on the first dropped entry, instead of once per dropped entry (a drop
+  storm used to print hundreds or thousands of lines). Later drops are only
+  counted in `dropped_full`; the warning printed at finalize states the exact
+  total.
 - A refused writer thread is an `io::Error` from init instead of a panic; the
   writer thread is named `s3dlio-oplog`.
 - A destination is resolved as described under "Op-log destinations": `file://`

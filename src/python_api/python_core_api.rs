@@ -773,7 +773,9 @@ pub fn is_op_log_active() -> PyResult<bool> {
 ///
 /// To avoid queue-full drops set S3DLIO_OPLOG_LOSSLESS=1 and/or raise
 /// S3DLIO_OPLOG_BUF. finalize_op_log() also prints one warning on stderr if
-/// anything was lost.
+/// anything was lost, stating the exact number of queue-full drops. In the
+/// default mode the first queue-full drop of the session prints one stderr note
+/// at once; later drops are only counted.
 #[pyfunction]
 #[pyo3(name = "op_log_stats")]
 pub fn op_log_stats_py(py: Python<'_>) -> PyResult<Option<Bound<'_, PyDict>>> {
