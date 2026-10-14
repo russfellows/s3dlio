@@ -12,7 +12,8 @@ scope.  When that thread tries to retake the GIL, CPython force-exits it
 (``PyThread_exit_thread``) and the unwind frees Python objects without a thread
 state -> SIGSEGV.  Timing dependent: roughly 0-25 percent of runs.
 
-The fix registers an ``atexit`` hook that, with the GIL released, waits
+The fix registers an ``atexit`` hook that first closes a delivery gate (a late
+delivery is dropped unrun, never entering Python) and then, with the GIL released, waits
 (bounded) for in-flight result deliveries to finish before finalization.
 
 Each scenario runs in a FRESH subprocess, K times, sequentially; every run must
@@ -172,3 +173,55 @@ def test_pending_never_completing_task_does_not_hang_exit(child_env):
     # The drain timeout is 2 s; a never-completing task is not 'in flight', so
     # exit must come well inside that bound plus interpreter start-up.
     assert secs < 10.0, f"exit took {secs:.2f}s"
+
+
+def test_late_delivery_after_exit_drain_never_enters_python(child_env):
+    """A result that arrives after the exit drain must not be delivered.
+
+    An ``atexit`` handler registered BEFORE ``import s3dlio`` runs AFTER
+    s3dlio's drain (LIFO), so it sleeps with the GIL released once the delivery
+    gate has closed.  The abandoned ``get_async`` gets its HTTP 404 during that
+    sleep.  With the gate closed the Rust side must drop the delivery without
+    calling ``loop.call_soon_threadsafe`` (i.e. without entering Python), and
+    the process must still exit 0.
+    """
+    script = textwrap.dedent(
+        """
+        import atexit, socket, threading, time
+        calls = [0]
+        def late():
+            time.sleep(1.2)
+            print("LATE-DELIVERY-CALLS", calls[0], flush=True)
+        atexit.register(late)
+
+        import asyncio, s3dlio
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        port = srv.getsockname()[1]
+        def serve():
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            time.sleep(0.6)
+            conn.sendall(b"HTTP/1.1 404 Not Found\\r\\nContent-Length: 0\\r\\n"
+                         b"Connection: close\\r\\n\\r\\n")
+            time.sleep(2)
+        threading.Thread(target=serve, daemon=True).start()
+
+        loop = asyncio.new_event_loop()
+        orig = loop.call_soon_threadsafe
+        def counting(*a, **k):
+            calls[0] += 1
+            return orig(*a, **k)
+        loop.call_soon_threadsafe = counting
+
+        async def main():
+            pending = s3dlio.get_async(f"s3://127.0.0.1:{port}/b/k")
+            await asyncio.sleep(0.1)  # request in flight; never awaited
+        loop.run_until_complete(main())
+        """
+    )
+    for _ in range(3):
+        code, out, err, _ = _run_once(script, [], child_env)
+        assert code == 0, f"exit code {code}: {err.strip()[-300:]}"
+        assert "LATE-DELIVERY-CALLS 0" in out, (out, err.strip()[-300:])

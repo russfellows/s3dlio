@@ -38,18 +38,57 @@
 //! * [`future_into_py`] is a drop-in replacement for
 //!   `pyo3_async_runtimes::tokio::future_into_py` built on that runtime; every
 //!   s3dlio call site uses it.
-//! * [`register_exit_drain`] registers the `atexit` callback that releases the
-//!   GIL (`Python::detach`) and waits, bounded by
+//! * [`register_exit_drain`] registers the `atexit` callback.  The callback
+//!   first **closes the delivery gate** (`DeliveryTracker::close`), then
+//!   releases the GIL (`Python::detach`) and waits, bounded by
 //!   [`crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT`], until no delivery is in
 //!   flight.
+//!
+//! # The closed gate
+//!
+//! Waiting alone leaves a hole: a delivery whose future completes *after* the
+//! drain returned would still enter `Python::attach` and could be inside it
+//! when finalization starts.  The gate closes that hole.  The count and the
+//! `closed` flag live under one mutex, so `enter` has exactly two outcomes:
+//!
+//! * it ran before `close`: the delivery is counted, the drain waits for it,
+//!   and it completes normally (the drain released the GIL for it);
+//! * it ran after `close`: it is refused, and [`S3dlioRuntime::spawn_blocking`]
+//!   **does not call the delivery closure at all**.  The closure is dropped
+//!   unrun, on the calling tokio worker thread.  That thread is not attached
+//!   to Python, so the `Py<..>` objects the closure captured (the awaitable,
+//!   the event loop, the `contextvars.Context`) take pyo3's deferred-decref
+//!   path: `Py::drop` checks `thread_is_attached()`, and when false hands the
+//!   pointer to `register_decref`, which only pushes it onto a Rust-side
+//!   `Mutex<Vec>` and never calls into CPython.  Leaking those few references
+//!   during interpreter teardown is harmless.  The Python awaitable is never
+//!   completed, which is correct: the event loop that was awaiting it is gone.
+//!
+//! No path calls `Python::attach` after the gate closes, so no s3dlio delivery
+//! can be inside an attach scope when `Py_FinalizeEx` begins.  Ticket
+//! accounting stays exactly-once: a closure that ran, panicked or was dropped
+//! unrun by the runtime releases its single ticket through the RAII guard; a
+//! refused delivery never held one.
 //!
 //! A future that has not yet completed on the Rust side holds no ticket and is
 //! never waited for, so a task that never completes cannot delay or hang exit.
 //!
-//! Known limit: a delivery that *starts* after the drain returned (a task the
-//! script abandoned and that happens to finish during interpreter teardown) is
-//! outside what an `atexit` hook can cover; that is an upstream pyo3 /
-//! pyo3-async-runtimes concern, not something s3dlio can close from here.
+//! # Known limits
+//!
+//! * The drain wait is bounded.  A delivery that is still in flight when
+//!   [`crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT`] expires (a wedged
+//!   `call_soon_threadsafe`, for example) was admitted before the close and
+//!   can therefore still be inside `Python::attach` at finalization; the
+//!   timeout is logged.  That is the same crash as before, now reachable only
+//!   when a single delivery fails to finish within the timeout.
+//! * The gate covers deliveries made through [`future_into_py`].  Any other
+//!   `Python::attach` on a non-Python thread during teardown is outside this
+//!   module.
+//! * The gate never reopens: it closes at `atexit` and the process is ending.
+//!   A script that keeps using s3dlio async APIs from *other* `atexit`
+//!   handlers registered after this one (they run first, LIFO) is unaffected;
+//!   handlers registered before it run after the close and their s3dlio
+//!   awaitables will not complete.
 
 use std::cell::OnceCell;
 use std::future::Future;
@@ -70,36 +109,64 @@ use pyo3_async_runtimes::TaskLocals;
 /// recovered (the protected value is a plain integer, so poisoning cannot leave
 /// it inconsistent).
 pub(crate) struct DeliveryTracker {
-    in_flight: Mutex<usize>,
+    state: Mutex<TrackerState>,
     idle: Condvar,
+}
+
+/// The count and the closed flag live under ONE mutex so that "is the gate
+/// closed?" and "register one more delivery" are a single atomic decision.
+struct TrackerState {
+    in_flight: usize,
+    closed: bool,
 }
 
 impl DeliveryTracker {
     pub(crate) const fn new() -> Self {
         Self {
-            in_flight: Mutex::new(0),
+            state: Mutex::new(TrackerState {
+                in_flight: 0,
+                closed: false,
+            }),
             idle: Condvar::new(),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, usize> {
-        self.in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, TrackerState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Register one in-flight delivery.  The returned ticket releases it on drop.
-    pub(crate) fn enter(&'static self) -> DeliveryTicket {
-        {
-            let mut n = self.lock();
-            *n = n.saturating_add(1);
+    /// Register one in-flight delivery.  The returned ticket releases it on
+    /// drop.  Returns `None` once the gate is closed; nothing is counted then.
+    ///
+    /// The closed check and the increment happen under one lock hold, so every
+    /// delivery is either refused or visible to the drain's wait: there is no
+    /// window in which one is admitted but not counted.
+    pub(crate) fn enter(&'static self) -> Option<DeliveryTicket> {
+        let mut st = self.lock();
+        if st.closed {
+            return None;
         }
-        DeliveryTicket { tracker: self }
+        st.in_flight = st.in_flight.saturating_add(1);
+        drop(st);
+        Some(DeliveryTicket { tracker: self })
+    }
+
+    /// Close the gate: from now on [`enter`](Self::enter) refuses.  Deliveries
+    /// already counted are unaffected (they are waited for, not cancelled).
+    /// Permanent for the life of the process and idempotent.
+    pub(crate) fn close(&self) {
+        self.lock().closed = true;
+    }
+
+    /// Whether the gate has been closed.
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.lock().closed
     }
 
     /// Deliveries currently in flight.
     pub(crate) fn in_flight(&self) -> usize {
-        *self.lock()
+        self.lock().in_flight
     }
 
     /// Block the calling thread until no delivery is in flight or `timeout`
@@ -108,10 +175,10 @@ impl DeliveryTracker {
         let guard = self.lock();
         let guard = self
             .idle
-            .wait_timeout_while(guard, timeout, |n| *n > 0)
+            .wait_timeout_while(guard, timeout, |st| st.in_flight > 0)
             .unwrap_or_else(PoisonError::into_inner)
             .0;
-        *guard == 0
+        guard.in_flight == 0
     }
 }
 
@@ -123,9 +190,9 @@ pub(crate) struct DeliveryTicket {
 
 impl Drop for DeliveryTicket {
     fn drop(&mut self) {
-        let mut n = self.tracker.lock();
-        *n = n.saturating_sub(1);
-        if *n == 0 {
+        let mut st = self.tracker.lock();
+        st.in_flight = st.in_flight.saturating_sub(1);
+        if st.in_flight == 0 {
             self.tracker.idle.notify_all();
         }
     }
@@ -158,13 +225,41 @@ impl Runtime for S3dlioRuntime {
     where
         F: FnOnce() + Send + 'static,
     {
-        // Counted BEFORE the delivery is queued, released only after `f` (the
-        // whole Python::attach scope, drops included) has returned.
-        let ticket = DELIVERIES.enter();
-        pyo3_async_runtimes::tokio::get_runtime().spawn_blocking(move || {
+        spawn_gated(&DELIVERIES, f)
+    }
+}
+
+/// The gated `spawn_blocking` behind [`S3dlioRuntime`], parameterised on the
+/// tracker so tests can drive it without touching the process-wide gate.
+///
+/// * Gate open: the ticket is taken BEFORE the delivery is queued and released
+///   only after `f` (the whole `Python::attach` scope, drops included) has
+///   returned -- or, if `f` panics or the queued closure is dropped unrun at
+///   runtime shutdown, when the closure's captured ticket is dropped.
+/// * Gate closed: `f` is **not run**.  It is dropped right here, on the
+///   calling thread, which is a tokio worker that is not attached to Python:
+///   the `Py<..>` objects `f` captured are therefore dropped without the GIL,
+///   which pyo3 defers instead of touching CPython (see the module docs).  No
+///   ticket exists on this path, so nothing is counted and nothing can be
+///   double-released.
+fn spawn_gated<F>(tracker: &'static DeliveryTracker, f: F) -> tokio::task::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let runtime = pyo3_async_runtimes::tokio::get_runtime();
+    match tracker.enter() {
+        Some(ticket) => runtime.spawn_blocking(move || {
             f();
             drop(ticket);
-        })
+        }),
+        None => {
+            tracing::debug!(
+                "s3dlio: async result delivery dropped: interpreter is exiting \
+                 (issue #192 delivery gate closed)"
+            );
+            drop(f);
+            runtime.spawn(async {})
+        }
     }
 }
 
@@ -201,6 +296,7 @@ where
 #[pyfunction]
 fn drain_async_deliveries_at_exit(py: Python<'_>) {
     let timeout = crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT;
+    DELIVERIES.close();
     if !py.detach(|| DELIVERIES.wait_idle(timeout)) {
         tracing::warn!(
             in_flight = DELIVERIES.in_flight(),
@@ -245,7 +341,7 @@ mod tests {
     #[test]
     fn held_ticket_times_out_and_is_bounded() {
         let t = tracker();
-        let ticket = t.enter();
+        let ticket = t.enter().expect("gate open");
         assert_eq!(t.in_flight(), 1);
         let started = Instant::now();
         assert!(!t.wait_idle(Duration::from_millis(150)));
@@ -260,7 +356,7 @@ mod tests {
     #[test]
     fn release_from_another_thread_wakes_waiter_early() {
         let t = tracker();
-        let ticket = t.enter();
+        let ticket = t.enter().expect("gate open");
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             drop(ticket);
@@ -275,7 +371,8 @@ mod tests {
     #[test]
     fn every_ticket_counts_exactly_once() {
         let t = tracker();
-        let tickets: Vec<_> = (0..5).map(|_| t.enter()).collect();
+        let tickets: Vec<_> = (0..5).filter_map(|_| t.enter()).collect();
+        assert_eq!(tickets.len(), 5);
         assert_eq!(t.in_flight(), 5);
         for (i, ticket) in tickets.into_iter().enumerate() {
             drop(ticket);
@@ -288,7 +385,7 @@ mod tests {
     fn ticket_is_released_when_the_holder_panics() {
         let t = tracker();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ticket = t.enter();
+            let _ticket = t.enter().expect("gate open");
             assert_eq!(t.in_flight(), 1);
             std::panic::panic_any("simulated delivery panic");
         }));
@@ -301,15 +398,164 @@ mod tests {
     fn poisoned_lock_is_recovered() {
         let t = tracker();
         let poisoner = std::thread::spawn(move || {
-            let _guard = t.in_flight.lock().expect("lock");
+            let _guard = t.state.lock().expect("lock");
             std::panic::panic_any("poison the lock");
         });
         assert!(poisoner.join().is_err());
-        assert!(t.in_flight.is_poisoned());
-        let ticket = t.enter();
+        assert!(t.state.is_poisoned());
+        let ticket = t.enter().expect("gate open");
         assert_eq!(t.in_flight(), 1);
         drop(ticket);
         assert!(t.wait_idle(Duration::from_millis(10)));
+    }
+
+    // ---- closed gate (issue #192: late deliveries must never enter Python) ----
+
+    #[test]
+    fn closed_gate_refuses_new_tickets_and_counts_nothing() {
+        let t = tracker();
+        assert!(!t.is_closed());
+        t.close();
+        assert!(t.is_closed());
+        assert!(t.enter().is_none());
+        assert!(t.enter().is_none());
+        assert_eq!(t.in_flight(), 0);
+        assert!(t.wait_idle(Duration::from_millis(10)));
+        // Closing twice is harmless.
+        t.close();
+        assert!(t.is_closed());
+    }
+
+    #[test]
+    fn close_then_wait_still_waits_for_deliveries_already_in_flight() {
+        let t = tracker();
+        let ticket = t.enter().expect("gate open");
+        t.close();
+        // A delivery that entered before the close is still counted, still
+        // waited for, and not cancelled by the close.
+        assert_eq!(t.in_flight(), 1);
+        assert!(!t.wait_idle(Duration::from_millis(100)));
+        assert_eq!(t.in_flight(), 1);
+        // New work is refused while the old delivery is still running.
+        assert!(t.enter().is_none());
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(ticket);
+        });
+        let started = Instant::now();
+        assert!(t.wait_idle(Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        releaser.join().expect("releaser thread");
+        assert_eq!(t.in_flight(), 0);
+        assert!(t.is_closed());
+    }
+
+    /// Sets a flag when dropped: proves a closure was dropped (not leaked).
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn spawn_after_close_drops_the_closure_unrun_and_leaves_the_count_alone() {
+        let t = tracker();
+        t.close();
+        let ran = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let ran_in_task = Arc::clone(&ran);
+        let guard = DropFlag(Arc::clone(&dropped));
+
+        let handle = spawn_gated(t, move || {
+            let _guard = guard;
+            ran_in_task.store(true, Ordering::SeqCst);
+        });
+        // `f` is dropped synchronously, before the handle is even awaited.
+        assert!(dropped.load(Ordering::SeqCst), "closure must be dropped");
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(handle)
+            .expect("join no-op handle");
+        assert!(!ran.load(Ordering::SeqCst), "closure must NOT run");
+        assert_eq!(t.in_flight(), 0, "nothing counted, nothing released");
+        assert!(t.wait_idle(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn spawn_before_close_still_runs_and_releases_exactly_once() {
+        let t = tracker();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = Arc::clone(&ran);
+        let handle = spawn_gated(t, move || ran_in_task.store(true, Ordering::SeqCst));
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(handle)
+            .expect("join delivery");
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(t.in_flight(), 0);
+        t.close();
+        assert_eq!(t.in_flight(), 0);
+    }
+
+    #[test]
+    fn panicking_delivery_releases_its_ticket_exactly_once() {
+        let t = tracker();
+        let handle = spawn_gated(t, || std::panic::panic_any("simulated delivery panic"));
+        let joined = pyo3_async_runtimes::tokio::get_runtime().block_on(handle);
+        assert!(joined.is_err_and(|e| e.is_panic()));
+        assert_eq!(t.in_flight(), 0);
+        assert!(t.wait_idle(Duration::from_millis(10)));
+    }
+
+    /// `enter()` racing with `close()`: every iteration must end with a count
+    /// of 0, and "the enter succeeded" must coincide exactly with "the ticket
+    /// was already counted when the close finished" -- there is no window in
+    /// which a delivery is admitted but invisible to the drain.
+    #[test]
+    fn enter_racing_with_close_never_leaves_the_count_wrong() {
+        for iteration in 0..2000 {
+            let t = tracker();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+
+            let enterer = {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    match t.enter() {
+                        Some(ticket) => {
+                            // Hold the ticket until the closer has looked.
+                            let _ = release_rx.recv();
+                            drop(ticket);
+                            true
+                        }
+                        None => false,
+                    }
+                })
+            };
+            let closer = {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    t.close();
+                    let seen = t.in_flight();
+                    let _ = release_tx.send(());
+                    seen
+                })
+            };
+
+            let admitted = enterer.join().expect("enterer thread");
+            let seen_after_close = closer.join().expect("closer thread");
+            assert_eq!(
+                seen_after_close,
+                usize::from(admitted),
+                "iteration {iteration}: admitted={admitted} but the drain saw {seen_after_close}"
+            );
+            assert_eq!(t.in_flight(), 0, "iteration {iteration}: leaked count");
+            assert!(t.is_closed());
+            assert!(t.enter().is_none());
+        }
     }
 
     /// The blocking path of the real runtime adapter: the global ticket is
