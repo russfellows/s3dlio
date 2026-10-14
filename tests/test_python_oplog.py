@@ -25,8 +25,14 @@ HEADER = (
 EXPECTED_OPS = {"PUT": 20, "GET": 20, "LIST": 2}
 
 
-def test_python_api_oplog_file_and_direct_backends(tmp_path):
+def test_python_api_oplog_file_and_direct_backends(tmp_path, monkeypatch):
     import s3dlio
+
+    # This test counts exact rows in this process: the caller's op-log queue,
+    # lossless and buffer settings must not be able to change that.
+    for name in list(os.environ):
+        if name.startswith("S3DLIO_OPLOG_"):
+            monkeypatch.delenv(name)
 
     zstd = shutil.which("zstd")
     if zstd is None:
@@ -74,6 +80,10 @@ def test_python_api_oplog_file_and_direct_backends(tmp_path):
     finally:
         s3dlio.finalize_op_log()
     assert not s3dlio.is_op_log_active()
+
+    stats = s3dlio.op_log_stats()
+    assert stats["accepted"] == stats["written"] == sum(EXPECTED_OPS.values()), stats
+    assert stats["dropped_full"] == stats["writer_failed"] == 0 and stats["writer_error"] is None
 
     assert log_path.exists(), f"log file not created: {log_path}"
     # The file must be a COMPLETE zstd stream (finalize finished it).

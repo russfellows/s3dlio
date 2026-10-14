@@ -736,18 +736,30 @@ pub fn is_op_log_active() -> PyResult<bool> {
 /// Returns None before init_op_log(); otherwise a dict (available while
 /// logging is active AND after finalize_op_log()):
 ///
-///     accepted         entries queued for the writer; after finalize_op_log()
-///                      these are exactly the data rows in the file (unless
-///                      writer_failed is non-zero)
+///     accepted         entries queued for the writer
+///     written          rows the writer handed to the compressor without error
+///                      (an upper bound of the rows in the file)
 ///     dropped_full     entries dropped because the queue was full (default
 ///                      mode only)
-///     rejected_closed  entries that arrived after finalize began (not written)
-///     writer_failed    entries lost because the writer stopped on an I/O error
+///     rejected_closed  calls that arrived after finalize began (not in the file)
+///     writer_failed    calls refused because the writer had already stopped
+///     writer_error     None, or the first error the writer met (a failed write,
+///                      a failed finish/flush of the compressed stream, or a
+///                      writer panic) as text
 ///     lossless         True if S3DLIO_OPLOG_LOSSLESS=1 (callers wait, never drop)
 ///
-/// The log is complete when dropped_full == 0 and writer_failed == 0. To avoid
-/// drops set S3DLIO_OPLOG_LOSSLESS=1 and/or raise S3DLIO_OPLOG_BUF. finalize_op_log()
-/// also prints one warning on stderr if anything was dropped.
+/// After finalize_op_log() the log is COMPLETE exactly when
+/// accepted == written and dropped_full == 0 and writer_failed == 0 and
+/// writer_error is None. (accepted > written means entries were queued but never
+/// written, e.g. the disk filled up; writer_failed alone cannot show that.)
+/// rejected_closed is not part of "complete" -- those calls were never going to
+/// be in the file -- but finalize only after your worker threads have stopped, and
+/// check rejected_closed == 0 as well. While logging is active accepted > written
+/// is normal (the queue is draining), so judge completeness after finalize.
+///
+/// To avoid queue-full drops set S3DLIO_OPLOG_LOSSLESS=1 and/or raise
+/// S3DLIO_OPLOG_BUF. finalize_op_log() also prints one warning on stderr if
+/// anything was lost.
 #[pyfunction]
 #[pyo3(name = "op_log_stats")]
 pub fn op_log_stats_py(py: Python<'_>) -> PyResult<Option<Bound<'_, PyDict>>> {
@@ -760,6 +772,8 @@ pub fn op_log_stats_py(py: Python<'_>) -> PyResult<Option<Bound<'_, PyDict>>> {
     dict.set_item("rejected_closed", stats.rejected_closed)?;
     dict.set_item("writer_failed", stats.writer_failed)?;
     dict.set_item("lossless", stats.lossless)?;
+    dict.set_item("written", stats.written)?;
+    dict.set_item("writer_error", stats.writer_error)?;
     Ok(Some(dict))
 }
 

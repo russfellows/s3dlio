@@ -992,20 +992,35 @@ logged, and those created before `finalize_op_log` stop recording when it runs.
 
 The op-log is **lossy by default**: if the writer cannot keep up and the queue
 (`S3DLIO_OPLOG_BUF`, default 8192 entries) fills, entries are dropped rather than
-slowing your code. Detect that with `op_log_stats()`:
+slowing your code. The background writer can also fail (disk full) with entries
+still queued. Detect both with `op_log_stats()` **after** `finalize_op_log()`:
 
 ```python
+s3dlio.finalize_op_log()        # stop your worker threads first
 stats = s3dlio.op_log_stats()   # None before init_op_log(); else a dict
-# {'accepted': 4, 'dropped_full': 0, 'rejected_closed': 0,
-#  'writer_failed': 0, 'lossless': False}
-complete = stats["dropped_full"] == 0 and stats["writer_failed"] == 0
+# {'accepted': 4, 'written': 4, 'dropped_full': 0, 'rejected_closed': 0,
+#  'writer_failed': 0, 'writer_error': None, 'lossless': False}
+complete = (stats["accepted"] == stats["written"] and stats["dropped_full"] == 0
+            and stats["writer_failed"] == 0 and stats["writer_error"] is None)
 ```
 
-It works while logging is active and after `finalize_op_log()`; after finalize
-`accepted` is exactly the number of data rows in the file (unless
-`writer_failed` is non-zero). `finalize_op_log()` also prints one warning on
-stderr if anything was dropped. To avoid drops set `S3DLIO_OPLOG_LOSSLESS=1`
-(callers wait instead of dropping) and/or raise `S3DLIO_OPLOG_BUF`.
+The log is **complete** exactly when `accepted == written` and `dropped_full ==
+0` and `writer_failed == 0` and `writer_error is None`. `writer_error` is the
+first error the writer met (a failed write, a failed finish or flush of the
+compressed stream, or a writer panic) as text; `written` is an upper bound of the
+rows in the file. `writer_failed` only counts calls made *after* the writer
+stopped, so queued entries lost to a writer error show as `accepted > written`.
+
+Calls made after `finalize_op_log()` began (a store created before finalize that
+a worker still uses) are counted as `rejected_closed` and are **not in the file**;
+they are not part of "complete", but a program should finalize only after its
+workers stop and check `rejected_closed == 0` too.
+
+`op_log_stats()` works while logging is active and after `finalize_op_log()`
+(while active, `accepted > written` is normal). `finalize_op_log()` prints one
+warning on stderr if any record was lost, naming only the non-zero counts. To
+avoid queue-full drops set `S3DLIO_OPLOG_LOSSLESS=1` (callers wait instead of
+dropping) and/or raise `S3DLIO_OPLOG_BUF`.
 
 ### Python Convenience Helpers
 
@@ -1140,7 +1155,7 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089); `RuntimeError` after finalize |
 | `finalize_op_log()` | Write all accepted records (unless the writer fails with an I/O error) and close the log; releases the GIL while draining; terminal and idempotent |
 | `is_op_log_active()` | True between init and finalize only |
-| `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `dropped_full` / `rejected_closed` / `writer_failed` / `lossless`, available while active and after finalize, to detect dropped records |
+| `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `written` / `dropped_full` / `rejected_closed` / `writer_failed` / `writer_error` / `lossless`, available while active and after finalize, to detect lost records (complete = `accepted == written`, no drops, no refusals, `writer_error is None`) |
 
 ---
 

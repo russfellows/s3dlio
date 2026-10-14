@@ -14,7 +14,7 @@
 // Uninitialized so a corrected init succeeds.
 
 use s3dlio::s3_logger::{LogEntry, LogOutcome};
-use s3dlio::{finalize_op_logger, global_logger, init_op_logger};
+use s3dlio::{finalize_op_logger, global_logger, init_op_logger, op_log_stats};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -79,11 +79,20 @@ fn failed_init_can_be_retried() {
         global_logger().is_none(),
         "failed init must leave the op-log inactive"
     );
+    assert!(
+        op_log_stats().is_none(),
+        "a failed init must leave no stats: the session never started"
+    );
 
     let good = dir.path().join("ops.tsv.zst");
     init_op_logger(good.to_str().unwrap()).expect("corrected init must succeed");
     let logger = global_logger().expect("active after corrected init");
+    let fresh = op_log_stats().expect("stats exist once init succeeded");
+    assert_eq!((fresh.accepted, fresh.written), (0, 0));
     assert_eq!(logger.try_log(entry("ok")), LogOutcome::Accepted);
     finalize_op_logger();
+    let done = op_log_stats().expect("stats are kept after finalize");
+    assert_eq!((done.accepted, done.written), (1, 1));
+    assert!(done.is_complete());
     assert_eq!(logged_tags(&good), vec!["ok".to_string()]);
 }

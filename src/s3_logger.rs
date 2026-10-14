@@ -14,7 +14,7 @@ use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{
     mpsc::{channel, sync_channel, Receiver, SyncSender, TrySendError},
-    Arc, Mutex, MutexGuard, PoisonError,
+    Arc, Mutex, MutexGuard, OnceLock, PoisonError,
 };
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -163,17 +163,41 @@ pub fn global_logger() -> Option<Logger> {
 /// session, so a caller can tell whether the log is complete.
 ///
 /// Available while the session is Active and after it is Finalized (`None`
-/// only before [`init_op_logger`]). The counts cover every `log` / `try_log`
-/// call made through any clone of the session's [`Logger`]. `accepted` is the
-/// number of entries queued for the writer; once finalize has returned, those
-/// are exactly the data rows in the file unless `writer_failed` is non-zero or
-/// the writer stopped on an I/O error. The log is **complete** when
-/// `dropped_full == 0 && writer_failed == 0`; `rejected_closed` entries
-/// arrived after finalize began and are not drops of an open session.
+/// only before [`init_op_logger`]). The outcome counts cover every `log` /
+/// `try_log` call made through any clone of the session's [`Logger`]; `written`
+/// and `writer_error` come from the writer thread.
 ///
-/// Counters are relaxed atomics: a snapshot taken while producers are still
-/// logging is a consistent-enough progress report, not a transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// # When is the log complete?
+///
+/// After [`finalize_op_logger`] has returned, the log is **complete** exactly
+/// when [`OpLogStats::is_complete`] is true:
+///
+/// ```text
+/// accepted == written  &&  dropped_full == 0  &&  writer_failed == 0  &&  writer_error is None
+/// ```
+///
+/// - `accepted == written` catches entries that were queued but never reached
+///   the encoder, which is what a writer that dies on an I/O error with entries
+///   still queued leaves behind (`writer_failed` only counts calls made *after*
+///   the writer died, so on its own it misses them).
+/// - `writer_error` is the first error the writer met: a failed write, a failed
+///   zstd finish or final flush (the rows may all have been counted as written
+///   yet not be on disk), or a writer panic.
+///
+/// `rejected_closed` is deliberately **not** part of "complete": those calls
+/// arrived after finalize had begun and were never going to be in the file, but
+/// a program that still logs after finalizing has a bug of its own (finalize
+/// only after the workers stop), so check `rejected_closed == 0` as well.
+///
+/// Read the stats **after** finalize returns for the final answer. While the
+/// session is Active, `accepted > written` is normal (entries are queued), and
+/// the counters are relaxed atomics: a snapshot taken while producers are still
+/// logging is a progress report, not a transaction. Once finalize has returned,
+/// every call that was accepted, dropped or refused before it began has
+/// happened-before the read (see [`Logger::stats`]).
+///
+/// Not for construction by callers (`#[non_exhaustive]`): new fields may be added.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OpLogStats {
     /// Entries queued for the writer (`LogOutcome::Accepted`).
@@ -183,28 +207,94 @@ pub struct OpLogStats {
     pub dropped_full: u64,
     /// Entries rejected because finalize had begun (`LogOutcome::Closed`).
     pub rejected_closed: u64,
-    /// Entries not written because the writer had stopped after an I/O error
-    /// (`LogOutcome::WriterFailed`).
+    /// Entries refused because the writer had already stopped
+    /// (`LogOutcome::WriterFailed`). Entries that were queued *before* the
+    /// writer stopped are not counted here; they show as `accepted - written`.
     pub writer_failed: u64,
     /// True if the session blocks on a full queue instead of dropping
     /// (`S3DLIO_OPLOG_LOSSLESS=1`).
     pub lossless: bool,
+    /// Rows the writer thread handed to the zstd encoder without an error. An
+    /// upper bound of the rows in the file: the encoder and the file buffer
+    /// them, so a later flush/finish failure can still lose some.
+    pub written: u64,
+    /// The first error the writer thread met, if any (write, zstd finish,
+    /// final flush, or a panic), as text.
+    pub writer_error: Option<String>,
 }
 
-/// The single warning printed when finalize finds that records were lost
-/// (queue-full drops or a failed writer); `None` when the log is complete.
+impl OpLogStats {
+    /// True when nothing was lost: `accepted == written && dropped_full == 0 &&
+    /// writer_failed == 0 && writer_error.is_none()`. Meaningful once
+    /// [`finalize_op_logger`] has returned (see the type docs); calls counted in
+    /// `rejected_closed` are not part of it.
+    pub fn is_complete(&self) -> bool {
+        self.accepted == self.written
+            && self.dropped_full == 0
+            && self.writer_failed == 0
+            && self.writer_error.is_none()
+    }
+}
+
+/// The single warning printed when finalize finds that records were lost;
+/// `None` when the log is complete. Names only the non-zero losses and gives
+/// only the advice that applies to the session's mode.
 fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
-    if stats.dropped_full.saturating_add(stats.writer_failed) == 0 {
+    if stats.is_complete() {
         return None;
     }
-    Some(format!(
-        "op-log is INCOMPLETE: {} entries were dropped because the queue was full, \
-         {} were lost after the writer failed with an I/O error ({} were accepted). \
-         To avoid queue-full drops set S3DLIO_OPLOG_LOSSLESS=1 (callers wait \
-         instead of dropping) and/or raise S3DLIO_OPLOG_BUF (queue capacity in \
-         entries); check the op-log destination for I/O errors.",
-        stats.dropped_full, stats.writer_failed, stats.accepted
-    ))
+    let unwritten = stats.accepted.saturating_sub(stats.written);
+    let mut lines = Vec::new();
+    let mut advice = Vec::new();
+    if stats.dropped_full > 0 {
+        lines.push(format!(
+            "{} entries were dropped because the queue was full",
+            stats.dropped_full
+        ));
+    }
+    if stats.writer_failed > 0 {
+        lines.push(format!(
+            "{} entries were refused because the writer had already stopped",
+            stats.writer_failed
+        ));
+    }
+    if unwritten > 0 {
+        lines.push(format!("{unwritten} accepted entries were never written"));
+    }
+    if let Some(error) = &stats.writer_error {
+        lines.push(format!("the writer failed: {error}"));
+    }
+    if stats.rejected_closed > 0 {
+        lines.push(format!(
+            "{} calls arrived after finalize began and are not in the file",
+            stats.rejected_closed
+        ));
+    }
+    if stats.dropped_full > 0 && !stats.lossless {
+        advice.push(
+            "To avoid queue-full drops set S3DLIO_OPLOG_LOSSLESS=1 (callers wait \
+             instead of dropping) and/or raise S3DLIO_OPLOG_BUF (queue capacity in entries)."
+                .to_string(),
+        );
+    }
+    if unwritten > 0 || stats.writer_failed > 0 || stats.writer_error.is_some() {
+        advice.push(
+            "Check the op-log destination for I/O errors (full disk, permissions, \
+             a failing device) and this process's stderr for the writer's message."
+                .to_string(),
+        );
+    }
+    let mut text = format!(
+        "op-log is INCOMPLETE ({} accepted, {} written):\n  - {}",
+        stats.accepted,
+        stats.written,
+        lines.join("\n  - ")
+    );
+    for line in advice {
+        text.push('\n');
+        text.push_str(&line);
+    }
+    Some(text)
 }
 
 /// Statistics of the process's op-log session: `Some` while it is Active and
@@ -505,6 +595,164 @@ struct Shared {
     dropped_full: AtomicU64,
     rejected_closed: AtomicU64,
     writer_failed: AtomicU64,
+    /// What the writer thread reports (rows written, first error); a separate,
+    /// cache-line-aligned allocation so its stores never touch the line the
+    /// producers' counters and gate live on.
+    writer: Arc<WriterReport>,
+    /// Set (Release) by the first shutdown as its very last step; read
+    /// (Acquire) by [`Logger::stats`]. See there for the ordering argument.
+    final_published: AtomicBool,
+}
+
+/// What the writer thread tells everyone else. Written only by the writer thread
+/// (and, for a vanished writer, by shutdown), so `written` is never contended.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct WriterReport {
+    /// Rows handed to the zstd encoder without an error.
+    written: AtomicU64,
+    /// The FIRST error the writer met; later ones are ignored.
+    first_error: OnceLock<String>,
+}
+
+impl WriterReport {
+    /// Remember `what` went wrong, unless an earlier error is already recorded.
+    fn record_error(&self, what: &str, error: impl std::fmt::Display) {
+        let _ = self.first_error.set(format!("{what}: {error}"));
+    }
+}
+
+/// Wait for the writer thread's completion message. A closed channel with no
+/// message means the thread ended without finishing its work, which is an error.
+fn wait_for_writer(done: &Receiver<()>, report: &WriterReport) {
+    if done.recv().is_err() {
+        report.record_error(
+            "writer thread",
+            "ended without completing (it was terminated abnormally)",
+        );
+    }
+}
+
+/// Text of a panic payload.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// A zstd encoder that finishes its stream when dropped (so every early exit,
+/// such as a failed thread spawn in [`Logger::start`], still leaves a complete
+/// stream, as `auto_finish` did) but can also be finished explicitly, which is
+/// the only way to see the error.
+struct StreamEncoder<W: Write>(Option<Encoder<'static, W>>);
+
+impl<W: Write> StreamEncoder<W> {
+    fn new(sink: W, level: i32) -> std::io::Result<Self> {
+        Ok(Self(Some(Encoder::new(sink, level)?)))
+    }
+
+    fn encoder(&mut self) -> std::io::Result<&mut Encoder<'static, W>> {
+        self.0
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("the zstd stream is already finished"))
+    }
+
+    /// Write the zstd frame end and hand back the sink.
+    fn finish(&mut self) -> std::io::Result<W> {
+        self.0
+            .take()
+            .ok_or_else(|| std::io::Error::other("the zstd stream is already finished"))?
+            .finish()
+    }
+}
+
+impl<W: Write> Write for StreamEncoder<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.encoder()?.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.encoder()?.flush()
+    }
+}
+
+impl<W: Write> Drop for StreamEncoder<W> {
+    fn drop(&mut self) {
+        if let Some(encoder) = self.0.take() {
+            // Nobody is left to tell: an explicit `finish` is where errors are kept.
+            let _ = encoder.finish();
+        }
+    }
+}
+
+/// The writer thread's loop: numbers and writes entries until `Shutdown`, the
+/// queue closing, or a write error (recorded, then the loop ends). The
+/// `receiver` is consumed, so when the loop ends producers see the queue closed.
+fn write_rows<W: Write>(
+    receiver: Receiver<Message>,
+    encoder: &mut StreamEncoder<W>,
+    clock_offset: &AtomicI64,
+    report: &WriterReport,
+) {
+    let mut written = 0_u64;
+    for (idx, message) in (0_u64..).zip(receiver) {
+        let mut entry = match message {
+            Message::Entry(entry) => entry,
+            Message::Shutdown => break,
+        };
+        entry.idx = idx;
+        let offset = clock_offset.load(Ordering::Relaxed);
+        let line = entry.to_log_line(offset);
+        if let Err(e) = encoder.write_all(line.as_bytes()) {
+            report.record_error("write failed", &e);
+            let _ = writeln!(std::io::stderr(), "Error writing to op-log: {e}");
+            break;
+        }
+        written += 1;
+        // The only writer of this counter: a plain store, no read-modify-write.
+        report.written.store(written, Ordering::Relaxed);
+    }
+}
+
+/// Finish the zstd stream and flush the sink, recording (not dropping) errors.
+fn finish_stream<W: Write>(encoder: &mut StreamEncoder<W>, report: &WriterReport) {
+    match encoder.finish() {
+        Ok(mut sink) => {
+            if let Err(e) = sink.flush() {
+                report.record_error("final flush failed", &e);
+            }
+        }
+        Err(e) => report.record_error("finishing the zstd stream failed", &e),
+    }
+}
+
+/// Everything the writer thread does: write rows, then finish the stream, then
+/// say it is done. A panic in either part is caught and recorded, so shutdown
+/// never waits forever and the failure is visible in the stats; the stream is
+/// still finished after a panic in the row loop.
+fn run_writer<W: Write>(
+    receiver: Receiver<Message>,
+    mut encoder: StreamEncoder<W>,
+    clock_offset: &AtomicI64,
+    report: &WriterReport,
+    done: &std::sync::mpsc::Sender<()>,
+) {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+        write_rows(receiver, &mut encoder, clock_offset, report);
+    })) {
+        report.record_error("writer thread panicked", panic_text(&*payload));
+    }
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| finish_stream(&mut encoder, report))) {
+        report.record_error(
+            "writer thread panicked while finishing",
+            panic_text(&*payload),
+        );
+    }
+    drop(encoder);
+    let _ = done.send(());
 }
 
 impl Shared {
@@ -670,7 +918,7 @@ impl Logger {
         // One-shot channel to signal that the background thread finished.
         let (done_tx, done_rx) = channel::<()>();
 
-        let mut encoder = Encoder::new(sink, level)?.auto_finish();
+        let mut encoder = StreamEncoder::new(sink, level)?;
 
         // Write header now so even empty logs have the header.
         encoder.write_all(HEADER.as_bytes())?;
@@ -679,25 +927,18 @@ impl Logger {
         // Background writer thread.
         let clock_offset = Arc::new(AtomicI64::new(0));
         let clock_offset_clone = Arc::clone(&clock_offset);
+        let writer = Arc::new(WriterReport::default());
+        let writer_clone = Arc::clone(&writer);
         thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
-                for (idx, message) in (0_u64..).zip(receiver) {
-                    let mut entry = match message {
-                        Message::Entry(entry) => entry,
-                        Message::Shutdown => break,
-                    };
-                    entry.idx = idx;
-                    let offset = clock_offset_clone.load(Ordering::Relaxed);
-                    let line = entry.to_log_line(offset);
-                    if let Err(e) = encoder.write_all(line.as_bytes()) {
-                        eprintln!("Error writing to op-log: {e}");
-                        break;
-                    }
-                }
-                // Drop encoder here to finish the zstd stream.
-                drop(encoder);
-                let _ = done_tx.send(());
+                run_writer(
+                    receiver,
+                    encoder,
+                    &clock_offset_clone,
+                    &writer_clone,
+                    &done_tx,
+                );
             })
             .map_err(|e| {
                 std::io::Error::new(
@@ -719,6 +960,8 @@ impl Logger {
                 dropped_full: AtomicU64::new(0),
                 rejected_closed: AtomicU64::new(0),
                 writer_failed: AtomicU64::new(0),
+                writer,
+                final_published: AtomicBool::new(false),
             }),
         })
     }
@@ -751,15 +994,31 @@ impl Logger {
     }
 
     /// Counts of what happened to the entries submitted through this logger
-    /// (and its clones). See [`OpLogStats`].
+    /// (and its clones), and what the writer thread reported. See [`OpLogStats`].
+    ///
+    /// Ordering: the counters are relaxed atomics, so a read while producers are
+    /// logging is only a progress report. After the first `shutdown` (what
+    /// [`finalize_op_logger`] runs) has returned, a read sees the final values
+    /// of every call that began before the close: each such call bumped its
+    /// counter before its in-flight guard dropped (Release), shutdown's
+    /// wait-for-zero loads the count with Acquire, the writer's last stores
+    /// reach shutdown through the completion channel, and shutdown ends by
+    /// storing `final_published` with Release. The Acquire load below pairs with
+    /// that store, so everything shutdown had observed happens-before the loads
+    /// that follow, on any thread, with no help from the caller. Calls that
+    /// start after the close (`rejected_closed`) are concurrent with the read
+    /// by definition and are only as exact as any relaxed counter.
     pub fn stats(&self) -> OpLogStats {
         let shared = &*self.shared;
+        shared.final_published.load(Ordering::Acquire);
         OpLogStats {
             accepted: shared.accepted.load(Ordering::Relaxed),
             dropped_full: shared.dropped_full.load(Ordering::Relaxed),
             rejected_closed: shared.rejected_closed.load(Ordering::Relaxed),
             writer_failed: shared.writer_failed.load(Ordering::Relaxed),
             lossless: shared.lossless,
+            written: shared.writer.written.load(Ordering::Relaxed),
+            writer_error: shared.writer.first_error.get().cloned(),
         }
     }
 
@@ -897,12 +1156,18 @@ impl Logger {
         // Print info if info set
         info!("Shutting down S3 operation logging");
 
-        // Wait for the background thread to finish (encoder flushes on drop).
-        let _ = done.recv();
+        // Wait for the background thread to finish the zstd stream and flush the
+        // sink. A thread that vanished without saying so is recorded as an error.
+        wait_for_writer(&done, &shared.writer);
+
+        // Publish the final values (see `stats` for the ordering argument).
+        shared.final_published.store(true, Ordering::Release);
 
         // One warning, from the first (draining) finalize, if records were lost.
         if let Some(warning) = incomplete_warning(&self.stats()) {
-            eprintln!("{warning}");
+            // Never panic on a closed stderr (EPIPE): losing the warning is the
+            // lesser evil.
+            let _ = writeln!(std::io::stderr(), "{warning}");
         }
     }
 }
@@ -1774,45 +2039,31 @@ mod oplog_stats_tests {
         sink.release();
         logger.shutdown();
         let end = logger.stats();
-        assert_eq!(end, mid, "draining must not change the outcome counts");
+        assert_eq!(
+            (
+                end.accepted,
+                end.dropped_full,
+                end.rejected_closed,
+                end.writer_failed
+            ),
+            (
+                mid.accepted,
+                mid.dropped_full,
+                mid.rejected_closed,
+                mid.writer_failed
+            ),
+            "draining must not change the outcome counts"
+        );
+        assert_eq!(mid.written, 0, "the writer is still inside its first row");
+        assert_eq!(
+            end.written, end.accepted,
+            "draining writes every accepted row"
+        );
         assert_eq!(
             sink.rows() as u64,
             end.accepted,
             "accepted must equal the data rows in the file"
         );
-    }
-
-    // The finalize warning appears exactly when records were lost and carries
-    // the counts and both remedies.
-    #[test]
-    fn incomplete_warning_is_printed_only_for_lost_records() {
-        let mut st = Logger::open(
-            tempfile::tempdir()
-                .unwrap()
-                .path()
-                .join("w.zst")
-                .to_str()
-                .unwrap(),
-            8,
-            false,
-        )
-        .map(|l| {
-            l.shutdown();
-            l.stats()
-        })
-        .unwrap_or_else(|e| panic!("open: {e}"));
-        assert_eq!(incomplete_warning(&st), None);
-        st.rejected_closed = 99; // not a loss of an open session
-        st.accepted = 7;
-        assert_eq!(incomplete_warning(&st), None);
-        st.dropped_full = 123;
-        let w = incomplete_warning(&st).unwrap();
-        assert!(w.contains("123 entries were dropped"), "{w}");
-        assert!(w.contains("S3DLIO_OPLOG_LOSSLESS=1") && w.contains("S3DLIO_OPLOG_BUF"));
-        assert!(w.contains("(7 were accepted)"), "{w}");
-        st.dropped_full = 0;
-        st.writer_failed = 5;
-        assert!(incomplete_warning(&st).unwrap().contains("5 were lost"));
     }
 
     // Closed outcomes are counted, on both reject paths, and never counted as
@@ -1985,6 +2236,503 @@ mod oplog_stats_tests {
                 "round {round}"
             );
         }
+    }
+}
+
+// Writer-side loss and end-of-stream errors (issue #170 review, finding F1):
+// entries the writer accepted but never wrote, and errors that happen after the
+// last row (zstd finish, flush), a writer panic, must all show in the stats.
+#[cfg(test)]
+mod oplog_writer_error_tests {
+    use super::*;
+    use std::io::Read;
+    use std::sync::Condvar;
+    use std::time::Instant;
+
+    fn entry_at(tag: &str, when: SystemTime) -> LogEntry {
+        LogEntry {
+            idx: 0,
+            thread_id: 0,
+            operation: "GET".to_string(),
+            client_id: String::new(),
+            num_objects: 1,
+            bytes: 1,
+            endpoint: String::new(),
+            file: tag.to_string(),
+            error: None,
+            start_time: when,
+            first_byte_time: None,
+            end_time: when,
+        }
+    }
+
+    fn entry(tag: &str) -> LogEntry {
+        entry_at(tag, SystemTime::now())
+    }
+
+    /// ~400 KB of hex digits in the `file` column: one entry makes zstd hand
+    /// several blocks to the sink.
+    fn big_entry(seed: u64) -> LogEntry {
+        let mut x = seed | 1;
+        let mut file = String::with_capacity(400_000);
+        while file.len() < 400_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            file.push_str(&format!("{x:016x}"));
+        }
+        entry(&file)
+    }
+
+    #[derive(Default)]
+    struct QuotaState {
+        /// A write is waiting for `released`.
+        blocked: bool,
+        released: bool,
+        bytes: Vec<u8>,
+    }
+
+    /// A sink that stalls its writes until released, then keeps up to `quota`
+    /// bytes and fails every write that would exceed it (a disk that fills up).
+    #[derive(Clone)]
+    struct QuotaSink {
+        state: Arc<(Mutex<QuotaState>, Condvar)>,
+        quota: usize,
+    }
+
+    impl QuotaSink {
+        fn new(quota: usize) -> Self {
+            Self {
+                state: Arc::default(),
+                quota,
+            }
+        }
+
+        fn lock(&self) -> MutexGuard<'_, QuotaState> {
+            self.state.0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn wait_until_blocked(&self) {
+            let mut st = self.lock();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !st.blocked {
+                assert!(Instant::now() < deadline, "writer never reached the sink");
+                st = self
+                    .state
+                    .1
+                    .wait_timeout(st, Duration::from_millis(10))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+
+        fn release(&self) {
+            self.lock().released = true;
+            self.state.1.notify_all();
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.lock().bytes.clone()
+        }
+    }
+
+    impl Write for QuotaSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut st = self.lock();
+            if !st.released {
+                st.blocked = true;
+                self.state.1.notify_all();
+                while !st.released {
+                    st = self
+                        .state
+                        .1
+                        .wait_timeout(st, Duration::from_millis(10))
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+            }
+            if st.bytes.len() + buf.len() > self.quota {
+                return Err(std::io::Error::other("injected: no space left on device"));
+            }
+            st.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A sink that accepts everything until a failure is armed.
+    #[derive(Clone, Default)]
+    struct SwitchSink {
+        fail_write: Arc<AtomicBool>,
+        fail_flush: Arc<AtomicBool>,
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SwitchSink {
+        fn bytes(&self) -> Vec<u8> {
+            self.bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Write for SwitchSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected: write failed"));
+            }
+            self.bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush.load(Ordering::SeqCst) {
+                Err(std::io::Error::other("injected: flush failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Complete rows of the readable prefix of a possibly truncated zstd stream
+    /// (header excluded). Each complete row must have 13 columns and the next idx.
+    fn readable_rows(bytes: &[u8]) -> u64 {
+        let mut decoder = zstd::stream::read::Decoder::new(bytes).unwrap();
+        let (mut text, mut buf) = (Vec::new(), [0_u8; 65536]);
+        // Stops at the end of the stream or at the first error (a truncated stream).
+        while let Ok(n @ 1..) = decoder.read(&mut buf) {
+            text.extend_from_slice(&buf[..n]);
+        }
+        let text = String::from_utf8_lossy(&text);
+        // Only newline-terminated lines are complete rows.
+        let complete = text.rfind('\n').map_or("", |last| &text[..=last]);
+        let mut lines = complete.lines();
+        assert_eq!(lines.next().map(|h| h.starts_with("idx\t")), Some(true));
+        let mut rows = 0;
+        for line in lines {
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cols.len(), 13, "row {rows}");
+            assert_eq!(cols[0], rows.to_string(), "row {rows} idx");
+            rows += 1;
+        }
+        rows
+    }
+
+    fn stats(accepted: u64, written: u64) -> OpLogStats {
+        OpLogStats {
+            accepted,
+            dropped_full: 0,
+            rejected_closed: 0,
+            writer_failed: 0,
+            lossless: false,
+            written,
+            writer_error: None,
+        }
+    }
+
+    // THE bug: the writer fails on a full disk with many entries queued. Every
+    // one of them was Accepted, no later call is refused, and so the counters
+    // that existed before (`dropped_full`, `writer_failed`) all read zero --
+    // yet most of the log is gone. `written < accepted` and `writer_error` say so.
+    //
+    // What the destination holds: a zstd stream cut at the failure point. It has
+    // no frame end (a strict decoder reports the truncation), its readable
+    // prefix is the header plus R complete rows with sequential idx, and
+    // R <= written (the encoder buffers, so rows handed to it are not all out).
+    #[test]
+    fn writer_failure_with_entries_queued_shows_in_the_stats() {
+        const QUEUED: u64 = 20;
+        for lossless in [false, true] {
+            let sink = QuotaSink::new(600_000);
+            sink.lock().released = true; // the header is written by `start` itself
+            let logger = Logger::start(sink.clone(), 64, lossless, 1, "oplog-wf").unwrap();
+            {
+                let mut st = sink.lock();
+                st.released = false;
+                st.blocked = false;
+            }
+            assert_eq!(logger.try_log(big_entry(0)), LogOutcome::Accepted);
+            sink.wait_until_blocked(); // the writer holds row 0 inside the sink
+            for i in 1..QUEUED {
+                assert_eq!(logger.try_log(big_entry(i)), LogOutcome::Accepted);
+            }
+            sink.release();
+            logger.shutdown();
+
+            let st = logger.stats();
+            let ctx = format!("lossless={lossless}: {st:?}");
+            assert_eq!(st.accepted, QUEUED, "{ctx}");
+            // The pre-existing counters cannot see this loss:
+            assert_eq!(
+                (st.dropped_full, st.rejected_closed, st.writer_failed),
+                (0, 0, 0),
+                "{ctx}"
+            );
+            assert!(st.written >= 1 && st.written < st.accepted, "{ctx}");
+            let error = st.writer_error.as_deref().unwrap_or_default();
+            // The FIRST error (the failed write), not the later finish attempt's.
+            assert!(
+                error.starts_with("write failed") && error.contains("injected: no space left"),
+                "{ctx}"
+            );
+            assert!(!st.is_complete(), "{ctx}");
+
+            let warning = incomplete_warning(&st).unwrap_or_else(|| panic!("no warning: {ctx}"));
+            let lost = QUEUED - st.written;
+            assert!(
+                warning.contains(&format!("{lost} accepted entries were never written")),
+                "{warning}"
+            );
+            assert!(warning.contains("injected: no space left"), "{warning}");
+
+            let bytes = sink.bytes();
+            assert!(
+                zstd::decode_all(bytes.as_slice()).is_err(),
+                "{ctx}: the stream must be visibly truncated"
+            );
+            assert!(readable_rows(&bytes) <= st.written, "{ctx}");
+        }
+    }
+
+    // The error only appears when the stream is finished: the rows were all
+    // accepted and handed to the encoder (written == accepted), the zstd frame
+    // end cannot be written. Before the fix this was swallowed by the encoder's
+    // drop.
+    #[test]
+    fn zstd_finish_failure_is_reported() {
+        let sink = SwitchSink::default();
+        let logger = Logger::start(sink.clone(), 64, false, 1, "oplog-ff").unwrap();
+        for i in 0..5 {
+            assert_eq!(
+                logger.try_log(entry(&format!("r{i}"))),
+                LogOutcome::Accepted
+            );
+        }
+        // Five tiny rows stay inside the encoder: only finishing reaches the sink.
+        sink.fail_write.store(true, Ordering::SeqCst);
+        logger.shutdown();
+
+        let st = logger.stats();
+        assert_eq!((st.accepted, st.written), (5, 5), "{st:?}");
+        let error = st.writer_error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("finish") && error.contains("injected: write failed"),
+            "{st:?}"
+        );
+        assert!(!st.is_complete());
+        assert!(incomplete_warning(&st).is_some());
+        assert!(
+            zstd::decode_all(sink.bytes().as_slice()).is_err(),
+            "no frame end reached the sink"
+        );
+    }
+
+    // The final flush of the buffered sink (BufWriter in production) failing:
+    // every byte was handed over, but it may not be on disk.
+    #[test]
+    fn final_flush_failure_is_reported() {
+        let sink = SwitchSink::default();
+        let logger = Logger::start(sink.clone(), 64, false, 1, "oplog-fl").unwrap();
+        for i in 0..5 {
+            assert_eq!(
+                logger.try_log(entry(&format!("r{i}"))),
+                LogOutcome::Accepted
+            );
+        }
+        sink.fail_flush.store(true, Ordering::SeqCst);
+        logger.shutdown();
+
+        let st = logger.stats();
+        assert_eq!((st.accepted, st.written), (5, 5), "{st:?}");
+        let error = st.writer_error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("flush") && error.contains("injected: flush failed"),
+            "{st:?}"
+        );
+        assert!(!st.is_complete());
+        assert!(incomplete_warning(&st).is_some());
+        // Only the flush failed: the bytes that reached the sink are a whole stream.
+        assert_eq!(readable_rows(&sink.bytes()), 5);
+    }
+
+    // A panic in the writer thread (here: a time pushed before the epoch makes
+    // humantime's formatter panic, a recorded pre-existing limit) must not hang
+    // shutdown, and must show up as an error. The stream is still finished, so
+    // the rows before the panic are readable.
+    #[test]
+    fn writer_panic_is_reported_and_shutdown_does_not_hang() {
+        for lossless in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ops.tsv.zst");
+            let logger = Logger::open(path.to_str().unwrap(), 8, lossless).unwrap();
+            logger.set_clock_offset(2_000_000_000);
+            assert_eq!(logger.try_log(entry("fine")), LogOutcome::Accepted);
+            let pre_epoch = entry_at("boom", std::time::UNIX_EPOCH + Duration::from_secs(1));
+            assert_eq!(logger.try_log(pre_epoch), LogOutcome::Accepted);
+            for _ in 0..50 {
+                match logger.try_log(entry("later")) {
+                    // Full: the queue can fill before the writer reaches the bad row.
+                    LogOutcome::Accepted | LogOutcome::WriterFailed => {}
+                    LogOutcome::Full if !lossless => {}
+                    other => panic!("lossless={lossless}: unexpected {other:?}"),
+                }
+            }
+
+            let (done_tx, done_rx) = channel::<()>();
+            let closing = logger.clone();
+            thread::spawn(move || {
+                closing.shutdown();
+                let _ = done_tx.send(());
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("lossless={lossless}: shutdown hung after a panic"));
+
+            let st = logger.stats();
+            let error = st.writer_error.as_deref().unwrap_or_default();
+            assert!(
+                error.contains("panicked") && error.contains("after the epoch"),
+                "lossless={lossless}: {st:?}"
+            );
+            assert_eq!(st.written, 1, "only the row before the panic: {st:?}");
+            assert!(st.accepted >= 2, "{st:?}");
+            assert!(!st.is_complete());
+            assert!(incomplete_warning(&st).is_some());
+            let raw = std::fs::read(&path).unwrap();
+            assert_eq!(readable_rows(&raw), 1);
+            assert!(
+                zstd::decode_all(raw.as_slice()).is_ok(),
+                "the stream is finished after a writer panic"
+            );
+        }
+    }
+
+    // If the writer thread vanishes without its completion message (a panic that
+    // escaped), shutdown records that instead of ignoring the closed channel.
+    #[test]
+    fn missing_completion_message_is_recorded() {
+        let report = WriterReport::default();
+        let (done_tx, done_rx) = channel::<()>();
+        drop(done_tx);
+        wait_for_writer(&done_rx, &report);
+        let recorded = report.first_error.get().map(String::as_str);
+        assert!(
+            recorded.is_some_and(|e| e.contains("without completing")),
+            "{recorded:?}"
+        );
+
+        // A message from the writer is not an error, and the first error stays.
+        let report = WriterReport::default();
+        let (done_tx, done_rx) = channel::<()>();
+        done_tx.send(()).unwrap();
+        wait_for_writer(&done_rx, &report);
+        assert_eq!(report.first_error.get(), None);
+        report.record_error("write", "first");
+        report.record_error("flush", "second");
+        assert_eq!(
+            report.first_error.get().map(String::as_str),
+            Some("write: first")
+        );
+    }
+
+    // A healthy session: nothing to report, byte-for-byte what it always wrote.
+    #[test]
+    fn healthy_session_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ops.tsv.zst");
+        let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
+        for i in 0..7 {
+            assert_eq!(
+                logger.try_log(entry(&format!("r{i}"))),
+                LogOutcome::Accepted
+            );
+        }
+        logger.shutdown();
+        let st = logger.stats();
+        assert_eq!((st.accepted, st.written), (7, 7));
+        assert_eq!(st.writer_error, None);
+        assert!(st.is_complete());
+        assert_eq!(incomplete_warning(&st), None);
+        assert_eq!(
+            readable_rows(&std::fs::read(&path).unwrap()),
+            7,
+            "all rows in the file"
+        );
+    }
+
+    // "Complete" is exactly: accepted == written, no drops, no refused entries,
+    // no writer error. Closed calls are separate.
+    #[test]
+    fn is_complete_definition() {
+        assert!(stats(10, 10).is_complete());
+        let mut st = stats(10, 10);
+        st.rejected_closed = 99;
+        assert!(st.is_complete(), "rejected_closed is not part of complete");
+        assert!(!stats(10, 9).is_complete());
+        let mut st = stats(10, 10);
+        st.dropped_full = 1;
+        assert!(!st.is_complete());
+        let mut st = stats(10, 10);
+        st.writer_failed = 1;
+        assert!(!st.is_complete());
+        let mut st = stats(10, 10);
+        st.writer_error = Some("x".to_string());
+        assert!(!st.is_complete());
+    }
+
+    // The warning is tailored: only the non-zero counts, and only the advice that
+    // applies to the mode.
+    #[test]
+    fn warning_text_is_tailored_to_mode_and_counts() {
+        assert_eq!(incomplete_warning(&stats(100, 100)), None);
+        let mut closed_only = stats(100, 100);
+        closed_only.rejected_closed = 5;
+        assert_eq!(incomplete_warning(&closed_only), None);
+
+        // Lossy mode, queue-full drops only: the remedies, nothing else.
+        let mut drops = stats(100, 100);
+        drops.dropped_full = 7;
+        let w = incomplete_warning(&drops).unwrap();
+        assert!(w.contains("op-log is INCOMPLETE"), "{w}");
+        assert!(
+            w.contains("7 entries were dropped because the queue was full"),
+            "{w}"
+        );
+        assert!(w.contains("S3DLIO_OPLOG_LOSSLESS=1") && w.contains("S3DLIO_OPLOG_BUF"));
+        assert!(w.contains("100 accepted, 100 written"), "{w}");
+        for absent in ["never written", "writer failed", "refused", "I/O"] {
+            assert!(!w.contains(absent), "unexpected '{absent}' in: {w}");
+        }
+
+        // Lossless mode, writer error with queued entries lost: no LOSSLESS
+        // advice and no queue advice, no "dropped" line, the error is quoted.
+        let mut lost = stats(100, 40);
+        lost.lossless = true;
+        lost.writer_error = Some("write: no space left on device".to_string());
+        let w = incomplete_warning(&lost).unwrap();
+        assert!(w.contains("60 accepted entries were never written"), "{w}");
+        assert!(w.contains("no space left on device"), "{w}");
+        assert!(w.contains("destination"), "{w}");
+        for absent in ["LOSSLESS", "S3DLIO_OPLOG_BUF", "dropped", "refused"] {
+            assert!(!w.contains(absent), "unexpected '{absent}' in: {w}");
+        }
+
+        // Refused-after-the-writer-stopped and late (closed) calls are named
+        // only when non-zero.
+        let mut refused = stats(10, 10);
+        refused.writer_failed = 3;
+        refused.rejected_closed = 2;
+        let w = incomplete_warning(&refused).unwrap();
+        assert!(w.contains("3 entries were refused"), "{w}");
+        assert!(w.contains("2 calls arrived after finalize began"), "{w}");
+        assert!(!w.contains("dropped"), "{w}");
     }
 }
 

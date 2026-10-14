@@ -219,45 +219,84 @@ After finalize, `set_clock_offset` / `get_clock_offset` return an error of kind
 `Unsupported` saying the op-log was already finalized (before any init the kind
 is `NotFound`, "Logger not initialized").
 
-### Detecting dropped records
+### Detecting lost records
 
 By default the op-log is **lossy**: it never slows the caller, so when the
 writer cannot keep up and the queue (`S3DLIO_OPLOG_BUF`, default 8192 entries)
 is full, the entry is dropped. `S3DLIO_OPLOG_LOSSLESS=1` makes callers wait
-instead. A caller can always tell whether a log is complete:
+instead. Separately, the background writer can fail (disk full, I/O error) with
+entries still queued. A caller can always tell whether a log is complete:
 
 ```rust
-if let Some(stats) = s3dlio::op_log_stats() {          // Option<OpLogStats>
-    // stats.accepted, stats.dropped_full, stats.rejected_closed,
-    // stats.writer_failed, stats.lossless
-    let complete = stats.dropped_full == 0 && stats.writer_failed == 0;
+s3dlio::finalize_op_logger();                              // first: stop the workers, then finalize
+if let Some(stats) = s3dlio::op_log_stats() {              // Option<OpLogStats>
+    let complete = stats.is_complete();                    // see the definition below
+    let late_calls = stats.rejected_closed;                // should be 0 as well
 }
 ```
 
 ```python
+s3dlio.finalize_op_log()
 stats = s3dlio.op_log_stats()   # None before init_op_log(), else a dict
-complete = stats["dropped_full"] == 0 and stats["writer_failed"] == 0
+complete = (stats["accepted"] == stats["written"] and stats["dropped_full"] == 0
+            and stats["writer_failed"] == 0 and stats["writer_error"] is None)
 ```
+
+**Definition of complete.** After finalize has returned, the log is complete
+exactly when
+
+```
+accepted == written  AND  dropped_full == 0  AND  writer_failed == 0  AND  writer_error is None
+```
+
+(`OpLogStats::is_complete()` in Rust.) Judge completeness **after** finalize:
+while the session is Active, `accepted > written` is normal (entries are queued).
 
 | Count | Meaning |
 |---|---|
-| `accepted` | entries queued for the writer (`LogOutcome::Accepted`); after finalize these are the data rows in the file, unless `writer_failed` is non-zero |
+| `accepted` | entries queued for the writer (`LogOutcome::Accepted`) |
+| `written` | rows the writer handed to the zstd encoder without an error. An **upper bound** of the rows in the file: the encoder and the file buffer them, so a later flush or finish failure can still lose some (that failure is `writer_error`) |
 | `dropped_full` | entries dropped because the queue was full (`LogOutcome::Full`); default mode only, always 0 when lossless |
-| `rejected_closed` | entries that arrived after finalize began (`LogOutcome::Closed`); not written, not a loss of an open session |
-| `writer_failed` | entries lost because the writer stopped after an I/O error (`LogOutcome::WriterFailed`) |
+| `writer_failed` | calls **refused because the writer had already stopped** (`LogOutcome::WriterFailed`). It does *not* count entries that were queued before the writer stopped: those show as `accepted - written` |
+| `writer_error` | `None`, or the first error the writer met, as text: a failed write, a failed zstd finish or final flush, or a writer-thread panic |
+| `rejected_closed` | calls that arrived after finalize had begun (`LogOutcome::Closed`); see below |
 | `lossless` | the session's mode |
 
+**What the file holds after a writer error.** If the writer stops on an I/O
+error, entries still queued are not written and the file is a zstd stream cut
+at the failure point: it has no frame end (`zstd -t` and strict decoders report
+a truncated file), and a streaming decoder can read the header plus some number
+of complete rows R with `R <= written`. If only the final finish or flush fails,
+every row was handed over and the bytes may all be there, but `writer_error`
+says they are not guaranteed to be on disk. After a writer-thread panic the
+writer still finishes the stream, so the rows before the panic are readable.
+
+**`rejected_closed` is not part of "complete".** Calls made after finalize began
+(for example from a store created before finalize that is still used by a worker
+thread) are counted in `rejected_closed` and are **not in the file**; they were
+never going to be. A program that logs after finalizing has a defect of its own:
+finalize only after the workers that log have stopped, and check
+`rejected_closed == 0` as well as `is_complete()`.
+
 `op_log_stats()` / `Logger::stats()` work while the op-log is Active **and after
-it is Finalized** (`None` only before init), so a program can finalize and then
-check the totals. The counts cover every clone of the session's `Logger`, are
-relaxed atomics (a snapshot taken while threads are still logging is a progress
-report, not a transaction), and `OpLogStats` is `#[non_exhaustive]`.
-`finalize_op_logger()` / `finalize_op_log()` prints **one** stderr warning with
-the counts and the remedies (`S3DLIO_OPLOG_LOSSLESS=1`, a larger
-`S3DLIO_OPLOG_BUF`) if `dropped_full + writer_failed > 0`. A per-call
-`try_log` outcome is still available when you need to know about one entry.
+it is Finalized** (`None` only before init, including after a failed init), so a
+program can finalize and then check the totals. The counts cover every clone of
+the session's `Logger`. While threads are still logging they are relaxed atomics
+(a snapshot is a progress report, not a transaction). Once finalize has returned,
+a read has a happens-before edge with the final values of every call that began
+before the close: finalize publishes them with a Release store and `stats()` reads
+with Acquire. `OpLogStats` is `#[non_exhaustive]`.
+
+`finalize_op_logger()` / `finalize_op_log()` prints **one** stderr warning if any
+record was lost (anything that makes the log not complete): it names only the
+non-zero counts (and the writer's error), and gives the `S3DLIO_OPLOG_LOSSLESS=1`
+/ `S3DLIO_OPLOG_BUF` advice only when entries were dropped in lossy mode. A
+per-call `try_log` outcome is still available when you need to know about one
+entry.
 
 Cost: one relaxed `fetch_add` per call, on the path that matches its outcome.
+The writer thread keeps its own `written` counter (one plain store per row, in
+its own cache line), so the hot path has nothing added.
 
 ### Op-log destinations
 
@@ -314,15 +353,20 @@ not a machine-checked inventory:
 - Python `finalize_op_log` releases the GIL while it drains the queue, so other
   Python threads can run during a long drain.
 - `op_log_stats()` / `Logger::stats()` / `OpLogStats` (Python `op_log_stats()`)
-  are new: accepted, dropped (queue full), rejected-after-finalize and
-  writer-failed counts, available while Active and after Finalized, so a caller
-  can detect dropped records (see "Detecting dropped records"). Finalize prints
-  one stderr warning if records were dropped or lost. The default stays lossy.
+  are new: accepted, written, dropped (queue full), rejected-after-finalize and
+  writer-failed counts and the writer's first error, available while Active and
+  after Finalized, so a caller can detect lost records (see "Detecting lost
+  records"). Finalize prints one stderr warning if records were lost. The default
+  stays lossy.
+- The writer thread now finishes the zstd stream and flushes the file
+  explicitly and records any error (previously the encoder's drop ignored them),
+  and a panic in the writer thread is caught and recorded. The bytes written for
+  every accepted entry are unchanged.
 - Every `try_log` / `log` call now performs one atomic `fetch_add` and one
   `fetch_sub` on a single gate counter shared by all threads. This is a new
   per-entry cost, and it is contended when many threads log at once. It has not
   been benchmarked. Each call also bumps one relaxed outcome counter (see
-  "Detecting dropped records").
+  "Detecting lost records").
 - A clock offset of `i64::MIN` no longer panics the writer thread in builds with
   overflow checks. A corrected timestamp before the epoch (or at or after year
   9999) still panics inside the timestamp formatter, as before.

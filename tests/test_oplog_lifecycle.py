@@ -38,12 +38,21 @@ def zstd_cli() -> str:
     return path
 
 
+def child_env(extra=None) -> dict:
+    """This process's environment minus every S3DLIO_OPLOG_* variable, plus `extra`."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("S3DLIO_OPLOG_")}
+    env.update(extra or {})
+    return env
+
+
 def run_scenario(
     body: str, *args: str, timeout: int = 120, cwd=None, env=None
 ) -> subprocess.CompletedProcess:
     """Run `body` in a fresh interpreter whose working directory is `cwd` (or the
-    caller's if None), so tests can see what a relative path would create. `env`
-    adds variables to a copy of this process's environment."""
+    caller's if None), so tests can see what a relative path would create. The child
+    gets a copy of this process's environment WITHOUT any S3DLIO_OPLOG_* variable
+    (the caller's queue size / lossless / buffer settings must not change what a
+    scenario measures); `env` then adds the variables a scenario wants."""
     code = "import sys, os, s3dlio\n" + textwrap.dedent(body)
     proc = subprocess.Popen(
         [sys.executable, "-c", code, *args],
@@ -51,7 +60,7 @@ def run_scenario(
         stderr=subprocess.PIPE,
         text=True,
         cwd=None if cwd is None else str(cwd),
-        env=None if env is None else {**os.environ, **env},
+        env=child_env(env),
     )
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -324,7 +333,15 @@ def test_file_uri_with_nothing_after_it_is_rejected(tmp_path):
     assert sorted(tmp_path.iterdir()) == []
 
 
-STATS_KEYS = {"accepted", "dropped_full", "rejected_closed", "writer_failed", "lossless"}
+STATS_KEYS = {
+    "accepted",
+    "dropped_full",
+    "rejected_closed",
+    "writer_failed",
+    "lossless",
+    "written",
+    "writer_error",
+}
 
 
 def test_op_log_stats_none_before_init_then_counts_match_rows(tmp_path):
@@ -365,7 +382,10 @@ def test_op_log_stats_none_before_init_then_counts_match_rows(tmp_path):
     rows = read_rows(oplog)
     assert len(rows) == 4
     assert after["accepted"] == len(rows)
-    assert "INCOMPLETE" not in proc.stderr, "no warning when nothing was dropped"
+    # Complete: accepted == written, nothing dropped or refused, no writer error.
+    assert after["written"] == after["accepted"]
+    assert after["writer_error"] is None
+    assert "INCOMPLETE" not in proc.stderr, "no warning when nothing was lost"
 
 
 FLOOD = """
@@ -375,9 +395,9 @@ FLOOD = """
     uri = "file://" + work + "/a.bin"
     s3dlio.put_bytes(uri, b"aaaa")
     def worker():
-        for _ in range(1000):
+        for _ in range(WORKER_CALLS):
             s3dlio.get(uri)
-    threads = [threading.Thread(target=worker) for _ in range(4)]
+    threads = [threading.Thread(target=worker) for _ in range(WORKERS)]
     for t in threads:
         t.start()
     for t in threads:
@@ -385,6 +405,9 @@ FLOOD = """
     s3dlio.finalize_op_log()
     print(json.dumps(s3dlio.op_log_stats()))
 """
+WORKERS = 8
+WORKER_CALLS = 2500
+FLOOD_CALLS = 1 + WORKERS * WORKER_CALLS  # 1 put + the gets
 
 
 def run_flood(tmp_path, env):
@@ -393,31 +416,85 @@ def run_flood(tmp_path, env):
     work = tmp_path / "work"
     work.mkdir()
     oplog = tmp_path / "ops.tsv.zst"
-    proc = run_scenario(FLOOD, str(oplog), str(work), env=env)
+    body = FLOOD.replace("WORKER_CALLS", str(WORKER_CALLS)).replace("WORKERS", str(WORKERS))
+    proc = run_scenario(body, str(oplog), str(work), env=env)
     assert_ok(proc)
     return json.loads(proc.stdout.strip().splitlines()[-1]), read_rows(oplog), proc.stderr
 
 
-def test_default_mode_drops_are_counted_and_warned_about_once(tmp_path):
-    """A one-slot queue under four threads drops entries (the default is lossy);
-    op_log_stats() counts them, accepted == rows in the file, and finalize prints
-    exactly one warning that names the remedies (#170)."""
+def test_default_mode_counts_every_call_and_warns_exactly_when_entries_were_dropped(tmp_path):
+    """One-slot queue, eight threads, 20001 calls, default (lossy) mode.
+
+    Whether any call is dropped depends on how the writer thread is scheduled on
+    a shared host, so this test asserts only what must hold for EVERY schedule:
+    each call is counted exactly once (accepted + dropped_full == calls),
+    accepted == the rows in the file, and finalize prints one warning if and only
+    if something was dropped (with the drop count, the remedies and the other
+    non-zero counts). It therefore cannot flake: no schedule violates it. On a
+    host where the writer happens to keep up, the "drops happened" branch is not
+    exercised; that case is pinned deterministically elsewhere (a stalled sink in
+    the Rust unit tests of s3_logger::oplog_stats_tests, a real disk-limit error
+    in tests/oplog_lifecycle_finalize_warning.rs and in the last test below)."""
     env = {"S3DLIO_OPLOG_BUF": "1", "S3DLIO_OPLOG_LOSSLESS": "0"}
     stats, rows, stderr = run_flood(tmp_path, env)
     assert stats["lossless"] is False
-    assert stats["dropped_full"] > 0, stats
-    assert stats["accepted"] + stats["dropped_full"] == 4001, stats  # 1 put + 4000 gets
+    assert stats["accepted"] + stats["dropped_full"] == FLOOD_CALLS, stats
     assert stats["rejected_closed"] == stats["writer_failed"] == 0
-    assert stats["accepted"] == len(rows)
-    assert stderr.count("op-log is INCOMPLETE") == 1, stderr
-    assert f"{stats['dropped_full']} entries were dropped" in stderr
-    assert "S3DLIO_OPLOG_LOSSLESS=1" in stderr and "S3DLIO_OPLOG_BUF" in stderr
+    assert stats["accepted"] == stats["written"] == len(rows), stats
+    assert stats["writer_error"] is None
+    warnings = stderr.count("op-log is INCOMPLETE")
+    assert warnings == (1 if stats["dropped_full"] > 0 else 0), (stats, stderr)
+    if stats["dropped_full"] > 0:
+        assert f"{stats['dropped_full']} entries were dropped because the queue was full" in stderr
+        assert "S3DLIO_OPLOG_LOSSLESS=1" in stderr and "S3DLIO_OPLOG_BUF" in stderr
 
 
 def test_lossless_mode_reports_no_drops_and_no_warning(tmp_path):
     env = {"S3DLIO_OPLOG_BUF": "1", "S3DLIO_OPLOG_LOSSLESS": "1"}
     stats, rows, stderr = run_flood(tmp_path, env)
     assert stats["lossless"] is True
-    assert stats["accepted"] == len(rows) == 4001, stats
+    assert stats["accepted"] == stats["written"] == len(rows) == FLOOD_CALLS, stats
     assert stats["dropped_full"] == stats["rejected_closed"] == stats["writer_failed"] == 0
+    assert stats["writer_error"] is None
     assert "INCOMPLETE" not in stderr, stderr
+
+
+def test_write_error_at_the_end_of_the_stream_is_reported_deterministically(tmp_path):
+    """A REAL I/O error, produced deterministically: after the header is on disk the
+    child caps the file at its current size (RLIMIT_FSIZE, SIGXFSZ ignored so the
+    kernel returns EFBIG instead of killing the process). Four tiny rows stay in the
+    compressor, so finalize's write of the stream end fails: the rows were all
+    handed to the compressor (written == accepted) but the log is not complete, and
+    both op_log_stats() and the one stderr warning say so."""
+    work = tmp_path / "work"
+    work.mkdir()
+    oplog = tmp_path / "ops.tsv.zst"
+    proc = run_scenario(
+        """
+        import json, resource, signal
+        oplog, work = sys.argv[1:3]
+        s3dlio.init_op_log(oplog)
+        size = os.path.getsize(oplog)
+        assert size > 0, "the header must already be on disk"
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (size, size))
+        a = "file://" + work + "/a.bin"
+        s3dlio.put_bytes(a, b"aaaa")
+        for _ in range(3):
+            s3dlio.get(a)
+        s3dlio.finalize_op_log()
+        print(json.dumps(s3dlio.op_log_stats()))
+        """,
+        str(oplog),
+        str(work),
+    )
+    assert_ok(proc)
+    import json
+
+    stats = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert stats["accepted"] == stats["written"] == 4, stats
+    assert stats["dropped_full"] == stats["rejected_closed"] == stats["writer_failed"] == 0
+    assert isinstance(stats["writer_error"], str) and "File too large" in stats["writer_error"], stats
+    assert proc.stderr.count("op-log is INCOMPLETE") == 1, proc.stderr
+    assert "the writer failed:" in proc.stderr and "File too large" in proc.stderr
+    assert "S3DLIO_OPLOG_LOSSLESS=1" not in proc.stderr, "no queue advice: nothing was dropped"

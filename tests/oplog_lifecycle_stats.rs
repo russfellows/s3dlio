@@ -99,7 +99,26 @@ fn op_log_stats_before_during_and_after_finalize() {
     assert!(global_logger().is_none(), "no active logger after finalize");
 
     let after = op_log_stats().expect("Some after finalize (stats are kept)");
-    assert_eq!(after, during, "finalize must not change the counts");
+    assert_eq!(
+        (
+            after.accepted,
+            after.dropped_full,
+            after.rejected_closed,
+            after.writer_failed
+        ),
+        (
+            during.accepted,
+            during.dropped_full,
+            during.rejected_closed,
+            during.writer_failed
+        ),
+        "finalize must not change the outcome counts"
+    );
+    // The writer may still have been draining at `during`; after finalize it has
+    // written every accepted row, cleanly. Dropped entries make it incomplete.
+    assert_eq!(after.written, after.accepted);
+    assert_eq!(after.writer_error, None);
+    assert!(!after.is_complete(), "queue-full drops are not complete");
 
     for _ in 0..5 {
         assert_eq!(logger.try_log(entry("late")), LogOutcome::Closed);
@@ -107,6 +126,7 @@ fn op_log_stats_before_during_and_after_finalize() {
     let late = op_log_stats().expect("still Some");
     assert_eq!(late.rejected_closed, 5);
     assert_eq!(late.accepted, accepted);
+    assert_eq!(late.written, accepted);
 
     let text = zstd::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap();
     let rows = text.split(|b| *b == b'\n').count() - 2; // header and trailing empty
