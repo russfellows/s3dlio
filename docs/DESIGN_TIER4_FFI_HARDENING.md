@@ -314,9 +314,9 @@ different buckets:
   method existing as a separate zero-copy path from `write_owned_bytes()`,
   or (b) a materially more complex lifetime-pinning design. This is not a
   mechanical rewrite like the other 8.
-  *(Update, issue #201: `write_chunk()` now releases the GIL around its `block_on`; the
-  borrowed slice stays valid because the `PyBuffer` export is held until the write returns,
-  so the "GIL is held" half of the quoted invariant no longer applies and no copy was added.)*
+  *(Update, issue #201: `write_chunk()` now releases the GIL around its `block_on` only for an exact
+  `bytes` object, which is immutable and kept alive by the argument; a mutable exporter keeps the GIL,
+  so the quoted invariant still holds for it, and a strided view is copied first.)*
 
 **Option C — migrate only the easy bucket (7 sites: all 4
 `create_*_writer` + `finalize()` + `write_owned_bytes()`'s 2 call

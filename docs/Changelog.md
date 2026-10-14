@@ -11,7 +11,15 @@
   changed here.
 - `list()`, `stat()`, a writer's `write_chunk()` / `write_owned_bytes()`, `parquet_rg_row_offsets()` and
   `gcs_query_rapid_bucket()` release the GIL while they block on I/O, so other Python threads keep
-  running (#201). `write_chunk()` stays zero-copy: the buffer export is held until the write returns.
+  running (#201). `write_chunk()` releases the GIL, with no copy, only for an exact `bytes` object (nothing can
+  change it); a mutable buffer (bytearray, writable memoryview, numpy, mmap, ctypes) keeps the GIL for the
+  write as before, so another thread cannot tear it, and a strided or reversed view is copied under the GIL
+  and then written without it (pass `bytes(data)` to keep other threads running during a large write of
+  mutable data). `write_chunk()` of a strided or reversed view used to write the wrong bytes or read
+  adjacent memory and now writes exactly the bytes the view shows. A writer's `bytes_written()`,
+  `checksum()` and `compressed_bytes()` answer during a write in flight on another thread (values as of the
+  last completed write), and concurrent writes and `finalize()` on one writer run one after another instead
+  of raising "Already mutably borrowed".
 - `stat_async`, `exists_async`, `put_bytes_async`, `mkdir_async` and `put_many_async` use the shared store
   cache instead of building a store and S3 client per call, so a host-form server's connections are
   reused; racing cache misses build one store per key (#204). Op-log rows are unchanged.

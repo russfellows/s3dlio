@@ -120,6 +120,28 @@ struct StoreSlot {
     build: std::sync::Mutex<()>,
 }
 
+/// Take a slot's build lock. Uncontended, this is a plain `try_lock`. When another caller is
+/// building and this one is on a multi-thread Tokio runtime (the async entry points run on
+/// the pyo3 runtime), the wait is wrapped in `block_in_place` so the runtime can run other
+/// tasks on a replacement worker instead of losing this one for the whole cold start. Any
+/// other thread just waits. A poisoned lock (a build that panicked) guards no data and is
+/// recovered.
+fn lock_build(build: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    match build.try_lock() {
+        Ok(guard) => return guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+    let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
+        .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    if on_multi_thread_runtime {
+        tokio::task::block_in_place(|| build.lock().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        build.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 impl StoreSlot {
     fn new() -> Self {
         Self {
@@ -138,7 +160,7 @@ impl StoreSlot {
         if let Some(store) = self.store.get() {
             return Ok(Arc::clone(store));
         }
-        let _building = self.build.lock().unwrap_or_else(|e| e.into_inner());
+        let _building = lock_build(&self.build);
         if let Some(store) = self.store.get() {
             return Ok(Arc::clone(store)); // another caller built it while this one waited
         }
@@ -2216,72 +2238,175 @@ fn snapshot_final_writer_stats(writer: &dyn ObjectWriter) -> (u64, u64, Option<S
     )
 }
 
+/// (bytes_written, compressed_bytes, checksum) of a writer.
+type WriterStats = (u64, u64, Option<String>);
+
+/// Lock a mutex whose data stays consistent even if a holder panicked.
+fn lock_ignoring_poison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Python wrapper for ObjectWriter
+///
+/// `inner` is locked for the whole of a write or of `finalize()`, so calls on one writer
+/// from several threads run one after another instead of raising. `stats` holds the
+/// numbers as of the last COMPLETED call and is never held across I/O, so the accessors
+/// (`bytes_written`, `checksum`, `compressed_bytes`) answer immediately, even while a write
+/// is in flight on another thread (issue #201: the GIL is released during writes).
 #[pyclass]
 pub struct PyObjectWriter {
-    finalized_stats: Option<(u64, u64, Option<String>)>, // (bytes_written, compressed_bytes, checksum)
-    inner: Option<Box<dyn ObjectWriter>>,
+    inner: std::sync::Mutex<Option<Box<dyn ObjectWriter>>>,
+    stats: std::sync::Mutex<WriterStats>,
+}
+
+impl PyObjectWriter {
+    fn new(writer: Box<dyn ObjectWriter>) -> Self {
+        let stats = snapshot_final_writer_stats(writer.as_ref());
+        Self {
+            inner: std::sync::Mutex::new(Some(writer)),
+            stats: std::sync::Mutex::new(stats),
+        }
+    }
+
+    fn finalized_error() -> PyErr {
+        PyRuntimeError::new_err("Writer has been finalized")
+    }
+
+    fn publish_stats(&self, writer: &dyn ObjectWriter) {
+        *lock_ignoring_poison(&self.stats) = snapshot_final_writer_stats(writer);
+    }
+
+    /// Lock `inner` from a thread that holds the GIL, without ever waiting for the lock
+    /// while holding it: a thread writing with the GIL released needs the GIL back to
+    /// return, so waiting here with the GIL would deadlock.
+    fn lock_with_gil(
+        &self,
+        py: Python<'_>,
+    ) -> std::sync::MutexGuard<'_, Option<Box<dyn ObjectWriter>>> {
+        loop {
+            match self.inner.try_lock() {
+                Ok(guard) => return guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // Wait for the holder with the GIL released, then try again.
+                    py.detach(|| drop(lock_ignoring_poison(&self.inner)));
+                }
+            }
+        }
+    }
+
+    /// Write `data` through the locked writer and publish the new stats. Blocks the
+    /// calling thread; the caller decides whether it holds the GIL.
+    fn write_locked(
+        &self,
+        writer: &mut Option<Box<dyn ObjectWriter>>,
+        data: &[u8],
+    ) -> PyResult<()> {
+        let writer = writer.as_mut().ok_or_else(Self::finalized_error)?;
+        let result = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+            writer
+                .write_chunk(data)
+                .await
+                .map_err(|e| py_err(e.context("Failed to write chunk")))
+        });
+        self.publish_stats(writer.as_ref());
+        result
+    }
+
+    /// Write `data` with the GIL released. `data` must stay valid and unchanged for the
+    /// call without the GIL: immutable `bytes` or an owned copy.
+    fn write_detached(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        py.detach(|| {
+            let mut guard = lock_ignoring_poison(&self.inner);
+            self.write_locked(&mut guard, data)
+        })
+    }
+
+    /// `write_owned_bytes` for data already copied out of Python, GIL released.
+    fn write_owned_detached(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
+        py.detach(|| {
+            let mut guard = lock_ignoring_poison(&self.inner);
+            let writer = guard.take().ok_or_else(Self::finalized_error)?;
+            // The writer is moved into the 'static future for `submit_io` and handed
+            // back, so a failed write leaves it usable for a retry or `finalize()`.
+            let (writer, result) = submit_io(async move {
+                let mut writer = writer;
+                let r = writer.write_owned_bytes(data).await;
+                Ok::<_, anyhow::Error>((writer, r))
+            })?;
+            self.publish_stats(writer.as_ref());
+            *guard = Some(writer);
+            result.map_err(|e| py_err(e.context("Failed to write owned bytes")))
+        })
+    }
 }
 
 #[pymethods]
 impl PyObjectWriter {
-    /// Write a chunk of bytes to the stream (ZERO-COPY via buffer protocol)
+    /// Write a chunk of bytes to the stream (zero-copy via buffer protocol)
     ///
     /// Accepts any Python object supporting the buffer protocol:
     /// - bytes, bytearray, memoryview
     /// - NumPy arrays, PyTorch tensors
     /// - Any object with __buffer__ method
     ///
-    /// This method avoids copying data from Python to Rust by using PyBuffer
-    /// to get a direct view of Python's memory during the synchronous write.
+    /// No copy is made, except for a non-contiguous view (a strided or reversed
+    /// memoryview, a transposed array), which is copied once into contiguous memory.
     ///
-    /// The GIL is released for the blocking write (issue #201), so other Python
-    /// threads keep running. The borrowed memory stays valid without it: the
-    /// `PyBuffer` export is held until the write has returned, and a `bytes`
-    /// fallback is kept alive by `data`. Nothing is copied.
-    fn write_chunk(&mut self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let writer = self
-            .inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
-
-        // Try buffer protocol first (zero-copy path)
-        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-            // Get readonly slice - no copy!
-            let slice = unsafe {
-                // SAFETY: `buffer` is a live Py_buffer export, released only after the
-                // write below has returned, so the exporter cannot free or resize the
-                // memory (a bytearray refuses to resize while exported) while the GIL
-                // is released. The write only reads from the slice.
-                std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
-            };
-
-            // Synchronous write while buffer is alive, GIL released.
-            let result = py.detach(|| {
-                pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                    writer
-                        .write_chunk(slice)
-                        .await
-                        .map_err(|e| py_err(e.context("Failed to write chunk")))
-                })
-            });
-            // Release the export only now, with the GIL held again.
-            drop(buffer);
-            return result;
+    /// GIL: it is released for the blocking write (issue #201) only when `data` is an
+    /// exact `bytes` object, which no thread can change, or after the copy of a
+    /// non-contiguous view. For every other exporter (bytearray, a writable memoryview,
+    /// numpy, mmap, ctypes, ...) the GIL is kept for the write, as before #201, because
+    /// another thread could otherwise change the memory while it is being read. To keep
+    /// other threads running during a large write of mutable data, pass `bytes(data)`.
+    ///
+    /// Calls on one writer from several threads run one after another.
+    fn write_chunk(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        // An exact `bytes` object is immutable and `data` keeps it alive: zero-copy and
+        // safe to read without the GIL.
+        if data.is_exact_instance_of::<PyBytes>() {
+            if let Ok(bytes) = data.cast::<PyBytes>() {
+                return self.write_detached(py, bytes.as_bytes());
+            }
         }
 
-        // Fallback for PyBytes (shouldn't happen, but safe)
-        if let Ok(bytes) = data.cast::<PyBytes>() {
-            // `bytes` is immutable and `data` keeps it alive across the detached write.
-            let slice = bytes.as_bytes();
-            return py.detach(|| {
-                pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                    writer
-                        .write_chunk(slice)
-                        .await
-                        .map_err(|e| py_err(e.context("Failed to write chunk")))
-                })
-            });
+        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
+            if !buffer.is_c_contiguous() {
+                // The buffer pointer and byte length do not describe the view's bytes
+                // (strides). Copy them in logical order under the GIL, then write the
+                // owned copy without it.
+                let owned = buffer.to_vec(py).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!(
+                        "Buffer copy failed: {}",
+                        e
+                    ))
+                })?;
+                drop(buffer);
+                return self.write_detached(py, &owned);
+            }
+
+            let result = if buffer.len_bytes() == 0 {
+                let mut guard = self.lock_with_gil(py);
+                self.write_locked(&mut guard, &[])
+            } else {
+                // SAFETY: the buffer is C-contiguous and `buffer` is a live Py_buffer
+                // export, released only after the write has returned, so the exporter
+                // cannot free or resize the memory meanwhile. The GIL is HELD for the
+                // whole write, so no Python thread can change the contents during the
+                // read; non-Python code that shares the memory (a mmap or ctypes
+                // buffer written by native code) is the caller's responsibility, as in
+                // any buffer-protocol consumer. The write only reads from the slice.
+                let slice = unsafe {
+                    std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
+                };
+                let mut guard = self.lock_with_gil(py);
+                self.write_locked(&mut guard, slice)
+            };
+            // Release the export only now.
+            drop(buffer);
+            return result;
         }
 
         Err(PyRuntimeError::new_err(
@@ -2289,121 +2414,75 @@ impl PyObjectWriter {
         ))
     }
 
-    /// Write owned bytes (converts buffer protocol object to owned Vec for async)
+    /// Write owned bytes (copies the input out of Python, then writes with the GIL released)
     ///
     /// This method copies data but takes ownership, useful when the caller
-    /// doesn't need the buffer anymore. For true zero-copy, use write_chunk().
+    /// doesn't need the buffer anymore, and it releases the GIL for the whole write
+    /// whatever the type of `data` (the copy is made under the GIL, so a concurrent
+    /// change to a mutable buffer cannot tear it). For a zero-copy write of `bytes`
+    /// use write_chunk().
     ///
-    /// Implementation note: unlike `write_chunk()` (whose zero-copy fast path
-    /// keeps a borrowed buffer pointer alive across a synchronous `block_on`,
-    /// see docs/DESIGN_TIER4_FFI_HARDENING.md item 3), this method's input
-    /// data is already fully owned by the time it crosses the async
-    /// boundary — but `self.inner`'s writer itself is normally only
-    /// *borrowed* (`&mut`) here, not owned, which would still block a
-    /// migration to the `'static`-future-requiring `submit_io`. To resolve
-    /// that, the writer is temporarily `.take()`n (so it can be moved into
-    /// the future) and always restored to `self.inner` afterward regardless
-    /// of whether the write succeeded — preserving the existing contract
-    /// that a failed `write_owned_bytes()` call leaves the writer usable for
-    /// a retry or a clean `abort()`/`finalize()`, exactly as before this
-    /// migration.
-    fn write_owned_bytes(&mut self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let mut writer = self
-            .inner
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
-
+    /// Implementation note: the writer is temporarily moved out of the lock into the
+    /// `'static` future `submit_io` needs, and always put back afterwards whether or not
+    /// the write succeeded, so a failed `write_owned_bytes()` leaves the writer usable
+    /// for a retry or a clean `finalize()`.
+    fn write_owned_bytes(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         // Try buffer protocol
         if let Ok(buffer) = PyBuffer::<u8>::get(data) {
             let len = buffer.len_bytes();
             let mut vec = vec![0u8; len];
-            if let Err(e) = buffer.copy_to_slice(py, &mut vec[..]) {
-                self.inner = Some(writer); // restore -- this call never touched it
-                return Err(PyRuntimeError::new_err(format!(
-                    "Buffer copy failed: {}",
-                    e
-                )));
-            }
-
-            let (writer_back, write_result) = py.detach(|| {
-                submit_io(async move {
-                    let r = writer.write_owned_bytes(vec).await;
-                    Ok::<_, anyhow::Error>((writer, r))
-                })
-            })?;
-            self.inner = Some(writer_back);
-            return write_result.map_err(|e| py_err(e.context("Failed to write owned bytes")));
+            buffer
+                .copy_to_slice(py, &mut vec[..])
+                .map_err(|e| PyRuntimeError::new_err(format!("Buffer copy failed: {}", e)))?;
+            // The copy is made: release the export before the GIL is released.
+            drop(buffer);
+            return self.write_owned_detached(py, vec);
         }
 
         // Fallback for PyBytes
         if let Ok(bytes) = data.cast::<PyBytes>() {
-            let vec = bytes.as_bytes().to_vec();
-            let (writer_back, write_result) = py.detach(|| {
-                submit_io(async move {
-                    let r = writer.write_owned_bytes(vec).await;
-                    Ok::<_, anyhow::Error>((writer, r))
-                })
-            })?;
-            self.inner = Some(writer_back);
-            return write_result.map_err(|e| py_err(e.context("Failed to write owned bytes")));
+            return self.write_owned_detached(py, bytes.as_bytes().to_vec());
         }
 
-        // Neither buffer protocol nor PyBytes matched -- restore the writer
-        // (this call never touched it) before reporting the type error.
-        self.inner = Some(writer);
         Err(PyRuntimeError::new_err(
             "write_owned_bytes requires bytes-like object",
         ))
     }
 
     /// Finalize the writer and complete the upload
-    fn finalize(&mut self, py: Python<'_>) -> PyResult<(u64, u64)> {
-        if let Some(writer) = self.inner.take() {
-            py.detach(|| {
-                submit_io(async move {
-                    let stats = snapshot_final_writer_stats(writer.as_ref());
-                    writer.finalize().await?;
-                    Ok::<(u64, u64, Option<String>), anyhow::Error>(stats)
-                })
-            })
-            .inspect(|stats| {
-                self.finalized_stats = Some(stats.clone());
-            })
-            .map(|(bytes_written, compressed_bytes, _checksum)| (bytes_written, compressed_bytes))
-        } else {
-            Err(PyRuntimeError::new_err("Writer already finalized"))
-        }
+    fn finalize(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        py.detach(|| {
+            let mut guard = lock_ignoring_poison(&self.inner);
+            let writer = guard
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("Writer already finalized"))?;
+            let stats = submit_io(async move {
+                let stats = snapshot_final_writer_stats(writer.as_ref());
+                writer.finalize().await?;
+                Ok::<WriterStats, anyhow::Error>(stats)
+            })?;
+            let result = (stats.0, stats.1);
+            *lock_ignoring_poison(&self.stats) = stats;
+            Ok(result)
+        })
     }
 
-    /// Get the number of bytes written so far
+    /// Get the number of bytes written so far (as of the last completed write; it does
+    /// not wait for a write in flight on another thread)
     fn bytes_written(&self) -> PyResult<u64> {
-        if let Some((bytes_written, _, _)) = self.finalized_stats {
-            Ok(bytes_written)
-        } else if let Some(writer) = &self.inner {
-            Ok(writer.bytes_written())
-        } else {
-            Err(PyRuntimeError::new_err("Writer has been finalized"))
-        }
+        Ok(lock_ignoring_poison(&self.stats).0)
     }
 
-    /// Get the checksum of the data written (if available)
+    /// Get the checksum of the data written (if available; see `bytes_written` for when
+    /// it is read)
     fn checksum(&self) -> Option<String> {
-        if let Some((_, _, checksum)) = &self.finalized_stats {
-            checksum.clone()
-        } else {
-            self.inner.as_ref().and_then(|w| w.checksum())
-        }
+        lock_ignoring_poison(&self.stats).2.clone()
     }
 
-    /// Get the number of compressed bytes (if compression is enabled)
+    /// Get the number of compressed bytes (if compression is enabled; see
+    /// `bytes_written` for when it is read)
     fn compressed_bytes(&self) -> PyResult<u64> {
-        if let Some((_, compressed, _)) = self.finalized_stats {
-            Ok(compressed)
-        } else if let Some(writer) = &self.inner {
-            Ok(writer.compressed_bytes())
-        } else {
-            Err(PyRuntimeError::new_err("Writer has been finalized"))
-        }
+        Ok(lock_ignoring_poison(&self.stats).1)
     }
 }
 
@@ -2424,10 +2503,7 @@ pub fn create_s3_writer(
                 .await
                 .map_err(|e| e.context("Failed to create S3 writer"))?;
 
-            Ok(PyObjectWriter {
-                inner: Some(writer),
-                finalized_stats: None,
-            })
+            Ok(PyObjectWriter::new(writer))
         })
     })
 }
@@ -2450,10 +2526,7 @@ pub fn create_azure_writer(
                 .await
                 .map_err(|e| e.context("Failed to create Azure writer"))?;
 
-            Ok(PyObjectWriter {
-                inner: Some(writer),
-                finalized_stats: None,
-            })
+            Ok(PyObjectWriter::new(writer))
         })
     })
 }
@@ -2488,10 +2561,7 @@ pub fn create_filesystem_writer(
                 .await
                 .map_err(|e| e.context("Failed to create filesystem writer"))?;
 
-            Ok(PyObjectWriter {
-                inner: Some(writer),
-                finalized_stats: None,
-            })
+            Ok(PyObjectWriter::new(writer))
         })
     })
 }
@@ -2513,10 +2583,7 @@ pub fn create_direct_filesystem_writer(
                 .await
                 .map_err(|e| e.context("Failed to create direct filesystem writer"))?;
 
-            Ok(PyObjectWriter {
-                inner: Some(writer),
-                finalized_stats: None,
-            })
+            Ok(PyObjectWriter::new(writer))
         })
     })
 }
@@ -3838,6 +3905,42 @@ mod issue204_store_cache_tests {
                 "RED: racing callers were handed different stores for one key"
             );
         }
+    }
+
+    /// The async entry points call `get_or_create_store` from pyo3-runtime worker threads.
+    /// Racing misses there wait for the builder inside `block_in_place`: they complete,
+    /// and still build one store.
+    #[test]
+    fn racing_misses_on_a_multi_thread_runtime_complete_and_build_once() {
+        use crate::s3_client::issue173_worker_reentrancy_tests::{run_with_watchdog, WATCHDOG};
+        prepare_environment();
+        let uri = "s3://127.0.0.1:59206/bucket-204/some/key";
+        let done = run_with_watchdog("racing-misses-runtime", move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let tasks: Vec<_> = (0..8)
+                    .map(|_| {
+                        tokio::spawn(async move {
+                            get_or_create_store(uri, None)
+                                .map(|_| ())
+                                .map_err(|e| format!("{e:#}"))
+                        })
+                    })
+                    .collect();
+                for task in tasks {
+                    task.await.expect("task").expect("store");
+                }
+            });
+        });
+        assert!(
+            done.is_some(),
+            "racing misses on a multi-thread runtime did not finish within {WATCHDOG:?}"
+        );
+        assert_eq!(builds_for(uri), 1);
     }
 
     /// Sequential calls after the first are cache hits: no further build.

@@ -8,7 +8,8 @@ store cache (``get_or_create_store``), the same sequence reuses one pooled conne
 
 ``slow_s3_server.py`` (own process, delay 0, persistent HTTP/1.1 connections) counts the
 connections it accepts. ``mkdir_async`` makes no request on S3 (S3 has no ``mkdir``), so
-its routing is pinned by the Rust unit test ``issue204_async_entry_points_use_the_store_cache``.
+its routing is pinned by the Rust unit test
+``issue204_store_cache_tests::async_entry_points_use_the_store_cache``.
 
 Run against the wheel under test:
 ``uv run --no-project --with <wheel> --with pytest pytest tests/test_async_entry_points_reuse_store.py``.
