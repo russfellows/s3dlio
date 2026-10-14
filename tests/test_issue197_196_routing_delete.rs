@@ -603,10 +603,10 @@ async fn batch_helpers_reject_the_whole_batch_before_any_request() {
     assert!(b.requests().is_empty(), "{:?}", b.requests());
 }
 
-/// `upload_files` / `download_objects` / the multipart sink use the global
-/// client, so they refuse a URI naming a different server up front.
+/// `download_objects` / the multipart sink use the global client, so they refuse
+/// a URI naming a different server up front.
 #[tokio::test]
-async fn copy_and_multipart_entry_points_reject_a_uri_naming_another_server() {
+async fn download_and_multipart_entry_points_reject_a_uri_naming_another_server() {
     let g = global_mock();
     let b = Mock::start();
     let bucket = unique_bucket("copy");
@@ -616,13 +616,11 @@ async fn copy_and_multipart_entry_points_reject_a_uri_naming_another_server() {
 
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(&bucket);
     std::fs::create_dir_all(&dir).expect("scratch dir");
-    let file = dir.join("f.bin");
-    std::fs::write(&file, b"payload").expect("scratch file");
 
-    let r =
-        s3dlio::s3_copy::upload_files(&prefix, std::slice::from_ref(&file), 2, true, None).await;
-    assert_names(&r.expect_err("upload_files"), &prefix, &servers);
-
+    // `upload_files` is not in this list any more: since #199 a host-form
+    // destination is not rejected but uploaded to the NAMED server through a
+    // per-endpoint client (tests/s3_bucket_create_delete_routing.rs), which also
+    // satisfies #197 -- it never runs on the wrong server.
     let r = s3dlio::s3_copy::download_objects(&prefix, &dir.join("out"), 2, true, None).await;
     assert_names(&r.expect_err("download_objects"), &prefix, &servers);
 
