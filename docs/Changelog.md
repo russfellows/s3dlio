@@ -130,6 +130,46 @@
   be dialled with TLS; no override exists** (the explicit `s3+http://` form, #195,
   is the planned escape hatch).
 
+### Op-log accuracy: destinations (#168), lifecycle and drop detection (#170)
+
+The op-log TSV byte format (header, columns, idx numbering, timestamps, zstd
+framing) is unchanged; a golden test pins it.
+
+- **`file://` op-log destinations work (#168).** `init_op_logger("file:///tmp/x")`
+  / `init_op_log(...)` follow s3dlio's `file://` convention (the same as the
+  `file://` object store: lowercase prefix removed, the rest used literally).
+  Any other scheme (`s3://`, `direct://`, `FILE://`, ...) is rejected with an
+  error that names the destination, and creation errors name the path.
+- **One op-log session per process (#170).** The lifecycle is `Uninitialized` ->
+  `Active` -> `Finalized`, and `Finalized` is terminal. `init_op_log` while
+  Active is a no-op; after `finalize_op_log` it raises `RuntimeError` and touches
+  no file. `finalize_op_logger` / `finalize_op_log` is idempotent, waits for the
+  writer to finish, and releases the GIL in Python while it drains.
+- **Drop detection (#170).** New `s3dlio::op_log_stats()` -> `Option<OpLogStats>`
+  (and `Logger::stats()`), Python `s3dlio.op_log_stats()` (a dict, or `None`
+  before init): `accepted`, `written`, `dropped_full`, `rejected_closed`,
+  `writer_failed`, `writer_error`, `lossless`. `OpLogStats::is_complete()` is
+  `accepted == written && dropped_full == 0 && writer_failed == 0 &&
+  writer_error.is_none()`; judge it after finalize. `finalize_op_log()` prints one
+  stderr warning when a counted loss happened. The stats do not cover process
+  exit without finalize (no `atexit` hook), stores built before init, or errors
+  reported only at `close(2)`; "written" means accepted by `write(2)`, not
+  fsynced. See `docs/supplemental/OPERATION_LOGGING.md`.
+- **`Logger::try_log` / `LogOutcome` (#170).** `try_log(entry)` returns
+  `Accepted`, `Full`, `Closed` or `WriterFailed`; `Logger::log` still returns
+  `()`. Every `Accepted` entry is written by finalize, including entries racing
+  with it, unless the writer fails.
+- **The writer finishes the zstd stream and flushes explicitly (#170).** Errors
+  from the zstd frame end, the final flush and a writer-thread panic are recorded
+  in `writer_error` instead of being swallowed by the encoder's drop, and a writer
+  that dies with entries still queued shows as `accepted > written`.
+- **Robustness (#170).** The diagnostic lines the op-log prints on the `log()`
+  path no longer panic into the caller when stderr is closed or full. A panic
+  inside the first `finalize` (for example from a tracing subscriber) no longer
+  lets a later `finalize` return before the writer is done. The finalize warning
+  names a writer-thread panic as a defect rather than sending the reader to the
+  disk.
+
 ## Version 0.9.114 — Azure SDK stable 1.x migration
 
 - Updated `azure_storage_blob` and `azure_identity` from pre-release APIs to

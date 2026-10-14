@@ -712,8 +712,10 @@ pub fn init_op_log(path: &str) -> PyResult<()> {
 }
 
 /// Finish operation logging: write every accepted record (unless the writer
-/// fails with an I/O error), close the zstd stream and wait until the writer has
-/// finished and signalled completion. Terminal for this process (see
+/// fails: an I/O error or a panic in the writer thread, see op_log_stats()),
+/// close the zstd stream and wait until the writer has finished and signalled
+/// completion. Call it before the process exits: nothing does it for you (no
+/// atexit hook), and without it queued records and the zstd frame end are lost. Terminal for this process (see
 /// init_op_log). Safe to call repeatedly, or before init_op_log() (no effect).
 /// After it returns is_op_log_active() is False and operations on objects
 /// created earlier are no longer recorded. The GIL is released while the
@@ -730,8 +732,9 @@ pub fn is_op_log_active() -> PyResult<bool> {
     Ok(global_logger().is_some())
 }
 
-/// Counts of what happened to the entries submitted to the op-log, so you can
-/// tell whether the log is complete.
+/// Counts of what happened to the entries submitted to the op-log between
+/// init_op_log() and finalize_op_log(), so you can detect most ways records are
+/// lost.
 ///
 /// Returns None before init_op_log(); otherwise a dict (available while
 /// logging is active AND after finalize_op_log()):
@@ -745,17 +748,23 @@ pub fn is_op_log_active() -> PyResult<bool> {
 ///     writer_failed    calls refused because the writer had already stopped
 ///     writer_error     None, or the first error the writer met (a failed write,
 ///                      a failed finish/flush of the compressed stream, or a
-///                      writer panic) as text
+///                      writer panic, which is a defect, not an I/O error) as text
 ///     lossless         True if S3DLIO_OPLOG_LOSSLESS=1 (callers wait, never drop)
 ///
-/// After finalize_op_log() the log is COMPLETE exactly when
+/// After finalize_op_log() no counted loss happened exactly when
 /// accepted == written and dropped_full == 0 and writer_failed == 0 and
-/// writer_error is None. (accepted > written means entries were queued but never
+/// writer_error is None. "written" means accepted by the OS write(2); there is no
+/// fsync, so it does not mean durable. (accepted > written means entries were queued but never
 /// written, e.g. the disk filled up; writer_failed alone cannot show that.)
 /// rejected_closed is not part of "complete" -- those calls were never going to
 /// be in the file -- but finalize only after your worker threads have stopped, and
 /// check rejected_closed == 0 as well. While logging is active accepted > written
 /// is normal (the queue is draining), so judge completeness after finalize.
+///
+/// NOT covered: process exit without finalize_op_log() (no atexit hook: queued
+/// records and the zstd frame end are lost and these stats are never read);
+/// objects created before init_op_log() (unlogged, uncounted); errors reported
+/// only when the file is closed (e.g. NFS or quota errors at close(2)).
 ///
 /// To avoid queue-full drops set S3DLIO_OPLOG_LOSSLESS=1 and/or raise
 /// S3DLIO_OPLOG_BUF. finalize_op_log() also prints one warning on stderr if

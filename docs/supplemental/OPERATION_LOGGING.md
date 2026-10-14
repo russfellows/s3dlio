@@ -196,7 +196,7 @@ The op-log moves through `Uninitialized` -> `Active` -> `Finalized`, and
 | Call | Uninitialized | Active | Finalized |
 |---|---|---|---|
 | `init_op_logger(path)` (`init_op_log`) | creates the file, becomes Active (a failed init stays Uninitialized, so it can be retried) | returns `Ok`; the new path is **not** created or truncated | **error** (Python: `RuntimeError`); no file is created or truncated |
-| `finalize_op_logger()` (`finalize_op_log`) | no-op | writes every accepted record (unless the writer fails with an I/O error), finishes the zstd stream, waits until the writer signals it has finished, becomes Finalized | no-op (waits if another finalize is still draining) |
+| `finalize_op_logger()` (`finalize_op_log`) | no-op | writes every accepted record (unless the writer fails: an I/O error or a writer-thread panic), finishes the zstd stream, waits until the writer signals it has finished, becomes Finalized | no-op (waits if another finalize is still draining) |
 | `global_logger()` / `is_op_log_active()` | `None` / `False` | `Some` / `True` | `None` / `False` |
 
 Stores capture the logger when they are constructed
@@ -210,8 +210,8 @@ Stores capture the logger when they are constructed
 `Logger::log(entry)` returns `()`, as it always has. `Logger::try_log(entry)`
 does the same work and returns a `LogOutcome` (`Accepted`, `Full`, `Closed`,
 `WriterFailed`). Every `Accepted` entry is written by finalize, including
-entries racing with it, unless the writer fails with an I/O error (after which
-`try_log` returns `WriterFailed`). The serializer itself was not changed by the
+entries racing with it, unless the writer fails first (an I/O error or a panic in
+the writer thread, after which `try_log` returns `WriterFailed`). The serializer itself was not changed by the
 lifecycle work (header, column order, idx numbering, operation names, zstd
 framing); see "What the format tests establish" below for what is checked.
 
@@ -224,8 +224,10 @@ is `NotFound`, "Logger not initialized").
 By default the op-log is **lossy**: it never slows the caller, so when the
 writer cannot keep up and the queue (`S3DLIO_OPLOG_BUF`, default 8192 entries)
 is full, the entry is dropped. `S3DLIO_OPLOG_LOSSLESS=1` makes callers wait
-instead. Separately, the background writer can fail (disk full, I/O error) with
-entries still queued. A caller can always tell whether a log is complete:
+instead. Separately, the background writer can fail (disk full, I/O error, or a
+panic in the writer thread) with entries still queued. The stats let a caller
+detect **most** ways records are lost, and the list below says which they do not
+cover:
 
 ```rust
 s3dlio::finalize_op_logger();                              // first: stop the workers, then finalize
@@ -242,15 +244,41 @@ complete = (stats["accepted"] == stats["written"] and stats["dropped_full"] == 0
             and stats["writer_failed"] == 0 and stats["writer_error"] is None)
 ```
 
-**Definition of complete.** After finalize has returned, the log is complete
-exactly when
+**What is counted.** The stats cover the calls that reached the session's
+`Logger` (any clone) **between init and finalize**. "Written" means the writer
+thread handed the row to the zstd encoder without an error and the buffered bytes
+were accepted by the OS `write(2)`; there is **no fsync**, so written does not
+mean durable.
+
+**What the stats cannot see.** A program that needs these covered must handle
+them itself:
+
+- **Process exit without `finalize_op_logger()` / `finalize_op_log()`.** Nothing
+  finalizes the log at exit: there is no `atexit` hook (Python), and the global
+  logger lives in a static that is never dropped (Rust). Entries still on the
+  queue, the buffered bytes and the zstd frame end are lost (the file is a
+  truncated stream), and the stats are never read. Always finalize before the
+  process ends.
+- **Stores built before `init_op_logger()`** hold no logger. Their operations are
+  neither logged nor counted.
+- **Errors that surface only at `close(2)`**, for example NFS or quota errors
+  reported when the file is closed. The writer closes the file by dropping it
+  after the last flush, and Rust's `File` drop ignores the result of `close`, so
+  such an error is not observable. Syncing the file would make it observable but
+  costs performance and goes beyond native write semantics, so the op-log does
+  not do it.
+
+**Definition of complete.** After finalize has returned, every loss that *is*
+counted is absent exactly when
 
 ```
 accepted == written  AND  dropped_full == 0  AND  writer_failed == 0  AND  writer_error is None
 ```
 
-(`OpLogStats::is_complete()` in Rust.) Judge completeness **after** finalize:
-while the session is Active, `accepted > written` is normal (entries are queued).
+(`OpLogStats::is_complete()` in Rust.) Complete means "none of the counted losses
+happened", not "durably on disk" (see above). Judge completeness **after**
+finalize: while the session is Active, `accepted > written` is normal (entries
+are queued).
 
 | Count | Meaning |
 |---|---|
@@ -258,7 +286,7 @@ while the session is Active, `accepted > written` is normal (entries are queued)
 | `written` | rows the writer handed to the zstd encoder without an error. An **upper bound** of the rows in the file: the encoder and the file buffer them, so a later flush or finish failure can still lose some (that failure is `writer_error`) |
 | `dropped_full` | entries dropped because the queue was full (`LogOutcome::Full`); default mode only, always 0 when lossless |
 | `writer_failed` | calls **refused because the writer had already stopped** (`LogOutcome::WriterFailed`). It does *not* count entries that were queued before the writer stopped: those show as `accepted - written` |
-| `writer_error` | `None`, or the first error the writer met, as text: a failed write, a failed zstd finish or final flush, or a writer-thread panic |
+| `writer_error` | `None`, or the first error the writer met, as text: a failed write, a failed zstd finish or final flush, or a writer-thread panic (text starting `writer thread panicked`: a defect in the process, not an I/O error) |
 | `rejected_closed` | calls that arrived after finalize had begun (`LogOutcome::Closed`); see below |
 | `lossless` | the session's mode |
 
@@ -290,7 +318,9 @@ with Acquire. `OpLogStats` is `#[non_exhaustive]`.
 `finalize_op_logger()` / `finalize_op_log()` prints **one** stderr warning if any
 record was lost (anything that makes the log not complete): it names only the
 non-zero counts (and the writer's error), and gives the `S3DLIO_OPLOG_LOSSLESS=1`
-/ `S3DLIO_OPLOG_BUF` advice only when entries were dropped in lossy mode. A
+/ `S3DLIO_OPLOG_BUF` advice only when entries were dropped in lossy mode. Its
+advice follows the writer's error: an I/O error points at the destination, a
+writer-thread panic says it is a defect to report, not a disk problem. A
 per-call `try_log` outcome is still available when you need to know about one
 entry.
 
