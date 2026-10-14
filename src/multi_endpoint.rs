@@ -233,6 +233,24 @@ struct EndpointInfo {
     store_endpoint_url: Option<String>,
 }
 
+/// Decide the per-endpoint client URL for the host part of a host-form S3 URI.
+///
+/// `ep` is the endpoint component returned by [`crate::s3_utils::parse_s3_uri_full`]
+/// (e.g. `10.9.0.17:9000`, `storage.googleapis.com:443`).
+///
+/// An explicit `http://` / `https://` string is used as given. Otherwise the
+/// scheme comes from [`crate::object_store::s3_endpoint_url_from_authority`], the
+/// same rule the single-endpoint path uses (`:443` and ports listed in
+/// `S3DLIO_S3_ENDPOINT_TLS_PORTS` are https, everything else http; issue #180).
+/// A host with no port keeps the historical `http://` form.
+fn s3_store_endpoint_url(ep: String) -> String {
+    if ep.starts_with("http://") || ep.starts_with("https://") {
+        return ep;
+    }
+    crate::object_store::s3_endpoint_url_from_authority(&ep)
+        .unwrap_or_else(|| format!("http://{}", ep))
+}
+
 /// Multi-endpoint ObjectStore wrapper with load balancing and per-endpoint configuration.
 ///
 /// This wrapper implements the ObjectStore trait and distributes requests across
@@ -373,12 +391,7 @@ impl MultiEndpointStore {
                     if let Ok(components) = crate::s3_utils::parse_s3_uri_full(&endpoint_config.uri)
                     {
                         if let Some(ep) = components.endpoint {
-                            let endpoint_url =
-                                if ep.starts_with("http://") || ep.starts_with("https://") {
-                                    ep
-                                } else {
-                                    format!("http://{}", ep)
-                                };
+                            let endpoint_url = s3_store_endpoint_url(ep);
                             let url_for_store = endpoint_url.clone();
                             let result = crate::s3_client::run_on_global_rt(async move {
                                 S3ObjectStore::for_endpoint(&url_for_store)
@@ -2249,6 +2262,114 @@ mod tests {
         assert_ne!(urls[0], urls[1], "endpoints 0 and 1 must be different");
         assert_ne!(urls[1], urls[2], "endpoints 1 and 2 must be different");
         assert_ne!(urls[0], urls[2], "endpoints 0 and 2 must be different");
+    }
+
+    // ── Issue #180: scheme selection must match the single-endpoint path ─────
+    //
+    // `s3://host:443/...` and ports named in S3DLIO_S3_ENDPOINT_TLS_PORTS must
+    // produce an https:// endpoint, exactly as `s3_endpoint_url_from_uri` does for
+    // single-endpoint URIs. Before the fix MultiEndpointStore built http://host:port
+    // for every host-form endpoint.
+
+    fn lock_tls_ports_env() -> std::sync::MutexGuard<'static, ()> {
+        crate::object_store::ENDPOINT_TLS_PORTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Build a MultiEndpointStore for `uri` with fake credentials and return the
+    /// endpoint URL its per-endpoint client was created with.
+    fn store_endpoint_url_for(uri: &str) -> Option<String> {
+        let _cred = CRED_LOCK.blocking_lock();
+        let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let saved_region = std::env::var("AWS_REGION").ok();
+        #[allow(deprecated)]
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        #[allow(deprecated)]
+        std::env::set_var("AWS_REGION", "us-east-1");
+
+        let result =
+            MultiEndpointStore::new(vec![uri.to_string()], LoadBalanceStrategy::RoundRobin, None);
+
+        restore_env("AWS_ACCESS_KEY_ID", saved_key);
+        restore_env("AWS_SECRET_ACCESS_KEY", saved_secret);
+        restore_env("AWS_REGION", saved_region);
+
+        let store = result.expect("MultiEndpointStore should be created with fake credentials");
+        store
+            .get_store_endpoint_urls()
+            .into_iter()
+            .next()
+            .expect("one endpoint configured")
+    }
+
+    #[test]
+    fn test_multi_endpoint_port_443_uses_https() {
+        let _env = lock_tls_ports_env();
+        assert_eq!(
+            store_endpoint_url_for("s3://storage.googleapis.com:443/bucket/"),
+            Some("https://storage.googleapis.com:443".to_string()),
+            "host:443 must be https, as in the single-endpoint path (issue #180)"
+        );
+    }
+
+    #[test]
+    fn test_multi_endpoint_unlisted_port_uses_http() {
+        let _env = lock_tls_ports_env();
+        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
+        #[allow(deprecated)]
+        std::env::remove_var("S3DLIO_S3_ENDPOINT_TLS_PORTS");
+        let got = store_endpoint_url_for("s3://10.9.0.17:9000/bucket/");
+        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
+        assert_eq!(got, Some("http://10.9.0.17:9000".to_string()));
+    }
+
+    #[test]
+    fn test_multi_endpoint_tls_ports_env_var_uses_https() {
+        let _env = lock_tls_ports_env();
+        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
+        #[allow(deprecated)]
+        std::env::set_var("S3DLIO_S3_ENDPOINT_TLS_PORTS", "9001,9443");
+        let got = store_endpoint_url_for("s3://minio.example:9001/bucket/");
+        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
+        assert_eq!(
+            got,
+            Some("https://minio.example:9001".to_string()),
+            "a port in S3DLIO_S3_ENDPOINT_TLS_PORTS must be https (issue #180)"
+        );
+    }
+
+    #[test]
+    fn test_s3_store_endpoint_url_rules() {
+        let _env = lock_tls_ports_env();
+        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
+        #[allow(deprecated)]
+        std::env::set_var("S3DLIO_S3_ENDPOINT_TLS_PORTS", "9001");
+
+        let cases = [
+            ("example.com:443", "https://example.com:443"),
+            ("example.com:9001", "https://example.com:9001"),
+            ("example.com:9000", "http://example.com:9000"),
+            ("[::1]:443", "https://[::1]:443"),
+            ("[::1]:9000", "http://[::1]:9000"),
+            // Explicit schemes are preserved untouched.
+            ("https://example.com:9000", "https://example.com:9000"),
+            ("http://example.com:443", "http://example.com:443"),
+            // No port: unchanged historical behaviour (http).
+            ("example.com", "http://example.com"),
+        ];
+        let got: Vec<String> = cases
+            .iter()
+            .map(|(ep, _)| s3_store_endpoint_url((*ep).to_string()))
+            .collect();
+        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
+
+        for ((ep, want), got) in cases.iter().zip(got) {
+            assert_eq!(&got, want, "endpoint {ep:?}");
+        }
     }
 
     // =========================================================================

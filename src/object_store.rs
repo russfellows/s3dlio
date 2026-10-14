@@ -3322,7 +3322,18 @@ fn s3_endpoint_url_from_uri(uri: &str) -> Option<String> {
     let after_scheme = uri.strip_prefix("s3://")?;
     // Authority is everything before the first '/'
     let authority = after_scheme.split('/').next()?;
+    s3_endpoint_url_from_authority(authority)
+}
 
+/// Build the endpoint URL (`https://host:port` or `http://host:port`) for a
+/// URI authority of the form `host:port` / `[ipv6]:port`.
+///
+/// This is the single place that decides the scheme of a host-form S3
+/// endpoint. Both the single-endpoint path ([`s3_endpoint_url_from_uri`]) and
+/// `MultiEndpointStore` use it, so they can never disagree (issue #180).
+///
+/// Returns `None` when the authority has no (valid) port.
+pub(crate) fn s3_endpoint_url_from_authority(authority: &str) -> Option<String> {
     // audit #154 bug 4.3 (E2): the previous check was
     // `authority.contains(':')` + `authority.rsplit(':').next()`. That
     // happens to produce the same result as the explicit parse below for
@@ -3374,6 +3385,11 @@ fn s3_endpoint_tls_ports_from_env() -> std::collections::HashSet<u16> {
         })
         .unwrap_or_default()
 }
+
+/// Serialises every test that reads or writes `S3DLIO_S3_ENDPOINT_TLS_PORTS`
+/// (shared with the multi-endpoint tests, which decide URL schemes the same way).
+#[cfg(test)]
+pub(crate) static ENDPOINT_TLS_PORTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_logger(uri, None)
@@ -4335,8 +4351,6 @@ mod s3_object_store_tests {
     // S3-compatible endpoint running on a non-standard port (e.g. a load
     // balancer terminating TLS on :9001) as https. S3DLIO_S3_ENDPOINT_TLS_PORTS
     // closes that gap.
-
-    static ENDPOINT_TLS_PORTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn s3_endpoint_url_from_uri_plain_bucket_has_no_endpoint() {
