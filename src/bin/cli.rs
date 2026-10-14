@@ -49,7 +49,10 @@ use s3dlio::{
 use s3dlio::list_pattern::ListPattern;
 use s3dlio::progress::{ProgressCallback, S3ProgressTracker};
 use s3dlio::{finalize_op_logger, global_logger, init_op_logger};
-use s3dlio::{generic_download_objects_with_summary, generic_upload_files_with_summary};
+use s3dlio::{
+    generic_download_objects_matching_with_summary, generic_download_objects_with_summary,
+    generic_upload_files_with_summary,
+};
 
 /// Returns per-crate log-level caps that prevent deadlocks.
 ///
@@ -223,9 +226,25 @@ enum Command {
         pattern: Option<String>,
     },
     /// Download one or many objects concurrently.
+    ///
+    /// On s3:// the URI is a literal key PREFIX, never a glob or regex: `get s3://b/file.txt`
+    /// downloads `file.txt` AND anything else that starts with `file.txt` (such as
+    /// `file.txt.bak`), and `get s3://b/dl` also selects `dl2/...`. End the URI with `/`
+    /// (`s3://b/dl/`) to select only the contents of that directory. To narrow the selection
+    /// with a regex use `--pattern`, which is matched against the object name relative to the
+    /// listing base (for `s3://b/dl/` and key `dl/sub/c.npz` the pattern sees `sub/c.npz`).
+    /// The literal-prefix rule is implemented for s3:// only; file://, direct://, gs:// and
+    /// az:// do not yet follow it (tracked in #220).
     Get {
-        /// S3 URI – a literal key prefix: a full key, or a prefix ending with `/` (never a glob or regex).
+        /// S3 URI - a literal key prefix (NOT a glob or regex): a full key, or a prefix ending with `/`.
+        /// `s3://b/file.txt` also selects `file.txt.bak`; end with `/` to select a directory's contents.
         uri: Option<String>,
+
+        /// Regex (client-side) that narrows the selection; matched against each listed
+        /// object relative to the listing base of URI. Compiled before any request is sent.
+        /// Not valid with --keylist or --offset/--length.
+        #[arg(short = 'p', long = "pattern", value_name = "REGEX")]
+        pattern: Option<String>,
 
         /// Maximum concurrent GET requests (default 64, max 4096).
         /// Accepts human suffixes: k=1,000  m=1,000,000  (e.g. 64, 128, 256).
@@ -331,8 +350,17 @@ enum Command {
         create_bucket: bool,
     },
     /// Download objects from any storage backend (S3, Azure, GCS, file://, direct://)
+    ///
+    /// On s3:// the source URI is a literal key PREFIX, never a glob or regex:
+    /// `download s3://b/file.txt dir` also downloads `file.txt.bak`, and `download s3://b/dl dir`
+    /// also selects `dl2/...`. End the URI with `/` (`s3://b/dl/`) to select only the contents of
+    /// that directory. To narrow the selection with a regex use `--pattern`, which is matched
+    /// against the object name relative to the listing base (for `s3://b/dl/` and key
+    /// `dl/sub/c.npz` the pattern sees `sub/c.npz`). The literal-prefix rule is implemented for
+    /// s3:// only; file://, direct://, gs:// and az:// do not yet follow it (tracked in #220).
     Download {
-        /// Source URI: a literal key prefix (a full key, or a prefix ending with '/'); never a glob or regex
+        /// Source URI: a literal key prefix (NOT a glob or regex): a full key, or a prefix ending with '/'.
+        /// `s3://b/file.txt` also selects `file.txt.bak`; end with '/' to select a directory's contents.
         src: String,
         /// Local directory to write into
         dest_dir: PathBuf,
@@ -343,6 +371,11 @@ enum Command {
         /// Download recursively
         #[clap(short, long)]
         recursive: bool,
+        /// Regex (client-side) that narrows the selection; matched against each listed
+        /// object relative to the listing base of the source URI. Compiled before any
+        /// request is sent or any file is created.
+        #[arg(short = 'p', long = "pattern", value_name = "REGEX")]
+        pattern: Option<String>,
     },
 
     /// Copy between local paths and storage URIs.
@@ -368,10 +401,18 @@ enum Command {
     },
 
     /// List objects at a storage URI (s3://, az://, gs://, file://, direct://)
+    ///
+    /// On s3:// the URI is a literal key PREFIX, never a regex: `ls s3://b/file.txt` also lists
+    /// `file.txt.bak`, and `ls s3://b/dl` also lists `dl2/`. End the URI with `/` (`s3://b/dl/`)
+    /// to list only the contents of that directory. To filter with a regex use `--pattern`,
+    /// matched against the entry relative to the listing base. The literal-prefix rule is
+    /// implemented for s3:// only; file://, direct://, gs:// and az:// do not yet follow it
+    /// (tracked in #220).
     #[clap(name = "list", visible_alias = "ls")]
     GenericList {
         /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, gs://bucket/prefix/, file:///path/);
-        /// a literal key prefix, never a regex (use --pattern to filter)
+        /// on s3:// a literal key prefix (`s3://b/file.txt` also selects `file.txt.bak`; end with `/`
+        /// for a directory's contents), never a regex (use --pattern to filter)
         uri: String,
 
         /// List objects recursively
@@ -798,6 +839,7 @@ async fn main() -> Result<()> {
         // New, with regex and recursion
         Command::Get {
             uri,
+            pattern,
             jobs,
             concurrent,
             keylist,
@@ -814,6 +856,7 @@ async fn main() -> Result<()> {
             }
             get_cmd(
                 uri.as_deref(),
+                pattern.as_deref(),
                 jobs,
                 concurrent,
                 keylist.as_deref(),
@@ -963,7 +1006,12 @@ async fn main() -> Result<()> {
             dest_dir,
             jobs,
             recursive,
+            pattern,
         } => {
+            // Compile the explicit --pattern first: an invalid regex fails here, before any
+            // credential lookup, listing request or file creation (#213).
+            let filter = pattern.as_deref().map(ListPattern::new).transpose()?;
+
             // Pre-tune GCS subchannels to match download concurrency.
             s3dlio::set_gcs_channel_count(jobs);
 
@@ -974,7 +1022,10 @@ async fn main() -> Result<()> {
             // Use generic object store to list objects (works with all backends)
             let logger = global_logger();
             let store = store_for_uri_with_logger(&src, logger)?;
-            let keys = store.list(&src, recursive).await?;
+            let mut keys = store.list(&src, recursive).await?;
+            if let Some(filter) = &filter {
+                filter.retain(&src, &mut keys);
+            }
 
             if keys.is_empty() {
                 bail!("No objects matched for download");
@@ -989,11 +1040,12 @@ async fn main() -> Result<()> {
             ));
 
             let t0 = Instant::now();
-            let summary = generic_download_objects_with_summary(
+            let summary = generic_download_objects_matching_with_summary(
                 &src,
                 &dest_dir,
                 jobs,
                 recursive,
+                filter.as_ref(),
                 Some(progress_callback.clone()),
             )
             .await?;
@@ -1379,10 +1431,12 @@ async fn stat_cmd(uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// Get command: downloads objects matching a key, prefix, or pattern.
+/// Get command: downloads the objects under a literal key prefix, optionally narrowed by an
+/// explicit `--pattern` regex.
 #[allow(clippy::too_many_arguments)]
 async fn get_cmd(
     uri: Option<&str>,
+    pattern: Option<&str>,
     jobs: usize,
     concurrent: Option<usize>,
     keylist: Option<&std::path::Path>,
@@ -1393,6 +1447,13 @@ async fn get_cmd(
 ) -> Result<()> {
     // Determine concurrency level (prefer concurrent over jobs for mp compatibility)
     let concurrency = concurrent.unwrap_or(jobs);
+
+    // Compile the explicit --pattern before anything else: an invalid regex fails here, with no
+    // request sent (#213). The URI itself is a literal key prefix, never a regex.
+    let filter = pattern.map(ListPattern::new).transpose()?;
+    if filter.is_some() && (keylist.is_some() || offset.is_some() || length.is_some()) {
+        bail!("--pattern selects among the objects listed under a URI prefix; it cannot be combined with --keylist or --offset/--length");
+    }
 
     // Pre-tune GCS subchannels to match concurrency before the first GCS client init.
     // The GCS client is a process-wide singleton (OnceCell); this must be called
@@ -1753,6 +1814,12 @@ async fn get_cmd(
         let key = result.with_context(|| format!("list error for '{}'", uri_str))?;
         if key.ends_with('/') {
             continue; // skip virtual directory entries (common prefixes)
+        }
+        // Explicit --pattern: matched against the key relative to the listing base of the URI.
+        if let Some(filter) = &filter {
+            if !filter.is_match(uri_str, &key) {
+                continue;
+            }
         }
         keys_listed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 

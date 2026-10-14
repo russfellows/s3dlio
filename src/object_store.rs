@@ -4491,6 +4491,10 @@ pub async fn generic_download_objects(
 }
 
 /// Generic download function with detailed transfer summary.
+///
+/// `src_uri` is the listing prefix; on `s3://` it is a LITERAL key prefix (issue #213).
+/// Use [`generic_download_objects_matching_with_summary`] to narrow the selection with an
+/// explicit regex.
 pub async fn generic_download_objects_with_summary(
     src_uri: &str,
     dest_dir: &Path,
@@ -4498,10 +4502,39 @@ pub async fn generic_download_objects_with_summary(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<TransferSummary> {
+    generic_download_objects_matching_with_summary(
+        src_uri,
+        dest_dir,
+        max_in_flight,
+        recursive,
+        None,
+        progress_callback,
+    )
+    .await
+}
+
+/// [`generic_download_objects_with_summary`] with an optional explicit regex filter.
+///
+/// Backend-aware (S3, Azure, GCS, `file://`, `direct://`): the listing goes through the
+/// store chosen by `src_uri`. When `pattern` is given, the listed entries are narrowed with
+/// [`ListPattern::retain`] (the pattern is matched against the entry relative to the listing
+/// base of `src_uri`) BEFORE the destination directory is created or anything is downloaded.
+/// Compile the [`ListPattern`] before calling, so an invalid regex fails without any request.
+pub async fn generic_download_objects_matching_with_summary(
+    src_uri: &str,
+    dest_dir: &Path,
+    max_in_flight: usize,
+    recursive: bool,
+    pattern: Option<&crate::list_pattern::ListPattern>,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<TransferSummary> {
     let store = store_for_uri_with_logger(src_uri, global_logger())?;
 
     // List objects to download
-    let keys = store.list(src_uri, recursive).await?;
+    let mut keys = store.list(src_uri, recursive).await?;
+    if let Some(pattern) = pattern {
+        pattern.retain(src_uri, &mut keys);
+    }
 
     if keys.is_empty() {
         bail!("No objects matched for download");

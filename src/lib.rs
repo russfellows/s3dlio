@@ -219,7 +219,8 @@ pub use object_store::{infer_scheme, ObjectMetadata, ObjectStore, Scheme};
 // Native backend specific exports
 #[cfg(feature = "native-backends")]
 pub use object_store::{
-    direct_io_store_for_uri, generic_download_objects, generic_download_objects_with_summary,
+    direct_io_store_for_uri, generic_download_objects,
+    generic_download_objects_matching_with_summary, generic_download_objects_with_summary,
     generic_upload_files, generic_upload_files_with_summary, high_performance_store_for_uri,
     store_for_uri, store_for_uri_with_config, store_for_uri_with_high_performance_cloud,
     S3ObjectStore, TransferSummary,
