@@ -1064,6 +1064,12 @@ pub struct S3ObjectStore {
     client: Option<std::sync::Arc<aws_sdk_s3::Client>>,
     /// The endpoint URL this store was created for (for logging / debugging).
     endpoint_url: Option<String>,
+    /// The store is the endpoint store of a `MultiEndpointStore` on a bucket-form S3
+    /// URI: its `get`/`put` write the S3 helper row (`S3Ops` shape) that they wrote
+    /// before W2, because a `MultiEndpointStore` is never wrapped in a
+    /// `LoggedObjectStore` and so has no other owner for the call (issue #175).
+    /// `false` everywhere else: a store's caller records the call (issue #169).
+    helper_rows: bool,
 }
 
 impl Default for S3ObjectStore {
@@ -1082,6 +1088,7 @@ impl S3ObjectStore {
             )),
             client: None,
             endpoint_url: None,
+            helper_rows: false,
         }
     }
 
@@ -1093,6 +1100,7 @@ impl S3ObjectStore {
             )),
             client: None,
             endpoint_url: None,
+            helper_rows: false,
         }
     }
 
@@ -1116,6 +1124,7 @@ impl S3ObjectStore {
             )),
             client: Some(std::sync::Arc::new(client)),
             endpoint_url: Some(endpoint_url.to_string()),
+            helper_rows: false,
         })
     }
 
@@ -1140,12 +1149,32 @@ impl S3ObjectStore {
             )),
             client: None,
             endpoint_url: Some(endpoint_url.to_string()),
+            helper_rows: false,
         }
     }
 
     #[inline]
     pub fn boxed() -> Box<dyn ObjectStore> {
         Box::new(Self::new())
+    }
+
+    /// A store on the process-wide client whose `get`/`put` write the S3 helper
+    /// row (the row the helpers `get_object` / `put_object_async` write when the
+    /// op-log is active). Only for the endpoint stores of a `MultiEndpointStore`
+    /// on bucket-form S3 URIs, which are never wrapped in a `LoggedObjectStore`;
+    /// see the `helper_rows` field.
+    pub(crate) fn with_helper_rows(mut self) -> Self {
+        self.helper_rows = true;
+        self
+    }
+
+    /// Whether `get` / `put` on the process-wide client write the helper row.
+    fn rows(&self) -> crate::s3_utils::Rows {
+        if self.helper_rows {
+            crate::s3_utils::Rows::Write
+        } else {
+            crate::s3_utils::Rows::Skip
+        }
     }
 
     /// Get object size, checking cache first
@@ -1405,9 +1434,9 @@ impl ObjectStore for S3ObjectStore {
             .unwrap_or(true); // Default: enabled
 
         if use_optimized {
-            s3_get_object_uri_optimized_rows(uri, Rows::Skip).await
+            s3_get_object_uri_optimized_rows(uri, self.rows()).await
         } else {
-            s3_get_object_uri_rows(uri, Rows::Skip).await
+            s3_get_object_uri_rows(uri, self.rows()).await
         }
     }
 
@@ -1496,7 +1525,7 @@ impl ObjectStore for S3ObjectStore {
             return Ok(());
         }
 
-        s3_put_object_uri_rows(uri, data, Rows::Skip).await
+        s3_put_object_uri_rows(uri, data, self.rows()).await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
