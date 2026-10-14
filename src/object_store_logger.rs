@@ -158,23 +158,56 @@ impl LoggedObjectStore {
         end_time: SystemTime,
         error: Option<String>,
     ) {
-        let entry = LogEntry {
-            idx: 0, // Set by logger
-            thread_id: get_thread_id(),
-            operation: operation.to_string(),
-            client_id: crate::s3_logger::get_client_id(), // Use global client_id
-            num_objects,
+        record_call(
+            &self.logger,
+            operation,
+            uri,
             bytes,
-            endpoint: extract_endpoint(uri),
-            file: strip_uri_scheme(uri), // Strip scheme prefix from file column
-            error,
+            num_objects,
             start_time,
-            first_byte_time, // Now accepts actual timestamp or None
+            first_byte_time,
             end_time,
-        };
-
-        self.logger.log(entry);
+            error,
+        );
     }
+}
+
+/// Build and submit ONE op-log row for a call on `uri`.
+///
+/// This is the single place that turns a call into a row: `client_id` from
+/// [`crate::s3_logger::get_client_id`], `endpoint`/`file` derived from the URI
+/// ([`extract_endpoint`], [`strip_uri_scheme`]), the calling thread. Every writer
+/// (this wrapper and the public S3 helper functions) goes through it, so the
+/// rows of one call cannot differ in shape depending on which layer wrote them
+/// (issue #169).
+#[allow(clippy::too_many_arguments)] // one field per column of the row
+pub(crate) fn record_call(
+    logger: &Logger,
+    operation: &str,
+    uri: &str,
+    bytes: u64,
+    num_objects: u32,
+    start_time: SystemTime,
+    first_byte_time: Option<SystemTime>,
+    end_time: SystemTime,
+    error: Option<String>,
+) {
+    let entry = LogEntry {
+        idx: 0, // Set by logger
+        thread_id: get_thread_id(),
+        operation: operation.to_string(),
+        client_id: crate::s3_logger::get_client_id(), // Use global client_id
+        num_objects,
+        bytes,
+        endpoint: extract_endpoint(uri),
+        file: strip_uri_scheme(uri), // Strip scheme prefix from file column
+        error,
+        start_time,
+        first_byte_time, // Actual timestamp or None
+        end_time,
+    };
+
+    logger.log(entry);
 }
 
 #[async_trait]

@@ -6,7 +6,8 @@
 use crate::data_loader::dataset::{Dataset, DatasetError};
 use crate::data_loader::options::{LoaderOptions, LoadingMode};
 use crate::data_loader::parallel_fetch::DropCancel;
-use crate::object_store::{store_for_uri, ObjectStore};
+use crate::object_store::{store_for_uri, store_for_uri_with_logger, ObjectStore};
+use crate::s3_logger::global_logger;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -46,7 +47,8 @@ pub struct MultiBackendDataset {
 impl MultiBackendDataset {
     /// Create dataset from URI prefix using appropriate backend
     pub async fn from_prefix(prefix_uri: &str) -> Result<Self> {
-        let store: Arc<dyn ObjectStore> = Arc::from(store_for_uri(prefix_uri)?);
+        let store: Arc<dyn ObjectStore> =
+            Arc::from(store_for_uri_with_logger(prefix_uri, global_logger())?);
         let uris = store.list(prefix_uri, true).await?;
 
         Ok(Self { uris, store })
@@ -62,7 +64,8 @@ impl MultiBackendDataset {
         }
 
         // Use first URI to determine backend
-        let store: Arc<dyn ObjectStore> = Arc::from(store_for_uri(&uris[0])?);
+        let store: Arc<dyn ObjectStore> =
+            Arc::from(store_for_uri_with_logger(&uris[0], global_logger())?);
         Ok(Self { uris, store })
     }
 

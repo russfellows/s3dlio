@@ -96,6 +96,11 @@ pub const SIZED_OBJECT_MARKER: &str = "sized-obj";
 /// Body served for keys containing [`SIZED_OBJECT_MARKER`].
 pub const SIZED_OBJECT_BODY: &[u8; 16] = b"0123456789abcdef";
 
+/// Key substring marker that makes the mock server answer a HeadObject
+/// request with `404 Not Found` (an object that does not exist). Used by the
+/// op-log tests that need a missing object on S3.
+pub const HEAD_NOT_FOUND_MARKER: &str = "head-404";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -453,6 +458,12 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         if path.contains(HEAD_FAILS_MARKER) {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockHeadObjectFailure");
         }
+        if path.contains(HEAD_NOT_FOUND_MARKER) {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+        }
         if path.contains(NO_CONTENT_LENGTH_MARKER) {
             return Response::builder()
                 .status(StatusCode::OK)
@@ -492,6 +503,17 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
             .status(StatusCode::OK)
             .header("Content-Length", "4")
             .body(Full::new(Bytes::from_static(b"mock")))
+            .unwrap();
+    }
+
+    // PutObject (single shot): PUT on a key path. The multipart UploadPart
+    // PUT (query `partNumber`) was answered above.
+    if method == Method::PUT {
+        state.record(&path, |c| c.put_calls += 1);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("ETag", "\"mock-put-etag\"")
+            .body(Full::new(Bytes::new()))
             .unwrap();
     }
 

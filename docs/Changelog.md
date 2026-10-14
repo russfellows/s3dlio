@@ -155,6 +155,34 @@ The details for each are in the sections below. **Read the behaviour changes bef
   be dialled with TLS; no override exists** (the explicit `s3+http://` form, #195,
   is the planned escape hatch).
 
+### Op-log accuracy: each call recorded exactly once (#169 W2)
+
+The op-log TSV format (13 columns, header, the values each column gets from
+`LoggedObjectStore`) is unchanged; the golden tests still pin it.
+
+- **One row per call on S3 (#169).** Every S3 `get`/`put` through a logged store
+  used to write two rows: the `LoggedObjectStore` row and a second row from the S3
+  backend's own writer (`endpoint` = `AWS_ENDPOINT_URL`, `file` = the bare key,
+  `client_id` = the access key id). That second writer is gone: `S3Ops` writes no
+  rows (**API change:** `S3Ops::new(client)`; it no longer takes a logger, client id
+  or endpoint). A store built without a logger (`store_for_uri`) is now silent for
+  S3 too, as it already was for every other backend.
+- **Public helpers record once, in the store's row shape (#169).** `s3_utils::get_object`,
+  `get_object_uri`, `get_object_uri_async`, `get_object_uri_optimized_async`,
+  `get_objects_parallel*` (Python `get_many` on `s3://`), `put_object_async`,
+  `put_object_uri_async` and `delete_objects` write one row per call: endpoint
+  `s3://<bucket>`, file `<bucket>/<key>`, `client_id` from `set_client_id()`. The
+  synchronous `delete_objects` now writes one `DELETE_BATCH` row for the call (it
+  wrote one `DELETE` row per 1000 keys with `file` = `(batch)`); a large object
+  fetched by concurrent ranges now has its row too.
+- **Checkpoint and the async-pool dataloader record explicitly (#169).**
+  `CheckpointStore::open*`, the concurrent shard reader, `MultiBackendDataset` and
+  Python `load_checkpoint_with_validation` ask for a logged store, so they are
+  recorded on every backend (they were recorded by accident, S3 only).
+- **Known consequence:** `MultiEndpointStore` `get`/`put` on bucket-form endpoints
+  and the `s3dlio-oplog` replayer no longer write the accidental inner row (#175).
+  See `docs/design/oplog-record-contract/W2-ownership-audit.md`.
+
 ### Op-log accuracy: destinations (#168), lifecycle and drop detection (#170)
 
 The op-log TSV byte format (header, columns, idx numbering, timestamps, zstd

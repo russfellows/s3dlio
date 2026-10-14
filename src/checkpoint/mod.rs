@@ -7,7 +7,8 @@ pub mod paths;
 pub mod reader;
 pub mod writer;
 
-use crate::object_store::{store_for_uri, ObjectStore};
+use crate::object_store::{store_for_uri_with_logger, ObjectStore};
+use crate::s3_logger::global_logger;
 use anyhow::Result;
 use bytes::Bytes;
 pub use latest::Latest;
@@ -122,7 +123,9 @@ pub struct CheckpointStore {
 impl CheckpointStore {
     /// Create a new checkpoint store with default configuration
     pub fn open(uri: &str) -> Result<Self> {
-        let store = store_for_uri(uri)?;
+        // Checkpoint saves and loads are user-facing calls: they are recorded
+        // when the op-log is active (a store built by `store_for_uri` is silent).
+        let store = store_for_uri_with_logger(uri, global_logger())?;
         Ok(Self {
             uri: uri.to_string(),
             store,
@@ -132,7 +135,9 @@ impl CheckpointStore {
 
     /// Create a checkpoint store with custom configuration
     pub fn open_with_config(uri: &str, config: CheckpointConfig) -> Result<Self> {
-        let store = store_for_uri(uri)?;
+        // Checkpoint saves and loads are user-facing calls: they are recorded
+        // when the op-log is active (a store built by `store_for_uri` is silent).
+        let store = store_for_uri_with_logger(uri, global_logger())?;
         Ok(Self {
             uri: uri.to_string(),
             store,

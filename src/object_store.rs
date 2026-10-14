@@ -36,13 +36,14 @@ use crate::s3_utils::{
     delete_objects_async as s3_delete_objects_async,
     format_sdk_error,
     get_object_range_uri_async as s3_get_object_range_uri_async,
-    get_object_uri_async as s3_get_object_uri_async,
-    get_object_uri_optimized_async as s3_get_object_uri_optimized_async,
+    // The S3 backend of a store never records: the store's caller does (issue #169).
+    get_object_uri_optimized_silent as s3_get_object_uri_optimized_silent,
+    get_object_uri_silent as s3_get_object_uri_silent,
     list_objects_stream as s3_list_objects_stream,
     parse_s3_uri,
     put_object_multipart_uri_async as s3_put_object_multipart_uri_async,
     // NEW: PUT operations via ObjectStore
-    put_object_uri_async as s3_put_object_uri_async,
+    put_object_uri_silent as s3_put_object_uri_silent,
     stat_object_uri_async as s3_stat_object_uri_async,
     // Reuse existing S3 helpers
     ObjectStat as S3ObjectStat,
@@ -1403,9 +1404,9 @@ impl ObjectStore for S3ObjectStore {
             .unwrap_or(true); // Default: enabled
 
         if use_optimized {
-            s3_get_object_uri_optimized_async(uri).await
+            s3_get_object_uri_optimized_silent(uri).await
         } else {
-            s3_get_object_uri_async(uri).await
+            s3_get_object_uri_silent(uri).await
         }
     }
 
@@ -1494,7 +1495,7 @@ impl ObjectStore for S3ObjectStore {
             return Ok(());
         }
 
-        s3_put_object_uri_async(uri, data).await
+        s3_put_object_uri_silent(uri, data).await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
