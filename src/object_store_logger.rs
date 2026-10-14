@@ -545,6 +545,112 @@ impl ObjectStore for LoggedObjectStore {
         self.inner.create_writer(uri, options).await
     }
 
+    // ------------------------------------------------------------------
+    // Methods with a trait default. The wrapper must never change what the
+    // inner store does (issue #177): each is forwarded, so the inner store's own
+    // implementation runs (an atomic `rename(2)`, a real `mkdir`, the S3
+    // size-cache fill, ...) instead of the trait default.
+    //
+    // Only `get_optimized` and `get_range_optimized` write a row: they are a GET
+    // and a GET_RANGE, ops that already exist, and they were recorded as such
+    // (through the default calling `get`/`get_range`) before. The others have no
+    // op name in the format, and adding one is a format change that needs the
+    // architect's approval, so they are forwarded SILENTLY: mkdir, rmdir,
+    // update_metadata, update_properties, copy, rename, pre_stat_objects,
+    // pre_stat_and_cache.
+    // ------------------------------------------------------------------
+
+    async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
+        let start = SystemTime::now();
+        let result = self.inner.get_optimized(uri).await;
+        let first_byte = SystemTime::now();
+        let end = first_byte;
+
+        let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+        let error = result.as_ref().err().map(|e| e.to_string());
+
+        self.log_operation("GET", uri, bytes, 1, start, Some(first_byte), end, error);
+
+        result
+    }
+
+    async fn get_range_optimized(
+        &self,
+        uri: &str,
+        offset: u64,
+        length: Option<u64>,
+        chunk_size: Option<usize>,
+        max_concurrency: Option<usize>,
+    ) -> Result<Bytes> {
+        let start = SystemTime::now();
+        let result = self
+            .inner
+            .get_range_optimized(uri, offset, length, chunk_size, max_concurrency)
+            .await;
+        let first_byte = SystemTime::now();
+        let end = first_byte;
+
+        let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+        let error = result.as_ref().err().map(|e| e.to_string());
+
+        self.log_operation(
+            "GET_RANGE",
+            uri,
+            bytes,
+            1,
+            start,
+            Some(first_byte),
+            end,
+            error,
+        );
+
+        result
+    }
+
+    async fn pre_stat_objects(
+        &self,
+        uris: &[String],
+        max_concurrent: usize,
+    ) -> Result<std::collections::HashMap<String, u64>> {
+        self.inner.pre_stat_objects(uris, max_concurrent).await
+    }
+
+    async fn pre_stat_and_cache(&self, uris: &[String], max_concurrent: usize) -> Result<usize> {
+        self.inner.pre_stat_and_cache(uris, max_concurrent).await
+    }
+
+    async fn copy(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
+        self.inner.copy(src_uri, dst_uri).await
+    }
+
+    async fn rename(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
+        self.inner.rename(src_uri, dst_uri).await
+    }
+
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        self.inner.mkdir(uri).await
+    }
+
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        self.inner.rmdir(uri, recursive).await
+    }
+
+    async fn update_metadata(
+        &self,
+        uri: &str,
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        self.inner.update_metadata(uri, metadata).await
+    }
+
+    async fn update_properties(
+        &self,
+        uri: &str,
+        properties: &crate::object_store::ObjectProperties,
+    ) -> Result<()> {
+        self.inner.update_properties(uri, properties).await
+    }
+
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
         // Delegate to inner store - writer operations logged at write time
         self.inner.get_writer(uri).await

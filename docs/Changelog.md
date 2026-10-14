@@ -188,6 +188,16 @@ The op-log TSV format (13 columns, header, the values each column gets from
   the op-log is active is recorded once and a call made when it is not is neither
   recorded nor counted, whatever the cache history. `get_async` and
   `get_range_async` are recorded.
+- **`LoggedObjectStore` is transparent (#177).** It forwards every `ObjectStore`
+  method to the inner store. `mkdir`, `rmdir`, `update_metadata` and
+  `update_properties` used to fail ("not implemented for this backend") and
+  `rename`/`copy` used to become get + put (+ delete) on a logged store; the S3
+  `get_optimized`/`get_range_optimized`/`pre_stat_and_cache` overrides were
+  bypassed. Rows: `get_optimized` writes a `GET` row and `get_range_optimized` a
+  `GET_RANGE` row (as before); `mkdir`, `rmdir`, `update_*`, `copy`, `rename`,
+  `pre_stat_objects` and `pre_stat_and_cache` have no op name in the format and
+  are forwarded without a row (`pre_stat_*` used to write one `HEAD` row per
+  object through the trait default).
 - **Known consequence:** `MultiEndpointStore` `get`/`put` on bucket-form endpoints
   and the `s3dlio-oplog` replayer no longer write the accidental inner row (#175).
   See `docs/design/oplog-record-contract/W2-ownership-audit.md`.
