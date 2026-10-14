@@ -740,3 +740,73 @@ async fn performance_factories_route_a_host_form_uri_to_its_server() {
         b.requests()
     );
 }
+
+// -----------------------------------------------------------------------------
+// #196 -- delete_prefix on a per-endpoint client
+// -----------------------------------------------------------------------------
+
+/// A 200 `DeleteObjects` response that lists a key under `<Error>` means that
+/// key was NOT deleted: `delete_prefix` must fail and name it.
+#[tokio::test]
+async fn delete_prefix_reports_per_key_errors_from_a_200_response() {
+    let a = Mock::start_with(MockCfg {
+        list_keys: vec!["p/a".into(), "p/b".into()],
+        delete_per_key_errors: true,
+    });
+    let store = endpoint_store(&a).await;
+
+    let err = store
+        .delete_prefix("s3://bkt/p/")
+        .await
+        .expect_err("per-key errors must fail delete_prefix");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("p/a") && msg.contains("p/b"),
+        "the keys not deleted must be named: {msg}"
+    );
+    assert!(msg.contains("AccessDenied"), "{msg}");
+    assert!(
+        a.requests().iter().any(|r| r.starts_with("POST /bkt")),
+        "a DeleteObjects request was sent: {:?}",
+        a.requests()
+    );
+}
+
+/// Control: with no per-key errors the same call succeeds and deletes.
+#[tokio::test]
+async fn delete_prefix_succeeds_when_every_key_is_deleted() {
+    let a = Mock::start_with(MockCfg {
+        list_keys: vec!["p/a".into(), "p/b".into()],
+        delete_per_key_errors: false,
+    });
+    let store = endpoint_store(&a).await;
+
+    store
+        .delete_prefix("s3://bkt/p/")
+        .await
+        .expect("all keys deleted");
+    assert!(
+        a.requests().iter().any(|r| r.starts_with("POST /bkt")),
+        "{:?}",
+        a.requests()
+    );
+}
+
+/// More than 1000 keys span several DeleteObjects requests; a per-key error in
+/// ANY chunk fails the call.
+#[tokio::test]
+async fn delete_prefix_per_key_error_is_reported_with_more_than_one_chunk() {
+    let keys: Vec<String> = (0..1500).map(|i| format!("p/{i:05}")).collect();
+    let a = Mock::start_with(MockCfg {
+        list_keys: keys,
+        delete_per_key_errors: true,
+    });
+    let store = endpoint_store(&a).await;
+
+    let err = store
+        .delete_prefix("s3://bkt/p/")
+        .await
+        .expect_err("per-key errors must fail delete_prefix");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("p/00000"), "first failed key named: {msg}");
+}

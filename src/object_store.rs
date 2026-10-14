@@ -40,7 +40,6 @@ use crate::s3_utils::{
     get_object_uri_optimized_rows as s3_get_object_uri_optimized_rows,
     get_object_uri_rows as s3_get_object_uri_rows,
     list_objects_stream as s3_list_objects_stream,
-    parse_s3_uri,
     put_object_multipart_uri_async as s3_put_object_multipart_uri_async,
     // NEW: PUT operations via ObjectStore
     put_object_uri_rows as s3_put_object_uri_rows,
@@ -1748,35 +1747,35 @@ impl ObjectStore for S3ObjectStore {
         }
 
         if let Some(client) = &self.client {
-            let keys = Self::list_with_client(client, &bucket, &key_prefix, true).await?;
-            let just_keys: Vec<String> = keys
+            let listed = Self::list_with_client(client, &bucket, &key_prefix, true).await?;
+            // `list_with_client` returns `s3://<bucket>/<key>`: strip that
+            // head rather than re-parsing (a re-parse could misread the key,
+            // and a listing entry that does not parse must be an error, never
+            // a key silently left out of the delete).
+            let uri_head = format!("s3://{bucket}/");
+            let just_keys = listed
                 .iter()
-                .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, k)| k))
-                .collect();
-            for chunk in just_keys.chunks(1000) {
-                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk
-                    .iter()
-                    .filter_map(|k| {
-                        aws_sdk_s3::types::ObjectIdentifier::builder()
-                            .key(k)
-                            .build()
-                            .ok()
-                    })
-                    .collect();
-                if objects.is_empty() {
-                    continue;
+                .map(|u| {
+                    u.strip_prefix(uri_head.as_str())
+                        .map(str::to_string)
+                        .with_context(|| {
+                            format!("unexpected listing entry '{u}' (not under '{uri_head}')")
+                        })
+                })
+                .collect::<Result<Vec<String>>>()?;
+            let total = just_keys.len();
+            let mut confirmed = 0usize;
+            for chunk in just_keys.chunks(crate::delete_batch_plan::DELETE_BATCH_MAX_KEYS) {
+                // Checks the per-key results inside the HTTP 200 body (#196).
+                if let Err(e) = Self::delete_chunk_with_client(client, &bucket, chunk).await {
+                    return Err(e.context(format!(
+                        "S3 delete_prefix of 's3://{bucket}/{key_prefix}' failed: {confirmed} of \
+                         {total} key(s) were confirmed deleted before the failing request, {} \
+                         later key(s) were not attempted",
+                        total - confirmed - chunk.len()
+                    )));
                 }
-                let delete = aws_sdk_s3::types::Delete::builder()
-                    .set_objects(Some(objects))
-                    .build()
-                    .context("Failed to build Delete request")?;
-                client
-                    .delete_objects()
-                    .bucket(&bucket)
-                    .delete(delete)
-                    .send()
-                    .await
-                    .with_context(|| format!("S3 delete_prefix failed for bucket '{}'", bucket))?;
+                confirmed += chunk.len();
             }
             return Ok(());
         }
