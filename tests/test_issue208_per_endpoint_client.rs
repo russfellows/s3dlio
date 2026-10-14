@@ -528,6 +528,73 @@ async fn get_range_optimized_above_threshold_reaches_only_the_stores_server() {
 }
 
 // ----------------------------------------------------------------------------
+// (2a) the single-range fallback inside the concurrent helper
+// ----------------------------------------------------------------------------
+
+/// A transfer at or above the concurrent threshold but no larger than ONE chunk
+/// takes the helper's single-range fallback (`total_bytes <= effective_chunk_size`),
+/// not the multi-range split and not the small-read path:
+///
+///   * `length = 100_000` is >= `THRESHOLD` (64 KiB), so `get_range_optimized`
+///     enters `get_object_concurrent_range_with_client` (a smaller length would be
+///     served by `get_range` without ever reaching the helper);
+///   * `chunk_size = CHUNK` (128 KiB) is >= `length`, so the helper issues ONE
+///     ranged GET through `get_object_range_with_client` instead of splitting.
+///
+/// That fallback must use the store's own client: A (the process-wide client's
+/// server) gets nothing, B gets the HEAD and exactly one ranged GET.
+#[tokio::test]
+async fn the_single_range_fallback_reaches_only_the_stores_server() {
+    let a = global_a();
+    let b = ObjMock::start(SEED_B, OBJECT_SIZE);
+    let store = store_for(&b).await;
+
+    let bucket = unique_bucket("rng-single");
+    let (offset, length) = (100_000u64, 100_000u64);
+    assert!(
+        (THRESHOLD..=CHUNK).contains(&length),
+        "the parameters must reach the single-range fallback"
+    );
+    let got = store
+        .get_range_optimized(
+            &format!("s3://{bucket}/obj"),
+            offset,
+            Some(length),
+            Some(CHUNK as usize),
+            Some(3),
+        )
+        .await
+        .expect("the single-range fallback must reach the store's server");
+
+    assert_eq!(
+        a.for_bucket(&bucket).len(),
+        0,
+        "A got a request: {:?}",
+        a.for_bucket(&bucket)
+    );
+    assert!(
+        got.as_ref() == expected(SEED_B, offset, length).as_slice(),
+        "bytes must be B's, from the requested range (got {} bytes)",
+        got.len()
+    );
+    let reqs = b.for_bucket(&bucket);
+    assert!(
+        count(&reqs, "HEAD", "") >= 1,
+        "B must get the size lookup, got {reqs:?}"
+    );
+    let gets: Vec<&Req> = reqs.iter().filter(|r| r.method == "GET").collect();
+    assert_eq!(
+        gets.len(),
+        1,
+        "exactly one GET (single range, not a split), got {reqs:?}"
+    );
+    assert!(
+        gets[0].range.is_some(),
+        "the one GET must be a ranged GET, got {reqs:?}"
+    );
+}
+
+// ----------------------------------------------------------------------------
 // (2b) the server must not depend on the object size
 // ----------------------------------------------------------------------------
 
