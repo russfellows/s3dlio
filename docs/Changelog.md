@@ -111,6 +111,50 @@ implicit expansion will now delete less; add `-r` where you mean "everything und
   `list_objects_with_prefix`. The library `delete_prefix` is not changed by this entry; Python
   `delete()` follows the same contract (previous entry, #212).
 
+### Fixed — a TAB, LF or CR in a value no longer breaks the op-log row (#186)
+
+This is a **bounded mitigation, not exact logging support.** The row is TAB-separated, one
+record per line, with no quoting; a TAB or newline in a value added columns or split the record
+(and a crafted key could forge a whole record). No encoding, version marker or reader change is
+made here; reversible encoding is future work.
+
+- **Behaviour change.** A record whose `op`, `client_id`, `endpoint` or `file` holds a TAB, LF or
+  CR is now **rejected (not written) and counted**; the writer carries on with the next record.
+  The record is **lost**: the call itself runs normally but leaves no row. Its `idx` is skipped.
+- **Behaviour change.** A TAB, LF or CR in `error` is **replaced by one space each** and the row
+  is still written, so a failed operation is kept (CR LF becomes two spaces).
+- Every other byte, a backslash included, is written as before; every row that was valid before is
+  byte-identical. The check is made where the row is built, so it covers values an external caller
+  gave to `Logger::log` too.
+- New `OpLogStats::rejected_unsafe_field` and `OpLogStats::normalized_error_text` (Rust;
+  `#[non_exhaustive]`, so additive) and the same two keys of Python `op_log_stats()`.
+  `rejected_unsafe_field` is part of `is_complete()`: a log with a rejected record is **not**
+  complete. `normalized_error_text` is not: every operation is recorded, only a message was
+  reworded, so a log with only such rows is still complete. The first rejection prints one stderr
+  note per session (it names the column, not the value); finalize's INCOMPLETE warning states the
+  exact count, and finalize prints one line stating how many error messages had characters
+  replaced by spaces.
+- A record that is rejected for this reason and also has an unformattable timestamp (#190) is
+  counted once, in `rejected_unsafe_field`. The #190 behaviour is unchanged.
+- See `docs/supplemental/OPERATION_LOGGING.md`, "Records with a TAB, LF or CR in a value".
+
+### Fixed — a row with an unformattable timestamp no longer ends the op-log (#190)
+
+- **Behaviour change.** The op-log writes each row's start, first-byte and end times as
+  RFC 3339 after the clock offset is applied. A corrected time before 1970-01-01T00:00:00Z or at
+  or after 10000-01-01T00:00:00Z (an offset computed against a reference of 0 does it to every
+  row) has no such text; the formatter panicked, and the panic ended the log: that row and every
+  later one were lost. The row is now **rejected (not written) and counted**, and the writer
+  carries on with the next row. Nothing is clamped or reformatted, and every other row is
+  byte-identical to before. The rejected row's `idx` is skipped, so later rows keep their numbers.
+- New `OpLogStats::rejected_unformattable` (Rust; `#[non_exhaustive]`, so additive) and the
+  `rejected_unformattable` key of Python `op_log_stats()`. It is part of `is_complete()`: a log
+  with a rejected row is **not** complete. The first rejection prints one stderr note per
+  session; `finalize_op_log()`'s INCOMPLETE warning states the exact count.
+- The writer checks representability before formatting (it does not rely on catching a panic).
+  The domain is humantime 2.4.0's: at or after the epoch, below 253,402,300,800 s after it.
+- See `docs/supplemental/OPERATION_LOGGING.md`, "Rows with an unformattable timestamp".
+
 ## Version 0.9.122 — Op-log accuracy (each call recorded once), server routing for every operation, replay fixes, Azure credential fix
 
 Fixes 14 issues: #169, #174, #177, #181, #182, #189, #196, #197, #199, #200, #183, #184, #187, #202.

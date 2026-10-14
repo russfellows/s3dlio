@@ -29,6 +29,13 @@ idx  thread  op  client_id  n_objects  bytes  endpoint  file  error  start  firs
 - `end`: ISO 8601 timestamp when operation completed
 - `duration_ns`: Operation duration in nanoseconds (end - start)
 
+**Values are not escaped or quoted.** The row is TAB-separated, one record per
+line. A TAB, LF (`\n`) or CR (`\r`) inside a value would add columns or split the
+record, so the writer never writes one: a record whose `op`, `client_id`, `endpoint`
+or `file` holds any of them is **rejected** (not written), and in `error` they are
+**replaced by spaces**. Every other byte, a backslash included, is written as it is.
+See "Records with a TAB, LF or CR in a value" below.
+
 ### One call, one row
 
 Each call you make is recorded **once**, by exactly one layer:
@@ -272,7 +279,9 @@ if let Some(stats) = s3dlio::op_log_stats() {              // Option<OpLogStats>
 s3dlio.finalize_op_log()
 stats = s3dlio.op_log_stats()   # None before init_op_log(), else a dict
 complete = (stats["accepted"] == stats["written"] and stats["dropped_full"] == 0
-            and stats["writer_failed"] == 0 and stats["writer_error"] is None)
+            and stats["writer_failed"] == 0 and stats["writer_error"] is None
+            and stats["rejected_unformattable"] == 0
+            and stats["rejected_unsafe_field"] == 0)
 ```
 
 **What is counted.** The stats cover the calls that reached the session's
@@ -309,6 +318,7 @@ counted is absent exactly when
 
 ```
 accepted == written  AND  dropped_full == 0  AND  writer_failed == 0  AND  writer_error is None
+AND  rejected_unformattable == 0  AND  rejected_unsafe_field == 0
 ```
 
 (`OpLogStats::is_complete()` in Rust.) Complete means "none of the counted losses
@@ -321,9 +331,12 @@ are queued).
 | `accepted` | entries queued for the writer (`LogOutcome::Accepted`) |
 | `written` | rows the writer handed to the zstd encoder without an error. An **upper bound** of the rows in the file: the encoder and the file buffer them, so a later flush or finish failure can still lose some (that failure is `writer_error`) |
 | `dropped_full` | entries dropped because the queue was full (`LogOutcome::Full`); default mode only, always 0 when lossless |
-| `writer_failed` | calls **refused because the writer had already stopped** (`LogOutcome::WriterFailed`). It does *not* count entries that were queued before the writer stopped: those show as `accepted - written` |
+| `writer_failed` | calls **refused because the writer had already stopped** (`LogOutcome::WriterFailed`). It does *not* count entries that were queued before the writer stopped: those show as `accepted - written`, as do rows the writer rejected (`rejected_unformattable`, `rejected_unsafe_field`): use those dedicated counters to tell the causes apart |
 | `writer_error` | `None`, or the first error the writer met, as text: a failed write, a failed zstd finish or final flush, or a writer-thread panic (text starting `writer thread panicked`: a defect in the process, not an I/O error) |
 | `rejected_closed` | calls that arrived after finalize had begun (`LogOutcome::Closed`); see below |
+| `rejected_unformattable` | accepted rows the writer did **not** write because a timestamp (start, first byte or end, after the clock offset is applied) is before `1970-01-01T00:00:00Z` or at or after `10000-01-01T00:00:00Z`, where the RFC 3339 text the log uses does not exist (#190). Such a row is absent from the file and its `idx` is skipped (later rows keep their numbers); the writer carries on. They are counted in `accepted` but not in `written`, so the log is **not** complete. See below |
+| `rejected_unsafe_field` | accepted records the writer did **not** write because `op`, `client_id`, `endpoint` or `file` holds a TAB, LF or CR (#186). The whole record is absent from the file and its `idx` is skipped; the writer carries on. They are counted in `accepted` but not in `written`, so the log is **not** complete. A record that is also unformattable is counted here only. See below |
+| `normalized_error_text` | written rows whose `error` text held a TAB, LF or CR, each replaced by one space (#186). The operation is fully recorded, so this is **not** part of "complete"; it discloses that a message was changed. See below |
 | `lossless` | the session's mode |
 
 **What the file holds after a writer error.** If the writer stops on an I/O
@@ -334,6 +347,47 @@ of complete rows R with `R <= written`. If only the final finish or flush fails,
 every row was handed over and the bytes may all be there, but `writer_error`
 says they are not guaranteed to be on disk. After a writer-thread panic the
 writer still finishes the stream, so the rows before the panic are readable.
+
+**Rows with an unformattable timestamp (#190).** The clock offset (`set_clock_offset`)
+is applied to the start, first-byte and end times of each row when the row is
+written. If the corrected time of any of the three is before 1970-01-01 or at or
+after year 10000 (for example an offset computed against a reference of 0, which
+pushes every row before the epoch), the row cannot be written as RFC 3339 and is
+**rejected, not written, and counted** in `rejected_unformattable`; nothing is
+clamped or rewritten. The writer does **not** stop: every later row that is
+formattable is written, byte for byte as it would have been. The first rejection
+prints one stderr note (later ones are only counted), and finalize's warning names
+the exact count and says the trace is incomplete. Fix the offset and re-run to get
+a full trace.
+
+**Records with a TAB, LF or CR in a value (#186).** The row has no quoting or
+escaping, so these three bytes cannot be carried in a value. What happens depends
+on the column:
+
+| Column | A TAB, LF or CR in it | Counted in |
+|---|---|---|
+| `op`, `client_id`, `endpoint`, `file` | the **whole record is rejected**: no row is written, the `idx` is skipped, later records are written unchanged | `rejected_unsafe_field`; the log is **not** complete |
+| `error` | each of the three is **replaced by one space** and the row is written (CR LF becomes two spaces); everything else in the row is as it would be for a clean message | `normalized_error_text`; the log stays complete |
+| any other byte (backslash, `%`, `"`, U+0085, U+2028, ...) | written as it is, as before | not counted |
+
+The check is made where the row is built, so it covers values an external caller
+passed to `Logger::log` (`op`, `endpoint`) as well as `file`, `client_id` (from
+`set_client_id`) and the endpoint the library fills in. The first rejected record of
+a session prints one stderr note naming the column (never the value); later ones are
+only counted. Finalize's INCOMPLETE warning states the exact count and the reason,
+and a separate line states how many error messages had characters replaced by
+spaces. That line is printed whether or not the log is complete: a log in which only
+error texts were changed is **complete** (every operation is recorded, only the
+wording of a diagnostic differs), so it gets the disclosure line and no warning.
+
+**This is not support for logging such names exactly.** A rejected record is
+**lost**: the call being traced still runs normally, but it leaves no row, so the
+trace under-counts it (the failed call whose path holds a TAB leaves no row at all).
+Nothing is encoded, so no reader can recover the value, and the file format, header
+and readers are unchanged. File names with a TAB or newline are legal on Linux and in
+object stores; if your workload uses them, the op-log of those calls is incomplete by
+design and `rejected_unsafe_field` tells you how many. A reversible encoding of such
+values, which would need a format marker and reader changes, is future work.
 
 **`rejected_closed` is not part of "complete".** Calls made after finalize began
 (for example from a store created before finalize that is still used by a worker
@@ -445,8 +499,18 @@ not a machine-checked inventory:
   been benchmarked. Each call also bumps one relaxed outcome counter (see
   "Detecting lost records").
 - A clock offset of `i64::MIN` no longer panics the writer thread in builds with
-  overflow checks. A corrected timestamp before the epoch (or at or after year
-  9999) still panics inside the timestamp formatter, as before.
+  overflow checks.
+- A row whose corrected timestamp is before the epoch or at or after year 10000
+  used to panic inside the timestamp formatter, which ended the log: that row and
+  every later one were lost. It is now rejected, counted in
+  `rejected_unformattable` and reported (see "Rows with an unformattable
+  timestamp"), and the writer carries on (#190).
+- A record whose `op`, `client_id`, `endpoint` or `file` held a TAB, LF or CR used to
+  be written with that character in it, which added columns or split the line and
+  broke readers. It is now rejected and counted in `rejected_unsafe_field`; a TAB, LF
+  or CR in `error` is replaced by a space and counted in `normalized_error_text` (see
+  "Records with a TAB, LF or CR in a value"). Every row that was valid before is
+  byte-identical (#186).
 
 ### What the format tests establish
 
