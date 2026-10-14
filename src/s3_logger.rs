@@ -54,9 +54,25 @@ mod race_hooks {
     use std::cell::Cell;
     use std::time::Duration;
 
+    type Hook = Box<dyn FnOnce()>;
+
     thread_local! {
         static STATE: Cell<Option<u64>> = const { Cell::new(None) };
         static ENTERED: Cell<u64> = const { Cell::new(0) };
+        static BEFORE_GATE: Cell<Option<Hook>> = const { Cell::new(None) };
+    }
+
+    /// Run `hook` once, on the current thread, at the next `try_log` between the
+    /// closed-bit hint and the gate increment (the window the hint cannot close).
+    pub(super) fn run_once_before_gate(hook: impl FnOnce() + 'static) {
+        BEFORE_GATE.with(|h| h.set(Some(Box::new(hook))));
+    }
+
+    /// Run (and clear) the hook set by [`run_once_before_gate`], if any.
+    pub(super) fn before_gate() {
+        if let Some(hook) = BEFORE_GATE.with(Cell::take) {
+            hook();
+        }
     }
 
     /// Record that the current thread just incremented the in-flight count.
@@ -160,17 +176,40 @@ pub fn global_logger() -> Option<Logger> {
 }
 
 /// Counts of what happened to the entries submitted to the process's op-log
-/// session, so a caller can tell whether the log is complete.
+/// session, so a caller can detect most ways records are lost.
 ///
 /// Available while the session is Active and after it is Finalized (`None`
 /// only before [`init_op_logger`]). The outcome counts cover every `log` /
-/// `try_log` call made through any clone of the session's [`Logger`]; `written`
-/// and `writer_error` come from the writer thread.
+/// `try_log` call that reached the session's [`Logger`] (through any clone)
+/// between init and finalize; `written` and `writer_error` come from the writer
+/// thread.
+///
+/// # What is counted, and what is not
+///
+/// "Written" means the writer thread handed the row to the zstd encoder without
+/// an error, and that the bytes the encoder and the file buffer were accepted by
+/// the OS `write(2)` call. There is **no fsync**: written does not mean durable.
+///
+/// These losses are **not** visible in the stats (a program that needs them
+/// covered must handle them itself):
+///
+/// - **Process exit without [`finalize_op_logger`].** Nothing finalizes the log
+///   at exit (there is no `atexit` hook, and the global logger lives in a static
+///   that is never dropped): entries still on the queue, the buffered bytes and
+///   the zstd frame end are lost, and the stats are never read. Always finalize
+///   before the process exits.
+/// - **Stores built before [`init_op_logger`]** hold no logger. Their operations
+///   are not logged and not counted.
+/// - **Errors reported only at `close(2)`** (for example NFS or quota errors that
+///   show up when the file is closed). The writer drops the `File` after its last
+///   flush, and Rust's `File` drop ignores the result of `close`, so such an
+///   error is not observable here. An fsync would not be added: it would cost
+///   performance and the op-log mirrors native write semantics.
 ///
 /// # When is the log complete?
 ///
-/// After [`finalize_op_logger`] has returned, the log is **complete** exactly
-/// when [`OpLogStats::is_complete`] is true:
+/// After [`finalize_op_logger`] has returned, every loss that **is** counted is
+/// absent exactly when [`OpLogStats::is_complete`] is true:
 ///
 /// ```text
 /// accepted == written  &&  dropped_full == 0  &&  writer_failed == 0  &&  writer_error is None
@@ -182,7 +221,7 @@ pub fn global_logger() -> Option<Logger> {
 ///   the writer died, so on its own it misses them).
 /// - `writer_error` is the first error the writer met: a failed write, a failed
 ///   zstd finish or final flush (the rows may all have been counted as written
-///   yet not be on disk), or a writer panic.
+///   yet not be on disk), or a writer panic (a defect, not an I/O error).
 ///
 /// `rejected_closed` is deliberately **not** part of "complete": those calls
 /// arrived after finalize had begun and were never going to be in the file, but
@@ -224,10 +263,10 @@ pub struct OpLogStats {
 }
 
 impl OpLogStats {
-    /// True when nothing was lost: `accepted == written && dropped_full == 0 &&
-    /// writer_failed == 0 && writer_error.is_none()`. Meaningful once
-    /// [`finalize_op_logger`] has returned (see the type docs); calls counted in
-    /// `rejected_closed` are not part of it.
+    /// True when none of the counted losses happened: `accepted == written &&
+    /// dropped_full == 0 && writer_failed == 0 && writer_error.is_none()`.
+    /// Meaningful once [`finalize_op_logger`] has returned (see the type docs for
+    /// what it cannot see); calls counted in `rejected_closed` are not part of it.
     pub fn is_complete(&self) -> bool {
         self.accepted == self.written
             && self.dropped_full == 0
@@ -236,9 +275,33 @@ impl OpLogStats {
     }
 }
 
+/// What the writer's recorded error says went wrong, which decides the advice:
+/// an I/O error points at the destination, a panic or a vanished thread does not.
+enum WriterFailure {
+    /// A failed write, zstd finish or final flush (or no error recorded at all).
+    Io,
+    /// The writer thread panicked: a defect in this process, not the destination.
+    Panic,
+    /// The writer thread ended without completing, with no error of its own.
+    Vanished,
+}
+
+impl WriterFailure {
+    fn of(error: Option<&str>) -> Self {
+        match error {
+            Some(e) if e.starts_with(WRITER_PANICKED) => Self::Panic,
+            Some(e) if e.starts_with(&format!("{WRITER_VANISHED}: {WRITER_VANISHED_WHY}")) => {
+                Self::Vanished
+            }
+            _ => Self::Io,
+        }
+    }
+}
+
 /// The single warning printed when finalize finds that records were lost;
 /// `None` when the log is complete. Names only the non-zero losses and gives
-/// only the advice that applies to the session's mode.
+/// only the advice that applies to the session's mode and to the kind of writer
+/// failure (an I/O error, a panic, or a thread that vanished).
 fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
     if stats.is_complete() {
         return None;
@@ -261,6 +324,15 @@ fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
     if unwritten > 0 {
         lines.push(format!("{unwritten} accepted entries were never written"));
     }
+    if stats.written > stats.accepted {
+        // The counters are separate relaxed atomics: a snapshot read while
+        // producers are still logging can see a row as written before its accept.
+        lines.push(format!(
+            "{} rows written but only {} accepted (the counters were read while \
+             the session was still active)",
+            stats.written, stats.accepted
+        ));
+    }
     if let Some(error) = &stats.writer_error {
         lines.push(format!("the writer failed: {error}"));
     }
@@ -278,11 +350,20 @@ fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
         );
     }
     if unwritten > 0 || stats.writer_failed > 0 || stats.writer_error.is_some() {
-        advice.push(
-            "Check the op-log destination for I/O errors (full disk, permissions, \
-             a failing device) and this process's stderr for the writer's message."
+        advice.push(match WriterFailure::of(stats.writer_error.as_deref()) {
+            WriterFailure::Io => "Check the op-log destination for I/O errors (full disk, \
+                 permissions, a failing device) and this process's stderr for the \
+                 writer's message."
                 .to_string(),
-        );
+            WriterFailure::Panic => "The writer thread panicked: that is a defect in this \
+                 process, not an I/O error. Entries after the panic point were lost. The \
+                 panic message is on this process's stderr; please report it."
+                .to_string(),
+            WriterFailure::Vanished => "The writer thread ended abnormally without \
+                 completing, so entries it had not written were lost. Check this \
+                 process's stderr for the cause."
+                .to_string(),
+        });
     }
     let mut text = format!(
         "op-log is INCOMPLETE ({} accepted, {} written):\n  - {}",
@@ -409,9 +490,13 @@ pub fn get_client_id() -> String {
 }
 
 /// Finish the process's op-log session: every record whose [`Logger::try_log`]
-/// (or `log`) call was accepted is written (unless the writer failed with an
-/// I/O error), and the writer has finished the zstd stream and signalled
-/// completion before this returns.
+/// (or `log`) call was accepted is written (unless the writer failed: an I/O
+/// error or a panic in the writer thread, see [`OpLogStats::writer_error`]), and
+/// the writer has finished the zstd stream and signalled completion before this
+/// returns.
+///
+/// The process must call this before it exits: nothing finalizes the log
+/// automatically, so without it queued entries and the zstd frame end are lost.
 ///
 /// Finalize is terminal and idempotent. Entries submitted once it has begun are
 /// rejected (`LogOutcome::Closed`), [`global_logger`] returns `None` and the
@@ -549,19 +634,20 @@ fn oplog_write_buffer_capacity() -> usize {
 }
 
 /// Result of [`Logger::try_log`]. Only `Accepted` entries can be in the file once
-/// the session is finalized, and they will be unless the writer fails with an
-/// I/O error.
+/// the session is finalized, and they will be unless the writer fails first (an
+/// I/O error, or a panic in the writer thread; see [`OpLogStats::writer_error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LogOutcome {
     /// Queued for the writer; it will be written, even if finalize runs next,
-    /// unless the writer fails with an I/O error before reaching it.
+    /// unless the writer fails (an I/O error, or a panic in the writer thread)
+    /// before reaching it.
     Accepted,
     /// The queue was full (non-lossless mode): the entry was dropped.
     Full,
     /// The session is finalizing or finalized: the entry was rejected, not written.
     Closed,
-    /// The writer stopped after an I/O error: the entry was not written.
+    /// The writer stopped (after an I/O error or a panic): the entry was not written.
     WriterFailed,
 }
 
@@ -580,7 +666,9 @@ struct Shared {
     /// `GATE_CLOSED` bit plus the number of `log()` calls in flight. See
     /// [`Logger::try_log`] and [`Logger::shutdown`] for the drain protocol.
     gate: AtomicU64,
-    /// Completion signal from the writer thread; taken by the first shutdown.
+    /// Completion signal from the writer thread; `Some` until a shutdown has seen
+    /// the writer finish. It is only taken out AFTER the wait, so a shutdown that
+    /// panics before that (poisoning the mutex) leaves it for the next caller.
     /// The mutex is held for the whole shutdown so later callers wait for it.
     done_rx: Mutex<Option<Receiver<()>>>,
     clock_offset_nanos: Arc<AtomicI64>, // Nanoseconds to adjust timestamps for distributed sync
@@ -622,15 +710,26 @@ impl WriterReport {
     }
 }
 
+/// How a writer failure is recorded (the start of `WriterReport::first_error`),
+/// so the finalize warning can tell a panic or a vanished thread from an I/O error.
+const WRITER_PANICKED: &str = "writer thread panicked";
+const WRITER_PANICKED_FINISHING: &str = "writer thread panicked while finishing";
+const WRITER_VANISHED: &str = "writer thread";
+const WRITER_VANISHED_WHY: &str = "ended without completing (it was terminated abnormally)";
+
 /// Wait for the writer thread's completion message. A closed channel with no
 /// message means the thread ended without finishing its work, which is an error.
 fn wait_for_writer(done: &Receiver<()>, report: &WriterReport) {
     if done.recv().is_err() {
-        report.record_error(
-            "writer thread",
-            "ended without completing (it was terminated abnormally)",
-        );
+        report.record_error(WRITER_VANISHED, WRITER_VANISHED_WHY);
     }
+}
+
+/// Print one diagnostic line to stderr. Never panics: `eprintln!` panics when
+/// stderr is closed or full, and these notes run on the caller's own I/O path
+/// (`try_log`), where losing a note is far better than failing the caller.
+fn stderr_note(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
 }
 
 /// Text of a panic payload.
@@ -717,12 +816,20 @@ fn write_rows<W: Write>(
 }
 
 /// Finish the zstd stream and flush the sink, recording (not dropping) errors.
+///
+/// The last thing that happens to the sink is its drop, which for the production
+/// sink (`BufWriter<File>`) closes the file. A failing `close(2)` (reported late
+/// by some network filesystems, or on a quota) is not observable: Rust's `File`
+/// drop ignores it, and the op-log deliberately adds no fsync. So the flush above
+/// it is the last error this writer can see, and `written` means "accepted by
+/// `write(2)`", not durable.
 fn finish_stream<W: Write>(encoder: &mut StreamEncoder<W>, report: &WriterReport) {
     match encoder.finish() {
         Ok(mut sink) => {
             if let Err(e) = sink.flush() {
                 report.record_error("final flush failed", &e);
             }
+            drop(sink); // explicit: the close error, if any, is ignored by `File`
         }
         Err(e) => report.record_error("finishing the zstd stream failed", &e),
     }
@@ -743,17 +850,23 @@ fn run_writer<W: Write>(
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
         write_rows(receiver, &mut encoder, clock_offset, report);
     })) {
-        report.record_error("writer thread panicked", panic_text(&*payload));
+        report.record_error(WRITER_PANICKED, panic_text(&*payload));
     }
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| finish_stream(&mut encoder, report))) {
-        report.record_error(
-            "writer thread panicked while finishing",
-            panic_text(&*payload),
-        );
+        report.record_error(WRITER_PANICKED_FINISHING, panic_text(&*payload));
     }
     drop(encoder);
     let _ = done.send(());
 }
+
+/// The body of the writer thread: [`run_writer`] in production.
+type WriterBody<W> = fn(
+    Receiver<Message>,
+    StreamEncoder<W>,
+    &AtomicI64,
+    &WriterReport,
+    &std::sync::mpsc::Sender<()>,
+);
 
 impl Shared {
     /// Outcome for a call that found the logger closed; prints the single
@@ -761,9 +874,9 @@ impl Shared {
     fn reject_closed(&self) -> LogOutcome {
         self.rejected_closed.fetch_add(1, Ordering::Relaxed);
         if !self.closed_noted.swap(true, Ordering::Relaxed) {
-            eprintln!(
+            stderr_note(
                 "op-log finalized: entries from stores created before finalize are no \
-                 longer recorded"
+                 longer recorded",
             );
         }
         LogOutcome::Closed
@@ -912,6 +1025,21 @@ impl Logger {
         level: i32,
         thread_name: &str,
     ) -> std::io::Result<Self> {
+        Self::start_with(sink, cap, lossless, level, thread_name, run_writer::<W>)
+    }
+
+    /// [`Logger::start`] with the writer thread's body given explicitly. Production
+    /// always passes [`run_writer`]; tests pass a body that misbehaves in a way the
+    /// real one is built to prevent (for example, ending without its completion
+    /// message), to prove the rest of the machinery copes.
+    fn start_with<W: Write + Send + 'static>(
+        sink: W,
+        cap: usize,
+        lossless: bool,
+        level: i32,
+        thread_name: &str,
+        run: WriterBody<W>,
+    ) -> std::io::Result<Self> {
         // Bounded channel for log entries (drop on overflow in `log()` via try_send).
         let (sender, receiver): (SyncSender<Message>, Receiver<Message>) = sync_channel(cap);
 
@@ -932,7 +1060,7 @@ impl Logger {
         thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
-                run_writer(
+                run(
                     receiver,
                     encoder,
                     &clock_offset_clone,
@@ -1040,7 +1168,7 @@ impl Logger {
     ///
     /// `Accepted` means the entry is on the writer's queue, ahead of the shutdown
     /// marker, so [`finalize_op_logger`] will write it unless the writer fails
-    /// with an I/O error. Once finalize has begun, calls return
+    /// (an I/O error or a panic in the writer thread). Once finalize has begun, calls return
     /// [`LogOutcome::Closed`] (never `Full`) and write nothing; at most one
     /// diagnostic is printed for the whole closed logger.
     ///
@@ -1058,7 +1186,10 @@ impl Logger {
             return shared.reject_closed();
         }
         #[cfg(test)]
-        race_hooks::point();
+        {
+            race_hooks::point();
+            race_hooks::before_gate();
+        }
 
         // Enter the gate. All updates to `gate` are totally ordered. If our add
         // comes before shutdown's `fetch_or(GATE_CLOSED)` in that order, shutdown's
@@ -1100,7 +1231,7 @@ impl Logger {
                 }
                 Err(TrySendError::Full(_)) => {
                     shared.dropped_full.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("op-log channel full; dropping entry");
+                    stderr_note("op-log channel full; dropping entry");
                     LogOutcome::Full
                 }
                 Err(TrySendError::Disconnected(_)) => {
@@ -1112,7 +1243,7 @@ impl Logger {
         if outcome == LogOutcome::WriterFailed
             && !shared.writer_failure_noted.swap(true, Ordering::Relaxed)
         {
-            eprintln!("op-log writer has stopped after an error; entries are being dropped");
+            stderr_note("op-log writer has stopped after an error; entries are being dropped");
         }
         outcome
     }
@@ -1123,16 +1254,18 @@ impl Logger {
     /// (2) wait until the in-flight count reaches zero, i.e. every `log()` that
     /// entered before the close has finished its send, so everything accepted is
     /// already on the queue (and is written unless the writer fails with an I/O
-    /// error); (3) send `Shutdown`, which the FIFO channel delivers
+    /// error or panic); (3) send `Shutdown`, which the FIFO channel delivers
     /// after all of those entries; (4) wait for the writer to finish the zstd
     /// stream. Idempotent; concurrent callers block until the first finishes.
     fn shutdown(&self) {
         let shared = &*self.shared;
+        // A poisoned lock (an earlier shutdown panicked) is recovered: the receiver
+        // is still in it unless that shutdown had already seen the writer finish.
         let mut done_rx = shared
             .done_rx
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let Some(done) = done_rx.take() else {
+        let Some(done) = done_rx.as_ref() else {
             return;
         };
 
@@ -1150,15 +1283,20 @@ impl Logger {
         }
 
         // Blocking send so the sentinel cannot be lost on a full queue. If the
-        // writer already stopped the send fails, which is fine.
+        // writer already stopped the send fails, which is fine. (After a panic in an
+        // earlier shutdown this is a second sentinel, which nothing reads: harmless.)
         let _ = shared.sender.send(Message::Shutdown);
 
-        // Print info if info set
+        // Print info if info set. A tracing subscriber may panic here; the receiver
+        // is still in the mutex, so the next shutdown waits for the writer itself.
         info!("Shutting down S3 operation logging");
 
         // Wait for the background thread to finish the zstd stream and flush the
         // sink. A thread that vanished without saying so is recorded as an error.
-        wait_for_writer(&done, &shared.writer);
+        wait_for_writer(done, &shared.writer);
+        // The writer is done: later calls have nothing left to wait for.
+        *done_rx = None;
+        drop(done_rx);
 
         // Publish the final values (see `stats` for the ordering argument).
         shared.final_published.store(true, Ordering::Release);
@@ -1846,6 +1984,37 @@ mod oplog_shutdown_tests {
         entry(&file)
     }
 
+    // The closed-bit hint cannot close every window: a caller can read the gate
+    // open, lose the CPU, and find it closed only at its fetch_add. That second
+    // reject path must count the call, send nothing and release the gate. The test
+    // hook runs the close in exactly that window, so the path is taken every time.
+    #[test]
+    fn a_close_between_the_hint_and_the_gate_is_rejected_at_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ops.tsv.zst");
+        let logger = Logger::open(path.to_str().unwrap(), 8, false).unwrap();
+        assert_eq!(logger.try_log(entry("a")), LogOutcome::Accepted);
+
+        let closer = logger.clone();
+        race_hooks::run_once_before_gate(move || closer.shutdown());
+        let entered_before = race_hooks::entered();
+        assert_eq!(logger.try_log(entry("late")), LogOutcome::Closed);
+        assert_eq!(
+            race_hooks::entered() - entered_before,
+            1,
+            "the call must have got past the hint and been refused by the gate"
+        );
+
+        let st = logger.stats();
+        assert_eq!((st.accepted, st.rejected_closed), (1, 1), "{st:?}");
+        assert_eq!(
+            logger.shared.gate.load(Ordering::SeqCst),
+            GATE_CLOSED,
+            "the refused call must give the gate back"
+        );
+        assert_eq!(read_tags(&path).unwrap(), ["a"], "nothing after the close");
+    }
+
     // Finding 11: after the writer fails with an I/O error, log() reports
     // WriterFailed -- never Full -- in both queue modes, and shutdown returns.
     #[test]
@@ -2236,6 +2405,191 @@ mod oplog_stats_tests {
                 "round {round}"
             );
         }
+    }
+
+    // ---- the note lines on the log() hot path must never panic (review P3-3) ----
+
+    const CHILD_ENV: &str = "S3DLIO_TEST_DEAD_STDERR_CHILD";
+    const CHILD_OK: &str = "dead-stderr child finished";
+
+    /// Run `body` in a child copy of this test binary whose stderr is `/dev/full`,
+    /// where every write fails (a closed or broken stderr). `eprintln!` panics on
+    /// such a write; the op-log's own notes must not, because they run inside the
+    /// caller's I/O path. `test` is the child's test path within this crate.
+    #[cfg(target_os = "linux")]
+    fn with_dead_stderr(test: &str, body: impl FnOnce()) {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            body();
+            println!("{CHILD_OK}");
+            return;
+        }
+        let dead = File::options().write(true).open("/dev/full").unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .stderr(std::process::Stdio::from(dead))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(CHILD_OK),
+            "the child died or never ran its body ({}): {stdout}",
+            out.status
+        );
+    }
+
+    /// `module_path!()` without the crate name: the path libtest filters on.
+    fn test_path(name: &str) -> String {
+        let module = module_path!();
+        let (_, module) = module.split_once("::").unwrap();
+        format!("{module}::{name}")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_note_survives_a_dead_stderr() {
+        with_dead_stderr(&test_path("closed_note_survives_a_dead_stderr"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ops.tsv.zst");
+            let logger = Logger::open(path.to_str().unwrap(), 8, false).unwrap();
+            logger.shutdown();
+            // The first call after the close prints the one "finalized" note.
+            assert_eq!(logger.try_log(entry("late")), LogOutcome::Closed);
+            assert_eq!(logger.try_log(entry("later")), LogOutcome::Closed);
+            assert_eq!(logger.stats().rejected_closed, 2);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_note_survives_a_dead_stderr() {
+        with_dead_stderr(&test_path("full_note_survives_a_dead_stderr"), || {
+            let sink = StallingSink::default();
+            sink.lock().released = true; // the header is written by `start` itself
+            let logger = Logger::start(sink.clone(), 1, false, 1, "oplog-dse-f").unwrap();
+            {
+                let mut st = sink.lock();
+                st.released = false;
+                st.blocked = false;
+            }
+            assert_eq!(logger.try_log(big_entry(1)), LogOutcome::Accepted);
+            sink.wait_until_blocked(); // the writer holds the big entry; the queue is empty
+            assert_eq!(logger.try_log(entry("queued")), LogOutcome::Accepted);
+            // Every one of these prints a "channel full" line.
+            for i in 0..3 {
+                assert_eq!(logger.try_log(entry(&format!("d{i}"))), LogOutcome::Full);
+            }
+            sink.release();
+            logger.shutdown();
+            assert_eq!(logger.stats().dropped_full, 3);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_stopped_note_survives_a_dead_stderr() {
+        with_dead_stderr(
+            &test_path("writer_stopped_note_survives_a_dead_stderr"),
+            || {
+                let armed = Arc::new(AtomicBool::new(false));
+                let logger = Logger::start(
+                    ArmedFailSink(Arc::clone(&armed)),
+                    64,
+                    false,
+                    1,
+                    "oplog-dse-w",
+                )
+                .unwrap();
+                armed.store(true, Ordering::SeqCst);
+                let mut seen_failed = false;
+                for i in 0..200_u64 {
+                    match logger.try_log(big_entry(i)) {
+                        LogOutcome::Accepted => thread::sleep(Duration::from_millis(20)),
+                        LogOutcome::WriterFailed => {
+                            seen_failed = true;
+                            break;
+                        }
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+                assert!(seen_failed, "the writer failure never surfaced");
+                logger.shutdown();
+            },
+        );
+    }
+
+    // ---- a panic inside shutdown must not let a later finalize return early (P3-2) ----
+
+    /// A tracing subscriber that panics on every event (what a faulty or hostile
+    /// `tracing` layer can do inside `info!`). Installed per thread only.
+    struct PanickingSubscriber;
+
+    impl tracing::Subscriber for PanickingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            panic!("injected: tracing subscriber panicked");
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    // The first shutdown panics (in the tracing call it makes) while the writer is
+    // still running. Before the fix it had already taken the completion receiver
+    // out of the mutex, so the panic lost it and every later finalize returned at
+    // once, before the writer was done, and the incomplete-log warning never ran.
+    #[test]
+    fn a_panic_in_the_first_shutdown_does_not_let_a_later_one_return_early() {
+        let sink = StallingSink::default();
+        sink.lock().released = true; // the header is written by `start` itself
+        let logger = Logger::start(sink.clone(), 8, false, 1, "oplog-ps").unwrap();
+        {
+            let mut st = sink.lock();
+            st.released = false;
+            st.blocked = false;
+        }
+        assert_eq!(logger.try_log(big_entry(1)), LogOutcome::Accepted);
+        sink.wait_until_blocked(); // the writer is stuck inside the sink
+
+        let first = logger.clone();
+        let outcome = thread::spawn(move || {
+            tracing::subscriber::with_default(PanickingSubscriber, || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| first.shutdown()))
+            })
+        })
+        .join()
+        .unwrap();
+        assert!(
+            outcome.is_err(),
+            "the injected panic never reached shutdown"
+        );
+
+        let (tx, rx) = channel::<()>();
+        let second = logger.clone();
+        thread::spawn(move || {
+            second.shutdown();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a later shutdown returned while the writer was still running"
+        );
+
+        sink.release();
+        rx.recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the later shutdown never returned"));
+        let st = logger.stats();
+        assert_eq!((st.accepted, st.written), (1, 1), "{st:?}");
+        assert!(st.is_complete(), "{st:?}");
+        // A third call finds the session already finished.
+        logger.shutdown();
+        assert_eq!(sink.rows(), 1);
     }
 }
 
@@ -2640,6 +2994,196 @@ mod oplog_writer_error_tests {
             report.first_error.get().map(String::as_str),
             Some("write: first")
         );
+    }
+
+    /// Call `logger.shutdown()` on another thread and fail the test (instead of
+    /// hanging it) if it has not returned within 30 seconds.
+    fn shutdown_within_30s(logger: &Logger, what: &str) {
+        let (done_tx, done_rx) = channel::<()>();
+        let closing = logger.clone();
+        thread::spawn(move || {
+            closing.shutdown();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("{what}: shutdown hung"));
+    }
+
+    /// A sink whose writes panic once armed: a panic seam that does not depend on
+    /// any other crate's behaviour.
+    #[derive(Clone, Default)]
+    struct PanicSink {
+        armed: Arc<AtomicBool>,
+    }
+
+    impl Write for PanicSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            assert!(
+                !self.armed.load(Ordering::SeqCst),
+                "injected: sink write panicked"
+            );
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A panic while WRITING ROWS (here: the sink panics when the first big row
+    // reaches it). Does not depend on humantime or on any time arithmetic. The
+    // first error is the row phase's; the stream is still finished afterwards.
+    #[test]
+    fn a_panic_in_the_row_loop_is_reported_and_shutdown_does_not_hang() {
+        for lossless in [false, true] {
+            let sink = PanicSink::default();
+            let logger = Logger::start(sink.clone(), 8, lossless, 1, "oplog-pr").unwrap();
+            sink.armed.store(true, Ordering::SeqCst);
+            assert_eq!(logger.try_log(big_entry(1)), LogOutcome::Accepted);
+            for _ in 0..20 {
+                match logger.try_log(entry("later")) {
+                    LogOutcome::Accepted | LogOutcome::WriterFailed => {}
+                    LogOutcome::Full if !lossless => {}
+                    other => panic!("lossless={lossless}: unexpected {other:?}"),
+                }
+            }
+            shutdown_within_30s(&logger, &format!("lossless={lossless}"));
+
+            let st = logger.stats();
+            let error = st.writer_error.as_deref().unwrap_or_default();
+            assert!(
+                error.starts_with("writer thread panicked:")
+                    && error.contains("injected: sink write panicked"),
+                "lossless={lossless}: {st:?}"
+            );
+            assert!(
+                !error.contains("while finishing"),
+                "the FIRST error is the row phase's: {st:?}"
+            );
+            assert_eq!(st.written, 0, "{st:?}");
+            assert!(!st.is_complete());
+            let warning = incomplete_warning(&st).unwrap();
+            assert!(
+                warning.contains("panicked") && !warning.contains("I/O errors"),
+                "a panic is not an I/O error: {warning}"
+            );
+        }
+    }
+
+    // A panic while FINISHING the stream: the rows were all written (they sit in
+    // the encoder), the frame end is what reaches the sink and panics. The second
+    // catch_unwind in the writer records it; without it the panic would escape the
+    // thread and surface only as a vanished writer.
+    #[test]
+    fn a_panic_while_finishing_the_stream_is_reported_as_such() {
+        let sink = PanicSink::default();
+        let logger = Logger::start(sink.clone(), 64, false, 1, "oplog-pf").unwrap();
+        for i in 0..3 {
+            assert_eq!(
+                logger.try_log(entry(&format!("r{i}"))),
+                LogOutcome::Accepted
+            );
+        }
+        // Three tiny rows stay inside the encoder: only finishing reaches the sink.
+        sink.armed.store(true, Ordering::SeqCst);
+        shutdown_within_30s(&logger, "finish phase");
+
+        let st = logger.stats();
+        assert_eq!((st.accepted, st.written), (3, 3), "{st:?}");
+        let error = st.writer_error.as_deref().unwrap_or_default();
+        assert!(
+            error.starts_with("writer thread panicked while finishing:")
+                && error.contains("injected: sink write panicked"),
+            "{st:?}"
+        );
+        assert!(!st.is_complete());
+        let warning = incomplete_warning(&st).unwrap();
+        assert!(
+            warning.contains("panicked") && !warning.contains("I/O errors"),
+            "a panic is not an I/O error: {warning}"
+        );
+    }
+
+    /// A writer body that returns at once without sending its completion message
+    /// (as a thread does that dies from a panic nobody caught).
+    fn vanishing_writer(
+        receiver: Receiver<Message>,
+        encoder: StreamEncoder<SwitchSink>,
+        _: &AtomicI64,
+        _: &WriterReport,
+        _: &std::sync::mpsc::Sender<()>,
+    ) {
+        drop(receiver);
+        drop(encoder);
+    }
+
+    // The real shutdown, not just `wait_for_writer` on its own: when the writer's
+    // completion channel closes without a message, shutdown must record it. A
+    // shutdown that ignored the closed channel would leave the stats clean.
+    #[test]
+    fn shutdown_records_a_writer_that_vanished_without_completing() {
+        let logger = Logger::start_with(
+            SwitchSink::default(),
+            8,
+            false,
+            1,
+            "oplog-vanish",
+            vanishing_writer,
+        )
+        .unwrap();
+        shutdown_within_30s(&logger, "vanished writer");
+
+        let st = logger.stats();
+        let error = st.writer_error.as_deref().unwrap_or_default();
+        assert!(error.contains("without completing"), "{st:?}");
+        assert!(!st.is_complete());
+        let warning = incomplete_warning(&st).unwrap();
+        assert!(
+            warning.contains("ended abnormally") && !warning.contains("I/O errors"),
+            "{warning}"
+        );
+    }
+
+    // The counters are separate relaxed atomics, so a snapshot read while the
+    // session is still Active can show more rows written than accepted. That is
+    // not complete either, and the warning must say what is wrong rather than print
+    // an empty bullet.
+    #[test]
+    fn written_above_accepted_is_named_not_an_empty_bullet() {
+        let st = stats(5, 7);
+        assert!(!st.is_complete());
+        let w = incomplete_warning(&st).unwrap();
+        assert!(w.contains("7 rows written but only 5 accepted"), "{w}");
+        for bullet in w.lines().filter(|l| l.trim_start().starts_with('-')) {
+            assert!(
+                !bullet.trim_start_matches([' ', '-']).trim().is_empty(),
+                "empty bullet in: {w}"
+            );
+        }
+    }
+
+    // Loss comes from a writer I/O error OR a writer panic; the advice must follow
+    // the actual error, not always send the reader to the disk.
+    #[test]
+    fn warning_advice_follows_the_kind_of_writer_failure() {
+        let mut panicked = stats(10, 1);
+        panicked.writer_error = Some("writer thread panicked: boom".to_string());
+        let w = incomplete_warning(&panicked).unwrap();
+        assert!(w.contains("writer thread panicked: boom"), "{w}");
+        assert!(w.contains("not an I/O error"), "{w}");
+        assert!(!w.contains("I/O errors (full disk"), "{w}");
+
+        let mut finishing = stats(10, 10);
+        finishing.writer_error = Some("writer thread panicked while finishing: boom".to_string());
+        let w = incomplete_warning(&finishing).unwrap();
+        assert!(w.contains("not an I/O error"), "{w}");
+
+        let mut io = stats(10, 1);
+        io.writer_error = Some("write failed: no space left on device".to_string());
+        let w = incomplete_warning(&io).unwrap();
+        assert!(w.contains("I/O errors (full disk"), "{w}");
+        assert!(!w.contains("not an I/O error"), "{w}");
     }
 
     // A healthy session: nothing to report, byte-for-byte what it always wrote.
