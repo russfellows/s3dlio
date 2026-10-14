@@ -61,6 +61,75 @@
   silently skipped, the rest were deleted, and the call returned `Ok`. Callers
   that relied on the skip must filter their URI list first.
 
+### `s3://` names a server only with an explicit port (BREAKING; #178, #193, #194)
+
+- **The first segment of `s3://X/...` is a server only when it carries an
+  explicit port** (`host:port` or `[ipv6]:port`). Otherwise it is always a
+  bucket. One shared rule (`s3_utils::classify_s3_first_segment`) now decides
+  this for the URI parser, the store factory (`store_for_uri*`),
+  `MultiEndpointStore` and the `s3-cli` bucket commands (`create-bucket` /
+  `delete-bucket`) and `--endpoints` lists, which previously used different
+  rules. The disagreement made `s3://10.0.0.5/bkt/key` take bucket/key from the
+  parser but send the request to whatever `AWS_ENDPOINT_URL` said (#178), and
+  made real dotted bucket names such as `data.example.com` parse as servers
+  (#193). **Other paths do not share the rule yet** and can still ignore a
+  server named in the URI: the Python store cache and Python get/stat/get_many
+  helpers (#171), `S3ObjectStore` operations on a URI naming a different server
+  than the store's own (#197; `delete` and `delete_batch` already reject such a URI, #179), the Python `create_bucket` / `delete_bucket`
+  helpers (#199), and `list_containers` / `s3-cli list-buckets` (#200).
+- **Strict grammar:** a server is `host:port` or `[ipv6]:port` with a plain
+  decimal port from 1 to 65535 (no `+`, no leading zeros, not `0`), a valid IPv6
+  address inside the brackets, and no userinfo. URLs (`http://host:9000`), ARNs,
+  an empty first segment and an empty host or port are rejected with specific
+  messages.
+- **Host grammar:** the host of `host:port` is 1 to 253 ASCII letters, digits,
+  `-`, `.` and `_` (`_` for container-style names such as `minio_1`) with no empty
+  label. Any other character (`/`, `\`, whitespace, control characters, `%`, `?`,
+  `#`, non-ASCII, ...) is an error naming it and the grammar, checked before any
+  endpoint URI is built. This closes a routing hole: `s3-cli --endpoints
+  node/prefix:9000` was accepted and generated `s3://node/prefix:9000/bucket/key`,
+  which parses as bucket `node` on the global client. A trailing dot
+  (`host.example.com.:9000`) is now rejected as an empty label.
+- A bare server URI given to the object parser (`s3://host:9000`,
+  `s3://host:9000/`) now reports `missing bucket after server 'host:9000'` with the
+  example `s3://host:9000/bucket/key`, instead of a "slash after bucket" message.
+- `s3-cli create-bucket` / `delete-bucket` destination is now covered by a test
+  that runs the real binary against two local mock S3 servers (the
+  `AWS_ENDPOINT_URL` server must see no request; the server named in the URI must
+  see the CreateBucket / DeleteBucket for the bucket) (#194).
+- **Errors instead of fallbacks:** `store_for_uri`, `store_for_uri_with_logger`,
+  `store_for_uri_with_config*`, `MultiEndpointStore::new` and
+  `MultiEndpointStore::from_config` now return an error for an invalid first
+  segment. Previously a parse problem was swallowed, or the endpoint silently fell
+  back to the global client.
+- **Breaking:** a portless DNS name is now a bucket (`s3://minio.example.com/bkt/key`
+  is bucket `minio.example.com`, key `bkt/key`). A portless IPv4 literal
+  (`s3://10.0.0.5/bkt/key`) and an unbracketed or portless IPv6 are errors, since
+  S3 forbids IP-shaped bucket names; the message says to add `:port`.
+- **Migration:** put the port in every URI that names a server:
+  `s3://10.0.0.5:9000/bkt/key`, `s3://minio.example.com:9000/bkt/key`,
+  `s3://[::1]:9000/bkt/key`. Every `--endpoints` entry must be `host:port` too.
+  A deprecation period is not possible because a portless host and a dotted
+  bucket name are the same grammar.
+- `S3DLIO_S3_ENDPOINT_HINT_TLDS` (added in 0.9.109) is deprecated and ignored;
+  the variable is checked once, at the first URI parse in the process, and a
+  warning is then logged and written once to stderr. The built-in suffix list is
+  removed. `MultiEndpointStore` also warns when an endpoint's first segment is a
+  bucket that contains a dot (a likely old portless host-form endpoint) and names
+  the fix: add `:port`.
+- `s3-cli create-bucket` / `delete-bucket` on `s3://host:port/bkt` now operate on
+  bucket `bkt` on that server (#194); before, the bucket name was `host:port` and
+  the request went to the global endpoint. Per-endpoint S3 stores now create and
+  delete buckets with their own client.
+- Planned: explicit `s3+http://` / `s3+https://` schemes (#195).
+- `MultiEndpointStore` now picks the endpoint scheme with the same rule as
+  single-endpoint URIs (#180): port `443` and ports listed in
+  `S3DLIO_S3_ENDPOINT_TLS_PORTS` use `https://`; every other port uses `http://`.
+  Previously it always built `http://host:port`. **A plain-HTTP server deliberately
+  listening on `:443`, or on a port named in `S3DLIO_S3_ENDPOINT_TLS_PORTS`, will now
+  be dialled with TLS; no override exists** (the explicit `s3+http://` form, #195,
+  is the planned escape hatch).
+
 ## Version 0.9.114 — Azure SDK stable 1.x migration
 
 - Updated `azure_storage_blob` and `azure_identity` from pre-release APIs to

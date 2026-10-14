@@ -1744,11 +1744,19 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
-        s3_create_bucket_async(name).await
+        // A per-endpoint store (built for `s3://host:port/...`) must create the
+        // bucket on ITS server, not on the global singleton's (issue #194).
+        match &self.client {
+            Some(client) => crate::s3_utils::create_bucket_with_client(client, name).await,
+            None => s3_create_bucket_async(name).await,
+        }
     }
 
     async fn delete_container(&self, name: &str) -> Result<()> {
-        s3_delete_bucket_async(name).await
+        match &self.client {
+            Some(client) => crate::s3_utils::delete_bucket_with_client(client, name).await,
+            None => s3_delete_bucket_async(name).await,
+        }
     }
 
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
@@ -3459,42 +3467,61 @@ impl ObjectWriter for GcsBufferedWriter {
 // use the global singleton client (which reads AWS_ENDPOINT_URL).  This is
 // correct for single-endpoint and AWS S3 deployments.
 
-/// Extract a per-endpoint HTTP URL from an S3 URI that contains an explicit host:port.
+/// Extract a per-endpoint HTTP URL from an S3 URI whose first segment names a
+/// server (an explicit `host:port` / `[ipv6]:port`).
 ///
-/// Returns `Some(endpoint_url)` when the URI authority contains a port number
-/// (e.g. `s3://10.9.0.17:80/bucket/` → `Some("http://10.9.0.17:80")`).
-/// Returns `None` for plain bucket URIs like `s3://my-bucket/prefix/`.
+/// - `s3://10.9.0.17:80/bucket/` → `Ok(Some("http://10.9.0.17:80"))`
+/// - `s3://my-bucket/prefix/`, `s3://data.example.com/key` → `Ok(None)` (a bucket;
+///   issues #178 / #193)
+/// - `s3://10.0.0.5/bkt/key` (portless IP) → `Err` telling the caller to add `:port`
+///
+/// The server-vs-bucket decision is made by
+/// [`crate::s3_utils::classify_s3_first_segment`], the same rule the URI parser,
+/// `MultiEndpointStore` and the CLI use.
 ///
 /// Used by [`store_for_uri_with_logger`] to create per-endpoint S3 clients
 /// rather than falling back to the global singleton (which honours
 /// `AWS_ENDPOINT_URL` and would route all traffic to one host).
-fn s3_endpoint_url_from_uri(uri: &str) -> Option<String> {
-    let after_scheme = uri.strip_prefix("s3://")?;
-    // Authority is everything before the first '/'
-    let authority = after_scheme.split('/').next()?;
-
-    // audit #154 bug 4.3 (E2): the previous check was
-    // `authority.contains(':')` + `authority.rsplit(':').next()`. That
-    // happens to produce the same result as the explicit parse below for
-    // every case exercised here, but only by accident of `rsplit` always
-    // returning the segment after the *last* colon -- it never validated
-    // IPv6 grammar. Parse bracketed-IPv6 and bare host:port authorities
-    // explicitly instead of relying on that coincidence, so the "no port"
-    // vs "has port" decision is deliberate rather than a fallout of a
-    // failed numeric parse.
-    let port_str = if let Some(bracket_end) = authority.find(']') {
-        // Bracketed IPv6 with no ':port' suffix -> not an endpoint URI.
-        authority[bracket_end + 1..].strip_prefix(':')?
-    } else {
-        match authority.matches(':').count() {
-            // S3 bucket names can't contain colons, so a lone ':' in a
-            // non-bracketed authority is unambiguously a port separator;
-            // zero colons is a plain bucket name; unbracketed IPv6 (2+
-            // colons) is ambiguous and rejected rather than guessed at.
-            1 => authority.rsplit(':').next()?,
-            _ => return None,
-        }
+pub(crate) fn s3_endpoint_url_from_uri(uri: &str) -> Result<Option<String>> {
+    let Some(after_scheme) = uri.strip_prefix("s3://") else {
+        return Ok(None);
     };
+    // The first segment is everything before the first '/'
+    let first_segment = after_scheme.split('/').next().unwrap_or("");
+    match crate::s3_utils::classify_s3_first_segment(first_segment)
+        .with_context(|| format!("invalid S3 URI '{uri}'"))?
+    {
+        crate::s3_utils::S3FirstSegment::Server(authority) => {
+            s3_endpoint_url_from_authority(authority)
+                .map(Some)
+                .with_context(|| format!("invalid S3 URI '{uri}'"))
+        }
+        crate::s3_utils::S3FirstSegment::Bucket(_) => Ok(None),
+    }
+}
+
+/// Build the endpoint URL (`https://host:port` or `http://host:port`) for a
+/// URI authority of the form `host:port` / `[ipv6]:port`.
+///
+/// This is the single place that decides the scheme of a host-form S3
+/// endpoint. Both the single-endpoint path ([`s3_endpoint_url_from_uri`]) and
+/// `MultiEndpointStore` use it, so they can never disagree (issue #180).
+///
+/// Errors (never `None`/a silent fallback) when `authority` is not a server per
+/// [`crate::s3_utils::classify_s3_first_segment`]: the classifier's own error is
+/// propagated, and a bucket-shaped authority yields a "not a server" error.
+pub(crate) fn s3_endpoint_url_from_authority(authority: &str) -> Result<String> {
+    let authority = match crate::s3_utils::classify_s3_first_segment(authority)? {
+        crate::s3_utils::S3FirstSegment::Server(authority) => authority,
+        crate::s3_utils::S3FirstSegment::Bucket(name) => bail!(
+            "'{name}' is not a server: a server is host:port or [ipv6]:port with an explicit port"
+        ),
+    };
+    // `authority` is `host:port` or `[ipv6]:port` with a valid port.
+    let port_str = authority
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .ok_or_else(|| anyhow::anyhow!("no port in server authority '{authority}'"))?;
 
     // Determine HTTP scheme from port: 443 → https, everything else → http,
     // unless the operator has named this port as TLS-terminated via
@@ -3502,13 +3529,15 @@ fn s3_endpoint_url_from_uri(uri: &str) -> Option<String> {
     // S3-compatible endpoints on non-standard ports, e.g. a load balancer
     // terminating TLS on :9001, otherwise had no way to get an https:// URL
     // out of this heuristic short of literally using port 443).
-    let port: u16 = port_str.parse().ok()?;
+    let port: u16 = port_str
+        .parse()
+        .with_context(|| format!("invalid port '{port_str}' in server authority '{authority}'"))?;
     let http_scheme = if port == 443 || s3_endpoint_tls_ports_from_env().contains(&port) {
         "https"
     } else {
         "http"
     };
-    Some(format!("{http_scheme}://{authority}"))
+    Ok(format!("{http_scheme}://{authority}"))
 }
 
 /// Additional ports to treat as TLS-terminated for [`s3_endpoint_url_from_uri`],
@@ -3524,6 +3553,11 @@ fn s3_endpoint_tls_ports_from_env() -> std::collections::HashSet<u16> {
         })
         .unwrap_or_default()
 }
+
+/// Serialises every test that reads or writes `S3DLIO_S3_ENDPOINT_TLS_PORTS`
+/// (shared with the multi-endpoint tests, which decide URL schemes the same way).
+#[cfg(test)]
+pub(crate) static ENDPOINT_TLS_PORTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_logger(uri, None)
@@ -3566,7 +3600,7 @@ pub fn store_for_uri_with_logger(
         Scheme::File => FileSystemObjectStore::boxed(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => {
-            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri) {
+            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri)? {
                 // Per-endpoint store: dedicated connection pool, ignores AWS_ENDPOINT_URL.
                 crate::s3_client::run_on_global_rt(async move {
                     S3ObjectStore::for_endpoint(&endpoint_url)
@@ -3643,7 +3677,7 @@ pub fn store_for_uri_with_config_and_logger(
             )
         }
         (Scheme::S3, _) => {
-            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri) {
+            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri)? {
                 // Per-endpoint store: dedicated connection pool, ignores AWS_ENDPOINT_URL.
                 crate::s3_client::run_on_global_rt(async move {
                     S3ObjectStore::for_endpoint(&endpoint_url)
@@ -4486,17 +4520,18 @@ mod s3_object_store_tests {
     // balancer terminating TLS on :9001) as https. S3DLIO_S3_ENDPOINT_TLS_PORTS
     // closes that gap.
 
-    static ENDPOINT_TLS_PORTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn s3_endpoint_url_from_uri_plain_bucket_has_no_endpoint() {
-        assert_eq!(s3_endpoint_url_from_uri("s3://my-bucket/prefix/key"), None);
+        assert_eq!(
+            s3_endpoint_url_from_uri("s3://my-bucket/prefix/key").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn s3_endpoint_url_from_uri_host_port_uses_http() {
         assert_eq!(
-            s3_endpoint_url_from_uri("s3://10.9.0.17:80/bucket/key"),
+            s3_endpoint_url_from_uri("s3://10.9.0.17:80/bucket/key").unwrap(),
             Some("http://10.9.0.17:80".to_string())
         );
     }
@@ -4504,7 +4539,7 @@ mod s3_object_store_tests {
     #[test]
     fn s3_endpoint_url_from_uri_port_443_uses_https() {
         assert_eq!(
-            s3_endpoint_url_from_uri("s3://minio.example.com:443/bucket/key"),
+            s3_endpoint_url_from_uri("s3://minio.example.com:443/bucket/key").unwrap(),
             Some("https://minio.example.com:443".to_string())
         );
     }
@@ -4512,19 +4547,21 @@ mod s3_object_store_tests {
     #[test]
     fn s3_endpoint_url_from_uri_bracketed_ipv6_with_port() {
         assert_eq!(
-            s3_endpoint_url_from_uri("s3://[::1]:9000/bucket/key"),
+            s3_endpoint_url_from_uri("s3://[::1]:9000/bucket/key").unwrap(),
             Some("http://[::1]:9000".to_string())
         );
     }
 
     #[test]
     fn s3_endpoint_url_from_uri_custom_tls_port_via_env_var() {
-        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK.lock().unwrap();
+        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
 
         #[allow(deprecated)]
         std::env::set_var("S3DLIO_S3_ENDPOINT_TLS_PORTS", "9001,9443");
-        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key");
+        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key").unwrap();
         restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
 
         assert_eq!(
@@ -4536,15 +4573,73 @@ mod s3_object_store_tests {
 
     #[test]
     fn s3_endpoint_url_from_uri_unlisted_custom_port_still_uses_http() {
-        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK.lock().unwrap();
+        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
 
         #[allow(deprecated)]
         std::env::remove_var("S3DLIO_S3_ENDPOINT_TLS_PORTS");
-        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key");
+        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key").unwrap();
         restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
 
         assert_eq!(result, Some("http://minio.example:9001".to_string()));
+    }
+
+    // Issues #178 / #193: only an explicit port makes the first segment a server.
+    #[test]
+    fn s3_endpoint_url_from_uri_portless_dns_name_is_a_bucket() {
+        for uri in [
+            "s3://data.example.com/dir/file.bin",
+            "s3://minio.example.com/bkt/key",
+            "s3://localhost/bkt/key",
+        ] {
+            assert_eq!(s3_endpoint_url_from_uri(uri).unwrap(), None, "{uri}");
+        }
+    }
+
+    #[test]
+    fn s3_endpoint_url_from_uri_portless_ip_is_an_error() {
+        for uri in [
+            "s3://10.0.0.5/bkt/key",
+            "s3://[::1]/bkt/key",
+            "s3://::1/bkt/key",
+        ] {
+            let err = s3_endpoint_url_from_uri(uri).unwrap_err();
+            assert!(format!("{err:#}").contains(":port"), "{uri}: {err:#}");
+        }
+    }
+
+    // F12: a classification error must propagate, never become "not a server".
+    #[test]
+    fn s3_endpoint_url_from_authority_propagates_classification_errors() {
+        // Not servers at all (buckets): an error saying so.
+        for bucket in ["data.example.com", "localhost"] {
+            let err = s3_endpoint_url_from_authority(bucket).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not a server"),
+                "{bucket}: {err:#}"
+            );
+        }
+        // Classifier errors keep the classifier's own message.
+        for (bad, hint) in [
+            ("10.0.0.5", "IP address with no port"),
+            ("host:notaport", "invalid port 'notaport'"),
+            ("host:0", "invalid port '0'"),
+            ("http://host:9000", "looks like a URL"),
+            // Host grammar: no endpoint URL is ever built from these.
+            ("node/prefix:9000", "invalid character '/'"),
+            ("a b:9000", "invalid character ' '"),
+            ("ho%st:9000", "invalid character '%'"),
+            ("host.:9000", "empty label"),
+        ] {
+            let err = s3_endpoint_url_from_authority(bad).unwrap_err();
+            assert!(format!("{err:#}").contains(hint), "{bad}: {err:#}");
+        }
+        assert_eq!(
+            s3_endpoint_url_from_authority("host:9000").unwrap(),
+            "http://host:9000"
+        );
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

@@ -241,14 +241,14 @@ fn test_component_struct_debug() {
 // S3 bucket naming rules) or merely contain those cluster-software names
 // as a prefix of an otherwise-unrelated bucket name.
 //
-// Locked contract (docs/implementation-plans/v0.9.109-audit-fix-plan.md
-// Sec 4, bug B8): narrow the heuristic to fire only on strings that
-// grammatically look like hostnames -- contain a colon (port), are a
-// dotted-quad IPv4 address, or end in a known endpoint-hint TLD/suffix
-// (configurable via S3DLIO_S3_ENDPOINT_HINT_TLDS). "Bucket with dots" and
-// "bucket starting with a digit" no longer misroute; genuine
-// endpoint-in-URI usage (with a port, or a recognizable hostname suffix)
-// still works.
+// Contract history: v0.9.109 narrowed the heuristic to strings that looked like
+// hostnames (a colon port, a dotted-quad IPv4 literal, or a last label in a
+// hint-TLD list extendable with S3DLIO_S3_ENDPOINT_HINT_TLDS). That heuristic
+// is gone (issues #178 / #193): the first segment is a server ONLY with an
+// explicit port, and S3DLIO_S3_ENDPOINT_HINT_TLDS is deprecated and ignored
+// (see the option-C tests below). The tests in this block still hold under the
+// current rule: dotted names, digit-prefixed names and names that merely begin
+// with minio / ceph / localhost are buckets; they stay as regression guards.
 
 #[test]
 fn test_dotted_bucket_names_no_longer_misroute_as_endpoints() {
@@ -295,41 +295,176 @@ fn test_localhost_prefixed_bucket_name_no_longer_misroutes_as_endpoint() {
     assert_eq!(result.key, "x");
 }
 
+// Issues #178 / #193 / #194 (maintainer decision, option C): the first segment
+// of `s3://X/...` names a SERVER only when it carries an explicit port
+// (`host:port` or `[ipv6]:port`). Otherwise it is ALWAYS a bucket -- dotted DNS
+// names included. A portless IPv4 literal or an unbracketed / portless IPv6 is a
+// clear error (S3 forbids IP-shaped bucket names, so it is not a valid bucket
+// either). These tests REPLACE the v0.9.109 tests that pinned the old portless
+// reading (a recognised TLD suffix, or S3DLIO_S3_ENDPOINT_HINT_TLDS, made a
+// portless name a server -- the cause of #178: the parser sent the data to one
+// host while the store factory sent the request to another).
+
 #[test]
-fn test_hostname_like_dotted_names_still_route_as_endpoints() {
-    // Genuine hostnames (recognizable TLD-like suffix) without a port
-    // must still be detected as endpoints -- the narrowing must not
-    // regress the endpoint-in-URI workflow for its typical form.
+fn test_portless_dns_names_are_buckets_issue_178() {
+    // Previously `minio.example.com` and `s3.company.internal` were parsed as
+    // endpoints because of their ".com" / ".internal" suffix (#178).
     let result = parse_s3_uri_full("s3://minio.example.com/bucket/key").unwrap();
-    assert_eq!(result.endpoint, Some("minio.example.com".to_string()));
-    assert_eq!(result.bucket, "bucket");
-    assert_eq!(result.key, "key");
+    assert_eq!(result.endpoint, None);
+    assert_eq!(result.bucket, "minio.example.com");
+    assert_eq!(result.key, "bucket/key");
 
     let result2 = parse_s3_uri_full("s3://s3.company.internal/bucket/key").unwrap();
-    assert_eq!(result2.endpoint, Some("s3.company.internal".to_string()));
-    assert_eq!(result2.bucket, "bucket");
-    assert_eq!(result2.key, "key");
+    assert_eq!(result2.endpoint, None);
+    assert_eq!(result2.bucket, "s3.company.internal");
+    assert_eq!(result2.key, "bucket/key");
+
+    // #193: a dotted bucket name whose last label is a hint-TLD is a bucket.
+    let result3 = parse_s3_uri_full("s3://data.example.com/dir/file.bin").unwrap();
+    assert_eq!(result3.endpoint, None);
+    assert_eq!(result3.bucket, "data.example.com");
+    assert_eq!(result3.key, "dir/file.bin");
+
+    let result4 = parse_s3_uri_full("s3://localhost/bkt/key").unwrap();
+    assert_eq!(result4.endpoint, None);
+    assert_eq!(result4.bucket, "localhost");
+    assert_eq!(result4.key, "bkt/key");
 }
 
 #[test]
-fn test_endpoint_hint_tld_env_var_extends_the_default_list() {
-    // A bucket-shaped-but-dotted name with a suffix NOT in the default
-    // list stays a bucket by default...
+fn test_endpoint_hint_tld_env_var_is_a_no_op_issue_178() {
+    // S3DLIO_S3_ENDPOINT_HINT_TLDS used to turn a portless name into a server.
+    // Under option C a portless name is never a server, so the variable is
+    // deprecated and has no effect (it logs a one-time deprecation warning).
     let uri = "s3://s3.mycorp.storagegrid/bucket/key";
-    let result = parse_s3_uri_full(uri).unwrap();
-    assert_eq!(
-        result.endpoint, None,
-        "unrecognized suffix must not be treated as an endpoint hint by default"
-    );
+    let before = parse_s3_uri_full(uri).unwrap();
 
-    // ...but adding it via the env var makes the same URI route as an endpoint.
     std::env::set_var("S3DLIO_S3_ENDPOINT_HINT_TLDS", "storagegrid");
-    let result2 = parse_s3_uri_full(uri).unwrap();
+    let after = parse_s3_uri_full(uri).unwrap();
     std::env::remove_var("S3DLIO_S3_ENDPOINT_HINT_TLDS");
-    assert_eq!(
-        result2.endpoint,
-        Some("s3.mycorp.storagegrid".to_string()),
-        "S3DLIO_S3_ENDPOINT_HINT_TLDS must extend the default suffix list"
+
+    assert_eq!(before.endpoint, None);
+    assert_eq!(after.endpoint, None, "the hint-TLD env var must be a no-op");
+    assert_eq!(after.bucket, "s3.mycorp.storagegrid");
+    assert_eq!(after.key, "bucket/key");
+}
+
+#[test]
+fn test_portless_ipv4_is_a_clear_error_issue_178() {
+    let err = parse_s3_uri_full("s3://10.0.0.5/bkt/key").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("s3://10.0.0.5:9000/"),
+        "error must tell the user to add :port with an example, got: {msg}"
     );
-    assert_eq!(result2.bucket, "bucket");
+    // The legacy two-value helper shares the rule.
+    assert!(parse_s3_uri("s3://10.0.0.5/bkt/key").is_err());
+}
+
+#[test]
+fn test_ipv6_requires_brackets_and_port_issue_178() {
+    // Bracketed with a port: a server.
+    let ok = parse_s3_uri_full("s3://[::1]:9000/bkt/key").unwrap();
+    assert_eq!(ok.endpoint.as_deref(), Some("[::1]:9000"));
+    assert_eq!(ok.bucket, "bkt");
+    assert_eq!(ok.key, "key");
+
+    // Bracketed without a port, and unbracketed: errors that ask for :port.
+    for uri in [
+        "s3://[::1]/bkt/key",
+        "s3://::1/bkt/key",
+        "s3://fe80::1/bkt/key",
+    ] {
+        let msg = format!("{:#}", parse_s3_uri_full(uri).unwrap_err());
+        assert!(msg.contains(":port"), "{uri}: {msg}");
+    }
+}
+
+#[test]
+fn test_invalid_port_is_an_error_issue_178() {
+    for uri in [
+        "s3://host.example.com:/bkt/key",
+        "s3://host.example.com:notaport/bkt/key",
+        "s3://host.example.com:99999/bkt/key",
+        "s3://:9000/bkt/key",
+    ] {
+        assert!(parse_s3_uri_full(uri).is_err(), "{uri} must be rejected");
+    }
+}
+
+#[test]
+fn test_explicit_port_with_dns_name_is_a_server_issue_178() {
+    let result = parse_s3_uri_full("s3://minio.example.com:9000/bucket/key").unwrap();
+    assert_eq!(result.endpoint.as_deref(), Some("minio.example.com:9000"));
+    assert_eq!(result.bucket, "bucket");
+    assert_eq!(result.key, "key");
+}
+
+// Issue #178 review F6: the retired S3DLIO_S3_ENDPOINT_HINT_TLDS variable's
+// deprecation warning must be observable without a tracing subscriber (it is also
+// written to stderr) and must be emitted exactly once per process, at the first
+// parse. The warning is guarded by a process-wide `Once`, so each case runs the
+// test binary again as a child process with a clean environment.
+
+const HINT_TLDS_CHILD_ENV: &str = "S3DLIO_TEST_HINT_TLDS_CHILD";
+const HINT_TLDS_WARNING: &str = "S3DLIO_S3_ENDPOINT_HINT_TLDS is deprecated and ignored";
+
+/// Child-process body: parse several URIs; does nothing in the parent run.
+#[test]
+fn hint_tlds_warning_child_body() {
+    if std::env::var_os(HINT_TLDS_CHILD_ENV).is_none() {
+        return;
+    }
+    for _ in 0..3 {
+        parse_s3_uri_full("s3://bucket/key").unwrap();
+    }
+    parse_s3_uri_full("s3://host:9000/bucket/key").unwrap();
+    assert!(parse_s3_uri_full("s3://10.0.0.5/bucket/key").is_err());
+}
+
+/// Run the child body with `hint` as the value of the retired variable (or unset)
+/// and return its stderr.
+fn run_hint_tlds_child(hint: Option<&str>) -> String {
+    let exe = std::env::current_exe().expect("current test executable");
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args([
+        "--exact",
+        "hint_tlds_warning_child_body",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(HINT_TLDS_CHILD_ENV, "1")
+    .env_remove("S3DLIO_S3_ENDPOINT_HINT_TLDS");
+    if let Some(value) = hint {
+        cmd.env("S3DLIO_S3_ENDPOINT_HINT_TLDS", value);
+    }
+    let out = cmd.output().expect("run child test process");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("1 passed"),
+        "child must actually run its test body:\n{stdout}\n{stderr}"
+    );
+    stderr
+}
+
+#[test]
+fn test_hint_tlds_deprecation_warning_is_on_stderr_exactly_once() {
+    let stderr = run_hint_tlds_child(Some("storagegrid"));
+    assert_eq!(
+        stderr.matches(HINT_TLDS_WARNING).count(),
+        1,
+        "the deprecation warning must be written to stderr exactly once, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_hint_tlds_no_warning_when_variable_unset() {
+    let stderr = run_hint_tlds_child(None);
+    assert_eq!(
+        stderr.matches(HINT_TLDS_WARNING).count(),
+        0,
+        "no warning without the variable, got:\n{stderr}"
+    );
 }

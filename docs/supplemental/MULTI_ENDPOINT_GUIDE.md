@@ -489,6 +489,13 @@ vec![
 ]
 ```
 
+**S3 server endpoints and the http/https rule.** An S3 endpoint names a server only
+with an explicit port (`s3://10.9.0.17:9000/bucket/`, `s3://[::1]:9000/bucket/`); a
+first segment without a port is a bucket, and a portless IP address is an error.
+The scheme is chosen from the port exactly as for a single-endpoint URI: port `443`
+and any port listed in `S3DLIO_S3_ENDPOINT_TLS_PORTS` use `https://`, every other
+port uses `http://` (there is no per-endpoint override).
+
 ### 2. Endpoint Homogeneity
 
 For best results with Round Robin, use similar endpoints:
