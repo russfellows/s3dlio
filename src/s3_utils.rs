@@ -1039,6 +1039,26 @@ pub async fn get_object_range_uri_async(
         "get_object_range: uri='{}', offset={}, length={:?}",
         uri, offset, length
     );
+    let bytes = get_object_range_async(&bucket, &key, offset, length).await?;
+    debug!(
+        "get_object_range: uri='{}', returned {} bytes",
+        uri,
+        bytes.len()
+    );
+    Ok(bytes)
+}
+
+/// Ranged GET on an already-parsed `(bucket, key)`; the key is sent exactly as
+/// given (issue #172). This is the core of [`get_object_range_uri_async`] and is
+/// called directly by callers that already hold the parsed pair, so a bucket
+/// never has to be re-serialised into an `s3://` string and re-parsed (a dotted
+/// or IP-shaped bucket name would be misread as an endpoint host).
+pub(crate) async fn get_object_range_async(
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Bytes> {
     // Locked contract (audit #152 f42, docs/implementation-plans/
     // v0.9.109-audit-fix-plan.md bug B2): `length=Some(0)` must return
     // zero bytes without a network call. The range-string builder below
@@ -1077,8 +1097,8 @@ pub async fn get_object_range_uri_async(
     let bytes = retry_get_body(|| async {
         let resp = client
             .get_object()
-            .bucket(&bucket)
-            .key(&key)
+            .bucket(bucket)
+            .key(key)
             .range(&range)
             .send()
             .await
@@ -1089,11 +1109,6 @@ pub async fn get_object_range_uri_async(
     })
     .await?;
 
-    debug!(
-        "get_object_range: uri='{}', returned {} bytes",
-        uri,
-        bytes.len()
-    );
     Ok(bytes)
 }
 
@@ -2113,8 +2128,10 @@ async fn get_object_with_known_size_async(
 
     // If total fits in one chunk, use a single range request (no concurrency overhead).
     if total_bytes <= effective_chunk_size as u64 {
-        let uri = format!("s3://{}/{}", bucket, key);
-        return get_object_range_uri_async(&uri, start_offset, Some(total_bytes)).await;
+        // Call the bucket/key core directly: round-tripping through a rebuilt
+        // `s3://` string would re-parse the bucket and could misread a dotted or
+        // IP-shaped bucket name as an endpoint host.
+        return get_object_range_async(bucket, key, start_offset, Some(total_bytes)).await;
     }
 
     let effective_concurrency =
