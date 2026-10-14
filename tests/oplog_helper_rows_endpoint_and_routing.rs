@@ -54,7 +54,10 @@ async fn helper_rows_name_the_effective_endpoint_and_foreign_servers_are_rejecte
     get_object_uri_async(uri).await.expect("helper get");
     assert_eq!(
         b.requests(),
-        vec!["PUT /bkt183h/key".to_string(), "GET /bkt183h/key".to_string()]
+        vec![
+            "PUT /bkt183h/key".to_string(),
+            "GET /bkt183h/key".to_string()
+        ]
     );
     assert_eq!(a.requests(), Vec::<String>::new(), "A got a request");
 
@@ -74,15 +77,28 @@ async fn helper_rows_name_the_effective_endpoint_and_foreign_servers_are_rejecte
     let joined = std::thread::spawn(move || get_objects_parallel(&batch, 2))
         .join()
         .expect("get_objects_parallel thread");
-    assert!(joined.is_err(), "get_objects_parallel naming another server");
+    assert!(
+        joined.is_err(),
+        "get_objects_parallel naming another server"
+    );
     assert_eq!(a.requests(), Vec::<String>::new(), "A got a request");
-    assert_eq!(b.requests().len(), 2, "B got a request for the rejected URIs");
+    assert_eq!(
+        b.requests().len(),
+        2,
+        "B got a request for the rejected URIs"
+    );
 
     finalize_op_logger();
     let rows = read_rows(&oplog);
     let summary: Vec<(String, String, String)> = rows
         .iter()
-        .map(|r| (r[COL_OP].clone(), r[COL_ENDPOINT].clone(), r[COL_FILE].clone()))
+        .map(|r| {
+            (
+                r[COL_OP].clone(),
+                r[COL_ENDPOINT].clone(),
+                r[COL_FILE].clone(),
+            )
+        })
         .collect();
     assert_eq!(
         summary,
