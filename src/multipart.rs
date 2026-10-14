@@ -37,8 +37,9 @@ use crate::constants::{
 
 use std::time::SystemTime;
 
+use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt, spawn_on_global_rt};
-use crate::s3_utils::{parse_s3_uri, SdkResultExt};
+use crate::s3_utils::SdkResultExt;
 
 use tracing::{debug, warn};
 
@@ -176,7 +177,7 @@ impl Drop for MultipartUploadSink {
 impl MultipartUploadSink {
     /// Create a new MPU sink from an "s3://bucket/key" URI.
     pub fn from_uri(uri: &str, cfg: MultipartUploadConfig) -> Result<Self> {
-        let (b, k) = parse_s3_uri(uri)?;
+        let (b, k) = parse_s3_uri_for_global_client(uri)?;
         Self::new(&b, &k, cfg)
     }
 

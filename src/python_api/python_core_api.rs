@@ -21,6 +21,7 @@ use tracing::{debug, warn, Level};
 
 // Project crates
 use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
+use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::list_containers::list_containers as list_containers_rs;
 use crate::object_store::{
     store_for_uri, store_for_uri_with_logger, store_routing_endpoint_for_uri,
@@ -603,7 +604,7 @@ pub fn mp_get(
 
     Python::attach(|py| {
         // Parse S3 URI
-        let (bucket, key_prefix) = parse_s3_uri(uri).map_err(py_err)?;
+        let (bucket, key_prefix) = parse_s3_uri_for_global_client(uri).map_err(py_err)?;
 
         // Generate object keys based on template and number
         let mut keys = Vec::new();

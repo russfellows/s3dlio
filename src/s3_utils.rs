@@ -1379,7 +1379,7 @@ pub async fn get_object_range_uri_async(
     offset: u64,
     length: Option<u64>,
 ) -> Result<Bytes> {
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET range: no key specified");
     }
@@ -1476,7 +1476,7 @@ pub async fn get_object_range_uri_timed_async(
     length: Option<u64>,
 ) -> Result<(Bytes, std::time::Duration, std::time::Duration)> {
     use std::time::Instant;
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET range: no key specified");
     }
@@ -1562,7 +1562,7 @@ pub async fn get_object_concurrent_range_async(
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
 ) -> Result<Bytes> {
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET concurrent range: no key specified");
     }
@@ -1977,7 +1977,7 @@ pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
 /// Async HEAD by full URI (non-blocking; safe inside Tokio)
 pub async fn stat_object_uri_async(uri: &str) -> Result<ObjectStat> {
     debug!("stat_object_uri_async: uri='{}'", uri);
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot HEAD: no key specified");
     }
@@ -2017,6 +2017,8 @@ pub fn stat_object_uri(uri: &str) -> anyhow::Result<ObjectStat> {
 /// spawns run concurrently regardless of iteration order). Panics are
 /// surfaced as errors instead of silently truncating the result.
 pub async fn stat_object_many_async(uris: Vec<String>) -> Result<Vec<ObjectStat>> {
+    // Issue #197: refuse the whole batch up front if any URI names another server.
+    crate::delete_batch_plan::validate_uris_for_global_client(&uris)?;
     let cancel = CancellationToken::new();
     let _drop_cancel = DropCancel(cancel.clone());
 
@@ -2216,6 +2218,8 @@ pub fn get_object_uri(uri: &str) -> anyhow::Result<Bytes> {
 ///   On subsequent epochs the cache is already warm; zero HEADs issued.
 /// - O(N log N) sort: replaced O(N²) linear scan with a pre-built HashMap index.
 pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec<(String, Bytes)>> {
+    // Issue #197: refuse the whole batch up front if any URI names another server.
+    crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec();
     run_on_global_rt(async move {
         // Build position index once (O(N)) for O(N log N) sort later.
@@ -2331,6 +2335,8 @@ pub fn get_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<Vec<(String, Bytes)>> {
+    // Issue #197: refuse the whole batch up front if any URI names another server.
+    crate::delete_batch_plan::validate_uris_for_global_client(&uris)?;
     let uris = uris.to_vec(); // own for 'static
     run_on_global_rt(async move {
         // Build position index once (O(N)) for O(N log N) sort later.
@@ -2404,7 +2410,7 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
 }
 
 pub(crate) async fn get_object_uri_optimized_rows(uri: &str, rows: Rows) -> Result<Bytes> {
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
     }
@@ -2535,7 +2541,7 @@ pub async fn get_object_uri_async(uri: &str) -> Result<Bytes> {
 
 pub(crate) async fn get_object_uri_rows(uri: &str, rows: Rows) -> Result<Bytes> {
     debug!("get_object_uri_async: uri='{}'", uri);
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
     }
@@ -2609,7 +2615,7 @@ pub async fn put_object_uri_async(uri: &str, data: Bytes) -> Result<()> {
 
 pub(crate) async fn put_object_uri_rows(uri: &str, data: Bytes, rows: Rows) -> Result<()> {
     debug!("put_object_uri_async: uri='{}', {} bytes", uri, data.len());
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     put_object_rows(&bucket, &key, data, rows).await
 }
 

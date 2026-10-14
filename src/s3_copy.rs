@@ -13,8 +13,9 @@ use tracing::{debug, error, info, warn};
 use std::{fs, path::Path, sync::Arc};
 use tokio::{fs as async_fs, sync::Semaphore};
 
+use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::progress::ProgressCallback;
-use crate::s3_utils::{create_bucket, get_object, list_objects, parse_s3_uri, put_object_async};
+use crate::s3_utils::{create_bucket, get_object, list_objects, put_object_async};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Functions that leverage existing s3_utils code
@@ -31,7 +32,7 @@ pub async fn upload_files<P: AsRef<Path>>(
     do_create_bucket: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
-    let (bucket, key_prefix) = parse_s3_uri(dest_prefix)?;
+    let (bucket, key_prefix) = parse_s3_uri_for_global_client(dest_prefix)?;
     // Allow empty prefix (bucket root) or a non-empty prefix that ends with '/'
     if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
         bail!("dest_prefix must end with '/' if specifying a non-root prefix");
@@ -136,7 +137,7 @@ pub async fn download_objects(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
-    let (bucket, mut key_pattern) = parse_s3_uri(src_uri)?;
+    let (bucket, mut key_pattern) = parse_s3_uri_for_global_client(src_uri)?;
 
     /*
      * Old

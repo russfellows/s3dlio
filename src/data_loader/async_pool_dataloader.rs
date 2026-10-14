@@ -61,6 +61,9 @@ impl MultiBackendDataset {
             });
         }
 
+        // One store serves every URI: refuse URIs naming another server (#197).
+        crate::object_store::ensure_s3_uris_share_first_uris_server(&uris)?;
+
         // Use first URI to determine backend
         let store: Arc<dyn ObjectStore> = Arc::from(store_for_uri_with_helper_rows(&uris[0])?);
         Ok(Self { uris, store })
