@@ -84,6 +84,18 @@ pub const GET_FAILS_ONCE_MARKER: &str = "get-fails-once";
 /// verification *call* as proof the just-completed upload is corrupt.
 pub const HEAD_FAILS_MARKER: &str = "head-fails";
 
+/// Key substring marker that makes the mock server treat the object as a
+/// real, [`SIZED_OBJECT_BODY`]-byte object: HeadObject reports its true
+/// `Content-Length`, and GetObject honours a `Range: bytes=a-b` header by
+/// returning exactly that slice (206), or the whole body (200) when no
+/// Range header is sent. Every other key keeps the fixed 4-byte `mock`
+/// behaviour that the older tests rely on. Used by the issue #172 tests,
+/// which must reach the code path that issues one ranged GET per chunk.
+pub const SIZED_OBJECT_MARKER: &str = "sized-obj";
+
+/// Body served for keys containing [`SIZED_OBJECT_MARKER`].
+pub const SIZED_OBJECT_BODY: &[u8; 16] = b"0123456789abcdef";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -98,11 +110,31 @@ pub struct PathCallCounts {
     pub abort_failures_returned: usize,
     pub get_calls: usize,
     pub head_calls: usize,
+    /// Single-object `DELETE /{bucket}/{key}` requests.
+    pub delete_calls: usize,
+    /// Keys named in a batch `DeleteObjects` (`POST /{bucket}?delete`) body,
+    /// counted under `/{bucket}/{key}`.
+    pub batch_delete_calls: usize,
+    /// Plain (non-multipart) `PUT /{bucket}/{key}` requests.
+    pub put_calls: usize,
+}
+
+/// One request exactly as the server received it: `path` and `query` are the
+/// raw (still percent-encoded) request-target components, and `range` is the
+/// `Range` header if one was sent. Used by tests that must prove which
+/// object path / which kind of GET (ranged or plain) went over the wire.
+#[derive(Clone, Debug)]
+pub struct RecordedRequest {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub range: Option<String>,
 }
 
 #[derive(Clone, Default)]
 pub struct MockS3State {
     per_path: Arc<Mutex<HashMap<String, PathCallCounts>>>,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
 impl MockS3State {
@@ -131,6 +163,25 @@ impl MockS3State {
             .get(key_path)
             .copied()
             .unwrap_or_default()
+    }
+
+    fn log_request(&self, req: RecordedRequest) {
+        self.requests.lock().unwrap().push(req);
+    }
+
+    /// Every request received so far whose raw path or raw query contains
+    /// `tag`, in arrival order. A test embeds a unique ASCII tag in its key,
+    /// so this returns that test's traffic -- INCLUDING requests for variant
+    /// paths (stripped, decoded, double-encoded) that `counts_for` cannot
+    /// enumerate because it needs the exact path up front.
+    pub fn requests_containing(&self, tag: &str) -> Vec<RecordedRequest> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path.contains(tag) || r.query.contains(tag))
+            .cloned()
+            .collect()
     }
 
     /// Poll `counts_for(key_path)` until `predicate` returns true or
@@ -249,6 +300,17 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
+    let range_header = req
+        .headers()
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    state.log_request(RecordedRequest {
+        method: method.to_string(),
+        path: path.clone(),
+        query: query.clone(),
+        range: range_header.clone(),
+    });
     // Collect the body — DeleteObjects needs to inspect which keys were
     // requested (see below); every other route just needs it drained so
     // the connection can be cleanly reused/closed.
@@ -269,6 +331,9 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         let mut deleted_xml = String::new();
         let mut error_xml = String::new();
         for key in &keys {
+            state.record(&format!("{}/{key}", path.trim_end_matches('/')), |c| {
+                c.batch_delete_calls += 1
+            });
             if key.contains(DELETE_FAILS_MARKER) {
                 error_xml.push_str(&format!(
                     "<Error><Key>{key}</Key><Code>AccessDenied</Code>\
@@ -348,6 +413,25 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
             .unwrap();
     }
 
+    // DeleteObject: DELETE .../{key} (no uploadId -- that is the abort above).
+    if method == Method::DELETE {
+        state.record(&path, |c| c.delete_calls += 1);
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+    }
+
+    // PutObject: PUT .../{key} (no partNumber -- that is UploadPart above).
+    if method == Method::PUT {
+        state.record(&path, |c| c.put_calls += 1);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("ETag", "\"mock-put-etag\"")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+    }
+
     // CompleteMultipartUpload: POST .../{key}?uploadId=...
     if method == Method::POST && query.contains("uploadId") {
         state.record(&path, |c| c.complete_calls += 1);
@@ -375,9 +459,14 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
                 .body(Full::new(Bytes::new()))
                 .unwrap();
         }
+        let head_len = if path.contains(SIZED_OBJECT_MARKER) {
+            SIZED_OBJECT_BODY.len()
+        } else {
+            0
+        };
         return Response::builder()
             .status(StatusCode::OK)
-            .header("Content-Length", "0")
+            .header("Content-Length", head_len.to_string())
             .body(Full::new(Bytes::new()))
             .unwrap();
     }
@@ -396,6 +485,9 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         if path.contains(GET_FAILS_ONCE_MARKER) && attempt == 1 {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockTransientGetFailure");
         }
+        if path.contains(SIZED_OBJECT_MARKER) {
+            return sized_object_get(range_header.as_deref());
+        }
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Length", "4")
@@ -406,6 +498,38 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Full::new(Bytes::from("mock-s3-server: unhandled route")))
+        .unwrap()
+}
+
+/// GetObject for a [`SIZED_OBJECT_MARKER`] key: no Range header returns the
+/// whole body (200); `bytes=a-b` / `bytes=a-` returns that inclusive slice
+/// (206), clamped to the body like real S3.
+fn sized_object_get(range_header: Option<&str>) -> Response<Full<Bytes>> {
+    let body = SIZED_OBJECT_BODY;
+    let spec = range_header.and_then(|h| h.strip_prefix("bytes="));
+    let Some(spec) = spec else {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Length", body.len().to_string())
+            .body(Full::new(Bytes::from_static(body)))
+            .unwrap();
+    };
+    let (start_s, end_s) = spec.split_once('-').unwrap_or((spec, ""));
+    let start = start_s.parse::<usize>().unwrap_or(0);
+    let last = body.len() - 1;
+    let end = end_s.parse::<usize>().map(|e| e.min(last)).unwrap_or(last);
+    if start > end {
+        return error_response(StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange");
+    }
+    let slice = &body[start..=end];
+    Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header("Content-Length", slice.len().to_string())
+        .header(
+            "Content-Range",
+            format!("bytes {start}-{end}/{}", body.len()),
+        )
+        .body(Full::new(Bytes::copy_from_slice(slice)))
         .unwrap()
 }
 

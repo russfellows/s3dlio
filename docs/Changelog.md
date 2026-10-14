@@ -1,5 +1,38 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### S3: every operation now uses the object key exactly as written (#172)
+
+- **Behavior change: keys with a leading `/` are no longer stripped.**
+  `s3://b//k` means the key `/k` (not `k`) for **every** S3 operation. Before
+  this change, `stat`, ranged reads (`get_range`, its timed variant and the
+  concurrent-range chunk reads), the size-probe HEAD that precedes a GET, and
+  large-object (known-size) reads removed the leading `/` and silently acted
+  on a *different* object (`k`), while PUT, plain GET and DELETE used `/k`. On
+  S3-compatible stores that treat `/k` and `k` as distinct keys (GCS interop,
+  for example) `stat` could report another object's size and `get_range`
+  could return another object's bytes.
+  - **Who is affected:** callers that built URIs with an accidental `//` had
+    `stat`, ranged reads and large-object reads succeed against the stripped
+    twin object `k`. Those calls now address `/k` as written and return
+    `NoSuchKey` if that object does not exist, consistently with plain GET.
+    Remove the stray `/` from the URI (or create the object under the key you
+    actually name) to fix such callers.
+- **Behavior change: `MultiEndpointStore` relative-path join for an endpoint
+  configured without a trailing `/`.** A relative path that starts with `/`
+  joined to an endpoint with no trailing `/` (for example endpoint
+  `s3://bucket` plus path `/data/x`) previously addressed the key `/data/x`
+  for PUT, GET and DELETE (the join produced `s3://bucket//data/x`) but
+  `data/x` for `stat` and ranged reads. It now addresses `data/x` for every
+  operation, the same as endpoints configured with a trailing `/`. Objects
+  that were previously written at `/data/x` through that call shape are **no
+  longer reachable by the same call**; read or move them with an explicit
+  `s3://bucket//data/x` URI.
+- Internal: the known-size large-object GET calls the bucket/key ranged-GET
+  core directly instead of rebuilding an `s3://` string and re-parsing it,
+  which could misread a dotted or IP-shaped bucket name as an endpoint host.
+
 ## Version 0.9.114 — Azure SDK stable 1.x migration
 
 - Updated `azure_storage_blob` and `azure_identity` from pre-release APIs to
