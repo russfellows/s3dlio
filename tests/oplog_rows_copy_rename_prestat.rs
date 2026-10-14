@@ -181,6 +181,14 @@ async fn copy_rename_and_pre_stat_record_their_real_requests() {
         !p3[1][COL_ERROR].is_empty(),
         "the failed PUT row carries the error: {p3:?}"
     );
+    // Through a STORE, the PUT row carries the size of the payload handed to put(),
+    // success or not (the helper path writes 0 on failure: see
+    // oplog_helper_rows_golden.rs). Each path keeps its own existing behaviour.
+    assert_eq!(
+        p3[1][common::oplog_rows::COL_BYTES],
+        "4",
+        "store path: a failed PUT row keeps the payload size: {p3:?}"
+    );
 
     let p4 = take(3);
     assert_eq!(
