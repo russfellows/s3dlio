@@ -810,35 +810,147 @@ pub fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
     Ok((components.bucket, components.key))
 }
 
+/// A server named by the first segment of an `s3://` URI (`host:port` or
+/// `[ipv6]:port`), with the endpoint URL a client for it is built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Server {
+    /// The authority as written in the URI, e.g. `10.9.0.17:9000`.
+    pub authority: String,
+    /// The endpoint URL derived from it (`http://10.9.0.17:9000`; `https` for
+    /// port 443 and the ports in `S3DLIO_S3_ENDPOINT_TLS_PORTS`).
+    pub endpoint_url: String,
+}
+
+/// Classify the first segment of an `s3://` URI with the shared server-vs-bucket
+/// rule ([`classify_s3_first_segment`], issues #178 / #199 / #200): `Ok(Some)`
+/// for an explicit `host:port` / `[ipv6]:port`, `Ok(None)` for a bucket name,
+/// `Err` for a portless IP address or any malformed segment.
+pub fn s3_server_of_first_segment(segment: &str) -> Result<Option<S3Server>> {
+    match classify_s3_first_segment(segment)? {
+        S3FirstSegment::Bucket(_) => Ok(None),
+        S3FirstSegment::Server(authority) => Ok(Some(S3Server {
+            authority: authority.to_string(),
+            endpoint_url: crate::object_store::s3_endpoint_url_from_authority(authority)?,
+        })),
+    }
+}
+
+/// Where a bucket-level request for an `s3://` URI or bare bucket name goes:
+/// the named server (`None` = the process-global client) and the bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3BucketTarget {
+    pub server: Option<S3Server>,
+    pub bucket: String,
+}
+
+/// Resolve `s3://bucket[/...]`, `s3://host:port/bucket[/...]` or a bare `bucket`
+/// to a [`S3BucketTarget`], with the shared server-vs-bucket rule
+/// ([`classify_s3_first_segment`]). Anything after the bucket (a key prefix) is
+/// ignored, as for `s3-cli create-bucket`.
+///
+/// Errors: a portless IP address (the #178 error), a malformed server, or a
+/// missing bucket (`s3://host:9000/`, `s3://`, an empty name).
+pub fn s3_bucket_target(uri_or_bucket: &str) -> Result<S3BucketTarget> {
+    let rest = uri_or_bucket.strip_prefix("s3://").unwrap_or(uri_or_bucket);
+    let mut segments = rest.split('/');
+    let first = segments.next().unwrap_or("");
+    let ctx = || format!("invalid S3 URI '{uri_or_bucket}'");
+    let server = s3_server_of_first_segment(first).with_context(ctx)?;
+    let bucket = match &server {
+        Some(server) => {
+            let bucket = segments.next().unwrap_or("");
+            if bucket.is_empty() {
+                return Err(missing_bucket_after_server(
+                    &server.authority,
+                    uri_or_bucket,
+                ));
+            }
+            bucket
+        }
+        None => first,
+    };
+    Ok(S3BucketTarget {
+        server,
+        bucket: bucket.to_string(),
+    })
+}
+
+/// The S3 client for `server`: a dedicated per-endpoint client when a server is
+/// named, the process-global client otherwise.
+async fn s3_client_for_server(server: Option<&S3Server>) -> Result<aws_sdk_s3::Client> {
+    match server {
+        Some(server) => {
+            crate::s3_client::create_s3_client_for_endpoint(&server.endpoint_url, None).await
+        }
+        None => aws_s3_client_async().await,
+    }
+}
+
 // -----------------------------------------------------------------------------
 // S3 Create bucket
 // -----------------------------------------------------------------------------
 /// Create an S3 bucket if it does not exist.
+///
+/// `bucket` is a bare bucket name on the process-global endpoint. To create the
+/// bucket a URI names (`s3://host:port/bucket` goes to that server), use
+/// [`create_bucket_for_uri`].
 pub fn create_bucket(bucket: &str) -> Result<()> {
     let bucket = bucket.to_string(); // own it
     run_on_global_rt(async move {
         let client = aws_s3_client_async().await?;
-        match client.create_bucket().bucket(&bucket).send().await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if let Some(code) = e.code() {
-                    if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" {
-                        Ok(())
-                    } else {
-                        Err(sdk_anyhow(
-                            format!("CreateBucket failed for '{}'", bucket),
-                            e,
-                        ))
-                    }
-                } else {
-                    Err(sdk_anyhow(
-                        format!("CreateBucket failed for '{}'", bucket),
-                        e,
-                    ))
-                }
-            }
-        }
+        create_bucket_if_absent_with_client(&client, &bucket).await
     })
+}
+
+/// `CreateBucket` on `client`, treating "already exists" (`BucketAlreadyOwnedByYou`,
+/// `BucketAlreadyExists`) as success.
+async fn create_bucket_if_absent_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+) -> Result<()> {
+    match client.create_bucket().bucket(bucket).send().await {
+        Ok(_) => Ok(()),
+        Err(e) => match e.code() {
+            Some("BucketAlreadyOwnedByYou" | "BucketAlreadyExists") => Ok(()),
+            _ => Err(sdk_anyhow(format!("CreateBucket failed for '{bucket}'"), e)),
+        },
+    }
+}
+
+/// Create the bucket an `s3://` URI (or bare bucket name) names, on the server
+/// it names (issue #199). Async; see [`create_bucket_for_uri`].
+pub async fn create_bucket_for_uri_async(uri_or_bucket: &str) -> Result<()> {
+    let target = s3_bucket_target(uri_or_bucket)?;
+    let client = s3_client_for_server(target.server.as_ref()).await?;
+    create_bucket_if_absent_with_client(&client, &target.bucket).await
+}
+
+/// Create the bucket an `s3://` URI (or bare bucket name) names, on the server
+/// it names; "already exists" is success.
+///
+/// - `bucket`, `s3://bucket`, `s3://bucket/prefix/` → bucket `bucket` on the
+///   process-global endpoint (`AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL`).
+/// - `s3://host:port/bucket[/prefix/]` → bucket `bucket` on `host:port`, through a
+///   per-endpoint client.
+/// - `s3://10.0.0.5/bucket` (portless IP) → the #178 error; nothing is sent.
+pub fn create_bucket_for_uri(uri_or_bucket: &str) -> Result<()> {
+    let uri = uri_or_bucket.to_string();
+    run_on_global_rt(async move { create_bucket_for_uri_async(&uri).await })
+}
+
+/// Delete the (empty) bucket an `s3://` URI (or bare bucket name) names, on the
+/// server it names (issue #199). Async; see [`delete_bucket_for_uri`].
+pub async fn delete_bucket_for_uri_async(uri_or_bucket: &str) -> Result<()> {
+    let target = s3_bucket_target(uri_or_bucket)?;
+    let client = s3_client_for_server(target.server.as_ref()).await?;
+    delete_bucket_with_client(&client, &target.bucket).await
+}
+
+/// Delete the (empty) bucket an `s3://` URI (or bare bucket name) names, on the
+/// server it names. Same URI forms and errors as [`create_bucket_for_uri`].
+pub fn delete_bucket_for_uri(uri_or_bucket: &str) -> Result<()> {
+    let uri = uri_or_bucket.to_string();
+    run_on_global_rt(async move { delete_bucket_for_uri_async(&uri).await })
 }
 
 // -----------------------------------------------------------------------------
@@ -953,13 +1065,28 @@ pub(crate) fn resolve_list_buckets_params(
 ///   uses `AWS_REGION` / `AWS_DEFAULT_REGION` from the environment.  Set
 ///   `AWS_S3_ADDRESSING_STYLE=path` when your endpoint requires path-style
 ///   addressing (GCS and most self-hosted services do).
+///
+/// Lists the process-global server's buckets (`AWS_ENDPOINT_URL_S3` /
+/// `AWS_ENDPOINT_URL`, or AWS). To list a server named in a URI
+/// (`s3://host:port/`), use [`list_buckets_at`].
 pub fn list_buckets() -> Result<Vec<BucketInfo>> {
+    list_buckets_at(None)
+}
+
+/// List the buckets of `server`, through a per-endpoint client, or of the
+/// process-global server when `server` is `None` (issue #200).
+pub fn list_buckets_at(server: Option<&S3Server>) -> Result<Vec<BucketInfo>> {
+    let server = server.cloned();
     run_on_global_rt(async move {
         dotenvy::dotenv().ok();
 
         // Log resolved params for diagnostics (pure helper, no side effects).
+        let endpoint_url_for_log = match &server {
+            Some(server) => Some(server.endpoint_url.clone()),
+            None => crate::s3_client::s3_endpoint_url_from_env(),
+        };
         resolve_list_buckets_params(
-            crate::s3_client::s3_endpoint_url_from_env().as_deref(),
+            endpoint_url_for_log.as_deref(),
             std::env::var("AWS_REGION")
                 .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                 .ok()
@@ -967,9 +1094,10 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
             std::env::var("AWS_S3_ADDRESSING_STYLE").ok().as_deref(),
         );
 
-        // Use the shared, fully-configured client (same reqwest transport,
-        // CA bundle, timeouts, and INFO-level logging as every other operation).
-        let client = crate::s3_client::aws_s3_client_async()
+        // The global client is the shared, fully-configured one (same reqwest
+        // transport, CA bundle, timeouts and INFO-level logging as every other
+        // operation); a named server gets a dedicated client built the same way.
+        let client = s3_client_for_server(server.as_ref())
             .await
             .context("Failed to initialise S3 client for list_buckets")?;
 

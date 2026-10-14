@@ -22,6 +22,9 @@
 //! // S3 (or S3-compatible via AWS_ENDPOINT_URL)
 //! let containers = list_containers("s3://")?;
 //!
+//! // The buckets of one specific S3-compatible server (explicit port required)
+//! let containers = list_containers("s3://minio.local:9000/")?;
+//!
 //! // GCS (requires GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT env var)
 //! let containers = list_containers("gs://")?;
 //!
@@ -41,7 +44,7 @@ use tracing::{debug, trace};
 
 #[cfg(any(feature = "backend-gcs", feature = "backend-azure"))]
 use crate::s3_client::run_on_global_rt;
-use crate::s3_utils::{list_buckets, BucketInfo};
+use crate::s3_utils::{list_buckets_at, s3_server_of_first_segment, BucketInfo, S3Server};
 
 #[cfg(all(feature = "backend-gcs", feature = "gcs-community"))]
 static GCS_COMMUNITY_LIST_CLIENT: OnceCell<Arc<crate::gcs_client::GcsClient>> =
@@ -102,7 +105,11 @@ pub struct ContainerInfo {
 ///
 /// The dispatch is based entirely on the URI **scheme**:
 ///
-/// - `s3://` → AWS S3 or S3-compatible (reads `AWS_ENDPOINT_URL` etc.)
+/// - `s3://` → AWS S3 or S3-compatible (reads `AWS_ENDPOINT_URL_S3` /
+///   `AWS_ENDPOINT_URL` etc.)
+/// - `s3://host:port/` (or `[ipv6]:port`) → the buckets of THAT server; a portless
+///   IP address (`s3://10.0.0.5/`) is an error; `s3://bucket/` and other
+///   portless names list the global server (issue #200)
 /// - `gs://` / `gcs://` → Google Cloud Storage (reads `GOOGLE_CLOUD_PROJECT`)
 /// - `az://account` → Azure Blob Storage containers for the given account
 /// - `file://[/path]` → top-level subdirectories under `/path`
@@ -124,7 +131,7 @@ pub fn list_containers(uri: &str) -> Result<Vec<ContainerInfo>> {
         || original == "s3://"
         || original.starts_with("s3://")
     {
-        list_s3_containers()
+        list_s3_containers(original)
     } else if original == "gs:"
         || original == "gs://"
         || original == "gcs:"
@@ -152,12 +159,38 @@ pub fn list_containers(uri: &str) -> Result<Vec<ContainerInfo>> {
 // S3 / S3-compatible
 // ---------------------------------------------------------------------------
 
-fn list_s3_containers() -> Result<Vec<ContainerInfo>> {
-    let buckets: Vec<BucketInfo> = list_buckets().context("Failed to list S3 buckets")?;
+/// The server an S3 listing URI names, by the shared server-vs-bucket rule
+/// ([`crate::s3_utils::classify_s3_first_segment`], issue #200):
+///
+/// - `s3://host:port/` (or `[ipv6]:port`) → `Some(server)`: list THAT server.
+/// - `s3://10.0.0.5/` (a portless IP) → `Err`, the #178 error: add `:port`.
+/// - `""`, `s3:`, `s3://`, `s3://bucket/`, `s3://data.example.com/` → `None`: list
+///   the process-global server (`AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL`, or AWS).
+fn s3_listing_server(uri: &str) -> Result<Option<S3Server>> {
+    let Some(rest) = uri.strip_prefix("s3://") else {
+        return Ok(None);
+    };
+    let first_segment = rest.split('/').next().unwrap_or("");
+    if first_segment.is_empty() {
+        return Ok(None);
+    }
+    s3_server_of_first_segment(first_segment).with_context(|| format!("invalid S3 URI '{uri}'"))
+}
+
+fn list_s3_containers(uri: &str) -> Result<Vec<ContainerInfo>> {
+    let server = s3_listing_server(uri)?;
+    let buckets: Vec<BucketInfo> =
+        list_buckets_at(server.as_ref()).context("Failed to list S3 buckets")?;
+    // A bucket listed from a named server is addressed through that server, so the
+    // URI can be passed straight back to s3dlio operations.
+    let uri_prefix = match &server {
+        Some(server) => format!("s3://{}/", server.authority),
+        None => "s3://".to_string(),
+    };
     Ok(buckets
         .into_iter()
         .map(|b| ContainerInfo {
-            uri: format!("s3://{}", b.name),
+            uri: format!("{uri_prefix}{}", b.name),
             name: b.name,
             creation_date: Some(b.creation_date),
         })
