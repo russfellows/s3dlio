@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use super::async_bridge::future_into_py;
 use bytes::Bytes;
 use pyo3::buffer::PyBuffer;
 use pyo3::conversion::IntoPyObjectExt;
@@ -11,7 +12,6 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods};
 use pyo3::Bound;
-use pyo3_async_runtimes::tokio::future_into_py;
 
 use tokio::task;
 

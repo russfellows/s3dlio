@@ -848,6 +848,15 @@ pub static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
     block
 });
 
+/// Upper bound on how long the Python `atexit` hook waits, with the GIL
+/// released, for in-flight async result deliveries to finish before the
+/// interpreter finalizes (issue #192).
+///
+/// A delivery normally completes in microseconds once the exiting thread
+/// releases the GIL; the bound exists only so a pathologically stuck delivery
+/// can never hang process exit.
+pub const ASYNC_EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(test)]
 mod h2_window_tests {
     use super::*;
