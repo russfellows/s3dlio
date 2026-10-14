@@ -830,7 +830,9 @@ for result in client.list_objects("my-bucket", "prefix/"):
 
 Keys are used exactly as written, as in AWS's `s3torchconnector`: only the `/` after the bucket is a
 separator, so `S3Item("s3://b//k", ...)` has `key == "/k"`, and `/k`, `k` and `a//b`, `a/b` are different
-objects (the DLIO storage classes follow the same rule).
+objects. The DLIO storage classes use a full-URI name exactly the same way, but keep their 0.9.124
+normalisation of a name relative to the configured namespace (`/train/f.npz` under `s3://b/base` is the
+key `base/train/f.npz`).
 
 ### Advantages over s3torchconnector
 

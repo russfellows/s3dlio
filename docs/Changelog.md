@@ -6,13 +6,18 @@
 
 After #172 the core addresses `s3://b//k` as the key `/k`. These layers still normalised keys, so for a
 key that begins with `/` or contains `//` they addressed or reported a different object than the core.
-**Behaviour change:** in the layers below, `/x` and `x`, or `a//b` and `a/b`, are now different objects.
-Only the ONE `/` that separates a base from a key is removed.
+**Behaviour change:** in the layers below (except namespace-relative DLIO names, see the first bullet),
+`/x` and `x`, or `a//b` and `a/b`, are now different objects. Only the ONE `/` that separates a base from a
+key is removed.
 
-- **DLIO integration** (`s3dlio_storage.py`, `s3_torch_storage.py`): an id is joined to the namespace by
-  one `/` and is otherwise untouched (`put_data("/x")` under `s3://b/base` writes `base//x`, no longer
-  `base/x`); a namespace loses at most one trailing `/`; `walk_node` lists the exact prefix. A DLIO
-  config that passed ids with a leading `/` expecting them to be re-rooted must drop that `/`.
+- **DLIO integration** (`s3dlio_storage.py`, `s3_torch_storage.py`): a name that is a FULL URI
+  (`s3://`, `az://`, `gs://`, `file://`, `direct://`) is used exactly (`put_data("s3://b//k")` writes the
+  key `/k`), and `s3_torch_storage.walk_node` lists the exact prefix of the full URI it is given.
+  A name that is relative to the configured namespace keeps its existing (0.9.124) filesystem-style
+  normalisation: the namespace loses its trailing `/` and the name its leading `/`, so
+  `put_data("/train/f.npz")` under `s3://b/base` still writes `base/train/f.npz` (not `base//train/f.npz`).
+  It is not established that DLIO supplies object keys rather than such names, and re-keying them would
+  make existing datasets disappear. No DLIO config needs to change.
 - **`s3dlio.compat.s3torchconnector`**: `S3Item.key` for `s3://b//k` is `/k` (was `k`), as AWS's own
   `s3torchconnector` does (its `parse_s3_uri` splits at the first `/` and strips nothing);
   `S3Client.put_object` / `get_object` / `list_objects` address the key and prefix exactly (a
