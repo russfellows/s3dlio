@@ -16,9 +16,14 @@ Only the ONE `/` that separates a base from a key is removed.
 - **`s3dlio.compat.s3torchconnector`**: `S3Item.key` for `s3://b//k` is `/k` (was `k`), as AWS's own
   `s3torchconnector` does (its `parse_s3_uri` splits at the first `/` and strips nothing);
   `S3Client.put_object` / `get_object` / `list_objects` address the key and prefix exactly (a
-  `list_objects` prefix URI loses at most one trailing `/` rather than all of them).
+  `list_objects` prefix URI loses no trailing `/`; one `/` is appended only if it has none).
 - **Azure https URI form**: `https://acct.blob.core.windows.net/c//k` is the container `c`, key `/k`,
-  the same blob as `az://acct/c//k` (it was key `k`). A URL with an empty container is an error.
+  the same key as `az://acct/c//k` (it was key `k`). A URL with an empty container
+  (`https://acct.blob.core.windows.net//k`) is an error; this is NOT parity with `az://`, where
+  `az://acct//k` still parses to the container `""` and key `k`.
+  A trailing `/` is part of the key: `https://acct.blob.core.windows.net/c/dir/` now addresses the
+  key `dir/` (it was `dir`). So `get` / `stat` / `delete` of a URI ending in `/` address `k/`, no
+  longer `k`, and listing `.../c/dir/` no longer matches `dir2/...`.
 - **arrow-backend** (`--no-default-features --features arrow-backend`): `object_store`'s `Path::from`
   drops empty segments, so `s3://b//x` addressed the object `x` and `s3://b/a//b` addressed `a/b`.
   Such keys, and an object key ending in `/`, are now refused with an error naming the key instead of
