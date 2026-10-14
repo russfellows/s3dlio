@@ -335,7 +335,7 @@ Standard AWS environment variables are also supported:
 | `AWS_ENDPOINT_URL` | Custom S3 endpoint URL (for MinIO or other S3-compatible storage) |
 | `AWS_CA_BUNDLE` | Path to custom CA certificate bundle (standard AWS SDK name) |
 
-### `s3://host:port/bucket/key` server-vs-bucket rule (changed in the Unreleased version; issues #178, #193, #194)
+### `s3://host:port/bucket/key` server-vs-bucket rule (changed in v0.9.120; issues #178, #193, #194)
 
 The first segment of `s3://X/...` names a **server** only when it carries an
 explicit port; otherwise it is **always a bucket**. One rule
@@ -410,7 +410,7 @@ it and put the port in the URI instead.
 treated as a bucket but contains a dot (for example an old `s3://minio.example.com/bucket/`
 endpoint): it names the endpoint and says to add `:port` if it is a server.
 
-> **Breaking change (Unreleased).** v0.9.109 – v0.9.114 treated a portless first
+> **Breaking change (v0.9.120).** v0.9.109 – v0.9.114 treated a portless first
 > segment as a server when it was an IPv4 literal or ended in a hostname-like
 > suffix. Migration: add `:port` to every URI that names a server
 > (`s3://minio.example.com/bkt/key` → `s3://minio.example.com:9000/bkt/key`).
@@ -639,6 +639,7 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 
 ## Version History
 
+- **v0.9.120** *(behaviour change: the `s3://` server-vs-bucket rule; retired: `S3DLIO_S3_ENDPOINT_HINT_TLDS`)*: `s3://X/...` names a server only when `X` carries an explicit port (`host:port` or `[ipv6]:port`). Every other first segment is a bucket, and a portless IP is an error (see "`s3://host:port/bucket/key` server-vs-bucket rule" above). `S3DLIO_S3_ENDPOINT_HINT_TLDS` is retired: it has no effect and warns once. `MultiEndpointStore` uses the same TLS rule as `S3DLIO_S3_ENDPOINT_TLS_PORTS` describes. The op-log accepts `file://` destinations and reports accepted, dropped and written counts through `op_log_stats()`. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.114** *(Azure SDK stable 1.x migration)*: Updated Azure Blob Storage and identity clients to the stable 1.x SDK line. Added `S3DLIO_AZURE_DOWNLOAD_MODE`, `S3DLIO_AZURE_CONCURRENT_ENGINE`, `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB`, `S3DLIO_AZURE_DOWNLOAD_CONCURRENCY`, and `S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB` for selecting and tuning Azure SDK managed downloads, s3dlio RangeEngine downloads, or sequential transfers. Raised the Rust MSRV to 1.88. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.112** *(new: `S3DLIO_RT_THREADS_UNSAFE`; behavior change: `S3DLIO_RT_THREADS` sanity clamp)*: Added a sanity clamp to `S3DLIO_RT_THREADS` — values below `RT_THREADS_LIMIT/4` are treated as downstream miscomputation and clamped up to `RT_THREADS_LIMIT`, with a stderr warning the first time it fires.  Rationale: the DLIO unet3d datagen bottleneck (2026-07-10, `docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md`) was caused by DLIO's `ObjStoreLibStorage.__init__` computing `S3DLIO_RT_THREADS = write_threads * 1.5` with Hydra's default `write_threads=1`, giving `S3DLIO_RT_THREADS=1` and building a 1-worker Tokio runtime that serialized every concurrent multipart upload part (10× throughput loss, live-measured 214 MB/s vs 1928 MB/s after fix on a 28-core host with s3-ultra).  `S3DLIO_RT_THREADS_UNSAFE=1` bypasses the clamp for legitimate low-thread scenarios (single-threaded test suites, fault-injection).  The clamp is inactive when `configure_thread_pools` was never called (`RT_THREADS_LIMIT=0`), preserving pure-Rust programmatic use.  Also in v0.9.112: FFI-boundary
   hardening (mlcommons/storage#755, s3dlio#161, s3dlio#162). Error conversion at
