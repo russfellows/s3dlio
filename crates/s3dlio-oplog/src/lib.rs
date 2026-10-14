@@ -17,6 +17,20 @@
 //! - **Pluggable execution**: OpExecutor trait for custom operation execution
 //! - **Multi-backend support**: Works with file://, s3://, az://, direct:// via s3dlio
 //!
+//! # Known limits of replay
+//!
+//! Replay is exact only for the five operations [`OpType`] models (GET, PUT, DELETE, LIST,
+//! STAT/HEAD). Rows for `GET_RANGE`, `DELETE_BATCH`, `DELETE_PREFIX`, `CREATE_CONTAINER` and
+//! `DELETE_CONTAINER` do not record the parameters needed to replay them exactly (s3dlio issue
+//! #176), so recognising their names would not make them replayable. The first such row, or any
+//! malformed row, makes [`OpLogReader::from_file`] (and therefore [`replay_workload`]) fail at
+//! load time, before any operation runs; the error names the file line, the row index and the
+//! op. [`ReplayConfig::continue_on_error`] applies only to operations that fail while executing,
+//! not to load errors. [`OpLogStreamReader`] reports the error for that row and yields the rows
+//! after it. Traces that mix in such rows cannot be replayed exactly yet. Separately, a
+//! `MultiEndpointStore` writes rows only for `get`/`put` on bucket-form endpoints (#175), so its
+//! op-logs under-count requests. See "Known gaps" in `docs/supplemental/OPERATION_LOGGING.md`.
+//!
 //! # Usage
 //!
 //! ## Basic Replay

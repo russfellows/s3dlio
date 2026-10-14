@@ -1,5 +1,38 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Changed — clearer op-log reader error for unsupported operations (#176)
+
+- `s3dlio-oplog` readers: a row whose op name the reader does not model (`GET_RANGE`,
+  `DELETE_BATCH`, `DELETE_PREFIX`, `CREATE_CONTAINER`, `DELETE_CONTAINER`) now fails with an error
+  that names the file line, the data row index and the op, and says the operation is not
+  supported for exact replay; any other unrecognised name is reported as unknown. Replay behaviour
+  is unchanged: `OpType` still has five variants, the full-file load still aborts at the first such
+  row, `continue_on_error` still applies only to execution, and nothing is skipped or filtered.
+
+### Documented — known op-log gaps (#175, #176 remain open)
+
+- `MultiEndpointStore` records only `get`/`put` on bucket-form endpoints; `list`, `delete`,
+  `get_range`, `stat` and every call on host-form (and `file://`, `az://`, `gs://`) endpoints write
+  no row (#175).
+- Compound-operation rows (`GET_RANGE`, `DELETE_BATCH`, `DELETE_PREFIX`, container operations) do
+  not carry the parameters needed for exact replay; recognising an op name does not mean exact
+  replay is supported. Full-file replay stops at the first unsupported or malformed row, and
+  `continue_on_error` does not bypass load errors. Mixed traces cannot be replayed exactly yet
+  (#176).
+- See "Known gaps" in `docs/supplemental/OPERATION_LOGGING.md`; the same facts are in
+  `OPLOG-GUIDE.md`, `MULTI_ENDPOINT_GUIDE.md` and the `s3dlio-oplog` README and rustdoc.
+- #175 and #176 are NOT fixed by this change; both issues remain open.
+
+### Removed — never-compiled `src/prefetch.rs` sketch (#203)
+
+- Deleted `src/prefetch.rs`, which was never declared in `lib.rs` and could not compile. The docs
+  that cited it now describe the loaders that exist. `data_loader::prefetch::spawn_prefetch` is
+  unchanged.
+
+---
+
 ## Version 0.9.122 — Op-log accuracy (each call recorded once), server routing for every operation, replay fixes, Azure credential fix
 
 Fixes 14 issues: #169, #174, #177, #181, #182, #189, #196, #197, #199, #200, #183, #184, #187, #202.

@@ -60,6 +60,38 @@ they are on S3/Azure/GCS (`copy` = GET + PUT, `rename` = GET + PUT + DELETE) and
 `file://` / `direct://`) and `mkdir`, `rmdir`, `update_metadata`, `update_properties`
 (which have no op name in the format) are forwarded without a row.
 
+### Known gaps
+
+These are open issues (#175, #176), not intended behaviour. They are documented here so a
+trace is not trusted for more than it holds.
+
+- **`MultiEndpointStore` writes few rows (#175).** `MultiEndpointStore` is never wrapped in a
+  logger. On bucket-form endpoints (`s3://<bucket>/...`) only `get` and `put` write a row (the
+  helper-shape row); `list`, `delete`, `get_range` and `stat` write nothing. On host-form
+  endpoints (`s3://host:port/bucket/...`) every call writes nothing, and so does every call on
+  `file://`, `az://` and `gs://` endpoints. An op-log from a `MultiEndpointStore` therefore
+  under-counts the requests that reached the servers, and can be header-only. For counts that do
+  not depend on the op-log use `MultiEndpointStore::get_all_stats()` /
+  `get_total_stats()`, or the servers' own request counts. Wrapping a `MultiEndpointStore`
+  yourself in `LoggedObjectStore` is not a fix: on bucket-form endpoints each `get`/`put` would
+  then be recorded twice.
+- **Compound-operation rows cannot be replayed exactly (#176).** The rows for `GET_RANGE`,
+  `DELETE_BATCH`, `DELETE_PREFIX`, `CREATE_CONTAINER` and `DELETE_CONTAINER` do not carry the
+  parameters that define the call: a `GET_RANGE` row has the number of bytes returned but not
+  the offset or the requested length; a `DELETE_BATCH` row has the key count and the first key
+  only; a `LIST` row does not record whether it was recursive. Recognising such an op name
+  would therefore not make an exact replay possible, and `OpType` does not model them.
+- **Replay stops at the first unsupported or malformed row.** `s3dlio-oplog` loads the whole file
+  before it runs anything (`OpLogReader::from_file`, used by `replay_workload`). The first row
+  with an op name it does not model, or one it cannot parse, aborts the load and nothing is
+  executed. `continue_on_error` only governs failures while executing operations; it does not
+  bypass load errors. The error now names the file line, the row index and the op, for example
+  `line 17 (row index 15): operation GET_RANGE is not supported for exact replay ...`.
+  `OpLogStreamReader` reports the same error per row and continues with the next row.
+- **Mixed traces cannot be replayed exactly yet.** A trace that contains compound-operation rows
+  (for example a `direct://` workload whose large files are read as ranged reads, which are
+  logged as `GET_RANGE`) cannot be replayed exactly with the current format and reader.
+
 ### Global Configuration Functions
 
 #### Clock Offset Synchronization

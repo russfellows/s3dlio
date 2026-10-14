@@ -47,7 +47,9 @@ fn batch_reader_error_names_line_and_op_tsv() {
         let msg = batch_err(&f);
         assert!(msg.contains("line 3"), "{name}: {msg}");
         assert!(
-            msg.contains(&format!("operation {name} is not supported for exact replay")),
+            msg.contains(&format!(
+                "operation {name} is not supported for exact replay"
+            )),
             "{name}: {msg}"
         );
     }
@@ -62,7 +64,9 @@ fn batch_reader_error_names_line_and_op_jsonl() {
         let msg = batch_err(&f);
         assert!(msg.contains("line 2"), "{name}: {msg}");
         assert!(
-            msg.contains(&format!("operation {name} is not supported for exact replay")),
+            msg.contains(&format!(
+                "operation {name} is not supported for exact replay"
+            )),
             "{name}: {msg}"
         );
     }
@@ -96,7 +100,10 @@ fn a_name_that_is_not_a_known_writer_op_is_called_unknown_not_unsupported() {
         row(1, "FROBNICATE", "s3://bkt", "bkt/b"),
     ]);
     let msg = batch_err(&f);
-    assert!(msg.contains("line 3") && msg.contains("FROBNICATE"), "{msg}");
+    assert!(
+        msg.contains("line 3") && msg.contains("FROBNICATE"),
+        "{msg}"
+    );
     assert!(msg.contains("unknown operation"), "{msg}");
     assert!(!msg.contains("not supported for exact replay"), "{msg}");
 }

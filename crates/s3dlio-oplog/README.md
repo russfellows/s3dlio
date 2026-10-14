@@ -84,6 +84,24 @@ async fn main() -> Result<()> {
 - `LIST` - Listing operations
 - `STAT` / `HEAD` - Metadata operations (HEAD is alias for STAT)
 
+These five are the only operations the reader models. s3dlio also writes `GET_RANGE`,
+`DELETE_BATCH`, `DELETE_PREFIX`, `CREATE_CONTAINER` and `DELETE_CONTAINER` rows, but those rows do
+not record the parameters needed for an exact replay (offset and length, the full key list, ...;
+s3dlio issue #176), so recognising the names would not make them replayable. Replay is strict:
+
+- a row with any other op name, or a malformed row, makes `OpLogReader::from_file` (and so
+  `replay_workload`) fail at load time, before any operation runs. The error names the file
+  line, the row index and the op, e.g.
+  `line 17 (row index 15): operation GET_RANGE is not supported for exact replay ...`;
+- `continue_on_error` only affects operations that fail while executing; it does not bypass load
+  errors;
+- `OpLogStreamReader` yields that error for the row and continues with the next one;
+- a trace that mixes in such rows (for example a `direct://` workload with ranged reads) cannot be
+  replayed exactly yet.
+
+Separately, a `MultiEndpointStore` records only `get`/`put` on bucket-form endpoints (#175), so its
+op-logs under-count. See "Known gaps" in `docs/supplemental/OPERATION_LOGGING.md`.
+
 ### URI Translation
 
 Remap operations between storage backends:

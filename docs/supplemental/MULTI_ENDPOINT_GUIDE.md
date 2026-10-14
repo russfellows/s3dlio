@@ -247,6 +247,19 @@ println!("Total: {} requests, {} bytes, {} errors",
 
 ---
 
+### Operation log (known gap, #175)
+
+A `MultiEndpointStore` is not wrapped in a logger, so the op-log it writes is incomplete: only
+`get` and `put` on bucket-form endpoints (`s3://<bucket>/...`) write a row. `list`, `delete`,
+`get_range` and `stat` on those endpoints, and every call on host-form endpoints
+(`s3://host:port/bucket/...`) and on `file://`, `az://` and `gs://` endpoints, write no row, so the
+log under-counts requests and can be header-only. Use `get_all_stats()` / `get_total_stats()` or
+the servers' own counts for request totals. Wrapping the store in `LoggedObjectStore` yourself
+would record bucket-form `get`/`put` twice. Details: "Known gaps" in
+[OPERATION_LOGGING.md](OPERATION_LOGGING.md).
+
+---
+
 ## Python API
 
 The Python interface provides simplified access with automatic async handling and zero-copy data access.
