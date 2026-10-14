@@ -398,6 +398,72 @@ impl ObjectStore for LoggedObjectStore {
         result
     }
 
+    async fn stat_if_exists(&self, uri: &str) -> Result<Option<ObjectMetadata>> {
+        let start = SystemTime::now();
+        let result = self.inner.stat_if_exists(uri).await;
+        let end = SystemTime::now();
+
+        let bytes = match &result {
+            Ok(Some(m)) => m.size,
+            _ => 0,
+        };
+        let error = match &result {
+            Ok(Some(_)) => None,
+            Ok(None) => Some("object not found".to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+
+        // Same row as stat(): a HEAD, metadata-only.
+        self.log_operation("HEAD", uri, bytes, 1, start, None, end, error);
+
+        result
+    }
+
+    fn list_objects_with_prefix<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<String>> + Send + 'a>> {
+        use futures::stream::StreamExt;
+
+        let start_time = SystemTime::now();
+        let mut inner_stream = self.inner.list_objects_with_prefix(uri_prefix);
+        let uri_str = uri_prefix.to_string();
+        let logger = self.logger.clone();
+
+        // Same wrapper as list_stream(): count the objects, log one LIST row
+        // when the stream ends.
+        Box::pin(async_stream::stream! {
+            let mut count = 0u32;
+            let mut stream_error: Option<String> = None;
+
+            while let Some(result) = inner_stream.next().await {
+                match &result {
+                    Ok(_) => {
+                        count += 1;
+                        yield result;
+                    }
+                    Err(e) => {
+                        stream_error = Some(e.to_string());
+                        yield result;
+                        break;
+                    }
+                }
+            }
+
+            record_call(
+                &logger,
+                "LIST",
+                &uri_str,
+                0,
+                count,
+                start_time,
+                None,
+                SystemTime::now(),
+                stream_error,
+            );
+        })
+    }
+
     async fn delete(&self, uri: &str) -> Result<()> {
         let start = SystemTime::now();
         let result = self.inner.delete(uri).await;

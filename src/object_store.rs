@@ -351,6 +351,46 @@ pub trait ObjectStore: Send + Sync {
     /// Stat a single object (HEAD-like).
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata>;
 
+    /// Stat a single object, telling "no such object" (`Ok(None)`) apart from
+    /// every other failure (`Err`: permission denied, transport error, ...).
+    ///
+    /// Used by `s3-cli delete` (issues #210 / #167): an exact-object delete
+    /// first confirms the object exists, a missing object is a clear error, and
+    /// any other lookup failure stops the command instead of triggering a
+    /// broader search.
+    ///
+    /// The default treats every `stat` failure as an error (never as "missing"),
+    /// which is the safe direction.  The S3 store overrides it to recognise a
+    /// 404.
+    async fn stat_if_exists(&self, uri: &str) -> Result<Option<ObjectMetadata>> {
+        self.stat(uri).await.map(Some)
+    }
+
+    /// Stream the URIs of the REAL objects whose key starts with the literal
+    /// prefix named by `uri_prefix`, recursively (no delimiter, no regex, no
+    /// synthetic directory entries).
+    ///
+    /// Used by `s3-cli delete -r`.  The S3 store overrides it with a literal
+    /// `ListObjectsV2` that yields only `Contents` entries.  The default (other
+    /// backends) streams their existing recursive listing and only accepts a
+    /// prefix ending in `/`, so a bare name is never read as a pattern.
+    fn list_objects_with_prefix<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+    ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+        if uri_prefix.ends_with('/') {
+            self.list_stream(uri_prefix, true)
+        } else {
+            let msg = format!(
+                "recursive listing of '{uri_prefix}' is not supported on this backend without a \
+                 trailing '/'"
+            );
+            Box::pin(futures::stream::once(
+                async move { Err(anyhow::anyhow!(msg)) },
+            ))
+        }
+    }
+
     /// Delete a single object.
     async fn delete(&self, uri: &str) -> Result<()>;
 
@@ -1720,6 +1760,55 @@ impl ObjectStore for S3ObjectStore {
         }
 
         s3_stat_object_uri_async(uri).await
+    }
+
+    async fn stat_if_exists(&self, uri: &str) -> Result<Option<ObjectMetadata>> {
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        debug!("S3ObjectStore::stat_if_exists uri='{}'", uri);
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+        if key.is_empty() {
+            // `s3://bucket` / `s3://bucket/` names no object.
+            return Ok(None);
+        }
+        match &self.client {
+            Some(client) => crate::s3_utils::head_object_if_exists(client, &bucket, &key).await,
+            None => {
+                let client = crate::s3_client::aws_s3_client_async().await?;
+                crate::s3_utils::head_object_if_exists(&client, &bucket, &key).await
+            }
+        }
+    }
+
+    fn list_objects_with_prefix<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+    ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            let (bucket, key_prefix) = match self.parse_uri_for_this_store(uri_prefix) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+            let client = match &self.client {
+                Some(client) => (**client).clone(),
+                None => match crate::s3_client::aws_s3_client_async().await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                },
+            };
+            let mut stream =
+                crate::s3_utils::list_object_uris_with_prefix_stream(client, bucket, key_prefix);
+            while let Some(item) = stream.next().await {
+                yield item;
+            }
+        })
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
