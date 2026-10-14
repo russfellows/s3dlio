@@ -2469,16 +2469,16 @@ impl AzureObjectStore {
         }
     }
 
-    async fn client_for_uri(uri: &str) -> Result<(AzureBlob, String, String, String)> {
+    fn client_for_uri(uri: &str) -> Result<(AzureBlob, String, String, String)> {
         let (account, container, key) = parse_azure_uri(uri)?;
         // If caller provided an https:// URL, we still build via account name to ensure
         // we normalize the list() return URIs as az://...
-        let cli = AzureBlob::with_default_credential(&account, &container).await?;
+        let cli = AzureBlob::with_default_credential(&account, &container)?;
         Ok((cli, account, container, key))
     }
 
-    async fn client_for_prefix(uri_prefix: &str) -> Result<(AzureBlob, String, String, String)> {
-        Self::client_for_uri(uri_prefix).await
+    fn client_for_prefix(uri_prefix: &str) -> Result<(AzureBlob, String, String, String)> {
+        Self::client_for_uri(uri_prefix)
     }
 
     /// Download using RangeEngine for concurrent range requests
@@ -2524,7 +2524,7 @@ impl AzureObjectStore {
 #[cfg(feature = "backend-azure")]
 impl ObjectStore for AzureObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
-        let (cli, _acct, _cont, key) = Self::client_for_uri(uri).await?;
+        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
 
         // Get blob size from cache or stat (v0.9.10: cache optimization)
         let object_size = self.get_object_size(uri).await?;
@@ -2545,7 +2545,7 @@ impl ObjectStore for AzureObjectStore {
     }
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
-        let (cli, _acct, _cont, key) = Self::client_for_uri(uri).await?;
+        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         debug!(
             "AzureObjectStore::get_range uri='{}', offset={}, length={:?}",
             uri, offset, length
@@ -2564,14 +2564,14 @@ impl ObjectStore for AzureObjectStore {
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
-        let (cli, _acct, _cont, key) = Self::client_for_uri(uri).await?;
+        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         debug!("AzureObjectStore::put uri='{}', {} bytes", uri, data.len());
         // Bytes→Bytes is zero-copy (reference counted buffer)
         cli.put(&key, data, true).await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
-        let (cli, _acct, _cont, key) = Self::client_for_uri(uri).await?;
+        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         debug!(
             "AzureObjectStore::put_multipart uri='{}', {} bytes, part_size={:?}",
             uri,
@@ -2599,7 +2599,7 @@ impl ObjectStore for AzureObjectStore {
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
-        let (cli, account, container, key_prefix) = Self::client_for_prefix(uri_prefix).await?;
+        let (cli, account, container, key_prefix) = Self::client_for_prefix(uri_prefix)?;
         debug!(
             "AzureObjectStore::list prefix='{}', recursive={}",
             uri_prefix, recursive
@@ -2643,7 +2643,7 @@ impl ObjectStore for AzureObjectStore {
     ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
         Box::pin(async_stream::stream! {
             debug!("AzureObjectStore::list_stream prefix='{}', recursive={}", uri_prefix, recursive);
-            let (cli, account, container, key_prefix) = match Self::client_for_prefix(uri_prefix).await {
+            let (cli, account, container, key_prefix) = match Self::client_for_prefix(uri_prefix) {
                 Ok(c) => c,
                 Err(e) => {
                     yield Err(e);
@@ -2683,14 +2683,14 @@ impl ObjectStore for AzureObjectStore {
     }
 
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
-        let (cli, _acct, _cont, key) = Self::client_for_uri(uri).await?;
+        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         debug!("AzureObjectStore::stat uri='{}'", uri);
         let p = cli.stat(&key).await?;
         Ok(az_props_to_meta(&p))
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
-        let (cli, _acct, _cont, key) = Self::client_for_uri(uri).await?;
+        let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         debug!("AzureObjectStore::delete uri='{}'", uri);
         cli.delete_objects(&[key]).await
     }
@@ -2708,12 +2708,10 @@ impl ObjectStore for AzureObjectStore {
         let mut failures: Vec<GroupFailure> = Vec::new();
         for group in &groups {
             let (account, container) = &group.target;
-            let Some(first_uri) = group.uris.first() else {
-                continue; // unreachable: a group always holds >= 1 URI
-            };
-            let outcome = match Self::client_for_uri(first_uri).await {
-                Ok((cli, _acct, _cont, _)) => cli.delete_objects(&group.keys).await,
-                Err(e) => Err(e),
+            let outcome = match group.uris.first().map(|u| Self::client_for_uri(u)) {
+                Some(Ok((cli, _acct, _cont, _))) => cli.delete_objects(&group.keys).await,
+                Some(Err(e)) => Err(e),
+                None => continue, // unreachable: a group always holds >= 1 URI
             };
             if let Err(error) = outcome {
                 failures.push(GroupFailure {
@@ -2730,7 +2728,7 @@ impl ObjectStore for AzureObjectStore {
         use futures::stream::StreamExt;
         debug!("AzureObjectStore::delete_prefix prefix='{}'", uri_prefix);
 
-        let (cli, _acct, _cont, key_prefix) = Self::client_for_prefix(uri_prefix).await?;
+        let (cli, _acct, _cont, key_prefix) = Self::client_for_prefix(uri_prefix)?;
 
         // Use streaming list to avoid loading millions of keys into memory
         let mut stream = cli.list_stream(Some(&key_prefix));
@@ -2775,7 +2773,7 @@ impl ObjectStore for AzureObjectStore {
         let container = it
             .next()
             .ok_or_else(|| anyhow!("expected \"account/container\""))?;
-        let cli = AzureBlob::with_default_credential(account, container).await?;
+        let cli = AzureBlob::with_default_credential(account, container)?;
         // best-effort create
         let _ = cli.create_container_if_missing().await?;
         Ok(())
@@ -2789,7 +2787,7 @@ impl ObjectStore for AzureObjectStore {
         let container = it
             .next()
             .ok_or_else(|| anyhow!("expected \"account/container\""))?;
-        let cli = AzureBlob::with_default_credential(account, container).await?;
+        let cli = AzureBlob::with_default_credential(account, container)?;
         let _ = cli.delete_container().await?;
         Ok(())
     }
@@ -2928,7 +2926,7 @@ impl ObjectWriter for AzureBufferedWriter {
         self.compressed_bytes = self.buffer.len() as u64;
 
         // Append compression extension if needed
-        let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri).await?;
+        let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
         let final_key =
             if self.compression.is_enabled() && !key.ends_with(self.compression.extension()) {
                 format!("{}{}", key, self.compression.extension())

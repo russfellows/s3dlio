@@ -7,8 +7,7 @@ use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use tokio::sync::OnceCell;
+use std::sync::{Arc, OnceLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +29,21 @@ use azure_storage_blob::models::{
 use tracing::{debug, warn};
 
 // Global credential cache to avoid repeated authentication
-static AZURE_CREDENTIAL: OnceCell<Arc<dyn TokenCredential>> = OnceCell::const_new();
+static AZURE_CREDENTIAL: OnceLock<Arc<dyn TokenCredential>> = OnceLock::new();
+
+/// The process-wide credential for https endpoints, created on first use.
+///
+/// Creation is synchronous and fallible: a failure is returned (and nothing is cached, so a
+/// later call retries). Two threads racing on the first call may each create a credential;
+/// one is kept and both get it. No runtime is needed, so this is safe on any Tokio runtime
+/// flavour, or none.
+fn shared_credential() -> Result<Arc<dyn TokenCredential>> {
+    if let Some(credential) = AZURE_CREDENTIAL.get() {
+        return Ok(Arc::clone(credential));
+    }
+    let credential: Arc<dyn TokenCredential> = DeveloperToolsCredential::new(None)?;
+    Ok(Arc::clone(AZURE_CREDENTIAL.get_or_init(|| credential)))
+}
 
 /// Azure's documented maximum number of uncommitted blocks per block blob.
 /// See <https://learn.microsoft.com/en-us/rest/api/storageservices/put-block>.
@@ -80,7 +93,7 @@ impl AzureBlob {
     /// When a custom endpoint is set, the account name is appended to form the full URL.
     /// Example: AZURE_STORAGE_ENDPOINT=http://localhost:10000 + account="devstoreaccount1"
     ///          → http://localhost:10000/devstoreaccount1
-    pub async fn with_default_credential(account: &str, container: &str) -> Result<Self> {
+    pub fn with_default_credential(account: &str, container: &str) -> Result<Self> {
         // Check for custom endpoint (for Azurite or other emulators/proxies)
         if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
             .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
@@ -92,35 +105,18 @@ impl AzureBlob {
                 format!("{}/{}", endpoint, account)
             };
             tracing::info!("Using custom Azure endpoint: {}", account_url);
-            return Self::with_default_credential_from_url(&account_url, container).await;
+            return Self::with_default_credential_from_url(&account_url, container);
         }
 
         Self::with_default_credential_from_url(&Self::account_url_from_account(account), container)
-            .await
     }
 
     /// Same, when a full endpoint URL (possibly emulator) is provided.
-    ///
-    /// Async because the https credential is created (once, then cached) on the caller's
-    /// runtime; nothing here blocks, so it is safe on a current-thread runtime. Credential
-    /// failures are returned as errors.
-    pub async fn with_default_credential_from_url(
-        account_url: &str,
-        container: &str,
-    ) -> Result<Self> {
+    pub fn with_default_credential_from_url(account_url: &str, container: &str) -> Result<Self> {
         let service_url = Url::parse(account_url)
             .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?;
         let credential = if service_url.scheme() == "https" {
-            Some(
-                AZURE_CREDENTIAL
-                    .get_or_try_init(|| async {
-                        let credential_arc = DeveloperToolsCredential::new(None)?;
-                        let credential: Arc<dyn TokenCredential> = credential_arc;
-                        Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
-                    })
-                    .await
-                    .map(Arc::clone)?,
-            )
+            Some(shared_credential()?)
         } else {
             None
         };
@@ -683,18 +679,12 @@ pub fn resolve_azure_account_url(account: &str) -> String {
 pub async fn list_account_containers(account: &str) -> Result<Vec<(String, Option<String>)>> {
     let account_url = resolve_azure_account_url(account);
 
-    let credential = AZURE_CREDENTIAL
-        .get_or_try_init(|| async {
-            let cred = DeveloperToolsCredential::new(None)?;
-            let cred: Arc<dyn azure_core::credentials::TokenCredential> = cred;
-            Ok::<_, anyhow::Error>(cred)
-        })
-        .await?;
+    let credential = shared_credential()?;
 
     let service_client = BlobServiceClient::new(
         Url::parse(&account_url)
             .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?,
-        Some(Arc::clone(credential)),
+        Some(credential),
         Some(BlobServiceClientOptions::default()),
     )
     .map_err(|e| anyhow!(e))?;

@@ -14,7 +14,27 @@
 #![cfg(feature = "backend-azure")]
 
 use s3dlio::api::store_for_uri;
+use s3dlio::azure_client::AzureBlob;
 use std::time::Duration;
+
+/// Public API check: the constructors are synchronous (they were before #202 and callers are
+/// not async). Called here from a plain `fn` with no runtime at all; this stops compiling if
+/// either constructor becomes `async`, and must not panic for lack of a runtime.
+#[test]
+fn constructors_are_synchronous_and_need_no_runtime() {
+    // http: no credential involved
+    let plain: anyhow::Result<AzureBlob> =
+        AzureBlob::with_default_credential_from_url("http://127.0.0.1:9/acct202", "cont202");
+    assert!(plain.is_ok(), "http endpoint builds");
+
+    // https: creates (and caches) the credential; any outcome but a panic is acceptable
+    let secure: anyhow::Result<AzureBlob> =
+        AzureBlob::with_default_credential_from_url("https://127.0.0.1:9", "cont202");
+    if let Err(e) = secure {
+        // a credential failure is reported as an error, never a panic
+        assert!(!format!("{e:#}").is_empty());
+    }
+}
 
 #[tokio::test] // current-thread runtime
 async fn azure_https_paths_return_err_on_a_current_thread_runtime() {

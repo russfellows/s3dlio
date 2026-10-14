@@ -41,10 +41,12 @@ async fn mk_client() -> Result<AzureBlob> {
             anyhow::ensure!(acc_from_url == acct,
                 "AZURE_BLOB_ACCOUNT_URL points to '{acc_from_url}', but AZURE_BLOB_ACCOUNT is '{acct}'");
         }
-        Ok(AzureBlob::with_default_credential_from_url(&url, &container).await?)
+        Ok(AzureBlob::with_default_credential_from_url(
+            &url, &container,
+        )?)
     } else {
         let acct = req_env("AZURE_BLOB_ACCOUNT")?;
-        Ok(AzureBlob::with_default_credential(&acct, &container).await?)
+        Ok(AzureBlob::with_default_credential(&acct, &container)?)
     }
 }
 
