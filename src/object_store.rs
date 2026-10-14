@@ -2163,11 +2163,12 @@ impl S3BufferedWriter {
 
     /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
     /// header and every block the encoder already emitted during `write_chunk` are in
-    /// `buffer`; the encoder's final output is appended to them (issue #218).
+    /// `buffer`; the encoder's final output is APPENDED to them, never assigned over them
+    /// (issue #218).
     fn seal_compression(&mut self) -> Result<()> {
         if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
+            let tail = compressor.finish()?;
+            self.buffer.extend_from_slice(&tail);
         }
         self.compressed_bytes = self.buffer.len() as u64;
         Ok(())
@@ -3000,11 +3001,12 @@ impl AzureBufferedWriter {
 
     /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
     /// header and every block the encoder already emitted during `write_chunk` are in
-    /// `buffer`; the encoder's final output is appended to them (issue #218).
+    /// `buffer`; the encoder's final output is APPENDED to them, never assigned over them
+    /// (issue #218).
     fn seal_compression(&mut self) -> Result<()> {
         if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
+            let tail = compressor.finish()?;
+            self.buffer.extend_from_slice(&tail);
         }
         self.compressed_bytes = self.buffer.len() as u64;
         Ok(())
@@ -3597,11 +3599,12 @@ impl GcsBufferedWriter {
 
     /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
     /// header and every block the encoder already emitted during `write_chunk` are in
-    /// `buffer`; the encoder's final output is appended to them (issue #218).
+    /// `buffer`; the encoder's final output is APPENDED to them, never assigned over them
+    /// (issue #218).
     fn seal_compression(&mut self) -> Result<()> {
         if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
+            let tail = compressor.finish()?;
+            self.buffer.extend_from_slice(&tail);
         }
         self.compressed_bytes = self.buffer.len() as u64;
         Ok(())
@@ -5301,7 +5304,11 @@ mod compressed_writer_seal_tests_218 {
         };
     }
 
-    seal_test!(s3_writer_seal_keeps_the_early_blocks, S3BufferedWriter, cfg(all()));
+    seal_test!(
+        s3_writer_seal_keeps_the_early_blocks,
+        S3BufferedWriter,
+        cfg(all())
+    );
     seal_test!(
         azure_writer_seal_keeps_the_early_blocks,
         AzureBufferedWriter,

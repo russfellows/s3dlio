@@ -706,11 +706,7 @@ async fn buffered_writers_upload_to_the_stores_server() {
     let b = ObjMock::start(SEED_B, OBJECT_SIZE);
     let store = store_for(&b).await;
     // The writer uploads with the default 16 MiB part size: 17 MiB is two parts.
-    // A compressed writer gets a small payload: a compressed writer currently drops the
-    // compressed bytes it emitted before finalize (incidental, not #208), so only a
-    // payload that stays inside the encoder until finalize round-trips.
     let large = payload(17 * 1024 * 1024);
-    let small = payload(32 * 1024);
 
     for name in [
         "get_writer",
@@ -721,7 +717,7 @@ async fn buffered_writers_upload_to_the_stores_server() {
         let bucket = unique_bucket(name);
         let uri = format!("s3://{bucket}/obj");
         let compressed = name.ends_with("compression") || name.ends_with("compressed");
-        let data = if compressed { &small } else { &large };
+        let data = &large;
         let mut writer = match name {
             "get_writer" => store.get_writer(&uri).await,
             "get_writer_with_compression" => {
@@ -740,11 +736,7 @@ async fn buffered_writers_upload_to_the_stores_server() {
         }
         .unwrap_or_else(|e| panic!("{name}: the writer must be created: {e:#}"));
 
-        for chunk in data.chunks(if compressed {
-            8 * 1024 + 1
-        } else {
-            3 * 1024 * 1024
-        }) {
+        for chunk in data.chunks(3 * 1024 * 1024) {
             writer
                 .write_chunk(chunk)
                 .await
