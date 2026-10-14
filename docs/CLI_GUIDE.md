@@ -238,19 +238,21 @@ which is sent to that server):
 
 | Command | Behavior |
 |---------|----------|
-| `delete s3://bkt/foo` | Deletes ONLY the object whose key is exactly `foo`. Never `foobar`, never `foo/child`. |
-| `delete s3://bkt/foo/` | Deletes ONLY the object whose key is exactly `foo/` (a zero-byte "folder marker"), if it exists. A trailing slash alone never means "recursive". |
-| either, exact object absent | Fails with a non-zero exit: `no such object: s3://bkt/foo; use -r to delete everything under a prefix`. Nothing is listed and nothing is deleted. |
+| `delete s3://bkt/foo` | Sends ONE delete request for exactly the key `foo`. Never `foobar`, never `foo/child`. |
+| `delete s3://bkt/foo/` | Sends ONE delete request for exactly the key `foo/` (a zero-byte "folder marker"). A trailing slash alone never means "recursive"; the output reminds you to use `-r`. |
+| either, object already missing | Success (exit 0), as with S3's own idempotent DELETE. Nothing is listed and nothing else is deleted. |
+| either, the delete request fails (403, 5xx, network) | Non-zero exit, `failed to delete <uri>: <cause>`. A failure is never read as "already absent". |
 | `delete -r s3://bkt/foo/` | Deletes the real objects whose key starts with `foo/`, nested ones included (`foo/a`, `foo/b/c`, and the marker `foo/` if present). Never `foobar`. |
 | `delete -r s3://bkt/foo` | Deletes the real objects whose key starts with the literal text `foo`. **This also matches `foobar` and `foo2/x`.** No `/` is appended for you. Write `foo/` to stay inside the folder. |
 
 How it works:
 
-- **Exact delete.** The object is looked up with a HEAD request first. A 404 gives the
-  "no such object" error. A permission error (403) or any other lookup failure stops the command
-  with that error; it never falls back to listing or to a broader delete. Deletion therefore needs
-  read (HEAD) permission in addition to delete permission. This is deliberately stricter than S3's
-  own idempotent DELETE, which reports success for a missing key.
+- **Exact delete.** One delete request for the named key, with no HEAD, no listing and no parent
+  lookup, so it needs only delete permission. S3 reports success for a key that does not exist, so
+  the command cannot tell "deleted" from "was already gone" and does not claim to. On other
+  backends only the backend's own typed not-found error counts as success; every other error fails
+  the command. On a **versioned bucket** a plain delete adds a delete marker and does not erase
+  earlier versions.
 - **Recursive delete.** The prefix is listed with no delimiter, so only real objects are returned
   (synthetic "directory" entries are never delete candidates), then deleted in batches of up to
   1,000 keys. Characters in the key are literal: `*`, `.`, `[` and so on are never read as a pattern.
@@ -258,7 +260,10 @@ How it works:
   each listed object URI, `s3://bkt/key`). It is an error without `-r`.
 - **Reporting.** S3 reports a key that does not exist as "deleted", so the command never claims a
   deleted count. The messages, exactly:
-  - exact delete: `Deleted s3://bkt/foo`;
+  - exact delete: `Delete request succeeded: s3://bkt/foo (S3 does not report whether the object existed)`
+    (other backends: `this backend does not report ...`). When the URI ends in `/` and `-r` was not
+    given, the text continues `; only the object named by this exact URI was targeted, not what is
+    under it (use -r to delete everything under a prefix)`;
   - `-r`, success: `Sent delete requests for N objects found under prefix <uri> (N listed; 0 reported errors)`;
   - `-r -p <regex>`, success: `Sent delete requests for N objects selected under prefix <uri> by pattern '<regex>' (M listed, N selected; 0 reported errors)`
     (`M` is counted before the pattern filter, `N` after it);
@@ -277,8 +282,10 @@ How it works:
   are not sent and are counted as not attempted; the rest of the prefix is not listed.
 - **Other backends.** `file://`, `direct://`, `gs://` and `az://` use their own existing listing.
   `-r` there requires a URI that ends in `/` and otherwise fails with an error (it never broadens
-  into a prefix match). Without `-r`, a missing object ends with
-  `cannot confirm that <uri> exists; nothing was deleted` (the cause follows), and nothing is deleted.
+  into a prefix match). Without `-r`, the same single delete request is made; an already-missing
+  object is success where the backend reports a typed not-found error (file backends, Azure
+  `BlobNotFound`, GCS NOT_FOUND). On GCS a missing bucket gives the same status as a missing
+  object, so it is not told apart.
 
 **Options:**
 | Option | Description |
@@ -290,10 +297,10 @@ How it works:
 **Examples:**
 
 ```bash
-# Delete one object (HEAD first; fails if it does not exist)
+# Delete one object (one request; succeeds even if it was already gone)
 s3-cli delete s3://bucket/dir/file.txt
 
-# Delete a folder-marker object only; dir/file.txt is untouched
+# Delete the folder-marker object "dir/" only; dir/file.txt is untouched
 s3-cli delete s3://bucket/dir/
 
 # Delete everything under the folder dir/

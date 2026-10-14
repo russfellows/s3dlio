@@ -1849,14 +1849,18 @@ pub fn get_many(
 /// Delete an object, or with ``recursive=True`` every object under a prefix
 /// (delete contract A, issue #212; the same contract as ``s3-cli delete``).
 ///
-/// ``delete(uri)`` deletes ONLY the object named by ``uri``:
+/// ``delete(uri)`` sends ONE delete request for exactly the key named by
+/// ``uri`` and returns ``None``:
 ///
-/// * The object is looked up first (S3: a HEAD request). On S3 a missing
-///   object (HEAD 404) raises ``FileNotFoundError`` ("no such object: ...");
-///   nothing is deleted. On other backends a missing object raises
-///   ``RuntimeError`` ("cannot confirm that ... exists; nothing was deleted").
-/// * A lookup that fails for any other reason (permission denied, network
-///   error, ...) raises ``RuntimeError`` and deletes nothing.
+/// * There is no lookup first. Deleting an object that is already missing
+///   succeeds (S3's DELETE succeeds for a missing key; on other backends only
+///   the backend's own typed not-found error is treated as success). Success
+///   means the delete request succeeded, not that an existing object was
+///   removed: S3 does not say whether the key existed, and on a versioned
+///   bucket a delete adds a delete marker and erases no earlier version.
+/// * Any actual failure (permission denied, server error, network error, ...)
+///   raises ``RuntimeError`` naming the key; it is never read as "already
+///   absent".
 /// * ``/``, ``*`` and ``?`` are ordinary key characters: ``s3://b/dir/`` names
 ///   the object ``dir/`` (not "everything under dir"), and ``s3://b/a*`` names
 ///   the key ``a*``. Nothing is listed, globbed or expanded, no parent is
@@ -1874,15 +1878,13 @@ pub fn get_many(
 /// a backend without a literal-prefix listing, ``recursive=True`` requires a
 /// URI ending in ``/`` (otherwise ``RuntimeError``, nothing deleted).
 ///
-/// The existence check needs read (HEAD) permission and ``recursive=True``
-/// needs list permission, in addition to delete. This replaced an earlier
-/// implicit expansion of a trailing ``/``, ``*`` or ``?`` (issue #212).
+/// ``recursive=True`` needs list permission in addition to delete. This
+/// replaced an earlier implicit expansion of a trailing ``/``, ``*`` or ``?``
+/// (issue #212).
 ///
 /// Raises:
-///     FileNotFoundError: the exact object does not exist (S3).
-///     RuntimeError: a missing object on other backends, and any other
-///         failure (nothing is deleted when the lookup or the first listing
-///         page fails).
+///     RuntimeError: any failure. For ``recursive=True``, nothing is deleted
+///         when the first listing page fails.
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false))]
 pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
@@ -1895,52 +1897,21 @@ pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
         // Submit to global runtime (io_uring pattern — never calls block_on).
         // The selection and deletion are the library's `delete_contract`,
         // shared with `s3-cli delete`.
-        let outcome = submit_io(async move {
-            Ok::<_, anyhow::Error>(if recursive {
-                let report = crate::delete_contract::delete_objects_under_literal_prefix(
+        submit_io(async move {
+            if recursive {
+                crate::delete_contract::delete_objects_under_literal_prefix(
                     store.as_ref(),
                     &uri_owned,
                     None,
                     None,
                 )
-                .await;
-                report
-                    .into_result(&uri_owned, None)
-                    .map_err(|e| DeleteFailure::Other(error_chain_message(&e)))
+                .await
+                .into_result(&uri_owned, None)
             } else {
-                crate::delete_contract::delete_exact_object(store.as_ref(), &uri_owned)
-                    .await
-                    .map_err(
-                        |e| match e.downcast_ref::<crate::delete_contract::NoSuchObject>() {
-                            Some(missing) => DeleteFailure::Missing(missing.uri.clone()),
-                            None => DeleteFailure::Other(error_chain_message(&e)),
-                        },
-                    )
-            })
-        })?;
-        outcome.map_err(PyErr::from)
+                crate::delete_contract::delete_exact_object(store.as_ref(), &uri_owned).await
+            }
+        })
     })
-}
-
-/// Why `delete` failed, kept apart so a missing object becomes
-/// `FileNotFoundError` and everything else `RuntimeError`.
-enum DeleteFailure {
-    /// The exact object does not exist (carries its URI).
-    Missing(String),
-    /// Any other failure (carries the full message).
-    Other(String),
-}
-
-impl From<DeleteFailure> for PyErr {
-    fn from(failure: DeleteFailure) -> PyErr {
-        match failure {
-            DeleteFailure::Missing(uri) => pyo3::exceptions::PyFileNotFoundError::new_err(format!(
-                "no such object: {uri}; nothing was deleted (use recursive=True to delete \
-                     everything under a prefix)"
-            )),
-            DeleteFailure::Other(msg) => PyRuntimeError::new_err(msg),
-        }
-    }
 }
 
 #[pyfunction]

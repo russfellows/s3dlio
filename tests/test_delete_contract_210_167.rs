@@ -5,10 +5,12 @@
 // Regression tests for s3dlio issues #210 and #167 and the architect-approved
 // `s3-cli delete` contract:
 //
-//   delete s3://bkt/foo     deletes ONLY the exact object `foo` (HEAD first)
-//   delete s3://bkt/foo/    deletes ONLY the exact object `foo/` (a trailing slash
-//                           alone never authorizes a recursive delete)
-//   either, object absent   non-zero exit, "no such object", no listing, no delete
+//   delete s3://bkt/foo     ONE delete request for exactly the key `foo`: no HEAD,
+//                           no listing
+//   delete s3://bkt/foo/    ONE delete request for exactly the key `foo/` (a trailing
+//                           slash alone never authorizes a recursive delete)
+//   either, object absent   exit 0 (S3 deletes are idempotent); a real failure
+//                           (403 on the DELETE) is a non-zero exit naming the key
 //   delete -r s3://bkt/foo/ deletes the REAL objects under the literal prefix `foo/`
 //   delete -r s3://bkt/foo  literal prefix `foo` (also matches `foobar`)
 //   -p/--pattern            only with -r; filters inside the -r selection
@@ -67,8 +69,9 @@ impl Req {
 struct State {
     keys: BTreeSet<String>,
     log: Vec<Req>,
-    /// When set, every HEAD is answered with this status (e.g. 403).
-    head_status: Option<u16>,
+    /// When set, every delete request (DELETE, or POST ?delete) is answered
+    /// with this status and an AccessDenied body, and deletes nothing.
+    delete_status: Option<u16>,
     /// Keys DeleteObjects must report as per-key errors (and not delete).
     delete_error_keys: BTreeSet<String>,
     /// When set, delimiter-less listings are paged this many keys at a time.
@@ -263,6 +266,15 @@ fn serve(mut s: TcpStream, st: Arc<Mutex<State>>) {
                  <IsTruncated>{truncated}</IsTruncated>{token}{contents}{cp}</ListBucketResult>"
             ),
         )
+    } else if st.delete_status.is_some()
+        && (method == "DELETE" || (method == "POST" && query.contains("delete")))
+    {
+        (
+            st.delete_status.unwrap_or(403),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code>\
+             <Message>mock refuses to delete</Message></Error>"
+                .to_string(),
+        )
     } else if method == "POST" && query.contains("delete") {
         delay_ms = st.delete_delay_ms;
         let mut del = String::new();
@@ -288,10 +300,10 @@ fn serve(mut s: TcpStream, st: Arc<Mutex<State>>) {
         st.keys.insert(key);
         (200, String::new())
     } else if method == "HEAD" {
-        match st.head_status {
-            Some(code) => (code, String::new()),
-            None if st.keys.contains(&key) => (200, String::new()),
-            None => (404, String::new()),
+        if st.keys.contains(&key) {
+            (200, String::new())
+        } else {
+            (404, String::new())
         }
     } else {
         (200, String::new())
@@ -474,17 +486,24 @@ fn deleted_request_key_list(f: &Fixture) -> Vec<String> {
     out
 }
 
-fn assert_no_list_no_delete(f: &Fixture, r: &Run) {
+/// The contract sends no lookup: no HEAD, no listing, and exactly the named key
+/// in exactly one delete request.
+fn assert_one_delete_no_lookup(f: &Fixture, r: &Run, key: &str) {
     let log = f.mock.log();
+    assert!(
+        !log.iter().any(|q| q.method == "HEAD"),
+        "a HEAD was issued:\n{}",
+        f.ctx(r)
+    );
     assert!(
         !log.iter().any(Req::is_list),
         "a listing was issued:\n{}",
         f.ctx(r)
     );
-    assert!(
-        !log.iter()
-            .any(|q| q.is_delete_objects() || q.is_delete_one()),
-        "a delete was issued:\n{}",
+    assert_eq!(
+        deleted_request_key_list(f),
+        vec![key.to_string()],
+        "{}",
         f.ctx(r)
     );
     f.assert_decoy_untouched();
@@ -513,18 +532,24 @@ macro_rules! both_modes {
 // 1. #210: a prefix that matches nothing must not delete unrelated objects
 // ----------------------------------------------------------------------------
 both_modes!(
-    t1_issue210_no_slash_missing_object_deletes_nothing,
+    t1_issue210_no_slash_deletes_only_the_named_key_and_survivors_stay,
     |mode| {
         let f = Fixture::new(mode, &["other/", "other/x"]);
         let r = f.run(&[], "testprefix");
-        assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
+        // the key does not exist: S3's DELETE succeeds, so the command does
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_one_delete_no_lookup(&f, &r, "testprefix");
+        assert_eq!(f.mock.keys(), set(&["other/", "other/x"]), "{}", f.ctx(&r));
         assert!(
-            r.out.contains("no such object") && r.out.contains("use -r"),
-            "message must say no such object / use -r:\n{}",
+            r.out.contains("Delete request succeeded: ")
+                && r.out.contains("testprefix")
+                && r.out.contains("does not report whether the object existed")
+                && !r.out.contains("Deleted s3://")
+                && !r.out.contains("-r"),
+            "must say the request succeeded, not that an object was removed, and carry no \
+             -r hint (no trailing slash):\n{}",
             f.ctx(&r)
         );
-        assert_no_list_no_delete(&f, &r);
-        assert_eq!(f.mock.keys(), set(&["other/", "other/x"]), "{}", f.ctx(&r));
     }
 );
 
@@ -532,7 +557,7 @@ both_modes!(
 // 2. #167: `delete <prefix>/` without -r where only nested keys exist
 // ----------------------------------------------------------------------------
 both_modes!(
-    t2_issue167_trailing_slash_without_r_deletes_nothing,
+    t2_issue167_trailing_slash_without_r_targets_only_the_slash_key,
     |mode| {
         let seed = [
             "testprefix/obj_1.txt/f.txt",
@@ -541,15 +566,16 @@ both_modes!(
         ];
         let f = Fixture::new(mode, &seed);
         let r = f.run(&[], "testprefix/");
-        assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
-        assert!(r.out.contains("no such object"), "{}", f.ctx(&r));
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_one_delete_no_lookup(&f, &r, "testprefix/");
+        assert_eq!(f.mock.keys(), set(&seed), "{}", f.ctx(&r));
         assert!(
-            !r.out.contains("Successfully deleted"),
-            "must not claim success:\n{}",
+            r.out.contains("Delete request succeeded: ")
+                && r.out.contains("use -r to delete everything under a prefix")
+                && !r.out.contains("Successfully deleted"),
+            "{}",
             f.ctx(&r)
         );
-        assert_no_list_no_delete(&f, &r);
-        assert_eq!(f.mock.keys(), set(&seed), "{}", f.ctx(&r));
     }
 );
 
@@ -560,8 +586,8 @@ both_modes!(t3_folder_marker_exact_delete_leaves_children, |mode| {
     let f = Fixture::new(mode, &["other/", "other/x"]);
     let r = f.run(&[], "other/");
     assert_eq!(r.code, 0, "{}", f.ctx(&r));
-    assert!(r.out.contains("Deleted"), "{}", f.ctx(&r));
-    assert!(!f.mock.log().iter().any(Req::is_list), "{}", f.ctx(&r));
+    assert!(r.out.contains("Delete request succeeded"), "{}", f.ctx(&r));
+    assert_one_delete_no_lookup(&f, &r, "other/");
     assert_eq!(deleted_request_keys(&f), set(&["other/"]), "{}", f.ctx(&r));
     assert_eq!(f.mock.keys(), set(&["other/x"]), "{}", f.ctx(&r));
     f.assert_decoy_untouched();
@@ -574,7 +600,7 @@ both_modes!(t4_exact_key_does_not_expand, |mode| {
     let f = Fixture::new(mode, &["foo", "foobar", "foo/child"]);
     let r = f.run(&[], "foo");
     assert_eq!(r.code, 0, "{}", f.ctx(&r));
-    assert!(!f.mock.log().iter().any(Req::is_list), "{}", f.ctx(&r));
+    assert_one_delete_no_lookup(&f, &r, "foo");
     assert_eq!(deleted_request_keys(&f), set(&["foo"]), "{}", f.ctx(&r));
     assert_eq!(
         f.mock.keys(),
@@ -670,24 +696,25 @@ both_modes!(t6_recursive_no_slash_is_literal_prefix, |mode| {
 });
 
 // ----------------------------------------------------------------------------
-// 7. HEAD permission failure stops the command: no listing, no delete
+// 7. A real failure of the delete request is an error, never "already absent"
 // ----------------------------------------------------------------------------
-both_modes!(t7_head_403_stops_everything, |mode| {
+both_modes!(t7_delete_403_is_an_error_naming_the_key, |mode| {
     let f = Fixture::new(mode, &["foo", "foobar", "foo/child"]);
-    f.mock.state.lock().expect("state").head_status = Some(403);
+    f.mock.state.lock().expect("state").delete_status = Some(403);
     let r = f.run(&[], "foo");
     assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
     assert!(
-        !r.out.contains("no such object"),
-        "a 403 is not a missing object:\n{}",
+        r.out.contains("failed to delete") && r.out.contains("foo"),
+        "the error must name the key:\n{}",
         f.ctx(&r)
     );
     assert!(
-        f.mock.log().iter().any(|q| q.method == "HEAD") && r.out.contains("403"),
-        "the failure must be the HEAD's 403:\n{}",
+        !r.out.contains("Delete request succeeded"),
+        "no success claim:\n{}",
         f.ctx(&r)
     );
-    assert_no_list_no_delete(&f, &r);
+    // one attempt, no lookup, no listing, nothing else touched
+    assert_one_delete_no_lookup(&f, &r, "foo");
     assert_eq!(
         f.mock.keys(),
         set(&["foo", "foobar", "foo/child"]),

@@ -835,7 +835,12 @@ impl GcsClient {
             .set_object(object.to_string())
             .send()
             .await
-            .map_err(|e| anyhow!("GCS DELETE failed for gs://{}/{}: {}", bucket, object, e))?;
+            .map_err(|e| {
+                // Keep the typed error as the source so callers can tell a
+                // NOT_FOUND from every other failure (delete_contract).
+                anyhow::Error::new(e)
+                    .context(format!("GCS DELETE failed for gs://{bucket}/{object}"))
+            })?;
 
         debug!("GCS DELETE success");
         Ok(())

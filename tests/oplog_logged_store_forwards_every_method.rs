@@ -61,7 +61,6 @@ const METHODS: &[Expectation] = &[
     ("list", &["LIST"], &["list"]),
     ("list_stream", &["LIST"], &["list_stream"]),
     ("stat", &["HEAD"], &["stat"]),
-    ("stat_if_exists", &["HEAD"], &["stat_if_exists"]),
     (
         "list_objects_with_prefix",
         &["LIST"],
@@ -216,10 +215,6 @@ impl ObjectStore for CountingStore {
         self.note("stat");
         Ok(metadata())
     }
-    async fn stat_if_exists(&self, _uri: &str) -> Result<Option<ObjectMetadata>> {
-        self.note("stat_if_exists");
-        Ok(Some(metadata()))
-    }
     fn list_objects_with_prefix<'a>(
         &'a self,
         _prefix: &'a str,
@@ -366,7 +361,6 @@ async fn call(store: &dyn ObjectStore, method: &str) {
             }
         }
         "stat" => drop(store.stat(uri).await.unwrap()),
-        "stat_if_exists" => assert!(store.stat_if_exists(uri).await.unwrap().is_some()),
         "list_objects_with_prefix" => {
             let mut s = store.list_objects_with_prefix("file:///data/");
             while let Some(item) = s.next().await {

@@ -4,72 +4,78 @@
 
 ### Changed — Python `delete(uri, recursive=False)` contract (INTENTIONAL COMPATIBILITY CHANGE) (#212)
 
-The Python `s3dlio.delete()` now follows the same delete contract as `s3-cli delete` (#210, #167).
-**Code that relied on the old implicit expansion will now raise or delete less; pass `recursive=True`
-where you mean "everything under a prefix".**
+The Python `s3dlio.delete()` now follows the same delete contract as `s3-cli delete` (#210, #167, next
+entry). **Code that relied on the old implicit expansion will now delete less; pass
+`recursive=True` where you mean "everything under a prefix".**
 
-- `delete(uri)` deletes ONLY the object with exactly that key. Before this change a URI ending in `/`
-  or containing `*` or `?` triggered a non-recursive listing and every returned entry was deleted,
-  synthetic common-prefix entries (`foo/sub/`) included, so `delete("s3://b/foo/")` removed `foo/x`
-  and tried to delete `foo/sub/` as a key. `/`, `*` and `?` are now ordinary key characters.
-- A missing object raises `FileNotFoundError` (it used to succeed silently, because S3 reports a
-  missing key as deleted). Any other lookup failure (for example a 403) raises `RuntimeError` and
-  deletes nothing. **The existence check is a HEAD, so `delete()` now needs read/HEAD permission in
-  addition to delete permission.** The DLIO integrations' `delete_node`, which already treats
-  `FileNotFoundError` as "already gone", now see that case.
+- `delete(uri)` sends ONE delete request for exactly the key named, with no HEAD and no listing, and
+  returns `None`. Before this change a URI ending in `/` or containing `*` or `?` triggered a
+  non-recursive listing and every returned entry was deleted, synthetic common-prefix entries
+  (`foo/sub/`) included, so `delete("s3://b/foo/")` removed `foo/x` and tried to delete `foo/sub/` as a
+  key. `/`, `*` and `?` are now ordinary key characters.
+- An already-missing object is success (S3's DELETE succeeds for a missing key; on other backends only
+  the backend's own typed not-found error is mapped to success). Success means the delete request
+  succeeded, not that an existing object was removed. Any actual failure (403, 5xx, network) raises
+  `RuntimeError` naming the key. No `FileNotFoundError` is raised any more; the DLIO integrations'
+  `delete_node`, which treats `FileNotFoundError` as "already gone", simply never sees it. A
+  bucket-only URI (`s3://b/`) raises `RuntimeError` without sending a request.
+- On a **versioned bucket** a delete adds a delete marker and does not erase earlier versions.
+- The op-log records an exact delete as one `DELETE` row, as before; no `HEAD` row is added.
 - `delete(uri, recursive=True)` deletes the real objects under the literal prefix: listed with no
   delimiter, objects only, nothing appended (`foo` also matches `foobar`), `*` and `?` literal (the last
   URI segment used to be read as a regex). It needs list permission. A prefix with no objects is a
   no-op. After a failed request or a listing error no further delete request is sent and the
   `RuntimeError` says how many keys were and were not attempted.
 - Other backends: `recursive=True` requires a URI ending in `/` (otherwise `RuntimeError`, nothing
-  deleted); a missing object raises `RuntimeError` ("cannot confirm that ... exists; nothing was
-  deleted").
-- Library: the exact-object lookup-then-delete and the literal-prefix selection/batching now live in
-  the new `s3dlio::delete_contract` module, shared by `s3-cli delete` and the Python API (CLI output
-  and behaviour unchanged). The lower-level `ObjectStore::delete`, `delete_batch`, `delete_prefix` and
-  the multi-endpoint store's `delete` are not changed.
+  deleted).
+- Library: the exact delete and the literal-prefix selection/batching now live in the new
+  `s3dlio::delete_contract` module, shared by `s3-cli delete` and the Python API. The lower-level
+  `ObjectStore::delete`, `delete_batch`, `delete_prefix` and the multi-endpoint store's `delete` keep
+  their behaviour, except that `delete` on a bucket-only S3/Azure/GCS URI now fails before sending
+  anything.
 
 ### Changed — `s3-cli delete` contract (INTENTIONAL COMPATIBILITY CHANGE) (#210, #167)
 
 `s3-cli delete` (alias `rm`) no longer expands a name into a prefix. **Scripts that relied on the old
-implicit expansion will now fail or delete less; add `-r` where you mean "everything under".**
+implicit expansion will now delete less; add `-r` where you mean "everything under".**
 
-- `delete s3://bkt/foo` and `delete s3://bkt/foo/` delete ONLY the object with exactly that key.
-  A trailing slash alone no longer authorizes a recursive delete (#167). The old prefix-without-`-r`
-  expansion and the fallback that listed the parent "directory" and deleted what it returned are
-  removed; that fallback deleted objects the user never named (for example a folder marker `other/`
-  when `delete s3://bkt/testprefix` matched nothing) (#210).
-- If the exact object is absent the command exits non-zero with `no such object: ...; use -r to
-  delete everything under a prefix`. This is **deliberately stricter than S3's idempotent
-  DELETE**: the command does a HEAD first, so it can need read/HEAD permission in addition to delete
-  permission. A 403 or any other lookup failure stops the command with that error (no listing, no
-  delete).
+- `delete s3://bkt/foo` and `delete s3://bkt/foo/` send ONE delete request for exactly that key, with
+  no HEAD and no listing, so only delete permission is needed. A trailing slash alone no longer
+  authorizes a recursive delete (#167). The old prefix-without-`-r` expansion and the fallback that
+  listed the parent "directory" and deleted what it returned are removed; that fallback deleted
+  objects the user never named (for example a folder marker `other/` when `delete s3://bkt/testprefix`
+  matched nothing) (#210).
+- An already-missing object is success (exit 0), as with S3's own idempotent DELETE; on other backends
+  only the backend's typed not-found error counts. A real failure of the request (403, 5xx, network)
+  exits non-zero with `failed to delete <uri>: <cause>`. The output is `Delete request succeeded:
+  <uri> (S3 does not report whether the object existed)`; when the URI ends in `/` and `-r` was not
+  given it adds that only the object named by the exact URI was targeted and to use `-r` for
+  everything under a prefix. On a **versioned bucket** a delete adds a delete marker and does not erase
+  earlier versions.
 - `delete -r s3://bkt/foo/` deletes the real objects under the literal prefix `foo/` (recursive listing
-  with no delimiter; synthetic common-prefix entries are never delete candidates).
-  `delete -r s3://bkt/foo` uses the literal prefix `foo`, so it also matches `foobar` (no `/` is
-  appended). Key characters are never read as a regex or wildcard.
+  with no delimiter; synthetic common-prefix entries are never delete candidates). It needs list
+  permission. `delete -r s3://bkt/foo` uses the literal prefix `foo`, so it also matches `foobar` (no
+  `/` is appended). Key characters are never read as a regex or wildcard.
 - `-p/--pattern` is accepted only with `-r` and filters the `-r` selection; without `-r` it is an error.
-- Messages no longer overstate: `Deleted s3://bkt/foo` for an exact delete; `Sent delete requests for N
-  objects found under prefix ... (N listed; 0 reported errors)` for `-r`. S3 reports non-existent keys
-  as deleted, so no "N deleted" count is claimed. A failed delete request, including a per-key error in
-  an HTTP 200 response, names the keys and exits non-zero. A listing failure is now an error (it
-  used to end the delete early and report success).
+- Messages for `-r` no longer overstate: `Sent delete requests for N objects found under prefix ... (N
+  listed; 0 reported errors)`. S3 reports non-existent keys as deleted, so no "N deleted" count is
+  claimed. A failed delete request, including a per-key error in an HTTP 200 response, names the keys
+  and exits non-zero. A listing failure is now an error (it used to end the delete early and report
+  success).
 - After a failure no further DeleteObjects request is sent (checked immediately before each send);
   requests already in flight finish and the not-attempted keys are counted in the message. A listing
   that fails before anything is sent is reported as the listing error, not as a delete summary. With
   `-p` the message distinguishes keys listed from keys selected, and a pattern that matches nothing
   says so (exit 0). `-j/--jobs` is accepted but currently unused.
 - Non-S3 backends (`file://`, `direct://`, `gs://`, `az://`): `-r` requires a URI ending in `/` and
-  otherwise errors (no broadening); without `-r` a missing object ends with `cannot confirm that
-  <uri> exists; nothing was deleted`.
+  otherwise errors (no broadening).
 - Limitation: the op-log LIST row for `delete -r` is written only when the listing stream is read to
   its end, exactly like the existing `list_stream` wrapper; a listing abandoned after a failure
   (the command stops listing once a request has failed) writes no LIST row.
 - Works with the process-wide client and with a per-endpoint client (`s3://host:port/bkt/...`), under
-  the #197 route-or-reject rules. New `ObjectStore` methods (default implementations provided):
-  `stat_if_exists` and `list_objects_with_prefix`. The library `delete_prefix` is not changed by this
-  entry; Python `delete()` follows the same contract (next entry, #212).
+  the #197 route-or-reject rules. New `ObjectStore` method (default implementation provided):
+  `list_objects_with_prefix`. The library `delete_prefix` is not changed by this entry; Python
+  `delete()` follows the same contract (previous entry, #212).
 
 ## Version 0.9.122 — Op-log accuracy (each call recorded once), server routing for every operation, replay fixes, Azure credential fix
 

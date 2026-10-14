@@ -351,27 +351,13 @@ pub trait ObjectStore: Send + Sync {
     /// Stat a single object (HEAD-like).
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata>;
 
-    /// Stat a single object, telling "no such object" (`Ok(None)`) apart from
-    /// every other failure (`Err`: permission denied, transport error, ...).
-    ///
-    /// Used by `s3-cli delete` (issues #210 / #167): an exact-object delete
-    /// first confirms the object exists, a missing object is a clear error, and
-    /// any other lookup failure stops the command instead of triggering a
-    /// broader search.
-    ///
-    /// The default treats every `stat` failure as an error (never as "missing"),
-    /// which is the safe direction.  The S3 store overrides it to recognise a
-    /// 404.
-    async fn stat_if_exists(&self, uri: &str) -> Result<Option<ObjectMetadata>> {
-        self.stat(uri).await.map(Some)
-    }
-
     /// Stream the URIs of the REAL objects whose key starts with the literal
     /// prefix named by `uri_prefix`, recursively (no delimiter, no regex, no
     /// synthetic directory entries).
     ///
-    /// Used by `s3-cli delete -r`.  The S3 store overrides it with a literal
-    /// `ListObjectsV2` that yields only `Contents` entries.  The default (other
+    /// Used by `s3-cli delete -r` and the Python `delete(..., recursive=True)`.
+    /// The S3 store overrides it with a literal `ListObjectsV2` that yields only
+    /// `Contents` entries.  The default (other
     /// backends) streams their existing recursive listing and only accepts a
     /// prefix ending in `/`, so a bare name is never read as a pattern.
     fn list_objects_with_prefix<'a>(
@@ -1762,25 +1748,6 @@ impl ObjectStore for S3ObjectStore {
         s3_stat_object_uri_async(uri).await
     }
 
-    async fn stat_if_exists(&self, uri: &str) -> Result<Option<ObjectMetadata>> {
-        if !uri.starts_with("s3://") {
-            bail!("S3ObjectStore expected s3:// URI");
-        }
-        debug!("S3ObjectStore::stat_if_exists uri='{}'", uri);
-        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
-        if key.is_empty() {
-            // `s3://bucket` / `s3://bucket/` names no object.
-            return Ok(None);
-        }
-        match &self.client {
-            Some(client) => crate::s3_utils::head_object_if_exists(client, &bucket, &key).await,
-            None => {
-                let client = crate::s3_client::aws_s3_client_async().await?;
-                crate::s3_utils::head_object_if_exists(&client, &bucket, &key).await
-            }
-        }
-    }
-
     fn list_objects_with_prefix<'a>(
         &'a self,
         uri_prefix: &'a str,
@@ -1820,6 +1787,9 @@ impl ObjectStore for S3ObjectStore {
         // A URI naming a server other than this store's own is an error, not
         // a delete of the same bucket/key on this store's server (#179).
         let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+        if key.is_empty() {
+            bail!("cannot delete '{uri}': it names a bucket, not an object");
+        }
 
         if let Some(client) = &self.client {
             client
@@ -2781,6 +2751,9 @@ impl ObjectStore for AzureObjectStore {
     async fn delete(&self, uri: &str) -> Result<()> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         debug!("AzureObjectStore::delete uri='{}'", uri);
+        if key.is_empty() {
+            bail!("cannot delete '{uri}': it names a container, not an object");
+        }
         cli.delete_objects(&[key]).await
     }
 
@@ -3385,6 +3358,9 @@ impl ObjectStore for GcsObjectStore {
     async fn delete(&self, uri: &str) -> Result<()> {
         let (bucket, object) = parse_gcs_uri(uri)?;
         debug!("GcsObjectStore::delete uri='{}'", uri);
+        if object.is_empty() {
+            bail!("cannot delete '{uri}': it names a bucket, not an object");
+        }
         let client = self.get_client().await?;
         client.delete_object(&bucket, &object).await
     }

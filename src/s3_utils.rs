@@ -1984,58 +1984,6 @@ pub async fn stat_object_uri_async(uri: &str) -> Result<ObjectStat> {
     stat_object(&bucket, &key).await
 }
 
-/// HEAD one object with an explicit client, telling "the object does not
-/// exist" (`Ok(None)`: HTTP 404) apart from every other failure (`Err`: a 403,
-/// a transport error, ...).  The key is sent exactly as given (issue #172).
-///
-/// Used by `s3-cli delete` (issues #210 / #167): a missing object is a clear
-/// "no such object", while a permission or lookup failure must stop the command
-/// instead of letting it fall back to anything broader.
-pub(crate) async fn head_object_if_exists(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<ObjectStat>> {
-    let resp = match client.head_object().bucket(bucket).key(key).send().await {
-        Ok(resp) => resp,
-        Err(SdkError::ServiceError(s))
-            if s.err().is_not_found() || s.raw().status().as_u16() == 404 =>
-        {
-            return Ok(None);
-        }
-        Err(e) => {
-            let status = match &e {
-                SdkError::ServiceError(s) => format!(" (HTTP {})", s.raw().status().as_u16()),
-                _ => String::new(),
-            };
-            return Err(sdk_anyhow(
-                format!("HEAD for s3://{bucket}/{key} failed{status}"),
-                e,
-            ));
-        }
-    };
-    Ok(Some(ObjectStat {
-        size: resp.content_length().unwrap_or_default() as u64,
-        last_modified: resp.last_modified().map(|t| t.to_string()),
-        e_tag: resp.e_tag().map(|s| s.to_string()),
-        content_type: resp.content_type().map(|s| s.to_string()),
-        content_language: resp.content_language().map(|s| s.to_string()),
-        content_encoding: resp.content_encoding().map(|s| s.to_string()),
-        cache_control: resp.cache_control().map(|s| s.to_string()),
-        content_disposition: resp.content_disposition().map(|s| s.to_string()),
-        expires: resp.expires_string().map(|s| s.to_string()),
-        storage_class: resp.storage_class().map(|s| s.as_str().to_string()),
-        server_side_encryption: resp
-            .server_side_encryption()
-            .map(|s| s.as_str().to_string()),
-        ssekms_key_id: resp.ssekms_key_id().map(|s| s.to_string()),
-        sse_customer_algorithm: resp.sse_customer_algorithm().map(|s| s.to_string()),
-        version_id: resp.version_id().map(|s| s.to_string()),
-        replication_status: resp.replication_status().map(|s| s.as_str().to_string()),
-        metadata: resp.metadata().cloned().unwrap_or_default(),
-    }))
-}
-
 /// Stream the URIs (`s3://bucket/key`) of the REAL objects whose key starts
 /// with the literal `prefix`: no delimiter (so the server never answers with
 /// `CommonPrefixes`), no regex, no key rewriting.  Only the `Contents` entries

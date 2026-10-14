@@ -2,10 +2,10 @@
 
 The contract (the same "contract A" as ``s3-cli delete``, issues #210 / #167):
 
-* ``delete(uri)`` deletes ONLY the object named by ``uri``. A missing object
-  raises ``FileNotFoundError``; a lookup that fails for any other reason
-  (e.g. 403) raises ``RuntimeError``; neither deletes anything, lists, or falls
-  back to anything broader.
+* ``delete(uri)`` sends ONE delete request for exactly the key named by ``uri``:
+  no HEAD first, no listing, nothing broader. An already-missing object is
+  success (S3's DELETE succeeds for a missing key); a real failure (e.g. 403 on
+  the DELETE) raises ``RuntimeError`` naming the key.
 * ``delete(uri, recursive=True)`` deletes the REAL objects under the LITERAL
   prefix: listed without a delimiter, objects only, no ``/`` appended.
 * ``/``, ``*`` and ``?`` are ordinary key characters, never an instruction to
@@ -47,7 +47,7 @@ class MockS3:
     def __init__(self, keys=()):
         self.keys = set(keys)
         self.log = []  # dicts: method, path, query, body_keys
-        self.head_status = None  # answer every HEAD with this status
+        self.delete_status = None  # answer every delete request (DELETE, POST ?delete) with this status
         self.list_status = None  # answer every delimiter-less listing with this status
         self.delete_error_keys = set()  # DeleteObjects reports these per key, deleting nothing
         self.page_size = None  # page delimiter-less listings
@@ -112,6 +112,14 @@ class MockS3:
         with self.lock:
             if method == "GET" and "list-type" in query:
                 return self._list(query)
+            if self.delete_status is not None and (
+                method == "DELETE" or (method == "POST" and "delete" in query)
+            ):
+                return (
+                    self.delete_status,
+                    '<?xml version="1.0"?><Error><Code>AccessDenied</Code>'
+                    "<Message>mock refuses to delete</Message></Error>",
+                )
             if method == "POST" and "delete" in query:
                 parts = []
                 for k in body_keys:
@@ -131,8 +139,6 @@ class MockS3:
                 self.keys.add(key)
                 return 200, ""
             if method == "HEAD":
-                if self.head_status is not None:
-                    return self.head_status, ""
                 return (200, "") if key in self.keys else (404, "")
             return 200, ""
 
@@ -274,6 +280,13 @@ def assert_no_list_no_delete(mock, out):
     assert not mock.sent_delete_keys(), f"a delete was issued{ctx(mock, out)}"
 
 
+def assert_one_delete_no_lookup(mock, out, key):
+    """The exact delete is one delete request for `key`: no HEAD, no listing."""
+    assert not mock.requests("HEAD"), f"a HEAD was issued{ctx(mock, out)}"
+    assert not mock.lists(), f"a listing was issued{ctx(mock, out)}"
+    assert mock.sent_delete_keys() == [key], f"expected one delete of {key!r}{ctx(mock, out)}"
+
+
 # ----------------------------------------------------------------------------
 # 1. delete(uri): ONLY the exact object
 # ----------------------------------------------------------------------------
@@ -285,18 +298,18 @@ def test_trailing_slash_deletes_only_the_marker_object_not_what_is_under_it(mock
     out = call_delete(m, "s3://bkt/foo/")
     assert_returned(out, m)
     assert m.keys == {"foo/x", "foo/sub/y", "foobar", "other/", "other/x"}, ctx(m, out)
-    assert m.sent_delete_keys() == ["foo/"], ctx(m, out)
-    assert not m.lists(), f"a listing was issued{ctx(m, out)}"
+    assert_one_delete_no_lookup(m, out, "foo/")
 
 
-def test_trailing_slash_without_marker_is_an_error_and_deletes_nothing(mock_factory):
-    """``foo/x`` exists but the object ``foo/`` does not: not found, and ``foo/x`` is safe."""
+def test_trailing_slash_without_marker_deletes_only_that_key_and_nested_objects_survive(mock_factory):
+    """#167: ``foo/x`` exists but the object ``foo/`` does not. The delete request for
+    ``foo/`` succeeds (S3 semantics); ``foo/x`` and everything else is untouched."""
     seed = ["foo/x", "foo/sub/y", "other/x"]
     m = mock_factory(seed)
     out = call_delete(m, "s3://bkt/foo/")
-    assert_raises(out, "FileNotFoundError", m, "no such object")
+    assert_returned(out, m)
     assert m.keys == set(seed), ctx(m, out)
-    assert_no_list_no_delete(m, out)
+    assert_one_delete_no_lookup(m, out, "foo/")
 
 
 def test_directory_with_only_subdirectories_never_deletes_common_prefixes(mock_factory):
@@ -304,20 +317,20 @@ def test_directory_with_only_subdirectories_never_deletes_common_prefixes(mock_f
     seed = ["d/sub/y", "d/sub/z"]
     m = mock_factory(seed)
     out = call_delete(m, "s3://bkt/d/")
-    assert_raises(out, "FileNotFoundError", m)
+    assert_returned(out, m)
     assert m.keys == set(seed), ctx(m, out)
-    assert_no_list_no_delete(m, out)
+    assert_one_delete_no_lookup(m, out, "d/")
 
 
-def test_missing_object_raises_file_not_found_and_touches_nothing(mock_factory):
+def test_missing_object_is_success_and_touches_nothing_else(mock_factory):
+    """#210: the key does not exist, but other/ and other/x do. One delete for
+    ``testprefix`` only; no listing of the bucket root, no deletion of ``other/``."""
     seed = ["other/", "other/x", "testprefix/a"]
     m = mock_factory(seed)
     out = call_delete(m, "s3://bkt/testprefix")
-    assert_raises(out, "FileNotFoundError", m, "no such object: s3://bkt/testprefix")
-    assert "OSError" in out["mro"], ctx(m, out)
+    assert_returned(out, m)
     assert m.keys == set(seed), ctx(m, out)
-    assert_no_list_no_delete(m, out)
-    assert [r["method"] for r in m.requests()] == ["HEAD"], ctx(m, out)
+    assert_one_delete_no_lookup(m, out, "testprefix")
 
 
 def test_exact_object_is_deleted_and_neighbours_survive(mock_factory):
@@ -325,29 +338,29 @@ def test_exact_object_is_deleted_and_neighbours_survive(mock_factory):
     out = call_delete(m, "s3://bkt/foo")
     assert_returned(out, m)
     assert m.keys == {"foo/", "foo/x", "foobar"}, ctx(m, out)
-    assert m.sent_delete_keys() == ["foo"], ctx(m, out)
-    assert not m.lists(), ctx(m, out)
+    assert_one_delete_no_lookup(m, out, "foo")
 
 
-def test_bucket_only_uri_names_no_object(mock_factory):
+def test_bucket_only_uri_names_no_object_and_sends_nothing(mock_factory):
     seed = ["a", "b/c"]
     m = mock_factory(seed)
     out = call_delete(m, "s3://bkt/")
-    assert out.get("exc") in ("FileNotFoundError", "RuntimeError"), ctx(m, out)
+    assert_raises(out, "RuntimeError", m, "names a bucket")
     assert m.keys == set(seed), ctx(m, out)
-    assert_no_list_no_delete(m, out)
+    assert not m.requests(), f"a request was sent{ctx(m, out)}"
 
 
-def test_lookup_failure_other_than_404_raises_runtime_error_and_deletes_nothing(mock_factory):
-    """A 403 on the existence check must not be read as "missing" nor as permission to proceed."""
+def test_delete_403_raises_runtime_error_naming_the_key_and_is_never_read_as_absent(mock_factory):
+    """A real failure of the delete request is an error; nothing else is tried."""
     seed = ["foo", "foo/x"]
     m = mock_factory(seed)
-    m.head_status = 403
+    m.delete_status = 403
     out = call_delete(m, "s3://bkt/foo")
-    assert_raises(out, "RuntimeError", m, "cannot confirm")
-    assert "403" in out["msg"], ctx(m, out)
+    assert_raises(out, "RuntimeError", m, "foo")
+    assert "failed to delete" in out["msg"], ctx(m, out)
     assert m.keys == set(seed), ctx(m, out)
-    assert_no_list_no_delete(m, out)
+    assert not m.requests("HEAD"), f"a HEAD was issued{ctx(m, out)}"
+    assert not m.lists(), f"a listing was issued{ctx(m, out)}"
 
 
 @pytest.mark.parametrize(
@@ -363,18 +376,17 @@ def test_star_and_question_mark_are_literal_key_characters(mock_factory, key, se
     out = call_delete(m, f"s3://bkt/{key}")
     assert_returned(out, m)
     assert m.keys == set(seed) - {key}, ctx(m, out)
-    assert m.sent_delete_keys() == [key], ctx(m, out)
-    assert not m.lists(), ctx(m, out)
+    assert_one_delete_no_lookup(m, out, key)
 
 
 @pytest.mark.parametrize("key", ["a*", "a?b"])
-def test_star_and_question_mark_missing_object_is_an_error_not_a_glob(mock_factory, key):
+def test_star_and_question_mark_missing_object_is_one_literal_delete_not_a_glob(mock_factory, key):
     seed = ["ab", "axb", "a/b"]
     m = mock_factory(seed)
     out = call_delete(m, f"s3://bkt/{key}")
-    assert_raises(out, "FileNotFoundError", m)
+    assert_returned(out, m)
     assert m.keys == set(seed), ctx(m, out)
-    assert_no_list_no_delete(m, out)
+    assert_one_delete_no_lookup(m, out, key)
 
 
 # ----------------------------------------------------------------------------
@@ -481,8 +493,9 @@ def test_file_backend_exact_delete_is_exact_and_recursive_needs_a_trailing_slash
     assert_returned(out, m)
     assert not (d / "f1").exists() and (d / "f2").exists()
 
+    # an already-missing file is success; nothing else is touched
     out = call_delete(m, f"file://{d}/missing")
-    assert out.get("exc") in ("FileNotFoundError", "RuntimeError"), out
+    assert_returned(out, m)
     assert (d / "f2").exists() and (d / "sub" / "g").exists()
 
     # -r with no trailing '/': a clear error, nothing deleted (never read as a pattern)
@@ -493,3 +506,32 @@ def test_file_backend_exact_delete_is_exact_and_recursive_needs_a_trailing_slash
     out = call_delete(m, f"file://{d}/", recursive=True)
     assert_returned(out, m)
     assert not (d / "f2").exists() and not (d / "sub" / "g").exists()
+
+
+# ----------------------------------------------------------------------------
+# 4. Op-log: an exact delete is recorded as exactly one DELETE row (no HEAD row)
+# ----------------------------------------------------------------------------
+
+OPLOG_CHILD = """
+    oplog = sys.argv[1]
+    s3dlio.init_op_log(oplog)
+    s3dlio.delete("s3://bkt/foo")        # present
+    s3dlio.delete("s3://bkt/missing")    # absent: success
+    s3dlio.delete("s3://bkt/foo/")       # trailing slash: just a key
+    s3dlio.finalize_op_log()
+"""
+
+
+def test_exact_delete_records_one_delete_row_each_and_no_head_row(mock_factory, tmp_path):
+    from test_oplog_lifecycle import read_rows
+
+    m = mock_factory(["foo", "foo/x", "keep"])
+    oplog = tmp_path / "ops.tsv.zst"
+    proc = run_scenario(textwrap.dedent(OPLOG_CHILD), str(oplog), env=env_for(m))
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    rows = read_rows(oplog)
+    assert [r["op"] for r in rows] == ["DELETE", "DELETE", "DELETE"], rows
+    assert [r["error"] for r in rows] == ["", "", ""], rows
+    assert not m.requests("HEAD"), m.render()
+    assert not m.lists(), m.render()
+    assert m.keys == {"foo/x", "keep"}, sorted(m.keys)

@@ -1868,12 +1868,11 @@ async fn get_cmd(
 ///
 /// The contract, in full:
 ///
-/// * `delete s3://bkt/foo` and `delete s3://bkt/foo/` delete ONLY the exact
-///   object of that name.  The object is looked up with HEAD first; if it is
-///   absent the command fails ("no such object"), and a permission or other
-///   lookup failure stops the command with that error.  Nothing is listed and
-///   nothing is expanded -- a trailing slash alone never authorizes a recursive
-///   delete.
+/// * `delete s3://bkt/foo` and `delete s3://bkt/foo/` send ONE delete request
+///   for exactly that key.  There is no lookup first; an already-missing object
+///   is success (S3 deletes are idempotent) and any actual failure (403, 5xx,
+///   network) is an error.  Nothing is listed and nothing is expanded -- a
+///   trailing slash alone never authorizes a recursive delete.
 /// * `delete -r s3://bkt/foo/` deletes the real objects whose key starts with
 ///   the literal prefix `foo/`, nested ones included.  `delete -r s3://bkt/foo`
 ///   uses the literal prefix `foo` (so it also matches `foobar`; no `/` is
@@ -1908,27 +1907,32 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
     }
 }
 
-/// `delete <uri>` without `-r`: HEAD the exact key, then delete exactly it
-/// (the selection and the delete are `s3dlio::delete_contract`, shared with the
-/// Python API).
+/// `delete <uri>` without `-r`: send one delete request for exactly the named
+/// key (no lookup, no listing), via `s3dlio::delete_contract`, shared with the
+/// Python API.  An already-missing object is success; every other failure is an
+/// error.  The message says the request succeeded, never that an existing
+/// object was removed (S3 does not report whether the key existed).
 async fn delete_exact_object(
     store: &dyn s3dlio::object_store::ObjectStore,
     uri: &str,
 ) -> Result<()> {
-    match s3dlio::delete_contract::delete_exact_object(store, uri).await {
-        Ok(()) => {
-            info!("Deleted single object: {}", uri);
-            eprintln!("Deleted {uri}");
-            Ok(())
-        }
-        Err(e)
-            if e.downcast_ref::<s3dlio::delete_contract::NoSuchObject>()
-                .is_some() =>
-        {
-            bail!("no such object: {uri}; use -r to delete everything under a prefix")
-        }
-        Err(e) => Err(e),
-    }
+    s3dlio::delete_contract::delete_exact_object(store, uri).await?;
+    info!("Delete request succeeded: {}", uri);
+    let who = if uri.starts_with("s3://") {
+        "S3"
+    } else {
+        "this backend"
+    };
+    let hint = if uri.ends_with('/') {
+        "; only the object named by this exact URI was targeted, not what is under it \
+         (use -r to delete everything under a prefix)"
+    } else {
+        ""
+    };
+    eprintln!(
+        "Delete request succeeded: {uri} ({who} does not report whether the object existed{hint})"
+    );
+    Ok(())
 }
 
 /// `delete -r <uri>`: delete the real objects under the literal prefix, listed

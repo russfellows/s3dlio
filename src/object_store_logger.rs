@@ -398,27 +398,6 @@ impl ObjectStore for LoggedObjectStore {
         result
     }
 
-    async fn stat_if_exists(&self, uri: &str) -> Result<Option<ObjectMetadata>> {
-        let start = SystemTime::now();
-        let result = self.inner.stat_if_exists(uri).await;
-        let end = SystemTime::now();
-
-        let bytes = match &result {
-            Ok(Some(m)) => m.size,
-            _ => 0,
-        };
-        let error = match &result {
-            Ok(Some(_)) => None,
-            Ok(None) => Some("object not found".to_string()),
-            Err(e) => Some(e.to_string()),
-        };
-
-        // Same row as stat(): a HEAD, metadata-only.
-        self.log_operation("HEAD", uri, bytes, 1, start, None, end, error);
-
-        result
-    }
-
     fn list_objects_with_prefix<'a>(
         &'a self,
         uri_prefix: &'a str,

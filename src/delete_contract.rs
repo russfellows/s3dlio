@@ -8,23 +8,26 @@
 //!
 //! The contract ("contract A"):
 //!
-//! * **Exact delete.**  `delete(uri)` deletes ONLY the object named by `uri`.
-//!   The object is looked up first ([`ObjectStore::stat_if_exists`]): an absent
-//!   object is a [`NoSuchObject`] error, and a lookup that fails for any other
-//!   reason (permission denied, transport error, ...) is an error that deletes
-//!   nothing.  Nothing is listed, no parent is consulted, and a trailing `/`,
-//!   `*` or `?` is part of the key, never an instruction.
+//! * **Exact delete.**  `delete(uri)` sends ONE delete request for exactly the
+//!   key named by `uri` -- no lookup first, no listing, no parent consulted.
+//!   A trailing `/`, `*` or `?` is part of the key, never an instruction.
+//!   Deleting an already-missing object SUCCEEDS (S3's DELETE succeeds for a
+//!   missing key; for a backend that reports it, exactly its typed not-found
+//!   error is mapped to success -- see [`is_not_found`]).  Every other failure
+//!   (403, 5xx, network, ...) is returned: a failure is never read as "already
+//!   absent".  Success means "the delete request succeeded", not "an existing
+//!   object was removed" (S3 does not say whether the key existed; on a
+//!   versioned bucket a delete adds a delete marker and erases no version).
 //! * **Recursive delete.**  [`delete_objects_under_literal_prefix`] deletes the
 //!   REAL objects whose key starts with the literal prefix given
 //!   ([`ObjectStore::list_objects_with_prefix`]: no delimiter, objects only,
 //!   no `/` appended -- the prefix `foo` also matches `foobar`).
 //!
 //! The functions here select and delete; the callers decide how to word the
-//! outcome (the CLI prints, Python raises).
-//!
-//! Both operations need read (HEAD / LIST) permission in addition to delete.
+//! outcome (the CLI prints, Python raises).  A recursive delete needs list
+//! permission in addition to delete.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use futures::stream::StreamExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -35,45 +38,54 @@ pub const DELETE_REQUEST_KEYS: usize = 1000;
 /// DeleteObjects requests kept in flight at once by a recursive delete.
 pub const DELETE_REQUESTS_IN_FLIGHT: usize = 10;
 
-/// The exact object named for deletion does not exist.
+/// Delete exactly the object `uri`: one delete request, no lookup.
 ///
-/// Callers recover it with `err.downcast_ref::<NoSuchObject>()` (the Python API
-/// maps it to `FileNotFoundError`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoSuchObject {
-    /// The URI that was looked up.
-    pub uri: String,
-}
-
-impl std::fmt::Display for NoSuchObject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "no such object: {}", self.uri)
-    }
-}
-
-impl std::error::Error for NoSuchObject {}
-
-/// Delete exactly the object `uri`: look it up, then delete it.
-///
-/// Errors: [`NoSuchObject`] when the object is absent (nothing is sent); a
-/// "cannot confirm that ... exists; nothing was deleted" error when the lookup
-/// fails for any other reason (nothing is sent); "failed to delete ..." when
-/// the delete itself fails.
+/// An already-missing object is success (see the module docs).  Any other
+/// failure is returned as "failed to delete ..." with the cause chained, so the
+/// URI is always named.
 pub async fn delete_exact_object(store: &dyn ObjectStore, uri: &str) -> Result<()> {
-    let found = store
-        .stat_if_exists(uri)
-        .await
-        .with_context(|| format!("cannot confirm that {uri} exists; nothing was deleted"))?;
-    if found.is_none() {
-        return Err(NoSuchObject {
-            uri: uri.to_string(),
-        }
-        .into());
+    match store.delete(uri).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_not_found(&e) => Ok(()),
+        Err(e) => Err(e.context(format!("failed to delete {uri}"))),
     }
-    store
-        .delete(uri)
-        .await
-        .with_context(|| format!("failed to delete {uri}"))
+}
+
+/// True only when `err` (or a cause in its chain) is a backend's TYPED
+/// "object not found" error:
+///
+/// * an [`std::io::Error`] of kind `NotFound` (file backends);
+/// * Azure (`backend-azure`): an HTTP 404 response with service error code
+///   `BlobNotFound` (a missing container is a different code and stays an
+///   error);
+/// * GCS (`backend-gcs`, official client): a NOT_FOUND status / HTTP 404.  The
+///   service gives the same status for a missing bucket, so a missing bucket
+///   is not told apart from a missing object there.
+///
+/// Message text is never inspected.  S3 needs no entry: its DELETE succeeds for
+/// a missing key.
+pub fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return io.kind() == std::io::ErrorKind::NotFound;
+        }
+        #[cfg(feature = "backend-azure")]
+        if let Some(az) = cause.downcast_ref::<azure_core::Error>() {
+            return matches!(
+                az.kind(),
+                azure_core::error::ErrorKind::HttpResponse { status, error_code, .. }
+                    if *status == azure_core::http::StatusCode::NotFound
+                        && error_code.as_deref() == Some("BlobNotFound")
+            );
+        }
+        #[cfg(feature = "backend-gcs")]
+        if let Some(g) = cause.downcast_ref::<google_cloud_gax::error::Error>() {
+            return g.http_status_code() == Some(404)
+                || g.status()
+                    .is_some_and(|s| s.code == google_cloud_gax::error::rpc::Code::NotFound);
+        }
+        false
+    })
 }
 
 /// What one batch of selected keys came back with.
@@ -304,25 +316,17 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream::Stream;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
     use std::pin::Pin;
     use std::sync::Mutex;
-
-    /// How the fake answers `stat_if_exists`.
-    #[derive(Clone, Copy, PartialEq)]
-    enum Lookup {
-        /// Present iff the key is in the fake's key set.
-        FromKeys,
-        /// Every lookup fails (e.g. HTTP 403).
-        Fails,
-    }
 
     /// An in-memory store that records every call. It relies on the trait
     /// DEFAULT `list_objects_with_prefix` (the non-S3 behaviour) unless
     /// `literal_listing` is set, in which case it mimics the S3 override.
     struct Fake {
         keys: Mutex<BTreeSet<String>>,
-        lookup: Lookup,
+        /// What `delete` fails with, if anything.
+        delete_error: Option<fn() -> anyhow::Error>,
         literal_listing: bool,
         /// A DeleteObjects request naming this key fails.
         fail_batch_with_key: Option<String>,
@@ -336,7 +340,7 @@ mod tests {
         fn new(keys: &[&str]) -> Fake {
             Fake {
                 keys: Mutex::new(keys.iter().map(|k| format!("s3://bkt/{k}")).collect()),
-                lookup: Lookup::FromKeys,
+                delete_error: None,
                 literal_listing: true,
                 fail_batch_with_key: None,
                 list_fails_after: None,
@@ -365,27 +369,6 @@ mod tests {
                 out.push(Err(anyhow::anyhow!("listing refused")));
             }
             out
-        }
-    }
-
-    fn stat_value() -> ObjectMetadata {
-        ObjectMetadata {
-            size: 1,
-            last_modified: None,
-            e_tag: None,
-            content_type: None,
-            content_language: None,
-            content_encoding: None,
-            cache_control: None,
-            content_disposition: None,
-            expires: None,
-            storage_class: None,
-            server_side_encryption: None,
-            ssekms_key_id: None,
-            sse_customer_algorithm: None,
-            version_id: None,
-            replication_status: None,
-            metadata: HashMap::new(),
         }
     }
 
@@ -436,15 +419,11 @@ mod tests {
         async fn stat(&self, _uri: &str) -> Result<ObjectMetadata> {
             bail!("stat is not used by the contract")
         }
-        async fn stat_if_exists(&self, uri: &str) -> Result<Option<ObjectMetadata>> {
-            self.note(format!("HEAD {uri}"));
-            match self.lookup {
-                Lookup::Fails => bail!("HEAD failed (HTTP 403)"),
-                Lookup::FromKeys => Ok(self.keys().contains(uri).then(stat_value)),
-            }
-        }
         async fn delete(&self, uri: &str) -> Result<()> {
             self.note(format!("DELETE {uri}"));
+            if let Some(make) = self.delete_error {
+                return Err(make());
+            }
             self.keys.lock().unwrap().remove(uri);
             Ok(())
         }
@@ -483,49 +462,121 @@ mod tests {
 
     // ---- exact delete -----------------------------------------------------
 
+    fn io_not_found() -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("remove_file failed")
+    }
+    fn io_denied() -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("remove_file failed")
+    }
+    fn http_403_text() -> anyhow::Error {
+        anyhow::anyhow!("S3 DELETE failed: service error: AccessDenied (HTTP 403)")
+    }
+    fn untyped_not_found_text() -> anyhow::Error {
+        anyhow::anyhow!("object not found (a string, not a typed not-found error)")
+    }
+
     #[tokio::test]
-    async fn exact_delete_removes_only_the_named_object() {
+    async fn exact_delete_sends_one_delete_and_no_lookup() {
         let f = Fake::new(&["foo", "foo/", "foo/x", "foobar"]);
         delete_exact_object(&f, "s3://bkt/foo").await.unwrap();
         assert_eq!(f.keys(), set(&["foo/", "foo/x", "foobar"]));
-        assert_eq!(f.calls(), ["HEAD s3://bkt/foo", "DELETE s3://bkt/foo"]);
+        assert_eq!(f.calls(), ["DELETE s3://bkt/foo"]);
     }
 
     #[tokio::test]
-    async fn exact_delete_trailing_slash_names_the_marker_object_and_never_lists() {
+    async fn exact_delete_trailing_slash_is_the_key_and_never_lists() {
         let f = Fake::new(&["foo/", "foo/x", "foo/sub/y"]);
         delete_exact_object(&f, "s3://bkt/foo/").await.unwrap();
         assert_eq!(f.keys(), set(&["foo/x", "foo/sub/y"]));
-        assert_eq!(f.calls(), ["HEAD s3://bkt/foo/", "DELETE s3://bkt/foo/"]);
+        assert_eq!(f.calls(), ["DELETE s3://bkt/foo/"]);
     }
 
     #[tokio::test]
-    async fn exact_delete_of_a_missing_object_is_no_such_object_and_sends_no_delete() {
+    async fn exact_delete_of_a_missing_object_succeeds_and_touches_nothing_else() {
         let f = Fake::new(&["foo/x", "other/"]);
-        let err = delete_exact_object(&f, "s3://bkt/foo/").await.unwrap_err();
-        let missing = err.downcast_ref::<NoSuchObject>().expect("typed error");
-        assert_eq!(missing.uri, "s3://bkt/foo/");
+        delete_exact_object(&f, "s3://bkt/foo/").await.unwrap();
         assert_eq!(f.keys(), set(&["foo/x", "other/"]));
-        assert_eq!(f.calls(), ["HEAD s3://bkt/foo/"]);
+        assert_eq!(f.calls(), ["DELETE s3://bkt/foo/"]);
     }
 
     #[tokio::test]
-    async fn exact_delete_lookup_failure_is_not_no_such_object_and_sends_no_delete() {
+    async fn exact_delete_maps_a_typed_not_found_to_success() {
+        let mut f = Fake::new(&["a"]);
+        f.delete_error = Some(io_not_found);
+        delete_exact_object(&f, "file:///d/a").await.unwrap();
+        assert_eq!(f.calls(), ["DELETE file:///d/a"]);
+    }
+
+    #[tokio::test]
+    async fn exact_delete_propagates_every_other_failure_naming_the_key() {
+        for make in [io_denied as fn() -> anyhow::Error, http_403_text] {
+            let mut f = Fake::new(&["foo"]);
+            f.delete_error = Some(make);
+            let err = delete_exact_object(&f, "s3://bkt/foo").await.unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.starts_with("failed to delete s3://bkt/foo"), "{text}");
+            assert_eq!(f.keys(), set(&["foo"]));
+            assert_eq!(f.calls(), ["DELETE s3://bkt/foo"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_delete_never_guesses_not_found_from_message_text() {
         let mut f = Fake::new(&["foo"]);
-        f.lookup = Lookup::Fails;
+        f.delete_error = Some(untyped_not_found_text);
         let err = delete_exact_object(&f, "s3://bkt/foo").await.unwrap_err();
-        assert!(err.downcast_ref::<NoSuchObject>().is_none(), "{err:#}");
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("cannot confirm that s3://bkt/foo exists"),
-            "{text}"
-        );
-        assert!(
-            text.contains("nothing was deleted") && text.contains("403"),
-            "{text}"
-        );
-        assert_eq!(f.keys(), set(&["foo"]));
-        assert_eq!(f.calls(), ["HEAD s3://bkt/foo"]);
+        assert!(format!("{err:#}").contains("not found"), "{err:#}");
+    }
+
+    #[test]
+    fn is_not_found_looks_through_context_but_only_at_typed_errors() {
+        assert!(is_not_found(&io_not_found().context("outer")));
+        assert!(!is_not_found(&io_denied()));
+        assert!(!is_not_found(&http_403_text()));
+        assert!(!is_not_found(&untyped_not_found_text()));
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn is_not_found_recognises_only_azure_blob_not_found() {
+        use azure_core::error::ErrorKind;
+        use azure_core::http::StatusCode;
+        let http = |status, code: &str| {
+            anyhow::Error::new(azure_core::Error::with_message(
+                ErrorKind::HttpResponse {
+                    status,
+                    error_code: Some(code.to_string()),
+                    raw_response: None,
+                },
+                "azure",
+            ))
+        };
+        assert!(is_not_found(&http(StatusCode::NotFound, "BlobNotFound")));
+        assert!(!is_not_found(&http(
+            StatusCode::NotFound,
+            "ContainerNotFound"
+        )));
+        assert!(!is_not_found(&http(
+            StatusCode::Forbidden,
+            "AuthorizationFailure"
+        )));
+    }
+
+    #[cfg(feature = "backend-gcs")]
+    #[test]
+    fn is_not_found_recognises_only_a_gcs_404() {
+        let http = |code: u16| {
+            anyhow::Error::new(google_cloud_gax::error::Error::http(
+                code,
+                http::HeaderMap::new(),
+                Bytes::from_static(b"body"),
+            ))
+        };
+        assert!(is_not_found(&http(404)));
+        assert!(!is_not_found(&http(403)));
+        assert!(!is_not_found(&http(500)));
     }
 
     #[tokio::test]
@@ -534,11 +585,7 @@ mod tests {
         delete_exact_object(&f, "s3://bkt/a*").await.unwrap();
         delete_exact_object(&f, "s3://bkt/a?b").await.unwrap();
         assert_eq!(f.keys(), set(&["ab", "axb"]));
-        assert!(
-            f.calls().iter().all(|c| !c.starts_with("LIST")),
-            "{:?}",
-            f.calls()
-        );
+        assert_eq!(f.calls(), ["DELETE s3://bkt/a*", "DELETE s3://bkt/a?b"]);
     }
 
     // ---- recursive delete --------------------------------------------------
