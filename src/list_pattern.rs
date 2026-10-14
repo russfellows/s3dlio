@@ -4,13 +4,14 @@
 //
 //! The explicit, client-side regex filter for listings (issue #213).
 //!
-//! A storage URI given to a listing is a LITERAL key prefix: `s3://b/data/run.1`
-//! lists every key that starts with `data/run.1` (so `data/run.1.old` too, but
-//! never `data/run_1` or `data/prerun.1`) and `.`, `(`, `[`, `+`, `$`, `?` in it
+//! Which objects an `s3://` URI selects is decided by [`crate::s3_selection`]: the key
+//! part is the exact object (and its `K/` directory), a directory (`K/`), or an explicit
+//! `*` / `**` glob -- never a bare string prefix, and `.`, `(`, `[`, `+`, `$`, `?` in it
 //! are ordinary characters. A regular expression is applied only when the caller
-//! passes one explicitly: Python `list(uri, pattern=...)`, `s3-cli ls --pattern`
-//! or [`crate::s3_copy::download_objects_matching`]. All of them use this one
-//! type, so they agree on what the pattern is matched against.
+//! passes one explicitly: Python `list(uri, pattern=...)`, `s3-cli ls|download|get
+//! --pattern` or [`crate::s3_copy::download_objects_matching`]. All of them use this one
+//! type, so they agree on what the pattern is matched against, and the pattern narrows
+//! the selection AFTER it has been made.
 //!
 //! # What the pattern sees
 //!
@@ -22,8 +23,10 @@
 //! 2. otherwise `P/` for an entry that lies under the directory `P`
 //!    (`s3://b/dl` and `s3://b/dl/sub/c.npz` -> `sub/c.npz`), and
 //! 3. otherwise the parent directory of `P` -- everything up to and including its
-//!    last `/` -- for the entries that merely START WITH `P`
-//!    (`s3://b/data/run.1` and `s3://b/data/run.1.old` -> `run.1.old`).
+//!    last `/` -- for any other entry (`s3://b/data/run.1` and the object
+//!    `s3://b/data/run.1` -> `run.1`); and
+//! 4. for a wildcard URI, the directory part of the text before its first `*`
+//!    (`s3://b/data/file*` -> `data/`, `s3://b/data/*/x` -> `data/`).
 //!
 //! An entry that does not start with the base is matched as it is.
 //!
@@ -98,6 +101,16 @@ fn s3_key_parts<'a>(listing_prefix: &str, entry: &'a str) -> Option<(String, &'a
 
 /// The listing-base rule over plain strings (a key, or a whole URI).
 fn strip_listing_base<'a>(listing_prefix: &str, entry: &'a str) -> Option<&'a str> {
+    // A wildcard URI (`data/file*`, `data/*/x`): the base is the directory part of the
+    // text before the first `*`, whatever the entry looks like.
+    if let Some(star) = listing_prefix.find('*') {
+        let before_star = &listing_prefix[..star];
+        let parent = match before_star.rfind('/') {
+            Some(slash) => &before_star[..=slash],
+            None => "",
+        };
+        return entry.strip_prefix(parent);
+    }
     if listing_prefix.ends_with('/') {
         return entry.strip_prefix(listing_prefix);
     }
