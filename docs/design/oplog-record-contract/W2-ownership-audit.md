@@ -1,99 +1,209 @@
-# W2: who records which call (ownership audit)
+# W2: who records which call (ownership audit, round 2)
 
-Wave W2 of the op-log work plan: each call is recorded exactly once (s3dlio #169, design doc
-`docs/DESIGN_OPLOG_RECORD_CONTRACT.md` section 8). This appendix lists every entry point that was
-recorded by the S3 backend's own ("inner") writer, what happens to it now, and the entry points that
-were never recorded. Labels: **[READ]** read in code on this branch, **[TEST]** pinned by an
-automated test named in the last column.
+Wave W2 of the op-log work plan: each call is recorded exactly once (s3dlio #169). This appendix lists
+every entry point that was recorded by the S3 backend's own ("inner") row writer, what happens to it now,
+and the entry points that were never recorded. Labels: **[READ]** read in code on this branch, **[TEST]**
+pinned by an automated test named in the last column.
 
-Before W2 the inner writer (`S3Ops::log_op`, reached only through `s3_utils::build_ops_async()`)
-fired on exactly three S3 helpers: `get_object`, `put_object_async` and the synchronous
-`delete_objects`. Everything that reached one of them wrote an inner row: a logged store wrote it in
-addition to its own row (the #169 duplicate), an unlogged store wrote it instead of nothing (logged
-by accident, S3 only). W2 removes the inner writer (`S3Ops` no longer takes a logger, client id or
-endpoint) and gives each call one owner:
+Round 2 supersedes round 1. Round 1 also changed the SERIALIZATION of the helper rows; that was not
+approved and is reverted (section 6 lists what changed back). The rule of this round: **no field of any
+row changes; the only change is that a call no longer writes two rows.**
+
+## 1. The ownership model
+
+Before W2 the inner writer (`S3Ops::log_op`) fired on exactly three S3 helpers: `get_object`,
+`put_object_async` and the synchronous `delete_objects`. Everything that reached one of them wrote an inner
+row: a logged store wrote it in addition to its own row (the #169 duplicate), an unlogged store wrote it
+instead of nothing (logged by accident, S3 only).
+
+Each call now has one owner:
 
 - **store**: a store built with a logger (`store_for_uri_with_logger(uri, Some(..))`) records through
-  `LoggedObjectStore`, on every backend;
-- **helper**: a public helper function that is a user entry point records through
-  `s3_utils::HelperCall`, which calls the same row builder as the store
-  (`object_store_logger::record_call`), so the row has the same shape: endpoint `s3://<bucket>`,
-  file `<bucket>/<key>`, `client_id` from `set_client_id()`, `first_byte` GET = end, PUT = start;
+  `LoggedObjectStore`, on every backend. Row shape: endpoint `s3://<bucket>`, file `<bucket>/<key>`,
+  `client_id` from `set_client_id()`.
+- **helper**: a public S3 helper function that is a user entry point records through `S3Ops`, with the
+  global logger, in the shape `S3Ops` always wrote (section 1.1). Unchanged from before W2.
 - **explicit**: a library entry point that builds its own store asks for a logged one
-  (`store_for_uri_with_logger(uri, global_logger())`);
-- **silent**: an internal transfer, or a store built without a logger (ruling D4/O1), writes nothing.
-  The S3 backend of every store calls the `*_silent` helpers, so a store's own recording is the only one.
+  (`store_for_uri_with_logger(uri, global_logger())`): checkpoint, the async-pool dataloader, Python
+  `load_checkpoint_with_validation`.
+- **silent**: the S3 backend of a store builds its `S3Ops` with no logger (`s3_utils::Rows::Skip`), so a
+  store's own recording is the only one. A store built without a logger records nothing.
+- **MultiEndpointStore, bucket-form endpoint**: its endpoint store is built with `with_helper_rows()`, so its
+  `get`/`put` write the helper row exactly as before W2 (it is never wrapped in a `LoggedObjectStore`).
 
-## 1. Entry points that were recorded by the inner writer
+### 1.1 The helper row (unchanged)
+
+| column | value (success) | value (failure) |
+|---|---|---|
+| `op` | `GET`, `PUT`, or `DELETE` (batch) | same |
+| `client_id` | `AWS_ACCESS_KEY_ID` (NOT `set_client_id()`) | same |
+| `n_objects` | 1 (batch: keys in that chunk) | same |
+| `bytes` | GET: body length. PUT: payload length. | **0** |
+| `endpoint` | `AWS_ENDPOINT_URL` (the server contacted; empty if unset) | same |
+| `file` | the bare key (batch: `(batch)`) | same |
+| `error` | empty | GET: `{:#}` of the error chain. PUT: `format_sdk_error` detail. Batch DELETE: the per-key failure list or the SDK detail |
+| `first_byte` | GET: time the response headers arrived. PUT, DELETE: empty | empty |
+
+**[TEST]** `oplog_helper_rows_golden` compares 25 helper rows (success, 403 failures, a retried 500 PUT,
+`delete_objects` of 0/1/1000/1001 keys and a per-key failure, `get_objects_parallel`, `get_range`,
+`S3BytesDataset`, `s3_copy` upload/download) with a fixture CAPTURED FROM THE PARENT (9473d2c) by running the
+same test there: byte-identical. The mock server's request log (method, path, host:port, retries) is checked
+alongside.
+
+## 2. Entry points that were recorded by the inner writer
 
 | Entry point | Rows before | Decision | Rows now | Test |
 |---|---|---|---|---|
-| Logged store, S3 `get`, `put` (`s3://bucket/..`) | 2 (outer + inner) | store | 1 | `oplog_exactly_once_logged_store_s3` |
-| Logged store, S3 `put_multipart`, `get_range`, `stat`, `list`, `delete`, `delete_batch`, `delete_prefix` | 1 (outer; these never reached the inner writer) | store | 1 (unchanged) | same |
+| Logged store, S3 `get`, `put` (`s3://bucket/..`) | 2 (outer + inner) | store | 1 (store shape) | `oplog_exactly_once_logged_store_s3` |
+| Logged store, S3 `put_multipart`, `get_range`, `stat`, `list`, `delete`, `delete_batch`, `delete_prefix` | 1 (outer; never reached the inner writer) | store | 1 (unchanged) | same |
 | Logged store, S3 host-form `s3://host:port/..` | 1 (per-endpoint client bypassed the inner writer) | store | 1 (unchanged) | [READ] `object_store.rs` per-endpoint `client` branches |
-| Unlogged store (`store_for_uri`, `store_for_uri_with_logger(.., None)`), S3 `get`, `put` | 1 inner row | silent (D4/O1) | 0 | `oplog_exactly_once_unlogged_store_s3` |
-| `s3_utils::get_object`, `get_object_uri_async`, `get_object_uri` (sync) | 1 inner row, wrong shape | helper | 1 `GET`, store shape | `oplog_exactly_once_helpers_s3` |
-| `s3_utils::get_object_uri_optimized_async` | 1 inner row, only when the object was served by a single GET; 0 for a range-split large object | helper | 1 `GET` whichever path served it | same |
-| `s3_utils::get_objects_parallel`, `get_objects_parallel_with_progress` (Python `get_many` for `s3://`, `get_many_stats`, `get_many_async`) | 1 inner row per small object, 0 per large object | helper | 1 `GET` per object | same |
-| `s3_utils::get_range` (downloads the whole object, then slices) | 1 inner `GET` | helper | 1 `GET` (the whole-object read it performs) | [READ] |
-| `s3_utils::put_object_async`, `put_object_uri_async` | 1 inner row, wrong shape | helper | 1 `PUT`, store shape | same |
-| `s3_utils::delete_objects` (sync, `lib.rs` re-export) | 1 inner `DELETE` row per 1000 keys, `file` = `(batch)` | helper | 1 `DELETE_BATCH` row per call, `n_objects` = keys, `file` = first URI; no row for an empty list | same |
-| `s3_copy::upload_files`, `s3_copy::download_objects` | 1 inner row per object | helper (they call the helpers above) | 1 row per object | [READ] |
-| `S3BytesDataset` (Python/Rust dataloader), sequential mode | 1 inner row per object | helper | 1 `GET` per object | [READ] |
-| Checkpoint `CheckpointStore::open*`, `Reader::read_all_shards_concurrent*` (save and load of shards, manifests, `latest.json`) | S3: inner rows for `get`/`put`; other backends: none | explicit | 1 row per call, every backend | `oplog_exactly_once_callers` (file://) |
-| `MultiBackendDataset::from_prefix`, `from_uris` (async pool dataloader) | S3: inner rows for `get`; other backends: none | explicit | 1 row per call, every backend | same |
-| Python `load_checkpoint_with_validation` | S3: 1 inner row | explicit | 1 `GET` | [READ] (needs the wheel) |
+| Unlogged store (`store_for_uri`, `store_for_uri_with_logger(.., None)`), S3 `get`, `put` | 1 inner row | silent | 0 | `oplog_exactly_once_unlogged_store_s3` |
+| `s3_utils::get_object`, `get_object_uri_async`, `get_object_uri` (sync) | 1 helper row | helper | 1, **unchanged shape** | `oplog_helper_rows_golden` |
+| `s3_utils::get_object_uri_optimized_async` | 1 helper row when served by a single GET; 0 for a range-split large object | helper | same: 1 / 0, **unchanged** | `oplog_helper_rows_golden`, `..._large_object` |
+| `s3_utils::get_objects_parallel*` (Python `get_many` for `s3://`, `get_many_stats`, `get_many_async`) | 1 per small object, 0 per large object | helper | same, **unchanged** | same |
+| `s3_utils::get_range` (downloads the whole object, then slices) | 1 helper `GET` | helper | 1, **unchanged** | `oplog_helper_rows_golden` |
+| `s3_utils::put_object_async`, `put_object_uri_async` | 1 helper row | helper | 1, **unchanged** | `oplog_helper_rows_golden` |
+| `s3_utils::delete_objects` (sync) | 1 `DELETE` row per 1000 keys, `file` = `(batch)`; none for an empty list | helper | same, **unchanged** | `oplog_helper_rows_golden` (0, 1, 1000, 1001 keys) |
+| `s3_copy::upload_files`, `s3_copy::download_objects` | 1 per object | helper | same, **unchanged** | `oplog_helper_rows_golden` |
+| `S3BytesDataset` sequential mode | 1 per object | helper | same, **unchanged** | `oplog_helper_rows_golden` |
+| Checkpoint `CheckpointStore::open*`, `Reader::read_all_shards_concurrent*` | S3: helper rows via the store's S3 backend; other backends: none | explicit | 1 per call, every backend, **store shape** | `oplog_exactly_once_callers` (file://) |
+| `MultiBackendDataset::from_prefix`, `from_uris` | S3: helper rows; other backends: none | explicit | 1 per call, every backend, **store shape** | same |
+| Python `load_checkpoint_with_validation` | S3: 1 helper row | explicit | 1 `GET`, **store shape** | [READ] |
+| `MultiEndpointStore` `get`/`put`, bucket-form endpoints | 1 helper row | helper (via `with_helper_rows`) | 1, **unchanged** | `oplog_multi_endpoint_rows` (also passes on the parent) |
 
-## 2. Entry points that lose an accidental inner row (reported, not fixed here)
+**Needs the architect's attention (changed shape, not in the round-2 rulings):** the "explicit" callers
+(checkpoint, `MultiBackendDataset`, Python `load_checkpoint_with_validation`) write the STORE shape now on S3
+(they wrote the helper shape, S3 only, before) and gained rows on file/direct/Azure/GCS. They were not on the
+not-approved list, so they are kept; reverting them to silent would lose their S3 rows entirely.
 
-| Entry point | Rows before | Rows now | Why not fixed in W2 |
+## 3. Rows that are gone (reported, not fixed here)
+
+| Entry point | Rows before | Rows now | Why |
 |---|---|---|---|
-| `MultiEndpointStore` `get` / `put` on bucket-form `s3://bucket/..` endpoints | 1 inner row (wrong shape) | 0 | #175 (out of scope for W2): `MultiEndpointStore` is never logged by design today; `get_range`, `list`, `delete` and host-form endpoints were already 0 |
-| `s3dlio-oplog` replayer (`crates/s3dlio-oplog/src/replayer.rs`, `store_for_uri`) | S3 `GET`/`PUT`: 1 inner row, if a global logger is active in the replaying process | 0 | consumer tool; capturing a replay is sai3-bench#103 |
+| Unlogged store, S3 `get`/`put` | 1 helper row | 0 | ruling D4/O1: a store built without a logger is silent |
+| `s3dlio-oplog` replayer (`crates/s3dlio-oplog/src/replayer.rs`, `store_for_uri`) | `GET`/`PUT`: 1 helper row if a global logger is active in the replaying process | 0 | consumer tool; capturing a replay is sai3-bench#103 |
 
-## 3. Entry points that were never recorded by the inner writer (unchanged)
-
-The inner writer did not cover these, so W2 neither adds nor removes a row. They are the remaining
-"missing rows" and belong to later waves:
+## 4. Entry points that were never recorded by the inner writer (unchanged)
 
 | Entry point | Today | Issue / note |
 |---|---|---|
 | `get_object_range_uri_async`, `get_object_range_uri_timed_async`, `get_object_concurrent_range_async` | no row from the helper (a logged store records `GET_RANGE`) | not an inner-writer path |
+| Large-object (range-split) reads through `get_object_uri_optimized_async` / `get_objects_parallel*` | no row (round 1 added one in a new shape; reverted) | proposal P-large in section 7 |
 | `stat_object`, `stat_object_uri_async`, `stat_object_many_async`, `list_objects*`, `list_objects_stream`, `delete_objects_async`, `put_object_multipart_uri_async`, `create_bucket*`, `delete_bucket*` | no row from the helper | not an inner-writer path |
 | Python `create_bucket`, `delete_bucket` | no row | #182 (Python bucket calls) |
 | Python `get_many` for `file://`, `direct://`, `az://`, `gs://` | no row | built without a logger |
-| Python `create_s3_writer` and the other writers | no row (writes are not recorded) | writer logging is a separate gap |
-| Parquet readers (`parquet_rg`, `parquet_file_cache`), `parquet_gen` | no row | built with `store_for_uri` (silent); only `get_range`, `stat`, `list`, `put_multipart` are used, which the inner writer never covered |
+| Python `create_s3_writer` and the other writers | no row | writer logging is a separate gap |
+| Parquet readers (`parquet_rg`, `parquet_file_cache`), `parquet_gen` | no row | built with `store_for_uri` (silent) |
 | `S3BytesDataset` range mode | no row | uses `get_object_range_uri_async` |
+| `MultiEndpointStore` `list`, `delete`, `get_range`, `stat`, host-form endpoints | no row | proposal P-MEP in section 7 |
 
-## 4. Validation (ground-truth harness on Google Cloud Storage)
+## 5. Rows and requests per logical operation
 
-`tests/oplog_accuracy/` (see its README), one run per wheel, same cases, GCS S3-interop endpoint,
-native `gcloud storage` as ground truth, 83 calls, `delete_batch` skipped (no probe given). Evidence:
-`evidence/w2/` (bucket names replaced by the roles B1/B2).
+R = op-log rows, Q = requests the S3 server (the in-process mock) received. SDK retries add requests, never
+rows (`oplog_helper_rows_golden`: a 500 PUT is retried by the SDK, one row; `oplog_rows_copy_rename_prestat`:
+same through a store). A read of an object whose size is not known first sends a HEAD size probe before its
+GET; that probe has never had a row of its own and is not counted below.
 
-| | parent wheel (9473d2c build, sha256 d3a9ef0c...) | final wheel (W2, sha256 10238517...) |
+| logical operation | backend | R | Q | test |
+|---|---|---|---|---|
+| logged store `copy` | S3 | `GET`, `PUT` | GET src, PUT dst | `oplog_rows_copy_rename_prestat` |
+| logged store `copy`, PUT fails | S3 | `GET`, `PUT`(error, bytes = payload) | GET, PUT x attempts (>= 2) | same |
+| logged store `rename` | S3 (and Azure, GCS, multi-endpoint) | `GET`, `PUT`, `DELETE` | GET src, PUT dst, DELETE src | same |
+| logged store `pre_stat_objects` | S3 | one `HEAD` per URI (error row for a missing one) | one HEAD per URI | same |
+| logged store `pre_stat_and_cache` | S3 | one `HEAD` per URI | one HEAD per URI; the size cache is filled with NO further request | same |
+| logged store `copy` | file:// | `GET`, `PUT` | read, write | same |
+| logged store `rename` | file://, direct:// | none (`rename(2)` is native; no op name describes it) | one `rename(2)` | same, `oplog_logged_store_file_transparent` |
+| logged store `pre_stat_objects`, `pre_stat_and_cache` | file:// | one `HEAD` per URI | one `stat` per URI | `oplog_rows_copy_rename_prestat` |
+| logged store `mkdir`, `rmdir`, `update_metadata`, `update_properties` | all | none (no op name; forwarded) | the backend's own | `oplog_logged_store_forwards_every_method` |
+| helper `put_object_async`, `put_object_uri_async` | S3 | 1 `PUT` | 1 PUT | `oplog_helper_rows_golden` |
+| helper `get_object*`, `get_range`, `get_objects_parallel*` (small object) | S3 | 1 `GET` per object | 1 GET (+ size probe) per object | same |
+| helper `get_object_uri_optimized_async`, `get_objects_parallel*` (large object) | S3 | none | ranged GETs | `..._large_object` |
+| helper `delete_objects`, 0 keys | S3 | none | none | `oplog_helper_rows_golden` |
+| helper `delete_objects`, 1 / 1000 / 1001 keys | S3 | 1 / 1 / 2 `DELETE (batch)` rows (n = 1 / 1000 / 1000 + 1) | 1 / 1 / 2 DeleteObjects POSTs | same |
+| helper host-form `get_many` | S3 | 1 `GET`, endpoint = `AWS_ENDPOINT_URL` (the server contacted) | 1 GET to `AWS_ENDPOINT_URL` | `oplog_helper_rows_host_form` |
+| `MultiEndpointStore.get`/`put`, bucket-form | S3 | 1 helper row each | 1 GET (+ size probe) / 1 PUT | `oplog_multi_endpoint_rows` |
+| `MultiEndpointStore.rename`, bucket-form | S3 | `GET`, `PUT` (the DELETE is silent) | GET, PUT, DELETE | same |
+| `MultiEndpointStore` `list`, `delete`, `get_range`, `stat`; any host-form operation | S3 | none | 1 request each | same |
+| Python store cache (#174) | all | a call is recorded exactly when the op-log is active at the call | n/a | `tests/test_oplog_store_cache.py`, `store_cache_logger_tests` |
+
+The op-log never records its own I/O: no row names the log file (`oplog_rows_copy_rename_prestat`,
+`oplog_lifecycle_no_self_log_*`).
+
+### 5.1 What `bytes` and `error` mean on a failed PUT (kept as they were, per path)
+
+Read from the code history (`S3Ops` since 0e07a59 and #506, `LoggedObjectStore` since 263e32c) and
+`docs/supplemental/OPERATION_LOGGING.md` ("`bytes`: data transferred"; no document says what a failed PUT
+transferred). The two paths differ and each is kept as it was; they are not aligned.
+
+- **Helper path (`S3Ops`)**: `bytes` is what was transferred and stored: the payload length only on success
+  and **0 on failure** (the first `S3Ops` already passed `0` for a failed GET; #506 added the failure rows of
+  the other operations, also with `0`). `error` is the same detail the caller's error carries (#506 made every
+  failure arm log `format_sdk_error(&e)` "so the s3dlio op-log file matches the caller's view"):
+  `service error: AccessDenied (...) — check AWS_ACCESS_KEY_ID ...`. Pinned by `oplog_helper_rows_golden`
+  (three failing PUTs, one of them retried).
+- **Store path (`LoggedObjectStore`)**: `bytes` is the size of the payload handed to `put()`, captured before
+  the call and written whether the call succeeds or not (**the payload size on failure**); the PUT sample in
+  OPERATION_LOGGING.md is exactly this code. `error` is `e.to_string()` of the error the store returned (the
+  S3 store's error already carries the SDK chain and the operation context). Pinned by
+  `oplog_rows_copy_rename_prestat` (failed PUT, bytes 4).
+
+## 6. What changed back from round 1
+
+| item | round 1 | round 2 |
 |---|---|---|
-| calls | 83 | 83 |
-| RECORD `DUPLICATE` | 20 | **0** |
-| RECORD `MISSING` | 7 | 6 |
-| RECORD `WRONG-FIELD` | 5 | 7 |
-| PASS (OK/OK) | 49 | 47 (against the parent's known.json), 68 (against the updated one) |
-| KNOWN | 34 | 9 / 15 |
-| NEW / CHANGED / FIXED | 0 / 0 / 0 | 2 / 4 / 21 (against the parent's known.json) |
+| `S3Ops` | writer removed, `S3Ops::new(client)` | restored byte-identical to 9473d2c |
+| helper `client_id` | `set_client_id()` | `AWS_ACCESS_KEY_ID` |
+| helper `endpoint` / `file` | `s3://<bucket>` / `<bucket>/<key>` | `AWS_ENDPOINT_URL` / bare key |
+| helper `first_byte` | GET = end, PUT = start | GET = measured header time, PUT = empty |
+| helper failure `error` | store-style text | S3Ops text (GET `{:#}`, PUT/DELETE `format_sdk_error`) |
+| `delete_objects` | one `DELETE_BATCH` row for the call, `file` = first URI | one `DELETE (batch)` row per 1000 keys |
+| large-object helper read | 1 new row | 0 rows (as before) |
+| host-form `get_many` endpoint column | `s3://<bucket>` (named no server) | `AWS_ENDPOINT_URL` (the server contacted) |
+| `MultiEndpointStore` get/put | 0 rows | 1 row each (as before) |
+| `LoggedObjectStore` copy / rename / pre_stat | forwarded, unrecorded (0 rows for real requests) | defaults recorded, native forwarded (section 5) |
 
-Against the parent's `known.json` the final run reports 21 FIXED, 2 NEW and 4 CHANGED:
+Unavoidable serialization changes: **none were made.** Two behaviours change that are not serialization but
+should be seen: (1) a store built without a logger writes nothing on S3 (D4/O1, round 1, kept); (2) the
+explicit callers' shape (section 2).
 
-- FIXED, #169: 18 calls (every S3 `get`/`put_bytes`/`put_bytes_async`, including the missing-key `get`, in
-  `core`, `repeat`, `two_buckets`, `leading_slash`, `async` and `s3_dest_reject`) are one correct row.
-- FIXED, #174: 3 calls (`async` `delete`, `host443_get_async`, `host443_decoydefault_get_async`) now have their row.
-- NEW, 2: `multi_endpoint` `get` and `put` are now MISSING. Their accidental legacy row is gone (section 2; #175).
-- CHANGED, 2: `host443_decoydefault_get_many` (`m1`, `m2`) record `OK` -> `WRONG-FIELD:server`. The call
-  still goes to the `AWS_ENDPOINT_URL` server (#171); the legacy row used to carry that server by accident, the
-  one row now written has the endpoint the URI asked for.
-- CHANGED, 2: `portless_get`, `portless_put` record `DUPLICATE+WRONG-FIELD:server` -> `WRONG-FIELD:server`.
+## 7. Proposals (NOT implemented; the architect approves or not)
 
-`known.json` was updated to the new expectations (entries for #169 and #174 removed; #175 now lists
-`get` and `put`; the two CHANGED entries restated). Re-evaluating the final run against it gives
-PASS 68, KNOWN 15, NEW 0, CHANGED 0, FIXED 0. Both runs cleaned up: the three namespaces were empty
-afterwards.
+### P-MEP: rows for the other `MultiEndpointStore` operations (#175)
+
+Today `list`, `delete`, `get_range`, `stat`, and every operation on a host-form endpoint write no row.
+Proposal: record them in the STORE shape (the shape `LoggedObjectStore` writes; implemented by wrapping each
+endpoint store in a `LoggedObjectStore` when a logger is active, which would also move the bucket-form
+`get`/`put` rows to the store shape: a serialization change, hence a proposal). Example rows (13 columns;
+`c1` = `set_client_id()`; endpoint store `s3://bkt/pfx/`; `T0..T1` timestamps; `d` = duration; empty
+columns are written empty, shown as `-`):
+
+```
+op          client_id n_objects bytes endpoint             file                       error start first_byte end duration_ns
+Before (every row below):  no row
+LIST        c1        2         0     s3://bkt             bkt/pfx/                   -     T0    -          T1  d      list("s3://bkt/pfx/")
+GET_RANGE   c1        1         2     s3://bkt             bkt/pfx/k                  -     T0    T1         T1  d      get_range(.., 0, Some(2))
+HEAD        c1        1         3     s3://bkt             bkt/pfx/k                  -     T0    -          T1  d      stat(..)
+DELETE      c1        1         0     s3://bkt             bkt/pfx/k                  -     T0    -          T1  d      delete(..)
+GET         c1        1         4     s3://127.0.0.1:9000  127.0.0.1:9000/bkt/pfx/k   -     T0    T1         T1  d      host-form get(..)
+PUT         c1        1         4     s3://127.0.0.1:9000  127.0.0.1:9000/bkt/pfx/k   -     T0    T0         T1  d      host-form put(..)
+```
+
+(`idx` and `thread` columns omitted; the real rows are tab-separated.) Consumers: the `s3dlio-oplog` replayer
+(`crates/s3dlio-oplog`) reads `op` in {GET, PUT, DELETE, LIST, STAT/HEAD} and rejects any other name as an
+unknown operation, so a `GET_RANGE` row would make a replay fail; it rebuilds the URI as `endpoint + file`;
+`tests/oplog_accuracy` judges every row against what happened; sai3-bench and warp-replay read the TSV.
+Decision needed: store shape or helper shape for these rows, and whether `GET_RANGE` rows are acceptable to the
+replayer.
+
+### P-large: a row for range-split large-object reads
+
+A helper row in the existing shape needs a `first_byte` (the measured header time of the first response) and
+a `bytes` (the assembled length). The ranged path has per-chunk header times only. Proposed row: `GET`,
+`client_id` = `AWS_ACCESS_KEY_ID`, `n_objects` 1, `bytes` = total length, endpoint = `AWS_ENDPOINT_URL`,
+file = bare key, `first_byte` = the earliest chunk's header time. Before: no row. Not implemented because the
+choice of `first_byte` is a semantic decision.
+
+## 8. Validation
+
+Round-1 history: `evidence/w2/` (round-1 builds, GCS harness, kept as history, NOT evidence for round 2).
+Round 2: see section 9.

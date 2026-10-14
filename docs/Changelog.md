@@ -157,28 +157,32 @@ The details for each are in the sections below. **Read the behaviour changes bef
 
 ### Op-log accuracy: each call recorded exactly once (#169 W2)
 
-The op-log TSV format (13 columns, header, the values each column gets from
-`LoggedObjectStore`) is unchanged; the golden tests still pin it.
+The op-log TSV format (13 columns, header) is unchanged, and so is every field the
+S3 helper functions have always written; the golden tests pin both.
 
 - **One row per call on S3 (#169).** Every S3 `get`/`put` through a logged store
   used to write two rows: the `LoggedObjectStore` row and a second row from the S3
   backend's own writer (`endpoint` = `AWS_ENDPOINT_URL`, `file` = the bare key,
-  `client_id` = the access key id). That second writer is gone: `S3Ops` writes no
-  rows (**API change:** `S3Ops::new(client)`; it no longer takes a logger, client id
-  or endpoint). A store built without a logger (`store_for_uri`) is now silent for
-  S3 too, as it already was for every other backend.
-- **Public helpers record once, in the store's row shape (#169).** `s3_utils::get_object`,
-  `get_object_uri`, `get_object_uri_async`, `get_object_uri_optimized_async`,
-  `get_objects_parallel*` (Python `get_many` on `s3://`), `put_object_async`,
-  `put_object_uri_async` and `delete_objects` write one row per call: endpoint
-  `s3://<bucket>`, file `<bucket>/<key>`, `client_id` from `set_client_id()`. The
-  synchronous `delete_objects` now writes one `DELETE_BATCH` row for the call (it
-  wrote one `DELETE` row per 1000 keys with `file` = `(batch)`); a large object
-  fetched by concurrent ranges now has its row too.
+  `client_id` = the access key id). The S3 backend of a store no longer writes that
+  second row. A store built without a logger (`store_for_uri`) is now silent for S3
+  too, as it already was for every other backend.
+- **The public helpers keep their own row, exactly as before (#169).**
+  `s3_utils::get_object`, `get_object_uri`, `get_object_uri_async`,
+  `get_object_uri_optimized_async`, `get_objects_parallel*` (Python `get_many` on
+  `s3://`), `get_range`, `put_object_async`, `put_object_uri_async`, the sync
+  `delete_objects`, `S3BytesDataset` (sequential) and `s3_copy` still write the row
+  `S3Ops` writes: `endpoint` = `AWS_ENDPOINT_URL`, `file` = the bare key, `client_id`
+  = `AWS_ACCESS_KEY_ID`, `bytes` = the data size (0 on failure), the measured
+  first-byte time for a GET, one `DELETE` row with `file` `(batch)` per 1000 keys
+  for `delete_objects`. `S3Ops::new(client, logger, client_id, endpoint)` is
+  unchanged. A call writes one row whichever layer it went through: the S3 backend
+  of a store is the only code that skips it. An object fetched by concurrent
+  ranges writes no helper row, as before.
 - **Checkpoint and the async-pool dataloader record explicitly (#169).**
   `CheckpointStore::open*`, the concurrent shard reader, `MultiBackendDataset` and
   Python `load_checkpoint_with_validation` ask for a logged store, so they are
-  recorded on every backend (they were recorded by accident, S3 only).
+  recorded on every backend in the store's row shape (they were recorded by
+  accident, S3 only, in the helper shape).
 - **Python store cache no longer decides whether a call is recorded (#174).**
   The module-level functions share a cache of stores; it kept the logger of
   whichever call built an entry first, `get_async`/`get_range_async` passed no
@@ -188,16 +192,23 @@ The op-log TSV format (13 columns, header, the values each column gets from
   the op-log is active is recorded once and a call made when it is not is neither
   recorded nor counted, whatever the cache history. `get_async` and
   `get_range_async` are recorded.
-- **`LoggedObjectStore` is transparent (#177).** It forwards every `ObjectStore`
-  method to the inner store. `mkdir`, `rmdir`, `update_metadata` and
-  `update_properties` used to fail ("not implemented for this backend") and
-  `rename`/`copy` used to become get + put (+ delete) on a logged store; the S3
-  `get_optimized`/`get_range_optimized`/`pre_stat_and_cache` overrides were
-  bypassed. Rows: `get_optimized` writes a `GET` row and `get_range_optimized` a
-  `GET_RANGE` row (as before); `mkdir`, `rmdir`, `update_*`, `copy`, `rename`,
-  `pre_stat_objects` and `pre_stat_and_cache` have no op name in the format and
-  are forwarded without a row (`pre_stat_*` used to write one `HEAD` row per
-  object through the trait default).
+- **`LoggedObjectStore` is transparent, without hiding real requests (#177).** It
+  forwards every `ObjectStore` method to the inner store. `mkdir`, `rmdir`,
+  `update_metadata` and `update_properties` used to fail ("not implemented for this
+  backend"); the S3 `get_optimized`/`get_range_optimized` overrides were bypassed.
+  Rows: `get_optimized` writes a `GET` row and `get_range_optimized` a `GET_RANGE`
+  row (as before); `mkdir`, `rmdir` and `update_*` have no op name in the format and
+  are forwarded without a row. `copy` and `rename` are forwarded and unrecorded
+  only when the inner store's implementation is a native operation (new provided
+  trait methods `has_native_copy` / `has_native_rename`, default `false`; only the
+  `rename(2)` of `file://` and `direct://` is native). Everywhere else (S3, Azure,
+  GCS, multi-endpoint) they are the trait defaults, made of real requests, so the
+  wrapper runs the default over itself and each request is a row as before:
+  `copy` = `GET` + `PUT`, `rename` = `GET` + `PUT` + `DELETE`. `pre_stat_objects`
+  and `pre_stat_and_cache` write one `HEAD` row per object, and
+  `pre_stat_and_cache` fills the inner store's size cache from the sizes it
+  learned (new provided method `seed_size_cache`, default no-op) without an extra
+  request.
 - **Streamed `LIST` rows carry the client id (#181).** The row written when a
   `list_stream()` stream completes had an empty `client_id`; it now goes through the
   same row builder as every other call, so it equals `list()`'s row.
@@ -214,9 +225,16 @@ The op-log TSV format (13 columns, header, the values each column gets from
   no store overrides it) and writes the error column of the failed HEAD, exactly
   as `stat` does for the same URI (backend-specific text). A present object is still
   a `HEAD` row without an error.
-- **Known consequence:** `MultiEndpointStore` `get`/`put` on bucket-form endpoints
-  and the `s3dlio-oplog` replayer no longer write the accidental inner row (#175).
-  See `docs/design/oplog-record-contract/W2-ownership-audit.md`.
+- **`MultiEndpointStore` keeps its `get`/`put` rows on bucket-form endpoints (#175).**
+  They are the helper-shape rows they always were (one `GET` / `PUT` per call,
+  `S3Ops` fields); the other operations (`list`, `delete`, `get_range`, `stat`, and
+  everything on host-form endpoints) never wrote rows and still do not. Rows for
+  them are a proposal in the audit file.
+- **Known consequences (reported, not changed here):** an unlogged store
+  (`store_for_uri`) is silent on S3 (it wrote the helper row by accident), and the
+  `s3dlio-oplog` replayer's `store_for_uri` no longer writes the accidental helper
+  row (capturing a replay is sai3-bench#103). See
+  `docs/design/oplog-record-contract/W2-ownership-audit.md`.
 
 ### Op-log accuracy: destinations (#168), lifecycle and drop detection (#170)
 

@@ -31,23 +31,33 @@ idx  thread  op  client_id  n_objects  bytes  endpoint  file  error  start  firs
 
 ### One call, one row
 
-Each call you make is recorded **once**, by exactly one layer, whatever the backend:
+Each call you make is recorded **once**, by exactly one layer:
 
 - a store built with a logger (`store_for_uri_with_logger(uri, global_logger())`)
-  records every call through it;
+  records every call through it, in the store's row shape (endpoint `s3://<bucket>`,
+  file `<bucket>/<key>`, `client_id` from `set_client_id()`);
 - the public S3 helper functions (`s3_utils::get_object`, `get_object_uri*`,
-  `put_object_async`, `put_object_uri_async`, `delete_objects`, `get_objects_parallel*`)
-  record their own call, in the same row shape (endpoint `s3://<bucket>`, file
-  `<bucket>/<key>`, `client_id` from `set_client_id()`);
+  `put_object_async`, `put_object_uri_async`, `delete_objects`, `get_objects_parallel*`,
+  `get_range`, and what is built on them: `S3BytesDataset`, `s3_copy`, Python `get_many`)
+  record their own call in the row they have always written: endpoint =
+  `AWS_ENDPOINT_URL`, file = the bare key, `client_id` = `AWS_ACCESS_KEY_ID`, `bytes`
+  0 on failure, the measured first-byte time for a GET. `delete_objects` writes one
+  `DELETE` row per 1000 keys with file `(batch)`. An object fetched by concurrent
+  ranges writes no such row;
 - a store built without a logger (`store_for_uri`) records nothing, even while the
   op-log is active; library entry points that build their own store (checkpoint,
   the async-pool dataloader) ask for a logged one;
-- the S3 backend never writes a row of its own.
+- the S3 backend of a store never writes a row of its own; a `MultiEndpointStore`
+  on bucket-form S3 endpoints is the one exception: its `get`/`put` write the helper
+  row, as they always did.
 
-`docs/design/oplog-record-contract/W2-ownership-audit.md` lists every entry point and
-who records it. Operations with no op name in the format (`mkdir`, `rmdir`, `copy`,
-`rename`, `update_metadata`, `update_properties`, bulk `pre_stat_*`) are forwarded
-by a logged store without a row.
+`docs/design/oplog-record-contract/W2-ownership-audit.md` lists every entry point, who
+records it, the rows and requests per operation, and the proposals for operations that
+write no row. On a logged store `copy` and `rename` are recorded as the real requests
+they are on S3/Azure/GCS (`copy` = GET + PUT, `rename` = GET + PUT + DELETE) and
+`pre_stat_*` as one HEAD per object; only a native operation (the `rename(2)` of
+`file://` / `direct://`) and `mkdir`, `rmdir`, `update_metadata`, `update_properties`
+(which have no op name in the format) are forwarded without a row.
 
 ### Global Configuration Functions
 
