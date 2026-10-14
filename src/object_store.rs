@@ -1248,6 +1248,41 @@ impl S3ObjectStore {
             .with_context(|| format!("S3 URI '{uri}' cannot be used with this store"))
     }
 
+    /// Gate for every operation that is handed to a helper which uses the
+    /// PROCESS-WIDE S3 client (multipart upload, concurrent-range GET, the
+    /// buffered writer's final upload).  Those helpers always talk to the global
+    /// server, whatever URI form they are given -- a bucket-form URI names no
+    /// server, so the URI check cannot catch it.  A per-endpoint store bound to
+    /// any other server must therefore refuse, before any request is made,
+    /// rather than run the operation on the wrong server (issue #197).  Per-endpoint
+    /// multipart and concurrent-range support is issue #208.
+    ///
+    /// A store on the process-wide client, or a per-endpoint store whose server IS
+    /// the global server, passes.
+    fn ensure_global_helper_reaches_this_store(&self, operation: &str) -> Result<()> {
+        let Some(url) = self.endpoint_url.as_deref() else {
+            return Ok(());
+        };
+        let mine = StoreServer::from_endpoint_url(url)
+            .context("S3ObjectStore endpoint URL is not usable")?;
+        match global_client_server() {
+            Some(global) if global.is_same_server(&mine) => Ok(()),
+            Some(global) => bail!(
+                "{operation} is not yet supported on a per-endpoint S3 store (issue #208): this \
+                 store talks to {}, but {operation} uses the process-wide S3 client, which talks \
+                 to {}",
+                mine.display(),
+                global.display()
+            ),
+            None => bail!(
+                "{operation} is not yet supported on a per-endpoint S3 store (issue #208): this \
+                 store talks to {}, but {operation} uses the process-wide S3 client, which talks \
+                 to the default AWS endpoint",
+                mine.display()
+            ),
+        }
+    }
+
     /// Delete every key of one bucket group (issue #179).
     ///
     /// On failure returns the index (into `group.uris`) of the first URI that
@@ -1575,6 +1610,7 @@ impl ObjectStore for S3ObjectStore {
         );
         // Issue #197: a URI naming another server is an error, never run here.
         self.parse_uri_for_this_store(uri)?;
+        self.ensure_global_helper_reaches_this_store("multipart upload")?;
         s3_put_object_multipart_uri_async(uri, data, part_size).await
     }
 
@@ -1830,6 +1866,8 @@ impl ObjectStore for S3ObjectStore {
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
         // Issue #197: a URI naming another server is an error, never run here.
         self.parse_uri_for_this_store(uri)?;
+        // The writer's final upload is a multipart upload on the process-wide client.
+        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer that collects chunks then uses put_multipart
         Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
     }
@@ -1841,6 +1879,8 @@ impl ObjectStore for S3ObjectStore {
     ) -> Result<Box<dyn ObjectWriter>> {
         // Issue #197: a URI naming another server is an error, never run here.
         self.parse_uri_for_this_store(uri)?;
+        // The writer's final upload is a multipart upload on the process-wide client.
+        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer with compression support
         Ok(Box::new(S3BufferedWriter::new_with_compression(
             uri.to_string(),
@@ -1855,6 +1895,8 @@ impl ObjectStore for S3ObjectStore {
     ) -> Result<Box<dyn ObjectWriter>> {
         // Issue #197: a URI naming another server is an error, never run here.
         self.parse_uri_for_this_store(uri)?;
+        // The writer's final upload is a multipart upload on the process-wide client.
+        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer that collects chunks then uses put_multipart
         if let Some(compression) = options.compression {
             Ok(Box::new(S3BufferedWriter::new_with_compression(
@@ -1884,7 +1926,8 @@ impl ObjectStore for S3ObjectStore {
                 "Using concurrent range GET for large object: {} bytes",
                 object_size
             );
-            // Use concurrent range GET for large objects
+            // Use concurrent range GET for large objects (process-wide client)
+            self.ensure_global_helper_reaches_this_store("concurrent range GET")?;
             crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await
         } else {
             debug!("Using standard GET for small object: {} bytes", object_size);
@@ -1924,7 +1967,8 @@ impl ObjectStore for S3ObjectStore {
                 "Using concurrent range GET for large transfer: {} bytes",
                 transfer_size
             );
-            // Use concurrent range GET for large transfers
+            // Use concurrent range GET for large transfers (process-wide client)
+            self.ensure_global_helper_reaches_this_store("concurrent range GET")?;
             crate::s3_utils::get_object_concurrent_range_async(
                 uri,
                 offset,

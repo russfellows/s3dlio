@@ -204,7 +204,13 @@ impl StoreServer {
         Ok(host == self.host && port.unwrap_or(self.default_port) == self.port)
     }
 
-    fn display(&self) -> String {
+    /// Do `self` and `other` name the same host and port?  (The scheme-default
+    /// port used for a portless URI authority is not part of the identity.)
+    pub(crate) fn is_same_server(&self, other: &StoreServer) -> bool {
+        self.host == other.host && self.port == other.port
+    }
+
+    pub(crate) fn display(&self) -> String {
         if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
         } else {
