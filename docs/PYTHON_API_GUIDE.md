@@ -984,6 +984,12 @@ Every other scheme is rejected as unsupported, shown as written: `s3://`,
 `direct://` and also `FILE://` (uppercase). Text before `://` that is not a valid
 URI scheme (for example `dir/a://b.log`) is a plain path.
 
+`file:` followed by anything but `//` (`file:x`, `file:/tmp/x`, also `FILE:x`) is
+rejected with an error that shows the `file://` spelling; a local file really
+named `file:x` is written `./file:x`. A one-letter scheme (`c://x`) is rejected
+like any other scheme, on every platform; the error says to write a Windows drive
+as `C:/dir/file` or `C:\dir\file` (`C:/x` and `C:\x` are plain paths).
+
 A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
 `init_op_log` while already active is a no-op; after `finalize_op_log` it raises
 `RuntimeError` and touches no file. `finalize_op_log` is safe to repeat. The

@@ -328,6 +328,10 @@ framing) is unchanged; a golden test pins it.
   `file://` object store: lowercase prefix removed, the rest used literally).
   Any other scheme (`s3://`, `direct://`, `FILE://`, ...) is rejected with an
   error that names the destination, and creation errors name the path.
+  `file:` in any case followed by anything but `//` (`file:x`, `file:/tmp/x`) is
+  also rejected (#191): **a change from 4542f82**, where `file:x` was accepted and
+  created a file literally named `file:x`. Use `./file:x` for such a name. `c://x`
+  stays rejected; its error now says to write a Windows drive as `C:/dir/file`.
 - **One op-log session per process (#170).** The lifecycle is `Uninitialized` ->
   `Active` -> `Finalized`, and `Finalized` is terminal. `init_op_log` while
   Active is a no-op; after `finalize_op_log` it raises `RuntimeError` and touches

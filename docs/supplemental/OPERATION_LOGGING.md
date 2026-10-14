@@ -434,6 +434,13 @@ not a machine-checked inventory:
 - A destination is resolved as described under "Op-log destinations": `file://`
   paths work, other schemes are rejected instead of becoming relative paths, and
   create errors name the path.
+- `file:x` and `file:/tmp/x` (`file:` in any case, not followed by `//`) are now
+  rejected with `InvalidInput` (issue #191). Before, `file:x` was accepted and
+  silently created a file literally named `file:x`, and `file:/tmp/x` was treated
+  as the relative path `file:/tmp/x` (it failed with "No such file or directory"
+  unless a directory named `file:` existed). `./file:x` is the plain-path spelling.
+  `c://x` stays rejected (as unsupported scheme `c://`) and its error now says how
+  to write a Windows drive.
 - `Logger::log` still returns `()`; `Logger::try_log` and `LogOutcome` are new.
 - An entry whose `operation` is `"__SHUTDOWN__"` used to be the writer's stop
   signal and ended the log (later entries were not written). It is now written as an

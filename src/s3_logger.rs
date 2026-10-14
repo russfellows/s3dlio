@@ -994,16 +994,29 @@ fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
             ),
         ));
     }
-    if path
+    if let Some(rest) = path
         .get(..5)
-        .is_some_and(|head| head.eq_ignore_ascii_case("file:"))
+        .filter(|head| head.eq_ignore_ascii_case("file:"))
+        .map(|_| &path[5..])
     {
+        // Suggest only spellings that mean what the user most likely meant:
+        // `file://` + the text for any rest, and `./` + the path only for a bare
+        // relative name ("./file:/abs" would be a path under a directory "file:").
+        let fix = if rest.is_empty() {
+            "write 'file:///tmp/ops.tsv.zst' (lowercase 'file://' and the path)".to_string()
+        } else if rest.starts_with('/') {
+            format!("write 'file://{rest}' (lowercase 'file://' and the path)")
+        } else {
+            format!(
+                "write 'file://{rest}' (lowercase 'file://' and the path), or './{path}' for a \
+                 local file whose name really begins with 'file:'"
+            )
+        };
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "op-log path '{path}' is a 'file:' URI without '//', which s3dlio does not \
-                 accept; write 'file:///tmp/ops.tsv.zst' (lowercase 'file://' and the path), \
-                 or './{path}' for a local file whose name really begins with 'file:'"
+                 accept; {fix}"
             ),
         ));
     }
@@ -1681,32 +1694,84 @@ mod oplog_path_tests {
 
     #[test]
     fn file_colon_without_double_slash_is_rejected_and_names_the_fix() {
-        for uri in [
-            "file:x",
-            "file:ops.tsv.zst",
-            "file:/tmp/ops.tsv.zst",
-            "file:",
-            "FILE:x",
-            "File:/tmp/ops.tsv.zst",
-        ] {
+        // (destination, texts the message must contain, texts it must not)
+        let cases: [(&str, &[&str], &[&str]); 6] = [
+            // A bare name: the file:// spelling, or ./ for a literal name.
+            ("file:x", &["'file://x'", "'./file:x'"], &[]),
+            (
+                "file:ops.tsv.zst",
+                &["'file://ops.tsv.zst'", "'./file:ops.tsv.zst'"],
+                &[],
+            ),
+            ("FILE:x", &["'file://x'", "'./FILE:x'"], &[]),
+            // An absolute path: only the file:///abs spelling ("./file:/abs"
+            // would be a path under a directory named "file:").
+            (
+                "file:/tmp/ops.tsv.zst",
+                &["'file:///tmp/ops.tsv.zst'"],
+                &["'./", "begins with"],
+            ),
+            (
+                "File:/tmp/ops.tsv.zst",
+                &["'file:///tmp/ops.tsv.zst'"],
+                &["'./", "begins with"],
+            ),
+            // Nothing after the colon: the generic example only.
+            ("file:", &["'file:///"], &["'./", "begins with"]),
+        ];
+        for (uri, wants, unwanted) in cases {
             let err = resolve_local_oplog_path(uri)
                 .err()
                 .unwrap_or_else(|| panic!("{uri} must be rejected"));
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
             let msg = err.to_string();
-            assert!(msg.contains(&format!("'{uri}'")), "{uri}: {msg}");
             assert!(
-                msg.contains("file:///") && msg.contains(&format!("./{uri}")),
-                "{uri}: the message must show both the file:// form and the ./ form: {msg}"
+                msg.contains(&format!("op-log path '{uri}'")),
+                "{uri}: {msg}"
             );
+            for want in wants {
+                assert!(msg.contains(want), "{uri}: missing {want}: {msg}");
+            }
+            for not in unwanted {
+                assert!(!msg.contains(not), "{uri}: must not contain {not}: {msg}");
+            }
         }
     }
 
+    // The case that really created a file before the fix: `file:x`, one colon,
+    // no slashes, relative to the current directory. Run in a fresh process so
+    // changing the current directory cannot disturb other tests.
     #[test]
-    fn file_colon_destination_creates_nothing() {
+    fn bare_file_colon_name_creates_no_file_in_the_current_directory() {
+        super::fresh_process::run(
+            module_path!(),
+            "bare_file_colon_name_creates_no_file_in_the_current_directory",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                std::env::set_current_dir(dir.path()).unwrap();
+                for uri in ["file:x", "file:ops.tsv.zst", "FILE:x"] {
+                    let err = Logger::new(uri)
+                        .err()
+                        .unwrap_or_else(|| panic!("{uri} must be rejected"));
+                    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}: {err}");
+                }
+                let left: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                assert!(
+                    left.is_empty(),
+                    "a rejected destination left files: {left:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn file_colon_absolute_destination_creates_nothing() {
         // "file:/<dir>/ops": before the fix this was a relative path under a
-        // directory named "file:" ("No such file or directory"); and "file:x"
-        // created a file named "file:x". Neither may touch the disk now.
+        // directory named "file:" ("No such file or directory"). It must be
+        // rejected up front, not fail inside File::create.
         let dir = tempfile::tempdir().unwrap();
         let abs = dir.path().join("ops.tsv.zst");
         let uri = format!("file:{}", abs.display());
