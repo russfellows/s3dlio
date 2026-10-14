@@ -183,7 +183,9 @@ class S3PyTorchConnectorStorage(S3Storage):
             else:
                 # Cloud storage: scheme://bucket/prefix
                 bucket = parsed.netloc
-                prefix = parsed.path.lstrip("/")
+                # Only the "/" after the bucket is a separator; a further "/" or an
+                # empty segment is part of the key prefix (issue #198).
+                prefix = parsed.path.removeprefix("/")
                 if prefix and not prefix.endswith("/"):
                     prefix += "/"
                 full_uri = f"{parsed.scheme}://{bucket}/{prefix}"

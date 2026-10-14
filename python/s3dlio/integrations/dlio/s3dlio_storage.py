@@ -152,7 +152,8 @@ class S3dlioStorage(DataStorage):
         parsed = urlparse(namespace)
         self.scheme = parsed.scheme or "s3"
         self.bucket = parsed.netloc
-        self.base_path = parsed.path.lstrip("/")
+        # Exactly the key prefix: only the one "/" after the bucket is a separator (#198).
+        self.base_path = parsed.path.removeprefix("/")
 
         # Get storage options from config if available
         storage_options = getattr(self._args, "storage_options", {}) or {}
@@ -294,15 +295,27 @@ class S3dlioStorage(DataStorage):
             return self._select_endpoint_via_strategy(endpoint_uris, "round_robin")
 
     def _make_uri(self, path: str) -> str:
-        """Convert a relative path to a full URI."""
+        """Convert a relative path to a full URI.
+
+        Keys are used exactly as written (issue #198): the namespace and the path
+        are joined by ONE "/", and a "/" or an empty segment in the path is part of
+        the key. ``/x`` and ``x`` (or ``a//b`` and ``a/b``) are different objects.
+        A single trailing "/" of the namespace is the separator; the empty path
+        names the namespace itself.
+        """
         if path.startswith(("s3://", "az://", "gs://", "file://", "direct://")):
             return path
-        # Combine with prefix
-        prefix = self.prefix.rstrip("/")
-        path = path.lstrip("/")
+        prefix = self.prefix.removesuffix("/")
         if path:
             return f"{prefix}/{path}"
         return prefix
+
+    def _dir_uri(self, path: str) -> str:
+        """The URI to list for the "directory" ``path`` (the namespace itself if empty)."""
+        if not path:
+            return self.prefix if self.prefix.endswith("/") else self.prefix + "/"
+        uri = self._make_uri(path)
+        return uri if uri.endswith("/") else uri + "/"
 
     @dlp.log
     def get_uri(self, id):
@@ -351,8 +364,7 @@ class S3dlioStorage(DataStorage):
 
         # Check if it's a "directory" by listing children
         try:
-            check_uri = uri if uri.endswith("/") else uri + "/"
-            children = s3dlio.list(check_uri)
+            children = s3dlio.list(self._dir_uri(id))
             if children:
                 return MetadataType.DIRECTORY
         except Exception:
@@ -365,11 +377,8 @@ class S3dlioStorage(DataStorage):
         """
         List objects under a path. Returns relative filenames.
         """
-        uri = self._make_uri(id)
-
         # Ensure ends with / for directory listing
-        if not uri.endswith("/"):
-            uri += "/"
+        uri = self._dir_uri(id)
 
         try:
             # s3dlio.list returns full URIs

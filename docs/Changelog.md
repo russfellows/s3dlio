@@ -1,5 +1,33 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed — object keys are used exactly as written in every layer (#198, the rest of the issue)
+
+After #172 the core addresses `s3://b//k` as the key `/k`. These layers still normalised keys, so for a
+key that begins with `/` or contains `//` they addressed or reported a different object than the core.
+**Behaviour change:** in the layers below, `/x` and `x`, or `a//b` and `a/b`, are now different objects.
+Only the ONE `/` that separates a base from a key is removed.
+
+- **DLIO integration** (`s3dlio_storage.py`, `s3_torch_storage.py`): an id is joined to the namespace by
+  one `/` and is otherwise untouched (`put_data("/x")` under `s3://b/base` writes `base//x`, no longer
+  `base/x`); a namespace loses at most one trailing `/`; `walk_node` lists the exact prefix. A DLIO
+  config that passed ids with a leading `/` expecting them to be re-rooted must drop that `/`.
+- **`s3dlio.compat.s3torchconnector`**: `S3Item.key` for `s3://b//k` is `/k` (was `k`), as AWS's own
+  `s3torchconnector` does (its `parse_s3_uri` splits at the first `/` and strips nothing);
+  `S3Client.put_object` / `get_object` / `list_objects` address the key and prefix exactly (a
+  `list_objects` prefix URI loses at most one trailing `/` rather than all of them).
+- **Azure https URI form**: `https://acct.blob.core.windows.net/c//k` is the container `c`, key `/k`,
+  the same blob as `az://acct/c//k` (it was key `k`). A URL with an empty container is an error.
+- **arrow-backend** (`--no-default-features --features arrow-backend`): `object_store`'s `Path::from`
+  drops empty segments, so `s3://b//x` addressed the object `x` and `s3://b/a//b` addressed `a/b`.
+  Such keys, and an object key ending in `/`, are now refused with an error naming the key instead of
+  addressing another object (`object_store::path::Path` cannot represent them). A listing prefix may
+  still end in `/`.
+- **Op-log replay onto a target** (`translate_uri`): a row for the object `/x` (logged `bkt//x`) replays
+  to `<target>//x`, no longer `<target>/x`. Rows that are not a shape s3dlio writes (hand-written,
+  legacy `S3Ops` `endpoint`+bare key) still lose one leading `/` of `file`, as pinned since #184.
+
 ## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
 
 Fixes 12 issues: #167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215.

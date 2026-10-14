@@ -828,6 +828,10 @@ for result in client.list_objects("my-bucket", "prefix/"):
         print(info.key)
 ```
 
+Keys are used exactly as written, as in AWS's `s3torchconnector`: only the `/` after the bucket is a
+separator, so `S3Item("s3://b//k", ...)` has `key == "/k"`, and `/k`, `k` and `a//b`, `a/b` are different
+objects (the DLIO storage classes follow the same rule).
+
 ### Advantages over s3torchconnector
 
 | Feature | s3torchconnector | s3dlio compat |

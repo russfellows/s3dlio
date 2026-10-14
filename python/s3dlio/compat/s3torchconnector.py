@@ -152,17 +152,21 @@ class S3Item:
     def _parse_uri_parts(self, parsed):
         """Extract bucket/container and key from parsed URI."""
         scheme = parsed.scheme or "s3"
+        # Keys are exact (issue #198): only the "/" after the bucket/container is a
+        # separator. `s3://b//k` is bucket `b`, key `/k`, as in AWS's s3torchconnector
+        # (`parse_s3_uri` splits at the first "/" and strips nothing).
+        path = parsed.path.removeprefix("/")
 
         if scheme == "s3":
             bucket = parsed.netloc
-            key = parsed.path.lstrip("/")
+            key = path
         elif scheme == "az":
-            parts = parsed.path.lstrip("/").split("/", 1)
+            parts = path.split("/", 1)
             bucket = f"{parsed.netloc}/{parts[0]}" if len(parts) > 0 else parsed.netloc
             key = parts[1] if len(parts) > 1 else ""
         elif scheme == "gs":
             bucket = parsed.netloc
-            key = parsed.path.lstrip("/")
+            key = path
         elif scheme in ("file", "direct"):
             full_path = parsed.path
             if "/" in full_path:
@@ -173,7 +177,7 @@ class S3Item:
                 key = full_path
         else:
             bucket = parsed.netloc or "unknown"
-            key = parsed.path.lstrip("/")
+            key = path
 
         return bucket, key
 
@@ -620,7 +624,7 @@ class S3Client:
             or key.startswith("file://")
         ):
             return key
-        return f"s3://{bucket}/{key.lstrip('/')}"
+        return f"s3://{bucket}/{key}"
 
     def put_object(self, bucket, key):
         """
@@ -719,9 +723,9 @@ class S3Client:
             or prefix.startswith("gs://")
             or prefix.startswith("file://")
         ):
-            uri = prefix.rstrip("/") + "/"
+            uri = prefix if prefix.endswith("/") else prefix + "/"
         else:
-            uri = f"s3://{bucket}/{prefix.lstrip('/')}"
+            uri = f"s3://{bucket}/{prefix}"
 
         class ObjectInfo:
             """Object metadata"""
