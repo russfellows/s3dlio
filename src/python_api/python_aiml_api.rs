@@ -3095,18 +3095,21 @@ pub fn read_tfrecord_index(index_path: &str) -> PyResult<Vec<(u64, u64)>> {
 ///     offsets = s3dlio.parquet_rg_row_offsets("s3://bucket/path/file.parquet")
 ///     # offsets == [0, 8192, 16384, ..., 1000000]
 #[pyfunction]
-pub fn parquet_rg_row_offsets(uri: &str) -> PyResult<Vec<i64>> {
+pub fn parquet_rg_row_offsets(py: Python<'_>, uri: &str) -> PyResult<Vec<i64>> {
     use crate::data_loader::parquet_file_cache;
     use crate::data_loader::parquet_rg::DEFAULT_FOOTER_CAP;
     use crate::s3_client::run_on_global_rt;
 
     let uri_owned = uri.to_owned();
-    let cached = run_on_global_rt(async move {
-        parquet_file_cache::get_or_fetch(&uri_owned, DEFAULT_FOOTER_CAP as u64).await
-    })
-    .map_err(py_err)?;
+    // GIL released while the footer is fetched (issue #201).
+    py.detach(|| {
+        let cached = run_on_global_rt(async move {
+            parquet_file_cache::get_or_fetch(&uri_owned, DEFAULT_FOOTER_CAP as u64).await
+        })
+        .map_err(py_err)?;
 
-    Ok(cached.rg_row_offsets.clone())
+        Ok(cached.rg_row_offsets.clone())
+    })
 }
 
 /// Evict a single file from the Parquet metadata cache.
