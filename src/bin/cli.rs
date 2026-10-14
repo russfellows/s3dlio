@@ -631,6 +631,13 @@ fn parse_human_count(input: &str) -> std::result::Result<usize, String> {
 /// in `s3dlio::constants::MAX_JOBS` (currently 4,096).
 fn parse_jobs(input: &str) -> std::result::Result<usize, String> {
     let n = parse_human_count(input)?;
+    // Issue #211: 0 jobs builds a permit-less semaphore and the command hangs.
+    if n == 0 {
+        return Err(format!(
+            "invalid jobs value '{}': jobs must be an integer >= 1 (valid range: 1 to {})",
+            input, MAX_JOBS
+        ));
+    }
     if n > MAX_JOBS {
         return Err(format!(
             "invalid jobs value '{}': {} exceeds the maximum of {} jobs. \
@@ -2507,6 +2514,14 @@ mod tests {
         assert_eq!(parse_jobs("256").unwrap(), 256);
         assert_eq!(parse_jobs("1000").unwrap(), 1000); // delete default
         assert_eq!(parse_jobs(&MAX_JOBS.to_string()).unwrap(), MAX_JOBS); // exactly at ceiling
+    }
+
+    #[test]
+    fn parse_jobs_rejects_zero() {
+        // Issue #211: 0 jobs builds a permit-less semaphore and hangs.
+        let err = parse_jobs("0").expect_err("0 jobs must be rejected");
+        assert!(err.contains(">= 1"), "{err}");
+        assert!(parse_jobs("0k").is_err());
     }
 
     #[test]

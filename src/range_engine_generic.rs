@@ -244,6 +244,13 @@ impl RangeEngine {
         F: Fn(u64, u64) -> Fut + Send + Sync + Clone + 'static,
         Fut: std::future::Future<Output = Result<Bytes>> + Send,
     {
+        // Issue #211: a range limit of 0 builds a permit-less semaphore and
+        // never fetches a range.
+        crate::concurrency::require_concurrency_at_least_one(
+            "max_concurrent_ranges",
+            self.config.max_concurrent_ranges,
+        )?;
+
         // audit #152 bug 2.8 (D9): a zero-byte object is a legitimate,
         // existing object (an empty file) -- not an error. Previously
         // this bailed with "Cannot download zero-sized object", turning

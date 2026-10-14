@@ -679,6 +679,9 @@ pub trait ObjectStore: Send + Sync {
     ) -> Result<std::collections::HashMap<String, u64>> {
         use futures::stream::{self, StreamExt};
 
+        // Issue #211: `buffer_unordered(0)` never polls anything and hangs.
+        crate::concurrency::require_concurrency_at_least_one("max_concurrent", max_concurrent)?;
+
         tracing::debug!(
             "Pre-statting {} objects (concurrent, max={})",
             uris.len(),
@@ -4295,6 +4298,8 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
     max_in_flight: usize,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<TransferSummary> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Expand patterns (globs, regex, and single paths)
     let mut paths = Vec::new();
     for pat in patterns {
@@ -4524,6 +4529,8 @@ pub async fn generic_download_objects_with_summary(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<TransferSummary> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     let store = store_for_uri_with_logger(src_uri, global_logger())?;
 
     // List objects to download

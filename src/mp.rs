@@ -172,6 +172,11 @@ impl RunSummary {
 
 /// Run a multi-process GET operation with the given configuration
 pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
+    // Issue #211: each worker is started with `--concurrent N`; 0 would hang it.
+    crate::concurrency::require_concurrency_at_least_one(
+        "concurrent_per_proc",
+        cfg.concurrent_per_proc,
+    )?;
     let start = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
 

@@ -1562,6 +1562,11 @@ pub async fn get_object_concurrent_range_async(
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
 ) -> Result<Bytes> {
+    // Issue #211: an explicit limit of 0 would hang a large-object GET; refuse
+    // it up front whatever the object size turns out to be.
+    if let Some(n) = max_concurrency {
+        crate::concurrency::require_concurrency_at_least_one("max_concurrency", n)?;
+    }
     let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET concurrent range: no key specified");
@@ -2278,6 +2283,8 @@ pub fn get_object_uri(uri: &str) -> anyhow::Result<Bytes> {
 ///   On subsequent epochs the cache is already warm; zero HEADs issued.
 /// - O(N log N) sort: replaced O(N²) linear scan with a pre-built HashMap index.
 pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec<(String, Bytes)>> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Issue #197: refuse the whole batch up front if any URI names another server.
     crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec();
@@ -2395,6 +2402,8 @@ pub fn get_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<Vec<(String, Bytes)>> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Issue #197: refuse the whole batch up front if any URI names another server.
     crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec(); // own for 'static
@@ -2630,6 +2639,8 @@ pub fn put_objects_with_random_data_and_type_with_progress(
     config: Config,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<()> {
+    // Issue #211: a limit of 0 would hang; refuse it before generating data.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     info!(
         "put_objects: type={:?}, size={} bytes, uris={} parallelism={}",
         config.object_type,
@@ -2736,6 +2747,8 @@ pub(crate) fn put_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> anyhow::Result<()> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Get the global logger once, outside the async block
     let logger = global_logger();
 
