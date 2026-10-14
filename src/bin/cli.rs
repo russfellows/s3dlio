@@ -193,10 +193,11 @@ enum Command {
     },
     /// Delete one exact object, or with -r every object under a literal key prefix.
     ///
-    /// Without -r, `delete s3://bkt/foo` and `delete s3://bkt/foo/` delete ONLY the
-    /// object with exactly that key (a trailing slash does not mean "recursive"). If
-    /// that object does not exist the command fails; it never lists or expands the
-    /// name. This needs HEAD (read) permission as well as delete permission.
+    /// Without -r, `delete s3://bkt/foo` and `delete s3://bkt/foo/` send ONE delete
+    /// request for exactly that key (a trailing slash does not mean "recursive"); the
+    /// name is never listed or expanded. An object that is already missing counts as
+    /// success (S3 does not report whether it existed); real failures such as access
+    /// denied are reported. On file:// and direct://, a directory is refused without -r.
     ///
     /// With -r, `delete -r s3://bkt/foo/` deletes every object whose key starts with
     /// `foo/`, nested ones included. `delete -r s3://bkt/foo` uses the literal prefix
