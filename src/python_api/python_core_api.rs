@@ -1851,8 +1851,10 @@ pub fn get_many(
 ///
 /// ``delete(uri)`` deletes ONLY the object named by ``uri``:
 ///
-/// * The object is looked up first (S3: a HEAD request). A missing object
-///   raises ``FileNotFoundError`` ("no such object: ..."); nothing is deleted.
+/// * The object is looked up first (S3: a HEAD request). On S3 a missing
+///   object (HEAD 404) raises ``FileNotFoundError`` ("no such object: ...");
+///   nothing is deleted. On other backends a missing object raises
+///   ``RuntimeError`` ("cannot confirm that ... exists; nothing was deleted").
 /// * A lookup that fails for any other reason (permission denied, network
 ///   error, ...) raises ``RuntimeError`` and deletes nothing.
 /// * ``/``, ``*`` and ``?`` are ordinary key characters: ``s3://b/dir/`` names
@@ -1877,9 +1879,10 @@ pub fn get_many(
 /// implicit expansion of a trailing ``/``, ``*`` or ``?`` (issue #212).
 ///
 /// Raises:
-///     FileNotFoundError: the exact object does not exist.
-///     RuntimeError: any other failure (nothing is deleted when the lookup or
-///         the first listing page fails).
+///     FileNotFoundError: the exact object does not exist (S3).
+///     RuntimeError: a missing object on other backends, and any other
+///         failure (nothing is deleted when the lookup or the first listing
+///         page fails).
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false))]
 pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {

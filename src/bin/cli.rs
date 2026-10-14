@@ -1915,9 +1915,9 @@ async fn delete_exact_object(
     store: &dyn s3dlio::object_store::ObjectStore,
     uri: &str,
 ) -> Result<()> {
-    info!("Deleting single object: {}", uri);
     match s3dlio::delete_contract::delete_exact_object(store, uri).await {
         Ok(()) => {
+            info!("Deleted single object: {}", uri);
             eprintln!("Deleted {uri}");
             Ok(())
         }
