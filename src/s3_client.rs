@@ -27,6 +27,65 @@ use tracing::{debug, info}; // For logging
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 // -----------------------------------------------------------------------------
+// Endpoint override resolution (issue #183)
+// -----------------------------------------------------------------------------
+
+/// Name of the AWS SDK's service-specific endpoint override for S3.
+pub const ENV_ENDPOINT_URL_S3: &str = "AWS_ENDPOINT_URL_S3";
+/// Name of the AWS SDK's global endpoint override (all services).
+pub const ENV_ENDPOINT_URL: &str = "AWS_ENDPOINT_URL";
+
+/// Pick the S3 endpoint override from the two environment values, with the
+/// AWS SDK's documented precedence: the service-specific `AWS_ENDPOINT_URL_S3`
+/// wins over the global `AWS_ENDPOINT_URL`. An empty value counts as unset.
+///
+/// Pure (no environment access) so the rule can be unit-tested.
+pub(crate) fn resolve_s3_endpoint_override(
+    service_specific: Option<&str>,
+    global: Option<&str>,
+) -> Option<String> {
+    [service_specific, global]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// The S3 endpoint override from the process environment, or `None` when
+/// neither variable is set (non-empty): `AWS_ENDPOINT_URL_S3` first, then
+/// `AWS_ENDPOINT_URL` (issue #183).
+///
+/// Every place in s3dlio that reads "the endpoint the environment names" uses
+/// this, so the global client, the store cache key and the diagnostics cannot
+/// disagree about which server a request goes to.
+pub fn s3_endpoint_url_from_env() -> Option<String> {
+    resolve_s3_endpoint_override(
+        env::var(ENV_ENDPOINT_URL_S3).ok().as_deref(),
+        env::var(ENV_ENDPOINT_URL).ok().as_deref(),
+    )
+}
+
+/// Make `url` the S3 endpoint for the rest of the process, for an explicit
+/// caller request (`s3-cli --endpoint-url`, Python `configure_s3`).
+///
+/// Sets `AWS_ENDPOINT_URL`, and also `AWS_ENDPOINT_URL_S3` if it is set:
+/// otherwise the service-specific variable, which has precedence (issue #183),
+/// would silently override what the caller just asked for.
+///
+/// Call it before any S3 client is created, while no other thread reads or
+/// writes the environment (process start, or `configure_s3` under the GIL).
+pub fn set_s3_endpoint_override(url: &str) {
+    // SAFETY: documented precondition above: called before any S3 client or
+    // worker thread exists, so nothing reads the environment concurrently.
+    unsafe {
+        env::set_var(ENV_ENDPOINT_URL, url);
+        if env::var_os(ENV_ENDPOINT_URL_S3).is_some() {
+            env::set_var(ENV_ENDPOINT_URL_S3, url);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Global runtime + S3 client (lazy, thread-safe)
 // -----------------------------------------------------------------------------
 static RT_HANDLE: once_cell::sync::OnceCell<Handle> = once_cell::sync::OnceCell::new();
@@ -452,11 +511,12 @@ pub async fn aws_s3_client_async() -> Result<Client> {
 
             let mut loader =
                 aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12()).region(region);
-            if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL") {
-                if !endpoint.is_empty() {
-                    info!("Custom S3 endpoint: {}", endpoint);
-                    loader = loader.endpoint_url(endpoint);
-                }
+            // AWS_ENDPOINT_URL_S3 (service-specific) wins over AWS_ENDPOINT_URL,
+            // as in the AWS SDK (issue #183). Applied explicitly so the choice
+            // is made here, once, rather than by SDK-internal ordering.
+            if let Some(endpoint) = s3_endpoint_url_from_env() {
+                info!("Custom S3 endpoint: {}", endpoint);
+                loader = loader.endpoint_url(endpoint);
             }
 
             // Load config fully async with optimized timeout configuration.
@@ -503,7 +563,7 @@ pub async fn aws_s3_client_async() -> Result<Client> {
                 .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
                 .build();
             info!("S3 client ready (path-style: forced, endpoint: {})",
-                env::var("AWS_ENDPOINT_URL").ok().as_deref().unwrap_or("AWS default"));
+                s3_endpoint_url_from_env().as_deref().unwrap_or("AWS default"));
             Ok::<_, anyhow::Error>(Client::from_conf(s3_config))
         })
         .await?;
@@ -1009,5 +1069,47 @@ pub(crate) mod issue173_worker_reentrancy_tests {
             Some(r) => assert_eq!(r.expect("foreign worker caller failed"), 9),
             None => panic!("run_on_global_rt from a foreign 1-worker runtime hung"),
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests -- issue #183: AWS_ENDPOINT_URL_S3 takes precedence over AWS_ENDPOINT_URL
+// -----------------------------------------------------------------------------
+#[cfg(test)]
+mod endpoint_override_precedence_tests {
+    use super::resolve_s3_endpoint_override as resolve;
+
+    #[test]
+    fn service_specific_wins_over_global() {
+        assert_eq!(
+            resolve(Some("http://s3-only:9000"), Some("http://global:9000")).as_deref(),
+            Some("http://s3-only:9000")
+        );
+    }
+
+    #[test]
+    fn global_is_used_when_service_specific_is_absent_or_empty() {
+        assert_eq!(
+            resolve(None, Some("http://global:9000")).as_deref(),
+            Some("http://global:9000")
+        );
+        assert_eq!(
+            resolve(Some(""), Some("http://global:9000")).as_deref(),
+            Some("http://global:9000")
+        );
+    }
+
+    #[test]
+    fn service_specific_alone_is_used() {
+        assert_eq!(
+            resolve(Some("http://s3-only:9000"), None).as_deref(),
+            Some("http://s3-only:9000")
+        );
+    }
+
+    #[test]
+    fn nothing_set_or_only_empty_values_is_no_override() {
+        assert_eq!(resolve(None, None), None);
+        assert_eq!(resolve(Some(""), Some("")), None);
     }
 }

@@ -95,7 +95,7 @@ impl StoreKey {
     /// the global-client cache entry.
     fn from_uri(uri: &str) -> anyhow::Result<Self> {
         let scheme = uri.split("://").next().unwrap_or("s3");
-        let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
+        let endpoint = crate::s3_client::s3_endpoint_url_from_env().unwrap_or_default();
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
         Ok(StoreKey {
@@ -1099,7 +1099,7 @@ pub fn configure_s3(
     // SAFETY: Python is single-threaded at this call site (GIL held); no S3
     // client or store has been created yet in the expected call pattern.
     if let Some(url) = endpoint_url {
-        unsafe { std::env::set_var("AWS_ENDPOINT_URL", url) };
+        crate::s3_client::set_s3_endpoint_override(url);
     }
     if let Some(r) = region {
         unsafe { std::env::set_var("AWS_DEFAULT_REGION", r) };

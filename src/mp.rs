@@ -239,6 +239,7 @@ pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
             "AWS_SECRET_ACCESS_KEY",
             "AWS_REGION",
             "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT_URL_S3",
             "AWS_PROFILE",
             "AWS_DEFAULT_REGION",
         ];

@@ -687,9 +687,9 @@ async fn main() -> Result<()> {
     // downstream code (aws_s3_client_async, list_buckets, store_for_uri, …)
     // picks it up via AWS_ENDPOINT_URL without modification.
     // CLI flag takes precedence over whatever is already in the environment.
+    // AWS_ENDPOINT_URL_S3, if set, is overridden too: it would otherwise win (#183).
     if let Some(ref url) = cli.endpoint_url {
-        // SAFETY: single-threaded at this point; no S3 client has been created yet.
-        unsafe { std::env::set_var("AWS_ENDPOINT_URL", url) };
+        s3dlio::s3_client::set_s3_endpoint_override(url);
     }
     if let Some(ref region) = cli.region {
         unsafe { std::env::set_var("AWS_DEFAULT_REGION", region) };

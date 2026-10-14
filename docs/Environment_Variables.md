@@ -333,6 +333,7 @@ Standard AWS environment variables are also supported:
 | `AWS_SESSION_TOKEN` | AWS session token (for temporary credentials) |
 | `AWS_REGION` | AWS region (e.g., `us-east-1`) |
 | `AWS_ENDPOINT_URL` | Custom S3 endpoint URL (for MinIO or other S3-compatible storage) |
+| `AWS_ENDPOINT_URL_S3` | S3-specific endpoint URL. Takes precedence over `AWS_ENDPOINT_URL`, as in the AWS SDK (issue #183). An empty value counts as unset. `s3-cli --endpoint-url` and Python `configure_s3(endpoint_url=...)` override both. A server named in the URI (`s3://host:port/bucket`) overrides all of them for that URI. |
 | `AWS_CA_BUNDLE` | Path to custom CA certificate bundle (standard AWS SDK name) |
 
 ### `s3://host:port/bucket/key` server-vs-bucket rule (changed in v0.9.120; issues #178, #193, #194)

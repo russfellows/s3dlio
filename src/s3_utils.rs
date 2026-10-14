@@ -140,10 +140,7 @@ where
                 "NoSuchBucket" => " — bucket does not exist; check the bucket name in the URI",
                 "AccessDenied" => " — check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
                 "InvalidAccessKeyId" => {
-                    if std::env::var("AWS_ENDPOINT_URL")
-                        .map(|v| v.is_empty())
-                        .unwrap_or(true)
-                    {
+                    if crate::s3_client::s3_endpoint_url_from_env().is_none() {
                         " — AWS_ACCESS_KEY_ID is not recognised by the server; \
                           no endpoint URL is set — did you forget --endpoint-url or AWS_ENDPOINT_URL? \
                           (credentials valid for a custom endpoint are rejected by real AWS S3)"
@@ -962,7 +959,7 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
 
         // Log resolved params for diagnostics (pure helper, no side effects).
         resolve_list_buckets_params(
-            std::env::var("AWS_ENDPOINT_URL").ok().as_deref(),
+            crate::s3_client::s3_endpoint_url_from_env().as_deref(),
             std::env::var("AWS_REGION")
                 .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                 .ok()
