@@ -225,6 +225,23 @@ impl PrefixDeleteReport {
     }
 }
 
+/// Send one filled batch: one `delete_batch`, or one `delete` per object.
+async fn send(store: &dyn ObjectStore, mode: DeleteMode, uris: &[String]) -> Result<()> {
+    match mode {
+        DeleteMode::Batched => store.delete_batch(uris).await,
+        DeleteMode::PerObject => {
+            for uri in uris {
+                match store.delete(uri).await {
+                    Ok(()) => {}
+                    Err(e) if is_not_found(&e) => {}
+                    Err(e) => return Err(e.context(format!("failed to delete {uri}"))),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// A predicate over the listed object URI (`s3://bkt/key`) narrowing the
 /// selection.
 pub type SelectionFilter<'a> = &'a (dyn Fn(&str) -> bool + Sync);
@@ -232,21 +249,42 @@ pub type SelectionFilter<'a> = &'a (dyn Fn(&str) -> bool + Sync);
 /// for so far)`; for progress display.
 pub type ProgressHook<'a> = &'a (dyn Fn(u64, usize) + Sync);
 
+/// How the selected objects are deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMode {
+    /// Batches of up to [`DELETE_REQUEST_KEYS`] keys per
+    /// [`ObjectStore::delete_batch`] (S3 DeleteObjects), `s3-cli delete -r`.
+    Batched,
+    /// One [`ObjectStore::delete`] per object (a single-key request each, the
+    /// op-log records one `DELETE` row per object), Python
+    /// `delete(..., recursive=True)`.  An object that has vanished since it was
+    /// listed (a typed not-found error) counts as deleted, as for an exact delete.
+    PerObject,
+}
+
 /// Delete the real objects under the literal prefix `uri`, listed recursively
 /// ([`ObjectStore::list_objects_with_prefix`]: no delimiter, objects only, no
-/// `/` appended), optionally narrowed by `filter`.
+/// `/` appended), optionally narrowed by `filter`.  The selection is the same
+/// for both [`DeleteMode`]s; only the way each selected object is deleted differs.
 ///
 /// After any failure (a delete request, a per-key error, the listing) no
-/// further DeleteObjects request is SENT: the check is made immediately before
-/// each send, so a batch that was only filled after the failure is skipped and
-/// counted as not attempted.  Requests already in flight finish.  Never
-/// panics; every failure is recorded in the returned report.
+/// further delete request is SENT: the check is made immediately before each
+/// send, so a batch that was only filled after the failure is skipped and
+/// counted as not attempted.  A listing error also cancels the batch being
+/// assembled when it occurs: its unsent keys are counted as not attempted, not
+/// sent.  Requests already in flight finish.  Never panics; every failure is
+/// recorded in the returned report.
 pub async fn delete_objects_under_literal_prefix(
     store: &dyn ObjectStore,
     uri: &str,
     filter: Option<SelectionFilter<'_>>,
+    mode: DeleteMode,
     progress: Option<ProgressHook<'_>>,
 ) -> PrefixDeleteReport {
+    let chunk_keys = match mode {
+        DeleteMode::Batched => DELETE_REQUEST_KEYS,
+        DeleteMode::PerObject => 1,
+    };
     let stop = AtomicBool::new(false);
     // `listed`: objects the listing returned, counted BEFORE the filter.
     // `selected`: objects that passed the filter, i.e. were handed to deletion.
@@ -278,7 +316,7 @@ pub async fn delete_objects_under_literal_prefix(
 
     let stop_ref = &stop;
     let outcomes = selection
-        .chunks(DELETE_REQUEST_KEYS)
+        .chunks(chunk_keys)
         .map(|chunk| async move {
             let mut uris = Vec::with_capacity(chunk.len());
             let mut list_error = None;
@@ -291,10 +329,11 @@ pub async fn delete_objects_under_literal_prefix(
                     }
                 }
             }
-            // The last look before sending: a batch filled after a failure is
-            // not sent. (A listing error in this very batch does not stop its
-            // own, already listed keys.)
-            let stopped = stop_ref.load(Ordering::Relaxed);
+            // The last look before sending. A batch filled after a failure is
+            // not sent, and neither is the batch in which the listing failed:
+            // the keys it holds were listed, but the listing that selected
+            // them did not finish, so they are counted as not attempted.
+            let stopped = stop_ref.load(Ordering::Relaxed) || list_error.is_some();
             if list_error.is_some() {
                 stop_ref.store(true, Ordering::Relaxed);
             }
@@ -306,7 +345,7 @@ pub async fn delete_objects_under_literal_prefix(
                     list_error,
                 };
             }
-            let result = store.delete_batch(&uris).await;
+            let result = send(store, mode, &uris).await;
             if result.is_err() {
                 stop_ref.store(true, Ordering::Relaxed);
             }
@@ -358,6 +397,8 @@ mod tests {
         keys: Mutex<BTreeSet<String>>,
         /// What `delete` fails with, if anything.
         delete_error: Option<fn() -> anyhow::Error>,
+        /// `delete` of exactly this URI fails with the given error.
+        delete_error_for: Option<(String, fn() -> anyhow::Error)>,
         literal_listing: bool,
         /// A DeleteObjects request naming this key fails.
         fail_batch_with_key: Option<String>,
@@ -372,6 +413,7 @@ mod tests {
             Fake {
                 keys: Mutex::new(keys.iter().map(|k| format!("s3://bkt/{k}")).collect()),
                 delete_error: None,
+                delete_error_for: None,
                 literal_listing: true,
                 fail_batch_with_key: None,
                 list_fails_after: None,
@@ -454,6 +496,11 @@ mod tests {
             self.note(format!("DELETE {uri}"));
             if let Some(make) = self.delete_error {
                 return Err(make());
+            }
+            if let Some((bad, make)) = &self.delete_error_for {
+                if bad == uri {
+                    return Err(make());
+                }
             }
             self.keys.lock().unwrap().remove(uri);
             Ok(())
@@ -662,7 +709,14 @@ mod tests {
     #[tokio::test]
     async fn prefix_delete_deletes_the_listed_objects_under_the_literal_prefix() {
         let f = Fake::new(&["foo", "foo/", "foo/x", "foobar", "other/x"]);
-        let report = delete_objects_under_literal_prefix(&f, "s3://bkt/foo", None, None).await;
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/foo",
+            None,
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
         assert!(!report.failed());
         assert_eq!(
             (report.listed, report.selected, report.requested),
@@ -678,8 +732,14 @@ mod tests {
     async fn prefix_delete_filter_narrows_the_selection_and_counts_before_and_after() {
         let f = Fake::new(&["p/a.txt", "p/b.log", "p/c.txt"]);
         let only_txt = |u: &str| u.ends_with(".txt");
-        let report =
-            delete_objects_under_literal_prefix(&f, "s3://bkt/p/", Some(&only_txt), None).await;
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/p/",
+            Some(&only_txt),
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
         assert_eq!(
             (report.listed, report.selected, report.requested),
             (3, 2, 2)
@@ -690,7 +750,14 @@ mod tests {
     #[tokio::test]
     async fn prefix_delete_with_nothing_under_the_prefix_sends_nothing() {
         let f = Fake::new(&["other/x"]);
-        let report = delete_objects_under_literal_prefix(&f, "s3://bkt/foo/", None, None).await;
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/foo/",
+            None,
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
         assert!(!report.failed());
         assert_eq!((report.listed, report.requested), (0, 0));
         assert_eq!(f.keys(), set(&["other/x"]));
@@ -702,7 +769,14 @@ mod tests {
         let names: Vec<String> = (0..2500).map(|i| format!("big/k{i:05}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let f = Fake::new(&refs);
-        let report = delete_objects_under_literal_prefix(&f, "s3://bkt/big/", None, None).await;
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/big/",
+            None,
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
         assert!(!report.failed());
         assert_eq!(report.requested, 2500);
         let mut sizes: Vec<usize> = f.batches.lock().unwrap().iter().map(Vec::len).collect();
@@ -718,7 +792,14 @@ mod tests {
         let mut f = Fake::new(&refs);
         // the first batch contains big/k00000 and fails
         f.fail_batch_with_key = Some("s3://bkt/big/k00000".to_string());
-        let report = delete_objects_under_literal_prefix(&f, "s3://bkt/big/", None, None).await;
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/big/",
+            None,
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
         assert!(report.failed());
         assert_eq!(report.failed_requests, 1);
         assert_eq!(
@@ -744,10 +825,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_listing_error_cancels_the_batch_being_assembled() {
+        let names: Vec<String> = (0..1500).map(|i| format!("big/k{i:05}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut f = Fake::new(&refs);
+        f.list_fails_after = Some(1500);
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/big/",
+            None,
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
+        // the full first batch was sent; the 500 keys listed before the error
+        // are NOT sent, they are counted as not attempted
+        assert_eq!(f.batches.lock().unwrap().len(), 1);
+        assert_eq!((report.requested, report.skipped), (1000, 500));
+        assert_eq!(report.list_problems.len(), 1);
+        assert_eq!(f.keys().len(), 500);
+        let text = format!(
+            "{:#}",
+            report.into_result("s3://bkt/big/", None).unwrap_err()
+        );
+        assert!(
+            text.contains("Sent delete requests for 1000 of the 1500 listed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("500 selected objects were NOT attempted"),
+            "{text}"
+        );
+        assert!(text.contains("listing refused"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_listing_error_in_the_only_batch_sends_nothing() {
+        let mut f = Fake::new(&["foo/a", "foo/b", "foo/c"]);
+        f.list_fails_after = Some(2);
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/foo/",
+            None,
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
+        assert!(f.batches.lock().unwrap().is_empty());
+        assert_eq!((report.requested, report.skipped, report.listed), (0, 2, 2));
+        assert_eq!(f.keys().len(), 3);
+        assert!(report.into_result("s3://bkt/foo/", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn per_object_mode_sends_one_delete_per_selected_object_and_no_batch() {
+        let f = Fake::new(&["foo/a", "foo/b", "foo/sub/c", "foobar", "other/x"]);
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/foo/",
+            None,
+            DeleteMode::PerObject,
+            None,
+        )
+        .await;
+        assert!(!report.failed());
+        assert_eq!(
+            (report.listed, report.selected, report.requested),
+            (3, 3, 3)
+        );
+        assert_eq!(f.keys(), set(&["foobar", "other/x"]));
+        let mut calls = f.calls();
+        calls.sort();
+        assert_eq!(
+            calls,
+            [
+                "DELETE s3://bkt/foo/a",
+                "DELETE s3://bkt/foo/b",
+                "DELETE s3://bkt/foo/sub/c",
+                "LIST_LITERAL s3://bkt/foo/",
+            ]
+        );
+        assert!(f.batches.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn per_object_mode_stops_after_a_failed_delete_and_counts_accurately() {
+        let names: Vec<String> = (0..60).map(|i| format!("p/k{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut f = Fake::new(&refs);
+        f.delete_error_for = Some(("s3://bkt/p/k00".to_string(), http_403_text));
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/p/",
+            None,
+            DeleteMode::PerObject,
+            None,
+        )
+        .await;
+        assert_eq!(report.failed_requests, 1);
+        assert!(
+            report.requested <= DELETE_REQUESTS_IN_FLIGHT,
+            "{}",
+            report.requested
+        );
+        let deletes = f
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("DELETE "))
+            .count();
+        assert_eq!(deletes, report.requested);
+        // the failed key and everything not sent is still there
+        assert!(f.keys().len() >= 60 - (report.requested - 1));
+        assert!(f.keys().contains("s3://bkt/p/k00"));
+        let text = format!("{:#}", report.into_result("s3://bkt/p/", None).unwrap_err());
+        assert!(text.contains("failed to delete s3://bkt/p/k00"), "{text}");
+        assert!(
+            text.contains("1 delete request(s) reported errors"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_object_mode_treats_a_vanished_object_as_deleted_and_honours_the_filter() {
+        let mut f = Fake::new(&["p/a.txt", "p/b.log", "p/c.txt"]);
+        f.delete_error_for = Some(("s3://bkt/p/a.txt".to_string(), io_not_found));
+        let only_txt = |u: &str| u.ends_with(".txt");
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/p/",
+            Some(&only_txt),
+            DeleteMode::PerObject,
+            None,
+        )
+        .await;
+        assert!(!report.failed(), "{:?}", report.delete_problems);
+        assert_eq!(
+            (report.listed, report.selected, report.requested),
+            (3, 2, 2)
+        );
+        assert!(f.keys().contains("s3://bkt/p/b.log"));
+    }
+
+    #[tokio::test]
     async fn prefix_delete_listing_failure_before_any_send_names_the_listing() {
         let mut f = Fake::new(&["foo/a", "foo/b"]);
         f.list_fails_after = Some(0);
-        let report = delete_objects_under_literal_prefix(&f, "s3://bkt/foo/", None, None).await;
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/foo/",
+            None,
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
         assert!(report.listing_failed_before_any_send());
         assert_eq!(f.keys(), set(&["foo/a", "foo/b"]));
         let text = format!(
@@ -765,7 +995,14 @@ mod tests {
     async fn prefix_delete_on_a_backend_without_literal_listing_needs_a_trailing_slash() {
         let mut f = Fake::new(&["foo/a", "foobar"]);
         f.literal_listing = false;
-        let report = delete_objects_under_literal_prefix(&f, "s3://bkt/foo", None, None).await;
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/foo",
+            None,
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
         assert!(report.listing_failed_before_any_send());
         let text = format!(
             "{:#}",
@@ -774,7 +1011,14 @@ mod tests {
         assert!(text.contains("without a trailing '/'"), "{text}");
         assert_eq!(f.keys(), set(&["foo/a", "foobar"]));
 
-        let report = delete_objects_under_literal_prefix(&f, "s3://bkt/foo/", None, None).await;
+        let report = delete_objects_under_literal_prefix(
+            &f,
+            "s3://bkt/foo/",
+            None,
+            DeleteMode::Batched,
+            None,
+        )
+        .await;
         assert!(!report.failed());
         assert_eq!(f.keys(), set(&["foobar"]));
     }

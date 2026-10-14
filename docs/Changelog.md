@@ -24,11 +24,15 @@ entry). **Code that relied on the old implicit expansion will now delete less; p
   (`... is a directory; use -r / recursive=True ...`) and deletes nothing, instead of removing the
   whole tree; a regular file is deleted and a missing path is success.
 - The op-log records an exact delete as one `DELETE` row, as before; no `HEAD` row is added.
+  `recursive=True` records one `LIST` row plus one `DELETE` row per object (replayable), not
+  `DELETE_BATCH`.
 - `delete(uri, recursive=True)` deletes the real objects under the literal prefix: listed with no
   delimiter, objects only, nothing appended (`foo` also matches `foobar`), `*` and `?` literal (the last
   URI segment used to be read as a regex). It needs list permission. A prefix with no objects is a
-  no-op. After a failed request or a listing error no further delete request is sent and the
-  `RuntimeError` says how many keys were and were not attempted.
+  no-op. Each selected object is deleted with its own request (up to 10 in flight), as before;
+  batching (DeleteObjects) is deferred for Python. After a failed request or a listing error no further
+  delete request is sent (requests already in flight finish) and the `RuntimeError` says how many
+  requests were sent and how many selected keys were not attempted.
 - Other backends: `recursive=True` requires a URI ending in `/` (otherwise `RuntimeError`, nothing
   deleted).
 - Library: the exact delete and the literal-prefix selection/batching now live in the new
@@ -60,6 +64,9 @@ implicit expansion will now delete less; add `-r` where you mean "everything und
   permission. `delete -r s3://bkt/foo` uses the literal prefix `foo`, so it also matches `foobar` (no
   `/` is appended). Key characters are never read as a regex or wildcard.
 - `-p/--pattern` is accepted only with `-r` and filters the `-r` selection; without `-r` it is an error.
+- A listing error part-way through a recursive delete does not send the partly filled batch in which
+  it occurred: those keys are counted as "NOT attempted" in the message. Batches that were already
+  complete have been sent (shared with Python `delete(..., recursive=True)`).
 - Messages for `-r` no longer overstate: `Sent delete requests for N objects found under prefix ... (N
   listed; 0 reported errors)`. S3 reports non-existent keys as deleted, so no "N deleted" count is
   claimed. A failed delete request, including a per-key error in an HTTP 200 response, names the keys

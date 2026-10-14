@@ -897,23 +897,18 @@ both_modes!(t12_truncated_page_without_token_is_an_error, |mode| {
         "{}",
         f.ctx(&r)
     );
-    // Only the three keys the first page returned may have been sent.
-    assert_eq!(
-        deleted_request_key_list(&f),
-        ["foo/a", "foo/b", "foo/c"],
+    // The incomplete listing cancels the batch being assembled: the three keys
+    // of the first page are not sent, they are counted as not attempted.
+    assert!(
+        r.out.contains("Sent delete requests for 0 of the 3 listed")
+            && r.out.contains("3 selected objects were NOT attempted"),
         "{}",
         f.ctx(&r)
     );
-    assert_eq!(f.mock.keys(), set(&["foo/d", "foo/e", "other/x"]));
+    assert!(deleted_request_key_list(&f).is_empty(), "{}", f.ctx(&r));
     assert_eq!(
-        f.mock
-            .log()
-            .iter()
-            .filter(|q| q.is_delete_objects())
-            .count(),
-        1,
-        "{}",
-        f.ctx(&r)
+        f.mock.keys(),
+        set(&["foo/a", "foo/b", "foo/c", "foo/d", "foo/e", "other/x"])
     );
     f.assert_decoy_untouched();
 });
@@ -930,24 +925,64 @@ both_modes!(t13_listing_error_midway_is_reported_accurately, |mode| {
     }
     let r = f.run(&["-r"], "foo/");
     assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
+    // The listing failed while the batch holding foo/a and foo/b was being
+    // assembled: that batch is NOT sent, its keys are counted as not attempted.
     assert!(
-        r.out.contains("Sent delete requests for 2 of the 2 listed")
+        r.out.contains("Sent delete requests for 0 of the 2 listed")
             && r.out.contains("no delete request reported an error")
+            && r.out.contains("2 selected objects were NOT attempted")
             && r.out.contains("listing failed")
             && r.out.contains("mock refuses to list"),
         "{}",
         f.ctx(&r)
     );
     assert!(!r.out.contains("0 reported errors"), "{}", f.ctx(&r));
+    assert!(
+        deleted_request_key_list(&f).is_empty(),
+        "no delete request may be sent:\n{}",
+        f.ctx(&r)
+    );
     assert_eq!(
-        deleted_request_key_list(&f),
-        ["foo/a", "foo/b"],
+        f.mock.keys(),
+        set(&["foo/a", "foo/b", "foo/c", "foo/d", "foo/e"]),
         "{}",
         f.ctx(&r)
     );
-    assert_eq!(f.mock.keys(), set(&["foo/c", "foo/d", "foo/e"]));
     f.assert_decoy_untouched();
 });
+
+// A full batch that was already complete when the listing failed IS sent; only
+// the partly filled batch in which the failure occurred is held back.
+both_modes!(
+    t13b_listing_error_sends_full_batches_but_not_the_partial_one,
+    |mode| {
+        let names: Vec<String> = (0..2500).map(|i| format!("many/{i:05}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let f = Fixture::new(mode, &refs);
+        {
+            let mut st = f.mock.state.lock().expect("state");
+            st.page_size = Some(1200);
+            st.list_failure = ListFailure::AfterFirstPage;
+        }
+        let r = f.run(&["-r"], "many/");
+        assert_ne!(r.code, 0, "must fail:\n{}", f.ctx(&r));
+        // page 1 listed 1200 keys: 1000 form a full batch (sent), 200 are the
+        // partial batch in which page 2 failed (not sent)
+        assert!(
+            r.out
+                .contains("Sent delete requests for 1000 of the 1200 listed")
+                && r.out.contains("200 selected objects were NOT attempted")
+                && r.out.contains("mock refuses to list"),
+            "{}",
+            f.ctx(&r)
+        );
+        let sent = deleted_request_key_list(&f);
+        assert_eq!(sent.len(), 1000, "{}", f.ctx(&r));
+        assert_eq!(f.mock.keys().len(), 1500, "{}", f.ctx(&r));
+        assert!(f.mock.keys().contains("many/01100"));
+        f.assert_decoy_untouched();
+    }
+);
 
 // ----------------------------------------------------------------------------
 // 14. A listing that fails at once reports the listing error, not a delete summary

@@ -1967,6 +1967,7 @@ async fn delete_prefix_objects(
         store,
         uri,
         filter.map(|_| &matches as s3dlio::delete_contract::SelectionFilter<'_>),
+        s3dlio::delete_contract::DeleteMode::Batched,
         Some(&progress),
     )
     .await;

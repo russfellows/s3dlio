@@ -51,6 +51,7 @@ class MockS3:
         self.list_status = None  # answer every delimiter-less listing with this status
         self.delete_error_keys = set()  # DeleteObjects reports these per key, deleting nothing
         self.page_size = None  # page delimiter-less listings
+        self.list_fail_after_first_page = False  # 403 every delimiter-less listing page after the first
         self.lock = threading.Lock()
         mock = self
 
@@ -133,6 +134,12 @@ class MockS3:
                         parts.append(f"<Deleted><Key>{escape(k)}</Key></Deleted>")
                 return 200, '<?xml version="1.0"?><DeleteResult>' + "".join(parts) + "</DeleteResult>"
             if method == "DELETE":
+                if key in self.delete_error_keys:
+                    return (
+                        403,
+                        '<?xml version="1.0"?><Error><Code>AccessDenied</Code>'
+                        "<Message>mock refuses this key</Message></Error>",
+                    )
                 self.keys.discard(key)
                 return 204, ""
             if method == "PUT":
@@ -144,6 +151,16 @@ class MockS3:
 
     def _list(self, query):
         delimiter = query.get("delimiter")
+        if (
+            self.list_fail_after_first_page
+            and delimiter is None
+            and "continuation-token" in query
+        ):
+            return (
+                403,
+                '<?xml version="1.0"?><Error><Code>AccessDenied</Code>'
+                "<Message>mock refuses to list</Message></Error>",
+            )
         if self.list_status is not None and delimiter is None:
             return (
                 self.list_status,
@@ -474,6 +491,102 @@ def test_recursive_per_key_error_in_a_successful_response_raises_and_names_the_k
     out = call_delete(m, "s3://bkt/foo/", recursive=True)
     assert_raises(out, "RuntimeError", m, "foo/b")
     assert "other" in m.keys and "foo/b" in m.keys, ctx(m, out)
+
+
+def delete_requests(mock):
+    """Every request that deletes: single DELETEs and DeleteObjects POSTs."""
+    return [
+        r
+        for r in mock.requests()
+        if r["method"] == "DELETE" or (r["method"] == "POST" and "delete" in r["query"])
+    ]
+
+
+def test_recursive_sends_one_list_then_one_single_key_delete_per_selected_object(mock_factory):
+    """Python keeps individual deletes (not batches): one recursive LIST, then one
+    delete request per selected object, each naming exactly ONE key. Keys outside the
+    literal prefix (foobar, other/x) are never named."""
+    m = mock_factory(["foo/", "foo/a", "foo/b/c", "foobar", "other/x"])
+    out = call_delete(m, "s3://bkt/foo/", recursive=True)
+    assert_returned(out, m)
+    assert m.keys == {"foobar", "other/x"}, ctx(m, out)
+    reqs = m.requests()
+    assert reqs[0]["method"] == "GET" and "list-type" in reqs[0]["query"], ctx(m, out)
+    assert len(m.lists()) == 1 and m.lists()[0]["query"].get("delimiter") is None, ctx(m, out)
+    deletes = delete_requests(m)
+    assert len(deletes) == 3, ctx(m, out)
+    assert all(r["method"] == "DELETE" or len(r["body_keys"]) == 1 for r in deletes), ctx(m, out)
+    assert sorted(m.sent_delete_keys()) == ["foo/", "foo/a", "foo/b/c"], ctx(m, out)
+    assert not m.requests("HEAD"), ctx(m, out)
+
+
+RECURSIVE_OPLOG_CHILD = """
+    oplog = sys.argv[1]
+    s3dlio.init_op_log(oplog)
+    s3dlio.delete("s3://bkt/foo/", recursive=True)
+    s3dlio.finalize_op_log()
+"""
+
+
+def test_recursive_records_one_list_row_and_one_delete_row_per_object_never_delete_batch(
+    mock_factory, tmp_path
+):
+    from collections import Counter
+
+    from test_oplog_lifecycle import read_rows
+
+    m = mock_factory(["foo/", "foo/a", "foo/b/c", "foobar"])
+    oplog = tmp_path / "ops.tsv.zst"
+    proc = run_scenario(textwrap.dedent(RECURSIVE_OPLOG_CHILD), str(oplog), env=env_for(m))
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    rows = read_rows(oplog)
+    assert Counter(r["op"] for r in rows) == {"LIST": 1, "DELETE": 3}, rows
+    # the op-log's file column is bucket/key
+    assert sorted(r["file"] for r in rows if r["op"] == "DELETE") == [
+        "bkt/foo/",
+        "bkt/foo/a",
+        "bkt/foo/b/c",
+    ], rows
+    assert all(r["error"] == "" for r in rows), rows
+    assert m.keys == {"foobar"}, sorted(m.keys)
+
+
+def test_recursive_stops_after_a_failed_delete_and_reports_accurate_counts(mock_factory):
+    """The first object deleted is refused. No request STARTS after the failure is
+    seen (requests already in flight, and ones that started before the refusal came
+    back, finish), and the counts in the message match what the server saw."""
+    seed = [f"foo/k{i:03d}" for i in range(150)] + ["foobar"]
+    m = mock_factory(seed)
+    m.delete_error_keys = {"foo/k000"}
+    out = call_delete(m, "s3://bkt/foo/", recursive=True)
+    assert_raises(out, "RuntimeError", m, "foo/k000")
+    sent = m.sent_delete_keys()
+    assert 1 <= len(sent) < 150, ctx(m, out)
+    msg = out["msg"]
+    match = re.search(r"Sent delete requests for (\d+) of the (\d+) listed", msg)
+    assert match, ctx(m, out)
+    requested, listed = int(match.group(1)), int(match.group(2))
+    assert requested == len(sent), ctx(m, out)
+    not_attempted = re.search(r"(\d+) selected objects were NOT attempted", msg)
+    skipped = int(not_attempted.group(1)) if not_attempted else 0
+    assert requested + skipped == listed, ctx(m, out)
+    assert "1 delete request(s) reported errors" in msg, ctx(m, out)
+    # the failed key, foobar and everything never sent are still there
+    assert "foo/k000" in m.keys and "foobar" in m.keys, ctx(m, out)
+    assert len(m.keys) >= len(seed) - (len(sent) - 1), ctx(m, out)
+
+
+def test_recursive_listing_error_midway_raises_and_sends_nothing_after_it(mock_factory):
+    """Page 1 (foo/a, foo/b) lists fine, page 2 is refused. Each object is its own
+    request, so a and b were already sent; c, d, e were never listed and are untouched."""
+    m = mock_factory(["foo/a", "foo/b", "foo/c", "foo/d", "foo/e"])
+    m.page_size = 2
+    m.list_fail_after_first_page = True
+    out = call_delete(m, "s3://bkt/foo/", recursive=True)
+    assert_raises(out, "RuntimeError", m, "mock refuses to list")
+    assert "listing failed" in out["msg"], ctx(m, out)
+    assert m.keys >= {"foo/c", "foo/d", "foo/e"}, ctx(m, out)
+    assert set(m.sent_delete_keys()) <= {"foo/a", "foo/b"}, ctx(m, out)
 
 
 # ----------------------------------------------------------------------------

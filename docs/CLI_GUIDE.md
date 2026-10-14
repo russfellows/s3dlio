@@ -279,7 +279,8 @@ How it works:
     HTTP response, or a listing error part-way):
     `Sent delete requests for X of the L listed under prefix <uri>; ...` (with `-p`: `of the S selected
     (pattern '<regex>') of L listed`), followed by the number of failed requests, the keys that failed,
-    and `K selected objects were NOT attempted` when batches were held back. Exit non-zero.
+    and `K selected objects were NOT attempted` when batches were held back (a listing error also
+    holds back the partly filled batch in which it occurred). Exit non-zero.
 - **After a failure, nothing more is sent.** The check is made immediately before each DeleteObjects
   request is sent. Requests already in flight finish; later batches (including a partly filled one)
   are not sent and are counted as not attempted; the rest of the prefix is not listed.

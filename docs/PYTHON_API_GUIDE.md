@@ -347,9 +347,12 @@ s3dlio.delete("s3://bucket/logs/2026/", recursive=True)  # every object whose ke
   no delimiter and only objects are deleted (never a synthetic "directory" entry); the prefix is used
   exactly as given and no `/` is appended, so `recursive=True` on `s3://b/foo` also removes `foobar`.
   Write `s3://b/foo/` to mean the directory. `*` and `?` are literal here too. A prefix with no objects
-  is a no-op. It needs list permission. If a delete request or the listing fails, no further delete
-  request is sent and `RuntimeError` reports how many keys were and were not attempted. S3 reports a
-  key that does not exist as deleted, so the call never says how many objects it removed.
+  is a no-op. It needs list permission. **Each selected object gets its own delete request** (up to
+  10 in flight), as before; the batched DeleteObjects that `s3-cli delete -r` uses is deferred for the
+  Python API. If a delete request or the listing fails, no further delete request is sent (requests
+  already in flight finish) and `RuntimeError` reports how many requests were sent and how many
+  selected keys were not attempted. S3 reports a key that does not exist as deleted, so the call never
+  says how many objects it removed.
 - **A directory is never deleted without `recursive=True`.** On `file://` and `direct://`,
   `delete("file:///d")` and `delete("file:///d/")` raise `RuntimeError` (`... is a directory; use -r /
   recursive=True ...`) and delete nothing; a regular file is deleted and a missing path is success.
@@ -357,7 +360,8 @@ s3dlio.delete("s3://bucket/logs/2026/", recursive=True)  # every object whose ke
 - **Other backends** (`file://`, `direct://`, `gs://`, `az://`) use the same two store operations;
   where a backend has no literal-prefix listing, `recursive=True` requires a URI ending in `/` and
   raises `RuntimeError` otherwise (nothing is deleted).
-- The op-log records an exact delete as one `DELETE` row (no `HEAD` row).
+- The op-log records an exact delete as one `DELETE` row (no `HEAD` row), and `recursive=True` as
+  one `LIST` row plus one `DELETE` row per object (replayable; never `DELETE_BATCH`).
 
 **Compatibility change (intentional).** Earlier versions deleted every listed entry for a URI ending
 in `/` or containing `*` or `?` (including synthetic common-prefix entries) and treated the last

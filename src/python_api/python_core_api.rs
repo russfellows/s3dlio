@@ -1870,9 +1870,12 @@ pub fn get_many(
 /// with the LITERAL prefix given: listed without a delimiter, objects only (a
 /// "directory" is never a deletion target), no ``/`` appended, so the prefix
 /// ``foo`` also matches ``foobar``; add the trailing ``/`` yourself to mean a
-/// directory. A prefix with no objects is a no-op. If a delete request or the
-/// listing fails, no further delete request is sent and ``RuntimeError`` names
-/// what was and was not attempted.
+/// directory. A prefix with no objects is a no-op. Each selected object gets
+/// its own delete request (several in flight at once), so the op-log records
+/// one ``LIST`` row and one ``DELETE`` row per object. If a delete request or
+/// the listing fails, no further delete request is sent (requests already in
+/// flight finish; keys listed but not yet sent are not sent) and
+/// ``RuntimeError`` names what was and was not attempted.
 ///
 /// Other backends follow the same contract through the same store methods; on
 /// a backend without a literal-prefix listing, ``recursive=True`` requires a
@@ -1903,6 +1906,10 @@ pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
                     store.as_ref(),
                     &uri_owned,
                     None,
+                    // One DELETE per object (as before #212): the op-log
+                    // records LIST + one DELETE row per object. Batching is
+                    // deferred.
+                    crate::delete_contract::DeleteMode::PerObject,
                     None,
                 )
                 .await
