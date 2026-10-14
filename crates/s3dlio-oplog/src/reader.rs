@@ -330,6 +330,40 @@ fn parse_rfc3339_start(text: &str, column: &str, file_line: usize) -> Result<Dat
         })
 }
 
+/// Op names the object-store writer emits that `OpType` does not model. A row carrying one is
+/// valid input that cannot be replayed exactly: its range, key list or other defining
+/// parameters are not recorded (s3dlio issue #176).
+const UNMODELLED_WRITER_OPS: &[&str] = &[
+    "GET_RANGE",
+    "DELETE_BATCH",
+    "DELETE_PREFIX",
+    "CREATE_CONTAINER",
+    "DELETE_CONTAINER",
+];
+
+/// Where the explanation of unsupported op names lives.
+const UNSUPPORTED_OP_DOC: &str = "docs/supplemental/OPERATION_LOGGING.md (Known gaps)";
+
+/// The outermost error context for a row whose op name `OpType` does not parse. Names the
+/// 1-based file line and the 0-based row index (lines after the header, all lines for JSONL;
+/// blank and comment lines that are skipped still count). A known writer op is reported as
+/// unsupported for exact replay; any other name as unknown. The error is only ever reported;
+/// no row is skipped or filtered.
+fn unsupported_op_context(op_str: &str, file_line: usize, row_index: usize) -> String {
+    if UNMODELLED_WRITER_OPS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(op_str))
+    {
+        format!(
+            "line {file_line} (row index {row_index}): operation {op_str} is not supported for exact replay (its range/key parameters are not recorded); see {UNSUPPORTED_OP_DOC}"
+        )
+    } else {
+        format!(
+            "line {file_line} (row index {row_index}): unknown operation '{op_str}' (the reader models GET, PUT, DELETE, LIST and STAT/HEAD)"
+        )
+    }
+}
+
 /// Parse a JSON value into an OpLogEntry
 fn parse_json_entry(json: &serde_json::Value, line_num: usize) -> Result<OpLogEntry> {
     let get_str = |key: &str| -> Option<String> {
@@ -347,7 +381,8 @@ fn parse_json_entry(json: &serde_json::Value, line_num: usize) -> Result<OpLogEn
 
     let op = op_str
         .parse::<OpType>()
-        .with_context(|| format!("Invalid operation type: {}", op_str))?;
+        .with_context(|| format!("Invalid operation type: {}", op_str))
+        .with_context(|| unsupported_op_context(&op_str, line_num + 1, line_num))?;
 
     // Parse other fields with sensible defaults
     let idx = get_u64("idx").unwrap_or(line_num as u64);
@@ -444,7 +479,8 @@ fn parse_tsv_entry(
 
     let op = op_str
         .parse::<OpType>()
-        .with_context(|| format!("Invalid operation type: {}", op_str))?;
+        .with_context(|| format!("Invalid operation type: {}", op_str))
+        .with_context(|| unsupported_op_context(op_str, line_num + 2, line_num))?;
 
     // Parse other fields
     let idx = get_u64("idx")?.unwrap_or(line_num as u64);

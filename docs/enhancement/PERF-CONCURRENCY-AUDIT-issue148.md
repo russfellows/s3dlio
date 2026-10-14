@@ -221,7 +221,6 @@ On the first error, `?` (or `??`) returns from the function immediately, droppin
 
 ```rust
 // object_store.rs:3646-3722 (generic_upload_files, generic_download_objects)
-// and prefetch.rs:38-54 (start_prefetch)
 while let Some(join_res) = futs.next().await {
     match join_res {
         Ok(Ok(_)) => summary.succeeded += 1,

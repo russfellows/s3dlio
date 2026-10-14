@@ -30,7 +30,10 @@ pub struct ReplayConfig {
     /// Speed multiplier (1.0 = original speed, 2.0 = 2x faster, 0.5 = half speed)
     pub speed: f64,
 
-    /// Continue execution on errors instead of stopping
+    /// Continue execution on errors instead of stopping.
+    ///
+    /// This applies only to operations that fail while executing. It does not bypass load
+    /// errors: an unsupported or malformed row aborts the load before anything runs.
     pub continue_on_error: bool,
 
     /// Optional operation filter (only replay specific operation types)
