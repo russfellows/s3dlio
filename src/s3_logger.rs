@@ -1416,6 +1416,42 @@ mod oplog_buffer_default_tests {
     }
 }
 
+/// Test support: run a test body in a fresh copy of this test binary, so it sees
+/// process-global state (the `tracing` callsite registry, the current directory)
+/// untouched by the other tests in the suite.
+#[cfg(test)]
+mod fresh_process {
+    const CHILD_ENV: &str = "S3DLIO_TEST_FRESH_PROCESS_CHILD";
+    const CHILD_OK: &str = "fresh-process child finished";
+
+    /// In the parent: spawn the test binary with `--exact <module>::<name>` and
+    /// the child flag, and assert that the child succeeded and ran its body (a
+    /// filtered-out child cannot pass vacuously). In the child: run `body`.
+    /// `module` is the caller's `module_path!()`.
+    pub(super) fn run(module: &str, name: &str, body: impl FnOnce()) {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            body();
+            println!("{CHILD_OK}");
+            return;
+        }
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args(["--exact", &format!("{module}::{name}")])
+            .args(["--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(CHILD_OK),
+            "the fresh-process child failed or never ran its body ({}):\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[cfg(test)]
 mod oplog_path_tests {
     use super::*;
@@ -2846,14 +2882,18 @@ mod oplog_stats_tests {
         sink: &StallingSink,
         while_installed: impl FnOnce() + Send + 'static,
     ) -> bool {
-        // Keep a second dispatcher registered for the whole call. With only one
-        // registered, `tracing` computes the interest of a callsite that is
-        // registered for the first time from the registering thread's own
-        // subscriber, ignoring this one (tracing-core `Rebuilder::JustOne`), and
-        // can cache "never" for the `info!` in `shutdown`. With two or more it
-        // consults every registered dispatcher.
-        let _second_dispatcher =
-            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        // Keep two extra dispatchers registered for the whole call, and create
+        // them BEFORE the panicking one is installed. `tracing` computes the
+        // interest of a callsite that is registered for the first time from the
+        // registering thread's own subscriber, ignoring every other dispatcher,
+        // whenever it counts at most one live registered dispatcher
+        // (tracing-core `Rebuilder::JustOne`); that can cache "never" for the
+        // `info!` in `shutdown`. With two pins alive the count is already 2
+        // before the panicking dispatcher registers and 3 after, so there is no
+        // moment with a count of one.
+        let _pins: [tracing::Dispatch; 2] = std::array::from_fn(|_| {
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+        });
         let first = logger.clone();
         let (tx, rx) = channel::<bool>();
         let handle = thread::spawn(move || {
@@ -2883,25 +2923,35 @@ mod oplog_stats_tests {
     // thread has no subscriber of its own, `tracing` can cache "never" for it and
     // the scoped subscriber of the test thread is never asked. This test forces
     // that order: another thread runs a whole session (the first `info!` in the
-    // process, if this test runs alone) while the subscriber is installed.
+    // process) while the subscriber is installed.
+    //
+    // It only discriminates in a process where nothing has run that `info!` yet,
+    // so the body runs in a fresh copy of the test binary (`fresh_process`), which
+    // makes it work the same alone and inside the full suite.
     #[test]
     fn the_injected_panic_fires_even_if_another_thread_ran_shutdown_first() {
-        let (logger, sink) = logger_with_a_stalled_writer("oplog-ps-race");
-        let _release = ReleaseOnDrop(sink.clone());
-        let panicked = first_shutdown_under_panicking_subscriber(&logger, &sink, || {
-            thread::spawn(|| {
-                let sink = StallingSink::default();
-                sink.lock().released = true;
-                Logger::start(sink, 8, false, 1, "oplog-ps-other")
-                    .unwrap()
-                    .shutdown();
-            })
-            .join()
-            .unwrap();
-        });
-        sink.release();
-        assert!(panicked, "the injected panic never reached shutdown");
-        logger.shutdown();
+        super::fresh_process::run(
+            module_path!(),
+            "the_injected_panic_fires_even_if_another_thread_ran_shutdown_first",
+            || {
+                let (logger, sink) = logger_with_a_stalled_writer("oplog-ps-race");
+                let _release = ReleaseOnDrop(sink.clone());
+                let panicked = first_shutdown_under_panicking_subscriber(&logger, &sink, || {
+                    thread::spawn(|| {
+                        let sink = StallingSink::default();
+                        sink.lock().released = true;
+                        Logger::start(sink, 8, false, 1, "oplog-ps-other")
+                            .unwrap()
+                            .shutdown();
+                    })
+                    .join()
+                    .unwrap();
+                });
+                sink.release();
+                assert!(panicked, "the injected panic never reached shutdown");
+                logger.shutdown();
+            },
+        );
     }
 
     // The first shutdown panics (in the tracing call it makes) while the writer is
