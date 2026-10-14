@@ -312,9 +312,9 @@ async fn test_s3_bench_13_column_tsv() -> Result<()> {
 
     // Write s3-bench format header and data
     writeln!(file, "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns")?;
-    writeln!(file, "0\t1\tGET\tclient-1\t1\t1048576\thttp://s3.local:9000\t/bucket/data/file1.bin\t\t1000000000\t1000500000\t1001000000\t1000000000")?;
-    writeln!(file, "1\t2\tPUT\tclient-1\t1\t2097152\thttp://s3.local:9000\t/bucket/data/file2.bin\t\t1002000000\t1002500000\t1003000000\t1000000000")?;
-    writeln!(file, "2\t1\tDELETE\tclient-1\t1\t0\thttp://s3.local:9000\t/bucket/data/file3.bin\t\t1004000000\t1004100000\t1004200000\t200000000")?;
+    writeln!(file, "0\t1\tGET\tclient-1\t1\t1048576\thttp://s3.local:9000\t/bucket/data/file1.bin\t\t2025-01-01T00:00:00Z\t2025-01-01T00:00:00.5Z\t2025-01-01T00:00:01Z\t1000000000")?;
+    writeln!(file, "1\t2\tPUT\tclient-1\t1\t2097152\thttp://s3.local:9000\t/bucket/data/file2.bin\t\t2025-01-01T00:00:02Z\t2025-01-01T00:00:02.5Z\t2025-01-01T00:00:03Z\t1000000000")?;
+    writeln!(file, "2\t1\tDELETE\tclient-1\t1\t0\thttp://s3.local:9000\t/bucket/data/file3.bin\t\t2025-01-01T00:00:04Z\t2025-01-01T00:00:04.1Z\t2025-01-01T00:00:04.2Z\t200000000")?;
     file.flush()?;
 
     let reader = OpLogReader::from_file(file.path())?;
@@ -399,7 +399,7 @@ async fn test_head_to_stat_alias() -> Result<()> {
     )?;
     writeln!(
         file,
-        "0\tHEAD\t0\ts3://bucket\tbucket/object.bin\t1000000000\t5000000\t"
+        "0\tHEAD\t0\ts3://bucket\tbucket/object.bin\t2025-01-01T00:00:00Z\t5000000\t"
     )?;
     file.flush()?;
 
@@ -480,7 +480,7 @@ async fn test_extra_columns_ignored() -> Result<()> {
     )?;
     writeln!(
         file,
-        "0\tGET\t1024\t/data/file.bin\textra_value\t42\t1000000000\t"
+        "0\tGET\t1024\t/data/file.bin\textra_value\t42\t2025-01-01T00:00:00Z\t"
     )?;
     file.flush()?;
 
@@ -503,7 +503,7 @@ async fn test_minimal_vs_extended_formats() -> Result<()> {
     writeln!(minimal_file, "op\tfile\tbytes\tstart\tduration_ns\terror")?;
     writeln!(
         minimal_file,
-        "GET\t/data/small.bin\t512\t1000000000\t1000000\t"
+        "GET\t/data/small.bin\t512\t2025-01-01T00:00:00Z\t1000000\t"
     )?;
     minimal_file.flush()?;
 
@@ -513,7 +513,7 @@ async fn test_minimal_vs_extended_formats() -> Result<()> {
     // Test extended format (s3-bench style)
     let mut extended_file = NamedTempFile::with_suffix(".tsv")?;
     writeln!(extended_file, "idx\tthread\top\tclient_id\tn_objects\tbytes\tendpoint\tfile\terror\tstart\tfirst_byte\tend\tduration_ns")?;
-    writeln!(extended_file, "0\t1\tGET\tc1\t1\t512\thttp://s3\t/data/small.bin\t\t1000000000\t1000500000\t1001000000\t1000000")?;
+    writeln!(extended_file, "0\t1\tGET\tc1\t1\t512\thttp://s3\t/data/small.bin\t\t2025-01-01T00:00:00Z\t2025-01-01T00:00:00.5Z\t2025-01-01T00:00:01Z\t1000000")?;
     extended_file.flush()?;
 
     let extended_reader = OpLogReader::from_file(extended_file.path())?;
@@ -544,7 +544,7 @@ async fn test_zstd_auto_detection() -> Result<()> {
     writeln!(encoder, "op\tfile\tbytes\tstart\tduration_ns\terror")?;
     writeln!(
         encoder,
-        "GET\t/compressed/file.bin\t2048\t1000000000\t5000000\t"
+        "GET\t/compressed/file.bin\t2048\t2025-01-01T00:00:00Z\t5000000\t"
     )?;
     encoder.finish()?;
 

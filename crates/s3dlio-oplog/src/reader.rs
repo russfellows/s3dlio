@@ -10,11 +10,12 @@
 //! by using background decompression and 1MB chunk buffering.
 
 use anyhow::{Context, Result};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use tracing::{debug, info, warn};
@@ -88,7 +89,7 @@ impl OpLogStreamReader {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let format = OpLogFormat::from_path(&path_buf)?;
-        let is_compressed = path_buf.extension().map_or(false, |ext| ext == "zst");
+        let is_compressed = path_buf.extension().is_some_and(|ext| ext == "zst");
 
         info!(
             "Opening streaming op-log reader for {:?} (format: {:?}, compressed: {})",
@@ -114,11 +115,15 @@ impl OpLogStreamReader {
         let (sender, receiver) = sync_channel(channel_cap);
 
         // Spawn background thread for decompression and parsing
+        let error_sender = sender.clone();
         let handle = thread::spawn(move || {
             if let Err(e) =
                 Self::parse_in_background(path_buf, format, is_compressed, chunk_size, sender)
             {
                 warn!("Background parsing error: {}", e);
+                // Deliver it to the consumer too (a bad header, an unreadable file): without
+                // this the channel just closes and the log reads as empty.
+                let _ = error_sender.send(Err(e));
             }
         });
 
@@ -301,6 +306,30 @@ impl OpLogReader {
 // Shared parsing functions used by both streaming and batch readers
 // =============================================================================
 
+/// Start time for a row from a log that carries no start column or key at all (the minimal
+/// dl-driver format): the read time, so a replay of it has no timing. Warned once per process.
+fn untimed_start() -> DateTime<Utc> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "op-log rows have no start time (no 'start', 't_start' or 't_start_ns'): using the \
+             time they are read, so replay timing and ordering information is lost"
+        );
+    }
+    Utc::now()
+}
+
+/// Parse an RFC 3339 `start` value; the error names the (1-based) file line and the text.
+fn parse_rfc3339_start(text: &str, column: &str, file_line: usize) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(text)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "line {file_line}: invalid {column} value '{text}': {e} (expected an RFC 3339 timestamp such as 2026-01-01T00:00:00Z)"
+            )
+        })
+}
+
 /// Parse a JSON value into an OpLogEntry
 fn parse_json_entry(json: &serde_json::Value, line_num: usize) -> Result<OpLogEntry> {
     let get_str = |key: &str| -> Option<String> {
@@ -328,12 +357,34 @@ fn parse_json_entry(json: &serde_json::Value, line_num: usize) -> Result<OpLogEn
     let duration_ns = get_u64("duration_ns");
     let error = get_str("error");
 
-    // Parse timestamp (try multiple field names)
-    let start = get_str("start")
-        .or_else(|| get_str("t_start"))
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.into())
-        .unwrap_or_else(|| chrono::Utc::now());
+    // Parse timestamp: `start` / `t_start` (RFC 3339 strings) or `t_start_ns` (integer
+    // nanoseconds since the Unix epoch). A row with none of them is untimed (the read time);
+    // a present but unparsable value is an error naming the line.
+    let file_line = line_num + 1;
+    let start = match ["start", "t_start"]
+        .iter()
+        .find_map(|k| json.get(*k).map(|v| (*k, v)))
+    {
+        Some((key, value)) => {
+            let text = value.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "line {file_line}: invalid {key} value {value}: expected an RFC 3339 string"
+                )
+            })?;
+            parse_rfc3339_start(text, key, file_line)?
+        }
+        None => match json.get("t_start_ns") {
+            Some(value) => {
+                let ns = value.as_i64().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "line {file_line}: invalid t_start_ns value {value}: expected integer nanoseconds since the Unix epoch"
+                    )
+                })?;
+                DateTime::<Utc>::from_timestamp_nanos(ns)
+            }
+            None => untimed_start(),
+        },
+    };
 
     Ok(OpLogEntry {
         idx,
@@ -405,12 +456,30 @@ fn parse_tsv_entry(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    // Parse timestamp
-    let start = get_field("start")
-        .or_else(|| get_field("t_start"))
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.into())
-        .unwrap_or_else(|| chrono::Utc::now());
+    // Parse timestamp: `start` / `t_start` (RFC 3339) or `t_start_ns` (integer nanoseconds
+    // since the Unix epoch). A log with none of these columns has no timing at all (the
+    // minimal dl-driver format) and takes the read time; a row that has the column but
+    // lacks the value or holds an unparsable one is an error naming its line.
+    let file_line = line_num + 2; // line_num counts data lines; the header is line 1
+    let start = if let Some(key) = ["start", "t_start"]
+        .into_iter()
+        .find(|k| col_mapping.contains_key(*k))
+    {
+        let text = get_field(key)
+            .ok_or_else(|| anyhow::anyhow!("line {file_line}: missing {key} value"))?;
+        parse_rfc3339_start(text, key, file_line)?
+    } else if col_mapping.contains_key("t_start_ns") {
+        let text = get_field("t_start_ns")
+            .ok_or_else(|| anyhow::anyhow!("line {file_line}: missing t_start_ns value"))?;
+        let ns = text.parse::<i64>().map_err(|e| {
+            anyhow::anyhow!(
+                "line {file_line}: invalid t_start_ns value '{text}': {e} (expected integer nanoseconds since the Unix epoch)"
+            )
+        })?;
+        DateTime::<Utc>::from_timestamp_nanos(ns)
+    } else {
+        untimed_start()
+    };
 
     Ok(OpLogEntry {
         idx,
