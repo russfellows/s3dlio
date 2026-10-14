@@ -1013,8 +1013,12 @@ as text; `written` is an upper bound of the rows in the file. `writer_failed` on
 stopped, so queued entries lost to a writer error show as `accepted > written`.
 
 What the stats count: the calls that reached the logger between `init_op_log` and
-`finalize_op_log`. "Written" means accepted by the OS `write(2)`; there is no
-fsync, so it does not mean durable. The stats do **not** cover:
+`finalize_op_log`. "Written" counts the rows the zstd compressor accepted (the
+bytes may still be buffered at that moment, and a later write, finish or flush can
+still fail, which shows as `writer_error`). A successful `finalize_op_log()` with
+the complete condition above true means every accepted row reached the compressor
+and the stream was finished and flushed to the file without error: that is
+completion, not durability (there is no fsync). The stats do **not** cover:
 
 - **Process exit without `finalize_op_log()`.** There is no `atexit` hook:
   entries still queued and the zstd frame end are lost, and the stats are never

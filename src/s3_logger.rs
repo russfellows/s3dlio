@@ -186,9 +186,18 @@ pub fn global_logger() -> Option<Logger> {
 ///
 /// # What is counted, and what is not
 ///
-/// "Written" means the writer thread handed the row to the zstd encoder without
-/// an error, and that the bytes the encoder and the file buffer were accepted by
-/// the OS `write(2)` call. There is **no fsync**: written does not mean durable.
+/// "Written" counts the rows the zstd compressor accepted: the writer thread
+/// increments it when `write_all` of the row into the encoder returns `Ok`. It
+/// says nothing about where the bytes are at that moment: they may still sit in
+/// the compressor, in its pending output, or in the file's `BufWriter`, and a
+/// later write, finish or flush can still fail (that failure is `writer_error`).
+/// So `written` is an upper bound of the rows in the file.
+///
+/// What a *successful finalize with [`OpLogStats::is_complete`]* establishes is
+/// that every accepted row reached the compressor, and that the stream was then
+/// finished and flushed to the file (the final `write(2)` calls were accepted)
+/// without error. That is **completion, not durability**: there is no fsync, and
+/// a `close(2)` error is unobservable (see below).
 ///
 /// These losses are **not** visible in the stats (a program that needs them
 /// covered must handle them itself):
@@ -821,8 +830,9 @@ fn write_rows<W: Write>(
 /// sink (`BufWriter<File>`) closes the file. A failing `close(2)` (reported late
 /// by some network filesystems, or on a quota) is not observable: Rust's `File`
 /// drop ignores it, and the op-log deliberately adds no fsync. So the flush above
-/// it is the last error this writer can see, and `written` means "accepted by
-/// `write(2)`", not durable.
+/// it is the last error this writer can see. `written` is not about this step:
+/// it counts rows the compressor accepted (see [`OpLogStats`]), and nothing here
+/// is fsynced, so even a clean finish is completion, not durability.
 fn finish_stream<W: Write>(encoder: &mut StreamEncoder<W>, report: &WriterReport) {
     match encoder.finish() {
         Ok(mut sink) => {

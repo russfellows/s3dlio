@@ -245,10 +245,15 @@ complete = (stats["accepted"] == stats["written"] and stats["dropped_full"] == 0
 ```
 
 **What is counted.** The stats cover the calls that reached the session's
-`Logger` (any clone) **between init and finalize**. "Written" means the writer
-thread handed the row to the zstd encoder without an error and the buffered bytes
-were accepted by the OS `write(2)`; there is **no fsync**, so written does not
-mean durable.
+`Logger` (any clone) **between init and finalize**. "Written" counts the rows the
+zstd compressor accepted: the writer thread bumps it when handing the row to the
+encoder returned without an error. At that moment the bytes may still be inside the
+compressor, in its pending output or in the file's buffer, and a later write,
+finish or flush can still fail (that failure is `writer_error`). A successful
+finalize with `is_complete()` true establishes that every accepted row reached the
+compressor and that the stream was then finished and flushed to the file without
+error. That is **completion, not durability**: there is no fsync, and a `close(2)`
+error is not observable (below).
 
 **What the stats cannot see.** A program that needs these covered must handle
 them itself:

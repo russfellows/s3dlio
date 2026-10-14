@@ -153,8 +153,10 @@ framing) is unchanged; a golden test pins it.
   writer_error.is_none()`; judge it after finalize. `finalize_op_log()` prints one
   stderr warning when a counted loss happened. The stats do not cover process
   exit without finalize (no `atexit` hook), stores built before init, or errors
-  reported only at `close(2)`; "written" means accepted by `write(2)`, not
-  fsynced. See `docs/supplemental/OPERATION_LOGGING.md`.
+  reported only at `close(2)`; "written" counts rows accepted by the zstd
+  compressor (they may still be buffered; a later failure is `writer_error`), so a
+  complete finalize means completion, not durability (no fsync). See
+  `docs/supplemental/OPERATION_LOGGING.md`.
 - **`Logger::try_log` / `LogOutcome` (#170).** `try_log(entry)` returns
   `Accepted`, `Full`, `Closed` or `WriterFailed`; `Logger::log` still returns
   `()`. Every `Accepted` entry is written by finalize, including entries racing

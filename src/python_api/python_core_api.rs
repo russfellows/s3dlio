@@ -753,9 +753,14 @@ pub fn is_op_log_active() -> PyResult<bool> {
 ///
 /// After finalize_op_log() no counted loss happened exactly when
 /// accepted == written and dropped_full == 0 and writer_failed == 0 and
-/// writer_error is None. "written" means accepted by the OS write(2); there is no
-/// fsync, so it does not mean durable. (accepted > written means entries were queued but never
-/// written, e.g. the disk filled up; writer_failed alone cannot show that.)
+/// writer_error is None. "written" counts rows the zstd compressor accepted; the
+/// bytes may still be buffered when it is counted, and a later write, finish or
+/// flush can still fail (that is writer_error). A successful finalize_op_log()
+/// with that condition true means every accepted row reached the compressor and
+/// the stream was finished and flushed to the file without error. That is
+/// completion, not durability: there is no fsync, and a close(2) error cannot be
+/// observed. (accepted > written means entries were queued but never written,
+/// e.g. the disk filled up; writer_failed alone cannot show that.)
 /// rejected_closed is not part of "complete" -- those calls were never going to
 /// be in the file -- but finalize only after your worker threads have stopped, and
 /// check rejected_closed == 0 as well. While logging is active accepted > written
