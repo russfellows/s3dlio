@@ -93,13 +93,13 @@
     "case": "me_host443",
     "call": "c1"
    },
-   "action": "WRONG-ACTION:scheme",
+   "action": "OK",
    "record": "MISSING",
    "issues": [
     "#180",
     "#175"
    ],
-   "note": "MultiEndpointStore dials a host-form :443 endpoint over plain http://; the failed call writes no row"
+   "note": "#180 fixed: MultiEndpointStore now dials a host-form :443 endpoint over https:443 and the get succeeds; MultiEndpointStore.get still writes no row (#175). Observed in run 20261014-034453 (previously: WRONG-ACTION:scheme, plain http://)"
   },
   {
    "match": {
@@ -151,25 +151,25 @@
     ],
     "call": "c1"
    },
-   "action": "WRONG-ACTION:outcome,server",
-   "record": "DUPLICATE+WRONG-FIELD:server",
+   "action": "OK",
+   "record": "MISSING",
    "issues": [
     "#178",
     "#169"
    ],
-   "note": "s3://10.255.255.1/bucket/key: the host is ignored, the call goes to AWS_ENDPOINT_URL and succeeds; the LoggedObjectStore row names the host that was never contacted"
+   "note": "s3://10.255.255.1/bucket/key (IP host, no port): #178 now fails the call with an invalid-S3-URI error before any request is made (0 SDK requests, so ACTION is OK); the failed call writes no op-log row. Observed in run 20261014-034453 (previously: host ignored, call succeeded against AWS_ENDPOINT_URL, DUPLICATE+WRONG-FIELD:server)"
   },
   {
    "match": {
     "case": "portless_stat",
     "call": "c1"
    },
-   "action": "WRONG-ACTION:outcome,server",
-   "record": "WRONG-FIELD:server",
+   "action": "OK",
+   "record": "MISSING",
    "issues": [
     "#178"
    ],
-   "note": "same as portless_get, for stat"
+   "note": "same as portless_get, for stat: #178 error before any request, no op-log row. Observed in run 20261014-034453 (previously: WRONG-ACTION:outcome,server / WRONG-FIELD:server)"
   }
  ],
  "process": [
