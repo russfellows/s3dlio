@@ -335,19 +335,48 @@ Standard AWS environment variables are also supported:
 | `AWS_ENDPOINT_URL` | Custom S3 endpoint URL (for MinIO or other S3-compatible storage) |
 | `AWS_CA_BUNDLE` | Path to custom CA certificate bundle (standard AWS SDK name) |
 
-### `s3://host/bucket/key` endpoint-in-URI detection (v0.9.109+)
+### `s3://host:port/bucket/key` server-vs-bucket rule (changed in the Unreleased version; issues #178, #193, #194)
 
-`parse_s3_uri_full` (used when a URI's first path segment might be a custom endpoint hostname rather than a bucket, e.g. for MinIO/Ceph clusters addressed directly in the URI) decides bucket-vs-endpoint using: a colon (port) present, the segment is a dotted-quad IPv4 address, or the segment contains a dot and its last label matches a known hostname-like suffix.
+The first segment of `s3://X/...` names a **server** only when it carries an
+explicit port; otherwise it is **always a bucket**. One rule
+(`s3dlio::s3_utils::classify_s3_first_segment`) is shared by the URI parser
+(`parse_s3_uri_full`), the store factory, `MultiEndpointStore` and the CLI
+bucket commands, so they cannot disagree.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `S3DLIO_S3_ENDPOINT_HINT_TLDS` | (unset) | Comma-separated list of additional suffixes (case-insensitive, no leading dot) to recognize as hostname-like when a URI's first path segment has no port — e.g. `export S3DLIO_S3_ENDPOINT_HINT_TLDS=storagegrid,mynas` lets `s3://cluster.storagegrid/bucket/key` route as an endpoint. Extends, does not replace, the built-in default list (`com`, `net`, `org`, `io`, `co`, `dev`, `cloud`, `app`, `biz`, `info`, `local`, `internal`, `lan`, `corp`, `home`, `cluster`, `svc`, `network`). |
+| URI | Meaning |
+|-----|---------|
+| `s3://bucket/key`, `s3://BUCKET/key`, `s3://my.bucket.name/key` | bucket `bucket` / `BUCKET` / `my.bucket.name` (uses `AWS_ENDPOINT_URL` or AWS) |
+| `s3://data.example.com/dir/file.bin`, `s3://minio.example.com/bkt/key`, `s3://localhost/bkt/key` | **bucket** `data.example.com` / `minio.example.com` / `localhost` — a dotted DNS name with no port is a bucket, never a server |
+| `s3://10.0.0.5:9000/bkt/key` | server `http://10.0.0.5:9000`, bucket `bkt` |
+| `s3://host.example.com:443/bkt/key` | server `https://host.example.com:443`, bucket `bkt` |
+| `s3://[::1]:9000/bkt/key` | server `http://[::1]:9000`, bucket `bkt` |
+| `s3://10.0.0.5/bkt/key` | **error**: an IP address with no port (S3 forbids IP-shaped bucket names, so it is not a bucket either). Add `:port`, e.g. `s3://10.0.0.5:9000/bkt/key` |
+| `s3://[::1]/bkt/key`, `s3://::1/bkt/key` | **error**: IPv6 must be bracketed and carry a port (`s3://[::1]:9000/bkt/key`) |
 
-> **Behavior change (v0.9.109).** Before this release, ANY first-path-segment with 2+ dots, a leading digit, or containing `minio`/`ceph`/`localhost` as a substring was misrouted as an endpoint — even though all of those are legal S3 bucket name shapes (e.g. `mycompany.data.backups`, `2024-training-data`, `minio-tenant-a`). Those now correctly parse as bucket names. If you relied on the old broader heuristic to route a no-port, unusual-suffix endpoint hostname, either add a port to the URI or add your hostname's suffix to `S3DLIO_S3_ENDPOINT_HINT_TLDS`.
+The same rule applies to `s3-cli create-bucket` / `delete-bucket`:
+`s3://host:port/bkt` creates / deletes bucket `bkt` **on that server** (before,
+the bucket name was taken to be `host:port`), and to every entry of `--endpoints`,
+which must each be `host:port` (a portless entry is an error).
+
+**`S3DLIO_S3_ENDPOINT_HINT_TLDS` is deprecated and ignored.** It extended a
+hostname-suffix heuristic (`com`, `net`, `local`, `internal`, …) that made a
+portless name such as `minio.example.com` a server. That heuristic is gone: a
+portless name is a bucket. The variable is kept as a no-op rather than removed so
+that a script that still exports it keeps running; s3dlio logs a one-time warning
+if it is set. Remove it and put the port in the URI instead.
+
+> **Breaking change (Unreleased).** v0.9.109 – v0.9.114 treated a portless first
+> segment as a server when it was an IPv4 literal or ended in a hostname-like
+> suffix. Migration: add `:port` to every URI that names a server
+> (`s3://minio.example.com/bkt/key` → `s3://minio.example.com:9000/bkt/key`).
+> A portless DNS name is now a bucket, and a portless IPv4 address is an error with
+> a message that says to add `:port`. A deprecation period is not possible: a
+> portless host and a dotted bucket name are the same grammar. An explicit
+> `s3+http://` / `s3+https://` form is planned (#195).
 
 ### `s3://host:port/bucket/key` per-endpoint TLS detection (v0.9.110+)
 
-When a URI's authority contains an explicit `host:port`, s3dlio creates a dedicated per-endpoint S3 client (see above) and must guess `http` vs `https` from the port alone, since no other scheme hint is available in an `s3://` URI. Port 443 always uses `https`; every other port defaults to `http`.
+When a URI's first segment is a server (an explicit `host:port`, see above), s3dlio creates a dedicated per-endpoint S3 client (see above) and must guess `http` vs `https` from the port alone, since no other scheme hint is available in an `s3://` URI. Port 443 always uses `https`; every other port defaults to `http`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|

@@ -295,41 +295,107 @@ fn test_localhost_prefixed_bucket_name_no_longer_misroutes_as_endpoint() {
     assert_eq!(result.key, "x");
 }
 
+// Issues #178 / #193 / #194 (maintainer decision, option C): the first segment
+// of `s3://X/...` names a SERVER only when it carries an explicit port
+// (`host:port` or `[ipv6]:port`). Otherwise it is ALWAYS a bucket -- dotted DNS
+// names included. A portless IPv4 literal or an unbracketed / portless IPv6 is a
+// clear error (S3 forbids IP-shaped bucket names, so it is not a valid bucket
+// either). These tests REPLACE the v0.9.109 tests that pinned the old portless
+// reading (a recognised TLD suffix, or S3DLIO_S3_ENDPOINT_HINT_TLDS, made a
+// portless name a server -- the cause of #178: the parser sent the data to one
+// host while the store factory sent the request to another).
+
 #[test]
-fn test_hostname_like_dotted_names_still_route_as_endpoints() {
-    // Genuine hostnames (recognizable TLD-like suffix) without a port
-    // must still be detected as endpoints -- the narrowing must not
-    // regress the endpoint-in-URI workflow for its typical form.
+fn test_portless_dns_names_are_buckets_issue_178() {
+    // Previously `minio.example.com` and `s3.company.internal` were parsed as
+    // endpoints because of their ".com" / ".internal" suffix (#178).
     let result = parse_s3_uri_full("s3://minio.example.com/bucket/key").unwrap();
-    assert_eq!(result.endpoint, Some("minio.example.com".to_string()));
-    assert_eq!(result.bucket, "bucket");
-    assert_eq!(result.key, "key");
+    assert_eq!(result.endpoint, None);
+    assert_eq!(result.bucket, "minio.example.com");
+    assert_eq!(result.key, "bucket/key");
 
     let result2 = parse_s3_uri_full("s3://s3.company.internal/bucket/key").unwrap();
-    assert_eq!(result2.endpoint, Some("s3.company.internal".to_string()));
-    assert_eq!(result2.bucket, "bucket");
-    assert_eq!(result2.key, "key");
+    assert_eq!(result2.endpoint, None);
+    assert_eq!(result2.bucket, "s3.company.internal");
+    assert_eq!(result2.key, "bucket/key");
+
+    // #193: a dotted bucket name whose last label is a hint-TLD is a bucket.
+    let result3 = parse_s3_uri_full("s3://data.example.com/dir/file.bin").unwrap();
+    assert_eq!(result3.endpoint, None);
+    assert_eq!(result3.bucket, "data.example.com");
+    assert_eq!(result3.key, "dir/file.bin");
+
+    let result4 = parse_s3_uri_full("s3://localhost/bkt/key").unwrap();
+    assert_eq!(result4.endpoint, None);
+    assert_eq!(result4.bucket, "localhost");
+    assert_eq!(result4.key, "bkt/key");
 }
 
 #[test]
-fn test_endpoint_hint_tld_env_var_extends_the_default_list() {
-    // A bucket-shaped-but-dotted name with a suffix NOT in the default
-    // list stays a bucket by default...
+fn test_endpoint_hint_tld_env_var_is_a_no_op_issue_178() {
+    // S3DLIO_S3_ENDPOINT_HINT_TLDS used to turn a portless name into a server.
+    // Under option C a portless name is never a server, so the variable is
+    // deprecated and has no effect (it logs a one-time deprecation warning).
     let uri = "s3://s3.mycorp.storagegrid/bucket/key";
-    let result = parse_s3_uri_full(uri).unwrap();
-    assert_eq!(
-        result.endpoint, None,
-        "unrecognized suffix must not be treated as an endpoint hint by default"
-    );
+    let before = parse_s3_uri_full(uri).unwrap();
 
-    // ...but adding it via the env var makes the same URI route as an endpoint.
     std::env::set_var("S3DLIO_S3_ENDPOINT_HINT_TLDS", "storagegrid");
-    let result2 = parse_s3_uri_full(uri).unwrap();
+    let after = parse_s3_uri_full(uri).unwrap();
     std::env::remove_var("S3DLIO_S3_ENDPOINT_HINT_TLDS");
-    assert_eq!(
-        result2.endpoint,
-        Some("s3.mycorp.storagegrid".to_string()),
-        "S3DLIO_S3_ENDPOINT_HINT_TLDS must extend the default suffix list"
+
+    assert_eq!(before.endpoint, None);
+    assert_eq!(after.endpoint, None, "the hint-TLD env var must be a no-op");
+    assert_eq!(after.bucket, "s3.mycorp.storagegrid");
+    assert_eq!(after.key, "bucket/key");
+}
+
+#[test]
+fn test_portless_ipv4_is_a_clear_error_issue_178() {
+    let err = parse_s3_uri_full("s3://10.0.0.5/bkt/key").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("s3://10.0.0.5:9000/"),
+        "error must tell the user to add :port with an example, got: {msg}"
     );
-    assert_eq!(result2.bucket, "bucket");
+    // The legacy two-value helper shares the rule.
+    assert!(parse_s3_uri("s3://10.0.0.5/bkt/key").is_err());
+}
+
+#[test]
+fn test_ipv6_requires_brackets_and_port_issue_178() {
+    // Bracketed with a port: a server.
+    let ok = parse_s3_uri_full("s3://[::1]:9000/bkt/key").unwrap();
+    assert_eq!(ok.endpoint.as_deref(), Some("[::1]:9000"));
+    assert_eq!(ok.bucket, "bkt");
+    assert_eq!(ok.key, "key");
+
+    // Bracketed without a port, and unbracketed: errors that ask for :port.
+    for uri in [
+        "s3://[::1]/bkt/key",
+        "s3://::1/bkt/key",
+        "s3://fe80::1/bkt/key",
+    ] {
+        let msg = format!("{:#}", parse_s3_uri_full(uri).unwrap_err());
+        assert!(msg.contains(":port"), "{uri}: {msg}");
+    }
+}
+
+#[test]
+fn test_invalid_port_is_an_error_issue_178() {
+    for uri in [
+        "s3://host.example.com:/bkt/key",
+        "s3://host.example.com:notaport/bkt/key",
+        "s3://host.example.com:99999/bkt/key",
+        "s3://:9000/bkt/key",
+    ] {
+        assert!(parse_s3_uri_full(uri).is_err(), "{uri} must be rejected");
+    }
+}
+
+#[test]
+fn test_explicit_port_with_dns_name_is_a_server_issue_178() {
+    let result = parse_s3_uri_full("s3://minio.example.com:9000/bucket/key").unwrap();
+    assert_eq!(result.endpoint.as_deref(), Some("minio.example.com:9000"));
+    assert_eq!(result.bucket, "bucket");
+    assert_eq!(result.key, "key");
 }

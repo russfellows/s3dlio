@@ -233,22 +233,17 @@ struct EndpointInfo {
     store_endpoint_url: Option<String>,
 }
 
-/// Decide the per-endpoint client URL for the host part of a host-form S3 URI.
+/// Decide the per-endpoint client URL for a configured S3 endpoint URI.
 ///
-/// `ep` is the endpoint component returned by [`crate::s3_utils::parse_s3_uri_full`]
-/// (e.g. `10.9.0.17:9000`, `storage.googleapis.com:443`).
-///
-/// An explicit `http://` / `https://` string is used as given. Otherwise the
-/// scheme comes from [`crate::object_store::s3_endpoint_url_from_authority`], the
-/// same rule the single-endpoint path uses (`:443` and ports listed in
-/// `S3DLIO_S3_ENDPOINT_TLS_PORTS` are https, everything else http; issue #180).
-/// A host with no port keeps the historical `http://` form.
-fn s3_store_endpoint_url(ep: String) -> String {
-    if ep.starts_with("http://") || ep.starts_with("https://") {
-        return ep;
-    }
-    crate::object_store::s3_endpoint_url_from_authority(&ep)
-        .unwrap_or_else(|| format!("http://{}", ep))
+/// Returns `Ok(Some(url))` when the URI's first segment names a server (an
+/// explicit `host:port` / `[ipv6]:port`), `Ok(None)` when it is a bucket, and an
+/// error for a portless IP literal (add `:port`). This is the same function
+/// the single-endpoint store factory uses
+/// ([`crate::object_store::s3_endpoint_url_from_uri`]), so the two can never
+/// disagree about server vs bucket (issues #178, #180): `:443` and ports listed
+/// in `S3DLIO_S3_ENDPOINT_TLS_PORTS` are https, everything else http.
+fn s3_store_endpoint_url(uri: &str) -> Result<Option<String>> {
+    crate::object_store::s3_endpoint_url_from_uri(uri)
 }
 
 /// Multi-endpoint ObjectStore wrapper with load balancing and per-endpoint configuration.
@@ -388,25 +383,21 @@ impl MultiEndpointStore {
                 // client (own connection pool, correct base URL) instead of routing through
                 // the global singleton.
                 if endpoint_config.uri.starts_with("s3://") {
-                    if let Ok(components) = crate::s3_utils::parse_s3_uri_full(&endpoint_config.uri)
-                    {
-                        if let Some(ep) = components.endpoint {
-                            let endpoint_url = s3_store_endpoint_url(ep);
-                            let url_for_store = endpoint_url.clone();
-                            let result = crate::s3_client::run_on_global_rt(async move {
-                                S3ObjectStore::for_endpoint(&url_for_store)
-                                    .await
-                                    .map(|s| Box::new(s) as Box<dyn ObjectStore>)
-                            })
-                            .with_context(|| {
-                                format!(
-                                    "Failed to create per-endpoint S3 store for: {}",
-                                    endpoint_config.uri
-                                )
-                            })?;
-                            store_endpoint_url = Some(endpoint_url);
-                            break 'store result;
-                        }
+                    if let Some(endpoint_url) = s3_store_endpoint_url(&endpoint_config.uri)? {
+                        let url_for_store = endpoint_url.clone();
+                        let result = crate::s3_client::run_on_global_rt(async move {
+                            S3ObjectStore::for_endpoint(&url_for_store)
+                                .await
+                                .map(|s| Box::new(s) as Box<dyn ObjectStore>)
+                        })
+                        .with_context(|| {
+                            format!(
+                                "Failed to create per-endpoint S3 store for: {}",
+                                endpoint_config.uri
+                            )
+                        })?;
+                        store_endpoint_url = Some(endpoint_url);
+                        break 'store result;
                     }
                 }
                 store_for_uri(&endpoint_config.uri).with_context(|| {
@@ -2277,9 +2268,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Build a MultiEndpointStore for `uri` with fake credentials and return the
-    /// endpoint URL its per-endpoint client was created with.
-    fn store_endpoint_url_for(uri: &str) -> Option<String> {
+    /// Try to build a MultiEndpointStore for `uri` with fake credentials.
+    fn try_build_store_with_fake_creds(uri: &str) -> Result<MultiEndpointStore> {
         let _cred = CRED_LOCK.blocking_lock();
         let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
@@ -2297,8 +2287,14 @@ mod tests {
         restore_env("AWS_ACCESS_KEY_ID", saved_key);
         restore_env("AWS_SECRET_ACCESS_KEY", saved_secret);
         restore_env("AWS_REGION", saved_region);
+        result
+    }
 
-        let store = result.expect("MultiEndpointStore should be created with fake credentials");
+    /// Build a MultiEndpointStore for `uri` with fake credentials and return the
+    /// endpoint URL its per-endpoint client was created with.
+    fn store_endpoint_url_for(uri: &str) -> Option<String> {
+        let store = try_build_store_with_fake_creds(uri)
+            .expect("MultiEndpointStore should be created with fake credentials");
         store
             .get_store_endpoint_urls()
             .into_iter()
@@ -2350,26 +2346,240 @@ mod tests {
         std::env::set_var("S3DLIO_S3_ENDPOINT_TLS_PORTS", "9001");
 
         let cases = [
-            ("example.com:443", "https://example.com:443"),
-            ("example.com:9001", "https://example.com:9001"),
-            ("example.com:9000", "http://example.com:9000"),
-            ("[::1]:443", "https://[::1]:443"),
-            ("[::1]:9000", "http://[::1]:9000"),
-            // Explicit schemes are preserved untouched.
-            ("https://example.com:9000", "https://example.com:9000"),
-            ("http://example.com:443", "http://example.com:443"),
-            // No port: unchanged historical behaviour (http).
-            ("example.com", "http://example.com"),
+            ("s3://example.com:443/b/", "https://example.com:443"),
+            ("s3://example.com:9001/b/", "https://example.com:9001"),
+            ("s3://example.com:9000/b/", "http://example.com:9000"),
+            ("s3://[::1]:443/b/", "https://[::1]:443"),
+            ("s3://[::1]:9000/b/", "http://[::1]:9000"),
         ];
-        let got: Vec<String> = cases
+        let got: Vec<Option<String>> = cases
             .iter()
-            .map(|(ep, _)| s3_store_endpoint_url((*ep).to_string()))
+            .map(|(uri, _)| s3_store_endpoint_url(uri).expect("valid server URI"))
             .collect();
+        // Issue #178: a portless DNS name is a bucket (no server); a portless IP errors.
+        let portless_dns = s3_store_endpoint_url("s3://example.com/b/").expect("bucket form");
+        let portless_ip = s3_store_endpoint_url("s3://10.0.0.5/b/");
         restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
 
-        for ((ep, want), got) in cases.iter().zip(got) {
-            assert_eq!(&got, want, "endpoint {ep:?}");
+        for ((uri, want), got) in cases.iter().zip(got) {
+            assert_eq!(got.as_deref(), Some(*want), "uri {uri:?}");
         }
+        assert_eq!(portless_dns, None);
+        assert!(portless_ip.is_err());
+    }
+
+    // ── Issues #178 / #193 / #194: one rule for "is the first segment a server?" ──
+    //
+    // The URI parser, the store factory and MultiEndpointStore each used to decide
+    // server-vs-bucket on their own and disagreed (a portless host was a server to
+    // the parser, a bucket to the factory). The decision (option C): the first
+    // segment names a SERVER only with an explicit port (`host:port`,
+    // `[ipv6]:port`); otherwise it is a BUCKET; a portless IPv4 literal or a
+    // portless / unbracketed IPv6 is an error. This one table drives all three
+    // components and asserts they agree.
+
+    enum Want {
+        /// First segment is a bucket: no per-endpoint server anywhere.
+        Bucket {
+            bucket: &'static str,
+            key: &'static str,
+        },
+        /// First segment is `authority`, served at `url`.
+        Server {
+            authority: &'static str,
+            url: &'static str,
+            bucket: &'static str,
+            key: &'static str,
+        },
+        /// Rejected everywhere; the message must contain `hint`.
+        Error { hint: &'static str },
+    }
+
+    /// The store factory's server decision, as `store_for_uri` makes it.
+    fn factory_server_decision(uri: &str) -> Result<Option<String>> {
+        crate::object_store::s3_endpoint_url_from_uri(uri)
+    }
+
+    #[test]
+    fn test_parser_factory_and_multi_endpoint_agree_on_server_vs_bucket() {
+        let _env = lock_tls_ports_env();
+        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
+        #[allow(deprecated)]
+        std::env::remove_var("S3DLIO_S3_ENDPOINT_TLS_PORTS");
+
+        use Want::*;
+        let corpus: Vec<(&str, Want)> = vec![
+            (
+                "s3://bucket/key",
+                Bucket {
+                    bucket: "bucket",
+                    key: "key",
+                },
+            ),
+            (
+                "s3://my.bucket.name/key",
+                Bucket {
+                    bucket: "my.bucket.name",
+                    key: "key",
+                },
+            ),
+            (
+                "s3://data.example.com/dir/file.bin",
+                Bucket {
+                    bucket: "data.example.com",
+                    key: "dir/file.bin",
+                },
+            ),
+            (
+                "s3://minio.example.com/bkt/key",
+                Bucket {
+                    bucket: "minio.example.com",
+                    key: "bkt/key",
+                },
+            ),
+            (
+                "s3://localhost/bkt/key",
+                Bucket {
+                    bucket: "localhost",
+                    key: "bkt/key",
+                },
+            ),
+            (
+                "s3://BUCKET/key",
+                Bucket {
+                    bucket: "BUCKET",
+                    key: "key",
+                },
+            ),
+            (
+                "s3://10.0.0.5/bkt/key",
+                Error {
+                    hint: "s3://10.0.0.5:9000/",
+                },
+            ),
+            (
+                "s3://10.0.0.5:9000/bkt/key",
+                Server {
+                    authority: "10.0.0.5:9000",
+                    url: "http://10.0.0.5:9000",
+                    bucket: "bkt",
+                    key: "key",
+                },
+            ),
+            (
+                "s3://host.example.com:443/bkt/key",
+                Server {
+                    authority: "host.example.com:443",
+                    url: "https://host.example.com:443",
+                    bucket: "bkt",
+                    key: "key",
+                },
+            ),
+            (
+                "s3://[::1]:9000/bkt/key",
+                Server {
+                    authority: "[::1]:9000",
+                    url: "http://[::1]:9000",
+                    bucket: "bkt",
+                    key: "key",
+                },
+            ),
+            ("s3://[::1]/bkt/key", Error { hint: ":port" }),
+            ("s3://::1/bkt/key", Error { hint: ":port" }),
+            (
+                "s3://host.example.com:notaport/bkt/key",
+                Error { hint: "port" },
+            ),
+        ];
+
+        let mut failures: Vec<String> = Vec::new();
+        for (uri, want) in &corpus {
+            let parsed = crate::s3_utils::parse_s3_uri_full(uri);
+            let factory = factory_server_decision(uri);
+            let multi = try_build_store_with_fake_creds(uri);
+            match want {
+                Bucket { bucket, key } => {
+                    match &parsed {
+                        Ok(c) if c.endpoint.is_none() && c.bucket == *bucket && c.key == *key => {}
+                        other => failures.push(format!(
+                            "{uri}: parser want bucket {bucket:?}/{key:?}, got {other:?}"
+                        )),
+                    }
+                    match &factory {
+                        Ok(None) => {}
+                        other => {
+                            failures.push(format!("{uri}: factory want no server, got {other:?}"))
+                        }
+                    }
+                    match &multi {
+                        Ok(m) if m.get_store_endpoint_urls() == vec![None] => {}
+                        Ok(m) => failures.push(format!(
+                            "{uri}: multi want no server, got {:?}",
+                            m.get_store_endpoint_urls()
+                        )),
+                        Err(e) => failures
+                            .push(format!("{uri}: multi want a bucket store, got error {e:#}")),
+                    }
+                }
+                Server {
+                    authority,
+                    url,
+                    bucket,
+                    key,
+                } => {
+                    match &parsed {
+                        Ok(c) if c.endpoint.as_deref() == Some(*authority) && c.bucket == *bucket && c.key == *key => {}
+                        other => failures.push(format!("{uri}: parser want server {authority:?} bucket {bucket:?}/{key:?}, got {other:?}")),
+                    }
+                    match &factory {
+                        Ok(Some(u)) if u == url => {}
+                        other => {
+                            failures.push(format!("{uri}: factory want {url:?}, got {other:?}"))
+                        }
+                    }
+                    match &multi {
+                        Ok(m) if m.get_store_endpoint_urls() == vec![Some((*url).to_string())] => {}
+                        Ok(m) => failures.push(format!(
+                            "{uri}: multi want {url:?}, got {:?}",
+                            m.get_store_endpoint_urls()
+                        )),
+                        Err(e) => {
+                            failures.push(format!("{uri}: multi want {url:?}, got error {e:#}"))
+                        }
+                    }
+                }
+                Error { hint } => {
+                    match &parsed {
+                        Err(e) if format!("{e:#}").contains(hint) => {}
+                        other => failures.push(format!(
+                            "{uri}: parser want error containing {hint:?}, got {other:?}"
+                        )),
+                    }
+                    match &factory {
+                        Err(e) if format!("{e:#}").contains(hint) => {}
+                        other => failures.push(format!(
+                            "{uri}: factory want error containing {hint:?}, got {other:?}"
+                        )),
+                    }
+                    match &multi {
+                        Err(e) if format!("{e:#}").contains(hint) => {}
+                        Ok(m) => failures.push(format!(
+                            "{uri}: multi want error containing {hint:?}, got store {:?}",
+                            m.get_store_endpoint_urls()
+                        )),
+                        Err(e) => {
+                            failures.push(format!("{uri}: multi error lacks {hint:?}: {e:#}"))
+                        }
+                    }
+                }
+            }
+        }
+        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
+        assert!(
+            failures.is_empty(),
+            "parser / factory / MultiEndpointStore disagree (#178):\n{}",
+            failures.join("\n")
+        );
     }
 
     // =========================================================================

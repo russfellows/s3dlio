@@ -1,5 +1,32 @@
 # s3dlio Changelog
 
+## Unreleased — `s3://` names a server only with an explicit port (BREAKING; #178, #193, #194)
+
+- **The first segment of `s3://X/...` is a server only when it carries an
+  explicit port** (`host:port` or `[ipv6]:port`). Otherwise it is always a
+  bucket. One shared rule (`s3_utils::classify_s3_first_segment`) now decides
+  this for the URI parser, the store factory, `MultiEndpointStore` and the CLI,
+  which previously used three different rules. The disagreement made
+  `s3://10.0.0.5/bkt/key` take bucket/key from the parser but send the request
+  to whatever `AWS_ENDPOINT_URL` said (#178), and made real dotted bucket names
+  such as `data.example.com` parse as servers (#193).
+- **Breaking:** a portless DNS name is now a bucket (`s3://minio.example.com/bkt/key`
+  is bucket `minio.example.com`, key `bkt/key`). A portless IPv4 literal
+  (`s3://10.0.0.5/bkt/key`) and an unbracketed or portless IPv6 are errors, since
+  S3 forbids IP-shaped bucket names; the message says to add `:port`.
+- **Migration:** put the port in every URI that names a server:
+  `s3://10.0.0.5:9000/bkt/key`, `s3://minio.example.com:9000/bkt/key`,
+  `s3://[::1]:9000/bkt/key`. Every `--endpoints` entry must be `host:port` too.
+  A deprecation period is not possible because a portless host and a dotted
+  bucket name are the same grammar.
+- `S3DLIO_S3_ENDPOINT_HINT_TLDS` (added in 0.9.109) is deprecated and ignored;
+  a one-time warning is logged if it is set. The built-in suffix list is removed.
+- `s3-cli create-bucket` / `delete-bucket` on `s3://host:port/bkt` now operate on
+  bucket `bkt` on that server (#194); before, the bucket name was `host:port` and
+  the request went to the global endpoint. Per-endpoint S3 stores now create and
+  delete buckets with their own client.
+- Planned: explicit `s3+http://` / `s3+https://` schemes (#195).
+
 ## Version 0.9.114 — Azure SDK stable 1.x migration
 
 - Updated `azure_storage_blob` and `azure_identity` from pre-release APIs to

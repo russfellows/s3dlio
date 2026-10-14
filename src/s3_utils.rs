@@ -393,7 +393,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ObjectType {
 /// Components of an S3 URI
 #[derive(Debug, Clone)]
 pub struct S3UriComponents {
-    /// Optional custom endpoint (e.g., "192.168.100.1:9001" or "minio.local:9000")
+    /// Optional custom server authority, always with an explicit port
+    /// (e.g., "192.168.100.1:9001", "minio.local:9000" or "[::1]:9000").
     /// If None, uses AWS_ENDPOINT_URL environment variable or default AWS endpoint
     pub endpoint: Option<String>,
     /// Bucket name
@@ -402,33 +403,14 @@ pub struct S3UriComponents {
     pub key: String,
 }
 
-/// Default set of hostname-like suffixes checked by [`looks_like_s3_endpoint`]
-/// against the LAST dot-separated label of a URI's first path segment.
-/// Extend at runtime via the comma-separated `S3DLIO_S3_ENDPOINT_HINT_TLDS`
-/// env var (audit #154 bug 4.1 / B8).
-const DEFAULT_ENDPOINT_HINT_TLDS: &[&str] = &[
-    // common public TLDs frequently used for self-hosted S3-compatible endpoints
-    "com", "net", "org", "io", "co", "dev", "cloud", "app", "biz", "info",
-    // conventional private/internal-infrastructure suffixes
-    "local", "internal", "lan", "corp", "home", "cluster", "svc", "network",
-];
-
-/// Returns the effective endpoint-hint suffix list: the built-in defaults
-/// plus any comma-separated entries from `S3DLIO_S3_ENDPOINT_HINT_TLDS`.
-fn endpoint_hint_tlds() -> Vec<String> {
-    let mut tlds: Vec<String> = DEFAULT_ENDPOINT_HINT_TLDS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    if let Ok(extra) = std::env::var("S3DLIO_S3_ENDPOINT_HINT_TLDS") {
-        for t in extra.split(',') {
-            let t = t.trim().to_lowercase();
-            if !t.is_empty() {
-                tlds.push(t);
-            }
-        }
-    }
-    tlds
+/// What the FIRST path segment of an `s3://` URI (the part before the first
+/// `/`) names. See [`classify_s3_first_segment`] for the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3FirstSegment<'a> {
+    /// A bucket name (no explicit port).
+    Bucket(&'a str),
+    /// A server authority with an explicit port: `host:port` or `[ipv6]:port`.
+    Server(&'a str),
 }
 
 /// True if `s` is a syntactically valid dotted-quad IPv4 address (four
@@ -446,53 +428,101 @@ fn looks_like_ipv4(s: &str) -> bool {
         })
 }
 
-/// Decide whether the first path segment of an `s3://` URI (the part
-/// before the first `/`) should be treated as a custom endpoint
-/// hostname rather than a bucket name.
-///
-/// Narrowed in v0.9.109 (audit #154 bug 4.1 / B8) to only fire on
-/// strings that are grammatically unambiguous or plausibly look like a
-/// real hostname:
-/// - contains `:` (a port — bucket names can never contain a colon)
-/// - is a dotted-quad IPv4 address (bucket names can never be formatted
-///   as an IP address, per S3 bucket naming rules)
-/// - contains a dot AND its last dot-separated label matches a known
-///   endpoint-hint suffix (see [`DEFAULT_ENDPOINT_HINT_TLDS`] /
-///   `S3DLIO_S3_ENDPOINT_HINT_TLDS`)
-///
-/// Deliberately does NOT fire on: a bare digit prefix, 2+ dots alone, or
-/// a `minio`/`ceph`/`localhost` substring — all of which are legal
-/// components of real S3 bucket names and were the source of the
-/// pre-v0.9.109 misclassification bug.
-fn looks_like_s3_endpoint(before_slash: &str) -> bool {
-    if before_slash.contains(':') {
-        return true;
-    }
-    if looks_like_ipv4(before_slash) {
-        return true;
-    }
-    if let Some(last_label) = before_slash.rsplit('.').next() {
-        if before_slash.contains('.') {
-            let last_label = last_label.to_lowercase();
-            if endpoint_hint_tlds().contains(&last_label) {
-                return true;
-            }
+/// Warn once, process-wide, if the retired `S3DLIO_S3_ENDPOINT_HINT_TLDS`
+/// variable is set: it no longer has any effect (issue #178).
+fn warn_if_retired_hint_tlds_env_set() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        if std::env::var_os("S3DLIO_S3_ENDPOINT_HINT_TLDS").is_some() {
+            tracing::warn!(
+                "S3DLIO_S3_ENDPOINT_HINT_TLDS is deprecated and ignored: an s3:// URI now names \
+                 a server only when its first segment carries an explicit port \
+                 (s3://host:port/bucket/key); every other first segment is a bucket (issue #178)"
+            );
         }
-    }
-    false
+    });
 }
 
-/// Parse S3 URI with optional endpoint support (Hybrid Approach - Option C)
+/// THE single rule that decides whether the first path segment of an `s3://`
+/// URI is a server or a bucket. The URI parser ([`parse_s3_uri_full`]), the
+/// store factory, `MultiEndpointStore` and the CLI bucket commands all call
+/// this, so they cannot disagree (issues #178, #193, #194).
 ///
-/// Supports two formats:
-/// 1. **Standard**: `s3://bucket/key`
-///    - Uses AWS_ENDPOINT_URL environment variable or default AWS endpoint
-///    - Compatible with existing code
+/// - `host:port` or `[ipv6]:port` (explicit, valid `u16` port) → [`S3FirstSegment::Server`].
+/// - A dotted-quad IPv4 literal with no port → **error**. S3 forbids IP-shaped
+///   bucket names, so it is not a bucket; the caller must add `:port`.
+/// - An IPv6 literal without brackets or without a port → **error**.
+/// - A colon with an empty host or an unparsable port → **error**.
+/// - Anything else — including dotted DNS-looking names such as
+///   `data.example.com` and `localhost` → [`S3FirstSegment::Bucket`].
+pub fn classify_s3_first_segment(segment: &str) -> Result<S3FirstSegment<'_>> {
+    warn_if_retired_hint_tlds_env_set();
+
+    let validate_port = |port: &str| -> Result<()> {
+        port.parse::<u16>().map(|_| ()).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid port '{port}' in '{segment}': an S3 URI server must be host:port \
+                 with a port from 0 to 65535 (e.g. s3://host:9000/bucket/key)"
+            )
+        })
+    };
+
+    if let Some(rest) = segment.strip_prefix('[') {
+        // Bracketed IPv6: "[addr]:port"
+        let Some((addr, after)) = rest.split_once(']') else {
+            bail!("unterminated '[' in '{segment}': an IPv6 server is written [addr]:port");
+        };
+        if addr.is_empty() {
+            bail!("empty IPv6 address in '{segment}'");
+        }
+        let Some(port) = after.strip_prefix(':') else {
+            bail!(
+                "'{segment}' names an IPv6 address without a port; add :port, \
+                 e.g. s3://{segment}:9000/bucket/key"
+            );
+        };
+        validate_port(port)?;
+        return Ok(S3FirstSegment::Server(segment));
+    }
+
+    match segment.matches(':').count() {
+        0 => {
+            if looks_like_ipv4(segment) {
+                bail!(
+                    "'{segment}' is an IP address with no port; add :port to name a server, \
+                     e.g. s3://{segment}:9000/bucket/key (an IP address cannot be an S3 bucket name)"
+                );
+            }
+            Ok(S3FirstSegment::Bucket(segment))
+        }
+        1 => {
+            let (host, port) = segment.split_once(':').unwrap_or((segment, ""));
+            if host.is_empty() {
+                bail!("missing host before ':' in '{segment}': use host:port, e.g. s3://host:9000/bucket/key");
+            }
+            validate_port(port)?;
+            Ok(S3FirstSegment::Server(segment))
+        }
+        _ => bail!(
+            "'{segment}' looks like an unbracketed IPv6 address; write it in brackets with a \
+             port, e.g. s3://[::1]:9000/bucket/key (add :port)"
+        ),
+    }
+}
+
+/// Parse S3 URI with optional endpoint support.
 ///
-/// 2. **With custom endpoint**: `s3://host:port/bucket/key` or `s3://host/bucket/key`
-///    - Explicitly specifies endpoint for MinIO, Ceph, or other S3-compatible storage
-///    - Host can be IP address, hostname, or domain
-///    - Port is optional (defaults to 9000 for custom endpoints, 443 for AWS)
+/// Two formats, told apart by [`classify_s3_first_segment`]:
+/// 1. **Bucket**: `s3://bucket/key` — also `s3://data.example.com/key`. Uses the
+///    `AWS_ENDPOINT_URL` environment variable or the default AWS endpoint.
+/// 2. **Server with an explicit port**: `s3://host:port/bucket/key` or
+///    `s3://[ipv6]:port/bucket/key` — names the S3-compatible server (MinIO,
+///    Ceph, GCS interop, ...) the request goes to.
+///
+/// The first segment is a server **only** when it carries an explicit port.
+/// A portless IPv4 literal (`s3://10.0.0.5/bkt/key`) or a portless / unbracketed
+/// IPv6 literal is an error: S3 forbids IP-shaped bucket names, so it can be
+/// neither; the message says to add `:port`.
 ///
 /// # Examples
 ///
@@ -511,26 +541,29 @@ fn looks_like_s3_endpoint(before_slash: &str) -> bool {
 /// assert_eq!(result.bucket, "mybucket");
 /// assert_eq!(result.key, "data.bin");
 ///
-/// // Custom hostname
+/// // Custom hostname, with its port
 /// let result = parse_s3_uri_full("s3://minio.local:9000/mybucket/path/to/file").unwrap();
 /// assert_eq!(result.endpoint, Some("minio.local:9000".to_string()));
+///
+/// // No port: a dotted name is a BUCKET, never a server
+/// let result = parse_s3_uri_full("s3://data.example.com/dir/file.bin").unwrap();
+/// assert_eq!(result.endpoint, None);
+/// assert_eq!(result.bucket, "data.example.com");
+/// assert_eq!(result.key, "dir/file.bin");
+///
+/// // A portless IP address is an error (add :port)
+/// assert!(parse_s3_uri_full("s3://10.0.0.5/mybucket/data.bin").is_err());
 /// ```
 ///
-/// # Behavior change (v0.9.109, audit #154 bug 4.1 / B8)
+/// # Behavior change (issues #178, #193, #194)
 ///
-/// Prior to v0.9.109, the first path segment was treated as an endpoint
-/// if it merely contained 2+ dots, started with a digit, or contained
-/// "minio"/"ceph"/"localhost" as a substring — misrouting legitimate S3
-/// bucket names using dotted naming conventions (e.g. `mycompany.data.
-/// backups`), digit-prefixed names (explicitly legal per S3 bucket
-/// naming rules, e.g. `2024-training-data`), or names merely containing
-/// those cluster-software names (e.g. `minio-tenant-a`). As of v0.9.109
-/// the heuristic only fires on a colon (port), a dotted-quad IPv4
-/// address, or a recognized hostname-like suffix — see
-/// [`looks_like_s3_endpoint`]. **If you relied on the old broader
-/// heuristic to route a bucket-shaped endpoint hostname with no port and
-/// no recognized suffix, add your suffix to
-/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` (comma-separated) or include a port.**
+/// Earlier releases also treated a portless first segment as a server when it
+/// was an IPv4 literal or its last label was a "hostname-like" TLD
+/// (`com`, `net`, `local`, ...; extendable with `S3DLIO_S3_ENDPOINT_HINT_TLDS`).
+/// That made the parser and the store factory disagree and misrouted real
+/// dotted bucket names. **Add `:port` to name a server.** The
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is now ignored (a one-time
+/// deprecation warning is logged if it is set).
 pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
     let trimmed = uri
         .strip_prefix("s3://")
@@ -543,40 +576,40 @@ pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
     let before_slash = &trimmed[..slash_pos];
     let after_slash = &trimmed[slash_pos + 1..];
 
-    let is_endpoint = looks_like_s3_endpoint(before_slash);
+    match classify_s3_first_segment(before_slash)
+        .with_context(|| format!("invalid S3 URI '{uri}'"))?
+    {
+        S3FirstSegment::Server(endpoint) => {
+            // Format: s3://host:port/bucket/key
+            let endpoint = endpoint.to_string();
 
-    if is_endpoint {
-        // Format: s3://endpoint:port/bucket/key or s3://endpoint/bucket/key
-        let endpoint = before_slash.to_string();
+            // Find next slash for bucket/key split
+            let slash_pos2 = after_slash.find('/').unwrap_or(after_slash.len());
+            let bucket = after_slash[..slash_pos2].to_string();
+            let key = if slash_pos2 < after_slash.len() {
+                after_slash[slash_pos2 + 1..].to_string()
+            } else {
+                String::new()
+            };
 
-        // Find next slash for bucket/key split
-        let slash_pos2 = after_slash.find('/').unwrap_or(after_slash.len());
-        let bucket = after_slash[..slash_pos2].to_string();
-        let key = if slash_pos2 < after_slash.len() {
-            after_slash[slash_pos2 + 1..].to_string()
-        } else {
-            String::new()
-        };
+            if bucket.is_empty() {
+                bail!("Bucket name cannot be empty in URI: {}", uri);
+            }
 
-        if bucket.is_empty() {
-            bail!("Bucket name cannot be empty in URI: {}", uri);
+            Ok(S3UriComponents {
+                endpoint: Some(endpoint),
+                bucket,
+                key,
+            })
         }
-
-        Ok(S3UriComponents {
-            endpoint: Some(endpoint),
-            bucket,
-            key,
-        })
-    } else {
-        // Format: s3://bucket/key (standard AWS)
-        let bucket = before_slash.to_string();
-        let key = after_slash.to_string();
-
-        Ok(S3UriComponents {
-            endpoint: None,
-            bucket,
-            key,
-        })
+        S3FirstSegment::Bucket(bucket) => {
+            // Format: s3://bucket/key (standard AWS)
+            Ok(S3UriComponents {
+                endpoint: None,
+                bucket: bucket.to_string(),
+                key: after_slash.to_string(),
+            })
+        }
     }
 }
 
@@ -1781,6 +1814,12 @@ pub async fn delete_objects_async(bucket: &str, keys: &[String]) -> Result<()> {
 /// Async version of delete_bucket — safe to call from within an async context.
 pub async fn delete_bucket_async(bucket: &str) -> Result<()> {
     let client = aws_s3_client_async().await?;
+    delete_bucket_with_client(&client, bucket).await
+}
+
+/// Delete `bucket` using an explicit client (e.g. a per-endpoint client built for
+/// `s3://host:port/bucket`, issue #194) instead of the process-wide singleton.
+pub async fn delete_bucket_with_client(client: &aws_sdk_s3::Client, bucket: &str) -> Result<()> {
     client
         .delete_bucket()
         .bucket(bucket)
@@ -1793,6 +1832,12 @@ pub async fn delete_bucket_async(bucket: &str) -> Result<()> {
 /// Async version of create_bucket — safe to call from within an async context.
 pub async fn create_bucket_async(bucket: &str) -> Result<()> {
     let client = aws_s3_client_async().await?;
+    create_bucket_with_client(&client, bucket).await
+}
+
+/// Create `bucket` using an explicit client (e.g. a per-endpoint client built for
+/// `s3://host:port/bucket`, issue #194) instead of the process-wide singleton.
+pub async fn create_bucket_with_client(client: &aws_sdk_s3::Client, bucket: &str) -> Result<()> {
     client
         .create_bucket()
         .bucket(bucket)
