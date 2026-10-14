@@ -685,6 +685,7 @@ pub fn mp_get(
     num: usize,
     template: &str,
 ) -> PyResult<Py<PyAny>> {
+    require_max_in_flight("procs", procs)?;
     require_max_in_flight("jobs", jobs)?;
     use crate::mp::{run_get_shards, MpGetConfigBuilder};
     use std::io::Write;

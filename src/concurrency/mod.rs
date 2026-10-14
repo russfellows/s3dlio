@@ -65,7 +65,14 @@ mod zero_limit_rejections {
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
-        rx.recv_timeout(BOUND).ok()
+        match rx.recv_timeout(BOUND) {
+            Ok(v) => Some(v),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            // The sender is dropped without a value only when `f` panicked.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the call PANICKED instead of returning an error")
+            }
+        }
     }
 
     async fn bounded<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
@@ -245,5 +252,28 @@ mod zero_limit_rejections {
             .build();
         let got = run_bounded(move || crate::mp::run_get_shards(&cfg));
         assert_zero_rejected("run_get_shards", got);
+    }
+
+    /// A worker count of 0 used to panic with a division by zero while sharding
+    /// the keys (needs at least one key).  It must be an error that names
+    /// `procs`, raised before any temp directory or process exists.
+    #[test]
+    fn mp_get_rejects_zero_procs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keylist = dir.path().join("keys.txt");
+        std::fs::write(&keylist, "s3://b/k0\n").expect("write keylist");
+        let cfg = crate::mp::MpGetConfigBuilder::new()
+            .procs(0)
+            .concurrent_per_proc(1)
+            .keylist(keylist)
+            .build();
+        let got = run_bounded(move || crate::mp::run_get_shards(&cfg));
+        let msg = got
+            .as_ref()
+            .and_then(|r| r.as_ref().err())
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(msg.contains("procs"), "error must name procs: {msg}");
+        assert_zero_rejected("run_get_shards procs", got);
     }
 }

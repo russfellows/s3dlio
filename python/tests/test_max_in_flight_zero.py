@@ -43,6 +43,7 @@ SYNC_CASES = {
     "get_many_stats": "s3dlio.get_many_stats(s3uris, max_in_flight=0)",
     "get_many_s3": "s3dlio.get_many(s3uris, max_in_flight=0)",
     "mp_get": 's3dlio.mp_get("s3://b/p/", procs=1, jobs=0, num=1)',
+    "mp_get_procs": 's3dlio.mp_get("s3://b/p/", procs=0, jobs=64, num=1)',
 }
 
 # Async entry points: the argument error must surface when the call is made
@@ -125,7 +126,7 @@ def _assert_rejected(result: subprocess.CompletedProcess) -> None:
     assert result.returncode == 0, f"expected ValueError, got:\n{result.stdout}"
     line = result.stdout.strip().splitlines()[-1]
     assert line.startswith("ValueError:"), line
-    assert "max_in_flight" in line or "jobs" in line, line
+    assert any(n in line for n in ("max_in_flight", "jobs", "procs")), line
     assert ">= 1" in line, f"message must state the valid range: {line}"
 
 
