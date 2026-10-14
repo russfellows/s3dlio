@@ -1,6 +1,12 @@
 #!/bin/bash
 # Build wheels for the current platform and Python versions.
 #
+# Fails loudly (issue #188): any error stops the script with a non-zero exit
+# status. It never reports success unless maturin ran and left a fresh
+# cp312 and cp313 wheel behind; wheels already in target/wheels/ from an
+# earlier build are never listed as results.
+set -euo pipefail
+
 # ── Platform detection ─────────────────────────────────────────────────────
 ARCH=$(uname -m)   # x86_64 | aarch64 | arm64
 OS=$(uname -s)     # Linux | Darwin
@@ -95,21 +101,78 @@ case "$PROFILE_ARG" in
     ;;
 esac
 
-if [ -n "$EXTRA_FEATURES" ]; then
+if [ -n "${EXTRA_FEATURES:-}" ]; then
     FEATURES="$FEATURES,$EXTRA_FEATURES"
     echo "Extra Rust features enabled: $EXTRA_FEATURES"
 fi
 
+# ── Preflight: the tools the build needs must exist ────────────────────────
+if ! command -v maturin >/dev/null 2>&1; then
+  echo "ERROR: maturin not found on PATH; no wheels were built." >&2
+  echo "       Install it (pip install maturin, or uv tool install maturin)," >&2
+  echo "       or run: uv run --no-project --with maturin --with patchelf $0" >&2
+  exit 1
+fi
+
+for PY in python3.12 python3.13; do
+  if ! command -v "$PY" >/dev/null 2>&1; then
+    echo "ERROR: $PY not found on PATH; no wheels were built." >&2
+    echo "       This script builds wheels for Python 3.12 and 3.13; install both." >&2
+    exit 1
+  fi
+done
+
 # ── Build for Python 3.12 and 3.13 on the native architecture ──────────────
-maturin build --release --features "$FEATURES" \
+# maturin writes wheels under cargo's target directory, wherever it is configured
+# (CARGO_TARGET_DIR, .cargo/config.toml build.target-dir). Ask cargo; fall back to
+# CARGO_TARGET_DIR, then ./target, if cargo metadata is unavailable or unparsable.
+TARGET_DIR=""
+if command -v cargo >/dev/null 2>&1; then
+  TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | grep -o '"target_directory":"[^"]*"' \
+    | sed -e 's/^"target_directory":"//' -e 's/"$//' || true)
+  # A path with JSON escapes is not trusted; use the fallback instead.
+  case "$TARGET_DIR" in
+    *\\*) TARGET_DIR="" ;;
+  esac
+fi
+if [ -z "$TARGET_DIR" ]; then
+  TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+fi
+WHEEL_DIR="${TARGET_DIR}/wheels"
+mkdir -p "$WHEEL_DIR"
+
+# Marker file: only wheels newer than this were produced by THIS run. It is created
+# inside the wheel directory so both sides of the `find -newer` comparison are on
+# the same filesystem and clock; its name can never match a wheel glob (*.whl).
+STAMP=$(mktemp "$WHEEL_DIR/.stamp.XXXXXX")
+trap 'rm -f "$STAMP"' EXIT
+
+if ! maturin build --release --features "$FEATURES" \
   -i python3.12 \
-  -i python3.13
+  -i python3.13; then
+  echo "ERROR: maturin build failed; no wheels were built." >&2
+  exit 1
+fi
+
+# ── Verify this run produced the expected wheels before claiming success ───
+NEW_WHEELS=()
+for TAG in cp312 cp313; do
+  FOUND=$(find "$WHEEL_DIR" -maxdepth 1 -name "*-${TAG}-*.whl" -newer "$STAMP" | sort)
+  if [ -z "$FOUND" ]; then
+    echo "ERROR: maturin exited 0 but produced no new ${TAG} wheel in ${WHEEL_DIR}/." >&2
+    exit 1
+  fi
+  while IFS= read -r WHEEL; do
+    NEW_WHEELS+=("$WHEEL")
+  done <<< "$FOUND"
+done
 
 echo ""
 echo "✅ Wheels built for Python 3.12 and 3.13 (${OS}/${ARCH})"
-echo "📦 Wheels location: target/wheels/"
+echo "📦 Wheels location: ${WHEEL_DIR}/"
 echo ""
-ls -lh target/wheels/*.whl 2>/dev/null || echo "No wheels found yet"
+ls -lh "${NEW_WHEELS[@]}"
 
 # ── Cross-compilation to Linux ARM64 (from Linux x86_64) ──────────────────
 # Uncomment to produce manylinux aarch64 wheels using maturin's cross-compile
