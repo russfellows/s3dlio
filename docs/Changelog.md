@@ -1,5 +1,21 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed — Python API (#198, #201, #204)
+
+- `s3dlio.list_keys` uses keys exactly as written, like every other operation since #172: a key with a
+  leading `/` or an empty segment (`a//b`) comes back as the object's real relative key, and
+  `prefix_uri + key` addresses the object listed (#198). The DLIO and `s3torchconnector` adapters,
+  the Azure https URI form, the arrow backend and op-log replay URIs, also named in #198, are not
+  changed here.
+- `list()`, `stat()`, a writer's `write_chunk()` / `write_owned_bytes()`, `parquet_rg_row_offsets()` and
+  `gcs_query_rapid_bucket()` release the GIL while they block on I/O, so other Python threads keep
+  running (#201). `write_chunk()` stays zero-copy: the buffer export is held until the write returns.
+- `stat_async`, `exists_async`, `put_bytes_async`, `mkdir_async` and `put_many_async` use the shared store
+  cache instead of building a store and S3 client per call, so a host-form server's connections are
+  reused; racing cache misses build one store per key (#204). Op-log rows are unchanged.
+
 ## Version 0.9.122 — Op-log accuracy (each call recorded once), server routing for every operation, replay fixes, Azure credential fix
 
 Fixes 14 issues: #169, #174, #177, #181, #182, #189, #196, #197, #199, #200, #183, #184, #187, #202.

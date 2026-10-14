@@ -108,19 +108,78 @@ impl StoreKey {
     }
 }
 
-/// Global cache of ObjectStore instances
+/// One cache slot: the store for one [`StoreKey`], built at most once.
+///
+/// `store` is read lock-free on every call after the first. `build` serialises
+/// the callers that find the slot empty, so one of them builds and the rest
+/// wait for its result instead of each building a store (and an S3 client with
+/// its own connection pool) that the others would then discard (issue #204).
+/// A failed build leaves the slot empty, so the next caller retries.
+struct StoreSlot {
+    store: std::sync::OnceLock<Arc<dyn ObjectStore>>,
+    build: std::sync::Mutex<()>,
+}
+
+impl StoreSlot {
+    fn new() -> Self {
+        Self {
+            store: std::sync::OnceLock::new(),
+            build: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// The slot's store, building it from `uri` if no caller has yet.
+    ///
+    /// Callers waiting on `build` are only those racing on the SAME key's first
+    /// miss; every other key, and every later call on this one, never touches the
+    /// lock. A poisoned lock (a build that panicked) guards no data, so it is
+    /// recovered and the build retried.
+    fn get_or_build(&self, uri: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
+        if let Some(store) = self.store.get() {
+            return Ok(Arc::clone(store));
+        }
+        let _building = self.build.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = self.store.get() {
+            return Ok(Arc::clone(store)); // another caller built it while this one waited
+        }
+        // store_for_uri_with_logger is SYNC, no runtime needed. The store itself is
+        // Send + Sync and uses the global runtime's I/O reactor when its async methods
+        // are called. Built without a logger: the cache must stay logger-free.
+        #[cfg(test)]
+        STORE_BUILD_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(uri.to_owned());
+        let built: Arc<dyn ObjectStore> = Arc::from(store_for_uri_with_logger(uri, None)?);
+        Ok(Arc::clone(self.store.get_or_init(|| built)))
+    }
+}
+
+/// Global cache of ObjectStore instances, one [`StoreSlot`] per [`StoreKey`].
 ///
 /// DashMap provides lock-free concurrent access (better than RwLock<HashMap>)
 /// for read-heavy workloads. Expected cache hit rate: >99% in typical workloads.
+/// A slot is inserted with the map's entry API, so racing callers share one slot
+/// per key and the slot makes the build happen once.
 ///
 /// Performance: <100ns per lookup (DashMap sharded locking)
-static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<dyn ObjectStore>>> = Lazy::new(DashMap::new);
+static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<StoreSlot>>> = Lazy::new(DashMap::new);
+
+/// Test hook: the URI of every store `get_or_create_store` built (not served from the
+/// cache), in order.  Lets a test count the builds for one URI.
+#[cfg(test)]
+static STORE_BUILD_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Get or create a cached ObjectStore instance.
 ///
 /// store_for_uri_with_logger() is synchronous — no runtime needed for creation.
-/// The store is cached by (scheme, endpoint, region, per-endpoint route) for
-/// >99% cache hit rate; see [`StoreKey`].
+/// The store is cached by (scheme, endpoint, region, per-endpoint route), for a
+/// cache hit rate above 99%; see [`StoreKey`]. Every Python entry point that needs
+/// a store, sync or async, gets it here (issue #204), so a host-form server's S3
+/// client and connection pool are built once and shared by all calls to it.
+///
+/// A cache miss is built ONCE per key however many callers race on it: the
+/// others wait for the builder (see [`StoreSlot`]).
 ///
 /// The cache holds only the UNLOGGED store, never a logger. `logger` is the
 /// caller's snapshot of `global_logger()` taken for THIS call, and a call that
@@ -144,22 +203,18 @@ fn get_or_create_store(
     // Routing errors propagate BEFORE the cache is consulted or populated.
     let key = StoreKey::from_uri(uri)?;
 
-    // Fast path: Store already exists (cache hit >99% in typical workloads)
-    let cached = STORE_CACHE.get(&key).map(|store| store.clone());
-    let store = match cached {
-        Some(store) => store,
-        None => {
-            // Slow path: Create new store — store_for_uri_with_logger is SYNC,
-            // no runtime needed. The store itself is Send + Sync and will use
-            // the global runtime's I/O reactor when async methods are called.
-            // Built without a logger: the cache must stay logger-free.
-            let store_box: Box<dyn ObjectStore> = store_for_uri_with_logger(uri, None)?;
-            let store_arc: Arc<dyn ObjectStore> = Arc::from(store_box);
-            // Two callers may build concurrently; both stores are equivalent, so
-            // keep whichever was inserted first.
-            STORE_CACHE.entry(key).or_insert(store_arc).value().clone()
-        }
+    // Fast path: the slot exists (cache hit >99% in typical workloads).
+    let existing = STORE_CACHE.get(&key).map(|slot| Arc::clone(slot.value()));
+    let slot = match existing {
+        Some(slot) => slot,
+        None => Arc::clone(
+            STORE_CACHE
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(StoreSlot::new()))
+                .value(),
+        ),
     };
+    let store = slot.get_or_build(uri)?;
 
     Ok(match logger {
         Some(logger) => Arc::new(
@@ -1185,8 +1240,11 @@ pub fn stat(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
 #[pyfunction]
 fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
-    let logger = global_logger();
-    let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+    // Through the shared store cache (issue #204), built with the GIL released: a
+    // miss may create a client (credential loading) on this caller thread.
+    let store = py
+        .detach(|| get_or_create_store(&uri, global_logger()))
+        .map_err(py_err)?;
 
     future_into_py(py, async move {
         let os = store.stat(&uri).await.map_err(py_err)?;
@@ -1293,8 +1351,10 @@ pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
 #[pyfunction]
 fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
-    let logger = global_logger();
-    let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+    // Through the shared store cache (issue #204); see `stat_async`.
+    let store = py
+        .detach(|| get_or_create_store(&uri, global_logger()))
+        .map_err(py_err)?;
 
     future_into_py(py, async move {
         match store.stat(&uri).await {
@@ -1460,8 +1520,7 @@ fn put_bytes_async<'py>(
     };
 
     future_into_py(py, async move {
-        let logger = global_logger();
-        let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
         put_verified_with_retry(store.as_ref(), &uri, data_owned)
             .await
             .map_err(py_err)
@@ -1510,8 +1569,7 @@ fn mkdir_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyA
     let uri = uri.to_owned();
 
     future_into_py(py, async move {
-        let logger = global_logger();
-        let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
         store.mkdir(&uri).await.map_err(py_err)
     })
 }
@@ -2083,7 +2141,7 @@ pub fn put_many_async<'py>(
             let sem = Arc::clone(&sem);
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                let store = store_for_uri_with_logger(&uri, global_logger()).map_err(py_err)?;
+                let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
                 store.put(&uri, data).await.map_err(py_err)?;
                 Ok::<_, PyErr>(())
             }));
@@ -3410,9 +3468,9 @@ mod issue173_store_creation_tests {
 // for the global AWS_ENDPOINT_URL client) and the request went to the wrong
 // server.  These tests need no network: store creation never connects.
 //
-// STORE_CACHE is process-global and `get_or_create_store` is check-then-insert
-// (two racing misses on one key can each insert, last writer wins), so these
-// tests serialise on TEST_LOCK and never remove entries.
+// STORE_CACHE is process-global, so these tests serialise on TEST_LOCK and never
+// remove entries (since #204 racing misses on one key build one store; the
+// serialising keeps the pointer-identity assertions independent of other tests).
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod issue171_store_cache_routing_tests {
@@ -3715,5 +3773,123 @@ mod issue199_put_bucket_tests {
                 "s3://127.0.0.1:9000/bkt/pfx/object-1".to_string(),
             ]
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- issue #204: the async entry points share the store cache, and a
+// cache miss is built once per key however many callers race on it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod issue204_store_cache_tests {
+    use super::*;
+
+    fn prepare_environment() {
+        // for_endpoint requires credentials to exist; none are ever used.
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+    }
+
+    /// How many stores `get_or_create_store` has built for `uri`.
+    fn builds_for(uri: &str) -> usize {
+        STORE_BUILD_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|built| built.as_str() == uri)
+            .count()
+    }
+
+    /// Every caller racing on one cold key gets the SAME store and exactly one
+    /// store is built.  The port is unique to this test (the cache is
+    /// process-global and other tests build their own keys); store creation
+    /// never connects.
+    #[test]
+    fn racing_misses_on_one_key_build_one_store() {
+        prepare_environment();
+        const CALLERS: usize = 8;
+        let uri = "s3://127.0.0.1:59204/bucket-204/some/key";
+        assert_eq!(builds_for(uri), 0, "the key must start cold");
+
+        let start = Arc::new(std::sync::Barrier::new(CALLERS));
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    get_or_create_store(uri, None).map_err(|e| format!("{e:#}"))
+                })
+            })
+            .collect();
+        let stores: Vec<Arc<dyn ObjectStore>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("caller thread").expect("store"))
+            .collect();
+
+        assert_eq!(
+            builds_for(uri),
+            1,
+            "RED: {CALLERS} callers racing on one cold key built {} stores",
+            builds_for(uri)
+        );
+        for store in &stores[1..] {
+            assert!(
+                Arc::ptr_eq(&stores[0], store),
+                "RED: racing callers were handed different stores for one key"
+            );
+        }
+    }
+
+    /// Sequential calls after the first are cache hits: no further build.
+    #[test]
+    fn a_warm_key_is_never_rebuilt() {
+        prepare_environment();
+        let uri = "s3://127.0.0.1:59205/bucket-204/some/key";
+        for _ in 0..3 {
+            get_or_create_store(uri, None).expect("store");
+        }
+        assert_eq!(
+            builds_for(uri),
+            1,
+            "three calls on one key built more than once"
+        );
+    }
+
+    /// Source of the entry point `name`: from its `fn` line to the closing brace at
+    /// column 0.
+    fn entry_point_source(name: &str) -> String {
+        let src = include_str!("python_core_api.rs");
+        let start = ["<'py>(", "<'p>(", "("]
+            .iter()
+            .find_map(|generics| src.find(&format!("fn {name}{generics}")))
+            .unwrap_or_else(|| panic!("entry point {name} not found"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("end of function");
+        rest[..end].to_string()
+    }
+
+    /// Structural guard for the entry points whose store build is not observable on
+    /// the wire (`mkdir_async` makes no S3 request): none may build its own store
+    /// with the factory; each must go through `get_or_create_store` (the #171
+    /// route-aware key, the #174 per-call logger wrapping).
+    #[test]
+    fn async_entry_points_use_the_store_cache() {
+        for name in [
+            "stat_async",
+            "exists_async",
+            "put_bytes_async",
+            "mkdir_async",
+            "put_many_async",
+        ] {
+            let body = entry_point_source(name);
+            assert!(
+                !body.contains("store_for_uri_with_logger("),
+                "RED: {name} builds a store per call with store_for_uri_with_logger"
+            );
+            assert!(
+                body.contains("get_or_create_store("),
+                "RED: {name} does not use get_or_create_store"
+            );
+        }
     }
 }
