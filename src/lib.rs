@@ -54,6 +54,7 @@ use pyo3::prelude::*;
 
 // Internal modules - these may change in future versions
 pub(crate) mod delete_batch_plan; // pure URI-grouping helpers for delete_batch (#179)
+pub mod delete_contract; // delete contract A shared by s3-cli and the Python API (#210, #167, #212)
 pub mod object_store;
 pub(crate) mod redirect_client; // HTTP 307 redirect following (for AIStore compatibility)
 pub mod retry; // v0.9.108+ Phase 4: shared retry helper for body-transfer failures

@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Changed — Python `delete(uri, recursive=False)` contract (INTENTIONAL COMPATIBILITY CHANGE) (#212)
+
+The Python `s3dlio.delete()` now follows the same delete contract as `s3-cli delete` (#210, #167).
+**Code that relied on the old implicit expansion will now raise or delete less; pass `recursive=True`
+where you mean "everything under a prefix".**
+
+- `delete(uri)` deletes ONLY the object with exactly that key. Before this change a URI ending in `/`
+  or containing `*` or `?` triggered a non-recursive listing and every returned entry was deleted,
+  synthetic common-prefix entries (`foo/sub/`) included, so `delete("s3://b/foo/")` removed `foo/x`
+  and tried to delete `foo/sub/` as a key. `/`, `*` and `?` are now ordinary key characters.
+- A missing object raises `FileNotFoundError` (it used to succeed silently, because S3 reports a
+  missing key as deleted). Any other lookup failure (for example a 403) raises `RuntimeError` and
+  deletes nothing. **The existence check is a HEAD, so `delete()` now needs read/HEAD permission in
+  addition to delete permission.** The DLIO integrations' `delete_node`, which already treats
+  `FileNotFoundError` as "already gone", now see that case.
+- `delete(uri, recursive=True)` deletes the real objects under the literal prefix: listed with no
+  delimiter, objects only, nothing appended (`foo` also matches `foobar`), `*` and `?` literal (the last
+  URI segment used to be read as a regex). It needs list permission. A prefix with no objects is a
+  no-op. After a failed request or a listing error no further delete request is sent and the
+  `RuntimeError` says how many keys were and were not attempted.
+- Other backends: `recursive=True` requires a URI ending in `/` (otherwise `RuntimeError`, nothing
+  deleted); a missing object raises `RuntimeError` ("cannot confirm that ... exists; nothing was
+  deleted").
+- Library: the exact-object lookup-then-delete and the literal-prefix selection/batching now live in
+  the new `s3dlio::delete_contract` module, shared by `s3-cli delete` and the Python API (CLI output
+  and behaviour unchanged). The lower-level `ObjectStore::delete`, `delete_batch`, `delete_prefix` and
+  the multi-endpoint store's `delete` are not changed.
+
 ### Changed — `s3-cli delete` contract (INTENTIONAL COMPATIBILITY CHANGE) (#210, #167)
 
 `s3-cli delete` (alias `rm`) no longer expands a name into a prefix. **Scripts that relied on the old
@@ -40,8 +68,8 @@ implicit expansion will now fail or delete less; add `-r` where you mean "everyt
   (the command stops listing once a request has failed) writes no LIST row.
 - Works with the process-wide client and with a per-endpoint client (`s3://host:port/bkt/...`), under
   the #197 route-or-reject rules. New `ObjectStore` methods (default implementations provided):
-  `stat_if_exists` and `list_objects_with_prefix`. Python `delete()` and the library `delete_prefix`
-  are not changed by this entry.
+  `stat_if_exists` and `list_objects_with_prefix`. The library `delete_prefix` is not changed by this
+  entry; Python `delete()` follows the same contract (next entry, #212).
 
 ## Version 0.9.122 — Op-log accuracy (each call recorded once), server routing for every operation, replay fixes, Azure credential fix
 
