@@ -464,3 +464,67 @@ fn download_with_an_explicit_pattern_keeps_the_glob_regex_selection() {
         "{err:#}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// Host-form URIs (`s3://host:port/bucket/key`) and an explicit pattern
+//
+// `S3ObjectStore::list` returns `s3://{bucket}/{key}` WITHOUT the host:port, so the
+// pattern base must be worked out from the KEY parts, not by comparing whole URIs.
+// Python `list(pattern=)`, `s3-cli ls -p` and `download_objects_matching` all use the
+// same rule and must agree.
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn host_form_uri_with_a_pattern_selects_relative_to_the_listing_base() {
+    use s3dlio::list_pattern::ListPattern;
+    let (port, _state, b) = seeded_bucket();
+    let store = S3ObjectStore::for_endpoint(&format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("for_endpoint");
+
+    // What Python `list(uri, recursive=True, pattern=...)` does: list, then retain.
+    for uri in [
+        format!("s3://127.0.0.1:{port}/{b}/dl/"),
+        format!("s3://127.0.0.1:{port}/{b}/dl"),
+    ] {
+        let mut keys = store.list(&uri, true).await.expect("list");
+        // the listing itself is unchanged: bucket-form entries
+        assert_eq!(
+            keys,
+            uris(&b, &["dl/a.npz", "dl/b.npz", "dl/c.txt", "dl/sub/d.npz"]),
+            "list({uri})"
+        );
+        ListPattern::new("^sub/")
+            .expect("pattern")
+            .retain(&uri, &mut keys);
+        assert_eq!(
+            keys,
+            uris(&b, &["dl/sub/d.npz"]),
+            "pattern '^sub/' on {uri} is matched against the key relative to the listing base"
+        );
+    }
+
+    // a non-slash prefix of a host-form URI: parent-directory base
+    let uri = format!("s3://127.0.0.1:{port}/{b}/data/run.1");
+    let mut keys = store.list(&uri, true).await.expect("list");
+    ListPattern::new("^run.1.old$")
+        .expect("pattern")
+        .retain(&uri, &mut keys);
+    assert_eq!(keys, uris(&b, &["data/run.1.old"]), "{uri}");
+}
+
+#[test]
+fn host_form_uri_download_matching_agrees_with_list_on_the_pattern() {
+    let (port, _state, b) = seeded_bucket();
+    let out = tempfile::tempdir().expect("tempdir");
+    on_fresh_runtime(s3dlio::s3_copy::download_objects_matching(
+        &format!("s3://127.0.0.1:{port}/{b}/dl/"),
+        Some(r"^sub/"),
+        out.path(),
+        4,
+        true,
+        None,
+    ))
+    .expect("download");
+    assert_eq!(downloaded_names(out.path()), vec!["d.npz"]);
+}

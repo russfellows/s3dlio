@@ -178,3 +178,21 @@ fn ls_invalid_pattern_is_an_error_not_a_listing() {
         r.stderr
     );
 }
+
+#[test]
+fn ls_pattern_with_a_host_form_uri_is_relative_to_the_listing_base() {
+    let (port, _s, b) = seeded();
+    // The CLI prints bucket-form URIs (`s3://bucket/key`) for a host-form argument; the
+    // pattern is still matched against the key relative to the listing base.
+    for uri in [
+        format!("s3://127.0.0.1:{port}/{b}/dl/"),
+        format!("s3://127.0.0.1:{port}/{b}/dl"),
+    ] {
+        assert_ls(
+            &s3_cli_ls(port, &["-r", "-p", "^sub/", &uri]),
+            &b,
+            &["dl/sub/c.npz"],
+            &format!("ls -r -p '^sub/' {uri}"),
+        );
+    }
+}

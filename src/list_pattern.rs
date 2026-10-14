@@ -26,9 +26,16 @@
 //!    (`s3://b/data/run.1` and `s3://b/data/run.1.old` -> `run.1.old`).
 //!
 //! An entry that does not start with the base is matched as it is.
+//!
+//! For `s3://` URIs the base is worked out on the KEY parts, so the host in a
+//! host-form prefix (`s3://127.0.0.1:9000/bkt/dl/`) does not matter: the entries a
+//! listing returns (`s3://bkt/dl/sub/c.npz`) are made relative exactly as the raw
+//! keys are.
 
 use anyhow::{Context, Result};
 use regex::Regex;
+
+use crate::s3_utils::parse_s3_uri_full;
 
 /// A compiled listing filter. Compile it BEFORE listing, so an invalid pattern
 /// fails without a single request being sent.
@@ -61,22 +68,50 @@ impl ListPattern {
 
 /// `entry` relative to the base of a listing of `listing_prefix` (see the
 /// [module docs](self) for the rule).
+///
+/// When both are `s3://` URIs the rule is applied to their KEY parts, so a
+/// host-form listing prefix (`s3://127.0.0.1:9000/bkt/dl/`) and the bucket-form
+/// entries a listing returns (`s3://bkt/dl/sub/c.npz`) agree with the raw-key
+/// callers (`download_objects_matching`). The result is always a suffix of `entry`.
 pub fn relative_to_listing_base<'a>(listing_prefix: &str, entry: &'a str) -> &'a str {
+    if let Some((prefix_key, entry_key)) = s3_key_parts(listing_prefix, entry) {
+        return strip_listing_base(&prefix_key, entry_key).unwrap_or(entry);
+    }
+    strip_listing_base(listing_prefix, entry).unwrap_or(entry)
+}
+
+/// The key of `listing_prefix` and the key part of `entry` (a suffix of it), when both
+/// are `s3://` URIs of the same bucket; `None` otherwise.
+fn s3_key_parts<'a>(listing_prefix: &str, entry: &'a str) -> Option<(String, &'a str)> {
+    if !listing_prefix.starts_with("s3://") || !entry.starts_with("s3://") {
+        return None;
+    }
+    let prefix = parse_s3_uri_full(listing_prefix).ok()?;
+    let listed = parse_s3_uri_full(entry).ok()?;
+    if prefix.bucket != listed.bucket {
+        return None;
+    }
+    // The key is the verbatim tail of the URI.
+    let entry_key = entry.get(entry.len().checked_sub(listed.key.len())?..)?;
+    Some((prefix.key, entry_key))
+}
+
+/// The listing-base rule over plain strings (a key, or a whole URI).
+fn strip_listing_base<'a>(listing_prefix: &str, entry: &'a str) -> Option<&'a str> {
     if listing_prefix.ends_with('/') {
-        return entry.strip_prefix(listing_prefix).unwrap_or(entry);
+        return entry.strip_prefix(listing_prefix);
     }
     if let Some(inside) = entry
         .strip_prefix(listing_prefix)
         .and_then(|rest| rest.strip_prefix('/'))
     {
-        return inside;
+        return Some(inside);
     }
-    match listing_prefix.rfind('/') {
-        Some(slash) => entry
-            .strip_prefix(&listing_prefix[..=slash])
-            .unwrap_or(entry),
-        None => entry,
-    }
+    let parent = match listing_prefix.rfind('/') {
+        Some(slash) => &listing_prefix[..=slash],
+        None => "",
+    };
+    entry.strip_prefix(parent)
 }
 
 #[cfg(test)]
@@ -123,6 +158,40 @@ mod tests {
         assert_eq!(relative_to_listing_base("dl/", "dl/a.npz"), "a.npz");
         assert_eq!(relative_to_listing_base("run.1", "run.1.old"), "run.1.old");
         assert_eq!(relative_to_listing_base("", "dl/a.npz"), "dl/a.npz");
+    }
+
+    #[test]
+    fn host_form_prefix_is_relative_to_the_key_parts() {
+        let host = "s3://127.0.0.1:9000/bkt/dl/";
+        assert_eq!(
+            relative_to_listing_base(host, "s3://bkt/dl/sub/c.npz"),
+            "sub/c.npz"
+        );
+        assert_eq!(
+            relative_to_listing_base("s3://127.0.0.1:9000/bkt/dl", "s3://bkt/dl/sub/c.npz"),
+            "sub/c.npz"
+        );
+        assert_eq!(
+            relative_to_listing_base(
+                "s3://127.0.0.1:9000/bkt/data/run.1",
+                "s3://bkt/data/run.1.old"
+            ),
+            "run.1.old"
+        );
+        assert_eq!(
+            relative_to_listing_base("s3://127.0.0.1:9000/bkt/foo", "s3://bkt/foobar"),
+            "foobar"
+        );
+        // another bucket: matched whole
+        assert_eq!(
+            relative_to_listing_base(host, "s3://other/dl/x"),
+            "s3://other/dl/x"
+        );
+        // the host-form entry works too
+        assert_eq!(
+            relative_to_listing_base(host, "s3://127.0.0.1:9000/bkt/dl/x"),
+            "x"
+        );
     }
 
     #[test]
