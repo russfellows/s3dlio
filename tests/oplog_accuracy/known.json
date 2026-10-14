@@ -3,21 +3,6 @@
  "expected": [
   {
    "match": {
-    "case": "leading_slash",
-    "call": [
-     "stat_slash_lead",
-     "range_slash_lead"
-    ]
-   },
-   "action": "WRONG-ACTION:key",
-   "record": "WRONG-FIELD:key",
-   "issues": [
-    "#172"
-   ],
-   "note": "stat/get_range strip the leading '/' of the key and read the OTHER object (<prefix>/slash/x); the row still names the asked key"
-  },
-  {
-   "match": {
     "case": "multi_endpoint",
     "call": [
      "get_range",
@@ -59,33 +44,20 @@
   },
   {
    "match": {
-    "case": [
-     "host443_get",
-     "host443_get_range"
-    ],
-    "call": "c1"
-   },
-   "action": "HANG",
-   "record": "HANG",
-   "issues": [
-    "#173"
-   ],
-   "note": "sync get/get_range on a host-form URI hang forever (store not yet cached)"
-  },
-  {
-   "match": {
     "case": "host443_decoydefault_get_many",
     "call": [
      "m1",
      "m2"
     ]
    },
-   "action": "WRONG-ACTION:port,scheme,server",
-   "record": "OK",
+   "action": "OK",
+   "record": "MISSING",
    "issues": [
-    "#171"
+    "#171",
+    "#197",
+    "#169"
    ],
-   "note": "get_many ignores the host-form URI and uses the configured endpoint (here an unroutable decoy); the rows truthfully name that endpoint"
+   "note": "get_many on a host-form URI that names a server other than the process-wide client's (here the configured endpoint is an unroutable decoy): rejected by the #197 route-or-reject check before any request (RuntimeError, 0 SDK requests, so ACTION is OK); the rejected call writes no op-log row. Observed in run 20261014-145359 (previously: WRONG-ACTION:port,scheme,server, the call went to the configured endpoint)"
   },
   {
    "match": {
