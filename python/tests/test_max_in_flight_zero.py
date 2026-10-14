@@ -44,6 +44,8 @@ SYNC_CASES = {
     "get_many_s3": "s3dlio.get_many(s3uris, max_in_flight=0)",
     "mp_get": 's3dlio.mp_get("s3://b/p/", procs=1, jobs=0, num=1)',
     "mp_get_procs": 's3dlio.mp_get("s3://b/p/", procs=0, jobs=64, num=1)',
+    "multipart_writer": 's3dlio.MultipartUploadWriter("b", "k", max_in_flight=0)',
+    "multipart_writer_from_uri": 's3dlio.MultipartUploadWriter.from_uri("s3://b/k", max_in_flight=0)',
 }
 
 # Async entry points: the argument error must surface when the call is made
