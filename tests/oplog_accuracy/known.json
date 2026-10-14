@@ -3,35 +3,6 @@
  "expected": [
   {
    "match": {
-    "case": [
-     "core",
-     "repeat",
-     "two_buckets",
-     "leading_slash",
-     "s3_dest_reject",
-     "async"
-    ],
-    "api": [
-     "get",
-     "put_bytes",
-     "put_bytes_async"
-    ],
-    "call": [
-     "get*",
-     "put*",
-     "range_*",
-     "stat_*"
-    ]
-   },
-   "action": "OK",
-   "record": "DUPLICATE",
-   "issues": [
-    "#169"
-   ],
-   "note": "every S3 GET/PUT is recorded twice: LoggedObjectStore row (endpoint s3://bucket, file bucket/key, empty client_id) + legacy S3Ops row (endpoint = AWS_ENDPOINT_URL, file = bare key, client_id = the access key id)"
-  },
-  {
-   "match": {
     "case": "leading_slash",
     "call": [
      "stat_slash_lead",
@@ -44,33 +15,6 @@
     "#172"
    ],
    "note": "stat/get_range strip the leading '/' of the key and read the OTHER object (<prefix>/slash/x); the row still names the asked key"
-  },
-  {
-   "match": {
-    "case": "async",
-    "call": "delete"
-   },
-   "action": "OK",
-   "record": "MISSING",
-   "issues": [
-    "#174"
-   ],
-   "note": "after get_async() created the logger-less cached store, a later sync delete writes no row"
-  },
-  {
-   "match": {
-    "case": [
-     "host443_get_async",
-     "host443_decoydefault_get_async"
-    ],
-    "call": "c1"
-   },
-   "action": "OK",
-   "record": "MISSING",
-   "issues": [
-    "#174"
-   ],
-   "note": "get_async() on a host-form URI writes no row"
   },
   {
    "match": {

@@ -207,3 +207,36 @@ choice of `first_byte` is a semantic decision.
 
 Round-1 history: `evidence/w2/` (round-1 builds, GCS harness, kept as history, NOT evidence for round 2).
 Round 2: see section 9.
+
+## 9. Round-2 validation (ground-truth harness on Google Cloud Storage)
+
+`tests/oplog_accuracy/` (see its README), one run on the final wheel (sha256 `d4802c6f...`, equal to the
+`wheel_sha256` in the run record), GCS S3-interop endpoint, native `gcloud storage` as ground truth, 83 calls
+(`delete_batch` skipped: no probe given). Evidence: `evidence/w2r2/` (bucket names replaced by the roles B1/B2).
+The mock-server tests above prove the row FIELDS byte-for-byte against the parent; the harness proves the
+rows against the real service.
+
+| | integration baseline, round 1 not included (run 20261014-034453, main's known.json) | round 2 (run 20261014-045732) |
+|---|---|---|
+| calls | 83 | 83 |
+| RECORD `DUPLICATE` | 18 | **0** |
+| RECORD `MISSING` | 10 | 7 |
+| RECORD `WRONG-FIELD` | 0 | **0** (round 1 had 7) |
+| NEW / CHANGED | 0 / 0 | **0 / 0** |
+| FIXED against main's `known.json` | 4 | 25 |
+
+The 25 FIXED against main's `known.json`: 18 x #169 (every S3 `get`/`put_bytes`/`put_bytes_async`, one correct
+row now), 3 x #174 (`async` `delete`, `host443_get_async`, `host443_decoydefault_get_async` have their row),
+and 4 that this branch did NOT fix: 2 x #172 (`stat`/`get_range` of a leading-slash key) and 2 x #173
+(`host443_get`, `host443_get_range`), which main already fixed (the integration run above shows the same 4
+FIXED on main's wheel before this branch; main's `known.json` still lists them). `known.json` was updated
+only for #169 and #174 (the DUPLICATE entry and the two #174 entries are removed); the #172/#173 entries are
+left for main's owner. Re-evaluated against the updated file: PASS 70, KNOWN 9, NEW 0, CHANGED 0, FIXED 4
+(exactly those four).
+
+Compared with round 1: `multi_endpoint` `get`/`put` are OK again (were NEW MISSING), the two
+`host443_decoydefault_get_many` rows are OK again (were `WRONG-FIELD:server`: the row names the server the
+call really went to; the wrong routing itself is #197/#171, KNOWN in the harness), and `portless_get` /
+`portless_put` are as on main (#178). The remaining 7 MISSING are the known #175 (`multi_endpoint`
+`get_range`, `list`, `delete`, `me_host443` get), #178 (`portless_*`, the failed call writes no row).
+Cleanup: 23 objects deleted, the run prefix is empty in both buckets, no process left running.
