@@ -3594,7 +3594,10 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
 /// `s3://host:port` + `host:port/bucket/key`.
 pub(crate) fn container_uri_prefix(uri: &str) -> String {
     let scheme_end = uri.find("://").map(|i| i + 3).unwrap_or(0);
-    if s3_endpoint_url_from_uri(uri).is_some() {
+    // An invalid first segment is an Err here; the factory has already propagated it
+    // (store_routing_endpoint_for_uri) before it asks for the prefix, so it is not
+    // a host-form URI as far as the prefix is concerned.
+    if matches!(s3_endpoint_url_from_uri(uri), Ok(Some(_))) {
         // Authority = everything up to the first '/'; keep it, then the '/'.
         let authority = uri[scheme_end..].split('/').next().unwrap_or_default();
         return format!("{}{authority}/", &uri[..scheme_end]);
