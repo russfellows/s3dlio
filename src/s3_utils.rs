@@ -353,7 +353,7 @@ async fn build_ops_for(rows: Rows) -> Result<S3Ops> {
         Rows::Write => {
             let logger = global_logger();
             let client_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
-            let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
+            let endpoint = crate::s3_client::s3_endpoint_url_from_env().unwrap_or_default();
             S3Ops::new(client, logger, &client_id, &endpoint)
         }
         Rows::Skip => S3Ops::new(client, None, "", ""),

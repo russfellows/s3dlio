@@ -259,15 +259,15 @@ pub(crate) fn parse_s3_uri_for_server(
     parse_s3_uri_resolving_server(uri, || Ok(store.cloned()))
 }
 
-/// The server the process-wide S3 client talks to: the one `AWS_ENDPOINT_URL`
-/// names (the client is built from it).  `None` when it is unset, empty or not
-/// a usable URL -- then the client talks to the default AWS endpoint, which no
-/// `host:port` in a URI can be matched against.
+/// The server the process-wide S3 client talks to: the one the environment
+/// names, decided by [`crate::s3_client::s3_endpoint_url_from_env`] -- the same
+/// rule the client is built with (`AWS_ENDPOINT_URL_S3` before
+/// `AWS_ENDPOINT_URL`, issue #183), so the routing guard and the client cannot
+/// disagree.  `None` when neither is set, or the value is not a usable URL --
+/// then the client talks to the default AWS endpoint, which no `host:port` in a
+/// URI can be matched against.
 pub(crate) fn global_client_server() -> Option<StoreServer> {
-    let url = std::env::var("AWS_ENDPOINT_URL").ok()?;
-    if url.is_empty() {
-        return None;
-    }
+    let url = crate::s3_client::s3_endpoint_url_from_env()?;
     StoreServer::from_endpoint_url(&url).ok()
 }
 
