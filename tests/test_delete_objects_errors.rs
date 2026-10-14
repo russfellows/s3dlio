@@ -55,7 +55,7 @@ fn s3ops_delete_objects_returns_ok_when_all_keys_succeed() {
 
     let result = run_on_global_rt(async move {
         let client = aws_s3_client_async().await?;
-        let ops = S3Ops::new(client);
+        let ops = S3Ops::new(client, None, "test-client", "mock-endpoint");
         ops.delete_objects(TEST_BUCKET, keys).await
     });
 
@@ -73,7 +73,7 @@ fn s3ops_delete_objects_returns_err_when_a_key_partially_fails() {
 
     let result = run_on_global_rt(async move {
         let client = aws_s3_client_async().await?;
-        let ops = S3Ops::new(client);
+        let ops = S3Ops::new(client, None, "test-client", "mock-endpoint");
         ops.delete_objects(TEST_BUCKET, keys).await
     });
 

@@ -1,0 +1,25 @@
+op=DELETE client_id=mock-access-key n_objects=1 bytes=0 endpoint=http://MOCK file=(batch) error=[] first_byte=none
+op=DELETE client_id=mock-access-key n_objects=1 bytes=0 endpoint=http://MOCK file=(batch) error=[] first_byte=none
+op=DELETE client_id=mock-access-key n_objects=1 bytes=0 endpoint=http://MOCK file=(batch) error=[golden/del/delete-fails-one: AccessDenied (mock server injected per-object delete failure)] first_byte=none
+op=DELETE client_id=mock-access-key n_objects=1000 bytes=0 endpoint=http://MOCK file=(batch) error=[] first_byte=none
+op=DELETE client_id=mock-access-key n_objects=1000 bytes=0 endpoint=http://MOCK file=(batch) error=[] first_byte=none
+op=GET client_id=mock-access-key n_objects=1 bytes=0 endpoint=http://MOCK file=golden/get-403-a error=[S3 GET for s3://mock-bucket/golden/get-403-a failed: service error: AccessDenied (mock server injected failure) — check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY] first_byte=none
+op=GET client_id=mock-access-key n_objects=1 bytes=0 endpoint=http://MOCK file=golden/get-403-opt error=[S3 GET for s3://mock-bucket/golden/get-403-opt failed: service error: AccessDenied (mock server injected failure) — check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY] first_byte=none
+op=GET client_id=mock-access-key n_objects=1 bytes=0 endpoint=http://MOCK file=golden/get-403-par error=[S3 GET for s3://mock-bucket/golden/get-403-par failed: service error: AccessDenied (mock server injected failure) — check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY] first_byte=none
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/down/bar error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/down/other/deep.dat error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/ds/bar error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/ds/other/deep.dat error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/get-ok error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/get-opt-ok error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/get-range-ok error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/get-sync-ok error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/get-uri-ok error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/par-1 error=[] first_byte=mid
+op=GET client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/par-2 error=[] first_byte=mid
+op=PUT client_id=mock-access-key n_objects=1 bytes=0 endpoint=http://MOCK file=golden/put-403-a error=[service error: AccessDenied (mock server injected failure) — check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY] first_byte=none
+op=PUT client_id=mock-access-key n_objects=1 bytes=0 endpoint=http://MOCK file=golden/put-403-uri error=[service error: AccessDenied (mock server injected failure) — check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY] first_byte=none
+op=PUT client_id=mock-access-key n_objects=1 bytes=0 endpoint=http://MOCK file=golden/put-500-retried error=[service error: MockPutFailure (mock server injected failure)] first_byte=none
+op=PUT client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/put-ok error=[] first_byte=none
+op=PUT client_id=mock-access-key n_objects=1 bytes=4 endpoint=http://MOCK file=golden/put-uri-ok error=[] first_byte=none
+op=PUT client_id=mock-access-key n_objects=1 bytes=6 endpoint=http://MOCK file=golden/up/golden-upload.bin error=[] first_byte=none

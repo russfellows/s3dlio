@@ -40,8 +40,8 @@ use crate::data_gen::generate_object;
 use crate::retry::retry_get_body;
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
 
-// S3 operation logging (the public helpers in this module record their own calls)
-use crate::s3_logger::{global_logger, Logger};
+// S3 operation logging (the public helpers in this module write the S3Ops row)
+use crate::s3_logger::global_logger;
 use crate::s3_ops::S3Ops;
 
 // Object size cache for eliminating redundant HEAD requests
@@ -327,85 +327,45 @@ fn get_size_cache() -> &'static Arc<ObjectSizeCache> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// helper: create an S3Ops around the global S3 client.
+// helpers: create an S3Ops around the global S3 client.
 //
-// `S3Ops` writes no op-log rows. A call is recorded once, by the layer the
-// caller used: `LoggedObjectStore` for a store built with a logger, or
-// `HelperCall` below for the public helper functions in this module that are
-// user entry points (issue #169, design doc section 8).
-async fn build_ops_async() -> Result<S3Ops> {
+// `S3Ops` is the S3 helpers' own row writer. A row is written ONLY when the
+// `S3Ops` was built with a logger, so the owner of a call is chosen by which
+// builder the call used (issue #169, one row per call):
+//
+// * `build_ops_async` -- the public helper functions of this module that are
+//   user entry points (`get_object`, `put_object_async`, `delete_objects`, and
+//   everything built on them). Wired to the singleton logger exactly as before
+//   W2, so the row they write is byte-for-byte the row they always wrote.
+// * `Rows::Skip` -- the S3 backend of an `ObjectStore`. The store's
+//   caller records the call (a `LoggedObjectStore`), or deliberately does not (a
+//   store built without a logger), so the backend must not write a second row.
+
+/// Whether a helper call writes the S3Ops row (see the block comment above).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rows {
+    /// Public helper: write the S3Ops row if the op-log is active.
+    Write,
+    /// Backend of an `ObjectStore`: write nothing.
+    Skip,
+}
+
+async fn build_ops_for(rows: Rows) -> Result<S3Ops> {
     let client = aws_s3_client_async().await?;
-    Ok(S3Ops::new(client))
-}
-
-/// Which value a helper's row carries in the `first_byte` column. These are the
-/// values `LoggedObjectStore` writes for the same operation, so one call has the
-/// same row whichever layer records it.
-enum FirstByte {
-    /// GET: the time the data was available to the caller (= the end time).
-    AtEnd,
-    /// PUT: the time the upload began (= the start time).
-    AtStart,
-    /// Metadata operations: not applicable.
-    None,
-}
-
-/// Records one call made through a public helper function of this module as ONE
-/// op-log row, in exactly the row shape `LoggedObjectStore` writes
-/// (`crate::object_store_logger::record_call`): endpoint `s3://<bucket>`,
-/// file `<bucket>/<key>`, client_id from `set_client_id()`.
-///
-/// The logger is captured when the call begins, so a call is recorded exactly
-/// when the op-log is active at that moment, and never when it is not.
-/// Internal transfers (the S3 backend of a store) use the `*_silent` functions
-/// instead, so that a store's own recording is the only one.
-struct HelperCall {
-    logger: Option<Logger>,
-    start: std::time::SystemTime,
-}
-
-impl HelperCall {
-    fn begin() -> Self {
-        Self {
-            logger: global_logger(),
-            start: std::time::SystemTime::now(),
+    Ok(match rows {
+        Rows::Write => {
+            let logger = global_logger();
+            let client_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
+            let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
+            S3Ops::new(client, logger, &client_id, &endpoint)
         }
-    }
+        Rows::Skip => S3Ops::new(client, None, "", ""),
+    })
+}
 
-    /// Record the call. `outcome` is the data size on success or the error.
-    fn finish(
-        self,
-        operation: &str,
-        uri: impl FnOnce() -> String,
-        num_objects: u32,
-        first_byte: FirstByte,
-        outcome: std::result::Result<u64, &anyhow::Error>,
-    ) {
-        let Some(logger) = self.logger else {
-            return;
-        };
-        let end = std::time::SystemTime::now();
-        let (bytes, error) = match outcome {
-            Ok(bytes) => (bytes, None),
-            Err(e) => (0, Some(e.to_string())),
-        };
-        let first_byte_time = match first_byte {
-            FirstByte::AtEnd => Some(end),
-            FirstByte::AtStart => Some(self.start),
-            FirstByte::None => None,
-        };
-        crate::object_store_logger::record_call(
-            &logger,
-            operation,
-            &uri(),
-            bytes,
-            num_objects,
-            self.start,
-            first_byte_time,
-            end,
-            error,
-        );
-    }
+// helper: create an S3Ops wired to the singleton logger (if any)
+async fn build_ops_async() -> Result<S3Ops> {
+    build_ops_for(Rows::Write).await
 }
 
 // -----------------------------------------------------------------------------
@@ -1982,35 +1942,22 @@ pub async fn stat_object_many_async(uris: Vec<String>) -> Result<Vec<ObjectStat>
 // Delete operation
 // -----------------------------------------------------------------------------
 
-/// Delete many keys (sent in batches of up to 1000).
+/// Delete many keys (up to 1000 per logged batch).
 ///
-/// With the op-log active this is recorded as ONE `DELETE_BATCH` row for the
-/// call (`n_objects` = number of keys, `file` = the first key's URI), the same
-/// row `LoggedObjectStore::delete_batch` writes. A call with no keys makes no
-/// request and writes no row.
+/// With the op-log active each batch of up to 1000 keys is ONE `DELETE` row
+/// (`file` = `(batch)`, `n_objects` = keys in that batch, endpoint =
+/// `AWS_ENDPOINT_URL`), written by `S3Ops::delete_objects`. An empty list
+/// sends no request and writes no row.
 pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
-    let call = HelperCall::begin();
-    let first_uri = keys.first().map(|k| format!("s3://{bucket}/{k}"));
-    let num_objects = keys.len() as u32;
     let bucket = bucket.to_string();
     let to_delete: Vec<String> = keys.to_vec();
-    let result = run_on_global_rt(async move {
+    run_on_global_rt(async move {
         let ops = build_ops_async().await?;
         for chunk in to_delete.chunks(1000) {
             ops.delete_objects(&bucket, chunk.to_vec()).await?;
         }
         Ok(())
-    });
-    if let Some(first_uri) = first_uri {
-        call.finish(
-            "DELETE_BATCH",
-            || first_uri,
-            num_objects,
-            FirstByte::None,
-            result.as_ref().map(|_| 0),
-        );
-    }
-    result
+    })
 }
 
 /// Async version of delete_objects — safe to call from within an async context
@@ -2113,25 +2060,15 @@ pub async fn create_bucket_with_client(client: &aws_sdk_s3::Client, bucket: &str
 // Download (GET) operations
 // -----------------------------------------------------------------------------
 
-/// Download a single object from S3. With the op-log active the call is
-/// recorded as one `GET` row (see `HelperCall`).
+/// Download a single object from S3 **with op‑logging**: with the op-log active
+/// the call is one `GET` row, written by `S3Ops::get_object`.
 pub async fn get_object(bucket: &str, key: &str) -> Result<Bytes> {
-    let call = HelperCall::begin();
-    let result = get_object_silent(bucket, key).await;
-    call.finish(
-        "GET",
-        || format!("s3://{bucket}/{key}"),
-        1,
-        FirstByte::AtEnd,
-        result.as_ref().map(|d| d.len() as u64),
-    );
-    result
+    get_object_rows(bucket, key, Rows::Write).await
 }
 
-/// [`get_object`] without recording. For the S3 backend of a store and other
-/// internal transfers, whose caller records the call (or deliberately does not).
-pub(crate) async fn get_object_silent(bucket: &str, key: &str) -> Result<Bytes> {
-    let data = build_ops_async().await?.get_object(bucket, key).await?;
+async fn get_object_rows(bucket: &str, key: &str, rows: Rows) -> Result<Bytes> {
+    // delegate to S3Ops (which records the GET when it has a logger) and propagate errors
+    let data = build_ops_for(rows).await?.get_object(bucket, key).await?;
 
     debug!("S3 GET s3://{}/{} ({} bytes)", bucket, key, data.len());
     Ok(data)
@@ -2321,27 +2258,6 @@ pub fn get_objects_parallel_with_progress(
     })
 }
 
-/// Optimised async GET (see [`get_object_uri_optimized_silent`] for what is
-/// optimised). With the op-log active the call is recorded as one `GET` row,
-/// whichever path (single GET or concurrent ranges) served it.
-#[cfg_attr(feature = "profiling", instrument(
-    name = "s3.get_optimized",
-    skip(uri),
-    fields(uri = %uri)
-))]
-pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
-    let call = HelperCall::begin();
-    let result = get_object_uri_optimized_silent(uri).await;
-    call.finish(
-        "GET",
-        || uri.to_string(),
-        1,
-        FirstByte::AtEnd,
-        result.as_ref().map(|d| d.len() as u64),
-    );
-    result
-}
-
 /// Optimised async GET that honours S3DLIO_ENABLE_RANGE_OPTIMIZATION on ALL paths.
 ///
 /// v0.9.31+ fixes (Finding 1 + bug fix):
@@ -2349,7 +2265,20 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
 /// - ObjectSizeCache checked before issuing HEAD; result stored after HEAD.
 /// - When range split is chosen, size is passed directly → eliminates HEAD #2.
 /// - All env-var reads cached via OnceLock (no syscall overhead on hot path).
-pub(crate) async fn get_object_uri_optimized_silent(uri: &str) -> Result<Bytes> {
+///
+/// With the op-log active, a single GET (the object is below the range threshold, or the
+/// size is unknown) is one `GET` row from `S3Ops`; an object fetched by concurrent ranges
+/// writes no row, exactly as before W2.
+#[cfg_attr(feature = "profiling", instrument(
+    name = "s3.get_optimized",
+    skip(uri),
+    fields(uri = %uri)
+))]
+pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
+    get_object_uri_optimized_rows(uri, Rows::Write).await
+}
+
+pub(crate) async fn get_object_uri_optimized_rows(uri: &str, rows: Rows) -> Result<Bytes> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
@@ -2359,7 +2288,7 @@ pub(crate) async fn get_object_uri_optimized_silent(uri: &str) -> Result<Bytes> 
     // Fixes the bug where S3DLIO_ENABLE_RANGE_OPTIMIZATION=0 was a no-op here.
     if !get_range_opt_enabled() {
         debug!("range_opt disabled: single GET for {}", uri);
-        return get_object_silent(&bucket, &key).await;
+        return get_object_rows(&bucket, &key, rows).await;
     }
 
     // Fast path: skip_head latch — skip HEAD, issue plain GET directly.
@@ -2368,7 +2297,7 @@ pub(crate) async fn get_object_uri_optimized_silent(uri: &str) -> Result<Bytes> 
     // range splitting for large objects — zero downside to skipping HEAD.
     if get_skip_head() {
         debug!("skip_head: plain GET (no HEAD) for {}", uri);
-        let bytes = get_object_silent(&bucket, &key).await?;
+        let bytes = get_object_rows(&bucket, &key, rows).await?;
         // Cache the actual size so future calls can range-split if warranted.
         get_size_cache()
             .put(uri.to_string(), bytes.len() as u64)
@@ -2401,12 +2330,12 @@ pub(crate) async fn get_object_uri_optimized_silent(uri: &str) -> Result<Bytes> 
                     sz
                 }
                 None => {
-                    return get_object_silent(&bucket, &key).await;
+                    return get_object_rows(&bucket, &key, rows).await;
                 }
             },
             Err(_) => {
                 // HEAD failed: fall back to single GET without range splitting.
-                return get_object_silent(&bucket, &key).await;
+                return get_object_rows(&bucket, &key, rows).await;
             }
         }
     };
@@ -2420,7 +2349,7 @@ pub(crate) async fn get_object_uri_optimized_silent(uri: &str) -> Result<Bytes> 
         // Pass known size → internal impl skips its own HEAD (eliminates HEAD #2).
         get_object_with_known_size_async(&bucket, &key, object_size, 0, None, None, None).await
     } else {
-        get_object_silent(&bucket, &key).await
+        get_object_rows(&bucket, &key, rows).await
     }
 }
 
@@ -2473,29 +2402,19 @@ async fn get_object_with_known_size_async(
     .await
 }
 
-/// Public async get object call. With the op-log active the call is recorded
-/// as one `GET` row.
+/// Public async get object call **with op‑logging**: with the op-log active it is
+/// one `GET` row from `S3Ops`.
 pub async fn get_object_uri_async(uri: &str) -> Result<Bytes> {
-    let call = HelperCall::begin();
-    let result = get_object_uri_silent(uri).await;
-    call.finish(
-        "GET",
-        || uri.to_string(),
-        1,
-        FirstByte::AtEnd,
-        result.as_ref().map(|d| d.len() as u64),
-    );
-    result
+    get_object_uri_rows(uri, Rows::Write).await
 }
 
-/// [`get_object_uri_async`] without recording (the S3 backend of a store).
-pub(crate) async fn get_object_uri_silent(uri: &str) -> Result<Bytes> {
-    debug!("get_object_uri_silent: uri='{}'", uri);
+pub(crate) async fn get_object_uri_rows(uri: &str, rows: Rows) -> Result<Bytes> {
+    debug!("get_object_uri_async: uri='{}'", uri);
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
     }
-    get_object_silent(&bucket, &key).await
+    get_object_rows(&bucket, &key, rows).await
 }
 
 // -----------------------------------------------------------------------------
@@ -2538,59 +2457,35 @@ pub fn put_objects_with_random_data_and_type_with_progress(
     put_objects_parallel_with_progress(uris_vec, buffer, max_in_flight, progress_callback)
 }
 
-/// Upload a single object to S3. With the op-log active the call is recorded
-/// as one `PUT` row (see `HelperCall`).
+/// Upload a single object to S3 **with op‑logging**: with the op-log active it is
+/// one `PUT` row from `S3Ops`.
 ///
 /// Accepts `Bytes` for zero-copy efficiency (no .to_vec() call).
 pub async fn put_object_async(bucket: &str, key: &str, data: Bytes) -> Result<()> {
-    let call = HelperCall::begin();
-    let len = data.len() as u64;
-    let result = put_object_silent(bucket, key, data).await;
-    call.finish(
-        "PUT",
-        || format!("s3://{bucket}/{key}"),
-        1,
-        FirstByte::AtStart,
-        result.as_ref().map(|_| len),
-    );
-    result
+    put_object_rows(bucket, key, data, Rows::Write).await
 }
 
-/// [`put_object_async`] without recording (the S3 backend of a store, whose
-/// caller records the call).
-pub(crate) async fn put_object_silent(bucket: &str, key: &str, data: Bytes) -> Result<()> {
+async fn put_object_rows(bucket: &str, key: &str, data: Bytes, rows: Rows) -> Result<()> {
     debug!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
-    // data moved, no copy
-    build_ops_async()
+    // delegate to S3Ops (which records the PUT when it has a logger) - data moved, no copy
+    build_ops_for(rows)
         .await?
         .put_object(bucket, key, data)
         .await?;
     Ok(())
 }
 
-/// Upload a single object to S3 by URI. With the op-log active the call is
-/// recorded as one `PUT` row.
+/// Upload a single object to S3 by URI **with op‑logging**.
 ///
 /// Accepts `Bytes` for zero-copy efficiency.
 pub async fn put_object_uri_async(uri: &str, data: Bytes) -> Result<()> {
-    let call = HelperCall::begin();
-    let len = data.len() as u64;
-    let result = put_object_uri_silent(uri, data).await;
-    call.finish(
-        "PUT",
-        || uri.to_string(),
-        1,
-        FirstByte::AtStart,
-        result.as_ref().map(|_| len),
-    );
-    result
+    put_object_uri_rows(uri, data, Rows::Write).await
 }
 
-/// [`put_object_uri_async`] without recording (the S3 backend of a store).
-pub(crate) async fn put_object_uri_silent(uri: &str, data: Bytes) -> Result<()> {
-    debug!("put_object_uri_silent: uri='{}', {} bytes", uri, data.len());
+pub(crate) async fn put_object_uri_rows(uri: &str, data: Bytes, rows: Rows) -> Result<()> {
+    debug!("put_object_uri_async: uri='{}', {} bytes", uri, data.len());
     let (bucket, key) = parse_s3_uri(uri)?;
-    put_object_silent(&bucket, &key, data).await
+    put_object_rows(&bucket, &key, data, rows).await
 }
 
 /// Upload object via multipart using existing MultipartUploadSink infrastructure.

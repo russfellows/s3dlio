@@ -3,32 +3,81 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-//! High-level S3 operations (GET, PUT, STAT, etc.).
+//! High-level, logged S3 operations (GET, PUT, STAT, etc.).
 //!
 //! This module provides an `S3Ops` struct that wraps the AWS S3 client
-//! to provide simplified I/O operations. It writes no op-log rows (see the
-//! `S3Ops` docs).
+//! to provide simplified, blocking I/O operations with detailed tracing.
 
 use crate::retry::retry_get_body;
-use crate::s3_utils::{sdk_anyhow, SdkResultExt};
+use crate::s3_logger::{LogEntry, Logger};
+use crate::s3_utils::{format_sdk_error, sdk_anyhow, SdkResultExt};
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::{types::Delete, Client};
 use bytes::Bytes;
+//use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
-/// A thin wrapper around the S3 client that provides simplified, high-level
-/// object operations (GET, PUT, STAT, ...).
-///
-/// `S3Ops` does **not** write op-log rows. Recording an operation is the job of
-/// the layer the caller uses to reach it (`LoggedObjectStore`, or the public
-/// helpers in `s3_utils`), so that one call is exactly one row (issue #169).
+use std::time::SystemTime;
+
+/// A wrapper around the S3 client to provide logged, high-level operations.
 pub struct S3Ops {
     client: Client,
+    logger: Option<Logger>,
+    client_id: String,
+    endpoint: String,
+}
+
+/// Private helper struct to reduce logging boilerplate.
+struct LogContext {
+    operation: &'static str,
+    key: String,
+    num_objects: u32,
+    start_time: SystemTime,
 }
 
 impl S3Ops {
-    /// Creates a new S3 operations handler around `client`.
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    /// Creates a new S3 operations handler.
+    pub fn new(client: Client, logger: Option<Logger>, client_id: &str, endpoint: &str) -> Self {
+        Self {
+            client,
+            logger,
+            client_id: client_id.to_string(),
+            endpoint: endpoint.to_string(),
+        }
+    }
+
+    /// Centralized helper function to log s3 operation's results.
+    fn log_op(
+        &self,
+        ctx: LogContext,
+        result: &Result<impl Sized, impl std::string::ToString>,
+        bytes: u64,
+        first_byte_time: Option<SystemTime>,
+    ) {
+        if let Some(logger) = &self.logger {
+            let end_time = SystemTime::now();
+
+            let mut hasher = DefaultHasher::new();
+            std::thread::current().id().hash(&mut hasher);
+            let thread_id = hasher.finish() as usize;
+
+            let entry = LogEntry {
+                idx: 0, // Will be set by the logger
+                thread_id,
+                operation: ctx.operation.to_string(),
+                client_id: self.client_id.clone(),
+                num_objects: ctx.num_objects,
+                bytes,
+                endpoint: self.endpoint.clone(),
+                file: ctx.key,
+                error: result.as_ref().err().map(|e| e.to_string()),
+                start_time: ctx.start_time,
+                first_byte_time,
+                end_time,
+            };
+            logger.log(entry);
+        }
     }
 
     /// GET (Download) an object.
@@ -39,13 +88,22 @@ impl S3Ops {
     /// caller level. GETs are idempotent and each attempt allocates a
     /// fresh `Bytes`, so retries are trivially safe here.
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes> {
+        let ctx = LogContext {
+            operation: "GET",
+            key: key.to_string(),
+            num_objects: 1,
+            start_time: SystemTime::now(),
+        };
+
         // Retry the whole send()+collect() pair — each attempt re-issues
-        // the request and drains a fresh body stream. Errors are converted
-        // to anyhow at the closure boundary via `sdk_context` for send()
-        // (preserves the SDK's connector chain — see #506) and `context`
-        // for the body-collect step.
-        // Zero-copy: the collected body is returned as `Bytes`.
-        retry_get_body(|| async {
+        // the request and drains a fresh body stream. Each closure
+        // invocation returns (Bytes, SystemTime) so `first_byte_time`
+        // reflects the successful attempt without capturing outer state
+        // through the FnMut closure. Errors are converted to anyhow at
+        // the closure boundary via `sdk_context` for send() (preserves
+        // the SDK's connector chain — see #506) and `context` for the
+        // body-collect step.
+        let result: Result<(Bytes, SystemTime)> = retry_get_body(|| async {
             let output = self
                 .client
                 .get_object()
@@ -54,15 +112,34 @@ impl S3Ops {
                 .send()
                 .await
                 .sdk_context(format!("S3 GET for s3://{}/{} failed", bucket, key))?;
+            let first_byte = SystemTime::now();
             let body = output
                 .body
                 .collect()
                 .await
                 .context("S3 GET body stream failed")?
                 .into_bytes();
-            Ok(body)
+            Ok((body, first_byte))
         })
-        .await
+        .await;
+
+        match result {
+            Ok((body, first_byte_time)) => {
+                let bytes = body.len() as u64;
+                self.log_op(ctx, &Ok::<(), &str>(()), bytes, Some(first_byte_time));
+                // Zero-copy: return Bytes directly instead of converting to Vec
+                Ok(body)
+            }
+            Err(e) => {
+                // `sdk_context` already flattened the SDK connector
+                // chain into the message — Display of the anyhow chain
+                // via `{:#}` reproduces the same detail we'd get from
+                // format_sdk_error() applied directly.
+                let detail = format!("{:#}", e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(e)
+            }
+        }
     }
 
     /// GET (Download) a range of bytes from an object.
@@ -78,9 +155,15 @@ impl S3Ops {
         start: u64,
         end: u64,
     ) -> Result<Bytes> {
+        let ctx = LogContext {
+            operation: "GET_RANGE",
+            key: format!("{}[{}-{}]", key, start, end),
+            num_objects: 1,
+            start_time: SystemTime::now(),
+        };
         let range = format!("bytes={}-{}", start, end);
 
-        retry_get_body(|| async {
+        let result: Result<(Bytes, SystemTime)> = retry_get_body(|| async {
             let output = self
                 .client
                 .get_object()
@@ -93,21 +176,43 @@ impl S3Ops {
                     "S3 GET_RANGE for s3://{}/{} bytes={}-{} failed",
                     bucket, key, start, end
                 ))?;
+            let first_byte = SystemTime::now();
             let body = output
                 .body
                 .collect()
                 .await
                 .context("S3 GET_RANGE body stream failed")?
                 .into_bytes();
-            Ok(body)
+            Ok((body, first_byte))
         })
-        .await
+        .await;
+
+        match result {
+            Ok((body, first_byte_time)) => {
+                let bytes = body.len() as u64;
+                self.log_op(ctx, &Ok::<(), &str>(()), bytes, Some(first_byte_time));
+                // Zero-copy: return Bytes directly
+                Ok(body)
+            }
+            Err(e) => {
+                let detail = format!("{:#}", e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(e)
+            }
+        }
     }
 
     /// PUT (Upload) an object.
     ///
     /// Accepts `Bytes` for zero-copy conversion to AWS SDK ByteStream.
     pub async fn put_object(&self, bucket: &str, key: &str, data: Bytes) -> Result<()> {
+        let ctx = LogContext {
+            operation: "PUT",
+            key: key.to_string(),
+            num_objects: 1,
+            start_time: SystemTime::now(),
+        };
+        let bytes = data.len() as u64;
         let body = data.into(); // Bytes → ByteStream is zero-copy (refcount bump)
 
         let result = if crate::s3_client::unsigned_payload_enabled() {
@@ -131,38 +236,97 @@ impl S3Ops {
                 .await
                 .map(|_| ())
         };
-        // Surface the SDK connector chain (e.g. dispatch failure detail)
-        // instead of the bare SdkError Display. See note in get_object.
-        result.map_err(|e| sdk_anyhow(format!("S3 PUT for s3://{}/{} failed", bucket, key), e))
+        match result {
+            Ok(()) => {
+                self.log_op(ctx, &Ok::<(), &str>(()), bytes, None);
+                Ok(())
+            }
+            Err(e) => {
+                // Surface the SDK connector chain (e.g. dispatch failure detail)
+                // instead of the bare SdkError Display. See note in get_object.
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 PUT for s3://{}/{} failed", bucket, key),
+                    e,
+                ))
+            }
+        }
     }
 
     /// STAT (Metadata) of an object.
     pub async fn stat_object(&self, bucket: &str, key: &str) -> Result<()> {
-        self.client
+        let ctx = LogContext {
+            operation: "STAT",
+            key: key.to_string(),
+            num_objects: 1,
+            start_time: SystemTime::now(),
+        };
+
+        let result = self
+            .client
             .head_object()
             .bucket(bucket)
             .key(key)
             .send()
-            .await
-            .map(|_| ())
-            .map_err(|e| sdk_anyhow(format!("S3 HEAD for s3://{}/{} failed", bucket, key), e))
+            .await;
+        match result {
+            Ok(_) => {
+                self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
+                Ok(())
+            }
+            Err(e) => {
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 HEAD for s3://{}/{} failed", bucket, key),
+                    e,
+                ))
+            }
+        }
     }
 
     /// DELETE a single object.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
-        self.client
+        let ctx = LogContext {
+            operation: "DELETE",
+            key: key.to_string(),
+            num_objects: 1,
+            start_time: SystemTime::now(),
+        };
+
+        let result = self
+            .client
             .delete_object()
             .bucket(bucket)
             .key(key)
             .send()
-            .await
-            .map(|_| ())
-            .map_err(|e| sdk_anyhow(format!("S3 DELETE for s3://{}/{} failed", bucket, key), e))
+            .await;
+        match result {
+            Ok(_) => {
+                self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
+                Ok(())
+            }
+            Err(e) => {
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 DELETE for s3://{}/{} failed", bucket, key),
+                    e,
+                ))
+            }
+        }
     }
 
     /// DELETE multiple objects in a single batch request.
     pub async fn delete_objects(&self, bucket: &str, keys: Vec<String>) -> Result<()> {
         let num_objects = keys.len() as u32;
+        let ctx = LogContext {
+            operation: "DELETE",
+            key: "(batch)".to_string(), // Use a placeholder for batch operations
+            num_objects,
+            start_time: SystemTime::now(),
+        };
 
         // FIX: Collect into a Result to handle potential build errors.
         let objects_to_delete: Result<Vec<_>, _> = keys
@@ -178,68 +342,101 @@ impl S3Ops {
             .set_objects(Some(objects_to_delete?))
             .build()?;
 
-        let output = self
+        let result = self
             .client
             .delete_objects()
             .bucket(bucket)
             .delete(delete_req)
             .send()
-            .await
-            .map_err(|e| {
-                sdk_anyhow(format!("S3 batch DELETE for bucket '{}' failed", bucket), e)
-            })?;
+            .await;
 
-        // Locked contract (audit #151 f36, docs/implementation-plans/
-        // v0.9.109-audit-fix-plan.md bug A4): S3's DeleteObjects
-        // returns HTTP 200 even when individual keys failed to
-        // delete (ACL denial, object-lock retention, throttling,
-        // etc.) — the per-object outcome lives in the response
-        // body's `errors` list, not the HTTP status. A bare
-        // `Ok(_)` here silently discarded that list, so a caller
-        // could believe a batch fully succeeded when some or all
-        // of it didn't. Keep the `Result<()>` signature (no API
-        // break) but inspect `.errors()` and surface them as Err.
-        let errs = output.errors();
-        if !errs.is_empty() {
-            let detail = errs
-                .iter()
-                .map(|e| {
-                    format!(
-                        "{}: {} ({})",
-                        e.key().unwrap_or("<unknown key>"),
-                        e.code().unwrap_or("<unknown code>"),
-                        e.message().unwrap_or("<no message>")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "S3 batch DELETE for bucket '{}' partially failed: {} of {} object(s) \
-                 not deleted: {}",
-                bucket,
-                errs.len(),
-                num_objects,
-                detail
-            );
+        match result {
+            Ok(output) => {
+                // Locked contract (audit #151 f36, docs/implementation-plans/
+                // v0.9.109-audit-fix-plan.md bug A4): S3's DeleteObjects
+                // returns HTTP 200 even when individual keys failed to
+                // delete (ACL denial, object-lock retention, throttling,
+                // etc.) — the per-object outcome lives in the response
+                // body's `errors` list, not the HTTP status. A bare
+                // `Ok(_)` here silently discarded that list, so a caller
+                // could believe a batch fully succeeded when some or all
+                // of it didn't. Keep the `Result<()>` signature (no API
+                // break) but inspect `.errors()` and surface them as Err.
+                let errs = output.errors();
+                if !errs.is_empty() {
+                    let detail = errs
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{}: {} ({})",
+                                e.key().unwrap_or("<unknown key>"),
+                                e.code().unwrap_or("<unknown code>"),
+                                e.message().unwrap_or("<no message>")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.log_op(ctx, &Err::<(), _>(detail.clone()), 0, None);
+                    bail!(
+                        "S3 batch DELETE for bucket '{}' partially failed: {} of {} object(s) \
+                         not deleted: {}",
+                        bucket,
+                        errs.len(),
+                        num_objects,
+                        detail
+                    );
+                }
+                self.log_op(ctx, &Ok::<(), &str>(()), 0, None);
+                Ok(())
+            }
+            Err(e) => {
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
+                    format!("S3 batch DELETE for bucket '{}' failed", bucket),
+                    e,
+                ))
+            }
         }
-        Ok(())
     }
 
     /// LIST objects with a given prefix.
     pub async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<usize> {
-        let output = self
+        let ctx = LogContext {
+            operation: "LIST",
+            key: prefix.to_string(),
+            num_objects: 0, // Will be updated after the call completes
+            start_time: SystemTime::now(),
+        };
+
+        let result = self
             .client
             .list_objects_v2()
             .bucket(bucket)
             .prefix(prefix)
             .send()
-            .await
-            .map_err(|e| {
-                sdk_anyhow(
+            .await;
+
+        match result {
+            Ok(output) => {
+                // FIX: Get the length directly from the slice.
+                let count = output.contents().len();
+
+                let log_ctx_with_count = LogContext {
+                    num_objects: count as u32,
+                    ..ctx
+                };
+                self.log_op(log_ctx_with_count, &Ok::<(), &str>(()), 0, None);
+                Ok(count)
+            }
+            Err(e) => {
+                let detail = format_sdk_error(&e);
+                self.log_op(ctx, &Err::<(), _>(detail), 0, None);
+                Err(sdk_anyhow(
                     format!("S3 LIST for bucket '{}' prefix '{}' failed", bucket, prefix),
                     e,
-                )
-            })?;
-        Ok(output.contents().len())
+                ))
+            }
+        }
     }
 }
