@@ -80,7 +80,7 @@ impl AzureBlob {
     /// When a custom endpoint is set, the account name is appended to form the full URL.
     /// Example: AZURE_STORAGE_ENDPOINT=http://localhost:10000 + account="devstoreaccount1"
     ///          → http://localhost:10000/devstoreaccount1
-    pub fn with_default_credential(account: &str, container: &str) -> Result<Self> {
+    pub async fn with_default_credential(account: &str, container: &str) -> Result<Self> {
         // Check for custom endpoint (for Azurite or other emulators/proxies)
         if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
             .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
@@ -92,29 +92,35 @@ impl AzureBlob {
                 format!("{}/{}", endpoint, account)
             };
             tracing::info!("Using custom Azure endpoint: {}", account_url);
-            return Self::with_default_credential_from_url(&account_url, container);
+            return Self::with_default_credential_from_url(&account_url, container).await;
         }
 
         Self::with_default_credential_from_url(&Self::account_url_from_account(account), container)
+            .await
     }
 
     /// Same, when a full endpoint URL (possibly emulator) is provided.
-    pub fn with_default_credential_from_url(account_url: &str, container: &str) -> Result<Self> {
+    ///
+    /// Async because the https credential is created (once, then cached) on the caller's
+    /// runtime; nothing here blocks, so it is safe on a current-thread runtime. Credential
+    /// failures are returned as errors.
+    pub async fn with_default_credential_from_url(
+        account_url: &str,
+        container: &str,
+    ) -> Result<Self> {
         let service_url = Url::parse(account_url)
             .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?;
         let credential = if service_url.scheme() == "https" {
-            Some(tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    AZURE_CREDENTIAL
-                        .get_or_try_init(|| async {
-                            let credential_arc = DeveloperToolsCredential::new(None)?;
-                            let credential: Arc<dyn TokenCredential> = credential_arc;
-                            Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
-                        })
-                        .await
-                        .map(Arc::clone)
-                })
-            })?)
+            Some(
+                AZURE_CREDENTIAL
+                    .get_or_try_init(|| async {
+                        let credential_arc = DeveloperToolsCredential::new(None)?;
+                        let credential: Arc<dyn TokenCredential> = credential_arc;
+                        Ok::<Arc<dyn TokenCredential>, anyhow::Error>(credential)
+                    })
+                    .await
+                    .map(Arc::clone)?,
+            )
         } else {
             None
         };
