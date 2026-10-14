@@ -15,8 +15,11 @@ use s3dlio_oplog::translate_uri;
 /// Keys that are legal object keys and must survive replay untouched.
 const KEYS: &[&str] = &["/x", "a//b", "x", "//x", "a/b/", "dir/"];
 
+/// How the writer composes the `file` column from a key.
+type ComposeFile = Box<dyn Fn(&str) -> String>;
+
 /// (endpoint, how the writer composes `file` from the key)
-fn writer_shapes() -> Vec<(&'static str, Box<dyn Fn(&str) -> String>)> {
+fn writer_shapes() -> Vec<(&'static str, ComposeFile)> {
     vec![
         ("s3://srcbkt", Box::new(|k| format!("srcbkt/{k}"))),
         (
