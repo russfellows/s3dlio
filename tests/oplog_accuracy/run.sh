@@ -58,7 +58,9 @@ if [ -z "$WHEEL" ]; then
 fi
 [ -f "$WHEEL" ] || { echo "wheel not found: $WHEEL" >&2; exit 2; }
 mkdir -p "$H/wheels" "$H/runs"
-cp -n "$WHEEL" "$H/wheels/" 2>/dev/null          # keep the exact wheel that was tested next to the results
+# keep the exact wheel that was tested next to the results. -f: a same-named stale copy from an earlier run
+# (every build of one version has the same file name) must not be tested instead of this wheel.
+[ "$WHEEL" -ef "$H/wheels/$(basename "$WHEEL")" ] || cp -f "$WHEEL" "$H/wheels/" || { echo "cannot copy the wheel to $H/wheels/" >&2; exit 2; }
 W="$H/wheels/$(basename "$WHEEL")"
 [ -f "$W" ] || W="$WHEEL"
 UV=(uv run --no-project --isolated --python "$PYV" --with "$W" python -I)
