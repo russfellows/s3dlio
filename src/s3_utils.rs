@@ -393,7 +393,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ObjectType {
 /// Components of an S3 URI
 #[derive(Debug, Clone)]
 pub struct S3UriComponents {
-    /// Optional custom endpoint (e.g., "192.168.100.1:9001" or "minio.local:9000")
+    /// Optional custom server authority, always with an explicit port
+    /// (e.g., "192.168.100.1:9001", "minio.local:9000" or "[::1]:9000").
     /// If None, uses AWS_ENDPOINT_URL environment variable or default AWS endpoint
     pub endpoint: Option<String>,
     /// Bucket name
@@ -402,33 +403,14 @@ pub struct S3UriComponents {
     pub key: String,
 }
 
-/// Default set of hostname-like suffixes checked by [`looks_like_s3_endpoint`]
-/// against the LAST dot-separated label of a URI's first path segment.
-/// Extend at runtime via the comma-separated `S3DLIO_S3_ENDPOINT_HINT_TLDS`
-/// env var (audit #154 bug 4.1 / B8).
-const DEFAULT_ENDPOINT_HINT_TLDS: &[&str] = &[
-    // common public TLDs frequently used for self-hosted S3-compatible endpoints
-    "com", "net", "org", "io", "co", "dev", "cloud", "app", "biz", "info",
-    // conventional private/internal-infrastructure suffixes
-    "local", "internal", "lan", "corp", "home", "cluster", "svc", "network",
-];
-
-/// Returns the effective endpoint-hint suffix list: the built-in defaults
-/// plus any comma-separated entries from `S3DLIO_S3_ENDPOINT_HINT_TLDS`.
-fn endpoint_hint_tlds() -> Vec<String> {
-    let mut tlds: Vec<String> = DEFAULT_ENDPOINT_HINT_TLDS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    if let Ok(extra) = std::env::var("S3DLIO_S3_ENDPOINT_HINT_TLDS") {
-        for t in extra.split(',') {
-            let t = t.trim().to_lowercase();
-            if !t.is_empty() {
-                tlds.push(t);
-            }
-        }
-    }
-    tlds
+/// What the FIRST path segment of an `s3://` URI (the part before the first
+/// `/`) names. See [`classify_s3_first_segment`] for the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3FirstSegment<'a> {
+    /// A bucket name (no explicit port).
+    Bucket(&'a str),
+    /// A server authority with an explicit port: `host:port` or `[ipv6]:port`.
+    Server(&'a str),
 }
 
 /// True if `s` is a syntactically valid dotted-quad IPv4 address (four
@@ -446,53 +428,254 @@ fn looks_like_ipv4(s: &str) -> bool {
         })
 }
 
-/// Decide whether the first path segment of an `s3://` URI (the part
-/// before the first `/`) should be treated as a custom endpoint
-/// hostname rather than a bucket name.
+/// Text of the one-time deprecation warning for the retired
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable.
+const RETIRED_HINT_TLDS_WARNING: &str =
+    "S3DLIO_S3_ENDPOINT_HINT_TLDS is deprecated and ignored: an s3:// URI now names \
+     a server only when its first segment carries an explicit port \
+     (s3://host:port/bucket/key); every other first segment is a bucket (issue #178)";
+
+/// Warn once per process, at the first parse, if the retired
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is set: it no longer has any effect
+/// (issue #178).
 ///
-/// Narrowed in v0.9.109 (audit #154 bug 4.1 / B8) to only fire on
-/// strings that are grammatically unambiguous or plausibly look like a
-/// real hostname:
-/// - contains `:` (a port — bucket names can never contain a colon)
-/// - is a dotted-quad IPv4 address (bucket names can never be formatted
-///   as an IP address, per S3 bucket naming rules)
-/// - contains a dot AND its last dot-separated label matches a known
-///   endpoint-hint suffix (see [`DEFAULT_ENDPOINT_HINT_TLDS`] /
-///   `S3DLIO_S3_ENDPOINT_HINT_TLDS`)
-///
-/// Deliberately does NOT fire on: a bare digit prefix, 2+ dots alone, or
-/// a `minio`/`ceph`/`localhost` substring — all of which are legal
-/// components of real S3 bucket names and were the source of the
-/// pre-v0.9.109 misclassification bug.
-fn looks_like_s3_endpoint(before_slash: &str) -> bool {
-    if before_slash.contains(':') {
-        return true;
-    }
-    if looks_like_ipv4(before_slash) {
-        return true;
-    }
-    if let Some(last_label) = before_slash.rsplit('.').next() {
-        if before_slash.contains('.') {
-            let last_label = last_label.to_lowercase();
-            if endpoint_hint_tlds().contains(&last_label) {
-                return true;
-            }
+/// The environment is read exactly once, the first time
+/// [`classify_s3_first_segment`] runs; setting the variable later in the same
+/// process neither warns nor changes anything. The warning goes to `tracing` AND
+/// to stderr, so it is visible in programs (and CLIs) that never install a
+/// tracing subscriber.
+fn warn_if_retired_hint_tlds_env_set() {
+    use std::io::Write;
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        if std::env::var_os("S3DLIO_S3_ENDPOINT_HINT_TLDS").is_some() {
+            tracing::warn!("{RETIRED_HINT_TLDS_WARNING}");
+            // Best effort: a closed or full stderr must not fail a parse.
+            let _ = writeln!(
+                std::io::stderr(),
+                "s3dlio: warning: {RETIRED_HINT_TLDS_WARNING}"
+            );
         }
-    }
-    false
+    });
 }
 
-/// Parse S3 URI with optional endpoint support (Hybrid Approach - Option C)
+/// Validate the port part of `host:port` / `[ipv6]:port`.
 ///
-/// Supports two formats:
-/// 1. **Standard**: `s3://bucket/key`
-///    - Uses AWS_ENDPOINT_URL environment variable or default AWS endpoint
-///    - Compatible with existing code
+/// Accepted: plain ASCII decimal digits, no leading zeros, value `1..=65535`.
+/// `u16::from_str` alone is too lax (it accepts a leading `+` and `0`); leading
+/// zeros are rejected because `host:09000` is ambiguous (octal habits) and would
+/// otherwise leave two spellings of one server in configs, URLs and logs.
+fn validate_s3_server_port(port: &str, segment: &str) -> Result<()> {
+    if port.is_empty() {
+        bail!(
+            "empty port in '{segment}': a server must be host:port with a port from 1 to 65535 \
+             (e.g. s3://host:9000/bucket/key)"
+        );
+    }
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        bail!(
+            "invalid port '{port}' in '{segment}': a port is 1 to 65535 written as plain decimal \
+             digits (no sign or other characters), e.g. s3://host:9000/bucket/key"
+        );
+    }
+    if port.len() > 1 && port.starts_with('0') {
+        bail!(
+            "invalid port '{port}' in '{segment}': leading zeros are not accepted; write the \
+             port without them (e.g. :9000)"
+        );
+    }
+    match port.parse::<u16>() {
+        Ok(n) if n >= 1 => Ok(()),
+        _ => bail!(
+            "invalid port '{port}' in '{segment}': a port must be from 1 to 65535 \
+             (e.g. s3://host:9000/bucket/key)"
+        ),
+    }
+}
+
+/// Longest host the `host:port` grammar accepts (the DNS name limit).
+const S3_SERVER_HOST_MAX_LEN: usize = 253;
+
+/// The supported host grammar, quoted in every host error.
+const S3_SERVER_HOST_GRAMMAR: &str = "a host is 1 to 253 ASCII letters, digits, '-', '.' and '_', \
+     with no empty labels (no leading or trailing '.', no '..')";
+
+/// Validate the host part of `host:port` (a DNS name, IPv4 literal or
+/// container-style name such as `minio_1`).
 ///
-/// 2. **With custom endpoint**: `s3://host:port/bucket/key` or `s3://host/bucket/key`
-///    - Explicitly specifies endpoint for MinIO, Ceph, or other S3-compatible storage
-///    - Host can be IP address, hostname, or domain
-///    - Port is optional (defaults to 9000 for custom endpoints, 443 for AWS)
+/// Grammar: 1..=253 characters, each an ASCII letter, digit, `-`, `.` or `_`
+/// (`_` is kept for container-style names), with no empty label (no leading or
+/// trailing `.`, no `..`). Anything else - `/`, `\`, whitespace, control
+/// characters, `%`, `?`, `#`, non-ASCII, ... - is an error naming the character.
+/// Enforcing this before any endpoint URI is built means a host can never change
+/// how `s3://host:port/bucket/key` is split (`node/prefix:9000` would otherwise
+/// read back as bucket `node`, routed to the global client).
+fn validate_s3_server_host(host: &str, segment: &str) -> Result<()> {
+    if host.is_empty() {
+        bail!(
+            "missing host before ':' in '{segment}': use host:port, e.g. \
+             s3://host:9000/bucket/key"
+        );
+    }
+    if let Some(bad) = host
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')))
+    {
+        bail!(
+            "invalid character {bad:?} in host '{host}' of '{segment}': {S3_SERVER_HOST_GRAMMAR}"
+        );
+    }
+    // Every character is ASCII here, so byte length is character length.
+    if host.len() > S3_SERVER_HOST_MAX_LEN {
+        bail!(
+            "host of '{segment}' is {} characters, longer than the {S3_SERVER_HOST_MAX_LEN} \
+             allowed: {S3_SERVER_HOST_GRAMMAR}",
+            host.len()
+        );
+    }
+    if host.split('.').any(str::is_empty) {
+        bail!("empty label (a leading or trailing '.', or '..') in host '{host}' of '{segment}': {S3_SERVER_HOST_GRAMMAR}");
+    }
+    Ok(())
+}
+
+/// THE single rule that decides whether the first path segment of an `s3://`
+/// URI is a server or a bucket. The URI parser ([`parse_s3_uri_full`]), the
+/// store factory (`store_for_uri*`), `MultiEndpointStore` and the `s3-cli`
+/// bucket commands and `--endpoints` lists all call this, so those components
+/// cannot disagree (issues #178, #193, #194). Other code paths that handle
+/// `s3://` URIs do not call it yet; see the Changelog for the tracking issues.
+///
+/// - `host:port` or `[ipv6]:port` (explicit port, plain decimal `1..=65535`, no
+///   leading zeros) → [`S3FirstSegment::Server`]. The bracketed content must be a
+///   valid IPv6 address; an unbracketed host must follow the host grammar: 1 to 253
+///   ASCII letters, digits, `-`, `.` and `_`, with no empty label. Any other
+///   character (`/`, `\`, whitespace, control characters, `%`, `?`, `#`,
+///   non-ASCII, ...) is an error naming it.
+/// - A dotted-quad IPv4 literal with no port → **error**. S3 forbids IP-shaped
+///   bucket names, so it is not a bucket; the caller must add `:port`.
+/// - An IPv6 literal without brackets or without a port → **error**.
+/// - Userinfo (`user@host:9000`), a URL (`http://host:9000`), an ARN, an empty
+///   segment, an empty host or port, or a malformed port → **error**, each with
+///   a message that names what was wrong.
+/// - Anything else — including dotted DNS-looking names such as
+///   `data.example.com` and `localhost` → [`S3FirstSegment::Bucket`]. Bucket
+///   names are not otherwise validated here.
+pub fn classify_s3_first_segment(segment: &str) -> Result<S3FirstSegment<'_>> {
+    warn_if_retired_hint_tlds_env_set();
+
+    if segment.is_empty() {
+        bail!(
+            "empty first segment in the S3 URI: expected a bucket name (s3://bucket/key) or a \
+             server with a port (s3://host:9000/bucket/key)"
+        );
+    }
+    if segment.contains("://") {
+        bail!(
+            "'{segment}' looks like a URL; a server is written host:port without a scheme \
+             or path (e.g. host:9000)"
+        );
+    }
+    if segment.contains('@') {
+        bail!(
+            "'{segment}' contains userinfo ('@'), which is not supported; write the server as \
+             host:port and supply credentials through the environment"
+        );
+    }
+    if segment.starts_with("arn:") && segment.matches(':').count() >= 2 {
+        bail!(
+            "'{segment}' looks like an ARN; ARNs are not supported here — use s3://bucket/key, \
+             or s3://host:port/bucket/key to name a server"
+        );
+    }
+
+    if let Some(rest) = segment.strip_prefix('[') {
+        // Bracketed IPv6: "[addr]:port"
+        let Some((addr, after)) = rest.split_once(']') else {
+            bail!("unterminated '[' in '{segment}': an IPv6 server is written [addr]:port");
+        };
+        if addr.is_empty() {
+            bail!("empty IPv6 address in '{segment}'");
+        }
+        if addr.parse::<std::net::Ipv6Addr>().is_err() {
+            if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+                bail!(
+                    "'{segment}' puts an IPv4 address inside brackets; brackets are for IPv6 \
+                     only — write {addr}:port"
+                );
+            }
+            bail!("invalid IPv6 address '{addr}' in '{segment}'");
+        }
+        if after.is_empty() {
+            bail!(
+                "'{segment}' names an IPv6 address without a port; add :port, \
+                 e.g. s3://{segment}:9000/bucket/key"
+            );
+        }
+        let Some(port) = after.strip_prefix(':') else {
+            bail!(
+                "unexpected text '{after}' after ']' in '{segment}': an IPv6 server is written \
+                 [addr]:port"
+            );
+        };
+        validate_s3_server_port(port, segment)?;
+        return Ok(S3FirstSegment::Server(segment));
+    }
+    if segment.contains(['[', ']']) {
+        bail!(
+            "unexpected bracket in '{segment}': brackets are only for an IPv6 server, [addr]:port"
+        );
+    }
+
+    match segment.matches(':').count() {
+        0 => {
+            if looks_like_ipv4(segment) {
+                bail!(
+                    "'{segment}' is an IP address with no port; add :port to name a server, \
+                     e.g. s3://{segment}:9000/bucket/key (an IP address cannot be an S3 bucket name)"
+                );
+            }
+            Ok(S3FirstSegment::Bucket(segment))
+        }
+        1 => {
+            let (host, port) = segment.split_once(':').unwrap_or((segment, ""));
+            validate_s3_server_host(host, segment)?;
+            validate_s3_server_port(port, segment)?;
+            Ok(S3FirstSegment::Server(segment))
+        }
+        _ if segment.parse::<std::net::Ipv6Addr>().is_ok() => bail!(
+            "'{segment}' is an unbracketed IPv6 address; write it in brackets with a \
+             port, e.g. s3://[{segment}]:9000/bucket/key (add :port)"
+        ),
+        _ => bail!(
+            "'{segment}' contains more than one ':' and is not an IPv6 address; a server is \
+             written host:port or [ipv6]:port"
+        ),
+    }
+}
+
+/// The error for `s3://host:9000`, `s3://host:9000/` and `s3://host:9000//key`:
+/// the server is fine, the bucket after it is missing.
+fn missing_bucket_after_server(endpoint: &str, uri: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "missing bucket after server '{endpoint}' in S3 URI '{uri}': the bucket name cannot be \
+         empty; write s3://{endpoint}/bucket/key"
+    )
+}
+
+/// Parse S3 URI with optional endpoint support.
+///
+/// Two formats, told apart by [`classify_s3_first_segment`]:
+/// 1. **Bucket**: `s3://bucket/key` — also `s3://data.example.com/key`. Uses the
+///    `AWS_ENDPOINT_URL` environment variable or the default AWS endpoint.
+/// 2. **Server with an explicit port**: `s3://host:port/bucket/key` or
+///    `s3://[ipv6]:port/bucket/key` — names the S3-compatible server (MinIO,
+///    Ceph, GCS interop, ...) the request goes to.
+///
+/// The first segment is a server **only** when it carries an explicit port.
+/// A portless IPv4 literal (`s3://10.0.0.5/bkt/key`) or a portless / unbracketed
+/// IPv6 literal is an error: S3 forbids IP-shaped bucket names, so it can be
+/// neither; the message says to add `:port`.
 ///
 /// # Examples
 ///
@@ -511,72 +694,80 @@ fn looks_like_s3_endpoint(before_slash: &str) -> bool {
 /// assert_eq!(result.bucket, "mybucket");
 /// assert_eq!(result.key, "data.bin");
 ///
-/// // Custom hostname
+/// // Custom hostname, with its port
 /// let result = parse_s3_uri_full("s3://minio.local:9000/mybucket/path/to/file").unwrap();
 /// assert_eq!(result.endpoint, Some("minio.local:9000".to_string()));
+///
+/// // No port: a dotted name is a BUCKET, never a server
+/// let result = parse_s3_uri_full("s3://data.example.com/dir/file.bin").unwrap();
+/// assert_eq!(result.endpoint, None);
+/// assert_eq!(result.bucket, "data.example.com");
+/// assert_eq!(result.key, "dir/file.bin");
+///
+/// // A portless IP address is an error (add :port)
+/// assert!(parse_s3_uri_full("s3://10.0.0.5/mybucket/data.bin").is_err());
 /// ```
 ///
-/// # Behavior change (v0.9.109, audit #154 bug 4.1 / B8)
+/// # Behavior change (issues #178, #193, #194)
 ///
-/// Prior to v0.9.109, the first path segment was treated as an endpoint
-/// if it merely contained 2+ dots, started with a digit, or contained
-/// "minio"/"ceph"/"localhost" as a substring — misrouting legitimate S3
-/// bucket names using dotted naming conventions (e.g. `mycompany.data.
-/// backups`), digit-prefixed names (explicitly legal per S3 bucket
-/// naming rules, e.g. `2024-training-data`), or names merely containing
-/// those cluster-software names (e.g. `minio-tenant-a`). As of v0.9.109
-/// the heuristic only fires on a colon (port), a dotted-quad IPv4
-/// address, or a recognized hostname-like suffix — see
-/// [`looks_like_s3_endpoint`]. **If you relied on the old broader
-/// heuristic to route a bucket-shaped endpoint hostname with no port and
-/// no recognized suffix, add your suffix to
-/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` (comma-separated) or include a port.**
+/// Earlier releases also treated a portless first segment as a server when it
+/// was an IPv4 literal or its last label was a "hostname-like" TLD
+/// (`com`, `net`, `local`, ...; extendable with `S3DLIO_S3_ENDPOINT_HINT_TLDS`).
+/// That made the parser and the store factory disagree and misrouted real
+/// dotted bucket names. **Add `:port` to name a server.** The
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is now ignored (a one-time
+/// deprecation warning is logged if it is set).
 pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
     let trimmed = uri
         .strip_prefix("s3://")
         .context("URI must start with s3://")?;
 
     // Find the first slash to split host/bucket from key
-    let slash_pos = trimmed
-        .find('/')
-        .context("URI must contain '/' after bucket")?;
+    let Some(slash_pos) = trimmed.find('/') else {
+        // `s3://host:9000` is a valid server with no bucket, not a bucket with a
+        // missing slash: say which.
+        if let Ok(S3FirstSegment::Server(endpoint)) = classify_s3_first_segment(trimmed) {
+            return Err(missing_bucket_after_server(endpoint, uri));
+        }
+        bail!("URI must contain '/' after bucket");
+    };
     let before_slash = &trimmed[..slash_pos];
     let after_slash = &trimmed[slash_pos + 1..];
 
-    let is_endpoint = looks_like_s3_endpoint(before_slash);
+    match classify_s3_first_segment(before_slash)
+        .with_context(|| format!("invalid S3 URI '{uri}'"))?
+    {
+        S3FirstSegment::Server(endpoint) => {
+            // Format: s3://host:port/bucket/key
+            let endpoint = endpoint.to_string();
 
-    if is_endpoint {
-        // Format: s3://endpoint:port/bucket/key or s3://endpoint/bucket/key
-        let endpoint = before_slash.to_string();
+            // Find next slash for bucket/key split
+            let slash_pos2 = after_slash.find('/').unwrap_or(after_slash.len());
+            let bucket = after_slash[..slash_pos2].to_string();
+            let key = if slash_pos2 < after_slash.len() {
+                after_slash[slash_pos2 + 1..].to_string()
+            } else {
+                String::new()
+            };
 
-        // Find next slash for bucket/key split
-        let slash_pos2 = after_slash.find('/').unwrap_or(after_slash.len());
-        let bucket = after_slash[..slash_pos2].to_string();
-        let key = if slash_pos2 < after_slash.len() {
-            after_slash[slash_pos2 + 1..].to_string()
-        } else {
-            String::new()
-        };
+            if bucket.is_empty() {
+                return Err(missing_bucket_after_server(&endpoint, uri));
+            }
 
-        if bucket.is_empty() {
-            bail!("Bucket name cannot be empty in URI: {}", uri);
+            Ok(S3UriComponents {
+                endpoint: Some(endpoint),
+                bucket,
+                key,
+            })
         }
-
-        Ok(S3UriComponents {
-            endpoint: Some(endpoint),
-            bucket,
-            key,
-        })
-    } else {
-        // Format: s3://bucket/key (standard AWS)
-        let bucket = before_slash.to_string();
-        let key = after_slash.to_string();
-
-        Ok(S3UriComponents {
-            endpoint: None,
-            bucket,
-            key,
-        })
+        S3FirstSegment::Bucket(bucket) => {
+            // Format: s3://bucket/key (standard AWS)
+            Ok(S3UriComponents {
+                endpoint: None,
+                bucket: bucket.to_string(),
+                key: after_slash.to_string(),
+            })
+        }
     }
 }
 
@@ -1039,6 +1230,26 @@ pub async fn get_object_range_uri_async(
         "get_object_range: uri='{}', offset={}, length={:?}",
         uri, offset, length
     );
+    let bytes = get_object_range_async(&bucket, &key, offset, length).await?;
+    debug!(
+        "get_object_range: uri='{}', returned {} bytes",
+        uri,
+        bytes.len()
+    );
+    Ok(bytes)
+}
+
+/// Ranged GET on an already-parsed `(bucket, key)`; the key is sent exactly as
+/// given (issue #172). This is the core of [`get_object_range_uri_async`] and is
+/// called directly by callers that already hold the parsed pair, so a bucket
+/// never has to be re-serialised into an `s3://` string and re-parsed (a dotted
+/// or IP-shaped bucket name would be misread as an endpoint host).
+pub(crate) async fn get_object_range_async(
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Bytes> {
     // Locked contract (audit #152 f42, docs/implementation-plans/
     // v0.9.109-audit-fix-plan.md bug B2): `length=Some(0)` must return
     // zero bytes without a network call. The range-string builder below
@@ -1077,8 +1288,8 @@ pub async fn get_object_range_uri_async(
     let bytes = retry_get_body(|| async {
         let resp = client
             .get_object()
-            .bucket(&bucket)
-            .key(key.trim_start_matches('/'))
+            .bucket(bucket)
+            .key(key)
             .range(&range)
             .send()
             .await
@@ -1089,11 +1300,6 @@ pub async fn get_object_range_uri_async(
     })
     .await?;
 
-    debug!(
-        "get_object_range: uri='{}', returned {} bytes",
-        uri,
-        bytes.len()
-    );
     Ok(bytes)
 }
 
@@ -1139,7 +1345,7 @@ pub async fn get_object_range_uri_timed_async(
     let resp = client
         .get_object()
         .bucket(&bucket)
-        .key(key.trim_start_matches('/'))
+        .key(&key)
         .range(range)
         .send()
         .await
@@ -1209,7 +1415,7 @@ pub async fn get_object_concurrent_range_async(
     let head_resp = client
         .head_object()
         .bucket(&bucket)
-        .key(key.trim_start_matches('/'))
+        .key(&key)
         .send()
         .await
         .sdk_context(format!(
@@ -1473,7 +1679,7 @@ async fn attempt_range_chunk_fill(
     let mut resp = client
         .get_object()
         .bucket(bucket)
-        .key(key.trim_start_matches('/'))
+        .key(key)
         .range(range_header)
         .send()
         .await
@@ -1574,18 +1780,17 @@ pub fn get_object_concurrent_range(
 pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
     // NOTE: Legacy S3Ops logging call removed here (was: `let _ = build_ops_async()...`)
     // Could hang on non-AWS endpoints. See docs/bugs/PYTHON_LIST_HANG_BUG_REPORT.md
-    let key_clean = key.trim_start_matches('/');
-
-    debug!("stat_object: bucket='{}', key='{}'", bucket, key_clean);
+    // Issue #172: the key the caller names is the key sent -- no stripping.
+    debug!("stat_object: bucket='{}', key='{}'", bucket, key);
 
     let client = aws_s3_client_async().await?;
     let resp = client
         .head_object()
         .bucket(bucket)
-        .key(key.trim_start_matches('/'))
+        .key(key)
         .send()
         .await
-        .sdk_context(format!("HEAD for s3://{}/{} failed", bucket, key_clean))?;
+        .sdk_context(format!("HEAD for s3://{}/{} failed", bucket, key))?;
 
     Ok(ObjectStat {
         size: resp.content_length().unwrap_or_default() as u64,
@@ -1781,6 +1986,12 @@ pub async fn delete_objects_async(bucket: &str, keys: &[String]) -> Result<()> {
 /// Async version of delete_bucket — safe to call from within an async context.
 pub async fn delete_bucket_async(bucket: &str) -> Result<()> {
     let client = aws_s3_client_async().await?;
+    delete_bucket_with_client(&client, bucket).await
+}
+
+/// Delete `bucket` using an explicit client (e.g. a per-endpoint client built for
+/// `s3://host:port/bucket`, issue #194) instead of the process-wide singleton.
+pub async fn delete_bucket_with_client(client: &aws_sdk_s3::Client, bucket: &str) -> Result<()> {
     client
         .delete_bucket()
         .bucket(bucket)
@@ -1793,6 +2004,12 @@ pub async fn delete_bucket_async(bucket: &str) -> Result<()> {
 /// Async version of create_bucket — safe to call from within an async context.
 pub async fn create_bucket_async(bucket: &str) -> Result<()> {
     let client = aws_s3_client_async().await?;
+    create_bucket_with_client(&client, bucket).await
+}
+
+/// Create `bucket` using an explicit client (e.g. a per-endpoint client built for
+/// `s3://host:port/bucket`, issue #194) instead of the process-wide singleton.
+pub async fn create_bucket_with_client(client: &aws_sdk_s3::Client, bucket: &str) -> Result<()> {
     client
         .create_bucket()
         .bucket(bucket)
@@ -2047,13 +2264,7 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
     } else {
         // Cache miss: issue one HEAD to learn the size, then cache it.
         let client = aws_s3_client_async().await?;
-        match client
-            .head_object()
-            .bucket(&bucket)
-            .key(key.trim_start_matches('/'))
-            .send()
-            .await
-        {
+        match client.head_object().bucket(&bucket).key(&key).send().await {
             // Locked contract (audit #152 f37, bug B3): a HEAD that
             // succeeds but omits Content-Length must not be cached as
             // size=0 (unwrap_or(0) did that here) — that poisons the
@@ -2120,8 +2331,10 @@ async fn get_object_with_known_size_async(
 
     // If total fits in one chunk, use a single range request (no concurrency overhead).
     if total_bytes <= effective_chunk_size as u64 {
-        let uri = format!("s3://{}/{}", bucket, key.trim_start_matches('/'));
-        return get_object_range_uri_async(&uri, start_offset, Some(total_bytes)).await;
+        // Call the bucket/key core directly: round-tripping through a rebuilt
+        // `s3://` string would re-parse the bucket and could misread a dotted or
+        // IP-shaped bucket name as an endpoint host.
+        return get_object_range_async(bucket, key, start_offset, Some(total_bytes)).await;
     }
 
     let effective_concurrency =
@@ -2538,11 +2751,54 @@ mod tests {
             .contains("must start with s3://"));
     }
 
+    // Issue #172 lock: the key is returned exactly as written -- every leading
+    // '/' after the bucket separator is part of the key, and every operation
+    // (stat, ranged GET, size probe, PUT, plain GET) must send it unchanged.
+    #[test]
+    fn test_parse_s3_uri_keeps_leading_slashes_in_key() {
+        let (bucket, key) = parse_s3_uri("s3://bkt//data/x").unwrap();
+        assert_eq!((bucket.as_str(), key.as_str()), ("bkt", "/data/x"));
+        let (_, key) = parse_s3_uri("s3://bkt///data/x").unwrap();
+        assert_eq!(key, "//data/x");
+        let (_, key) = parse_s3_uri("s3://bkt/data/x").unwrap();
+        assert_eq!(key, "data/x");
+    }
+
     #[test]
     fn test_parse_s3_uri_error_no_slash() {
         // Missing slash after bucket
         let result = parse_s3_uri_full("s3://mybucket");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_uri_server_without_bucket_says_so() {
+        // A bare server URI is not "a slash missing after the bucket": the server
+        // is fine, the bucket is missing, and the message shows the full form.
+        for uri in [
+            "s3://host:9000",
+            "s3://host:9000/",
+            "s3://[::1]:9000",
+            "s3://[::1]:9000/",
+        ] {
+            let server = uri
+                .strip_prefix("s3://")
+                .and_then(|r| r.strip_suffix('/').or(Some(r)))
+                .unwrap_or("");
+            let msg = format!("{:#}", parse_s3_uri_full(uri).unwrap_err());
+            assert!(
+                msg.contains(&format!("missing bucket after server '{server}'")),
+                "{uri}: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("s3://{server}/bucket/key")),
+                "{uri}: example missing in {msg}"
+            );
+            assert!(!msg.contains("after bucket"), "{uri}: stale text in {msg}");
+        }
+        // A bare bucket (no slash) keeps its own message.
+        let msg = format!("{:#}", parse_s3_uri_full("s3://mybucket").unwrap_err());
+        assert!(msg.contains("'/' after bucket"), "{msg}");
     }
 
     #[test]
@@ -2682,6 +2938,187 @@ mod tests {
             s.contains("connection refused"),
             "expected connector-error detail in top message, got: {}",
             s
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // classify_s3_first_segment (issues #178 / #193): the strict host:port grammar
+    // -------------------------------------------------------------------------
+
+    /// 253 characters (63 + 63 + 63 + 61 with dots) then a port.
+    const HOST_253_PORT: &str = concat!(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:9000"
+    );
+    /// One character longer than [`HOST_253_PORT`].
+    const HOST_254_PORT: &str = concat!(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:9000"
+    );
+
+    enum Seg {
+        Bucket,
+        Server,
+        /// Error whose full message must contain this text.
+        Fail(&'static str),
+    }
+
+    #[test]
+    fn test_classify_first_segment_grammar() {
+        use Seg::*;
+        let rows: &[(&str, Seg)] = &[
+            // Buckets (no explicit port): never validated as bucket names.
+            ("bucket", Bucket),
+            ("my.bucket.name", Bucket),
+            ("data.example.com", Bucket),
+            ("localhost", Bucket),
+            // Not four octets / octet > 255 / trailing dot: not an IPv4 literal.
+            ("1.2.3", Bucket),
+            ("999.1.1.1", Bucket),
+            ("10.0.0.5.", Bucket),
+            // Servers: explicit, plain-decimal port 1..=65535.
+            ("host:9000", Server),
+            ("host:1", Server),
+            ("host:65535", Server),
+            ("10.0.0.5:9000", Server),
+            ("[::1]:9000", Server),
+            ("[2001:db8::5]:443", Server),
+            // Host grammar (review of 0c9e18f): 1..=253 of ASCII letters, digits,
+            // '-', '.', '_', no empty labels. Anything else is an error naming the
+            // character; nothing that could change how the URI is split survives.
+            ("minio_1:9000", Server),
+            ("my-host.a_b.c:9000", Server),
+            ("MinIO.Example.COM:9000", Server),
+            ("node/prefix:9000", Fail("invalid character '/'")),
+            ("node\\prefix:9000", Fail("invalid character '\\\\'")),
+            ("a b:9000", Fail("invalid character ' '")),
+            ("a\tb:9000", Fail("invalid character '\\t'")),
+            ("a\u{0}b:9000", Fail("invalid character '\\0'")),
+            ("ho%st:9000", Fail("invalid character '%'")),
+            ("ho?st:9000", Fail("invalid character '?'")),
+            ("ho#st:9000", Fail("invalid character '#'")),
+            ("h\u{f4}st:9000", Fail("invalid character '\u{f4}'")),
+            ("a;b:9000", Fail("invalid character ';'")),
+            (".host:9000", Fail("empty label")),
+            ("host.:9000", Fail("empty label")),
+            ("host.example.com.:9000", Fail("empty label")),
+            ("ho..st:9000", Fail("empty label")),
+            ("node/prefix:9000", Fail("ASCII letters, digits")),
+            // Length: 253 accepted, 254 rejected.
+            (HOST_253_PORT, Server),
+            (HOST_254_PORT, Fail("253")),
+            // Ports that `u16::from_str` would accept but are not plain 1..=65535.
+            ("host:+9000", Fail("invalid port '+9000'")),
+            ("host:0", Fail("invalid port '0'")),
+            ("host:00", Fail("invalid port '00'")),
+            ("host:09000", Fail("leading zero")),
+            ("host:65536", Fail("invalid port '65536'")),
+            ("host:99999", Fail("invalid port '99999'")),
+            ("host:-1", Fail("invalid port '-1'")),
+            (
+                "host:\u{0669}\u{0660}\u{0660}\u{0660}",
+                Fail("invalid port"),
+            ),
+            ("host:abc", Fail("invalid port 'abc'")),
+            ("host:", Fail("empty port")),
+            ("[::1]:", Fail("empty port")),
+            ("[::1]:0", Fail("invalid port '0'")),
+            ("[::1]:+9000", Fail("invalid port '+9000'")),
+            // Missing host.
+            (":9000", Fail("missing host")),
+            // Userinfo is never accepted, with or without a port.
+            ("user@host:9000", Fail("userinfo")),
+            ("user:pw@host:9000", Fail("userinfo")),
+            ("user@host", Fail("userinfo")),
+            ("[::1]@x:9000", Fail("userinfo")),
+            // Bracketed IPv6 content is validated.
+            ("[x]:9000", Fail("invalid IPv6 address 'x'")),
+            ("[junk]:9000", Fail("invalid IPv6 address 'junk'")),
+            ("[10.0.0.5]:9000", Fail("IPv4 address inside brackets")),
+            ("[::1", Fail("unterminated '['")),
+            ("[", Fail("unterminated '['")),
+            ("[]:9000", Fail("empty IPv6 address")),
+            ("[::1]", Fail("without a port")),
+            ("[::1]x:9000", Fail("unexpected text")),
+            ("[fe80::1%eth0]:9000", Fail("invalid IPv6 address")),
+            ("host]:9000", Fail("unexpected bracket")),
+            ("ho[st:9000", Fail("unexpected bracket")),
+            // Portless IPv4 literal (incl. leading-zero octets): an IP is never a bucket.
+            ("10.0.0.5", Fail("IP address with no port")),
+            ("010.001.002.003", Fail("IP address with no port")),
+            // Unbracketed IPv6.
+            ("::1", Fail("unbracketed IPv6")),
+            ("2001:db8::5", Fail("unbracketed IPv6")),
+            // More than one ':' that is NOT an IPv6 address must not be called IPv6.
+            ("host:9000:x", Fail("more than one ':'")),
+            ("a:b:c:d", Fail("more than one ':'")),
+            // URL-shaped input (e.g. an --endpoints entry).
+            ("http://host:9000", Fail("looks like a URL")),
+            ("https://host", Fail("looks like a URL")),
+            ("s3://host:9000", Fail("looks like a URL")),
+            // ARNs.
+            (
+                "arn:aws:s3:us-east-1:123:accesspoint",
+                Fail("looks like an ARN"),
+            ),
+            ("arn:aws:s3:::bucket", Fail("looks like an ARN")),
+            // A host that merely starts with "arn" is still a normal host:port.
+            ("arn:9000", Server),
+            ("arn", Bucket),
+            // Empty first segment.
+            ("", Fail("empty first segment")),
+        ];
+
+        let mut failures = Vec::new();
+        for (segment, want) in rows {
+            let got = classify_s3_first_segment(segment);
+            match (want, &got) {
+                (Bucket, Ok(S3FirstSegment::Bucket(b))) if b == segment => {}
+                (Server, Ok(S3FirstSegment::Server(a))) if a == segment => {}
+                (Fail(hint), Err(e)) if format!("{e:#}").contains(hint) => {
+                    // The IPv6 label must be reserved for real IPv6 addresses.
+                    if !segment.contains("::")
+                        && !segment.starts_with('[')
+                        && format!("{e:#}").contains("unbracketed IPv6")
+                    {
+                        failures.push(format!("{segment:?}: wrongly called IPv6: {e:#}"));
+                    }
+                }
+                (_, other) => {
+                    let want = match want {
+                        Bucket => "bucket".to_string(),
+                        Server => "server".to_string(),
+                        Fail(h) => format!("error containing {h:?}"),
+                    };
+                    failures.push(format!("{segment:?}: want {want}, got {other:?}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "classify_s3_first_segment mismatches:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_classify_url_and_arn_errors_name_the_fix() {
+        let url = format!(
+            "{:#}",
+            classify_s3_first_segment("http://host:9000").unwrap_err()
+        );
+        assert!(url.contains("host:9000") && url.contains("scheme"), "{url}");
+        let arn = format!(
+            "{:#}",
+            classify_s3_first_segment("arn:aws:s3:us-east-1:123:accesspoint").unwrap_err()
+        );
+        assert!(
+            arn.contains("ARN") && arn.contains("not supported"),
+            "{arn}"
         );
     }
 }

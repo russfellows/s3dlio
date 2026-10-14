@@ -139,8 +139,8 @@ pub enum LoadBalanceStrategy {
 ```rust
 let config = MultiEndpointStoreConfig {
     endpoint_configs: vec![
-        EndpointConfig { uri: "s3://fast-endpoint/bucket".to_string(), .. },
-        EndpointConfig { uri: "s3://slow-endpoint/bucket".to_string(), .. },
+        EndpointConfig { uri: "s3://fast-endpoint:9000/bucket".to_string(), .. },
+        EndpointConfig { uri: "s3://slow-endpoint:9000/bucket".to_string(), .. },
     ],
     strategy: LoadBalanceStrategy::ShortestExpectedWaitingTime { alpha: 0.2 },
     ..Default::default()

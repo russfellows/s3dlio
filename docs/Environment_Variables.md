@@ -318,7 +318,7 @@ export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `S3DLIO_OPLOG_LOSSLESS` | `false` | Enable lossless operation logging (higher memory usage) |
-| `S3DLIO_OPLOG_BUF` | `8192` | Bounded channel capacity, in log *entries*, between the calling thread and the background writer thread. Entries are dropped (with an stderr warning) once full, unless `S3DLIO_OPLOG_LOSSLESS=true`. |
+| `S3DLIO_OPLOG_BUF` | `8192` | Bounded channel capacity, in log *entries*, between the calling thread and the background writer thread. Entries are dropped once full (one stderr note per op-log session on the first drop; the exact total is in the warning `finalize_op_log()` prints), unless `S3DLIO_OPLOG_LOSSLESS=true`; `op_log_stats()` counts them (and the entries a failed writer never wrote) and says whether the log is complete. |
 | `S3DLIO_OPLOG_WBUFCAP` | `262144` | `BufWriter` capacity, in *bytes*, for the op-log output file. A larger buffer flushes to disk less often. (v0.9.110: corrected from a previously-documented `4096`, which never matched the code default — see Version History.) |
 | `S3DLIO_OPLOG_LEVEL` | `1` | Operation logging level (0=off, 1=basic, 2=verbose) |
 
@@ -335,19 +335,93 @@ Standard AWS environment variables are also supported:
 | `AWS_ENDPOINT_URL` | Custom S3 endpoint URL (for MinIO or other S3-compatible storage) |
 | `AWS_CA_BUNDLE` | Path to custom CA certificate bundle (standard AWS SDK name) |
 
-### `s3://host/bucket/key` endpoint-in-URI detection (v0.9.109+)
+### `s3://host:port/bucket/key` server-vs-bucket rule (changed in v0.9.120; issues #178, #193, #194)
 
-`parse_s3_uri_full` (used when a URI's first path segment might be a custom endpoint hostname rather than a bucket, e.g. for MinIO/Ceph clusters addressed directly in the URI) decides bucket-vs-endpoint using: a colon (port) present, the segment is a dotted-quad IPv4 address, or the segment contains a dot and its last label matches a known hostname-like suffix.
+The first segment of `s3://X/...` names a **server** only when it carries an
+explicit port; otherwise it is **always a bucket**. One rule
+(`s3dlio::s3_utils::classify_s3_first_segment`) is shared by exactly these
+components, so they agree with each other:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `S3DLIO_S3_ENDPOINT_HINT_TLDS` | (unset) | Comma-separated list of additional suffixes (case-insensitive, no leading dot) to recognize as hostname-like when a URI's first path segment has no port — e.g. `export S3DLIO_S3_ENDPOINT_HINT_TLDS=storagegrid,mynas` lets `s3://cluster.storagegrid/bucket/key` route as an endpoint. Extends, does not replace, the built-in default list (`com`, `net`, `org`, `io`, `co`, `dev`, `cloud`, `app`, `biz`, `info`, `local`, `internal`, `lan`, `corp`, `home`, `cluster`, `svc`, `network`). |
+- the URI parser (`parse_s3_uri_full`, and `parse_s3_uri` which wraps it);
+- the store factory (`store_for_uri`, `store_for_uri_with_logger`,
+  `store_for_uri_with_config*`);
+- `MultiEndpointStore` (`new` / `from_config`);
+- `s3-cli create-bucket` / `delete-bucket` and every `--endpoints` entry.
 
-> **Behavior change (v0.9.109).** Before this release, ANY first-path-segment with 2+ dots, a leading digit, or containing `minio`/`ceph`/`localhost` as a substring was misrouted as an endpoint — even though all of those are legal S3 bucket name shapes (e.g. `mycompany.data.backups`, `2024-training-data`, `minio-tenant-a`). Those now correctly parse as bucket names. If you relied on the old broader heuristic to route a no-port, unusual-suffix endpoint hostname, either add a port to the URI or add your hostname's suffix to `S3DLIO_S3_ENDPOINT_HINT_TLDS`.
+**Not covered yet.** Other code paths that accept an `s3://` URI do not call this
+rule and can still ignore a server named in the URI: the Python store cache and
+Python get/stat/get_many helpers (#171), `S3ObjectStore` operations on a URI that
+names a different server than the store's own (#197), the Python
+`create_bucket` / `delete_bucket` helpers (#199), and `list_containers` /
+`s3-cli list-buckets` (#200). Until those are fixed, use the single-endpoint
+`AWS_ENDPOINT_URL` or the paths listed above when a request must reach a
+specific server.
+
+**Strict `host:port` grammar.** A server is `host:port` or `[ipv6]:port`, where
+the port is plain decimal digits from `1` to `65535` with no sign and no leading
+zeros (`:09000`, `:+9000` and `:0` are errors), the bracketed content is a valid
+IPv6 address, and there is no userinfo (`user@host:9000` is an error). URLs
+(`http://host:9000`), ARNs and an empty first segment are rejected with a message
+that says what was wrong; they are not reported as IPv6 problems.
+
+**Host grammar.** The host of an unbracketed `host:port` is 1 to 253 characters,
+each an ASCII letter, digit, `-`, `.` or `_` (`_` is kept for container-style
+names such as `minio_1`), with no empty label (no leading or trailing `.`, no
+`..`). Everything else is an error that names the offending character and the
+grammar: `/`, `\`, whitespace, control characters, `%`, `?`, `#`, `;`, non-ASCII
+text, and `@` (userinfo). This is checked before any endpoint URI is built, so a
+host can never change how `s3://host:port/bucket/key` is split: `--endpoints
+node/prefix:9000` is rejected instead of producing `s3://node/prefix:9000/...`,
+which would parse as bucket `node` on the global client. A trailing dot (an
+absolute FQDN such as `host.example.com.:9000`) was accepted by the previous
+revision of this change and is now an error; write `host.example.com:9000`.
+
+| URI | Meaning |
+|-----|---------|
+| `s3://bucket/key`, `s3://BUCKET/key`, `s3://my.bucket.name/key` | bucket `bucket` / `BUCKET` / `my.bucket.name` (uses `AWS_ENDPOINT_URL` or AWS) |
+| `s3://data.example.com/dir/file.bin`, `s3://minio.example.com/bkt/key`, `s3://localhost/bkt/key` | **bucket** `data.example.com` / `minio.example.com` / `localhost` — a dotted DNS name with no port is a bucket, never a server |
+| `s3://10.0.0.5:9000/bkt/key` | server `http://10.0.0.5:9000`, bucket `bkt` |
+| `s3://host.example.com:443/bkt/key` | server `https://host.example.com:443`, bucket `bkt` |
+| `s3://[::1]:9000/bkt/key` | server `http://[::1]:9000`, bucket `bkt` |
+| `s3://10.0.0.5/bkt/key` | **error**: an IP address with no port (S3 forbids IP-shaped bucket names, so it is not a bucket either). Add `:port`, e.g. `s3://10.0.0.5:9000/bkt/key` |
+| `s3://[::1]/bkt/key`, `s3://::1/bkt/key` | **error**: IPv6 must be bracketed and carry a port (`s3://[::1]:9000/bkt/key`) |
+
+For `s3-cli create-bucket` / `delete-bucket`, `s3://host:port/bkt` creates /
+deletes bucket `bkt` **on that server** (before, the bucket name was taken to be
+`host:port`). Every `--endpoints` entry must be `host:port` (a portless entry, or
+a URL such as `http://host:9000`, is an error).
+
+**Errors, not fallbacks.** `store_for_uri*` and `MultiEndpointStore::new` /
+`from_config` now return an error for an invalid first segment (a portless IP, a
+malformed port, ...). Previously a parse problem was swallowed and the request
+went to the global client.
+
+**`S3DLIO_S3_ENDPOINT_HINT_TLDS` is deprecated and ignored.** It extended a
+hostname-suffix heuristic (`com`, `net`, `local`, `internal`, …) that made a
+portless name such as `minio.example.com` a server. That heuristic is gone: a
+portless name is a bucket. The variable is kept as a no-op rather than removed so
+that a script that still exports it keeps running. The variable is checked once,
+at the first URI parse in the process (setting it later has no effect and no
+warning); if it is set then, s3dlio logs a warning through `tracing` and also
+writes it once to stderr, so it is visible without a tracing subscriber. Remove
+it and put the port in the URI instead.
+
+`MultiEndpointStore` also logs a warning when an endpoint's first segment is
+treated as a bucket but contains a dot (for example an old `s3://minio.example.com/bucket/`
+endpoint): it names the endpoint and says to add `:port` if it is a server.
+
+> **Breaking change (v0.9.120).** v0.9.109 – v0.9.114 treated a portless first
+> segment as a server when it was an IPv4 literal or ended in a hostname-like
+> suffix. Migration: add `:port` to every URI that names a server
+> (`s3://minio.example.com/bkt/key` → `s3://minio.example.com:9000/bkt/key`).
+> A portless DNS name is now a bucket, and a portless IPv4 address is an error with
+> a message that says to add `:port`. A deprecation period is not possible: a
+> portless host and a dotted bucket name are the same grammar. An explicit
+> `s3+http://` / `s3+https://` form is planned (#195).
 
 ### `s3://host:port/bucket/key` per-endpoint TLS detection (v0.9.110+)
 
-When a URI's authority contains an explicit `host:port`, s3dlio creates a dedicated per-endpoint S3 client (see above) and must guess `http` vs `https` from the port alone, since no other scheme hint is available in an `s3://` URI. Port 443 always uses `https`; every other port defaults to `http`.
+When a URI's first segment is a server (an explicit `host:port`, see above), s3dlio creates a dedicated per-endpoint S3 client (see above) and must guess `http` vs `https` from the port alone, since no other scheme hint is available in an `s3://` URI. Port 443 always uses `https`; every other port defaults to `http`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -565,6 +639,7 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 
 ## Version History
 
+- **v0.9.120** *(behaviour change: the `s3://` server-vs-bucket rule; retired: `S3DLIO_S3_ENDPOINT_HINT_TLDS`)*: `s3://X/...` names a server only when `X` carries an explicit port (`host:port` or `[ipv6]:port`). Every other first segment is a bucket, and a portless IP is an error (see "`s3://host:port/bucket/key` server-vs-bucket rule" above). `S3DLIO_S3_ENDPOINT_HINT_TLDS` is retired: it has no effect and warns once. `MultiEndpointStore` uses the same TLS rule as `S3DLIO_S3_ENDPOINT_TLS_PORTS` describes. The op-log accepts `file://` destinations and reports accepted, dropped and written counts through `op_log_stats()`. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.114** *(Azure SDK stable 1.x migration)*: Updated Azure Blob Storage and identity clients to the stable 1.x SDK line. Added `S3DLIO_AZURE_DOWNLOAD_MODE`, `S3DLIO_AZURE_CONCURRENT_ENGINE`, `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB`, `S3DLIO_AZURE_DOWNLOAD_CONCURRENCY`, and `S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB` for selecting and tuning Azure SDK managed downloads, s3dlio RangeEngine downloads, or sequential transfers. Raised the Rust MSRV to 1.88. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.112** *(new: `S3DLIO_RT_THREADS_UNSAFE`; behavior change: `S3DLIO_RT_THREADS` sanity clamp)*: Added a sanity clamp to `S3DLIO_RT_THREADS` — values below `RT_THREADS_LIMIT/4` are treated as downstream miscomputation and clamped up to `RT_THREADS_LIMIT`, with a stderr warning the first time it fires.  Rationale: the DLIO unet3d datagen bottleneck (2026-07-10, `docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md`) was caused by DLIO's `ObjStoreLibStorage.__init__` computing `S3DLIO_RT_THREADS = write_threads * 1.5` with Hydra's default `write_threads=1`, giving `S3DLIO_RT_THREADS=1` and building a 1-worker Tokio runtime that serialized every concurrent multipart upload part (10× throughput loss, live-measured 214 MB/s vs 1928 MB/s after fix on a 28-core host with s3-ultra).  `S3DLIO_RT_THREADS_UNSAFE=1` bypasses the clamp for legitimate low-thread scenarios (single-threaded test suites, fault-injection).  The clamp is inactive when `configure_thread_pools` was never called (`RT_THREADS_LIMIT=0`), preserving pure-Rust programmatic use.  Also in v0.9.112: FFI-boundary
   hardening (mlcommons/storage#755, s3dlio#161, s3dlio#162). Error conversion at

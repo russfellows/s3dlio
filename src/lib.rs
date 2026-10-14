@@ -53,6 +53,7 @@ pub mod profiling;
 use pyo3::prelude::*;
 
 // Internal modules - these may change in future versions
+pub(crate) mod delete_batch_plan; // pure URI-grouping helpers for delete_batch (#179)
 pub mod object_store;
 pub(crate) mod redirect_client; // HTTP 307 redirect following (for AIStore compatibility)
 pub mod retry; // v0.9.108+ Phase 4: shared retry helper for body-transfer failures
@@ -251,7 +252,8 @@ pub use crate::config::ObjectType;
 
 // logger helpers:
 pub use crate::s3_logger::{
-    finalize_op_logger, get_clock_offset, init_op_logger, set_clock_offset,
+    finalize_op_logger, get_clock_offset, init_op_logger, op_log_stats, set_clock_offset,
+    OpLogStats,
 };
 
 // Bring in Python wrappers from python_api.rs when building as extension.

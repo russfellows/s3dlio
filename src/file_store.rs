@@ -283,8 +283,11 @@ impl FileSystemObjectStore {
         }
     }
 
-    /// Convert a URI to a filesystem path
-    fn uri_to_path(uri: &str) -> Result<PathBuf> {
+    /// Convert a URI to a filesystem path.
+    ///
+    /// `pub(crate)` so the op-log's tests can check that its `file://` handling
+    /// resolves to the same path (src/s3_logger.rs).
+    pub(crate) fn uri_to_path(uri: &str) -> Result<PathBuf> {
         if !uri.starts_with("file://") {
             bail!("FileSystemObjectStore expects file:// URI, got: {}", uri);
         }

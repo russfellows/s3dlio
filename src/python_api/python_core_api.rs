@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use super::async_bridge::future_into_py;
 use bytes::Bytes;
 use pyo3::buffer::PyBuffer;
 use pyo3::conversion::IntoPyObjectExt;
@@ -11,7 +12,6 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods};
 use pyo3::Bound;
-use pyo3_async_runtimes::tokio::future_into_py;
 
 use tokio::task;
 
@@ -22,9 +22,11 @@ use tracing::{debug, warn, Level};
 // Project crates
 use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
 use crate::list_containers::list_containers as list_containers_rs;
-use crate::object_store::{store_for_uri, store_for_uri_with_logger};
+use crate::object_store::{
+    store_for_uri, store_for_uri_with_logger, store_routing_endpoint_for_uri,
+};
 use crate::s3_client::run_on_global_rt;
-use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger};
+use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger, op_log_stats};
 use crate::s3_utils::{
     create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs, get_objects_parallel,
     parse_s3_uri, put_objects_with_random_data_and_type, stat_object_many_async,
@@ -71,24 +73,37 @@ use std::sync::Arc;
 ///
 /// Note: We DON'T include bucket in the key because AWS clients work across
 /// all buckets in a region/endpoint. This maximizes cache hit rate.
+///
+/// `route` is the server the factory would pick for the URI: it is taken from
+/// [`store_routing_endpoint_for_uri`], the same function
+/// `store_for_uri_with_logger` calls, so a host-form URI
+/// (`s3://host:port/bucket/key`) is cached per server and a bucket URI
+/// (`None`) is cached per `AWS_ENDPOINT_URL` (issue #171).  The cache never
+/// calls the factory on a hit, so anything the factory routes on must be in
+/// the key.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct StoreKey {
-    scheme: String,   // "s3", "az", "gs", "file", "direct"
-    endpoint: String, // AWS_ENDPOINT_URL or default
-    region: String,   // AWS_REGION or default
+    scheme: String,        // "s3", "az", "gs", "file", "direct"
+    endpoint: String,      // AWS_ENDPOINT_URL or default
+    region: String,        // AWS_REGION or default
+    route: Option<String>, // per-endpoint URL the factory routes this URI to, if any
 }
 
 impl StoreKey {
-    fn from_uri(uri: &str) -> Self {
+    /// Errors when the routing decision does (an invalid server in the URI,
+    /// issue #178): never mapped to "no route", which would alias the URI onto
+    /// the global-client cache entry.
+    fn from_uri(uri: &str) -> anyhow::Result<Self> {
         let scheme = uri.split("://").next().unwrap_or("s3");
         let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
-        StoreKey {
+        Ok(StoreKey {
             scheme: scheme.to_string(),
             endpoint,
             region,
-        }
+            route: store_routing_endpoint_for_uri(uri)?,
+        })
     }
 }
 
@@ -103,12 +118,14 @@ static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<dyn ObjectStore>>> = Lazy::new(Da
 /// Get or create a cached ObjectStore instance.
 ///
 /// store_for_uri_with_logger() is synchronous — no runtime needed for creation.
-/// The store is cached by (scheme, endpoint, region) for >99% cache hit rate.
+/// The store is cached by (scheme, endpoint, region, per-endpoint route) for
+/// >99% cache hit rate; see [`StoreKey`].
 fn get_or_create_store(
     uri: &str,
     logger: Option<crate::s3_logger::Logger>,
 ) -> anyhow::Result<Arc<dyn ObjectStore>> {
-    let key = StoreKey::from_uri(uri);
+    // Routing errors propagate BEFORE the cache is consulted or populated.
+    let key = StoreKey::from_uri(uri)?;
 
     // Fast path: Store already exists (cache hit >99% in typical workloads)
     if let Some(store) = STORE_CACHE.get(&key) {
@@ -663,20 +680,117 @@ pub fn init_logging(level: &str) -> PyResult<()> {
     Ok(())
 }
 
+/// Enable operation logging to a local zstd-compressed TSV file.
+///
+/// A process supports exactly ONE op-log session (init -> finalize, no restart).
+///
+/// Args:
+///     path: Local filesystem path (e.g. "/tmp/ops.tsv.zst") or a file://
+///         destination (e.g. "file:///tmp/ops.tsv.zst"). The parent directory
+///         must exist. file:// follows s3dlio's file:// convention (the same
+///         as the file:// object store); it is not full RFC 8089: only the
+///         lowercase prefix "file://" is recognised, it is removed, and the
+///         rest is the path, used literally ("file://localhost/x" is the
+///         relative path "localhost/x"; "%20" is not decoded; "file://" alone
+///         is an error). Any other scheme, including "FILE://", "direct://"
+///         and s3://, is rejected as unsupported.
+///
+/// Behaviour:
+///     - First call: creates the file and starts logging. A call that fails
+///       (bad path, unsupported scheme) leaves logging uninitialized, so a
+///       corrected call can succeed.
+///     - Call while logging is already active: returns without effect; the new
+///       path is not created or truncated.
+///     - Call after finalize_op_log(): raises RuntimeError and touches no file.
+///
+/// Stores/readers capture the logger when they are constructed: objects created
+/// before init_op_log() are never logged; objects created before
+/// finalize_op_log() stop recording when it runs.
 #[pyfunction]
 pub fn init_op_log(path: &str) -> PyResult<()> {
     init_op_logger(path).map_err(py_err)
 }
 
+/// Finish operation logging: write every accepted record (unless the writer
+/// fails: an I/O error or a panic in the writer thread, see op_log_stats()),
+/// close the zstd stream and wait until the writer has finished and signalled
+/// completion. Call it before the process exits: nothing does it for you (no
+/// atexit hook), and without it queued records and the zstd frame end are lost. Terminal for this process (see
+/// init_op_log). Safe to call repeatedly, or before init_op_log() (no effect).
+/// After it returns is_op_log_active() is False and operations on objects
+/// created earlier are no longer recorded. The GIL is released while the
+/// pending records are drained, so other Python threads keep running.
 #[pyfunction]
-pub fn finalize_op_log() -> PyResult<()> {
-    finalize_op_logger();
+pub fn finalize_op_log(py: Python<'_>) -> PyResult<()> {
+    py.detach(finalize_op_logger);
     Ok(())
 }
 
+/// True only between a successful init_op_log() and finalize_op_log().
 #[pyfunction]
 pub fn is_op_log_active() -> PyResult<bool> {
     Ok(global_logger().is_some())
+}
+
+/// Counts of what happened to the entries submitted to the op-log between
+/// init_op_log() and finalize_op_log(), so you can detect most ways records are
+/// lost.
+///
+/// Returns None before init_op_log(); otherwise a dict (available while
+/// logging is active AND after finalize_op_log()):
+///
+///     accepted         entries queued for the writer
+///     written          rows the writer handed to the compressor without error
+///                      (an upper bound of the rows in the file)
+///     dropped_full     entries dropped because the queue was full (default
+///                      mode only)
+///     rejected_closed  calls that arrived after finalize began (not in the file)
+///     writer_failed    calls refused because the writer had already stopped
+///     writer_error     None, or the first error the writer met (a failed write,
+///                      a failed finish/flush of the compressed stream, or a
+///                      writer panic, which is a defect, not an I/O error) as text
+///     lossless         True if S3DLIO_OPLOG_LOSSLESS=1 (callers wait, never drop)
+///
+/// After finalize_op_log() no counted loss happened exactly when
+/// accepted == written and dropped_full == 0 and writer_failed == 0 and
+/// writer_error is None. "written" counts rows the zstd compressor accepted; the
+/// bytes may still be buffered when it is counted, and a later write, finish or
+/// flush can still fail (that is writer_error). A successful finalize_op_log()
+/// with that condition true means every accepted row reached the compressor and
+/// the stream was finished and flushed to the file without error. That is
+/// completion, not durability: there is no fsync, and a close(2) error cannot be
+/// observed. (accepted > written means entries were queued but never written,
+/// e.g. the disk filled up; writer_failed alone cannot show that.)
+/// rejected_closed is not part of "complete" -- those calls were never going to
+/// be in the file -- but finalize only after your worker threads have stopped, and
+/// check rejected_closed == 0 as well. While logging is active accepted > written
+/// is normal (the queue is draining), so judge completeness after finalize.
+///
+/// NOT covered: process exit without finalize_op_log() (no atexit hook: queued
+/// records and the zstd frame end are lost and these stats are never read);
+/// objects created before init_op_log() (unlogged, uncounted); errors reported
+/// only when the file is closed (e.g. NFS or quota errors at close(2)).
+///
+/// To avoid queue-full drops set S3DLIO_OPLOG_LOSSLESS=1 and/or raise
+/// S3DLIO_OPLOG_BUF. finalize_op_log() also prints one warning on stderr if
+/// anything was lost, stating the exact number of queue-full drops. In the
+/// default mode the first queue-full drop of the session prints one stderr note
+/// at once; later drops are only counted.
+#[pyfunction]
+#[pyo3(name = "op_log_stats")]
+pub fn op_log_stats_py(py: Python<'_>) -> PyResult<Option<Bound<'_, PyDict>>> {
+    let Some(stats) = op_log_stats() else {
+        return Ok(None);
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("accepted", stats.accepted)?;
+    dict.set_item("dropped_full", stats.dropped_full)?;
+    dict.set_item("rejected_closed", stats.rejected_closed)?;
+    dict.set_item("writer_failed", stats.writer_failed)?;
+    dict.set_item("lossless", stats.lossless)?;
+    dict.set_item("written", stats.written)?;
+    dict.set_item("writer_error", stats.writer_error)?;
+    Ok(Some(dict))
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,13 +1206,16 @@ pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
     let uri_owned = uri.to_owned();
     py.detach(|| {
         let logger = global_logger();
+        // Build the store on the caller thread BEFORE submit_io (issue #173),
+        // as `stat`/`list` do: a host-form S3 URI creates its client via
+        // `run_on_global_rt`, which must not run on a global-runtime worker.
+        let store = match get_or_create_store(&uri_owned, logger) {
+            Ok(s) => s,
+            Err(_) => return Ok(false), // URI parsing error → doesn't exist
+        };
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            let store = match get_or_create_store(&uri_owned, logger) {
-                Ok(s) => s,
-                Err(_) => return Ok(false), // URI parsing error → doesn't exist
-            };
-
             match store.stat(&uri_owned).await {
                 Ok(_) => Ok(true),
                 Err(_) => Ok(false),
@@ -1216,12 +1333,11 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
     };
 
     py.detach(move || {
+        // Build the store on the caller thread BEFORE submit_io (issue #173).
+        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
-        submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri, logger)?;
-            put_verified_with_retry(store.as_ref(), &uri, data_owned).await
-        })
+        submit_io(async move { put_verified_with_retry(store.as_ref(), &uri, data_owned).await })
     })
 }
 
@@ -1325,12 +1441,11 @@ pub fn mkdir(py: Python<'_>, uri: &str) -> PyResult<()> {
     let uri = uri.to_owned();
 
     py.detach(move || {
+        // Build the store on the caller thread BEFORE submit_io (issue #173).
+        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
-        submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri, logger)?;
-            store.mkdir(&uri).await
-        })
+        submit_io(async move { store.mkdir(&uri).await })
     })
 }
 
@@ -1410,10 +1525,13 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
     // Use universal ObjectStore API for all backends (with op-log support)
     let uri_owned = uri.to_owned();
     py.detach(|| {
+        // Build the store on the caller thread BEFORE submit_io (issue #173):
+        // for a host-form URI this calls `run_on_global_rt`, which must not
+        // be reached from a global-runtime worker.
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri_owned, logger)?;
             let bytes = store.get(&uri_owned).await?;
             Ok(PyBytesView::new(bytes))
         })
@@ -1432,10 +1550,11 @@ pub fn get_range_py(
     // Use universal ObjectStore interface for range requests
     let uri_owned = uri.to_owned();
     py.detach(|| {
+        // Build the store on the caller thread BEFORE submit_io (issue #173).
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri_owned, logger)?;
             let bytes = store.get_range(&uri_owned, offset, length).await?;
             Ok(PyBytesView::new(bytes))
         })
@@ -1687,11 +1806,11 @@ pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
     // Use universal ObjectStore API for deletion (with op-log support)
     let uri_owned = uri.to_owned();
     py.detach(|| {
+        // Build the store on the caller thread BEFORE submit_io (issue #173).
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri_owned, logger)?;
-
             // Check if URI contains wildcards or ends with / (pattern/directory)
             let has_pattern =
                 uri_owned.contains('*') || uri_owned.contains('?') || uri_owned.ends_with('/');
@@ -1731,14 +1850,22 @@ pub fn upload(
     let paths: Vec<PathBuf> = src_patterns.into_iter().map(PathBuf::from).collect();
     let dest_prefix_owned = dest_prefix.to_owned();
     py.detach(|| {
+        // Get logger if op-log is active
+        let logger = global_logger();
+
+        // The bucket-creation store (only when explicitly requested) is built
+        // on the caller thread BEFORE submit_io (issue #173): a host-form S3
+        // URI creates its client via `run_on_global_rt`, which must not be
+        // reached from a global-runtime worker.  Its failure is still only
+        // warned about, inside the future, exactly as before.
+        let bucket_store =
+            create_bucket.then(|| store_for_uri_with_logger(&dest_prefix_owned, logger));
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            // Get logger if op-log is active
-            let logger = global_logger();
-
             // Handle bucket creation ONLY if explicitly requested
-            if create_bucket {
-                match store_for_uri_with_logger(&dest_prefix_owned, logger.clone()) {
+            if let Some(bucket_store) = bucket_store {
+                match bucket_store {
                     Ok(store) => {
                         // Extract bucket/container name from URI
                         if dest_prefix_owned.starts_with("s3://") {
@@ -1786,6 +1913,10 @@ pub fn upload(
 // put_many() - Batch put for maximum throughput (Python API)
 // ---------------------------------------------------------------------------
 
+/// One `put_many` item with its store already resolved (or the resolution
+/// error, surfaced from that item's task): (uri, data, store).
+type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
+
 /// Put multiple objects in parallel from Python.
 ///
 /// Accepts a list of (uri, data) tuples where data is Python bytes.
@@ -1831,18 +1962,33 @@ pub fn put_many(
         .collect();
 
     py.detach(move || {
+        // Build every store on the caller thread BEFORE submit_io (issue
+        // #173): a host-form S3 URI creates its client via
+        // `run_on_global_rt`, which must not be reached from a global-runtime
+        // worker.  Stores are cached by (scheme, endpoint, region), so after
+        // the first URI of a kind these are cache hits.  A creation failure
+        // is carried per item and surfaces from that item's task, so the
+        // error semantics (other items still run; first error returned) are
+        // unchanged.
+        let logger = global_logger();
+        let prepared: Vec<PreparedPut> = owned_items
+            .into_iter()
+            .map(|(uri, data)| {
+                let store = get_or_create_store(&uri, logger.clone());
+                (uri, data, store)
+            })
+            .collect();
+
         // Submit entire batch to global runtime (io_uring pattern)
         submit_io(async move {
             let sem = Arc::new(Semaphore::new(max_in_flight));
             let mut futs = FuturesUnordered::new();
-            let logger = global_logger();
 
-            for (uri, data) in owned_items {
+            for (uri, data, store) in prepared {
                 let sem = Arc::clone(&sem);
-                let logger = logger.clone();
                 futs.push(tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await.unwrap();
-                    let store = get_or_create_store(&uri, logger)?;
+                    let store = store?;
                     store.put(&uri, data).await?;
                     Ok::<_, anyhow::Error>(())
                 }));
@@ -2806,6 +2952,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(finalize_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(is_op_log_active, m)?)?;
+    m.add_function(wrap_pyfunction!(op_log_stats_py, m)?)?;
 
     // URI parsing utilities
     m.add_function(wrap_pyfunction!(parse_s3_uri_full, m)?)?;
@@ -3104,5 +3251,251 @@ mod put_verify_tests {
 
         std::env::remove_var("S3DLIO_PUT_VERIFY");
         result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- issue #173: sync entry points must build host-form stores on the
+// caller thread, and `get_or_create_store` must also be safe when it IS called
+// from a runtime worker.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod issue173_store_creation_tests {
+    use super::*;
+    use crate::s3_client::issue173_worker_reentrancy_tests::{run_with_watchdog, WATCHDOG};
+
+    /// Host-form URI: the authority carries `host:port`, so
+    /// `store_for_uri_with_logger` takes the `run_on_global_rt(for_endpoint)`
+    /// path.  Store creation does not connect, so the (closed) port 9 is never
+    /// contacted.
+    const HOST_FORM_URI: &str = "s3://127.0.0.1:9/bucket/key";
+
+    fn prepare_environment() {
+        // for_endpoint requires credentials to exist; none are ever used.
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        // Force the slow (creating) path of get_or_create_store.
+        STORE_CACHE.remove(&StoreKey::from_uri(HOST_FORM_URI).expect("valid URI"));
+    }
+
+    /// The exact shape of the old `get`/`get_range`/`put_bytes` bodies:
+    /// `get_or_create_store` inside the future handed to `submit_io`, i.e.
+    /// executing on a global-runtime worker.
+    #[test]
+    fn get_or_create_store_inside_submit_io_completes_for_host_form_uri() {
+        prepare_environment();
+        let got = run_with_watchdog("py-submit-io", || {
+            submit_io(async move {
+                get_or_create_store(HOST_FORM_URI, None)
+                    .map(|_| ())
+                    .map_err(|e| e.context("get_or_create_store"))
+            })
+        });
+        match got {
+            Some(r) => assert!(r.is_ok(), "store creation failed: {r:?}"),
+            None => panic!(
+                "RED: get_or_create_store(host-form) inside submit_io did not \
+                 return within {WATCHDOG:?} (issue #173 deadlock)"
+            ),
+        }
+    }
+
+    /// The shape of the fixed entry points: create on the caller thread
+    /// (no runtime worker involved), then hand the store to `submit_io`.
+    #[test]
+    fn store_created_on_caller_thread_before_submit_io_completes() {
+        prepare_environment();
+        let got = run_with_watchdog("py-caller-thread", || {
+            let store = get_or_create_store(HOST_FORM_URI, None)?;
+            submit_io(async move {
+                // Touch the store on the worker, as the entry points do.
+                let _ = store.as_ref();
+                Ok::<(), anyhow::Error>(())
+            })
+            .map_err(|e| anyhow::anyhow!("submit_io failed: {e}"))
+        });
+        match got {
+            Some(r) => assert!(r.is_ok(), "caller-thread creation failed: {r:?}"),
+            None => panic!(
+                "caller-thread store creation + submit_io did not return within {WATCHDOG:?}"
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- issue #171: the store cache must key on the server a URI names.
+//
+// Before the fix `StoreKey` was (scheme, AWS_ENDPOINT_URL, region), so a
+// cache hit for `s3://hostB:9000/b/k` returned the store built for hostA (or
+// for the global AWS_ENDPOINT_URL client) and the request went to the wrong
+// server.  These tests need no network: store creation never connects.
+//
+// STORE_CACHE is process-global and `get_or_create_store` is check-then-insert
+// (two racing misses on one key can each insert, last writer wins), so these
+// tests serialise on TEST_LOCK and never remove entries.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod issue171_store_cache_routing_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serialise() -> MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    const GLOBAL_BUCKET_URI: &str = "s3://plain-bucket-171/key";
+    const GLOBAL_BUCKET_URI_2: &str = "s3://another-plain-bucket-171/key";
+
+    fn host_form(port: u16, bucket: &str) -> String {
+        format!("s3://127.0.0.1:{port}/{bucket}/some/key")
+    }
+
+    fn prepare_environment() {
+        // for_endpoint requires credentials to exist; none are ever used.
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+    }
+
+    #[test]
+    fn host_form_uris_on_different_servers_have_different_keys() {
+        let _guard = serialise();
+        assert!(
+            StoreKey::from_uri(&host_form(19, "b")).expect("valid URI")
+                != StoreKey::from_uri(&host_form(20, "b")).expect("valid URI"),
+            "RED: two host-form URIs on different host:port share one StoreKey"
+        );
+    }
+
+    #[test]
+    fn host_form_and_bucket_form_uris_have_different_keys() {
+        let _guard = serialise();
+        assert!(
+            StoreKey::from_uri(&host_form(19, "b")).expect("valid URI")
+                != StoreKey::from_uri(GLOBAL_BUCKET_URI).expect("valid URI"),
+            "RED: a host-form URI and a bucket URI share one StoreKey"
+        );
+    }
+
+    #[test]
+    fn same_server_different_buckets_share_a_key() {
+        let _guard = serialise();
+        assert!(
+            StoreKey::from_uri(&host_form(19, "bucket1")).expect("valid URI")
+                == StoreKey::from_uri(&host_form(19, "bucket2")).expect("valid URI"),
+            "buckets on one server must share a StoreKey or the cache never hits"
+        );
+        assert!(
+            StoreKey::from_uri(GLOBAL_BUCKET_URI).expect("valid URI")
+                == StoreKey::from_uri(GLOBAL_BUCKET_URI_2).expect("valid URI"),
+            "bucket URIs on the global endpoint must share a StoreKey"
+        );
+    }
+
+    #[test]
+    fn different_servers_get_distinct_stores_from_the_cache() {
+        let _guard = serialise();
+        prepare_environment();
+        let a = get_or_create_store(&host_form(31, "bucket1"), None).expect("store for server A");
+        // Warm-cache hit for A, then ask for B: the old key returned A's store.
+        let b = get_or_create_store(&host_form(32, "bucket1"), None).expect("store for server B");
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "RED: get_or_create_store returned server A's store for a server B URI"
+        );
+    }
+
+    #[test]
+    fn host_form_and_bucket_form_get_distinct_stores_from_the_cache() {
+        let _guard = serialise();
+        prepare_environment();
+        let host = get_or_create_store(&host_form(33, "bucket1"), None).expect("host-form store");
+        let global = get_or_create_store(GLOBAL_BUCKET_URI, None).expect("global store");
+        assert!(
+            !Arc::ptr_eq(&global, &host),
+            "RED: a host-form URI was served by the global-endpoint store"
+        );
+    }
+
+    #[test]
+    fn same_server_different_buckets_reuse_one_cached_store() {
+        let _guard = serialise();
+        prepare_environment();
+        let first = get_or_create_store(&host_form(34, "bucket1"), None).expect("bucket1 store");
+        let second = get_or_create_store(&host_form(34, "bucket2"), None).expect("bucket2 store");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two buckets on one server must hit the same cached store"
+        );
+        let g1 = get_or_create_store(GLOBAL_BUCKET_URI, None).expect("global store 1");
+        let g2 = get_or_create_store(GLOBAL_BUCKET_URI_2, None).expect("global store 2");
+        assert!(
+            Arc::ptr_eq(&g1, &g2),
+            "two buckets on the global endpoint must hit the same cached store"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #171 x #178: a routing error must reach the caller BEFORE the cache is
+    // consulted or populated. If `StoreKey::from_uri` mapped the #178 error to
+    // "no route" (`None`), an invalid server URI would hash to the global-client
+    // key and be served by the store cached for a perfectly valid bucket URI.
+    // -----------------------------------------------------------------------
+
+    /// How many cache entries sit under the global-client key (route `None`).
+    fn global_route_entries() -> usize {
+        let want = StoreKey::from_uri(GLOBAL_BUCKET_URI).expect("valid URI");
+        STORE_CACHE.iter().filter(|e| *e.key() == want).count()
+    }
+
+    #[test]
+    fn invalid_server_uri_errors_instead_of_hitting_a_warm_cache() {
+        let _guard = serialise();
+        prepare_environment();
+        let warm_global = get_or_create_store(GLOBAL_BUCKET_URI, None).expect("warm global store");
+        let warm_host =
+            get_or_create_store(&host_form(35, "bucket1"), None).expect("warm host-form");
+        let entries_before = global_route_entries();
+        assert_eq!(
+            entries_before, 1,
+            "exactly one global-route entry is cached"
+        );
+
+        for bad in [
+            "s3://10.0.0.5/bkt/key",        // portless IP literal
+            "s3://node%x:9000/bkt/key",     // invalid host character
+            "s3://127.0.0.1:99999/bkt/key", // port out of range
+            "s3://[::1]/bkt/key",           // IPv6 without a port
+        ] {
+            assert!(
+                StoreKey::from_uri(bad).is_err(),
+                "RED: StoreKey::from_uri({bad}) must be an error, not a key"
+            );
+            match get_or_create_store(bad, None) {
+                Ok(store) => panic!(
+                    "RED: get_or_create_store({bad}) returned a store (global cached store: {}, \
+                     host-form cached store: {})",
+                    Arc::ptr_eq(&store, &warm_global),
+                    Arc::ptr_eq(&store, &warm_host)
+                ),
+                Err(e) => assert!(
+                    format!("{e:#}").contains(bad),
+                    "the error must name the URI: {e:#}"
+                ),
+            }
+        }
+
+        assert_eq!(
+            global_route_entries(),
+            entries_before,
+            "a failed lookup must not populate the cache"
+        );
+        // The warm entries are untouched and still served for valid URIs.
+        let again = get_or_create_store(GLOBAL_BUCKET_URI_2, None).expect("global store");
+        assert!(Arc::ptr_eq(&again, &warm_global));
+        let host_again = get_or_create_store(&host_form(35, "bucket2"), None).expect("host-form");
+        assert!(Arc::ptr_eq(&host_again, &warm_host));
     }
 }

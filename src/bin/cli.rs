@@ -41,7 +41,9 @@ use s3dlio::{
     list_containers,
     multi_endpoint::{LoadBalanceStrategy, MultiEndpointStore},
     object_store::{store_for_uri_with_logger, ObjectStore},
-    parse_s3_uri, ContainerInfo, ObjectType, DEFAULT_OBJECT_SIZE,
+    parse_s3_uri,
+    s3_utils::{classify_s3_first_segment, S3FirstSegment},
+    ContainerInfo, ObjectType, DEFAULT_OBJECT_SIZE,
 };
 
 use s3dlio::progress::{ProgressCallback, S3ProgressTracker};
@@ -423,6 +425,7 @@ fn requires_aws_credentials(uri: &str) -> bool {
 ///
 /// Scheme → extracted name:
 ///   s3://bucket[/prefix]              → "bucket"
+///   s3://host:port/bucket[/prefix]    → "bucket" (on that server)
 ///   gs://bucket[/prefix]              → "bucket"
 ///   gcs://bucket[/prefix]             → "bucket"
 ///   az://account/container[/prefix]   → "account/container"
@@ -431,7 +434,17 @@ fn requires_aws_credentials(uri: &str) -> bool {
 ///   direct:///path[/…]                → "/path[/…]"
 fn extract_container_name(uri: &str) -> Result<String> {
     if let Some(rest) = uri.strip_prefix("s3://") {
-        let bucket = rest.split('/').next().unwrap_or("").trim_end_matches('/');
+        // Same server-vs-bucket rule as the URI parser and the store factory
+        // (issues #178, #194): `s3://host:port/bkt` is bucket `bkt` on that server;
+        // any other first segment is the bucket itself.
+        let mut segments = rest.split('/');
+        let first = segments.next().unwrap_or("");
+        let bucket = match classify_s3_first_segment(first)
+            .with_context(|| format!("invalid S3 URI '{uri}'"))?
+        {
+            S3FirstSegment::Bucket(bucket) => bucket,
+            S3FirstSegment::Server(_) => segments.next().unwrap_or(""),
+        };
         if bucket.is_empty() {
             bail!("No bucket name found in S3 URI: {}", uri);
         }
@@ -2155,6 +2168,28 @@ async fn delete_cmd(uri: &str, _jobs: usize, recursive: bool, pattern: Option<&s
     Ok(())
 }
 
+/// Split a comma-separated `--endpoints` list into server authorities.
+///
+/// Every entry names a server, so every entry must carry an explicit port
+/// (`host:port` or `[ipv6]:port`). A portless entry would otherwise be read back
+/// as a bucket name in the generated `s3://host/...` URI (issue #178), so it is
+/// rejected with a message that says to add `:port`.
+fn endpoint_authorities(endpoints: &str) -> Result<Vec<&str>> {
+    endpoints
+        .split(',')
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .map(|h| match classify_s3_first_segment(h) {
+            Ok(S3FirstSegment::Server(authority)) => Ok(authority),
+            Ok(S3FirstSegment::Bucket(_)) => bail!(
+                "--endpoints entry '{h}' has no port; a server must be host:port \
+                 (add :port, e.g. {h}:9000)"
+            ),
+            Err(e) => Err(e.context(format!("invalid --endpoints entry '{h}'"))),
+        })
+        .collect()
+}
+
 /// Build per-endpoint S3 URIs from a comma-separated endpoint list and a base S3 URI.
 ///
 /// For example, `endpoints = "10.9.0.17:9000,10.9.0.18:9000"` and
@@ -2171,10 +2206,8 @@ fn build_s3_endpoint_uris(endpoints: &str, base_uri: &str) -> Result<Vec<String>
     } else {
         format!("{}/", path)
     };
-    let uris: Vec<String> = endpoints
-        .split(',')
-        .map(|h| h.trim())
-        .filter(|h| !h.is_empty())
+    let uris: Vec<String> = endpoint_authorities(endpoints)?
+        .into_iter()
         .map(|h| format!("s3://{}/{}", h, path))
         .collect();
     if uris.is_empty() {
@@ -2194,10 +2227,8 @@ fn build_s3_endpoint_uris(endpoints: &str, base_uri: &str) -> Result<Vec<String>
 ///
 /// Used for keylist mode where object paths are preserved and only the endpoint is replaced.
 fn build_s3_host_root_uris(endpoints: &str) -> Result<Vec<String>> {
-    let uris: Vec<String> = endpoints
-        .split(',')
-        .map(|h| h.trim())
-        .filter(|h| !h.is_empty())
+    let uris: Vec<String> = endpoint_authorities(endpoints)?
+        .into_iter()
         .map(|h| format!("s3://{}/", h))
         .collect();
     if uris.is_empty() {
@@ -2397,6 +2428,43 @@ mod tests {
     fn extract_s3_trailing_slash_only() {
         // "s3://" alone has no bucket — should error
         assert!(extract_container_name("s3://").is_err());
+    }
+
+    // Issue #194 / #178: `s3://host:port/bkt` names bucket `bkt` ON that server;
+    // before the fix create-bucket / delete-bucket used "host:port" as the bucket.
+    #[test]
+    fn extract_s3_server_form_names_the_bucket_on_that_server() {
+        assert_eq!(
+            extract_container_name("s3://10.0.0.5:9000/bkt").unwrap(),
+            "bkt"
+        );
+        assert_eq!(
+            extract_container_name("s3://host.example.com:443/bkt/some/prefix/").unwrap(),
+            "bkt"
+        );
+        assert_eq!(
+            extract_container_name("s3://[::1]:9000/bkt").unwrap(),
+            "bkt"
+        );
+    }
+
+    #[test]
+    fn extract_s3_server_form_without_a_bucket_errors() {
+        assert!(extract_container_name("s3://10.0.0.5:9000").is_err());
+        assert!(extract_container_name("s3://10.0.0.5:9000/").is_err());
+    }
+
+    #[test]
+    fn extract_s3_dotted_name_is_a_bucket_and_portless_ip_errors() {
+        assert_eq!(
+            extract_container_name("s3://data.example.com/prefix").unwrap(),
+            "data.example.com"
+        );
+        let msg = format!(
+            "{:#}",
+            extract_container_name("s3://10.0.0.5/bkt").unwrap_err()
+        );
+        assert!(msg.contains("s3://10.0.0.5:9000/"), "{msg}");
     }
 
     #[test]
@@ -2653,6 +2721,95 @@ mod tests {
     fn build_s3_endpoint_uris_rejects_non_s3_uri() {
         assert!(build_s3_endpoint_uris("host:9000", "az://myaccount/mycontainer/").is_err());
         assert!(build_s3_endpoint_uris("host:9000", "file:///mnt/data/").is_err());
+    }
+
+    // Issue #178: an --endpoints entry names a server, so it must carry a port;
+    // a portless DNS name would silently become a bucket in the generated URI.
+    #[test]
+    fn build_s3_endpoint_uris_requires_a_port_on_every_endpoint() {
+        for bad in [
+            "minio.example.com",
+            "10.9.0.17",
+            "10.9.0.17:9000,minio.example.com",
+            "[::1]",
+        ] {
+            let err = build_s3_endpoint_uris(bad, "s3://bucket/").unwrap_err();
+            assert!(format!("{err:#}").contains(":port"), "{bad}: {err:#}");
+        }
+        assert!(build_s3_endpoint_uris("[::1]:9000", "s3://bucket/").is_ok());
+    }
+
+    #[test]
+    fn build_s3_host_root_uris_requires_a_port_on_every_endpoint() {
+        for bad in [
+            "minio.example.com",
+            "10.9.0.17",
+            "10.9.0.17:9000,minio.example.com",
+        ] {
+            let err = build_s3_host_root_uris(bad).unwrap_err();
+            assert!(format!("{err:#}").contains(":port"), "{bad}: {err:#}");
+        }
+    }
+
+    // Issue #178 (review F9/F10): --endpoints entries are held to the same strict
+    // host:port grammar as the URI parser, with messages that fit the input.
+    #[test]
+    fn endpoints_entries_are_validated_with_specific_messages() {
+        for (bad, hint) in [
+            ("http://host:9000", "looks like a URL"),
+            ("https://host", "looks like a URL"),
+            ("arn:aws:s3:us-east-1:123:accesspoint", "looks like an ARN"),
+            ("host:+9000", "invalid port '+9000'"),
+            ("host:0", "invalid port '0'"),
+            ("host:09000", "leading zero"),
+            ("user@host:9000", "userinfo"),
+            ("[x]:9000", "invalid IPv6 address 'x'"),
+            ("[10.0.0.5]:9000", "IPv4 address inside brackets"),
+            ("[::1", "unterminated '['"),
+            (":9000", "missing host"),
+            ("host:", "empty port"),
+            ("::1", "unbracketed IPv6"),
+            ("host:9000:x", "more than one ':'"),
+            // Host grammar: these used to be accepted and built a URI that parsed
+            // as a different bucket (`node/prefix:9000` -> bucket `node`, global client).
+            ("node/prefix:9000", "invalid character '/'"),
+            ("a b:9000", "invalid character ' '"),
+            ("ho%st:9000", "invalid character '%'"),
+            ("host.:9000", "empty label"),
+            ("10.9.0.17:9000,node/prefix:9000", "invalid character '/'"),
+            ("10.9.0.17:9000,http://10.9.0.18:9000", "looks like a URL"),
+        ] {
+            let msg = format!(
+                "{:#}",
+                build_s3_endpoint_uris(bad, "s3://bucket/").unwrap_err()
+            );
+            assert!(msg.contains(hint), "{bad}: want {hint:?}, got {msg}");
+            assert!(
+                msg.contains("--endpoints entry"),
+                "{bad}: error must name the --endpoints entry, got {msg}"
+            );
+            let msg = format!("{:#}", build_s3_host_root_uris(bad).unwrap_err());
+            assert!(
+                msg.contains(hint),
+                "{bad} (root uris): want {hint:?}, got {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_s3_rejects_malformed_first_segments() {
+        for (uri, hint) in [
+            ("s3://host:+9000/bkt", "invalid port"),
+            ("s3://user@host:9000/bkt", "userinfo"),
+            ("s3://[x]:9000/bkt", "invalid IPv6 address"),
+            (
+                "s3://arn:aws:s3:us-east-1:123:accesspoint/x",
+                "looks like an ARN",
+            ),
+        ] {
+            let msg = format!("{:#}", extract_container_name(uri).unwrap_err());
+            assert!(msg.contains(hint), "{uri}: want {hint:?}, got {msg}");
+        }
     }
 
     #[test]

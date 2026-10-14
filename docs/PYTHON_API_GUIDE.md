@@ -966,10 +966,79 @@ s3dlio.create_tfrecord_index(
 ### Operation Logging
 
 ```python
-s3dlio.init_op_log("file:///tmp/operations.log")
+s3dlio.init_op_log("/tmp/operations.tsv.zst")
 # ... operations are automatically logged ...
 s3dlio.finalize_op_log()
 ```
+
+The op-log is written to the local filesystem as a zstd-compressed TSV. The
+path may be a plain path (`/tmp/operations.tsv.zst`) or a `file://` destination
+(`file:///tmp/operations.tsv.zst`); the parent directory must already exist.
+`file://` follows **s3dlio's `file://` convention** (the same as the `file://`
+object store); it is **not** full RFC 8089. Only the lowercase prefix `file://`
+is recognised: it is removed and the rest is the path, used literally, so
+`file:///tmp/x` is `/tmp/x`, but `file://localhost/x` is the *relative* path
+`localhost/x`, `file://relative/x` is the relative path `relative/x`, and
+percent sequences are not decoded. `file://` with nothing after it is an error.
+Every other scheme is rejected as unsupported, shown as written: `s3://`,
+`direct://` and also `FILE://` (uppercase). Text before `://` that is not a valid
+URI scheme (for example `dir/a://b.log`) is a plain path.
+
+A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
+`init_op_log` while already active is a no-op; after `finalize_op_log` it raises
+`RuntimeError` and touches no file. `finalize_op_log` is safe to repeat. Stores
+capture the logger at construction: those created before `init_op_log` are never
+logged, and those created before `finalize_op_log` stop recording when it runs.
+
+The op-log is **lossy by default**: if the writer cannot keep up and the queue
+(`S3DLIO_OPLOG_BUF`, default 8192 entries) fills, entries are dropped rather than
+slowing your code. The background writer can also fail (disk full, or a panic in
+the writer thread) with entries still queued. Detect both with `op_log_stats()`
+**after** `finalize_op_log()`:
+
+```python
+s3dlio.finalize_op_log()        # stop your worker threads first
+stats = s3dlio.op_log_stats()   # None before init_op_log(); else a dict
+# {'accepted': 4, 'written': 4, 'dropped_full': 0, 'rejected_closed': 0,
+#  'writer_failed': 0, 'writer_error': None, 'lossless': False}
+complete = (stats["accepted"] == stats["written"] and stats["dropped_full"] == 0
+            and stats["writer_failed"] == 0 and stats["writer_error"] is None)
+```
+
+No counted loss happened exactly when `accepted == written` and `dropped_full ==
+0` and `writer_failed == 0` and `writer_error is None`. `writer_error` is the
+first error the writer met (a failed write, a failed finish or flush of the
+compressed stream, or a writer panic, which is a defect rather than an I/O error)
+as text; `written` is an upper bound of the rows in the file. `writer_failed` only counts calls made *after* the writer
+stopped, so queued entries lost to a writer error show as `accepted > written`.
+
+What the stats count: the calls that reached the logger between `init_op_log` and
+`finalize_op_log`. "Written" counts the rows the zstd compressor accepted (the
+bytes may still be buffered at that moment, and a later write, finish or flush can
+still fail, which shows as `writer_error`). A successful `finalize_op_log()` with
+the complete condition above true means every accepted row reached the compressor
+and the stream was finished and flushed to the file without error: that is
+completion, not durability (there is no fsync). The stats do **not** cover:
+
+- **Process exit without `finalize_op_log()`.** There is no `atexit` hook:
+  entries still queued and the zstd frame end are lost, and the stats are never
+  read. Always call `finalize_op_log()` before the process ends.
+- **Stores created before `init_op_log()`**: they are unlogged and uncounted.
+- **Errors reported only when the file is closed** (for example NFS or quota
+  errors at `close(2)`): they are not observable.
+
+Calls made after `finalize_op_log()` began (a store created before finalize that
+a worker still uses) are counted as `rejected_closed` and are **not in the file**;
+they are not part of "complete", but a program should finalize only after its
+workers stop and check `rejected_closed == 0` too.
+
+`op_log_stats()` works while logging is active and after `finalize_op_log()`
+(while active, `accepted > written` is normal). `finalize_op_log()` prints one
+warning on stderr if any record was lost, naming only the non-zero counts (the
+exact number of queue-full drops included). In the default mode the first
+queue-full drop also prints one stderr note per session; later drops are only
+counted. To avoid queue-full drops set `S3DLIO_OPLOG_LOSSLESS=1` (callers wait
+instead of dropping) and/or raise `S3DLIO_OPLOG_BUF`.
 
 ### Python Convenience Helpers
 
@@ -1101,9 +1170,10 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | Function | Description |
 |----------|-------------|
 | `init_logging(level)` | Set log level: trace, debug, info, warn, error |
-| `init_op_log(path)` | Enable operation logging to file |
-| `finalize_op_log()` | Flush and close operation log |
-| `is_op_log_active()` | Check if operation logging is active |
+| `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089); `RuntimeError` after finalize |
+| `finalize_op_log()` | Write all accepted records (unless the writer fails: an I/O error or a writer-thread panic) and close the log; **call it before the process exits, nothing does it for you**; releases the GIL while draining; terminal and idempotent |
+| `is_op_log_active()` | True between init and finalize only |
+| `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `written` / `dropped_full` / `rejected_closed` / `writer_failed` / `writer_error` / `lossless`, available while active and after finalize, to detect lost records (complete = `accepted == written`, no drops, no refusals, `writer_error is None`) |
 
 ---
 

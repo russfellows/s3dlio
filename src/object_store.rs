@@ -26,6 +26,10 @@ fn compute_checksum(data: &[u8]) -> String {
 }
 
 // --- S3 ----------------------------------------------------------------------
+use crate::delete_batch_plan::{
+    aggregate_failures, group_uris_by_bucket, parse_s3_uri_for_server, BucketGroup, GroupFailure,
+    StoreServer,
+};
 use crate::s3_utils::{
     create_bucket_async as s3_create_bucket_async,
     delete_bucket_async as s3_delete_bucket_async,
@@ -352,6 +356,27 @@ pub trait ObjectStore: Send + Sync {
 
     /// Delete multiple objects efficiently (batched when backend supports it).
     /// Backends should override for optimal batch delete (e.g., S3 DeleteObjects API).
+    ///
+    /// # Semantics (S3, GCS and Azure stores; issue #179)
+    ///
+    /// - The batch may name objects in several buckets / containers; each URI is
+    ///   deleted in the bucket (Azure: account + container) it names, never in
+    ///   the bucket of the first URI.
+    /// - **Every URI is validated before anything is deleted.**  A batch that
+    ///   contains a URI the store cannot use fails as a whole, naming each such
+    ///   URI, and deletes nothing.  This is a behaviour change: an unparseable
+    ///   URI past the first used to be silently skipped while the rest of the
+    ///   batch was deleted and `Ok(())` returned.
+    /// - A store talks to exactly one server.  For S3, a URI of the host form
+    ///   (`s3://host:port/bucket/key`) names a server; if it is not the
+    ///   store's own server (a per-endpoint store: its endpoint host:port,
+    ///   compared case-insensitively, with the scheme's default port filled in
+    ///   and no DNS resolution; a store on the process-wide client: any
+    ///   server-naming URI) the whole batch is rejected before any request.
+    /// - Buckets are processed in order of first appearance, keys in caller
+    ///   order within a bucket.  A failure in one bucket does not stop the
+    ///   others; the returned error names the URIs not confirmed deleted, and
+    ///   the first failure's cause chain is its source.
     async fn delete_batch(&self, uris: &[String]) -> Result<()>;
 
     /// Delete all objects under a prefix.
@@ -1137,6 +1162,113 @@ impl S3ObjectStore {
         Ok(metadata.size)
     }
 
+    /// The one server this store talks to, for comparison with the server a
+    /// URI names: `Some` for a per-endpoint store, `None` for a store on the
+    /// process-wide client (whose server comes from the environment).
+    fn server_identity(&self) -> Result<Option<StoreServer>> {
+        self.endpoint_url
+            .as_deref()
+            .map(StoreServer::from_endpoint_url)
+            .transpose()
+            .context("S3ObjectStore endpoint URL is not usable")
+    }
+
+    /// `parse_s3_uri` for this store: additionally rejects a URI that names a
+    /// server other than the store's own (issue #179, round 2).  The store
+    /// would otherwise apply that URI's bucket/key to ITS server.
+    fn parse_uri_for_this_store(&self, uri: &str) -> Result<(String, String)> {
+        let server = self.server_identity()?;
+        parse_s3_uri_for_server(uri, server.as_ref())
+            .with_context(|| format!("S3 URI '{uri}' cannot be used with this store"))
+    }
+
+    /// Delete every key of one bucket group (issue #179).
+    ///
+    /// On failure returns the index (into `group.uris`) of the first URI that
+    /// was not confirmed deleted, plus the error.  Requests are issued in
+    /// order, at most `DELETE_BATCH_MAX_KEYS` keys each, and stop at the first
+    /// failing request, exactly as the pre-#179 single-bucket loop did.
+    async fn delete_bucket_group(
+        &self,
+        group: &BucketGroup<String>,
+    ) -> std::result::Result<(), (usize, anyhow::Error)> {
+        let bucket = &group.target;
+
+        if let Some(client) = &self.client {
+            let mut done = 0usize;
+            for (_chunk_uris, chunk_keys) in group.chunks() {
+                Self::delete_chunk_with_client(client, bucket, chunk_keys)
+                    .await
+                    .map_err(|e| (done, e))?;
+                done += chunk_keys.len();
+            }
+            return Ok(());
+        }
+
+        // Global-client path: s3_delete_objects_async chunks at 1000 itself
+        // and checks the per-key results of every response.
+        s3_delete_objects_async(bucket, &group.keys)
+            .await
+            .map_err(|e| (0, e))
+    }
+
+    /// One DeleteObjects request (<= 1000 keys) through a per-endpoint client.
+    async fn delete_chunk_with_client(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<()> {
+        // Fallible collect: a key that cannot be turned into an identifier is
+        // an error, never silently left out of the request.
+        let objects = keys
+            .iter()
+            .map(|k| {
+                aws_sdk_s3::types::ObjectIdentifier::builder()
+                    .key(k)
+                    .build()
+                    .with_context(|| format!("Failed to build DeleteObjects entry for key '{k}'"))
+            })
+            .collect::<Result<Vec<aws_sdk_s3::types::ObjectIdentifier>>>()?;
+        let delete = aws_sdk_s3::types::Delete::builder()
+            .set_objects(Some(objects))
+            .build()
+            .context("Failed to build Delete request")?;
+        let output = client
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .send()
+            .await
+            .with_context(|| format!("S3 batch DELETE failed for bucket '{}'", bucket))?;
+
+        // S3 reports per-key failures inside an HTTP 200 body (see
+        // s3_utils::delete_objects_async, audit #151 f36); do not discard them.
+        let errs = output.errors();
+        if !errs.is_empty() {
+            let detail = errs
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}: {} ({})",
+                        e.key().unwrap_or("<unknown key>"),
+                        e.code().unwrap_or("<unknown code>"),
+                        e.message().unwrap_or("<no message>")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "S3 batch DELETE for bucket '{}' partially failed: {} of {} object(s) not \
+                 deleted: {}",
+                bucket,
+                errs.len(),
+                keys.len(),
+                detail
+            );
+        }
+        Ok(())
+    }
+
     /// List objects using a given client (shared implementation for list() and list_stream()).
     async fn list_with_client(
         client: &aws_sdk_s3::Client,
@@ -1452,11 +1584,12 @@ impl ObjectStore for S3ObjectStore {
 
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
-            let key_clean = key.trim_start_matches('/');
+            // Issue #172: the key the caller names is the key sent -- no
+            // stripping (get_range above already used it verbatim).
             let resp = client
                 .head_object()
                 .bucket(&bucket)
-                .key(key_clean)
+                .key(&key)
                 .send()
                 .await
                 .sdk_context(format!("S3 HEAD failed for '{}'", uri))?;
@@ -1491,8 +1624,11 @@ impl ObjectStore for S3ObjectStore {
         }
         debug!("S3ObjectStore::delete uri='{}'", uri);
 
+        // A URI naming a server other than this store's own is an error, not
+        // a delete of the same bucket/key on this store's server (#179).
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+
         if let Some(client) = &self.client {
-            let (bucket, key) = parse_s3_uri(uri)?;
             client
                 .delete_object()
                 .bucket(&bucket)
@@ -1503,7 +1639,6 @@ impl ObjectStore for S3ObjectStore {
             return Ok(());
         }
 
-        let (bucket, key) = parse_s3_uri(uri)?;
         s3_delete_objects_async(&bucket, &[key]).await
     }
 
@@ -1513,41 +1648,25 @@ impl ObjectStore for S3ObjectStore {
         }
         debug!("S3ObjectStore::delete_batch {} URIs", uris.len());
 
-        // Extract bucket and keys from URIs
-        let (bucket, _) = parse_s3_uri(&uris[0])?;
-        let keys: Vec<String> = uris
-            .iter()
-            .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, key)| key))
-            .collect();
-
-        if let Some(client) = &self.client {
-            for chunk in keys.chunks(1000) {
-                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk
-                    .iter()
-                    .filter_map(|k| {
-                        aws_sdk_s3::types::ObjectIdentifier::builder()
-                            .key(k)
-                            .build()
-                            .ok()
-                    })
-                    .collect();
-                let delete = aws_sdk_s3::types::Delete::builder()
-                    .set_objects(Some(objects))
-                    .build()
-                    .context("Failed to build Delete request")?;
-                client
-                    .delete_objects()
-                    .bucket(&bucket)
-                    .delete(delete)
-                    .send()
-                    .await
-                    .with_context(|| format!("S3 batch DELETE failed for bucket '{}'", bucket))?;
+        // Issue #179: a batch may span several buckets, and DeleteObjects
+        // addresses exactly one.  Group by bucket (validating every URI first,
+        // so a batch we cannot fully interpret deletes nothing), then issue
+        // the requests per bucket.  A single-bucket batch is one group and
+        // behaves exactly as before.  A store talks to ONE server, so a URI
+        // naming any other server is rejected in the same up-front pass.
+        let server = self.server_identity()?;
+        let groups = group_uris_by_bucket(uris, |u| parse_s3_uri_for_server(u, server.as_ref()))?;
+        let mut failures: Vec<GroupFailure> = Vec::new();
+        for group in &groups {
+            if let Err((first_undeleted, error)) = self.delete_bucket_group(group).await {
+                failures.push(GroupFailure {
+                    target: format!("s3://{}", group.target),
+                    uris: group.uris.iter().skip(first_undeleted).cloned().collect(),
+                    error,
+                });
             }
-            return Ok(());
         }
-
-        // Use S3 batch delete API (1000 objects per request)
-        s3_delete_objects_async(&bucket, &keys).await
+        aggregate_failures(uris.len(), failures)
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -1625,11 +1744,19 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn create_container(&self, name: &str) -> Result<()> {
-        s3_create_bucket_async(name).await
+        // A per-endpoint store (built for `s3://host:port/...`) must create the
+        // bucket on ITS server, not on the global singleton's (issue #194).
+        match &self.client {
+            Some(client) => crate::s3_utils::create_bucket_with_client(client, name).await,
+            None => s3_create_bucket_async(name).await,
+        }
     }
 
     async fn delete_container(&self, name: &str) -> Result<()> {
-        s3_delete_bucket_async(name).await
+        match &self.client {
+            Some(client) => crate::s3_utils::delete_bucket_with_client(client, name).await,
+            None => s3_delete_bucket_async(name).await,
+        }
     }
 
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
@@ -1958,6 +2085,13 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     }
 
     bail!("not a recognized Azure URI: {}", uri)
+}
+
+/// `delete_batch` grouping key for Azure URIs: `((account, container), key)`.
+#[cfg(feature = "backend-azure")]
+fn azure_group_key(uri: &str) -> Result<((String, String), String)> {
+    let (account, container, key) = parse_azure_uri(uri)?;
+    Ok(((account, container), key))
 }
 
 #[cfg(feature = "backend-azure")]
@@ -2439,14 +2573,27 @@ impl ObjectStore for AzureObjectStore {
         }
         debug!("AzureObjectStore::delete_batch {} URIs", uris.len());
 
-        // Azure Blob batch delete: already supports batching
-        let (cli, _acct, _cont, _) = Self::client_for_uri(&uris[0])?;
-        let keys: Vec<String> = uris
-            .iter()
-            .filter_map(|uri| Self::client_for_uri(uri).ok().map(|(_, _, _, key)| key))
-            .collect();
-
-        cli.delete_objects(&keys).await
+        // Issue #179: a batch may span several containers (or accounts); a
+        // client addresses exactly one container.  Group by (account,
+        // container), validating every URI first, then delete per container.
+        let groups = group_uris_by_bucket(uris, azure_group_key)?;
+        let mut failures: Vec<GroupFailure> = Vec::new();
+        for group in &groups {
+            let (account, container) = &group.target;
+            let outcome = match group.uris.first().map(|u| Self::client_for_uri(u)) {
+                Some(Ok((cli, _acct, _cont, _))) => cli.delete_objects(&group.keys).await,
+                Some(Err(e)) => Err(e),
+                None => continue, // unreachable: a group always holds >= 1 URI
+            };
+            if let Err(error) = outcome {
+                failures.push(GroupFailure {
+                    target: format!("az://{account}/{container}"),
+                    uris: group.uris.clone(),
+                    error,
+                });
+            }
+        }
+        aggregate_failures(uris.len(), failures)
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -3025,15 +3172,26 @@ impl ObjectStore for GcsObjectStore {
         }
         debug!("GcsObjectStore::delete_batch {} URIs", uris.len());
 
-        // GCS batch delete: extract bucket and objects
-        let (bucket, _) = parse_gcs_uri(&uris[0])?;
-        let objects: Vec<String> = uris
-            .iter()
-            .filter_map(|uri| parse_gcs_uri(uri).ok().map(|(_, obj)| obj))
-            .collect();
-
+        // Issue #179: a batch may span several buckets; delete_objects
+        // addresses exactly one.  Group by bucket, validating every URI first
+        // (a batch we cannot fully interpret deletes nothing), then delete per
+        // bucket.  A single-bucket batch is one group, as before.
+        let groups = group_uris_by_bucket(uris, parse_gcs_uri)?;
         let client = self.get_client().await?;
-        client.delete_objects(&bucket, objects).await
+        let mut failures: Vec<GroupFailure> = Vec::new();
+        for group in &groups {
+            if let Err(error) = client
+                .delete_objects(&group.target, group.keys.clone())
+                .await
+            {
+                failures.push(GroupFailure {
+                    target: format!("gs://{}", group.target),
+                    uris: group.uris.clone(),
+                    error,
+                });
+            }
+        }
+        aggregate_failures(uris.len(), failures)
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -3309,42 +3467,61 @@ impl ObjectWriter for GcsBufferedWriter {
 // use the global singleton client (which reads AWS_ENDPOINT_URL).  This is
 // correct for single-endpoint and AWS S3 deployments.
 
-/// Extract a per-endpoint HTTP URL from an S3 URI that contains an explicit host:port.
+/// Extract a per-endpoint HTTP URL from an S3 URI whose first segment names a
+/// server (an explicit `host:port` / `[ipv6]:port`).
 ///
-/// Returns `Some(endpoint_url)` when the URI authority contains a port number
-/// (e.g. `s3://10.9.0.17:80/bucket/` → `Some("http://10.9.0.17:80")`).
-/// Returns `None` for plain bucket URIs like `s3://my-bucket/prefix/`.
+/// - `s3://10.9.0.17:80/bucket/` → `Ok(Some("http://10.9.0.17:80"))`
+/// - `s3://my-bucket/prefix/`, `s3://data.example.com/key` → `Ok(None)` (a bucket;
+///   issues #178 / #193)
+/// - `s3://10.0.0.5/bkt/key` (portless IP) → `Err` telling the caller to add `:port`
+///
+/// The server-vs-bucket decision is made by
+/// [`crate::s3_utils::classify_s3_first_segment`], the same rule the URI parser,
+/// `MultiEndpointStore` and the CLI use.
 ///
 /// Used by [`store_for_uri_with_logger`] to create per-endpoint S3 clients
 /// rather than falling back to the global singleton (which honours
 /// `AWS_ENDPOINT_URL` and would route all traffic to one host).
-fn s3_endpoint_url_from_uri(uri: &str) -> Option<String> {
-    let after_scheme = uri.strip_prefix("s3://")?;
-    // Authority is everything before the first '/'
-    let authority = after_scheme.split('/').next()?;
-
-    // audit #154 bug 4.3 (E2): the previous check was
-    // `authority.contains(':')` + `authority.rsplit(':').next()`. That
-    // happens to produce the same result as the explicit parse below for
-    // every case exercised here, but only by accident of `rsplit` always
-    // returning the segment after the *last* colon -- it never validated
-    // IPv6 grammar. Parse bracketed-IPv6 and bare host:port authorities
-    // explicitly instead of relying on that coincidence, so the "no port"
-    // vs "has port" decision is deliberate rather than a fallout of a
-    // failed numeric parse.
-    let port_str = if let Some(bracket_end) = authority.find(']') {
-        // Bracketed IPv6 with no ':port' suffix -> not an endpoint URI.
-        authority[bracket_end + 1..].strip_prefix(':')?
-    } else {
-        match authority.matches(':').count() {
-            // S3 bucket names can't contain colons, so a lone ':' in a
-            // non-bracketed authority is unambiguously a port separator;
-            // zero colons is a plain bucket name; unbracketed IPv6 (2+
-            // colons) is ambiguous and rejected rather than guessed at.
-            1 => authority.rsplit(':').next()?,
-            _ => return None,
-        }
+pub(crate) fn s3_endpoint_url_from_uri(uri: &str) -> Result<Option<String>> {
+    let Some(after_scheme) = uri.strip_prefix("s3://") else {
+        return Ok(None);
     };
+    // The first segment is everything before the first '/'
+    let first_segment = after_scheme.split('/').next().unwrap_or("");
+    match crate::s3_utils::classify_s3_first_segment(first_segment)
+        .with_context(|| format!("invalid S3 URI '{uri}'"))?
+    {
+        crate::s3_utils::S3FirstSegment::Server(authority) => {
+            s3_endpoint_url_from_authority(authority)
+                .map(Some)
+                .with_context(|| format!("invalid S3 URI '{uri}'"))
+        }
+        crate::s3_utils::S3FirstSegment::Bucket(_) => Ok(None),
+    }
+}
+
+/// Build the endpoint URL (`https://host:port` or `http://host:port`) for a
+/// URI authority of the form `host:port` / `[ipv6]:port`.
+///
+/// This is the single place that decides the scheme of a host-form S3
+/// endpoint. Both the single-endpoint path ([`s3_endpoint_url_from_uri`]) and
+/// `MultiEndpointStore` use it, so they can never disagree (issue #180).
+///
+/// Errors (never `None`/a silent fallback) when `authority` is not a server per
+/// [`crate::s3_utils::classify_s3_first_segment`]: the classifier's own error is
+/// propagated, and a bucket-shaped authority yields a "not a server" error.
+pub(crate) fn s3_endpoint_url_from_authority(authority: &str) -> Result<String> {
+    let authority = match crate::s3_utils::classify_s3_first_segment(authority)? {
+        crate::s3_utils::S3FirstSegment::Server(authority) => authority,
+        crate::s3_utils::S3FirstSegment::Bucket(name) => bail!(
+            "'{name}' is not a server: a server is host:port or [ipv6]:port with an explicit port"
+        ),
+    };
+    // `authority` is `host:port` or `[ipv6]:port` with a valid port.
+    let port_str = authority
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .ok_or_else(|| anyhow::anyhow!("no port in server authority '{authority}'"))?;
 
     // Determine HTTP scheme from port: 443 → https, everything else → http,
     // unless the operator has named this port as TLS-terminated via
@@ -3352,13 +3529,15 @@ fn s3_endpoint_url_from_uri(uri: &str) -> Option<String> {
     // S3-compatible endpoints on non-standard ports, e.g. a load balancer
     // terminating TLS on :9001, otherwise had no way to get an https:// URL
     // out of this heuristic short of literally using port 443).
-    let port: u16 = port_str.parse().ok()?;
+    let port: u16 = port_str
+        .parse()
+        .with_context(|| format!("invalid port '{port_str}' in server authority '{authority}'"))?;
     let http_scheme = if port == 443 || s3_endpoint_tls_ports_from_env().contains(&port) {
         "https"
     } else {
         "http"
     };
-    Some(format!("{http_scheme}://{authority}"))
+    Ok(format!("{http_scheme}://{authority}"))
 }
 
 /// Additional ports to treat as TLS-terminated for [`s3_endpoint_url_from_uri`],
@@ -3374,6 +3553,32 @@ fn s3_endpoint_tls_ports_from_env() -> std::collections::HashSet<u16> {
         })
         .unwrap_or_default()
 }
+
+/// The per-endpoint routing decision the `store_for_uri*` factories make for
+/// `uri`: `Some(endpoint_url)` when they build a dedicated client for the
+/// server the URI names, `None` when they use the process-global client (or a
+/// non-S3 backend).
+///
+/// This is the single source of that decision.  The factories call it to pick
+/// the client, and any cache of stores built by the factories (the Python
+/// `STORE_CACHE`, issue #171) must key on its result, so that the cache and the
+/// factories cannot disagree about which server a URI reaches.
+///
+/// A URI whose first segment is an invalid server (for example a portless IP,
+/// issue #178) is an `Err`, never `Ok(None)`: callers must propagate it before
+/// consulting or populating any cache, so a bad URI can never be served by a
+/// store cached for a valid one.
+pub(crate) fn store_routing_endpoint_for_uri(uri: &str) -> Result<Option<String>> {
+    match infer_scheme(uri) {
+        Scheme::S3 => s3_endpoint_url_from_uri(uri),
+        _ => Ok(None),
+    }
+}
+
+/// Serialises every test that reads or writes `S3DLIO_S3_ENDPOINT_TLS_PORTS`
+/// (shared with the multi-endpoint tests, which decide URL schemes the same way).
+#[cfg(test)]
+pub(crate) static ENDPOINT_TLS_PORTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_logger(uri, None)
@@ -3416,7 +3621,7 @@ pub fn store_for_uri_with_logger(
         Scheme::File => FileSystemObjectStore::boxed(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::S3 => {
-            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri) {
+            if let Some(endpoint_url) = store_routing_endpoint_for_uri(uri)? {
                 // Per-endpoint store: dedicated connection pool, ignores AWS_ENDPOINT_URL.
                 crate::s3_client::run_on_global_rt(async move {
                     S3ObjectStore::for_endpoint(&endpoint_url)
@@ -3493,7 +3698,7 @@ pub fn store_for_uri_with_config_and_logger(
             )
         }
         (Scheme::S3, _) => {
-            if let Some(endpoint_url) = s3_endpoint_url_from_uri(uri) {
+            if let Some(endpoint_url) = store_routing_endpoint_for_uri(uri)? {
                 // Per-endpoint store: dedicated connection pool, ignores AWS_ENDPOINT_URL.
                 crate::s3_client::run_on_global_rt(async move {
                     S3ObjectStore::for_endpoint(&endpoint_url)
@@ -4336,17 +4541,18 @@ mod s3_object_store_tests {
     // balancer terminating TLS on :9001) as https. S3DLIO_S3_ENDPOINT_TLS_PORTS
     // closes that gap.
 
-    static ENDPOINT_TLS_PORTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn s3_endpoint_url_from_uri_plain_bucket_has_no_endpoint() {
-        assert_eq!(s3_endpoint_url_from_uri("s3://my-bucket/prefix/key"), None);
+        assert_eq!(
+            s3_endpoint_url_from_uri("s3://my-bucket/prefix/key").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn s3_endpoint_url_from_uri_host_port_uses_http() {
         assert_eq!(
-            s3_endpoint_url_from_uri("s3://10.9.0.17:80/bucket/key"),
+            s3_endpoint_url_from_uri("s3://10.9.0.17:80/bucket/key").unwrap(),
             Some("http://10.9.0.17:80".to_string())
         );
     }
@@ -4354,7 +4560,7 @@ mod s3_object_store_tests {
     #[test]
     fn s3_endpoint_url_from_uri_port_443_uses_https() {
         assert_eq!(
-            s3_endpoint_url_from_uri("s3://minio.example.com:443/bucket/key"),
+            s3_endpoint_url_from_uri("s3://minio.example.com:443/bucket/key").unwrap(),
             Some("https://minio.example.com:443".to_string())
         );
     }
@@ -4362,19 +4568,21 @@ mod s3_object_store_tests {
     #[test]
     fn s3_endpoint_url_from_uri_bracketed_ipv6_with_port() {
         assert_eq!(
-            s3_endpoint_url_from_uri("s3://[::1]:9000/bucket/key"),
+            s3_endpoint_url_from_uri("s3://[::1]:9000/bucket/key").unwrap(),
             Some("http://[::1]:9000".to_string())
         );
     }
 
     #[test]
     fn s3_endpoint_url_from_uri_custom_tls_port_via_env_var() {
-        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK.lock().unwrap();
+        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
 
         #[allow(deprecated)]
         std::env::set_var("S3DLIO_S3_ENDPOINT_TLS_PORTS", "9001,9443");
-        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key");
+        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key").unwrap();
         restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
 
         assert_eq!(
@@ -4386,15 +4594,73 @@ mod s3_object_store_tests {
 
     #[test]
     fn s3_endpoint_url_from_uri_unlisted_custom_port_still_uses_http() {
-        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK.lock().unwrap();
+        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
 
         #[allow(deprecated)]
         std::env::remove_var("S3DLIO_S3_ENDPOINT_TLS_PORTS");
-        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key");
+        let result = s3_endpoint_url_from_uri("s3://minio.example:9001/bucket/key").unwrap();
         restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
 
         assert_eq!(result, Some("http://minio.example:9001".to_string()));
+    }
+
+    // Issues #178 / #193: only an explicit port makes the first segment a server.
+    #[test]
+    fn s3_endpoint_url_from_uri_portless_dns_name_is_a_bucket() {
+        for uri in [
+            "s3://data.example.com/dir/file.bin",
+            "s3://minio.example.com/bkt/key",
+            "s3://localhost/bkt/key",
+        ] {
+            assert_eq!(s3_endpoint_url_from_uri(uri).unwrap(), None, "{uri}");
+        }
+    }
+
+    #[test]
+    fn s3_endpoint_url_from_uri_portless_ip_is_an_error() {
+        for uri in [
+            "s3://10.0.0.5/bkt/key",
+            "s3://[::1]/bkt/key",
+            "s3://::1/bkt/key",
+        ] {
+            let err = s3_endpoint_url_from_uri(uri).unwrap_err();
+            assert!(format!("{err:#}").contains(":port"), "{uri}: {err:#}");
+        }
+    }
+
+    // F12: a classification error must propagate, never become "not a server".
+    #[test]
+    fn s3_endpoint_url_from_authority_propagates_classification_errors() {
+        // Not servers at all (buckets): an error saying so.
+        for bucket in ["data.example.com", "localhost"] {
+            let err = s3_endpoint_url_from_authority(bucket).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not a server"),
+                "{bucket}: {err:#}"
+            );
+        }
+        // Classifier errors keep the classifier's own message.
+        for (bad, hint) in [
+            ("10.0.0.5", "IP address with no port"),
+            ("host:notaport", "invalid port 'notaport'"),
+            ("host:0", "invalid port '0'"),
+            ("http://host:9000", "looks like a URL"),
+            // Host grammar: no endpoint URL is ever built from these.
+            ("node/prefix:9000", "invalid character '/'"),
+            ("a b:9000", "invalid character ' '"),
+            ("ho%st:9000", "invalid character '%'"),
+            ("host.:9000", "empty label"),
+        ] {
+            let err = s3_endpoint_url_from_authority(bad).unwrap_err();
+            assert!(format!("{err:#}").contains(hint), "{bad}: {err:#}");
+        }
+        assert_eq!(
+            s3_endpoint_url_from_authority("host:9000").unwrap(),
+            "http://host:9000"
+        );
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -4495,5 +4761,78 @@ mod list_common_prefix_tests {
             "listing subdir/ must NOT include sibling top_file.txt; got: {:?}",
             keys
         );
+    }
+}
+
+// ── delete_batch URI grouping for the GCS and Azure adapters (issue #179) ──
+//
+// The S3 adapter is covered end-to-end by tests/test_delete_batch_buckets.rs
+// (mock endpoint).  GCS and Azure need live credentials for a store-level
+// test, so their bucket/container grouping is pinned here with the exact
+// parser each adapter hands to `group_uris_by_bucket`.
+#[cfg(test)]
+mod delete_batch_grouping_tests {
+    #[cfg(any(feature = "backend-gcs", feature = "backend-azure"))]
+    use super::*;
+
+    #[cfg(feature = "backend-gcs")]
+    #[test]
+    fn gcs_batch_is_split_per_bucket_and_gcs_scheme_alias_groups_together() {
+        let uris: Vec<String> = ["gs://bucket1/p/a", "gs://bucket2/p/b", "gcs://bucket1/p/c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let g = group_uris_by_bucket(&uris, parse_gcs_uri).expect("group");
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].target, "bucket1");
+        assert_eq!(g[0].keys, vec!["p/a", "p/c"]);
+        assert_eq!(g[1].target, "bucket2");
+        assert_eq!(g[1].keys, vec!["p/b"]);
+    }
+
+    #[cfg(feature = "backend-gcs")]
+    #[test]
+    fn gcs_batch_with_unparseable_uri_is_an_error() {
+        let uris: Vec<String> = ["gs://bucket1/a", "s3://wrong-scheme/b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = group_uris_by_bucket(&uris, parse_gcs_uri).unwrap_err();
+        assert!(format!("{err:#}").contains("s3://wrong-scheme/b"));
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn azure_batch_is_split_per_account_and_container() {
+        let uris: Vec<String> = [
+            "az://acct1/cont1/a",
+            "az://acct1/cont2/b",
+            "az://acct2/cont1/c",
+            "https://acct1.blob.core.windows.net/cont1/d",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let g = group_uris_by_bucket(&uris, azure_group_key).expect("group");
+        let targets: Vec<(&str, &str)> = g
+            .iter()
+            .map(|x| (x.target.0.as_str(), x.target.1.as_str()))
+            .collect();
+        assert_eq!(
+            targets,
+            vec![("acct1", "cont1"), ("acct1", "cont2"), ("acct2", "cont1")]
+        );
+        assert_eq!(g[0].keys, vec!["a", "d"]);
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn azure_batch_with_unparseable_uri_is_an_error() {
+        let uris: Vec<String> = ["az://acct1/cont1/a", "s3://nope/b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = group_uris_by_bucket(&uris, azure_group_key).unwrap_err();
+        assert!(format!("{err:#}").contains("s3://nope/b"));
     }
 }

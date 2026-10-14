@@ -75,7 +75,29 @@ jobs:
 
       - name: Test (Rust)
         run: cargo test --release --lib --offline
-      
+
+      # The slower Rust-only integration steps (delete_batch grouping, the
+      # GCS/Azure feature build, the op-log lifecycle binaries) run once per OS
+      # in the parallel `rust-extra` job below, not once per Python version here.
+
+      # The zstd command-line tool is what the op-log tests use to prove a
+      # finished log is a complete zstd stream; the Python op-log tests below
+      # skip without it, so fail here if it is missing instead.
+      - name: Install zstd CLI (op-log tests)
+        run: |
+          for i in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y zstd; then
+              break
+            fi
+            if [ "$i" = "3" ]; then
+              echo "apt-get update/install failed after 3 attempts" >&2
+              exit 1
+            fi
+            echo "apt-get failed (attempt $i); retrying..."
+            sleep $((i * 5))
+          done
+          zstd --version
+
       - name: Build (Python)
         run: |
           pip install maturin
@@ -91,6 +113,126 @@ jobs:
         run: |
           python -c "import s3dlio; data = s3dlio.generate_data(1024*1024); view = memoryview(data); print(f'✓ Zero-copy memoryview: {len(view)} bytes')"
           python -c "import s3dlio; buf = bytearray(1024); n = s3dlio.generate_into_buffer(buf); print(f'✓ Zero-copy write: {n} bytes')"
+
+      # Op-log Python tests against the wheel built and installed above (the
+      # wheel is the artifact that exercises the PyO3 boundary: init/finalize,
+      # the GIL release in finalize_op_log, destination errors). Each scenario
+      # runs in a fresh interpreter; they need the zstd CLI installed earlier.
+      # NOTE: written without being able to run GitHub Actions; see the commit
+      # message for what was and was not verified locally.
+      - name: Test (Python - op-log)
+        run: |
+          pip install pytest
+          python -m pytest -q tests/test_oplog_lifecycle.py tests/test_python_oplog.py
+
+  # Rust-only integration tests that do not depend on the Python version. They
+  # run once per OS, in parallel with the `test` matrix, instead of six times
+  # inside it (2 OS x 3 Python versions).
+  rust-extra:
+    name: Rust integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      # Same network hardening as the `test` job (curl-8.x HTTP/2 bug).
+      - name: Configure cargo network robustness
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml <<'EOF'
+          [registries.crates-io]
+          protocol = "sparse"
+
+          [http]
+          multiplexing = false
+          timeout = 120
+          EOF
+
+      - name: Cache cargo registry, git deps, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-extra-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-extra-
+
+      - name: Fetch dependencies (with retry)
+        run: |
+          for i in 1 2 3; do
+            cargo fetch --locked && break
+            echo "cargo fetch failed (attempt $i); retrying..."
+            sleep $((i * 10))
+          done
+
+      # delete_batch bucket/server grouping (#179).  The integration test runs
+      # against an in-process mock S3 endpoint (no network, no credentials).
+      - name: Test (Rust - delete_batch bucket grouping)
+        run: cargo test --release --offline --test test_delete_batch_buckets
+
+      # The GCS and Azure adapters' delete_batch grouping is feature-gated, so
+      # the plain `--lib` run in the `test` job does not compile or run it.
+      - name: Test (Rust - delete_batch GCS/Azure grouping)
+        run: cargo test --release --lib --offline --features backend-gcs,backend-azure delete_batch
+
+      # Op-log (#168, #170): the zstd command-line tool is what the op-log
+      # tests use to prove a finished log is a complete zstd stream.
+      - name: Install zstd CLI (op-log tests)
+        run: |
+          for i in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y zstd; then
+              break
+            fi
+            if [ "$i" = "3" ]; then
+              echo "apt-get update/install failed after 3 attempts" >&2
+              exit 1
+            fi
+            echo "apt-get failed (attempt $i); retrying..."
+            sleep $((i * 5))
+          done
+          zstd --version
+
+      # Every tests/oplog_lifecycle_*.rs is its own binary (= its own process,
+      # because the op-log is process-global), run explicitly by name. Must run
+      # as the default non-root runner user: the spawn-failure test lowers
+      # RLIMIT_NPROC, which root / CAP_SYS_RESOURCE ignore. With
+      # S3DLIO_REQUIRE_SPAWN_FAILURE_TEST=1 that test FAILS instead of quietly
+      # returning when it cannot produce the failure.
+      - name: Test (Rust - op-log lifecycle)
+        env:
+          S3DLIO_REQUIRE_SPAWN_FAILURE_TEST: "1"
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" = "0" ]; then
+            echo "op-log lifecycle tests must run as a non-root user" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          files=(tests/oplog_lifecycle_*.rs)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no tests/oplog_lifecycle_*.rs found" >&2
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            name="$(basename "$f" .rs)"
+            echo "::group::$name"
+            status=0
+            cargo test --release --offline --test "$name" || status=$?
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              exit "$status"
+            fi
+          done
 
   lint:
     name: Lint
