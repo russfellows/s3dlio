@@ -172,6 +172,37 @@ impl ArrowObjectStore {
     }
 }
 
+/// Read `length` bytes from `offset` (to the end of the object if `length` is `None`).
+async fn read_range(
+    store: &dyn AosObjectStore,
+    path: &Path,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Bytes> {
+    // A zero-length range cannot be expressed as an HTTP range header (the end would be
+    // `offset - 1`); like the native backends, answer it as empty without a request.
+    if length == Some(0) {
+        return Ok(Bytes::new());
+    }
+    let range = match length {
+        Some(len) => {
+            let end = offset.checked_add(len).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "range end overflow: offset={offset} + length={len} exceeds u64::MAX"
+                )
+            })?;
+            GetRange::Bounded(offset..end)
+        }
+        None => GetRange::Offset(offset),
+    };
+    let opts = GetOptions {
+        range: Some(range),
+        ..Default::default()
+    };
+    let reader = store.get_opts(path, opts).await?;
+    Ok(reader.bytes().await?)
+}
+
 // ----------------------------------------------------------------------------
 // ObjectStore impl
 // ----------------------------------------------------------------------------
@@ -186,17 +217,7 @@ impl S3DlioObjectStore for ArrowObjectStore {
 
     async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let (store, path, _url) = Self::parse(uri)?;
-        let range = if let Some(len) = length {
-            GetRange::Bounded(offset..(offset + len))
-        } else {
-            GetRange::Offset(offset)
-        };
-        let opts = GetOptions {
-            range: Some(range),
-            ..Default::default()
-        };
-        let reader = store.get_opts(&path, opts).await?;
-        Ok(reader.bytes().await?)
+        read_range(store.as_ref(), &path, offset, length).await
     }
 
     async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
@@ -594,6 +615,54 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("not a uri"), "error must name the URI: {msg}");
         assert!(msg.contains("nothing deleted"), "{msg}");
+    }
+
+    async fn memory_store(contents: &'static [u8]) -> (aos::memory::InMemory, Path) {
+        let store = aos::memory::InMemory::new();
+        let path = Path::from("obj.bin");
+        store
+            .put(&path, PutPayload::from(Bytes::from_static(contents)))
+            .await
+            .expect("put fixture");
+        (store, path)
+    }
+
+    // A zero-length range is empty, at offset 0 and elsewhere, and makes no request
+    // (the underlying range header cannot express it).
+    #[tokio::test]
+    async fn read_range_zero_length_is_empty() {
+        let (store, path) = memory_store(b"0123456789").await;
+        for offset in [0u64, 5, 10, 1000, u64::MAX] {
+            let got = read_range(&store, &path, offset, Some(0)).await;
+            assert_eq!(got.expect("zero-length range").len(), 0, "offset {offset}");
+        }
+    }
+
+    // offset + length beyond u64::MAX is an error, never a panic or a wrapped range.
+    #[tokio::test]
+    async fn read_range_offset_plus_length_overflow_is_an_error() {
+        let (store, path) = memory_store(b"0123456789").await;
+        let err = read_range(&store, &path, u64::MAX, Some(2))
+            .await
+            .expect_err("overflow must be rejected");
+        assert!(format!("{err:#}").contains("overflow"), "{err:#}");
+        assert!(read_range(&store, &path, u64::MAX - 1, Some(5))
+            .await
+            .is_err());
+    }
+
+    // Normal ranges still return the right bytes.
+    #[tokio::test]
+    async fn read_range_returns_requested_bytes() {
+        let (store, path) = memory_store(b"0123456789").await;
+        let got = read_range(&store, &path, 2, Some(3))
+            .await
+            .expect("bounded");
+        assert_eq!(&got[..], b"234");
+        let got = read_range(&store, &path, 7, None)
+            .await
+            .expect("open-ended");
+        assert_eq!(&got[..], b"789");
     }
 
     // list_stream reports a listing failure as a single Err item, like `list`.
