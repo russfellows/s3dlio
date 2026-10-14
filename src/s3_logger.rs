@@ -159,6 +159,64 @@ pub fn global_logger() -> Option<Logger> {
     }
 }
 
+/// Counts of what happened to the entries submitted to the process's op-log
+/// session, so a caller can tell whether the log is complete.
+///
+/// Available while the session is Active and after it is Finalized (`None`
+/// only before [`init_op_logger`]). The counts cover every `log` / `try_log`
+/// call made through any clone of the session's [`Logger`]. `accepted` is the
+/// number of entries queued for the writer; once finalize has returned, those
+/// are exactly the data rows in the file unless `writer_failed` is non-zero or
+/// the writer stopped on an I/O error. The log is **complete** when
+/// `dropped_full == 0 && writer_failed == 0`; `rejected_closed` entries
+/// arrived after finalize began and are not drops of an open session.
+///
+/// Counters are relaxed atomics: a snapshot taken while producers are still
+/// logging is a consistent-enough progress report, not a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OpLogStats {
+    /// Entries queued for the writer (`LogOutcome::Accepted`).
+    pub accepted: u64,
+    /// Entries dropped because the queue was full (`LogOutcome::Full`);
+    /// only happens in the default non-lossless mode.
+    pub dropped_full: u64,
+    /// Entries rejected because finalize had begun (`LogOutcome::Closed`).
+    pub rejected_closed: u64,
+    /// Entries not written because the writer had stopped after an I/O error
+    /// (`LogOutcome::WriterFailed`).
+    pub writer_failed: u64,
+    /// True if the session blocks on a full queue instead of dropping
+    /// (`S3DLIO_OPLOG_LOSSLESS=1`).
+    pub lossless: bool,
+}
+
+/// The single warning printed when finalize finds that records were lost
+/// (queue-full drops or a failed writer); `None` when the log is complete.
+fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
+    if stats.dropped_full.saturating_add(stats.writer_failed) == 0 {
+        return None;
+    }
+    Some(format!(
+        "op-log is INCOMPLETE: {} entries were dropped because the queue was full, \
+         {} were lost after the writer failed with an I/O error ({} were accepted). \
+         To avoid queue-full drops set S3DLIO_OPLOG_LOSSLESS=1 (callers wait \
+         instead of dropping) and/or raise S3DLIO_OPLOG_BUF (queue capacity in \
+         entries); check the op-log destination for I/O errors.",
+        stats.dropped_full, stats.writer_failed, stats.accepted
+    ))
+}
+
+/// Statistics of the process's op-log session: `Some` while it is Active and
+/// after it is Finalized, `None` only before [`init_op_logger`]. See
+/// [`OpLogStats`] for how to use them to detect dropped records.
+pub fn op_log_stats() -> Option<OpLogStats> {
+    match &*lock_state() {
+        OpLogState::Active(logger) | OpLogState::Finalized(logger) => Some(logger.stats()),
+        OpLogState::Uninitialized => None,
+    }
+}
+
 /// Set clock offset for the global logger (convenience function).
 ///
 /// # Parameters
@@ -441,12 +499,19 @@ struct Shared {
     lossless: bool,
     closed_noted: AtomicBool,
     writer_failure_noted: AtomicBool,
+    /// Outcome counters behind [`Logger::stats`]. Each is bumped only on the
+    /// path it names, with a relaxed `fetch_add`.
+    accepted: AtomicU64,
+    dropped_full: AtomicU64,
+    rejected_closed: AtomicU64,
+    writer_failed: AtomicU64,
 }
 
 impl Shared {
     /// Outcome for a call that found the logger closed; prints the single
     /// "finalized" diagnostic for the whole logger the first time.
     fn reject_closed(&self) -> LogOutcome {
+        self.rejected_closed.fetch_add(1, Ordering::Relaxed);
         if !self.closed_noted.swap(true, Ordering::Relaxed) {
             eprintln!(
                 "op-log finalized: entries from stores created before finalize are no \
@@ -650,6 +715,10 @@ impl Logger {
                 lossless,
                 closed_noted: AtomicBool::new(false),
                 writer_failure_noted: AtomicBool::new(false),
+                accepted: AtomicU64::new(0),
+                dropped_full: AtomicU64::new(0),
+                rejected_closed: AtomicU64::new(0),
+                writer_failed: AtomicU64::new(0),
             }),
         })
     }
@@ -679,6 +748,19 @@ impl Logger {
     /// Get the current clock offset value.
     pub fn get_clock_offset(&self) -> i64 {
         self.shared.clock_offset_nanos.load(Ordering::Relaxed)
+    }
+
+    /// Counts of what happened to the entries submitted through this logger
+    /// (and its clones). See [`OpLogStats`].
+    pub fn stats(&self) -> OpLogStats {
+        let shared = &*self.shared;
+        OpLogStats {
+            accepted: shared.accepted.load(Ordering::Relaxed),
+            dropped_full: shared.dropped_full.load(Ordering::Relaxed),
+            rejected_closed: shared.rejected_closed.load(Ordering::Relaxed),
+            writer_failed: shared.writer_failed.load(Ordering::Relaxed),
+            lossless: shared.lossless,
+        }
     }
 
     /// Submit a log entry, ignoring what happened to it.
@@ -741,18 +823,31 @@ impl Logger {
         let outcome = if shared.lossless {
             // Blocking: guarantees no drops (may stall if writer can’t keep up).
             match shared.sender.send(Message::Entry(entry)) {
-                Ok(()) => LogOutcome::Accepted,
-                Err(_) => LogOutcome::WriterFailed,
+                Ok(()) => {
+                    shared.accepted.fetch_add(1, Ordering::Relaxed);
+                    LogOutcome::Accepted
+                }
+                Err(_) => {
+                    shared.writer_failed.fetch_add(1, Ordering::Relaxed);
+                    LogOutcome::WriterFailed
+                }
             }
         } else {
             // Non‑blocking: preserves I/O throughput; may drop under burst.
             match shared.sender.try_send(Message::Entry(entry)) {
-                Ok(()) => LogOutcome::Accepted,
+                Ok(()) => {
+                    shared.accepted.fetch_add(1, Ordering::Relaxed);
+                    LogOutcome::Accepted
+                }
                 Err(TrySendError::Full(_)) => {
+                    shared.dropped_full.fetch_add(1, Ordering::Relaxed);
                     eprintln!("op-log channel full; dropping entry");
                     LogOutcome::Full
                 }
-                Err(TrySendError::Disconnected(_)) => LogOutcome::WriterFailed,
+                Err(TrySendError::Disconnected(_)) => {
+                    shared.writer_failed.fetch_add(1, Ordering::Relaxed);
+                    LogOutcome::WriterFailed
+                }
             }
         };
         if outcome == LogOutcome::WriterFailed
@@ -804,6 +899,11 @@ impl Logger {
 
         // Wait for the background thread to finish (encoder flushes on drop).
         let _ = done.recv();
+
+        // One warning, from the first (draining) finalize, if records were lost.
+        if let Some(warning) = incomplete_warning(&self.stats()) {
+            eprintln!("{warning}");
+        }
     }
 }
 
@@ -1518,6 +1618,372 @@ mod oplog_shutdown_tests {
             }
             logger.shutdown(); // must return even though the writer is gone
             assert_eq!(logger.try_log(entry("closed")), LogOutcome::Closed);
+        }
+    }
+}
+
+// Drop detection (issue #170): `Logger::stats()` must count every outcome of
+// `try_log` exactly once, so a caller can tell whether the log is complete.
+#[cfg(test)]
+mod oplog_stats_tests {
+    use super::*;
+    use std::sync::Condvar;
+
+    fn entry(tag: &str) -> LogEntry {
+        let now = SystemTime::now();
+        LogEntry {
+            idx: 0,
+            thread_id: 0,
+            operation: "GET".to_string(),
+            client_id: String::new(),
+            num_objects: 1,
+            bytes: 1,
+            endpoint: String::new(),
+            file: tag.to_string(),
+            error: None,
+            start_time: now,
+            first_byte_time: None,
+            end_time: now,
+        }
+    }
+
+    /// ~400 KB in the `file` column so one entry forces zstd to hand output to
+    /// the sink (and a blocked sink therefore blocks the writer thread).
+    fn big_entry(seed: u64) -> LogEntry {
+        let mut x = seed | 1;
+        let mut file = String::with_capacity(400_000);
+        while file.len() < 400_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            file.push_str(&format!("{x:016x}"));
+        }
+        entry(&file)
+    }
+
+    #[derive(Default)]
+    struct SinkState {
+        /// A write is waiting for `released`.
+        blocked: bool,
+        released: bool,
+        bytes: Vec<u8>,
+    }
+
+    /// A sink that stalls its first write until released, then keeps all bytes.
+    #[derive(Clone, Default)]
+    struct StallingSink(Arc<(Mutex<SinkState>, Condvar)>);
+
+    impl StallingSink {
+        fn lock(&self) -> MutexGuard<'_, SinkState> {
+            self.0 .0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn wait_until_blocked(&self) {
+            let mut st = self.lock();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !st.blocked {
+                assert!(Instant::now() < deadline, "writer never reached the sink");
+                st = self
+                    .0
+                     .1
+                    .wait_timeout(st, Duration::from_millis(10))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+
+        fn release(&self) {
+            self.lock().released = true;
+            self.0 .1.notify_all();
+        }
+
+        /// Data rows (header excluded) of the complete zstd stream written so far.
+        fn rows(&self) -> usize {
+            let text = zstd::decode_all(self.lock().bytes.as_slice()).unwrap();
+            String::from_utf8(text).unwrap().lines().count() - 1
+        }
+    }
+
+    impl Write for StallingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut st = self.lock();
+            if !st.released {
+                st.blocked = true;
+                self.0 .1.notify_all();
+                while !st.released {
+                    st = self
+                        .0
+                         .1
+                        .wait_timeout(st, Duration::from_millis(10))
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+            }
+            st.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    use std::time::Instant;
+
+    // Tiny queue + a stalled writer: the entries beyond the queue are dropped and
+    // `dropped_full` equals the number of `Full` outcomes; `accepted` equals the
+    // rows that reach the file.
+    #[test]
+    fn dropped_full_matches_full_outcomes_and_accepted_matches_rows_written() {
+        const CAP: usize = 4;
+        const SENT: usize = 25;
+        // The header was flushed before the sink stalled, so only release the
+        // sink once the writer is blocked inside a write of the big entry.
+        let sink = StallingSink::default();
+        {
+            // Header write happens in `start`, on this thread: let it through.
+            sink.lock().released = true;
+        }
+        let logger = Logger::start(sink.clone(), CAP, false, 1, "oplog-stats").unwrap();
+        {
+            let mut st = sink.lock();
+            st.released = false;
+            st.blocked = false;
+        }
+
+        assert_eq!(logger.try_log(big_entry(1)), LogOutcome::Accepted);
+        sink.wait_until_blocked(); // writer holds the big entry; queue is empty
+
+        let (mut accepted, mut full) = (1_u64, 0_u64);
+        for i in 0..SENT {
+            match logger.try_log(entry(&format!("e{i}"))) {
+                LogOutcome::Accepted => accepted += 1,
+                LogOutcome::Full => full += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 1 + CAP as u64, "queue holds exactly CAP entries");
+        assert_eq!(full, (SENT - CAP) as u64);
+
+        let mid = logger.stats();
+        assert_eq!(mid.accepted, accepted);
+        assert_eq!(mid.dropped_full, full);
+        assert_eq!((mid.rejected_closed, mid.writer_failed), (0, 0));
+        assert!(!mid.lossless);
+
+        sink.release();
+        logger.shutdown();
+        let end = logger.stats();
+        assert_eq!(end, mid, "draining must not change the outcome counts");
+        assert_eq!(
+            sink.rows() as u64,
+            end.accepted,
+            "accepted must equal the data rows in the file"
+        );
+    }
+
+    // The finalize warning appears exactly when records were lost and carries
+    // the counts and both remedies.
+    #[test]
+    fn incomplete_warning_is_printed_only_for_lost_records() {
+        let mut st = Logger::open(
+            tempfile::tempdir()
+                .unwrap()
+                .path()
+                .join("w.zst")
+                .to_str()
+                .unwrap(),
+            8,
+            false,
+        )
+        .map(|l| {
+            l.shutdown();
+            l.stats()
+        })
+        .unwrap_or_else(|e| panic!("open: {e}"));
+        assert_eq!(incomplete_warning(&st), None);
+        st.rejected_closed = 99; // not a loss of an open session
+        st.accepted = 7;
+        assert_eq!(incomplete_warning(&st), None);
+        st.dropped_full = 123;
+        let w = incomplete_warning(&st).unwrap();
+        assert!(w.contains("123 entries were dropped"), "{w}");
+        assert!(w.contains("S3DLIO_OPLOG_LOSSLESS=1") && w.contains("S3DLIO_OPLOG_BUF"));
+        assert!(w.contains("(7 were accepted)"), "{w}");
+        st.dropped_full = 0;
+        st.writer_failed = 5;
+        assert!(incomplete_warning(&st).unwrap().contains("5 were lost"));
+    }
+
+    // Closed outcomes are counted, on both reject paths, and never counted as
+    // accepted.
+    #[test]
+    fn rejected_closed_counts_calls_after_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ops.tsv.zst");
+        let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
+        for i in 0..3 {
+            assert_eq!(
+                logger.try_log(entry(&format!("a{i}"))),
+                LogOutcome::Accepted
+            );
+        }
+        assert_eq!(logger.stats().rejected_closed, 0);
+        logger.shutdown();
+        for _ in 0..7 {
+            assert_eq!(logger.try_log(entry("late")), LogOutcome::Closed);
+        }
+        let st = logger.stats();
+        assert_eq!(st.accepted, 3);
+        assert_eq!(st.rejected_closed, 7);
+        assert_eq!((st.dropped_full, st.writer_failed), (0, 0));
+    }
+
+    // Lossless mode blocks instead of dropping: a one-slot queue under four
+    // producers shows zero drops and every entry accepted.
+    #[test]
+    fn lossless_mode_reports_zero_drops() {
+        const PRODUCERS: usize = 4;
+        const EACH: usize = 500;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ops.tsv.zst");
+        let logger = Logger::open(path.to_str().unwrap(), 1, true).unwrap();
+        let handles: Vec<_> = (0..PRODUCERS)
+            .map(|t| {
+                let logger = logger.clone();
+                thread::spawn(move || {
+                    for n in 0..EACH {
+                        assert_eq!(
+                            logger.try_log(entry(&format!("t{t}-{n}"))),
+                            LogOutcome::Accepted
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        logger.shutdown();
+        let st = logger.stats();
+        assert!(st.lossless);
+        assert_eq!(st.accepted, (PRODUCERS * EACH) as u64);
+        assert_eq!(
+            (st.dropped_full, st.rejected_closed, st.writer_failed),
+            (0, 0, 0)
+        );
+        let text = zstd::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap();
+        assert_eq!(text.split(|b| *b == b'\n').count() - 2, PRODUCERS * EACH);
+    }
+
+    /// A sink that accepts everything until armed, then fails every write.
+    struct ArmedFailSink(Arc<AtomicBool>);
+
+    impl Write for ArmedFailSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0.load(Ordering::SeqCst) {
+                Err(std::io::Error::other("injected: no space left on device"))
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // After the writer dies, `writer_failed` equals the number of WriterFailed
+    // outcomes in both queue modes (the send-error path in lossless mode, the
+    // disconnected path otherwise).
+    #[test]
+    fn writer_failed_matches_writer_failed_outcomes_in_both_modes() {
+        for lossless in [false, true] {
+            let armed = Arc::new(AtomicBool::new(false));
+            let logger = Logger::start(
+                ArmedFailSink(Arc::clone(&armed)),
+                1024,
+                lossless,
+                1,
+                "oplog-stats-f",
+            )
+            .unwrap();
+            assert_eq!(logger.try_log(entry("before")), LogOutcome::Accepted);
+            armed.store(true, Ordering::SeqCst);
+
+            let (mut accepted, mut failed) = (1_u64, 0_u64);
+            for i in 0..200_u64 {
+                match logger.try_log(big_entry(i)) {
+                    LogOutcome::Accepted => {
+                        accepted += 1;
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    LogOutcome::WriterFailed => {
+                        failed += 1;
+                        break;
+                    }
+                    other => panic!("lossless={lossless}: unexpected {other:?}"),
+                }
+            }
+            assert_eq!(failed, 1, "lossless={lossless}: writer failure never seen");
+            for _ in 0..5 {
+                assert_eq!(logger.try_log(entry("after")), LogOutcome::WriterFailed);
+                failed += 1;
+            }
+            let st = logger.stats();
+            assert_eq!(st.writer_failed, failed, "lossless={lossless}");
+            assert_eq!(st.accepted, accepted, "lossless={lossless}");
+            assert_eq!(st.dropped_full, 0, "lossless={lossless}");
+            logger.shutdown();
+        }
+    }
+
+    // Under a shutdown race each outcome the producers observed is counted
+    // exactly once, whichever reject path (closed hint or gate) saw it.
+    #[test]
+    fn counters_equal_outcomes_observed_by_racing_producers() {
+        for round in 0..200_u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ops.tsv.zst");
+            let cap = [1_usize, 2, 8][(round % 3) as usize];
+            let logger = Logger::open(path.to_str().unwrap(), cap, false).unwrap();
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let logger = logger.clone();
+                    thread::spawn(move || {
+                        let mut seen = [0_u64; 3]; // accepted, full, closed
+                        let mut extra_closed = 0;
+                        loop {
+                            match logger.try_log(entry("x")) {
+                                LogOutcome::Accepted => seen[0] += 1,
+                                LogOutcome::Full => seen[1] += 1,
+                                LogOutcome::Closed => {
+                                    seen[2] += 1;
+                                    extra_closed += 1;
+                                    if extra_closed == 3 {
+                                        return seen;
+                                    }
+                                }
+                                LogOutcome::WriterFailed => panic!("writer failed"),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            thread::sleep(Duration::from_micros(100 * (round % 7)));
+            logger.shutdown();
+            let mut total = [0_u64; 3];
+            for h in handles {
+                for (t, n) in total.iter_mut().zip(h.join().unwrap()) {
+                    *t += n;
+                }
+            }
+            let st = logger.stats();
+            assert_eq!(
+                [st.accepted, st.dropped_full, st.rejected_closed],
+                total,
+                "round {round}"
+            );
         }
     }
 }

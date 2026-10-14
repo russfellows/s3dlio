@@ -85,6 +85,9 @@ pub use crate::object_store::{infer_scheme, Scheme};
 /// Initialize operation logging to a file
 pub use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger, Logger};
 
+/// Detect dropped op-log records: counts of accepted / dropped / rejected entries (issue #170)
+pub use crate::s3_logger::{op_log_stats, OpLogStats};
+
 /// Set clock offset for distributed op-log synchronization (issue #100)
 pub use crate::s3_logger::{get_clock_offset, set_clock_offset};
 

@@ -26,7 +26,7 @@ use crate::object_store::{
     store_for_uri, store_for_uri_with_logger, store_routing_endpoint_for_uri,
 };
 use crate::s3_client::run_on_global_rt;
-use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger};
+use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger, op_log_stats};
 use crate::s3_utils::{
     create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs, get_objects_parallel,
     parse_s3_uri, put_objects_with_random_data_and_type, stat_object_many_async,
@@ -728,6 +728,39 @@ pub fn finalize_op_log(py: Python<'_>) -> PyResult<()> {
 #[pyfunction]
 pub fn is_op_log_active() -> PyResult<bool> {
     Ok(global_logger().is_some())
+}
+
+/// Counts of what happened to the entries submitted to the op-log, so you can
+/// tell whether the log is complete.
+///
+/// Returns None before init_op_log(); otherwise a dict (available while
+/// logging is active AND after finalize_op_log()):
+///
+///     accepted         entries queued for the writer; after finalize_op_log()
+///                      these are exactly the data rows in the file (unless
+///                      writer_failed is non-zero)
+///     dropped_full     entries dropped because the queue was full (default
+///                      mode only)
+///     rejected_closed  entries that arrived after finalize began (not written)
+///     writer_failed    entries lost because the writer stopped on an I/O error
+///     lossless         True if S3DLIO_OPLOG_LOSSLESS=1 (callers wait, never drop)
+///
+/// The log is complete when dropped_full == 0 and writer_failed == 0. To avoid
+/// drops set S3DLIO_OPLOG_LOSSLESS=1 and/or raise S3DLIO_OPLOG_BUF. finalize_op_log()
+/// also prints one warning on stderr if anything was dropped.
+#[pyfunction]
+#[pyo3(name = "op_log_stats")]
+pub fn op_log_stats_py(py: Python<'_>) -> PyResult<Option<Bound<'_, PyDict>>> {
+    let Some(stats) = op_log_stats() else {
+        return Ok(None);
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("accepted", stats.accepted)?;
+    dict.set_item("dropped_full", stats.dropped_full)?;
+    dict.set_item("rejected_closed", stats.rejected_closed)?;
+    dict.set_item("writer_failed", stats.writer_failed)?;
+    dict.set_item("lossless", stats.lossless)?;
+    Ok(Some(dict))
 }
 
 // ---------------------------------------------------------------------------
@@ -2889,6 +2922,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(finalize_op_log, m)?)?;
     m.add_function(wrap_pyfunction!(is_op_log_active, m)?)?;
+    m.add_function(wrap_pyfunction!(op_log_stats_py, m)?)?;
 
     // URI parsing utilities
     m.add_function(wrap_pyfunction!(parse_s3_uri_full, m)?)?;

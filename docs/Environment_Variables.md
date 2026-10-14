@@ -318,7 +318,7 @@ export S3DLIO_CHUNK_SIZE=16777216  # 16 MB chunks
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `S3DLIO_OPLOG_LOSSLESS` | `false` | Enable lossless operation logging (higher memory usage) |
-| `S3DLIO_OPLOG_BUF` | `8192` | Bounded channel capacity, in log *entries*, between the calling thread and the background writer thread. Entries are dropped (with an stderr warning) once full, unless `S3DLIO_OPLOG_LOSSLESS=true`. |
+| `S3DLIO_OPLOG_BUF` | `8192` | Bounded channel capacity, in log *entries*, between the calling thread and the background writer thread. Entries are dropped (with an stderr warning) once full, unless `S3DLIO_OPLOG_LOSSLESS=true`; `op_log_stats()` counts them. |
 | `S3DLIO_OPLOG_WBUFCAP` | `262144` | `BufWriter` capacity, in *bytes*, for the op-log output file. A larger buffer flushes to disk less often. (v0.9.110: corrected from a previously-documented `4096`, which never matched the code default — see Version History.) |
 | `S3DLIO_OPLOG_LEVEL` | `1` | Operation logging level (0=off, 1=basic, 2=verbose) |
 

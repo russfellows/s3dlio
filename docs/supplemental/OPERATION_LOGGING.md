@@ -219,6 +219,46 @@ After finalize, `set_clock_offset` / `get_clock_offset` return an error of kind
 `Unsupported` saying the op-log was already finalized (before any init the kind
 is `NotFound`, "Logger not initialized").
 
+### Detecting dropped records
+
+By default the op-log is **lossy**: it never slows the caller, so when the
+writer cannot keep up and the queue (`S3DLIO_OPLOG_BUF`, default 8192 entries)
+is full, the entry is dropped. `S3DLIO_OPLOG_LOSSLESS=1` makes callers wait
+instead. A caller can always tell whether a log is complete:
+
+```rust
+if let Some(stats) = s3dlio::op_log_stats() {          // Option<OpLogStats>
+    // stats.accepted, stats.dropped_full, stats.rejected_closed,
+    // stats.writer_failed, stats.lossless
+    let complete = stats.dropped_full == 0 && stats.writer_failed == 0;
+}
+```
+
+```python
+stats = s3dlio.op_log_stats()   # None before init_op_log(), else a dict
+complete = stats["dropped_full"] == 0 and stats["writer_failed"] == 0
+```
+
+| Count | Meaning |
+|---|---|
+| `accepted` | entries queued for the writer (`LogOutcome::Accepted`); after finalize these are the data rows in the file, unless `writer_failed` is non-zero |
+| `dropped_full` | entries dropped because the queue was full (`LogOutcome::Full`); default mode only, always 0 when lossless |
+| `rejected_closed` | entries that arrived after finalize began (`LogOutcome::Closed`); not written, not a loss of an open session |
+| `writer_failed` | entries lost because the writer stopped after an I/O error (`LogOutcome::WriterFailed`) |
+| `lossless` | the session's mode |
+
+`op_log_stats()` / `Logger::stats()` work while the op-log is Active **and after
+it is Finalized** (`None` only before init), so a program can finalize and then
+check the totals. The counts cover every clone of the session's `Logger`, are
+relaxed atomics (a snapshot taken while threads are still logging is a progress
+report, not a transaction), and `OpLogStats` is `#[non_exhaustive]`.
+`finalize_op_logger()` / `finalize_op_log()` prints **one** stderr warning with
+the counts and the remedies (`S3DLIO_OPLOG_LOSSLESS=1`, a larger
+`S3DLIO_OPLOG_BUF`) if `dropped_full + writer_failed > 0`. A per-call
+`try_log` outcome is still available when you need to know about one entry.
+
+Cost: one relaxed `fetch_add` per call, on the path that matches its outcome.
+
 ### Op-log destinations
 
 The destination is a local file. A plain path is used as given. A destination
@@ -273,10 +313,16 @@ not a machine-checked inventory:
   original source error are no longer available from it.
 - Python `finalize_op_log` releases the GIL while it drains the queue, so other
   Python threads can run during a long drain.
+- `op_log_stats()` / `Logger::stats()` / `OpLogStats` (Python `op_log_stats()`)
+  are new: accepted, dropped (queue full), rejected-after-finalize and
+  writer-failed counts, available while Active and after Finalized, so a caller
+  can detect dropped records (see "Detecting dropped records"). Finalize prints
+  one stderr warning if records were dropped or lost. The default stays lossy.
 - Every `try_log` / `log` call now performs one atomic `fetch_add` and one
   `fetch_sub` on a single gate counter shared by all threads. This is a new
   per-entry cost, and it is contended when many threads log at once. It has not
-  been benchmarked.
+  been benchmarked. Each call also bumps one relaxed outcome counter (see
+  "Detecting dropped records").
 - A clock offset of `i64::MIN` no longer panics the writer thread in builds with
   overflow checks. A corrected timestamp before the epoch (or at or after year
   9999) still panics inside the timestamp formatter, as before.

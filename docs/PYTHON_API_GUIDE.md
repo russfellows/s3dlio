@@ -990,6 +990,23 @@ A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
 capture the logger at construction: those created before `init_op_log` are never
 logged, and those created before `finalize_op_log` stop recording when it runs.
 
+The op-log is **lossy by default**: if the writer cannot keep up and the queue
+(`S3DLIO_OPLOG_BUF`, default 8192 entries) fills, entries are dropped rather than
+slowing your code. Detect that with `op_log_stats()`:
+
+```python
+stats = s3dlio.op_log_stats()   # None before init_op_log(); else a dict
+# {'accepted': 4, 'dropped_full': 0, 'rejected_closed': 0,
+#  'writer_failed': 0, 'lossless': False}
+complete = stats["dropped_full"] == 0 and stats["writer_failed"] == 0
+```
+
+It works while logging is active and after `finalize_op_log()`; after finalize
+`accepted` is exactly the number of data rows in the file (unless
+`writer_failed` is non-zero). `finalize_op_log()` also prints one warning on
+stderr if anything was dropped. To avoid drops set `S3DLIO_OPLOG_LOSSLESS=1`
+(callers wait instead of dropping) and/or raise `S3DLIO_OPLOG_BUF`.
+
 ### Python Convenience Helpers
 
 ```python
@@ -1123,6 +1140,7 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089); `RuntimeError` after finalize |
 | `finalize_op_log()` | Write all accepted records (unless the writer fails with an I/O error) and close the log; releases the GIL while draining; terminal and idempotent |
 | `is_op_log_active()` | True between init and finalize only |
+| `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `dropped_full` / `rejected_closed` / `writer_failed` / `lossless`, available while active and after finalize, to detect dropped records |
 
 ---
 

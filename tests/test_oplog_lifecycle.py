@@ -6,6 +6,7 @@ are run with Popen; on a timeout the child gets SIGTERM (never SIGKILL) and the
 test fails, reporting the hang.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -38,10 +39,11 @@ def zstd_cli() -> str:
 
 
 def run_scenario(
-    body: str, *args: str, timeout: int = 120, cwd=None
+    body: str, *args: str, timeout: int = 120, cwd=None, env=None
 ) -> subprocess.CompletedProcess:
     """Run `body` in a fresh interpreter whose working directory is `cwd` (or the
-    caller's if None), so tests can see what a relative path would create."""
+    caller's if None), so tests can see what a relative path would create. `env`
+    adds variables to a copy of this process's environment."""
     code = "import sys, os, s3dlio\n" + textwrap.dedent(body)
     proc = subprocess.Popen(
         [sys.executable, "-c", code, *args],
@@ -49,6 +51,7 @@ def run_scenario(
         stderr=subprocess.PIPE,
         text=True,
         cwd=None if cwd is None else str(cwd),
+        env=None if env is None else {**os.environ, **env},
     )
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -319,3 +322,102 @@ def test_file_uri_with_nothing_after_it_is_rejected(tmp_path):
     )
     assert_ok(proc)
     assert sorted(tmp_path.iterdir()) == []
+
+
+STATS_KEYS = {"accepted", "dropped_full", "rejected_closed", "writer_failed", "lossless"}
+
+
+def test_op_log_stats_none_before_init_then_counts_match_rows(tmp_path):
+    """op_log_stats() is None before init, a dict of counts while active and after
+    finalize; for a small file:// workload accepted == the data rows in the file (#170)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    oplog = tmp_path / "ops.tsv.zst"
+    proc = run_scenario(
+        """
+        import json
+        oplog, work = sys.argv[1:3]
+        assert s3dlio.op_log_stats() is None
+        s3dlio.init_op_log(oplog)
+        during = s3dlio.op_log_stats()
+        assert isinstance(during, dict)
+        a, b = "file://" + work + "/a.bin", "file://" + work + "/b.bin"
+        s3dlio.put_bytes(a, b"aaaa")
+        s3dlio.put_bytes(b, b"bbbbbb")
+        assert bytes(s3dlio.get(a)) == b"aaaa"
+        assert bytes(s3dlio.get(b)) == b"bbbbbb"
+        s3dlio.finalize_op_log()
+        after = s3dlio.op_log_stats()
+        print(json.dumps({"during": during, "after": after}))
+        """,
+        str(oplog),
+        str(work),
+    )
+    assert_ok(proc)
+    import json
+
+    reported = json.loads(proc.stdout.strip().splitlines()[-1])
+    during, after = reported["during"], reported["after"]
+    assert set(during) == STATS_KEYS and set(after) == STATS_KEYS
+    assert (during["accepted"], during["dropped_full"]) == (0, 0)
+    assert after["lossless"] is False
+    assert after["dropped_full"] == after["rejected_closed"] == after["writer_failed"] == 0
+    rows = read_rows(oplog)
+    assert len(rows) == 4
+    assert after["accepted"] == len(rows)
+    assert "INCOMPLETE" not in proc.stderr, "no warning when nothing was dropped"
+
+
+FLOOD = """
+    import json, threading
+    oplog, work = sys.argv[1:3]
+    s3dlio.init_op_log(oplog)
+    uri = "file://" + work + "/a.bin"
+    s3dlio.put_bytes(uri, b"aaaa")
+    def worker():
+        for _ in range(1000):
+            s3dlio.get(uri)
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    s3dlio.finalize_op_log()
+    print(json.dumps(s3dlio.op_log_stats()))
+"""
+
+
+def run_flood(tmp_path, env):
+    import json
+
+    work = tmp_path / "work"
+    work.mkdir()
+    oplog = tmp_path / "ops.tsv.zst"
+    proc = run_scenario(FLOOD, str(oplog), str(work), env=env)
+    assert_ok(proc)
+    return json.loads(proc.stdout.strip().splitlines()[-1]), read_rows(oplog), proc.stderr
+
+
+def test_default_mode_drops_are_counted_and_warned_about_once(tmp_path):
+    """A one-slot queue under four threads drops entries (the default is lossy);
+    op_log_stats() counts them, accepted == rows in the file, and finalize prints
+    exactly one warning that names the remedies (#170)."""
+    env = {"S3DLIO_OPLOG_BUF": "1", "S3DLIO_OPLOG_LOSSLESS": "0"}
+    stats, rows, stderr = run_flood(tmp_path, env)
+    assert stats["lossless"] is False
+    assert stats["dropped_full"] > 0, stats
+    assert stats["accepted"] + stats["dropped_full"] == 4001, stats  # 1 put + 4000 gets
+    assert stats["rejected_closed"] == stats["writer_failed"] == 0
+    assert stats["accepted"] == len(rows)
+    assert stderr.count("op-log is INCOMPLETE") == 1, stderr
+    assert f"{stats['dropped_full']} entries were dropped" in stderr
+    assert "S3DLIO_OPLOG_LOSSLESS=1" in stderr and "S3DLIO_OPLOG_BUF" in stderr
+
+
+def test_lossless_mode_reports_no_drops_and_no_warning(tmp_path):
+    env = {"S3DLIO_OPLOG_BUF": "1", "S3DLIO_OPLOG_LOSSLESS": "1"}
+    stats, rows, stderr = run_flood(tmp_path, env)
+    assert stats["lossless"] is True
+    assert stats["accepted"] == len(rows) == 4001, stats
+    assert stats["dropped_full"] == stats["rejected_closed"] == stats["writer_failed"] == 0
+    assert "INCOMPLETE" not in stderr, stderr
