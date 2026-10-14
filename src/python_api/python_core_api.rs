@@ -807,9 +807,9 @@ pub fn is_op_log_active() -> PyResult<bool> {
 /// After finalize_op_log() no counted loss happened exactly when
 /// accepted == written and dropped_full == 0 and writer_failed == 0 and
 /// writer_error is None and rejected_unformattable == 0 and
-/// rejected_unsafe_field == 0. "written" counts rows the zstd compressor accepted; the
-/// bytes may still be buffered when it is counted, and a later write, finish or
-/// flush can still fail (that is writer_error). A successful finalize_op_log()
+/// rejected_unsafe_field == 0. "written" counts rows the zstd compressor
+/// accepted; the bytes may still be buffered when it is counted, and a later
+/// write, finish or flush can still fail (that is writer_error). A successful finalize_op_log()
 /// with that condition true means every accepted row reached the compressor and
 /// the stream was finished and flushed to the file without error. That is
 /// completion, not durability: there is no fsync, and a close(2) error cannot be

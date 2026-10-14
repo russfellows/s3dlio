@@ -393,8 +393,9 @@ fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
         lines.push(format!(
             "{} entries were rejected because a timestamp could not be formatted \
              (before 1970-01-01 or after 9999-12-31 once the clock offset is \
-             applied); the trace is incomplete. Check the value passed to \
-             set_clock_offset",
+             applied); the trace is incomplete. Check the clock offset \
+             (set_clock_offset), the system clock, or the timestamps supplied in \
+             log entries",
             stats.rejected_unformattable
         ));
     }
