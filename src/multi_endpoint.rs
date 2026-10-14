@@ -463,17 +463,12 @@ impl MultiEndpointStore {
         // If the URI doesn't contain "://", treat it as a relative path
         // and prepend the target endpoint's URI
         if !uri.contains("://") {
-            // Relative path - combine with target endpoint
-            let target_prefix = if target_endpoint.uri.ends_with('/') {
-                &target_endpoint.uri[..]
-            } else {
-                // Add trailing slash
-                return format!("{}/{}", target_endpoint.uri, uri);
-            };
-
-            // Handle leading slash in relative path
+            // Relative path - combine with target endpoint. A relative path
+            // is anchored at the endpoint, so its leading '/' (if any) is not
+            // part of the key; strip it on BOTH branches of the join so the
+            // result never carries an accidental '//' (issue #172 audit).
             let path = uri.trim_start_matches('/');
-            return format!("{}{}", target_prefix, path);
+            return join_endpoint_path(&target_endpoint.uri, path);
         }
 
         // Check if URI matches any configured endpoint prefix
@@ -482,27 +477,17 @@ impl MultiEndpointStore {
                 // Extract path component after the prefix
                 let path = &uri[prefix.len()..];
 
-                // Construct new URI with target endpoint's prefix
-                let target_prefix = if target_endpoint.uri.ends_with('/') {
-                    &target_endpoint.uri
-                } else {
-                    // This shouldn't happen since we normalize, but handle it
-                    return format!("{}/{}", target_endpoint.uri, path);
-                };
-
-                return format!("{}{}", target_prefix, path);
+                // Construct new URI with target endpoint's prefix. `path` is
+                // the remainder after the matched prefix and is kept verbatim
+                // (a key that itself starts with '/' must survive the rewrite).
+                return join_endpoint_path(&target_endpoint.uri, path);
             }
 
             // Also check without trailing slash (e.g., "file:///tmp/ep1" matches "file:///tmp/ep1/data")
             let prefix_no_slash = prefix.trim_end_matches('/');
             if uri.starts_with(prefix_no_slash) && uri[prefix_no_slash.len()..].starts_with('/') {
                 let path = &uri[prefix_no_slash.len() + 1..]; // Skip the '/'
-                let target_prefix = if target_endpoint.uri.ends_with('/') {
-                    &target_endpoint.uri
-                } else {
-                    return format!("{}/{}", target_endpoint.uri, path);
-                };
-                return format!("{}{}", target_prefix, path);
+                return join_endpoint_path(&target_endpoint.uri, path);
             }
         }
 
@@ -1381,6 +1366,18 @@ impl ObjectStore for MultiEndpointStore {
         }
 
         result
+    }
+}
+
+/// Join an endpoint URI and a path with exactly one '/' between them,
+/// whether or not the endpoint was configured with a trailing '/'
+/// (`EndpointInfo::uri` keeps the endpoint exactly as configured). `path` is
+/// appended verbatim: callers decide whether a leading '/' is part of it.
+fn join_endpoint_path(endpoint_uri: &str, path: &str) -> String {
+    if endpoint_uri.ends_with('/') {
+        format!("{endpoint_uri}{path}")
+    } else {
+        format!("{endpoint_uri}/{path}")
     }
 }
 
@@ -3003,5 +3000,68 @@ mod tests {
             let on_disk = fs::read(d.path().join("replicated.bin")).unwrap();
             assert_eq!(on_disk, data.to_vec());
         }
+    }
+
+    // =========================================================================
+    // Issue #172 join-site audit: relative paths must never produce an
+    // accidental '//' when joined onto an endpoint URI. `EndpointInfo::uri` is
+    // the endpoint exactly as configured (only `endpoint_prefixes` is
+    // normalised), so an endpoint WITHOUT a trailing '/' is a real, common
+    // configuration. Before the fix, its relative-path branch skipped the
+    // leading-'/' handling that the trailing-'/' branch had, producing
+    // "<endpoint>//data/x" -- an accidental '//' that only worked because
+    // stat/range-GET silently stripped it again (the #172 bug).
+    // =========================================================================
+
+    fn rewrite(endpoint_suffix: &str, input: &str) -> (String, String) {
+        let tmp = TempDir::new().unwrap();
+        let ep = format!("file://{}{}", tmp.path().display(), endpoint_suffix);
+        let store =
+            MultiEndpointStore::new(vec![ep.clone()], LoadBalanceStrategy::RoundRobin, None)
+                .unwrap();
+        let got = store.rewrite_uri_for_endpoint(input, &store.endpoints[0]);
+        (ep, got)
+    }
+
+    #[test]
+    fn rewrite_relative_path_never_doubles_the_slash_without_trailing_slash_endpoint() {
+        for input in ["/data/x", "data/x"] {
+            let (ep, got) = rewrite("", input);
+            assert_eq!(
+                got,
+                format!("{ep}/data/x"),
+                "relative {input:?} onto endpoint {ep:?} must join with exactly one '/'"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_relative_path_never_doubles_the_slash_with_trailing_slash_endpoint() {
+        for input in ["/data/x", "data/x"] {
+            let (ep, got) = rewrite("/", input);
+            assert_eq!(got, format!("{ep}data/x"), "relative {input:?} onto {ep:?}");
+        }
+    }
+
+    /// A full URI that matches an endpoint prefix keeps its remainder
+    /// verbatim (so an S3 key that genuinely starts with '/' survives the
+    /// rewrite); only the join itself must be single-slash.
+    #[test]
+    fn rewrite_prefixed_uri_preserves_the_remainder_exactly() {
+        let tmp = TempDir::new().unwrap();
+        let ep = format!("file://{}", tmp.path().display());
+        let store =
+            MultiEndpointStore::new(vec![ep.clone()], LoadBalanceStrategy::RoundRobin, None)
+                .unwrap();
+        let target = &store.endpoints[0];
+        assert_eq!(
+            store.rewrite_uri_for_endpoint(&format!("{ep}/data/x"), target),
+            format!("{ep}/data/x")
+        );
+        assert_eq!(
+            store.rewrite_uri_for_endpoint(&format!("{ep}//data/x"), target),
+            format!("{ep}//data/x"),
+            "a remainder that itself starts with '/' is part of the key and must be kept"
+        );
     }
 }

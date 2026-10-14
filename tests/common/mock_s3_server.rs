@@ -84,6 +84,18 @@ pub const GET_FAILS_ONCE_MARKER: &str = "get-fails-once";
 /// verification *call* as proof the just-completed upload is corrupt.
 pub const HEAD_FAILS_MARKER: &str = "head-fails";
 
+/// Key substring marker that makes the mock server treat the object as a
+/// real, [`SIZED_OBJECT_BODY`]-byte object: HeadObject reports its true
+/// `Content-Length`, and GetObject honours a `Range: bytes=a-b` header by
+/// returning exactly that slice (206), or the whole body (200) when no
+/// Range header is sent. Every other key keeps the fixed 4-byte `mock`
+/// behaviour that the older tests rely on. Used by the issue #172 tests,
+/// which must reach the code path that issues one ranged GET per chunk.
+pub const SIZED_OBJECT_MARKER: &str = "sized-obj";
+
+/// Body served for keys containing [`SIZED_OBJECT_MARKER`].
+pub const SIZED_OBJECT_BODY: &[u8; 16] = b"0123456789abcdef";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -249,6 +261,11 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
+    let range_header = req
+        .headers()
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     // Collect the body — DeleteObjects needs to inspect which keys were
     // requested (see below); every other route just needs it drained so
     // the connection can be cleanly reused/closed.
@@ -375,9 +392,14 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
                 .body(Full::new(Bytes::new()))
                 .unwrap();
         }
+        let head_len = if path.contains(SIZED_OBJECT_MARKER) {
+            SIZED_OBJECT_BODY.len()
+        } else {
+            0
+        };
         return Response::builder()
             .status(StatusCode::OK)
-            .header("Content-Length", "0")
+            .header("Content-Length", head_len.to_string())
             .body(Full::new(Bytes::new()))
             .unwrap();
     }
@@ -396,6 +418,9 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         if path.contains(GET_FAILS_ONCE_MARKER) && attempt == 1 {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockTransientGetFailure");
         }
+        if path.contains(SIZED_OBJECT_MARKER) {
+            return sized_object_get(range_header.as_deref());
+        }
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Length", "4")
@@ -406,6 +431,38 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Full::new(Bytes::from("mock-s3-server: unhandled route")))
+        .unwrap()
+}
+
+/// GetObject for a [`SIZED_OBJECT_MARKER`] key: no Range header returns the
+/// whole body (200); `bytes=a-b` / `bytes=a-` returns that inclusive slice
+/// (206), clamped to the body like real S3.
+fn sized_object_get(range_header: Option<&str>) -> Response<Full<Bytes>> {
+    let body = SIZED_OBJECT_BODY;
+    let spec = range_header.and_then(|h| h.strip_prefix("bytes="));
+    let Some(spec) = spec else {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Length", body.len().to_string())
+            .body(Full::new(Bytes::from_static(body)))
+            .unwrap();
+    };
+    let (start_s, end_s) = spec.split_once('-').unwrap_or((spec, ""));
+    let start = start_s.parse::<usize>().unwrap_or(0);
+    let last = body.len() - 1;
+    let end = end_s.parse::<usize>().map(|e| e.min(last)).unwrap_or(last);
+    if start > end {
+        return error_response(StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange");
+    }
+    let slice = &body[start..=end];
+    Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header("Content-Length", slice.len().to_string())
+        .header(
+            "Content-Range",
+            format!("bytes {start}-{end}/{}", body.len()),
+        )
+        .body(Full::new(Bytes::copy_from_slice(slice)))
         .unwrap()
 }
 

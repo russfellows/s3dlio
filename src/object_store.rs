@@ -1452,11 +1452,12 @@ impl ObjectStore for S3ObjectStore {
 
         if let Some(client) = &self.client {
             let (bucket, key) = parse_s3_uri(uri)?;
-            let key_clean = key.trim_start_matches('/');
+            // Issue #172: the key the caller names is the key sent -- no
+            // stripping (get_range above already used it verbatim).
             let resp = client
                 .head_object()
                 .bucket(&bucket)
-                .key(key_clean)
+                .key(&key)
                 .send()
                 .await
                 .sdk_context(format!("S3 HEAD failed for '{}'", uri))?;

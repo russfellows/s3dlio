@@ -1078,7 +1078,7 @@ pub async fn get_object_range_uri_async(
         let resp = client
             .get_object()
             .bucket(&bucket)
-            .key(key.trim_start_matches('/'))
+            .key(&key)
             .range(&range)
             .send()
             .await
@@ -1139,7 +1139,7 @@ pub async fn get_object_range_uri_timed_async(
     let resp = client
         .get_object()
         .bucket(&bucket)
-        .key(key.trim_start_matches('/'))
+        .key(&key)
         .range(range)
         .send()
         .await
@@ -1209,7 +1209,7 @@ pub async fn get_object_concurrent_range_async(
     let head_resp = client
         .head_object()
         .bucket(&bucket)
-        .key(key.trim_start_matches('/'))
+        .key(&key)
         .send()
         .await
         .sdk_context(format!(
@@ -1473,7 +1473,7 @@ async fn attempt_range_chunk_fill(
     let mut resp = client
         .get_object()
         .bucket(bucket)
-        .key(key.trim_start_matches('/'))
+        .key(key)
         .range(range_header)
         .send()
         .await
@@ -1574,18 +1574,17 @@ pub fn get_object_concurrent_range(
 pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
     // NOTE: Legacy S3Ops logging call removed here (was: `let _ = build_ops_async()...`)
     // Could hang on non-AWS endpoints. See docs/bugs/PYTHON_LIST_HANG_BUG_REPORT.md
-    let key_clean = key.trim_start_matches('/');
-
-    debug!("stat_object: bucket='{}', key='{}'", bucket, key_clean);
+    // Issue #172: the key the caller names is the key sent -- no stripping.
+    debug!("stat_object: bucket='{}', key='{}'", bucket, key);
 
     let client = aws_s3_client_async().await?;
     let resp = client
         .head_object()
         .bucket(bucket)
-        .key(key.trim_start_matches('/'))
+        .key(key)
         .send()
         .await
-        .sdk_context(format!("HEAD for s3://{}/{} failed", bucket, key_clean))?;
+        .sdk_context(format!("HEAD for s3://{}/{} failed", bucket, key))?;
 
     Ok(ObjectStat {
         size: resp.content_length().unwrap_or_default() as u64,
@@ -2047,13 +2046,7 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
     } else {
         // Cache miss: issue one HEAD to learn the size, then cache it.
         let client = aws_s3_client_async().await?;
-        match client
-            .head_object()
-            .bucket(&bucket)
-            .key(key.trim_start_matches('/'))
-            .send()
-            .await
-        {
+        match client.head_object().bucket(&bucket).key(&key).send().await {
             // Locked contract (audit #152 f37, bug B3): a HEAD that
             // succeeds but omits Content-Length must not be cached as
             // size=0 (unwrap_or(0) did that here) — that poisons the
@@ -2120,7 +2113,7 @@ async fn get_object_with_known_size_async(
 
     // If total fits in one chunk, use a single range request (no concurrency overhead).
     if total_bytes <= effective_chunk_size as u64 {
-        let uri = format!("s3://{}/{}", bucket, key.trim_start_matches('/'));
+        let uri = format!("s3://{}/{}", bucket, key);
         return get_object_range_uri_async(&uri, start_offset, Some(total_bytes)).await;
     }
 
@@ -2536,6 +2529,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must start with s3://"));
+    }
+
+    // Issue #172 lock: the key is returned exactly as written -- every leading
+    // '/' after the bucket separator is part of the key, and every operation
+    // (stat, ranged GET, size probe, PUT, plain GET) must send it unchanged.
+    #[test]
+    fn test_parse_s3_uri_keeps_leading_slashes_in_key() {
+        let (bucket, key) = parse_s3_uri("s3://bkt//data/x").unwrap();
+        assert_eq!((bucket.as_str(), key.as_str()), ("bkt", "/data/x"));
+        let (_, key) = parse_s3_uri("s3://bkt///data/x").unwrap();
+        assert_eq!(key, "//data/x");
+        let (_, key) = parse_s3_uri("s3://bkt/data/x").unwrap();
+        assert_eq!(key, "data/x");
     }
 
     #[test]
