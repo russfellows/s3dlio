@@ -26,6 +26,9 @@ fn compute_checksum(data: &[u8]) -> String {
 }
 
 // --- S3 ----------------------------------------------------------------------
+use crate::delete_batch_plan::{
+    aggregate_failures, group_uris_by_bucket, BucketGroup, GroupFailure,
+};
 use crate::s3_utils::{
     create_bucket_async as s3_create_bucket_async,
     delete_bucket_async as s3_delete_bucket_async,
@@ -1137,6 +1140,91 @@ impl S3ObjectStore {
         Ok(metadata.size)
     }
 
+    /// Delete every key of one bucket group (issue #179).
+    ///
+    /// On failure returns the index (into `group.uris`) of the first URI that
+    /// was not confirmed deleted, plus the error.  Requests are issued in
+    /// order, at most `DELETE_BATCH_MAX_KEYS` keys each, and stop at the first
+    /// failing request, exactly as the pre-#179 single-bucket loop did.
+    async fn delete_bucket_group(
+        &self,
+        group: &BucketGroup<String>,
+    ) -> std::result::Result<(), (usize, anyhow::Error)> {
+        let bucket = &group.target;
+
+        if let Some(client) = &self.client {
+            let mut done = 0usize;
+            for (_chunk_uris, chunk_keys) in group.chunks() {
+                Self::delete_chunk_with_client(client, bucket, chunk_keys)
+                    .await
+                    .map_err(|e| (done, e))?;
+                done += chunk_keys.len();
+            }
+            return Ok(());
+        }
+
+        // Global-client path: s3_delete_objects_async chunks at 1000 itself
+        // and checks the per-key results of every response.
+        s3_delete_objects_async(bucket, &group.keys)
+            .await
+            .map_err(|e| (0, e))
+    }
+
+    /// One DeleteObjects request (<= 1000 keys) through a per-endpoint client.
+    async fn delete_chunk_with_client(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<()> {
+        let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = keys
+            .iter()
+            .filter_map(|k| {
+                aws_sdk_s3::types::ObjectIdentifier::builder()
+                    .key(k)
+                    .build()
+                    .ok()
+            })
+            .collect();
+        let delete = aws_sdk_s3::types::Delete::builder()
+            .set_objects(Some(objects))
+            .build()
+            .context("Failed to build Delete request")?;
+        let output = client
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .send()
+            .await
+            .with_context(|| format!("S3 batch DELETE failed for bucket '{}'", bucket))?;
+
+        // S3 reports per-key failures inside an HTTP 200 body (see
+        // s3_utils::delete_objects_async, audit #151 f36); do not discard them.
+        let errs = output.errors();
+        if !errs.is_empty() {
+            let detail = errs
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}: {} ({})",
+                        e.key().unwrap_or("<unknown key>"),
+                        e.code().unwrap_or("<unknown code>"),
+                        e.message().unwrap_or("<no message>")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "S3 batch DELETE for bucket '{}' partially failed: {} of {} object(s) not \
+                 deleted: {}",
+                bucket,
+                errs.len(),
+                keys.len(),
+                detail
+            );
+        }
+        Ok(())
+    }
+
     /// List objects using a given client (shared implementation for list() and list_stream()).
     async fn list_with_client(
         client: &aws_sdk_s3::Client,
@@ -1513,41 +1601,23 @@ impl ObjectStore for S3ObjectStore {
         }
         debug!("S3ObjectStore::delete_batch {} URIs", uris.len());
 
-        // Extract bucket and keys from URIs
-        let (bucket, _) = parse_s3_uri(&uris[0])?;
-        let keys: Vec<String> = uris
-            .iter()
-            .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, key)| key))
-            .collect();
-
-        if let Some(client) = &self.client {
-            for chunk in keys.chunks(1000) {
-                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk
-                    .iter()
-                    .filter_map(|k| {
-                        aws_sdk_s3::types::ObjectIdentifier::builder()
-                            .key(k)
-                            .build()
-                            .ok()
-                    })
-                    .collect();
-                let delete = aws_sdk_s3::types::Delete::builder()
-                    .set_objects(Some(objects))
-                    .build()
-                    .context("Failed to build Delete request")?;
-                client
-                    .delete_objects()
-                    .bucket(&bucket)
-                    .delete(delete)
-                    .send()
-                    .await
-                    .with_context(|| format!("S3 batch DELETE failed for bucket '{}'", bucket))?;
+        // Issue #179: a batch may span several buckets, and DeleteObjects
+        // addresses exactly one.  Group by bucket (validating every URI first,
+        // so a batch we cannot fully interpret deletes nothing), then issue
+        // the requests per bucket.  A single-bucket batch is one group and
+        // behaves exactly as before.
+        let groups = group_uris_by_bucket(uris, parse_s3_uri)?;
+        let mut failures: Vec<GroupFailure> = Vec::new();
+        for group in &groups {
+            if let Err((first_undeleted, error)) = self.delete_bucket_group(group).await {
+                failures.push(GroupFailure {
+                    target: format!("s3://{}", group.target),
+                    uris: group.uris.iter().skip(first_undeleted).cloned().collect(),
+                    error,
+                });
             }
-            return Ok(());
         }
-
-        // Use S3 batch delete API (1000 objects per request)
-        s3_delete_objects_async(&bucket, &keys).await
+        aggregate_failures(uris.len(), failures)
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -1958,6 +2028,13 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     }
 
     bail!("not a recognized Azure URI: {}", uri)
+}
+
+/// `delete_batch` grouping key for Azure URIs: `((account, container), key)`.
+#[cfg(feature = "backend-azure")]
+fn azure_group_key(uri: &str) -> Result<((String, String), String)> {
+    let (account, container, key) = parse_azure_uri(uri)?;
+    Ok(((account, container), key))
 }
 
 #[cfg(feature = "backend-azure")]
@@ -2439,14 +2516,27 @@ impl ObjectStore for AzureObjectStore {
         }
         debug!("AzureObjectStore::delete_batch {} URIs", uris.len());
 
-        // Azure Blob batch delete: already supports batching
-        let (cli, _acct, _cont, _) = Self::client_for_uri(&uris[0])?;
-        let keys: Vec<String> = uris
-            .iter()
-            .filter_map(|uri| Self::client_for_uri(uri).ok().map(|(_, _, _, key)| key))
-            .collect();
-
-        cli.delete_objects(&keys).await
+        // Issue #179: a batch may span several containers (or accounts); a
+        // client addresses exactly one container.  Group by (account,
+        // container), validating every URI first, then delete per container.
+        let groups = group_uris_by_bucket(uris, azure_group_key)?;
+        let mut failures: Vec<GroupFailure> = Vec::new();
+        for group in &groups {
+            let (account, container) = &group.target;
+            let outcome = match group.uris.first().map(|u| Self::client_for_uri(u)) {
+                Some(Ok((cli, _acct, _cont, _))) => cli.delete_objects(&group.keys).await,
+                Some(Err(e)) => Err(e),
+                None => continue, // unreachable: a group always holds >= 1 URI
+            };
+            if let Err(error) = outcome {
+                failures.push(GroupFailure {
+                    target: format!("az://{account}/{container}"),
+                    uris: group.uris.clone(),
+                    error,
+                });
+            }
+        }
+        aggregate_failures(uris.len(), failures)
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -3025,15 +3115,26 @@ impl ObjectStore for GcsObjectStore {
         }
         debug!("GcsObjectStore::delete_batch {} URIs", uris.len());
 
-        // GCS batch delete: extract bucket and objects
-        let (bucket, _) = parse_gcs_uri(&uris[0])?;
-        let objects: Vec<String> = uris
-            .iter()
-            .filter_map(|uri| parse_gcs_uri(uri).ok().map(|(_, obj)| obj))
-            .collect();
-
+        // Issue #179: a batch may span several buckets; delete_objects
+        // addresses exactly one.  Group by bucket, validating every URI first
+        // (a batch we cannot fully interpret deletes nothing), then delete per
+        // bucket.  A single-bucket batch is one group, as before.
+        let groups = group_uris_by_bucket(uris, parse_gcs_uri)?;
         let client = self.get_client().await?;
-        client.delete_objects(&bucket, objects).await
+        let mut failures: Vec<GroupFailure> = Vec::new();
+        for group in &groups {
+            if let Err(error) = client
+                .delete_objects(&group.target, group.keys.clone())
+                .await
+            {
+                failures.push(GroupFailure {
+                    target: format!("gs://{}", group.target),
+                    uris: group.uris.clone(),
+                    error,
+                });
+            }
+        }
+        aggregate_failures(uris.len(), failures)
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -4495,5 +4596,78 @@ mod list_common_prefix_tests {
             "listing subdir/ must NOT include sibling top_file.txt; got: {:?}",
             keys
         );
+    }
+}
+
+// ── delete_batch URI grouping for the GCS and Azure adapters (issue #179) ──
+//
+// The S3 adapter is covered end-to-end by tests/test_delete_batch_buckets.rs
+// (mock endpoint).  GCS and Azure need live credentials for a store-level
+// test, so their bucket/container grouping is pinned here with the exact
+// parser each adapter hands to `group_uris_by_bucket`.
+#[cfg(test)]
+mod delete_batch_grouping_tests {
+    #[cfg(any(feature = "backend-gcs", feature = "backend-azure"))]
+    use super::*;
+
+    #[cfg(feature = "backend-gcs")]
+    #[test]
+    fn gcs_batch_is_split_per_bucket_and_gcs_scheme_alias_groups_together() {
+        let uris: Vec<String> = ["gs://bucket1/p/a", "gs://bucket2/p/b", "gcs://bucket1/p/c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let g = group_uris_by_bucket(&uris, parse_gcs_uri).expect("group");
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].target, "bucket1");
+        assert_eq!(g[0].keys, vec!["p/a", "p/c"]);
+        assert_eq!(g[1].target, "bucket2");
+        assert_eq!(g[1].keys, vec!["p/b"]);
+    }
+
+    #[cfg(feature = "backend-gcs")]
+    #[test]
+    fn gcs_batch_with_unparseable_uri_is_an_error() {
+        let uris: Vec<String> = ["gs://bucket1/a", "s3://wrong-scheme/b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = group_uris_by_bucket(&uris, parse_gcs_uri).unwrap_err();
+        assert!(format!("{err:#}").contains("s3://wrong-scheme/b"));
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn azure_batch_is_split_per_account_and_container() {
+        let uris: Vec<String> = [
+            "az://acct1/cont1/a",
+            "az://acct1/cont2/b",
+            "az://acct2/cont1/c",
+            "https://acct1.blob.core.windows.net/cont1/d",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let g = group_uris_by_bucket(&uris, azure_group_key).expect("group");
+        let targets: Vec<(&str, &str)> = g
+            .iter()
+            .map(|x| (x.target.0.as_str(), x.target.1.as_str()))
+            .collect();
+        assert_eq!(
+            targets,
+            vec![("acct1", "cont1"), ("acct1", "cont2"), ("acct2", "cont1")]
+        );
+        assert_eq!(g[0].keys, vec!["a", "d"]);
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn azure_batch_with_unparseable_uri_is_an_error() {
+        let uris: Vec<String> = ["az://acct1/cont1/a", "s3://nope/b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = group_uris_by_bucket(&uris, azure_group_key).unwrap_err();
+        assert!(format!("{err:#}").contains("s3://nope/b"));
     }
 }
