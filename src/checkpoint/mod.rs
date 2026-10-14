@@ -7,7 +7,7 @@ pub mod paths;
 pub mod reader;
 pub mod writer;
 
-use crate::object_store::{store_for_uri, ObjectStore};
+use crate::object_store::{store_for_uri_with_helper_rows, ObjectStore};
 use anyhow::Result;
 use bytes::Bytes;
 pub use latest::Latest;
@@ -122,7 +122,9 @@ pub struct CheckpointStore {
 impl CheckpointStore {
     /// Create a new checkpoint store with default configuration
     pub fn open(uri: &str) -> Result<Self> {
-        let store = store_for_uri(uri)?;
+        // As before W2: an unlogged store; on a bucket-form S3 URI its get/put write the
+        // S3 helper row when the op-log is active, on every other backend no row.
+        let store = store_for_uri_with_helper_rows(uri)?;
         Ok(Self {
             uri: uri.to_string(),
             store,
@@ -132,7 +134,9 @@ impl CheckpointStore {
 
     /// Create a checkpoint store with custom configuration
     pub fn open_with_config(uri: &str, config: CheckpointConfig) -> Result<Self> {
-        let store = store_for_uri(uri)?;
+        // As before W2: an unlogged store; on a bucket-form S3 URI its get/put write the
+        // S3 helper row when the op-log is active, on every other backend no row.
+        let store = store_for_uri_with_helper_rows(uri)?;
         Ok(Self {
             uri: uri.to_string(),
             store,

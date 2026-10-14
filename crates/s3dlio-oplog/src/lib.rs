@@ -118,4 +118,4 @@ pub mod uri;
 pub use reader::{OpLogFormat, OpLogReader, OpLogStreamReader};
 pub use replayer::{replay_with_s3dlio, replay_workload, OpExecutor, ReplayConfig, S3dlioExecutor};
 pub use types::{OpLogEntry, OpType};
-pub use uri::translate_uri;
+pub use uri::{row_uri, translate_uri, RowUriError};

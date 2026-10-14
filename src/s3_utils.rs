@@ -40,7 +40,7 @@ use crate::data_gen::generate_object;
 use crate::retry::retry_get_body;
 use crate::s3_client::{aws_s3_client_async, run_on_global_rt};
 
-// S3 operation logging
+// S3 operation logging (the public helpers in this module write the S3Ops row)
 use crate::s3_logger::global_logger;
 use crate::s3_ops::S3Ops;
 
@@ -140,10 +140,7 @@ where
                 "NoSuchBucket" => " — bucket does not exist; check the bucket name in the URI",
                 "AccessDenied" => " — check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
                 "InvalidAccessKeyId" => {
-                    if std::env::var("AWS_ENDPOINT_URL")
-                        .map(|v| v.is_empty())
-                        .unwrap_or(true)
-                    {
+                    if crate::s3_client::s3_endpoint_url_from_env().is_none() {
                         " — AWS_ACCESS_KEY_ID is not recognised by the server; \
                           no endpoint URL is set — did you forget --endpoint-url or AWS_ENDPOINT_URL? \
                           (credentials valid for a custom endpoint are rejected by real AWS S3)"
@@ -327,13 +324,45 @@ fn get_size_cache() -> &'static Arc<ObjectSizeCache> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// helpers: create an S3Ops around the global S3 client.
+//
+// `S3Ops` is the S3 helpers' own row writer. A row is written ONLY when the
+// `S3Ops` was built with a logger, so the owner of a call is chosen by which
+// builder the call used (issue #169, one row per call):
+//
+// * `build_ops_async` -- the public helper functions of this module that are
+//   user entry points (`get_object`, `put_object_async`, `delete_objects`, and
+//   everything built on them). Wired to the singleton logger exactly as before
+//   W2, so the row they write has the same fields as the row they always wrote.
+// * `Rows::Skip` -- the S3 backend of an `ObjectStore`. The store's
+//   caller records the call (a `LoggedObjectStore`), or deliberately does not (a
+//   store built without a logger), so the backend must not write a second row.
+
+/// Whether a helper call writes the S3Ops row (see the block comment above).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rows {
+    /// Public helper: write the S3Ops row if the op-log is active.
+    Write,
+    /// Backend of an `ObjectStore`: write nothing.
+    Skip,
+}
+
+async fn build_ops_for(rows: Rows) -> Result<S3Ops> {
+    let client = aws_s3_client_async().await?;
+    Ok(match rows {
+        Rows::Write => {
+            let logger = global_logger();
+            let client_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
+            let endpoint = crate::s3_client::s3_endpoint_url_from_env().unwrap_or_default();
+            S3Ops::new(client, logger, &client_id, &endpoint)
+        }
+        Rows::Skip => S3Ops::new(client, None, "", ""),
+    })
+}
+
 // helper: create an S3Ops wired to the singleton logger (if any)
 async fn build_ops_async() -> Result<S3Ops> {
-    let client = aws_s3_client_async().await?;
-    let logger = global_logger();
-    let client_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
-    let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
-    Ok(S3Ops::new(client, logger, &client_id, &endpoint))
+    build_ops_for(Rows::Write).await
 }
 
 // -----------------------------------------------------------------------------
@@ -781,35 +810,147 @@ pub fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
     Ok((components.bucket, components.key))
 }
 
+/// A server named by the first segment of an `s3://` URI (`host:port` or
+/// `[ipv6]:port`), with the endpoint URL a client for it is built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Server {
+    /// The authority as written in the URI, e.g. `10.9.0.17:9000`.
+    pub authority: String,
+    /// The endpoint URL derived from it (`http://10.9.0.17:9000`; `https` for
+    /// port 443 and the ports in `S3DLIO_S3_ENDPOINT_TLS_PORTS`).
+    pub endpoint_url: String,
+}
+
+/// Classify the first segment of an `s3://` URI with the shared server-vs-bucket
+/// rule ([`classify_s3_first_segment`], issues #178 / #199 / #200): `Ok(Some)`
+/// for an explicit `host:port` / `[ipv6]:port`, `Ok(None)` for a bucket name,
+/// `Err` for a portless IP address or any malformed segment.
+pub fn s3_server_of_first_segment(segment: &str) -> Result<Option<S3Server>> {
+    match classify_s3_first_segment(segment)? {
+        S3FirstSegment::Bucket(_) => Ok(None),
+        S3FirstSegment::Server(authority) => Ok(Some(S3Server {
+            authority: authority.to_string(),
+            endpoint_url: crate::object_store::s3_endpoint_url_from_authority(authority)?,
+        })),
+    }
+}
+
+/// Where a bucket-level request for an `s3://` URI or bare bucket name goes:
+/// the named server (`None` = the process-global client) and the bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3BucketTarget {
+    pub server: Option<S3Server>,
+    pub bucket: String,
+}
+
+/// Resolve `s3://bucket[/...]`, `s3://host:port/bucket[/...]` or a bare `bucket`
+/// to a [`S3BucketTarget`], with the shared server-vs-bucket rule
+/// ([`classify_s3_first_segment`]). Anything after the bucket (a key prefix) is
+/// ignored, as for `s3-cli create-bucket`.
+///
+/// Errors: a portless IP address (the #178 error), a malformed server, or a
+/// missing bucket (`s3://host:9000/`, `s3://`, an empty name).
+pub fn s3_bucket_target(uri_or_bucket: &str) -> Result<S3BucketTarget> {
+    let rest = uri_or_bucket.strip_prefix("s3://").unwrap_or(uri_or_bucket);
+    let mut segments = rest.split('/');
+    let first = segments.next().unwrap_or("");
+    let ctx = || format!("invalid S3 URI '{uri_or_bucket}'");
+    let server = s3_server_of_first_segment(first).with_context(ctx)?;
+    let bucket = match &server {
+        Some(server) => {
+            let bucket = segments.next().unwrap_or("");
+            if bucket.is_empty() {
+                return Err(missing_bucket_after_server(
+                    &server.authority,
+                    uri_or_bucket,
+                ));
+            }
+            bucket
+        }
+        None => first,
+    };
+    Ok(S3BucketTarget {
+        server,
+        bucket: bucket.to_string(),
+    })
+}
+
+/// The S3 client for `server`: a dedicated per-endpoint client when a server is
+/// named, the process-global client otherwise.
+async fn s3_client_for_server(server: Option<&S3Server>) -> Result<aws_sdk_s3::Client> {
+    match server {
+        Some(server) => {
+            crate::s3_client::create_s3_client_for_endpoint(&server.endpoint_url, None).await
+        }
+        None => aws_s3_client_async().await,
+    }
+}
+
 // -----------------------------------------------------------------------------
 // S3 Create bucket
 // -----------------------------------------------------------------------------
 /// Create an S3 bucket if it does not exist.
+///
+/// `bucket` is a bare bucket name on the process-global endpoint. To create the
+/// bucket a URI names (`s3://host:port/bucket` goes to that server), use
+/// [`create_bucket_for_uri`].
 pub fn create_bucket(bucket: &str) -> Result<()> {
     let bucket = bucket.to_string(); // own it
     run_on_global_rt(async move {
         let client = aws_s3_client_async().await?;
-        match client.create_bucket().bucket(&bucket).send().await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if let Some(code) = e.code() {
-                    if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" {
-                        Ok(())
-                    } else {
-                        Err(sdk_anyhow(
-                            format!("CreateBucket failed for '{}'", bucket),
-                            e,
-                        ))
-                    }
-                } else {
-                    Err(sdk_anyhow(
-                        format!("CreateBucket failed for '{}'", bucket),
-                        e,
-                    ))
-                }
-            }
-        }
+        create_bucket_if_absent_with_client(&client, &bucket).await
     })
+}
+
+/// `CreateBucket` on `client`, treating "already exists" (`BucketAlreadyOwnedByYou`,
+/// `BucketAlreadyExists`) as success.
+async fn create_bucket_if_absent_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+) -> Result<()> {
+    match client.create_bucket().bucket(bucket).send().await {
+        Ok(_) => Ok(()),
+        Err(e) => match e.code() {
+            Some("BucketAlreadyOwnedByYou" | "BucketAlreadyExists") => Ok(()),
+            _ => Err(sdk_anyhow(format!("CreateBucket failed for '{bucket}'"), e)),
+        },
+    }
+}
+
+/// Create the bucket an `s3://` URI (or bare bucket name) names, on the server
+/// it names (issue #199). Async; see [`create_bucket_for_uri`].
+pub async fn create_bucket_for_uri_async(uri_or_bucket: &str) -> Result<()> {
+    let target = s3_bucket_target(uri_or_bucket)?;
+    let client = s3_client_for_server(target.server.as_ref()).await?;
+    create_bucket_if_absent_with_client(&client, &target.bucket).await
+}
+
+/// Create the bucket an `s3://` URI (or bare bucket name) names, on the server
+/// it names; "already exists" is success.
+///
+/// - `bucket`, `s3://bucket`, `s3://bucket/prefix/` → bucket `bucket` on the
+///   process-global endpoint (`AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL`).
+/// - `s3://host:port/bucket[/prefix/]` → bucket `bucket` on `host:port`, through a
+///   per-endpoint client.
+/// - `s3://10.0.0.5/bucket` (portless IP) → the #178 error; nothing is sent.
+pub fn create_bucket_for_uri(uri_or_bucket: &str) -> Result<()> {
+    let uri = uri_or_bucket.to_string();
+    run_on_global_rt(async move { create_bucket_for_uri_async(&uri).await })
+}
+
+/// Delete the (empty) bucket an `s3://` URI (or bare bucket name) names, on the
+/// server it names (issue #199). Async; see [`delete_bucket_for_uri`].
+pub async fn delete_bucket_for_uri_async(uri_or_bucket: &str) -> Result<()> {
+    let target = s3_bucket_target(uri_or_bucket)?;
+    let client = s3_client_for_server(target.server.as_ref()).await?;
+    delete_bucket_with_client(&client, &target.bucket).await
+}
+
+/// Delete the (empty) bucket an `s3://` URI (or bare bucket name) names, on the
+/// server it names. Same URI forms and errors as [`create_bucket_for_uri`].
+pub fn delete_bucket_for_uri(uri_or_bucket: &str) -> Result<()> {
+    let uri = uri_or_bucket.to_string();
+    run_on_global_rt(async move { delete_bucket_for_uri_async(&uri).await })
 }
 
 // -----------------------------------------------------------------------------
@@ -924,13 +1065,28 @@ pub(crate) fn resolve_list_buckets_params(
 ///   uses `AWS_REGION` / `AWS_DEFAULT_REGION` from the environment.  Set
 ///   `AWS_S3_ADDRESSING_STYLE=path` when your endpoint requires path-style
 ///   addressing (GCS and most self-hosted services do).
+///
+/// Lists the process-global server's buckets (`AWS_ENDPOINT_URL_S3` /
+/// `AWS_ENDPOINT_URL`, or AWS). To list a server named in a URI
+/// (`s3://host:port/`), use [`list_buckets_at`].
 pub fn list_buckets() -> Result<Vec<BucketInfo>> {
+    list_buckets_at(None)
+}
+
+/// List the buckets of `server`, through a per-endpoint client, or of the
+/// process-global server when `server` is `None` (issue #200).
+pub fn list_buckets_at(server: Option<&S3Server>) -> Result<Vec<BucketInfo>> {
+    let server = server.cloned();
     run_on_global_rt(async move {
         dotenvy::dotenv().ok();
 
         // Log resolved params for diagnostics (pure helper, no side effects).
+        let endpoint_url_for_log = match &server {
+            Some(server) => Some(server.endpoint_url.clone()),
+            None => crate::s3_client::s3_endpoint_url_from_env(),
+        };
         resolve_list_buckets_params(
-            std::env::var("AWS_ENDPOINT_URL").ok().as_deref(),
+            endpoint_url_for_log.as_deref(),
             std::env::var("AWS_REGION")
                 .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                 .ok()
@@ -938,9 +1094,10 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
             std::env::var("AWS_S3_ADDRESSING_STYLE").ok().as_deref(),
         );
 
-        // Use the shared, fully-configured client (same reqwest transport,
-        // CA bundle, timeouts, and INFO-level logging as every other operation).
-        let client = crate::s3_client::aws_s3_client_async()
+        // The global client is the shared, fully-configured one (same reqwest
+        // transport, CA bundle, timeouts and INFO-level logging as every other
+        // operation); a named server gets a dedicated client built the same way.
+        let client = s3_client_for_server(server.as_ref())
             .await
             .context("Failed to initialise S3 client for list_buckets")?;
 
@@ -1222,7 +1379,7 @@ pub async fn get_object_range_uri_async(
     offset: u64,
     length: Option<u64>,
 ) -> Result<Bytes> {
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET range: no key specified");
     }
@@ -1319,7 +1476,7 @@ pub async fn get_object_range_uri_timed_async(
     length: Option<u64>,
 ) -> Result<(Bytes, std::time::Duration, std::time::Duration)> {
     use std::time::Instant;
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET range: no key specified");
     }
@@ -1405,7 +1562,7 @@ pub async fn get_object_concurrent_range_async(
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
 ) -> Result<Bytes> {
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET concurrent range: no key specified");
     }
@@ -1820,7 +1977,7 @@ pub async fn stat_object(bucket: &str, key: &str) -> Result<ObjectStat> {
 /// Async HEAD by full URI (non-blocking; safe inside Tokio)
 pub async fn stat_object_uri_async(uri: &str) -> Result<ObjectStat> {
     debug!("stat_object_uri_async: uri='{}'", uri);
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot HEAD: no key specified");
     }
@@ -1860,6 +2017,8 @@ pub fn stat_object_uri(uri: &str) -> anyhow::Result<ObjectStat> {
 /// spawns run concurrently regardless of iteration order). Panics are
 /// surfaced as errors instead of silently truncating the result.
 pub async fn stat_object_many_async(uris: Vec<String>) -> Result<Vec<ObjectStat>> {
+    // Issue #197: refuse the whole batch up front if any URI names another server.
+    crate::delete_batch_plan::validate_uris_for_global_client(&uris)?;
     let cancel = CancellationToken::new();
     let _drop_cancel = DropCancel(cancel.clone());
 
@@ -1910,7 +2069,12 @@ pub async fn stat_object_many_async(uris: Vec<String>) -> Result<Vec<ObjectStat>
 // Delete operation
 // -----------------------------------------------------------------------------
 
-/// Delete many keys (up to 1000 per logged batch).
+/// Delete many keys (up to 1000 per logged batch).
+///
+/// With the op-log active each batch of up to 1000 keys is ONE `DELETE` row
+/// (`file` = `(batch)`, `n_objects` = keys in that batch, endpoint =
+/// `AWS_ENDPOINT_URL`), written by `S3Ops::delete_objects`. An empty list
+/// sends no request and writes no row.
 pub fn delete_objects(bucket: &str, keys: &[String]) -> Result<()> {
     let bucket = bucket.to_string();
     let to_delete: Vec<String> = keys.to_vec();
@@ -2023,10 +2187,15 @@ pub async fn create_bucket_with_client(client: &aws_sdk_s3::Client, bucket: &str
 // Download (GET) operations
 // -----------------------------------------------------------------------------
 
-/// Download a single object from S3 **with op‑logging**.
+/// Download a single object from S3 **with op‑logging**: with the op-log active
+/// the call is one `GET` row, written by `S3Ops::get_object`.
 pub async fn get_object(bucket: &str, key: &str) -> Result<Bytes> {
-    // delegate to S3Ops (which records the GET) and propagate errors
-    let data = build_ops_async().await?.get_object(bucket, key).await?;
+    get_object_rows(bucket, key, Rows::Write).await
+}
+
+async fn get_object_rows(bucket: &str, key: &str, rows: Rows) -> Result<Bytes> {
+    // delegate to S3Ops (which records the GET when it has a logger) and propagate errors
+    let data = build_ops_for(rows).await?.get_object(bucket, key).await?;
 
     debug!("S3 GET s3://{}/{} ({} bytes)", bucket, key, data.len());
     Ok(data)
@@ -2049,6 +2218,8 @@ pub fn get_object_uri(uri: &str) -> anyhow::Result<Bytes> {
 ///   On subsequent epochs the cache is already warm; zero HEADs issued.
 /// - O(N log N) sort: replaced O(N²) linear scan with a pre-built HashMap index.
 pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec<(String, Bytes)>> {
+    // Issue #197: refuse the whole batch up front if any URI names another server.
+    crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec();
     run_on_global_rt(async move {
         // Build position index once (O(N)) for O(N log N) sort later.
@@ -2164,6 +2335,8 @@ pub fn get_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<Vec<(String, Bytes)>> {
+    // Issue #197: refuse the whole batch up front if any URI names another server.
+    crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec(); // own for 'static
     run_on_global_rt(async move {
         // Build position index once (O(N)) for O(N log N) sort later.
@@ -2223,13 +2396,21 @@ pub fn get_objects_parallel_with_progress(
 /// - ObjectSizeCache checked before issuing HEAD; result stored after HEAD.
 /// - When range split is chosen, size is passed directly → eliminates HEAD #2.
 /// - All env-var reads cached via OnceLock (no syscall overhead on hot path).
+///
+/// With the op-log active, a single GET (the object is below the range threshold, or the
+/// size is unknown) is one `GET` row from `S3Ops`; an object fetched by concurrent ranges
+/// writes no row, exactly as before W2.
 #[cfg_attr(feature = "profiling", instrument(
     name = "s3.get_optimized",
     skip(uri),
     fields(uri = %uri)
 ))]
 pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
-    let (bucket, key) = parse_s3_uri(uri)?;
+    get_object_uri_optimized_rows(uri, Rows::Write).await
+}
+
+pub(crate) async fn get_object_uri_optimized_rows(uri: &str, rows: Rows) -> Result<Bytes> {
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
     }
@@ -2238,7 +2419,7 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
     // Fixes the bug where S3DLIO_ENABLE_RANGE_OPTIMIZATION=0 was a no-op here.
     if !get_range_opt_enabled() {
         debug!("range_opt disabled: single GET for {}", uri);
-        return get_object(&bucket, &key).await;
+        return get_object_rows(&bucket, &key, rows).await;
     }
 
     // Fast path: skip_head latch — skip HEAD, issue plain GET directly.
@@ -2247,7 +2428,7 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
     // range splitting for large objects — zero downside to skipping HEAD.
     if get_skip_head() {
         debug!("skip_head: plain GET (no HEAD) for {}", uri);
-        let bytes = get_object(&bucket, &key).await?;
+        let bytes = get_object_rows(&bucket, &key, rows).await?;
         // Cache the actual size so future calls can range-split if warranted.
         get_size_cache()
             .put(uri.to_string(), bytes.len() as u64)
@@ -2280,12 +2461,12 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
                     sz
                 }
                 None => {
-                    return get_object(&bucket, &key).await;
+                    return get_object_rows(&bucket, &key, rows).await;
                 }
             },
             Err(_) => {
                 // HEAD failed: fall back to single GET without range splitting.
-                return get_object(&bucket, &key).await;
+                return get_object_rows(&bucket, &key, rows).await;
             }
         }
     };
@@ -2299,7 +2480,7 @@ pub async fn get_object_uri_optimized_async(uri: &str) -> Result<Bytes> {
         // Pass known size → internal impl skips its own HEAD (eliminates HEAD #2).
         get_object_with_known_size_async(&bucket, &key, object_size, 0, None, None, None).await
     } else {
-        get_object(&bucket, &key).await
+        get_object_rows(&bucket, &key, rows).await
     }
 }
 
@@ -2352,14 +2533,19 @@ async fn get_object_with_known_size_async(
     .await
 }
 
-/// Public async get object call
+/// Public async get object call **with op‑logging**: with the op-log active it is
+/// one `GET` row from `S3Ops`.
 pub async fn get_object_uri_async(uri: &str) -> Result<Bytes> {
+    get_object_uri_rows(uri, Rows::Write).await
+}
+
+pub(crate) async fn get_object_uri_rows(uri: &str, rows: Rows) -> Result<Bytes> {
     debug!("get_object_uri_async: uri='{}'", uri);
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET: no key specified");
     }
-    get_object(&bucket, &key).await
+    get_object_rows(&bucket, &key, rows).await
 }
 
 // -----------------------------------------------------------------------------
@@ -2402,13 +2588,18 @@ pub fn put_objects_with_random_data_and_type_with_progress(
     put_objects_parallel_with_progress(uris_vec, buffer, max_in_flight, progress_callback)
 }
 
-/// Upload a single object to S3 **with op‑logging**.
+/// Upload a single object to S3 **with op‑logging**: with the op-log active it is
+/// one `PUT` row from `S3Ops`.
 ///
 /// Accepts `Bytes` for zero-copy efficiency (no .to_vec() call).
 pub async fn put_object_async(bucket: &str, key: &str, data: Bytes) -> Result<()> {
+    put_object_rows(bucket, key, data, Rows::Write).await
+}
+
+async fn put_object_rows(bucket: &str, key: &str, data: Bytes, rows: Rows) -> Result<()> {
     debug!("S3 PUT s3://{}/{} ({} bytes)", bucket, key, data.len());
-    // delegate to S3Ops (which records the PUT) - data moved, no copy
-    build_ops_async()
+    // delegate to S3Ops (which records the PUT when it has a logger) - data moved, no copy
+    build_ops_for(rows)
         .await?
         .put_object(bucket, key, data)
         .await?;
@@ -2419,9 +2610,13 @@ pub async fn put_object_async(bucket: &str, key: &str, data: Bytes) -> Result<()
 ///
 /// Accepts `Bytes` for zero-copy efficiency.
 pub async fn put_object_uri_async(uri: &str, data: Bytes) -> Result<()> {
+    put_object_uri_rows(uri, data, Rows::Write).await
+}
+
+pub(crate) async fn put_object_uri_rows(uri: &str, data: Bytes, rows: Rows) -> Result<()> {
     debug!("put_object_uri_async: uri='{}', {} bytes", uri, data.len());
-    let (bucket, key) = parse_s3_uri(uri)?;
-    put_object_async(&bucket, &key, data).await
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
+    put_object_rows(&bucket, &key, data, rows).await
 }
 
 /// Upload object via multipart using existing MultipartUploadSink infrastructure.

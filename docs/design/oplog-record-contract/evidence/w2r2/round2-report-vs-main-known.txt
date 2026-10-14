@@ -1,0 +1,367 @@
+======================================================================================================================================================
+TRACE-ACCURACY REPORT   s3dlio 0.9.114   wheel s3dlio-0.9.114-cp313-cp313-manylinux_2_39_x86_64.whl   prefix s3dlio-harness-20261014-725c55
+truth: ground-truth call list + gcloud native state + s3dlio client debug log (GCS S3 endpoint https://storage.googleapis.com); no local server, no consumer tools
+======================================================================================================================================================
+case/form                  call               api              target (as asked)                            | (1) ACTION                 | (2) RECORD                     | status
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+core__path                 put                put_bytes        B1/<P>/core/p1                     | OK                         | OK                             | FIXED #169
+core__path                 get                get              B1/<P>/data/a.bin                  | OK                         | OK                             | FIXED #169
+core__path                 get_range          get_range        B1/<P>/data/a.bin                  | OK                         | OK                             | PASS
+core__path                 stat               stat             B1/<P>/data/a.bin                  | OK                         | OK                             | PASS
+core__path                 list               list             B1/<P>/data/                       | OK                         | OK                             | PASS
+core__path                 list_rec           list             B1/<P>/data/                       | OK                         | OK                             | PASS
+core__path                 delete             delete           B1/<P>/core/p1                     | OK                         | OK                             | PASS
+core__path                 get_missing        get              B1/<P>/core/nope                   | OK                         | OK                             | FIXED #169
+core__path                 stat_missing       stat             B1/<P>/core/nope                   | OK                         | OK                             | PASS
+core__path                 exists             exists           B1/<P>/data/a.bin                  | OK                         | OK                             | PASS
+core__path                 exists_missing     exists           B1/<P>/core/nope                   | OK                         | OK                             | PASS
+core__fileuri              put                put_bytes        B1/<P>/core/p1                     | OK                         | OK                             | FIXED #169
+core__fileuri              get                get              B1/<P>/data/a.bin                  | OK                         | OK                             | FIXED #169
+core__fileuri              get_range          get_range        B1/<P>/data/a.bin                  | OK                         | OK                             | PASS
+core__fileuri              stat               stat             B1/<P>/data/a.bin                  | OK                         | OK                             | PASS
+core__fileuri              list               list             B1/<P>/data/                       | OK                         | OK                             | PASS
+core__fileuri              list_rec           list             B1/<P>/data/                       | OK                         | OK                             | PASS
+core__fileuri              delete             delete           B1/<P>/core/p1                     | OK                         | OK                             | PASS
+core__fileuri              get_missing        get              B1/<P>/core/nope                   | OK                         | OK                             | FIXED #169
+core__fileuri              stat_missing       stat             B1/<P>/core/nope                   | OK                         | OK                             | PASS
+core__fileuri              exists             exists           B1/<P>/data/a.bin                  | OK                         | OK                             | PASS
+core__fileuri              exists_missing     exists           B1/<P>/core/nope                   | OK                         | OK                             | PASS
+repeat__fileuri            get0               get              B1/<P>/data/a.bin                  | OK                         | OK                             | FIXED #169
+repeat__fileuri            get1               get              B1/<P>/data/a.bin                  | OK                         | OK                             | FIXED #169
+repeat__fileuri            get2               get              B1/<P>/data/a.bin                  | OK                         | OK                             | FIXED #169
+repeat__fileuri            stat0              stat             B1/<P>/data/a.bin                  | OK                         | OK                             | PASS
+repeat__fileuri            stat1              stat             B1/<P>/data/a.bin                  | OK                         | OK                             | PASS
+repeat__fileuri            stat2              stat             B1/<P>/data/a.bin                  | OK                         | OK                             | PASS
+two_buckets__path          get_same_b1        get              B1/<P>/same/obj                    | OK                         | OK                             | FIXED #169
+two_buckets__path          get_same_b2        get              B2/<P>/same/obj                    | OK                         | OK                             | FIXED #169
+two_buckets__path          stat_same_b1       stat             B1/<P>/same/obj                    | OK                         | OK                             | PASS
+two_buckets__path          stat_same_b2       stat             B2/<P>/same/obj                    | OK                         | OK                             | PASS
+two_buckets__path          put_B1   put_bytes        B1/<P>/tb/put                      | OK                         | OK                             | FIXED #169
+two_buckets__path          put_B2   put_bytes        B2/<P>/tb/put                      | OK                         | OK                             | FIXED #169
+two_buckets__path          delete_b2          delete           B2/<P>/del/a                       | OK                         | OK                             | PASS
+leading_slash__fileuri     get_slash_lead     get              B1//<P>/slash/x                    | OK                         | OK                             | FIXED #169
+leading_slash__fileuri     get_slash_plain    get              B1/<P>/slash/x                     | OK                         | OK                             | FIXED #169
+leading_slash__fileuri     stat_slash_lead    stat             B1//<P>/slash/x                    | OK                         | OK                             | FIXED #172
+leading_slash__fileuri     stat_slash_plain   stat             B1/<P>/slash/x                     | OK                         | OK                             | PASS
+leading_slash__fileuri     range_slash_lead   get_range        B1//<P>/slash/x                    | OK                         | OK                             | FIXED #172
+leading_slash__fileuri     range_slash_plain  get_range        B1/<P>/slash/x                     | OK                         | OK                             | PASS
+leading_slash__fileuri     put_lead           put_bytes        B1//<P>/slash/pnew                 | OK                         | OK                             | FIXED #169
+leading_slash__fileuri     delete_lead        delete           B1//<P>/del/ls                     | OK                         | OK                             | PASS
+async__path                put_async          put_bytes_async  B1/<P>/as/p1                       | OK                         | OK                             | FIXED #169
+async__path                get_async0         get_async        B1/<P>/async/g1                    | OK                         | OK                             | PASS
+async__path                get_async1         get_async        B1/<P>/async/g1                    | OK                         | OK                             | PASS
+async__path                stat_async         stat_async       B1/<P>/async/g1                    | OK                         | OK                             | PASS
+async__path                delete             delete           B1/<P>/as/p1                       | OK                         | OK                             | FIXED #174
+get_many__fileuri          many0              get_many         B1/<P>/many/m0                     | OK                         | OK                             | PASS
+get_many__fileuri          many1              get_many         B1/<P>/many/m1                     | OK                         | OK                             | PASS
+get_many__fileuri          many2              get_many         B1/<P>/many/m2                     | OK                         | OK                             | PASS
+local_files__path          put                put_bytes        file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__path          get                get              file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__path          get_range          get_range        file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__path          stat               stat             file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__path          list               list             file:dir/                                    | OK                         | OK                             | PASS
+local_files__path          delete             delete           file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__path          get_missing        get              file:nope.bin                                | OK                         | OK                             | PASS
+local_files__fileuri       put                put_bytes        file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__fileuri       get                get              file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__fileuri       get_range          get_range        file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__fileuri       stat               stat             file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__fileuri       list               list             file:dir/                                    | OK                         | OK                             | PASS
+local_files__fileuri       delete             delete           file:f1.bin                                  | OK                         | OK                             | PASS
+local_files__fileuri       get_missing        get              file:nope.bin                                | OK                         | OK                             | PASS
+s3_dest_reject__path       get_after_reinit   get              B1/<P>/data/a.bin                  | OK                         | OK                             | FIXED #169
+multi_endpoint__path       get                me.get           B1/<P>/me/m1                       | OK                         | OK                             | PASS
+multi_endpoint__path       get_range          me.get_range     B1/<P>/me/m1                       | OK                         | MISSING                        | KNOWN #175
+multi_endpoint__path       put                me.put           B1/<P>/me/p1                       | OK                         | OK                             | PASS
+multi_endpoint__path       list               me.list          B1/<P>/me/                         | OK                         | MISSING                        | KNOWN #175
+multi_endpoint__path       delete             me.delete        B1/<P>/me/p1                       | OK                         | MISSING                        | KNOWN #175
+host443_get__path          c1                 get              storage.googleapis.co~|B1/<P>/dat~ | OK                         | OK                             | FIXED #173
+host443_stat__path         c1                 stat             storage.googleapis.co~|B1/<P>/dat~ | OK                         | OK                             | PASS
+host443_get_range__path    c1                 get_range        storage.googleapis.co~|B1/<P>/dat~ | OK                         | OK                             | FIXED #173
+host443_get_async__path    c1                 get_async        storage.googleapis.co~|B1/<P>/dat~ | OK                         | OK                             | FIXED #174
+host443_decoydefault_stat__path c1                 stat             storage.googleapis.co~|B1/<P>/dat~ | OK                         | OK                             | PASS
+host443_decoydefault_get_async__path c1                 get_async        storage.googleapis.co~|B1/<P>/dat~ | OK                         | OK                             | FIXED #174
+host443_decoydefault_get_many__path m1                 get_many         storage.googleapis.co~|B1/<P>/dat~ | WRONG-ACTION:port,scheme,~ | OK                             | KNOWN #171
+host443_decoydefault_get_many__path m2                 get_many         storage.googleapis.co~|B1/<P>/dat~ | WRONG-ACTION:port,scheme,~ | OK                             | KNOWN #171
+portless_get__path         c1                 get              10.255.255.1|B1/<P>/data/c.bin     | OK                         | MISSING                        | KNOWN #178/#169
+portless_stat__path        c1                 stat             10.255.255.1|B1/<P>/data/c.bin     | OK                         | MISSING                        | KNOWN #178
+portless_put__path         c1                 put_bytes        10.255.255.1|B1/<P>/pl/put-np      | OK                         | MISSING                        | KNOWN #178/#169
+me_host443__path           c1                 me.get           storage.googleapis.co~|B1/<P>/me/~ | OK                         | MISSING                        | KNOWN #180/#175
+
+======================================================================================================================================================
+DETAILS (every call whose verdict is not PASS)
+======================================================================================================================================================
+[core__path :: put] put_bytes  s3://B1/<P>/core/p1   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/core/p1
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/core/p1  sdk_requests=1 (PutObject)
+    row 0: PUT       client_id='' n=1 bytes=100 endpoint=s3://B1 file=B1/<P>/core/p1 err=''  -> fields ok
+    note  : row idx 0: server not recorded
+[core__path :: get] get  s3://B1/<P>/data/a.bin   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin  sdk_requests=2 (HeadObject,GetObject)
+    row 1: GET       client_id='' n=1 bytes=331 endpoint=s3://B1 file=B1/<P>/data/a.bin err=''  -> fields ok
+    note  : row idx 1: server not recorded
+[core__path :: get_missing] get  s3://B1/<P>/core/nope   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ERROR: RuntimeError: S3 GET for s3://B1/s3dlio-harness-20261014-725c55/core/nope failed: service error: NoSuchKey (The specified key doe~
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/core/nope
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/core/nope  sdk_requests=4 (HeadObject,GetObject,GetObject,GetObject)
+    row 7: GET       client_id='' n=1 bytes=0 endpoint=s3://B1 file=B1/<P>/core/nope err=S3 GET for s3://B1/~  -> fields ok
+    note  : row idx 7: server not recorded
+[core__fileuri :: put] put_bytes  s3://B1/<P>/core/p1   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/core/p1
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/core/p1  sdk_requests=1 (PutObject)
+    row 0: PUT       client_id='' n=1 bytes=100 endpoint=s3://B1 file=B1/<P>/core/p1 err=''  -> fields ok
+    note  : row idx 0: server not recorded
+[core__fileuri :: get] get  s3://B1/<P>/data/a.bin   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin  sdk_requests=2 (HeadObject,GetObject)
+    row 1: GET       client_id='' n=1 bytes=331 endpoint=s3://B1 file=B1/<P>/data/a.bin err=''  -> fields ok
+    note  : row idx 1: server not recorded
+[core__fileuri :: get_missing] get  s3://B1/<P>/core/nope   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ERROR: RuntimeError: S3 GET for s3://B1/s3dlio-harness-20261014-725c55/core/nope failed: service error: NoSuchKey (The specified key doe~
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/core/nope
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/core/nope  sdk_requests=4 (HeadObject,GetObject,GetObject,GetObject)
+    row 7: GET       client_id='' n=1 bytes=0 endpoint=s3://B1 file=B1/<P>/core/nope err=S3 GET for s3://B1/~  -> fields ok
+    note  : row idx 7: server not recorded
+[repeat__fileuri :: get0] get  s3://B1/<P>/data/a.bin   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin  sdk_requests=2 (HeadObject,GetObject)
+    row 0: GET       client_id='' n=1 bytes=331 endpoint=s3://B1 file=B1/<P>/data/a.bin err=''  -> fields ok
+    note  : row idx 0: server not recorded
+[repeat__fileuri :: get1] get  s3://B1/<P>/data/a.bin   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin  sdk_requests=1 (GetObject)
+    row 1: GET       client_id='' n=1 bytes=331 endpoint=s3://B1 file=B1/<P>/data/a.bin err=''  -> fields ok
+    note  : row idx 1: server not recorded
+[repeat__fileuri :: get2] get  s3://B1/<P>/data/a.bin   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin  sdk_requests=1 (GetObject)
+    row 2: GET       client_id='' n=1 bytes=331 endpoint=s3://B1 file=B1/<P>/data/a.bin err=''  -> fields ok
+    note  : row idx 2: server not recorded
+[two_buckets__path :: get_same_b1] get  s3://B1/<P>/same/obj   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/same/obj
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/same/obj  sdk_requests=2 (HeadObject,GetObject)
+    row 0: GET       client_id='' n=1 bytes=401 endpoint=s3://B1 file=B1/<P>/same/obj err=''  -> fields ok
+    note  : row idx 0: server not recorded
+[two_buckets__path :: get_same_b2] get  s3://B2/<P>/same/obj   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B2 key=<P>/same/obj
+    actual: server=https://storage.googleapis.com bucket=B2 key=<P>/same/obj  sdk_requests=2 (HeadObject,GetObject)
+    row 1: GET       client_id='' n=1 bytes=409 endpoint=s3://B2 file=B2/<P>/same/obj err=''  -> fields ok
+    note  : row idx 1: server not recorded
+[two_buckets__path :: put_B1] put_bytes  s3://B1/<P>/tb/put   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/tb/put
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/tb/put  sdk_requests=1 (PutObject)
+    row 4: PUT       client_id='' n=1 bytes=120 endpoint=s3://B1 file=B1/<P>/tb/put err=''  -> fields ok
+    note  : row idx 4: server not recorded
+[two_buckets__path :: put_B2] put_bytes  s3://B2/<P>/tb/put   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B2 key=<P>/tb/put
+    actual: server=https://storage.googleapis.com bucket=B2 key=<P>/tb/put  sdk_requests=1 (PutObject)
+    row 5: PUT       client_id='' n=1 bytes=121 endpoint=s3://B2 file=B2/<P>/tb/put err=''  -> fields ok
+    note  : row idx 5: server not recorded
+[leading_slash__fileuri :: get_slash_lead] get  s3://B1//<P>/slash/x   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=/<P>/slash/x
+    actual: server=https://storage.googleapis.com bucket=B1 key=/<P>/slash/x  sdk_requests=2 (HeadObject,GetObject)
+    row 0: GET       client_id='' n=1 bytes=433 endpoint=s3://B1 file=B1//<P>/slash/x err=''  -> fields ok
+    note  : row idx 0: server not recorded
+[leading_slash__fileuri :: get_slash_plain] get  s3://B1/<P>/slash/x   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/slash/x
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/slash/x  sdk_requests=2 (HeadObject,GetObject)
+    row 1: GET       client_id='' n=1 bytes=421 endpoint=s3://B1 file=B1/<P>/slash/x err=''  -> fields ok
+    note  : row idx 1: server not recorded
+[leading_slash__fileuri :: stat_slash_lead] stat  s3://B1//<P>/slash/x   -> FIXED  (known #172: expected action=WRONG-ACTION:key record=WRONG-FIELD:key)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=/<P>/slash/x
+    actual: server=https://storage.googleapis.com bucket=B1 key=/<P>/slash/x  sdk_requests=1 (HeadObject)
+    evidence: client log: stat_object bucket='B1' key='/<P>/slash/x'
+    row 2: HEAD      client_id='' n=1 bytes=433 endpoint=s3://B1 file=B1//<P>/slash/x err=''  -> fields ok
+    note  : row idx 2: server not recorded
+[leading_slash__fileuri :: range_slash_lead] get_range  s3://B1//<P>/slash/x   -> FIXED  (known #172: expected action=WRONG-ACTION:key record=WRONG-FIELD:key)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=/<P>/slash/x
+    actual: server=https://storage.googleapis.com bucket=B1 key=/<P>/slash/x  sdk_requests=1 (GetObject)
+    row 4: GET_RANGE client_id='' n=1 bytes=20 endpoint=s3://B1 file=B1//<P>/slash/x err=''  -> fields ok
+    note  : row idx 4: server not recorded
+[leading_slash__fileuri :: put_lead] put_bytes  s3://B1//<P>/slash/pnew   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=/<P>/slash/pnew
+    actual: server=https://storage.googleapis.com bucket=B1 key=/<P>/slash/pnew  sdk_requests=1 (PutObject)
+    row 6: PUT       client_id='' n=1 bytes=140 endpoint=s3://B1 file=B1//<P>/slash/pnew err=''  -> fields ok
+    note  : row idx 6: server not recorded
+[async__path :: put_async] put_bytes_async  s3://B1/<P>/as/p1   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/as/p1
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/as/p1  sdk_requests=1 (PutObject)
+    row 0: PUT       client_id='' n=1 bytes=150 endpoint=s3://B1 file=B1/<P>/as/p1 err=''  -> fields ok
+    note  : row idx 0: server not recorded
+[async__path :: delete] delete  s3://B1/<P>/as/p1   -> FIXED  (known #174: expected action=OK record=MISSING)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/as/p1
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/as/p1  sdk_requests=1 (DeleteObjects)
+    row 4: DELETE    client_id='' n=1 bytes=0 endpoint=s3://B1 file=B1/<P>/as/p1 err=''  -> fields ok
+    note  : row idx 4: server not recorded
+[s3_dest_reject__path :: get_after_reinit] get  s3://B1/<P>/data/a.bin   -> FIXED  (known #169: expected action=OK record=DUPLICATE)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/data/a.bin  sdk_requests=2 (HeadObject,GetObject)
+    row 0: GET       client_id='' n=1 bytes=331 endpoint=s3://B1 file=B1/<P>/data/a.bin err=''  -> fields ok
+    note  : row idx 0: server not recorded
+[multi_endpoint__path :: get_range] me.get_range  s3://B1/<P>/me/m1   -> KNOWN  (known #175: expected action=OK record=MISSING)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/me/m1
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/me/m1  sdk_requests=1 (GetObject)
+    row   : none in window
+[multi_endpoint__path :: list] me.list  s3://B1/<P>/me/   -> KNOWN  (known #175: expected action=OK record=MISSING)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/me/
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/me/  sdk_requests=1 (ListObjectsV2)
+    row   : none in window
+[multi_endpoint__path :: delete] me.delete  s3://B1/<P>/me/p1   -> KNOWN  (known #175: expected action=OK record=MISSING)
+    outcome: ok
+    asked : server=https://storage.googleapis.com bucket=B1 key=<P>/me/p1
+    actual: server=https://storage.googleapis.com bucket=B1 key=<P>/me/p1  sdk_requests=1 (DeleteObjects)
+    row   : none in window
+[host443_get__path :: c1] get  s3://storage.googleapis.com:443/B1/<P>/data/b.bin   -> FIXED  (known #173: expected action=HANG record=HANG)
+    outcome: ok
+    asked : server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/b.bin
+    actual: server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/b.bin  sdk_requests=1 (GetObject)
+    row 0: GET       client_id='' n=1 bytes=347 endpoint=s3://storage.googleapis.com:443 file=storage.googleapis.com:443/B1/<P>/data/b.bin err=''  -> fields ok
+[host443_get_range__path :: c1] get_range  s3://storage.googleapis.com:443/B1/<P>/data/b.bin   -> FIXED  (known #173: expected action=HANG record=HANG)
+    outcome: ok
+    asked : server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/b.bin
+    actual: server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/b.bin  sdk_requests=1 (GetObject)
+    row 0: GET_RANGE client_id='' n=1 bytes=40 endpoint=s3://storage.googleapis.com:443 file=storage.googleapis.com:443/B1/<P>/data/b.bin err=''  -> fields ok
+[host443_get_async__path :: c1] get_async  s3://storage.googleapis.com:443/B1/<P>/data/b.bin   -> FIXED  (known #174: expected action=OK record=MISSING)
+    outcome: ok
+    asked : server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/b.bin
+    actual: server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/b.bin  sdk_requests=1 (GetObject)
+    row 0: GET       client_id='' n=1 bytes=347 endpoint=s3://storage.googleapis.com:443 file=storage.googleapis.com:443/B1/<P>/data/b.bin err=''  -> fields ok
+[host443_decoydefault_get_async__path :: c1] get_async  s3://storage.googleapis.com:443/B1/<P>/data/b.bin   -> FIXED  (known #174: expected action=OK record=MISSING)
+    outcome: ok
+    asked : server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/b.bin
+    actual: server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/b.bin  sdk_requests=1 (GetObject)
+    row 0: GET       client_id='' n=1 bytes=347 endpoint=s3://storage.googleapis.com:443 file=storage.googleapis.com:443/B1/<P>/data/b.bin err=''  -> fields ok
+[host443_decoydefault_get_many__path :: m1] get_many  s3://storage.googleapis.com:443/B1/<P>/data/b.bin   -> KNOWN  (known #171: expected action=WRONG-ACTION:port,scheme,server record=OK)
+    outcome: ERROR: RuntimeError: S3 GET for s3://B1/s3dlio-harness-20261014-725c55/data/a.bin failed: dispatch failure (connection timeout: timeout:~
+    asked : server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/b.bin
+    actual: server=http://10.255.255.1:9 bucket=B1 key=<P>/data/b.bin  sdk_requests=6 (HeadObject,HeadObject,HeadObject,HeadObject,GetObject,GetObject)
+    row 1: GET       client_id=<credential> n=1 bytes=0 endpoint=http://10.255.255.1:9 file=<P>/data/b.bin err=S3 GET for s3://B1/~  -> fields ok
+    note  : client_id carries a credential (row idx 1)
+    note  : row idx 1: bucket not recorded
+[host443_decoydefault_get_many__path :: m2] get_many  s3://storage.googleapis.com:443/B1/<P>/data/a.bin   -> KNOWN  (known #171: expected action=WRONG-ACTION:port,scheme,server record=OK)
+    outcome: ERROR: RuntimeError: S3 GET for s3://B1/s3dlio-harness-20261014-725c55/data/a.bin failed: dispatch failure (connection timeout: timeout:~
+    asked : server=https://storage.googleapis.com:443 bucket=B1 key=<P>/data/a.bin
+    actual: server=http://10.255.255.1:9 bucket=B1 key=<P>/data/a.bin  sdk_requests=6 (HeadObject,HeadObject,HeadObject,HeadObject,GetObject,GetObject)
+    row 0: GET       client_id=<credential> n=1 bytes=0 endpoint=http://10.255.255.1:9 file=<P>/data/a.bin err=S3 GET for s3://B1/~  -> fields ok
+    note  : client_id carries a credential (row idx 0)
+    note  : row idx 0: bucket not recorded
+[portless_get__path :: c1] get  s3://10.255.255.1/B1/<P>/data/c.bin   -> KNOWN  (known #178,#169: expected action=OK record=MISSING)
+    outcome: ERROR: RuntimeError: invalid S3 URI 's3://10.255.255.1/B1/s3dlio-harness-20261014-725c55/data/c.bin': '10.255.255.1' is an IP address wi~
+    asked : server=10.255.255.1 bucket=B1 key=<P>/data/c.bin
+    actual: server=- bucket=B1 key=<P>/data/c.bin  sdk_requests=0 ()
+    row   : none in window
+[portless_stat__path :: c1] stat  s3://10.255.255.1/B1/<P>/data/c.bin   -> KNOWN  (known #178: expected action=OK record=MISSING)
+    outcome: ERROR: RuntimeError: invalid S3 URI 's3://10.255.255.1/B1/s3dlio-harness-20261014-725c55/data/c.bin': '10.255.255.1' is an IP address wi~
+    asked : server=10.255.255.1 bucket=B1 key=<P>/data/c.bin
+    actual: server=- bucket=B1 key=<P>/data/c.bin  sdk_requests=0 ()
+    row   : none in window
+[portless_put__path :: c1] put_bytes  s3://10.255.255.1/B1/<P>/pl/put-np   -> KNOWN  (known #178,#169: expected action=OK record=MISSING)
+    outcome: ERROR: RuntimeError: invalid S3 URI 's3://10.255.255.1/B1/s3dlio-harness-20261014-725c55/pl/put-np': '10.255.255.1' is an IP address wit~
+    asked : server=10.255.255.1 bucket=B1 key=<P>/pl/put-np
+    actual: server=- bucket=B1 key=<P>/pl/put-np  sdk_requests=0 ()
+    row   : none in window
+[me_host443__path :: c1] me.get  s3://storage.googleapis.com:443/B1/<P>/me/m1   -> KNOWN  (known #180,#175: expected action=OK record=MISSING)
+    outcome: ok
+    asked : server=https://storage.googleapis.com:443 bucket=B1 key=<P>/me/m1
+    actual: server=https://storage.googleapis.com:443 bucket=B1 key=<P>/me/m1  sdk_requests=1 (GetObject)
+    row   : none in window
+
+======================================================================================================================================================
+PER-CASE LIFECYCLE / FILE CHECKS
+======================================================================================================================================================
+local_files__path:
+    SELF-RECORD     OK: op-log never recorded itself
+local_files__fileuri:
+    SELF-RECORD     OK: op-log never recorded itself
+s3_dest_reject__path:
+    S3-DEST-REJECT  OK: rejected (RuntimeError: op-log path 's3://B1/s3dlio-harness-20261014-725c55/opl~); nothing created locally or natively
+
+FINAL NATIVE AUDIT (state when the run ended, before cleanup): objects at the end that no PUT asked for: []
+   fixtures no longer present at the end: [('B1', '/<P>/del/ls'), ('B2', '<P>/del/a')]
+   ... of which NO delete call asked for: []
+
+======================================================================================================================================================
+SUMMARY (calls; 'N-of-total')
+======================================================================================================================================================
+core__path                 calls= 11 | ACTION ok= 11 wrong=  0 hang= 0 | RECORD ok= 11 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=8 KNOWN=0 NEW=0 CHANGED=0 FIXED=3
+core__fileuri              calls= 11 | ACTION ok= 11 wrong=  0 hang= 0 | RECORD ok= 11 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=8 KNOWN=0 NEW=0 CHANGED=0 FIXED=3
+repeat__fileuri            calls=  6 | ACTION ok=  6 wrong=  0 hang= 0 | RECORD ok=  6 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=3 KNOWN=0 NEW=0 CHANGED=0 FIXED=3
+two_buckets__path          calls=  7 | ACTION ok=  7 wrong=  0 hang= 0 | RECORD ok=  7 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=3 KNOWN=0 NEW=0 CHANGED=0 FIXED=4
+leading_slash__fileuri     calls=  8 | ACTION ok=  8 wrong=  0 hang= 0 | RECORD ok=  8 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=3 KNOWN=0 NEW=0 CHANGED=0 FIXED=5
+async__path                calls=  5 | ACTION ok=  5 wrong=  0 hang= 0 | RECORD ok=  5 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=3 KNOWN=0 NEW=0 CHANGED=0 FIXED=2
+get_many__fileuri          calls=  3 | ACTION ok=  3 wrong=  0 hang= 0 | RECORD ok=  3 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=3 KNOWN=0 NEW=0 CHANGED=0 FIXED=0
+local_files__path          calls=  7 | ACTION ok=  7 wrong=  0 hang= 0 | RECORD ok=  7 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=7 KNOWN=0 NEW=0 CHANGED=0 FIXED=0
+local_files__fileuri       calls=  7 | ACTION ok=  7 wrong=  0 hang= 0 | RECORD ok=  7 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=7 KNOWN=0 NEW=0 CHANGED=0 FIXED=0
+s3_dest_reject__path       calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  1 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=0 NEW=0 CHANGED=0 FIXED=1
+multi_endpoint__path       calls=  5 | ACTION ok=  5 wrong=  0 hang= 0 | RECORD ok=  2 missing=  3 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=2 KNOWN=3 NEW=0 CHANGED=0 FIXED=0
+host443_get__path          calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  1 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=0 NEW=0 CHANGED=0 FIXED=1
+host443_stat__path         calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  1 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=1 KNOWN=0 NEW=0 CHANGED=0 FIXED=0
+host443_get_range__path    calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  1 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=0 NEW=0 CHANGED=0 FIXED=1
+host443_get_async__path    calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  1 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=0 NEW=0 CHANGED=0 FIXED=1
+host443_decoydefault_stat__path calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  1 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=1 KNOWN=0 NEW=0 CHANGED=0 FIXED=0
+host443_decoydefault_get_async__path calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  1 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=0 NEW=0 CHANGED=0 FIXED=1
+host443_decoydefault_get_many__path calls=  2 | ACTION ok=  0 wrong=  2 hang= 0 | RECORD ok=  2 missing=  0 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=2 NEW=0 CHANGED=0 FIXED=0
+portless_get__path         calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  0 missing=  1 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=1 NEW=0 CHANGED=0 FIXED=0
+portless_stat__path        calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  0 missing=  1 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=1 NEW=0 CHANGED=0 FIXED=0
+portless_put__path         calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  0 missing=  1 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=1 NEW=0 CHANGED=0 FIXED=0
+me_host443__path           calls=  1 | ACTION ok=  1 wrong=  0 hang= 0 | RECORD ok=  0 missing=  1 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=0 KNOWN=1 NEW=0 CHANGED=0 FIXED=0
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ALL CALLS                  calls= 83 | ACTION ok= 81 wrong=  2 hang= 0 | RECORD ok= 76 missing=  7 duplicate=  0 wrong-field=  0 hang= 0 n/a= 0 | PASS=49 KNOWN=9 NEW=0 CHANGED=0 FIXED=25
+phantom op-log rows (rows with no call): 0
+
+UNEXPECTED (NEW or CHANGED vs known.json): 0 of 83 calls
+KNOWN DEFECT NO LONGER PRESENT (FIXED): 25
+   core__path :: put              was ['#169']
+   core__path :: get              was ['#169']
+   core__path :: get_missing      was ['#169']
+   core__fileuri :: put              was ['#169']
+   core__fileuri :: get              was ['#169']
+   core__fileuri :: get_missing      was ['#169']
+   repeat__fileuri :: get0             was ['#169']
+   repeat__fileuri :: get1             was ['#169']
+   repeat__fileuri :: get2             was ['#169']
+   two_buckets__path :: get_same_b1      was ['#169']
+   two_buckets__path :: get_same_b2      was ['#169']
+   two_buckets__path :: put_B1 was ['#169']
+   two_buckets__path :: put_B2 was ['#169']
+   leading_slash__fileuri :: get_slash_lead   was ['#169']
+   leading_slash__fileuri :: get_slash_plain  was ['#169']
+   leading_slash__fileuri :: stat_slash_lead  was ['#172']
+   leading_slash__fileuri :: range_slash_lead was ['#172']
+   leading_slash__fileuri :: put_lead         was ['#169']
+   async__path :: put_async        was ['#169']
+   async__path :: delete           was ['#174']
+   s3_dest_reject__path :: get_after_reinit was ['#169']
+   host443_get__path :: c1               was ['#173']
+   host443_get_range__path :: c1               was ['#173']
+   host443_get_async__path :: c1               was ['#174']
+   host443_decoydefault_get_async__path :: c1               was ['#174']
+UNEXPECTED case-level findings (process/lifecycle/file/phantom): 0
+SKIPPED CASE delete_batch: SKIP: no delete_batch probe given (--delbatch-bin missing or not a file)   (verdict SKIP: not evaluated, not a failure)
+
+NOT COVERED by this harness (by design): create_bucket / delete_bucket (never create or delete GCS buckets); delete_batch op-log rows (the Rust probe has no logger; action checked only); GET_RANGE offset/length are not a column in the row format (cannot be verified from the trace).
+REQUESTS: s3dlio SDK attempts (from client debug logs) = 89;  gcloud native = 123 {'setup': 48, 'snapshot': 9, 'describe': 20, 'cleanup': 46};  total = 212
+CLEANUP: deleted 23 objects; prefix empty in both buckets = True; remaining = {'gs://B1/s3dlio-harness-20261014-725c55/': [], 'gs://B1//s3dlio-harness-20261014-725c55/': [], 'gs://B2/s3dlio-harness-20261014-725c55/': []}
+RUNTIME: 50.5 s

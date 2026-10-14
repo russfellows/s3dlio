@@ -6,6 +6,7 @@
 use std::env;
 
 pub mod mock_s3_server;
+pub mod oplog_rows;
 
 /// Test configuration for GCS tests
 pub struct TestConfig {

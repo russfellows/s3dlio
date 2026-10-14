@@ -79,7 +79,7 @@ impl ArrowObjectStore {
                 }
 
                 // Set custom endpoint if provided
-                if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
+                if let Some(endpoint) = crate::s3_client::s3_endpoint_url_from_env() {
                     builder = builder.with_endpoint(&endpoint);
                     // For custom endpoints, we often need allow_http
                     if endpoint.starts_with("http://") {
@@ -485,7 +485,7 @@ fn setup_arrow_environment() {
     {
         println!("🔧 Arrow backend: Using credentials from environment");
     }
-    if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
+    if let Some(endpoint) = crate::s3_client::s3_endpoint_url_from_env() {
         println!("🔧 Arrow backend: Using custom endpoint: {}", endpoint);
     }
     if let Ok(region) = std::env::var("AWS_DEFAULT_REGION") {

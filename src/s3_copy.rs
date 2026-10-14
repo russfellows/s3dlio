@@ -13,8 +13,12 @@ use tracing::{debug, error, info, warn};
 use std::{fs, path::Path, sync::Arc};
 use tokio::{fs as async_fs, sync::Semaphore};
 
+use crate::delete_batch_plan::parse_s3_uri_for_global_client;
+use crate::object_store::{store_for_uri, ObjectStore};
 use crate::progress::ProgressCallback;
-use crate::s3_utils::{create_bucket, get_object, list_objects, parse_s3_uri, put_object_async};
+use crate::s3_utils::{
+    create_bucket_for_uri_async, get_object, list_objects, parse_s3_uri_full, put_object_async,
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Functions that leverage existing s3_utils code
@@ -24,6 +28,10 @@ use crate::s3_utils::{create_bucket, get_object, list_objects, parse_s3_uri, put
 /// Upload local files (supports globs) into `s3://bucket/prefix/…`,
 /// streaming each file off disk with up to `max_in_flight` tasks.
 /// If `do_create_bucket` is true, we attempt to create the bucket first.
+///
+/// `dest_prefix` may name a server (`s3://host:port/bucket/prefix/`): the bucket is
+/// then created on, and the files are uploaded to, THAT server through a
+/// per-endpoint client (issue #199); a portless IP address is an error.
 pub async fn upload_files<P: AsRef<Path>>(
     dest_prefix: &str,
     patterns: &[P],
@@ -31,7 +39,8 @@ pub async fn upload_files<P: AsRef<Path>>(
     do_create_bucket: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
-    let (bucket, key_prefix) = parse_s3_uri(dest_prefix)?;
+    let dest = parse_s3_uri_full(dest_prefix)?;
+    let (bucket, key_prefix) = (dest.bucket, dest.key);
     // Allow empty prefix (bucket root) or a non-empty prefix that ends with '/'
     if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
         bail!("dest_prefix must end with '/' if specifying a non-root prefix");
@@ -57,8 +66,15 @@ pub async fn upload_files<P: AsRef<Path>>(
     }
 
     if do_create_bucket {
-        create_bucket(&bucket)?;
+        create_bucket_for_uri_async(dest_prefix).await?;
     }
+
+    // A destination that names a server uploads through that server's client; a
+    // plain bucket uses the process-global client (and its op-log path) as before.
+    let endpoint_store: Option<Arc<dyn ObjectStore>> = match &dest.endpoint {
+        Some(_) => Some(Arc::from(store_for_uri(dest_prefix)?)),
+        None => None,
+    };
 
     // Cap the number of concurrent tasks to the number of items
     let effective_jobs = std::cmp::min(max_in_flight, paths.len());
@@ -84,6 +100,8 @@ pub async fn upload_files<P: AsRef<Path>>(
             let sem = sem.clone();
             let bucket = bucket.clone();
             let progress = progress_callback.clone();
+            let endpoint_store = endpoint_store.clone();
+            let endpoint = dest.endpoint.clone();
             let fname = path
                 .file_name()
                 .ok_or_else(|| anyhow::anyhow!("Bad path {:?}", path))?
@@ -97,7 +115,14 @@ pub async fn upload_files<P: AsRef<Path>>(
                 debug!("starting upload of {:?} → s3://{}/{}", path, bucket, key);
                 let _permit = sem.acquire_owned().await.unwrap();
                 let body = ByteStream::from_path(&path).await?;
-                put_object_async(&bucket, &key, body.collect().await?.into_bytes()).await?;
+                let bytes = body.collect().await?.into_bytes();
+                match (&endpoint_store, &endpoint) {
+                    (Some(store), Some(authority)) => {
+                        let uri = format!("s3://{authority}/{bucket}/{key}");
+                        store.put(&uri, bytes).await?;
+                    }
+                    _ => put_object_async(&bucket, &key, bytes).await?,
+                }
                 debug!("finished upload of {:?} → s3://{}/{}", path, bucket, key);
 
                 // Update progress if callback provided
@@ -136,7 +161,7 @@ pub async fn download_objects(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
-    let (bucket, mut key_pattern) = parse_s3_uri(src_uri)?;
+    let (bucket, mut key_pattern) = parse_s3_uri_for_global_client(src_uri)?;
 
     /*
      * Old

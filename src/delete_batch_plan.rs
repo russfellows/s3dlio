@@ -204,7 +204,13 @@ impl StoreServer {
         Ok(host == self.host && port.unwrap_or(self.default_port) == self.port)
     }
 
-    fn display(&self) -> String {
+    /// Do `self` and `other` name the same host and port?  (The scheme-default
+    /// port used for a portless URI authority is not part of the identity.)
+    pub(crate) fn is_same_server(&self, other: &StoreServer) -> bool {
+        self.host == other.host && self.port == other.port
+    }
+
+    pub(crate) fn display(&self) -> String {
         if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
         } else {
@@ -256,9 +262,36 @@ pub(crate) fn parse_s3_uri_for_server(
     uri: &str,
     store: Option<&StoreServer>,
 ) -> Result<(String, String)> {
+    parse_s3_uri_resolving_server(uri, || Ok(store.cloned()))
+}
+
+/// The server the process-wide S3 client talks to: the one the environment
+/// names, decided by [`crate::s3_client::s3_endpoint_url_from_env`] -- the same
+/// rule the client is built with (`AWS_ENDPOINT_URL_S3` before
+/// `AWS_ENDPOINT_URL`, issue #183), so the routing guard and the client cannot
+/// disagree.  `None` when neither is set, or the value is not a usable URL --
+/// then the client talks to the default AWS endpoint, which no `host:port` in a
+/// URI can be matched against.
+pub(crate) fn global_client_server() -> Option<StoreServer> {
+    let url = crate::s3_client::s3_endpoint_url_from_env()?;
+    StoreServer::from_endpoint_url(&url).ok()
+}
+
+/// THE check behind issue #197: parse one S3 URI for a store / client whose
+/// server is produced by `resolve`, and reject a URI that names a different
+/// server, before any request is made.
+///
+/// `resolve` runs only when the URI names a server at all (the host form), so a
+/// bucket-form URI -- the hot path -- pays nothing for it.  `Ok(None)` means
+/// "the process-wide client with no usable `AWS_ENDPOINT_URL`": every URI that
+/// names a server is rejected.
+pub(crate) fn parse_s3_uri_resolving_server<F>(uri: &str, resolve: F) -> Result<(String, String)>
+where
+    F: FnOnce() -> Result<Option<StoreServer>>,
+{
     let c = crate::s3_utils::parse_s3_uri_full(uri)?;
     if let Some(named) = c.endpoint.as_deref() {
-        match store {
+        match resolve()? {
             Some(server) => {
                 if !server.is_named_by(named)? {
                     bail!(
@@ -268,12 +301,44 @@ pub(crate) fn parse_s3_uri_for_server(
                 }
             }
             None => bail!(
-                "names server '{named}' but this store uses the process-wide S3 client, \
-                 which cannot address a server named in a URI"
+                "names server '{named}' but this store uses the process-wide S3 client with no \
+                 AWS_ENDPOINT_URL (the default AWS endpoint), which cannot address a server \
+                 named in a URI"
             ),
         }
     }
     Ok((c.bucket, c.key))
+}
+
+/// [`parse_s3_uri_for_server`] for code that uses the process-wide S3 client
+/// (the `s3_utils` `*_uri_*` helpers, copy, multipart, data loaders): a URI is
+/// accepted if it names no server or names exactly the server
+/// `AWS_ENDPOINT_URL` points at, and rejected otherwise.
+pub(crate) fn parse_s3_uri_for_global_client(uri: &str) -> Result<(String, String)> {
+    parse_s3_uri_resolving_server(uri, || Ok(global_client_server()))
+        .with_context(|| format!("S3 URI '{uri}' cannot be used with the process-wide S3 client"))
+}
+
+/// Validate a whole batch for the process-wide client before any request is
+/// made: if any URI is rejected, none is used.  The error names each offending
+/// URI.
+pub(crate) fn validate_uris_for_global_client(uris: &[String]) -> Result<()> {
+    let mut bad: Vec<String> = Vec::new();
+    for uri in uris {
+        if let Err(e) = parse_s3_uri_for_global_client(uri) {
+            bad.push(format!("'{uri}' ({e:#})"));
+        }
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{} of {} URI(s) rejected (unparseable, or naming a server other than the one the \
+         process-wide S3 client talks to); no request was made: {}",
+        bad.len(),
+        uris.len(),
+        summarize(&bad)
+    ))
 }
 
 #[cfg(test)]

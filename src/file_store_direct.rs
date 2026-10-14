@@ -1533,6 +1533,11 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         Ok(())
     }
 
+    /// `rename` is the filesystem's atomic `rename(2)` (below), not copy + delete.
+    fn has_native_rename(&self) -> bool {
+        true
+    }
+
     async fn rename(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
         if !Self::is_valid_file_uri(src_uri) {
             bail!("FileSystemObjectStore expected file:// or direct:// URI for source");

@@ -96,6 +96,24 @@ pub const SIZED_OBJECT_MARKER: &str = "sized-obj";
 /// Body served for keys containing [`SIZED_OBJECT_MARKER`].
 pub const SIZED_OBJECT_BODY: &[u8; 16] = b"0123456789abcdef";
 
+/// Key substring marker that makes the mock server answer a HeadObject
+/// request with `404 Not Found` (an object that does not exist). Used by the
+/// op-log tests that need a missing object on S3.
+pub const HEAD_NOT_FOUND_MARKER: &str = "head-404";
+
+/// Key substring marker that makes the mock server answer a plain PutObject
+/// with `403 AccessDenied` (a persistent, non-retried failure).
+pub const PUT_FORBIDDEN_MARKER: &str = "put-403";
+
+/// Key substring marker that makes the mock server answer a plain PutObject
+/// with `500` every time. The S3 SDK retries a 500, so one call reaches the
+/// server several times (`PathCallCounts::put_calls` counts every attempt).
+pub const PUT_FAILS_MARKER: &str = "put-500";
+
+/// Key substring marker that makes the mock server answer GetObject with
+/// `403 AccessDenied` (a persistent, non-retried failure).
+pub const GET_FORBIDDEN_MARKER: &str = "get-403";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -129,6 +147,8 @@ pub struct RecordedRequest {
     pub path: String,
     pub query: String,
     pub range: Option<String>,
+    /// The `Host` header (`host:port` the client addressed), if one was sent.
+    pub host: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -305,11 +325,18 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         .get("range")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let host_header = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.to_string()));
     state.log_request(RecordedRequest {
         method: method.to_string(),
         path: path.clone(),
         query: query.clone(),
         range: range_header.clone(),
+        host: host_header,
     });
     // Collect the body — DeleteObjects needs to inspect which keys were
     // requested (see below); every other route just needs it drained so
@@ -424,6 +451,14 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
 
     // PutObject: PUT .../{key} (no partNumber -- that is UploadPart above).
     if method == Method::PUT {
+        if path.contains(PUT_FORBIDDEN_MARKER) {
+            state.record(&path, |c| c.put_calls += 1);
+            return error_response(StatusCode::FORBIDDEN, "AccessDenied");
+        }
+        if path.contains(PUT_FAILS_MARKER) {
+            state.record(&path, |c| c.put_calls += 1);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockPutFailure");
+        }
         state.record(&path, |c| c.put_calls += 1);
         return Response::builder()
             .status(StatusCode::OK)
@@ -452,6 +487,12 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         state.record(&path, |c| c.head_calls += 1);
         if path.contains(HEAD_FAILS_MARKER) {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockHeadObjectFailure");
+        }
+        if path.contains(HEAD_NOT_FOUND_MARKER) {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
         }
         if path.contains(NO_CONTENT_LENGTH_MARKER) {
             return Response::builder()
@@ -482,6 +523,9 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     // (which Full<Bytes> response bodies can't under-deliver).
     if method == Method::GET {
         let attempt = state.record_and_get(&path, |c| c.get_calls += 1);
+        if path.contains(GET_FORBIDDEN_MARKER) {
+            return error_response(StatusCode::FORBIDDEN, "AccessDenied");
+        }
         if path.contains(GET_FAILS_ONCE_MARKER) && attempt == 1 {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockTransientGetFailure");
         }
@@ -492,6 +536,25 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
             .status(StatusCode::OK)
             .header("Content-Length", "4")
             .body(Full::new(Bytes::from_static(b"mock")))
+            .unwrap();
+    }
+
+    // DeleteBucket / DeleteObject: any DELETE that is not an AbortMultipartUpload.
+    if method == Method::DELETE {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+    }
+
+    // PutObject (single shot) and CreateBucket: PUT on a path. The multipart UploadPart
+    // PUT (query `partNumber`) was answered above.
+    if method == Method::PUT {
+        state.record(&path, |c| c.put_calls += 1);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("ETag", "\"mock-put-etag\"")
+            .body(Full::new(Bytes::new()))
             .unwrap();
     }
 

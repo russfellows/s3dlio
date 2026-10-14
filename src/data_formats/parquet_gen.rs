@@ -323,8 +323,8 @@ pub async fn generate_and_write_parquet_schema_streaming(
     rows_per_rg: usize,
     num_row_groups: usize,
 ) -> Result<()> {
+    use crate::delete_batch_plan::parse_s3_uri_for_global_client;
     use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
-    use crate::s3_utils::parse_s3_uri;
     use tokio::sync::mpsc;
 
     // Channel capacity 2: producer can be one row group ahead of consumer.
@@ -427,7 +427,7 @@ pub async fn generate_and_write_parquet_schema_streaming(
     // ── Consumer: async upload of received chunks ─────────────────────────────
     // Open the multipart upload before the first chunk arrives so that
     // CreateMultipartUpload is in flight while the producer generates RG 0.
-    let (bucket, key) = parse_s3_uri(uri)?;
+    let (bucket, key) = parse_s3_uri_for_global_client(uri)?;
     let mut sink = MultipartUploadSink::new_async(&bucket, &key, MultipartUploadConfig::default())
         .await
         .context("CreateMultipartUpload failed")?;

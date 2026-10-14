@@ -424,6 +424,11 @@ impl MultiEndpointStore {
                     if let Some(warning) = portless_host_form_warning(&endpoint_config.uri) {
                         tracing::warn!("{warning}");
                     }
+                    // Bucket-form endpoint on the process-wide client. A
+                    // MultiEndpointStore is never wrapped in a LoggedObjectStore, so
+                    // its get/put keep the S3 helper row they wrote before W2
+                    // (issue #175); its other operations never wrote one.
+                    break 'store Box::new(S3ObjectStore::new().with_helper_rows());
                 }
                 store_for_uri(&endpoint_config.uri).with_context(|| {
                     format!("Failed to create store for URI: {}", endpoint_config.uri)

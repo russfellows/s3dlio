@@ -764,6 +764,11 @@ impl ObjectStore for FileSystemObjectStore {
         Ok(())
     }
 
+    /// `rename` is the filesystem's atomic `rename(2)` (below), not copy + delete.
+    fn has_native_rename(&self) -> bool {
+        true
+    }
+
     async fn rename(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
         if !src_uri.starts_with("file://") {
             bail!("FileSystemObjectStore expected file:// URI for source");
@@ -845,11 +850,17 @@ impl ObjectStore for FileSystemObjectStore {
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
 
         // Populate size cache with results (TTL=0 means immediate expiration)
-        for (uri, size) in size_map.iter() {
-            self.size_cache.put(uri.clone(), *size).await;
-        }
+        self.seed_size_cache(&size_map).await;
 
         Ok(size_map.len())
+    }
+
+    /// Fill the size cache with sizes the caller already learned from `stat` calls
+    /// (no request is made); see [`ObjectStore::seed_size_cache`].
+    async fn seed_size_cache(&self, sizes: &HashMap<String, u64>) {
+        for (uri, size) in sizes.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
     }
     // =========================================================================
     // Metadata Operations (v0.10.0+) - ported from sai3-bench fs_metadata.rs

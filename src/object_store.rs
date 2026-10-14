@@ -27,8 +27,8 @@ fn compute_checksum(data: &[u8]) -> String {
 
 // --- S3 ----------------------------------------------------------------------
 use crate::delete_batch_plan::{
-    aggregate_failures, group_uris_by_bucket, parse_s3_uri_for_server, BucketGroup, GroupFailure,
-    StoreServer,
+    aggregate_failures, global_client_server, group_uris_by_bucket, parse_s3_uri_for_server,
+    parse_s3_uri_resolving_server, BucketGroup, GroupFailure, StoreServer,
 };
 use crate::s3_utils::{
     create_bucket_async as s3_create_bucket_async,
@@ -36,13 +36,13 @@ use crate::s3_utils::{
     delete_objects_async as s3_delete_objects_async,
     format_sdk_error,
     get_object_range_uri_async as s3_get_object_range_uri_async,
-    get_object_uri_async as s3_get_object_uri_async,
-    get_object_uri_optimized_async as s3_get_object_uri_optimized_async,
+    // The S3 backend of a store writes no row of its own: the store's caller records the call (issue #169).
+    get_object_uri_optimized_rows as s3_get_object_uri_optimized_rows,
+    get_object_uri_rows as s3_get_object_uri_rows,
     list_objects_stream as s3_list_objects_stream,
-    parse_s3_uri,
     put_object_multipart_uri_async as s3_put_object_multipart_uri_async,
     // NEW: PUT operations via ObjectStore
-    put_object_uri_async as s3_put_object_uri_async,
+    put_object_uri_rows as s3_put_object_uri_rows,
     stat_object_uri_async as s3_stat_object_uri_async,
     // Reuse existing S3 helpers
     ObjectStat as S3ObjectStat,
@@ -470,6 +470,40 @@ pub trait ObjectStore: Send + Sync {
 
         // Convert Bytes to Vec<u8> for backward compatibility
         Ok(data.to_vec())
+    }
+
+    /// `true` only when this store's [`ObjectStore::copy`] is a NATIVE operation of the
+    /// backend (a server-side copy, `copy_file_range`, ...) and not the trait default
+    /// (a `get` followed by a `put` on this same store).
+    ///
+    /// A wrapper that records calls (`LoggedObjectStore`) needs to know: a native
+    /// operation is one call to the backend that no op name describes, so the wrapper
+    /// forwards it; the default is made of real `get` and `put` calls, which the
+    /// wrapper must run over ITSELF so that each of them is recorded. A backend that
+    /// overrides `copy` with a native operation must return `true` here.
+    fn has_native_copy(&self) -> bool {
+        false
+    }
+
+    /// `true` only when this store's [`ObjectStore::rename`] is a NATIVE operation of
+    /// the backend (`rename(2)` on `file://` and `direct://`) and not the trait default
+    /// (`copy` then `delete`). See [`ObjectStore::has_native_copy`] for why a call
+    /// recorder needs to know. A backend that overrides `rename` natively must return
+    /// `true` here.
+    fn has_native_rename(&self) -> bool {
+        false
+    }
+
+    /// Record object sizes this store has ALREADY learned (the answers of `stat`
+    /// calls the caller made) in the store's size cache, without making any request.
+    /// Default: the store has no size cache, nothing happens.
+    ///
+    /// `pre_stat_and_cache` is "stat these objects, then cache the sizes". A call
+    /// recorder runs the stats through itself so that each HEAD is recorded, and then
+    /// hands the sizes to the store it wraps with this method, so the cache fill the
+    /// store's own `pre_stat_and_cache` would do still happens, with no extra request.
+    async fn seed_size_cache(&self, sizes: &HashMap<String, u64>) {
+        let _ = sizes;
     }
 
     /// Default copy reads then writes. Backends can override with server-side copy.
@@ -1062,6 +1096,12 @@ pub struct S3ObjectStore {
     client: Option<std::sync::Arc<aws_sdk_s3::Client>>,
     /// The endpoint URL this store was created for (for logging / debugging).
     endpoint_url: Option<String>,
+    /// The store is the endpoint store of a `MultiEndpointStore` on a bucket-form S3
+    /// URI: its `get`/`put` write the S3 helper row (`S3Ops` shape) that they wrote
+    /// before W2, because a `MultiEndpointStore` is never wrapped in a
+    /// `LoggedObjectStore` and so has no other owner for the call (issue #175).
+    /// `false` everywhere else: a store's caller records the call (issue #169).
+    helper_rows: bool,
 }
 
 impl Default for S3ObjectStore {
@@ -1080,6 +1120,7 @@ impl S3ObjectStore {
             )),
             client: None,
             endpoint_url: None,
+            helper_rows: false,
         }
     }
 
@@ -1091,6 +1132,7 @@ impl S3ObjectStore {
             )),
             client: None,
             endpoint_url: None,
+            helper_rows: false,
         }
     }
 
@@ -1114,6 +1156,7 @@ impl S3ObjectStore {
             )),
             client: Some(std::sync::Arc::new(client)),
             endpoint_url: Some(endpoint_url.to_string()),
+            helper_rows: false,
         })
     }
 
@@ -1138,12 +1181,32 @@ impl S3ObjectStore {
             )),
             client: None,
             endpoint_url: Some(endpoint_url.to_string()),
+            helper_rows: false,
         }
     }
 
     #[inline]
     pub fn boxed() -> Box<dyn ObjectStore> {
         Box::new(Self::new())
+    }
+
+    /// A store on the process-wide client whose `get`/`put` write the S3 helper
+    /// row (the row the helpers `get_object` / `put_object_async` write when the
+    /// op-log is active). Only for the endpoint stores of a `MultiEndpointStore`
+    /// on bucket-form S3 URIs, which are never wrapped in a `LoggedObjectStore`;
+    /// see the `helper_rows` field.
+    pub(crate) fn with_helper_rows(mut self) -> Self {
+        self.helper_rows = true;
+        self
+    }
+
+    /// Whether `get` / `put` on the process-wide client write the helper row.
+    fn rows(&self) -> crate::s3_utils::Rows {
+        if self.helper_rows {
+            crate::s3_utils::Rows::Write
+        } else {
+            crate::s3_utils::Rows::Skip
+        }
     }
 
     /// Get object size, checking cache first
@@ -1163,23 +1226,61 @@ impl S3ObjectStore {
     }
 
     /// The one server this store talks to, for comparison with the server a
-    /// URI names: `Some` for a per-endpoint store, `None` for a store on the
-    /// process-wide client (whose server comes from the environment).
+    /// URI names: the endpoint of a per-endpoint store, or -- for a store on
+    /// the process-wide client -- the server `AWS_ENDPOINT_URL` names (`None`
+    /// when that is unset: the default AWS endpoint).
     fn server_identity(&self) -> Result<Option<StoreServer>> {
-        self.endpoint_url
-            .as_deref()
-            .map(StoreServer::from_endpoint_url)
-            .transpose()
-            .context("S3ObjectStore endpoint URL is not usable")
+        match self.endpoint_url.as_deref() {
+            Some(url) => StoreServer::from_endpoint_url(url)
+                .map(Some)
+                .context("S3ObjectStore endpoint URL is not usable"),
+            None => Ok(global_client_server()),
+        }
     }
 
     /// `parse_s3_uri` for this store: additionally rejects a URI that names a
-    /// server other than the store's own (issue #179, round 2).  The store
-    /// would otherwise apply that URI's bucket/key to ITS server.
+    /// server other than the store's own (issues #179, #197).  The store would
+    /// otherwise apply that URI's bucket/key to ITS server.  The store's server
+    /// is only worked out when the URI names one, so bucket-form URIs (the hot
+    /// path) pay nothing for the check.
     fn parse_uri_for_this_store(&self, uri: &str) -> Result<(String, String)> {
-        let server = self.server_identity()?;
-        parse_s3_uri_for_server(uri, server.as_ref())
+        parse_s3_uri_resolving_server(uri, || self.server_identity())
             .with_context(|| format!("S3 URI '{uri}' cannot be used with this store"))
+    }
+
+    /// Gate for every operation that is handed to a helper which uses the
+    /// PROCESS-WIDE S3 client (multipart upload, concurrent-range GET, the
+    /// buffered writer's final upload).  Those helpers always talk to the global
+    /// server, whatever URI form they are given -- a bucket-form URI names no
+    /// server, so the URI check cannot catch it.  A per-endpoint store bound to
+    /// any other server must therefore refuse, before any request is made,
+    /// rather than run the operation on the wrong server (issue #197).  Per-endpoint
+    /// multipart and concurrent-range support is issue #208.
+    ///
+    /// A store on the process-wide client, or a per-endpoint store whose server IS
+    /// the global server, passes.
+    fn ensure_global_helper_reaches_this_store(&self, operation: &str) -> Result<()> {
+        let Some(url) = self.endpoint_url.as_deref() else {
+            return Ok(());
+        };
+        let mine = StoreServer::from_endpoint_url(url)
+            .context("S3ObjectStore endpoint URL is not usable")?;
+        match global_client_server() {
+            Some(global) if global.is_same_server(&mine) => Ok(()),
+            Some(global) => bail!(
+                "{operation} is not yet supported on a per-endpoint S3 store (issue #208): this \
+                 store talks to {}, but {operation} uses the process-wide S3 client, which talks \
+                 to {}",
+                mine.display(),
+                global.display()
+            ),
+            None => bail!(
+                "{operation} is not yet supported on a per-endpoint S3 store (issue #208): this \
+                 store talks to {}, but {operation} uses the process-wide S3 client, which talks \
+                 to the default AWS endpoint",
+                mine.display()
+            ),
+        }
     }
 
     /// Delete every key of one bucket group (issue #179).
@@ -1364,7 +1465,7 @@ impl ObjectStore for S3ObjectStore {
         debug!("S3ObjectStore::get uri='{}'", uri);
 
         if let Some(client) = &self.client {
-            let (bucket, key) = parse_s3_uri(uri)?;
+            let (bucket, key) = self.parse_uri_for_this_store(uri)?;
             // v0.9.108+ (issue #148 Phase 4b): wrap send()+collect() in
             // retry_get_body so body-transfer failures (no longer
             // covered by smithy's send()-level retry once the connector
@@ -1403,9 +1504,9 @@ impl ObjectStore for S3ObjectStore {
             .unwrap_or(true); // Default: enabled
 
         if use_optimized {
-            s3_get_object_uri_optimized_async(uri).await
+            s3_get_object_uri_optimized_rows(uri, self.rows()).await
         } else {
-            s3_get_object_uri_async(uri).await
+            s3_get_object_uri_rows(uri, self.rows()).await
         }
     }
 
@@ -1427,7 +1528,7 @@ impl ObjectStore for S3ObjectStore {
         }
 
         if let Some(client) = &self.client {
-            let (bucket, key) = parse_s3_uri(uri)?;
+            let (bucket, key) = self.parse_uri_for_this_store(uri)?;
             let range_header = match length {
                 Some(len) => format!(
                     "bytes={}-{}",
@@ -1469,7 +1570,7 @@ impl ObjectStore for S3ObjectStore {
         debug!("S3ObjectStore::put uri='{}', {} bytes", uri, data.len());
 
         if let Some(client) = &self.client {
-            let (bucket, key) = parse_s3_uri(uri)?;
+            let (bucket, key) = self.parse_uri_for_this_store(uri)?;
             if crate::s3_client::unsigned_payload_enabled() {
                 client
                     .put_object()
@@ -1494,7 +1595,7 @@ impl ObjectStore for S3ObjectStore {
             return Ok(());
         }
 
-        s3_put_object_uri_async(uri, data).await
+        s3_put_object_uri_rows(uri, data, self.rows()).await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
@@ -1507,6 +1608,9 @@ impl ObjectStore for S3ObjectStore {
             data.len(),
             part_size
         );
+        // Issue #197: a URI naming another server is an error, never run here.
+        self.parse_uri_for_this_store(uri)?;
+        self.ensure_global_helper_reaches_this_store("multipart upload")?;
         s3_put_object_multipart_uri_async(uri, data, part_size).await
     }
 
@@ -1515,7 +1619,7 @@ impl ObjectStore for S3ObjectStore {
             "S3ObjectStore::list prefix='{}', recursive={}",
             uri_prefix, recursive
         );
-        let (bucket, key_prefix) = parse_s3_uri(uri_prefix)?;
+        let (bucket, key_prefix) = self.parse_uri_for_this_store(uri_prefix)?;
 
         if let Some(client) = &self.client {
             return Self::list_with_client(client, &bucket, &key_prefix, recursive).await;
@@ -1541,7 +1645,7 @@ impl ObjectStore for S3ObjectStore {
         recursive: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
         Box::pin(async_stream::stream! {
-            let (bucket, key_prefix) = match parse_s3_uri(uri_prefix) {
+            let (bucket, key_prefix) = match self.parse_uri_for_this_store(uri_prefix) {
                 Ok((b, k)) => (b, k),
                 Err(e) => {
                     yield Err(e);
@@ -1583,7 +1687,7 @@ impl ObjectStore for S3ObjectStore {
         debug!("S3ObjectStore::stat uri='{}'", uri);
 
         if let Some(client) = &self.client {
-            let (bucket, key) = parse_s3_uri(uri)?;
+            let (bucket, key) = self.parse_uri_for_this_store(uri)?;
             // Issue #172: the key the caller names is the key sent -- no
             // stripping (get_range above already used it verbatim).
             let resp = client
@@ -1673,41 +1777,41 @@ impl ObjectStore for S3ObjectStore {
         use futures::stream::StreamExt;
         debug!("S3ObjectStore::delete_prefix prefix='{}'", uri_prefix);
 
-        let (bucket, mut key_prefix) = parse_s3_uri(uri_prefix)?;
+        let (bucket, mut key_prefix) = self.parse_uri_for_this_store(uri_prefix)?;
         if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
             key_prefix.push('/');
         }
 
         if let Some(client) = &self.client {
-            let keys = Self::list_with_client(client, &bucket, &key_prefix, true).await?;
-            let just_keys: Vec<String> = keys
+            let listed = Self::list_with_client(client, &bucket, &key_prefix, true).await?;
+            // `list_with_client` returns `s3://<bucket>/<key>`: strip that
+            // head rather than re-parsing (a re-parse could misread the key,
+            // and a listing entry that does not parse must be an error, never
+            // a key silently left out of the delete).
+            let uri_head = format!("s3://{bucket}/");
+            let just_keys = listed
                 .iter()
-                .filter_map(|uri| parse_s3_uri(uri).ok().map(|(_, k)| k))
-                .collect();
-            for chunk in just_keys.chunks(1000) {
-                let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk
-                    .iter()
-                    .filter_map(|k| {
-                        aws_sdk_s3::types::ObjectIdentifier::builder()
-                            .key(k)
-                            .build()
-                            .ok()
-                    })
-                    .collect();
-                if objects.is_empty() {
-                    continue;
+                .map(|u| {
+                    u.strip_prefix(uri_head.as_str())
+                        .map(str::to_string)
+                        .with_context(|| {
+                            format!("unexpected listing entry '{u}' (not under '{uri_head}')")
+                        })
+                })
+                .collect::<Result<Vec<String>>>()?;
+            let total = just_keys.len();
+            let mut confirmed = 0usize;
+            for chunk in just_keys.chunks(crate::delete_batch_plan::DELETE_BATCH_MAX_KEYS) {
+                // Checks the per-key results inside the HTTP 200 body (#196).
+                if let Err(e) = Self::delete_chunk_with_client(client, &bucket, chunk).await {
+                    return Err(e.context(format!(
+                        "S3 delete_prefix of 's3://{bucket}/{key_prefix}' failed: {confirmed} of \
+                         {total} key(s) were confirmed deleted before the failing request, {} \
+                         later key(s) were not attempted",
+                        total - confirmed - chunk.len()
+                    )));
                 }
-                let delete = aws_sdk_s3::types::Delete::builder()
-                    .set_objects(Some(objects))
-                    .build()
-                    .context("Failed to build Delete request")?;
-                client
-                    .delete_objects()
-                    .bucket(&bucket)
-                    .delete(delete)
-                    .send()
-                    .await
-                    .with_context(|| format!("S3 delete_prefix failed for bucket '{}'", bucket))?;
+                confirmed += chunk.len();
             }
             return Ok(());
         }
@@ -1760,6 +1864,10 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
+        // Issue #197: a URI naming another server is an error, never run here.
+        self.parse_uri_for_this_store(uri)?;
+        // The writer's final upload is a multipart upload on the process-wide client.
+        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer that collects chunks then uses put_multipart
         Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
     }
@@ -1769,6 +1877,10 @@ impl ObjectStore for S3ObjectStore {
         uri: &str,
         compression: CompressionConfig,
     ) -> Result<Box<dyn ObjectWriter>> {
+        // Issue #197: a URI naming another server is an error, never run here.
+        self.parse_uri_for_this_store(uri)?;
+        // The writer's final upload is a multipart upload on the process-wide client.
+        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer with compression support
         Ok(Box::new(S3BufferedWriter::new_with_compression(
             uri.to_string(),
@@ -1781,6 +1893,10 @@ impl ObjectStore for S3ObjectStore {
         uri: &str,
         options: WriterOptions,
     ) -> Result<Box<dyn ObjectWriter>> {
+        // Issue #197: a URI naming another server is an error, never run here.
+        self.parse_uri_for_this_store(uri)?;
+        // The writer's final upload is a multipart upload on the process-wide client.
+        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer that collects chunks then uses put_multipart
         if let Some(compression) = options.compression {
             Ok(Box::new(S3BufferedWriter::new_with_compression(
@@ -1797,6 +1913,8 @@ impl ObjectStore for S3ObjectStore {
             bail!("S3ObjectStore expected s3:// URI");
         }
 
+        // Issue #197: a URI naming another server is an error, never run here.
+        self.parse_uri_for_this_store(uri)?;
         // Get object size from cache or stat (v0.9.10: cache optimization)
         let object_size = self.get_object_size(uri).await?;
 
@@ -1808,7 +1926,8 @@ impl ObjectStore for S3ObjectStore {
                 "Using concurrent range GET for large object: {} bytes",
                 object_size
             );
-            // Use concurrent range GET for large objects
+            // Use concurrent range GET for large objects (process-wide client)
+            self.ensure_global_helper_reaches_this_store("concurrent range GET")?;
             crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await
         } else {
             debug!("Using standard GET for small object: {} bytes", object_size);
@@ -1828,6 +1947,8 @@ impl ObjectStore for S3ObjectStore {
         if !uri.starts_with("s3://") {
             bail!("S3ObjectStore expected s3:// URI");
         }
+        // Issue #197: a URI naming another server is an error, never run here.
+        self.parse_uri_for_this_store(uri)?;
 
         let transfer_size = match length {
             Some(len) => len,
@@ -1846,7 +1967,8 @@ impl ObjectStore for S3ObjectStore {
                 "Using concurrent range GET for large transfer: {} bytes",
                 transfer_size
             );
-            // Use concurrent range GET for large transfers
+            // Use concurrent range GET for large transfers (process-wide client)
+            self.ensure_global_helper_reaches_this_store("concurrent range GET")?;
             crate::s3_utils::get_object_concurrent_range_async(
                 uri,
                 offset,
@@ -1903,11 +2025,17 @@ impl ObjectStore for S3ObjectStore {
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
 
         // Populate size cache with results
-        for (uri, size) in size_map.iter() {
-            self.size_cache.put(uri.clone(), *size).await;
-        }
+        self.seed_size_cache(&size_map).await;
 
         Ok(size_map.len())
+    }
+
+    /// Fill the size cache with sizes the caller already learned from `stat` calls
+    /// (no request is made); see [`ObjectStore::seed_size_cache`].
+    async fn seed_size_cache(&self, sizes: &HashMap<String, u64>) {
+        for (uri, size) in sizes.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
     }
 }
 
@@ -2706,11 +2834,17 @@ impl ObjectStore for AzureObjectStore {
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
 
         // Populate size cache with results
-        for (uri, size) in size_map.iter() {
-            self.size_cache.put(uri.clone(), *size).await;
-        }
+        self.seed_size_cache(&size_map).await;
 
         Ok(size_map.len())
+    }
+
+    /// Fill the size cache with sizes the caller already learned from `stat` calls
+    /// (no request is made); see [`ObjectStore::seed_size_cache`].
+    async fn seed_size_cache(&self, sizes: &HashMap<String, u64>) {
+        for (uri, size) in sizes.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
     }
 }
 
@@ -3288,11 +3422,17 @@ impl ObjectStore for GcsObjectStore {
         let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
 
         // Populate size cache with results
-        for (uri, size) in size_map.iter() {
-            self.size_cache.put(uri.clone(), *size).await;
-        }
+        self.seed_size_cache(&size_map).await;
 
         Ok(size_map.len())
+    }
+
+    /// Fill the size cache with sizes the caller already learned from `stat` calls
+    /// (no request is made); see [`ObjectStore::seed_size_cache`].
+    async fn seed_size_cache(&self, sizes: &HashMap<String, u64>) {
+        for (uri, size) in sizes.iter() {
+            self.size_cache.put(uri.clone(), *size).await;
+        }
     }
 }
 
@@ -3575,6 +3715,53 @@ pub(crate) fn store_routing_endpoint_for_uri(uri: &str) -> Result<Option<String>
     }
 }
 
+/// A store with its own client for the server at `endpoint_url` (dedicated
+/// connection pool, ignores `AWS_ENDPOINT_URL`).
+fn s3_per_endpoint_store(endpoint_url: String) -> Result<Box<dyn ObjectStore>> {
+    crate::s3_client::run_on_global_rt(async move {
+        S3ObjectStore::for_endpoint(&endpoint_url)
+            .await
+            .map(|s| Box::new(s) as Box<dyn ObjectStore>)
+    })
+}
+
+/// The S3 store for `uri`: a per-endpoint store when the URI names a server
+/// (`s3://host:port/...`), the process-wide-client store otherwise.  Used by
+/// the factories that return a store for a URI, so none of them can hand back
+/// the global store for a URI naming another server (issue #197).
+fn s3_store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
+    match store_routing_endpoint_for_uri(uri)? {
+        Some(endpoint_url) => s3_per_endpoint_store(endpoint_url),
+        None => Ok(S3ObjectStore::boxed()),
+    }
+}
+
+/// Check that every S3 URI in `uris` can be served by the ONE store built for
+/// `uris[0]` (as the data loaders do): each must name no server or the server
+/// that store talks to.  The first URI naming any other server is an error, so
+/// a loader built over mixed servers fails when it is built, before any request.
+pub(crate) fn ensure_s3_uris_share_first_uris_server(uris: &[String]) -> Result<()> {
+    let Some(first) = uris.first() else {
+        return Ok(());
+    };
+    if infer_scheme(first) != Scheme::S3 {
+        return Ok(());
+    }
+    let server = match store_routing_endpoint_for_uri(first)? {
+        Some(url) => Some(StoreServer::from_endpoint_url(&url)?),
+        None => global_client_server(),
+    };
+    for uri in uris.iter().filter(|u| infer_scheme(u) == Scheme::S3) {
+        parse_s3_uri_resolving_server(uri, || Ok(server.clone())).with_context(|| {
+            format!(
+                "S3 URI '{uri}' cannot be served by the store built for '{first}' (one store \
+                 serves all URIs of this loader)"
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Serialises every test that reads or writes `S3DLIO_S3_ENDPOINT_TLS_PORTS`
 /// (shared with the multi-endpoint tests, which decide URL schemes the same way).
 #[cfg(test)]
@@ -3582,6 +3769,43 @@ pub(crate) static ENDPOINT_TLS_PORTS_ENV_LOCK: std::sync::Mutex<()> = std::sync:
 
 pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_logger(uri, None)
+}
+
+/// [`store_for_uri`] for the library entry points that always built an unlogged
+/// store and relied on the S3 backend's own row (checkpoint save/load, the
+/// concurrent shard reader, `MultiBackendDataset`, Python
+/// `load_checkpoint_with_validation`).
+///
+/// Identical to `store_for_uri` except for ONE case: a bucket-form S3 URI (the
+/// process-wide client) gets a store whose `get`/`put` write the S3 helper row
+/// (`S3Ops` shape) when the op-log is active, exactly the row they wrote before
+/// W2 (issue #169). Every other URI (host-form S3, `file://`, `direct://`,
+/// `az://`, `gs://`) gets the plain unlogged store and writes no row, as before.
+pub(crate) fn store_for_uri_with_helper_rows(uri: &str) -> Result<Box<dyn ObjectStore>> {
+    if infer_scheme(uri) == Scheme::S3 && store_routing_endpoint_for_uri(uri)?.is_none() {
+        return Ok(Box::new(S3ObjectStore::new().with_helper_rows()));
+    }
+    store_for_uri(uri)
+}
+
+/// The URI prefix a bare container name is joined to when a logged store records
+/// `create_container` / `delete_container`, so the row has the endpoint and file
+/// the same store's other rows have.
+///
+/// `scheme://` for every backend (`s3://`, `file://`, `az://`, ...), and
+/// `s3://host:port/` for an S3 host-form store, whose other rows are
+/// `s3://host:port` + `host:port/bucket/key`.
+pub(crate) fn container_uri_prefix(uri: &str) -> String {
+    let scheme_end = uri.find("://").map(|i| i + 3).unwrap_or(0);
+    // An invalid first segment is an Err here; the factory has already propagated it
+    // (store_routing_endpoint_for_uri) before it asks for the prefix, so it is not
+    // a host-form URI as far as the prefix is concerned.
+    if matches!(s3_endpoint_url_from_uri(uri), Ok(Some(_))) {
+        // Authority = everything up to the first '/'; keep it, then the '/'.
+        let authority = uri[scheme_end..].split('/').next().unwrap_or_default();
+        return format!("{}{authority}/", &uri[..scheme_end]);
+    }
+    uri[..scheme_end].to_string()
 }
 
 /// Create a store for the given URI with optional operation logging.
@@ -3657,7 +3881,11 @@ pub fn store_for_uri_with_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -3734,7 +3962,11 @@ pub fn store_for_uri_with_config_and_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -3756,7 +3988,7 @@ pub fn direct_io_store_for_uri_with_logger(
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
-        Scheme::S3 => S3ObjectStore::boxed(),
+        Scheme::S3 => s3_store_for_uri(uri)?,
         Scheme::Azure => {
             #[cfg(feature = "backend-azure")]
             {
@@ -3782,7 +4014,11 @@ pub fn direct_io_store_for_uri_with_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -3804,7 +4040,7 @@ pub fn high_performance_store_for_uri_with_logger(
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
-        Scheme::S3 => S3ObjectStore::boxed(),
+        Scheme::S3 => s3_store_for_uri(uri)?,
         Scheme::Azure => {
             #[cfg(feature = "backend-azure")]
             {
@@ -3830,7 +4066,11 @@ pub fn high_performance_store_for_uri_with_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -3887,13 +4127,17 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
-        Scheme::S3 => {
-            let config = S3Config {
-                enable_range_engine: true, // Enable for high-performance
-                ..Default::default()
-            };
-            Box::new(S3ObjectStore::with_config(config))
-        }
+        Scheme::S3 => match store_routing_endpoint_for_uri(uri)? {
+            // A URI naming a server gets that server's store (issue #197).
+            Some(endpoint_url) => s3_per_endpoint_store(endpoint_url)?,
+            None => {
+                let config = S3Config {
+                    enable_range_engine: true, // Enable for high-performance
+                    ..Default::default()
+                };
+                Box::new(S3ObjectStore::with_config(config))
+            }
+        },
         Scheme::Azure => {
             #[cfg(feature = "backend-azure")]
             {
@@ -3927,7 +4171,11 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -4540,6 +4788,24 @@ mod s3_object_store_tests {
     // S3-compatible endpoint running on a non-standard port (e.g. a load
     // balancer terminating TLS on :9001) as https. S3DLIO_S3_ENDPOINT_TLS_PORTS
     // closes that gap.
+
+    #[test]
+    fn container_uri_prefix_is_the_scheme_plus_the_host_authority_for_host_form_s3() {
+        assert_eq!(container_uri_prefix("s3://bucket/key"), "s3://");
+        assert_eq!(container_uri_prefix("file:///tmp/x"), "file://");
+        assert_eq!(container_uri_prefix("direct:///tmp/x"), "direct://");
+        assert_eq!(container_uri_prefix("az://account/container/b"), "az://");
+        assert_eq!(container_uri_prefix("gs://bucket/o"), "gs://");
+        assert_eq!(
+            container_uri_prefix("s3://10.9.0.17:80/bucket/key"),
+            "s3://10.9.0.17:80/"
+        );
+        assert_eq!(
+            container_uri_prefix("s3://[::1]:9000/bucket/key"),
+            "s3://[::1]:9000/"
+        );
+        assert_eq!(container_uri_prefix("not-a-uri"), "");
+    }
 
     #[test]
     fn s3_endpoint_url_from_uri_plain_bucket_has_no_endpoint() {

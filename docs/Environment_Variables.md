@@ -333,6 +333,7 @@ Standard AWS environment variables are also supported:
 | `AWS_SESSION_TOKEN` | AWS session token (for temporary credentials) |
 | `AWS_REGION` | AWS region (e.g., `us-east-1`) |
 | `AWS_ENDPOINT_URL` | Custom S3 endpoint URL (for MinIO or other S3-compatible storage) |
+| `AWS_ENDPOINT_URL_S3` | S3-specific endpoint URL. Takes precedence over `AWS_ENDPOINT_URL`, as in the AWS SDK (issue #183). An empty value counts as unset. `s3-cli --endpoint-url` and Python `configure_s3(endpoint_url=...)` override both. A server named in the URI (`s3://host:port/bucket`) overrides all of them for that URI. **Limitation of the explicit override:** `s3-cli --endpoint-url` and `configure_s3(endpoint_url=...)` work by setting these variables in the running process. Mutating the process environment is not thread-safe against code that reads it through C `getenv` (libc, native libraries, other Python extension modules); s3dlio's own readers are safe. Neither the CLI nor Python `configure_s3` is guaranteed single-threaded (the CLI runs on a Tokio runtime; `configure_s3` can run after s3dlio's runtimes and other threads have started), so call it at start-up, **before the first S3 operation**: the process-wide client is built once from the environment and an override made afterwards does not change it. |
 | `AWS_CA_BUNDLE` | Path to custom CA certificate bundle (standard AWS SDK name) |
 
 ### `s3://host:port/bucket/key` server-vs-bucket rule (changed in v0.9.120; issues #178, #193, #194)
@@ -350,10 +351,11 @@ components, so they agree with each other:
 
 **Not covered yet.** Other code paths that accept an `s3://` URI do not call this
 rule and can still ignore a server named in the URI: the Python store cache and
-Python get/stat/get_many helpers (#171), `S3ObjectStore` operations on a URI that
-names a different server than the store's own (#197), the Python
-`create_bucket` / `delete_bucket` helpers (#199), and `list_containers` /
-`s3-cli list-buckets` (#200). Until those are fixed, use the single-endpoint
+Python get/stat/get_many helpers (#171) and `S3ObjectStore` operations on a URI that
+names a different server than the store's own (#197). Bucket create/delete
+(Python `create_bucket` / `delete_bucket` / `put(should_create_bucket=True)`,
+`s3-cli put --create-bucket`; #199) and `list_containers` / `s3-cli list-buckets`
+(#200) do follow the rule. Until the rest are fixed, use the single-endpoint
 `AWS_ENDPOINT_URL` or the paths listed above when a request must reach a
 specific server.
 
@@ -639,6 +641,7 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 
 ## Version History
 
+- **v0.9.122** *(behaviour change: `AWS_ENDPOINT_URL_S3` precedence)*: `AWS_ENDPOINT_URL_S3` now takes precedence over `AWS_ENDPOINT_URL`, as in the AWS SDK; an empty value counts as unset. The op-log helper rows record this effective endpoint. `s3-cli --endpoint-url` and Python `configure_s3(endpoint_url=...)` still win over both. Limitation of `set_s3_endpoint_override`: it writes the process environment (unsafe against native threads that read it concurrently; nothing enforces the ordering), so call it at start-up, before any S3 work or native threads; an override made after the first S3 operation does not move the already-built process-wide client. A server named in a URI (`s3://host:port/bucket`) wins for that URI. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.120** *(behaviour change: the `s3://` server-vs-bucket rule; retired: `S3DLIO_S3_ENDPOINT_HINT_TLDS`)*: `s3://X/...` names a server only when `X` carries an explicit port (`host:port` or `[ipv6]:port`). Every other first segment is a bucket, and a portless IP is an error (see "`s3://host:port/bucket/key` server-vs-bucket rule" above). `S3DLIO_S3_ENDPOINT_HINT_TLDS` is retired: it has no effect and warns once. `MultiEndpointStore` uses the same TLS rule as `S3DLIO_S3_ENDPOINT_TLS_PORTS` describes. The op-log accepts `file://` destinations and reports accepted, dropped and written counts through `op_log_stats()`. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.114** *(Azure SDK stable 1.x migration)*: Updated Azure Blob Storage and identity clients to the stable 1.x SDK line. Added `S3DLIO_AZURE_DOWNLOAD_MODE`, `S3DLIO_AZURE_CONCURRENT_ENGINE`, `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB`, `S3DLIO_AZURE_DOWNLOAD_CONCURRENCY`, and `S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB` for selecting and tuning Azure SDK managed downloads, s3dlio RangeEngine downloads, or sequential transfers. Raised the Rust MSRV to 1.88. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.112** *(new: `S3DLIO_RT_THREADS_UNSAFE`; behavior change: `S3DLIO_RT_THREADS` sanity clamp)*: Added a sanity clamp to `S3DLIO_RT_THREADS` — values below `RT_THREADS_LIMIT/4` are treated as downstream miscomputation and clamped up to `RT_THREADS_LIMIT`, with a stderr warning the first time it fires.  Rationale: the DLIO unet3d datagen bottleneck (2026-07-10, `docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md`) was caused by DLIO's `ObjStoreLibStorage.__init__` computing `S3DLIO_RT_THREADS = write_threads * 1.5` with Hydra's default `write_threads=1`, giving `S3DLIO_RT_THREADS=1` and building a 1-worker Tokio runtime that serialized every concurrent multipart upload part (10× throughput loss, live-measured 214 MB/s vs 1928 MB/s after fix on a 28-core host with s3-ultra).  `S3DLIO_RT_THREADS_UNSAFE=1` bypasses the clamp for legitimate low-thread scenarios (single-threaded test suites, fault-injection).  The clamp is inactive when `configure_thread_pools` was never called (`RT_THREADS_LIMIT=0`), preserving pure-Rust programmatic use.  Also in v0.9.112: FFI-boundary

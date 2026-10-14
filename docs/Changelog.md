@@ -1,5 +1,168 @@
 # s3dlio Changelog
 
+## Version 0.9.122 — Op-log accuracy (each call recorded once), server routing for every operation, replay fixes, Azure credential fix
+
+Fixes 14 issues: #169, #174, #177, #181, #182, #189, #196, #197, #199, #200, #183, #184, #187, #202.
+Version 0.9.120 was never published to PyPI; everything in the 0.9.120 section below ships for the
+first time in this release, together with the changes listed here. **Read the behaviour changes
+before upgrading:**
+- `AWS_ENDPOINT_URL_S3` now takes precedence over `AWS_ENDPOINT_URL` (#183).
+- An `S3ObjectStore` (and the S3 helper functions) reject a URI that names a server other than the
+  one they talk to, before any request is sent (#197).
+- `s3://host:port/bucket` create/delete bucket and `s3://host:port/` list-buckets act on that
+  server (#199, #200).
+- A store writes one op-log row per S3 call instead of two (#169); the Python store cache no longer
+  decides whether a call is recorded (#174).
+- Op-log replay errors on rows it cannot rebuild and on an unparsable start time (#184, #187).
+
+The golden op-log tests compare NORMALISED fields (timing and variable values are normalised),
+not the raw files byte for byte.
+
+### Fixed — a per-endpoint store no longer runs a request on the global client (#197, #196)
+
+- A URI that names a server other than the one the store talks to is rejected before any request
+  is sent; the S3 helper functions apply the same check. `delete_prefix` on a per-endpoint client
+  reports per-key errors (#196).
+
+### Fixed — op-log replay (#184, #187) and Azure credential creation (#202)
+
+- The replay URI is rebuilt from the rows s3dlio writes; rows that cannot be rebuilt are an error
+  (legacy and unrecognised rows still translate onto an explicit target as before). An unparsable
+  start time is an error. `OpType` keeps its five variants, so op names it does not model
+  (`GET_RANGE`, `DELETE_BATCH`, `DELETE_PREFIX`, `CREATE_CONTAINER`, `DELETE_CONTAINER`) are still
+  rejected with a clear error, as before. The Azure https credential is created synchronously (no
+  `block_in_place` or `block_on`); the public constructors stay synchronous and cache the credential
+  in a `OnceLock` (#202).
+
+### Fixed — bucket create/delete ignored a server named in the URI (#199)
+
+- `s3://host:port/bkt` now creates/deletes bucket `bkt` **on `host:port`** (per-endpoint
+  client) in: Python `create_bucket` / `delete_bucket`, Python `put` / `put_async` with
+  `should_create_bucket=True`, `s3-cli put --create-bucket`, and
+  `s3_copy::upload_files(.., do_create_bucket = true)` (which now also uploads through
+  that server). Before, the Python calls took `host:port/bkt` (or just `host:port`) as
+  the bucket name and sent it to the `AWS_ENDPOINT_URL` server. `bkt`, `s3://bkt` and
+  `s3://bkt/` still mean bucket `bkt` on the global endpoint; a portless IP
+  (`s3://10.0.0.5/bkt`) is the #178 error and nothing is sent. Python `put(..,
+  should_create_bucket=True)` on a non-`s3://` prefix no longer tries to create an S3
+  bucket. New Rust API: `s3_utils::create_bucket_for_uri[_async]`,
+  `s3_utils::delete_bucket_for_uri[_async]`.
+
+### Fixed — `list_containers` / `s3-cli list-buckets` ignored a server named in the URI (#200)
+
+- `s3://host:port/` (or `[ipv6]:port`) now lists **that server's** buckets, through a
+  per-endpoint client; before, any `s3://...` URI listed the `AWS_ENDPOINT_URL` server's
+  buckets. The listed URIs name the server (`s3://host:port/<bucket>`), so they can be
+  passed straight back to s3dlio. A portless IP address (`s3://10.0.0.5/`) is now the
+  #178 error ("IP address with no port"). `s3://`, `s3://bucket/` and other portless
+  names still list the global server. Applies to the Rust `list_containers`, the Python
+  `list_containers` and `s3-cli list-buckets`. New Rust API:
+  `s3_utils::list_buckets_at`, `s3_utils::s3_bucket_target` and
+  `s3_utils::s3_server_of_first_segment`.
+
+### Fixed — `AWS_ENDPOINT_URL_S3` now takes precedence over `AWS_ENDPOINT_URL` (#183)
+
+- **Behavior change.** s3dlio applied `AWS_ENDPOINT_URL` as an explicit endpoint, which
+  overrode the AWS SDK's service-specific `AWS_ENDPOINT_URL_S3`: with both set, every
+  request went to the `AWS_ENDPOINT_URL` server and `AWS_ENDPOINT_URL_S3` was ignored.
+  s3dlio now follows the SDK's documented order, in one place
+  (`s3dlio::s3_client::s3_endpoint_url_from_env`): `AWS_ENDPOINT_URL_S3`, then
+  `AWS_ENDPOINT_URL`; an empty value counts as unset. That one rule feeds the global
+  S3 client, `list_buckets`, the Python store-cache key, the arrow backend and the
+  error hints.
+  - **Who is affected:** deployments that set both variables to *different* servers
+    and relied on `AWS_ENDPOINT_URL` winning. Unset `AWS_ENDPOINT_URL_S3`, or point it
+    at the server you want.
+  - `s3-cli --endpoint-url` and Python `configure_s3(endpoint_url=...)` still win: they
+    also overwrite `AWS_ENDPOINT_URL_S3` when it is set. A server named in the URI
+    (`s3://host:port/bucket`) wins over all of them for that URI.
+  - The op-log is unchanged (record format frozen); which server a row's request went
+    to is the subject of #169.
+
+
+### Op-log accuracy: each call recorded exactly once (#169 W2)
+
+The op-log TSV format (13 columns, header) is unchanged, and so is every field the
+S3 helper functions have always written; the golden tests pin both (they compare normalised fields, not raw files byte for byte).
+
+- **One row per call on S3 (#169).** Every S3 `get`/`put` through a logged store
+  used to write two rows: the `LoggedObjectStore` row and a second row from the S3
+  backend's own writer (`endpoint` = `AWS_ENDPOINT_URL`, `file` = the bare key,
+  `client_id` = the access key id). The S3 backend of a store no longer writes that
+  second row. A store built without a logger (`store_for_uri`) is now silent for S3
+  too, as it already was for every other backend.
+- **The public helpers keep their own row, exactly as before (#169).**
+  `s3_utils::get_object`, `get_object_uri`, `get_object_uri_async`,
+  `get_object_uri_optimized_async`, `get_objects_parallel*` (Python `get_many` on
+  `s3://`), `get_range`, `put_object_async`, `put_object_uri_async`, the sync
+  `delete_objects`, `S3BytesDataset` (sequential) and `s3_copy` still write the row
+  `S3Ops` writes: `endpoint` = the effective endpoint (`AWS_ENDPOINT_URL_S3` if set, otherwise
+  `AWS_ENDPOINT_URL`; #183), `file` = the bare key, `client_id`
+  = `AWS_ACCESS_KEY_ID`, `bytes` = the data size (0 on failure), the measured
+  first-byte time for a GET, one `DELETE` row with `file` `(batch)` per 1000 keys
+  for `delete_objects`. `S3Ops::new(client, logger, client_id, endpoint)` is
+  unchanged. A call writes one row whichever layer it went through: the S3 backend
+  of a store is the only code that skips it. An object fetched by concurrent
+  ranges writes no helper row, as before.
+- **Checkpoint, the shard reader, the async-pool dataloader and Python
+  `load_checkpoint_with_validation` write their rows exactly as before (#169).**
+  They build an unlogged store; on a bucket-form S3 URI its `get`/`put` write the
+  helper row (`S3Ops` shape) when the op-log is active, on every other backend they
+  write no row. Rows for those backends are a proposal in the audit file.
+- **Python store cache no longer decides whether a call is recorded (#174).**
+  The module-level functions share a cache of stores; it kept the logger of
+  whichever call built an entry first, `get_async`/`get_range_async` passed no
+  logger, `init_op_log` did not clear it and a cached store kept a finalized
+  logger. The cache now holds only unlogged stores and each call wraps its store
+  with the logger it reads (`global_logger()`) when it is made, so a call made while
+  the op-log is active is recorded once and a call made when it is not is neither
+  recorded nor counted, whatever the cache history. `get_async` and
+  `get_range_async` are recorded.
+- **`LoggedObjectStore` is transparent, without hiding real requests (#177).** It
+  forwards every `ObjectStore` method to the inner store. `mkdir`, `rmdir`,
+  `update_metadata` and `update_properties` used to fail ("not implemented for this
+  backend"); the S3 `get_optimized`/`get_range_optimized` overrides were bypassed.
+  Rows: `get_optimized` writes a `GET` row and `get_range_optimized` a `GET_RANGE`
+  row (as before); `mkdir`, `rmdir` and `update_*` have no op name in the format and
+  are forwarded without a row. `copy` and `rename` are forwarded and unrecorded
+  only when the inner store's implementation is a native operation (new provided
+  trait methods `has_native_copy` / `has_native_rename`, default `false`; only the
+  `rename(2)` of `file://` and `direct://` is native). Everywhere else (S3, Azure,
+  GCS, multi-endpoint) they are the trait defaults, made of real requests, so the
+  wrapper runs the default over itself and each request is a row as before:
+  `copy` = `GET` + `PUT`, `rename` = `GET` + `PUT` + `DELETE`. `pre_stat_objects`
+  and `pre_stat_and_cache` write one `HEAD` row per object, and
+  `pre_stat_and_cache` fills the inner store's size cache from the sizes it
+  learned (new provided method `seed_size_cache`, default no-op) without an extra
+  request.
+- **Streamed `LIST` rows carry the client id (#181).** The row written when a
+  `list_stream()` stream completes had an empty `client_id`; it now goes through the
+  same row builder as every other call, so it equals `list()`'s row.
+- **Container rows use the store's endpoint and file (#182).** `CREATE_CONTAINER` /
+  `DELETE_CONTAINER` rows were written with the bare name (endpoint `unknown`).
+  A store built by the factories now knows its URI prefix (`s3://`, `file://`,
+  `az://`, `s3://host:port/` for an S3 host-form store) and the rows read like the
+  store's other rows: `s3://bkt` + `bkt`, `file://` + `/dir`. A hand-wrapped store
+  (`LoggedObjectStore::new`) keeps the old behaviour; `with_container_prefix`
+  supplies the prefix. Python `create_bucket` / `delete_bucket` still write no row.
+- **`exists()` == false is a failed `HEAD` row (#189).** It was a `HEAD` row with
+  an empty error, indistinguishable from a successful HEAD. The wrapper now answers
+  `exists` through the inner store's `stat` (the trait's definition of `exists`;
+  no store overrides it) and writes the error column of the failed HEAD, exactly
+  as `stat` does for the same URI (backend-specific text). A present object is still
+  a `HEAD` row without an error.
+- **`MultiEndpointStore` keeps its `get`/`put` rows on bucket-form endpoints (#175).**
+  They are the helper-shape rows they always were (one `GET` / `PUT` per call,
+  `S3Ops` fields); the other operations (`list`, `delete`, `get_range`, `stat`, and
+  everything on host-form endpoints) never wrote rows and still do not. Rows for
+  them are a proposal in the audit file.
+- **Known consequences (reported, not changed here):** an unlogged store
+  (`store_for_uri`) is silent on S3 (it wrote the helper row by accident), and the
+  `s3dlio-oplog` replayer's `store_for_uri` no longer writes the accidental helper
+  row (capturing a replay is sai3-bench#103). See
+  `docs/design/oplog-record-contract/W2-ownership-audit.md`.
+
+
 ## Version 0.9.120 — Correct routing (server, bucket, key), no sync hang, no exit crash, op-log lifecycle
 
 Fixes 11 issues: #168, #170, #171, #172, #173, #178, #179, #180, #192, #193, #194.

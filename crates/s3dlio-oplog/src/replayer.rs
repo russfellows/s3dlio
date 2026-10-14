@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::reader::OpLogReader;
 use crate::types::{OpLogEntry, OpType};
-use crate::uri::translate_uri;
+use crate::uri::{row_uri, translate_uri};
 
 /// Replay configuration
 #[derive(Debug, Clone)]
@@ -256,6 +256,18 @@ pub async fn replay_workload<E: OpExecutor + 'static>(
     Ok(())
 }
 
+/// URI an operation acts on: the translation of the row onto `target` (the target supplies the
+/// destination, so every row translates), or, with no target, the exact original URI. Without a
+/// target, a row whose URI cannot be reconstructed unambiguously is an error naming the row
+/// (never guessed, never silently dropped).
+fn row_target_uri(op: &OpLogEntry, target: Option<&str>) -> Result<String> {
+    match target {
+        Some(tgt) => translate_uri(&op.file, &op.endpoint, tgt),
+        None => row_uri(&op.endpoint, &op.file).map_err(anyhow::Error::from),
+    }
+    .with_context(|| format!("cannot replay {} row idx {}", op.op, op.idx))
+}
+
 /// Schedule operation at absolute time and execute with microsecond precision
 async fn schedule_and_execute<E: OpExecutor>(
     op: OpLogEntry,
@@ -264,6 +276,10 @@ async fn schedule_and_execute<E: OpExecutor>(
     target: Option<&str>,
     executor: &E,
 ) -> Result<()> {
+    // Resolve the URI before waiting: a row that cannot be replayed fails without executing
+    // anything.
+    let uri = row_target_uri(&op, target)?;
+
     let target_time = replay_epoch + delay;
     let now = Instant::now();
 
@@ -275,13 +291,6 @@ async fn schedule_and_execute<E: OpExecutor>(
         })
         .await?;
     }
-
-    // Translate URI if target provided
-    let uri = if let Some(tgt) = target {
-        translate_uri(&op.file, &op.endpoint, tgt)?
-    } else {
-        format!("{}{}", op.endpoint, op.file)
-    };
 
     debug!("Executing {:?} on {}", op.op, uri);
 
@@ -351,12 +360,12 @@ mod tests {
         writeln!(file, "op\tfile\tendpoint\tbytes\tstart").unwrap();
         writeln!(
             file,
-            "GET\tdata/test.dat\tfile:///tmp/\t1024\t2025-01-01T00:00:00Z"
+            "GET\tsrc-bucket/data/test.dat\ts3://src-bucket\t1024\t2025-01-01T00:00:00Z"
         )
         .unwrap();
         writeln!(
             file,
-            "PUT\tdata/test2.dat\tfile:///tmp/\t2048\t2025-01-01T00:00:01Z"
+            "PUT\tsrc-bucket/data/test2.dat\ts3://src-bucket\t2048\t2025-01-01T00:00:01Z"
         )
         .unwrap();
         file.flush().unwrap();

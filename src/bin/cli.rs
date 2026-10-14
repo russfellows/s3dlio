@@ -687,9 +687,9 @@ async fn main() -> Result<()> {
     // downstream code (aws_s3_client_async, list_buckets, store_for_uri, …)
     // picks it up via AWS_ENDPOINT_URL without modification.
     // CLI flag takes precedence over whatever is already in the environment.
+    // AWS_ENDPOINT_URL_S3, if set, is overridden too: it would otherwise win (#183).
     if let Some(ref url) = cli.endpoint_url {
-        // SAFETY: single-threaded at this point; no S3 client has been created yet.
-        unsafe { std::env::set_var("AWS_ENDPOINT_URL", url) };
+        s3dlio::s3_client::set_s3_endpoint_override(url);
     }
     if let Some(ref region) = cli.region {
         unsafe { std::env::set_var("AWS_DEFAULT_REGION", region) };
@@ -1134,10 +1134,13 @@ async fn main() -> Result<()> {
                 check_aws_credentials()?;
 
                 // Handle S3-specific bucket creation
+                // `s3://host:port/bkt/...` creates `bkt` on THAT server (issue #199);
+                // a URI that cannot name a bucket (portless IP) is an error.
                 if create_bucket_flag {
-                    let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
-                    if let Err(e) = s3dlio::s3_utils::create_bucket(&bucket) {
-                        eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
+                    let target = s3dlio::s3_utils::s3_bucket_target(&uri_prefix)?;
+                    if let Err(e) = s3dlio::s3_utils::create_bucket_for_uri_async(&uri_prefix).await
+                    {
+                        eprintln!("Warning: failed to create bucket {}: {}", target.bucket, e);
                     }
                 }
             }

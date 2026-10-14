@@ -986,9 +986,14 @@ URI scheme (for example `dir/a://b.log`) is a plain path.
 
 A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
 `init_op_log` while already active is a no-op; after `finalize_op_log` it raises
-`RuntimeError` and touches no file. `finalize_op_log` is safe to repeat. Stores
-capture the logger at construction: those created before `init_op_log` are never
-logged, and those created before `finalize_op_log` stop recording when it runs.
+`RuntimeError` and touches no file. `finalize_op_log` is safe to repeat. The
+module-level functions (`get`, `put_bytes`, `stat`, `list`, `delete`, `get_async`,
+...) check the op-log on every call: a call made while it is active is recorded
+once, a call made before `init_op_log` or after `finalize_op_log` is not,
+whichever call first used the scheme. Objects you construct yourself (stores,
+readers, writers) capture the logger at construction: those created before
+`init_op_log` are never logged, and those created before `finalize_op_log` stop
+recording when it runs.
 
 The op-log is **lossy by default**: if the writer cannot keep up and the queue
 (`S3DLIO_OPLOG_BUF`, default 8192 entries) fills, entries are dropped rather than

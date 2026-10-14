@@ -100,6 +100,11 @@ fn get_thread_id() -> usize {
 pub struct LoggedObjectStore {
     inner: Arc<dyn ObjectStore>,
     logger: Logger,
+    /// What a bare container name (`create_container("bucket")`) is joined to
+    /// to form the URI the row is derived from: `s3://`, `file://`,
+    /// `s3://host:port/`, ... `None` when the scheme is not known (a store
+    /// wrapped by hand with [`LoggedObjectStore::new`]).
+    container_prefix: Option<String>,
 }
 
 impl LoggedObjectStore {
@@ -109,7 +114,39 @@ impl LoggedObjectStore {
     /// * `inner` - The underlying ObjectStore implementation to wrap
     /// * `logger` - The Logger instance to use for recording operations
     pub fn new(inner: Arc<dyn ObjectStore>, logger: Logger) -> Self {
-        Self { inner, logger }
+        Self {
+            inner,
+            logger,
+            container_prefix: None,
+        }
+    }
+
+    /// Like [`LoggedObjectStore::new`], for a store built for URIs that start
+    /// with `container_prefix` (the scheme, plus the authority for an S3 host-form
+    /// store: `s3://`, `file://`, `s3://10.0.0.1:9000/`).
+    ///
+    /// `create_container` / `delete_container` receive a bare name, not a URI.
+    /// With the prefix the wrapper writes their rows with the endpoint and file
+    /// the store's other rows have (`s3://bkt` + `bkt`, `file://` + `/dir`) instead
+    /// of endpoint `unknown` and a bare name (issue #182).
+    pub fn with_container_prefix(
+        inner: Arc<dyn ObjectStore>,
+        logger: Logger,
+        container_prefix: String,
+    ) -> Self {
+        Self {
+            inner,
+            logger,
+            container_prefix: Some(container_prefix),
+        }
+    }
+
+    /// The URI a container operation's row is derived from.
+    fn container_uri(&self, name: &str) -> String {
+        match &self.container_prefix {
+            Some(prefix) if !name.contains("://") => format!("{prefix}{name}"),
+            _ => name.to_string(),
+        }
     }
 
     /// Helper to log an operation with standard fields.
@@ -158,23 +195,57 @@ impl LoggedObjectStore {
         end_time: SystemTime,
         error: Option<String>,
     ) {
-        let entry = LogEntry {
-            idx: 0, // Set by logger
-            thread_id: get_thread_id(),
-            operation: operation.to_string(),
-            client_id: crate::s3_logger::get_client_id(), // Use global client_id
-            num_objects,
+        record_call(
+            &self.logger,
+            operation,
+            uri,
             bytes,
-            endpoint: extract_endpoint(uri),
-            file: strip_uri_scheme(uri), // Strip scheme prefix from file column
-            error,
+            num_objects,
             start_time,
-            first_byte_time, // Now accepts actual timestamp or None
+            first_byte_time,
             end_time,
-        };
-
-        self.logger.log(entry);
+            error,
+        );
     }
+}
+
+/// Build and submit ONE op-log row for a call on `uri`.
+///
+/// This is the single place that turns a call into a row: `client_id` from
+/// [`crate::s3_logger::get_client_id`], `endpoint`/`file` derived from the URI
+/// ([`extract_endpoint`], [`strip_uri_scheme`]), the calling thread. The store
+/// wrappers (this one and the ones that build on it) go through it. The public S3
+/// helper functions do NOT: they keep their own serializer (`S3Ops::log_op`), whose
+/// row shape the golden tests pin separately, so one call writes one row whichever
+/// layer wrote it (issue #169).
+#[allow(clippy::too_many_arguments)] // one field per column of the row
+pub(crate) fn record_call(
+    logger: &Logger,
+    operation: &str,
+    uri: &str,
+    bytes: u64,
+    num_objects: u32,
+    start_time: SystemTime,
+    first_byte_time: Option<SystemTime>,
+    end_time: SystemTime,
+    error: Option<String>,
+) {
+    let entry = LogEntry {
+        idx: 0, // Set by logger
+        thread_id: get_thread_id(),
+        operation: operation.to_string(),
+        client_id: crate::s3_logger::get_client_id(), // Use global client_id
+        num_objects,
+        bytes,
+        endpoint: extract_endpoint(uri),
+        file: strip_uri_scheme(uri), // Strip scheme prefix from file column
+        error,
+        start_time,
+        first_byte_time, // Actual timestamp or None
+        end_time,
+    };
+
+    logger.log(entry);
 }
 
 #[async_trait]
@@ -297,24 +368,19 @@ impl ObjectStore for LoggedObjectStore {
                 }
             }
 
-            // Log the complete operation
-            let end_time = SystemTime::now();
-            let entry = LogEntry {
-                idx: 0, // Set by logger
-                thread_id: get_thread_id(),
-                operation: "LIST".to_string(),
-                client_id: String::new(),
-                num_objects: count,
-                bytes: 0,
-                endpoint: extract_endpoint(&uri_str),
-                file: strip_uri_scheme(&uri_str),
-                error: stream_error,
+            // Log the complete operation: the same row builder as every other
+            // call, so this row cannot differ from list()'s (issue #181).
+            record_call(
+                &logger,
+                "LIST",
+                &uri_str,
+                0,
+                count,
                 start_time,
-                first_byte_time: None,
-                end_time,
-            };
-
-            logger.log(entry);
+                None,
+                SystemTime::now(),
+                stream_error,
+            );
         })
     }
 
@@ -389,7 +455,16 @@ impl ObjectStore for LoggedObjectStore {
         let error = result.as_ref().err().map(|e| e.to_string());
 
         // CREATE_CONTAINER is metadata-only operation
-        self.log_operation("CREATE_CONTAINER", name, 0, 1, start, None, end, error);
+        self.log_operation(
+            "CREATE_CONTAINER",
+            &self.container_uri(name),
+            0,
+            1,
+            start,
+            None,
+            end,
+            error,
+        );
 
         result
     }
@@ -402,22 +477,40 @@ impl ObjectStore for LoggedObjectStore {
         let error = result.as_ref().err().map(|e| e.to_string());
 
         // DELETE_CONTAINER is metadata-only operation
-        self.log_operation("DELETE_CONTAINER", name, 0, 1, start, None, end, error);
+        self.log_operation(
+            "DELETE_CONTAINER",
+            &self.container_uri(name),
+            0,
+            1,
+            start,
+            None,
+            end,
+            error,
+        );
 
         result
     }
 
     async fn exists(&self, uri: &str) -> Result<bool> {
         let start = SystemTime::now();
-        let result = self.inner.exists(uri).await;
+        // `exists` is defined as "stat() succeeds" (the trait default, and no store
+        // overrides it). Ask the inner store's stat so that a negative answer can be
+        // recorded the way the same failed HEAD is recorded by `stat`: the error
+        // column holds the error the HEAD returned (issue #189). Calling
+        // `inner.exists()` would hide that error, and probing again to recover it
+        // would add a request the op-log does not show.
+        let stat = self.inner.stat(uri).await;
         let end = SystemTime::now();
 
-        let error = result.as_ref().err().map(|e| e.to_string());
+        let (exists, error) = match stat {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
 
         // Log as HEAD operation (existence check, metadata-only)
         self.log_operation("HEAD", uri, 0, 1, start, None, end, error);
 
-        result
+        Ok(exists)
     }
 
     async fn get_with_validation(
@@ -510,6 +603,149 @@ impl ObjectStore for LoggedObjectStore {
         // Note: We log the final write, not the writer creation
         // The writer itself will handle logging when finalized
         self.inner.create_writer(uri, options).await
+    }
+
+    // ------------------------------------------------------------------
+    // Methods with a trait default. The wrapper must never change what the
+    // inner store does (issue #177), AND must never hide a real request from the
+    // op-log. Which of the two applies depends on whether the inner store's
+    // implementation is a native backend operation or just the trait default:
+    //
+    // * `get_optimized`, `get_range_optimized`: forwarded, and recorded as the GET
+    //   and GET_RANGE they are (they were recorded as such, through the default
+    //   calling `get`/`get_range`, before).
+    // * `copy`, `rename`: a NATIVE implementation (`has_native_copy`,
+    //   `has_native_rename`: today only the `rename(2)` of `file://` and
+    //   `direct://`) is forwarded and NOT recorded (no op name describes it). When
+    //   the inner store uses the trait default (every S3, Azure, GCS and
+    //   multi-endpoint copy and rename), the default algorithm runs over THIS
+    //   wrapper, so its real GET, PUT and DELETE requests are recorded, one row each.
+    // * `pre_stat_objects`: not overridden; the default stats through this wrapper
+    //   (one HEAD row per URI). `pre_stat_and_cache` additionally hands the sizes
+    //   to the inner store's cache (`seed_size_cache`) without a request.
+    // * `mkdir`, `rmdir`, `update_metadata`, `update_properties`: forwarded
+    //   SILENTLY. They have no op name in the format, and adding one is a format
+    //   change that needs the architect's approval.
+    // ------------------------------------------------------------------
+
+    async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
+        let start = SystemTime::now();
+        let result = self.inner.get_optimized(uri).await;
+        let first_byte = SystemTime::now();
+        let end = first_byte;
+
+        let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+        let error = result.as_ref().err().map(|e| e.to_string());
+
+        self.log_operation("GET", uri, bytes, 1, start, Some(first_byte), end, error);
+
+        result
+    }
+
+    async fn get_range_optimized(
+        &self,
+        uri: &str,
+        offset: u64,
+        length: Option<u64>,
+        chunk_size: Option<usize>,
+        max_concurrency: Option<usize>,
+    ) -> Result<Bytes> {
+        let start = SystemTime::now();
+        let result = self
+            .inner
+            .get_range_optimized(uri, offset, length, chunk_size, max_concurrency)
+            .await;
+        let first_byte = SystemTime::now();
+        let end = first_byte;
+
+        let bytes = result.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+        let error = result.as_ref().err().map(|e| e.to_string());
+
+        self.log_operation(
+            "GET_RANGE",
+            uri,
+            bytes,
+            1,
+            start,
+            Some(first_byte),
+            end,
+            error,
+        );
+
+        result
+    }
+
+    // `pre_stat_objects` is NOT overridden: the trait default stats every URI through
+    // `self.stat`, i.e. through this wrapper, so each URI is one recorded `HEAD` row,
+    // exactly as before W2, and the inner store (whatever it is) answers each `stat`.
+
+    async fn pre_stat_and_cache(&self, uris: &[String], max_concurrent: usize) -> Result<usize> {
+        // The stats go through this wrapper (one recorded HEAD per URI). Then the sizes
+        // they found are handed to the inner store's size cache, which is what the
+        // inner store's own `pre_stat_and_cache` would have filled (issue #177), with
+        // no further request.
+        let size_map = self.pre_stat_objects(uris, max_concurrent).await?;
+        self.inner.seed_size_cache(&size_map).await;
+        Ok(size_map.len())
+    }
+
+    async fn seed_size_cache(&self, sizes: &std::collections::HashMap<String, u64>) {
+        self.inner.seed_size_cache(sizes).await
+    }
+
+    fn has_native_copy(&self) -> bool {
+        self.inner.has_native_copy()
+    }
+
+    fn has_native_rename(&self) -> bool {
+        self.inner.has_native_rename()
+    }
+
+    async fn copy(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
+        if self.inner.has_native_copy() {
+            // A native copy is one backend call that no op name describes: forwarded,
+            // not recorded.
+            return self.inner.copy(src_uri, dst_uri).await;
+        }
+        // The trait default (`get` then `put`), run over THIS wrapper so that the real
+        // GET and PUT requests it makes are recorded, one row each.
+        let data = self.get(src_uri).await?;
+        self.put(dst_uri, data).await
+    }
+
+    async fn rename(&self, src_uri: &str, dst_uri: &str) -> Result<()> {
+        if self.inner.has_native_rename() {
+            // `rename(2)`: atomic, no op name describes it: forwarded, not recorded.
+            return self.inner.rename(src_uri, dst_uri).await;
+        }
+        // The trait default (`copy` then `delete`), run over THIS wrapper so that the
+        // GET + PUT (or the native copy) and the DELETE are recorded, one row each.
+        self.copy(src_uri, dst_uri).await?;
+        self.delete(src_uri).await
+    }
+
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        self.inner.mkdir(uri).await
+    }
+
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        self.inner.rmdir(uri, recursive).await
+    }
+
+    async fn update_metadata(
+        &self,
+        uri: &str,
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        self.inner.update_metadata(uri, metadata).await
+    }
+
+    async fn update_properties(
+        &self,
+        uri: &str,
+        properties: &crate::object_store::ObjectProperties,
+    ) -> Result<()> {
+        self.inner.update_properties(uri, properties).await
     }
 
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {

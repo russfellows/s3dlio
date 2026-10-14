@@ -1,0 +1,217 @@
+{
+ "prefix": "s3dlio-harness-20261014-290467",
+ "seed": "c3898871",
+ "b1": "B1",
+ "b2": "B2",
+ "wheel": "/mnt/scratch/s3dlio-worktrees/fix_169-exactly-once/tests/oplog_accuracy/wheels/s3dlio-0.9.114-cp313-cp313-manylinux_2_39_x86_64.whl",
+ "wheel_sha256": "10238517ffd072f21bedfcc46e4c1f5b9ed0426c2e362b708a97a30ad77657d2",
+ "started": "2026-10-14T03:36:57",
+ "endpoint": "https://storage.googleapis.com",
+ "hostform_host": "storage.googleapis.com",
+ "delbatch_bin": null,
+ "skipped": [
+  {
+   "case": "delete_batch",
+   "reason": "SKIP: no delete_batch probe given (--delbatch-bin missing or not a file)"
+  }
+ ],
+ "s3dlio_version": "0.9.114",
+ "case_results": [
+  {
+   "tag": "core__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 2.92,
+   "pid": 3874063
+  },
+  {
+   "tag": "core__fileuri",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 2.72,
+   "pid": 3874420
+  },
+  {
+   "tag": "repeat__fileuri",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.67,
+   "pid": 3874646
+  },
+  {
+   "tag": "two_buckets__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 4.47,
+   "pid": 3874712
+  },
+  {
+   "tag": "leading_slash__fileuri",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 3.92,
+   "pid": 3874898
+  },
+  {
+   "tag": "async__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 1.97,
+   "pid": 3875180
+  },
+  {
+   "tag": "get_many__fileuri",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.41,
+   "pid": 3875288
+  },
+  {
+   "tag": "local_files__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.31,
+   "pid": 3875351
+  },
+  {
+   "tag": "local_files__fileuri",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.36,
+   "pid": 3875418
+  },
+  {
+   "tag": "s3_dest_reject__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 1.02,
+   "pid": 3875484
+  },
+  {
+   "tag": "multi_endpoint__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 1.87,
+   "pid": 3875557
+  },
+  {
+   "tag": "host443_get__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 25.22,
+   "pid": 3875646
+  },
+  {
+   "tag": "host443_stat__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.31,
+   "pid": 3875862
+  },
+  {
+   "tag": "host443_get_range__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 25.21,
+   "pid": 3875922
+  },
+  {
+   "tag": "host443_get_async__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.37,
+   "pid": 3876030
+  },
+  {
+   "tag": "host443_decoydefault_stat__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.36,
+   "pid": 3876106
+  },
+  {
+   "tag": "host443_decoydefault_get_async__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.31,
+   "pid": 3876167
+  },
+  {
+   "tag": "host443_decoydefault_get_many__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 15.25,
+   "pid": 3876245
+  },
+  {
+   "tag": "portless_get__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.42,
+   "pid": 3876327
+  },
+  {
+   "tag": "portless_stat__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.31,
+   "pid": 3876445
+  },
+  {
+   "tag": "portless_put__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.97,
+   "pid": 3876531
+  },
+  {
+   "tag": "me_host443__path",
+   "rc": 0,
+   "timed_out": false,
+   "stuck": false,
+   "secs": 0.26,
+   "pid": 3876628
+  }
+ ],
+ "cleanup": {
+  "deleted": 24,
+  "remaining": {
+   "gs://B1/s3dlio-harness-20261014-290467/": [],
+   "gs://B1//s3dlio-harness-20261014-290467/": [],
+   "gs://B2/s3dlio-harness-20261014-290467/": []
+  },
+  "empty": true
+ },
+ "elapsed_s": 102.2,
+ "native_requests": {
+  "gcloud": 125,
+  "n_calls": 35,
+  "by_who": {
+   "setup": 48,
+   "snapshot": 9,
+   "describe": 20,
+   "cleanup": 48
+  }
+ }
+}

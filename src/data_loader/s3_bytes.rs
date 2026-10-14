@@ -6,11 +6,11 @@
 use crate::data_loader::options::{LoaderOptions, ReaderMode};
 use crate::data_loader::parallel_fetch::DropCancel;
 use crate::data_loader::{Dataset, DatasetError};
+use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::s3_utils::{
     get_object_range_uri_async, // NEW: implemented in s3_utils.rs next
     get_object_uri_async,
     list_objects as list_objects_rs,
-    parse_s3_uri,
     stat_object_uri_async,
 };
 use async_trait::async_trait;
@@ -36,7 +36,8 @@ impl S3BytesDataset {
 
     /// NEW: honor LoaderOptions (reader strategy + part params)
     pub fn from_prefix_with_opts(uri: &str, opts: &LoaderOptions) -> Result<Self, DatasetError> {
-        let (bucket, prefix) = parse_s3_uri(uri).map_err(|e| DatasetError::from(e.to_string()))?;
+        let (bucket, prefix) =
+            parse_s3_uri_for_global_client(uri).map_err(|e| DatasetError::from(e.to_string()))?;
 
         // Recursively list keys under prefix
         let keys = list_objects_rs(&bucket, &prefix, true)
