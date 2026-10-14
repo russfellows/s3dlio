@@ -1005,13 +1005,19 @@ the writer thread) with entries still queued. Detect both with `op_log_stats()`
 s3dlio.finalize_op_log()        # stop your worker threads first
 stats = s3dlio.op_log_stats()   # None before init_op_log(); else a dict
 # {'accepted': 4, 'written': 4, 'dropped_full': 0, 'rejected_closed': 0,
-#  'writer_failed': 0, 'writer_error': None, 'lossless': False}
+#  'writer_failed': 0, 'writer_error': None, 'lossless': False,
+#  'rejected_unformattable': 0}
 complete = (stats["accepted"] == stats["written"] and stats["dropped_full"] == 0
-            and stats["writer_failed"] == 0 and stats["writer_error"] is None)
+            and stats["writer_failed"] == 0 and stats["writer_error"] is None
+            and stats["rejected_unformattable"] == 0)
 ```
 
 No counted loss happened exactly when `accepted == written` and `dropped_full ==
-0` and `writer_failed == 0` and `writer_error is None`. `writer_error` is the
+0` and `writer_failed == 0` and `writer_error is None` and
+`rejected_unformattable == 0`. `rejected_unformattable` counts accepted rows the
+writer did not write because a timestamp (after the clock offset is applied) is
+before 1970-01-01 or at or after year 10000 and has no RFC 3339 text; such a row
+is absent from the file, later rows are written, and the trace is incomplete (#190). `writer_error` is the
 first error the writer met (a failed write, a failed finish or flush of the
 compressed stream, or a writer panic, which is a defect rather than an I/O error)
 as text; `written` is an upper bound of the rows in the file. `writer_failed` only counts calls made *after* the writer
@@ -1178,7 +1184,7 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `init_op_log(path)` | Start the process's single op-log session on a local file (plain path or `file://` destination, s3dlio's file-store convention, not full RFC 8089); `RuntimeError` after finalize |
 | `finalize_op_log()` | Write all accepted records (unless the writer fails: an I/O error or a writer-thread panic) and close the log; **call it before the process exits, nothing does it for you**; releases the GIL while draining; terminal and idempotent |
 | `is_op_log_active()` | True between init and finalize only |
-| `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `written` / `dropped_full` / `rejected_closed` / `writer_failed` / `writer_error` / `lossless`, available while active and after finalize, to detect lost records (complete = `accepted == written`, no drops, no refusals, `writer_error is None`) |
+| `op_log_stats()` | `None` before `init_op_log`; else a dict `accepted` / `written` / `dropped_full` / `rejected_closed` / `writer_failed` / `writer_error` / `lossless` / `rejected_unformattable`, available while active and after finalize, to detect lost records (complete = `accepted == written`, no drops, no refusals, `writer_error is None`, `rejected_unformattable == 0`) |
 
 ---
 

@@ -784,10 +784,17 @@ pub fn is_op_log_active() -> PyResult<bool> {
 ///                      a failed finish/flush of the compressed stream, or a
 ///                      writer panic, which is a defect, not an I/O error) as text
 ///     lossless         True if S3DLIO_OPLOG_LOSSLESS=1 (callers wait, never drop)
+///     rejected_unformattable
+///                      accepted rows the writer did not write because a
+///                      timestamp (start, first byte or end, after the clock
+///                      offset is applied) is before 1970-01-01 or after
+///                      9999-12-31 and cannot be written as RFC 3339. The row is
+///                      absent from the file (its idx is skipped), later rows are
+///                      written, and the trace is incomplete.
 ///
 /// After finalize_op_log() no counted loss happened exactly when
 /// accepted == written and dropped_full == 0 and writer_failed == 0 and
-/// writer_error is None. "written" counts rows the zstd compressor accepted; the
+/// writer_error is None and rejected_unformattable == 0. "written" counts rows the zstd compressor accepted; the
 /// bytes may still be buffered when it is counted, and a later write, finish or
 /// flush can still fail (that is writer_error). A successful finalize_op_log()
 /// with that condition true means every accepted row reached the compressor and
@@ -824,6 +831,7 @@ pub fn op_log_stats_py(py: Python<'_>) -> PyResult<Option<Bound<'_, PyDict>>> {
     dict.set_item("lossless", stats.lossless)?;
     dict.set_item("written", stats.written)?;
     dict.set_item("writer_error", stats.writer_error)?;
+    dict.set_item("rejected_unformattable", stats.rejected_unformattable)?;
     Ok(Some(dict))
 }
 

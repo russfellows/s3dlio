@@ -1,5 +1,24 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed — a row with an unformattable timestamp no longer ends the op-log (#190)
+
+- **Behaviour change.** The op-log writes each row's start, first-byte and end times as
+  RFC 3339 after the clock offset is applied. A corrected time before 1970-01-01T00:00:00Z or at
+  or after 10000-01-01T00:00:00Z (an offset computed against a reference of 0 does it to every
+  row) has no such text; the formatter panicked, and the panic ended the log: that row and every
+  later one were lost. The row is now **rejected (not written) and counted**, and the writer
+  carries on with the next row. Nothing is clamped or reformatted, and every other row is
+  byte-identical to before. The rejected row's `idx` is skipped, so later rows keep their numbers.
+- New `OpLogStats::rejected_unformattable` (Rust; `#[non_exhaustive]`, so additive) and the
+  `rejected_unformattable` key of Python `op_log_stats()`. It is part of `is_complete()`: a log
+  with a rejected row is **not** complete. The first rejection prints one stderr note per
+  session; `finalize_op_log()`'s INCOMPLETE warning states the exact count.
+- The writer checks representability before formatting (it does not rely on catching a panic).
+  The domain is humantime 2.4.0's: at or after the epoch, below 253,402,300,800 s after it.
+- See `docs/supplemental/OPERATION_LOGGING.md`, "Rows with an unformattable timestamp".
+
 ## Version 0.9.122 — Op-log accuracy (each call recorded once), server routing for every operation, replay fixes, Azure credential fix
 
 Fixes 14 issues: #169, #174, #177, #181, #182, #189, #196, #197, #199, #200, #183, #184, #187, #202.

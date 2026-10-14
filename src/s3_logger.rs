@@ -17,7 +17,7 @@ use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError,
 };
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 use zstd::stream::write::Encoder;
 
@@ -222,12 +222,20 @@ pub fn global_logger() -> Option<Logger> {
 ///
 /// ```text
 /// accepted == written  &&  dropped_full == 0  &&  writer_failed == 0  &&  writer_error is None
+///     &&  rejected_unformattable == 0
 /// ```
 ///
 /// - `accepted == written` catches entries that were queued but never reached
 ///   the encoder, which is what a writer that dies on an I/O error with entries
 ///   still queued leaves behind (`writer_failed` only counts calls made *after*
 ///   the writer died, so on its own it misses them).
+/// - `rejected_unformattable` counts rows the writer refused to write because a
+///   timestamp (start, first byte or end, after the clock offset is applied) lies
+///   before 1970-01-01T00:00:00Z or at or after 10000-01-01T00:00:00Z, where the
+///   RFC 3339 text the log uses does not exist. Such a row is absent from the
+///   file, the writer carries on with later rows, and the trace is incomplete.
+///   Every accepted row is exactly one of written, rejected here, or unwritten
+///   because the writer died.
 /// - `writer_error` is the first error the writer met: a failed write, a failed
 ///   zstd finish or final flush (the rows may all have been counted as written
 ///   yet not be on disk), or a writer panic (a defect, not an I/O error).
@@ -269,11 +277,18 @@ pub struct OpLogStats {
     /// The first error the writer thread met, if any (write, zstd finish,
     /// final flush, or a panic), as text.
     pub writer_error: Option<String>,
+    /// Accepted rows the writer did NOT write because a timestamp could not be
+    /// formatted: before 1970-01-01T00:00:00Z or at or after 10000-01-01T00:00:00Z
+    /// once the clock offset was applied (see [`LogEntry`] and `set_clock_offset`).
+    /// The row is absent from the file (its `idx` is skipped) and the writer
+    /// continues with the next one.
+    pub rejected_unformattable: u64,
 }
 
 impl OpLogStats {
     /// True when none of the counted losses happened: `accepted == written &&
-    /// dropped_full == 0 && writer_failed == 0 && writer_error.is_none()`.
+    /// dropped_full == 0 && writer_failed == 0 && writer_error.is_none() &&
+    /// rejected_unformattable == 0`.
     /// Meaningful once [`finalize_op_logger`] has returned (see the type docs for
     /// what it cannot see); calls counted in `rejected_closed` are not part of it.
     pub fn is_complete(&self) -> bool {
@@ -281,6 +296,7 @@ impl OpLogStats {
             && self.dropped_full == 0
             && self.writer_failed == 0
             && self.writer_error.is_none()
+            && self.rejected_unformattable == 0
     }
 }
 
@@ -315,7 +331,12 @@ fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
     if stats.is_complete() {
         return None;
     }
-    let unwritten = stats.accepted.saturating_sub(stats.written);
+    // Rejected rows were accepted and will never be written, but they are named
+    // on their own line below, not as lost to a failing writer.
+    let unwritten = stats
+        .accepted
+        .saturating_sub(stats.written)
+        .saturating_sub(stats.rejected_unformattable);
     let mut lines = Vec::new();
     let mut advice = Vec::new();
     if stats.dropped_full > 0 {
@@ -340,6 +361,15 @@ fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
             "{} rows written but only {} accepted (the counters were read while \
              the session was still active)",
             stats.written, stats.accepted
+        ));
+    }
+    if stats.rejected_unformattable > 0 {
+        lines.push(format!(
+            "{} entries were rejected because a timestamp could not be formatted \
+             (before 1970-01-01 or after 9999-12-31 once the clock offset is \
+             applied); the trace is incomplete. Check the value passed to \
+             set_clock_offset",
+            stats.rejected_unformattable
         ));
     }
     if let Some(error) = &stats.writer_error {
@@ -544,8 +574,40 @@ pub struct LogEntry {
     pub end_time: SystemTime,
 }
 
+/// First whole second after the last one humantime's RFC 3339 formatter accepts:
+/// 253_402_300_800 s after the epoch is 10000-01-01T00:00:00Z. Its `Display`
+/// impl returns `fmt::Error` for `secs_since_epoch >= 253_402_300_800` (humantime
+/// 2.4.0, `src/date.rs` lines 268-270, "year 9999"), and `to_string()` on that
+/// panics. Pinned against the real formatter by a boundary test.
+const RFC3339_END_SECS: u64 = 253_402_300_800;
+
+/// `t` as `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`, the exact text of
+/// `humantime::format_rfc3339_nanos(t).to_string()`, or `None` when humantime
+/// cannot format it. That is every `t` before `UNIX_EPOCH` (its `Display` calls
+/// `duration_since(UNIX_EPOCH).expect("all times should be after the epoch")`,
+/// `src/date.rs` lines 261-264) and every `t` at or after
+/// [`RFC3339_END_SECS`] seconds. Both are checked before the formatter runs, and
+/// the write itself is fallible, so nothing here can panic.
+fn format_timestamp(t: SystemTime) -> Option<String> {
+    let since_epoch = t.duration_since(UNIX_EPOCH).ok()?;
+    if since_epoch.as_secs() >= RFC3339_END_SECS {
+        return None;
+    }
+    let mut text = String::with_capacity(30);
+    std::fmt::Write::write_fmt(
+        &mut text,
+        format_args!("{}", humantime::format_rfc3339_nanos(t)),
+    )
+    .ok()?;
+    Some(text)
+}
+
 impl LogEntry {
-    fn to_log_line(&self, clock_offset_nanos: i64) -> String {
+    /// The log row for this entry after the clock offset is applied, or `None`
+    /// when any of its three timestamps (start, first byte, end) cannot be
+    /// formatted (see [`format_timestamp`]). Nothing is written for such a row;
+    /// the writer counts it and goes on (issue #190).
+    fn to_log_line(&self, clock_offset_nanos: i64) -> Option<String> {
         // Apply clock offset correction for distributed systems
         // Positive offset means local clock is ahead, so we subtract to align with reference time
         // `unsigned_abs` instead of negation: `-i64::MIN` overflows (a panic in
@@ -585,13 +647,14 @@ impl LogEntry {
             .duration_since(corrected_start)
             .unwrap_or_default()
             .as_nanos();
-        let start_ts = humantime::format_rfc3339_nanos(corrected_start).to_string();
-        let end_ts = humantime::format_rfc3339_nanos(corrected_end).to_string();
-        let first_byte_ts = corrected_first_byte
-            .map(|t| humantime::format_rfc3339_nanos(t).to_string())
-            .unwrap_or_default();
+        let start_ts = format_timestamp(corrected_start)?;
+        let end_ts = format_timestamp(corrected_end)?;
+        let first_byte_ts = match corrected_first_byte {
+            Some(t) => format_timestamp(t)?,
+            None => String::new(),
+        };
         let error_str = self.error.as_deref().unwrap_or_default();
-        format!(
+        Some(format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             self.idx,
             self.thread_id,
@@ -606,7 +669,7 @@ impl LogEntry {
             first_byte_ts,
             end_ts,
             duration_ns
-        )
+        ))
     }
 }
 
@@ -711,6 +774,8 @@ struct Shared {
 struct WriterReport {
     /// Rows handed to the zstd encoder without an error.
     written: AtomicU64,
+    /// Rows not written because a timestamp could not be formatted (#190).
+    rejected_unformattable: AtomicU64,
     /// The FIRST error the writer met; later ones are ignored.
     first_error: OnceLock<String>,
 }
@@ -808,6 +873,9 @@ fn write_rows<W: Write>(
     report: &WriterReport,
 ) {
     let mut written = 0_u64;
+    let mut rejected = 0_u64;
+    // `idx` numbers every message, so a rejected row leaves a gap in the column
+    // and each later row keeps the number it would have had.
     for (idx, message) in (0_u64..).zip(receiver) {
         let mut entry = match message {
             Message::Entry(entry) => entry,
@@ -815,7 +883,24 @@ fn write_rows<W: Write>(
         };
         entry.idx = idx;
         let offset = clock_offset.load(Ordering::Relaxed);
-        let line = entry.to_log_line(offset);
+        let Some(line) = entry.to_log_line(offset) else {
+            // Not written, not fatal: count it, say so once per session, and
+            // carry on with the next row. The exact total is in the warning
+            // finalize prints.
+            rejected += 1;
+            report
+                .rejected_unformattable
+                .store(rejected, Ordering::Relaxed);
+            if rejected == 1 {
+                stderr_note(
+                    "op-log: a row's timestamp cannot be formatted (before 1970-01-01 \
+                     or after 9999-12-31 once the clock offset is applied); the row is \
+                     not written and later rows continue (further rejections are \
+                     counted and reported when the op-log is finalized)",
+                );
+            }
+            continue;
+        };
         if let Err(e) = encoder.write_all(line.as_bytes()) {
             report.record_error("write failed", &e);
             let _ = writeln!(std::io::stderr(), "Error writing to op-log: {e}");
@@ -1161,6 +1246,7 @@ impl Logger {
             lossless: shared.lossless,
             written: shared.writer.written.load(Ordering::Relaxed),
             writer_error: shared.writer.first_error.get().cloned(),
+            rejected_unformattable: shared.writer.rejected_unformattable.load(Ordering::Relaxed),
         }
     }
 
@@ -2918,6 +3004,7 @@ mod oplog_writer_error_tests {
             lossless: false,
             written,
             writer_error: None,
+            rejected_unformattable: 0,
         }
     }
 
@@ -3046,12 +3133,17 @@ mod oplog_writer_error_tests {
         assert_eq!(readable_rows(&sink.bytes()), 5);
     }
 
-    // A panic in the writer thread (here: a time pushed before the epoch makes
-    // humantime's formatter panic, a recorded pre-existing limit) must not hang
-    // shutdown, and must show up as an error. The stream is still finished, so
-    // the rows before the panic are readable.
+    // Issue #190. This test used to cover "a panic in the writer thread" with a
+    // time pushed before the epoch, which made humantime's formatter panic (a
+    // recorded pre-existing limit): shutdown did not hang, the error was
+    // reported, and every row after the bad one was lost. That input no longer
+    // panics: the row is rejected and counted, and the writer writes every later
+    // row. The same input is kept, with the new contract. Panics in the writer
+    // thread (shutdown not hanging, the error shown, the stream still finished)
+    // stay covered with an injected panic: `a_panic_in_the_row_loop_is_reported_and_shutdown_does_not_hang` (PanicSink)
+    // and `a_panic_while_finishing_the_stream_is_reported_as_such`.
     #[test]
-    fn writer_panic_is_reported_and_shutdown_does_not_hang() {
+    fn a_pre_epoch_row_is_rejected_and_counted_without_a_writer_panic() {
         for lossless in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("ops.tsv.zst");
@@ -3068,33 +3160,32 @@ mod oplog_writer_error_tests {
                     other => panic!("lossless={lossless}: unexpected {other:?}"),
                 }
             }
-
-            let (done_tx, done_rx) = channel::<()>();
-            let closing = logger.clone();
-            thread::spawn(move || {
-                closing.shutdown();
-                let _ = done_tx.send(());
-            });
-            done_rx
-                .recv_timeout(Duration::from_secs(30))
-                .unwrap_or_else(|_| panic!("lossless={lossless}: shutdown hung after a panic"));
+            shutdown_within_30s(&logger, "a rejected row");
 
             let st = logger.stats();
-            let error = st.writer_error.as_deref().unwrap_or_default();
-            assert!(
-                error.contains("panicked") && error.contains("after the epoch"),
-                "lossless={lossless}: {st:?}"
+            assert_eq!(st.writer_error, None, "lossless={lossless}: {st:?}");
+            assert_eq!(st.writer_failed, 0, "lossless={lossless}: {st:?}");
+            assert_eq!(st.rejected_unformattable, 1, "lossless={lossless}: {st:?}");
+            assert_eq!(
+                st.written,
+                st.accepted - 1,
+                "every accepted row but the bad one is written: {st:?}"
             );
-            assert_eq!(st.written, 1, "only the row before the panic: {st:?}");
-            assert!(st.accepted >= 2, "{st:?}");
+            assert!(st.written > 1, "rows after the bad one survive: {st:?}");
             assert!(!st.is_complete());
             assert!(incomplete_warning(&st).is_some());
-            let raw = std::fs::read(&path).unwrap();
-            assert_eq!(readable_rows(&raw), 1);
-            assert!(
-                zstd::decode_all(raw.as_slice()).is_ok(),
-                "the stream is finished after a writer panic"
-            );
+            let text = String::from_utf8(
+                zstd::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap(),
+            )
+            .unwrap();
+            let files: Vec<&str> = text
+                .lines()
+                .skip(1)
+                .map(|l| l.split('\t').nth(7).unwrap())
+                .collect();
+            assert_eq!(files.len() as u64, st.written);
+            assert_eq!(files.first(), Some(&"fine"));
+            assert!(!files.contains(&"boom"));
         }
     }
 
@@ -3359,6 +3450,37 @@ mod oplog_writer_error_tests {
         let mut st = stats(10, 10);
         st.writer_error = Some("x".to_string());
         assert!(!st.is_complete());
+        // A rejected row is accepted but never written: not complete, whatever
+        // the other counters say.
+        let mut st = stats(10, 9);
+        st.rejected_unformattable = 1;
+        assert!(!st.is_complete());
+        let mut st = stats(10, 10);
+        st.rejected_unformattable = 1;
+        assert!(!st.is_complete());
+    }
+
+    // Rejected rows have their own line and are not also reported as "never
+    // written"; rows really lost to a dying writer still are, on top of them.
+    #[test]
+    fn warning_separates_rejected_rows_from_unwritten_rows() {
+        let mut st = stats(10, 9);
+        st.rejected_unformattable = 1;
+        let w = incomplete_warning(&st).unwrap();
+        assert!(
+            w.contains("1 entries were rejected because a timestamp could not be formatted")
+                && w.contains("set_clock_offset")
+                && !w.contains("never written"),
+            "{w}"
+        );
+        let mut st = stats(10, 7);
+        st.rejected_unformattable = 1;
+        let w = incomplete_warning(&st).unwrap();
+        assert!(
+            w.contains("1 entries were rejected")
+                && w.contains("2 accepted entries were never written"),
+            "{w}"
+        );
     }
 
     // The warning is tailored: only the non-zero counts, and only the advice that
@@ -3689,7 +3811,7 @@ mod oplog_clock_offset_tests {
                 ),
             ),
         ] {
-            assert_eq!(e.to_log_line(offset), want, "offset {offset}");
+            assert_eq!(e.to_log_line(offset), Some(want), "offset {offset}");
         }
     }
 
@@ -3701,21 +3823,21 @@ mod oplog_clock_offset_tests {
         let e = entry_at(far());
         assert_eq!(
             e.to_log_line(i64::MAX),
-            row(
+            Some(row(
                 3,
                 "1994-08-11T17:59:23.268680982Z",
                 "1994-08-11T17:59:23.270180982Z",
                 "1994-08-11T17:59:23.272680982Z",
-            )
+            ))
         );
         assert_eq!(
             e.to_log_line(i64::MIN),
-            row(
+            Some(row(
                 3,
                 "2579-03-01T17:33:56.978232597Z",
                 "2579-03-01T17:33:56.979732597Z",
                 "2579-03-01T17:33:56.982232597Z",
-            )
+            ))
         );
     }
 
@@ -3772,7 +3894,7 @@ mod oplog_clock_offset_tests {
             for &o in &offsets {
                 assert_eq!(
                     e.to_log_line(o),
-                    to_log_line_before_the_fix(e, o),
+                    Some(to_log_line_before_the_fix(e, o)),
                     "offset {o}"
                 );
             }
@@ -3784,16 +3906,16 @@ mod oplog_clock_offset_tests {
     // changed by the overflow fix):
     // - a first_byte that the offset pushes out of SystemTime's range is an
     //   empty first_byte column;
-    // - a corrected time BEFORE the epoch panics inside humantime's formatter
-    //   ("all times should be after the epoch"), which in the writer thread
-    //   ends the log. That is a pre-existing limit, recorded in the report.
+    // - a corrected time the formatter cannot write (before the epoch, or in
+    //   year 10000 and later) makes `to_log_line` return `None`: the writer
+    //   rejects and counts the row (issue #190, see the tests below).
     #[test]
     fn unrepresentable_first_byte_is_empty() {
         let mut e = entry_at(base());
         e.first_byte_time = Some(UNIX_EPOCH + Duration::new(i64::MAX as u64, 0));
         assert_eq!(
-            e.to_log_line(-1_500_000_000),
-            "3\t1\tGET\tc\t1\t10\te\tf\t\t2023-11-14T22:13:21.623456789Z\t\t2023-11-14T22:13:21.627456789Z\t4000000\n"
+            e.to_log_line(-1_500_000_000).as_deref(),
+            Some("3\t1\tGET\tc\t1\t10\te\tf\t\t2023-11-14T22:13:21.623456789Z\t\t2023-11-14T22:13:21.627456789Z\t4000000\n")
         );
     }
 
@@ -3806,19 +3928,260 @@ mod oplog_clock_offset_tests {
         })
     }
 
+    // Issue #190. This test used to pin that a corrected time before the epoch
+    // PANICS inside humantime's formatter, which in the writer thread ended the
+    // log for good (every later row lost). The contract is now: such a row has no
+    // line (`None`) and the writer goes on. The panic is still asserted for the
+    // pre-fix arithmetic below, as proof that these entries are the ones that used
+    // to panic and that `to_log_line` no longer reaches the panicking formatter.
     #[test]
-    fn times_pushed_before_the_epoch_panic_in_the_formatter_as_they_always_did() {
+    fn times_pushed_before_the_epoch_have_no_line_instead_of_a_formatter_panic() {
         // start/end pushed below the epoch.
         let near_epoch = entry_at(UNIX_EPOCH + Duration::from_secs(1));
         // Only first_byte (earlier than start in this contrived entry) is pushed below.
         let mut only_first_byte = entry_at(UNIX_EPOCH + Duration::from_secs(10));
         only_first_byte.first_byte_time = Some(UNIX_EPOCH + Duration::from_secs(1));
         for (name, e) in [("start", near_epoch), ("first_byte", only_first_byte)] {
-            let new = panic_text(|| e.to_log_line(2_000_000_000));
-            let old = panic_text(|| to_log_line_before_the_fix(&e, 2_000_000_000));
-            let new = new.unwrap_or_else(|| panic!("{name}: expected the formatter to panic"));
-            assert!(new.contains("all times should be after the epoch"), "{new}");
-            assert_eq!(Some(new), old, "{name}: old and new panic identically");
+            let old = panic_text(|| to_log_line_before_the_fix(&e, 2_000_000_000))
+                .unwrap_or_else(|| panic!("{name}: the old arithmetic should have panicked"));
+            assert!(old.contains("all times should be after the epoch"), "{old}");
+            let mut new = None;
+            let panicked = panic_text(|| {
+                new = e.to_log_line(2_000_000_000);
+                String::new()
+            });
+            assert_eq!(
+                panicked, None,
+                "{name}: no panic, so no catch_unwind needed"
+            );
+            assert_eq!(new, None, "{name}: the row has no line");
         }
+    }
+}
+
+// Issue #190: a row whose corrected timestamp cannot be formatted (before
+// 1970-01-01T00:00:00Z or at/after 10000-01-01T00:00:00Z, the domain of
+// humantime's RFC 3339 formatter) is rejected and counted; the writer carries on.
+#[cfg(test)]
+mod oplog_unformattable_timestamp_tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// First second humantime cannot format: 10000-01-01T00:00:00Z.
+    const END_SECS: u64 = 253_402_300_800;
+    const CHILD_ENV: &str = "S3DLIO_TEST_UNFORMATTABLE_CHILD";
+    const CHILD_OK: &str = "unformattable child finished";
+
+    fn entry_at(start: SystemTime) -> LogEntry {
+        LogEntry {
+            idx: 0,
+            thread_id: 1,
+            operation: "GET".to_string(),
+            client_id: "c".to_string(),
+            num_objects: 1,
+            bytes: 10,
+            endpoint: "e".to_string(),
+            file: "f".to_string(),
+            error: None,
+            start_time: start,
+            first_byte_time: Some(start + Duration::from_nanos(1_500_000)),
+            end_time: start + Duration::from_nanos(4_000_000),
+        }
+    }
+
+    /// 2023-11-14T22:13:20.123456789Z
+    fn base() -> SystemTime {
+        UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)
+    }
+
+    /// The row a healthy entry at `base()` becomes, written out literally;
+    /// `second` is the corrected second ("18" for a +2 s offset, "22" for -2 s).
+    fn good_row(idx: u64, second: &str) -> String {
+        format!(
+            "{idx}\t1\tGET\tc\t1\t10\te\tf\t\t2023-11-14T22:13:{second}.123456789Z\t\
+             2023-11-14T22:13:{second}.124956789Z\t2023-11-14T22:13:{second}.127456789Z\t4000000\n"
+        )
+    }
+
+    fn test_path(name: &str) -> String {
+        let module = module_path!();
+        let (_, module) = module.split_once("::").unwrap();
+        format!("{module}::{name}")
+    }
+
+    /// The decoded file as lines, header first.
+    fn file_text(path: &std::path::Path) -> String {
+        let bytes = std::fs::read(path).unwrap();
+        String::from_utf8(zstd::decode_all(bytes.as_slice()).unwrap()).unwrap()
+    }
+
+    /// Log `before` healthy rows, `bad`, then `after` healthy rows under `offset`;
+    /// finalize and return the decoded file and the stats.
+    fn session(
+        offset: i64,
+        before: usize,
+        bad: LogEntry,
+        after: usize,
+        tag: &str,
+    ) -> (String, OpLogStats) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{tag}.tsv.zst"));
+        let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
+        logger.set_clock_offset(offset);
+        for _ in 0..before {
+            assert_eq!(logger.try_log(entry_at(base())), LogOutcome::Accepted);
+        }
+        assert_eq!(logger.try_log(bad), LogOutcome::Accepted);
+        for _ in 0..after {
+            assert_eq!(logger.try_log(entry_at(base())), LogOutcome::Accepted);
+        }
+        logger.shutdown();
+        (file_text(&path), logger.stats())
+    }
+
+    /// The three ways a corrected time leaves the formatter's domain.
+    fn bad_shapes() -> Vec<(&'static str, i64, &'static str, LogEntry)> {
+        // start (and end) pushed below the epoch by a +2 s offset
+        let start = entry_at(UNIX_EPOCH + Duration::from_secs(1));
+        // only first_byte (earlier than start in this contrived entry) pushed below
+        let mut first_byte = entry_at(UNIX_EPOCH + Duration::from_secs(10));
+        first_byte.first_byte_time = Some(UNIX_EPOCH + Duration::from_secs(1));
+        // end pushed to year 10000 by a -2 s offset (which adds 2 s)
+        let mut end = entry_at(base());
+        end.end_time = UNIX_EPOCH + Duration::from_secs(END_SECS - 1);
+        vec![
+            ("start", 2_000_000_000, "18", start),
+            ("first_byte", 2_000_000_000, "18", first_byte),
+            ("end", -2_000_000_000, "22", end),
+        ]
+    }
+
+    #[test]
+    fn the_unformattable_row_is_rejected_and_every_later_row_is_written_unchanged() {
+        for (name, offset, second, bad) in bad_shapes() {
+            let (text, st) = session(offset, 2, bad, 5, name);
+            let mut want = String::from(HEADER);
+            // idx is the queue position, so the rejected row leaves a gap at 2 and
+            // every later row keeps the idx it would have had on a healthy log.
+            for idx in [0, 1, 3, 4, 5, 6, 7] {
+                want.push_str(&good_row(idx, second));
+            }
+            assert_eq!(text, want, "{name}");
+            assert_eq!(st.accepted, 8, "{name}: {st:?}");
+            assert_eq!(st.written, 7, "{name}: {st:?}");
+            assert_eq!(st.writer_error, None, "{name}: the writer must not panic");
+            assert_eq!(st.rejected_unformattable, 1, "{name}: {st:?}");
+            assert!(!st.is_complete(), "{name}: a rejected row is not complete");
+            // Not reported as rows lost to a failing writer: they have their own line.
+            let warning = incomplete_warning(&st).unwrap();
+            assert!(
+                warning
+                    .contains("1 entries were rejected because a timestamp could not be formatted"),
+                "{name}: {warning}"
+            );
+            assert!(
+                !warning.contains("never written") && !warning.contains("panicked"),
+                "{name}: {warning}"
+            );
+        }
+    }
+
+    // The edges of the formatter's domain, against the real formatter: the first
+    // and last representable instants are written, the instants just outside are
+    // not (and nothing panics getting there).
+    #[test]
+    fn the_edges_of_the_formatter_domain() {
+        let at = |t: SystemTime| {
+            let mut e = entry_at(t);
+            e.first_byte_time = None;
+            e.end_time = t;
+            e.to_log_line(0)
+        };
+        let last = UNIX_EPOCH + Duration::new(END_SECS - 1, 999_999_999);
+        let ts = |line: Option<String>| line.map(|l| l.split('\t').nth(9).unwrap().to_string());
+        assert_eq!(
+            ts(at(UNIX_EPOCH)).as_deref(),
+            Some("1970-01-01T00:00:00.000000000Z")
+        );
+        assert_eq!(
+            ts(at(last)).as_deref(),
+            Some("9999-12-31T23:59:59.999999999Z")
+        );
+        assert_eq!(at(UNIX_EPOCH - Duration::from_nanos(1)), None);
+        assert_eq!(at(last + Duration::from_nanos(1)), None);
+        // humantime itself agrees about where its domain ends: its own `to_string`
+        // is fine on `last` and panics one nanosecond later (so the constant
+        // `RFC3339_END_SECS` cannot drift from the formatter unnoticed).
+        let catch = |t: SystemTime| {
+            catch_unwind(AssertUnwindSafe(|| {
+                humantime::format_rfc3339_nanos(t).to_string()
+            }))
+            .is_ok()
+        };
+        assert!(catch(last));
+        assert!(!catch(last + Duration::from_nanos(1)));
+        assert!(!catch(UNIX_EPOCH - Duration::from_nanos(1)));
+    }
+
+    /// Run `body` in a child copy of this test binary with stderr in a file, then
+    /// hand that stderr to `check` in the parent.
+    fn with_captured_stderr(test: &str, body: impl FnOnce(), check: impl FnOnce(&str)) {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            body();
+            println!("{CHILD_OK}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("child-stderr.txt");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .stderr(std::process::Stdio::from(File::create(&path).unwrap()))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.status.success() && stdout.contains(CHILD_OK),
+            "the child died or never ran its body ({}): {stdout}\n{stderr}",
+            out.status
+        );
+        check(&stderr);
+    }
+
+    #[test]
+    fn three_rejections_print_one_note_and_finalize_names_the_exact_count() {
+        with_captured_stderr(
+            &test_path("three_rejections_print_one_note_and_finalize_names_the_exact_count"),
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("three.tsv.zst");
+                let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
+                logger.set_clock_offset(2_000_000_000);
+                for _ in 0..3 {
+                    let early = entry_at(UNIX_EPOCH + Duration::from_secs(1));
+                    assert_eq!(logger.try_log(early), LogOutcome::Accepted);
+                    assert_eq!(logger.try_log(entry_at(base())), LogOutcome::Accepted);
+                }
+                logger.shutdown();
+            },
+            |stderr| {
+                let notes = stderr
+                    .lines()
+                    .filter(|l| l.contains("timestamp cannot be formatted"))
+                    .count();
+                assert_eq!(notes, 1, "one note per session, not per row\n{stderr}");
+                let warning = "3 entries were rejected because a timestamp could not be formatted";
+                assert_eq!(
+                    stderr.lines().filter(|l| l.contains(warning)).count(),
+                    1,
+                    "the finalize warning states the exact count\n{stderr}"
+                );
+                assert!(
+                    !stderr.contains("panicked"),
+                    "nothing may panic for this case\n{stderr}"
+                );
+            },
+        );
     }
 }

@@ -341,6 +341,7 @@ STATS_KEYS = {
     "lossless",
     "written",
     "writer_error",
+    "rejected_unformattable",
 }
 
 
@@ -385,6 +386,8 @@ def test_op_log_stats_none_before_init_then_counts_match_rows(tmp_path):
     # Complete: accepted == written, nothing dropped or refused, no writer error.
     assert after["written"] == after["accepted"]
     assert after["writer_error"] is None
+    # #190: rows whose timestamp cannot be formatted are counted; none here.
+    assert during["rejected_unformattable"] == after["rejected_unformattable"] == 0
     assert "INCOMPLETE" not in proc.stderr, "no warning when nothing was lost"
 
 

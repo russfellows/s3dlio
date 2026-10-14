@@ -272,7 +272,8 @@ if let Some(stats) = s3dlio::op_log_stats() {              // Option<OpLogStats>
 s3dlio.finalize_op_log()
 stats = s3dlio.op_log_stats()   # None before init_op_log(), else a dict
 complete = (stats["accepted"] == stats["written"] and stats["dropped_full"] == 0
-            and stats["writer_failed"] == 0 and stats["writer_error"] is None)
+            and stats["writer_failed"] == 0 and stats["writer_error"] is None
+            and stats["rejected_unformattable"] == 0)
 ```
 
 **What is counted.** The stats cover the calls that reached the session's
@@ -309,6 +310,7 @@ counted is absent exactly when
 
 ```
 accepted == written  AND  dropped_full == 0  AND  writer_failed == 0  AND  writer_error is None
+AND  rejected_unformattable == 0
 ```
 
 (`OpLogStats::is_complete()` in Rust.) Complete means "none of the counted losses
@@ -324,6 +326,7 @@ are queued).
 | `writer_failed` | calls **refused because the writer had already stopped** (`LogOutcome::WriterFailed`). It does *not* count entries that were queued before the writer stopped: those show as `accepted - written` |
 | `writer_error` | `None`, or the first error the writer met, as text: a failed write, a failed zstd finish or final flush, or a writer-thread panic (text starting `writer thread panicked`: a defect in the process, not an I/O error) |
 | `rejected_closed` | calls that arrived after finalize had begun (`LogOutcome::Closed`); see below |
+| `rejected_unformattable` | accepted rows the writer did **not** write because a timestamp (start, first byte or end, after the clock offset is applied) is before `1970-01-01T00:00:00Z` or at or after `10000-01-01T00:00:00Z`, where the RFC 3339 text the log uses does not exist (#190). Such a row is absent from the file and its `idx` is skipped (later rows keep their numbers); the writer carries on. They are counted in `accepted` but not in `written`, so the log is **not** complete. See below |
 | `lossless` | the session's mode |
 
 **What the file holds after a writer error.** If the writer stops on an I/O
@@ -334,6 +337,18 @@ of complete rows R with `R <= written`. If only the final finish or flush fails,
 every row was handed over and the bytes may all be there, but `writer_error`
 says they are not guaranteed to be on disk. After a writer-thread panic the
 writer still finishes the stream, so the rows before the panic are readable.
+
+**Rows with an unformattable timestamp (#190).** The clock offset (`set_clock_offset`)
+is applied to the start, first-byte and end times of each row when the row is
+written. If the corrected time of any of the three is before 1970-01-01 or at or
+after year 10000 (for example an offset computed against a reference of 0, which
+pushes every row before the epoch), the row cannot be written as RFC 3339 and is
+**rejected, not written, and counted** in `rejected_unformattable`; nothing is
+clamped or rewritten. The writer does **not** stop: every later row that is
+formattable is written, byte for byte as it would have been. The first rejection
+prints one stderr note (later ones are only counted), and finalize's warning names
+the exact count and says the trace is incomplete. Fix the offset and re-run to get
+a full trace.
 
 **`rejected_closed` is not part of "complete".** Calls made after finalize began
 (for example from a store created before finalize that is still used by a worker
@@ -445,8 +460,12 @@ not a machine-checked inventory:
   been benchmarked. Each call also bumps one relaxed outcome counter (see
   "Detecting lost records").
 - A clock offset of `i64::MIN` no longer panics the writer thread in builds with
-  overflow checks. A corrected timestamp before the epoch (or at or after year
-  9999) still panics inside the timestamp formatter, as before.
+  overflow checks.
+- A row whose corrected timestamp is before the epoch or at or after year 10000
+  used to panic inside the timestamp formatter, which ended the log: that row and
+  every later one were lost. It is now rejected, counted in
+  `rejected_unformattable` and reported (see "Rows with an unformattable
+  timestamp"), and the writer carries on (#190).
 
 ### What the format tests establish
 
