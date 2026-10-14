@@ -100,6 +100,11 @@ fn get_thread_id() -> usize {
 pub struct LoggedObjectStore {
     inner: Arc<dyn ObjectStore>,
     logger: Logger,
+    /// What a bare container name (`create_container("bucket")`) is joined to
+    /// to form the URI the row is derived from: `s3://`, `file://`,
+    /// `s3://host:port/`, ... `None` when the scheme is not known (a store
+    /// wrapped by hand with [`LoggedObjectStore::new`]).
+    container_prefix: Option<String>,
 }
 
 impl LoggedObjectStore {
@@ -109,7 +114,39 @@ impl LoggedObjectStore {
     /// * `inner` - The underlying ObjectStore implementation to wrap
     /// * `logger` - The Logger instance to use for recording operations
     pub fn new(inner: Arc<dyn ObjectStore>, logger: Logger) -> Self {
-        Self { inner, logger }
+        Self {
+            inner,
+            logger,
+            container_prefix: None,
+        }
+    }
+
+    /// Like [`LoggedObjectStore::new`], for a store built for URIs that start
+    /// with `container_prefix` (the scheme, plus the authority for an S3 host-form
+    /// store: `s3://`, `file://`, `s3://10.0.0.1:9000/`).
+    ///
+    /// `create_container` / `delete_container` receive a bare name, not a URI.
+    /// With the prefix the wrapper writes their rows with the endpoint and file
+    /// the store's other rows have (`s3://bkt` + `bkt`, `file://` + `/dir`) instead
+    /// of endpoint `unknown` and a bare name (issue #182).
+    pub fn with_container_prefix(
+        inner: Arc<dyn ObjectStore>,
+        logger: Logger,
+        container_prefix: String,
+    ) -> Self {
+        Self {
+            inner,
+            logger,
+            container_prefix: Some(container_prefix),
+        }
+    }
+
+    /// The URI a container operation's row is derived from.
+    fn container_uri(&self, name: &str) -> String {
+        match &self.container_prefix {
+            Some(prefix) if !name.contains("://") => format!("{prefix}{name}"),
+            _ => name.to_string(),
+        }
     }
 
     /// Helper to log an operation with standard fields.
@@ -417,7 +454,16 @@ impl ObjectStore for LoggedObjectStore {
         let error = result.as_ref().err().map(|e| e.to_string());
 
         // CREATE_CONTAINER is metadata-only operation
-        self.log_operation("CREATE_CONTAINER", name, 0, 1, start, None, end, error);
+        self.log_operation(
+            "CREATE_CONTAINER",
+            &self.container_uri(name),
+            0,
+            1,
+            start,
+            None,
+            end,
+            error,
+        );
 
         result
     }
@@ -430,7 +476,16 @@ impl ObjectStore for LoggedObjectStore {
         let error = result.as_ref().err().map(|e| e.to_string());
 
         // DELETE_CONTAINER is metadata-only operation
-        self.log_operation("DELETE_CONTAINER", name, 0, 1, start, None, end, error);
+        self.log_operation(
+            "DELETE_CONTAINER",
+            &self.container_uri(name),
+            0,
+            1,
+            start,
+            None,
+            end,
+            error,
+        );
 
         result
     }

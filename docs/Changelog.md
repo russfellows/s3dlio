@@ -201,6 +201,13 @@ The op-log TSV format (13 columns, header, the values each column gets from
 - **Streamed `LIST` rows carry the client id (#181).** The row written when a
   `list_stream()` stream completes had an empty `client_id`; it now goes through the
   same row builder as every other call, so it equals `list()`'s row.
+- **Container rows use the store's endpoint and file (#182).** `CREATE_CONTAINER` /
+  `DELETE_CONTAINER` rows were written with the bare name (endpoint `unknown`).
+  A store built by the factories now knows its URI prefix (`s3://`, `file://`,
+  `az://`, `s3://host:port/` for an S3 host-form store) and the rows read like the
+  store's other rows: `s3://bkt` + `bkt`, `file://` + `/dir`. A hand-wrapped store
+  (`LoggedObjectStore::new`) keeps the old behaviour; `with_container_prefix`
+  supplies the prefix. Python `create_bucket` / `delete_bucket` still write no row.
 - **Known consequence:** `MultiEndpointStore` `get`/`put` on bucket-form endpoints
   and the `s3dlio-oplog` replayer no longer write the accidental inner row (#175).
   See `docs/design/oplog-record-contract/W2-ownership-audit.md`.

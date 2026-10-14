@@ -161,9 +161,13 @@ fn get_or_create_store(
     };
 
     Ok(match logger {
-        Some(logger) => Arc::new(crate::object_store_logger::LoggedObjectStore::new(
-            store, logger,
-        )),
+        Some(logger) => Arc::new(
+            crate::object_store_logger::LoggedObjectStore::with_container_prefix(
+                store,
+                logger,
+                crate::object_store::container_uri_prefix(uri),
+            ),
+        ),
         None => store,
     })
 }

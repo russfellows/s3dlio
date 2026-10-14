@@ -3585,6 +3585,23 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_logger(uri, None)
 }
 
+/// The URI prefix a bare container name is joined to when a logged store records
+/// `create_container` / `delete_container`, so the row has the endpoint and file
+/// the same store's other rows have.
+///
+/// `scheme://` for every backend (`s3://`, `file://`, `az://`, ...), and
+/// `s3://host:port/` for an S3 host-form store, whose other rows are
+/// `s3://host:port` + `host:port/bucket/key`.
+pub(crate) fn container_uri_prefix(uri: &str) -> String {
+    let scheme_end = uri.find("://").map(|i| i + 3).unwrap_or(0);
+    if s3_endpoint_url_from_uri(uri).is_some() {
+        // Authority = everything up to the first '/'; keep it, then the '/'.
+        let authority = uri[scheme_end..].split('/').next().unwrap_or_default();
+        return format!("{}{authority}/", &uri[..scheme_end]);
+    }
+    uri[..scheme_end].to_string()
+}
+
 /// Create a store for the given URI with optional operation logging.
 ///
 /// When a logger is provided, all ObjectStore operations will be traced to the op-log.
@@ -3658,7 +3675,11 @@ pub fn store_for_uri_with_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -3735,7 +3756,11 @@ pub fn store_for_uri_with_config_and_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -3783,7 +3808,11 @@ pub fn direct_io_store_for_uri_with_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -3831,7 +3860,11 @@ pub fn high_performance_store_for_uri_with_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -3928,7 +3961,11 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
 
     // Wrap with logger if provided
     if let Some(logger) = logger {
-        Ok(Box::new(LoggedObjectStore::new(Arc::from(store), logger)))
+        Ok(Box::new(LoggedObjectStore::with_container_prefix(
+            Arc::from(store),
+            logger,
+            container_uri_prefix(uri),
+        )))
     } else {
         Ok(store)
     }
@@ -4541,6 +4578,24 @@ mod s3_object_store_tests {
     // S3-compatible endpoint running on a non-standard port (e.g. a load
     // balancer terminating TLS on :9001) as https. S3DLIO_S3_ENDPOINT_TLS_PORTS
     // closes that gap.
+
+    #[test]
+    fn container_uri_prefix_is_the_scheme_plus_the_host_authority_for_host_form_s3() {
+        assert_eq!(container_uri_prefix("s3://bucket/key"), "s3://");
+        assert_eq!(container_uri_prefix("file:///tmp/x"), "file://");
+        assert_eq!(container_uri_prefix("direct:///tmp/x"), "direct://");
+        assert_eq!(container_uri_prefix("az://account/container/b"), "az://");
+        assert_eq!(container_uri_prefix("gs://bucket/o"), "gs://");
+        assert_eq!(
+            container_uri_prefix("s3://10.9.0.17:80/bucket/key"),
+            "s3://10.9.0.17:80/"
+        );
+        assert_eq!(
+            container_uri_prefix("s3://[::1]:9000/bucket/key"),
+            "s3://[::1]:9000/"
+        );
+        assert_eq!(container_uri_prefix("not-a-uri"), "");
+    }
 
     #[test]
     fn s3_endpoint_url_from_uri_plain_bucket_has_no_endpoint() {

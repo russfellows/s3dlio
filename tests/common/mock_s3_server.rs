@@ -506,7 +506,15 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
             .unwrap();
     }
 
-    // PutObject (single shot): PUT on a key path. The multipart UploadPart
+    // DeleteBucket / DeleteObject: any DELETE that is not an AbortMultipartUpload.
+    if method == Method::DELETE {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+    }
+
+    // PutObject (single shot) and CreateBucket: PUT on a path. The multipart UploadPart
     // PUT (query `partNumber`) was answered above.
     if method == Method::PUT {
         state.record(&path, |c| c.put_calls += 1);
