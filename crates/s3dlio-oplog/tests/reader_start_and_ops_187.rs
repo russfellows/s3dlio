@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-//! Regression tests for s3dlio issue #187: an unparsable `start` silently became "now",
-//! and the op names the writer emits (`DELETE_BATCH`, ...) were rejected by the reader.
+//! Regression tests for s3dlio issue #187: an unparsable `start` silently became "now".
+//! (Op names `OpType` does not model remain a clear error; see the last section.)
 
 mod oplog_support;
 
@@ -136,17 +136,14 @@ fn jsonl_bad_start_is_an_error_naming_the_line() {
 }
 
 // ----------------------------------------------------------------------------
-// #187: op names the writer emits
+// #187: op names outside the five OpType variants stay a clear error
 // ----------------------------------------------------------------------------
 
-/// Every operation name `LoggedObjectStore` / `S3Ops` can write (HEAD is an alias of STAT).
-const WRITER_OPS: &[&str] = &[
-    "GET",
+/// Operation names the object-store writer can emit that `OpType` does not model. `OpType` is
+/// matched exhaustively by downstream crates, so it keeps exactly its five variants and these
+/// names remain what they always were: a clear per-row error, never silent acceptance.
+const UNMODELLED_WRITER_OPS: &[&str] = &[
     "GET_RANGE",
-    "PUT",
-    "LIST",
-    "STAT",
-    "DELETE",
     "DELETE_BATCH",
     "DELETE_PREFIX",
     "CREATE_CONTAINER",
@@ -154,61 +151,57 @@ const WRITER_OPS: &[&str] = &[
 ];
 
 #[test]
-fn every_writer_op_name_parses_and_round_trips() {
-    for name in WRITER_OPS {
-        let op: OpType = name.parse().unwrap_or_else(|e| panic!("{name}: {e:#}"));
-        assert_eq!(op.to_string(), *name);
+fn unmodelled_op_names_do_not_parse() {
+    for name in UNMODELLED_WRITER_OPS {
+        let err = name.parse::<OpType>().expect_err(name);
+        assert!(
+            format!("{err:#}").contains(&format!("Unknown operation type: {name}")),
+            "{name}: {err:#}"
+        );
     }
     assert_eq!("HEAD".parse::<OpType>().expect("HEAD"), OpType::STAT);
 }
 
 #[test]
-fn reader_loads_a_log_containing_every_writer_op() {
-    let rows: Vec<String> = WRITER_OPS
-        .iter()
-        .enumerate()
-        .map(|(i, op)| row(i as u32, op, "s3://bkt", "bkt/k"))
-        .collect();
-    let f = tsv(&rows);
-    let r = OpLogReader::from_file(f.path()).expect("all writer ops must load");
-    assert_eq!(r.len(), WRITER_OPS.len());
-}
-
-#[tokio::test]
-async fn compound_ops_are_unsupported_for_exact_replay_and_never_executed() {
-    for name in [
-        "DELETE_BATCH",
-        "DELETE_PREFIX",
-        "GET_RANGE",
-        "CREATE_CONTAINER",
-        "DELETE_CONTAINER",
-    ] {
+fn reader_rejects_a_log_containing_an_unmodelled_op_with_a_clear_error() {
+    for name in UNMODELLED_WRITER_OPS {
         let f = tsv(&[
             row(0, "GET", "s3://bkt", "bkt/a"),
             row(1, name, "s3://bkt", "bkt/b"),
-            row(2, "GET", "s3://bkt", "bkt/c"),
         ]);
-
-        // Default: the replay fails and says why.
-        let (res, _) = replay(&f, None, false, None).await;
-        let err = format!("{:#}", res.expect_err(name));
+        let msg = read_err(&f);
         assert!(
-            err.contains("unsupported for exact replay") && err.contains(name),
-            "{name}: {err}"
+            msg.contains(&format!("Invalid operation type: {name}"))
+                && msg.contains("Unknown operation type"),
+            "{name}: {msg}"
         );
-
-        // continue_on_error: the plain rows run, the compound row is never executed.
-        let (res, seen) = replay(&f, None, true, None).await;
-        assert!(res.is_ok(), "{name}: {res:?}");
-        assert_eq!(
-            seen,
-            vec!["GET s3://bkt/a".to_string(), "GET s3://bkt/c".to_string()],
-            "{name}"
-        );
-
-        // The existing opt-in (filter_ops) is the way to leave them out explicitly.
-        let (res, seen) = replay(&f, None, false, Some(vec![OpType::GET])).await;
-        assert!(res.is_ok(), "{name} filtered: {res:?}");
-        assert_eq!(seen.len(), 2, "{name}");
     }
+}
+
+#[test]
+fn stream_reader_reports_only_the_unmodelled_row() {
+    let f = tsv(&[
+        row(0, "GET", "s3://bkt", "bkt/a"),
+        row(1, "DELETE_BATCH", "s3://bkt", "bkt/b"),
+        row(2, "GET", "s3://bkt", "bkt/c"),
+    ]);
+    let results: Vec<_> = OpLogStreamReader::from_file(f.path())
+        .expect("open")
+        .collect();
+    assert_eq!(results.len(), 3);
+    assert!(results[0].is_ok() && results[2].is_ok());
+    let msg = format!("{:#}", results[1].as_ref().expect_err("unmodelled row"));
+    assert!(msg.contains("DELETE_BATCH"), "{msg}");
+}
+
+#[tokio::test]
+async fn replay_of_a_log_with_an_unmodelled_op_fails_and_executes_nothing() {
+    let f = tsv(&[
+        row(0, "GET", "s3://bkt", "bkt/a"),
+        row(1, "GET_RANGE", "s3://bkt", "bkt/b"),
+    ]);
+    let (res, seen) = replay(&f, None, false, None).await;
+    let err = format!("{:#}", res.expect_err("must fail"));
+    assert!(err.contains("GET_RANGE"), "{err}");
+    assert!(seen.is_empty(), "{seen:?}");
 }

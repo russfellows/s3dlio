@@ -256,28 +256,6 @@ pub async fn replay_workload<E: OpExecutor + 'static>(
     Ok(())
 }
 
-/// Fail rows whose operation the log does not record completely enough to repeat.
-///
-/// To replay a log that contains them, leave them out with [`ReplayConfig::filter_ops`]
-/// (or set `continue_on_error`, which reports each one as a failed operation).
-fn check_exactly_replayable(op: &OpLogEntry) -> Result<()> {
-    if op.op.is_exactly_replayable() {
-        return Ok(());
-    }
-    let why = match op.op {
-        OpType::GET_RANGE => "the row records the bytes returned, not the offset or length",
-        OpType::DELETE_BATCH => "the row records only the first URI of the batch and its count",
-        OpType::DELETE_PREFIX => "the row records the prefix, not the objects removed",
-        _ => "the row records a bare container name with no scheme",
-    };
-    anyhow::bail!(
-        "{} row idx {} is unsupported for exact replay: {} (exclude it with filter_ops)",
-        op.op,
-        op.idx,
-        why
-    )
-}
-
 /// URI an operation acts on: the translation of the row onto `target` (the target supplies the
 /// destination, so every row translates), or, with no target, the exact original URI. Without a
 /// target, a row whose URI cannot be reconstructed unambiguously is an error naming the row
@@ -298,9 +276,8 @@ async fn schedule_and_execute<E: OpExecutor>(
     target: Option<&str>,
     executor: &E,
 ) -> Result<()> {
-    // Reject what a row cannot repeat, then resolve the URI, before waiting: a row that cannot
-    // be replayed exactly fails without executing anything.
-    check_exactly_replayable(&op)?;
+    // Resolve the URI before waiting: a row that cannot be replayed fails without executing
+    // anything.
     let uri = row_target_uri(&op, target)?;
 
     let target_time = replay_epoch + delay;
@@ -324,16 +301,6 @@ async fn schedule_and_execute<E: OpExecutor>(
         OpType::DELETE => executor.delete(&uri).await?,
         OpType::LIST => executor.list(&uri).await?,
         OpType::STAT => executor.stat(&uri).await?,
-        // check_exactly_replayable() has already returned an error for these.
-        OpType::GET_RANGE
-        | OpType::DELETE_BATCH
-        | OpType::DELETE_PREFIX
-        | OpType::CREATE_CONTAINER
-        | OpType::DELETE_CONTAINER => anyhow::bail!(
-            "{} row idx {} is unsupported for exact replay",
-            op.op,
-            op.idx
-        ),
     }
 
     Ok(())
