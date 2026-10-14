@@ -3762,4 +3762,52 @@ mod tests {
             "a remainder that itself starts with '/' is part of the key and must be kept"
         );
     }
+
+    // =========================================================================
+    // Cross-fix interaction (#172 exact-key joins x #178/#180 endpoint
+    // classification and TLS x #179 store-server check). None of the three
+    // branches could test this alone: the join is #172, the https endpoint is
+    // #180, and the rewritten URI must still be accepted by the #179 store
+    // check for that https server.
+    // =========================================================================
+
+    /// A TLS endpoint configured WITHOUT a trailing '/': the per-endpoint client
+    /// is https (#180), a relative path joins with one '/' and the exact key
+    /// (#172), and the resulting URI names the store's own https server, so the
+    /// #179 server check accepts it and yields the exact bucket and key.
+    #[test]
+    fn tls_endpoint_without_trailing_slash_keeps_https_and_the_exact_key() {
+        let _env = lock_tls_ports_env();
+        let ep = "s3://storage.googleapis.com:443/bkt";
+        let store = try_build_store_with_fake_creds(ep).expect("TLS endpoint store");
+        let url = store
+            .get_store_endpoint_urls()
+            .into_iter()
+            .next()
+            .expect("one endpoint")
+            .expect("per-endpoint client URL");
+        assert_eq!(url, "https://storage.googleapis.com:443");
+
+        let target = &store.endpoints[0];
+        let server = crate::delete_batch_plan::StoreServer::from_endpoint_url(&url)
+            .expect("store server from https URL");
+
+        for (input, want_key) in [
+            ("/data/x", "data/x"),
+            ("data/x", "data/x"),
+            // A full URI whose remainder starts with '/' is the key "/data/x".
+            ("s3://storage.googleapis.com:443/bkt//data/x", "/data/x"),
+        ] {
+            let got = store.rewrite_uri_for_endpoint(input, target);
+            assert!(
+                got.starts_with("s3://storage.googleapis.com:443/bkt/"),
+                "{input:?} -> {got:?}"
+            );
+            let (bucket, key) =
+                crate::delete_batch_plan::parse_s3_uri_for_server(&got, Some(&server))
+                    .unwrap_or_else(|e| panic!("{input:?} -> {got:?} rejected: {e:#}"));
+            assert_eq!(bucket, "bkt", "{input:?} -> {got:?}");
+            assert_eq!(key, want_key, "{input:?} -> {got:?}");
+        }
+    }
 }

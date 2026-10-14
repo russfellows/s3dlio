@@ -718,3 +718,90 @@ async fn several_failing_buckets_keep_the_first_cause_chain() {
         err.chain().count()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cross-fix interaction (#179 delete_batch x #178 "a server needs a port").
+//
+// `delete_batch` decides whether a URI names another server through the URI
+// parser. After #178 the parser applies the single `classify_s3_first_segment`
+// rule, so a portless IP literal is an ERROR (not a bucket, not a server) and a
+// portless DNS name is a BUCKET (not a server). Neither branch could assert this
+// alone: #179 alone classified by the old suffix-hint rule, #178 alone had a
+// delete_batch that ignored the host entirely.
+// ---------------------------------------------------------------------------
+
+/// A portless IP literal is the #178 error ("add :port") and nothing is sent,
+/// for `delete_batch` (anywhere in the batch) and for a single `delete`.
+#[tokio::test]
+async fn portless_ip_uri_is_the_178_error_and_deletes_nothing() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+    let portless = "s3://10.0.0.5/bkt/key";
+
+    for batch in [
+        uris(&[portless]),
+        uris(&["s3://bkt-a/ok", portless]),
+        uris(&[portless, "s3://bkt-a/ok"]),
+    ] {
+        let outcome = store.delete_batch(&batch).await;
+        assert!(
+            mock.requests().is_empty(),
+            "no request may be sent (outcome {outcome:?}): {:?}",
+            mock.requests()
+        );
+        let err = outcome.expect_err("a portless IP is an error, never 'no server'");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("10.0.0.5") && msg.contains("add :port"),
+            "must be the #178 message that says to add :port: {msg}"
+        );
+    }
+
+    let outcome = store.delete(portless).await;
+    assert!(
+        mock.requests().is_empty() && mock.single_deletes().is_empty(),
+        "no request of any kind may be sent (outcome {outcome:?})"
+    );
+    let msg = format!(
+        "{:#}",
+        outcome.expect_err("delete() of a portless IP must fail")
+    );
+    assert!(msg.contains("add :port"), "{msg}");
+}
+
+/// A portless DNS name is a BUCKET (#178), so it is not "another server": the
+/// batch is accepted and the name is sent as the bucket on the store's server.
+#[tokio::test]
+async fn portless_dns_name_is_a_bucket_not_another_server() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+
+    store
+        .delete_batch(&uris(&["s3://minio.example.com/data/k", "s3://bkt-a/1"]))
+        .await
+        .expect("a dotted portless name is a bucket on this store's server");
+
+    let by_bucket = mock.keys_by_bucket();
+    assert_eq!(by_bucket["minio.example.com"], vec!["data/k"]);
+    assert_eq!(by_bucket["bkt-a"], vec!["1"]);
+    assert_eq!(by_bucket.len(), 2);
+}
+
+/// Leading-'/' keys (#172) survive the #179 grouping: `s3://b//k` is the key
+/// `/k` in bucket `b`, distinct from `k`, and is sent verbatim.
+#[tokio::test]
+async fn leading_slash_key_is_deleted_as_written() {
+    let mock = start_mock(HashMap::new()).await;
+    let store = store_for(&mock).await;
+
+    store
+        .delete_batch(&uris(&["s3://bkt-a//data/x", "s3://bkt-a/data/y"]))
+        .await
+        .expect("delete_batch");
+
+    assert_eq!(
+        mock.keys_by_bucket()["bkt-a"],
+        vec!["/data/x", "data/y"],
+        "the leading '/' is part of the key"
+    );
+}
