@@ -27,6 +27,17 @@ implicit expansion will now fail or delete less; add `-r` where you mean "everyt
   as deleted, so no "N deleted" count is claimed. A failed delete request, including a per-key error in
   an HTTP 200 response, names the keys and exits non-zero. A listing failure is now an error (it
   used to end the delete early and report success).
+- After a failure no further DeleteObjects request is sent (checked immediately before each send);
+  requests already in flight finish and the not-attempted keys are counted in the message. A listing
+  that fails before anything is sent is reported as the listing error, not as a delete summary. With
+  `-p` the message distinguishes keys listed from keys selected, and a pattern that matches nothing
+  says so (exit 0). `-j/--jobs` is accepted but currently unused.
+- Non-S3 backends (`file://`, `direct://`, `gs://`, `az://`): `-r` requires a URI ending in `/` and
+  otherwise errors (no broadening); without `-r` a missing object ends with `cannot confirm that
+  <uri> exists; nothing was deleted`.
+- Limitation: the op-log LIST row for `delete -r` is written only when the listing stream is read to
+  its end, exactly like the existing `list_stream` wrapper; a listing abandoned after a failure
+  (the command stops listing once a request has failed) writes no LIST row.
 - Works with the process-wide client and with a per-endpoint client (`s3://host:port/bkt/...`), under
   the #197 route-or-reject rules. New `ObjectStore` methods (default implementations provided):
   `stat_if_exists` and `list_objects_with_prefix`. Python `delete()` and the library `delete_prefix`

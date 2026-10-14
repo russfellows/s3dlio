@@ -256,12 +256,29 @@ How it works:
   1,000 keys. Characters in the key are literal: `*`, `.`, `[` and so on are never read as a pattern.
 - **`-p/--pattern`** is a client-side regex that narrows the `-r` selection (it is matched against
   each listed object URI, `s3://bkt/key`). It is an error without `-r`.
-- **Reporting.** S3 reports a key that does not exist as "deleted", so the command does not claim a
-  deleted count. An exact delete prints `Deleted s3://bkt/foo`. A recursive delete prints
-  `Sent delete requests for N objects found under prefix s3://bkt/foo/ (N listed; 0 reported errors)`,
-  or `No objects found under prefix: ...` (exit 0) when nothing matched. If any delete request
-  reports an error, including a per-key error inside a successful HTTP response, the keys are named,
-  the command stops starting new batches, and the exit code is non-zero.
+- **Reporting.** S3 reports a key that does not exist as "deleted", so the command never claims a
+  deleted count. The messages, exactly:
+  - exact delete: `Deleted s3://bkt/foo`;
+  - `-r`, success: `Sent delete requests for N objects found under prefix <uri> (N listed; 0 reported errors)`;
+  - `-r -p <regex>`, success: `Sent delete requests for N objects selected under prefix <uri> by pattern '<regex>' (M listed, N selected; 0 reported errors)`
+    (`M` is counted before the pattern filter, `N` after it);
+  - `-r` and nothing under the prefix: `No objects found under prefix: <uri>` (exit 0);
+  - `-r -p <regex>` and nothing matches: `No objects under prefix <uri> match pattern '<regex>' (M listed)` (exit 0);
+  - a listing that fails before anything is sent (for example a malformed URI such as `-r s3://bkt`,
+    or a failing first page): `cannot list objects under prefix <uri>; nothing was deleted: <cause>`
+    (exit non-zero, no delete summary);
+  - a failure after requests were sent (a failed request, a per-key error inside a successful
+    HTTP response, or a listing error part-way):
+    `Sent delete requests for X of the L listed under prefix <uri>; ...` (with `-p`: `of the S selected
+    (pattern '<regex>') of L listed`), followed by the number of failed requests, the keys that failed,
+    and `K selected objects were NOT attempted` when batches were held back. Exit non-zero.
+- **After a failure, nothing more is sent.** The check is made immediately before each DeleteObjects
+  request is sent. Requests already in flight finish; later batches (including a partly filled one)
+  are not sent and are counted as not attempted; the rest of the prefix is not listed.
+- **Other backends.** `file://`, `direct://`, `gs://` and `az://` use their own existing listing.
+  `-r` there requires a URI that ends in `/` and otherwise fails with an error (it never broadens
+  into a prefix match). Without `-r`, a missing object ends with
+  `cannot confirm that <uri> exists; nothing was deleted` (the cause follows), and nothing is deleted.
 
 **Options:**
 | Option | Description |
