@@ -40,3 +40,113 @@ pub(crate) fn lock() -> MutexGuard<'static, ()> {
 pub(crate) async fn lock_async() -> MutexGuard<'static, ()> {
     ENV_TEST_LOCK.lock().await
 }
+
+// ---------------------------------------------------------------------------
+// Panic-safe restore
+// ---------------------------------------------------------------------------
+//
+// The lock above never poisons, so a failed assertion inside a test body must
+// not leave the variables it changed behind for the next test.  Restoring
+// after `body()` returns is not enough -- a panic skips it.  These guards
+// restore in `Drop`, which also runs while unwinding.
+//
+// Declare them AFTER the lock guard: locals drop in reverse order, so the
+// restore then runs while the lock is still held.
+
+/// Restores process environment variables to the values they had when the
+/// guard was created, on drop (including during a panic unwind).
+pub(crate) struct EnvRestore {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvRestore {
+    /// Record the current value (or absence) of each of `vars`.  Create it
+    /// BEFORE changing any of them.
+    pub(crate) fn capture(vars: &[&'static str]) -> Self {
+        Self {
+            saved: vars.iter().map(|v| (*v, std::env::var_os(v))).collect(),
+        }
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..) {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// Restores a process-wide `AtomicUsize` (for example `RT_THREADS_LIMIT`) to
+/// the value it had when the guard was created, on drop (including during a
+/// panic unwind).
+pub(crate) struct AtomicRestore {
+    target: &'static std::sync::atomic::AtomicUsize,
+    prev: usize,
+}
+
+impl AtomicRestore {
+    /// Record the current value of `target`.  Create it BEFORE changing it.
+    pub(crate) fn capture(target: &'static std::sync::atomic::AtomicUsize) -> Self {
+        Self {
+            target,
+            prev: target.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for AtomicRestore {
+    fn drop(&mut self) {
+        self.target
+            .store(self.prev, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod restore_guard_tests {
+    use super::{lock, AtomicRestore, EnvRestore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SET_VAR: &str = "S3DLIO_TEST_ENV_RESTORE_PROBE_SET";
+    const UNSET_VAR: &str = "S3DLIO_TEST_ENV_RESTORE_PROBE_UNSET";
+    static PROBE_ATOMIC: AtomicUsize = AtomicUsize::new(7);
+
+    /// A panic inside the body must still put the variables and the atomic
+    /// back (#216): this is the case a restore loop after `body()` misses.
+    #[test]
+    fn restore_runs_when_the_body_panics() {
+        let _guard = lock();
+        std::env::set_var(SET_VAR, "original");
+        std::env::remove_var(UNSET_VAR);
+        PROBE_ATOMIC.store(7, Ordering::Relaxed);
+
+        let outcome = std::panic::catch_unwind(|| {
+            let _env = EnvRestore::capture(&[SET_VAR, UNSET_VAR]);
+            let _atomic = AtomicRestore::capture(&PROBE_ATOMIC);
+            std::env::set_var(SET_VAR, "changed");
+            std::env::set_var(UNSET_VAR, "now-set");
+            PROBE_ATOMIC.store(99, Ordering::Relaxed);
+            panic!("simulated failed assertion");
+        });
+
+        assert!(outcome.is_err(), "the body was expected to panic");
+        assert_eq!(std::env::var(SET_VAR).as_deref(), Ok("original"));
+        assert!(std::env::var_os(UNSET_VAR).is_none(), "must be unset again");
+        assert_eq!(PROBE_ATOMIC.load(Ordering::Relaxed), 7);
+        std::env::remove_var(SET_VAR);
+    }
+
+    #[test]
+    fn restore_runs_on_normal_return() {
+        let _guard = lock();
+        std::env::remove_var(UNSET_VAR);
+        {
+            let _env = EnvRestore::capture(&[UNSET_VAR]);
+            std::env::set_var(UNSET_VAR, "x");
+        }
+        assert!(std::env::var_os(UNSET_VAR).is_none());
+    }
+}

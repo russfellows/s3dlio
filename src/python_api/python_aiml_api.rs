@@ -3469,7 +3469,7 @@ mod checkpoint_runtime_sizing_tests {
     #[test]
     fn build_checkpoint_runtime_honors_explicit_thread_budget() {
         let _guard = crate::test_env::lock();
-        let prev = std::env::var("S3DLIO_RT_THREADS").ok();
+        let _env = crate::test_env::EnvRestore::capture(&["S3DLIO_RT_THREADS"]);
         std::env::set_var("S3DLIO_RT_THREADS", "2");
 
         let rt = build_checkpoint_runtime().expect("build checkpoint runtime");
@@ -3489,11 +3489,6 @@ mod checkpoint_runtime_sizing_tests {
             while set.join_next().await.is_some() {}
         });
         let elapsed = start.elapsed();
-
-        match prev {
-            Some(v) => std::env::set_var("S3DLIO_RT_THREADS", v),
-            None => std::env::remove_var("S3DLIO_RT_THREADS"),
-        }
 
         // 2 workers, 3 tasks of 150ms each -> 2 waves -> >= ~300ms. An
         // unconstrained pool (this host's real core count) would run all 3

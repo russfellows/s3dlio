@@ -345,15 +345,10 @@ mod tests {
     #[test]
     fn recommended_data_gen_threads_honors_explicit_thread_budget_when_no_override() {
         let _guard = crate::test_env::lock();
-        let prev = std::env::var("S3DLIO_RT_THREADS").ok();
+        let _env = crate::test_env::EnvRestore::capture(&["S3DLIO_RT_THREADS"]);
         std::env::set_var("S3DLIO_RT_THREADS", "2");
 
         let threads = recommended_data_gen_threads(None, None);
-
-        match prev {
-            Some(v) => std::env::set_var("S3DLIO_RT_THREADS", v),
-            None => std::env::remove_var("S3DLIO_RT_THREADS"),
-        }
 
         assert_eq!(
             threads, 2,
@@ -368,15 +363,10 @@ mod tests {
         // max_threads=Some(n) must still be an unconditional override,
         // regardless of S3DLIO_RT_THREADS.
         let _guard = crate::test_env::lock();
-        let prev = std::env::var("S3DLIO_RT_THREADS").ok();
+        let _env = crate::test_env::EnvRestore::capture(&["S3DLIO_RT_THREADS"]);
         std::env::set_var("S3DLIO_RT_THREADS", "2");
 
         let threads = recommended_data_gen_threads(None, Some(5));
-
-        match prev {
-            Some(v) => std::env::set_var("S3DLIO_RT_THREADS", v),
-            None => std::env::remove_var("S3DLIO_RT_THREADS"),
-        }
 
         assert_eq!(threads, 5);
     }
