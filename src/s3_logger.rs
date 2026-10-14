@@ -222,7 +222,7 @@ pub fn global_logger() -> Option<Logger> {
 ///
 /// ```text
 /// accepted == written  &&  dropped_full == 0  &&  writer_failed == 0  &&  writer_error is None
-///     &&  rejected_unformattable == 0
+///     &&  rejected_unformattable == 0  &&  rejected_unsafe_field == 0
 /// ```
 ///
 /// - `accepted == written` catches entries that were queued but never reached
@@ -236,6 +236,19 @@ pub fn global_logger() -> Option<Logger> {
 ///   file, the writer carries on with later rows, and the trace is incomplete.
 ///   Every accepted row is exactly one of written, rejected here, or unwritten
 ///   because the writer died.
+/// - `rejected_unsafe_field` counts records the writer refused to write because
+///   `op`, `client_id`, `endpoint` or `file` holds a TAB, LF or CR (issue #186).
+///   The row is TAB-separated and one record per line with no quoting, so such a
+///   value would add columns or split the line; the whole record is absent from
+///   the file (its `idx` is skipped), the writer carries on, and the trace is
+///   incomplete. The record is **lost, not encoded**: this is not support for
+///   logging such names exactly. A record that is also unformattable is counted
+///   here only (this check comes first), so each record is counted once.
+/// - `normalized_error_text` is **not** part of "complete". It counts written rows
+///   whose `error` text held a TAB, LF or CR, each replaced by one space so the
+///   row stays valid. The operation is fully recorded (only the wording of the
+///   diagnostic changed), so the log is still complete; the count and a line at
+///   finalize disclose the change.
 /// - `writer_error` is the first error the writer met: a failed write, a failed
 ///   zstd finish or final flush (the rows may all have been counted as written
 ///   yet not be on disk), or a writer panic (a defect, not an I/O error).
@@ -283,12 +296,23 @@ pub struct OpLogStats {
     /// The row is absent from the file (its `idx` is skipped) and the writer
     /// continues with the next one.
     pub rejected_unformattable: u64,
+    /// Accepted records the writer did NOT write because `op`, `client_id`,
+    /// `endpoint` or `file` held a TAB, LF or CR (issue #186). The record is
+    /// absent from the file (its `idx` is skipped) and the writer continues with
+    /// the next one. Checked before the timestamps, so a record with both problems
+    /// is counted here only.
+    pub rejected_unsafe_field: u64,
+    /// Written rows whose `error` text held a TAB, LF or CR and had each replaced
+    /// by one space (issue #186). The row is written and the operation recorded,
+    /// so this does not make the log incomplete; it discloses a changed message.
+    pub normalized_error_text: u64,
 }
 
 impl OpLogStats {
     /// True when none of the counted losses happened: `accepted == written &&
     /// dropped_full == 0 && writer_failed == 0 && writer_error.is_none() &&
-    /// rejected_unformattable == 0`.
+    /// rejected_unformattable == 0 && rejected_unsafe_field == 0`.
+    /// `normalized_error_text` is not a loss and is not part of it.
     /// Meaningful once [`finalize_op_logger`] has returned (see the type docs for
     /// what it cannot see); calls counted in `rejected_closed` are not part of it.
     pub fn is_complete(&self) -> bool {
@@ -297,6 +321,7 @@ impl OpLogStats {
             && self.writer_failed == 0
             && self.writer_error.is_none()
             && self.rejected_unformattable == 0
+            && self.rejected_unsafe_field == 0
     }
 }
 
@@ -336,7 +361,8 @@ fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
     let unwritten = stats
         .accepted
         .saturating_sub(stats.written)
-        .saturating_sub(stats.rejected_unformattable);
+        .saturating_sub(stats.rejected_unformattable)
+        .saturating_sub(stats.rejected_unsafe_field);
     let mut lines = Vec::new();
     let mut advice = Vec::new();
     if stats.dropped_full > 0 {
@@ -370,6 +396,15 @@ fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
              applied); the trace is incomplete. Check the value passed to \
              set_clock_offset",
             stats.rejected_unformattable
+        ));
+    }
+    if stats.rejected_unsafe_field > 0 {
+        lines.push(format!(
+            "{} entries were rejected because op, client_id, endpoint or file held a \
+             TAB, LF or CR (the TSV row cannot carry them); the records are lost, not \
+             encoded, and the trace is incomplete. Look for such characters in object \
+             names, file names, set_client_id and endpoints",
+            stats.rejected_unsafe_field
         ));
     }
     if let Some(error) = &stats.writer_error {
@@ -415,6 +450,21 @@ fn incomplete_warning(stats: &OpLogStats) -> Option<String> {
         text.push_str(&line);
     }
     Some(text)
+}
+
+/// The finalize line that discloses error texts changed by the writer (issue
+/// #186); `None` when none were. Separate from [`incomplete_warning`] because it
+/// reports no loss: the rows were written and the log may well be complete.
+fn normalized_note(stats: &OpLogStats) -> Option<String> {
+    if stats.normalized_error_text == 0 {
+        return None;
+    }
+    Some(format!(
+        "op-log: {} error messages had TAB, LF or CR characters replaced by spaces so \
+         the rows stay valid; the operations are recorded and this alone does not make \
+         the log incomplete",
+        stats.normalized_error_text
+    ))
 }
 
 /// Statistics of the process's op-log session: `Some` while it is Active and
@@ -602,12 +652,62 @@ fn format_timestamp(t: SystemTime) -> Option<String> {
     Some(text)
 }
 
+/// True when `s` holds a byte that ends a column (TAB) or a record (LF, CR) in the
+/// TSV row. Bytes, not chars: those three are ASCII and never occur inside a
+/// multi-byte UTF-8 sequence, so no other character is touched (U+0085, U+2028
+/// and U+2029 are written as they always were).
+fn breaks_the_row(s: &str) -> bool {
+    s.bytes().any(|b| matches!(b, b'\t' | b'\n' | b'\r'))
+}
+
+/// Why a record has no row (it is never written, counted, and the writer goes on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowRejection {
+    /// `op`, `client_id`, `endpoint` or `file` holds a TAB, LF or CR (issue #186);
+    /// carries the column name. Decided first.
+    UnsafeField(&'static str),
+    /// A timestamp is outside the RFC 3339 formatter's domain (issue #190).
+    UnformattableTimestamp,
+}
+
+/// A record's row, and whether its `error` text had to be changed to make it one.
+#[derive(Debug, PartialEq, Eq)]
+struct RenderedRow {
+    line: String,
+    /// `error` held a TAB, LF or CR and each was replaced by one space (#186).
+    error_normalized: bool,
+}
+
 impl LogEntry {
-    /// The log row for this entry after the clock offset is applied, or `None`
-    /// when any of its three timestamps (start, first byte, end) cannot be
-    /// formatted (see [`format_timestamp`]). Nothing is written for such a row;
-    /// the writer counts it and goes on (issue #190).
-    fn to_log_line(&self, clock_offset_nanos: i64) -> Option<String> {
+    /// The first of `op`, `client_id`, `endpoint`, `file` (in column order) that
+    /// holds a TAB, LF or CR, by column name.
+    fn unsafe_identity_field(&self) -> Option<&'static str> {
+        [
+            ("op", &self.operation),
+            ("client_id", &self.client_id),
+            ("endpoint", &self.endpoint),
+            ("file", &self.file),
+        ]
+        .into_iter()
+        .find_map(|(name, value)| breaks_the_row(value).then_some(name))
+    }
+
+    /// The row of this entry after the clock offset is applied, or why it has
+    /// none. This is the serialization boundary, so everything that reaches the
+    /// file passes it, including `op` and `endpoint` an external caller supplied
+    /// through `Logger::log`.
+    ///
+    /// - A TAB, LF or CR in `op`, `client_id`, `endpoint` or `file` rejects the
+    ///   record ([`RowRejection::UnsafeField`], issue #186). Checked first.
+    /// - A timestamp (start, first byte, end) that cannot be formatted rejects it
+    ///   ([`RowRejection::UnformattableTimestamp`], see [`format_timestamp`], #190).
+    /// - A TAB, LF or CR in `error` is replaced by one space each and the row is
+    ///   kept (`error_normalized`). Every other byte, a backslash included, is
+    ///   written as it is.
+    fn render_row(&self, clock_offset_nanos: i64) -> Result<RenderedRow, RowRejection> {
+        if let Some(column) = self.unsafe_identity_field() {
+            return Err(RowRejection::UnsafeField(column));
+        }
         // Apply clock offset correction for distributed systems
         // Positive offset means local clock is ahead, so we subtract to align with reference time
         // `unsigned_abs` instead of negation: `-i64::MIN` overflows (a panic in
@@ -647,14 +747,21 @@ impl LogEntry {
             .duration_since(corrected_start)
             .unwrap_or_default()
             .as_nanos();
-        let start_ts = format_timestamp(corrected_start)?;
-        let end_ts = format_timestamp(corrected_end)?;
+        let timestamp = |t| format_timestamp(t).ok_or(RowRejection::UnformattableTimestamp);
+        let start_ts = timestamp(corrected_start)?;
+        let end_ts = timestamp(corrected_end)?;
         let first_byte_ts = match corrected_first_byte {
-            Some(t) => format_timestamp(t)?,
+            Some(t) => timestamp(t)?,
             None => String::new(),
         };
-        let error_str = self.error.as_deref().unwrap_or_default();
-        Some(format!(
+        let error_text = self.error.as_deref().unwrap_or_default();
+        let error_normalized = breaks_the_row(error_text);
+        let error_str = if error_normalized {
+            std::borrow::Cow::Owned(error_text.replace(['\t', '\n', '\r'], " "))
+        } else {
+            std::borrow::Cow::Borrowed(error_text)
+        };
+        let line = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             self.idx,
             self.thread_id,
@@ -669,7 +776,18 @@ impl LogEntry {
             first_byte_ts,
             end_ts,
             duration_ns
-        ))
+        );
+        Ok(RenderedRow {
+            line,
+            error_normalized,
+        })
+    }
+
+    /// Test-only view of [`LogEntry::render_row`]: the line, or `None` for any
+    /// rejection (the shape the #190 tests were written against).
+    #[cfg(test)]
+    fn to_log_line(&self, clock_offset_nanos: i64) -> Option<String> {
+        self.render_row(clock_offset_nanos).ok().map(|r| r.line)
     }
 }
 
@@ -776,6 +894,11 @@ struct WriterReport {
     written: AtomicU64,
     /// Rows not written because a timestamp could not be formatted (#190).
     rejected_unformattable: AtomicU64,
+    /// Records not written because `op`, `client_id`, `endpoint` or `file` held a
+    /// TAB, LF or CR (#186).
+    rejected_unsafe_field: AtomicU64,
+    /// Written rows whose `error` text had TAB, LF or CR replaced by spaces (#186).
+    normalized_error_text: AtomicU64,
     /// The FIRST error the writer met; later ones are ignored.
     first_error: OnceLock<String>,
 }
@@ -873,7 +996,9 @@ fn write_rows<W: Write>(
     report: &WriterReport,
 ) {
     let mut written = 0_u64;
-    let mut rejected = 0_u64;
+    let mut rejected_unformattable = 0_u64;
+    let mut rejected_unsafe_field = 0_u64;
+    let mut normalized = 0_u64;
     // `idx` numbers every message, so a rejected row leaves a gap in the column
     // and each later row keeps the number it would have had.
     for (idx, message) in (0_u64..).zip(receiver) {
@@ -883,25 +1008,44 @@ fn write_rows<W: Write>(
         };
         entry.idx = idx;
         let offset = clock_offset.load(Ordering::Relaxed);
-        let Some(line) = entry.to_log_line(offset) else {
-            // Not written, not fatal: count it, say so once per session, and
-            // carry on with the next row. The exact total is in the warning
-            // finalize prints.
-            rejected += 1;
-            report
-                .rejected_unformattable
-                .store(rejected, Ordering::Relaxed);
-            if rejected == 1 {
-                stderr_note(
-                    "op-log: a row's timestamp cannot be formatted (before 1970-01-01 \
-                     or after 9999-12-31 once the clock offset is applied); the row is \
-                     not written and later rows continue (further rejections are \
-                     counted and reported when the op-log is finalized)",
-                );
+        let row = match entry.render_row(offset) {
+            Ok(row) => row,
+            // Not written, not fatal: count it (once, by its first reason), say so
+            // once per session, and carry on with the next row. The exact totals
+            // are in the warning finalize prints.
+            Err(RowRejection::UnsafeField(column)) => {
+                rejected_unsafe_field += 1;
+                report
+                    .rejected_unsafe_field
+                    .store(rejected_unsafe_field, Ordering::Relaxed);
+                if rejected_unsafe_field == 1 {
+                    // The column is named, the value is not: it is hostile or huge.
+                    stderr_note(&format!(
+                        "op-log: the `{column}` column holds a TAB, LF or CR, which the \
+                         TSV row cannot carry; the whole record is not written and later \
+                         records continue (further rejections are counted and reported \
+                         when the op-log is finalized)"
+                    ));
+                }
+                continue;
             }
-            continue;
+            Err(RowRejection::UnformattableTimestamp) => {
+                rejected_unformattable += 1;
+                report
+                    .rejected_unformattable
+                    .store(rejected_unformattable, Ordering::Relaxed);
+                if rejected_unformattable == 1 {
+                    stderr_note(
+                        "op-log: a row's timestamp cannot be formatted (before 1970-01-01 \
+                         or after 9999-12-31 once the clock offset is applied); the row is \
+                         not written and later rows continue (further rejections are \
+                         counted and reported when the op-log is finalized)",
+                    );
+                }
+                continue;
+            }
         };
-        if let Err(e) = encoder.write_all(line.as_bytes()) {
+        if let Err(e) = encoder.write_all(row.line.as_bytes()) {
             report.record_error("write failed", &e);
             let _ = writeln!(std::io::stderr(), "Error writing to op-log: {e}");
             break;
@@ -909,6 +1053,13 @@ fn write_rows<W: Write>(
         written += 1;
         // The only writer of this counter: a plain store, no read-modify-write.
         report.written.store(written, Ordering::Relaxed);
+        if row.error_normalized {
+            // Counted once the row is written, so a rejected or failed row is not.
+            normalized += 1;
+            report
+                .normalized_error_text
+                .store(normalized, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1247,6 +1398,8 @@ impl Logger {
             written: shared.writer.written.load(Ordering::Relaxed),
             writer_error: shared.writer.first_error.get().cloned(),
             rejected_unformattable: shared.writer.rejected_unformattable.load(Ordering::Relaxed),
+            rejected_unsafe_field: shared.writer.rejected_unsafe_field.load(Ordering::Relaxed),
+            normalized_error_text: shared.writer.normalized_error_text.load(Ordering::Relaxed),
         }
     }
 
@@ -1410,10 +1563,16 @@ impl Logger {
         shared.final_published.store(true, Ordering::Release);
 
         // One warning, from the first (draining) finalize, if records were lost.
-        if let Some(warning) = incomplete_warning(&self.stats()) {
+        let final_stats = self.stats();
+        if let Some(warning) = incomplete_warning(&final_stats) {
             // Never panic on a closed stderr (EPIPE): losing the warning is the
             // lesser evil.
             let _ = writeln!(std::io::stderr(), "{warning}");
+        }
+        // Changed error texts are not a loss, so they are not in the warning above
+        // (and are printed whether or not the log is complete).
+        if let Some(note) = normalized_note(&final_stats) {
+            let _ = writeln!(std::io::stderr(), "{note}");
         }
     }
 }
@@ -3005,6 +3164,8 @@ mod oplog_writer_error_tests {
             written,
             writer_error: None,
             rejected_unformattable: 0,
+            rejected_unsafe_field: 0,
+            normalized_error_text: 0,
         }
     }
 
@@ -4180,6 +4341,477 @@ mod oplog_unformattable_timestamp_tests {
                 assert!(
                     !stderr.contains("panicked"),
                     "nothing may panic for this case\n{stderr}"
+                );
+            },
+        );
+    }
+}
+
+// Issue #186 (bounded mitigation): the row is TAB-separated, one record per line,
+// and nothing is escaped. A TAB, LF or CR in `op`, `client_id`, `endpoint` or
+// `file` rejects the whole record (counted, reported, later rows continue); in
+// `error` each of them becomes a space and the row is still written (counted and
+// disclosed). Every other byte, a backslash included, is written unchanged.
+#[cfg(test)]
+mod oplog_unsafe_field_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    const CHILD_ENV: &str = "S3DLIO_TEST_UNSAFE_FIELD_CHILD";
+    const CHILD_OK: &str = "unsafe-field child finished";
+    const BREAKERS: [(&str, char); 3] = [("TAB", '\t'), ("LF", '\n'), ("CR", '\r')];
+
+    // Counter accessors, so the very same tests run against the tree before the
+    // fix (RED: the stubs below) and after it (GREEN).
+    fn unsafe_rejections(st: &OpLogStats) -> u64 {
+        st.rejected_unsafe_field
+    }
+    fn normalized(st: &OpLogStats) -> u64 {
+        st.normalized_error_text
+    }
+
+    /// 2023-11-14T22:13:20.123456789Z
+    fn base() -> SystemTime {
+        UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)
+    }
+
+    /// A healthy entry at `base()`; callers overwrite the column under test.
+    fn entry() -> LogEntry {
+        LogEntry {
+            idx: 0,
+            thread_id: 1,
+            operation: "GET".to_string(),
+            client_id: "c".to_string(),
+            num_objects: 1,
+            bytes: 10,
+            endpoint: "e".to_string(),
+            file: "f".to_string(),
+            error: None,
+            start_time: base(),
+            first_byte_time: Some(base() + Duration::from_nanos(1_500_000)),
+            end_time: base() + Duration::from_nanos(4_000_000),
+        }
+    }
+
+    /// The row an `entry()` with these column values becomes, written out
+    /// literally (offset 0), not derived from the production formatter.
+    fn row(idx: u64, op: &str, client: &str, endpoint: &str, file: &str, error: &str) -> String {
+        format!(
+            "{idx}\t1\t{op}\t{client}\t1\t10\t{endpoint}\t{file}\t{error}\t\
+             2023-11-14T22:13:20.123456789Z\t2023-11-14T22:13:20.124956789Z\t\
+             2023-11-14T22:13:20.127456789Z\t4000000\n"
+        )
+    }
+
+    fn good_row(idx: u64) -> String {
+        row(idx, "GET", "c", "e", "f", "")
+    }
+
+    fn test_path(name: &str) -> String {
+        let module = module_path!();
+        let (_, module) = module.split_once("::").unwrap();
+        format!("{module}::{name}")
+    }
+
+    fn file_text(path: &std::path::Path) -> String {
+        let bytes = std::fs::read(path).unwrap();
+        String::from_utf8(zstd::decode_all(bytes.as_slice()).unwrap()).unwrap()
+    }
+
+    /// Log `entries` in order (all must be accepted), finalize, return the decoded
+    /// file and the stats.
+    fn session(entries: Vec<LogEntry>, tag: &str) -> (String, OpLogStats) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{tag}.tsv.zst"));
+        let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
+        for e in entries {
+            assert_eq!(logger.try_log(e), LogOutcome::Accepted);
+        }
+        logger.shutdown();
+        (file_text(&path), logger.stats())
+    }
+
+    /// Set the column `name` of `e` to `value`.
+    fn with_column(mut e: LogEntry, name: &str, value: String) -> LogEntry {
+        match name {
+            "op" => e.operation = value,
+            "client_id" => e.client_id = value,
+            "endpoint" => e.endpoint = value,
+            "file" => e.file = value,
+            "error" => e.error = Some(value),
+            other => panic!("no column {other}"),
+        }
+        e
+    }
+
+    // Each identity column x TAB/LF/CR, at the start, in the middle and at the end
+    // of the value: the record is absent, the rows before and after it are the
+    // exact bytes a healthy log has (the rejected row leaves a gap in idx), the
+    // writer does not fail, and the loss is counted, makes the log incomplete and
+    // is named in the finalize warning.
+    #[test]
+    fn an_identity_field_with_tab_lf_or_cr_rejects_the_record_and_later_rows_are_unchanged() {
+        for column in ["op", "client_id", "endpoint", "file"] {
+            for (what, ch) in BREAKERS {
+                for value in [format!("{ch}x"), format!("a{ch}b"), format!("x{ch}")] {
+                    let ctx = format!("{column} with {what}: {value:?}");
+                    let bad = with_column(entry(), column, value);
+                    let mut entries = vec![entry(), entry(), bad];
+                    entries.extend((0..3).map(|_| entry()));
+                    let (text, st) = session(entries, "identity");
+                    let mut want = String::from(HEADER);
+                    for idx in [0, 1, 3, 4, 5] {
+                        want.push_str(&good_row(idx));
+                    }
+                    assert_eq!(text, want, "{ctx}");
+                    assert_eq!(st.accepted, 6, "{ctx}: {st:?}");
+                    assert_eq!(st.written, 5, "{ctx}: {st:?}");
+                    assert_eq!(st.writer_error, None, "{ctx}: {st:?}");
+                    assert_eq!(unsafe_rejections(&st), 1, "{ctx}: {st:?}");
+                    assert_eq!(st.rejected_unformattable, 0, "{ctx}: {st:?}");
+                    assert_eq!(normalized(&st), 0, "{ctx}: {st:?}");
+                    assert!(
+                        !st.is_complete(),
+                        "{ctx}: a rejected record is not complete"
+                    );
+                    let warning = incomplete_warning(&st).unwrap();
+                    assert!(
+                        warning.contains(
+                            "1 entries were rejected because op, client_id, endpoint or file \
+                             held a TAB, LF or CR"
+                        ),
+                        "{ctx}: {warning}"
+                    );
+                    assert!(
+                        !warning.contains("never written") && !warning.contains("timestamp"),
+                        "{ctx}: {warning}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The forged-record case of the issue: a key that carries a whole other record.
+    // Nothing of it reaches the file, and every row that is there has 13 fields.
+    #[test]
+    fn a_key_that_embeds_a_forged_record_writes_nothing_of_it() {
+        let forged = "x\n99\t1\tDELETE\tc\t1\t0\te\tvictim\t\t2023-11-14T22:13:20.123456789Z\t\
+                      2023-11-14T22:13:20.124956789Z\t2023-11-14T22:13:20.127456789Z\t1\n";
+        let (text, st) = session(
+            vec![
+                entry(),
+                with_column(entry(), "file", forged.to_string()),
+                entry(),
+            ],
+            "forged",
+        );
+        assert!(
+            !text.contains("DELETE") && !text.contains("victim"),
+            "{text}"
+        );
+        for line in text.lines() {
+            assert_eq!(line.split('\t').count(), 13, "{line:?}");
+        }
+        assert_eq!(text.lines().count(), 3, "header and the two healthy rows");
+        assert_eq!(unsafe_rejections(&st), 1, "{st:?}");
+    }
+
+    // `error` is diagnostic text: each TAB, LF and CR becomes ONE space and the row
+    // is still written, so the failed operation is kept. The rest of the row is
+    // exactly what a clean message gives; the replacement is counted, once per row.
+    #[test]
+    fn an_error_with_tab_lf_or_cr_is_written_with_spaces_and_counted() {
+        for (what, ch) in BREAKERS {
+            let ctx = format!("error with {what}");
+            let dirty = format!("boom{ch}RequestId: abc{ch}{ch}end");
+            let (text, st) = session(
+                vec![
+                    with_column(entry(), "error", dirty),
+                    with_column(entry(), "error", "boom RequestId: abc  end".to_string()),
+                    entry(),
+                ],
+                "error",
+            );
+            let mut want = String::from(HEADER);
+            want.push_str(&row(0, "GET", "c", "e", "f", "boom RequestId: abc  end"));
+            want.push_str(&row(1, "GET", "c", "e", "f", "boom RequestId: abc  end"));
+            want.push_str(&good_row(2));
+            assert_eq!(text, want, "{ctx}");
+            let lines: Vec<&str> = text.lines().skip(1).collect();
+            assert_eq!(
+                lines[0].split_once('\t').unwrap().1,
+                lines[1].split_once('\t').unwrap().1,
+                "{ctx}: identical to the clean message apart from idx"
+            );
+            assert_eq!(st.accepted, 3, "{ctx}: {st:?}");
+            assert_eq!(st.written, 3, "{ctx}: {st:?}");
+            assert_eq!(
+                normalized(&st),
+                1,
+                "{ctx}: one row had its text changed: {st:?}"
+            );
+            assert_eq!(unsafe_rejections(&st), 0, "{ctx}: {st:?}");
+            // The operation is fully recorded, so the log is complete; the change is
+            // disclosed, not a loss.
+            assert!(st.is_complete(), "{ctx}: {st:?}");
+            assert_eq!(incomplete_warning(&st), None, "{ctx}");
+        }
+        // CR LF is two characters, so two spaces.
+        let (text, st) = session(
+            vec![with_column(entry(), "error", "a\r\nb".to_string())],
+            "crlf",
+        );
+        assert!(
+            text.ends_with(&row(0, "GET", "c", "e", "f", "a  b")),
+            "{text}"
+        );
+        assert_eq!(normalized(&st), 1, "{st:?}");
+    }
+
+    // Every other byte is written exactly as before: a backslash (the issue's own
+    // escape character), percent codes, a quote, the literal text `\t`, and the
+    // Unicode line separators U+0085 / U+2028 / U+2029 (their UTF-8 bytes contain no
+    // 0x09, 0x0A or 0x0D). Nothing is counted, and the log is complete.
+    #[test]
+    fn every_other_byte_is_written_unchanged_and_nothing_is_counted() {
+        let values = [
+            "dir\\sub\\tfile.bin",
+            "a%20b%09c.bin",
+            "q\"uote",
+            "back\\\\slash\\n",
+            "nel\u{85}ls\u{2028}ps\u{2029}",
+            "caf\u{e9} \u{1f600}",
+            " lead and trail ",
+        ];
+        for value in values {
+            let mut e = entry();
+            e.operation = value.to_string();
+            e.client_id = value.to_string();
+            e.endpoint = value.to_string();
+            e.file = value.to_string();
+            e.error = Some(value.to_string());
+            let (text, st) = session(vec![e], "other");
+            let mut want = String::from(HEADER);
+            want.push_str(&row(0, value, value, value, value, value));
+            assert_eq!(text, want, "{value:?}");
+            assert_eq!(unsafe_rejections(&st), 0, "{value:?}: {st:?}");
+            assert_eq!(normalized(&st), 0, "{value:?}: {st:?}");
+            assert!(st.is_complete(), "{value:?}: {st:?}");
+            assert_eq!(incomplete_warning(&st), None, "{value:?}");
+        }
+    }
+
+    // A record can be refused for either reason; each record is counted once, and
+    // an unsafe identity field is decided first. A record rejected for any reason
+    // is not also counted as normalised (it was not written).
+    #[test]
+    fn a_record_rejected_for_both_reasons_is_counted_once_unsafe_field_first() {
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(5);
+        let both = {
+            let mut e = with_column(entry(), "file", "a\tb".to_string());
+            e.start_time = pre_epoch;
+            e.end_time = pre_epoch;
+            e.first_byte_time = None;
+            e
+        };
+        let only_time = {
+            let mut e = entry();
+            e.start_time = pre_epoch;
+            e.end_time = pre_epoch;
+            e.first_byte_time = None;
+            e
+        };
+        let time_and_dirty_error = with_column(only_time.clone(), "error", "x\ty".to_string());
+        let unsafe_and_dirty_error = with_column(
+            with_column(entry(), "op", "G\nT".to_string()),
+            "error",
+            "x\ty".to_string(),
+        );
+        let (text, st) = session(
+            vec![
+                entry(),
+                both,
+                only_time,
+                time_and_dirty_error,
+                unsafe_and_dirty_error,
+                entry(),
+            ],
+            "both",
+        );
+        let mut want = String::from(HEADER);
+        want.push_str(&good_row(0));
+        want.push_str(&good_row(5));
+        assert_eq!(text, want);
+        assert_eq!(st.accepted, 6, "{st:?}");
+        assert_eq!(st.written, 2, "{st:?}");
+        // both + unsafe_and_dirty_error: unsafe field; only_time + time_and_dirty_error: time.
+        assert_eq!(unsafe_rejections(&st), 2, "{st:?}");
+        assert_eq!(st.rejected_unformattable, 2, "{st:?}");
+        assert_eq!(
+            normalized(&st),
+            0,
+            "rejected rows are not normalised rows: {st:?}"
+        );
+        assert_eq!(
+            st.accepted,
+            st.written + unsafe_rejections(&st) + st.rejected_unformattable,
+            "every accepted record is written or counted exactly once: {st:?}"
+        );
+        let warning = incomplete_warning(&st).unwrap();
+        assert!(
+            warning.contains("2 entries were rejected because op, client_id, endpoint or file")
+                && warning
+                    .contains("2 entries were rejected because a timestamp could not be formatted")
+                && !warning.contains("never written"),
+            "{warning}"
+        );
+    }
+
+    // The two counters do not mask one another or the older ones.
+    #[test]
+    fn stats_completeness_and_warning_with_synthetic_counts() {
+        let st = |accepted, written| OpLogStats {
+            accepted,
+            dropped_full: 0,
+            rejected_closed: 0,
+            writer_failed: 0,
+            lossless: false,
+            written,
+            writer_error: None,
+            rejected_unformattable: 0,
+            rejected_unsafe_field: 0,
+            normalized_error_text: 0,
+        };
+        // Normalised rows alone leave the log complete and silent...
+        let mut s = st(10, 10);
+        s.normalized_error_text = 4;
+        assert!(s.is_complete());
+        assert_eq!(incomplete_warning(&s), None);
+        // ...but are disclosed on their own line.
+        let note = normalized_note(&s).unwrap();
+        assert!(
+            note.contains("4 error messages had TAB, LF or CR characters replaced by spaces"),
+            "{note}"
+        );
+        assert_eq!(normalized_note(&st(10, 10)), None);
+        // A rejected record is accepted but never written.
+        let mut s = st(10, 9);
+        s.rejected_unsafe_field = 1;
+        assert!(!s.is_complete());
+        let w = incomplete_warning(&s).unwrap();
+        assert!(!w.contains("never written"), "{w}");
+        // Rows really lost to a dying writer are still reported on top of them.
+        let mut s = st(10, 6);
+        s.rejected_unsafe_field = 1;
+        s.rejected_unformattable = 1;
+        let w = incomplete_warning(&s).unwrap();
+        assert!(
+            w.contains("1 entries were rejected because op, client_id, endpoint or file")
+                && w.contains("1 entries were rejected because a timestamp")
+                && w.contains("2 accepted entries were never written"),
+            "{w}"
+        );
+    }
+
+    /// Run `body` in a child copy of this test binary with stderr in a file, then
+    /// hand that stderr to `check` in the parent.
+    fn with_captured_stderr(test: &str, body: impl FnOnce(), check: impl FnOnce(&str)) {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            body();
+            println!("{CHILD_OK}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("child-stderr.txt");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .stderr(std::process::Stdio::from(File::create(&path).unwrap()))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.status.success() && stdout.contains(CHILD_OK),
+            "the child died or never ran its body ({}): {stdout}\n{stderr}",
+            out.status
+        );
+        check(&stderr);
+    }
+
+    // One stderr note for the whole session, however many records are rejected and
+    // whichever column; finalize then states the exact counts: the rejected records
+    // in the INCOMPLETE warning and the replaced error texts on their own line.
+    #[test]
+    fn rejections_print_one_note_and_finalize_names_the_exact_counts() {
+        with_captured_stderr(
+            &test_path("rejections_print_one_note_and_finalize_names_the_exact_counts"),
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("many.tsv.zst");
+                let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
+                for column in ["op", "client_id", "endpoint", "file"] {
+                    let bad = with_column(entry(), column, "a\tb".to_string());
+                    assert_eq!(logger.try_log(bad), LogOutcome::Accepted);
+                    assert_eq!(logger.try_log(entry()), LogOutcome::Accepted);
+                }
+                for _ in 0..2 {
+                    let dirty = with_column(entry(), "error", "x\ny".to_string());
+                    assert_eq!(logger.try_log(dirty), LogOutcome::Accepted);
+                }
+                logger.shutdown();
+            },
+            |stderr| {
+                let notes = stderr
+                    .lines()
+                    .filter(|l| l.contains("column holds a TAB, LF or CR"))
+                    .count();
+                assert_eq!(notes, 1, "one note per session, not per record\n{stderr}");
+                let warning = "4 entries were rejected because op, client_id, endpoint or file \
+                               held a TAB, LF or CR";
+                assert_eq!(
+                    stderr.lines().filter(|l| l.contains(warning)).count(),
+                    1,
+                    "the finalize warning states the exact count\n{stderr}"
+                );
+                let disclosure = "2 error messages had TAB, LF or CR characters replaced by spaces";
+                assert_eq!(
+                    stderr.lines().filter(|l| l.contains(disclosure)).count(),
+                    1,
+                    "finalize discloses the replaced error texts\n{stderr}"
+                );
+                assert!(!stderr.contains("panicked"), "{stderr}");
+            },
+        );
+    }
+
+    // Only error texts changed: no rejection note, no INCOMPLETE warning (the log
+    // is complete), but the replacement is disclosed at finalize.
+    #[test]
+    fn normalised_errors_alone_are_disclosed_but_do_not_make_the_log_incomplete() {
+        with_captured_stderr(
+            &test_path("normalised_errors_alone_are_disclosed_but_do_not_make_the_log_incomplete"),
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("norm.tsv.zst");
+                let logger = Logger::open(path.to_str().unwrap(), 64, false).unwrap();
+                for _ in 0..3 {
+                    let dirty = with_column(entry(), "error", "x\r\ny".to_string());
+                    assert_eq!(logger.try_log(dirty), LogOutcome::Accepted);
+                }
+                logger.shutdown();
+                assert!(logger.stats().is_complete());
+            },
+            |stderr| {
+                assert!(
+                    stderr.contains(
+                        "3 error messages had TAB, LF or CR characters replaced by spaces"
+                    ),
+                    "{stderr}"
+                );
+                assert!(
+                    !stderr.contains("INCOMPLETE") && !stderr.contains("column holds a TAB"),
+                    "{stderr}"
                 );
             },
         );
