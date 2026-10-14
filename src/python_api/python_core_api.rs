@@ -108,19 +108,100 @@ impl StoreKey {
     }
 }
 
-/// Global cache of ObjectStore instances
+/// One cache slot: the store for one [`StoreKey`], built at most once.
+///
+/// `store` is read lock-free on every call after the first. `build` serialises
+/// the callers that find the slot empty, so one of them builds and the rest
+/// wait for its result instead of each building a store (and an S3 client with
+/// its own connection pool) that the others would then discard (issue #204).
+/// A failed build leaves the slot empty, so the next caller retries.
+struct StoreSlot {
+    store: std::sync::OnceLock<Arc<dyn ObjectStore>>,
+    build: std::sync::Mutex<()>,
+}
+
+/// Take a slot's build lock. Uncontended, this is a plain `try_lock`. When another caller is
+/// building and this one is on a multi-thread Tokio runtime (the async entry points run on
+/// the pyo3 runtime), the wait is wrapped in `block_in_place` so the runtime can run other
+/// tasks on a replacement worker instead of losing this one for the whole cold start. Any
+/// other thread just waits. A poisoned lock (a build that panicked) guards no data and is
+/// recovered.
+fn lock_build(build: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    match build.try_lock() {
+        Ok(guard) => return guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+    let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
+        .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    if on_multi_thread_runtime {
+        tokio::task::block_in_place(|| build.lock().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        build.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl StoreSlot {
+    fn new() -> Self {
+        Self {
+            store: std::sync::OnceLock::new(),
+            build: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// The slot's store, building it from `uri` if no caller has yet.
+    ///
+    /// Callers waiting on `build` are only those racing on the SAME key's first
+    /// miss; every other key, and every later call on this one, never touches the
+    /// lock. A poisoned lock (a build that panicked) guards no data, so it is
+    /// recovered and the build retried.
+    fn get_or_build(&self, uri: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
+        if let Some(store) = self.store.get() {
+            return Ok(Arc::clone(store));
+        }
+        let _building = lock_build(&self.build);
+        if let Some(store) = self.store.get() {
+            return Ok(Arc::clone(store)); // another caller built it while this one waited
+        }
+        // store_for_uri_with_logger is SYNC, no runtime needed. The store itself is
+        // Send + Sync and uses the global runtime's I/O reactor when its async methods
+        // are called. Built without a logger: the cache must stay logger-free.
+        #[cfg(test)]
+        STORE_BUILD_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(uri.to_owned());
+        let built: Arc<dyn ObjectStore> = Arc::from(store_for_uri_with_logger(uri, None)?);
+        Ok(Arc::clone(self.store.get_or_init(|| built)))
+    }
+}
+
+/// Global cache of ObjectStore instances, one [`StoreSlot`] per [`StoreKey`].
 ///
 /// DashMap provides lock-free concurrent access (better than RwLock<HashMap>)
 /// for read-heavy workloads. Expected cache hit rate: >99% in typical workloads.
+/// A slot is inserted with the map's entry API, so racing callers share one slot
+/// per key and the slot makes the build happen once.
 ///
 /// Performance: <100ns per lookup (DashMap sharded locking)
-static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<dyn ObjectStore>>> = Lazy::new(DashMap::new);
+static STORE_CACHE: Lazy<DashMap<StoreKey, Arc<StoreSlot>>> = Lazy::new(DashMap::new);
+
+/// Test hook: the URI of every store `get_or_create_store` built (not served from the
+/// cache), in order.  Lets a test count the builds for one URI.
+#[cfg(test)]
+static STORE_BUILD_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Get or create a cached ObjectStore instance.
 ///
 /// store_for_uri_with_logger() is synchronous — no runtime needed for creation.
-/// The store is cached by (scheme, endpoint, region, per-endpoint route) for
-/// >99% cache hit rate; see [`StoreKey`].
+/// The store is cached by (scheme, endpoint, region, per-endpoint route), for a
+/// cache hit rate above 99%; see [`StoreKey`]. Every Python entry point that needs
+/// a store, sync or async, gets it here (issue #204), so a host-form server's S3
+/// client and connection pool are built once and shared by all calls to it.
+///
+/// A cache miss is built ONCE per key however many callers race on it: the
+/// others wait for the builder (see [`StoreSlot`]).
 ///
 /// The cache holds only the UNLOGGED store, never a logger. `logger` is the
 /// caller's snapshot of `global_logger()` taken for THIS call, and a call that
@@ -144,22 +225,18 @@ fn get_or_create_store(
     // Routing errors propagate BEFORE the cache is consulted or populated.
     let key = StoreKey::from_uri(uri)?;
 
-    // Fast path: Store already exists (cache hit >99% in typical workloads)
-    let cached = STORE_CACHE.get(&key).map(|store| store.clone());
-    let store = match cached {
-        Some(store) => store,
-        None => {
-            // Slow path: Create new store — store_for_uri_with_logger is SYNC,
-            // no runtime needed. The store itself is Send + Sync and will use
-            // the global runtime's I/O reactor when async methods are called.
-            // Built without a logger: the cache must stay logger-free.
-            let store_box: Box<dyn ObjectStore> = store_for_uri_with_logger(uri, None)?;
-            let store_arc: Arc<dyn ObjectStore> = Arc::from(store_box);
-            // Two callers may build concurrently; both stores are equivalent, so
-            // keep whichever was inserted first.
-            STORE_CACHE.entry(key).or_insert(store_arc).value().clone()
-        }
+    // Fast path: the slot exists (cache hit >99% in typical workloads).
+    let existing = STORE_CACHE.get(&key).map(|slot| Arc::clone(slot.value()));
+    let slot = match existing {
+        Some(slot) => slot,
+        None => Arc::clone(
+            STORE_CACHE
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(StoreSlot::new()))
+                .value(),
+        ),
     };
+    let store = slot.get_or_build(uri)?;
 
     Ok(match logger {
         Some(logger) => Arc::new(
@@ -784,12 +861,32 @@ pub fn is_op_log_active() -> PyResult<bool> {
 ///                      a failed finish/flush of the compressed stream, or a
 ///                      writer panic, which is a defect, not an I/O error) as text
 ///     lossless         True if S3DLIO_OPLOG_LOSSLESS=1 (callers wait, never drop)
+///     rejected_unformattable
+///                      accepted rows the writer did not write because a
+///                      timestamp (start, first byte or end, after the clock
+///                      offset is applied) is before 1970-01-01 or after
+///                      9999-12-31 and cannot be written as RFC 3339. The row is
+///                      absent from the file (its idx is skipped), later rows are
+///                      written, and the trace is incomplete.
+///     rejected_unsafe_field
+///                      accepted records the writer did not write because the
+///                      operation name, client id, endpoint or file holds a TAB,
+///                      LF or CR, which the tab-separated row cannot carry. The
+///                      whole record is absent from the file (its idx is skipped),
+///                      later records are written, and the trace is incomplete.
+///                      The record is lost, not encoded.
+///     normalized_error_text
+///                      written rows whose error text held a TAB, LF or CR, each
+///                      replaced by one space. The operation is recorded, so this
+///                      does NOT make the log incomplete; it discloses a changed
+///                      message.
 ///
 /// After finalize_op_log() no counted loss happened exactly when
 /// accepted == written and dropped_full == 0 and writer_failed == 0 and
-/// writer_error is None. "written" counts rows the zstd compressor accepted; the
-/// bytes may still be buffered when it is counted, and a later write, finish or
-/// flush can still fail (that is writer_error). A successful finalize_op_log()
+/// writer_error is None and rejected_unformattable == 0 and
+/// rejected_unsafe_field == 0. "written" counts rows the zstd compressor
+/// accepted; the bytes may still be buffered when it is counted, and a later
+/// write, finish or flush can still fail (that is writer_error). A successful finalize_op_log()
 /// with that condition true means every accepted row reached the compressor and
 /// the stream was finished and flushed to the file without error. That is
 /// completion, not durability: there is no fsync, and a close(2) error cannot be
@@ -824,6 +921,9 @@ pub fn op_log_stats_py(py: Python<'_>) -> PyResult<Option<Bound<'_, PyDict>>> {
     dict.set_item("lossless", stats.lossless)?;
     dict.set_item("written", stats.written)?;
     dict.set_item("writer_error", stats.writer_error)?;
+    dict.set_item("rejected_unformattable", stats.rejected_unformattable)?;
+    dict.set_item("rejected_unsafe_field", stats.rejected_unsafe_field)?;
+    dict.set_item("normalized_error_text", stats.normalized_error_text)?;
     Ok(Some(dict))
 }
 
@@ -1128,14 +1228,22 @@ pub fn configure_s3(
 // --- `list` function
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false, pattern = None))]
-pub fn list(uri: &str, recursive: bool, pattern: Option<&str>) -> PyResult<Vec<String>> {
+pub fn list(
+    py: Python<'_>,
+    uri: &str,
+    recursive: bool,
+    pattern: Option<&str>,
+) -> PyResult<Vec<String>> {
     // Universal list using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
-    let logger = global_logger();
-    let store = get_or_create_store(uri, logger).map_err(py_err)?;
     let uri_owned = uri.to_owned();
 
-    // Submit to global runtime (io_uring pattern — never calls block_on)
-    let mut keys = submit_io(async move { store.list(&uri_owned, recursive).await })?;
+    // The GIL is released for the whole blocking part -- store creation (credential
+    // loading) and the network listing -- so other Python threads keep running (issue #201).
+    let mut keys = py.detach(|| {
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        // Submit to global runtime (io_uring pattern — never calls block_on)
+        submit_io(async move { store.list(&uri_owned, recursive).await })
+    })?;
 
     // Apply client-side regex filtering against the relative path (after the listing prefix).
     // Pattern sees only the key portion after the URI prefix, e.g. "llama3-8b/" not the full URI.
@@ -1161,12 +1269,14 @@ pub fn list(uri: &str, recursive: bool, pattern: Option<&str>) -> PyResult<Vec<S
 #[pyfunction]
 pub fn stat(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
     // Universal stat using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
-    let logger = global_logger();
-    let store = get_or_create_store(uri, logger).map_err(py_err)?;
     let uri_owned = uri.to_owned();
 
-    // Submit to global runtime (io_uring pattern — never calls block_on)
-    let os = submit_io(async move { store.stat(&uri_owned).await })?;
+    // GIL released across store creation and the network request (issue #201).
+    let os = py.detach(|| {
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+        // Submit to global runtime (io_uring pattern — never calls block_on)
+        submit_io(async move { store.stat(&uri_owned).await })
+    })?;
 
     let d = stat_to_pydict(py, os)?;
     Ok(d.unbind().into())
@@ -1175,8 +1285,11 @@ pub fn stat(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
 #[pyfunction]
 fn stat_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
-    let logger = global_logger();
-    let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+    // Through the shared store cache (issue #204), built with the GIL released: a
+    // miss may create a client (credential loading) on this caller thread.
+    let store = py
+        .detach(|| get_or_create_store(&uri, global_logger()))
+        .map_err(py_err)?;
 
     future_into_py(py, async move {
         let os = store.stat(&uri).await.map_err(py_err)?;
@@ -1283,8 +1396,10 @@ pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
 #[pyfunction]
 fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
-    let logger = global_logger();
-    let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+    // Through the shared store cache (issue #204); see `stat_async`.
+    let store = py
+        .detach(|| get_or_create_store(&uri, global_logger()))
+        .map_err(py_err)?;
 
     future_into_py(py, async move {
         match store.stat(&uri).await {
@@ -1450,8 +1565,7 @@ fn put_bytes_async<'py>(
     };
 
     future_into_py(py, async move {
-        let logger = global_logger();
-        let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
         put_verified_with_retry(store.as_ref(), &uri, data_owned)
             .await
             .map_err(py_err)
@@ -1500,8 +1614,7 @@ fn mkdir_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, PyA
     let uri = uri.to_owned();
 
     future_into_py(py, async move {
-        let logger = global_logger();
-        let store = store_for_uri_with_logger(&uri, logger).map_err(py_err)?;
+        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
         store.mkdir(&uri).await.map_err(py_err)
     })
 }
@@ -1845,6 +1958,49 @@ pub fn get_many(
 }
 
 // --- `delete` function
+//
+/// Delete an object, or with ``recursive=True`` every object under a prefix
+/// (delete contract A, issue #212; the same contract as ``s3-cli delete``).
+///
+/// ``delete(uri)`` sends ONE delete request for exactly the key named by
+/// ``uri`` and returns ``None``:
+///
+/// * There is no lookup first. Deleting an object that is already missing
+///   succeeds (S3's DELETE succeeds for a missing key; on other backends only
+///   the backend's own typed not-found error is treated as success). Success
+///   means the delete request succeeded, not that an existing object was
+///   removed: S3 does not say whether the key existed, and on a versioned
+///   bucket a delete adds a delete marker and erases no earlier version.
+/// * Any actual failure (permission denied, server error, network error, ...)
+///   raises ``RuntimeError`` naming the key; it is never read as "already
+///   absent".
+/// * ``/``, ``*`` and ``?`` are ordinary key characters: ``s3://b/dir/`` names
+///   the object ``dir/`` (not "everything under dir"), and ``s3://b/a*`` names
+///   the key ``a*``. Nothing is listed, globbed or expanded, no parent is
+///   consulted, and no ``/`` is added.
+///
+/// ``delete(uri, recursive=True)`` deletes the real objects whose key starts
+/// with the LITERAL prefix given: listed without a delimiter, objects only (a
+/// "directory" is never a deletion target), no ``/`` appended, so the prefix
+/// ``foo`` also matches ``foobar``; add the trailing ``/`` yourself to mean a
+/// directory. A prefix with no objects is a no-op. Each selected object gets
+/// its own delete request (several in flight at once), so the op-log records
+/// one ``LIST`` row and one ``DELETE`` row per object. If a delete request or
+/// the listing fails, no further delete request is sent (requests already in
+/// flight finish; keys listed but not yet sent are not sent) and
+/// ``RuntimeError`` names what was and was not attempted.
+///
+/// Other backends follow the same contract through the same store methods; on
+/// a backend without a literal-prefix listing, ``recursive=True`` requires a
+/// URI ending in ``/`` (otherwise ``RuntimeError``, nothing deleted).
+///
+/// ``recursive=True`` needs list permission in addition to delete. This
+/// replaced an earlier implicit expansion of a trailing ``/``, ``*`` or ``?``
+/// (issue #212).
+///
+/// Raises:
+///     RuntimeError: any failure. For ``recursive=True``, nothing is deleted
+///         when the first listing page fails.
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false))]
 pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
@@ -1854,29 +2010,25 @@ pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
         // Build the store on the caller thread BEFORE submit_io (issue #173).
         let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
 
-        // Submit to global runtime (io_uring pattern — never calls block_on)
+        // Submit to global runtime (io_uring pattern — never calls block_on).
+        // The selection and deletion are the library's `delete_contract`,
+        // shared with `s3-cli delete`.
         submit_io(async move {
-            // Check if URI contains wildcards or ends with / (pattern/directory)
-            let has_pattern =
-                uri_owned.contains('*') || uri_owned.contains('?') || uri_owned.ends_with('/');
-
-            if has_pattern || recursive {
-                // Need to list objects first, then delete them
-                let list_results = store.list(&uri_owned, recursive).await?;
-
-                if list_results.is_empty() {
-                    // No objects matched - this is OK
-                    return Ok(());
-                }
-
-                // Delete each object (list returns full URIs)
-                for obj_uri in list_results {
-                    store.delete(&obj_uri).await?;
-                }
-                Ok(())
+            if recursive {
+                crate::delete_contract::delete_objects_under_literal_prefix(
+                    store.as_ref(),
+                    &uri_owned,
+                    None,
+                    // One DELETE per object (as before #212): the op-log
+                    // records LIST + one DELETE row per object. Batching is
+                    // deferred.
+                    crate::delete_contract::DeleteMode::PerObject,
+                    None,
+                )
+                .await
+                .into_result(&uri_owned, None)
             } else {
-                // Simple single object deletion
-                store.delete(&uri_owned).await
+                crate::delete_contract::delete_exact_object(store.as_ref(), &uri_owned).await
             }
         })
     })
@@ -2073,7 +2225,7 @@ pub fn put_many_async<'py>(
             let sem = Arc::clone(&sem);
             futs.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                let store = store_for_uri_with_logger(&uri, global_logger()).map_err(py_err)?;
+                let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
                 store.put(&uri, data).await.map_err(py_err)?;
                 Ok::<_, PyErr>(())
             }));
@@ -2148,57 +2300,180 @@ fn snapshot_final_writer_stats(writer: &dyn ObjectWriter) -> (u64, u64, Option<S
     )
 }
 
+/// (bytes_written, compressed_bytes, checksum) of a writer.
+type WriterStats = (u64, u64, Option<String>);
+
+/// Lock a mutex whose data stays consistent even if a holder panicked.
+fn lock_ignoring_poison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Python wrapper for ObjectWriter
+///
+/// `inner` is locked for the whole of a write or of `finalize()`, so calls on one writer
+/// from several threads run one after another instead of raising. `stats` holds the
+/// numbers as of the last COMPLETED call and is never held across I/O, so the accessors
+/// (`bytes_written`, `checksum`, `compressed_bytes`) answer immediately, even while a write
+/// is in flight on another thread (issue #201: the GIL is released during writes).
 #[pyclass]
 pub struct PyObjectWriter {
-    finalized_stats: Option<(u64, u64, Option<String>)>, // (bytes_written, compressed_bytes, checksum)
-    inner: Option<Box<dyn ObjectWriter>>,
+    inner: std::sync::Mutex<Option<Box<dyn ObjectWriter>>>,
+    stats: std::sync::Mutex<WriterStats>,
+}
+
+impl PyObjectWriter {
+    fn new(writer: Box<dyn ObjectWriter>) -> Self {
+        let stats = snapshot_final_writer_stats(writer.as_ref());
+        Self {
+            inner: std::sync::Mutex::new(Some(writer)),
+            stats: std::sync::Mutex::new(stats),
+        }
+    }
+
+    fn finalized_error() -> PyErr {
+        PyRuntimeError::new_err("Writer has been finalized")
+    }
+
+    fn publish_stats(&self, writer: &dyn ObjectWriter) {
+        *lock_ignoring_poison(&self.stats) = snapshot_final_writer_stats(writer);
+    }
+
+    /// Lock `inner` from a thread that holds the GIL, without ever waiting for the lock
+    /// while holding it: a thread writing with the GIL released needs the GIL back to
+    /// return, so waiting here with the GIL would deadlock.
+    fn lock_with_gil(
+        &self,
+        py: Python<'_>,
+    ) -> std::sync::MutexGuard<'_, Option<Box<dyn ObjectWriter>>> {
+        loop {
+            match self.inner.try_lock() {
+                Ok(guard) => return guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // Wait for the holder with the GIL released, then try again.
+                    py.detach(|| drop(lock_ignoring_poison(&self.inner)));
+                }
+            }
+        }
+    }
+
+    /// Write `data` through the locked writer and publish the new stats. Blocks the
+    /// calling thread; the caller decides whether it holds the GIL.
+    fn write_locked(
+        &self,
+        writer: &mut Option<Box<dyn ObjectWriter>>,
+        data: &[u8],
+    ) -> PyResult<()> {
+        let writer = writer.as_mut().ok_or_else(Self::finalized_error)?;
+        let result = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+            writer
+                .write_chunk(data)
+                .await
+                .map_err(|e| py_err(e.context("Failed to write chunk")))
+        });
+        self.publish_stats(writer.as_ref());
+        result
+    }
+
+    /// Write `data` with the GIL released. `data` must stay valid and unchanged for the
+    /// call without the GIL: immutable `bytes` or an owned copy.
+    fn write_detached(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        py.detach(|| {
+            let mut guard = lock_ignoring_poison(&self.inner);
+            self.write_locked(&mut guard, data)
+        })
+    }
+
+    /// `write_owned_bytes` for data already copied out of Python, GIL released.
+    fn write_owned_detached(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
+        py.detach(|| {
+            let mut guard = lock_ignoring_poison(&self.inner);
+            let writer = guard.take().ok_or_else(Self::finalized_error)?;
+            // The writer is moved into the 'static future for `submit_io` and handed
+            // back, so a failed write leaves it usable for a retry or `finalize()`.
+            let (writer, result) = submit_io(async move {
+                let mut writer = writer;
+                let r = writer.write_owned_bytes(data).await;
+                Ok::<_, anyhow::Error>((writer, r))
+            })?;
+            self.publish_stats(writer.as_ref());
+            *guard = Some(writer);
+            result.map_err(|e| py_err(e.context("Failed to write owned bytes")))
+        })
+    }
 }
 
 #[pymethods]
 impl PyObjectWriter {
-    /// Write a chunk of bytes to the stream (ZERO-COPY via buffer protocol)
+    /// Write a chunk of bytes to the stream (zero-copy via buffer protocol)
     ///
     /// Accepts any Python object supporting the buffer protocol:
     /// - bytes, bytearray, memoryview
     /// - NumPy arrays, PyTorch tensors
     /// - Any object with __buffer__ method
     ///
-    /// This method avoids copying data from Python to Rust by using PyBuffer
-    /// to get a direct view of Python's memory during the synchronous write.
-    fn write_chunk(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let writer = self
-            .inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
-
-        // Try buffer protocol first (zero-copy path)
-        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-            // Get readonly slice - no copy!
-            let slice = unsafe {
-                // SAFETY: We hold the buffer for the entire duration of block_on,
-                // so the memory remains valid. The GIL is held during block_on.
-                std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
-            };
-
-            // Synchronous write while buffer is alive
-            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer
-                    .write_chunk(slice)
-                    .await
-                    .map_err(|e| py_err(e.context("Failed to write chunk")))
-            });
+    /// No copy is made, except for a non-contiguous view (a strided or reversed
+    /// memoryview, a transposed array), which is copied once into contiguous memory.
+    ///
+    /// GIL: it is released for the blocking write (issue #201) only when `data` is an
+    /// exact `bytes` object, which no thread can change, or after the copy of a
+    /// non-contiguous view. For every other exporter (bytearray, a writable memoryview,
+    /// numpy, mmap, ctypes, ...) the GIL is kept for the write, as before #201, because
+    /// another thread could otherwise change the memory while it is being read. To keep
+    /// other threads running during a large write of mutable data, pass `bytes(data)`.
+    ///
+    /// Calls on one writer from several threads run one after another.
+    fn write_chunk(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        // An exact `bytes` object is immutable and `data` keeps it alive: zero-copy and
+        // safe to read without the GIL.
+        if data.is_exact_instance_of::<PyBytes>() {
+            if let Ok(bytes) = data.cast::<PyBytes>() {
+                return self.write_detached(py, bytes.as_bytes());
+            }
         }
 
-        // Fallback for PyBytes (shouldn't happen, but safe)
-        if let Ok(bytes) = data.cast::<PyBytes>() {
-            let slice = bytes.as_bytes();
-            return pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                writer
-                    .write_chunk(slice)
-                    .await
-                    .map_err(|e| py_err(e.context("Failed to write chunk")))
-            });
+        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
+            if !buffer.is_c_contiguous() {
+                // The buffer pointer and byte length do not describe the view's bytes
+                // (strides). Copy them in logical order under the GIL, then write the
+                // owned copy without it.
+                let owned = buffer.to_vec(py).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!(
+                        "Buffer copy failed: {}",
+                        e
+                    ))
+                })?;
+                drop(buffer);
+                return self.write_detached(py, &owned);
+            }
+
+            // Take the writer lock FIRST. Waiting for it may release the GIL, and a
+            // reference over the caller's memory must not exist while another Python
+            // thread can run and change that memory.
+            let mut guard = self.lock_with_gil(py);
+            let result = if buffer.len_bytes() == 0 {
+                self.write_locked(&mut guard, &[])
+            } else {
+                // SAFETY: the buffer is C-contiguous and `buffer` is a live Py_buffer
+                // export, released only after the write has returned, so the exporter
+                // cannot free or resize the memory meanwhile. The slice is created
+                // only now, after the lock was acquired, and the GIL is HELD from
+                // here through the end of the write (`write_locked` does not release
+                // it), so no Python thread can change the contents while the slice
+                // exists. Non-Python code that shares the memory (a mmap or ctypes
+                // buffer written by native code) is the caller's responsibility, as
+                // in any buffer-protocol consumer. The write only reads from the slice.
+                let slice = unsafe {
+                    std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
+                };
+                self.write_locked(&mut guard, slice)
+            };
+            drop(guard);
+            // Release the export only now.
+            drop(buffer);
+            return result;
         }
 
         Err(PyRuntimeError::new_err(
@@ -2206,117 +2481,75 @@ impl PyObjectWriter {
         ))
     }
 
-    /// Write owned bytes (converts buffer protocol object to owned Vec for async)
+    /// Write owned bytes (copies the input out of Python, then writes with the GIL released)
     ///
     /// This method copies data but takes ownership, useful when the caller
-    /// doesn't need the buffer anymore. For true zero-copy, use write_chunk().
+    /// doesn't need the buffer anymore, and it releases the GIL for the whole write
+    /// whatever the type of `data` (the copy is made under the GIL, so a concurrent
+    /// change to a mutable buffer cannot tear it). For a zero-copy write of `bytes`
+    /// use write_chunk().
     ///
-    /// Implementation note: unlike `write_chunk()` (whose zero-copy fast path
-    /// keeps a borrowed buffer pointer alive across a synchronous `block_on`,
-    /// see docs/DESIGN_TIER4_FFI_HARDENING.md item 3), this method's input
-    /// data is already fully owned by the time it crosses the async
-    /// boundary — but `self.inner`'s writer itself is normally only
-    /// *borrowed* (`&mut`) here, not owned, which would still block a
-    /// migration to the `'static`-future-requiring `submit_io`. To resolve
-    /// that, the writer is temporarily `.take()`n (so it can be moved into
-    /// the future) and always restored to `self.inner` afterward regardless
-    /// of whether the write succeeded — preserving the existing contract
-    /// that a failed `write_owned_bytes()` call leaves the writer usable for
-    /// a retry or a clean `abort()`/`finalize()`, exactly as before this
-    /// migration.
-    fn write_owned_bytes(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let mut writer = self
-            .inner
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("Writer has been finalized"))?;
-
+    /// Implementation note: the writer is temporarily moved out of the lock into the
+    /// `'static` future `submit_io` needs, and always put back afterwards whether or not
+    /// the write succeeded, so a failed `write_owned_bytes()` leaves the writer usable
+    /// for a retry or a clean `finalize()`.
+    fn write_owned_bytes(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         // Try buffer protocol
         if let Ok(buffer) = PyBuffer::<u8>::get(data) {
             let len = buffer.len_bytes();
             let mut vec = vec![0u8; len];
-            if let Err(e) = buffer.copy_to_slice(data.py(), &mut vec[..]) {
-                self.inner = Some(writer); // restore -- this call never touched it
-                return Err(PyRuntimeError::new_err(format!(
-                    "Buffer copy failed: {}",
-                    e
-                )));
-            }
-
-            let (writer_back, write_result) = submit_io(async move {
-                let r = writer.write_owned_bytes(vec).await;
-                Ok::<_, anyhow::Error>((writer, r))
-            })?;
-            self.inner = Some(writer_back);
-            return write_result.map_err(|e| py_err(e.context("Failed to write owned bytes")));
+            buffer
+                .copy_to_slice(py, &mut vec[..])
+                .map_err(|e| PyRuntimeError::new_err(format!("Buffer copy failed: {}", e)))?;
+            // The copy is made: release the export before the GIL is released.
+            drop(buffer);
+            return self.write_owned_detached(py, vec);
         }
 
         // Fallback for PyBytes
         if let Ok(bytes) = data.cast::<PyBytes>() {
-            let vec = bytes.as_bytes().to_vec();
-            let (writer_back, write_result) = submit_io(async move {
-                let r = writer.write_owned_bytes(vec).await;
-                Ok::<_, anyhow::Error>((writer, r))
-            })?;
-            self.inner = Some(writer_back);
-            return write_result.map_err(|e| py_err(e.context("Failed to write owned bytes")));
+            return self.write_owned_detached(py, bytes.as_bytes().to_vec());
         }
 
-        // Neither buffer protocol nor PyBytes matched -- restore the writer
-        // (this call never touched it) before reporting the type error.
-        self.inner = Some(writer);
         Err(PyRuntimeError::new_err(
             "write_owned_bytes requires bytes-like object",
         ))
     }
 
     /// Finalize the writer and complete the upload
-    fn finalize(&mut self, py: Python<'_>) -> PyResult<(u64, u64)> {
-        if let Some(writer) = self.inner.take() {
-            py.detach(|| {
-                submit_io(async move {
-                    let stats = snapshot_final_writer_stats(writer.as_ref());
-                    writer.finalize().await?;
-                    Ok::<(u64, u64, Option<String>), anyhow::Error>(stats)
-                })
-            })
-            .inspect(|stats| {
-                self.finalized_stats = Some(stats.clone());
-            })
-            .map(|(bytes_written, compressed_bytes, _checksum)| (bytes_written, compressed_bytes))
-        } else {
-            Err(PyRuntimeError::new_err("Writer already finalized"))
-        }
+    fn finalize(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        py.detach(|| {
+            let mut guard = lock_ignoring_poison(&self.inner);
+            let writer = guard
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("Writer already finalized"))?;
+            let stats = submit_io(async move {
+                let stats = snapshot_final_writer_stats(writer.as_ref());
+                writer.finalize().await?;
+                Ok::<WriterStats, anyhow::Error>(stats)
+            })?;
+            let result = (stats.0, stats.1);
+            *lock_ignoring_poison(&self.stats) = stats;
+            Ok(result)
+        })
     }
 
-    /// Get the number of bytes written so far
+    /// Get the number of bytes written so far (as of the last completed write; it does
+    /// not wait for a write in flight on another thread)
     fn bytes_written(&self) -> PyResult<u64> {
-        if let Some((bytes_written, _, _)) = self.finalized_stats {
-            Ok(bytes_written)
-        } else if let Some(writer) = &self.inner {
-            Ok(writer.bytes_written())
-        } else {
-            Err(PyRuntimeError::new_err("Writer has been finalized"))
-        }
+        Ok(lock_ignoring_poison(&self.stats).0)
     }
 
-    /// Get the checksum of the data written (if available)
+    /// Get the checksum of the data written (if available; see `bytes_written` for when
+    /// it is read)
     fn checksum(&self) -> Option<String> {
-        if let Some((_, _, checksum)) = &self.finalized_stats {
-            checksum.clone()
-        } else {
-            self.inner.as_ref().and_then(|w| w.checksum())
-        }
+        lock_ignoring_poison(&self.stats).2.clone()
     }
 
-    /// Get the number of compressed bytes (if compression is enabled)
+    /// Get the number of compressed bytes (if compression is enabled; see
+    /// `bytes_written` for when it is read)
     fn compressed_bytes(&self) -> PyResult<u64> {
-        if let Some((_, compressed, _)) = self.finalized_stats {
-            Ok(compressed)
-        } else if let Some(writer) = &self.inner {
-            Ok(writer.compressed_bytes())
-        } else {
-            Err(PyRuntimeError::new_err("Writer has been finalized"))
-        }
+        Ok(lock_ignoring_poison(&self.stats).1)
     }
 }
 
@@ -2337,10 +2570,7 @@ pub fn create_s3_writer(
                 .await
                 .map_err(|e| e.context("Failed to create S3 writer"))?;
 
-            Ok(PyObjectWriter {
-                inner: Some(writer),
-                finalized_stats: None,
-            })
+            Ok(PyObjectWriter::new(writer))
         })
     })
 }
@@ -2363,10 +2593,7 @@ pub fn create_azure_writer(
                 .await
                 .map_err(|e| e.context("Failed to create Azure writer"))?;
 
-            Ok(PyObjectWriter {
-                inner: Some(writer),
-                finalized_stats: None,
-            })
+            Ok(PyObjectWriter::new(writer))
         })
     })
 }
@@ -2401,10 +2628,7 @@ pub fn create_filesystem_writer(
                 .await
                 .map_err(|e| e.context("Failed to create filesystem writer"))?;
 
-            Ok(PyObjectWriter {
-                inner: Some(writer),
-                finalized_stats: None,
-            })
+            Ok(PyObjectWriter::new(writer))
         })
     })
 }
@@ -2426,10 +2650,7 @@ pub fn create_direct_filesystem_writer(
                 .await
                 .map_err(|e| e.context("Failed to create direct filesystem writer"))?;
 
-            Ok(PyObjectWriter {
-                inner: Some(writer),
-                finalized_stats: None,
-            })
+            Ok(PyObjectWriter::new(writer))
         })
     })
 }
@@ -2938,10 +3159,15 @@ fn gcs_get_rapid_mode() -> Option<bool> {
 /// True
 #[pyfunction]
 #[cfg(feature = "backend-gcs")]
-fn gcs_query_rapid_bucket(bucket_or_uri: &str) -> PyResult<bool> {
+fn gcs_query_rapid_bucket(py: Python<'_>, bucket_or_uri: &str) -> PyResult<bool> {
     let owned = bucket_or_uri.to_owned();
-    submit_io(async move {
-        Ok::<bool, anyhow::Error>(crate::google_gcs_client::query_gcs_rapid_bucket(&owned).await)
+    // GIL released while the bucket is queried (issue #201).
+    py.detach(|| {
+        submit_io(async move {
+            Ok::<bool, anyhow::Error>(
+                crate::google_gcs_client::query_gcs_rapid_bucket(&owned).await,
+            )
+        })
     })
 }
 
@@ -3376,9 +3602,9 @@ mod issue173_store_creation_tests {
 // for the global AWS_ENDPOINT_URL client) and the request went to the wrong
 // server.  These tests need no network: store creation never connects.
 //
-// STORE_CACHE is process-global and `get_or_create_store` is check-then-insert
-// (two racing misses on one key can each insert, last writer wins), so these
-// tests serialise on TEST_LOCK and never remove entries.
+// STORE_CACHE is process-global, so these tests serialise on TEST_LOCK and never
+// remove entries (since #204 racing misses on one key build one store; the
+// serialising keeps the pointer-identity assertions independent of other tests).
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod issue171_store_cache_routing_tests {
@@ -3680,6 +3906,202 @@ mod issue199_put_bucket_tests {
                 "s3://127.0.0.1:9000/bkt/pfx/object-0".to_string(),
                 "s3://127.0.0.1:9000/bkt/pfx/object-1".to_string(),
             ]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- issue #204: the async entry points share the store cache, and a
+// cache miss is built once per key however many callers race on it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod issue204_store_cache_tests {
+    use super::*;
+
+    fn prepare_environment() {
+        // for_endpoint requires credentials to exist; none are ever used.
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+    }
+
+    /// How many stores `get_or_create_store` has built for `uri`.
+    fn builds_for(uri: &str) -> usize {
+        STORE_BUILD_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|built| built.as_str() == uri)
+            .count()
+    }
+
+    /// Every caller racing on one cold key gets the SAME store and exactly one
+    /// store is built.  The port is unique to this test (the cache is
+    /// process-global and other tests build their own keys); store creation
+    /// never connects.
+    #[test]
+    fn racing_misses_on_one_key_build_one_store() {
+        prepare_environment();
+        const CALLERS: usize = 8;
+        let uri = "s3://127.0.0.1:59204/bucket-204/some/key";
+        assert_eq!(builds_for(uri), 0, "the key must start cold");
+
+        let start = Arc::new(std::sync::Barrier::new(CALLERS));
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    get_or_create_store(uri, None).map_err(|e| format!("{e:#}"))
+                })
+            })
+            .collect();
+        let stores: Vec<Arc<dyn ObjectStore>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("caller thread").expect("store"))
+            .collect();
+
+        assert_eq!(
+            builds_for(uri),
+            1,
+            "RED: {CALLERS} callers racing on one cold key built {} stores",
+            builds_for(uri)
+        );
+        for store in &stores[1..] {
+            assert!(
+                Arc::ptr_eq(&stores[0], store),
+                "RED: racing callers were handed different stores for one key"
+            );
+        }
+    }
+
+    /// The async entry points call `get_or_create_store` from pyo3-runtime worker threads.
+    /// Racing misses there wait for the builder inside `block_in_place`: they complete,
+    /// and still build one store.
+    #[test]
+    fn racing_misses_on_a_multi_thread_runtime_complete_and_build_once() {
+        use crate::s3_client::issue173_worker_reentrancy_tests::{run_with_watchdog, WATCHDOG};
+        prepare_environment();
+        let uri = "s3://127.0.0.1:59206/bucket-204/some/key";
+        let done = run_with_watchdog("racing-misses-runtime", move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let tasks: Vec<_> = (0..8)
+                    .map(|_| {
+                        tokio::spawn(async move {
+                            get_or_create_store(uri, None)
+                                .map(|_| ())
+                                .map_err(|e| format!("{e:#}"))
+                        })
+                    })
+                    .collect();
+                for task in tasks {
+                    task.await.expect("task").expect("store");
+                }
+            });
+        });
+        assert!(
+            done.is_some(),
+            "racing misses on a multi-thread runtime did not finish within {WATCHDOG:?}"
+        );
+        assert_eq!(builds_for(uri), 1);
+    }
+
+    /// Sequential calls after the first are cache hits: no further build.
+    #[test]
+    fn a_warm_key_is_never_rebuilt() {
+        prepare_environment();
+        let uri = "s3://127.0.0.1:59205/bucket-204/some/key";
+        for _ in 0..3 {
+            get_or_create_store(uri, None).expect("store");
+        }
+        assert_eq!(
+            builds_for(uri),
+            1,
+            "three calls on one key built more than once"
+        );
+    }
+
+    /// Source of the entry point `name`: from its `fn` line to the closing brace at
+    /// column 0.
+    fn entry_point_source(name: &str) -> String {
+        let src = include_str!("python_core_api.rs");
+        let start = ["<'py>(", "<'p>(", "("]
+            .iter()
+            .find_map(|generics| src.find(&format!("fn {name}{generics}")))
+            .unwrap_or_else(|| panic!("entry point {name} not found"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("end of function");
+        rest[..end].to_string()
+    }
+
+    /// Structural guard for the entry points whose store build is not observable on
+    /// the wire (`mkdir_async` makes no S3 request): none may build its own store
+    /// with the factory; each must go through `get_or_create_store` (the #171
+    /// route-aware key, the #174 per-call logger wrapping).
+    #[test]
+    fn async_entry_points_use_the_store_cache() {
+        for name in [
+            "stat_async",
+            "exists_async",
+            "put_bytes_async",
+            "mkdir_async",
+            "put_many_async",
+        ] {
+            let body = entry_point_source(name);
+            assert!(
+                !body.contains("store_for_uri_with_logger("),
+                "RED: {name} builds a store per call with store_for_uri_with_logger"
+            );
+            assert!(
+                body.contains("get_or_create_store("),
+                "RED: {name} does not use get_or_create_store"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- PyObjectWriter::write_chunk must not create a reference over a mutable
+// exporter's memory before it holds the writer lock: waiting for the lock releases
+// the GIL, and another Python thread may then change that memory under the reference.
+//
+// A behavioural RED is not possible: the read itself happens with the GIL held, so
+// the only difference is a live `&[u8]` over memory that changes during the wait
+// (undefined behaviour in the abstract machine, no observable torn data). The order
+// of the two steps is therefore pinned structurally.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod write_chunk_slice_after_lock_tests {
+    #[test]
+    fn the_slice_over_a_mutable_buffer_is_created_after_the_writer_lock_is_taken() {
+        let src = include_str!("python_core_api.rs");
+        let start = src
+            .find("fn write_chunk(&self, py: Python<'_>")
+            .expect("write_chunk not found");
+        let rest = &src[start..];
+        let end = rest.find("\n    }\n").expect("end of write_chunk");
+        let body = &rest[..end];
+
+        assert_eq!(
+            body.matches("self.lock_with_gil(py)").count(),
+            1,
+            "RED: write_chunk takes the writer lock in more than one place, so a slice can be \
+             built on a path that has not taken it yet"
+        );
+        let lock = body
+            .find("self.lock_with_gil(py)")
+            .expect("RED: write_chunk's GIL-held path does not take the writer lock");
+        let slice = body
+            .find("from_raw_parts(")
+            .expect("RED: write_chunk's GIL-held path builds no slice");
+        assert!(
+            lock < slice,
+            "RED: the slice over the caller's buffer is created before the writer lock is \
+             acquired (acquiring it can release the GIL)"
         );
     }
 }

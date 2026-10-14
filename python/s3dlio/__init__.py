@@ -66,11 +66,23 @@ del _name
 # ------------------------------------------------------------------
 # 2) convenience helpers - generic versions that work with all URI schemes
 # ------------------------------------------------------------------
+def _after_scheme(uri: str) -> str:
+    """The part of a URI after ``scheme://`` (the whole string if it has no scheme)."""
+    return uri.split("://", 1)[1] if "://" in uri else uri
+
+
 def list_keys(uri: str) -> List[str]:
     """
     Return object keys (relative paths) under the given URI prefix.
 
     Works with all URI schemes: file://, s3://, az://, gs://, direct://
+
+    Keys are used exactly as written, like every other s3dlio operation (issue #172):
+    the prefix is the URI minus its scheme, and a returned key is the listed object's
+    key minus that prefix, with no other normalisation. A leading ``/`` or an empty
+    segment (``a//b``) in a key is part of the key, so ``uri + key`` (for a ``uri`` that
+    ends in ``/``) is the URI of the object listed. One separator is dropped when the
+    URI does not end in ``/`` (``s3://b/dir`` lists ``dir/x`` as ``x``).
 
     Example:
         keys = list_keys("file:///data/prefix/")  # Returns ['file1.bin', 'file2.bin']
@@ -78,31 +90,20 @@ def list_keys(uri: str) -> List[str]:
     """
     full_uris = _core.list(uri)
 
-    # Extract the base path to strip from results
-    if "://" in uri:
-        scheme, rest = uri.split("://", 1)
-        # For file://, the path starts with /; for cloud, it's bucket/path
-        if scheme in ("file", "direct"):
-            base = rest.rstrip("/")
-        else:
-            base = rest.rstrip("/")
-    else:
-        base = uri.rstrip("/")
+    prefix = _after_scheme(uri)
 
     keys = []
     for full_uri in full_uris:
-        if "://" in full_uri:
-            _, path = full_uri.split("://", 1)
-        else:
-            path = full_uri
+        path = _after_scheme(full_uri)
 
-        # Strip the base path to get relative key
-        path = path.lstrip("/")
-        base_stripped = base.lstrip("/")
-        if path.startswith(base_stripped):
-            key = path[len(base_stripped) :].lstrip("/")
+        if path.startswith(prefix):
+            key = path[len(prefix) :]
+            # The "/" between a directory-style prefix and the key is a separator, not
+            # part of the key.
+            if prefix and not prefix.endswith("/") and key.startswith("/"):
+                key = key[1:]
         else:
-            # Fallback: just get the filename
+            # Fallback (e.g. the URI carries a pattern): just get the filename
             key = path.rsplit("/", 1)[-1] if "/" in path else path
 
         if key:

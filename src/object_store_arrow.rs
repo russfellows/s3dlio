@@ -9,6 +9,7 @@ use bytes::Bytes;
 use crc32fast::Hasher;
 // Note: Futures stream traits not needed for simple implementation
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use url::Url;
 
@@ -22,7 +23,7 @@ use crate::object_store::{
 
 use aos::{
     aws::AmazonS3Builder, path::Path, GetOptions, GetRange, ObjectStore as AosObjectStore,
-    PutPayload,
+    ObjectStoreExt as _, PutPayload,
 };
 use object_store as aos;
 
@@ -33,6 +34,12 @@ use object_store as aos;
 /// Arrow-backed implementation.
 /// Stateless: we re-parse the URL each call to honor full-URI semantics in s3dlio.
 pub struct ArrowObjectStore;
+
+impl Default for ArrowObjectStore {
+    fn default() -> Self {
+        Self
+    }
+}
 
 impl ArrowObjectStore {
     pub fn new() -> Self {
@@ -136,7 +143,7 @@ impl ArrowObjectStore {
         }
 
         // Append Arrow location (never starts with '/')
-        rebuilt.push_str(&location.to_string());
+        rebuilt.push_str(location.as_ref());
         rebuilt
     }
 
@@ -165,46 +172,63 @@ impl ArrowObjectStore {
     }
 }
 
+/// Read `length` bytes from `offset` (to the end of the object if `length` is `None`).
+async fn read_range(
+    store: &dyn AosObjectStore,
+    path: &Path,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Bytes> {
+    // A zero-length range cannot be expressed as an HTTP range header (the end would be
+    // `offset - 1`); like the native backends, answer it as empty without a request.
+    if length == Some(0) {
+        return Ok(Bytes::new());
+    }
+    let range = match length {
+        Some(len) => {
+            let end = offset.checked_add(len).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "range end overflow: offset={offset} + length={len} exceeds u64::MAX"
+                )
+            })?;
+            GetRange::Bounded(offset..end)
+        }
+        None => GetRange::Offset(offset),
+    };
+    let opts = GetOptions {
+        range: Some(range),
+        ..Default::default()
+    };
+    let reader = store.get_opts(path, opts).await?;
+    Ok(reader.bytes().await?)
+}
+
 // ----------------------------------------------------------------------------
 // ObjectStore impl
 // ----------------------------------------------------------------------------
 
 #[async_trait]
 impl S3DlioObjectStore for ArrowObjectStore {
-    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get(&self, uri: &str) -> Result<Bytes> {
         let (store, path, _url) = Self::parse(uri)?;
         let reader = store.get(&path).await?;
-        let bytes = reader.bytes().await?;
-        Ok(bytes.to_vec())
+        Ok(reader.bytes().await?)
     }
 
-    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+    async fn get_range(&self, uri: &str, offset: u64, length: Option<u64>) -> Result<Bytes> {
         let (store, path, _url) = Self::parse(uri)?;
-        let range = if let Some(len) = length {
-            GetRange::Bounded(offset..(offset + len))
-        } else {
-            GetRange::Offset(offset)
-        };
-        let opts = GetOptions {
-            range: Some(range),
-            ..Default::default()
-        };
-        let reader = store.get_opts(&path, opts).await?;
-        let bytes = reader.bytes().await?;
-        Ok(bytes.to_vec())
+        read_range(store.as_ref(), &path, offset, length).await
     }
 
-    async fn put(&self, uri: &str, data: &[u8]) -> Result<()> {
+    async fn put(&self, uri: &str, data: Bytes) -> Result<()> {
         let (store, path, _url) = Self::parse(uri)?;
-        store
-            .put(&path, PutPayload::from(Bytes::copy_from_slice(data)))
-            .await?;
+        store.put(&path, PutPayload::from(data)).await?;
         Ok(())
     }
 
     // For now route multipart to Arrow's regular `put` (Arrow chooses optimal strategy internally).
     // You can switch to `WriteMultipart` later if you want strict part size / concurrency control.
-    async fn put_multipart(&self, uri: &str, data: &[u8], _part_size: Option<usize>) -> Result<()> {
+    async fn put_multipart(&self, uri: &str, data: Bytes, _part_size: Option<usize>) -> Result<()> {
         self.put(uri, data).await
     }
 
@@ -232,6 +256,25 @@ impl S3DlioObjectStore for ArrowObjectStore {
         Ok(out)
     }
 
+    // Same semantics as `list`: the buffered result is yielded item by item, like the
+    // file:// backend does. The backend call itself is not paged by this adapter.
+    fn list_stream<'a>(
+        &'a self,
+        uri_prefix: &'a str,
+        recursive: bool,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<String>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            match self.list(uri_prefix, recursive).await {
+                Ok(uris) => {
+                    for uri in uris {
+                        yield Ok(uri);
+                    }
+                }
+                Err(e) => yield Err(e),
+            }
+        })
+    }
+
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
         let (store, path, _url) = Self::parse(uri)?;
         let meta = store.head(&path).await?;
@@ -242,6 +285,46 @@ impl S3DlioObjectStore for ArrowObjectStore {
         let (store, path, _url) = Self::parse(uri)?;
         store.delete(&path).await?;
         Ok(())
+    }
+
+    // Validates every URI first: a batch with an unusable URI deletes nothing and names
+    // each such URI. Then deletes one by one; a failure does not stop the others, and the
+    // returned error names every URI not confirmed deleted.
+    async fn delete_batch(&self, uris: &[String]) -> Result<()> {
+        let mut parsed = Vec::with_capacity(uris.len());
+        let mut invalid: Vec<String> = Vec::new();
+        for uri in uris {
+            match Self::parse(uri) {
+                Ok((store, path, _url)) => parsed.push((uri, store, path)),
+                Err(e) => invalid.push(format!("{uri} ({e:#})")),
+            }
+        }
+        if !invalid.is_empty() {
+            bail!(
+                "delete_batch rejected, nothing deleted; unusable URIs: {}",
+                invalid.join(", ")
+            );
+        }
+
+        let mut failed: Vec<String> = Vec::new();
+        let mut first_cause: Option<anyhow::Error> = None;
+        for (uri, store, path) in parsed {
+            if let Err(e) = store.delete(&path).await {
+                failed.push(uri.clone());
+                if first_cause.is_none() {
+                    first_cause = Some(anyhow::Error::new(e));
+                }
+            }
+        }
+        match first_cause {
+            None => Ok(()),
+            Some(cause) => Err(cause.context(format!(
+                "delete_batch: {} of {} objects not confirmed deleted: {}",
+                failed.len(),
+                uris.len(),
+                failed.join(", ")
+            ))),
+        }
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
@@ -268,7 +351,7 @@ impl S3DlioObjectStore for ArrowObjectStore {
 
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn S3DlioObjectWriter>> {
         // No compression
-        ArrowWriter::new(uri, CompressionConfig::None).await
+        ArrowWriter::open(uri, CompressionConfig::None).await
     }
 
     async fn get_writer_with_compression(
@@ -276,7 +359,7 @@ impl S3DlioObjectStore for ArrowObjectStore {
         uri: &str,
         compression: CompressionConfig,
     ) -> Result<Box<dyn S3DlioObjectWriter>> {
-        ArrowWriter::new(uri, compression).await
+        ArrowWriter::open(uri, compression).await
     }
 
     async fn create_writer(
@@ -285,12 +368,12 @@ impl S3DlioObjectStore for ArrowObjectStore {
         options: WriterOptions,
     ) -> Result<Box<dyn S3DlioObjectWriter>> {
         let compression = options.compression.unwrap_or(CompressionConfig::None);
-        ArrowWriter::new(uri, compression).await
+        ArrowWriter::open(uri, compression).await
     }
 
     // For now, fall back to default optimized paths (S3-specific concurrency doesn't apply here).
     // If you want, you can later implement `get_ranges` coalescing for Arrow to speed large reads.
-    async fn get_optimized(&self, uri: &str) -> Result<Vec<u8>> {
+    async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
         self.get(uri).await
     }
 
@@ -301,7 +384,7 @@ impl S3DlioObjectStore for ArrowObjectStore {
         length: Option<u64>,
         _chunk_size: Option<usize>,
         _max_concurrency: Option<usize>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         self.get_range(uri, offset, length).await
     }
 }
@@ -338,7 +421,7 @@ struct ArrowWriter {
 }
 
 impl ArrowWriter {
-    async fn new(
+    async fn open(
         dest_uri: &str,
         compression: CompressionConfig,
     ) -> Result<Box<dyn S3DlioObjectWriter>> {
@@ -346,7 +429,7 @@ impl ArrowWriter {
 
         // Adjust path for compression extension
         let final_path = if compression.is_enabled() {
-            Path::from(format!("{}{}", path.to_string(), compression.extension()))
+            Path::from(format!("{}{}", path, compression.extension()))
         } else {
             path
         };
@@ -509,4 +592,85 @@ pub fn store_for_uri(_uri: &str) -> Result<Box<dyn S3DlioObjectStore>> {
     // Arrow's parse_url handles scheme detection automatically, so we can
     // use a single ArrowObjectStore instance for all URI types
     Ok(ArrowObjectStore::boxed())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    // The factory must hand back a store usable through the current trait object.
+    #[test]
+    fn factory_returns_trait_object() {
+        assert!(store_for_uri("s3://bucket/key").is_ok());
+    }
+
+    // An unusable URI anywhere in the batch rejects the whole batch (nothing deleted)
+    // and names the URI; this is decided before any request, so no network is needed.
+    #[tokio::test]
+    async fn delete_batch_rejects_unusable_uri_and_names_it() {
+        let store = ArrowObjectStore::new();
+        let uris = vec!["not a uri".to_string()];
+        let err = store.delete_batch(&uris).await.expect_err("must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a uri"), "error must name the URI: {msg}");
+        assert!(msg.contains("nothing deleted"), "{msg}");
+    }
+
+    async fn memory_store(contents: &'static [u8]) -> (aos::memory::InMemory, Path) {
+        let store = aos::memory::InMemory::new();
+        let path = Path::from("obj.bin");
+        store
+            .put(&path, PutPayload::from(Bytes::from_static(contents)))
+            .await
+            .expect("put fixture");
+        (store, path)
+    }
+
+    // A zero-length range is empty, at offset 0 and elsewhere, and makes no request
+    // (the underlying range header cannot express it).
+    #[tokio::test]
+    async fn read_range_zero_length_is_empty() {
+        let (store, path) = memory_store(b"0123456789").await;
+        for offset in [0u64, 5, 10, 1000, u64::MAX] {
+            let got = read_range(&store, &path, offset, Some(0)).await;
+            assert_eq!(got.expect("zero-length range").len(), 0, "offset {offset}");
+        }
+    }
+
+    // offset + length beyond u64::MAX is an error, never a panic or a wrapped range.
+    #[tokio::test]
+    async fn read_range_offset_plus_length_overflow_is_an_error() {
+        let (store, path) = memory_store(b"0123456789").await;
+        let err = read_range(&store, &path, u64::MAX, Some(2))
+            .await
+            .expect_err("overflow must be rejected");
+        assert!(format!("{err:#}").contains("overflow"), "{err:#}");
+        assert!(read_range(&store, &path, u64::MAX - 1, Some(5))
+            .await
+            .is_err());
+    }
+
+    // Normal ranges still return the right bytes.
+    #[tokio::test]
+    async fn read_range_returns_requested_bytes() {
+        let (store, path) = memory_store(b"0123456789").await;
+        let got = read_range(&store, &path, 2, Some(3))
+            .await
+            .expect("bounded");
+        assert_eq!(&got[..], b"234");
+        let got = read_range(&store, &path, 7, None)
+            .await
+            .expect("open-ended");
+        assert_eq!(&got[..], b"789");
+    }
+
+    // list_stream reports a listing failure as a single Err item, like `list`.
+    #[tokio::test]
+    async fn list_stream_yields_error_for_unusable_prefix() {
+        let store = ArrowObjectStore::new();
+        let items: Vec<Result<String>> = store.list_stream("not a uri", false).collect().await;
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_err());
+    }
 }

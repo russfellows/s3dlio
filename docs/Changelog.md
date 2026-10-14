@@ -1,5 +1,230 @@
 # s3dlio Changelog
 
+## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
+
+Fixes 12 issues: #167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215.
+**Read the behaviour changes before upgrading:**
+- **Delete contract (#210, #167, #212).** An exact `s3-cli delete` / Python `delete()` is ONE
+  DELETE request, with no HEAD and no listing; a missing object is success; a trailing `/` never
+  makes a delete recursive; `-r` / `recursive=True` deletes the real objects under the LITERAL
+  prefix (`foo` also matches `foobar`; `*` and `?` are ordinary characters); on `file://` and
+  `direct://` a directory is refused without `-r`. Scripts that relied on the old implicit
+  expansion now delete less. Python `delete()` no longer raises `FileNotFoundError`.
+- **Op-log destination (#191).** `file:` followed by anything but `//` (`file:x`) is rejected as an
+  op-log destination (it used to create a file literally named `file:x`).
+- **Op-log row safety (#186, #190).** A record whose `op`, `client_id`, `endpoint` or `file` holds
+  a TAB, LF or CR is rejected (not written) and counted; a TAB, LF or CR in `error` is replaced by
+  a space; a row with an unformattable timestamp is rejected and counted instead of ending the log.
+  `op_log_stats()` (and Rust `OpLogStats`) gain `rejected_unformattable`, `rejected_unsafe_field`
+  and `normalized_error_text`.
+- **Build (#188).** `build_pyo3.sh` now fails loudly (non-zero exit) if maturin is missing or a
+  build fails, and requires BOTH a cp312 and a cp313 wheel to be freshly built.
+
+Also in this release: Python `list()`, `stat()`, writer writes and two other calls release the GIL
+while blocking on I/O, `write_chunk()` of a strided view writes the right bytes, and the async
+entry points reuse the shared store cache (#201, #204); `list_keys` returns keys exactly as written
+(#198, `list_keys` only); the arrow-backend `ObjectStore` implementation compiles again, handles a
+zero-length / overflowing range read, and is checked in CI (#207); the never-compiled
+`src/prefetch.rs` sketch is removed and the docs that cited it corrected (#203); the op-log reader's
+unsupported-operation error names the line, row and op (#176, documentation and error text only);
+the #170 shutdown-panic test is bounded and race-free (#215).
+
+### Known limitations / deferred
+
+- #198 is only partly fixed: `list_keys` uses keys as written; the DLIO and `s3torchconnector`
+  adapters, the Azure https URI form, the arrow backend and op-log replay URIs are not changed.
+- #175 and #176 stay OPEN: only documentation and a clearer reader error were added; the op-log
+  gaps are listed under "Known gaps" in `docs/supplemental/OPERATION_LOGGING.md`.
+- #205 remains a documented gap.
+- #208, #211, #213 and #216 are open and not addressed by this release.
+- Python `delete(..., recursive=True)` deletes one request per object (up to 10 in flight);
+  batching is deferred.
+
+### Fixed — Python API (#198, #201, #204)
+
+- `s3dlio.list_keys` uses keys exactly as written, like every other operation since #172: a key with a
+  leading `/` or an empty segment (`a//b`) comes back as the object's real relative key, and
+  `prefix_uri + key` addresses the object listed (#198). The DLIO and `s3torchconnector` adapters,
+  the Azure https URI form, the arrow backend and op-log replay URIs, also named in #198, are not
+  changed here.
+- `list()`, `stat()`, a writer's `write_chunk()` / `write_owned_bytes()`, `parquet_rg_row_offsets()` and
+  `gcs_query_rapid_bucket()` release the GIL while they block on I/O, so other Python threads keep
+  running (#201). `write_chunk()` releases the GIL, with no copy, only for an exact `bytes` object (nothing can
+  change it); a mutable buffer (bytearray, writable memoryview, numpy, mmap, ctypes) keeps the GIL for the
+  write as before, so another thread cannot tear it, and a strided or reversed view is copied under the GIL
+  and then written without it (pass `bytes(data)` to keep other threads running during a large write of
+  mutable data). `write_chunk()` of a strided or reversed view used to write the wrong bytes or read
+  adjacent memory and now writes exactly the bytes the view shows. A writer's `bytes_written()`,
+  `checksum()` and `compressed_bytes()` answer during a write in flight on another thread (values as of the
+  last completed write), and concurrent writes and `finalize()` on one writer run one after another instead
+  of raising "Already mutably borrowed".
+- `stat_async`, `exists_async`, `put_bytes_async`, `mkdir_async` and `put_many_async` use the shared store
+  cache instead of building a store and S3 client per call, so a host-form server's connections are
+  reused; racing cache misses build one store per key (#204). Op-log rows are unchanged.
+
+### Changed — Python `delete(uri, recursive=False)` contract (INTENTIONAL COMPATIBILITY CHANGE) (#212)
+
+The Python `s3dlio.delete()` now follows the same delete contract as `s3-cli delete` (#210, #167, next
+entry). **Code that relied on the old implicit expansion will now delete less; pass
+`recursive=True` where you mean "everything under a prefix".**
+
+- `delete(uri)` sends ONE delete request for exactly the key named, with no HEAD and no listing, and
+  returns `None`. Before this change a URI ending in `/` or containing `*` or `?` triggered a
+  non-recursive listing and every returned entry was deleted, synthetic common-prefix entries
+  (`foo/sub/`) included, so `delete("s3://b/foo/")` removed `foo/x` and tried to delete `foo/sub/` as a
+  key. `/`, `*` and `?` are now ordinary key characters.
+- An already-missing object is success (S3's DELETE succeeds for a missing key; on other backends only
+  the backend's own typed not-found error is mapped to success). Success means the delete request
+  succeeded, not that an existing object was removed. Any actual failure (403, 5xx, network) raises
+  `RuntimeError` naming the key. No `FileNotFoundError` is raised any more; the DLIO integrations'
+  `delete_node`, which treats `FileNotFoundError` as "already gone", simply never sees it. A
+  bucket-only URI (`s3://b/`) raises `RuntimeError` without sending a request.
+- On a **versioned bucket** a delete adds a delete marker and does not erase earlier versions.
+- On `file://` and `direct://`, `delete()` of a path that is a directory raises `RuntimeError`
+  (`... is a directory; use -r / recursive=True ...`) and deletes nothing, instead of removing the
+  whole tree; a regular file is deleted and a missing path is success.
+- The op-log records an exact delete as one `DELETE` row, as before; no `HEAD` row is added.
+  `recursive=True` records one `LIST` row plus one `DELETE` row per object (replayable), not
+  `DELETE_BATCH`.
+- `delete(uri, recursive=True)` deletes the real objects under the literal prefix: listed with no
+  delimiter, objects only, nothing appended (`foo` also matches `foobar`), `*` and `?` literal (the last
+  URI segment used to be read as a regex). It needs list permission. A prefix with no objects is a
+  no-op. Each selected object is deleted with its own request (up to 10 in flight), as before;
+  batching (DeleteObjects) is deferred for Python. After a failed request or a listing error no further
+  delete request is sent (requests already in flight finish) and the `RuntimeError` says how many
+  requests were sent and how many selected keys were not attempted.
+- Other backends: `recursive=True` requires a URI ending in `/` (otherwise `RuntimeError`, nothing
+  deleted).
+- Library: the exact delete and the literal-prefix selection/batching now live in the new
+  `s3dlio::delete_contract` module, shared by `s3-cli delete` and the Python API. The lower-level
+  `ObjectStore::delete`, `delete_batch`, `delete_prefix` and the multi-endpoint store's `delete` keep
+  their behaviour, except that `delete` on a bucket-only S3/Azure/GCS URI now fails before sending
+  anything.
+
+### Changed — `s3-cli delete` contract (INTENTIONAL COMPATIBILITY CHANGE) (#210, #167)
+
+`s3-cli delete` (alias `rm`) no longer expands a name into a prefix. **Scripts that relied on the old
+implicit expansion will now delete less; add `-r` where you mean "everything under".**
+
+- `delete s3://bkt/foo` and `delete s3://bkt/foo/` send ONE delete request for exactly that key, with
+  no HEAD and no listing, so only delete permission is needed. A trailing slash alone no longer
+  authorizes a recursive delete (#167). The old prefix-without-`-r` expansion and the fallback that
+  listed the parent "directory" and deleted what it returned are removed; that fallback deleted
+  objects the user never named (for example a folder marker `other/` when `delete s3://bkt/testprefix`
+  matched nothing) (#210).
+- An already-missing object is success (exit 0), as with S3's own idempotent DELETE; on other backends
+  only the backend's typed not-found error counts. A real failure of the request (403, 5xx, network)
+  exits non-zero with `failed to delete <uri>: <cause>`. The output is `Delete request succeeded:
+  <uri> (S3 does not report whether the object existed)`; when the URI ends in `/` and `-r` was not
+  given it adds that only the object named by the exact URI was targeted and to use `-r` for
+  everything under a prefix. On a **versioned bucket** a delete adds a delete marker and does not erase
+  earlier versions.
+- `delete -r s3://bkt/foo/` deletes the real objects under the literal prefix `foo/` (recursive listing
+  with no delimiter; synthetic common-prefix entries are never delete candidates). It needs list
+  permission. `delete -r s3://bkt/foo` uses the literal prefix `foo`, so it also matches `foobar` (no
+  `/` is appended). Key characters are never read as a regex or wildcard.
+- `-p/--pattern` is accepted only with `-r` and filters the `-r` selection; without `-r` it is an error.
+- A listing error part-way through a recursive delete does not send the partly filled batch in which
+  it occurred: those keys are counted as "NOT attempted" in the message. Batches that were already
+  complete have been sent (shared with Python `delete(..., recursive=True)`).
+- Messages for `-r` no longer overstate: `Sent delete requests for N objects found under prefix ... (N
+  listed; 0 reported errors)`. S3 reports non-existent keys as deleted, so no "N deleted" count is
+  claimed. A failed delete request, including a per-key error in an HTTP 200 response, names the keys
+  and exits non-zero. A listing failure is now an error (it used to end the delete early and report
+  success).
+- After a failure no further DeleteObjects request is sent (checked immediately before each send);
+  requests already in flight finish and the not-attempted keys are counted in the message. A listing
+  that fails before anything is sent is reported as the listing error, not as a delete summary. With
+  `-p` the message distinguishes keys listed from keys selected, and a pattern that matches nothing
+  says so (exit 0). `-j/--jobs` is accepted but currently unused.
+- Non-S3 backends (`file://`, `direct://`, `gs://`, `az://`): `-r` requires a URI ending in `/` and
+  otherwise errors (no broadening).
+- On `file://` and `direct://`, an exact `delete` of a path that is a directory fails (`... is a
+  directory; use -r / recursive=True ...`) and deletes nothing; use `-r` with a trailing `/`.
+- Limitation: the op-log LIST row for `delete -r` is written only when the listing stream is read to
+  its end, exactly like the existing `list_stream` wrapper; a listing abandoned after a failure
+  (the command stops listing once a request has failed) writes no LIST row.
+- Works with the process-wide client and with a per-endpoint client (`s3://host:port/bkt/...`), under
+  the #197 route-or-reject rules. New `ObjectStore` method (default implementation provided):
+  `list_objects_with_prefix`. The library `delete_prefix` is not changed by this entry; Python
+  `delete()` follows the same contract (previous entry, #212).
+
+### Fixed — a TAB, LF or CR in a value no longer breaks the op-log row (#186)
+
+This is a **bounded mitigation, not exact logging support.** The row is TAB-separated, one
+record per line, with no quoting; a TAB or newline in a value added columns or split the record
+(and a crafted key could forge a whole record). No encoding, version marker or reader change is
+made here; reversible encoding is future work.
+
+- **Behaviour change.** A record whose `op`, `client_id`, `endpoint` or `file` holds a TAB, LF or
+  CR is now **rejected (not written) and counted**; the writer carries on with the next record.
+  The record is **lost**: the call itself runs normally but leaves no row. Its `idx` is skipped.
+- **Behaviour change.** A TAB, LF or CR in `error` is **replaced by one space each** and the row
+  is still written, so a failed operation is kept (CR LF becomes two spaces).
+- Every other byte, a backslash included, is written as before; every row that was valid before is
+  byte-identical. The check is made where the row is built, so it covers values an external caller
+  gave to `Logger::log` too.
+- New `OpLogStats::rejected_unsafe_field` and `OpLogStats::normalized_error_text` (Rust;
+  `#[non_exhaustive]`, so additive) and the same two keys of Python `op_log_stats()`.
+  `rejected_unsafe_field` is part of `is_complete()`: a log with a rejected record is **not**
+  complete. `normalized_error_text` is not: every operation is recorded, only a message was
+  reworded, so a log with only such rows is still complete. The first rejection prints one stderr
+  note per session (it names the column, not the value); finalize's INCOMPLETE warning states the
+  exact count, and finalize prints one line stating how many error messages had characters
+  replaced by spaces.
+- A record that is rejected for this reason and also has an unformattable timestamp (#190) is
+  counted once, in `rejected_unsafe_field`. The #190 behaviour is unchanged.
+- See `docs/supplemental/OPERATION_LOGGING.md`, "Records with a TAB, LF or CR in a value".
+
+### Fixed — a row with an unformattable timestamp no longer ends the op-log (#190)
+
+- **Behaviour change.** The op-log writes each row's start, first-byte and end times as
+  RFC 3339 after the clock offset is applied. A corrected time before 1970-01-01T00:00:00Z or at
+  or after 10000-01-01T00:00:00Z (an offset computed against a reference of 0 does it to every
+  row) has no such text; the formatter panicked, and the panic ended the log: that row and every
+  later one were lost. The row is now **rejected (not written) and counted**, and the writer
+  carries on with the next row. Nothing is clamped or reformatted, and every other row is
+  byte-identical to before. The rejected row's `idx` is skipped, so later rows keep their numbers.
+- New `OpLogStats::rejected_unformattable` (Rust; `#[non_exhaustive]`, so additive) and the
+  `rejected_unformattable` key of Python `op_log_stats()`. It is part of `is_complete()`: a log
+  with a rejected row is **not** complete. The first rejection prints one stderr note per
+  session; `finalize_op_log()`'s INCOMPLETE warning states the exact count.
+- The writer checks representability before formatting (it does not rely on catching a panic).
+  The domain is humantime 2.4.0's: at or after the epoch, below 253,402,300,800 s after it.
+- See `docs/supplemental/OPERATION_LOGGING.md`, "Rows with an unformattable timestamp".
+
+### Changed — clearer op-log reader error for unsupported operations (#176)
+
+- `s3dlio-oplog` readers: a row whose op name the reader does not model (`GET_RANGE`,
+  `DELETE_BATCH`, `DELETE_PREFIX`, `CREATE_CONTAINER`, `DELETE_CONTAINER`) now fails with an error
+  that names the file line, the row index (a 0-based count of lines after the header that also counts
+  skipped blank and comment lines) and the op, and says the operation is not
+  supported for exact replay; any other unrecognised name is reported as unknown. Replay behaviour
+  is unchanged: `OpType` still has five variants, the full-file load still aborts at the first such
+  row, `continue_on_error` still applies only to execution, and nothing is skipped or filtered.
+
+### Documented — known op-log gaps (#175, #176 remain open)
+
+- `MultiEndpointStore` records only `get`/`put` on bucket-form endpoints; `list`, `delete`,
+  `get_range`, `stat` and every call on host-form (and `file://`, `az://`, `gs://`) endpoints write
+  no row (#175).
+- Compound-operation rows (`GET_RANGE`, `DELETE_BATCH`, `DELETE_PREFIX`, container operations) do
+  not carry the parameters needed for exact replay; recognising an op name does not mean exact
+  replay is supported. Full-file replay stops at the first unsupported or malformed row, and
+  `continue_on_error` does not bypass load errors. Mixed traces cannot be replayed exactly yet
+  (#176).
+- See "Known gaps" in `docs/supplemental/OPERATION_LOGGING.md`; the same facts are in
+  `OPLOG-GUIDE.md`, `MULTI_ENDPOINT_GUIDE.md` and the `s3dlio-oplog` README and rustdoc.
+- #175 and #176 are NOT fixed by this change; both issues remain open.
+
+### Removed — never-compiled `src/prefetch.rs` sketch (#203)
+
+- Deleted `src/prefetch.rs`, which was never declared in `lib.rs` and could not compile. The docs
+  that cited it now describe the loaders that exist. `data_loader::prefetch::spawn_prefetch` is
+  unchanged.
+
+---
+
 ## Version 0.9.122 — Op-log accuracy (each call recorded once), server routing for every operation, replay fixes, Azure credential fix
 
 Fixes 14 issues: #169, #174, #177, #181, #182, #189, #196, #197, #199, #200, #183, #184, #187, #202.
@@ -328,6 +553,13 @@ framing) is unchanged; a golden test pins it.
   `file://` object store: lowercase prefix removed, the rest used literally).
   Any other scheme (`s3://`, `direct://`, `FILE://`, ...) is rejected with an
   error that names the destination, and creation errors name the path.
+  `file:` in any case followed by anything but `//` (`file:x`, `file:/tmp/x`) is
+  also rejected (#191): **a change from 4542f82**, where `file:x` was accepted and
+  created a file literally named `file:x`. Use `./file:x` for such a name. `c://x`
+  stays rejected; its error now says to write a Windows drive as `C:/dir/file`.
+  The destination must be a local path or a `file://` URI: cloud destinations
+  (`s3://`, `gs://`, `az://`, `direct://`, ...) are not supported, and a string like
+  `s3:bucket/key` (no `//`) is treated as a literal local file name.
 - **One op-log session per process (#170).** The lifecycle is `Uninitialized` ->
   `Active` -> `Finalized`, and `Finalized` is terminal. `init_op_log` while
   Active is a no-op; after `finalize_op_log` it raises `RuntimeError` and touches

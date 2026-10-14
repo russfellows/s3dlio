@@ -341,6 +341,9 @@ STATS_KEYS = {
     "lossless",
     "written",
     "writer_error",
+    "rejected_unformattable",
+    "rejected_unsafe_field",
+    "normalized_error_text",
 }
 
 
@@ -385,7 +388,63 @@ def test_op_log_stats_none_before_init_then_counts_match_rows(tmp_path):
     # Complete: accepted == written, nothing dropped or refused, no writer error.
     assert after["written"] == after["accepted"]
     assert after["writer_error"] is None
+    # #190: rows whose timestamp cannot be formatted are counted; none here.
+    assert during["rejected_unformattable"] == after["rejected_unformattable"] == 0
+    # #186: records with a TAB/LF/CR in a value are rejected, error texts reworded; none here.
+    for key in ("rejected_unsafe_field", "normalized_error_text"):
+        assert during[key] == after[key] == 0, key
     assert "INCOMPLETE" not in proc.stderr, "no warning when nothing was lost"
+
+
+def test_a_tab_or_newline_in_a_file_name_rejects_the_record_and_is_counted(tmp_path):
+    """#186: file:// names with a TAB or LF no longer break the row. The record is
+    absent, counted in rejected_unsafe_field (so the log is incomplete and finalize
+    says so), and the records before and after it are intact 13-column rows."""
+    work = tmp_path / "work"
+    work.mkdir()
+    oplog = tmp_path / "ops.tsv.zst"
+    proc = run_scenario(
+        """
+        import json
+        oplog, work = sys.argv[1:3]
+        s3dlio.init_op_log(oplog)
+        s3dlio.put_bytes("file://" + work + "/before.bin", b"x" * 10)
+        s3dlio.put_bytes("file://" + work + "/a\\tb.bin", b"x" * 10)
+        s3dlio.put_bytes("file://" + work + "/c\\nd.bin", b"y" * 10)
+        try:
+            s3dlio.get("file://" + work + "/missing\\tname.bin")
+        except Exception:
+            pass
+        s3dlio.put_bytes("file://" + work + "/after.bin", b"z" * 10)
+        s3dlio.finalize_op_log()
+        print(json.dumps(s3dlio.op_log_stats()))
+        """,
+        str(oplog),
+        str(work),
+    )
+    assert_ok(proc)
+    import json
+
+    stats = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert set(stats) == STATS_KEYS
+    assert stats["rejected_unsafe_field"] == 3, stats
+    assert stats["normalized_error_text"] == 0, stats
+    assert stats["rejected_unformattable"] == 0, stats
+    assert stats["accepted"] == stats["written"] + 3, stats
+    # Every row in the file has 13 columns; the rejected ones left gaps in idx.
+    zstd_cli()
+    assert_complete_zstd_stream(oplog)
+    text = subprocess.run(
+        [zstd_cli(), "-dc", str(oplog)], capture_output=True, check=True
+    ).stdout.decode("utf-8")
+    lines = text.split("\n")
+    assert lines[-1] == "" and lines[0] == HEADER
+    rows = [dict(zip(COLUMNS, line.split("\t"))) for line in lines[1:-1]]
+    assert all(len(line.split("\t")) == 13 for line in lines[1:-1]), text
+    assert [r["file"].rsplit("/", 1)[-1] for r in rows] == ["before.bin", "after.bin"], rows
+    assert [r["idx"] for r in rows] == ["0", "4"], rows
+    assert "INCOMPLETE" in proc.stderr and "3 entries were rejected because" in proc.stderr
+    assert "TAB, LF or CR" in proc.stderr
 
 
 FLOOD = """

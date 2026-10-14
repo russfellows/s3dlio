@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-1018-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.122-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-1094-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.124-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -12,7 +12,9 @@ High-performance, multi-protocol storage library for AI/ML workloads with univer
 
 Full-backend builds support the stable Azure Blob Storage Rust SDK 1.0 API.
 
-> **v0.9.122 — Each op-log call is recorded once; every operation reaches the server its URI names.** `AWS_ENDPOINT_URL_S3` now takes precedence over `AWS_ENDPOINT_URL`; URIs naming another server are rejected before any request; bucket create/delete and list-buckets honour `s3://host:port/`; a store writes one op-log row per S3 call; op-log replay rebuilds URIs from the rows it reads; the Azure credential no longer uses `block_in_place`. 14 issues fixed (#169, #174, #177, #181, #182, #183, #184, #187, #189, #196, #197, #199, #200, #202). v0.9.120 was not published to PyPI; its changes ship in this release. **Behaviour changes are listed in [docs/Changelog.md](docs/Changelog.md).**
+> **v0.9.124 — Exact delete contract, Python API fixes, safer op-log rows.** `s3-cli delete` and Python `delete()` now send ONE DELETE for exactly the key named (no HEAD, no listing; a missing object is success; a trailing `/` is never recursive); `-r` / `recursive=True` deletes the real objects under the literal prefix, and a directory is refused without `-r`. Python `list()`, `stat()` and writer calls release the GIL while blocking, async entry points reuse the shared store cache, and `list_keys` returns keys as written. Op-log rows with a TAB, LF or CR in an identity field, or an unformattable timestamp, are rejected and counted (`op_log_stats()` gains `rejected_unsafe_field`, `normalized_error_text`, `rejected_unformattable`); `file:x` op-log destinations are rejected. `build_pyo3.sh` now fails loudly and requires both cp312 and cp313 wheels. 12 issues fixed (#167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215). **Behaviour changes are listed in [docs/Changelog.md](docs/Changelog.md).**
+
+> **v0.9.122 (prior) — Each op-log call is recorded once; every operation reaches the server its URI names.** 14 issues fixed (#169, #174, #177, #181, #182, #183, #184, #187, #189, #196, #197, #199, #200, #202). See [docs/Changelog.md](docs/Changelog.md).
 
 > **v0.9.120 (prior, not published to PyPI) — Correct routing, no sync hang, no exit crash, op-log lifecycle.** Requests now always reach the server, bucket and key the URI names. Changes: an `s3://X/` names a server only with an explicit `:port`; a leading `/` in a key is kept; `delete_batch` never deletes in the wrong bucket or on the wrong server; the Python store cache is keyed by server; `MultiEndpointStore` uses https on TLS ports. Sync Python calls on host-form URIs no longer hang, and the interpreter no longer crashes at exit after async calls. The op-log accepts `file://` destinations, and `op_log_stats()` reports dropped and unwritten records. 11 issues fixed (#168, #170–#173, #178–#180, #192–#194). **Behaviour changes are listed in [docs/Changelog.md](docs/Changelog.md).**
 >
@@ -230,13 +232,16 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 
 ## 🌟 Latest Release
 
-**v0.9.122** — Each op-log call recorded once, server routing for every operation, replay and Azure credential fixes (14 issues). See [docs/Changelog.md](docs/Changelog.md).
+**v0.9.124** — Exact delete contract for s3-cli and Python, Python GIL and store-cache fixes, op-log row safety (12 issues). See [docs/Changelog.md](docs/Changelog.md).
+
+**v0.9.122 (prior)** — Each op-log call recorded once, server routing for every operation, replay and Azure credential fixes (14 issues). See [docs/Changelog.md](docs/Changelog.md).
 
 **v0.9.120 (prior; not published to PyPI)** — Correct server/bucket/key routing, sync-hang and exit-crash fixes, op-log lifecycle and drop detection (11 issues). See [docs/Changelog.md](docs/Changelog.md).
 
 **v0.9.112 (prior)** — Tokio-runtime sanity clamp on `S3DLIO_RT_THREADS` + MPI-aware thread pool auto-init + FFI-boundary hardening (storage#755, #161, #162). See [docs/Changelog.md](docs/Changelog.md) and [docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md](docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md).
 
 **Recent highlights:**
+- **v0.9.124** — Delete contract: exact delete is one DELETE, `-r` uses the literal prefix (#210, #167, #212); Python GIL release and shared store cache (#201, #204); op-log row safety (#186, #190, #191); arrow-backend fixes (#207); `build_pyo3.sh` fails loudly (#188); 12 issues
 - **v0.9.122** — Op-log accuracy: one row per S3 call (#169, #174, #177, #181, #182, #189); `AWS_ENDPOINT_URL_S3` precedence (#183); server routing for every operation (#196, #197, #199, #200); op-log replay fixes (#184, #187); Azure credential fix (#202)
 - **v0.9.120** — Routing correctness (#171, #172, #178, #179, #180, #193, #194), sync-hang fix (#173), exit-crash fix (#192), op-log `file://` destinations, lifecycle and `op_log_stats()` (#168, #170); 961 tests passing
 - **v0.9.112** — Three independent hardening changes: (1) sanity clamp on `S3DLIO_RT_THREADS` — values below `RT_THREADS_LIMIT/4` are treated as downstream miscomputation and clamped up (live-measured 9× throughput recovery on the DLIO unet3d datagen bottleneck: 214 → 1928 MB/s at NP=1); new `S3DLIO_RT_THREADS_UNSAFE=1` escape hatch. (2) MPI-aware thread pool auto-init at import time — every s3dlio-owned pool (Tokio runtime, checkpoint runtime, Rayon global, dgen-rs) is now sized to `num_cpus / world_size` without any opt-in. (3) FFI-boundary hardening (storage#755, #161, #162): error-chain preservation across 25+ PyO3 boundary sites, unknown-length dataset iteration raises instead of silently yielding nothing, 7 of 9 writer `block_on()` sites migrated off a reentrancy-panic risk, 3 sync-iterator classes switched to a non-poisoning mutex, `MultiEndpointStore` explicit per-endpoint pinning + fan-out replication; 762 tests passing
