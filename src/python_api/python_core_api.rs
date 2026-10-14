@@ -1092,13 +1092,16 @@ pub fn exists(py: Python<'_>, uri: &str) -> PyResult<bool> {
     let uri_owned = uri.to_owned();
     py.detach(|| {
         let logger = global_logger();
+        // Build the store on the caller thread BEFORE submit_io (issue #173),
+        // as `stat`/`list` do: a host-form S3 URI creates its client via
+        // `run_on_global_rt`, which must not run on a global-runtime worker.
+        let store = match get_or_create_store(&uri_owned, logger) {
+            Ok(s) => s,
+            Err(_) => return Ok(false), // URI parsing error → doesn't exist
+        };
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            let store = match get_or_create_store(&uri_owned, logger) {
-                Ok(s) => s,
-                Err(_) => return Ok(false), // URI parsing error → doesn't exist
-            };
-
             match store.stat(&uri_owned).await {
                 Ok(_) => Ok(true),
                 Err(_) => Ok(false),
@@ -1216,12 +1219,11 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
     };
 
     py.detach(move || {
+        // Build the store on the caller thread BEFORE submit_io (issue #173).
+        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
-        submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri, logger)?;
-            put_verified_with_retry(store.as_ref(), &uri, data_owned).await
-        })
+        submit_io(async move { put_verified_with_retry(store.as_ref(), &uri, data_owned).await })
     })
 }
 
@@ -1325,12 +1327,11 @@ pub fn mkdir(py: Python<'_>, uri: &str) -> PyResult<()> {
     let uri = uri.to_owned();
 
     py.detach(move || {
+        // Build the store on the caller thread BEFORE submit_io (issue #173).
+        let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
-        submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri, logger)?;
-            store.mkdir(&uri).await
-        })
+        submit_io(async move { store.mkdir(&uri).await })
     })
 }
 
@@ -1410,10 +1411,13 @@ pub fn get(py: Python<'_>, uri: &str) -> PyResult<PyBytesView> {
     // Use universal ObjectStore API for all backends (with op-log support)
     let uri_owned = uri.to_owned();
     py.detach(|| {
+        // Build the store on the caller thread BEFORE submit_io (issue #173):
+        // for a host-form URI this calls `run_on_global_rt`, which must not
+        // be reached from a global-runtime worker.
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri_owned, logger)?;
             let bytes = store.get(&uri_owned).await?;
             Ok(PyBytesView::new(bytes))
         })
@@ -1432,10 +1436,11 @@ pub fn get_range_py(
     // Use universal ObjectStore interface for range requests
     let uri_owned = uri.to_owned();
     py.detach(|| {
+        // Build the store on the caller thread BEFORE submit_io (issue #173).
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri_owned, logger)?;
             let bytes = store.get_range(&uri_owned, offset, length).await?;
             Ok(PyBytesView::new(bytes))
         })
@@ -1687,11 +1692,11 @@ pub fn delete(py: Python<'_>, uri: &str, recursive: bool) -> PyResult<()> {
     // Use universal ObjectStore API for deletion (with op-log support)
     let uri_owned = uri.to_owned();
     py.detach(|| {
+        // Build the store on the caller thread BEFORE submit_io (issue #173).
+        let store = get_or_create_store(&uri_owned, global_logger()).map_err(py_err)?;
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            let logger = global_logger();
-            let store = get_or_create_store(&uri_owned, logger)?;
-
             // Check if URI contains wildcards or ends with / (pattern/directory)
             let has_pattern =
                 uri_owned.contains('*') || uri_owned.contains('?') || uri_owned.ends_with('/');
@@ -1731,14 +1736,22 @@ pub fn upload(
     let paths: Vec<PathBuf> = src_patterns.into_iter().map(PathBuf::from).collect();
     let dest_prefix_owned = dest_prefix.to_owned();
     py.detach(|| {
+        // Get logger if op-log is active
+        let logger = global_logger();
+
+        // The bucket-creation store (only when explicitly requested) is built
+        // on the caller thread BEFORE submit_io (issue #173): a host-form S3
+        // URI creates its client via `run_on_global_rt`, which must not be
+        // reached from a global-runtime worker.  Its failure is still only
+        // warned about, inside the future, exactly as before.
+        let bucket_store =
+            create_bucket.then(|| store_for_uri_with_logger(&dest_prefix_owned, logger));
+
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move {
-            // Get logger if op-log is active
-            let logger = global_logger();
-
             // Handle bucket creation ONLY if explicitly requested
-            if create_bucket {
-                match store_for_uri_with_logger(&dest_prefix_owned, logger.clone()) {
+            if let Some(bucket_store) = bucket_store {
+                match bucket_store {
                     Ok(store) => {
                         // Extract bucket/container name from URI
                         if dest_prefix_owned.starts_with("s3://") {
@@ -1786,6 +1799,10 @@ pub fn upload(
 // put_many() - Batch put for maximum throughput (Python API)
 // ---------------------------------------------------------------------------
 
+/// One `put_many` item with its store already resolved (or the resolution
+/// error, surfaced from that item's task): (uri, data, store).
+type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
+
 /// Put multiple objects in parallel from Python.
 ///
 /// Accepts a list of (uri, data) tuples where data is Python bytes.
@@ -1831,18 +1848,33 @@ pub fn put_many(
         .collect();
 
     py.detach(move || {
+        // Build every store on the caller thread BEFORE submit_io (issue
+        // #173): a host-form S3 URI creates its client via
+        // `run_on_global_rt`, which must not be reached from a global-runtime
+        // worker.  Stores are cached by (scheme, endpoint, region), so after
+        // the first URI of a kind these are cache hits.  A creation failure
+        // is carried per item and surfaces from that item's task, so the
+        // error semantics (other items still run; first error returned) are
+        // unchanged.
+        let logger = global_logger();
+        let prepared: Vec<PreparedPut> = owned_items
+            .into_iter()
+            .map(|(uri, data)| {
+                let store = get_or_create_store(&uri, logger.clone());
+                (uri, data, store)
+            })
+            .collect();
+
         // Submit entire batch to global runtime (io_uring pattern)
         submit_io(async move {
             let sem = Arc::new(Semaphore::new(max_in_flight));
             let mut futs = FuturesUnordered::new();
-            let logger = global_logger();
 
-            for (uri, data) in owned_items {
+            for (uri, data, store) in prepared {
                 let sem = Arc::clone(&sem);
-                let logger = logger.clone();
                 futs.push(tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await.unwrap();
-                    let store = get_or_create_store(&uri, logger)?;
+                    let store = store?;
                     store.put(&uri, data).await?;
                     Ok::<_, anyhow::Error>(())
                 }));
@@ -3104,5 +3136,74 @@ mod put_verify_tests {
 
         std::env::remove_var("S3DLIO_PUT_VERIFY");
         result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- issue #173: sync entry points must build host-form stores on the
+// caller thread, and `get_or_create_store` must also be safe when it IS called
+// from a runtime worker.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod issue173_store_creation_tests {
+    use super::*;
+    use crate::s3_client::issue173_worker_reentrancy_tests::{run_with_watchdog, WATCHDOG};
+
+    /// Host-form URI: the authority carries `host:port`, so
+    /// `store_for_uri_with_logger` takes the `run_on_global_rt(for_endpoint)`
+    /// path.  Store creation does not connect, so the (closed) port 9 is never
+    /// contacted.
+    const HOST_FORM_URI: &str = "s3://127.0.0.1:9/bucket/key";
+
+    fn prepare_environment() {
+        // for_endpoint requires credentials to exist; none are ever used.
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        // Force the slow (creating) path of get_or_create_store.
+        STORE_CACHE.remove(&StoreKey::from_uri(HOST_FORM_URI));
+    }
+
+    /// The exact shape of the old `get`/`get_range`/`put_bytes` bodies:
+    /// `get_or_create_store` inside the future handed to `submit_io`, i.e.
+    /// executing on a global-runtime worker.
+    #[test]
+    fn get_or_create_store_inside_submit_io_completes_for_host_form_uri() {
+        prepare_environment();
+        let got = run_with_watchdog("py-submit-io", || {
+            submit_io(async move {
+                get_or_create_store(HOST_FORM_URI, None)
+                    .map(|_| ())
+                    .map_err(|e| e.context("get_or_create_store"))
+            })
+        });
+        match got {
+            Some(r) => assert!(r.is_ok(), "store creation failed: {r:?}"),
+            None => panic!(
+                "RED: get_or_create_store(host-form) inside submit_io did not \
+                 return within {WATCHDOG:?} (issue #173 deadlock)"
+            ),
+        }
+    }
+
+    /// The shape of the fixed entry points: create on the caller thread
+    /// (no runtime worker involved), then hand the store to `submit_io`.
+    #[test]
+    fn store_created_on_caller_thread_before_submit_io_completes() {
+        prepare_environment();
+        let got = run_with_watchdog("py-caller-thread", || {
+            let store = get_or_create_store(HOST_FORM_URI, None)?;
+            submit_io(async move {
+                // Touch the store on the worker, as the entry points do.
+                let _ = store.as_ref();
+                Ok::<(), anyhow::Error>(())
+            })
+            .map_err(|e| anyhow::anyhow!("submit_io failed: {e}"))
+        });
+        match got {
+            Some(r) => assert!(r.is_ok(), "caller-thread creation failed: {r:?}"),
+            None => panic!(
+                "caller-thread store creation + submit_io did not return within {WATCHDOG:?}"
+            ),
+        }
     }
 }

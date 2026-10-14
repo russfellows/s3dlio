@@ -279,27 +279,70 @@ fn get_runtime_threads() -> usize {
 
 /// Run an async `fut` on the global runtime and block the **current** thread
 /// until it completes. Handles both runtime and non-runtime contexts.
+///
+/// # Never blocks a runtime worker on its own runtime (issue #173)
+///
+/// When the caller is already inside a Tokio runtime -- including, crucially,
+/// a worker of the global runtime itself (e.g. a sync Python entry point that
+/// builds a host-form S3 store inside the future it handed to `submit_io`) --
+/// this function used to spawn `fut` and then park the worker on a
+/// `std::sync::mpsc::Receiver::recv()`.  Tokio puts a task spawned from a
+/// worker into that worker's LIFO slot, and other workers never steal from
+/// the LIFO slot; the only thing that moves it is the worker itself (which
+/// is parked in `recv()`) or `block_in_place`.  The spawned task therefore
+/// never ran, regardless of the worker count.
+///
+/// The fix, by calling context:
+/// * **No runtime on this thread** -- plain OS thread: spawn and wait, as
+///   before.
+/// * **Multi-thread runtime** (the global runtime always is one) -- wait
+///   inside [`tokio::task::block_in_place`].  That hands the worker's core,
+///   including its LIFO slot, to another worker *before* we block, and the
+///   spawn performed inside the closure goes through the injection queue, so
+///   `fut` is always runnable by some other worker.  This also keeps a
+///   foreign multi-thread runtime's capacity intact while we wait.
+///   `block_in_place` was chosen over "await the nested future directly"
+///   because this function is synchronous and returns `T`, not a future:
+///   the nested future cannot be awaited from here without changing the
+///   signature of ~40 sync callers.
+/// * **Current-thread runtime** -- `block_in_place` panics there, so it is
+///   not used.  The global runtime is always multi-thread and is a different
+///   runtime, so a plain blocking wait can only stall the caller's own
+///   (single-thread) runtime, never deadlock against the global one; `fut`
+///   still executes on the global runtime.  This is the pre-existing
+///   behaviour that e.g. `#[tokio::test]` callers rely on.
+///
+/// Recorded limit: a thread that is a multi-thread runtime handle's
+/// `enter()` guard *inside* a current-thread `block_on` is not detectable
+/// from `Handle::runtime_flavor()` and would make `block_in_place` panic.
 pub fn run_on_global_rt<F, T>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    // Check if we're already in a runtime context
     match tokio::runtime::Handle::try_current() {
-        Ok(_) => {
-            // We're already in a runtime context, but we still need to execute on our global runtime
-            // Use spawn and block with a different approach
-            let handle = global_rt_handle().clone();
-            let (tx, rx) = std::sync::mpsc::channel();
+        Ok(current) => {
+            let spawn_and_wait = move || {
+                let handle = global_rt_handle().clone();
+                let (tx, rx) = std::sync::mpsc::channel();
 
-            handle.spawn(async move {
-                let result = fut.await;
-                let _ = tx.send(result);
-            });
+                handle.spawn(async move {
+                    let result = fut.await;
+                    let _ = tx.send(result);
+                });
 
-            // Use blocking receive which works even from within runtime context
-            rx.recv()
-                .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
+                rx.recv()
+                    .map_err(|_| anyhow::anyhow!("global runtime task crashed: RecvError(())"))?
+            };
+
+            match current.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(spawn_and_wait)
+                }
+                // Current-thread (or any future flavor): block_in_place is
+                // invalid here; see the doc comment above.
+                _ => spawn_and_wait(),
+            }
         }
         Err(_) => {
             // Not in a runtime, use our original approach with oneshot
@@ -784,5 +827,187 @@ mod tier4_reentrancy_tests {
             run_on_global_rt(async { Ok(42) })
         });
         assert_eq!(result.unwrap(), 42);
+    }
+}
+
+/// Regression tests for s3dlio issue #173: `run_on_global_rt` called from a
+/// worker of the global runtime itself used to park that worker on a std
+/// `recv()` while the spawned task sat in the worker's never-stolen LIFO
+/// slot, so the call never returned.
+#[cfg(test)]
+pub(crate) mod issue173_worker_reentrancy_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Upper bound for any scenario below; an unfixed tree hangs forever, a
+    /// fixed one finishes in milliseconds.
+    pub(crate) const WATCHDOG: Duration = Duration::from_secs(20);
+
+    /// Run `scenario` on a detached std thread and wait at most [`WATCHDOG`]
+    /// for its result; `None` means it hung (RED).
+    ///
+    /// The scenario thread is deliberately never joined.  When the code
+    /// under test deadlocks, that thread (and the global-runtime worker it is
+    /// waiting on) stays blocked forever, but a detached thread cannot hold
+    /// up the test binary: the libtest harness ends the process with
+    /// `std::process::exit` after the last test, which does not wait for
+    /// other threads.  The global runtime's own driver thread is already
+    /// parked forever by design, so nothing new is introduced.
+    pub(crate) fn run_with_watchdog<R, S>(name: &str, scenario: S) -> Option<R>
+    where
+        R: Send + 'static,
+        S: FnOnce() -> R + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name(format!("watchdog-{name}"))
+            .spawn(move || {
+                let _ = tx.send(scenario());
+            })
+            .expect("spawn watchdog scenario thread");
+        rx.recv_timeout(WATCHDOG).ok()
+    }
+
+    /// Spawn `body` as a task on the global runtime and block this (plain)
+    /// thread for its result.
+    fn on_global_worker<R, F>(body: F) -> R
+    where
+        R: Send + 'static,
+        F: std::future::Future<Output = R> + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        global_rt_handle().spawn(async move {
+            let _ = tx.send(body.await);
+        });
+        rx.recv().expect("global runtime task dropped its result")
+    }
+
+    /// The exact deadlock shape: from inside a task running on a global
+    /// runtime worker, call `run_on_global_rt` with a trivial future.
+    #[test]
+    fn run_on_global_rt_from_global_worker_does_not_deadlock() {
+        let got = run_with_watchdog("nested", || {
+            on_global_worker(async { run_on_global_rt(async { Ok(42_u32) }) })
+        });
+        match got {
+            Some(r) => assert_eq!(r.expect("nested run_on_global_rt failed"), 42),
+            None => panic!(
+                "RED: run_on_global_rt called from a global-runtime worker did not \
+                 return within {WATCHDOG:?} (issue #173 deadlock)"
+            ),
+        }
+    }
+
+    /// Many more concurrent re-entrant callers than there are workers: every
+    /// worker ends up inside the nested wait at once.
+    #[test]
+    fn run_on_global_rt_from_many_global_workers_does_not_deadlock() {
+        const CALLERS: u32 = 128;
+        let got = run_with_watchdog("many", || {
+            on_global_worker(async {
+                let mut set = tokio::task::JoinSet::new();
+                for i in 0..CALLERS {
+                    set.spawn(async move { run_on_global_rt(async move { Ok(i) }) });
+                }
+                let mut sum = 0_u64;
+                while let Some(joined) = set.join_next().await {
+                    sum += u64::from(joined.expect("join")?);
+                }
+                Ok::<u64, anyhow::Error>(sum)
+            })
+        });
+        let expected: u64 = (0..CALLERS).map(u64::from).sum();
+        match got {
+            Some(r) => assert_eq!(r.expect("many nested calls failed"), expected),
+            None => panic!(
+                "RED: {CALLERS} concurrent nested run_on_global_rt calls did not \
+                 finish within {WATCHDOG:?} (issue #173 deadlock)"
+            ),
+        }
+    }
+
+    /// The nested future itself calls `run_on_global_rt` again (two levels).
+    #[test]
+    fn run_on_global_rt_two_levels_deep_from_global_worker_does_not_deadlock() {
+        let got = run_with_watchdog("depth2", || {
+            on_global_worker(async {
+                run_on_global_rt(async { run_on_global_rt(async { Ok(7_u32) }) })
+            })
+        });
+        match got {
+            Some(r) => assert_eq!(r.expect("two-level nested call failed"), 7),
+            None => panic!(
+                "RED: two-level nested run_on_global_rt did not return within \
+                 {WATCHDOG:?} (issue #173 deadlock)"
+            ),
+        }
+    }
+
+    /// Host-form S3 store creation (`store_for_uri_with_logger` ->
+    /// `run_on_global_rt(S3ObjectStore::for_endpoint)`) from a global worker.
+    /// Store creation does not connect, so the endpoint is never contacted.
+    #[test]
+    fn host_form_store_creation_from_global_worker_does_not_deadlock() {
+        // for_endpoint insists on credentials being present; they are never
+        // used because no request is made.
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+        let got = run_with_watchdog("hostform", || {
+            on_global_worker(async {
+                crate::object_store::store_for_uri_with_logger("s3://127.0.0.1:9/bucket/key", None)
+                    .map(|_| ())
+            })
+        });
+        match got {
+            Some(r) => r.expect("host-form store creation failed"),
+            None => panic!(
+                "RED: host-form store creation from a global-runtime worker did \
+                 not return within {WATCHDOG:?} (issue #173 deadlock)"
+            ),
+        }
+    }
+
+    /// A caller on a *current-thread* runtime (`#[tokio::test]` default)
+    /// must keep working: `block_in_place` would panic there, so the plain
+    /// blocking wait is retained for that flavor.
+    #[test]
+    fn run_on_global_rt_from_current_thread_runtime_still_completes() {
+        let got = run_with_watchdog("current-thread", || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime");
+            rt.block_on(async { run_on_global_rt(async { Ok(5_u32) }) })
+        });
+        match got {
+            Some(r) => assert_eq!(r.expect("current-thread caller failed"), 5),
+            None => panic!("run_on_global_rt from a current-thread runtime hung"),
+        }
+    }
+
+    /// Guard (not a discriminating RED): a caller on a foreign multi-thread
+    /// runtime with a *single* worker still completes.  It passes on the
+    /// unfixed tree when run alone (the nested task runs on the global
+    /// runtime, not the foreign one); it only fails there as collateral when
+    /// earlier RED tests in the same process have already wedged the global
+    /// runtime's workers.
+    #[test]
+    fn run_on_global_rt_from_single_worker_foreign_runtime_completes() {
+        let got = run_with_watchdog("foreign-1", || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("build foreign runtime");
+            rt.block_on(async {
+                tokio::spawn(async { run_on_global_rt(async { Ok(9_u32) }) })
+                    .await
+                    .expect("join")
+            })
+        });
+        match got {
+            Some(r) => assert_eq!(r.expect("foreign worker caller failed"), 9),
+            None => panic!("run_on_global_rt from a foreign 1-worker runtime hung"),
+        }
     }
 }
