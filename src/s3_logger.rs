@@ -947,6 +947,15 @@ fn is_rfc3986_scheme(s: &str) -> bool {
 ///   would be passed to `File::create` as a bogus relative path (issue #168).
 /// - Text before `://` that is not a valid scheme leaves the destination a plain
 ///   path: `<dir>/a://b.log` is the local path `<dir>/a:/b.log`.
+/// - `file:` (any case) followed by anything but `//` (`file:x`,
+///   `file:/tmp/x`) is a file URI in a form s3dlio does not accept (the file
+///   store refuses it too), so it is rejected with `ErrorKind::InvalidInput`
+///   rather than creating a file whose name begins with `file:` (issue #191).
+///   A local file really named `file:x` is written `./file:x`. Other text with a
+///   colon (`ops-12:30.tsv.zst`, `C:\logs\x`, `C:/logs/x`) is a plain path.
+/// - A single-letter scheme before `://` (`c://x`) is a valid RFC 3986 scheme
+///   and is rejected like any other, on every platform; the message says how to
+///   write a Windows drive path (`C:/dir/file` or `C:\dir\file`, issue #191).
 fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
     const FILE_PREFIX: &str = "file://";
     if let Some(local) = path.strip_prefix(FILE_PREFIX) {
@@ -966,12 +975,35 @@ fn resolve_local_oplog_path(path: &str) -> std::io::Result<&str> {
         .split_once("://")
         .filter(|(scheme, _)| is_rfc3986_scheme(scheme))
     {
+        // "c://x" is not a Windows drive path here: the scheme rule is the same
+        // on every platform. Say how to spell the drive instead.
+        let drive_hint = if scheme.len() == 1 {
+            format!(
+                "; for a Windows drive write '{scheme}:/dir/file' or '{scheme}:\\dir\\file' \
+                 (one slash or a backslash after the colon)"
+            )
+        } else {
+            String::new()
+        };
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "op-log path '{path}' uses unsupported scheme '{scheme}://'; the op-log must be \
                  written to a local filesystem path, e.g. '/tmp/ops.tsv.zst' or \
-                 'file:///tmp/ops.tsv.zst' (lowercase 'file://')"
+                 'file:///tmp/ops.tsv.zst' (lowercase 'file://'){drive_hint}"
+            ),
+        ));
+    }
+    if path
+        .get(..5)
+        .is_some_and(|head| head.eq_ignore_ascii_case("file:"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "op-log path '{path}' is a 'file:' URI without '//', which s3dlio does not \
+                 accept; write 'file:///tmp/ops.tsv.zst' (lowercase 'file://' and the path), \
+                 or './{path}' for a local file whose name really begins with 'file:'"
             ),
         ));
     }
@@ -1601,6 +1633,109 @@ mod oplog_path_tests {
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
             assert!(err.to_string().contains(uri), "{uri}: {err}");
             assert!(err.to_string().contains(shown), "{uri}: {err}");
+        }
+    }
+
+    // Issue #191, decision 1: "file:" followed by anything but "//" is a file
+    // URI in a form s3dlio does not accept (the file store refuses it too), so
+    // it is rejected with a pointer to "file:///path" instead of silently
+    // creating a file whose name starts with "file:". The scheme match is
+    // case-insensitive, like the "FILE://" rejection above. A local file that
+    // really is named "file:x" is written "./file:x".
+
+    #[test]
+    fn file_colon_without_double_slash_is_rejected_and_names_the_fix() {
+        for uri in [
+            "file:x",
+            "file:ops.tsv.zst",
+            "file:/tmp/ops.tsv.zst",
+            "file:",
+            "FILE:x",
+            "File:/tmp/ops.tsv.zst",
+        ] {
+            let err = resolve_local_oplog_path(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("'{uri}'")), "{uri}: {msg}");
+            assert!(
+                msg.contains("file:///") && msg.contains(&format!("./{uri}")),
+                "{uri}: the message must show both the file:// form and the ./ form: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_colon_destination_creates_nothing() {
+        // "file:/<dir>/ops": before the fix this was a relative path under a
+        // directory named "file:" ("No such file or directory"); and "file:x"
+        // created a file named "file:x". Neither may touch the disk now.
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("ops.tsv.zst");
+        let uri = format!("file:{}", abs.display());
+        let err = Logger::new(&uri).expect_err("file:/abs must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert!(!abs.exists());
+    }
+
+    #[test]
+    fn a_colon_name_stays_reachable_as_a_plain_path() {
+        // "./file:x" is a relative path, not a URI; other names with a colon too.
+        for path in [
+            "./file:x",
+            "dir/file:x",
+            "/tmp/file:x",
+            "filex:y",
+            "ops-12:30.tsv.zst",
+        ] {
+            assert_eq!(
+                resolve_local_oplog_path(path).unwrap_or_else(|e| panic!("{path}: {e}")),
+                path
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("file:x");
+        drop(Logger::new(named.to_str().unwrap()).expect("an absolute path with a colon works"));
+        assert!(named.exists());
+    }
+
+    // Issue #191, decision 2: a one-letter scheme is still an RFC 3986 scheme,
+    // so "c://x" is rejected on every platform (the convention does not change
+    // by operating system); the message says how to write a Windows drive path.
+    // "C:\x" and "C:/x" contain no "://" and are plain paths, as before.
+
+    #[test]
+    fn single_letter_scheme_with_double_slash_is_rejected_with_a_drive_hint() {
+        for uri in ["c://x", "C://logs/ops.tsv.zst"] {
+            let err = resolve_local_oplog_path(uri)
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be rejected"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{uri}");
+            let msg = err.to_string();
+            assert!(msg.contains("unsupported scheme"), "{uri}: {msg}");
+            assert!(
+                msg.contains("drive") && msg.contains(":/dir/file") && msg.contains(":\\dir\\file"),
+                "{uri}: the message must say how to write a drive path: {msg}"
+            );
+        }
+        // Longer schemes do not get the drive hint.
+        let msg = resolve_local_oplog_path("ab://x").unwrap_err().to_string();
+        assert!(!msg.contains("drive"), "{msg}");
+    }
+
+    #[test]
+    fn windows_drive_paths_without_a_doubled_slash_are_plain_paths() {
+        for path in [
+            r"C:\x",
+            "C:/x",
+            r"C:\logs\ops.tsv.zst",
+            "c:/logs/ops.tsv.zst",
+        ] {
+            assert_eq!(
+                resolve_local_oplog_path(path).unwrap_or_else(|e| panic!("{path}: {e}")),
+                path
+            );
         }
     }
 
