@@ -142,6 +142,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          components: clippy
 
       # Same network hardening as the `test` job (curl-8.x HTTP/2 bug).
       - name: Configure cargo network robustness
@@ -184,6 +185,16 @@ jobs:
       # the plain `--lib` run in the `test` job does not compile or run it.
       - name: Test (Rust - delete_batch GCS/Azure grouping)
         run: cargo test --release --lib --offline --features backend-gcs,backend-azure delete_batch
+
+      # The Apache Arrow object_store backend (#207).  `arrow-backend` and
+      # `native-backends` are mutually exclusive, so it is built in isolation
+      # with --no-default-features (never --all-features).  Nothing else in CI
+      # compiles this feature, which is how its ObjectStore impl went stale.
+      - name: Check (Rust - arrow-backend)
+        run: cargo check --no-default-features --features arrow-backend --offline
+
+      - name: Clippy (Rust - arrow-backend)
+        run: cargo clippy --no-default-features --features arrow-backend --offline -- -D warnings
 
       # Op-log (#168, #170): the zstd command-line tool is what the op-log
       # tests use to prove a finished log is a complete zstd stream.

@@ -25,6 +25,7 @@ features = ["extension-module"]
 [[bin]]
 name = "s3-cli"
 path = "src/bin/cli.rs"
+required-features = ["native-backends"]  # s3-cli uses native-only exports; arrow-backend builds the library only (issue #207)
 
 [dependencies]
 # AWS SDK - relaxed to any 1.x so `cargo update` picks up patch/minor bumps
