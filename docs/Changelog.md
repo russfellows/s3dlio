@@ -12,8 +12,10 @@ used to split the URI at its last `/`, send only the left part to the server and
 part as an UNANCHORED regular expression over the keys that came back; in non-recursive mode every
 common prefix was added unfiltered. So `s3://b/data/run.1` also matched `data/run_1` and
 `data/prerun.1`, `s3://b/foo` listed `afoo` and every top-level folder, and a key containing `(` or
-`[` failed with "Invalid regex pattern". (`file://`, `direct://`, `gs://` and `az://` were already
-literal.)
+`[` failed with "Invalid regex pattern". This change converts S3 (`s3://`) only. The other backends
+(`file://`, `direct://`, `gs://`, `az://`) are unchanged and do NOT yet follow this rule (for
+example `gs://` and `az://` non-recursive listings keep their own directory-style handling of a
+prefix without a trailing `/`); that is tracked in #220.
 
 Now the whole key part of the URI is the S3 prefix:
 
@@ -24,8 +26,15 @@ Now the whole key part of the URI is the S3 prefix:
 - Non-recursive: `s3://b/foo` returns `foo`, `foobar` and the directory `foo/`, not `afoo`
   and not unrelated folders. S3 filters both objects and common prefixes by the prefix.
 - **To select with a regex use the explicit option**: Python `list(uri, recursive, pattern=...)`
-  and `s3-cli ls --pattern`. The regex feature is unchanged: a Rust regex matched against the entry
-  relative to the listing base. One shared implementation (`s3dlio::list_pattern::ListPattern`) now
+  and `s3-cli ls --pattern`. The feature is still a Rust regex matched (unanchored) against the entry
+  relative to the listing base, but the base is now defined for every S3 prefix: the prefix itself
+  when it ends with `/`; the directory `P/` for an entry under it; otherwise the parent directory of
+  `P` (everything up to its last `/`). This differs from before for a prefix WITHOUT a trailing `/`:
+  an entry that merely starts with the prefix (`s3://b/dl` and `s3://b/dlx`, `s3://b/data/run.1` and
+  `s3://b/data/run.1.old`) used to be matched against the whole URI and is now matched against
+  `dlx` / `run.1.old`, so a pattern such as `^s3://` no longer matches it. For host-form URIs
+  (`s3://host:port/bkt/dl/`) the base is taken from the key parts, so it agrees with the entries a
+  listing returns (`s3://bkt/dl/...`). One shared implementation (`s3dlio::list_pattern::ListPattern`) now
   serves Python, the CLI and the new `s3_copy::download_objects_matching(src_uri, pattern, ...)`.
   An invalid pattern fails before any request. (Python `list()` raised the raw regex error and
   compiled the pattern after listing; it now raises `Invalid regex pattern: '...'` first.)

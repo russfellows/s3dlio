@@ -111,12 +111,14 @@ All commands use consistent URI formats across backends:
 
 List objects in any storage backend with optional filtering and counting.
 
-The URI is a **literal key prefix**, never a regex (v0.9.125, #213): `s3-cli ls s3://b/data/run.1`
+For `s3://` URIs the URI is a **literal key prefix**, never a regex (#213): `s3-cli ls s3://b/data/run.1`
 lists `data/run.1`, `data/run.1.old` and `data/run.1/` (everything that starts with `data/run.1`),
 but not `data/run_1` or `data/prerun.1`; `.`, `(`, `[`, `+`, `$`, `?` in the URI are ordinary
 characters. Without `-r`, matching objects and matching "directories" are listed:
 `s3-cli ls s3://b/foo` shows `foo`, `foobar` and `foo/`, not `afoo` and not unrelated folders. To
 filter with a regex use `-p/--pattern` (see [Regex Pattern Filtering](#regex-pattern-filtering)).
+This literal-prefix rule is implemented for `s3://` only; `file://`, `direct://`, `gs://` and
+`az://` listings are unchanged (tracked in #220).
 
 ```bash
 s3-cli ls [OPTIONS] <URI>
@@ -366,9 +368,13 @@ s3-cli put [OPTIONS] <URI>
 
 The `-p/--pattern` option accepts standard Rust regex patterns. Patterns are applied **client-side** after listing, so they work with all backends.
 
-A regex only ever comes from `-p/--pattern`: the URI itself is always a literal key prefix (v0.9.125,
-#213; earlier versions read the last segment of an S3 URI as a regex). The pattern is matched
-(unanchored) against each entry **relative to the listing base**, not against the whole URI:
+For `s3://` URIs a regex only ever comes from `-p/--pattern`: the URI itself is always a literal key
+prefix (#213; earlier versions read the last segment of an S3 URI as a regex). The pattern is matched
+(unanchored) against each entry **relative to the listing base**, not against the whole URI. The base
+is the prefix when it ends with `/`, the directory `P/` for an entry under a prefix `P` without a
+trailing `/`, and otherwise the parent directory of `P`. For a prefix without a trailing `/` this
+differs from earlier versions, which matched an entry that merely starts with the prefix against the
+whole URI. For a host-form URI (`s3://host:port/bkt/dl/`) the base is taken from the key parts:
 
 | Listed URI | Entry | What the pattern sees |
 |------------|-------|-----------------------|

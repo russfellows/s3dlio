@@ -189,6 +189,9 @@ pub async fn download_objects(
 /// (unanchored) against each listed key relative to the listing base (see
 /// [`crate::list_pattern`]), so `("s3://b/dl/", r"\.npz$")` downloads the `.npz`
 /// objects under `dl/`. An invalid pattern fails before anything is listed.
+///
+/// It lists through a blocking call on s3dlio's own global runtime, so it must not be called
+/// from a task running on that runtime (the same constraint as [`download_objects`]).
 pub async fn download_objects_matching(
     src_uri: &str,
     pattern: Option<&str>,
