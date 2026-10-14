@@ -2670,15 +2670,13 @@ mod oplog_stats_tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    // The first shutdown panics (in the tracing call it makes) while the writer is
-    // still running. Before the fix it had already taken the completion receiver
-    // out of the mutex, so the panic lost it and every later finalize returned at
-    // once, before the writer was done, and the incomplete-log warning never ran.
-    #[test]
-    fn a_panic_in_the_first_shutdown_does_not_let_a_later_one_return_early() {
+    /// A logger whose writer thread is stuck inside the sink (holding one big
+    /// entry), so `shutdown` has a running writer to wait for until
+    /// `sink.release()`.
+    fn logger_with_a_stalled_writer(name: &str) -> (Logger, StallingSink) {
         let sink = StallingSink::default();
         sink.lock().released = true; // the header is written by `start` itself
-        let logger = Logger::start(sink.clone(), 8, false, 1, "oplog-ps").unwrap();
+        let logger = Logger::start(sink.clone(), 8, false, 1, name).unwrap();
         {
             let mut st = sink.lock();
             st.released = false;
@@ -2686,17 +2684,102 @@ mod oplog_stats_tests {
         }
         assert_eq!(logger.try_log(big_entry(1)), LogOutcome::Accepted);
         sink.wait_until_blocked(); // the writer is stuck inside the sink
+        (logger, sink)
+    }
 
+    /// Releases the sink when dropped, so a failed assertion in the test body
+    /// never leaves the writer thread stuck inside the sink.
+    struct ReleaseOnDrop(StallingSink);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// Run `logger.shutdown()` on a fresh thread under [`PanickingSubscriber`]
+    /// and report whether the injected panic reached it. `while_installed` runs
+    /// on that thread after the subscriber is installed, before `shutdown`.
+    ///
+    /// Without the panic, `shutdown` would wait for the stalled writer until the
+    /// sink is released, so the wait here is bounded: on timeout the sink is
+    /// released (the thread then finishes) and the call returns `false`. When the
+    /// panic fires the sink is left stalled, so the caller can start a later
+    /// shutdown against the still-running writer.
+    fn first_shutdown_under_panicking_subscriber(
+        logger: &Logger,
+        sink: &StallingSink,
+        while_installed: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        // Keep a second dispatcher registered for the whole call. With only one
+        // registered, `tracing` computes the interest of a callsite that is
+        // registered for the first time from the registering thread's own
+        // subscriber, ignoring this one (tracing-core `Rebuilder::JustOne`), and
+        // can cache "never" for the `info!` in `shutdown`. With two or more it
+        // consults every registered dispatcher.
+        let _second_dispatcher =
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let first = logger.clone();
-        let outcome = thread::spawn(move || {
-            tracing::subscriber::with_default(PanickingSubscriber, || {
+        let (tx, rx) = channel::<bool>();
+        let handle = thread::spawn(move || {
+            let panicked = tracing::subscriber::with_default(PanickingSubscriber, || {
+                while_installed();
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| first.shutdown()))
             })
-        })
-        .join()
-        .unwrap();
+            .is_err();
+            let _ = tx.send(panicked);
+        });
+        let panicked = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                // No panic: `shutdown` is waiting for the writer. Unblock it so the
+                // thread ends, then report that the injection did not happen.
+                sink.release();
+                false
+            });
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("the shutdown thread died outside the injected panic"));
+        panicked
+    }
+
+    // The injected panic comes from the `info!` inside `shutdown`. Its callsite
+    // is registered with `tracing` the first time any thread runs it; when that
+    // thread has no subscriber of its own, `tracing` can cache "never" for it and
+    // the scoped subscriber of the test thread is never asked. This test forces
+    // that order: another thread runs a whole session (the first `info!` in the
+    // process, if this test runs alone) while the subscriber is installed.
+    #[test]
+    fn the_injected_panic_fires_even_if_another_thread_ran_shutdown_first() {
+        let (logger, sink) = logger_with_a_stalled_writer("oplog-ps-race");
+        let _release = ReleaseOnDrop(sink.clone());
+        let panicked = first_shutdown_under_panicking_subscriber(&logger, &sink, || {
+            thread::spawn(|| {
+                let sink = StallingSink::default();
+                sink.lock().released = true;
+                Logger::start(sink, 8, false, 1, "oplog-ps-other")
+                    .unwrap()
+                    .shutdown();
+            })
+            .join()
+            .unwrap();
+        });
+        sink.release();
+        assert!(panicked, "the injected panic never reached shutdown");
+        logger.shutdown();
+    }
+
+    // The first shutdown panics (in the tracing call it makes) while the writer is
+    // still running. Before the fix it had already taken the completion receiver
+    // out of the mutex, so the panic lost it and every later finalize returned at
+    // once, before the writer was done, and the incomplete-log warning never ran.
+    #[test]
+    fn a_panic_in_the_first_shutdown_does_not_let_a_later_one_return_early() {
+        let (logger, sink) = logger_with_a_stalled_writer("oplog-ps");
+        let _release = ReleaseOnDrop(sink.clone());
+
         assert!(
-            outcome.is_err(),
+            first_shutdown_under_panicking_subscriber(&logger, &sink, || {}),
             "the injected panic never reached shutdown"
         );
 
