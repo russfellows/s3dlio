@@ -18,7 +18,9 @@ Run against the wheel under test:
 ``uv run --no-project --with <wheel> --with pytest pytest tests/test_python_exact_keys_198.py``.
 """
 
+import importlib.util
 import json
+import sys
 import textwrap
 
 import pytest
@@ -141,8 +143,46 @@ FAKE_TORCH = """
 """
 
 
-def install_fake_torch_in_process():
+# Modules that bind the stand-in `torch` when it is installed; all are put back (or
+# removed) when the test ends so no later test in the session sees the stub.
+_TORCH_STUB_SCOPE = (
+    "torch",
+    "torch.utils",
+    "torch.utils.data",
+    "s3dlio.compat",
+    "s3dlio.compat.s3torchconnector",
+)
+
+
+@pytest.fixture
+def fake_torch_in_process():
+    """Install the stand-in `torch` in this process for one test, then undo it.
+
+    A real torch, when present, is used and left alone."""
+    before = {name: sys.modules.get(name) for name in _TORCH_STUB_SCOPE}
+    s3dlio_pkg = sys.modules.get("s3dlio")
+    compat_attr = getattr(s3dlio_pkg, "compat", None)
     exec(textwrap.dedent(FAKE_TORCH), {})
+    # The stand-in is a bare ModuleType, so it has no `__file__`; a real torch does.
+    stub_installed = before["torch"] is None and not hasattr(
+        sys.modules["torch"], "__file__"
+    )
+    try:
+        yield
+    finally:
+        if stub_installed:
+            for name, previous in before.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
+            pkg = sys.modules.get("s3dlio")
+            if pkg is not None:
+                if compat_attr is None:
+                    if hasattr(pkg, "compat"):
+                        delattr(pkg, "compat")
+                else:
+                    pkg.compat = compat_attr
 
 
 # Run a list of [method, args...] calls on `S3dlioStorage(namespace)`.
@@ -328,20 +368,20 @@ def test_dlio_torch_walk_node_lists_the_exact_prefix(
         ("az://acct/cont/x", "acct/cont", "x"),
     ],
 )
-def test_compat_s3item_reports_the_exact_key(uri, bucket, key):
-    install_fake_torch_in_process()
+def test_compat_s3item_reports_the_exact_key(fake_torch_in_process, uri, bucket, key):
     from s3dlio.compat.s3torchconnector import S3Item
 
     item = S3Item(uri, b"")
     assert (item.bucket, item.key) == (bucket, key)
 
 
-def test_compat_s3item_matches_the_upstream_parse_s3_uri_contract():
+def test_compat_s3item_matches_the_upstream_parse_s3_uri_contract(
+    fake_torch_in_process,
+):
     """AWS's s3torchconnector `parse_s3_uri` (awslabs/s3-connector-for-pytorch,
     s3torchconnector/src/s3torchconnector/_s3dataset_common.py) does
     ``uri[len("s3://"):].split("/", maxsplit=1)``: bucket and key, nothing stripped, so
     `s3://b//k` is bucket `b`, key `/k`. Mirror it exactly."""
-    install_fake_torch_in_process()
     from s3dlio.compat.s3torchconnector import S3Item
 
     def upstream(uri):
@@ -411,3 +451,19 @@ def test_compat_list_objects_lists_the_exact_prefix(
     mock = mock_factory(["/d/x", "a//b/y", "d/z"])
     run_child(mock, COMPAT_CHILD, bucket, "list", prefix)
     assert list_prefixes(mock) == [wanted], mock.render()
+
+
+def test_fake_torch_is_scoped_to_the_test_that_installs_it():
+    """The stand-in `torch` and the modules that bound it are gone after the test."""
+    if hasattr(sys.modules.get("torch"), "__file__"):
+        pytest.skip("a real torch is already imported; no stand-in is used")
+    if importlib.util.find_spec("torch") is not None:
+        pytest.skip("a real torch is installed; no stand-in is used")
+    names = ("torch", "torch.utils", "torch.utils.data")
+    assert not any(n in sys.modules for n in names)
+    fixture = fake_torch_in_process.__wrapped__()
+    next(fixture)
+    assert all(n in sys.modules for n in names)
+    fixture.close()
+    assert not any(n in sys.modules for n in names)
+    assert "s3dlio.compat.s3torchconnector" not in sys.modules
