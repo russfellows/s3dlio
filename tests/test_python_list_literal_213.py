@@ -25,7 +25,6 @@ import json
 import textwrap
 
 import pytest
-
 from test_oplog_lifecycle import run_scenario
 from test_python_delete_contract_212 import MockS3, env_for
 
@@ -85,13 +84,17 @@ CHILD = """
 
 def call_list(mock, uri, recursive=False, pattern=""):
     proc = run_scenario(
-        textwrap.dedent(CHILD), uri, "1" if recursive else "0", pattern, env=env_for(mock)
+        textwrap.dedent(CHILD),
+        uri,
+        "1" if recursive else "0",
+        pattern,
+        env=env_for(mock),
     )
     lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, (
         f"child failed: rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
-    return json.loads(lines[-1][len("RESULT "):])
+    return json.loads(lines[-1][len("RESULT ") :])
 
 
 def uris(*keys):
