@@ -18,7 +18,6 @@ import tempfile
 import textwrap
 
 import pytest
-
 import s3dlio
 
 # Bounded time for "immediately": import + one rejected call is well under 1 s.
