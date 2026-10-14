@@ -398,6 +398,12 @@ Edge cases (issue #191), all following that convention:
 | `c://x`, `C://logs/ops.tsv.zst` | rejected on every platform: a one-letter scheme is still a scheme. The message tells you to write the drive as `C:/logs/ops.tsv.zst` or `C:\logs\ops.tsv.zst`. |
 | `C:\logs\ops.tsv.zst`, `C:/logs/ops.tsv.zst` | plain paths (no `://`): a drive path on Windows |
 | `ops-12:30.tsv.zst` | plain path (a colon alone does not make a URI) |
+| `s3:bucket/key`, `gs:x`, `az:c/k` (a scheme and a colon, no `//`) | plain path: a **literal local file name** (here `s3:bucket/key` is the file `key` in a directory named `s3:bucket`), not a cloud destination. Only `file:` is special-cased. |
+
+**The op-log destination must be a local path or a `file://` URI.** Cloud and other
+non-local destinations (`s3://`, `gs://`, `az://`, `direct://`, ...) are not
+supported and are rejected. A string such as `s3:bucket/key` (no `//`) is not
+recognised as a URI and is treated as a literal local file name.
 
 ### Behaviour changes for users of the op-log API
 

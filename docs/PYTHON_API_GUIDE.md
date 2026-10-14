@@ -990,6 +990,11 @@ named `file:x` is written `./file:x`. A one-letter scheme (`c://x`) is rejected
 like any other scheme, on every platform; the error says to write a Windows drive
 as `C:/dir/file` or `C:\dir\file` (`C:/x` and `C:\x` are plain paths).
 
+**The op-log destination must be a local path or a `file://` URI.** Cloud
+destinations (`s3://`, `gs://`, `az://`, `direct://`, etc.) are not supported. A
+string like `s3:bucket/key` (no `//`) is not a URI here: it is treated as a literal
+local file name.
+
 A process supports **one** op-log session: `init_op_log` -> `finalize_op_log`.
 `init_op_log` while already active is a no-op; after `finalize_op_log` it raises
 `RuntimeError` and touches no file. `finalize_op_log` is safe to repeat. The

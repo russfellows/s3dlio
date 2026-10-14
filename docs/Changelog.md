@@ -332,6 +332,9 @@ framing) is unchanged; a golden test pins it.
   also rejected (#191): **a change from 4542f82**, where `file:x` was accepted and
   created a file literally named `file:x`. Use `./file:x` for such a name. `c://x`
   stays rejected; its error now says to write a Windows drive as `C:/dir/file`.
+  The destination must be a local path or a `file://` URI: cloud destinations
+  (`s3://`, `gs://`, `az://`, `direct://`, ...) are not supported, and a string like
+  `s3:bucket/key` (no `//`) is treated as a literal local file name.
 - **One op-log session per process (#170).** The lifecycle is `Uninitialized` ->
   `Active` -> `Finalized`, and `Finalized` is terminal. `init_op_log` while
   Active is a no-op; after `finalize_op_log` it raises `RuntimeError` and touches
