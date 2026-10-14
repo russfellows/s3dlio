@@ -183,8 +183,10 @@ class S3PyTorchConnectorStorage(S3Storage):
             else:
                 # Cloud storage: scheme://bucket/prefix
                 bucket = parsed.netloc
-                # Only the "/" after the bucket is a separator; a further "/" or an
-                # empty segment is part of the key prefix (issue #198).
+                # `id` is a FULL URI here (a scheme is required above), so it is used
+                # exactly (issue #198): only the "/" after the bucket is a separator.
+                # This adapter joins no namespace-relative name, so the 0.9.124
+                # filesystem-style normalisation of such names does not apply.
                 prefix = parsed.path.removeprefix("/")
                 if prefix and not prefix.endswith("/"):
                     prefix += "/"

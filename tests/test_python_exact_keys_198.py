@@ -7,6 +7,12 @@ are different objects. The adapters above the core (the DLIO storage classes
 and the s3torchconnector compat layer) used to ``lstrip('/')`` keys, so for a
 key that begins with ``/`` they addressed or reported a different object.
 
+One deliberate exception (the D2 ruling): a DLIO NAME that is relative to the
+configured namespace is a filesystem-style name, and ``S3dlioStorage`` keeps its
+0.9.124 normalisation (``/train/f.npz`` under ``s3://b/base`` is the key
+``base/train/f.npz``, not ``base//train/f.npz``): it is not established that DLIO
+supplies object keys rather than such names. A FULL URI (``s3://b//k``) is exact.
+
 Every test drives the real ``s3dlio`` extension module in a FRESH interpreter
 (the S3 client is process-global) against a recording in-process mock S3
 server (the one from ``test_python_delete_contract_212``) and asserts the exact
@@ -233,7 +239,16 @@ def storage_calls(mock, namespace, *calls):
 # ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("key", KEYS)
+# A namespace-relative NAME and the key 0.9.124 (and this release) gives it.
+RELATIVE_NAMES = [
+    ("/x", "x"),
+    ("//x", "x"),
+    ("a//b", "a//b"),
+    ("x", "x"),
+]
+
+
+@pytest.mark.parametrize("name,rel", RELATIVE_NAMES)
 @pytest.mark.parametrize(
     "namespace,base",
     [
@@ -243,27 +258,65 @@ def storage_calls(mock, namespace, *calls):
         ("s3://bkt/base/", "base/"),
     ],
 )
-def test_dlio_storage_addresses_the_exact_key(mock_factory, namespace, base, key):
-    """An id is joined to the namespace by ONE separator; the id itself is untouched."""
-    mock = mock_factory([base + key])
+def test_dlio_storage_namespace_relative_names_keep_the_0_9_124_normalisation(
+    mock_factory, namespace, base, name, rel
+):
+    """A namespace-relative name loses its leading `/` (as in 0.9.124); `a//b` is left alone."""
+    mock = mock_factory([base + rel])
     out = storage_calls(
         mock,
         namespace,
-        ["put_data", key, "payload"],
-        ["get_data", key],
-        ["isfile", key],
-        ["delete_node", key],
+        ["put_data", name, "payload"],
+        ["get_data", name],
+        ["isfile", name],
+        ["delete_node", name],
     )
     assert [o.get("exc") for o in out] == [None] * 4, out
-    expected = base + key
+    expected = base + rel
     assert keys_on_the_wire(mock, "PUT") == [expected], mock.render()
     assert keys_on_the_wire(mock, "GET") == [expected], mock.render()
     assert keys_on_the_wire(mock, "HEAD") == [expected], mock.render()
     assert mock.sent_delete_keys() == [expected], mock.render()
 
 
-def test_dlio_storage_keys_with_and_without_slash_are_different_objects(mock_factory):
-    """Writing `/x` and `x` makes two objects, not one overwritten twice."""
+def test_dlio_storage_relative_train_file_reads_and_writes_base_slash_train(
+    mock_factory,
+):
+    """The D2 ruling: `/train/f.npz` under `s3://b/base` is the key `base/train/f.npz`."""
+    mock = mock_factory(["base/train/f.npz"])
+    out = storage_calls(
+        mock,
+        "s3://bkt/base",
+        ["put_data", "/train/f.npz", "payload"],
+        ["get_data", "/train/f.npz"],
+    )
+    assert [o.get("exc") for o in out] == [None] * 2, out
+    assert keys_on_the_wire(mock, "PUT") == ["base/train/f.npz"], mock.render()
+    assert keys_on_the_wire(mock, "GET") == ["base/train/f.npz"], mock.render()
+
+
+def test_dlio_storage_full_uri_reads_and_writes_the_exact_key(mock_factory):
+    """A FULL URI is exact (#198): `s3://bkt//k` is the key `/k`, whatever the namespace."""
+    mock = mock_factory(["/k"])
+    out = storage_calls(
+        mock,
+        "s3://bkt/base",
+        ["put_data", "s3://bkt//k", "payload"],
+        ["get_data", "s3://bkt//k"],
+        ["isfile", "s3://bkt//k"],
+        ["delete_node", "s3://bkt//k"],
+    )
+    assert [o.get("exc") for o in out] == [None] * 4, out
+    assert keys_on_the_wire(mock, "PUT") == ["/k"], mock.render()
+    assert keys_on_the_wire(mock, "GET") == ["/k"], mock.render()
+    assert keys_on_the_wire(mock, "HEAD") == ["/k"], mock.render()
+    assert mock.sent_delete_keys() == ["/k"], mock.render()
+
+
+def test_dlio_storage_relative_names_with_and_without_leading_slash_are_one_object(
+    mock_factory,
+):
+    """0.9.124: `/x` and `x` are the same object; `a//b` and `a/b` are still two."""
     mock = mock_factory()
     storage_calls(
         mock,
@@ -273,9 +326,7 @@ def test_dlio_storage_keys_with_and_without_slash_are_different_objects(mock_fac
         ["put_data", "a//b", "double"],
         ["put_data", "a/b", "single"],
     )
-    assert mock.keys == {"base//x", "base/x", "base/a//b", "base/a/b"}, sorted(
-        mock.keys
-    )
+    assert mock.keys == {"base/x", "base/a//b", "base/a/b"}, sorted(mock.keys)
 
 
 def test_dlio_storage_full_uris_pass_through(mock_factory):
@@ -284,11 +335,143 @@ def test_dlio_storage_full_uris_pass_through(mock_factory):
     assert mock.keys == {"/x"}, sorted(mock.keys)
 
 
-def test_dlio_storage_namespace_with_trailing_empty_segment_is_exact(mock_factory):
-    """`s3://bkt/p//` is the base `p//`: one trailing `/` is the separator, the rest is the key."""
+def test_dlio_storage_namespace_trailing_slashes_are_dropped_as_in_0_9_124(
+    mock_factory,
+):
+    """`s3://bkt/p//` is the base `p`: every trailing `/` of the namespace is dropped."""
     mock = mock_factory()
     storage_calls(mock, "s3://bkt/p//", ["put_data", "x", "d"])
-    assert mock.keys == {"p//x"}, sorted(mock.keys)
+    assert mock.keys == {"p/x"}, sorted(mock.keys)
+
+
+# ----------------------------------------------------------------------------
+# 1b. DLIO s3dlio_storage: namespace-relative names are the 0.9.124 function, verbatim
+# ----------------------------------------------------------------------------
+
+
+class Oracle0_9_124:
+    """The namespace-relative name handling of v0.9.124, copied VERBATIM from commit
+    2bfac2a (`python/s3dlio/integrations/dlio/s3dlio_storage.py`), the oracle the
+    D2 ruling pins: `__init__` set `self.prefix = namespace` and
+    `self.base_path = parsed.path.lstrip("/")`; `_make_uri` and `get_uri` are below;
+    `walk_node` (and `get_node`'s directory probe) made the listing URI by adding a
+    final "/" to `_make_uri(id)` when it had none (`_dir_uri` is that step)."""
+
+    def __init__(self, namespace):
+        from urllib.parse import urlparse
+
+        self.prefix = namespace
+        self.base_path = urlparse(namespace).path.lstrip("/")
+
+    def _make_uri(self, path: str) -> str:
+        """Convert a relative path to a full URI."""
+        if path.startswith(("s3://", "az://", "gs://", "file://", "direct://")):
+            return path
+        # Combine with prefix
+        prefix = self.prefix.rstrip("/")
+        path = path.lstrip("/")
+        if path:
+            return f"{prefix}/{path}"
+        return prefix
+
+    def get_uri(self, id):
+        """Return the id as a full URI."""
+        return self._make_uri(id)
+
+    def _dir_uri(self, path: str) -> str:
+        uri = self._make_uri(path)
+        # Ensure ends with / for directory listing
+        if not uri.endswith("/"):
+            uri += "/"
+        return uri
+
+
+EQUIV_NAMESPACES = [
+    "s3://b",
+    "s3://b/",
+    "s3://b/base",
+    "s3://b/base/",
+    "s3://b/base//",
+    "file:///tmp/x",
+    "direct:///tmp/x",
+    "az://acct/c/base",
+]
+EQUIV_NAMES = [
+    "train/f.npz",
+    "/train/f.npz",
+    "//train/f.npz",
+    "a//b",
+    "x/",
+    "",
+    # full URIs are exact, and pass through unchanged in 0.9.124 too
+    "s3://b//k",
+    "s3://b/a//b",
+    "file:///tmp/y//z",
+]
+
+# Every (namespace, name) on the CURRENT adapter, in a fresh interpreter.
+DLIO_EQUIV_CHILD = (
+    FAKE_DLIO
+    + """
+    from s3dlio.integrations.dlio.s3dlio_storage import S3dlioStorage
+
+    spec = json.loads(sys.argv[1])
+    out = []
+    for ns in spec["namespaces"]:
+        storage = S3dlioStorage(ns)
+        row = {"namespace": ns, "base_path": storage.base_path, "names": {}}
+        for name in spec["names"]:
+            row["names"][name] = {
+                "make": storage._make_uri(name),
+                "dir": storage._dir_uri(name),
+                "get_uri": storage.get_uri(name),
+            }
+        out.append(row)
+    print("RESULT " + json.dumps(out))
+"""
+)
+
+
+def test_dlio_storage_namespace_relative_names_equal_the_0_9_124_functions(
+    mock_factory,
+):
+    """For a grid of namespaces x names, `_make_uri` / `_dir_uri` / `get_uri` /
+    `base_path` equal the verbatim v0.9.124 implementation above (D2 option C)."""
+    mock = mock_factory()
+    rows = run_child(
+        mock,
+        DLIO_EQUIV_CHILD,
+        json.dumps({"namespaces": EQUIV_NAMESPACES, "names": EQUIV_NAMES}),
+    )
+    assert [r["namespace"] for r in rows] == EQUIV_NAMESPACES
+    mismatches = []
+    for row in rows:
+        oracle = Oracle0_9_124(row["namespace"])
+        if row["base_path"] != oracle.base_path:
+            mismatches.append(
+                (row["namespace"], "base_path", row["base_path"], oracle.base_path)
+            )
+        for name, got in row["names"].items():
+            want = {
+                "make": oracle._make_uri(name),
+                "dir": oracle._dir_uri(name),
+                "get_uri": oracle.get_uri(name),
+            }
+            for field, value in want.items():
+                if got[field] != value:
+                    mismatches.append(
+                        (row["namespace"], name, field, got[field], value)
+                    )
+    assert not mismatches, mismatches
+
+
+def test_oracle_pins_the_documented_0_9_124_results():
+    """The oracle itself: the named D2 example, so a mis-copied oracle cannot pass vacuously."""
+    o = Oracle0_9_124("s3://b/base")
+    assert o._make_uri("/train/f.npz") == "s3://b/base/train/f.npz"
+    assert o._make_uri("s3://b//k") == "s3://b//k"
+    assert Oracle0_9_124("s3://b/base//")._make_uri("") == "s3://b/base"
+    assert Oracle0_9_124("s3://b/base//")._dir_uri("") == "s3://b/base/"
 
 
 # ----------------------------------------------------------------------------
@@ -301,12 +484,12 @@ def test_dlio_storage_namespace_with_trailing_empty_segment_is_exact(mock_factor
     [
         ("s3://bkt/base", "base/", ["base/x", "base/y", "base2/z"], ["x", "y"]),
         ("s3://bkt/base/", "base/", ["base/x", "base/y", "base2/z"], ["x", "y"]),
-        # the namespace itself ends in an empty segment: the base is `base//`
-        ("s3://bkt/base//", "base//", ["base//x", "base//y", "base/z"], ["x", "y"]),
-        ("s3://bkt//", "/", ["/x", "/y", "z"], ["x", "y"]),
+        # trailing `/` of the namespace are dropped, as in 0.9.124: the base is `base/`
+        ("s3://bkt/base//", "base/", ["base/x", "base/y", "base2/z"], ["x", "y"]),
+        ("s3://bkt//", "", ["x", "y"], ["x", "y"]),
     ],
 )
-def test_dlio_storage_walk_node_lists_the_exact_prefix_and_names_round_trip(
+def test_dlio_storage_walk_node_lists_the_namespace_prefix_and_names_round_trip(
     mock_factory, namespace, prefix, seeded, names
 ):
     mock = mock_factory(seeded)
