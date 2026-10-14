@@ -189,23 +189,36 @@ s3dlio is frequently called from within MPI-parallel DLIO. Key facts:
 
 ## 5. Prefetch Module Notes
 
-### `src/prefetch.rs` (Prefetcher handle)
+### Prefetch and read-ahead mechanisms that exist today
 
-The simple top-level `Prefetcher` struct uses `get_object(&bucket, &key)` — the basic path without
-cache or range-split logic. This is intentional for streaming use cases where the caller controls
-the iteration. For the DLIO training workload, `get_many()`/`get_objects_parallel()` is used
-instead (batch per step), not the Prefetcher.
+There is no stand-alone "prefetcher" module for a list of objects (an earlier sketch of one,
+`src/prefetch.rs`, was never part of the build and has been removed). Background fetching is done by
+the loaders themselves, each with its own bounded queue and cancel-on-drop:
 
-**Future enhancement:** Update `Prefetcher` to use `get_object_uri_optimized_async()` so range
-splitting and size cache apply to the streaming path as well. Low priority since DLIO doesn't use
-this interface.
+- **Python `PyBytesAsyncDataLoader`** (`__iter__` and `items()`): a sliding window of `prefetch`
+  concurrent GETs feeding a bounded channel; `items()` yields `(uri, bytes)` in completion order.
+  Implemented in `src/python_api/python_aiml_api.rs`.
+- **`AsyncPoolDataLoader` / `UnifiedDataLoader`** (`src/data_loader/async_pool_dataloader.rs`): a
+  pool of fetch tasks with a per-request timeout and `readahead_batches` batches queued.
+- **Parquet row-group stream** (`python_aiml_api.rs`): `prefetch` row-group range GETs in flight.
+- **`get_many()` / `get_objects_parallel()`** (`src/s3_utils.rs`): semaphore-bounded concurrent GETs
+  for one batch; it returns when the whole batch is done (no overlap with the next batch).
+- **Generic Rust `DataLoader<D>`** (`src/data_loader/dataloader.rs`): `LoaderOptions.prefetch` is the
+  depth of the batch queue; items are fetched one at a time, so it does not add GET concurrency.
+- **`data_loader::prefetch::spawn_prefetch`** (below): a small public helper, described next.
+
+For the DLIO training workload, `get_many()`/`get_objects_parallel()` is used (batch per step).
 
 ### `src/data_loader/prefetch.rs` (DataLoader-integrated prefetch)
 
-The data_loader prefetcher uses the `S3BytesDataset` with `ReaderMode::Sequential` or
-`ReaderMode::Range`. These go through `get_object_uri_async()` or `get_object_range_uri_async()`
-respectively — not the optimized path. The data_loader is a separate abstraction designed for
-Rust-native use and the PyTorch DataLoader protocol; DLIO uses `get_many()` directly.
+`spawn_prefetch(cap, producer, cancel_token)` is a small public helper: it calls the `producer`
+closure strictly one call at a time and sends each result through a bounded channel of `cap` items,
+stopping on the first error, when the receiver is dropped, or when the optional `CancellationToken`
+is cancelled. It adds queue depth, not request concurrency. The loaders that read objects
+(`S3BytesDataset` with `ReaderMode::Sequential` or `ReaderMode::Range`) go through
+`get_object_uri_async()` or `get_object_range_uri_async()` respectively — not the optimized path.
+The data_loader is a separate abstraction designed for Rust-native use and the PyTorch DataLoader
+protocol; DLIO uses `get_many()` directly.
 
 ---
 
@@ -242,6 +255,5 @@ export S3DLIO_SIZE_CACHE_TTL_SECS=3600  # Default is fine; set lower to free RAM
 |---|---|---|
 | HEAD #1 elimination | When file lists include sizes (e.g. from `list_objects()` returning stats), pass sizes into `get_objects_parallel()` to skip all HEADs | `s3_utils.rs` |
 | Adaptive range threshold | Auto-detect link speed to set threshold without env var | `s3_utils.rs` |
-| Prefetcher cache integration | Update `src/prefetch.rs` to use `get_object_uri_optimized_async()` | `prefetch.rs` |
 | Data loader pipeline | Consider using DataLoader + S3BytesDataset for DLIO to get prefetch windowing | TBD |
 | Cache memory bound | Add max-entry count to ObjectSizeCache to prevent unbounded growth with unique-file workloads | `object_size_cache.rs` |
