@@ -123,11 +123,29 @@ for PY in python3.12 python3.13; do
 done
 
 # ── Build for Python 3.12 and 3.13 on the native architecture ──────────────
-WHEEL_DIR="${CARGO_TARGET_DIR:-target}/wheels"
+# maturin writes wheels under cargo's target directory, wherever it is configured
+# (CARGO_TARGET_DIR, .cargo/config.toml build.target-dir). Ask cargo; fall back to
+# CARGO_TARGET_DIR, then ./target, if cargo metadata is unavailable or unparsable.
+TARGET_DIR=""
+if command -v cargo >/dev/null 2>&1; then
+  TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | grep -o '"target_directory":"[^"]*"' \
+    | sed -e 's/^"target_directory":"//' -e 's/"$//' || true)
+  # A path with JSON escapes is not trusted; use the fallback instead.
+  case "$TARGET_DIR" in
+    *\\*) TARGET_DIR="" ;;
+  esac
+fi
+if [ -z "$TARGET_DIR" ]; then
+  TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+fi
+WHEEL_DIR="${TARGET_DIR}/wheels"
 mkdir -p "$WHEEL_DIR"
 
-# Marker file: only wheels newer than this were produced by THIS run.
-STAMP=$(mktemp)
+# Marker file: only wheels newer than this were produced by THIS run. It is created
+# inside the wheel directory so both sides of the `find -newer` comparison are on
+# the same filesystem and clock; its name can never match a wheel glob (*.whl).
+STAMP=$(mktemp "$WHEEL_DIR/.stamp.XXXXXX")
 trap 'rm -f "$STAMP"' EXIT
 
 if ! maturin build --release --features "$FEATURES" \
