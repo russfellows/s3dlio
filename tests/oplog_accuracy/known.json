@@ -1,0 +1,200 @@
+{
+ "_comment": "Outcomes EXPECTED TODAY (s3dlio 0.9.114 wheel, GCS S3 endpoint). A call with no entry is expected to be ACTION=OK and RECORD=OK. Per call the report says PASS (matches OK/OK), KNOWN (defect reproduced exactly as listed), FIXED (listed defect gone), CHANGED (different failure than listed), NEW (failure with no entry). 'action'/'record' use the report's signature strings. 'issues' are github.com/russfellows/s3dlio issue numbers; 'seen' says whether this exact outcome was observed on the 0.9.114 wheel when the entry was written.",
+ "expected": [
+  {
+   "match": {
+    "case": [
+     "core",
+     "repeat",
+     "two_buckets",
+     "leading_slash",
+     "s3_dest_reject",
+     "async"
+    ],
+    "api": [
+     "get",
+     "put_bytes",
+     "put_bytes_async"
+    ],
+    "call": [
+     "get*",
+     "put*",
+     "range_*",
+     "stat_*"
+    ]
+   },
+   "action": "OK",
+   "record": "DUPLICATE",
+   "issues": [
+    "#169"
+   ],
+   "note": "every S3 GET/PUT is recorded twice: LoggedObjectStore row (endpoint s3://bucket, file bucket/key, empty client_id) + legacy S3Ops row (endpoint = AWS_ENDPOINT_URL, file = bare key, client_id = the access key id)"
+  },
+  {
+   "match": {
+    "case": "leading_slash",
+    "call": [
+     "stat_slash_lead",
+     "range_slash_lead"
+    ]
+   },
+   "action": "WRONG-ACTION:key",
+   "record": "WRONG-FIELD:key",
+   "issues": [
+    "#172"
+   ],
+   "note": "stat/get_range strip the leading '/' of the key and read the OTHER object (<prefix>/slash/x); the row still names the asked key"
+  },
+  {
+   "match": {
+    "case": "async",
+    "call": "delete"
+   },
+   "action": "OK",
+   "record": "MISSING",
+   "issues": [
+    "#174"
+   ],
+   "note": "after get_async() created the logger-less cached store, a later sync delete writes no row"
+  },
+  {
+   "match": {
+    "case": [
+     "host443_get_async",
+     "host443_decoydefault_get_async"
+    ],
+    "call": "c1"
+   },
+   "action": "OK",
+   "record": "MISSING",
+   "issues": [
+    "#174"
+   ],
+   "note": "get_async() on a host-form URI writes no row"
+  },
+  {
+   "match": {
+    "case": "multi_endpoint",
+    "call": [
+     "get_range",
+     "list",
+     "delete"
+    ]
+   },
+   "action": "OK",
+   "record": "MISSING",
+   "issues": [
+    "#175"
+   ],
+   "note": "MultiEndpointStore get_range/list/delete write no row (get and put do produce one legacy S3Ops row: partial logging)"
+  },
+  {
+   "match": {
+    "case": "me_host443",
+    "call": "c1"
+   },
+   "action": "WRONG-ACTION:scheme",
+   "record": "MISSING",
+   "issues": [
+    "#180",
+    "#175"
+   ],
+   "note": "MultiEndpointStore dials a host-form :443 endpoint over plain http://; the failed call writes no row"
+  },
+  {
+   "match": {
+    "case": "delete_batch",
+    "call": "member2"
+   },
+   "action": "WRONG-ACTION:bucket,object",
+   "record": "N/A",
+   "issues": [
+    "#179"
+   ],
+   "note": "delete_batch sends every key to the bucket of uris[0]: the bucket-B2 target survives, the same-key decoy in bucket B1 is deleted, Ok returned"
+  },
+  {
+   "match": {
+    "case": [
+     "host443_get",
+     "host443_get_range"
+    ],
+    "call": "c1"
+   },
+   "action": "HANG",
+   "record": "HANG",
+   "issues": [
+    "#173"
+   ],
+   "note": "sync get/get_range on a host-form URI hang forever (store not yet cached)"
+  },
+  {
+   "match": {
+    "case": "host443_decoydefault_get_many",
+    "call": [
+     "m1",
+     "m2"
+    ]
+   },
+   "action": "WRONG-ACTION:port,scheme,server",
+   "record": "OK",
+   "issues": [
+    "#171"
+   ],
+   "note": "get_many ignores the host-form URI and uses the configured endpoint (here an unroutable decoy); the rows truthfully name that endpoint"
+  },
+  {
+   "match": {
+    "case": [
+     "portless_get",
+     "portless_put"
+    ],
+    "call": "c1"
+   },
+   "action": "WRONG-ACTION:outcome,server",
+   "record": "DUPLICATE+WRONG-FIELD:server",
+   "issues": [
+    "#178",
+    "#169"
+   ],
+   "note": "s3://10.255.255.1/bucket/key: the host is ignored, the call goes to AWS_ENDPOINT_URL and succeeds; the LoggedObjectStore row names the host that was never contacted"
+  },
+  {
+   "match": {
+    "case": "portless_stat",
+    "call": "c1"
+   },
+   "action": "WRONG-ACTION:outcome,server",
+   "record": "WRONG-FIELD:server",
+   "issues": [
+    "#178"
+   ],
+   "note": "same as portless_get, for stat"
+  }
+ ],
+ "process": [
+  {
+   "case": "me_host443",
+   "issues": [
+    "#192"
+   ],
+   "note": "intermittent SIGSEGV (exit 139) at interpreter exit after a failed MultiEndpointStore get (~50% of runs)"
+  }
+ ],
+ "reported_but_not_reproduced_on_0.9.114": {
+  "#171 stat (host-form :443)": "host443_decoydefault_stat: stat went to the host-form host on :443 over https (SDK log), correct object, 1 correct row",
+  "#171 get_async (host-form :443)": "host443_decoydefault_get_async: GetObject went to the host-form host on :443 over https; only the missing row (#174) is wrong",
+  "#175 MultiEndpointStore.get/put": "multi_endpoint get/put DO produce one (legacy S3Ops-style) row each; only get_range/list/delete are silent",
+  "#189 exists() false": "exists_missing writes a HEAD row WITH an error text (not a success row)"
+ },
+ "audit_unasked_deletions": [
+  {
+   "bucket": "B1",
+   "key_rel": "db/x2",
+   "issues": [
+    "#179"
+   ],
+   "note": "the same-key decoy in the other bucket, deleted by delete_batch"
+  }
+ ]
+}

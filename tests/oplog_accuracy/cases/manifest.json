@@ -1,0 +1,274 @@
+[
+ {
+  "case": "core",
+  "script": "c01_core.py",
+  "forms": [
+   "path",
+   "fileuri"
+  ],
+  "timeout": 120
+ },
+ {
+  "case": "repeat",
+  "script": "c02_repeat.py",
+  "forms": [
+   "fileuri"
+  ],
+  "timeout": 120
+ },
+ {
+  "case": "two_buckets",
+  "script": "c03_two_buckets.py",
+  "forms": [
+   "path"
+  ],
+  "timeout": 120
+ },
+ {
+  "case": "leading_slash",
+  "script": "c04_leading_slash.py",
+  "forms": [
+   "fileuri"
+  ],
+  "timeout": 120
+ },
+ {
+  "case": "async",
+  "script": "c05_async.py",
+  "forms": [
+   "path"
+  ],
+  "timeout": 120
+ },
+ {
+  "case": "get_many",
+  "script": "c06_get_many.py",
+  "forms": [
+   "fileuri"
+  ],
+  "timeout": 120
+ },
+ {
+  "case": "local_files",
+  "script": "c07_local_files.py",
+  "forms": [
+   "path",
+   "fileuri"
+  ],
+  "timeout": 60
+ },
+ {
+  "case": "s3_dest_reject",
+  "script": "c08_s3_dest_reject.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 60
+ },
+ {
+  "case": "multi_endpoint",
+  "script": "c11_multi_endpoint.py",
+  "forms": [
+   "path"
+  ],
+  "timeout": 120
+ },
+ {
+  "case": "delete_batch",
+  "script": "c12_delete_batch.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90
+ },
+ {
+  "case": "host443_get",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 25,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "host443",
+   "H_OP": "get"
+  }
+ },
+ {
+  "case": "host443_stat",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 25,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "host443",
+   "H_OP": "stat"
+  }
+ },
+ {
+  "case": "host443_get_range",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 25,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "host443",
+   "H_OP": "get_range"
+  }
+ },
+ {
+  "case": "host443_get_async",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 25,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "host443",
+   "H_OP": "get_async"
+  }
+ },
+ {
+  "case": "host443_decoydefault_stat",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 25,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "host443",
+   "H_OP": "stat",
+   "AWS_ENDPOINT_URL": "http://10.255.255.1:9"
+  }
+ },
+ {
+  "case": "host443_decoydefault_get_async",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 25,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "host443",
+   "H_OP": "get_async",
+   "AWS_ENDPOINT_URL": "http://10.255.255.1:9"
+  }
+ },
+ {
+  "case": "host443_decoydefault_get_many",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 25,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "host443",
+   "H_OP": "get_many",
+   "AWS_ENDPOINT_URL": "http://10.255.255.1:9"
+  }
+ },
+ {
+  "case": "portless_get",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 40,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "portless",
+   "H_OP": "get"
+  }
+ },
+ {
+  "case": "portless_stat",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 40,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "portless",
+   "H_OP": "stat"
+  }
+ },
+ {
+  "case": "portless_put",
+  "script": "c09_hostform.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 40,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10,
+   "H_MODE": "portless",
+   "H_OP": "put"
+  }
+ },
+ {
+  "case": "me_host443",
+  "script": "c11b_me_host443.py",
+  "forms": [
+   "path"
+  ],
+  "single_form": true,
+  "timeout": 90,
+  "env": {
+   "H_CALL_TIMEOUT": 25,
+   "S3DLIO_MAX_RETRY_ATTEMPTS": 1,
+   "S3DLIO_CONNECT_TIMEOUT_SECS": 5,
+   "S3DLIO_OPERATION_TIMEOUT_SECS": 10
+  }
+ }
+]
