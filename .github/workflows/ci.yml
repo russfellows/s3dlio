@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main, master]
 
+# Least privilege for every job: CI only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test on ${{ matrix.os }}

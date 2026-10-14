@@ -438,11 +438,11 @@ mod tests {
             .expect("live Azure container listing should succeed");
         let expected_prefix = format!("az://{account}/");
         for container in containers {
+            // The message deliberately omits the account name and the URI (which embeds
+            // it): CodeQL rust/cleartext-logging treats the account as sensitive.
             assert!(
                 container.uri.starts_with(&expected_prefix),
-                "Azure container URI '{}' must use account prefix '{}'",
-                container.uri,
-                expected_prefix
+                "an Azure container URI does not use the configured account prefix"
             );
         }
     }

@@ -29,8 +29,7 @@ import textwrap
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
-from xml.etree import ElementTree
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape, unescape
 
 import pytest
 
@@ -40,6 +39,28 @@ from test_oplog_lifecycle import run_scenario
 # ----------------------------------------------------------------------------
 # Recording mock S3
 # ----------------------------------------------------------------------------
+
+
+def _delete_objects_keys(body: bytes) -> list:
+    """The <Key> values of a DeleteObjects request body, in order.
+
+    A plain linear scan: no regular expression (CodeQL py/polynomial-redos) and
+    no XML parser (CodeQL py/xml-bomb). The mock only ever sees requests from
+    this test's own client; keys are XML-escaped by the SDK, so unescape them.
+    """
+    text = body.decode("utf-8", "replace")
+    keys = []
+    pos = 0
+    while True:
+        start = text.find("<Key>", pos)
+        if start < 0:
+            return keys
+        start += len("<Key>")
+        end = text.find("</Key>", start)
+        if end < 0:
+            return keys
+        keys.append(unescape(text[start:end]))
+        pos = end + len("</Key>")
 
 
 class MockS3:
@@ -83,10 +104,7 @@ class MockS3:
                 key = path.lstrip("/").partition("/")[2]
                 body_keys = []
                 if self.command == "POST" and body:
-                    # Parse the DeleteObjects XML properly (namespace-agnostic) instead of
-                    # scanning it with a regex; ElementTree also decodes XML entities.
-                    root = ElementTree.fromstring(body)
-                    body_keys = [el.text or "" for el in root.iter() if el.tag.rsplit("}", 1)[-1] == "Key"]
+                    body_keys = _delete_objects_keys(body)
                 status, resp = mock.respond(self.command, key, query, body_keys)
                 with mock.lock:
                     mock.log.append(
