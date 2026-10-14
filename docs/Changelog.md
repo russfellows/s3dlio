@@ -1,5 +1,37 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Changed — `s3-cli delete` contract (INTENTIONAL COMPATIBILITY CHANGE) (#210, #167)
+
+`s3-cli delete` (alias `rm`) no longer expands a name into a prefix. **Scripts that relied on the old
+implicit expansion will now fail or delete less; add `-r` where you mean "everything under".**
+
+- `delete s3://bkt/foo` and `delete s3://bkt/foo/` delete ONLY the object with exactly that key.
+  A trailing slash alone no longer authorizes a recursive delete (#167). The old prefix-without-`-r`
+  expansion and the fallback that listed the parent "directory" and deleted what it returned are
+  removed; that fallback deleted objects the user never named (for example a folder marker `other/`
+  when `delete s3://bkt/testprefix` matched nothing) (#210).
+- If the exact object is absent the command exits non-zero with `no such object: ...; use -r to
+  delete everything under a prefix`. This is **deliberately stricter than S3's idempotent
+  DELETE**: the command does a HEAD first, so it can need read/HEAD permission in addition to delete
+  permission. A 403 or any other lookup failure stops the command with that error (no listing, no
+  delete).
+- `delete -r s3://bkt/foo/` deletes the real objects under the literal prefix `foo/` (recursive listing
+  with no delimiter; synthetic common-prefix entries are never delete candidates).
+  `delete -r s3://bkt/foo` uses the literal prefix `foo`, so it also matches `foobar` (no `/` is
+  appended). Key characters are never read as a regex or wildcard.
+- `-p/--pattern` is accepted only with `-r` and filters the `-r` selection; without `-r` it is an error.
+- Messages no longer overstate: `Deleted s3://bkt/foo` for an exact delete; `Sent delete requests for N
+  objects found under prefix ... (N listed; 0 reported errors)` for `-r`. S3 reports non-existent keys
+  as deleted, so no "N deleted" count is claimed. A failed delete request, including a per-key error in
+  an HTTP 200 response, names the keys and exits non-zero. A listing failure is now an error (it
+  used to end the delete early and report success).
+- Works with the process-wide client and with a per-endpoint client (`s3://host:port/bkt/...`), under
+  the #197 route-or-reject rules. New `ObjectStore` methods (default implementations provided):
+  `stat_if_exists` and `list_objects_with_prefix`. Python `delete()` and the library `delete_prefix`
+  are not changed by this entry.
+
 ## Version 0.9.122 — Op-log accuracy (each call recorded once), server routing for every operation, replay fixes, Azure credential fix
 
 Fixes 14 issues: #169, #174, #177, #181, #182, #189, #196, #197, #199, #200, #183, #184, #187, #202.

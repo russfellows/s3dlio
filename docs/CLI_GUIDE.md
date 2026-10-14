@@ -227,34 +227,76 @@ s3-cli download -j 128 s3://bucket/large-dataset/ ./dataset/
 
 ### delete - Delete Objects
 
-Delete one or more objects. Supports prefix deletion and regex filtering.
+Delete one exact object, or, with `-r`, every object under a literal key prefix. Alias: `rm`.
 
 ```bash
 s3-cli delete [OPTIONS] <URI>
 ```
 
+**The contract** (`bkt` is a bucket; `URI` may also be the host form `s3://host:port/bkt/...`,
+which is sent to that server):
+
+| Command | Behavior |
+|---------|----------|
+| `delete s3://bkt/foo` | Deletes ONLY the object whose key is exactly `foo`. Never `foobar`, never `foo/child`. |
+| `delete s3://bkt/foo/` | Deletes ONLY the object whose key is exactly `foo/` (a zero-byte "folder marker"), if it exists. A trailing slash alone never means "recursive". |
+| either, exact object absent | Fails with a non-zero exit: `no such object: s3://bkt/foo; use -r to delete everything under a prefix`. Nothing is listed and nothing is deleted. |
+| `delete -r s3://bkt/foo/` | Deletes the real objects whose key starts with `foo/`, nested ones included (`foo/a`, `foo/b/c`, and the marker `foo/` if present). Never `foobar`. |
+| `delete -r s3://bkt/foo` | Deletes the real objects whose key starts with the literal text `foo`. **This also matches `foobar` and `foo2/x`.** No `/` is appended for you. Write `foo/` to stay inside the folder. |
+
+How it works:
+
+- **Exact delete.** The object is looked up with a HEAD request first. A 404 gives the
+  "no such object" error. A permission error (403) or any other lookup failure stops the command
+  with that error; it never falls back to listing or to a broader delete. Deletion therefore needs
+  read (HEAD) permission in addition to delete permission. This is deliberately stricter than S3's
+  own idempotent DELETE, which reports success for a missing key.
+- **Recursive delete.** The prefix is listed with no delimiter, so only real objects are returned
+  (synthetic "directory" entries are never delete candidates), then deleted in batches of up to
+  1,000 keys. Characters in the key are literal: `*`, `.`, `[` and so on are never read as a pattern.
+- **`-p/--pattern`** is a client-side regex that narrows the `-r` selection (it is matched against
+  each listed object URI, `s3://bkt/key`). It is an error without `-r`.
+- **Reporting.** S3 reports a key that does not exist as "deleted", so the command does not claim a
+  deleted count. An exact delete prints `Deleted s3://bkt/foo`. A recursive delete prints
+  `Sent delete requests for N objects found under prefix s3://bkt/foo/ (N listed; 0 reported errors)`,
+  or `No objects found under prefix: ...` (exit 0) when nothing matched. If any delete request
+  reports an error, including a per-key error inside a successful HTTP response, the keys are named,
+  the command stops starting new batches, and the exit code is non-zero.
+
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `-r, --recursive` | Delete all objects under prefix |
-| `-j, --jobs <N>` | Concurrent deletion jobs (default: 32) |
-| `-p, --pattern <REGEX>` | Only delete objects matching regex |
+| `-r, --recursive` | Delete every object under the literal key prefix (recursive listing) |
+| `-p, --pattern <REGEX>` | With `-r` only: narrow the selection to URIs matching the regex |
+| `-j, --jobs <N>` | Accepted for compatibility; currently not used (batches are 1,000 keys) |
 
 **Examples:**
 
 ```bash
-# Delete single object
-s3-cli delete s3://bucket/file.txt
+# Delete one object (HEAD first; fails if it does not exist)
+s3-cli delete s3://bucket/dir/file.txt
 
-# Delete all objects under prefix
+# Delete a folder-marker object only; dir/file.txt is untouched
+s3-cli delete s3://bucket/dir/
+
+# Delete everything under the folder dir/
 s3-cli delete -r s3://bucket/temp-data/
 
-# Delete only .log files
-s3-cli delete -r s3://bucket/logs/ -p '.*\.log$'
+# CAUTION: the literal prefix "temp" also matches temp-data/..., temporary.txt, tempest/...
+s3-cli delete -r s3://bucket/temp
 
-# High-concurrency deletion
-s3-cli delete -r -j 100 gs://bucket/old-data/
+# Delete only .log objects under a folder
+s3-cli delete -r s3://bucket/logs/ -p '\.log$'
+
+# Same, against a specific server
+s3-cli delete -r s3://10.0.0.5:9000/bucket/logs/
 ```
+
+**Migrating from earlier versions.** `delete s3://bkt/prefix/` (no `-r`) and
+`delete s3://bkt/prefix` used to expand to the objects found under the name, with a fallback that
+listed the parent "directory" (issues #167, #210: it could delete objects that were never named, and
+it printed "Successfully deleted" when it deleted nothing). That behavior is gone. Add `-r` where you
+mean "everything under".
 
 ---
 
