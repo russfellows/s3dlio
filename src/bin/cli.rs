@@ -2751,6 +2751,60 @@ mod tests {
         }
     }
 
+    // Issue #178 (review F9/F10): --endpoints entries are held to the same strict
+    // host:port grammar as the URI parser, with messages that fit the input.
+    #[test]
+    fn endpoints_entries_are_validated_with_specific_messages() {
+        for (bad, hint) in [
+            ("http://host:9000", "looks like a URL"),
+            ("https://host", "looks like a URL"),
+            ("arn:aws:s3:us-east-1:123:accesspoint", "looks like an ARN"),
+            ("host:+9000", "invalid port '+9000'"),
+            ("host:0", "invalid port '0'"),
+            ("host:09000", "leading zero"),
+            ("user@host:9000", "userinfo"),
+            ("[x]:9000", "invalid IPv6 address 'x'"),
+            ("[10.0.0.5]:9000", "IPv4 address inside brackets"),
+            ("[::1", "unterminated '['"),
+            (":9000", "missing host"),
+            ("host:", "empty port"),
+            ("::1", "unbracketed IPv6"),
+            ("host:9000:x", "more than one ':'"),
+            ("10.9.0.17:9000,http://10.9.0.18:9000", "looks like a URL"),
+        ] {
+            let msg = format!(
+                "{:#}",
+                build_s3_endpoint_uris(bad, "s3://bucket/").unwrap_err()
+            );
+            assert!(msg.contains(hint), "{bad}: want {hint:?}, got {msg}");
+            assert!(
+                msg.contains("--endpoints entry"),
+                "{bad}: error must name the --endpoints entry, got {msg}"
+            );
+            let msg = format!("{:#}", build_s3_host_root_uris(bad).unwrap_err());
+            assert!(
+                msg.contains(hint),
+                "{bad} (root uris): want {hint:?}, got {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_s3_rejects_malformed_first_segments() {
+        for (uri, hint) in [
+            ("s3://host:+9000/bkt", "invalid port"),
+            ("s3://user@host:9000/bkt", "userinfo"),
+            ("s3://[x]:9000/bkt", "invalid IPv6 address"),
+            (
+                "s3://arn:aws:s3:us-east-1:123:accesspoint/x",
+                "looks like an ARN",
+            ),
+        ] {
+            let msg = format!("{:#}", extract_container_name(uri).unwrap_err());
+            assert!(msg.contains(hint), "{uri}: want {hint:?}, got {msg}");
+        }
+    }
+
     #[test]
     fn build_s3_endpoint_uris_rejects_empty_list() {
         assert!(build_s3_endpoint_uris("  ,  ", "s3://bucket/").is_err());

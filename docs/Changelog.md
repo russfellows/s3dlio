@@ -5,11 +5,27 @@
 - **The first segment of `s3://X/...` is a server only when it carries an
   explicit port** (`host:port` or `[ipv6]:port`). Otherwise it is always a
   bucket. One shared rule (`s3_utils::classify_s3_first_segment`) now decides
-  this for the URI parser, the store factory, `MultiEndpointStore` and the CLI,
-  which previously used three different rules. The disagreement made
-  `s3://10.0.0.5/bkt/key` take bucket/key from the parser but send the request
-  to whatever `AWS_ENDPOINT_URL` said (#178), and made real dotted bucket names
-  such as `data.example.com` parse as servers (#193).
+  this for the URI parser, the store factory (`store_for_uri*`),
+  `MultiEndpointStore` and the `s3-cli` bucket commands (`create-bucket` /
+  `delete-bucket`) and `--endpoints` lists, which previously used different
+  rules. The disagreement made `s3://10.0.0.5/bkt/key` take bucket/key from the
+  parser but send the request to whatever `AWS_ENDPOINT_URL` said (#178), and
+  made real dotted bucket names such as `data.example.com` parse as servers
+  (#193). **Other paths do not share the rule yet** and can still ignore a
+  server named in the URI: the Python store cache and Python get/stat/get_many
+  helpers (#171), `S3ObjectStore` operations on a URI naming a different server
+  than the store's own (#197), the Python `create_bucket` / `delete_bucket`
+  helpers (#199), and `list_containers` / `s3-cli list-buckets` (#200).
+- **Strict grammar:** a server is `host:port` or `[ipv6]:port` with a plain
+  decimal port from 1 to 65535 (no `+`, no leading zeros, not `0`), a valid IPv6
+  address inside the brackets, and no userinfo. URLs (`http://host:9000`), ARNs,
+  an empty first segment and an empty host or port are rejected with specific
+  messages.
+- **Errors instead of fallbacks:** `store_for_uri`, `store_for_uri_with_logger`,
+  `store_for_uri_with_config*`, `MultiEndpointStore::new` and
+  `MultiEndpointStore::from_config` now return an error for an invalid first
+  segment. Previously a parse problem was swallowed, or the endpoint silently fell
+  back to the global client.
 - **Breaking:** a portless DNS name is now a bucket (`s3://minio.example.com/bkt/key`
   is bucket `minio.example.com`, key `bkt/key`). A portless IPv4 literal
   (`s3://10.0.0.5/bkt/key`) and an unbracketed or portless IPv6 are errors, since
@@ -20,7 +36,11 @@
   A deprecation period is not possible because a portless host and a dotted
   bucket name are the same grammar.
 - `S3DLIO_S3_ENDPOINT_HINT_TLDS` (added in 0.9.109) is deprecated and ignored;
-  a one-time warning is logged if it is set. The built-in suffix list is removed.
+  the variable is checked once, at the first URI parse in the process, and a
+  warning is then logged and written once to stderr. The built-in suffix list is
+  removed. `MultiEndpointStore` also warns when an endpoint's first segment is a
+  bucket that contains a dot (a likely old portless host-form endpoint) and names
+  the fix: add `:port`.
 - `s3-cli create-bucket` / `delete-bucket` on `s3://host:port/bkt` now operate on
   bucket `bkt` on that server (#194); before, the bucket name was `host:port` and
   the request went to the global endpoint. Per-endpoint S3 stores now create and

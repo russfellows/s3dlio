@@ -339,9 +339,30 @@ Standard AWS environment variables are also supported:
 
 The first segment of `s3://X/...` names a **server** only when it carries an
 explicit port; otherwise it is **always a bucket**. One rule
-(`s3dlio::s3_utils::classify_s3_first_segment`) is shared by the URI parser
-(`parse_s3_uri_full`), the store factory, `MultiEndpointStore` and the CLI
-bucket commands, so they cannot disagree.
+(`s3dlio::s3_utils::classify_s3_first_segment`) is shared by exactly these
+components, so they agree with each other:
+
+- the URI parser (`parse_s3_uri_full`, and `parse_s3_uri` which wraps it);
+- the store factory (`store_for_uri`, `store_for_uri_with_logger`,
+  `store_for_uri_with_config*`);
+- `MultiEndpointStore` (`new` / `from_config`);
+- `s3-cli create-bucket` / `delete-bucket` and every `--endpoints` entry.
+
+**Not covered yet.** Other code paths that accept an `s3://` URI do not call this
+rule and can still ignore a server named in the URI: the Python store cache and
+Python get/stat/get_many helpers (#171), `S3ObjectStore` operations on a URI that
+names a different server than the store's own (#197), the Python
+`create_bucket` / `delete_bucket` helpers (#199), and `list_containers` /
+`s3-cli list-buckets` (#200). Until those are fixed, use the single-endpoint
+`AWS_ENDPOINT_URL` or the paths listed above when a request must reach a
+specific server.
+
+**Strict `host:port` grammar.** A server is `host:port` or `[ipv6]:port`, where
+the port is plain decimal digits from `1` to `65535` with no sign and no leading
+zeros (`:09000`, `:+9000` and `:0` are errors), the bracketed content is a valid
+IPv6 address, and there is no userinfo (`user@host:9000` is an error). URLs
+(`http://host:9000`), ARNs and an empty first segment are rejected with a message
+that says what was wrong; they are not reported as IPv6 problems.
 
 | URI | Meaning |
 |-----|---------|
@@ -353,17 +374,29 @@ bucket commands, so they cannot disagree.
 | `s3://10.0.0.5/bkt/key` | **error**: an IP address with no port (S3 forbids IP-shaped bucket names, so it is not a bucket either). Add `:port`, e.g. `s3://10.0.0.5:9000/bkt/key` |
 | `s3://[::1]/bkt/key`, `s3://::1/bkt/key` | **error**: IPv6 must be bracketed and carry a port (`s3://[::1]:9000/bkt/key`) |
 
-The same rule applies to `s3-cli create-bucket` / `delete-bucket`:
-`s3://host:port/bkt` creates / deletes bucket `bkt` **on that server** (before,
-the bucket name was taken to be `host:port`), and to every entry of `--endpoints`,
-which must each be `host:port` (a portless entry is an error).
+For `s3-cli create-bucket` / `delete-bucket`, `s3://host:port/bkt` creates /
+deletes bucket `bkt` **on that server** (before, the bucket name was taken to be
+`host:port`). Every `--endpoints` entry must be `host:port` (a portless entry, or
+a URL such as `http://host:9000`, is an error).
+
+**Errors, not fallbacks.** `store_for_uri*` and `MultiEndpointStore::new` /
+`from_config` now return an error for an invalid first segment (a portless IP, a
+malformed port, ...). Previously a parse problem was swallowed and the request
+went to the global client.
 
 **`S3DLIO_S3_ENDPOINT_HINT_TLDS` is deprecated and ignored.** It extended a
 hostname-suffix heuristic (`com`, `net`, `local`, `internal`, …) that made a
 portless name such as `minio.example.com` a server. That heuristic is gone: a
 portless name is a bucket. The variable is kept as a no-op rather than removed so
-that a script that still exports it keeps running; s3dlio logs a one-time warning
-if it is set. Remove it and put the port in the URI instead.
+that a script that still exports it keeps running. The variable is checked once,
+at the first URI parse in the process (setting it later has no effect and no
+warning); if it is set then, s3dlio logs a warning through `tracing` and also
+writes it once to stderr, so it is visible without a tracing subscriber. Remove
+it and put the port in the URI instead.
+
+`MultiEndpointStore` also logs a warning when an endpoint's first segment is
+treated as a bucket but contains a dot (for example an old `s3://minio.example.com/bucket/`
+endpoint): it names the endpoint and says to add `:port` if it is a server.
 
 > **Breaking change (Unreleased).** v0.9.109 – v0.9.114 treated a portless first
 > segment as a server when it was an IPv4 literal or ended in a hostname-like

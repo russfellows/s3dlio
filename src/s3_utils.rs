@@ -428,44 +428,117 @@ fn looks_like_ipv4(s: &str) -> bool {
         })
 }
 
-/// Warn once, process-wide, if the retired `S3DLIO_S3_ENDPOINT_HINT_TLDS`
-/// variable is set: it no longer has any effect (issue #178).
+/// Text of the one-time deprecation warning for the retired
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable.
+const RETIRED_HINT_TLDS_WARNING: &str =
+    "S3DLIO_S3_ENDPOINT_HINT_TLDS is deprecated and ignored: an s3:// URI now names \
+     a server only when its first segment carries an explicit port \
+     (s3://host:port/bucket/key); every other first segment is a bucket (issue #178)";
+
+/// Warn once per process, at the first parse, if the retired
+/// `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is set: it no longer has any effect
+/// (issue #178).
+///
+/// The environment is read exactly once, the first time
+/// [`classify_s3_first_segment`] runs; setting the variable later in the same
+/// process neither warns nor changes anything. The warning goes to `tracing` AND
+/// to stderr, so it is visible in programs (and CLIs) that never install a
+/// tracing subscriber.
 fn warn_if_retired_hint_tlds_env_set() {
+    use std::io::Write;
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         if std::env::var_os("S3DLIO_S3_ENDPOINT_HINT_TLDS").is_some() {
-            tracing::warn!(
-                "S3DLIO_S3_ENDPOINT_HINT_TLDS is deprecated and ignored: an s3:// URI now names \
-                 a server only when its first segment carries an explicit port \
-                 (s3://host:port/bucket/key); every other first segment is a bucket (issue #178)"
+            tracing::warn!("{RETIRED_HINT_TLDS_WARNING}");
+            // Best effort: a closed or full stderr must not fail a parse.
+            let _ = writeln!(
+                std::io::stderr(),
+                "s3dlio: warning: {RETIRED_HINT_TLDS_WARNING}"
             );
         }
     });
 }
 
+/// Validate the port part of `host:port` / `[ipv6]:port`.
+///
+/// Accepted: plain ASCII decimal digits, no leading zeros, value `1..=65535`.
+/// `u16::from_str` alone is too lax (it accepts a leading `+` and `0`); leading
+/// zeros are rejected because `host:09000` is ambiguous (octal habits) and would
+/// otherwise leave two spellings of one server in configs, URLs and logs.
+fn validate_s3_server_port(port: &str, segment: &str) -> Result<()> {
+    if port.is_empty() {
+        bail!(
+            "empty port in '{segment}': a server must be host:port with a port from 1 to 65535 \
+             (e.g. s3://host:9000/bucket/key)"
+        );
+    }
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        bail!(
+            "invalid port '{port}' in '{segment}': a port is 1 to 65535 written as plain decimal \
+             digits (no sign or other characters), e.g. s3://host:9000/bucket/key"
+        );
+    }
+    if port.len() > 1 && port.starts_with('0') {
+        bail!(
+            "invalid port '{port}' in '{segment}': leading zeros are not accepted; write the \
+             port without them (e.g. :9000)"
+        );
+    }
+    match port.parse::<u16>() {
+        Ok(n) if n >= 1 => Ok(()),
+        _ => bail!(
+            "invalid port '{port}' in '{segment}': a port must be from 1 to 65535 \
+             (e.g. s3://host:9000/bucket/key)"
+        ),
+    }
+}
+
 /// THE single rule that decides whether the first path segment of an `s3://`
 /// URI is a server or a bucket. The URI parser ([`parse_s3_uri_full`]), the
-/// store factory, `MultiEndpointStore` and the CLI bucket commands all call
-/// this, so they cannot disagree (issues #178, #193, #194).
+/// store factory (`store_for_uri*`), `MultiEndpointStore` and the `s3-cli`
+/// bucket commands and `--endpoints` lists all call this, so those components
+/// cannot disagree (issues #178, #193, #194). Other code paths that handle
+/// `s3://` URIs do not call it yet; see the Changelog for the tracking issues.
 ///
-/// - `host:port` or `[ipv6]:port` (explicit, valid `u16` port) → [`S3FirstSegment::Server`].
+/// - `host:port` or `[ipv6]:port` (explicit port, plain decimal `1..=65535`, no
+///   leading zeros) → [`S3FirstSegment::Server`]. The bracketed content must be a
+///   valid IPv6 address.
 /// - A dotted-quad IPv4 literal with no port → **error**. S3 forbids IP-shaped
 ///   bucket names, so it is not a bucket; the caller must add `:port`.
 /// - An IPv6 literal without brackets or without a port → **error**.
-/// - A colon with an empty host or an unparsable port → **error**.
+/// - Userinfo (`user@host:9000`), a URL (`http://host:9000`), an ARN, an empty
+///   segment, an empty host or port, or a malformed port → **error**, each with
+///   a message that names what was wrong.
 /// - Anything else — including dotted DNS-looking names such as
-///   `data.example.com` and `localhost` → [`S3FirstSegment::Bucket`].
+///   `data.example.com` and `localhost` → [`S3FirstSegment::Bucket`]. Bucket
+///   names are not otherwise validated here.
 pub fn classify_s3_first_segment(segment: &str) -> Result<S3FirstSegment<'_>> {
     warn_if_retired_hint_tlds_env_set();
 
-    let validate_port = |port: &str| -> Result<()> {
-        port.parse::<u16>().map(|_| ()).map_err(|_| {
-            anyhow::anyhow!(
-                "invalid port '{port}' in '{segment}': an S3 URI server must be host:port \
-                 with a port from 0 to 65535 (e.g. s3://host:9000/bucket/key)"
-            )
-        })
-    };
+    if segment.is_empty() {
+        bail!(
+            "empty first segment in the S3 URI: expected a bucket name (s3://bucket/key) or a \
+             server with a port (s3://host:9000/bucket/key)"
+        );
+    }
+    if segment.contains("://") {
+        bail!(
+            "'{segment}' looks like a URL; a server is written host:port without a scheme \
+             or path (e.g. host:9000)"
+        );
+    }
+    if segment.contains('@') {
+        bail!(
+            "'{segment}' contains userinfo ('@'), which is not supported; write the server as \
+             host:port and supply credentials through the environment"
+        );
+    }
+    if segment.starts_with("arn:") && segment.matches(':').count() >= 2 {
+        bail!(
+            "'{segment}' looks like an ARN; ARNs are not supported here — use s3://bucket/key, \
+             or s3://host:port/bucket/key to name a server"
+        );
+    }
 
     if let Some(rest) = segment.strip_prefix('[') {
         // Bracketed IPv6: "[addr]:port"
@@ -475,14 +548,34 @@ pub fn classify_s3_first_segment(segment: &str) -> Result<S3FirstSegment<'_>> {
         if addr.is_empty() {
             bail!("empty IPv6 address in '{segment}'");
         }
-        let Some(port) = after.strip_prefix(':') else {
+        if addr.parse::<std::net::Ipv6Addr>().is_err() {
+            if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+                bail!(
+                    "'{segment}' puts an IPv4 address inside brackets; brackets are for IPv6 \
+                     only — write {addr}:port"
+                );
+            }
+            bail!("invalid IPv6 address '{addr}' in '{segment}'");
+        }
+        if after.is_empty() {
             bail!(
                 "'{segment}' names an IPv6 address without a port; add :port, \
                  e.g. s3://{segment}:9000/bucket/key"
             );
+        }
+        let Some(port) = after.strip_prefix(':') else {
+            bail!(
+                "unexpected text '{after}' after ']' in '{segment}': an IPv6 server is written \
+                 [addr]:port"
+            );
         };
-        validate_port(port)?;
+        validate_s3_server_port(port, segment)?;
         return Ok(S3FirstSegment::Server(segment));
+    }
+    if segment.contains(['[', ']']) {
+        bail!(
+            "unexpected bracket in '{segment}': brackets are only for an IPv6 server, [addr]:port"
+        );
     }
 
     match segment.matches(':').count() {
@@ -500,12 +593,16 @@ pub fn classify_s3_first_segment(segment: &str) -> Result<S3FirstSegment<'_>> {
             if host.is_empty() {
                 bail!("missing host before ':' in '{segment}': use host:port, e.g. s3://host:9000/bucket/key");
             }
-            validate_port(port)?;
+            validate_s3_server_port(port, segment)?;
             Ok(S3FirstSegment::Server(segment))
         }
+        _ if segment.parse::<std::net::Ipv6Addr>().is_ok() => bail!(
+            "'{segment}' is an unbracketed IPv6 address; write it in brackets with a \
+             port, e.g. s3://[{segment}]:9000/bucket/key (add :port)"
+        ),
         _ => bail!(
-            "'{segment}' looks like an unbracketed IPv6 address; write it in brackets with a \
-             port, e.g. s3://[::1]:9000/bucket/key (add :port)"
+            "'{segment}' contains more than one ':' and is not an IPv6 address; a server is \
+             written host:port or [ipv6]:port"
         ),
     }
 }
@@ -2727,6 +2824,149 @@ mod tests {
             s.contains("connection refused"),
             "expected connector-error detail in top message, got: {}",
             s
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // classify_s3_first_segment (issues #178 / #193): the strict host:port grammar
+    // -------------------------------------------------------------------------
+
+    enum Seg {
+        Bucket,
+        Server,
+        /// Error whose full message must contain this text.
+        Fail(&'static str),
+    }
+
+    #[test]
+    fn test_classify_first_segment_grammar() {
+        use Seg::*;
+        let rows: &[(&str, Seg)] = &[
+            // Buckets (no explicit port): never validated as bucket names.
+            ("bucket", Bucket),
+            ("my.bucket.name", Bucket),
+            ("data.example.com", Bucket),
+            ("localhost", Bucket),
+            // Not four octets / octet > 255 / trailing dot: not an IPv4 literal.
+            ("1.2.3", Bucket),
+            ("999.1.1.1", Bucket),
+            ("10.0.0.5.", Bucket),
+            // Servers: explicit, plain-decimal port 1..=65535.
+            ("host:9000", Server),
+            ("host:1", Server),
+            ("host:65535", Server),
+            ("10.0.0.5:9000", Server),
+            ("host.example.com.:9000", Server),
+            ("[::1]:9000", Server),
+            ("[2001:db8::5]:443", Server),
+            // Ports that `u16::from_str` would accept but are not plain 1..=65535.
+            ("host:+9000", Fail("invalid port '+9000'")),
+            ("host:0", Fail("invalid port '0'")),
+            ("host:00", Fail("invalid port '00'")),
+            ("host:09000", Fail("leading zero")),
+            ("host:65536", Fail("invalid port '65536'")),
+            ("host:99999", Fail("invalid port '99999'")),
+            ("host:-1", Fail("invalid port '-1'")),
+            (
+                "host:\u{0669}\u{0660}\u{0660}\u{0660}",
+                Fail("invalid port"),
+            ),
+            ("host:abc", Fail("invalid port 'abc'")),
+            ("host:", Fail("empty port")),
+            ("[::1]:", Fail("empty port")),
+            ("[::1]:0", Fail("invalid port '0'")),
+            ("[::1]:+9000", Fail("invalid port '+9000'")),
+            // Missing host.
+            (":9000", Fail("missing host")),
+            // Userinfo is never accepted, with or without a port.
+            ("user@host:9000", Fail("userinfo")),
+            ("user:pw@host:9000", Fail("userinfo")),
+            ("user@host", Fail("userinfo")),
+            ("[::1]@x:9000", Fail("userinfo")),
+            // Bracketed IPv6 content is validated.
+            ("[x]:9000", Fail("invalid IPv6 address 'x'")),
+            ("[junk]:9000", Fail("invalid IPv6 address 'junk'")),
+            ("[10.0.0.5]:9000", Fail("IPv4 address inside brackets")),
+            ("[::1", Fail("unterminated '['")),
+            ("[", Fail("unterminated '['")),
+            ("[]:9000", Fail("empty IPv6 address")),
+            ("[::1]", Fail("without a port")),
+            ("[::1]x:9000", Fail("unexpected text")),
+            ("[fe80::1%eth0]:9000", Fail("invalid IPv6 address")),
+            ("host]:9000", Fail("unexpected bracket")),
+            ("ho[st:9000", Fail("unexpected bracket")),
+            // Portless IPv4 literal (incl. leading-zero octets): an IP is never a bucket.
+            ("10.0.0.5", Fail("IP address with no port")),
+            ("010.001.002.003", Fail("IP address with no port")),
+            // Unbracketed IPv6.
+            ("::1", Fail("unbracketed IPv6")),
+            ("2001:db8::5", Fail("unbracketed IPv6")),
+            // More than one ':' that is NOT an IPv6 address must not be called IPv6.
+            ("host:9000:x", Fail("more than one ':'")),
+            ("a:b:c:d", Fail("more than one ':'")),
+            // URL-shaped input (e.g. an --endpoints entry).
+            ("http://host:9000", Fail("looks like a URL")),
+            ("https://host", Fail("looks like a URL")),
+            ("s3://host:9000", Fail("looks like a URL")),
+            // ARNs.
+            (
+                "arn:aws:s3:us-east-1:123:accesspoint",
+                Fail("looks like an ARN"),
+            ),
+            ("arn:aws:s3:::bucket", Fail("looks like an ARN")),
+            // A host that merely starts with "arn" is still a normal host:port.
+            ("arn:9000", Server),
+            ("arn", Bucket),
+            // Empty first segment.
+            ("", Fail("empty first segment")),
+        ];
+
+        let mut failures = Vec::new();
+        for (segment, want) in rows {
+            let got = classify_s3_first_segment(segment);
+            match (want, &got) {
+                (Bucket, Ok(S3FirstSegment::Bucket(b))) if b == segment => {}
+                (Server, Ok(S3FirstSegment::Server(a))) if a == segment => {}
+                (Fail(hint), Err(e)) if format!("{e:#}").contains(hint) => {
+                    // The IPv6 label must be reserved for real IPv6 addresses.
+                    if !segment.contains("::")
+                        && !segment.starts_with('[')
+                        && format!("{e:#}").contains("unbracketed IPv6")
+                    {
+                        failures.push(format!("{segment:?}: wrongly called IPv6: {e:#}"));
+                    }
+                }
+                (_, other) => {
+                    let want = match want {
+                        Bucket => "bucket".to_string(),
+                        Server => "server".to_string(),
+                        Fail(h) => format!("error containing {h:?}"),
+                    };
+                    failures.push(format!("{segment:?}: want {want}, got {other:?}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "classify_s3_first_segment mismatches:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_classify_url_and_arn_errors_name_the_fix() {
+        let url = format!(
+            "{:#}",
+            classify_s3_first_segment("http://host:9000").unwrap_err()
+        );
+        assert!(url.contains("host:9000") && url.contains("scheme"), "{url}");
+        let arn = format!(
+            "{:#}",
+            classify_s3_first_segment("arn:aws:s3:us-east-1:123:accesspoint").unwrap_err()
+        );
+        assert!(
+            arn.contains("ARN") && arn.contains("not supported"),
+            "{arn}"
         );
     }
 }

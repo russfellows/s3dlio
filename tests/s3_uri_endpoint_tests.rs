@@ -241,14 +241,14 @@ fn test_component_struct_debug() {
 // S3 bucket naming rules) or merely contain those cluster-software names
 // as a prefix of an otherwise-unrelated bucket name.
 //
-// Locked contract (docs/implementation-plans/v0.9.109-audit-fix-plan.md
-// Sec 4, bug B8): narrow the heuristic to fire only on strings that
-// grammatically look like hostnames -- contain a colon (port), are a
-// dotted-quad IPv4 address, or end in a known endpoint-hint TLD/suffix
-// (configurable via S3DLIO_S3_ENDPOINT_HINT_TLDS). "Bucket with dots" and
-// "bucket starting with a digit" no longer misroute; genuine
-// endpoint-in-URI usage (with a port, or a recognizable hostname suffix)
-// still works.
+// Contract history: v0.9.109 narrowed the heuristic to strings that looked like
+// hostnames (a colon port, a dotted-quad IPv4 literal, or a last label in a
+// hint-TLD list extendable with S3DLIO_S3_ENDPOINT_HINT_TLDS). That heuristic
+// is gone (issues #178 / #193): the first segment is a server ONLY with an
+// explicit port, and S3DLIO_S3_ENDPOINT_HINT_TLDS is deprecated and ignored
+// (see the option-C tests below). The tests in this block still hold under the
+// current rule: dotted names, digit-prefixed names and names that merely begin
+// with minio / ceph / localhost are buckets; they stay as regression guards.
 
 #[test]
 fn test_dotted_bucket_names_no_longer_misroute_as_endpoints() {
@@ -398,4 +398,73 @@ fn test_explicit_port_with_dns_name_is_a_server_issue_178() {
     assert_eq!(result.endpoint.as_deref(), Some("minio.example.com:9000"));
     assert_eq!(result.bucket, "bucket");
     assert_eq!(result.key, "key");
+}
+
+// Issue #178 review F6: the retired S3DLIO_S3_ENDPOINT_HINT_TLDS variable's
+// deprecation warning must be observable without a tracing subscriber (it is also
+// written to stderr) and must be emitted exactly once per process, at the first
+// parse. The warning is guarded by a process-wide `Once`, so each case runs the
+// test binary again as a child process with a clean environment.
+
+const HINT_TLDS_CHILD_ENV: &str = "S3DLIO_TEST_HINT_TLDS_CHILD";
+const HINT_TLDS_WARNING: &str = "S3DLIO_S3_ENDPOINT_HINT_TLDS is deprecated and ignored";
+
+/// Child-process body: parse several URIs; does nothing in the parent run.
+#[test]
+fn hint_tlds_warning_child_body() {
+    if std::env::var_os(HINT_TLDS_CHILD_ENV).is_none() {
+        return;
+    }
+    for _ in 0..3 {
+        parse_s3_uri_full("s3://bucket/key").unwrap();
+    }
+    parse_s3_uri_full("s3://host:9000/bucket/key").unwrap();
+    assert!(parse_s3_uri_full("s3://10.0.0.5/bucket/key").is_err());
+}
+
+/// Run the child body with `hint` as the value of the retired variable (or unset)
+/// and return its stderr.
+fn run_hint_tlds_child(hint: Option<&str>) -> String {
+    let exe = std::env::current_exe().expect("current test executable");
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args([
+        "--exact",
+        "hint_tlds_warning_child_body",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(HINT_TLDS_CHILD_ENV, "1")
+    .env_remove("S3DLIO_S3_ENDPOINT_HINT_TLDS");
+    if let Some(value) = hint {
+        cmd.env("S3DLIO_S3_ENDPOINT_HINT_TLDS", value);
+    }
+    let out = cmd.output().expect("run child test process");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("1 passed"),
+        "child must actually run its test body:\n{stdout}\n{stderr}"
+    );
+    stderr
+}
+
+#[test]
+fn test_hint_tlds_deprecation_warning_is_on_stderr_exactly_once() {
+    let stderr = run_hint_tlds_child(Some("storagegrid"));
+    assert_eq!(
+        stderr.matches(HINT_TLDS_WARNING).count(),
+        1,
+        "the deprecation warning must be written to stderr exactly once, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_hint_tlds_no_warning_when_variable_unset() {
+    let stderr = run_hint_tlds_child(None);
+    assert_eq!(
+        stderr.matches(HINT_TLDS_WARNING).count(),
+        0,
+        "no warning without the variable, got:\n{stderr}"
+    );
 }

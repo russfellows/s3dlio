@@ -3342,7 +3342,9 @@ pub(crate) fn s3_endpoint_url_from_uri(uri: &str) -> Result<Option<String>> {
         .with_context(|| format!("invalid S3 URI '{uri}'"))?
     {
         crate::s3_utils::S3FirstSegment::Server(authority) => {
-            Ok(s3_endpoint_url_from_authority(authority))
+            s3_endpoint_url_from_authority(authority)
+                .map(Some)
+                .with_context(|| format!("invalid S3 URI '{uri}'"))
         }
         crate::s3_utils::S3FirstSegment::Bucket(_) => Ok(None),
     }
@@ -3355,16 +3357,21 @@ pub(crate) fn s3_endpoint_url_from_uri(uri: &str) -> Result<Option<String>> {
 /// endpoint. Both the single-endpoint path ([`s3_endpoint_url_from_uri`]) and
 /// `MultiEndpointStore` use it, so they can never disagree (issue #180).
 ///
-/// Returns `None` when the authority is not a server per
-/// [`crate::s3_utils::classify_s3_first_segment`] (no valid explicit port).
-pub(crate) fn s3_endpoint_url_from_authority(authority: &str) -> Option<String> {
-    let crate::s3_utils::S3FirstSegment::Server(authority) =
-        crate::s3_utils::classify_s3_first_segment(authority).ok()?
-    else {
-        return None;
+/// Errors (never `None`/a silent fallback) when `authority` is not a server per
+/// [`crate::s3_utils::classify_s3_first_segment`]: the classifier's own error is
+/// propagated, and a bucket-shaped authority yields a "not a server" error.
+pub(crate) fn s3_endpoint_url_from_authority(authority: &str) -> Result<String> {
+    let authority = match crate::s3_utils::classify_s3_first_segment(authority)? {
+        crate::s3_utils::S3FirstSegment::Server(authority) => authority,
+        crate::s3_utils::S3FirstSegment::Bucket(name) => bail!(
+            "'{name}' is not a server: a server is host:port or [ipv6]:port with an explicit port"
+        ),
     };
     // `authority` is `host:port` or `[ipv6]:port` with a valid port.
-    let port_str = authority.rsplit(':').next()?;
+    let port_str = authority
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .ok_or_else(|| anyhow::anyhow!("no port in server authority '{authority}'"))?;
 
     // Determine HTTP scheme from port: 443 → https, everything else → http,
     // unless the operator has named this port as TLS-terminated via
@@ -3372,13 +3379,15 @@ pub(crate) fn s3_endpoint_url_from_authority(authority: &str) -> Option<String> 
     // S3-compatible endpoints on non-standard ports, e.g. a load balancer
     // terminating TLS on :9001, otherwise had no way to get an https:// URL
     // out of this heuristic short of literally using port 443).
-    let port: u16 = port_str.parse().ok()?;
+    let port: u16 = port_str
+        .parse()
+        .with_context(|| format!("invalid port '{port_str}' in server authority '{authority}'"))?;
     let http_scheme = if port == 443 || s3_endpoint_tls_ports_from_env().contains(&port) {
         "https"
     } else {
         "http"
     };
-    Some(format!("{http_scheme}://{authority}"))
+    Ok(format!("{http_scheme}://{authority}"))
 }
 
 /// Additional ports to treat as TLS-terminated for [`s3_endpoint_url_from_uri`],
@@ -4451,11 +4460,31 @@ mod s3_object_store_tests {
         }
     }
 
+    // F12: a classification error must propagate, never become "not a server".
     #[test]
-    fn s3_endpoint_url_from_authority_rejects_non_servers() {
-        assert_eq!(s3_endpoint_url_from_authority("data.example.com"), None);
-        assert_eq!(s3_endpoint_url_from_authority("10.0.0.5"), None);
-        assert_eq!(s3_endpoint_url_from_authority("host:notaport"), None);
+    fn s3_endpoint_url_from_authority_propagates_classification_errors() {
+        // Not servers at all (buckets): an error saying so.
+        for bucket in ["data.example.com", "localhost"] {
+            let err = s3_endpoint_url_from_authority(bucket).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not a server"),
+                "{bucket}: {err:#}"
+            );
+        }
+        // Classifier errors keep the classifier's own message.
+        for (bad, hint) in [
+            ("10.0.0.5", "IP address with no port"),
+            ("host:notaport", "invalid port 'notaport'"),
+            ("host:0", "invalid port '0'"),
+            ("http://host:9000", "looks like a URL"),
+        ] {
+            let err = s3_endpoint_url_from_authority(bad).unwrap_err();
+            assert!(format!("{err:#}").contains(hint), "{bad}: {err:#}");
+        }
+        assert_eq!(
+            s3_endpoint_url_from_authority("host:9000").unwrap(),
+            "http://host:9000"
+        );
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

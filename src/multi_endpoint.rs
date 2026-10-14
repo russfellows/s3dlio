@@ -246,6 +246,28 @@ fn s3_store_endpoint_url(uri: &str) -> Result<Option<String>> {
     crate::object_store::s3_endpoint_url_from_uri(uri)
 }
 
+/// The warning for an endpoint whose first segment is classified as a bucket but
+/// contains a dot (`None` for every other endpoint).
+///
+/// Before issue #178 a portless `s3://minio.example.com/bucket/` endpoint named a
+/// server; it now names a bucket and routes through the global client
+/// (`AWS_ENDPOINT_URL`). A dotted name with no port is most likely such an old
+/// endpoint, so the message says what changed and how to fix it. A genuine
+/// dotted bucket name (`s3://my.bucket.name/prefix/`) triggers the same warning;
+/// the text covers that case too.
+fn portless_host_form_warning(uri: &str) -> Option<String> {
+    let first_segment = uri.strip_prefix("s3://")?.split('/').next()?;
+    match crate::s3_utils::classify_s3_first_segment(first_segment) {
+        Ok(crate::s3_utils::S3FirstSegment::Bucket(name)) if name.contains('.') => Some(format!(
+            "multi-endpoint S3 endpoint '{uri}': '{name}' has no port, so it is treated as a \
+             BUCKET name and requests use the global client (AWS_ENDPOINT_URL), not a server \
+             named '{name}'. If '{name}' is a server, add its port: s3://{name}:PORT/<bucket>/ \
+             (issue #178)"
+        )),
+        _ => None,
+    }
+}
+
 /// Multi-endpoint ObjectStore wrapper with load balancing and per-endpoint configuration.
 ///
 /// This wrapper implements the ObjectStore trait and distributes requests across
@@ -398,6 +420,9 @@ impl MultiEndpointStore {
                         })?;
                         store_endpoint_url = Some(endpoint_url);
                         break 'store result;
+                    }
+                    if let Some(warning) = portless_host_form_warning(&endpoint_config.uri) {
+                        tracing::warn!("{warning}");
                     }
                 }
                 store_for_uri(&endpoint_config.uri).with_context(|| {
@@ -2299,8 +2324,8 @@ mod tests {
         }
     }
 
-    /// Try to build a MultiEndpointStore for `uri` with fake credentials.
-    fn try_build_store_with_fake_creds(uri: &str) -> Result<MultiEndpointStore> {
+    /// Run `f` with fake AWS credentials set (restored afterwards), holding `CRED_LOCK`.
+    fn with_fake_creds<T>(f: impl FnOnce() -> T) -> T {
         let _cred = CRED_LOCK.blocking_lock();
         let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
@@ -2312,13 +2337,19 @@ mod tests {
         #[allow(deprecated)]
         std::env::set_var("AWS_REGION", "us-east-1");
 
-        let result =
-            MultiEndpointStore::new(vec![uri.to_string()], LoadBalanceStrategy::RoundRobin, None);
+        let result = f();
 
         restore_env("AWS_ACCESS_KEY_ID", saved_key);
         restore_env("AWS_SECRET_ACCESS_KEY", saved_secret);
         restore_env("AWS_REGION", saved_region);
         result
+    }
+
+    /// Try to build a MultiEndpointStore for `uri` with fake credentials.
+    fn try_build_store_with_fake_creds(uri: &str) -> Result<MultiEndpointStore> {
+        with_fake_creds(|| {
+            MultiEndpointStore::new(vec![uri.to_string()], LoadBalanceStrategy::RoundRobin, None)
+        })
     }
 
     /// Build a MultiEndpointStore for `uri` with fake credentials and return the
@@ -2361,6 +2392,24 @@ mod tests {
             Some("https://minio.example:9001".to_string()),
             "a port in S3DLIO_S3_ENDPOINT_TLS_PORTS must be https (issue #180)"
         );
+    }
+
+    #[test]
+    fn test_portless_host_form_warning() {
+        // A dotted, portless first segment: the warning names the endpoint and the fix.
+        let w = portless_host_form_warning("s3://minio.example.com/bucket/").expect("dotted");
+        assert!(w.contains("s3://minio.example.com/bucket/"), "{w}");
+        assert!(w.contains("add its port") && w.contains(":PORT"), "{w}");
+        // No warning: plain buckets, servers with a port, errors, and non-S3 URIs.
+        for uri in [
+            "s3://bucket/prefix/",
+            "s3://minio.example.com:9000/bucket/",
+            "s3://10.0.0.5/bucket/",
+            "s3://[::1]:9000/bucket/",
+            "file:///tmp/x/",
+        ] {
+            assert_eq!(portless_host_form_warning(uri), None, "{uri}");
+        }
     }
 
     #[test]
@@ -2422,7 +2471,11 @@ mod tests {
             bucket: &'static str,
             key: &'static str,
         },
-        /// Rejected everywhere; the message must contain `hint`.
+        /// A server with no `/` after it (`s3://host:9000`): a valid
+        /// MultiEndpointStore / factory endpoint, but the full-URI parser needs a
+        /// `/` and says so.
+        ServerWithoutKey { url: &'static str },
+        /// Rejected by every component; the message must contain `hint`.
         Error { hint: &'static str },
     }
 
@@ -2431,12 +2484,32 @@ mod tests {
         crate::object_store::s3_endpoint_url_from_uri(uri)
     }
 
+    /// `store_for_uri` and `store_for_uri_with_logger(_, None)`, run with fake
+    /// credentials; `Ok(())` when a store was built, else the error text.
+    fn build_via_store_factories(uri: &str) -> (Result<(), String>, Result<(), String>) {
+        with_fake_creds(|| {
+            let plain = crate::object_store::store_for_uri(uri)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"));
+            let logged = crate::object_store::store_for_uri_with_logger(uri, None)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"));
+            (plain, logged)
+        })
+    }
+
     #[test]
     fn test_parser_factory_and_multi_endpoint_agree_on_server_vs_bucket() {
         let env = lock_tls_ports_env();
         env.clear();
 
         use Want::*;
+        let server = |authority, url, bucket, key| Server {
+            authority,
+            url,
+            bucket,
+            key,
+        };
         let corpus: Vec<(&str, Want)> = vec![
             (
                 "s3://bucket/key",
@@ -2480,6 +2553,29 @@ mod tests {
                     key: "key",
                 },
             ),
+            // Not IPv4 literals (three labels, octet > 255, trailing dot): buckets.
+            (
+                "s3://1.2.3/key",
+                Bucket {
+                    bucket: "1.2.3",
+                    key: "key",
+                },
+            ),
+            (
+                "s3://999.1.1.1/key",
+                Bucket {
+                    bucket: "999.1.1.1",
+                    key: "key",
+                },
+            ),
+            (
+                "s3://10.0.0.5./key",
+                Bucket {
+                    bucket: "10.0.0.5.",
+                    key: "key",
+                },
+            ),
+            // Portless IPv4 literals, including leading-zero octets, are errors.
             (
                 "s3://10.0.0.5/bkt/key",
                 Error {
@@ -2487,69 +2583,147 @@ mod tests {
                 },
             ),
             (
-                "s3://10.0.0.5:9000/bkt/key",
-                Server {
-                    authority: "10.0.0.5:9000",
-                    url: "http://10.0.0.5:9000",
-                    bucket: "bkt",
-                    key: "key",
+                "s3://010.001.002.003/bkt/key",
+                Error {
+                    hint: "IP address with no port",
                 },
+            ),
+            (
+                "s3://10.0.0.5:9000/bkt/key",
+                server("10.0.0.5:9000", "http://10.0.0.5:9000", "bkt", "key"),
             ),
             (
                 "s3://host.example.com:443/bkt/key",
-                Server {
-                    authority: "host.example.com:443",
-                    url: "https://host.example.com:443",
-                    bucket: "bkt",
-                    key: "key",
-                },
+                server(
+                    "host.example.com:443",
+                    "https://host.example.com:443",
+                    "bkt",
+                    "key",
+                ),
             ),
             (
                 "s3://[::1]:9000/bkt/key",
-                Server {
-                    authority: "[::1]:9000",
-                    url: "http://[::1]:9000",
-                    bucket: "bkt",
-                    key: "key",
+                server("[::1]:9000", "http://[::1]:9000", "bkt", "key"),
+            ),
+            (
+                "s3://[::1]/bkt/key",
+                Error {
+                    hint: "without a port",
                 },
             ),
-            ("s3://[::1]/bkt/key", Error { hint: ":port" }),
-            ("s3://::1/bkt/key", Error { hint: ":port" }),
+            (
+                "s3://::1/bkt/key",
+                Error {
+                    hint: "unbracketed IPv6",
+                },
+            ),
+            // Malformed ports.
             (
                 "s3://host.example.com:notaport/bkt/key",
-                Error { hint: "port" },
+                Error {
+                    hint: "invalid port 'notaport'",
+                },
             ),
-            // Out-of-range port.
             (
                 "s3://host.example.com:99999/bkt/key",
-                Error { hint: "port" },
+                Error {
+                    hint: "invalid port '99999'",
+                },
+            ),
+            (
+                "s3://host:+9000/bkt/key",
+                Error {
+                    hint: "invalid port '+9000'",
+                },
+            ),
+            (
+                "s3://host:0/bkt/key",
+                Error {
+                    hint: "invalid port '0'",
+                },
+            ),
+            (
+                "s3://host:09000/bkt/key",
+                Error {
+                    hint: "leading zero",
+                },
+            ),
+            ("s3://host:/bkt/key", Error { hint: "empty port" }),
+            (
+                "s3://:9000/bkt/key",
+                Error {
+                    hint: "missing host",
+                },
+            ),
+            (
+                "s3://:9000/",
+                Error {
+                    hint: "missing host",
+                },
+            ),
+            // Userinfo.
+            ("s3://user@host:9000/bkt/key", Error { hint: "userinfo" }),
+            // Bracketed IPv6 content.
+            (
+                "s3://[x]:9000/bkt/key",
+                Error {
+                    hint: "invalid IPv6 address 'x'",
+                },
+            ),
+            (
+                "s3://[10.0.0.5]:9000/bkt/key",
+                Error {
+                    hint: "IPv4 address inside brackets",
+                },
+            ),
+            (
+                "s3://[::1/bkt/key",
+                Error {
+                    hint: "unterminated '['",
+                },
+            ),
+            // Empty first segment.
+            (
+                "s3:///bkt/key",
+                Error {
+                    hint: "empty first segment",
+                },
+            ),
+            // ARN.
+            (
+                "s3://arn:aws:s3:us-east-1:123:accesspoint/x",
+                Error {
+                    hint: "looks like an ARN",
+                },
             ),
             // Host case and a trailing dot are kept verbatim.
             (
                 "s3://MinIO.Example.COM:9000/bkt/key",
-                Server {
-                    authority: "MinIO.Example.COM:9000",
-                    url: "http://MinIO.Example.COM:9000",
-                    bucket: "bkt",
-                    key: "key",
-                },
+                server(
+                    "MinIO.Example.COM:9000",
+                    "http://MinIO.Example.COM:9000",
+                    "bkt",
+                    "key",
+                ),
             ),
             (
                 "s3://host.example.com.:9000/bkt/key",
-                Server {
-                    authority: "host.example.com.:9000",
-                    url: "http://host.example.com.:9000",
-                    bucket: "bkt",
-                    key: "key",
-                },
+                server(
+                    "host.example.com.:9000",
+                    "http://host.example.com.:9000",
+                    "bkt",
+                    "key",
+                ),
             ),
             (
                 "s3://[::1]:443/bkt/key",
-                Server {
-                    authority: "[::1]:443",
-                    url: "https://[::1]:443",
-                    bucket: "bkt",
-                    key: "key",
+                server("[::1]:443", "https://[::1]:443", "bkt", "key"),
+            ),
+            // No '/' after the server: fine for the factories, a parser error.
+            (
+                "s3://host:9000",
+                ServerWithoutKey {
+                    url: "http://host:9000",
                 },
             ),
         ];
@@ -2559,6 +2733,7 @@ mod tests {
             let parsed = crate::s3_utils::parse_s3_uri_full(uri);
             let factory = factory_server_decision(uri);
             let multi = try_build_store_with_fake_creds(uri);
+            let (store_plain, store_logged) = build_via_store_factories(uri);
             // Whatever the expectation, the single-endpoint factory's server URL
             // must equal MultiEndpointStore's, and an error in one is an error in
             // the other (#180, #178).
@@ -2570,6 +2745,21 @@ mod tests {
                     m.as_ref().map(|m| m.get_store_endpoint_urls())
                 )),
             }
+            // `store_for_uri` and `store_for_uri_with_logger` build a store exactly
+            // when the server decision succeeded, and fail with the same error.
+            for (name, built) in [
+                ("store_for_uri", &store_plain),
+                ("store_for_uri_with_logger", &store_logged),
+            ] {
+                match (&factory, built) {
+                    (Ok(_), Ok(())) => {}
+                    (Err(fe), Err(be)) if be == &format!("{fe:#}") => {}
+                    (f, b) => failures.push(format!(
+                        "{uri}: {name} gave {b:?} but the server decision was {f:?}"
+                    )),
+                }
+            }
+            let error_has = |e: &anyhow::Error, hint: &str| format!("{e:#}").contains(hint);
             match want {
                 Bucket { bucket, key } => {
                     match &parsed {
@@ -2578,11 +2768,18 @@ mod tests {
                             "{uri}: parser want bucket {bucket:?}/{key:?}, got {other:?}"
                         )),
                     }
+                    // A bucket row: the factories build a (global-client) store and
+                    // the server decision names no per-endpoint URL.
                     match &factory {
                         Ok(None) => {}
                         other => {
                             failures.push(format!("{uri}: factory want no server, got {other:?}"))
                         }
+                    }
+                    if store_plain.is_err() || store_logged.is_err() {
+                        failures.push(format!(
+                            "{uri}: store_for_uri want a store, got {store_plain:?} / {store_logged:?}"
+                        ));
                     }
                     match &multi {
                         Ok(m) if m.get_store_endpoint_urls() == vec![None] => {}
@@ -2610,6 +2807,11 @@ mod tests {
                             failures.push(format!("{uri}: factory want {url:?}, got {other:?}"))
                         }
                     }
+                    if store_plain.is_err() || store_logged.is_err() {
+                        failures.push(format!(
+                            "{uri}: store_for_uri want a store for {url}, got {store_plain:?} / {store_logged:?}"
+                        ));
+                    }
                     match &multi {
                         Ok(m) if m.get_store_endpoint_urls() == vec![Some((*url).to_string())] => {}
                         Ok(m) => failures.push(format!(
@@ -2621,21 +2823,58 @@ mod tests {
                         }
                     }
                 }
+                ServerWithoutKey { url } => {
+                    match &parsed {
+                        Err(e) if error_has(e, "after bucket") => {}
+                        other => failures.push(format!(
+                            "{uri}: parser want a missing-'/' error, got {other:?}"
+                        )),
+                    }
+                    match &factory {
+                        Ok(Some(u)) if u == url => {}
+                        other => {
+                            failures.push(format!("{uri}: factory want {url:?}, got {other:?}"))
+                        }
+                    }
+                    if store_plain.is_err() || store_logged.is_err() {
+                        failures.push(format!(
+                            "{uri}: store_for_uri want a store, got {store_plain:?} / {store_logged:?}"
+                        ));
+                    }
+                    match &multi {
+                        Ok(m) if m.get_store_endpoint_urls() == vec![Some((*url).to_string())] => {}
+                        other => failures.push(format!(
+                            "{uri}: multi want {url:?}, got {:?}",
+                            other.as_ref().map(|m| m.get_store_endpoint_urls())
+                        )),
+                    }
+                }
                 Error { hint } => {
                     match &parsed {
-                        Err(e) if format!("{e:#}").contains(hint) => {}
+                        Err(e) if error_has(e, hint) => {}
                         other => failures.push(format!(
                             "{uri}: parser want error containing {hint:?}, got {other:?}"
                         )),
                     }
                     match &factory {
-                        Err(e) if format!("{e:#}").contains(hint) => {}
+                        Err(e) if error_has(e, hint) => {}
                         other => failures.push(format!(
                             "{uri}: factory want error containing {hint:?}, got {other:?}"
                         )),
                     }
+                    for (name, built) in [
+                        ("store_for_uri", &store_plain),
+                        ("store_for_uri_with_logger", &store_logged),
+                    ] {
+                        match built {
+                            Err(msg) if msg.contains(hint) => {}
+                            other => failures.push(format!(
+                                "{uri}: {name} want error containing {hint:?}, got {other:?}"
+                            )),
+                        }
+                    }
                     match &multi {
-                        Err(e) if format!("{e:#}").contains(hint) => {}
+                        Err(e) if error_has(e, hint) => {}
                         Ok(m) => failures.push(format!(
                             "{uri}: multi want error containing {hint:?}, got store {:?}",
                             m.get_store_endpoint_urls()
