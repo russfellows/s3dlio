@@ -29,7 +29,8 @@ import textwrap
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
-from xml.sax.saxutils import escape, unescape
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape
 
 import pytest
 
@@ -81,8 +82,11 @@ class MockS3:
                 path = unquote(split.path)
                 key = path.lstrip("/").partition("/")[2]
                 body_keys = []
-                if self.command == "POST":
-                    body_keys = [unescape(k) for k in re.findall(r"<Key>(.*?)</Key>", body.decode("utf-8", "replace"), re.S)]
+                if self.command == "POST" and body:
+                    # Parse the DeleteObjects XML properly (namespace-agnostic) instead of
+                    # scanning it with a regex; ElementTree also decodes XML entities.
+                    root = ElementTree.fromstring(body)
+                    body_keys = [el.text or "" for el in root.iter() if el.tag.rsplit("}", 1)[-1] == "Key"]
                 status, resp = mock.respond(self.command, key, query, body_keys)
                 with mock.lock:
                     mock.log.append(
