@@ -29,8 +29,8 @@ use crate::object_store::{
 use crate::s3_client::run_on_global_rt;
 use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger, op_log_stats};
 use crate::s3_utils::{
-    create_bucket as create_bucket_rs, delete_bucket as delete_bucket_rs, get_objects_parallel,
-    parse_s3_uri, put_objects_with_random_data_and_type, stat_object_many_async,
+    create_bucket_for_uri, delete_bucket_for_uri, get_objects_parallel, parse_s3_uri,
+    put_objects_with_random_data_and_type, s3_bucket_target, stat_object_many_async,
     DEFAULT_OBJECT_SIZE,
 };
 use crate::{generic_download_objects, generic_upload_files};
@@ -830,7 +830,7 @@ pub fn op_log_stats_py(py: Python<'_>) -> PyResult<Option<Bound<'_, PyDict>>> {
 // ---------------------------------------------------------------------------
 // Utility helpers
 // ---------------------------------------------------------------------------
-fn build_uri_list(prefix: &str, template: &str, num: usize) -> PyResult<(String, Vec<String>)> {
+fn build_uri_list(prefix: &str, template: &str, num: usize) -> PyResult<Vec<String>> {
     // Extract scheme and parse URI generically (works for s3://, az://, file://, etc.)
     let scheme_end = prefix
         .find("://")
@@ -863,8 +863,28 @@ fn build_uri_list(prefix: &str, template: &str, num: usize) -> PyResult<(String,
             format!("{}{}/{}{}", scheme, bucket, key_prefix, name)
         })
         .collect();
-    Ok((bucket, uris))
+    Ok(uris)
 }
+
+/// Create the bucket a `put(prefix, ..., should_create_bucket=True)` call writes
+/// into: for an `s3://` prefix, the bucket it names on the server it names
+/// (`s3://host:port/bkt/pfx/` is bucket `bkt` on `host:port`, issue #199). Other
+/// schemes have no S3 bucket to create.
+///
+/// `Err` only for a prefix that cannot name a bucket (a portless IP address, the
+/// #178 error, or no bucket at all); a failed *creation* (the bucket may exist, or
+/// the credentials may only allow object writes) is logged and the put proceeds.
+fn create_put_bucket(prefix: &str) -> anyhow::Result<()> {
+    if !prefix.starts_with("s3://") {
+        return Ok(());
+    }
+    let target = s3_bucket_target(prefix)?;
+    if let Err(e) = create_bucket_for_uri(prefix) {
+        warn!("Failed to create bucket {}: {}", target.bucket, e);
+    }
+    Ok(())
+}
+
 fn str_to_obj(s: &str) -> ObjectType {
     ObjectType::from(s)
 }
@@ -923,29 +943,22 @@ fn parse_s3_uri_full(py: Python<'_>, uri: &str) -> PyResult<Py<PyAny>> {
 // - create-bucket command
 #[pyfunction]
 pub fn create_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
-    // --- Add consistent prefix handling, just like in the CLI ---
-    let final_bucket_name = bucket_name
-        .strip_prefix("s3://")
-        .unwrap_or(bucket_name)
-        .trim_end_matches('/')
-        .to_string(); // Own the string to move it across the thread boundary
+    // `bkt`, `s3://bkt`, `s3://bkt/` -> bucket `bkt` on the global endpoint;
+    // `s3://host:port/bkt` -> bucket `bkt` on that server (issue #199).
+    let bucket_name = bucket_name.to_string(); // Own it to move across the thread boundary
 
     // Release the GIL to allow other Python threads to run
-    py.detach(move || create_bucket_rs(&final_bucket_name).map_err(py_err))
+    py.detach(move || create_bucket_for_uri(&bucket_name).map_err(py_err))
 }
 
 // - delete-bucket command
 #[pyfunction]
 pub fn delete_bucket(py: Python<'_>, bucket_name: &str) -> PyResult<()> {
-    // Clean the input string to get a valid bucket name
-    let final_bucket_name = bucket_name
-        .strip_prefix("s3://")
-        .unwrap_or(bucket_name)
-        .trim_end_matches('/')
-        .to_string(); // Own the string to move across the thread boundary
+    // Same URI forms as `create_bucket` (issue #199).
+    let bucket_name = bucket_name.to_string(); // Own it to move across the thread boundary
 
     // Release the GIL for the blocking S3 call
-    py.detach(move || delete_bucket_rs(&final_bucket_name).map_err(py_err))
+    py.detach(move || delete_bucket_for_uri(&bucket_name).map_err(py_err))
 }
 
 // ---------------------------------------------------------------------------
@@ -977,7 +990,7 @@ pub fn put(
 ) -> PyResult<()> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let template = template.unwrap_or("object-{}");
-    let (bucket, uris) = build_uri_list(prefix, template, num)?;
+    let uris = build_uri_list(prefix, template, num)?;
     let jobs = max_in_flight.min(num);
     let obj = str_to_obj(object_type);
     let algorithm = str_to_data_gen_algorithm(data_gen_algorithm);
@@ -988,9 +1001,7 @@ pub fn put(
         .with_chunk_size(chunk_size);
     py.detach(|| {
         if should_create_bucket {
-            if let Err(e) = create_bucket_rs(&bucket) {
-                warn!("Failed to create bucket {}: {}", bucket, e);
-            }
+            create_put_bucket(prefix).map_err(py_err)?;
         }
         put_objects_with_random_data_and_type(&uris, sz, jobs, config).map_err(py_err)
     })
@@ -1022,7 +1033,7 @@ pub(crate) fn put_async_py<'p>(
 ) -> PyResult<Bound<'p, PyAny>> {
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let template = template.unwrap_or("object-{}");
-    let (bucket, uris) = build_uri_list(prefix, template, num)?;
+    let uris = build_uri_list(prefix, template, num)?;
     let jobs = max_in_flight.min(num);
     let obj = str_to_obj(object_type);
     let algorithm = str_to_data_gen_algorithm(data_gen_algorithm);
@@ -1032,12 +1043,11 @@ pub(crate) fn put_async_py<'p>(
         .with_data_gen_mode(mode)
         .with_chunk_size(chunk_size);
 
+    let prefix = prefix.to_string();
     future_into_py(py, async move {
         task::spawn_blocking(move || {
             if should_create_bucket {
-                if let Err(e) = create_bucket_rs(&bucket) {
-                    warn!("Failed to create bucket {}: {}", bucket, e);
-                }
+                create_put_bucket(&prefix).map_err(py_err)?;
             }
             put_objects_with_random_data_and_type(&uris, sz, jobs, config).map_err(py_err)
         })
@@ -3577,5 +3587,98 @@ mod store_cache_logger_tests {
             assert_eq!(accepted(&second), 1, "logged call on a cache hit");
             assert_eq!(accepted(&first), 1, "the first logger is not used again");
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- issue #199: `put(..., should_create_bucket=True)` on a host-form prefix.
+//
+// Before the fix `build_uri_list` took the FIRST segment as the bucket, so
+// `s3://host:9000/bkt/pfx/` asked the global endpoint to create a bucket named
+// `host:9000`. The tests use a tiny in-process mock that records each request.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod issue199_put_bucket_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    /// Mock S3 server: answers every request `200` and records `"METHOD /path"`.
+    fn start_mock() -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().expect("mock addr").port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_thread = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let seen = Arc::clone(&seen_in_thread);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = stream.read(&mut buf) else { return };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let mut parts = head.lines().next().unwrap_or("").split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("").trim_end_matches('/');
+                    if let Ok(mut r) = seen.lock() {
+                        r.push(format!("{method} {path}"));
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// `create_s3_client_for_endpoint` refuses to build a client without credentials.
+    fn ensure_test_credentials() {
+        if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+            unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test-access-key") };
+        }
+        if std::env::var("AWS_SECRET_ACCESS_KEY").is_err() {
+            unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret-key") };
+        }
+    }
+
+    #[test]
+    fn host_form_prefix_creates_the_bucket_on_the_named_server() {
+        ensure_test_credentials();
+        let (port, seen) = start_mock();
+
+        create_put_bucket(&format!("s3://127.0.0.1:{port}/bkt199py/pfx/"))
+            .expect("a host-form prefix names a bucket");
+
+        let seen = seen.lock().map(|r| r.clone()).unwrap_or_default();
+        assert_eq!(seen, vec!["PUT /bkt199py".to_string()]);
+    }
+
+    #[test]
+    fn portless_ip_prefix_is_the_178_error() {
+        let err = create_put_bucket("s3://10.0.0.5/bkt/pfx/").expect_err("portless IP");
+        assert!(
+            format!("{err:#}").contains("IP address with no port"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn non_s3_prefix_has_no_bucket_to_create() {
+        create_put_bucket("file:///tmp/s3dlio-199-no-bucket/").expect("nothing to create");
+    }
+
+    #[test]
+    fn object_uris_keep_the_server_and_the_bucket() {
+        let uris = build_uri_list("s3://127.0.0.1:9000/bkt/pfx/", "object-{}", 2)
+            .expect("build the object URIs");
+        assert_eq!(
+            uris,
+            vec![
+                "s3://127.0.0.1:9000/bkt/pfx/object-0".to_string(),
+                "s3://127.0.0.1:9000/bkt/pfx/object-1".to_string(),
+            ]
+        );
     }
 }

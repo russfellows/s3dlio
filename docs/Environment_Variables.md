@@ -351,10 +351,11 @@ components, so they agree with each other:
 
 **Not covered yet.** Other code paths that accept an `s3://` URI do not call this
 rule and can still ignore a server named in the URI: the Python store cache and
-Python get/stat/get_many helpers (#171), `S3ObjectStore` operations on a URI that
-names a different server than the store's own (#197), the Python
-`create_bucket` / `delete_bucket` helpers (#199), and `list_containers` /
-`s3-cli list-buckets` (#200). Until those are fixed, use the single-endpoint
+Python get/stat/get_many helpers (#171) and `S3ObjectStore` operations on a URI that
+names a different server than the store's own (#197). Bucket create/delete
+(Python `create_bucket` / `delete_bucket` / `put(should_create_bucket=True)`,
+`s3-cli put --create-bucket`; #199) and `list_containers` / `s3-cli list-buckets`
+(#200) do follow the rule. Until the rest are fixed, use the single-endpoint
 `AWS_ENDPOINT_URL` or the paths listed above when a request must reach a
 specific server.
 

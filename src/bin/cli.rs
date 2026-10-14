@@ -1134,10 +1134,13 @@ async fn main() -> Result<()> {
                 check_aws_credentials()?;
 
                 // Handle S3-specific bucket creation
+                // `s3://host:port/bkt/...` creates `bkt` on THAT server (issue #199);
+                // a URI that cannot name a bucket (portless IP) is an error.
                 if create_bucket_flag {
-                    let (bucket, _prefix) = parse_s3_uri(&uri_prefix)?;
-                    if let Err(e) = s3dlio::s3_utils::create_bucket(&bucket) {
-                        eprintln!("Warning: failed to create bucket {}: {}", bucket, e);
+                    let target = s3dlio::s3_utils::s3_bucket_target(&uri_prefix)?;
+                    if let Err(e) = s3dlio::s3_utils::create_bucket_for_uri_async(&uri_prefix).await
+                    {
+                        eprintln!("Warning: failed to create bucket {}: {}", target.bucket, e);
                     }
                 }
             }
