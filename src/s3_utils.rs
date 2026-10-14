@@ -493,6 +493,52 @@ fn validate_s3_server_port(port: &str, segment: &str) -> Result<()> {
     }
 }
 
+/// Longest host the `host:port` grammar accepts (the DNS name limit).
+const S3_SERVER_HOST_MAX_LEN: usize = 253;
+
+/// The supported host grammar, quoted in every host error.
+const S3_SERVER_HOST_GRAMMAR: &str = "a host is 1 to 253 ASCII letters, digits, '-', '.' and '_', \
+     with no empty labels (no leading or trailing '.', no '..')";
+
+/// Validate the host part of `host:port` (a DNS name, IPv4 literal or
+/// container-style name such as `minio_1`).
+///
+/// Grammar: 1..=253 characters, each an ASCII letter, digit, `-`, `.` or `_`
+/// (`_` is kept for container-style names), with no empty label (no leading or
+/// trailing `.`, no `..`). Anything else - `/`, `\`, whitespace, control
+/// characters, `%`, `?`, `#`, non-ASCII, ... - is an error naming the character.
+/// Enforcing this before any endpoint URI is built means a host can never change
+/// how `s3://host:port/bucket/key` is split (`node/prefix:9000` would otherwise
+/// read back as bucket `node`, routed to the global client).
+fn validate_s3_server_host(host: &str, segment: &str) -> Result<()> {
+    if host.is_empty() {
+        bail!(
+            "missing host before ':' in '{segment}': use host:port, e.g. \
+             s3://host:9000/bucket/key"
+        );
+    }
+    if let Some(bad) = host
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')))
+    {
+        bail!(
+            "invalid character {bad:?} in host '{host}' of '{segment}': {S3_SERVER_HOST_GRAMMAR}"
+        );
+    }
+    // Every character is ASCII here, so byte length is character length.
+    if host.len() > S3_SERVER_HOST_MAX_LEN {
+        bail!(
+            "host of '{segment}' is {} characters, longer than the {S3_SERVER_HOST_MAX_LEN} \
+             allowed: {S3_SERVER_HOST_GRAMMAR}",
+            host.len()
+        );
+    }
+    if host.split('.').any(str::is_empty) {
+        bail!("empty label (a leading or trailing '.', or '..') in host '{host}' of '{segment}': {S3_SERVER_HOST_GRAMMAR}");
+    }
+    Ok(())
+}
+
 /// THE single rule that decides whether the first path segment of an `s3://`
 /// URI is a server or a bucket. The URI parser ([`parse_s3_uri_full`]), the
 /// store factory (`store_for_uri*`), `MultiEndpointStore` and the `s3-cli`
@@ -502,7 +548,10 @@ fn validate_s3_server_port(port: &str, segment: &str) -> Result<()> {
 ///
 /// - `host:port` or `[ipv6]:port` (explicit port, plain decimal `1..=65535`, no
 ///   leading zeros) → [`S3FirstSegment::Server`]. The bracketed content must be a
-///   valid IPv6 address.
+///   valid IPv6 address; an unbracketed host must follow the host grammar: 1 to 253
+///   ASCII letters, digits, `-`, `.` and `_`, with no empty label. Any other
+///   character (`/`, `\`, whitespace, control characters, `%`, `?`, `#`,
+///   non-ASCII, ...) is an error naming it.
 /// - A dotted-quad IPv4 literal with no port → **error**. S3 forbids IP-shaped
 ///   bucket names, so it is not a bucket; the caller must add `:port`.
 /// - An IPv6 literal without brackets or without a port → **error**.
@@ -590,9 +639,7 @@ pub fn classify_s3_first_segment(segment: &str) -> Result<S3FirstSegment<'_>> {
         }
         1 => {
             let (host, port) = segment.split_once(':').unwrap_or((segment, ""));
-            if host.is_empty() {
-                bail!("missing host before ':' in '{segment}': use host:port, e.g. s3://host:9000/bucket/key");
-            }
+            validate_s3_server_host(host, segment)?;
             validate_s3_server_port(port, segment)?;
             Ok(S3FirstSegment::Server(segment))
         }
@@ -605,6 +652,15 @@ pub fn classify_s3_first_segment(segment: &str) -> Result<S3FirstSegment<'_>> {
              written host:port or [ipv6]:port"
         ),
     }
+}
+
+/// The error for `s3://host:9000`, `s3://host:9000/` and `s3://host:9000//key`:
+/// the server is fine, the bucket after it is missing.
+fn missing_bucket_after_server(endpoint: &str, uri: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "missing bucket after server '{endpoint}' in S3 URI '{uri}': the bucket name cannot be \
+         empty; write s3://{endpoint}/bucket/key"
+    )
 }
 
 /// Parse S3 URI with optional endpoint support.
@@ -667,9 +723,14 @@ pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
         .context("URI must start with s3://")?;
 
     // Find the first slash to split host/bucket from key
-    let slash_pos = trimmed
-        .find('/')
-        .context("URI must contain '/' after bucket")?;
+    let Some(slash_pos) = trimmed.find('/') else {
+        // `s3://host:9000` is a valid server with no bucket, not a bucket with a
+        // missing slash: say which.
+        if let Ok(S3FirstSegment::Server(endpoint)) = classify_s3_first_segment(trimmed) {
+            return Err(missing_bucket_after_server(endpoint, uri));
+        }
+        bail!("URI must contain '/' after bucket");
+    };
     let before_slash = &trimmed[..slash_pos];
     let after_slash = &trimmed[slash_pos + 1..];
 
@@ -690,7 +751,7 @@ pub fn parse_s3_uri_full(uri: &str) -> Result<S3UriComponents> {
             };
 
             if bucket.is_empty() {
-                bail!("Bucket name cannot be empty in URI: {}", uri);
+                return Err(missing_bucket_after_server(&endpoint, uri));
             }
 
             Ok(S3UriComponents {
@@ -2688,6 +2749,36 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_s3_uri_server_without_bucket_says_so() {
+        // A bare server URI is not "a slash missing after the bucket": the server
+        // is fine, the bucket is missing, and the message shows the full form.
+        for uri in [
+            "s3://host:9000",
+            "s3://host:9000/",
+            "s3://[::1]:9000",
+            "s3://[::1]:9000/",
+        ] {
+            let server = uri
+                .strip_prefix("s3://")
+                .and_then(|r| r.strip_suffix('/').or(Some(r)))
+                .unwrap_or("");
+            let msg = format!("{:#}", parse_s3_uri_full(uri).unwrap_err());
+            assert!(
+                msg.contains(&format!("missing bucket after server '{server}'")),
+                "{uri}: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("s3://{server}/bucket/key")),
+                "{uri}: example missing in {msg}"
+            );
+            assert!(!msg.contains("after bucket"), "{uri}: stale text in {msg}");
+        }
+        // A bare bucket (no slash) keeps its own message.
+        let msg = format!("{:#}", parse_s3_uri_full("s3://mybucket").unwrap_err());
+        assert!(msg.contains("'/' after bucket"), "{msg}");
+    }
+
+    #[test]
     fn test_parse_s3_uri_error_empty_bucket() {
         // Empty bucket name with endpoint
         let result = parse_s3_uri_full("s3://192.168.1.1:9000//data.bin");
@@ -2831,6 +2922,21 @@ mod tests {
     // classify_s3_first_segment (issues #178 / #193): the strict host:port grammar
     // -------------------------------------------------------------------------
 
+    /// 253 characters (63 + 63 + 63 + 61 with dots) then a port.
+    const HOST_253_PORT: &str = concat!(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:9000"
+    );
+    /// One character longer than [`HOST_253_PORT`].
+    const HOST_254_PORT: &str = concat!(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:9000"
+    );
+
     enum Seg {
         Bucket,
         Server,
@@ -2856,9 +2962,32 @@ mod tests {
             ("host:1", Server),
             ("host:65535", Server),
             ("10.0.0.5:9000", Server),
-            ("host.example.com.:9000", Server),
             ("[::1]:9000", Server),
             ("[2001:db8::5]:443", Server),
+            // Host grammar (review of 0c9e18f): 1..=253 of ASCII letters, digits,
+            // '-', '.', '_', no empty labels. Anything else is an error naming the
+            // character; nothing that could change how the URI is split survives.
+            ("minio_1:9000", Server),
+            ("my-host.a_b.c:9000", Server),
+            ("MinIO.Example.COM:9000", Server),
+            ("node/prefix:9000", Fail("invalid character '/'")),
+            ("node\\prefix:9000", Fail("invalid character '\\\\'")),
+            ("a b:9000", Fail("invalid character ' '")),
+            ("a\tb:9000", Fail("invalid character '\\t'")),
+            ("a\u{0}b:9000", Fail("invalid character '\\0'")),
+            ("ho%st:9000", Fail("invalid character '%'")),
+            ("ho?st:9000", Fail("invalid character '?'")),
+            ("ho#st:9000", Fail("invalid character '#'")),
+            ("h\u{f4}st:9000", Fail("invalid character '\u{f4}'")),
+            ("a;b:9000", Fail("invalid character ';'")),
+            (".host:9000", Fail("empty label")),
+            ("host.:9000", Fail("empty label")),
+            ("host.example.com.:9000", Fail("empty label")),
+            ("ho..st:9000", Fail("empty label")),
+            ("node/prefix:9000", Fail("ASCII letters, digits")),
+            // Length: 253 accepted, 254 rejected.
+            (HOST_253_PORT, Server),
+            (HOST_254_PORT, Fail("253")),
             // Ports that `u16::from_str` would accept but are not plain 1..=65535.
             ("host:+9000", Fail("invalid port '+9000'")),
             ("host:0", Fail("invalid port '0'")),

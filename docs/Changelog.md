@@ -21,6 +21,21 @@
   address inside the brackets, and no userinfo. URLs (`http://host:9000`), ARNs,
   an empty first segment and an empty host or port are rejected with specific
   messages.
+- **Host grammar:** the host of `host:port` is 1 to 253 ASCII letters, digits,
+  `-`, `.` and `_` (`_` for container-style names such as `minio_1`) with no empty
+  label. Any other character (`/`, `\`, whitespace, control characters, `%`, `?`,
+  `#`, non-ASCII, ...) is an error naming it and the grammar, checked before any
+  endpoint URI is built. This closes a routing hole: `s3-cli --endpoints
+  node/prefix:9000` was accepted and generated `s3://node/prefix:9000/bucket/key`,
+  which parses as bucket `node` on the global client. A trailing dot
+  (`host.example.com.:9000`) is now rejected as an empty label.
+- A bare server URI given to the object parser (`s3://host:9000`,
+  `s3://host:9000/`) now reports `missing bucket after server 'host:9000'` with the
+  example `s3://host:9000/bucket/key`, instead of a "slash after bucket" message.
+- `s3-cli create-bucket` / `delete-bucket` destination is now covered by a test
+  that runs the real binary against two local mock S3 servers (the
+  `AWS_ENDPOINT_URL` server must see no request; the server named in the URI must
+  see the CreateBucket / DeleteBucket for the bucket) (#194).
 - **Errors instead of fallbacks:** `store_for_uri`, `store_for_uri_with_logger`,
   `store_for_uri_with_config*`, `MultiEndpointStore::new` and
   `MultiEndpointStore::from_config` now return an error for an invalid first

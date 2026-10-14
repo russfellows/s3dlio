@@ -2770,6 +2770,13 @@ mod tests {
             ("host:", "empty port"),
             ("::1", "unbracketed IPv6"),
             ("host:9000:x", "more than one ':'"),
+            // Host grammar: these used to be accepted and built a URI that parsed
+            // as a different bucket (`node/prefix:9000` -> bucket `node`, global client).
+            ("node/prefix:9000", "invalid character '/'"),
+            ("a b:9000", "invalid character ' '"),
+            ("ho%st:9000", "invalid character '%'"),
+            ("host.:9000", "empty label"),
+            ("10.9.0.17:9000,node/prefix:9000", "invalid character '/'"),
             ("10.9.0.17:9000,http://10.9.0.18:9000", "looks like a URL"),
         ] {
             let msg = format!(

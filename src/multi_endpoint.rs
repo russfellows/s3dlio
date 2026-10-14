@@ -2471,9 +2471,9 @@ mod tests {
             bucket: &'static str,
             key: &'static str,
         },
-        /// A server with no `/` after it (`s3://host:9000`): a valid
-        /// MultiEndpointStore / factory endpoint, but the full-URI parser needs a
-        /// `/` and says so.
+        /// A server with no bucket after it (`s3://host:9000`, `s3://host:9000/`):
+        /// a valid MultiEndpointStore / factory endpoint, but the full-URI parser
+        /// needs a bucket and says "missing bucket after server".
         ServerWithoutKey { url: &'static str },
         /// Rejected by every component; the message must contain `hint`.
         Error { hint: &'static str },
@@ -2706,14 +2706,64 @@ mod tests {
                     "key",
                 ),
             ),
+            // Host grammar: ASCII letters, digits, '-', '.', '_'; no empty labels.
+            (
+                "s3://minio_1:9000/bkt/key",
+                server("minio_1:9000", "http://minio_1:9000", "bkt", "key"),
+            ),
             (
                 "s3://host.example.com.:9000/bkt/key",
-                server(
-                    "host.example.com.:9000",
-                    "http://host.example.com.:9000",
-                    "bkt",
-                    "key",
-                ),
+                Error {
+                    hint: "empty label",
+                },
+            ),
+            (
+                "s3://.host:9000/bkt/key",
+                Error {
+                    hint: "empty label",
+                },
+            ),
+            (
+                "s3://ho..st:9000/bkt/key",
+                Error {
+                    hint: "empty label",
+                },
+            ),
+            (
+                "s3://a b:9000/bkt/key",
+                Error {
+                    hint: "invalid character ' '",
+                },
+            ),
+            (
+                "s3://ho%st:9000/bkt/key",
+                Error {
+                    hint: "invalid character '%'",
+                },
+            ),
+            (
+                "s3://ho?st:9000/bkt/key",
+                Error {
+                    hint: "invalid character '?'",
+                },
+            ),
+            (
+                "s3://ho#st:9000/bkt/key",
+                Error {
+                    hint: "invalid character '#'",
+                },
+            ),
+            (
+                "s3://ho\\st:9000/bkt/key",
+                Error {
+                    hint: "invalid character '\\\\'",
+                },
+            ),
+            (
+                "s3://h\u{f4}st:9000/bkt/key",
+                Error {
+                    hint: "invalid character '\u{f4}'",
+                },
             ),
             (
                 "s3://[::1]:443/bkt/key",
@@ -2722,6 +2772,12 @@ mod tests {
             // No '/' after the server: fine for the factories, a parser error.
             (
                 "s3://host:9000",
+                ServerWithoutKey {
+                    url: "http://host:9000",
+                },
+            ),
+            (
+                "s3://host:9000/",
                 ServerWithoutKey {
                     url: "http://host:9000",
                 },
@@ -2825,9 +2881,9 @@ mod tests {
                 }
                 ServerWithoutKey { url } => {
                     match &parsed {
-                        Err(e) if error_has(e, "after bucket") => {}
+                        Err(e) if error_has(e, "missing bucket after server 'host:9000'") => {}
                         other => failures.push(format!(
-                            "{uri}: parser want a missing-'/' error, got {other:?}"
+                            "{uri}: parser want a missing-bucket error, got {other:?}"
                         )),
                     }
                     match &factory {

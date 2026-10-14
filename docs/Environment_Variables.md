@@ -364,6 +364,18 @@ IPv6 address, and there is no userinfo (`user@host:9000` is an error). URLs
 (`http://host:9000`), ARNs and an empty first segment are rejected with a message
 that says what was wrong; they are not reported as IPv6 problems.
 
+**Host grammar.** The host of an unbracketed `host:port` is 1 to 253 characters,
+each an ASCII letter, digit, `-`, `.` or `_` (`_` is kept for container-style
+names such as `minio_1`), with no empty label (no leading or trailing `.`, no
+`..`). Everything else is an error that names the offending character and the
+grammar: `/`, `\`, whitespace, control characters, `%`, `?`, `#`, `;`, non-ASCII
+text, and `@` (userinfo). This is checked before any endpoint URI is built, so a
+host can never change how `s3://host:port/bucket/key` is split: `--endpoints
+node/prefix:9000` is rejected instead of producing `s3://node/prefix:9000/...`,
+which would parse as bucket `node` on the global client. A trailing dot (an
+absolute FQDN such as `host.example.com.:9000`) was accepted by the previous
+revision of this change and is now an error; write `host.example.com:9000`.
+
 | URI | Meaning |
 |-----|---------|
 | `s3://bucket/key`, `s3://BUCKET/key`, `s3://my.bucket.name/key` | bucket `bucket` / `BUCKET` / `my.bucket.name` (uses `AWS_ENDPOINT_URL` or AWS) |

@@ -4477,6 +4477,11 @@ mod s3_object_store_tests {
             ("host:notaport", "invalid port 'notaport'"),
             ("host:0", "invalid port '0'"),
             ("http://host:9000", "looks like a URL"),
+            // Host grammar: no endpoint URL is ever built from these.
+            ("node/prefix:9000", "invalid character '/'"),
+            ("a b:9000", "invalid character ' '"),
+            ("ho%st:9000", "invalid character '%'"),
+            ("host.:9000", "empty label"),
         ] {
             let err = s3_endpoint_url_from_authority(bad).unwrap_err();
             assert!(format!("{err:#}").contains(hint), "{bad}: {err:#}");
