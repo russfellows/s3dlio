@@ -2387,23 +2387,28 @@ impl PyObjectWriter {
                 return self.write_detached(py, &owned);
             }
 
+            // Take the writer lock FIRST. Waiting for it may release the GIL, and a
+            // reference over the caller's memory must not exist while another Python
+            // thread can run and change that memory.
+            let mut guard = self.lock_with_gil(py);
             let result = if buffer.len_bytes() == 0 {
-                let mut guard = self.lock_with_gil(py);
                 self.write_locked(&mut guard, &[])
             } else {
                 // SAFETY: the buffer is C-contiguous and `buffer` is a live Py_buffer
                 // export, released only after the write has returned, so the exporter
-                // cannot free or resize the memory meanwhile. The GIL is HELD for the
-                // whole write, so no Python thread can change the contents during the
-                // read; non-Python code that shares the memory (a mmap or ctypes
-                // buffer written by native code) is the caller's responsibility, as in
-                // any buffer-protocol consumer. The write only reads from the slice.
+                // cannot free or resize the memory meanwhile. The slice is created
+                // only now, after the lock was acquired, and the GIL is HELD from
+                // here through the end of the write (`write_locked` does not release
+                // it), so no Python thread can change the contents while the slice
+                // exists. Non-Python code that shares the memory (a mmap or ctypes
+                // buffer written by native code) is the caller's responsibility, as
+                // in any buffer-protocol consumer. The write only reads from the slice.
                 let slice = unsafe {
                     std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
                 };
-                let mut guard = self.lock_with_gil(py);
                 self.write_locked(&mut guard, slice)
             };
+            drop(guard);
             // Release the export only now.
             drop(buffer);
             return result;
@@ -3994,5 +3999,47 @@ mod issue204_store_cache_tests {
                 "RED: {name} does not use get_or_create_store"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- PyObjectWriter::write_chunk must not create a reference over a mutable
+// exporter's memory before it holds the writer lock: waiting for the lock releases
+// the GIL, and another Python thread may then change that memory under the reference.
+//
+// A behavioural RED is not possible: the read itself happens with the GIL held, so
+// the only difference is a live `&[u8]` over memory that changes during the wait
+// (undefined behaviour in the abstract machine, no observable torn data). The order
+// of the two steps is therefore pinned structurally.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod write_chunk_slice_after_lock_tests {
+    #[test]
+    fn the_slice_over_a_mutable_buffer_is_created_after_the_writer_lock_is_taken() {
+        let src = include_str!("python_core_api.rs");
+        let start = src
+            .find("fn write_chunk(&self, py: Python<'_>")
+            .expect("write_chunk not found");
+        let rest = &src[start..];
+        let end = rest.find("\n    }\n").expect("end of write_chunk");
+        let body = &rest[..end];
+
+        assert_eq!(
+            body.matches("self.lock_with_gil(py)").count(),
+            1,
+            "RED: write_chunk takes the writer lock in more than one place, so a slice can be \
+             built on a path that has not taken it yet"
+        );
+        let lock = body
+            .find("self.lock_with_gil(py)")
+            .expect("RED: write_chunk's GIL-held path does not take the writer lock");
+        let slice = body
+            .find("from_raw_parts(")
+            .expect("RED: write_chunk's GIL-held path builds no slice");
+        assert!(
+            lock < slice,
+            "RED: the slice over the caller's buffer is created before the writer lock is \
+             acquired (acquiring it can release the GIL)"
+        );
     }
 }

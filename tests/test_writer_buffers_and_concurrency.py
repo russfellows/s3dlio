@@ -202,3 +202,64 @@ def test_accessors_and_a_second_write_work_during_an_inflight_write(slow_fifo):
     assert result["monotonic"], result
     assert result["final"] == 16 * 1024 * 1024 + 4, result
     reader.wait(timeout=60)
+
+
+def test_a_write_waiting_for_the_writer_lock_writes_the_buffer_as_it_is_when_it_starts(
+    slow_fifo,
+):
+    """A mutable buffer changed while its write waits for the writer lock.
+
+    Thread A keeps the writer busy (slow FIFO). Thread B calls write_chunk(bytearray) and
+    waits for the lock; thread C overwrites the bytearray during that wait. B's bytes are
+    those of the buffer when its write actually starts (all 'Z'), never a mixture.
+    (Behavioural guard only: the structural Rust test
+    ``write_chunk_slice_after_lock_tests`` pins that no slice over the buffer exists
+    during the wait, which no output can show.)
+    """
+    fifo, drained, reader = slow_fifo
+    result = run_scenario(
+        """
+        writer = s3dlio.create_filesystem_writer("file://" + sys.argv[1], s3dlio.PyWriterOptions())
+        size = 8 * 1024 * 1024
+        data = bytearray(b"A" * size)
+        errors = []
+
+        def first():
+            try:
+                writer.write_chunk(bytes(16 * 1024 * 1024))
+            except Exception as exc:
+                errors.append("first: " + repr(exc))
+
+        def second():
+            try:
+                writer.write_chunk(data)
+            except Exception as exc:
+                errors.append("second: " + repr(exc))
+
+        def mutate():
+            time.sleep(0.5)  # B is waiting for the lock A holds until the reader drains
+            data[:] = b"Z" * size
+
+        a = threading.Thread(target=first)
+        a.start()
+        time.sleep(0.2)  # A holds the lock
+        b = threading.Thread(target=second)
+        c = threading.Thread(target=mutate)
+        b.start()
+        c.start()
+        for t in (a, b, c):
+            t.join()
+        print(json.dumps({"errors": errors}))
+        """,
+        str(fifo),
+    )
+    assert result["errors"] == [], result
+    reader.wait(timeout=60)
+    content = drained.read_bytes()
+    tail = content.lstrip(b"\x00")  # A's 16 MiB of zeros, then B's bytes
+    assert len(tail) >= 1024 * 1024, (
+        f"too little of the second write was drained: {len(tail)}"
+    )
+    assert tail == b"Z" * len(tail), (
+        f"the second write was torn: {tail.count(b'A')} 'A' and {tail.count(b'Z')} 'Z' bytes"
+    )
