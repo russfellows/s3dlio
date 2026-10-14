@@ -2262,10 +2262,41 @@ mod tests {
     // single-endpoint URIs. Before the fix MultiEndpointStore built http://host:port
     // for every host-form endpoint.
 
-    fn lock_tls_ports_env() -> std::sync::MutexGuard<'static, ()> {
-        crate::object_store::ENDPOINT_TLS_PORTS_ENV_LOCK
+    /// Holds `ENDPOINT_TLS_PORTS_ENV_LOCK` and restores the original value of
+    /// `S3DLIO_S3_ENDPOINT_TLS_PORTS` when dropped, including when a test panics,
+    /// so a failing test cannot leak the variable into the others.
+    struct TlsPortsEnvGuard {
+        saved: Option<String>,
+        // Declared last so the variable is restored (in `drop`) before the lock is released.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TlsPortsEnvGuard {
+        fn set(&self, value: &str) {
+            #[allow(deprecated)]
+            std::env::set_var("S3DLIO_S3_ENDPOINT_TLS_PORTS", value);
+        }
+
+        fn clear(&self) {
+            #[allow(deprecated)]
+            std::env::remove_var("S3DLIO_S3_ENDPOINT_TLS_PORTS");
+        }
+    }
+
+    impl Drop for TlsPortsEnvGuard {
+        fn drop(&mut self) {
+            restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", self.saved.take());
+        }
+    }
+
+    fn lock_tls_ports_env() -> TlsPortsEnvGuard {
+        let lock = crate::object_store::ENDPOINT_TLS_PORTS_ENV_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| e.into_inner());
+        TlsPortsEnvGuard {
+            saved: std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok(),
+            _lock: lock,
+        }
     }
 
     /// Try to build a MultiEndpointStore for `uri` with fake credentials.
@@ -2314,23 +2345,17 @@ mod tests {
 
     #[test]
     fn test_multi_endpoint_unlisted_port_uses_http() {
-        let _env = lock_tls_ports_env();
-        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
-        #[allow(deprecated)]
-        std::env::remove_var("S3DLIO_S3_ENDPOINT_TLS_PORTS");
+        let env = lock_tls_ports_env();
+        env.clear();
         let got = store_endpoint_url_for("s3://10.9.0.17:9000/bucket/");
-        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
         assert_eq!(got, Some("http://10.9.0.17:9000".to_string()));
     }
 
     #[test]
     fn test_multi_endpoint_tls_ports_env_var_uses_https() {
-        let _env = lock_tls_ports_env();
-        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
-        #[allow(deprecated)]
-        std::env::set_var("S3DLIO_S3_ENDPOINT_TLS_PORTS", "9001,9443");
+        let env = lock_tls_ports_env();
+        env.set("9001,9443");
         let got = store_endpoint_url_for("s3://minio.example:9001/bucket/");
-        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
         assert_eq!(
             got,
             Some("https://minio.example:9001".to_string()),
@@ -2340,10 +2365,8 @@ mod tests {
 
     #[test]
     fn test_s3_store_endpoint_url_rules() {
-        let _env = lock_tls_ports_env();
-        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
-        #[allow(deprecated)]
-        std::env::set_var("S3DLIO_S3_ENDPOINT_TLS_PORTS", "9001");
+        let env = lock_tls_ports_env();
+        env.set("9001");
 
         let cases = [
             ("s3://example.com:443/b/", "https://example.com:443"),
@@ -2359,13 +2382,21 @@ mod tests {
         // Issue #178: a portless DNS name is a bucket (no server); a portless IP errors.
         let portless_dns = s3_store_endpoint_url("s3://example.com/b/").expect("bucket form");
         let portless_ip = s3_store_endpoint_url("s3://10.0.0.5/b/");
-        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
+        // Malformed ports / bare IPv6 must be errors, never a garbage URL.
+        let malformed: Vec<&str> = ["s3://host:99999/b/", "s3://host:abc/b/", "s3://[::1]/b/"]
+            .into_iter()
+            .filter(|uri| s3_store_endpoint_url(uri).is_ok())
+            .collect();
 
         for ((uri, want), got) in cases.iter().zip(got) {
             assert_eq!(got.as_deref(), Some(*want), "uri {uri:?}");
         }
         assert_eq!(portless_dns, None);
         assert!(portless_ip.is_err());
+        assert!(
+            malformed.is_empty(),
+            "malformed server segments must be errors, not URLs: {malformed:?}"
+        );
     }
 
     // ── Issues #178 / #193 / #194: one rule for "is the first segment a server?" ──
@@ -2402,10 +2433,8 @@ mod tests {
 
     #[test]
     fn test_parser_factory_and_multi_endpoint_agree_on_server_vs_bucket() {
-        let _env = lock_tls_ports_env();
-        let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
-        #[allow(deprecated)]
-        std::env::remove_var("S3DLIO_S3_ENDPOINT_TLS_PORTS");
+        let env = lock_tls_ports_env();
+        env.clear();
 
         use Want::*;
         let corpus: Vec<(&str, Want)> = vec![
@@ -2490,6 +2519,39 @@ mod tests {
                 "s3://host.example.com:notaport/bkt/key",
                 Error { hint: "port" },
             ),
+            // Out-of-range port.
+            (
+                "s3://host.example.com:99999/bkt/key",
+                Error { hint: "port" },
+            ),
+            // Host case and a trailing dot are kept verbatim.
+            (
+                "s3://MinIO.Example.COM:9000/bkt/key",
+                Server {
+                    authority: "MinIO.Example.COM:9000",
+                    url: "http://MinIO.Example.COM:9000",
+                    bucket: "bkt",
+                    key: "key",
+                },
+            ),
+            (
+                "s3://host.example.com.:9000/bkt/key",
+                Server {
+                    authority: "host.example.com.:9000",
+                    url: "http://host.example.com.:9000",
+                    bucket: "bkt",
+                    key: "key",
+                },
+            ),
+            (
+                "s3://[::1]:443/bkt/key",
+                Server {
+                    authority: "[::1]:443",
+                    url: "https://[::1]:443",
+                    bucket: "bkt",
+                    key: "key",
+                },
+            ),
         ];
 
         let mut failures: Vec<String> = Vec::new();
@@ -2497,6 +2559,17 @@ mod tests {
             let parsed = crate::s3_utils::parse_s3_uri_full(uri);
             let factory = factory_server_decision(uri);
             let multi = try_build_store_with_fake_creds(uri);
+            // Whatever the expectation, the single-endpoint factory's server URL
+            // must equal MultiEndpointStore's, and an error in one is an error in
+            // the other (#180, #178).
+            match (&factory, &multi) {
+                (Ok(f), Ok(m)) if m.get_store_endpoint_urls() == vec![f.clone()] => {}
+                (Err(_), Err(_)) => {}
+                (f, m) => failures.push(format!(
+                    "{uri}: factory {f:?} != multi {:?}",
+                    m.as_ref().map(|m| m.get_store_endpoint_urls())
+                )),
+            }
             match want {
                 Bucket { bucket, key } => {
                     match &parsed {
@@ -2574,7 +2647,6 @@ mod tests {
                 }
             }
         }
-        restore_env("S3DLIO_S3_ENDPOINT_TLS_PORTS", saved);
         assert!(
             failures.is_empty(),
             "parser / factory / MultiEndpointStore disagree (#178):\n{}",

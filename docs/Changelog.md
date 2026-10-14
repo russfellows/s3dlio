@@ -26,6 +26,13 @@
   the request went to the global endpoint. Per-endpoint S3 stores now create and
   delete buckets with their own client.
 - Planned: explicit `s3+http://` / `s3+https://` schemes (#195).
+- `MultiEndpointStore` now picks the endpoint scheme with the same rule as
+  single-endpoint URIs (#180): port `443` and ports listed in
+  `S3DLIO_S3_ENDPOINT_TLS_PORTS` use `https://`; every other port uses `http://`.
+  Previously it always built `http://host:port`. **A plain-HTTP server deliberately
+  listening on `:443`, or on a port named in `S3DLIO_S3_ENDPOINT_TLS_PORTS`, will now
+  be dialled with TLS; no override exists** (the explicit `s3+http://` form, #195,
+  is the planned escape hatch).
 
 ## Version 0.9.114 — Azure SDK stable 1.x migration
 

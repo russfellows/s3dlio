@@ -4395,7 +4395,9 @@ mod s3_object_store_tests {
 
     #[test]
     fn s3_endpoint_url_from_uri_custom_tls_port_via_env_var() {
-        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK.lock().unwrap();
+        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
 
         #[allow(deprecated)]
@@ -4412,7 +4414,9 @@ mod s3_object_store_tests {
 
     #[test]
     fn s3_endpoint_url_from_uri_unlisted_custom_port_still_uses_http() {
-        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK.lock().unwrap();
+        let _guard = ENDPOINT_TLS_PORTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS").ok();
 
         #[allow(deprecated)]
