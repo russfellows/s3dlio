@@ -668,9 +668,16 @@ impl ObjectStore for LoggedObjectStore {
     // * `pre_stat_objects`: not overridden; the default stats through this wrapper
     //   (one HEAD row per URI). `pre_stat_and_cache` additionally hands the sizes
     //   to the inner store's cache (`seed_size_cache`) without a request.
-    // * `mkdir`, `rmdir`, `update_metadata`, `update_properties`: forwarded
-    //   SILENTLY. They have no op name in the format, and adding one is a format
-    //   change that needs the architect's approval.
+    // * `rmdir`: recorded as ONE `DELETE_PREFIX` row on the directory URI (bytes 0,
+    //   count 0, no first byte, the error on failure), recursive or not, exactly as
+    //   `delete_prefix` is, so a whole tree removed through s3dlio is never missing
+    //   from the log (issue #228). `DELETE_PREFIX` is an op name the format already
+    //   has, so this is NOT a format change. The inner store's `rmdir` never routes
+    //   back through a logger, so there is exactly one row per call.
+    // * `mkdir`, `update_metadata`, `update_properties`: forwarded SILENTLY. They
+    //   have no op name in the format, and adding one is a format change that needs
+    //   the architect's approval (a `mkdir` can be inferred from the writes that
+    //   follow it).
     // ------------------------------------------------------------------
 
     async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
@@ -774,7 +781,18 @@ impl ObjectStore for LoggedObjectStore {
     }
 
     async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
-        self.inner.rmdir(uri, recursive).await
+        let start = SystemTime::now();
+        let result = self.inner.rmdir(uri, recursive).await;
+        let end = SystemTime::now();
+
+        let error = result.as_ref().err().map(|e| e.to_string());
+
+        // Same shape as `delete_prefix`: the directory URI, bytes 0, count 0 (the
+        // number of entries removed is not known), no first_byte. Recorded whether
+        // the removal succeeds or fails, recursive or not (issue #228).
+        self.log_operation("DELETE_PREFIX", uri, 0, 0, start, None, end, error);
+
+        result
     }
 
     async fn update_metadata(

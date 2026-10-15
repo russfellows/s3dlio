@@ -12,7 +12,8 @@
 // A counting inner store overrides EVERY trait method and notes which one was
 // reached. Each call on the wrapper must reach exactly the same method on the
 // inner store, and the op-log must hold one row only for the operations that
-// already have an op name (the rest are forwarded silently).
+// already have an op name (the rest are forwarded silently). `rmdir` is
+// recorded as a `DELETE_PREFIX` row (#228); `mkdir`, `update_*` stay silent.
 //
 // A guard test reads the trait's source and fails when a method is added to
 // `ObjectStore` without being added here, so a new defaulted method cannot be
@@ -112,9 +113,10 @@ const METHODS: &[Expectation] = &[
         &["stat", "stat", "seed_size_cache"],
     ),
     ("seed_size_cache", &[], &["seed_size_cache"]),
-    // No op name exists for these: forwarded, not recorded.
+    // rmdir is recorded as one DELETE_PREFIX row (#228); the rest have no op name
+    // in the format: forwarded, not recorded.
     ("mkdir", &[], &["mkdir"]),
-    ("rmdir", &[], &["rmdir"]),
+    ("rmdir", &["DELETE_PREFIX"], &["rmdir"]),
     ("update_metadata", &[], &["update_metadata"]),
     ("update_properties", &[], &["update_properties"]),
     ("get_writer", &[], &["get_writer"]),
