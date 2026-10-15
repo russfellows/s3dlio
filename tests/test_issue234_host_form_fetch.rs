@@ -206,7 +206,7 @@ fn cli_download_fetches_from_the_server_that_listed() {
     let dest = fresh_dir("clidl");
     let uri = format!("s3://{}/{bucket}/dl/", b.authority());
 
-    let out = s3_cli(&a, &["download", "-r", &uri, dest.to_str().unwrap()]);
+    let out = s3_cli(a, &["download", "-r", &uri, dest.to_str().unwrap()]);
 
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(
@@ -239,7 +239,7 @@ fn cli_download_with_pattern_fetches_from_the_server_that_listed() {
     let uri = format!("s3://{}/{bucket}/dl/", b.authority());
 
     let out = s3_cli(
-        &a,
+        a,
         &[
             "download",
             "-r",
@@ -266,7 +266,7 @@ fn cli_get_fetches_from_the_server_that_listed() {
     let (a, b, bucket) = two_servers("cliget");
     let uri = format!("s3://{}/{bucket}/dl/", b.authority());
 
-    let out = s3_cli(&a, &["get", "-r", &uri]);
+    let out = s3_cli(a, &["get", "-r", &uri]);
 
     assert!(out.status.success(), "{}", text(&out));
     assert!(
