@@ -41,6 +41,19 @@ fn range_presize(range_len: Option<u64>) -> Option<u64> {
     range_len.map(|len| len.min(crate::constants::AZURE_RANGE_PRESIZE_MAX))
 }
 
+/// A numeric response header.
+fn header_u64(headers: &azure_core::http::headers::Headers, name: &'static str) -> Option<u64> {
+    headers
+        .get_optional_str(&azure_core::http::headers::HeaderName::from_static(name))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// How many bytes a range read reserves: what the response's `Content-Length` says it carries,
+/// else the requested length, capped (a caller-chosen length is not a promise).
+fn range_expected_len(content_length: Option<u64>, requested: Option<u64>) -> Option<u64> {
+    content_length.or_else(|| range_presize(requested))
+}
+
 /// The blob's total length from a download response's headers: the total in `Content-Range`
 /// (`bytes 0-1023/4096`) if the response was a partial one, else `Content-Length`.
 fn total_len_from_headers(content_range: Option<&str>, content_length: Option<u64>) -> Option<u64> {
@@ -360,26 +373,42 @@ impl AzureBlob {
             self.container, key, start, end
         );
         let blob = self.blob_client(key)?;
-        let range = match end {
-            Some(e) if e >= start => HttpRange::new(start, e - start + 1),
-            Some(e) => bail!("invalid Azure byte range: end {e} precedes start {start}"),
+        // The range length, with checked arithmetic: `get_range(0, Some(u64::MAX))` is a
+        // legal "to the end" request and must not overflow.
+        let range_len = match end {
+            Some(e) => Some(
+                e.checked_sub(start)
+                    .and_then(|d| d.checked_add(1))
+                    .ok_or_else(|| {
+                        anyhow!("invalid Azure byte range: end {e} precedes start {start}, or the range is too long")
+                    })?,
+            ),
+            None => None,
+        };
+        let range = match range_len {
+            Some(len) => HttpRange::new(start, len),
             None => HttpRange::from_offset(start),
         };
         // One request for the whole range: with the SDK's default 4 MiB partition a 64 MiB
-        // range was sixteen serial sub-requests, each through an SDK partition buffer.
+        // range was sixteen serial sub-requests, each through an SDK partition buffer. An
+        // open-ended range uses the default download partition (32 MiB).
+        let partition_size = match range_len {
+            Some(len) => usize::try_from(len).ok(),
+            None => Some(crate::constants::DEFAULT_AZURE_DOWNLOAD_PART_SIZE),
+        };
         let opts = BlobClientDownloadOptions {
             range: Some(range),
             parallel: NonZeroUsize::new(1),
-            partition_size: end
-                .and_then(|e| usize::try_from(e - start + 1).ok())
-                .and_then(NonZeroUsize::new),
+            partition_size: partition_size.and_then(NonZeroUsize::new),
             ..Default::default()
         };
         let resp = blob
             .download(Some(opts))
             .await
             .map_err(|e| self.auth_err(e))?;
-        let expected = range_presize(end.map(|e| e - start + 1));
+        // The response says how many bytes it carries (one request covers the range): reserve
+        // that. Without the header, reserve the requested length, capped.
+        let expected = range_expected_len(header_u64(&resp.headers, "content-length"), range_len);
         let body = collect_body(resp.body, expected).await?;
         debug!(
             "AzureBlob::get_range success: key='{}', {} bytes",
@@ -440,21 +469,17 @@ impl AzureBlob {
             .download(Some(options))
             .await
             .map_err(|e| self.auth_err(e))?;
-        // Without a size hint, take the blob's length from the response (the SDK's first
-        // request is a ranged GET, so `Content-Range` carries the total).
-        let expected_len = expected_len.or_else(|| {
-            let headers = &resp.headers;
-            total_len_from_headers(
-                headers.get_optional_str(&azure_core::http::headers::HeaderName::from_static(
-                    "content-range",
-                )),
-                headers
-                    .get_optional_str(&azure_core::http::headers::HeaderName::from_static(
-                        "content-length",
-                    ))
-                    .and_then(|v| v.trim().parse().ok()),
-            )
-        });
+        // The blob's length from the response (the SDK's first request is a ranged GET, so
+        // `Content-Range` carries the total) is what the server says NOW; the caller's hint (a
+        // possibly stale `stat`) is used only when the response has no length.
+        let headers = &resp.headers;
+        let expected_len = total_len_from_headers(
+            headers.get_optional_str(&azure_core::http::headers::HeaderName::from_static(
+                "content-range",
+            )),
+            header_u64(headers, "content-length"),
+        )
+        .or(expected_len);
         let body = collect_body(resp.body, expected_len).await?;
         debug!(
             "AzureBlob::get success: key='{}', {} bytes",
@@ -1074,6 +1099,15 @@ mod tests {
             );
         }
         assert_eq!(sequential_partition_size(floor as u64 * 4), floor * 4);
+    }
+
+    #[test]
+    fn range_reads_reserve_what_the_response_says_else_the_capped_request() {
+        let cap = crate::constants::AZURE_RANGE_PRESIZE_MAX;
+        assert_eq!(range_expected_len(Some(4096), Some(1 << 40)), Some(4096));
+        assert_eq!(range_expected_len(None, Some(1 << 40)), Some(cap));
+        assert_eq!(range_expected_len(None, Some(10)), Some(10));
+        assert_eq!(range_expected_len(None, None), None);
     }
 
     #[test]

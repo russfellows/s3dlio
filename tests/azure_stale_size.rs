@@ -6,189 +6,27 @@
 //! `AzureObjectStore` caches the size a `HEAD` reported for 60 s. A blob that is overwritten
 //! with a different size inside that window used to make the sequential download plan its
 //! requests from the OLD size: a blob cached as 0 or 1 byte and then grown to 1 MiB became about
-//! a million one-byte range requests, issued one after another (the SDK learns the real length
-//! from the first response but keeps the caller's partition size).
+//! a million one-byte range requests, issued one after another.
 //!
 //! Everything runs against a local fake Blob service on http (`auto` sends no credential there).
-//! The fake answers 403 after `REQUEST_CAP` requests, so a regression fails in milliseconds
-//! instead of hanging.
+//! The fake answers 403 after 300 requests, so a regression fails in milliseconds instead of
+//! hanging. The tests share the process environment, so each holds `ENV_LOCK`.
 
 #![cfg(feature = "backend-azure")]
 
+#[path = "common/azure_fake.rs"]
+mod azure_fake;
+
+use azure_fake::*;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use s3dlio::object_store::{AzureConfig, AzureDownloadMode, AzureObjectStore, ObjectStore};
-use std::collections::HashMap;
-use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
 
-const REQUEST_CAP: usize = 300;
-const MIB: usize = 1024 * 1024;
-
-#[derive(Default)]
-struct Fake {
-    blobs: HashMap<String, Vec<u8>>,
-    /// (method, range header) of every request, in order.
-    requests: Vec<(String, Option<String>)>,
-}
-
-type State = Arc<Mutex<Fake>>;
-
-fn plain(status: StatusCode) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .body(Full::new(Bytes::new()))
-        .unwrap()
-}
-
-async fn handle(state: State, req: Request<Incoming>) -> Response<Full<Bytes>> {
-    let method = req.method().clone();
-    let path = req.uri().path().trim_start_matches('/').to_string();
-    let range = req
-        .headers()
-        .get("range")
-        .or_else(|| req.headers().get("x-ms-range"))
-        .map(|v| v.to_str().unwrap_or("").to_string());
-    let body = req
-        .into_body()
-        .collect()
-        .await
-        .map(|b| b.to_bytes())
-        .unwrap_or_default();
-
-    let mut fake = state.lock().unwrap();
-    fake.requests.push((method.to_string(), range.clone()));
-    if fake.requests.len() > REQUEST_CAP {
-        return plain(StatusCode::FORBIDDEN);
-    }
-    match method {
-        Method::PUT => {
-            fake.blobs.insert(path, body.to_vec());
-            Response::builder()
-                .status(StatusCode::CREATED)
-                .header("etag", "\"0x1\"")
-                .header("last-modified", "Wed, 14 Oct 2026 10:00:00 GMT")
-                .body(Full::new(Bytes::new()))
-                .unwrap()
-        }
-        Method::DELETE => {
-            let existed = fake.blobs.remove(&path).is_some();
-            plain(if existed {
-                StatusCode::ACCEPTED
-            } else {
-                StatusCode::NOT_FOUND
-            })
-        }
-        Method::GET | Method::HEAD => {
-            let Some(data) = fake.blobs.get(&path).cloned() else {
-                return plain(StatusCode::NOT_FOUND);
-            };
-            let total = data.len();
-            let mut builder = Response::builder()
-                .header("etag", "\"0x1\"")
-                .header("last-modified", "Wed, 14 Oct 2026 10:00:00 GMT")
-                .header("x-ms-blob-type", "BlockBlob")
-                .header("accept-ranges", "bytes");
-            let (status, chunk) = match range.as_deref() {
-                Some(r) if method == Method::GET => {
-                    let (s, e) = r.trim_start_matches("bytes=").split_once('-').unwrap();
-                    let start: usize = s.parse().unwrap();
-                    if start >= total {
-                        // What Azure answers for a range past the end (and for any range of an
-                        // empty blob).
-                        return Response::builder()
-                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                            .header("x-ms-error-code", "InvalidRange")
-                            .header("content-range", format!("bytes */{total}"))
-                            .body(Full::new(Bytes::new()))
-                            .unwrap();
-                    }
-                    let end = if e.is_empty() {
-                        total - 1
-                    } else {
-                        e.parse::<usize>().unwrap().min(total - 1)
-                    };
-                    builder =
-                        builder.header("content-range", format!("bytes {start}-{end}/{total}"));
-                    (StatusCode::PARTIAL_CONTENT, data[start..=end].to_vec())
-                }
-                _ => (StatusCode::OK, data),
-            };
-            builder = builder.status(status);
-            if method == Method::HEAD {
-                builder
-                    .header("content-length", total.to_string())
-                    .body(Full::new(Bytes::new()))
-                    .unwrap()
-            } else {
-                builder
-                    .header("content-length", chunk.len().to_string())
-                    .body(Full::new(Bytes::from(chunk)))
-                    .unwrap()
-            }
-        }
-        _ => plain(StatusCode::METHOD_NOT_ALLOWED),
-    }
-}
-
-async fn start() -> (State, u16) {
-    let state: State = Arc::default();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let shared = Arc::clone(&state);
-    tokio::spawn(async move {
-        loop {
-            let Ok((tcp, _)) = listener.accept().await else {
-                continue;
-            };
-            let state = Arc::clone(&shared);
-            tokio::spawn(async move {
-                let service = service_fn(move |req| {
-                    let state = Arc::clone(&state);
-                    async move { Ok::<_, Infallible>(handle(state, req).await) }
-                });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(TokioIo::new(tcp), service)
-                    .await;
-            });
-        }
-    });
-    (state, port)
-}
-
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-    (0..len)
-        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
-        .collect()
-}
-
-fn uri(key: &str) -> String {
-    format!("az://acct/ctr/{key}")
-}
-
-fn set_blob(state: &State, key: &str, data: Vec<u8>) {
-    state
-        .lock()
-        .unwrap()
-        .blobs
-        .insert(format!("acct/ctr/{key}"), data);
-}
-
-fn requests_since(state: &State, mark: usize) -> Vec<(String, Option<String>)> {
-    state.lock().unwrap().requests[mark..].to_vec()
-}
-
-fn mark(state: &State) -> usize {
-    state.lock().unwrap().requests.len()
-}
-
-fn count(requests: &[(String, Option<String>)], method: &str) -> usize {
-    requests.iter().filter(|(m, _)| m == method).count()
+async fn setup() -> (tokio::sync::MutexGuard<'static, ()>, State) {
+    let guard = ENV_LOCK.lock().await;
+    clear_azure_env();
+    let (state, port) = start().await;
+    std::env::set_var("AZURE_STORAGE_ENDPOINT", format!("http://127.0.0.1:{port}"));
+    (guard, state)
 }
 
 fn store(mode: AzureDownloadMode, range_engine: bool) -> AzureObjectStore {
@@ -202,8 +40,14 @@ fn store(mode: AzureDownloadMode, range_engine: bool) -> AzureObjectStore {
     AzureObjectStore::with_config(config)
 }
 
-/// Read `key` once, then grow it on the fake, then read it again inside the size-cache TTL.
-async fn stale_then_grow(state: &State, store: &AzureObjectStore, key: &str, first: usize) {
+/// Read `key` once, then change it on the fake, then read it again inside the size-cache TTL.
+async fn stale_then_change(
+    state: &State,
+    store: &AzureObjectStore,
+    key: &str,
+    first: usize,
+    second: usize,
+) {
     set_blob(state, key, pattern(first, 1));
     let got = store
         .get(&uri(key))
@@ -211,55 +55,48 @@ async fn stale_then_grow(state: &State, store: &AzureObjectStore, key: &str, fir
         .unwrap_or_else(|e| panic!("first read of {first} bytes: {e:#}"));
     assert_eq!(got.as_ref(), pattern(first, 1).as_slice());
 
-    let grown = pattern(MIB + 12_345, 7);
-    set_blob(state, key, grown.clone());
+    set_blob(state, key, pattern(second, 7));
     let before = mark(state);
-    let got = store
-        .get(&uri(key))
-        .await
-        .unwrap_or_else(|e| panic!("read after growing from {first} bytes: {e:#}"));
+    let got = store.get(&uri(key)).await.unwrap_or_else(|e| {
+        panic!("read after the blob changed from {first} to {second} bytes: {e:#}")
+    });
     assert_eq!(
         got.len(),
-        grown.len(),
-        "short or wrong-length body after the blob grew from {first} bytes"
+        second,
+        "wrong-length body after the blob changed from {first} to {second}"
     );
-    assert_eq!(got.as_ref(), grown.as_slice());
+    assert_eq!(got.as_ref(), pattern(second, 7).as_slice());
     let seen = requests_since(state, before);
     assert!(
         seen.len() <= 12,
-        "RED: re-reading a blob that grew from {first} bytes to {} made {} requests (cap {REQUEST_CAP}): {:?}",
-        grown.len(),
-        seen.len(),
-        &seen[..seen.len().min(5)]
+        "RED: re-reading a blob that changed from {first} to {second} bytes made {} requests",
+        seen.len()
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn downloads_do_not_plan_requests_from_a_stale_size() {
-    let (state, port) = start().await;
-    std::env::set_var("AZURE_STORAGE_ENDPOINT", format!("http://127.0.0.1:{port}"));
-    for var in [
-        "S3DLIO_AZURE_CREDENTIAL",
-        "S3DLIO_AZURE_SAS_TOKEN",
-        "AZURE_BLOB_ENDPOINT_URL",
-    ] {
-        std::env::remove_var(var);
-    }
+    let (_guard, state) = setup().await;
 
-    // 1. Sequential (explicit): the cached size is only a hint. 0 and 1 byte are the worst cases.
+    // Sequential (explicit): the cached size is only a hint. 0 and 1 byte are the worst cases.
     let sequential = store(AzureDownloadMode::Sequential, false);
-    stale_then_grow(&state, &sequential, "seq-zero", 0).await;
-    stale_then_grow(&state, &sequential, "seq-one", 1).await;
+    stale_then_change(&state, &sequential, "seq-zero", 0, MIB + 12_345).await;
+    stale_then_change(&state, &sequential, "seq-one", 1, MIB + 12_345).await;
+    // ... and a blob that shrank.
+    stale_then_change(&state, &sequential, "seq-shrink", 2 * MIB, 700).await;
 
-    // 2. The default (Auto, Azure SDK engine) does not even ask for the size.
+    // The default (Auto, Azure SDK engine) does not even ask for the size.
     let default = AzureObjectStore::new();
-    stale_then_grow(&state, &default, "auto-one", 1).await;
+    stale_then_change(&state, &default, "auto-one", 1, MIB + 12_345).await;
+    stale_then_change(&state, &default, "auto-shrink", 2 * MIB, 700).await;
 
-    // 3. s3dlio's RangeEngine plans its ranges from the size, so it must not trust a cached one.
+    // s3dlio's RangeEngine plans its ranges from the size: grown and shrunk blobs.
     let engine = store(AzureDownloadMode::Auto, true);
-    stale_then_grow(&state, &engine, "engine-128k", 128 * 1024).await;
+    stale_then_change(&state, &engine, "engine-grow", 128 * 1024, MIB + 12_345).await;
+    stale_then_change(&state, &engine, "engine-shrink", MIB, 300 * 1024).await;
+    stale_then_change(&state, &engine, "engine-to-small", MIB, 1000).await;
 
-    // 4. Default mode: no HEAD at all, one GET per small blob.
+    // Default mode: no HEAD at all, one GET per small blob.
     let n = 5;
     for i in 0..n {
         set_blob(&state, &format!("plain-{i}"), pattern(1000 + i, 3));
@@ -273,48 +110,156 @@ async fn downloads_do_not_plan_requests_from_a_stale_size() {
     assert_eq!(
         count(&seen, "HEAD"),
         0,
-        "RED: the default mode asked for the size of every blob first: {seen:?}"
+        "RED: the default mode asked for sizes first: {seen:?}"
     );
     assert_eq!(count(&seen, "GET"), n, "{seen:?}");
+}
 
-    // 5. A write through the store updates the cached size; a delete drops it.
-    set_blob(&state, "mut", pattern(10, 5));
-    sequential.get(&uri("mut")).await.unwrap(); // caches 10
-    let big = pattern(MIB, 9);
+/// The RangeEngine trusts a cached size only with a guard: repeated reads of an unchanged blob
+/// cost no HEAD (before the guard every GET started with one), and a changed blob is caught by
+/// the guard and read correctly after one fresh HEAD.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn range_engine_reads_cost_no_head_while_the_size_is_unchanged() {
+    let (_guard, state) = setup().await;
+    let engine = store(AzureDownloadMode::Auto, true);
+    let data = pattern(MIB, 2);
+    set_blob(&state, "steady", data.clone());
+
+    assert_eq!(
+        engine.get(&uri("steady")).await.unwrap().as_ref(),
+        data.as_slice()
+    );
+    let before = mark(&state);
+    for _ in 0..4 {
+        assert_eq!(
+            engine.get(&uri("steady")).await.unwrap().as_ref(),
+            data.as_slice()
+        );
+    }
+    let seen = requests_since(&state, before);
+    assert_eq!(
+        count(&seen, "HEAD"),
+        0,
+        "RED: {} HEADs for 4 reads of an unchanged blob (one per read before the guard)",
+        count(&seen, "HEAD")
+    );
+    // 4 reads x 4 chunks of 256 KiB.
+    assert_eq!(count(&seen, "GET"), 16, "{seen:?}");
+
+    // Grown: the guard (one byte past the planned end of the last range) sees it; one HEAD, one
+    // retry, the right bytes.
+    let grown = pattern(MIB + 777, 9);
+    set_blob(&state, "steady", grown.clone());
+    let before = mark(&state);
+    assert_eq!(
+        engine.get(&uri("steady")).await.unwrap().as_ref(),
+        grown.as_slice()
+    );
+    assert_eq!(count(&requests_since(&state, before), "HEAD"), 1);
+
+    // Shrunk: a range past the end is an error from the engine; same recovery.
+    let shrunk = pattern(300 * 1024, 4);
+    set_blob(&state, "steady", shrunk.clone());
+    let before = mark(&state);
+    assert_eq!(
+        engine.get(&uri("steady")).await.unwrap().as_ref(),
+        shrunk.as_slice()
+    );
+    assert_eq!(count(&requests_since(&state, before), "HEAD"), 1);
+
+    // A blob that is really gone is an error, not a retry loop.
+    state.lock().unwrap().blobs.remove("acct/ctr/steady");
+    let before = mark(&state);
+    assert!(engine.get(&uri("steady")).await.is_err());
+    assert!(requests_since(&state, before).len() <= 8);
+}
+
+/// Writes and deletes through a store invalidate exactly the sizes they make stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_and_deletes_invalidate_only_the_affected_cached_sizes() {
+    let (_guard, state) = setup().await;
+    let sequential = store(AzureDownloadMode::Sequential, false);
+    for key in ["inv/a", "inv/b", "inv/c", "other/d"] {
+        set_blob(&state, key, pattern(500, 1));
+        sequential.get(&uri(key)).await.unwrap(); // caches the size
+    }
+
+    let heads_reading = |key: &'static str| {
+        let sequential = &sequential;
+        let state = &state;
+        async move {
+            let before = mark(state);
+            let _ = sequential.get(&uri(key)).await;
+            count(&requests_since(state, before), "HEAD")
+        }
+    };
+
+    // A cache hit costs no HEAD.
+    assert_eq!(heads_reading("inv/a").await, 0, "unchanged blob");
+
+    // put: the written URI is invalidated, its neighbours are not.
     sequential
-        .put(&uri("mut"), Bytes::from(big.clone()))
+        .put(&uri("inv/a"), Bytes::from(pattern(900, 2)))
+        .await
+        .unwrap();
+    assert_eq!(heads_reading("inv/a").await, 1, "RED: after put");
+    assert_eq!(heads_reading("inv/b").await, 0, "neighbour of a put");
+
+    // delete: only the deleted URI.
+    sequential.delete(&uri("inv/b")).await.unwrap();
+    assert_eq!(
+        heads_reading("inv/b").await,
+        1,
+        "RED: after delete (the deleted blob)"
+    );
+    assert_eq!(
+        heads_reading("inv/c").await,
+        0,
+        "RED: neighbour of a delete"
+    );
+    assert_eq!(heads_reading("other/d").await, 0, "RED: another directory");
+
+    // delete_batch: the named URIs.
+    sequential.get(&uri("inv/a")).await.unwrap(); // re-cache
+    sequential.delete_batch(&[uri("inv/c")]).await.unwrap();
+    assert_eq!(
+        heads_reading("inv/c").await,
+        1,
+        "RED: after delete_batch (the deleted blob)"
+    );
+    assert_eq!(
+        heads_reading("inv/a").await,
+        0,
+        "RED: neighbour of a delete_batch"
+    );
+
+    // delete_prefix: the deleted keys, not the whole cache.
+    set_blob(&state, "pre/x", pattern(100, 1));
+    set_blob(&state, "pre/y", pattern(100, 1));
+    sequential.get(&uri("pre/x")).await.unwrap();
+    sequential.get(&uri("pre/y")).await.unwrap();
+    sequential
+        .delete_prefix("az://acct/ctr/pre/")
         .await
         .unwrap();
     assert_eq!(
-        sequential.get(&uri("mut")).await.unwrap().as_ref(),
-        big.as_slice()
+        heads_reading("pre/x").await,
+        1,
+        "RED: after delete_prefix (a deleted blob)"
     );
-    sequential.delete(&uri("mut")).await.unwrap();
-    let before = mark(&state);
-    assert!(
-        sequential.get(&uri("mut")).await.is_err(),
-        "the blob is gone"
-    );
-    let seen = requests_since(&state, before);
-    assert!(
-        count(&seen, "HEAD") >= 1,
-        "RED: after delete the next read trusted the cached size and made no HEAD: {seen:?}"
+    assert_eq!(
+        heads_reading("other/d").await,
+        0,
+        "RED: outside the deleted prefix"
     );
 }
 
 /// A range read is one request however long the range is, and a huge requested length over a
-/// small blob neither fails nor reserves that length.
+/// small blob neither fails nor reserves that length. An open-ended range is one request up to
+/// the default partition size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn range_reads_are_one_request_and_do_not_reserve_the_requested_length() {
-    let (state, port) = start().await;
-    std::env::set_var("AZURE_STORAGE_ENDPOINT", format!("http://127.0.0.1:{port}"));
-    for var in [
-        "S3DLIO_AZURE_CREDENTIAL",
-        "S3DLIO_AZURE_SAS_TOKEN",
-        "AZURE_BLOB_ENDPOINT_URL",
-    ] {
-        std::env::remove_var(var);
-    }
+    let (_guard, state) = setup().await;
     let store = AzureObjectStore::new();
     let big = pattern(20 * MIB, 4);
     set_blob(&state, "range-big", big.clone());
@@ -330,9 +275,44 @@ async fn range_reads_are_one_request_and_do_not_reserve_the_requested_length() {
     assert_eq!(
         count(&seen, "GET"),
         1,
-        "RED: an 8 MiB range took {} GET requests: {seen:?}",
+        "RED: an 8 MiB range took {} GETs: {seen:?}",
         count(&seen, "GET")
     );
+
+    // Open-ended: the rest of a 20 MiB blob is one request (the default partition is 32 MiB),
+    // not five 4 MiB ones.
+    let before = mark(&state);
+    let rest = store
+        .get_range(&uri("range-big"), 2 * MIB as u64, None)
+        .await
+        .unwrap();
+    assert_eq!(rest.as_ref(), &big[2 * MIB..]);
+    let seen = requests_since(&state, before);
+    assert_eq!(
+        count(&seen, "GET"),
+        1,
+        "RED: an open-ended range took {} GETs: {seen:?}",
+        count(&seen, "GET")
+    );
+
+    // The client-level API takes an inclusive end: the longest possible range must be an
+    // error, not an arithmetic overflow.
+    let base = std::env::var("AZURE_STORAGE_ENDPOINT").unwrap();
+    let client = s3dlio::azure_client::AzureBlob::with_default_credential_from_url(
+        &format!("{base}/acct"),
+        "ctr",
+    )
+    .unwrap();
+    let err = client
+        .get_range("range-big", 0, Some(u64::MAX))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("too long"), "{err:#}");
+    let err = client
+        .get_range("range-big", 10, Some(5))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("precedes"), "{err:#}");
 
     // "To the end" idiom: a 1 TiB length over a small blob returns the blob.
     set_blob(&state, "range-small", pattern(1000, 8));

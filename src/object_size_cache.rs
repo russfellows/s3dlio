@@ -353,6 +353,34 @@ impl ObjectSizeCache {
         );
     }
 
+    /// Remove the entry for `uri`, if there is one (a write or delete made it stale). Returns
+    /// whether an entry was removed. A miss, the common case, takes only the shared read lock.
+    pub async fn invalidate(&self, uri: &str) -> bool {
+        if !self.cache.read().await.map.contains_key(uri) {
+            return false;
+        }
+        self.cache.write().await.remove(uri).is_some()
+    }
+
+    /// [`invalidate`](Self::invalidate) for many URIs, with one read-lock pass to find the ones
+    /// that are cached and a write lock only if there are any. Returns how many were removed.
+    pub async fn invalidate_many<'a>(&self, uris: impl IntoIterator<Item = &'a str>) -> usize {
+        let cached: Vec<&str> = {
+            let cache = self.cache.read().await;
+            uris.into_iter()
+                .filter(|u| cache.map.contains_key(*u))
+                .collect()
+        };
+        if cached.is_empty() {
+            return 0;
+        }
+        let mut cache = self.cache.write().await;
+        cached
+            .into_iter()
+            .filter(|u| cache.remove(u).is_some())
+            .count()
+    }
+
     /// Clear expired entries from cache
     ///
     /// Expired entries are also removed when `get` finds them, and the cache
@@ -461,6 +489,42 @@ impl CacheStats {
 mod tests {
     use super::*;
     use tokio::time::sleep;
+
+    #[tokio::test]
+    async fn invalidate_removes_only_the_named_entries() {
+        let cache = ObjectSizeCache::with_max_entries(Duration::from_secs(60), 100);
+        for i in 0..10 {
+            cache.put(format!("az://a/c/o{i}"), i).await;
+        }
+        assert!(!cache.invalidate("az://a/c/absent").await);
+        assert!(cache.invalidate("az://a/c/o3").await);
+        assert!(!cache.invalidate("az://a/c/o3").await, "already gone");
+        let removed = cache
+            .invalidate_many([
+                "az://a/c/o1",
+                "az://a/c/o2",
+                "az://a/c/absent",
+                "az://a/c/o3",
+            ])
+            .await;
+        assert_eq!(removed, 2);
+        assert_eq!(cache.invalidate_many(std::iter::empty::<&str>()).await, 0);
+        assert_eq!(cache.get("az://a/c/o3").await, None);
+        assert_eq!(cache.get("az://a/c/o4").await, Some(4));
+        assert_eq!(cache.stats().await.total_entries, 7);
+        // The write order survives removals: new entries still evict the oldest first.
+        let small = ObjectSizeCache::with_max_entries(Duration::from_secs(60), 3);
+        for i in 0..3 {
+            small.put(format!("u{i}"), i).await;
+        }
+        small.invalidate("u1").await;
+        small.put("u3".into(), 3).await;
+        small.put("u4".into(), 4).await; // evicts u0, the oldest
+        assert_eq!(small.get("u0").await, None);
+        assert_eq!(small.get("u2").await, Some(2));
+        assert_eq!(small.get("u3").await, Some(3));
+        assert_eq!(small.get("u4").await, Some(4));
+    }
 
     #[tokio::test]
     async fn test_cache_basic() {
