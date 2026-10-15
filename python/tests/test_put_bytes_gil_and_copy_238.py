@@ -11,6 +11,7 @@ Run: uv run --no-project --isolated --with <wheel> --with pytest --with numpy \
          python -m pytest python/tests/test_put_bytes_gil_and_copy_238.py
 """
 
+import asyncio
 import json
 import os
 import subprocess
@@ -18,7 +19,6 @@ import sys
 import tempfile
 
 import pytest
-
 import s3dlio
 
 MIB = 1024 * 1024
@@ -42,7 +42,8 @@ elif kind == "memoryview":
     payload = memoryview(bytearray(b"\x5a") * size)
 elif kind == "bytesview":
     seed = os.path.join(os.path.dirname(uri[len("file://"):]), "seed.bin")
-    s3dlio.put_bytes("file://" + seed, bytearray(b"\x3c") * size)
+    # seed.bin was written by the parent with plain file I/O, so no put_bytes copy
+    # inflates this process's memory high-water mark before the measurement.
     payload = s3dlio.get("file://" + seed)
     os.unlink(seed)
 else:
@@ -75,7 +76,11 @@ state["max_gap"] = 0.0
 
 t0 = time.perf_counter()
 if use_async:
-    asyncio.run(s3dlio.put_bytes_async(uri, payload))
+    async def go():
+        # put_bytes_async needs a running event loop when it is CALLED.
+        await s3dlio.put_bytes_async(uri, payload)
+
+    asyncio.run(go())
 else:
     s3dlio.put_bytes(uri, payload)
 elapsed = time.perf_counter() - t0
@@ -90,6 +95,10 @@ print(json.dumps({
 
 
 def run_child(uri, kind, use_async=False, mib=PAYLOAD_MIB):
+    if kind == "bytesview":
+        seed = os.path.join(os.path.dirname(uri[len("file://") :]), "seed.bin")
+        with open(seed, "wb") as f:
+            f.write(b"\x3c" * (mib * MIB))
     out = subprocess.run(
         [sys.executable, "-c", CHILD, uri, kind, str(mib), "1" if use_async else "0"],
         check=True,
@@ -168,6 +177,13 @@ def _exporters(raw):
         pass
 
 
+def _put_async(uri, payload):
+    async def go():
+        await s3dlio.put_bytes_async(uri, payload)
+
+    asyncio.run(go())
+
+
 def _readback(uri):
     return bytes(memoryview(s3dlio.get(uri)))
 
@@ -185,8 +201,6 @@ def test_roundtrip_every_exporter(work_dir, scheme, size):
 @pytest.mark.parametrize("scheme", ["file", "direct"])
 @pytest.mark.parametrize("size", SIZES)
 def test_roundtrip_bytesview_and_async(work_dir, scheme, size):
-    import asyncio
-
     raw = _pattern(size)
     seed = f"file://{work_dir}/seed-{size}.bin"
     s3dlio.put_bytes(seed, raw)
@@ -196,12 +210,12 @@ def test_roundtrip_bytesview_and_async(work_dir, scheme, size):
     assert _readback(uri) == raw
 
     uri2 = f"{scheme}://{work_dir}/bv-async-{size}.bin"
-    asyncio.run(s3dlio.put_bytes_async(uri2, view))
+    _put_async(uri2, view)
     assert _readback(uri2) == raw
 
     for name, payload in _exporters(raw):
         uri3 = f"{scheme}://{work_dir}/async-{name}-{size}.bin"
-        asyncio.run(s3dlio.put_bytes_async(uri3, payload))
+        _put_async(uri3, payload)
         assert _readback(uri3) == raw, f"async {name} {scheme} size {size}"
 
 
