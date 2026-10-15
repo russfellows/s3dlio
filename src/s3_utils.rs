@@ -13,7 +13,6 @@ use aws_smithy_runtime_api::client::result::SdkError;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 #[cfg(feature = "extension-module")]
 use pyo3::{FromPyObject, PyAny};
-use regex::Regex;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +34,7 @@ use tracing::{debug, info};
 use crate::config::Config;
 use crate::config::ObjectType;
 use crate::data_gen::generate_object;
+use crate::list_pattern::ListPattern;
 
 // S3 client creation
 use crate::retry::retry_get_body;
@@ -1131,119 +1131,64 @@ pub struct BucketInfo {
     pub creation_date: String,
 }
 
-/// List keys under a path, with regex matching on the final path component.
-/// Handles S3 pagination automatically.
+/// List the keys an `s3://` URI selects (issue #213; the rule is in
+/// [`crate::s3_selection`]). Handles S3 pagination automatically.
+///
+/// `path` is the whole key part of the URI: empty or ending in `/` lists everything
+/// under it; a key with no `*` selects the object with exactly that key and, when
+/// `recursive`, everything under `path/` (never `path.bak`); a key with `*` is a glob
+/// over the full key. It is never read as a regular expression.
 ///
 /// **DEPRECATED**: This S3-specific function will be removed in v1.0.0.
 /// For backend-agnostic code, use `ObjectStore::list()` via `store_for_uri()`.
-///
-/// # Migration
-/// ```ignore
-/// // Old (S3-specific):
-/// let objects = list_objects("bucket", "prefix/", true)?;
-///
-/// // New (Universal):
-/// use s3dlio::api::{store_for_uri, ObjectStore};
-/// let store = store_for_uri("s3://bucket/prefix/")?;
-/// let objects = store.list("", true, None).await?;
-/// ```
 pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<String>> {
+    list_objects_with_pattern(bucket, path, None, recursive)
+}
+
+/// [`list_objects`] narrowed by an EXPLICIT client-side regex (issue #213).
+///
+/// `prefix` is the key part of the URI (see [`list_objects`]); `pattern`, if any, is
+/// matched against each returned key relative to the listing base (see
+/// [`crate::list_pattern`]). An invalid pattern is an error before any request is sent.
+pub(crate) fn list_objects_with_pattern(
+    bucket: &str,
+    prefix: &str,
+    pattern: Option<&str>,
+    recursive: bool,
+) -> Result<Vec<String>> {
+    // Compile before anything is sent.
+    let filter = pattern.map(ListPattern::new).transpose()?;
     // Clone inputs to move them into the async block
     let bucket = bucket.to_string();
-    let path = path.to_string();
+    let prefix = prefix.to_string();
 
     // Use the new tokio runtime framework
     run_on_global_rt(async move {
-        // 1. Determine the S3 prefix and the regex pattern from the input path.
-        let (prefix, pattern) = match path.rfind('/') {
-            Some(index) => {
-                let (p, pat) = path.split_at(index + 1);
-                (p, pat)
-            }
-            None => ("", path.as_str()),
-        };
-
-        // If the pattern is empty (e.g., path ends in "/"), default to matching everything.
-        let final_pattern = if pattern.is_empty() { ".*" } else { pattern };
-
-        // Use the recursive flag as-is - don't auto-enable recursion
-        let effective_recursive = recursive;
-
-        // 2. Compile the regex.
-        let re = Regex::new(final_pattern)
-            .with_context(|| format!("Invalid regex pattern: '{}'", final_pattern))?;
-
         // NOTE: Legacy S3Ops logging call removed here (was: `let _ = build_ops_async()...`)
         // It caused all Python list() calls to hang on non-AWS endpoints (IMDSv2 timeout).
         // See docs/bugs/PYTHON_LIST_HANG_BUG_REPORT.md for full root cause analysis.
 
         let client = aws_s3_client_async().await?;
-        let mut keys = Vec::new();
-        let mut cont: Option<String> = None;
-
-        // 3. Set the delimiter for the S3 API call based on the effective recursive flag.
-        let delimiter = if effective_recursive { None } else { Some("/") };
-
         debug!(
-            "list_objects: bucket='{}', prefix='{}', pattern='{}', recursive={}, effective_recursive={}",
-            bucket, prefix, final_pattern, recursive, effective_recursive
+            "list_objects: bucket='{}', key='{}', recursive={}",
+            bucket, prefix, recursive
         );
 
-        loop {
-            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix);
-
-            if let Some(d) = delimiter {
-                req_builder = req_builder.delimiter(d);
-            }
-
-            if let Some(token) = &cont {
-                req_builder = req_builder.continuation_token(token);
-                debug!("  loop: continuation_token={:?}", cont);
-            }
-
-            let resp = req_builder
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("list_objects_v2 failed: {}", format_sdk_error(&e)))?;
-            debug!(
-                "  page received: {} contents, {} common prefixes",
-                resp.contents().len(),
-                resp.common_prefixes().len()
-            );
-
-            // 4. Filter and collect results based on the regex.
-
-            // Handle objects (files)
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    if let Some(basename) = key.strip_prefix(prefix) {
-                        if re.is_match(basename) {
-                            debug!("    matched key: '{}'", key);
-                            keys.push(key.to_string());
-                        }
-                    }
-                }
-            }
-
-            // In non-recursive mode, yield common prefixes as directory entries.
-            if !effective_recursive {
-                for common_prefix in resp.common_prefixes() {
-                    if let Some(prefix_key) = common_prefix.prefix() {
-                        debug!("    common prefix (directory): '{}'", prefix_key);
-                        keys.push(prefix_key.to_string());
-                    }
-                }
-            }
-
-            if let Some(next) = resp.next_continuation_token() {
-                cont = Some(next.to_string());
-                debug!("  next_continuation_token='{}'", cont.as_ref().unwrap());
-            } else {
-                debug!("  no more pages, breaking");
-                break;
-            }
+        let mut keys = Vec::new();
+        let mut stream = crate::s3_selection::select_key_stream(
+            client,
+            bucket.clone(),
+            &prefix,
+            recursive,
+            false,
+        );
+        while let Some(item) = stream.next().await {
+            keys.push(item?);
         }
 
+        if let Some(filter) = &filter {
+            filter.retain(&prefix, &mut keys);
+        }
         info!("list_objects result: {} total keys", keys.len());
         keys.sort(); // Sort for consistent output
         Ok(keys)
@@ -1253,6 +1198,10 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
 /// Streaming version of list_objects that yields results as they arrive.
 /// Returns a stream of keys (without the s3:// prefix) for memory efficiency.
 /// Callers can format URIs as needed: format!("s3://{}/{}", bucket, key)
+///
+/// `path` is the whole key part of the URI and selects objects exactly as
+/// [`list_objects`] describes (issue #213; [`crate::s3_selection`]). An unusable key
+/// (a wildcard key ending in `/`) is the stream's first item, an `Err`.
 ///
 /// **Implementation note**: Uses an inline `async_stream::stream!` (no `tokio::spawn`)
 /// so all S3 and tracing calls run on the caller's task. This avoids the tracing-subscriber
@@ -1267,100 +1216,13 @@ pub async fn list_objects_stream(
         bucket, path, recursive
     );
 
-    // Determine the S3 prefix and regex pattern from the input path.
-    // Do this eagerly (before returning the stream) so callers get parse errors immediately.
-    let (prefix_str, pattern_str) = match path.rfind('/') {
-        Some(index) => {
-            let (p, pat) = path.split_at(index + 1);
-            (p.to_string(), pat.to_string())
-        }
-        None => (String::new(), path.clone()),
-    };
-    let final_pattern = if pattern_str.is_empty() {
-        ".*".to_string()
-    } else {
-        pattern_str
-    };
-    let re = Regex::new(&final_pattern)
-        .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
-
-    let delimiter = if recursive {
-        None
-    } else {
-        Some("/".to_string())
-    };
-
-    debug!(
-        "list_objects_stream: prefix='{}', pattern='{}', recursive={}, delimiter={:?}",
-        prefix_str, final_pattern, recursive, delimiter
-    );
-
-    // Build the client eagerly too — any credential errors surface before the stream starts.
+    // Build the client eagerly too -- any credential errors surface before the stream starts.
     let client = aws_s3_client_async().await?;
 
-    // Return an inline pinned stream: no tokio::spawn, runs entirely on the caller's task.
-    // This avoids tracing-subscriber deadlocks when RUST_LOG=debug/trace is set.
-    Ok(Box::pin(async_stream::stream! {
-        let mut cont: Option<String> = None;
-        let mut page_count: u32 = 0;
-        let mut total_keys: u64 = 0;
-
-        loop {
-            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix_str.as_str());
-
-            if let Some(ref d) = delimiter {
-                req_builder = req_builder.delimiter(d.as_str());
-            }
-
-            if let Some(ref token) = cont {
-                req_builder = req_builder.continuation_token(token.as_str());
-            }
-
-            let resp = match req_builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(anyhow::anyhow!("list_objects_v2 failed: {}", format_sdk_error(&e)));
-                    return;
-                }
-            };
-
-            page_count += 1;
-            debug!(
-                "  page {}: {} contents, {} common prefixes",
-                page_count, resp.contents().len(), resp.common_prefixes().len()
-            );
-
-            // Yield matching objects from this page.
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    if let Some(basename) = key.strip_prefix(prefix_str.as_str()) {
-                        if re.is_match(basename) {
-                            yield Ok(key.to_string());
-                        }
-                    }
-                }
-            }
-
-            // In non-recursive mode, yield common prefixes as directory entries.
-            if !recursive {
-                for common_prefix in resp.common_prefixes() {
-                    if let Some(prefix_key) = common_prefix.prefix() {
-                        debug!("    common prefix (directory): '{}'", prefix_key);
-                        yield Ok(prefix_key.to_string());
-                    }
-                }
-            }
-
-            total_keys += resp.contents().len() as u64;
-
-            if let Some(next) = resp.next_continuation_token() {
-                cont = Some(next.to_string());
-            } else {
-                debug!("  list_objects_stream done: {} pages, {} total keys streamed", page_count, total_keys);
-                break;
-            }
-        }
-    }))
+    // The selection runs on the caller's task: no tokio::spawn (see the note above).
+    Ok(crate::s3_selection::select_key_stream(
+        client, bucket, &path, recursive, false,
+    ))
 }
 
 /// NEW: Async GET by byte-range on full s3:// URI.
@@ -2059,64 +1921,29 @@ pub async fn stat_object_uri_async(uri: &str) -> Result<ObjectStat> {
     stat_object(&bucket, &key).await
 }
 
-/// Stream the URIs (`s3://bucket/key`) of the REAL objects whose key starts
-/// with the literal `prefix`: no delimiter (so the server never answers with
-/// `CommonPrefixes`), no regex, no key rewriting.  Only the `Contents` entries
-/// of each page are yielded -- synthetic entries are never recognised by shape
-/// (a real object may end in `/` and have size 0), they simply never appear.
+/// Stream the URIs (`s3://bucket/key`) of the REAL objects the key part `key`
+/// selects, recursively (issue #213; the rule is in [`crate::s3_selection`]): a key
+/// with no `*` that does not end in `/` selects that exact object and everything under
+/// `key/` -- never `key.bak`; a key ending in `/` (or empty) selects everything under
+/// it; a key with `*` is a glob over the full key.
+///
+/// There is no delimiter (so the server never answers with `CommonPrefixes`), no
+/// regex, no key rewriting. Only objects are yielded -- synthetic entries are never
+/// recognised by shape (a real object may end in `/` and have size 0), they simply
+/// never appear.
 ///
 /// A truncated page without a continuation token is an error, never a silently
 /// short listing.
 pub(crate) fn list_object_uris_with_prefix_stream(
     client: aws_sdk_s3::Client,
     bucket: String,
-    prefix: String,
+    key: String,
 ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
-    Box::pin(async_stream::stream! {
-        let mut cont: Option<String> = None;
-        loop {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(bucket.as_str())
-                .prefix(prefix.as_str());
-            if let Some(ref token) = cont {
-                req = req.continuation_token(token.as_str());
-            }
-            let resp = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(anyhow::anyhow!(
-                        "list_objects_v2 failed for bucket '{}' prefix '{}': {}",
-                        bucket,
-                        prefix,
-                        format_sdk_error(&e)
-                    ));
-                    return;
-                }
-            };
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    yield Ok(format!("s3://{bucket}/{key}"));
-                }
-            }
-            if resp.is_truncated().unwrap_or(false) {
-                match resp.next_continuation_token() {
-                    Some(next) => cont = Some(next.to_string()),
-                    None => {
-                        yield Err(anyhow::anyhow!(
-                            "list_objects_v2 for bucket '{}' prefix '{}' was truncated but gave \
-                             no continuation token; the listing is incomplete",
-                            bucket,
-                            prefix
-                        ));
-                        return;
-                    }
-                }
-            } else {
-                return;
-            }
-        }
-    })
+    let uri_bucket = bucket.clone();
+    Box::pin(
+        crate::s3_selection::select_key_stream(client, bucket, &key, true, true)
+            .map(move |item| item.map(|k| format!("s3://{uri_bucket}/{k}"))),
+    )
 }
 
 /*

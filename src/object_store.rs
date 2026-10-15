@@ -34,7 +34,6 @@ use crate::s3_utils::{
     create_bucket_async as s3_create_bucket_async,
     delete_bucket_async as s3_delete_bucket_async,
     delete_objects_async as s3_delete_objects_async,
-    format_sdk_error,
     get_object_range_uri_async as s3_get_object_range_uri_async,
     // The S3 backend of a store writes no row of its own: the store's caller records the call (issue #169).
     get_object_uri_optimized_rows as s3_get_object_uri_optimized_rows,
@@ -351,15 +350,16 @@ pub trait ObjectStore: Send + Sync {
     /// Stat a single object (HEAD-like).
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata>;
 
-    /// Stream the URIs of the REAL objects whose key starts with the literal
-    /// prefix named by `uri_prefix`, recursively (no delimiter, no regex, no
-    /// synthetic directory entries).
+    /// Stream the URIs of the REAL objects selected by `uri_prefix`, recursively (no
+    /// delimiter, no regex, no synthetic directory entries).
     ///
     /// Used by `s3-cli delete -r` and the Python `delete(..., recursive=True)`.
-    /// The S3 store overrides it with a literal `ListObjectsV2` that yields only
-    /// `Contents` entries.  The default (other
-    /// backends) streams their existing recursive listing and only accepts a
-    /// prefix ending in `/`, so a bare name is never read as a pattern.
+    /// The S3 store applies the `s3://` selection rule (issue #213,
+    /// `crate::s3_selection`): `s3://b/K` with no `*` selects the object `K` and
+    /// everything under `K/` -- never `K.bak`; a trailing `/` selects everything under
+    /// it; `*` / `**` make an explicit glob over the full key. Only `Contents` entries are
+    /// yielded.  The default (other backends) streams their existing recursive listing and
+    /// only accepts a prefix ending in `/`, so a bare name is never read as a pattern.
     fn list_objects_with_prefix<'a>(
         &'a self,
         uri_prefix: &'a str,
@@ -1384,86 +1384,54 @@ impl S3ObjectStore {
         Ok(())
     }
 
-    /// List objects using a given client (shared implementation for list() and list_stream()).
+    /// List what the key part `key` of an `s3://` URI selects, using a given client (shared
+    /// implementation for list() and list_stream()).
+    ///
+    /// The rule (issue #213) is `crate::s3_selection`: a key with no `*` that does not end
+    /// in `/` selects that exact object and (when `recursive`) everything under `key/`,
+    /// never `key.bak`; a key ending in `/` selects everything under it; a key with `*` is
+    /// a glob over the full key. Non-recursive, directories appear as `.../` entries.
+    /// There is no client-side regex here; an explicit one is applied by the caller
+    /// (`ListPattern`).
     async fn list_with_client(
         client: &aws_sdk_s3::Client,
         bucket: &str,
-        key_prefix: &str,
+        key: &str,
         recursive: bool,
     ) -> Result<Vec<String>> {
-        use regex::Regex;
-        let (prefix_str, pattern_str) = match key_prefix.rfind('/') {
-            Some(idx) => {
-                let (p, pat) = key_prefix.split_at(idx + 1);
-                (p.to_string(), pat.to_string())
-            }
-            None => (String::new(), key_prefix.to_string()),
-        };
-        let final_pattern = if pattern_str.is_empty() {
-            ".*".to_string()
-        } else {
-            pattern_str
-        };
-        let re = Regex::new(&final_pattern)
-            .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
-        let delimiter = if recursive {
-            None
-        } else {
-            Some("/".to_string())
-        };
-
+        use futures::StreamExt;
+        let mut stream = crate::s3_selection::select_key_stream(
+            client.clone(),
+            bucket.to_string(),
+            key,
+            recursive,
+            false,
+        );
         let mut keys = Vec::new();
-        let mut cont: Option<String> = None;
-        loop {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix_str.as_str());
-            if let Some(ref d) = delimiter {
-                req = req.delimiter(d.as_str());
-            }
-            if let Some(ref t) = cont {
-                req = req.continuation_token(t.as_str());
-            }
-            let resp = req.send().await.map_err(|e| {
-                anyhow::anyhow!(
-                    "list_objects_v2 failed for bucket '{}': {}",
-                    bucket,
-                    format_sdk_error(&e)
-                )
-            })?;
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    // Locked contract (audit #154 f24, docs/implementation-plans/
-                    // v0.9.109-audit-fix-plan.md bug B7): the regex must match
-                    // against the key's tail PAST the prefix, not the whole
-                    // key. `key.starts_with(&prefix_str)` was always true here
-                    // (S3 was already queried with `prefix(prefix_str)`), which
-                    // made the `||` a vacuous OR and the regex dead code —
-                    // every key under the prefix passed regardless of whether
-                    // it matched `final_pattern`.
-                    let tail_matches = key
-                        .strip_prefix(prefix_str.as_str())
-                        .map(|rest| re.is_match(rest))
-                        .unwrap_or(false);
-                    if tail_matches {
-                        keys.push(format!("s3://{}/{}", bucket, key));
-                    }
-                }
-            }
-            // In non-recursive mode, include common prefixes (virtual directories).
-            if !recursive {
-                for cp in resp.common_prefixes() {
-                    if let Some(prefix_key) = cp.prefix() {
-                        keys.push(format!("s3://{}/{}", bucket, prefix_key));
-                    }
-                }
-            }
-            if resp.is_truncated().unwrap_or(false) {
-                cont = resp.next_continuation_token().map(|s| s.to_string());
-            } else {
-                break;
-            }
+        while let Some(item) = stream.next().await {
+            keys.push(format!("s3://{}/{}", bucket, item?));
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// The keys under the LITERAL prefix `prefix` (`s3://bucket/<key>` URIs), read as a plain
+    /// S3 key prefix: no wildcard, no exact-object rule. Used by `delete_prefix`, whose
+    /// prefix always ends in `/`.
+    async fn list_literal_prefix_with_client(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>> {
+        use futures::StreamExt;
+        let mut stream = crate::s3_selection::literal_prefix_key_stream(
+            client.clone(),
+            bucket.to_string(),
+            prefix.to_string(),
+        );
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            keys.push(format!("s3://{}/{}", bucket, item?));
         }
         keys.sort();
         Ok(keys)
@@ -1839,8 +1807,9 @@ impl ObjectStore for S3ObjectStore {
         }
 
         if let Some(client) = &self.client {
-            let listed = Self::list_with_client(client, &bucket, &key_prefix, true).await?;
-            // `list_with_client` returns `s3://<bucket>/<key>`: strip that
+            let listed =
+                Self::list_literal_prefix_with_client(client, &bucket, &key_prefix).await?;
+            // `list_literal_prefix_with_client` returns `s3://<bucket>/<key>`: strip that
             // head rather than re-parsing (a re-parse could misread the key,
             // and a listing entry that does not parse must be an error, never
             // a key silently left out of the delete).
@@ -1872,8 +1841,14 @@ impl ObjectStore for S3ObjectStore {
             return Ok(());
         }
 
-        // Use streaming list to avoid loading millions of keys into memory
-        let mut stream = s3_list_objects_stream(bucket.clone(), key_prefix, true).await?;
+        // Use streaming list to avoid loading millions of keys into memory. The prefix is
+        // LITERAL here (it always ends in '/'): a '*' in it is a key character, not a glob.
+        let global_client = crate::s3_client::aws_s3_client_async().await?;
+        let mut stream = crate::s3_selection::literal_prefix_key_stream(
+            global_client,
+            bucket.clone(),
+            key_prefix,
+        );
         let mut batch = Vec::with_capacity(1000);
         let mut total_deleted = 0;
 
@@ -4588,6 +4563,12 @@ pub async fn generic_download_objects(
 }
 
 /// Generic download function with detailed transfer summary.
+///
+/// `src_uri` selects the objects; on `s3://` the rule is [`crate::s3_selection`] (issue #213):
+/// a name selects that object (and its `name/` directory when recursive) and never
+/// `name.bak`, a trailing `/` a directory, `*` / `**` an explicit glob.
+/// Use [`generic_download_objects_matching_with_summary`] to narrow the selection with an
+/// explicit regex.
 pub async fn generic_download_objects_with_summary(
     src_uri: &str,
     dest_dir: &Path,
@@ -4597,10 +4578,39 @@ pub async fn generic_download_objects_with_summary(
 ) -> Result<TransferSummary> {
     // Issue #211: a limit of 0 would hang; refuse it before anything else.
     crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
+    generic_download_objects_matching_with_summary(
+        src_uri,
+        dest_dir,
+        max_in_flight,
+        recursive,
+        None,
+        progress_callback,
+    )
+    .await
+}
+
+/// [`generic_download_objects_with_summary`] with an optional explicit regex filter.
+///
+/// Backend-aware (S3, Azure, GCS, `file://`, `direct://`): the listing goes through the
+/// store chosen by `src_uri`. When `pattern` is given, the listed entries are narrowed with
+/// [`ListPattern::retain`] (the pattern is matched against the entry relative to the listing
+/// base of `src_uri`) BEFORE the destination directory is created or anything is downloaded.
+/// Compile the [`ListPattern`] before calling, so an invalid regex fails without any request.
+pub async fn generic_download_objects_matching_with_summary(
+    src_uri: &str,
+    dest_dir: &Path,
+    max_in_flight: usize,
+    recursive: bool,
+    pattern: Option<&crate::list_pattern::ListPattern>,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<TransferSummary> {
     let store = store_for_uri_with_logger(src_uri, global_logger())?;
 
     // List objects to download
-    let keys = store.list(src_uri, recursive).await?;
+    let mut keys = store.list(src_uri, recursive).await?;
+    if let Some(pattern) = pattern {
+        pattern.retain(src_uri, &mut keys);
+    }
 
     if keys.is_empty() {
         bail!("No objects matched for download");

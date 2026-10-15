@@ -291,9 +291,37 @@ uris = s3dlio.list("s3://bucket/prefix/")
 # Recursive listing
 uris = s3dlio.list("s3://bucket/prefix/", recursive=True)
 
-# With glob pattern filter
-uris = s3dlio.list("s3://bucket/prefix/", pattern="*.npz")
+# With an explicit regex filter (a Rust regex, NOT a glob; see below)
+uris = s3dlio.list("s3://bucket/prefix/", recursive=True, pattern=r"\.npz$")
 ```
+
+**For `s3://` URIs the key is a name, a directory or an explicit glob -- never a regex, never a bare
+prefix (#213).** `list("s3://b/data/run.1", recursive=True)` returns the object `data/run.1` and the keys
+under `data/run.1/` and nothing else: not `data/run.1.old`, `data/run_1` or `data/prerun.1`. A name
+selects only itself (and its `name/` directory), so `list("s3://b/file.txt")` never returns
+`file.txt.bak`. The characters `.`, `(`, `)`, `[`, `+`, `$`, `?` in the URI are ordinary characters and
+never fail to parse. With `recursive=False` the object AND the "directory" (returned with a trailing
+`/`) come back: `list("s3://b/foo")` returns `foo` and `foo/`, not `foobar`, `afoo` or unrelated
+top-level folders. A trailing `/` (`s3://b/dl/`) selects everything under it, and the bucket root
+(`s3://b/`) everything in the bucket. `*` makes an explicit glob over the FULL key: `*` matches any run
+of characters except `/`, `**` matches any run including `/`, everything else is literal.
+`list("s3://b/file.txt*")` returns `file.txt`, `file.txt.bak` and `file.txt2`;
+`list("s3://b/data/**.npz")` every `.npz` under `data/`. With a wildcard an object is selected iff its
+full key matches, so `recursive` makes no difference; a wildcard key ending in `/` raises
+`RuntimeError`. `download()` follows the same rule. Earlier versions split the URI at its last `/` and
+compiled the rest as an unanchored regex. Only `s3://` follows this rule; `file://`, `direct://`,
+`gs://` and `az://` listings are unchanged (tracked in #220).
+
+**`pattern=` is the one way to select by regular expression.** It is a Rust `regex` (not a glob),
+applied AFTER the selection above, and matched, unanchored, against each returned URI *relative to the
+listing base*: the key itself when it ends with `/` (`s3://b/dl/` and `s3://b/dl/sub/c.npz` ->
+`sub/c.npz`), the directory when the key names one (`s3://b/dl` -> `sub/c.npz`), the parent directory
+for the named object (`s3://b/data/run.1` -> `run.1`), and for a wildcard URI the directory part of the
+text before the first `*` (`s3://b/data/file*` and `s3://b/data/file.txt.bak` -> `file.txt.bak`). For a
+URI without a trailing `/` this differs from earlier versions, which matched an entry that merely
+starts with the prefix against the whole URI. For a host-form URI
+(`s3://host:port/bkt/dl/`) the base is taken from the key parts. An invalid pattern raises before
+any request is made. `s3-cli ls --pattern` uses the same rule.
 
 ### stat() — Get Metadata
 
@@ -343,11 +371,13 @@ s3dlio.delete("s3://bucket/logs/2026/", recursive=True)  # every object whose ke
 - **`/`, `*` and `?` are ordinary key characters.** `delete("s3://b/dir/")` deletes the object named
   `dir/` (a folder marker) and nothing under it; `delete("s3://b/a*")` deletes the key `a*`, not every
   key starting with `a`. A trailing slash never means "recursive".
-- **`delete(uri, recursive=True)` deletes the real objects under the LITERAL prefix.** The listing uses
-  no delimiter and only objects are deleted (never a synthetic "directory" entry); the prefix is used
-  exactly as given and no `/` is appended, so `recursive=True` on `s3://b/foo` also removes `foobar`.
-  Write `s3://b/foo/` to mean the directory. `*` and `?` are literal here too. A prefix with no objects
-  is a no-op. It needs list permission. **Each selected object gets its own delete request** (up to
+- **`delete(uri, recursive=True)` deletes the real objects the `s3://` URI selects (#213).** The
+  listing uses no delimiter and only objects are deleted (never a synthetic "directory" entry).
+  `recursive=True` on `s3://b/foo` removes the object `foo` and everything under `foo/`, and NEVER
+  `foobar` or `foo.bak`; `s3://b/foo/` means the directory; `s3://b/foo*` is an explicit glob that
+  selects `foo`, `foo.bak` and `foobar` (`*` stays in one directory level, `**` crosses `/`); `?` is
+  literal. A wildcard key ending in `/` raises `RuntimeError` and deletes nothing. A selection with no
+  objects is a no-op. It needs list permission. **Each selected object gets its own delete request** (up to
   10 in flight), as before; the batched DeleteObjects that `s3-cli delete -r` uses is deferred for the
   Python API. If a delete request or the listing fails, no further delete request is sent (requests
   already in flight finish) and `RuntimeError` reports how many requests were sent and how many
@@ -358,7 +388,7 @@ s3dlio.delete("s3://bucket/logs/2026/", recursive=True)  # every object whose ke
   recursive=True ...`) and delete nothing; a regular file is deleted and a missing path is success.
   `recursive=True` with a trailing `/` deletes the files under it.
 - **Other backends** (`file://`, `direct://`, `gs://`, `az://`) use the same two store operations;
-  where a backend has no literal-prefix listing, `recursive=True` requires a URI ending in `/` and
+  where a backend has no prefix listing, `recursive=True` requires a URI ending in `/` and
   raises `RuntimeError` otherwise (nothing is deleted).
 - The op-log records an exact delete as one `DELETE` row (no `HEAD` row), and `recursive=True` as
   one `LIST` row plus one `DELETE` row per object (replayable; never `DELETE_BATCH`).
@@ -467,6 +497,9 @@ s3dlio.download(
     src_uri="s3://bucket/downloads/",
     dest_dir="/data/output/"
 )
+
+# On s3:// the source URI selects like list(): "s3://bucket/a.txt" is only a.txt (never
+# a.txt.bak); "s3://bucket/a.txt*" is the explicit glob that also takes a.txt.bak
 ```
 
 ### mp_get() — Multi-Process GET

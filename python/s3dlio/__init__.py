@@ -103,7 +103,7 @@ def list_keys(uri: str) -> List[str]:
             if prefix and not prefix.endswith("/") and key.startswith("/"):
                 key = key[1:]
         else:
-            # Fallback (e.g. the URI carries a pattern): just get the filename
+            # Fallback (a listed entry that does not start with the listed prefix): just get the filename
             key = path.rsplit("/", 1)[-1] if "/" in path else path
 
         if key:

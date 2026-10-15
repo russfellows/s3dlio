@@ -230,23 +230,36 @@ import s3dlio
 
 # Test S3
 s3dlio.upload(['test.txt'], 's3://bucket/prefix/')
-s3dlio.download('s3://bucket/prefix/*.txt', './s3_local/')
+s3dlio.download('s3://bucket/prefix/', './s3_local/')
 
 # Test Azure
 s3dlio.upload(['test.txt'], 'az://container/prefix/')
-s3dlio.download('az://container/prefix/*.txt', './azure_local/')
+s3dlio.download('az://container/prefix/', './azure_local/')
 
 # Test GCS
 s3dlio.upload(['test.txt'], 'gs://bucket/prefix/')
-s3dlio.download('gs://bucket/prefix/*.txt', './gcs_local/')
+s3dlio.download('gs://bucket/prefix/', './gcs_local/')
 
 # Test Local
 s3dlio.upload(['test.txt'], 'file:///tmp/prefix/')
-s3dlio.download('file:///tmp/prefix/*.txt', './local_copy/')
+s3dlio.download('file:///tmp/prefix/', './local_copy/')
 
 # Test DirectIO
 s3dlio.upload(['test.txt'], 'direct:///tmp/directio/prefix/')
-s3dlio.download('direct:///tmp/directio/prefix/*.txt', './directio_copy/')
+s3dlio.download('direct:///tmp/directio/prefix/', './directio_copy/')
+```
+
+On `s3://` a URI is a name, a directory or an explicit glob (#213): `s3://bucket/prefix/` selects every
+object under `prefix/`, `s3://bucket/prefix` (no trailing `/`) selects only the object `prefix` and what
+is under `prefix/` (never `prefix2/...` or `prefix.bak`), and `s3://bucket/prefix*` /
+`s3://bucket/prefix/*.txt` are globs (`*` stays in one directory level, `**` crosses `/`). The other
+backends do not yet follow this rule (tracked in #220); the
+examples above use a directory prefix for all of them. To select by name, use the CLI's explicit
+regex option, which is matched against the name relative to the listing base:
+
+```bash
+s3-cli download -r -p '\.txt$' s3://bucket/prefix/ ./s3_local/
+s3-cli download -r -p '\.txt$' file:///tmp/prefix/ ./local_copy/
 ```
 
 ### DataLoader Integration Testing
@@ -257,10 +270,10 @@ from torch.utils.data import DataLoader
 
 # Test each backend
 datasets = [
-    S3IterableDataset("s3://bucket/data/*.bin", batch_size=32),
-    S3IterableDataset("az://container/data/*.bin", batch_size=32),
-    S3IterableDataset("gs://bucket/data/*.bin", batch_size=32),
-    S3IterableDataset("file:///data/*.bin", batch_size=32),
+    S3IterableDataset("s3://bucket/data/", batch_size=32),
+    S3IterableDataset("az://container/data/", batch_size=32),
+    S3IterableDataset("gs://bucket/data/", batch_size=32),
+    S3IterableDataset("file:///data/", batch_size=32),
 ]
 
 for dataset in datasets:

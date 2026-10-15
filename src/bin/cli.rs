@@ -46,9 +46,13 @@ use s3dlio::{
     ContainerInfo, ObjectType, DEFAULT_OBJECT_SIZE,
 };
 
+use s3dlio::list_pattern::ListPattern;
 use s3dlio::progress::{ProgressCallback, S3ProgressTracker};
 use s3dlio::{finalize_op_logger, global_logger, init_op_logger};
-use s3dlio::{generic_download_objects_with_summary, generic_upload_files_with_summary};
+use s3dlio::{
+    generic_download_objects_matching_with_summary, generic_download_objects_with_summary,
+    generic_upload_files_with_summary,
+};
 
 /// Returns per-crate log-level caps that prevent deadlocks.
 ///
@@ -191,7 +195,7 @@ enum Command {
         /// Full S3 URI (e.g. s3://bucket/prefix/key)
         uri: String,
     },
-    /// Delete one exact object, or with -r every object under a literal key prefix.
+    /// Delete one exact object, or with -r the objects an s3:// URI selects.
     ///
     /// Without -r, `delete s3://bkt/foo` and `delete s3://bkt/foo/` send ONE delete
     /// request for exactly that key (a trailing slash does not mean "recursive"); the
@@ -199,12 +203,15 @@ enum Command {
     /// success (S3 does not report whether it existed); real failures such as access
     /// denied are reported. On file:// and direct://, a directory is refused without -r.
     ///
-    /// With -r, `delete -r s3://bkt/foo/` deletes every object whose key starts with
-    /// `foo/`, nested ones included. `delete -r s3://bkt/foo` uses the literal prefix
-    /// `foo`, so it ALSO deletes `foobar`; add the `/` to stay inside a folder.
+    /// With -r on s3://, `delete -r s3://bkt/foo/` deletes every object under `foo/`, nested ones
+    /// included. `delete -r s3://bkt/foo` deletes the object `foo` and everything under `foo/` and
+    /// NEVER `foobar` or `foo.bak`: a name selects only itself. `*` makes an explicit glob over the full
+    /// key (`*` stays in one directory level, `**` crosses `/`): `delete -r 's3://bkt/foo*'` deletes
+    /// `foo`, `foo.bak` and `foobar`. A wildcard key ending in `/` is refused and nothing is deleted.
     #[clap(visible_alias = "rm")]
     Delete {
-        /// S3 URI of the exact object, or with -r the literal key prefix.
+        /// S3 URI of the exact object, or with -r the selection: a name (the object and its `name/`
+        /// directory, never `name.bak`), a directory (`name/`), or a `*` / `**` glob.
         uri: String,
 
         /// Accepted for compatibility but currently unused: DeleteObjects requests
@@ -212,7 +219,7 @@ enum Command {
         #[arg(short = 'j', long = "jobs", default_value_t = 1000, value_parser = parse_jobs)]
         jobs: usize,
 
-        /// Delete every object under the literal key prefix (listed recursively).
+        /// Delete every object the URI selects (listed recursively).
         #[clap(short, long)]
         recursive: bool,
 
@@ -222,9 +229,26 @@ enum Command {
         pattern: Option<String>,
     },
     /// Download one or many objects concurrently.
+    ///
+    /// On s3:// the URI is a name, never a bare prefix and never a regex: `get s3://b/file.txt`
+    /// downloads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` downloads everything under
+    /// `dl/` (never `dl2/`); `get s3://b/dl/` the contents of that directory. `*` makes an explicit
+    /// glob over the full key (`*` stays in one directory level, `**` crosses `/`):
+    /// `get 's3://b/file.txt*'` downloads `file.txt`, `file.txt.bak` and `file.txt2`. To narrow the
+    /// selection with a regex use `--pattern`, matched against the object name relative to the
+    /// listing base (for `s3://b/dl/` and key `dl/sub/c.npz` the pattern sees `sub/c.npz`).
+    /// This rule is implemented for s3:// only; file://, direct://, gs:// and az:// do not yet
+    /// follow it (tracked in #220).
     Get {
-        /// S3 URI – can be a full key or a prefix ending with `/`.
+        /// S3 URI: a full key (selects only that object, and with -r what is under `key/`), a directory
+        /// ending with `/`, or a `*` / `**` glob. `s3://b/file.txt` never selects `file.txt.bak`.
         uri: Option<String>,
+
+        /// Regex (client-side) that narrows the selection; matched against each listed
+        /// object relative to the listing base of URI. Compiled before any request is sent.
+        /// Not valid with --keylist or --offset/--length.
+        #[arg(short = 'p', long = "pattern", value_name = "REGEX")]
+        pattern: Option<String>,
 
         /// Maximum concurrent GET requests (default 64, max 4096).
         /// Accepts human suffixes: k=1,000  m=1,000,000  (e.g. 64, 128, 256).
@@ -329,9 +353,20 @@ enum Command {
         #[arg(short = 'c', long = "create-bucket")]
         create_bucket: bool,
     },
-    /// Download objects from any storage backend (S3, Azure, GCS, file://, direct://), supports glob and regex patterns
+    /// Download objects from any storage backend (S3, Azure, GCS, file://, direct://)
+    ///
+    /// On s3:// the source URI is a name, never a bare prefix and never a regex:
+    /// `download s3://b/file.txt dir` downloads `file.txt` and NEVER `file.txt.bak`;
+    /// `download -r s3://b/dl dir` downloads everything under `dl/` (never `dl2/`). `*` makes an
+    /// explicit glob over the full key (`*` stays in one directory level, `**` crosses `/`):
+    /// `download 's3://b/file.txt*' dir` downloads `file.txt`, `file.txt.bak` and `file.txt2`. To
+    /// narrow the selection with a regex use `--pattern`, matched against the object name relative
+    /// to the listing base (for `s3://b/dl/` and key `dl/sub/c.npz` the pattern sees `sub/c.npz`).
+    /// This rule is implemented for s3:// only; file://, direct://, gs:// and az:// do not yet
+    /// follow it (tracked in #220).
     Download {
-        /// Source URI with optional patterns – supports full URIs, prefixes, globs ('*','?'), and regex patterns
+        /// Source URI: a full key (only that object, and with -r what is under `key/`), a directory
+        /// ending with '/', or a `*` / `**` glob. `s3://b/file.txt` never selects `file.txt.bak`.
         src: String,
         /// Local directory to write into
         dest_dir: PathBuf,
@@ -342,6 +377,11 @@ enum Command {
         /// Download recursively
         #[clap(short, long)]
         recursive: bool,
+        /// Regex (client-side) that narrows the selection; matched against each listed
+        /// object relative to the listing base of the source URI. Compiled before any
+        /// request is sent or any file is created.
+        #[arg(short = 'p', long = "pattern", value_name = "REGEX")]
+        pattern: Option<String>,
     },
 
     /// Copy between local paths and storage URIs.
@@ -367,16 +407,29 @@ enum Command {
     },
 
     /// List objects at a storage URI (s3://, az://, gs://, file://, direct://)
+    ///
+    /// On s3:// the URI is a name, never a bare prefix and never a regex: `ls s3://b/file.txt` lists
+    /// `file.txt` and NEVER `file.txt.bak`; `ls s3://b/dl` lists the directory entry `dl/` (never
+    /// `dl2/`), `ls -r s3://b/dl` everything under `dl/`; `ls s3://b/dl/` the contents of `dl/`.
+    /// `*` makes an explicit glob over the full key (`*` stays in one directory level, `**`
+    /// crosses `/`; `-r` makes no difference): `ls 's3://b/file.txt*'` lists `file.txt`,
+    /// `file.txt.bak` and `file.txt2`. A wildcard key ending in `/` is refused. To filter with a
+    /// regex use `--pattern`, applied after the selection and matched against the entry relative to
+    /// the listing base. This rule is implemented for s3:// only; file://, direct://, gs:// and
+    /// az:// do not yet follow it (tracked in #220).
     #[clap(name = "list", visible_alias = "ls")]
     GenericList {
-        /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, gs://bucket/prefix/, file:///path/)
+        /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, gs://bucket/prefix/, file:///path/);
+        /// on s3:// a name (`s3://b/file.txt` never selects `file.txt.bak`), a directory (end with `/`),
+        /// or a `*` / `**` glob; never a regex (use --pattern to filter)
         uri: String,
 
         /// List objects recursively
         #[clap(short, long)]
         recursive: bool,
 
-        /// Optional regex pattern to filter results (applied client-side, works with all backends)
+        /// Optional regex pattern to filter results (applied client-side, works with all backends),
+        /// matched against each entry relative to the listing base
         /// Example: '.*\.txt$' to match only .txt files
         #[clap(short, long)]
         pattern: Option<String>,
@@ -802,6 +855,7 @@ async fn main() -> Result<()> {
         // New, with regex and recursion
         Command::Get {
             uri,
+            pattern,
             jobs,
             concurrent,
             keylist,
@@ -818,6 +872,7 @@ async fn main() -> Result<()> {
             }
             get_cmd(
                 uri.as_deref(),
+                pattern.as_deref(),
                 jobs,
                 concurrent,
                 keylist.as_deref(),
@@ -967,7 +1022,12 @@ async fn main() -> Result<()> {
             dest_dir,
             jobs,
             recursive,
+            pattern,
         } => {
+            // Compile the explicit --pattern first: an invalid regex fails here, before any
+            // credential lookup, listing request or file creation (#213).
+            let filter = pattern.as_deref().map(ListPattern::new).transpose()?;
+
             // Pre-tune GCS subchannels to match download concurrency.
             s3dlio::set_gcs_channel_count(jobs);
 
@@ -978,7 +1038,10 @@ async fn main() -> Result<()> {
             // Use generic object store to list objects (works with all backends)
             let logger = global_logger();
             let store = store_for_uri_with_logger(&src, logger)?;
-            let keys = store.list(&src, recursive).await?;
+            let mut keys = store.list(&src, recursive).await?;
+            if let Some(filter) = &filter {
+                filter.retain(&src, &mut keys);
+            }
 
             if keys.is_empty() {
                 bail!("No objects matched for download");
@@ -993,11 +1056,12 @@ async fn main() -> Result<()> {
             ));
 
             let t0 = Instant::now();
-            let summary = generic_download_objects_with_summary(
+            let summary = generic_download_objects_matching_with_summary(
                 &src,
                 &dest_dir,
                 jobs,
                 recursive,
+                filter.as_ref(),
                 Some(progress_callback.clone()),
             )
             .await?;
@@ -1201,8 +1265,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Generic list command that works with any storage backend
-/// Supports optional client-side regex filtering
+/// Generic list command that works with any storage backend.
+/// The URI is a literal key prefix; an explicit `--pattern` regex filters the result client-side.
 /// Uses streaming for memory efficiency and visible progress
 async fn generic_list_cmd(
     uri: &str,
@@ -1211,7 +1275,6 @@ async fn generic_list_cmd(
     count_only: bool,
 ) -> Result<()> {
     use futures::stream::StreamExt;
-    use regex::Regex;
 
     debug!(
         "generic_list_cmd: uri='{}', recursive={}, pattern={:?}, count_only={}",
@@ -1234,21 +1297,14 @@ async fn generic_list_cmd(
     let logger = global_logger();
     let store = store_for_uri_with_logger(uri, logger)?;
 
-    // Compile regex pattern if provided.
-    // Pattern is matched against the relative path (key portion after the listing prefix),
-    // e.g. listing s3://bucket/prefix/ and key s3://bucket/prefix/foo/bar → pattern sees "foo/bar".
-    let re = pattern
-        .map(|pat| Regex::new(pat).with_context(|| format!("Invalid regex pattern: '{}'", pat)))
-        .transpose()?;
-    // Normalise the prefix for stripping: ensure it ends with '/'
-    let base = if uri.ends_with('/') {
-        uri.to_owned()
-    } else {
-        format!("{}/", uri)
-    };
+    // Compile the explicit --pattern, if any, before anything is listed. The URI itself is a
+    // LITERAL key prefix, never a regex (issue #213). The pattern is matched against the
+    // entry relative to the listing base (see `s3dlio::list_pattern`), e.g. listing
+    // s3://bucket/prefix/ and key s3://bucket/prefix/foo/bar -> the pattern sees "foo/bar".
+    let filter = pattern.map(ListPattern::new).transpose()?;
     debug!(
-        "generic_list_cmd: cli pattern={:?} (matched against relative path after '{}')",
-        pattern, base
+        "generic_list_cmd: cli pattern={:?} (matched against the path relative to the listing base of '{}')",
+        pattern, uri
     );
 
     let mut stream = store.list_stream(uri, recursive);
@@ -1298,10 +1354,9 @@ async fn generic_list_cmd(
     while let Some(result) = stream.next().await {
         let key = result?;
 
-        // Apply client-side regex filtering against the relative path (after the listing prefix)
-        if let Some(ref regex) = re {
-            let relative = key.strip_prefix(base.as_str()).unwrap_or(&key);
-            if !regex.is_match(relative) {
+        // Apply the explicit client-side regex to the path relative to the listing base
+        if let Some(ref filter) = filter {
+            if !filter.is_match(uri, &key) {
                 continue;
             }
         }
@@ -1392,10 +1447,12 @@ async fn stat_cmd(uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// Get command: downloads objects matching a key, prefix, or pattern.
+/// Get command: downloads the objects under a literal key prefix, optionally narrowed by an
+/// explicit `--pattern` regex.
 #[allow(clippy::too_many_arguments)]
 async fn get_cmd(
     uri: Option<&str>,
+    pattern: Option<&str>,
     jobs: usize,
     concurrent: Option<usize>,
     keylist: Option<&std::path::Path>,
@@ -1406,6 +1463,13 @@ async fn get_cmd(
 ) -> Result<()> {
     // Determine concurrency level (prefer concurrent over jobs for mp compatibility)
     let concurrency = concurrent.unwrap_or(jobs);
+
+    // Compile the explicit --pattern before anything else: an invalid regex fails here, with no
+    // request sent (#213). The URI itself is a literal key prefix, never a regex.
+    let filter = pattern.map(ListPattern::new).transpose()?;
+    if filter.is_some() && (keylist.is_some() || offset.is_some() || length.is_some()) {
+        bail!("--pattern selects among the objects listed under a URI prefix; it cannot be combined with --keylist or --offset/--length");
+    }
 
     // Pre-tune GCS subchannels to match concurrency before the first GCS client init.
     // The GCS client is a process-wide singleton (OnceCell); this must be called
@@ -1767,6 +1831,12 @@ async fn get_cmd(
         if key.ends_with('/') {
             continue; // skip virtual directory entries (common prefixes)
         }
+        // Explicit --pattern: matched against the key relative to the listing base of the URI.
+        if let Some(filter) = &filter {
+            if !filter.is_match(uri_str, &key) {
+                continue;
+            }
+        }
         keys_listed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Block here until a concurrency slot is available, then spawn immediately.
@@ -1800,7 +1870,7 @@ async fn get_cmd(
     if keys_seen == 0 {
         updater.abort();
         pb.finish_and_clear();
-        bail!("No objects match pattern '{}'", uri_str);
+        bail!("No objects found under the key prefix '{}'", uri_str);
     }
 
     // Phase 2: drain all in-flight downloads and collect errors.
@@ -1881,10 +1951,10 @@ async fn get_cmd(
 ///   is success (S3 deletes are idempotent) and any actual failure (403, 5xx,
 ///   network) is an error.  Nothing is listed and nothing is expanded -- a
 ///   trailing slash alone never authorizes a recursive delete.
-/// * `delete -r s3://bkt/foo/` deletes the real objects whose key starts with
-///   the literal prefix `foo/`, nested ones included.  `delete -r s3://bkt/foo`
-///   uses the literal prefix `foo` (so it also matches `foobar`; no `/` is
-///   appended).
+/// * `delete -r s3://bkt/foo/` deletes the real objects under `foo/`, nested
+///   ones included.  `delete -r s3://bkt/foo` deletes the object `foo` and
+///   everything under `foo/` -- never `foobar` (issue #213; `foo*` is the
+///   explicit glob that selects it).  `*` / `**` select by glob over the full key.
 /// * `-p/--pattern` only filters the `-r` selection; it is an error without `-r`.
 ///
 /// This is an intentional compatibility change from the earlier implicit
@@ -1943,7 +2013,7 @@ async fn delete_exact_object(
     Ok(())
 }
 
-/// `delete -r <uri>`: delete the real objects under the literal prefix, listed
+/// `delete -r <uri>`: delete the real objects the URI selects (name, directory or glob), listed
 /// recursively (no delimiter), optionally narrowed by `filter` (the pattern text
 /// and its compiled regex, matched against the listed object URI).
 ///
@@ -1955,7 +2025,7 @@ async fn delete_prefix_objects(
     uri: &str,
     filter: Option<(&str, &regex::Regex)>,
 ) -> Result<()> {
-    info!("Deleting objects under literal prefix: {}", uri);
+    info!("Deleting the objects selected by: {}", uri);
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_bar()

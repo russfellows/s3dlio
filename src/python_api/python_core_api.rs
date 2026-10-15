@@ -1244,6 +1244,13 @@ pub fn configure_s3(
 }
 
 // --- `list` function
+//
+// On s3:// `uri` is never a regular expression and never a bare prefix (issue #213, rule in
+// `crate::s3_selection`): `s3://b/K` lists the object `K` (and, recursive, what is under `K/`)
+// and NEVER `K.bak`; a trailing `/` lists a directory; `*` / `**` make an explicit glob over the
+// full key. `.`, `(`, `[`, `+`, `$` and `?` in it are ordinary characters. `pattern` is the one explicit way to
+// select by regular expression; it is matched against each listed entry relative to the
+// listing base (`crate::list_pattern`), the same rule `s3-cli ls --pattern` uses.
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false, pattern = None))]
 pub fn list(
@@ -1252,6 +1259,12 @@ pub fn list(
     recursive: bool,
     pattern: Option<&str>,
 ) -> PyResult<Vec<String>> {
+    // Compile an explicit pattern first: an invalid one fails before any request is made.
+    let filter = pattern
+        .map(crate::list_pattern::ListPattern::new)
+        .transpose()
+        .map_err(py_err)?;
+
     // Universal list using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
     let uri_owned = uri.to_owned();
 
@@ -1263,20 +1276,9 @@ pub fn list(
         submit_io(async move { store.list(&uri_owned, recursive).await })
     })?;
 
-    // Apply client-side regex filtering against the relative path (after the listing prefix).
-    // Pattern sees only the key portion after the URI prefix, e.g. "llama3-8b/" not the full URI.
-    if let Some(pat) = pattern {
-        use regex::Regex;
-        let re = Regex::new(pat).map_err(py_err)?;
-        let base = if uri.ends_with('/') {
-            uri.to_owned()
-        } else {
-            format!("{}/", uri)
-        };
-        keys.retain(|k| {
-            let relative = k.strip_prefix(base.as_str()).unwrap_or(k.as_str());
-            re.is_match(relative)
-        });
+    // Apply the explicit client-side regex against the path relative to the listing base.
+    if let Some(filter) = &filter {
+        filter.retain(uri, &mut keys);
     }
 
     Ok(keys)
@@ -2002,11 +2004,13 @@ pub fn get_many(
 ///   the key ``a*``. Nothing is listed, globbed or expanded, no parent is
 ///   consulted, and no ``/`` is added.
 ///
-/// ``delete(uri, recursive=True)`` deletes the real objects whose key starts
-/// with the LITERAL prefix given: listed without a delimiter, objects only (a
-/// "directory" is never a deletion target), no ``/`` appended, so the prefix
-/// ``foo`` also matches ``foobar``; add the trailing ``/`` yourself to mean a
-/// directory. A prefix with no objects is a no-op. Each selected object gets
+/// ``delete(uri, recursive=True)`` deletes the real objects the ``s3://`` URI
+/// selects (issue #213): listed without a delimiter, objects only (a
+/// "directory" is never a deletion target). ``foo`` selects the object ``foo``
+/// and everything under ``foo/`` and NEVER ``foobar`` or ``foo.bak``; ``foo/``
+/// selects everything under it; ``*`` makes an explicit glob over the full key
+/// (``*`` stays in one directory level, ``**`` crosses ``/``), so ``foo*`` selects
+/// ``foo``, ``foo.bak`` and ``foobar``. A selection with no objects is a no-op. Each selected object gets
 /// its own delete request (several in flight at once), so the op-log records
 /// one ``LIST`` row and one ``DELETE`` row per object. If a delete request or
 /// the listing fails, no further delete request is sent (requests already in
