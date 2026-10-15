@@ -83,20 +83,20 @@ async fn rmdir_is_recorded_as_one_delete_prefix_row() {
         .await
         .expect("rmdir of a missing directory is success");
 
-    // 5. direct:// recursive rmdir. The direct:// store does not implement
-    //    mkdir/rmdir (the trait default bails), so the call fails; the logged
-    //    store still writes its one row, with the error. The test follows the
-    //    call's outcome, so it stays valid if the backend later implements rmdir.
+    // 5. direct:// recursive rmdir: the `file://` behaviour (#229), one row, no error.
     let direct_dir = format!("{root}/direct_dir");
     std::fs::create_dir_all(format!("{direct_dir}/sub")).unwrap();
     std::fs::write(format!("{direct_dir}/sub/f.bin"), b"d").unwrap();
     let direct = store_for_uri_with_logger(&format!("direct://{root}"), global_logger()).unwrap();
-    let direct_result = direct.rmdir(&format!("direct://{direct_dir}"), true).await;
-    let direct_err = direct_result.as_ref().err().map(|e| e.to_string());
+    direct
+        .rmdir(&format!("direct://{direct_dir}"), true)
+        .await
+        .expect("direct:// recursive rmdir");
+    assert!(!std::path::Path::new(&direct_dir).exists());
 
     // 6. mkdir on both stores writes no row (guard against over-logging).
     store.mkdir(&format!("file://{root}/m1/m2")).await.unwrap();
-    let _ = direct.mkdir(&format!("direct://{root}/m3")).await;
+    direct.mkdir(&format!("direct://{root}/m3")).await.unwrap();
 
     finalize_op_logger();
     let rows = read_rows(&oplog);
@@ -119,7 +119,7 @@ async fn rmdir_is_recorded_as_one_delete_prefix_row() {
         ("file://", empty, ""),
         ("file://", full, err_text.as_str()),
         ("file://", missing, ""),
-        ("direct://", direct_dir, direct_err.as_deref().unwrap_or("")),
+        ("direct://", direct_dir, ""),
     ];
     for (i, (endpoint, dir, error)) in expect.iter().enumerate() {
         assert_eq!(&rows[i][COL_ENDPOINT], endpoint, "row {i} endpoint");
