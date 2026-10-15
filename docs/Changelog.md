@@ -2,7 +2,33 @@
 
 ## Unreleased
 
+### Changed (BEHAVIOUR CHANGE)
+
+- **The writers' `crc32c:` checksum is now a real CRC-32C (#256).** Every streaming writer (file,
+  `direct://`, the data-generating streaming writer, S3, Azure, GCS and the Arrow backend) reported
+  its checksum as `crc32c:<hex>` but computed CRC-32 (IEEE) with `crc32fast`, so the value never
+  matched a GCS `crc32c` or an S3 `x-amz-checksum-crc32c`, and the label named the wrong algorithm.
+  The value is now CRC-32C (Castagnoli), computed with the hardware-accelerated `crc32c` crate
+  (SSE4.2 / ARMv8 CRC, software fallback; the crate was already in `Cargo.lock`); the label is
+  unchanged. **The hex digits differ for every input**: for the bytes `123456789` the writers used to
+  report `crc32c:cbf43926` and now report `crc32c:e3069283`. Anything that stored a checksum from an
+  earlier release and compares it with a new one (for example a checkpoint manifest written before
+  and read with validation after) must recompute it. The integrity-validation helper
+  (`get_with_validation` / `get_range_with_validation`) uses the same algorithm, so a value a writer
+  reports still validates the object it wrote. New: `s3dlio::checksum` (`Crc32c`, `crc32c_of`,
+  `crc32c_label`). The ZIP/NPZ container CRC is unchanged (that format requires CRC-32).
+
 ### Fixed
+
+- **The retry loop keeps its own attempts for every error code the AWS SDK retries (#240
+  follow-up).** The first version of the #240 classifier listed only some of the codes the pinned AWS
+  SDK (aws-runtime 1.7.5) treats as transient or throttling. `RequestTimeoutException`,
+  `ThrottledException`, `RequestThrottledException`, `TransactionInProgressException`,
+  `LimitExceededException`, `PriorRequestNotComplete` and `EC2ThrottledException` on a 4xx status were
+  judged definite, so after the SDK had spent its own attempts the s3dlio loop gave up instead of
+  starting its own attempts. The classifier now carries the SDK's complete throttling and transient
+  tables (a unit test compares them with the pinned crate, so an SDK upgrade that adds a code fails the
+  build until the table is updated) plus the S3-specific codes it always had.
 
 - **The object size cache no longer grows without bound (#241).** The process-global size cache (and
   the per-store size caches) never removed anything: an expired entry was treated as a miss but left in
@@ -49,7 +75,8 @@
   With the optional `arrow-backend` feature, `delete_prefix("s3://b/p")` listed only the immediate
   children of `p`, so `p/b/c` and `p/b/d/e` were left behind while the call returned success. It now
   lists everything under `p/` recursively (streamed, never collected whole) and deletes it with S3
-  `DeleteObjects` requests of up to 1000 keys each, 10 requests in flight at a time. `pfoo/x` and
+  `DeleteObjects` requests of up to 1000 keys each, 10 requests in flight at a time (that bound is
+  specific to S3: see the note below). `pfoo/x` and
   `p2/y` are not touched, and neither is an object named exactly `p`. A key counts as failed unless the
   store confirmed it deleted, so a request that fails as a whole counts every key in it; a failed
   listing is one failure, ends the listing and is reported as "listing incomplete". If anything fails
@@ -61,7 +88,12 @@
   addressed through the Arrow backend's `object_store` layer, which strips the trailing `/`: the
   marker `p/` is never reported as an entry of `p/` and is not deleted, and a nested marker `p/sub/`
   is listed as `s3://b/p/sub` and may remain after `delete_prefix` (the delete of the key `p/sub`
-  reports success while `p/sub/` stays).
+  reports success while `p/sub/` stays). (3) The "10 requests in flight" bound is S3's. It counts
+  chunks of up to 1000 keys, and one chunk is one request only for S3 `DeleteObjects`; the other
+  stores split a chunk inside `object_store` 0.13.2's `delete_stream`, which multiplies the bound per
+  outer chunk: Azure sends batch requests of 256 keys (up to 4 per chunk, so up to 40 in flight), and
+  GCS and plain HTTP send one DELETE per object, 10 at a time per chunk (up to 100 in flight); S3 with
+  bulk delete disabled deletes per object, 20 per chunk (up to 200 in flight).
 
 - **Arrow backend: listing an `s3://` URI with a key prefix no longer returns doubled URIs (#222).**
   With the optional `arrow-backend` feature, listing `s3://b/dir/` returned `s3://b/dir/dir/x` for the

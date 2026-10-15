@@ -298,7 +298,16 @@ async fn list_under(
 /// 1000 keys. Deleting key by key would therefore cost a request per key. The keys are
 /// grouped here into chunks of [`DELETE_REQUEST_KEYS`] (the `DeleteObjects` limit), each
 /// chunk is one `delete_stream` call, and [`DELETE_REQUESTS_IN_FLIGHT`] chunks run at a
-/// time. An endpoint without `DeleteObjects` (Google Cloud Storage's S3 interoperability
+/// time.
+///
+/// **The bound of 10 requests in flight is S3-specific.** It counts chunks, and one chunk
+/// is exactly one request only for S3's `DeleteObjects`. In the pinned `object_store`
+/// 0.13.2 the other stores split a chunk further inside `delete_stream`: Azure sends
+/// batch requests of 256 keys (up to four per chunk, so up to 40 in flight), and the
+/// GCS and plain-HTTP stores send one DELETE per object, 10 at a time per chunk (up to
+/// 100 in flight). S3 with bulk delete disabled does the same per-object delete (20 per
+/// chunk, up to 200). Only the S3 bound is a request bound; for the others it multiplies.
+/// An endpoint without `DeleteObjects` (Google Cloud Storage's S3 interoperability
 /// endpoint) is NOT supported for delete by this backend: every request fails and so does
 /// the call, naming the keys. Use `gs://` for GCS.
 ///
