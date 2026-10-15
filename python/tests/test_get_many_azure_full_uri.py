@@ -160,8 +160,8 @@ def test_get_many_azure_writes_op_log_rows(fake_blob_endpoint, tmp_path):
     finally:
         s3dlio.finalize_op_log()
     stats = s3dlio.op_log_stats()
-    # One GET row per object, as get() writes.
-    assert stats["accepted"] >= len(uris), stats
+    # Exactly one GET row per object, as get() writes (not zero, not two).
+    assert stats["accepted"] == len(uris), stats
 
 
 def test_get_many_azure_refuses_a_uri_without_a_key(fake_blob_endpoint):

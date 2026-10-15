@@ -55,8 +55,10 @@ fn total_len_from_headers(content_range: Option<&str>, content_length: Option<u6
 ///
 /// The SDK's `ResponseBody::collect()` appends to an empty `BytesMut` with `reserve`, so a large
 /// blob is copied again at every growth step; `collect_into` needs the exact length up front and
-/// fails if the blob is larger. Reading the stream here keeps one copy per byte and still
-/// tolerates a size that changed since the `stat`.
+/// fails if the blob is larger. Reading the stream here copies each chunk once, into a buffer that
+/// is not reallocated, and still tolerates a size that changed since the `stat`. That is one
+/// copy inside s3dlio after the SDK delivers the chunks: the SDK's partitioned download (blobs
+/// above the partition size) buffers each partition itself first.
 async fn collect_body<S>(body: S, expected_len: Option<u64>) -> Result<Bytes>
 where
     S: Stream<Item = azure_core::Result<Bytes>> + Unpin,
@@ -88,10 +90,51 @@ where
 /// [`crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX`]; at the limit one entry is evicted
 /// (a client still in use stays alive through its `Arc`). Building a client is synchronous
 /// and does no I/O, so it is done under the lock and every caller gets the same client.
-type ServiceClientCache =
-    std::sync::Mutex<std::collections::HashMap<String, (Arc<BlobServiceClient>, CredentialMode)>>;
-static SERVICE_CLIENTS: std::sync::LazyLock<ServiceClientCache> =
-    std::sync::LazyLock::new(Default::default);
+struct ServiceClientCache {
+    clients: std::sync::Mutex<
+        std::collections::HashMap<String, (Arc<BlobServiceClient>, CredentialMode)>,
+    >,
+    max: usize,
+}
+
+impl ServiceClientCache {
+    fn new(max: usize) -> Self {
+        Self {
+            clients: Default::default(),
+            max,
+        }
+    }
+
+    /// The client cached under `key`, or the one `build` makes (and caches, evicting one
+    /// entry first if the cache is full). `build` runs under the lock.
+    fn get_or_build(
+        &self,
+        key: String,
+        build: impl FnOnce() -> Result<(Arc<BlobServiceClient>, CredentialMode)>,
+    ) -> Result<(Arc<BlobServiceClient>, CredentialMode)> {
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((client, mode)) = clients.get(&key) {
+            return Ok((Arc::clone(client), *mode));
+        }
+        let (client, mode) = build()?;
+        if clients.len() >= self.max {
+            if let Some(evict) = clients.keys().next().cloned() {
+                clients.remove(&evict);
+            }
+        }
+        clients.insert(key, (Arc::clone(&client), mode));
+        Ok((client, mode))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.clients.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+static SERVICE_CLIENTS: std::sync::LazyLock<ServiceClientCache> = std::sync::LazyLock::new(|| {
+    ServiceClientCache::new(crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX)
+});
 
 /// The (cached) service client for `account_url`, and the credential mode it uses.
 ///
@@ -120,50 +163,34 @@ fn service_client_for_url(account_url: &str) -> Result<(Arc<BlobServiceClient>, 
         service_url.set_query(Some(&token));
     }
 
-    let mut clients = SERVICE_CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((client, mode)) = clients.get(&key) {
-        return Ok((Arc::clone(client), *mode));
-    }
-    let credential = if mode.uses_bearer_token() {
-        if !https {
-            bail!(
-                "Azure credential mode {mode} sends a bearer token and needs an https endpoint, \
-                 but the endpoint is {plain_url}; use S3DLIO_AZURE_CREDENTIAL=none or sas for \
-                 an http endpoint such as Azurite"
-            );
-        }
-        Some(azure_credential::credential_for(mode)?)
-    } else {
-        None
-    };
-    #[cfg(test)]
-    SERVICE_CLIENT_BUILD_LOG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(plain_url);
-    let client = Arc::new(
-        BlobServiceClient::new(
-            service_url,
-            credential,
-            Some(BlobServiceClientOptions::default()),
-        )
-        .map_err(|e| anyhow!(azure_credential::redact_sas(&e.to_string())))?,
-    );
-    if clients.len() >= crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX {
-        if let Some(evict) = clients.keys().next().cloned() {
-            clients.remove(&evict);
-        }
-    }
-    clients.insert(key, (Arc::clone(&client), mode));
-    Ok((client, mode))
-}
-
-#[cfg(test)]
-fn cached_service_client_count() -> usize {
-    SERVICE_CLIENTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .len()
+    SERVICE_CLIENTS.get_or_build(key, || {
+        let credential = if mode.uses_bearer_token() {
+            if !https {
+                bail!(
+                    "Azure credential mode {mode} sends a bearer token and needs an https \
+                     endpoint, but the endpoint is {plain_url}; use S3DLIO_AZURE_CREDENTIAL=none \
+                     or sas for an http endpoint such as Azurite"
+                );
+            }
+            Some(azure_credential::credential_for(mode)?)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        SERVICE_CLIENT_BUILD_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(plain_url.clone());
+        let client = Arc::new(
+            BlobServiceClient::new(
+                service_url,
+                credential,
+                Some(BlobServiceClientOptions::default()),
+            )
+            .map_err(|e| anyhow!(azure_credential::redact_sas(&e.to_string())))?,
+        );
+        Ok((client, mode))
+    })
 }
 
 /// Test hook: the URL of every `BlobServiceClient` this module built (as opposed to served
@@ -999,16 +1026,66 @@ mod tests {
     }
 
     // The cache is bounded: a process that touches many accounts does not grow it forever.
+    // A private cache instance, so the test cannot evict the global cache's entries that other
+    // tests are counting.
     #[test]
     fn the_service_client_cache_is_bounded() {
-        for i in 0..(crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX + 10) {
-            AzureBlob::with_default_credential_from_url(
-                &format!("http://127.0.0.1:59400/bounded{i}"),
-                "c",
-            )
-            .unwrap();
+        let cache = ServiceClientCache::new(3);
+        let build = |n: usize| {
+            move || {
+                let url = Url::parse(&format!("http://127.0.0.1:59400/bounded{n}")).unwrap();
+                let client = BlobServiceClient::new(url, None, None).map_err(|e| anyhow!(e))?;
+                Ok((Arc::new(client), CredentialMode::None))
+            }
+        };
+        let mut first = None;
+        for i in 0..10 {
+            let (client, _) = cache.get_or_build(format!("k{i}"), build(i)).unwrap();
+            first.get_or_insert(client);
+            assert!(
+                cache.len() <= 3,
+                "{} entries after {} accounts",
+                cache.len(),
+                i + 1
+            );
         }
-        assert!(cached_service_client_count() <= crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX);
+        assert_eq!(cache.len(), 3);
+        // A hit does not build and does not evict.
+        let (again, _) = cache
+            .get_or_build("k9".into(), || -> Result<_> { panic!("must be a hit") })
+            .unwrap();
+        assert!(again.url().as_str().contains("bounded9"));
+    }
+
+    #[test]
+    fn range_reads_reserve_at_most_the_cap_and_sequential_partitions_have_a_floor() {
+        let cap = crate::constants::AZURE_RANGE_PRESIZE_MAX;
+        assert_eq!(range_presize(None), None);
+        assert_eq!(range_presize(Some(1000)), Some(1000));
+        assert_eq!(range_presize(Some(cap)), Some(cap));
+        assert_eq!(range_presize(Some(1 << 40)), Some(cap));
+
+        let floor = crate::constants::AZURE_MIN_DOWNLOAD_PARTITION_SIZE;
+        for stale in [0u64, 1, 4096, floor as u64 - 1] {
+            assert_eq!(
+                sequential_partition_size(stale),
+                floor,
+                "a stale {stale}-byte hint"
+            );
+        }
+        assert_eq!(sequential_partition_size(floor as u64 * 4), floor * 4);
+    }
+
+    #[test]
+    fn the_blob_length_comes_from_content_range_else_content_length() {
+        assert_eq!(
+            total_len_from_headers(Some("bytes 0-1048575/9437184"), Some(1048576)),
+            Some(9437184)
+        );
+        assert_eq!(total_len_from_headers(Some("bytes */0"), None), Some(0));
+        assert_eq!(total_len_from_headers(None, Some(77)), Some(77));
+        assert_eq!(total_len_from_headers(Some("bytes 0-9/*"), Some(10)), None);
+        assert_eq!(total_len_from_headers(None, None), None);
     }
 
     // Issue #242 review: list_account_containers handed a bearer-token credential to every

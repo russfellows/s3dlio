@@ -43,6 +43,7 @@
     `get()` does (#174). Before, each URI built a new store and no row was written.
   - A URI that names no object (`az://acct/container`, `gs://bucket/`) is refused before any read
     starts: `Cannot GET: no key specified in URI`.
+  - A read task that panics is reported as `GET <uri>: the read task failed: ...`, with its URI.
   - `get_many` of `file://`/`direct://` already passed full URIs and is unchanged. `get_many_async()` and
     `get_many_stats()` still send every URI through the S3-only reader and refuse non-S3 URIs.
   Covered by unit tests with a fake store and, for Azure, a Python test against a local fake Blob
@@ -53,13 +54,35 @@
   connections and the SDK's token cache are shared. `list_account_containers` no longer attaches a
   credential to an `http://` endpoint (the SDK refused it with "must use https"). Not measured against
   live Azure (no network access in the test runs); the unit tests count client constructions.
-- **GCS and Azure GETs copy each byte once (#252).** The GCS HTTP read started a 1 MiB buffer and let it
-  double, so an object over 1 MiB was copied again at each growth step; the Azure reads used the SDK's
-  `collect()`, which also grows chunk by chunk. Both now receive into one buffer sized from the object
-  size in the response (GCS, clamped to the requested range) or the stat size / requested range
-  (Azure); if the server sends more than announced the buffer still grows. A test counts buffer growth
-  (an 8 MiB body: 3 growths before, 0 now). The GCS gRPC read already sized its buffer from the object
-  size and is unchanged. Throughput was not measured.
+  Limit: a cached client keeps its bearer token until it nears expiry (about an hour), so after
+  `az login` as a different identity a running process keeps using the old one until the token
+  refreshes or the process restarts. When more than 64 accounts are used an arbitrary cached client is evicted
+  (it is rebuilt, with a new token request, on next use).
+- **GCS HTTP and Azure GETs no longer grow their receive buffer by doubling (#252).** The GCS HTTP read
+  started a 1 MiB buffer and let it double, so an object over 1 MiB was copied again at each growth step
+  (an 8 MiB body: 3 growths); the Azure reads used the SDK's `collect()`, which also grows chunk by chunk.
+  Both now receive into one buffer sized from the object size in the response (GCS, clamped to the requested
+  range) or the length the Azure response announces (`Content-Range`/`Content-Length`), the size hint, or the
+  requested range (an Azure range reserves at most 128 MiB up front). If the server sends more than announced
+  the buffer still grows. The result is **one copy inside s3dlio after the SDK delivers the data**; it does not
+  remove copies the SDK makes itself (Azure partitioned downloads, used above 32 MiB, buffer each partition
+  first). A test counts buffer growth. Throughput was not measured.
+- **GCS gRPC range reads reserve the range, not the object (#255).** The gRPC read sized its buffer to the
+  whole object even for a range read, so a 1 MiB range of a multi-TiB object tried to reserve the object, and a
+  negative size from the server wrapped through `as usize`. The buffer and the read timeout are now sized to
+  the bytes the read returns (clamped to the object); a negative size is 0 and the buffer grows as data
+  arrives. Full reads are unchanged. Tested on the sizing function only (no GCS service offline).
+- **Azure: a stale cached size can no longer turn a download into one request per byte (#242 review).**
+  `AzureObjectStore` caches the size a `HEAD` reports for 60 s. A blob cached as 0 or 1 byte and then
+  enlarged made the sequential download plan one-byte ranges (the SDK keeps the caller's partition size and
+  learns the real length only from the first response), roughly a million serial requests for 1 MiB. Now:
+  the partition size is never below 32 MiB whatever the hint says; the default mode (`Auto` with the Azure
+  SDK engine) and `azure-sdk` make **no `HEAD` at all** (one request for a blob up to 32 MiB; the buffer is
+  sized from the response); the s3dlio RangeEngine, which plans its ranges from the size, re-checks the size
+  instead of trusting a cached one; `put`/`put_multipart` update, and `delete`/`delete_batch`/`delete_prefix`
+  clear, the cached sizes (Azure and GCS); `AzureBlob::get_range` asks for its whole range in one request
+  instead of 4 MiB sub-requests. Tested against a fake Blob service that refuses after 300 requests.
+  Cache growth is bounded separately by the #241 size-cache fix, which this relies on.
 - **Azure: the documentation no longer tells you to authenticate with `AZURE_STORAGE_KEY` (#239).** (The service-principal, managed-identity and SAS modes this entry says were missing were added afterwards, see #253 above.)
   The docs (`PYTHON_API_GUIDE.md`, `Environment_Variables.md`, `CLI_GUIDE.md`) said an Azure account key,
   `AZURE_STORAGE_ACCOUNT`, or the service-principal variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,

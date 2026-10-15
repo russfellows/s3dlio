@@ -4188,12 +4188,16 @@ where
     let sem = Arc::new(Semaphore::new(max_in_flight));
     let failed = Arc::new(AtomicBool::new(false));
     let mut tasks: JoinSet<Result<Option<(usize, String, Bytes)>>> = JoinSet::new();
+    // Which URI each task reads, so a task that panics is still reported by URI.
+    let mut task_uris: std::collections::HashMap<tokio::task::Id, String> =
+        std::collections::HashMap::new();
 
     for (index, uri) in uris.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
         let store_for = Arc::clone(&store_for);
         let failed = Arc::clone(&failed);
-        tasks.spawn(async move {
+        let task_uri = uri.clone();
+        let handle = tasks.spawn(async move {
             let _permit = sem
                 .acquire_owned()
                 .await
@@ -4214,6 +4218,7 @@ where
                 }
             }
         });
+        task_uris.insert(handle.id(), task_uri);
     }
 
     let mut out = Vec::new();
@@ -4227,7 +4232,11 @@ where
             }
             Err(join_err) => {
                 failed.store(true, Ordering::Release);
-                first_err.get_or_insert(anyhow!("get_many read task failed: {join_err}"));
+                let uri = task_uris
+                    .get(&join_err.id())
+                    .map(String::as_str)
+                    .unwrap_or("?");
+                first_err.get_or_insert(anyhow!("GET {uri}: the read task failed: {join_err}"));
             }
         }
     }
@@ -5924,6 +5933,9 @@ mod get_many_with_stores_tests {
             if uri.ends_with("bad") {
                 bail!("backend refused {uri}");
             }
+            if uri.ends_with("panic") {
+                panic!("injected panic reading {uri}");
+            }
             if uri.ends_with("slow") {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
@@ -6068,6 +6080,45 @@ mod get_many_with_stores_tests {
             at_return.0,
             at_return.1 + 1,
             "every read that started finished, except the one that failed: {at_return:?}"
+        );
+    }
+
+    // The reads that have not started when a read fails are skipped, not downloaded. Made
+    // deterministic: one permit and a current-thread runtime, so the tasks run in spawn order
+    // and the first (failing) read finishes before any other acquires the permit.
+    #[tokio::test]
+    async fn reads_that_have_not_started_are_skipped_after_a_failure() {
+        let seen: Seen = Arc::default();
+        let reads: Arc<Reads> = Arc::default();
+        let mut uris = vec!["az://acct/c/first-bad".to_string()];
+        uris.extend((0..6).map(|i| format!("az://acct/c/obj{i}-slow")));
+
+        let err = get_many_with_stores(uris, 1, counting_factory(&seen, &reads))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("first-bad"), "{err:#}");
+        assert_eq!(
+            reads.snapshot(),
+            (1, 0),
+            "RED: reads started after the first failure (started, completed)"
+        );
+    }
+
+    // A panicking read is an error that still names its URI.
+    #[tokio::test]
+    async fn a_panicking_read_is_reported_with_its_uri() {
+        let seen: Seen = Arc::default();
+        let uris = vec![
+            "az://acct/c/fine".to_string(),
+            "az://acct/c/the-one-panic".to_string(),
+        ];
+        let err = get_many_with_stores(uris, 2, factory(&seen))
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("GET az://acct/c/the-one-panic"),
+            "RED: the URI is missing from: {message}"
         );
     }
 

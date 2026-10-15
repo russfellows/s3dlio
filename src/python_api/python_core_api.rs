@@ -3850,7 +3850,6 @@ mod store_cache_logger_tests {
                 format!("file://{}", f.display())
             })
             .collect();
-        let prefix = format!("file://{}", dir.path().display());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -3865,17 +3864,17 @@ mod store_cache_logger_tests {
             "RED: get_many wrote no op-log row per object"
         );
 
-        let built = STORE_BUILD_LOG
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|u| u.starts_with(&prefix))
-            .count();
-        assert!(
-            built <= 1,
-            "{} URIs under one store key built {built} stores",
-            uris.len()
-        );
+        // Every URI under one store key is served by the SAME cached store (not a store built
+        // per URI), whether or not another test warmed the key first.
+        let first = get_or_create_store(&uris[0], None).unwrap();
+        for uri in &uris[1..] {
+            let other = get_or_create_store(uri, None).unwrap();
+            assert!(
+                Arc::ptr_eq(&first, &other),
+                "RED: {uri} got a different store from the cache than {}",
+                uris[0]
+            );
+        }
     }
 }
 

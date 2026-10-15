@@ -451,7 +451,7 @@ impl GcsClient {
         let bucket_name = format_bucket_name(bucket);
         if self.is_rapid_bucket(bucket).await {
             debug!("GCS GET (gRPC): bucket={}, object={}", bucket, object);
-            self.get_object_via_grpc(&bucket_name, bucket, object, ReadRange::all())
+            self.get_object_via_grpc(&bucket_name, bucket, object, ReadRange::all(), None)
                 .await
         } else {
             debug!("GCS GET (HTTP): bucket={}, object={}", bucket, object);
@@ -467,13 +467,14 @@ impl GcsClient {
         bucket: &str,
         object: &str,
         range: ReadRange,
+        window: Option<(u64, Option<u64>)>,
     ) -> Result<Bytes> {
         let requested_range = range.clone();
         let (expected_size, mut data, mut chunk_count) = if requested_range == ReadRange::all() {
             retry_with_backoff(GCS_FULL_READ_RETRY_MAX_ATTEMPTS, |attempt| {
                 let range = range.clone();
                 async move {
-                    self.get_object_via_grpc_once(bucket_name, bucket, object, range)
+                    self.get_object_via_grpc_once(bucket_name, bucket, object, range, window)
                         .await
                         .map_err(|e| {
                             info!(
@@ -486,7 +487,7 @@ impl GcsClient {
             })
             .await?
         } else {
-            self.get_object_via_grpc_once(bucket_name, bucket, object, range)
+            self.get_object_via_grpc_once(bucket_name, bucket, object, range, window)
                 .await?
         };
 
@@ -519,6 +520,7 @@ impl GcsClient {
                             bucket,
                             object,
                             ReadRange::segment(offset, remaining),
+                            Some((offset, Some(remaining))),
                         )
                         .await
                         .map_err(|e| {
@@ -566,6 +568,7 @@ impl GcsClient {
         bucket: &str,
         object: &str,
         range: ReadRange,
+        window: Option<(u64, Option<u64>)>,
     ) -> Result<(usize, BytesMut, u32)> {
         let requested_range = range.clone();
         let attempt_timeout = gcs_bidi_attempt_timeout();
@@ -634,9 +637,11 @@ impl GcsClient {
             }
         };
 
-        let size_hint = descriptor.object().size as usize;
-        let mut data = BytesMut::with_capacity(size_hint);
-        let chunk_timeout = gcs_read_chunk_timeout(size_hint as u64);
+        // `size_hint` is the whole object (the full-read repair compares against it); the buffer
+        // and the chunk timeout are sized to the bytes this read returns (#255).
+        let (size_hint, capacity) = grpc_read_sizes(descriptor.object().size, window);
+        let mut data = BytesMut::with_capacity(capacity);
+        let chunk_timeout = gcs_read_chunk_timeout(capacity as u64);
         let progress_interval = gcs_read_chunk_progress_interval();
         let mut chunk_count: u32 = 0;
         while let Some(chunk) = {
@@ -777,8 +782,14 @@ impl GcsClient {
                 "GCS GET RANGE (gRPC): bucket={}, object={}, offset={}, length={:?}",
                 bucket, object, offset, length
             );
-            self.get_object_via_grpc(&bucket_name, bucket, object, read_range.clone())
-                .await
+            self.get_object_via_grpc(
+                &bucket_name,
+                bucket,
+                object,
+                read_range.clone(),
+                Some((offset, length)),
+            )
+            .await
         } else {
             debug!(
                 "GCS GET RANGE (HTTP): bucket={}, object={}, offset={}, length={:?}",
@@ -1474,6 +1485,17 @@ fn http_read_expected_len(object_size: i64, window: Option<(u64, Option<u64>)>) 
         Some((offset, Some(length))) => length.min(size.saturating_sub(offset)),
         Some((offset, None)) => size.saturating_sub(offset),
     }
+}
+
+/// Sizes for a gRPC read, from the object size the descriptor reports and the requested window
+/// (`None` = the whole object): `(object_size, buffer_capacity)`. The capacity is the bytes the
+/// read will return, so a 1 MiB range of a multi-TiB object reserves 1 MiB, not the object
+/// (#255); a negative or unrepresentable size is 0 (the buffer grows as data arrives) instead of
+/// wrapping through `as usize`.
+fn grpc_read_sizes(object_size: i64, window: Option<(u64, Option<u64>)>) -> (usize, usize) {
+    let size = usize::try_from(object_size).unwrap_or(0);
+    let capacity = usize::try_from(http_read_expected_len(object_size, window)).unwrap_or(0);
+    (size, capacity)
 }
 
 fn gcs_read_chunk_timeout(expected_size_bytes: u64) -> Option<Duration> {
@@ -2465,6 +2487,43 @@ mod zero_copy_tests {
             0
         );
         assert_eq!(http_read_expected_len(-1, None), 0);
+    }
+
+    // Issue #255: a gRPC range read sized its buffer to the whole object.
+    #[test]
+    fn grpc_range_reads_reserve_the_range_not_the_object() {
+        use super::grpc_read_sizes;
+        const MIB: i64 = 1024 * 1024;
+        let tib5: i64 = 5 * 1024 * 1024 * MIB;
+        // Full read: the object.
+        assert_eq!(
+            grpc_read_sizes(8 * MIB, None),
+            (8 * MIB as usize, 8 * MIB as usize)
+        );
+        // A 1 MiB range of a 5 TiB object reserves 1 MiB; the object size is still reported.
+        let (size, capacity) = grpc_read_sizes(tib5, Some((MIB as u64, Some(MIB as u64))));
+        assert_eq!(size, tib5 as usize);
+        assert_eq!(
+            capacity, MIB as usize,
+            "RED: reserved {capacity} bytes for a 1 MiB range"
+        );
+        // Open-ended range: from the offset to the end; past the end: nothing.
+        assert_eq!(
+            grpc_read_sizes(8 * MIB, Some((2 * MIB as u64, None))).1,
+            6 * MIB as usize
+        );
+        assert_eq!(
+            grpc_read_sizes(8 * MIB, Some((9 * MIB as u64, Some(1)))).1,
+            0
+        );
+        // A range longer than the object is clamped.
+        assert_eq!(
+            grpc_read_sizes(MIB, Some((0, Some(1 << 40)))).1,
+            MIB as usize
+        );
+        // A negative size must not wrap to a huge capacity.
+        assert_eq!(grpc_read_sizes(-1, None), (0, 0));
+        assert_eq!(grpc_read_sizes(i64::MIN, Some((0, Some(5)))), (0, 0));
     }
 
     /// The HTTP read path must use the pre-sized buffer, not a doubling `BytesMut`.

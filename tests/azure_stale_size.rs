@@ -301,3 +301,44 @@ async fn downloads_do_not_plan_requests_from_a_stale_size() {
         "RED: after delete the next read trusted the cached size and made no HEAD: {seen:?}"
     );
 }
+
+/// A range read is one request however long the range is, and a huge requested length over a
+/// small blob neither fails nor reserves that length.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn range_reads_are_one_request_and_do_not_reserve_the_requested_length() {
+    let (state, port) = start().await;
+    std::env::set_var("AZURE_STORAGE_ENDPOINT", format!("http://127.0.0.1:{port}"));
+    for var in [
+        "S3DLIO_AZURE_CREDENTIAL",
+        "S3DLIO_AZURE_SAS_TOKEN",
+        "AZURE_BLOB_ENDPOINT_URL",
+    ] {
+        std::env::remove_var(var);
+    }
+    let store = AzureObjectStore::new();
+    let big = pattern(20 * MIB, 4);
+    set_blob(&state, "range-big", big.clone());
+
+    // 8 MiB: the SDK's default 4 MiB partition made this two serial requests.
+    let before = mark(&state);
+    let got = store
+        .get_range(&uri("range-big"), MIB as u64, Some(8 * MIB as u64))
+        .await
+        .unwrap();
+    assert_eq!(got.as_ref(), &big[MIB..9 * MIB]);
+    let seen = requests_since(&state, before);
+    assert_eq!(
+        count(&seen, "GET"),
+        1,
+        "RED: an 8 MiB range took {} GET requests: {seen:?}",
+        count(&seen, "GET")
+    );
+
+    // "To the end" idiom: a 1 TiB length over a small blob returns the blob.
+    set_blob(&state, "range-small", pattern(1000, 8));
+    let got = store
+        .get_range(&uri("range-small"), 0, Some(1 << 40))
+        .await
+        .unwrap();
+    assert_eq!(got.as_ref(), pattern(1000, 8).as_slice());
+}

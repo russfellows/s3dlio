@@ -4,12 +4,17 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 //! The destination buffer for a streamed GET (GCS HTTP, Azure): sized once from the length
-//! the server announced, so every received byte is copied exactly once.
+//! the server announced (GCS: the stored object size in the response; Azure: the blob length from
+//! the response's `Content-Range`/`Content-Length`, or the size hint or requested range), so
+//! the buffer is never reallocated and re-copied as the data arrives.
 //!
-//! Issue #252: the GET paths started a 1 MiB `BytesMut` and let it double, so an object over
+//! Issue #252: the GCS HTTP path started a 1 MiB `BytesMut` and let it double, so an object over
 //! 1 MiB was copied again at every growth step (about one extra full copy of the object, plus
-//! allocator churn). Growth is still allowed when the server sends more than it announced
-//! (it must not lose data), it is just no longer the normal case.
+//! allocator churn); the Azure path used the SDK's `collect()`, which also grows chunk by chunk.
+//! This is **one copy inside s3dlio after the SDK delivers the data**: it does not remove
+//! copies the SDK itself makes (the Azure SDK's partitioned downloads, used for blobs above the
+//! partition size, buffer each partition and hand it up). Growth is still allowed when the server
+//! sends more than it announced (it must not lose data), it is just no longer the normal case.
 
 use bytes::Bytes;
 
