@@ -45,6 +45,70 @@ fn shared_credential() -> Result<Arc<dyn TokenCredential>> {
     Ok(Arc::clone(AZURE_CREDENTIAL.get_or_init(|| credential)))
 }
 
+/// Process-wide `BlobServiceClient`s, one per account URL.
+///
+/// A client owns the HTTP pipeline: its connection pool, TLS state and the bearer-token
+/// cache of its authorization policy. Building one per operation threw all of that away,
+/// so every object paid a new TCP/TLS handshake and a new `az account get-access-token`
+/// process (twice: HEAD and GET). The map is bounded by
+/// [`crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX`]; at the limit one entry is evicted
+/// (a client still in use stays alive through its `Arc`). Building a client is synchronous
+/// and does no I/O, so it is done under the lock and every caller gets the same client.
+static SERVICE_CLIENTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<BlobServiceClient>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The (cached) service client for `account_url`. A bearer-token credential is attached only
+/// for an `https` endpoint; an `http` endpoint (an emulator such as Azurite) gets none, since
+/// the SDK refuses a credential on a non-https URL.
+fn service_client_for_url(account_url: &str) -> Result<Arc<BlobServiceClient>> {
+    let service_url = Url::parse(account_url)
+        .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?;
+    let key = service_url.to_string();
+    let mut clients = SERVICE_CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(client) = clients.get(&key) {
+        return Ok(Arc::clone(client));
+    }
+    let credential = if service_url.scheme() == "https" {
+        Some(shared_credential()?)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    SERVICE_CLIENT_BUILD_LOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(key.clone());
+    let client = Arc::new(
+        BlobServiceClient::new(
+            service_url,
+            credential,
+            Some(BlobServiceClientOptions::default()),
+        )
+        .map_err(|e| anyhow!(e))?,
+    );
+    if clients.len() >= crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX {
+        if let Some(evict) = clients.keys().next().cloned() {
+            clients.remove(&evict);
+        }
+    }
+    clients.insert(key, Arc::clone(&client));
+    Ok(client)
+}
+
+#[cfg(test)]
+fn cached_service_client_count() -> usize {
+    SERVICE_CLIENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+
+/// Test hook: the URL of every `BlobServiceClient` this module built (as opposed to served
+/// from its cache), in order.
+#[cfg(test)]
+static SERVICE_CLIENT_BUILD_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Azure's documented maximum number of uncommitted blocks per block blob.
 /// See <https://learn.microsoft.com/en-us/rest/api/storageservices/put-block>.
 /// Exceeding this is a `commit_block_list` failure on Azure's side; audit
@@ -115,22 +179,8 @@ impl AzureBlob {
 
     /// Same, when a full endpoint URL (possibly emulator) is provided.
     pub fn with_default_credential_from_url(account_url: &str, container: &str) -> Result<Self> {
-        let service_url = Url::parse(account_url)
-            .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?;
-        let credential = if service_url.scheme() == "https" {
-            Some(shared_credential()?)
-        } else {
-            None
-        };
-        let service_client = BlobServiceClient::new(
-            service_url,
-            credential,
-            Some(BlobServiceClientOptions::default()),
-        )
-        .map_err(|e| anyhow!(e))?;
-
         Ok(Self {
-            service_client: Arc::new(service_client),
+            service_client: service_client_for_url(account_url)?,
             container: container.to_string(),
         })
     }
@@ -676,20 +726,16 @@ pub fn resolve_azure_account_url(account: &str) -> String {
 ///
 /// Returns `Vec<(container_name, Option<last_modified_string>)>`.
 ///
-/// Credentials follow the same chain as [`AzureBlob::with_default_credential`]:
-/// environment variables, managed identity, developer tools, etc.
+/// Credentials are the same as for [`AzureBlob::with_default_credential`]: for an `https`
+/// endpoint the Azure developer-tool credential (`az login`, then `azd auth login`; the `az` /
+/// `azd` executables must be on `PATH`); for an `http` endpoint (Azurite) none.
 pub async fn list_account_containers(account: &str) -> Result<Vec<(String, Option<String>)>> {
-    let account_url = resolve_azure_account_url(account);
+    list_account_containers_at(&resolve_azure_account_url(account)).await
+}
 
-    let credential = shared_credential()?;
-
-    let service_client = BlobServiceClient::new(
-        Url::parse(&account_url)
-            .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?,
-        Some(credential),
-        Some(BlobServiceClientOptions::default()),
-    )
-    .map_err(|e| anyhow!(e))?;
+/// [`list_account_containers`] against an explicit account URL.
+async fn list_account_containers_at(account_url: &str) -> Result<Vec<(String, Option<String>)>> {
+    let service_client = service_client_for_url(account_url)?;
 
     let mut containers: Vec<(String, Option<String>)> = Vec::new();
     let mut pager = service_client
@@ -720,6 +766,80 @@ mod tests {
 
     // Mutex to serialize tests that modify environment variables
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn builds_for(url: &str) -> usize {
+        SERVICE_CLIENT_BUILD_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|built| built.as_str() == url)
+            .count()
+    }
+
+    // Issue #242 review: every get/stat/get_range used to build a new BlobServiceClient (a new
+    // HTTP connection pool, TLS state and empty bearer-token cache). Calls for one account
+    // URL now share one client.
+    #[test]
+    fn one_service_client_per_account_url() {
+        let url = "http://127.0.0.1:59301/acct242";
+        let clients: Vec<AzureBlob> = (0..20)
+            .map(|i| AzureBlob::with_default_credential_from_url(url, &format!("c{i}")).unwrap())
+            .collect();
+        assert_eq!(
+            builds_for("http://127.0.0.1:59301/acct242"),
+            1,
+            "RED: 20 clients for one account URL built {} service clients",
+            builds_for("http://127.0.0.1:59301/acct242")
+        );
+        for c in &clients[1..] {
+            assert!(Arc::ptr_eq(&clients[0].service_client, &c.service_client));
+        }
+        // The container stays per-client.
+        assert_eq!(clients[3].container, "c3");
+
+        let other =
+            AzureBlob::with_default_credential_from_url("http://127.0.0.1:59302/other", "c")
+                .unwrap();
+        assert!(!Arc::ptr_eq(
+            &clients[0].service_client,
+            &other.service_client
+        ));
+    }
+
+    // The cache is bounded: a process that touches many accounts does not grow it forever.
+    #[test]
+    fn the_service_client_cache_is_bounded() {
+        for i in 0..(crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX + 10) {
+            AzureBlob::with_default_credential_from_url(
+                &format!("http://127.0.0.1:59400/bounded{i}"),
+                "c",
+            )
+            .unwrap();
+        }
+        assert!(cached_service_client_count() <= crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX);
+    }
+
+    // Issue #242 review: list_account_containers handed a bearer-token credential to every
+    // client, so an http:// endpoint (Azurite) was refused by the SDK with "must use https".
+    // It now follows with_default_credential_from_url: no credential for http.
+    #[tokio::test]
+    async fn list_account_containers_on_an_http_endpoint_sends_no_credential() {
+        // With a credential the SDK refuses the client at once ("must use https"). Without
+        // one the call goes on to the network, where nothing listens and the SDK retries for
+        // a long while, so a timeout means the client was built, which is what is tested.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            list_account_containers_at("http://127.0.0.1:9/acct"),
+        )
+        .await;
+        if let Ok(Err(e)) = outcome {
+            let message = format!("{e:#}");
+            assert!(
+                !message.contains("must use https"),
+                "RED: an http endpoint was given a credential: {message}"
+            );
+        }
+    }
 
     #[test]
     fn request_content_from_bytes_preserves_sliced_allocation() {

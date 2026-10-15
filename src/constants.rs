@@ -31,6 +31,10 @@ pub const DEFAULT_AZURE_DOWNLOAD_PART_SIZE: usize = 32 * 1024 * 1024;
 /// Default Azure SDK managed-download concurrency.
 pub const DEFAULT_AZURE_DOWNLOAD_CONCURRENCY: usize = 16;
 
+/// Most Azure service clients (one per account URL) kept for reuse; see
+/// `azure_client::AzureBlob::with_default_credential_from_url`.
+pub const AZURE_SERVICE_CLIENT_CACHE_MAX: usize = 64;
+
 /// Selects `auto`, `azure-sdk`, `s3dlio`, or `sequential` Azure downloads.
 pub const ENV_AZURE_DOWNLOAD_MODE: &str = "S3DLIO_AZURE_DOWNLOAD_MODE";
 
