@@ -28,6 +28,28 @@ use azure_storage_blob::models::{
 };
 use tracing::{debug, warn};
 
+/// The partition size for a sequential download of a blob believed to be `object_size` bytes.
+fn sequential_partition_size(object_size: u64) -> usize {
+    usize::try_from(object_size)
+        .unwrap_or(usize::MAX)
+        .max(crate::constants::AZURE_MIN_DOWNLOAD_PARTITION_SIZE)
+}
+
+/// How many bytes a range read reserves before the data arrives: the range length, never more
+/// than [`crate::constants::AZURE_RANGE_PRESIZE_MAX`].
+fn range_presize(range_len: Option<u64>) -> Option<u64> {
+    range_len.map(|len| len.min(crate::constants::AZURE_RANGE_PRESIZE_MAX))
+}
+
+/// The blob's total length from a download response's headers: the total in `Content-Range`
+/// (`bytes 0-1023/4096`) if the response was a partial one, else `Content-Length`.
+fn total_len_from_headers(content_range: Option<&str>, content_length: Option<u64>) -> Option<u64> {
+    match content_range {
+        Some(range) => range.rsplit('/').next().and_then(|t| t.trim().parse().ok()),
+        None => content_length,
+    }
+}
+
 /// Receive a download body into one buffer sized from `expected_len` (see
 /// [`AzureBlob::get_with_sdk_concurrency_sized`]); without a length it grows as data arrives.
 ///
@@ -316,16 +338,21 @@ impl AzureBlob {
             Some(e) => bail!("invalid Azure byte range: end {e} precedes start {start}"),
             None => HttpRange::from_offset(start),
         };
+        // One request for the whole range: with the SDK's default 4 MiB partition a 64 MiB
+        // range was sixteen serial sub-requests, each through an SDK partition buffer.
         let opts = BlobClientDownloadOptions {
             range: Some(range),
             parallel: NonZeroUsize::new(1),
+            partition_size: end
+                .and_then(|e| usize::try_from(e - start + 1).ok())
+                .and_then(NonZeroUsize::new),
             ..Default::default()
         };
         let resp = blob
             .download(Some(opts))
             .await
             .map_err(|e| self.auth_err(e))?;
-        let expected = end.map(|e| e - start + 1);
+        let expected = range_presize(end.map(|e| e - start + 1));
         let body = collect_body(resp.body, expected).await?;
         debug!(
             "AzureBlob::get_range success: key='{}', {} bytes",
@@ -340,8 +367,13 @@ impl AzureBlob {
         self.get_with_sdk_concurrency(key, None, None).await
     }
 
+    /// One stream, one request for a blob up to the partition size. `object_size` is a hint (a
+    /// cached size can be stale): it sizes the destination buffer and may enlarge the partition
+    /// (fewer requests for a large blob), but the partition is never smaller than
+    /// [`crate::constants::AZURE_MIN_DOWNLOAD_PARTITION_SIZE`], so a stale tiny hint cannot turn a
+    /// bigger blob into one request per byte.
     pub async fn get_sequential(&self, key: &str, object_size: u64) -> Result<Bytes> {
-        let partition_size = usize::try_from(object_size).unwrap_or(usize::MAX).max(1);
+        let partition_size = sequential_partition_size(object_size);
         self.get_with_sdk_concurrency_sized(key, Some(1), Some(partition_size), Some(object_size))
             .await
     }
@@ -381,6 +413,21 @@ impl AzureBlob {
             .download(Some(options))
             .await
             .map_err(|e| self.auth_err(e))?;
+        // Without a size hint, take the blob's length from the response (the SDK's first
+        // request is a ranged GET, so `Content-Range` carries the total).
+        let expected_len = expected_len.or_else(|| {
+            let headers = &resp.headers;
+            total_len_from_headers(
+                headers.get_optional_str(&azure_core::http::headers::HeaderName::from_static(
+                    "content-range",
+                )),
+                headers
+                    .get_optional_str(&azure_core::http::headers::HeaderName::from_static(
+                        "content-length",
+                    ))
+                    .and_then(|v| v.trim().parse().ok()),
+            )
+        });
         let body = collect_body(resp.body, expected_len).await?;
         debug!(
             "AzureBlob::get success: key='{}', {} bytes",

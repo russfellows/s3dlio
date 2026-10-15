@@ -31,6 +31,19 @@ pub const DEFAULT_AZURE_DOWNLOAD_PART_SIZE: usize = 32 * 1024 * 1024;
 /// Default Azure SDK managed-download concurrency.
 pub const DEFAULT_AZURE_DOWNLOAD_CONCURRENCY: usize = 16;
 
+/// Smallest partition size a sequential Azure download plans its requests with (32 MiB).
+///
+/// A cached object size is only a hint, and may be stale. The SDK splits a download into
+/// partitions of the size it is given, so a stale 0- or 1-byte hint turned a re-read of a blob
+/// that had grown to 1 MiB into about a million one-byte requests. The partition size is
+/// therefore never smaller than this, whatever the hint says.
+pub const AZURE_MIN_DOWNLOAD_PARTITION_SIZE: usize = 32 * 1024 * 1024;
+
+/// Largest buffer an Azure range read reserves up front (128 MiB), however long a range the
+/// caller asked for. The buffer still grows if the server sends more, so this only bounds what
+/// a caller-chosen length (`get_range(.., Some(1 << 40))` to mean "to the end") can reserve.
+pub const AZURE_RANGE_PRESIZE_MAX: u64 = 128 * 1024 * 1024;
+
 /// Most Azure service clients (one per account URL) kept for reuse; see
 /// `azure_client::AzureBlob::with_default_credential_from_url`.
 pub const AZURE_SERVICE_CLIENT_CACHE_MAX: usize = 64;

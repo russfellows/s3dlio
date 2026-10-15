@@ -2622,6 +2622,106 @@ impl AzureObjectStore {
         Ok(metadata.size)
     }
 
+    /// The object size and whether it came from the size cache (and so may be stale).
+    async fn get_object_size_with_origin(&self, uri: &str) -> Result<(u64, bool)> {
+        if let Some(cached_size) = self.size_cache.get(uri).await {
+            return Ok((cached_size, true));
+        }
+        Ok((self.get_object_size(uri).await?, false))
+    }
+
+    /// The object size from a `HEAD` now, whatever the cache holds; the cache is updated.
+    async fn fresh_object_size(&self, uri: &str) -> Result<u64> {
+        let metadata = self.stat(uri).await?;
+        self.size_cache.put(uri.to_string(), metadata.size).await;
+        Ok(metadata.size)
+    }
+
+    /// The body of `delete_batch`, separate so the caller can clear the size cache after it.
+    async fn delete_batch_inner(&self, uris: &[String]) -> Result<()> {
+        // Issue #179: a batch may span several containers (or accounts); a
+        // client addresses exactly one container.  Group by (account,
+        // container), validating every URI first, then delete per container.
+        let groups = group_uris_by_bucket(uris, azure_group_key)?;
+        let mut failures: Vec<GroupFailure> = Vec::new();
+        for group in &groups {
+            let (account, container) = &group.target;
+            let outcome = match group.uris.first().map(|u| Self::client_for_uri(u)) {
+                Some(Ok((cli, _acct, _cont, _))) => cli.delete_objects(&group.keys).await,
+                Some(Err(e)) => Err(e),
+                None => continue, // unreachable: a group always holds >= 1 URI
+            };
+            if let Err(error) = outcome {
+                failures.push(GroupFailure {
+                    target: format!("az://{account}/{container}"),
+                    uris: group.uris.clone(),
+                    error,
+                });
+            }
+        }
+        aggregate_failures(uris.len(), failures)
+    }
+
+    /// The body of `delete_prefix`, separate so the caller can clear the size cache after it.
+    async fn delete_prefix_inner(&self, uri_prefix: &str) -> Result<()> {
+        use futures::stream::StreamExt;
+        debug!("AzureObjectStore::delete_prefix prefix='{}'", uri_prefix);
+
+        let (account, container, key_prefix) = azure_delete_prefix_target(uri_prefix)?;
+        let cli = AzureBlob::with_default_credential(&account, &container)?;
+
+        // Use streaming list to avoid loading millions of keys into memory
+        let mut stream = cli.list_stream(Some(&key_prefix));
+        let mut batch = Vec::with_capacity(1000);
+        let mut total_deleted = 0;
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(key) => {
+                    batch.push(key);
+
+                    // Delete in batches of 1000 to avoid memory bloat
+                    if batch.len() >= 1000 {
+                        cli.delete_objects(&batch).await?;
+                        total_deleted += batch.len();
+                        batch.clear();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Delete final partial batch if any
+        if !batch.is_empty() {
+            cli.delete_objects(&batch).await?;
+            total_deleted += batch.len();
+        }
+
+        debug!(
+            "Azure delete_prefix deleted {} objects total",
+            total_deleted
+        );
+        Ok(())
+    }
+
+    /// Whether a full read needs the blob's size before it starts. The SDK's managed download
+    /// learns the length from its first (ranged) response, so the default (`Auto` with the
+    /// Azure SDK engine) and an explicit `AzureSdk` mode need no `HEAD`; the s3dlio
+    /// RangeEngine plans its ranges from the size, and `Sequential` uses it to choose a
+    /// partition size.
+    fn full_read_needs_size(&self) -> bool {
+        if self.config.enable_range_engine {
+            return true;
+        }
+        match self.config.download_mode {
+            AzureDownloadMode::AzureSdk => false,
+            AzureDownloadMode::Auto => {
+                self.config.auto_concurrent_engine != AzureConcurrentEngine::AzureSdk
+            }
+            AzureDownloadMode::S3dlio | AzureDownloadMode::Sequential => true,
+        }
+    }
+
     fn download_mode_for_size(&self, object_size: u64) -> AzureDownloadMode {
         if self.config.enable_range_engine {
             return if object_size >= self.config.range_engine.min_split_size {
@@ -2700,11 +2800,33 @@ impl ObjectStore for AzureObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
 
-        // Get blob size from cache or stat (v0.9.10: cache optimization)
-        let object_size = self.get_object_size(uri).await?;
+        if !self.full_read_needs_size() {
+            // No HEAD: the SDK discovers the length from its first response, and the buffer is
+            // sized from that response.
+            return cli
+                .get_with_sdk_concurrency_sized(
+                    &key,
+                    Some(self.config.sdk_download_concurrency),
+                    Some(self.config.sdk_download_part_size),
+                    None,
+                )
+                .await;
+        }
+
+        // The size comes from the cache (v0.9.10) or a HEAD. A cached size can be stale.
+        let (object_size, from_cache) = self.get_object_size_with_origin(uri).await?;
 
         match self.download_mode_for_size(object_size) {
-            AzureDownloadMode::S3dlio => self.get_with_range_engine(uri, object_size).await,
+            AzureDownloadMode::S3dlio => {
+                // The RangeEngine plans exactly object_size bytes of ranges: a stale smaller
+                // size would silently truncate the result, so it never trusts a cached size.
+                let object_size = if from_cache {
+                    self.fresh_object_size(uri).await?
+                } else {
+                    object_size
+                };
+                self.get_with_range_engine(uri, object_size).await
+            }
             AzureDownloadMode::AzureSdk => {
                 cli.get_with_sdk_concurrency_sized(
                     &key,
@@ -2742,7 +2864,11 @@ impl ObjectStore for AzureObjectStore {
         let (cli, _acct, _cont, key) = Self::client_for_uri(uri)?;
         debug!("AzureObjectStore::put uri='{}', {} bytes", uri, data.len());
         // Bytes→Bytes is zero-copy (reference counted buffer)
-        cli.put(&key, data, true).await
+        let len = data.len() as u64;
+        cli.put(&key, data, true).await?;
+        // The cached size (if any) is the old object's.
+        self.size_cache.put(uri.to_string(), len).await;
+        Ok(())
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {
@@ -2769,8 +2895,11 @@ impl ObjectStore for AzureObjectStore {
             .collect::<Vec<_>>();
         let stream = stream::iter(chunks);
 
+        let len = data.len() as u64;
         cli.upload_multipart_stream(&key, stream, part, max_in_flight)
-            .await
+            .await?;
+        self.size_cache.put(uri.to_string(), len).await;
+        Ok(())
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
@@ -2870,7 +2999,10 @@ impl ObjectStore for AzureObjectStore {
         if key.is_empty() {
             bail!("cannot delete '{uri}': it names a container, not an object");
         }
-        cli.delete_objects(&[key]).await
+        let outcome = cli.delete_objects(&[key]).await;
+        // Whether or not every delete succeeded, no cached size can be trusted any more.
+        self.size_cache.clear().await;
+        outcome
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
@@ -2878,69 +3010,15 @@ impl ObjectStore for AzureObjectStore {
             return Ok(());
         }
         debug!("AzureObjectStore::delete_batch {} URIs", uris.len());
-
-        // Issue #179: a batch may span several containers (or accounts); a
-        // client addresses exactly one container.  Group by (account,
-        // container), validating every URI first, then delete per container.
-        let groups = group_uris_by_bucket(uris, azure_group_key)?;
-        let mut failures: Vec<GroupFailure> = Vec::new();
-        for group in &groups {
-            let (account, container) = &group.target;
-            let outcome = match group.uris.first().map(|u| Self::client_for_uri(u)) {
-                Some(Ok((cli, _acct, _cont, _))) => cli.delete_objects(&group.keys).await,
-                Some(Err(e)) => Err(e),
-                None => continue, // unreachable: a group always holds >= 1 URI
-            };
-            if let Err(error) = outcome {
-                failures.push(GroupFailure {
-                    target: format!("az://{account}/{container}"),
-                    uris: group.uris.clone(),
-                    error,
-                });
-            }
-        }
-        aggregate_failures(uris.len(), failures)
+        let outcome = self.delete_batch_inner(uris).await;
+        self.size_cache.clear().await;
+        outcome
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
-        use futures::stream::StreamExt;
-        debug!("AzureObjectStore::delete_prefix prefix='{}'", uri_prefix);
-
-        let (account, container, key_prefix) = azure_delete_prefix_target(uri_prefix)?;
-        let cli = AzureBlob::with_default_credential(&account, &container)?;
-
-        // Use streaming list to avoid loading millions of keys into memory
-        let mut stream = cli.list_stream(Some(&key_prefix));
-        let mut batch = Vec::with_capacity(1000);
-        let mut total_deleted = 0;
-
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(key) => {
-                    batch.push(key);
-
-                    // Delete in batches of 1000 to avoid memory bloat
-                    if batch.len() >= 1000 {
-                        cli.delete_objects(&batch).await?;
-                        total_deleted += batch.len();
-                        batch.clear();
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Delete final partial batch if any
-        if !batch.is_empty() {
-            cli.delete_objects(&batch).await?;
-            total_deleted += batch.len();
-        }
-
-        debug!(
-            "Azure delete_prefix deleted {} objects total",
-            total_deleted
-        );
-        Ok(())
+        let outcome = self.delete_prefix_inner(uri_prefix).await;
+        self.size_cache.clear().await;
+        outcome
     }
 
     /// No-op: an object store has no directories (issue #229). A prefix exists once
@@ -3414,11 +3492,25 @@ impl ObjectStore for GcsObjectStore {
             return client.get_object(&bucket, &object).await;
         }
 
-        // Get object size from cache or stat (v0.9.10: cache optimization)
-        let object_size = self.get_object_size(uri).await?;
+        // Get object size from cache or stat (v0.9.10: cache optimization). A cached size can
+        // be stale.
+        let cached = self.size_cache.get(uri).await;
+        let object_size = match cached {
+            Some(size) => size,
+            None => self.get_object_size(uri).await?,
+        };
 
         // Use RangeEngine for large objects (default 4MB+)
         if object_size >= self.config.range_engine.min_split_size {
+            // The RangeEngine plans exactly object_size bytes of ranges: a stale smaller size
+            // would silently truncate the result, so it never trusts a cached size.
+            let object_size = if cached.is_some() {
+                let size = self.stat(uri).await?.size;
+                self.size_cache.put(uri.to_string(), size).await;
+                size
+            } else {
+                object_size
+            };
             debug!(
                 "GCS object size {} >= threshold {}, using RangeEngine for {}",
                 object_size, self.config.range_engine.min_split_size, uri
@@ -3451,7 +3543,11 @@ impl ObjectStore for GcsObjectStore {
         let (bucket, object) = parse_gcs_uri(uri)?;
         debug!("GcsObjectStore::put uri='{}', {} bytes", uri, data.len());
         let client = self.get_client().await?;
-        client.put_object(&bucket, &object, data).await
+        let len = data.len() as u64;
+        client.put_object(&bucket, &object, data).await?;
+        // The cached size (if any) is the old object's.
+        self.size_cache.put(uri.to_string(), len).await;
+        Ok(())
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, _part_size: Option<usize>) -> Result<()> {
@@ -3468,7 +3564,10 @@ impl ObjectStore for GcsObjectStore {
             data.len()
         );
         let client = self.get_client().await?;
-        client.put_object(&bucket, &object, data).await
+        let len = data.len() as u64;
+        client.put_object(&bucket, &object, data).await?;
+        self.size_cache.put(uri.to_string(), len).await;
+        Ok(())
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
@@ -3530,63 +3629,81 @@ impl ObjectStore for GcsObjectStore {
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
-        let (bucket, object) = parse_gcs_uri(uri)?;
-        debug!("GcsObjectStore::delete uri='{}'", uri);
-        if object.is_empty() {
-            bail!("cannot delete '{uri}': it names a bucket, not an object");
+        let outcome: Result<()> = async {
+            let (bucket, object) = parse_gcs_uri(uri)?;
+            debug!("GcsObjectStore::delete uri='{}'", uri);
+            if object.is_empty() {
+                bail!("cannot delete '{uri}': it names a bucket, not an object");
+            }
+            let client = self.get_client().await?;
+            client.delete_object(&bucket, &object).await
         }
-        let client = self.get_client().await?;
-        client.delete_object(&bucket, &object).await
+        .await;
+        // Whether or not every delete succeeded, no cached size can be trusted any more.
+        self.size_cache.clear().await;
+        outcome
     }
 
     async fn delete_batch(&self, uris: &[String]) -> Result<()> {
-        if uris.is_empty() {
-            return Ok(());
-        }
-        debug!("GcsObjectStore::delete_batch {} URIs", uris.len());
-
-        // Issue #179: a batch may span several buckets; delete_objects
-        // addresses exactly one.  Group by bucket, validating every URI first
-        // (a batch we cannot fully interpret deletes nothing), then delete per
-        // bucket.  A single-bucket batch is one group, as before.
-        let groups = group_uris_by_bucket(uris, parse_gcs_uri)?;
-        let client = self.get_client().await?;
-        let mut failures: Vec<GroupFailure> = Vec::new();
-        for group in &groups {
-            if let Err(error) = client
-                .delete_objects(&group.target, group.keys.clone())
-                .await
-            {
-                failures.push(GroupFailure {
-                    target: format!("gs://{}", group.target),
-                    uris: group.uris.clone(),
-                    error,
-                });
+        let outcome: Result<()> = async {
+            if uris.is_empty() {
+                return Ok(());
             }
+            debug!("GcsObjectStore::delete_batch {} URIs", uris.len());
+
+            // Issue #179: a batch may span several buckets; delete_objects
+            // addresses exactly one.  Group by bucket, validating every URI first
+            // (a batch we cannot fully interpret deletes nothing), then delete per
+            // bucket.  A single-bucket batch is one group, as before.
+            let groups = group_uris_by_bucket(uris, parse_gcs_uri)?;
+            let client = self.get_client().await?;
+            let mut failures: Vec<GroupFailure> = Vec::new();
+            for group in &groups {
+                if let Err(error) = client
+                    .delete_objects(&group.target, group.keys.clone())
+                    .await
+                {
+                    failures.push(GroupFailure {
+                        target: format!("gs://{}", group.target),
+                        uris: group.uris.clone(),
+                        error,
+                    });
+                }
+            }
+            aggregate_failures(uris.len(), failures)
         }
-        aggregate_failures(uris.len(), failures)
+        .await;
+        // Whether or not every delete succeeded, no cached size can be trusted any more.
+        self.size_cache.clear().await;
+        outcome
     }
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
-        debug!("GcsObjectStore::delete_prefix prefix='{}'", uri_prefix);
-        let (bucket, key_prefix) = gcs_delete_prefix_target(uri_prefix)?;
+        let outcome: Result<()> = async {
+            debug!("GcsObjectStore::delete_prefix prefix='{}'", uri_prefix);
+            let (bucket, key_prefix) = gcs_delete_prefix_target(uri_prefix)?;
 
-        let client = self.get_client().await?;
+            let client = self.get_client().await?;
 
-        // Use streaming list to avoid loading millions of keys into memory
-        // List all objects (returns Vec, not a stream)
-        let keys = client
-            .list_objects(&bucket, Some(&key_prefix), true)
-            .await?;
-        let total_deleted = keys.len();
+            // Use streaming list to avoid loading millions of keys into memory
+            // List all objects (returns Vec, not a stream)
+            let keys = client
+                .list_objects(&bucket, Some(&key_prefix), true)
+                .await?;
+            let total_deleted = keys.len();
 
-        // Delete in batches of 1000 to avoid overloading the API
-        for chunk in keys.chunks(1000) {
-            client.delete_objects(&bucket, chunk.to_vec()).await?;
+            // Delete in batches of 1000 to avoid overloading the API
+            for chunk in keys.chunks(1000) {
+                client.delete_objects(&bucket, chunk.to_vec()).await?;
+            }
+
+            debug!("GCS delete_prefix deleted {} objects total", total_deleted);
+            Ok(())
         }
-
-        debug!("GCS delete_prefix deleted {} objects total", total_deleted);
-        Ok(())
+        .await;
+        // Whether or not every delete succeeded, no cached size can be trusted any more.
+        self.size_cache.clear().await;
+        outcome
     }
 
     /// No-op: an object store has no directories (issue #229). A prefix exists once
@@ -6008,5 +6125,61 @@ mod get_many_with_stores_tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("max_in_flight"), "{err:#}");
         assert!(seen.lock().unwrap().is_empty());
+    }
+}
+
+// Blue review 2026-10-15: a size cached by `get` must not outlive a write or delete through the
+// same store, and the RangeEngine must never plan its ranges from a cached size. The Azure
+// behaviour is tested against a fake Blob service (tests/azure_stale_size.rs); GCS has no local
+// stand-in, so this pins its source shape.
+#[cfg(all(test, feature = "backend-gcs"))]
+mod gcs_size_cache_hygiene_tests {
+    fn gcs_impl() -> &'static str {
+        let src = include_str!("object_store.rs");
+        let start = src
+            .find("impl ObjectStore for GcsObjectStore {")
+            .expect("impl");
+        let end = src[start..].find("\n}\n").expect("end of impl") + start;
+        &src[start..end]
+    }
+
+    fn method<'a>(body: &'a str, sig: &str) -> &'a str {
+        let a = body.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+        let end = body[a..].find("\n    }\n").expect("end of method") + a;
+        &body[a..end]
+    }
+
+    #[test]
+    fn writes_update_and_deletes_clear_the_cached_size() {
+        let body = gcs_impl();
+        for sig in ["async fn put(", "async fn put_multipart("] {
+            assert!(
+                method(body, sig).contains("size_cache.put("),
+                "RED: {sig} leaves the cached size of the overwritten object"
+            );
+        }
+        for sig in [
+            "async fn delete(",
+            "async fn delete_batch(",
+            "async fn delete_prefix(",
+        ] {
+            assert!(
+                method(body, sig).contains("size_cache.clear()"),
+                "RED: {sig} leaves cached sizes of deleted objects"
+            );
+        }
+    }
+
+    #[test]
+    fn the_range_engine_does_not_trust_a_cached_size() {
+        let get = method(gcs_impl(), "async fn get(");
+        let engine = get.find("get_with_range_engine(").expect("engine call");
+        let stat = get
+            .find("self.stat(uri)")
+            .expect("a fresh stat before the engine");
+        assert!(
+            stat < engine,
+            "RED: the RangeEngine is planned from the cached size"
+        );
     }
 }
