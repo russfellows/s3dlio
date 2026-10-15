@@ -1097,6 +1097,34 @@ mod tests {
     // Mutex to serialize tests that modify environment variables
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    /// Serialise with other environment-changing tests and start from a known environment:
+    /// nothing that selects an Azure credential or endpoint may leak in from the developer's
+    /// shell (or from a test that ran before).
+    fn clean_azure_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        reset_azure_env();
+        guard
+    }
+
+    /// The reset alone, for an async test that must not hold the lock across an await.
+    fn reset_azure_env() {
+        for (name, _) in std::env::vars() {
+            if name.starts_with("AZURE_")
+                || name.starts_with("S3DLIO_AZURE_")
+                || matches!(
+                    name.as_str(),
+                    "IDENTITY_ENDPOINT"
+                        | "IDENTITY_HEADER"
+                        | "IMDS_ENDPOINT"
+                        | "MSI_ENDPOINT"
+                        | "MSI_SECRET"
+                )
+            {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
     fn builds_for(url: &str) -> usize {
         SERVICE_CLIENT_BUILD_LOG
             .lock()
@@ -1144,6 +1172,7 @@ mod tests {
     // URL now share one client.
     #[test]
     fn one_service_client_per_account_url() {
+        let _env = clean_azure_env();
         let url = "http://127.0.0.1:59301/acct242";
         let clients: Vec<AzureBlob> = (0..20)
             .map(|i| AzureBlob::with_default_credential_from_url(url, &format!("c{i}")).unwrap())
@@ -1322,6 +1351,7 @@ mod tests {
     // It now follows with_default_credential_from_url: no credential for http.
     #[tokio::test]
     async fn list_account_containers_on_an_http_endpoint_sends_no_credential() {
+        reset_azure_env();
         // With a credential the SDK refuses the client at once ("must use https"). Without
         // one the call goes on to the network, where nothing listens and the SDK retries for
         // a long while, so a timeout means the client was built, which is what is tested.

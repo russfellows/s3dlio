@@ -8,10 +8,17 @@
   The Azure backend used only the `az`/`azd` developer login, so it could not authenticate on Azure VMs, AKS pods or
   in CI. `S3DLIO_AZURE_CREDENTIAL` now selects `auto` (default), `cli`, `managed-identity`, `client-secret`,
   `client-certificate`, `workload-identity`, `sas` or `none` (case-insensitive; an unknown value is an error listing
-  the valid ones). `auto` takes the first whose variables are present: workload identity
-  (`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`), client secret (`AZURE_CLIENT_ID`,
-  `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`), client certificate (`AZURE_CLIENT_CERTIFICATE_PATH`), managed identity
-  (`IDENTITY_ENDPOINT`/`MSI_ENDPOINT` set, or the instance metadata service identifies an Azure VM), then `az`/`azd`.
+  the valid ones). **BEHAVIOUR CHANGE: the default is now `auto`, a fallback chain.** Before, every Azure
+  request used `az`/`azd` only and the `AZURE_*` service-principal variables were ignored. `auto` now tries, in
+  order, workload identity (`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`), client secret
+  (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`), client certificate (`AZURE_CLIENT_CERTIFICATE_PATH`),
+  managed identity (`IDENTITY_ENDPOINT`/`MSI_ENDPOINT` set, or the instance metadata service identifies an Azure VM),
+  then `az`/`azd`, skips members whose variables are not set, falls through a member that cannot produce a token (for
+  example a VM with no assigned identity goes on to `az`), uses the first that works for the rest of the process, and
+  lists every member tried and why if none works. The Azure metadata probe runs on the blocking pool with an overall
+  bound of under 0.5 s and is not memoised as a "no". Set `S3DLIO_AZURE_CREDENTIAL=cli` for the old behaviour.
+  Credentials are created once per mode and kept for the life of the process: a rotated secret, certificate or
+  token file needs a restart.
   `AZURE_AUTHORITY_HOST` (https only) is honoured by the SDK for the Entra ID modes. `sas` appends
   `S3DLIO_AZURE_SAS_TOKEN` to every request URL (the SDK keeps the query on GET, HEAD, PUT, DELETE and LIST; tested).
   Each credential is created once per process and shared by the cached per-account client (#242 follow-up), so the SDK
@@ -30,6 +37,19 @@
 
 ### Fixed
 
+- **Deleting an `az://` object that is already gone succeeds again (#253 review).** Wrapping Azure errors to
+  name the credential mode and hide a SAS token turned them into plain text, so the delete contract no longer
+  recognised `BlobNotFound` and `delete`/`delete -r` failed for a blob that was already missing (or vanished
+  between the listing and its delete). Errors now keep the typed SDK error inside, and batch deletes treat a
+  missing blob as deleted.
+- **Azure hardening (#253 review).** An `az://` account name must be 3-24 lowercase letters and digits (with a
+  custom endpoint such as Azurite the rule is relaxed, but `/ ? # @ \`, whitespace and control characters are
+  never accepted), checked before any request or credential use, so `az://attacker.example#/c/k` cannot redirect a
+  request or a bearer token. A SAS token is refused over plain `http` to anything but `localhost`/loopback.
+  Endpoint and account URLs in log lines and error messages are shown without their query string, and
+  `list_account_containers` errors name the credential mode like blob operations.
+- **GCS gRPC full reads cannot abort on an absurd size (#255 follow-up).** The gRPC receive buffer is reserved
+  with `try_reserve` and falls back to growth instead of aborting if the reservation fails.
 - **`get_many()` on `az://` and `gs://` URIs no longer fails for every key (#242).** The function
   stripped the scheme and container/bucket and handed the Azure and GCS stores only a bare object
   key, but those stores read the account/container/bucket from the full URI, so every read errored
@@ -78,11 +98,17 @@
   learns the real length only from the first response), roughly a million serial requests for 1 MiB. Now:
   the partition size is never below 32 MiB whatever the hint says; the default mode (`Auto` with the Azure
   SDK engine) and `azure-sdk` make **no `HEAD` at all** (one request for a blob up to 32 MiB; the buffer is
-  sized from the response); the s3dlio RangeEngine, which plans its ranges from the size, re-checks the size
-  instead of trusting a cached one; `put`/`put_multipart` update, and `delete`/`delete_batch`/`delete_prefix`
-  clear, the cached sizes (Azure and GCS); `AzureBlob::get_range` asks for its whole range in one request
-  instead of 4 MiB sub-requests. Tested against a fake Blob service that refuses after 300 requests.
-  Cache growth is bounded separately by the #241 size-cache fix, which this relies on.
+  sized from the response); the s3dlio RangeEngine, which plans its ranges from the size, uses a cached size
+  without a `HEAD` but guarded: its last range asks for one byte more than planned, so a blob that grew (an
+  over read) or shrank (a short read or a range error) makes the engine fail, and the read is retried once
+  with a size from a fresh `HEAD` (an unchanged blob costs no `HEAD`; before this guard every RangeEngine read
+  started with one); `put`/`put_multipart` forget the written object's cached size and
+  `delete`/`delete_batch`/`delete_prefix` forget exactly the deleted objects' (never the whole cache), under one
+  canonical `az://account/container/key` / `gs://bucket/object` key (Azure and GCS); an Azure range read reserves
+  the response's `Content-Length` and asks for its whole range in one request (an open-ended range uses the 32 MiB
+  default partition, not the SDK's 4 MiB). Tested against a fake Blob service that refuses after 300 requests.
+  Cache growth is bounded separately by the #241 size-cache fix, which this builds on (`ObjectSizeCache` gained
+  `invalidate` and `invalidate_many`).
 - **Azure: the documentation no longer tells you to authenticate with `AZURE_STORAGE_KEY` (#239).** (The service-principal, managed-identity and SAS modes this entry says were missing were added afterwards, see #253 above.)
   The docs (`PYTHON_API_GUIDE.md`, `Environment_Variables.md`, `CLI_GUIDE.md`) said an Azure account key,
   `AZURE_STORAGE_ACCOUNT`, or the service-principal variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,

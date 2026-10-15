@@ -242,13 +242,15 @@ pub fn mode_for_endpoint(https: bool) -> Result<CredentialMode> {
     })
 }
 
+type SharedEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 type CredentialSource =
     Arc<dyn Fn(CredentialMode) -> Result<Arc<dyn TokenCredential>> + Send + Sync>;
 
 /// The `auto` credential: tries the chain members that apply, in order, at the first token
 /// request, and remembers the first that yields a token.
 struct AutoCredential {
-    env: Arc<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    env: SharedEnv,
     /// Does the instance metadata service identify an Azure VM? (blocking)
     imds_is_azure: Arc<dyn Fn() -> bool + Send + Sync>,
     credential_for: CredentialSource,

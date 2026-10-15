@@ -55,6 +55,18 @@ impl ReadBuffer {
         self.data.len()
     }
 
+    /// Whether nothing has been received.
+    #[cfg(feature = "backend-gcs")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// The bytes received so far.
+    #[cfg(feature = "backend-gcs")]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+
     /// How many times the buffer had to grow after it was created.
     #[cfg(test)]
     pub(crate) fn reallocations(&self) -> usize {

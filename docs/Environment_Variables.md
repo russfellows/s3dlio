@@ -447,7 +447,7 @@ error that lists the valid ones):
 
 | Value | What is used | Variables read |
 |-------|--------------|----------------|
-| `auto` (default) | The first of the rows below whose variables are present, in this order: workload identity, client secret, client certificate, managed identity, `cli`. Never picks `sas` or `none`. On an `http` endpoint (Azurite) `auto` sends no credential. | see below |
+| `auto` (default) | A fallback chain, like the Azure SDKs' `DefaultAzureCredential`: tries workload identity, client secret, client certificate, managed identity, then `cli`, in that order, and uses the first that yields a token. Never picks `sas` or `none`. On an `http` endpoint (Azurite) `auto` sends no credential. | see below |
 | `workload-identity` | AKS / Entra workload identity (federated token) | `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` |
 | `client-secret` | Service principal with a secret | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` |
 | `client-certificate` | Service principal with a certificate: a PKCS#12 (`.pfx`) file with an RSA key. **Only in builds with the cargo feature `azure-client-certificate`** (it links OpenSSL; not in `full-backends` or the default wheel) | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE_PATH`, optional `AZURE_CLIENT_CERTIFICATE_PASSWORD`, optional `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN` (read by the SDK) |
@@ -456,16 +456,25 @@ error that lists the valid ones):
 | `sas` | No bearer token; `S3DLIO_AZURE_SAS_TOKEN` is appended to every request URL (works over `http` and `https`) | `S3DLIO_AZURE_SAS_TOKEN` |
 | `none` | No credential (anonymous access, Azurite) | none |
 
-`auto` picks `workload-identity` when `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`
-are all set; else `client-secret` when `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_SECRET` are set;
-else `client-certificate` when `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_CERTIFICATE_PATH` are set;
-else `managed-identity` when `IDENTITY_ENDPOINT` or `MSI_ENDPOINT` is set, or the instance metadata service
-at 169.254.169.254:80 answers `GET /metadata/instance` with an Azure instance document within 250 ms (asked once
-per process; Google Cloud and AWS VMs answer that address too, and are not taken for Azure); else `cli`.
+**How `auto` works.** At the first token request it goes down the chain and skips every member whose variables
+are not set: `workload-identity` needs `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`;
+`client-secret` needs `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_SECRET`; `client-certificate` needs
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_CERTIFICATE_PATH`; `managed-identity` applies when
+`IDENTITY_ENDPOINT` or `MSI_ENDPOINT` is set, or when the instance metadata service at 169.254.169.254:80 answers
+`GET /metadata/instance` with an Azure instance document (Google Cloud and AWS VMs answer that address too and are not
+taken for Azure); `cli` always applies. A member that fails to produce a token (an identity not assigned to the VM, a
+rejected secret, `az` not installed) is passed over and the next is tried. The member that works is remembered for the
+process. If none works the error lists each member tried and why. The metadata probe runs off the async runtime's
+workers and is bounded: at most 250 ms to connect plus 250 ms to read the answer (so under 0.5 s), once per failed
+token request, never memoised as a "no". **Changed in this release:** before, the default was `az`/`azd` only and the
+`AZURE_*` service-principal variables were ignored; with `auto` they are now honoured, and a host that is on Azure
+tries its managed identity before `az`. Set `S3DLIO_AZURE_CREDENTIAL=cli` for the old behaviour.
 
 `AZURE_AUTHORITY_HOST` (default `https://login.microsoftonline.com`; it must be `https`) is read by the SDK for
-`client-secret`, `client-certificate` and `workload-identity`. Each credential is created once per process and shared,
-so the SDK caches and refreshes tokens; only `cli` runs a process (per token request, not per object). A request
+`client-secret`, `client-certificate` and `workload-identity`. Each credential is created once per process and shared
+for the life of the process, so the SDK caches and refreshes its tokens; a rotated secret, certificate or federated
+token file is not picked up until the process restarts. The bearer token itself is cached by each cached per-account
+client (at most 64) until it nears expiry. Only `cli` runs a process (per token request, not per object). A request
 rejected with 401 or 403 and a failed token request both name the credential mode in the error.
 A bearer-token mode needs an `https` endpoint (the SDK refuses a token over `http`); use `sas` or `none` for an
 `http` endpoint. The SAS token is never logged and is removed from error messages. Not read: `AZURE_STORAGE_ACCOUNT`,
@@ -480,7 +489,7 @@ use (`azure_storage_blob` 1.0 / `azure_core` 1.1) can only sign requests with be
 | `AZURE_BLOB_ENDPOINT_URL` | (unset) | Alternative for `AZURE_STORAGE_ENDPOINT` |
 | `S3DLIO_AZURE_DOWNLOAD_MODE` | `auto` | Download strategy: `auto`, `azure-sdk`, `s3dlio`, or `sequential` |
 | `S3DLIO_AZURE_CONCURRENT_ENGINE` | `azure-sdk` | Concurrent engine selected by `auto`: `azure-sdk` or `s3dlio` |
-| `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB` | `32` | Object size at which `auto` enables its concurrent engine |
+| `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB` | `32` | Object size at which `auto` switches from one stream to the concurrent engine. In the default mode (`auto` with the `azure-sdk` engine) no size is looked up: every blob is read with the SDK's managed download, which is one request up to the partition size (`S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB`) and concurrent above it, so the threshold only matters with `S3DLIO_AZURE_CONCURRENT_ENGINE=s3dlio` (or the legacy `enable_range_engine`), where it is compared with a `HEAD` size |
 | `S3DLIO_AZURE_DOWNLOAD_CONCURRENCY` | `16` | Parallel requests used by Azure SDK managed downloads |
 | `S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB` | `32` | Partition size used by Azure SDK managed downloads |
 

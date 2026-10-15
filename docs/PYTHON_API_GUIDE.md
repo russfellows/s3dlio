@@ -563,8 +563,9 @@ The storage account comes from the URI (`az://account/container/key`). Set
 `S3DLIO_AZURE_CREDENTIAL` to choose the credential (default `auto`): `workload-identity`, `client-secret`,
 `client-certificate` (needs a build with the cargo feature `azure-client-certificate`), `managed-identity`,
 `cli` (`az login` / `azd auth login`; the `az` / `azd` executable must be on `PATH`), `sas`, or `none`.
-`auto` takes the first of workload identity, client secret, client certificate, managed identity and `cli`
-whose variables are present. A bearer-token mode needs an `https` endpoint. Account keys (Shared Key) and
+`auto` is a fallback chain over workload identity, client secret, client certificate, managed identity and `cli`
+(members whose variables are not set are skipped; one that fails to give a token falls through to the next). Credentials
+are created once per process, so rotating a secret needs a restart. A bearer-token mode needs an `https` endpoint. Account keys (Shared Key) and
 connection strings are **not** supported (the Azure SDK s3dlio is built on, `azure_storage_blob` 1.0, signs
 only with bearer tokens or a SAS). The full table of modes and the variables each reads is in
 [Environment_Variables.md](Environment_Variables.md#azure-blob-storage-configuration).

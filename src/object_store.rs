@@ -6263,57 +6263,89 @@ mod get_many_with_stores_tests {
 }
 
 // Blue review 2026-10-15: a size cached by `get` must not outlive a write or delete through the
-// same store, and the RangeEngine must never plan its ranges from a cached size. The Azure
-// behaviour is tested against a fake Blob service (tests/azure_stale_size.rs); GCS has no local
-// stand-in, so this pins its source shape.
+// same store. The Azure behaviour is tested end to end against a fake Blob service
+// (tests/azure_stale_size.rs). GCS cannot run offline: its client needs Google credentials and a
+// bucket-layout RPC before any request, so these tests drive the store's own size bookkeeping
+// (what `put`/`delete*` call) directly, and pin by source that every mutating method calls it.
 #[cfg(all(test, feature = "backend-gcs"))]
 mod gcs_size_cache_hygiene_tests {
-    fn gcs_impl() -> &'static str {
+    use super::*;
+
+    async fn cached(store: &GcsObjectStore, uri: &str) -> Option<u64> {
+        store.size_cache.get(&gcs_size_key(uri)).await
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_size_removes_only_that_object_whichever_scheme_spelling_was_used() {
+        let store = GcsObjectStore::new();
+        for (uri, size) in [
+            ("gs://b/dir/a", 1),
+            ("gs://b/dir/b", 2),
+            ("gs://b/other", 3),
+        ] {
+            store.size_cache.put(gcs_size_key(uri), size).await;
+        }
+        // `gcs://` and `gs://` name the same object.
+        store.forget_sizes(["gcs://b/dir/a"]).await;
+        assert_eq!(
+            cached(&store, "gs://b/dir/a").await,
+            None,
+            "RED: not forgotten"
+        );
+        assert_eq!(cached(&store, "gs://b/dir/b").await, Some(2));
+        store
+            .forget_sizes(["gs://b/dir/b", "gs://b/never-cached"])
+            .await;
+        assert_eq!(cached(&store, "gs://b/dir/b").await, None);
+        assert_eq!(
+            cached(&store, "gs://b/other").await,
+            Some(3),
+            "a neighbour keeps its size"
+        );
+    }
+
+    #[test]
+    fn size_keys_are_canonical() {
+        assert_eq!(gcs_size_key("gcs://b/o/p"), "gs://b/o/p");
+        assert_eq!(gcs_size_key("gs://b/o/p"), "gs://b/o/p");
+    }
+
+    #[test]
+    fn every_mutating_method_forgets_the_sizes_it_makes_stale() {
         let src = include_str!("object_store.rs");
         let start = src
             .find("impl ObjectStore for GcsObjectStore {")
             .expect("impl");
-        let end = src[start..].find("\n}\n").expect("end of impl") + start;
-        &src[start..end]
-    }
-
-    fn method<'a>(body: &'a str, sig: &str) -> &'a str {
-        let a = body.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
-        let end = body[a..].find("\n    }\n").expect("end of method") + a;
-        &body[a..end]
-    }
-
-    #[test]
-    fn writes_update_and_deletes_clear_the_cached_size() {
-        let body = gcs_impl();
-        for sig in ["async fn put(", "async fn put_multipart("] {
-            assert!(
-                method(body, sig).contains("size_cache.put("),
-                "RED: {sig} leaves the cached size of the overwritten object"
-            );
-        }
+        let body = &src[start..src[start..].find("\n}\n").expect("end") + start];
         for sig in [
+            "async fn put(",
+            "async fn put_multipart(",
             "async fn delete(",
             "async fn delete_batch(",
             "async fn delete_prefix(",
         ] {
+            let a = body.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+            let end = body[a..].find("\n    }\n").expect("end of method") + a;
             assert!(
-                method(body, sig).contains("size_cache.clear()"),
-                "RED: {sig} leaves cached sizes of deleted objects"
+                body[a..end].contains("forget_sizes("),
+                "RED: {sig} leaves cached sizes of changed objects"
             );
         }
     }
 
     #[test]
-    fn the_range_engine_does_not_trust_a_cached_size() {
-        let get = method(gcs_impl(), "async fn get(");
-        let engine = get.find("get_with_range_engine(").expect("engine call");
-        let stat = get
-            .find("self.stat(uri)")
-            .expect("a fresh stat before the engine");
+    fn the_range_engine_is_guarded_when_it_uses_a_cached_size() {
+        let src = include_str!("object_store.rs");
+        let start = src
+            .find("impl ObjectStore for GcsObjectStore {")
+            .expect("impl");
+        let body = &src[start..];
+        let a = body.find("async fn get(").expect("get");
+        let get = &body[a..body[a..].find("\n    }\n").expect("end") + a];
+        assert!(get.contains("get_with_range_engine(uri, object_size, cached.is_some())"));
         assert!(
-            stat < engine,
-            "RED: the RangeEngine is planned from the cached size"
+            get.contains("fresh_object_size(uri)"),
+            "no fresh-size retry"
         );
     }
 }

@@ -87,7 +87,10 @@ class _FakeBlobs(BaseHTTPRequestHandler):
             )
         if self.command == "DELETE":
             existed = self.blobs.pop(path, None) is not None
-            return self._reply(202 if existed else 404)
+            return self._reply(
+                202 if existed else 404,
+                headers=None if existed else {"x-ms-error-code": "BlobNotFound"},
+            )
         data = self.blobs.get(path)
         if data is None:
             return self._reply(404, headers={"x-ms-error-code": "BlobNotFound"})
@@ -247,3 +250,25 @@ def test_gcs_backend_is_compiled_in_and_get_many_refuses_bad_batches_before_any_
     with pytest.raises(RuntimeError, match="same backend scheme"):
         s3dlio.get_many(["gs://some-bucket/a", uri("b")])
     assert fake.requests == [], "no request may be made for a refused batch"
+
+
+def test_azure_deleting_a_missing_blob_succeeds_and_recursive_delete_works(fake):
+    """The idempotent-delete contract through the wheel (the typed BlobNotFound must survive)."""
+    _require_backends()
+    s3dlio.delete(uri("never/existed.bin"))  # no error
+    for i in range(3):
+        s3dlio.put_bytes(uri(f"tree/o{i}.bin"), payload(100 + i, i))
+    s3dlio.delete(f"az://{ACCOUNT}/{CONTAINER}/tree/", recursive=True)
+    assert not [k for k in fake.blobs if "/tree/" in k], fake.blobs.keys()
+    s3dlio.delete(
+        f"az://{ACCOUNT}/{CONTAINER}/tree/", recursive=True
+    )  # again: still fine
+
+
+def test_azure_malformed_account_names_are_refused_before_any_request(fake):
+    _require_backends()
+    fake.requests.clear()
+    for bad in ("az://attacker.example#/c/k", "az://a?b/c/k", "az://acct@evil/c/k"):
+        with pytest.raises(RuntimeError, match="invalid Azure account"):
+            s3dlio.get(bad)
+    assert fake.requests == []

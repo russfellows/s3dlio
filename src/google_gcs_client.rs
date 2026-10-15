@@ -16,7 +16,7 @@ use crate::gcs_constants::{
 };
 use crate::read_buffer::ReadBuffer;
 use anyhow::{anyhow, bail, Result};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use futures::Stream;
 use google_cloud_gax::paginator::ItemPaginator;
 use google_cloud_storage::client::{Storage, StorageControl};
@@ -538,7 +538,7 @@ impl GcsClient {
                         break;
                     }
 
-                    data.put_slice(tail.as_ref());
+                    data.push(tail.as_slice());
                     chunk_count += tail_chunks;
                 }
             }
@@ -559,7 +559,7 @@ impl GcsClient {
             data.len(),
             chunk_count
         );
-        Ok(data.freeze())
+        Ok(data.into_bytes())
     }
 
     async fn get_object_via_grpc_once(
@@ -569,7 +569,7 @@ impl GcsClient {
         object: &str,
         range: ReadRange,
         window: Option<(u64, Option<u64>)>,
-    ) -> Result<(usize, BytesMut, u32)> {
+    ) -> Result<(usize, ReadBuffer, u32)> {
         let requested_range = range.clone();
         let attempt_timeout = gcs_bidi_attempt_timeout();
         let (descriptor, mut reader) = match self
@@ -607,7 +607,7 @@ impl GcsClient {
                                 "GCS GET (gRPC) empty-object fallback: treating OUT_OF_RANGE as empty for gs://{}/{}",
                                 bucket, object
                             );
-                            return Ok((0, BytesMut::new(), 0));
+                            return Ok((0, ReadBuffer::with_expected_len(0), 0));
                         }
                         Ok(metadata) => {
                             trace!(
@@ -640,7 +640,9 @@ impl GcsClient {
         // `size_hint` is the whole object (the full-read repair compares against it); the buffer
         // and the chunk timeout are sized to the bytes this read returns (#255).
         let (size_hint, capacity) = grpc_read_sizes(descriptor.object().size, window);
-        let mut data = BytesMut::with_capacity(capacity);
+        // Reserved with `try_reserve`: a huge capacity cannot abort the process (it falls back
+        // to growth).
+        let mut data = ReadBuffer::with_expected_len(capacity as u64);
         let chunk_timeout = gcs_read_chunk_timeout(capacity as u64);
         let progress_interval = gcs_read_chunk_progress_interval();
         let mut chunk_count: u32 = 0;
@@ -693,7 +695,7 @@ impl GcsClient {
         {
             chunk_count += 1;
             trace!("GCS GET (gRPC) chunk #{}: {} bytes", chunk_count, chunk.len());
-            data.put_slice(&chunk);
+            data.push(&chunk);
         }
 
         Ok((size_hint, data, chunk_count))
