@@ -5007,9 +5007,11 @@ mod azure_download_mode_tests {
 
     #[test]
     fn auto_mode_uses_threshold_and_selected_concurrent_engine() {
-        let mut config = AzureConfig::default();
-        config.download_mode = AzureDownloadMode::Auto;
-        config.auto_concurrent_engine = AzureConcurrentEngine::AzureSdk;
+        let mut config = AzureConfig {
+            download_mode: AzureDownloadMode::Auto,
+            auto_concurrent_engine: AzureConcurrentEngine::AzureSdk,
+            ..AzureConfig::default()
+        };
         config.range_engine.min_split_size = 32 * 1024 * 1024;
         let store = AzureObjectStore::with_config(config.clone());
 

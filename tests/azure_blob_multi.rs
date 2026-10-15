@@ -70,7 +70,7 @@ async fn multi_blob_roundtrip_and_cleanup() -> Result<()> {
     // Build some sample contents of varying sizes
     let mut keys: Vec<String> = Vec::new();
     for i in 0..n_blobs {
-        let key = format!("{}/blob-{:02}.bin", &prefix, i);
+        let key = format!("{}/blob-{:02}.bin", prefix, i);
         let size = (i + 1) * 64 * 1024; // 64KiB, 128KiB, ...
         let mut data = vec![0u8; size];
         for (idx, b) in data.iter_mut().enumerate() {
