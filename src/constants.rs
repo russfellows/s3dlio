@@ -19,53 +19,88 @@ pub const DEFAULT_MIN_IO_SIZE: usize = 64 * 1024;
 /// Bytes in one MiB, for the `*_MB` environment variables.
 pub const BYTES_PER_MIB: usize = 1024 * 1024;
 
-/// Default cap, in bytes, on the aligned bounce buffer a `direct://` (O_DIRECT) PUT copies
-/// through when the caller's own memory cannot be used directly (1 GiB).
+/// Default size, in bytes, of one `direct://` (O_DIRECT) bounce buffer (64 MiB).
 ///
 /// O_DIRECT needs the buffer ADDRESS, the file offset and the length of every I/O to be
-/// multiples of the device alignment (4096). A source whose address is already aligned is
-/// written straight from the caller's memory in one `write` and never uses this buffer.
-/// Any other source (Python `bytes`/`bytearray`, a `Vec`-backed `Bytes`: heap pointers are
-/// only 16-byte aligned) must be copied into an aligned buffer first. The buffer is sized
-/// `min(round_up(object size), this cap)`, so an unaligned object up to the cap is ONE copy and
-/// ONE `write`; a larger one is written one full buffer at a time. Before this change the
-/// loop wrote ONE 4 KiB block per `write` (512 MiB took 45 s, about 11 MiB/s, issue #244).
+/// multiples of the device alignment (4096). A PUT source whose address is already aligned is
+/// written straight from the caller's memory in one `write` and never uses a bounce buffer.
+/// Every other PUT, and (optionally, see [`ENV_DIRECT_IO_GET_MODE`]) every GET, moves its data
+/// through the shared per-NUMA-node pool of warm, page-aligned bounce buffers described in
+/// `direct_bounce.rs`: buffers are allocated and first-touched once per node and reused, used in
+/// ping-pong pairs so the copy of chunk `k+1` overlaps the I/O of chunk `k`.
 ///
-/// Trade-off: a bigger cap means fewer syscalls but more temporary memory per in-flight
-/// unaligned PUT (up to the cap, never more than the object itself; the pages are only
-/// touched as they are filled). 1 GiB keeps every object up to 1 GiB a single write.
-/// Lower it with [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`] when many large PUTs run at once.
-/// GETs do not use a bounce buffer: they read straight into one aligned buffer.
-pub const DEFAULT_DIRECT_IO_BOUNCE_SIZE: usize = 1024 * BYTES_PER_MIB;
+/// Why 64 MiB at most: the I/O is large enough that per-syscall cost is noise, while a pair
+/// (2 buffers) per node keeps the total bounce memory small and bounded:
+/// `nodes x pairs x 2 x size` (default: 128 MiB per NUMA node), shared by every in-flight
+/// request in both directions. Override with [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`], clamped to
+/// [`MIN_DIRECT_IO_BOUNCE_SIZE_MB`]..=[`MAX_DIRECT_IO_BOUNCE_SIZE_MB`].
+pub const DEFAULT_DIRECT_IO_BOUNCE_SIZE: usize = 64 * BYTES_PER_MIB;
 
-/// Size, in bytes, of the aligned staging buffer a `direct://` STREAMING writer
-/// (`DirectIOWriter`) fills before each O_DIRECT write (64 MiB). Smaller than
-/// [`DEFAULT_DIRECT_IO_BOUNCE_SIZE`] because a stream's final size is unknown and many
-/// writers may be open at once; a page-aligned chunk bypasses it entirely.
-pub const DEFAULT_DIRECT_IO_WRITER_STAGING_SIZE: usize = 64 * BYTES_PER_MIB;
+/// Smallest accepted `direct://` bounce-buffer size in MiB.
+pub const MIN_DIRECT_IO_BOUNCE_SIZE_MB: usize = 4;
+
+/// Largest accepted `direct://` bounce-buffer size in MiB.
+pub const MAX_DIRECT_IO_BOUNCE_SIZE_MB: usize = 64;
 
 /// Environment variable overriding [`DEFAULT_DIRECT_IO_BOUNCE_SIZE`], in MiB.
 ///
-/// Rounded down to a multiple of the O_DIRECT alignment; `0` or an unparseable value
-/// selects the default (1 GiB). Example: `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=256`.
+/// Clamped to 4..=64; `0` or an unparseable value selects the default (64).
+/// Example: `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=16`.
 pub const ENV_DIRECT_IO_BOUNCE_SIZE_MB: &str = "S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB";
 
-/// Resolve the effective `direct://` bounce-buffer size in bytes.
-///
-/// Reads [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`] on each call (one `getenv` per PUT/GET, noise
-/// next to the I/O); falls back to [`DEFAULT_DIRECT_IO_BOUNCE_SIZE`] when unset, zero,
-/// unparseable or too large to express in bytes.
+/// Default number of ping-pong buffer PAIRS per NUMA node (1 pair = 2 buffers).
+pub const DEFAULT_DIRECT_IO_BOUNCE_PAIRS: usize = 1;
+
+/// Largest accepted pairs-per-node value.
+pub const MAX_DIRECT_IO_BOUNCE_PAIRS: usize = 64;
+
+/// Environment variable setting the number of buffer pairs per NUMA node (1..=64). More pairs
+/// let more requests use warm buffers at once, at `2 x size` more memory per pair per node.
+pub const ENV_DIRECT_IO_BOUNCE_PAIRS: &str = "S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE";
+
+/// Environment variable choosing what a request does when every pair of its node is in use:
+/// `wait` (default; strict FIFO across PUTs and GETs, so neither direction starves the other)
+/// or `fallback` (use a private buffer of one bounce size for this request: no pipelining, extra
+/// memory bounded by one buffer per concurrent request beyond the pool).
+pub const ENV_DIRECT_IO_BOUNCE_WHEN_BUSY: &str = "S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY";
+
+/// Environment variable choosing how a `direct://` GET reads: `direct` (default for now) reads
+/// straight into one fresh page-aligned buffer of the object's size, zero copies but fresh page
+/// faults on every call; `pooled` reads through the shared bounce pool (warm buffers, one copy
+/// into the destination). Which is faster depends on load; this stays `direct` until measured.
+pub const ENV_DIRECT_IO_GET_MODE: &str = "S3DLIO_DIRECT_IO_GET_MODE";
+
+/// Objects whose bounce need is at most this many bytes (1 MiB) do not lease a pair: they use a
+/// private buffer of their own size, which costs less than waiting for the shared pair.
+pub const DIRECT_IO_POOL_MIN_OBJECT: usize = BYTES_PER_MIB;
+
+/// Size, in bytes, of the aligned staging buffer a `direct://` STREAMING writer
+/// (`DirectIOWriter`) fills before each O_DIRECT write (64 MiB). A stream's final size is
+/// unknown and many writers may be open at once; a page-aligned chunk bypasses it entirely.
+pub const DEFAULT_DIRECT_IO_WRITER_STAGING_SIZE: usize = 64 * BYTES_PER_MIB;
+
+/// Resolve the effective bounce-buffer size in bytes (clamped, see
+/// [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`]).
 pub fn direct_io_bounce_size() -> usize {
     parse_direct_io_bounce_size(std::env::var(ENV_DIRECT_IO_BOUNCE_SIZE_MB).ok().as_deref())
 }
 
-/// Pure parser behind [`direct_io_bounce_size`]: MiB text to bytes, default on anything
-/// unusable (unset, empty, non-numeric, zero, overflow).
-fn parse_direct_io_bounce_size(raw: Option<&str>) -> usize {
+/// Pure parser behind [`direct_io_bounce_size`]: MiB text to bytes, clamped to the accepted
+/// range, the default on anything unusable (unset, empty, non-numeric, zero).
+pub fn parse_direct_io_bounce_size(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&mb| mb > 0)
-        .and_then(|mb| mb.checked_mul(BYTES_PER_MIB))
+        .map(|mb| mb.clamp(MIN_DIRECT_IO_BOUNCE_SIZE_MB, MAX_DIRECT_IO_BOUNCE_SIZE_MB))
+        .map(|mb| mb * BYTES_PER_MIB)
         .unwrap_or(DEFAULT_DIRECT_IO_BOUNCE_SIZE)
+}
+
+/// Pure parser for [`ENV_DIRECT_IO_BOUNCE_PAIRS`]: clamped to 1..=64, default 1.
+pub fn parse_direct_io_bounce_pairs(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(MAX_DIRECT_IO_BOUNCE_PAIRS))
+        .unwrap_or(DEFAULT_DIRECT_IO_BOUNCE_PAIRS)
 }
 
 #[cfg(test)]
@@ -88,24 +123,36 @@ mod direct_io_bounce_size_tests {
                 "{raw:?}"
             );
         }
+    }
+
+    #[test]
+    fn sizes_are_clamped_to_4_to_64_mib() {
+        assert_eq!(parse_direct_io_bounce_size(Some("1")), 4 * BYTES_PER_MIB);
+        assert_eq!(parse_direct_io_bounce_size(Some("16")), 16 * BYTES_PER_MIB);
+        assert_eq!(parse_direct_io_bounce_size(Some(" 8 ")), 8 * BYTES_PER_MIB);
+        assert_eq!(
+            parse_direct_io_bounce_size(Some("1024")),
+            64 * BYTES_PER_MIB
+        );
         assert_eq!(
             parse_direct_io_bounce_size(Some(&usize::MAX.to_string())),
-            DEFAULT_DIRECT_IO_BOUNCE_SIZE
+            64 * BYTES_PER_MIB
         );
     }
 
     #[test]
-    fn megabytes_are_converted_to_bytes() {
-        assert_eq!(
-            parse_direct_io_bounce_size(Some("256")),
-            256 * BYTES_PER_MIB
-        );
-        assert_eq!(parse_direct_io_bounce_size(Some(" 8 ")), 8 * BYTES_PER_MIB);
+    fn default_is_the_documented_64_mib() {
+        assert_eq!(DEFAULT_DIRECT_IO_BOUNCE_SIZE, 64 * BYTES_PER_MIB);
+        assert_eq!(parse_direct_io_bounce_size(None), 64 * BYTES_PER_MIB);
     }
 
     #[test]
-    fn default_is_large_enough_to_keep_writes_large() {
-        const { assert!(DEFAULT_DIRECT_IO_BOUNCE_SIZE >= BYTES_PER_MIB) };
+    fn pairs_are_clamped_to_1_to_64() {
+        assert_eq!(parse_direct_io_bounce_pairs(None), 1);
+        assert_eq!(parse_direct_io_bounce_pairs(Some("0")), 1);
+        assert_eq!(parse_direct_io_bounce_pairs(Some("x")), 1);
+        assert_eq!(parse_direct_io_bounce_pairs(Some("3")), 3);
+        assert_eq!(parse_direct_io_bounce_pairs(Some("9999")), 64);
     }
 }
 
@@ -955,6 +1002,17 @@ pub static BASE_BLOCK: Lazy<Vec<u8>> = Lazy::new(|| {
 /// releases the GIL; the bound exists only so a pathologically stuck delivery
 /// can never hang process exit.
 pub const ASYNC_EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the buffer-export releaser thread waits after being woken before it takes the
+/// GIL (25 ms). A `put_bytes` caller, or the `put_bytes_async` delivery path, normally drains
+/// the released exports itself within microseconds; the grace period lets them, so the
+/// releaser finds the queue empty and never contends for the GIL on the hot path. It only
+/// matters when nobody drains (for example a cancelled awaitable).
+pub const EXPORT_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Payload size below which the default `put_bytes_async` snapshot is copied with the GIL
+/// held (256 KiB): releasing and re-taking the GIL costs more than copying that much.
+pub const SNAPSHOT_GIL_DETACH_THRESHOLD: usize = 256 * 1024;
 
 #[cfg(test)]
 mod h2_window_tests {

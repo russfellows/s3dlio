@@ -313,7 +313,11 @@ where
 fn drain_async_deliveries_at_exit(py: Python<'_>) {
     let timeout = crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT;
     DELIVERIES.close();
-    if !py.detach(|| DELIVERIES.wait_idle(timeout)) {
+    let drained = py.detach(|| DELIVERIES.wait_idle(timeout));
+    // Release what buffer exports are queued and stop releasing/queueing for good (issue
+    // #238): nothing may attach to the interpreter once it starts finalizing.
+    super::put_payload::begin_shutdown(py);
+    if !drained {
         tracing::warn!(
             in_flight = DELIVERIES.in_flight(),
             timeout = ?timeout,
