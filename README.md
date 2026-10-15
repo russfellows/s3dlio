@@ -683,26 +683,34 @@ file is decided by one switch, `S3DLIO_LOAD_DOTENV`, and the default depends on 
 
 | `S3DLIO_LOAD_DOTENV` | Effect |
 |----------------------|--------|
-| `1` / `true` | load `.env` from the working directory (the nearest parent directory that has one, as before) |
-| `0` / `false` | never load a `.env` file |
+| `1` / `true` / `yes` / `on` (any case) | load `.env` from the working directory (the nearest parent directory that has one, as before) |
+| `0` / `false` / `no` / `off` (any case) | never load a `.env` file |
 | a file path | load exactly that file |
 | unset | the default above |
 
 - Any environment variable can come from the file (`AWS_*`, `S3DLIO_*`, `AZURE_*`, `GOOGLE_*`).
 - **Precedence: the real environment always wins.** A variable that is already set is never overridden
   by the file; the file only fills in what is missing.
-- The switch is read from the real environment (not from a `.env`) once per process. `s3-cli` loads the
-  file at start-up; a library loads it once, when it first builds an S3 client or lists buckets, so
-  settings s3dlio reads earlier (for example `S3DLIO_RT_THREADS`) do not see values that exist only in the
-  file. To have the file's values from the start, load it yourself: Rust
-  `s3dlio::dotenv::load_env_file("path/to/.env")?`, or `python-dotenv`'s `load_dotenv()` in Python.
-- When a `.env` exists but is not loaded because of the library default, s3dlio logs one INFO line
-  saying how to enable it.
+- The switch is read from the real environment (not from a `.env`) once per process, and the file is
+  loaded once, at the first of: `s3-cli` start-up; Python `import s3dlio`; for Rust, the first use of the
+  global runtime, `store_for_uri*`, an S3 / Azure / GCS client or a bucket/container listing. That is
+  before s3dlio reads any setting, so `S3DLIO_RT_THREADS`, `S3DLIO_OPLOG_*`, the range-GET settings and
+  the endpoint/region all see the file's values.
+- To have the file's values even earlier (before your own code calls anything in s3dlio), load it
+  yourself: Rust `s3dlio::dotenv::load_env_file("path/to/.env")?`, or in Python `python-dotenv`'s
+  `load_dotenv()` **before** `import s3dlio`.
+- When a `.env` exists but is not loaded because of the library default, s3dlio logs one INFO line saying
+  how to enable it, and the "Missing AWS_ACCESS_KEY_ID ..." error carries the same hint (so a Python user
+  who sees only the exception still learns that the file is being ignored).
+- `s3-cli` prints a warning on stderr when `S3DLIO_LOAD_DOTENV` names a file it cannot read.
 
 **Behaviour change for library users (since 0.9.128):** earlier releases loaded `.env` implicitly when the
 first client was built. Set `S3DLIO_LOAD_DOTENV=1` (or a file path) to get that back. Details:
 [Environment Variables Reference](docs/Environment_Variables.md#env-files-s3dlio_load_dotenv).
-Enable comprehensive S3 operation logging compatible with MinIO warp format:
+
+### Operation Logging (MinIO warp format)
+S3 operation logging compatible with the MinIO warp format is described under
+[Operation Logging (Op-Log)](#operation-logging-op-log) above.
 
 
 ## Advanced Features

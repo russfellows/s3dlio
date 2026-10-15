@@ -10,19 +10,19 @@ process:
 
 | `S3DLIO_LOAD_DOTENV` | Effect |
 |----------------------|--------|
-| `1` or `true` (any case) | Load `.env` from the working directory. As `dotenvy` has always done here, the nearest parent directory that contains a `.env` is used if the working directory has none. |
-| `0` or `false` (any case) | Never load a `.env` file. No log line. |
-| any other non-empty value | A file path: load exactly that file. A path that cannot be read is logged as a warning and nothing is loaded; the working directory's `.env` is not a fallback. |
+| `1`, `true`, `yes` or `on` (any case) | Load `.env` from the working directory. As `dotenvy` has always done here, the nearest parent directory that contains a `.env` is used if the working directory has none. |
+| `0`, `false`, `no` or `off` (any case) | Never load a `.env` file. No log line, no hint. |
+| any other non-empty value | A file path: load exactly that file. A path that cannot be read is logged as a warning (`s3-cli` prints it on stderr, because no log subscriber exists yet when it loads the file) and nothing is loaded; the working directory's `.env` is not a fallback. |
 | unset or empty | The default of the running program, below. |
 
-Only the spellings above are booleans; `yes`/`on` are treated as file names.
+Only the spellings above are booleans; any other value is a file path.
 
 ### Defaults
 
 | Program | Default | |
 |---------|---------|--|
 | `s3-cli` | `1` (on) | CLI users keep the convenience; the file is loaded at start-up, before the command line is parsed and before any client exists. |
-| Library: Rust crate, Python package (`import s3dlio`) | `0` (off) | A `.env` in whatever directory the host process was started from would silently change credentials, endpoints and every other `S3DLIO_*` / `AWS_*` setting of the whole process. When a `.env` exists (in the working directory or a parent) but is not loaded because of this default, one INFO line is logged, naming `S3DLIO_LOAD_DOTENV` and `s3dlio::dotenv::load_env_file`. An explicit `0` logs nothing. |
+| Library: Rust crate, Python package (`import s3dlio`) | `0` (off) | A `.env` in whatever directory the host process was started from would silently change credentials, endpoints and every other `S3DLIO_*` / `AWS_*` setting of the whole process. When a `.env` exists (in the working directory or a parent) but is not loaded because of this default, one INFO line is logged, naming `S3DLIO_LOAD_DOTENV` and `s3dlio::dotenv::load_env_file`, and the error for missing S3 credentials ("Missing AWS_ACCESS_KEY_ID ...") carries the same hint, which is how a Python user sees it. An explicit `0` logs nothing and adds nothing to the error. |
 
 Changed in 0.9.128 (#243): library use used to load `.env` implicitly at the first S3 client build.
 Set `S3DLIO_LOAD_DOTENV=1` (or a path) to keep that behaviour.
@@ -35,11 +35,18 @@ Set `S3DLIO_LOAD_DOTENV=1` (or a path) to keep that behaviour.
 - **The real environment wins.** A variable that is already set (exported in the shell, set by the
   parent process, or set by the application before s3dlio ran) is **never overridden** by the file.
   The file only provides the variables that are missing.
-- *When* the file is read: `s3-cli` at start-up. A library once per process, the first time it builds an
-  S3 client (including per-endpoint clients), lists buckets or containers, or sets up the Arrow
-  backend. Settings read before that point (for example `S3DLIO_RT_THREADS`, op-log settings) only see
-  values that were in the real environment. An application that needs the file's values everywhere
-  should load the file itself, first thing:
+- *When* the file is read: once per process, at the first of these, which is before s3dlio reads any
+  setting (so `S3DLIO_RT_THREADS`, `S3DLIO_OPLOG_*`, `S3DLIO_ENABLE_RANGE_OPTIMIZATION`,
+  `S3DLIO_RANGE_THRESHOLD_MB`, `AWS_ENDPOINT_URL`, `AWS_REGION` ... all see the file's values):
+
+  | Program | The file is read at |
+  |---------|---------------------|
+  | `s3-cli` | start-up, before the command line is parsed |
+  | Python | `import s3dlio` (the extension module's initialisation, before any thread or pool is created) |
+  | Rust | the first use of the global runtime (`run_on_global_rt` and everything built on it), `store_for_uri*`, an S3 / Azure / GCS client, a bucket or container listing, or the Arrow backend set-up |
+
+  Python users can also load the file themselves **before** `import s3dlio` (see below). An application
+  that needs the file's values before its own first call into s3dlio should load it first thing:
 
 ```rust
 // Rust: load a specific file explicitly; variables that are already set are kept.
@@ -47,7 +54,7 @@ s3dlio::dotenv::load_env_file("/etc/myapp/s3dlio.env")?;
 ```
 
 ```python
-# Python: use python-dotenv (or set os.environ yourself) before the first s3dlio call,
+# Python: use python-dotenv (or set os.environ yourself) BEFORE importing s3dlio,
 # or run the process with S3DLIO_LOAD_DOTENV=/etc/myapp/s3dlio.env
 from dotenv import load_dotenv
 load_dotenv("/etc/myapp/s3dlio.env")

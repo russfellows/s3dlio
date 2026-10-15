@@ -677,6 +677,12 @@ for batch in loader:
     pass  # Train
 ```
 
+`ObjectStoreMapDataset` fetches every item by the exact object it listed. Keys: for `s3://` (also with
+the server form `s3://host:port/bucket/...`) the key is the full key from the bucket root, prefix included
+(`s3://bkt/dir/` lists `dir/x`); for `file://` and `direct://` it is the path below the dataset root
+(`sub/b.bin`, or just the file name when the URI names one file). `s3dlio.create_dataset(uri).uris()` gives the URI
+that fetches each item.
+
 ### JAX Integration
 
 ```python
