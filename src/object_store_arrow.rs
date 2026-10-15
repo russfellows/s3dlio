@@ -13,6 +13,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use url::{Position, Url};
 
+use crate::delete_contract::DELETE_REQUESTS_IN_FLIGHT;
+
 use crate::object_store::{
     CompressionConfig,
     ObjectMetadata, // alias to s3_utils::ObjectStat
@@ -267,41 +269,51 @@ async fn list_under(
 /// `object_store` evaluates a prefix on a path-segment basis: `p` covers `p/a` and
 /// `p/b/c` but never `pfoo/x` or `p2/y`, so an unrelated sibling is never selected. The
 /// listing is recursive (`list_with_delimiter` returns the immediate children only) and
-/// is handed to `delete_stream`, which the S3, GCS and Azure stores serve with their bulk
-/// delete. A failure does not stop the others; the call fails if any object listed was
-/// not confirmed deleted, naming the first few.
+/// is consumed as a stream, never collected. Each listed object gets its own DELETE
+/// request, [`DELETE_REQUESTS_IN_FLIGHT`] at a time, as the native backends do: the
+/// bulk `DeleteObjects` request that `delete_stream` sends on S3 is not supported by every
+/// S3-compatible endpoint (Google Cloud Storage's S3 interoperability endpoint rejects it)
+/// and one failure in it would count as a single failure for up to 1000 objects.
+///
+/// A failure does not stop the others. Every failed object, and every listing error, is
+/// counted on its own; the call fails if there is any, quoting the first few.
 async fn delete_under(store: &dyn AosObjectStore, base: &Path) -> Result<()> {
     use futures::StreamExt as _;
 
     // An empty prefix is the whole store (the bucket root).
     let prefix = (!base.as_ref().is_empty()).then_some(base);
-    let skip = base.clone();
-    let locations = store
+    let outcomes = store
         .list(prefix)
-        .map(|entry| entry.map(|m| m.location))
-        .filter(move |entry| {
-            std::future::ready(!matches!(entry, Ok(location) if *location == skip))
-        });
-    let mut results = store.delete_stream(locations.boxed());
+        .filter(|entry| std::future::ready(!matches!(entry, Ok(meta) if meta.location == *base)))
+        .map(|entry| async move {
+            match entry {
+                Ok(meta) => store
+                    .delete(&meta.location)
+                    .await
+                    .map_err(|e| format!("{}: {e}", meta.location)),
+                Err(e) => Err(format!("listing: {e}")),
+            }
+        })
+        .buffer_unordered(DELETE_REQUESTS_IN_FLIGHT);
+    tokio::pin!(outcomes);
 
     let mut deleted = 0usize;
     let mut failures: Vec<String> = Vec::new();
     let mut failed = 0usize;
-    while let Some(result) = results.next().await {
-        match result {
-            Ok(_) => deleted += 1,
-            Err(e) => {
+    while let Some(outcome) = outcomes.next().await {
+        match outcome {
+            Ok(()) => deleted += 1,
+            Err(what) => {
                 failed += 1;
                 if failures.len() < MAX_NAMED_DELETE_FAILURES {
-                    failures.push(format!("{e}"));
+                    failures.push(what);
                 }
             }
         }
     }
     if failed > 0 {
         bail!(
-            "delete_prefix: {failed} objects under {:?} not confirmed deleted ({deleted} \
-             deleted); first errors: {}",
+            "delete_prefix: {failed} failed under {:?} ({deleted} deleted); first errors: {}",
             base.as_ref(),
             failures.join("; ")
         );
@@ -1125,6 +1137,13 @@ mod tests {
     struct Probe {
         inner: aos::memory::InMemory,
         marker: Option<Path>,
+        /// Like the GCS S3-interop endpoint: a delete request naming more than one key
+        /// (`DeleteObjects`, `POST ?delete`) fails for every key in it.
+        bulk_unsupported: bool,
+        /// A listing that ends with an error item, like a failed continuation page.
+        list_error: bool,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Probe {
@@ -1132,14 +1151,23 @@ mod tests {
             Self {
                 inner,
                 marker: None,
+                bulk_unsupported: false,
+                list_error: false,
+                in_flight: Arc::default(),
+                max_in_flight: Arc::default(),
             }
         }
 
         fn with_marker(inner: aos::memory::InMemory, marker: &str) -> Self {
             Self {
-                inner,
                 marker: Some(Path::from(marker)),
+                ..Self::new(inner)
             }
+        }
+
+        /// The most delete requests that were in flight at the same time.
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         /// The marker's own entry, when `prefix` is the marker.
@@ -1185,25 +1213,58 @@ mod tests {
             &self,
             locations: futures::stream::BoxStream<'static, aos::Result<Path>>,
         ) -> futures::stream::BoxStream<'static, aos::Result<Path>> {
-            self.inner
-                .delete_stream(
-                    locations
-                        .map(|l| match l {
-                            Ok(p) if p.as_ref().contains("bad") => Err(aos::Error::Generic {
-                                store: "Probe",
-                                source: format!("refused {p}").into(),
-                            }),
-                            other => other,
-                        })
-                        .boxed(),
-                )
-                .boxed()
+            use std::sync::atomic::Ordering::SeqCst;
+            let inner = self.inner.clone();
+            let bulk_unsupported = self.bulk_unsupported;
+            let (current, max) = (self.in_flight.clone(), self.max_in_flight.clone());
+            let refused = |why: String| aos::Error::Generic {
+                store: "Probe",
+                source: why.into(),
+            };
+            futures::stream::once(async move {
+                let items: Vec<aos::Result<Path>> = locations.collect().await;
+                if bulk_unsupported && items.len() > 1 {
+                    return items
+                        .into_iter()
+                        .map(|_| Err(refused("bulk delete is not supported".to_string())))
+                        .collect::<Vec<_>>();
+                }
+                let now = current.fetch_add(1, SeqCst) + 1;
+                max.fetch_max(now, SeqCst);
+                // Let the other requests of a concurrent delete start.
+                tokio::task::yield_now().await;
+                let checked: Vec<aos::Result<Path>> = items
+                    .into_iter()
+                    .map(|l| match l {
+                        Ok(p) if p.as_ref().contains("bad") => Err(refused(format!("refused {p}"))),
+                        other => other,
+                    })
+                    .collect();
+                let out = inner
+                    .delete_stream(futures::stream::iter(checked).boxed())
+                    .collect::<Vec<_>>()
+                    .await;
+                current.fetch_sub(1, SeqCst);
+                out
+            })
+            .flat_map(futures::stream::iter)
+            .boxed()
         }
         fn list(
             &self,
             prefix: Option<&Path>,
         ) -> futures::stream::BoxStream<'static, aos::Result<aos::ObjectMeta>> {
-            let listed = self.inner.list(prefix);
+            let mut listed = self.inner.list(prefix);
+            if self.list_error {
+                listed = listed
+                    .chain(futures::stream::once(std::future::ready(Err(
+                        aos::Error::Generic {
+                            store: "Probe",
+                            source: "listing page failed".into(),
+                        },
+                    ))))
+                    .boxed();
+            }
             match self.marker_for(prefix) {
                 Some(marker) => {
                     let inner = self.inner.clone();
@@ -1239,7 +1300,7 @@ mod tests {
         let (base, _url) = s3_prefix("s3://b/p/");
         let err = delete_under(&store, &base).await.expect_err("must fail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("2 objects"), "{msg}");
+        assert!(msg.contains("2 failed"), "{msg}");
         assert!(
             msg.contains("refused p/bad1") || msg.contains("refused p/x/bad2"),
             "{msg}"
@@ -1292,6 +1353,71 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{uri} does not address a listed object: {e}"));
         }
+    }
+
+    // F2: the GCS S3-interop endpoint rejects `DeleteObjects`, which a bulk delete sends.
+    // `delete_prefix` must work with one delete request per object, as it did before #232.
+    #[tokio::test]
+    async fn delete_prefix_sends_one_delete_request_per_object() {
+        let keys: Vec<String> = (0..25).map(|i| format!("p/d{}/k{i}", i % 3)).collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut store = Probe::new(seeded(&refs).await);
+        store.bulk_unsupported = true;
+        let (base, _url) = s3_prefix("s3://b/p/");
+        delete_under(&store, &base).await.expect("delete_prefix");
+        assert_eq!(remaining(&store.inner).await, Vec::<String>::new());
+    }
+
+    // At most DELETE_REQUESTS_IN_FLIGHT requests at once (the repo-wide bound), and the
+    // deletes do overlap.
+    #[tokio::test]
+    async fn delete_prefix_bounds_and_uses_request_concurrency() {
+        let keys: Vec<String> = (0..60).map(|i| format!("p/k{i}")).collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let store = Probe::new(seeded(&refs).await);
+        let (base, _url) = s3_prefix("s3://b/p/");
+        delete_under(&store, &base).await.expect("delete_prefix");
+        let max = store.max_in_flight();
+        assert!(
+            (2..=crate::delete_contract::DELETE_REQUESTS_IN_FLIGHT).contains(&max),
+            "max in flight {max}"
+        );
+        assert_eq!(remaining(&store.inner).await, Vec::<String>::new());
+    }
+
+    // Every failed object counts on its own, however many requests there are, and the
+    // error quotes only the first few.
+    #[tokio::test]
+    async fn delete_prefix_counts_every_failed_object() {
+        let mut keys: Vec<String> = (0..7).map(|i| format!("p/bad{i}")).collect();
+        keys.extend((0..20).map(|i| format!("p/ok{i}")));
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let store = Probe::new(seeded(&refs).await);
+        let (base, _url) = s3_prefix("s3://b/p/");
+        let err = delete_under(&store, &base).await.expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("7 failed"), "{msg}");
+        assert!(msg.contains("20 deleted"), "{msg}");
+        assert_eq!(
+            msg.matches("refused").count(),
+            MAX_NAMED_DELETE_FAILURES,
+            "{msg}"
+        );
+        assert_eq!(remaining(&store.inner).await.len(), 7);
+    }
+
+    // A failed listing is an error of the call, not a short success; the objects listed
+    // before the failure are still deleted.
+    #[tokio::test]
+    async fn delete_prefix_fails_when_the_listing_fails() {
+        let mut store = Probe::new(seeded(&["p/a", "p/b"]).await);
+        store.list_error = true;
+        let (base, _url) = s3_prefix("s3://b/p/");
+        let err = delete_under(&store, &base).await.expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("1 failed"), "{msg}");
+        assert!(msg.contains("listing page failed"), "{msg}");
+        assert_eq!(remaining(&store.inner).await, Vec::<String>::new());
     }
 
     // F1: S3 stores the folder marker `p/` as an object. `object_store` parses listed keys
