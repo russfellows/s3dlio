@@ -4,7 +4,7 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use super::async_bridge::future_into_py;
-use super::put_payload::{put_payload_from_py, PayloadUse};
+use super::put_payload::{drain_pending_exports, put_payload_from_py, PayloadUse};
 use bytes::Bytes;
 use pyo3::buffer::PyBuffer;
 use pyo3::conversion::IntoPyObjectExt;
@@ -1434,22 +1434,26 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 // put_bytes() - Put from a Python bytes-like object to any backend
 // ---------------------------------------------------------------------------
 
-/// Put bytes data to any storage backend.
+/// Put bytes data to any storage backend, without copying it where possible.
 ///
 /// What is copied (details and the safety argument: `put_payload.rs`):
-/// * `s3dlio.BytesView`: not copied (reference-count clone).
-/// * `bytes`, `bytearray`, `memoryview`, numpy arrays and other contiguous
-///   buffer-protocol objects: not copied. The buffer is held (it cannot be resized or
-///   freed) and read in place **with the GIL released**, so other Python threads keep
-///   running during a large PUT.
-/// * Non-contiguous (strided) views and objects that only provide `__bytes__()`: one
-///   copy, made with the GIL held.
+/// * `s3dlio.BytesView`, exact `bytes`: 0 copies.
+/// * Any other C-contiguous buffer, whatever its item type (bytearray, memoryview, numpy
+///   uint8/float32/bool/..., `array.array`, ctypes arrays, mmap): 0 copies. The buffer is
+///   held and read in place with the GIL released, so other Python threads keep running
+///   during a large PUT.
+/// * A non-contiguous (strided, reversed, transposed) view: one gather copy with the GIL
+///   held. An object that only provides `__bytes__()`: one copy, made by Python.
 ///
-/// The call blocks until the object is written. **Do not modify a mutable buffer
-/// (bytearray, writable memoryview, numpy array, mmap) from another thread while the
-/// call is running**: the upload would contain a mix of old and new bytes (the process
-/// stays memory-safe). On `file://` and `direct://` the store also writes straight from
-/// that buffer, so the payload is never duplicated.
+/// The native stores then write that memory without another copy on `s3://`, `gs://`,
+/// `az://` and `file://`. `direct://` (O_DIRECT) writes a page-aligned source (address
+/// multiple of 4096) straight from it; any other source is copied once into an aligned
+/// bounce buffer (up to 1 GiB, one write).
+///
+/// The call blocks until the object is written. While it runs the source is exported:
+/// * resizing it from another thread (`bytearray.extend()`/`clear()`) raises `BufferError`;
+/// * you must not modify its bytes from another thread: the stored object would mix old
+///   and new bytes (memory-safe, but not the data you meant).
 ///
 /// # Arguments
 /// * `uri` - Full URI including scheme (s3://, az://, gs://, file://, direct://)
@@ -1483,36 +1487,59 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
 
     let data_owned = put_payload_from_py(py, data, PayloadUse::Blocking)?;
 
-    py.detach(move || {
+    let result = py.detach(move || {
         // Build the store on the caller thread BEFORE submit_io (issue #173).
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
 
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move { put_verified_with_retry(store.as_ref(), &uri, data_owned).await })
-    })
+    });
+    // The store dropped its last clone of the payload on a runtime thread, which must not
+    // wait for the GIL, so it queued the buffer export instead of releasing it: release it
+    // now (we hold the GIL again) so the caller can resize the source as soon as we return.
+    drain_pending_exports(py);
+    result
 }
 
 /// Async version of put_bytes() - accepts any bytes-like object
 ///
-/// Accepts (in order of optimization):
-/// 1. s3dlio's own BytesView - no copy (Arc clone)
-/// 2. Python `bytes` - no copy (immutable; the buffer is held until the write is done)
-/// 3. Other buffer protocol objects (numpy arrays, bytearray, memoryview, mmap) - ONE
-///    snapshot copy taken when the call is made, with the GIL released, so the caller may
-///    reuse or resize the buffer as soon as this function returns
-/// 4. Non-contiguous views / any object with __bytes__() - one copy with the GIL held
+/// Must be called with a running event loop, and awaited.
+///
+/// What is copied:
+/// * `s3dlio.BytesView`, exact `bytes`: 0 copies.
+/// * Any other C-contiguous buffer (bytearray, memoryview, numpy of any dtype,
+///   `array.array`, ctypes, mmap), DEFAULT (`borrow=False`): ONE snapshot copy, taken
+///   before this function returns, with the GIL released. The caller may then reuse,
+///   modify or resize the buffer immediately. The only requirement is not to modify it
+///   from another thread DURING that copy.
+/// * Same, with `borrow=True`: 0 copies. The buffer is held and read in place until the
+///   awaitable completes. By passing `borrow=True` the caller PROMISES not to modify, resize
+///   or free the buffer until the awaitable has completed (successfully or not); until
+///   then `bytearray.extend()/clear()` raise `BufferError` and any write to the bytes
+///   corrupts the stored object. The export is released before the awaitable resolves.
+///   Use it for large buffers you own for the duration of the call (for example pinned host
+///   memory).
+/// * A non-contiguous view: one gather copy with the GIL held; `__bytes__()`-only object:
+///   one copy. (`borrow` has no effect on these.)
 ///
 /// Design philosophy: Be liberal in what you accept, optimize based on what you get.
 /// Never reject valid data - match the permissiveness of minio/boto3/s3torch.
 #[pyfunction]
+#[pyo3(signature = (uri, data, *, borrow = false))]
 fn put_bytes_async<'py>(
     py: Python<'py>,
     uri: &str,
     data: &Bound<'_, PyAny>,
+    borrow: bool,
 ) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
 
-    let data_owned = put_payload_from_py(py, data, PayloadUse::Deferred)?;
+    let usage = if borrow {
+        PayloadUse::Borrowed
+    } else {
+        PayloadUse::Snapshot
+    };
+    let data_owned = put_payload_from_py(py, data, usage)?;
 
     future_into_py(py, async move {
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;

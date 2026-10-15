@@ -259,6 +259,12 @@ where
     let runtime = pyo3_async_runtimes::tokio::get_runtime();
     match tracker.enter() {
         Some(ticket) => runtime.spawn_blocking(move || {
+            // Release buffer exports queued by a finished `put_bytes_async(borrow=True)` BEFORE
+            // the result reaches Python, so the caller can resize its buffer right after the
+            // `await`. This thread is a blocking-pool thread that attaches to Python anyway.
+            if super::put_payload::exports_pending() {
+                let _ = Python::try_attach(super::put_payload::drain_pending_exports);
+            }
             f();
             drop(ticket);
         }),
