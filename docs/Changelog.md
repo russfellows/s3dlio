@@ -32,7 +32,7 @@
   the native module (which loads it) is imported before s3dlio's own `torch` import. Not promised:
   s3dlio cannot know whether its host already has threads or has already imported `torch`; a host that
   needs a race-free environment loads the file (or sets the real environment) at the very start of the
-  process, and forked children inherit the parent's resolved policy. `s3-cli` prints a
+  process, and forked children inherit the parent's resolved policy. `import s3dlio` now imports the native module first, outside any `try`, so if it fails the caller sees that error instead of PyO3's "initialized once" message from a second attempt. `s3-cli` prints a
   warning on stderr when `S3DLIO_LOAD_DOTENV` names a file it cannot read. Documented in the README and
   `docs/Environment_Variables.md`.
 
