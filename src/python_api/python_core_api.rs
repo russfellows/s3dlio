@@ -4,14 +4,16 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use super::async_bridge::future_into_py;
-use super::put_payload::{drain_pending_exports, put_payload_from_py, PayloadUse};
+use super::put_payload::{
+    export_stats, put_payload, quiesce_async, quiesce_blocking, Latch, PayloadUse,
+};
 use bytes::Bytes;
-use pyo3::buffer::PyBuffer;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::ffi;
+use pyo3::ffi::c_str;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyDictMethods, PyList, PyListMethods};
 use pyo3::Bound;
 
 use tokio::task;
@@ -1452,8 +1454,13 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 ///
 /// The call blocks until the object is written. While it runs the source is exported:
 /// * resizing it from another thread (`bytearray.extend()`/`clear()`) raises `BufferError`;
-/// * you must not modify its bytes from another thread: the stored object would mix old
-///   and new bytes (memory-safe, but not the data you meant).
+/// * you must not modify its bytes from another thread: that is a DATA RACE (the bytes
+///   uploaded are undefined; the buffer is never freed or resized meanwhile, but that does not
+///   make a concurrent write safe).
+///
+/// The call does not return - normally or with an error - until every native reader of the
+/// buffer is done and the export has been released (bounded wait; on timeout the buffer stays
+/// pinned and `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it).
 ///
 /// # Arguments
 /// * `uri` - Full URI including scheme (s3://, az://, gs://, file://, direct://)
@@ -1485,7 +1492,8 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult<()> {
     let uri = uri.to_owned();
 
-    let data_owned = put_payload_from_py(py, data, PayloadUse::Blocking)?;
+    let payload = put_payload(py, data, PayloadUse::Blocking)?;
+    let data_owned = payload.bytes;
 
     let result = py.detach(move || {
         // Build the store on the caller thread BEFORE submit_io (issue #173).
@@ -1494,10 +1502,15 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move { put_verified_with_retry(store.as_ref(), &uri, data_owned).await })
     });
-    // The store dropped its last clone of the payload on a runtime thread, which must not
-    // wait for the GIL, so it queued the buffer export instead of releasing it: release it
-    // now (we hold the GIL again) so the caller can resize the source as soon as we return.
-    drain_pending_exports(py);
+    // The put is over (it succeeded, failed, or the store gave up), but a backend may still hold
+    // a clone of the payload (an SDK/hyper task, a detached writer). Wait, with the GIL released,
+    // until the LAST clone is gone (the owner's drop), then release the export with this
+    // thread's real GIL token: the call does not return while any native reader can still
+    // touch the caller's buffer. Bounded; on timeout the buffer stays pinned (see
+    // `EXPORT_QUIESCE_TIMEOUT`).
+    if let Some(latch) = &payload.latch {
+        quiesce_blocking(py, latch);
+    }
     result
 }
 
@@ -1515,8 +1528,13 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
 /// * Same, with `borrow=True`: 0 copies. The buffer is held and read in place until the
 ///   awaitable completes. By passing `borrow=True` the caller PROMISES not to modify, resize
 ///   or free the buffer until the awaitable has completed (successfully or not); until
-///   then `bytearray.extend()/clear()` raise `BufferError` and any write to the bytes
-///   corrupts the stored object. The export is released before the awaitable resolves.
+///   then `bytearray.extend()/clear()` raise `BufferError` and any write to the bytes is a
+///   data race (the bytes uploaded are undefined). The awaitable (an `asyncio.Task` for
+///   `borrow=True`) completes - with the result, with an error, or with `CancelledError` - only
+///   after every native reader of the buffer is done and the export has been released: a
+///   cancellation is delivered to the caller after that point, not before, so reusing the
+///   buffer after `CancelledError` is safe. (Cancelling therefore waits for a running native
+///   write to finish; the wait is bounded, see `s3dlio._put_export_stats()`.)
 ///   Use it for large buffers you own for the duration of the call (for example pinned host
 ///   memory).
 /// * A non-contiguous view: one gather copy with the GIL held; `__bytes__()`-only object:
@@ -1539,14 +1557,102 @@ fn put_bytes_async<'py>(
     } else {
         PayloadUse::Snapshot
     };
-    let data_owned = put_payload_from_py(py, data, usage)?;
+    let payload = put_payload(py, data, usage)?;
+    let data_owned = payload.bytes;
 
-    future_into_py(py, async move {
+    let inner = future_into_py(py, async move {
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
         put_verified_with_retry(store.as_ref(), &uri, data_owned)
             .await
             .map_err(py_err)
-    })
+    })?;
+
+    // A payload that borrows the caller's memory may still be read by native code (a blocking
+    // file write that a cancelled future cannot stop, a backend task) after the Python future
+    // has become terminal. So the awaitable is wrapped: its completion - success, error OR
+    // cancellation - is delayed until every native reader is done and the export has been
+    // released with a real GIL token.
+    match payload.latch {
+        None => Ok(inner),
+        Some(latch) => guarded_awaitable(py, inner, latch),
+    }
+}
+
+/// The Python helper that makes an awaitable's completion wait for the export barrier.
+const PUT_GUARD_PY: &std::ffi::CStr = c_str!(
+    "import asyncio
+
+async def _wait_quiet(quiesce):
+    fut = asyncio.ensure_future(quiesce())
+    while True:
+        try:
+            await asyncio.shield(fut)
+            return
+        except asyncio.CancelledError:
+            if fut.done():
+                return
+            # cancelled again while waiting for the native readers: keep waiting
+
+async def guard(inner, quiesce):
+    # Cancelling this task cancels `inner` (the put), but the cancellation is only delivered
+    # to the caller AFTER `quiesce()` says no native reader of the borrowed buffer remains.
+    try:
+        result = await inner
+    except BaseException:
+        await _wait_quiet(quiesce)
+        raise
+    await _wait_quiet(quiesce)
+    return result
+"
+);
+
+fn guarded_awaitable<'py>(
+    py: Python<'py>,
+    inner: Bound<'py, PyAny>,
+    latch: std::sync::Arc<Latch>,
+) -> PyResult<Bound<'py, PyAny>> {
+    static GUARD: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+    let guard = match GUARD.get() {
+        Some(g) => g.clone_ref(py),
+        None => {
+            let module = PyModule::from_code(
+                py,
+                PUT_GUARD_PY,
+                c_str!("s3dlio_put_guard.py"),
+                c_str!("_s3dlio_put_guard"),
+            )?;
+            let f = module.getattr("guard")?.unbind();
+            GUARD.get_or_init(|| f).clone_ref(py)
+        }
+    };
+    let quiesce = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
+              -> PyResult<Py<PyAny>> {
+            let latch = latch.clone();
+            let fut = future_into_py(args.py(), async move {
+                quiesce_async(latch).await;
+                Ok(())
+            })?;
+            Ok(fut.unbind())
+        },
+    )?;
+    let coro = guard.bind(py).call1((inner, quiesce))?;
+    py.import("asyncio")?.call_method1("ensure_future", (coro,))
+}
+
+/// Counters of the buffer-export barrier (diagnostics and tests):
+/// `{"quiesce_timeouts": int, "queued": int}`.
+#[pyfunction]
+fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let s = export_stats();
+    let d = PyDict::new(py);
+    d.set_item("quiesce_timeouts", s.quiesce_timeouts)?;
+    d.set_item("queued", s.queued)?;
+    Ok(d)
 }
 
 // ---------------------------------------------------------------------------
@@ -2337,25 +2443,6 @@ impl PyObjectWriter {
         *lock_ignoring_poison(&self.stats) = snapshot_final_writer_stats(writer);
     }
 
-    /// Lock `inner` from a thread that holds the GIL, without ever waiting for the lock
-    /// while holding it: a thread writing with the GIL released needs the GIL back to
-    /// return, so waiting here with the GIL would deadlock.
-    fn lock_with_gil(
-        &self,
-        py: Python<'_>,
-    ) -> std::sync::MutexGuard<'_, Option<Box<dyn ObjectWriter>>> {
-        loop {
-            match self.inner.try_lock() {
-                Ok(guard) => return guard,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    // Wait for the holder with the GIL released, then try again.
-                    py.detach(|| drop(lock_ignoring_poison(&self.inner)));
-                }
-            }
-        }
-    }
-
     /// Write `data` through the locked writer and publish the new stats. Blocks the
     /// calling thread; the caller decides whether it holds the GIL.
     fn write_locked(
@@ -2375,29 +2462,12 @@ impl PyObjectWriter {
     }
 
     /// Write `data` with the GIL released. `data` must stay valid and unchanged for the
-    /// call without the GIL: immutable `bytes` or an owned copy.
+    /// call without the GIL: an exported buffer the caller promised not to modify, or an
+    /// immutable `bytes`.
     fn write_detached(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
         py.detach(|| {
             let mut guard = lock_ignoring_poison(&self.inner);
             self.write_locked(&mut guard, data)
-        })
-    }
-
-    /// `write_owned_bytes` for data already copied out of Python, GIL released.
-    fn write_owned_detached(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
-        py.detach(|| {
-            let mut guard = lock_ignoring_poison(&self.inner);
-            let writer = guard.take().ok_or_else(Self::finalized_error)?;
-            // The writer is moved into the 'static future for `submit_io` and handed
-            // back, so a failed write leaves it usable for a retry or `finalize()`.
-            let (writer, result) = submit_io(async move {
-                let mut writer = writer;
-                let r = writer.write_owned_bytes(data).await;
-                Ok::<_, anyhow::Error>((writer, r))
-            })?;
-            self.publish_stats(writer.as_ref());
-            *guard = Some(writer);
-            result.map_err(|e| py_err(e.context("Failed to write owned bytes")))
         })
     }
 }
@@ -2408,109 +2478,44 @@ impl PyObjectWriter {
     ///
     /// Accepts any Python object supporting the buffer protocol:
     /// - bytes, bytearray, memoryview
-    /// - NumPy arrays, PyTorch tensors
+    /// - NumPy arrays (any dtype), PyTorch tensors, ctypes arrays, mmap
     /// - Any object with __buffer__ method
     ///
-    /// No copy is made, except for a non-contiguous view (a strided or reversed
-    /// memoryview, a transposed array), which is copied once into contiguous memory.
+    /// The conversion is the same as `put_bytes()`'s (see `put_payload.rs`): a C-contiguous
+    /// buffer is read in place with NO copy made by this Python layer, a non-contiguous view
+    /// is gathered once by Python, an object that only has `__bytes__()` is converted once.
     ///
-    /// GIL: it is released for the blocking write (issue #201) only when `data` is an
-    /// exact `bytes` object, which no thread can change, or after the copy of a
-    /// non-contiguous view. For every other exporter (bytearray, a writable memoryview,
-    /// numpy, mmap, ctypes, ...) the GIL is kept for the write, as before #201, because
-    /// another thread could otherwise change the memory while it is being read. To keep
-    /// other threads running during a large write of mutable data, pass `bytes(data)`.
+    /// GIL: it is RELEASED for the blocking write, for every kind of buffer. While the call
+    /// runs the buffer is exported (resizing it from another thread raises `BufferError`), and
+    /// you must not modify its bytes from another thread: that is a data race and the data
+    /// written is undefined. (Before 0.9.128 the GIL was held for mutable buffers, which made
+    /// other Python threads wait for the whole write.)
+    ///
+    /// Whether the writer then copies the data itself depends on the backend (a multipart
+    /// writer copies into its part buffers; a file writer does not).
     ///
     /// Calls on one writer from several threads run one after another.
     fn write_chunk(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        // An exact `bytes` object is immutable and `data` keeps it alive: zero-copy and
-        // safe to read without the GIL.
-        if data.is_exact_instance_of::<PyBytes>() {
-            if let Ok(bytes) = data.cast::<PyBytes>() {
-                return self.write_detached(py, bytes.as_bytes());
-            }
+        let payload = put_payload(py, data, PayloadUse::Blocking)?;
+        let result = self.write_detached(py, payload.bytes.as_ref());
+        // The write took a borrowed slice (nothing keeps a clone), so the export is free now:
+        // release it with this thread's GIL token before returning.
+        let latch = payload.latch;
+        drop(payload.bytes);
+        if let Some(latch) = latch {
+            quiesce_blocking(py, &latch);
         }
-
-        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-            if !buffer.is_c_contiguous() {
-                // The buffer pointer and byte length do not describe the view's bytes
-                // (strides). Copy them in logical order under the GIL, then write the
-                // owned copy without it.
-                let owned = buffer.to_vec(py).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!(
-                        "Buffer copy failed: {}",
-                        e
-                    ))
-                })?;
-                drop(buffer);
-                return self.write_detached(py, &owned);
-            }
-
-            // Take the writer lock FIRST. Waiting for it may release the GIL, and a
-            // reference over the caller's memory must not exist while another Python
-            // thread can run and change that memory.
-            let mut guard = self.lock_with_gil(py);
-            let result = if buffer.len_bytes() == 0 {
-                self.write_locked(&mut guard, &[])
-            } else {
-                // SAFETY: the buffer is C-contiguous and `buffer` is a live Py_buffer
-                // export, released only after the write has returned, so the exporter
-                // cannot free or resize the memory meanwhile. The slice is created
-                // only now, after the lock was acquired, and the GIL is HELD from
-                // here through the end of the write (`write_locked` does not release
-                // it), so no Python thread can change the contents while the slice
-                // exists. Non-Python code that shares the memory (a mmap or ctypes
-                // buffer written by native code) is the caller's responsibility, as
-                // in any buffer-protocol consumer. The write only reads from the slice.
-                let slice = unsafe {
-                    std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
-                };
-                self.write_locked(&mut guard, slice)
-            };
-            drop(guard);
-            // Release the export only now.
-            drop(buffer);
-            return result;
-        }
-
-        Err(PyRuntimeError::new_err(
-            "write_chunk requires bytes-like object (bytes, bytearray, memoryview, numpy array, etc.)"
-        ))
+        result
     }
 
-    /// Write owned bytes (copies the input out of Python, then writes with the GIL released)
+    /// Write owned bytes. Kept for compatibility: since 0.9.128 it is identical to
+    /// `write_chunk()` (no copy is made by the Python layer any more, and the GIL is
+    /// released for the write; see `write_chunk()` for the buffer contract).
     ///
-    /// This method copies data but takes ownership, useful when the caller
-    /// doesn't need the buffer anymore, and it releases the GIL for the whole write
-    /// whatever the type of `data` (the copy is made under the GIL, so a concurrent
-    /// change to a mutable buffer cannot tear it). For a zero-copy write of `bytes`
-    /// use write_chunk().
-    ///
-    /// Implementation note: the writer is temporarily moved out of the lock into the
-    /// `'static` future `submit_io` needs, and always put back afterwards whether or not
-    /// the write succeeded, so a failed `write_owned_bytes()` leaves the writer usable
-    /// for a retry or a clean `finalize()`.
+    /// The writer is put back after a failed write, so a failed `write_owned_bytes()`
+    /// leaves it usable for a retry or a clean `finalize()`.
     fn write_owned_bytes(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Try buffer protocol
-        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-            let len = buffer.len_bytes();
-            let mut vec = vec![0u8; len];
-            buffer
-                .copy_to_slice(py, &mut vec[..])
-                .map_err(|e| PyRuntimeError::new_err(format!("Buffer copy failed: {}", e)))?;
-            // The copy is made: release the export before the GIL is released.
-            drop(buffer);
-            return self.write_owned_detached(py, vec);
-        }
-
-        // Fallback for PyBytes
-        if let Ok(bytes) = data.cast::<PyBytes>() {
-            return self.write_owned_detached(py, bytes.as_bytes().to_vec());
-        }
-
-        Err(PyRuntimeError::new_err(
-            "write_owned_bytes requires bytes-like object",
-        ))
+        self.write_chunk(py, data)
     }
 
     /// Finalize the writer and complete the upload
@@ -3246,6 +3251,7 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(exists_async, m)?)?;
     m.add_function(wrap_pyfunction!(put_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(put_bytes_async, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_export_stats, m)?)?;
     m.add_function(wrap_pyfunction!(mkdir, m)?)?;
     m.add_function(wrap_pyfunction!(mkdir_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
@@ -4064,19 +4070,20 @@ mod issue204_store_cache_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Tests -- PyObjectWriter::write_chunk must not create a reference over a mutable
-// exporter's memory before it holds the writer lock: waiting for the lock releases
-// the GIL, and another Python thread may then change that memory under the reference.
+// Tests -- PyObjectWriter::write_chunk / write_owned_bytes (issue #254).
 //
-// A behavioural RED is not possible: the read itself happens with the GIL held, so
-// the only difference is a live `&[u8]` over memory that changes during the wait
-// (undefined behaviour in the abstract machine, no observable torn data). The order
-// of the two steps is therefore pinned structurally.
+// Superseded design: write_chunk used to keep the GIL for every mutable buffer and took the
+// writer lock BEFORE building a slice over the caller's memory (waiting for the lock could
+// release the GIL). It now converts the argument like put_bytes() (a held buffer export, no
+// copy by the Python layer) and writes with the GIL RELEASED under the documented "do not
+// modify during the call" contract. The behaviour (RSS, GIL stall, round trips) is tested in
+// python/tests/test_python_write_paths_254.py; this pins the structure: no private raw-slice
+// path and no GIL-held write is left in write_chunk.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-mod write_chunk_slice_after_lock_tests {
+mod write_chunk_uses_the_shared_payload_conversion_tests {
     #[test]
-    fn the_slice_over_a_mutable_buffer_is_created_after_the_writer_lock_is_taken() {
+    fn write_chunk_converts_with_put_payload_and_writes_detached() {
         let src = include_str!("python_core_api.rs");
         let start = src
             .find("fn write_chunk(&self, py: Python<'_>")
@@ -4084,23 +4091,21 @@ mod write_chunk_slice_after_lock_tests {
         let rest = &src[start..];
         let end = rest.find("\n    }\n").expect("end of write_chunk");
         let body = &rest[..end];
-
-        assert_eq!(
-            body.matches("self.lock_with_gil(py)").count(),
-            1,
-            "RED: write_chunk takes the writer lock in more than one place, so a slice can be \
-             built on a path that has not taken it yet"
-        );
-        let lock = body
-            .find("self.lock_with_gil(py)")
-            .expect("RED: write_chunk's GIL-held path does not take the writer lock");
-        let slice = body
-            .find("from_raw_parts(")
-            .expect("RED: write_chunk's GIL-held path builds no slice");
         assert!(
-            lock < slice,
-            "RED: the slice over the caller's buffer is created before the writer lock is \
-             acquired (acquiring it can release the GIL)"
+            body.contains("put_payload("),
+            "write_chunk must use put_payload"
+        );
+        assert!(
+            body.contains("write_detached("),
+            "the write must run with the GIL released"
+        );
+        assert!(
+            !body.contains("from_raw_parts(") && !body.contains("write_locked("),
+            "write_chunk must not build its own slice or write with the GIL held"
+        );
+        assert!(
+            body.contains("quiesce_blocking("),
+            "the export must be released before returning"
         );
     }
 }

@@ -70,9 +70,8 @@ pub const ENV_DIRECT_IO_BOUNCE_WHEN_BUSY: &str = "S3DLIO_DIRECT_IO_BOUNCE_WHEN_B
 /// into the destination). Which is faster depends on load; this stays `direct` until measured.
 pub const ENV_DIRECT_IO_GET_MODE: &str = "S3DLIO_DIRECT_IO_GET_MODE";
 
-/// Objects whose bounce need is at most this many bytes (1 MiB) do not lease a pair: they use a
-/// private buffer of their own size, which costs less than waiting for the shared pair.
-pub const DIRECT_IO_POOL_MIN_OBJECT: usize = BYTES_PER_MIB;
+/// How often a request waiting for a bounce buffer re-checks whether it was cancelled (25 ms).
+pub const BOUNCE_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Size, in bytes, of the aligned staging buffer a `direct://` STREAMING writer
 /// (`DirectIOWriter`) fills before each O_DIRECT write (64 MiB). A stream's final size is
@@ -1009,6 +1008,12 @@ pub const ASYNC_EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// releaser finds the queue empty and never contends for the GIL on the hot path. It only
 /// matters when nobody drains (for example a cancelled awaitable).
 pub const EXPORT_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// How long a put waits, after the store finished with it, for every native reader of a
+/// borrowed Python buffer to let go (30 s). If a backend still holds a clone of the payload after
+/// this, the buffer stays PINNED (never released while it can still be read), the event is logged
+/// once and counted (`s3dlio._put_export_stats()["quiesce_timeouts"]`), and the call completes.
+pub const EXPORT_QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Payload size below which the default `put_bytes_async` snapshot is copied with the GIL
 /// held (256 KiB): releasing and re-taking the GIL costs more than copying that much.

@@ -35,9 +35,26 @@
 //! * the exporter cannot be resized or freed: `bytearray.extend()/clear()` from another
 //!   thread raises `BufferError`;
 //! * the caller must NOT modify the bytes (another thread writing to the bytearray, numpy
-//!   array, mmap or ctypes memory). Nothing prevents it, and the stored object would then
-//!   mix old and new bytes. This is memory-safe but not byte-correct. It applies to the
-//!   snapshot copy of `put_bytes_async` too (it happens with the GIL released).
+//!   array, mmap or ctypes memory). Nothing prevents it, and it is a DATA RACE: the Rust side
+//!   reads the memory through shared references, so concurrent writes are undefined behaviour
+//!   in the Rust sense and the bytes uploaded are undefined. The memory itself is not freed or
+//!   resized meanwhile (the export pins it), but that is not a safety net for writers. The same
+//!   applies to the snapshot copy of `put_bytes_async` (made with the GIL released above
+//!   256 KiB).
+//!
+//! # The completion barrier
+//!
+//! A put does not complete - normally, with an error, OR by cancellation - until every native
+//! reader of the borrowed memory is done and the export has really been released. The
+//! per-call [`Latch`] is signalled by the export owner's `Drop`, which runs when the LAST clone
+//! of the `Bytes` dies wherever that happens (Tokio tasks, SDK/hyper tasks, `spawn_blocking`
+//! writers that a cancelled future cannot stop). `put_bytes` waits on the latch (GIL
+//! released) after the put returned; the awaitable of `put_bytes_async(borrow=True)` is an
+//! `asyncio.Task` running a small guard coroutine that, on success, error or cancellation,
+//! first waits for the latch (shielded from further cancellation) and only then resolves or
+//! raises. The wait is bounded by `EXPORT_QUIESCE_TIMEOUT`; if a backend never drops its clone
+//! the buffer stays pinned (never released while it can be read), the event is logged once and
+//! counted, and the call completes.
 //!
 //! # Releasing the export never blocks a runtime thread
 //!
@@ -91,11 +108,13 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-use crate::constants::{EXPORT_RELEASE_GRACE, SNAPSHOT_GIL_DETACH_THRESHOLD};
+use crate::constants::{
+    EXPORT_QUIESCE_TIMEOUT, EXPORT_RELEASE_GRACE, SNAPSHOT_GIL_DETACH_THRESHOLD,
+};
 
 /// How long the store reads the payload relative to the Python call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,8 +129,154 @@ pub(crate) enum PayloadUse {
     Borrowed,
 }
 
+/// The completion barrier of ONE call that holds a buffer export.
+///
+/// A put must not complete (normally, with an error, or by cancellation) until every native
+/// reader of the borrowed memory is done and the export has really been released. The readers are
+/// the clones of the `Bytes` built over the export, wherever they live (Tokio tasks, hyper/SDK
+/// tasks, `spawn_blocking` file writers that a cancelled future cannot stop). The owner's `Drop`
+/// runs when the LAST clone dies, so it is the exact "all readers are done" event:
+///
+/// * `dropped`: the owner has been dropped (no native reader remains); the export is then queued
+///   for release (or released explicitly with a `py` token);
+/// * `released`: `PyBuffer_Release` has run.
+///
+/// The Python-facing completion waits for `dropped` (bounded by `EXPORT_QUIESCE_TIMEOUT`), then
+/// releases the queue with a real `py` token, and only then resolves, raises, or raises
+/// `CancelledError`.
+pub(crate) struct Latch {
+    state: Mutex<LatchState>,
+    cv: Condvar,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct LatchState {
+    dropped: bool,
+    released: bool,
+}
+
+/// Times a wait for native readers gave up (a backend kept a clone past the timeout).
+static QUIESCE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static QUIESCE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Record that a backend did not drop its clone in time: the export STAYS PINNED (memory that is
+/// still being read is never released); log once, count always.
+fn note_quiesce_timeout() {
+    QUIESCE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    if !QUIESCE_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "s3dlio: a storage backend kept reading a borrowed Python buffer for more than {:?} \
+             after the put finished; the buffer stays pinned (it is released when the backend \
+             lets go). Further occurrences are only counted (see s3dlio._put_export_stats())",
+            EXPORT_QUIESCE_TIMEOUT
+        );
+    }
+}
+
+impl Latch {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(LatchState::default()),
+            cv: Condvar::new(),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LatchState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn mark_dropped(&self) {
+        self.lock().dropped = true;
+        self.cv.notify_all();
+        self.notify.notify_one();
+    }
+
+    fn mark_released(&self) {
+        self.lock().released = true;
+    }
+
+    pub(crate) fn is_dropped(&self) -> bool {
+        self.lock().dropped
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_released(&self) -> bool {
+        self.lock().released
+    }
+
+    /// Block until the owner has been dropped; `false` on timeout. Call without the GIL.
+    pub(crate) fn wait_dropped_blocking(&self, timeout: Duration) -> bool {
+        let guard = self.lock();
+        let (guard, _) = self
+            .cv
+            .wait_timeout_while(guard, timeout, |s| !s.dropped)
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.dropped
+    }
+
+    /// Async variant of [`wait_dropped_blocking`](Self::wait_dropped_blocking).
+    pub(crate) async fn wait_dropped(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.is_dropped() {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, self.notify.notified())
+                .await
+                .is_err()
+            {
+                return self.is_dropped();
+            }
+        }
+    }
+}
+
+/// Wait (GIL released) until every native reader of the export is done, then release the queue
+/// with the real `py` token. Used by the blocking `put_bytes` before it returns, however the put
+/// ended. On timeout the export stays pinned and the timeout is counted.
+pub(crate) fn quiesce_blocking(py: Python<'_>, latch: &Latch) {
+    if py.detach(|| latch.wait_dropped_blocking(EXPORT_QUIESCE_TIMEOUT)) {
+        drain_pending_exports(py);
+    } else {
+        note_quiesce_timeout();
+    }
+}
+
+/// Async counterpart for the awaitable of `put_bytes_async(borrow=True)`: wait for the owner's
+/// drop, then release the queue on a blocking-pool thread that attaches to Python (never a
+/// runtime worker). Runs even when the awaitable was cancelled.
+pub(crate) async fn quiesce_async(latch: Arc<Latch>) {
+    if latch.wait_dropped(EXPORT_QUIESCE_TIMEOUT).await {
+        let _ = tokio::task::spawn_blocking(|| Python::try_attach(drain_pending_exports)).await;
+    } else {
+        note_quiesce_timeout();
+    }
+}
+
+/// Counters for the export barrier (hidden Python function `s3dlio._put_export_stats()`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExportStats {
+    /// Waits for native readers that timed out (export left pinned).
+    pub(crate) quiesce_timeouts: u64,
+    /// Exports waiting in the release queue right now.
+    pub(crate) queued: usize,
+}
+
+pub(crate) fn export_stats() -> ExportStats {
+    ExportStats {
+        quiesce_timeouts: QUIESCE_TIMEOUTS.load(Ordering::Relaxed),
+        queued: QUEUE.get().map_or(0, |q| q.count.load(Ordering::Acquire)),
+    }
+}
+
 /// A raw `Py_buffer` export (`PyBUF_SIMPLE`: any C-contiguous exporter, any item type).
-struct RawExport(Box<ffi::Py_buffer>);
+struct RawExport {
+    view: Box<ffi::Py_buffer>,
+    /// Marked "released" when `PyBuffer_Release` has really run (set by `ExportOwner::new`).
+    latch: Option<Arc<Latch>>,
+}
 
 // SAFETY: the struct is only read from other threads (its `buf`/`len` are fixed for the life
 // of the export) and released by value under the GIL.
@@ -147,7 +312,7 @@ impl RawExport {
         if unsafe { ffi::PyObject_GetBuffer(data.as_ptr(), &mut *view, flags) } == -1 {
             return Err(PyErr::fetch(data.py()));
         }
-        Ok(Self(view))
+        Ok(Self { view, latch: None })
     }
 
     /// Request a flat view of `data`. `Ok(None)`: the object has no flat (C-contiguous) view
@@ -162,9 +327,9 @@ impl RawExport {
             Ok(e) => e,
             Err(_) => return Ok(None),
         };
-        if !export.0.format.is_null() {
+        if !export.view.format.is_null() {
             // SAFETY: a non-null `format` is a NUL-terminated string owned by the exporter.
-            let fmt = unsafe { std::ffi::CStr::from_ptr(export.0.format) }
+            let fmt = unsafe { std::ffi::CStr::from_ptr(export.view.format) }
                 .to_string_lossy()
                 .into_owned();
             if format_has_pointers(&fmt) {
@@ -176,13 +341,16 @@ impl RawExport {
     }
 
     fn len(&self) -> usize {
-        usize::try_from(self.0.len).unwrap_or(0)
+        usize::try_from(self.view.len).unwrap_or(0)
     }
 
     /// Release the export; the `py` token proves the GIL is held.
     fn release(mut self, _py: Python<'_>) {
         // SAFETY: `_py` proves this thread holds the GIL.
-        unsafe { ffi::PyBuffer_Release(&mut *self.0) };
+        unsafe { ffi::PyBuffer_Release(&mut *self.view) };
+        if let Some(latch) = &self.latch {
+            latch.mark_released();
+        }
     }
 }
 
@@ -339,17 +507,31 @@ struct ExportOwner {
 }
 
 impl ExportOwner {
-    fn new(export: RawExport) -> Self {
+    fn new(mut export: RawExport, latch: Arc<Latch>) -> Self {
+        export.latch = Some(latch);
         Self {
             export: Some(export),
             queue: None,
         }
     }
 
-    /// Release now; the `py` token proves the GIL is held.
+    /// Same, queueing into `queue` instead of the process-wide one (tests).
+    #[cfg(test)]
+    fn with_queue(export: RawExport, queue: &'static ReleaseQueue) -> (Self, Arc<Latch>) {
+        let latch = Latch::new();
+        let mut owner = Self::new(export, latch.clone());
+        owner.queue = Some(queue);
+        (owner, latch)
+    }
+
+    /// Release now; the `py` token proves the GIL is held. Marks the call's latch dropped too.
     fn release(mut self, py: Python<'_>) {
         if let Some(export) = self.export.take() {
+            let latch = export.latch.clone();
             export.release(py);
+            if let Some(latch) = latch {
+                latch.mark_dropped();
+            }
         }
     }
 }
@@ -361,7 +543,7 @@ impl AsRef<[u8]> for ExportOwner {
             // contiguous; `buf`/`len` describe `len` readable bytes. Documented caller
             // obligation: no concurrent modification of those bytes.
             Some(e) if e.len() > 0 => unsafe {
-                std::slice::from_raw_parts(e.0.buf as *const u8, e.len())
+                std::slice::from_raw_parts(e.view.buf as *const u8, e.len())
             },
             _ => &[],
         }
@@ -373,12 +555,21 @@ impl Drop for ExportOwner {
         let Some(export) = self.export.take() else {
             return;
         };
+        // The last native reader is gone: this IS the "all readers done" event. The latch is
+        // signalled AFTER the export is queued, so a waiter that wakes and drains finds it.
+        let latch = export.latch.clone();
+        let signal = |latch: &Option<Arc<Latch>>| {
+            if let Some(l) = latch {
+                l.mark_dropped();
+            }
+        };
         let queue = match self.queue {
             Some(q) => q,
             None => {
                 // Do not even start the releaser thread once the interpreter is exiting.
                 if SHUTDOWN.load(Ordering::Acquire) {
                     std::mem::forget(export);
+                    signal(&latch);
                     return;
                 }
                 global_queue()
@@ -387,9 +578,11 @@ impl Drop for ExportOwner {
         // SAFETY: always safe to call.
         if queue.shutdown.load(Ordering::Acquire) || unsafe { ffi::Py_IsInitialized() } == 0 {
             std::mem::forget(export); // nothing may attach any more: abandon with the process
+            signal(&latch);
             return;
         }
         queue.push(export);
+        signal(&latch);
     }
 }
 
@@ -450,22 +643,42 @@ fn try_snapshot(src: &[u8], reserve: usize) -> Result<Bytes, std::collections::T
     Ok(Bytes::from(v))
 }
 
+/// The payload of a put: the `Bytes` for the store and, when it is backed by a buffer export
+/// that the call must wait for, the completion barrier.
+pub(crate) struct Payload {
+    pub(crate) bytes: Bytes,
+    /// `Some` only for payloads backed by a held `Py_buffer` export (`Blocking`/`Borrowed`
+    /// buffers other than exact `bytes`); immutable payloads need no barrier.
+    pub(crate) latch: Option<Arc<Latch>>,
+}
+
 /// Convert `data` to the `Bytes` that is written to the store (see the module docs for
 /// exactly what is copied).
+#[cfg(test)]
 pub(crate) fn put_payload_from_py(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
     usage: PayloadUse,
 ) -> PyResult<Bytes> {
+    put_payload(py, data, usage).map(|p| p.bytes)
+}
+
+/// Like [`put_payload_from_py`] but also returns the completion barrier of a held export.
+pub(crate) fn put_payload(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    usage: PayloadUse,
+) -> PyResult<Payload> {
+    let plain = |bytes| Payload { bytes, latch: None };
     // 1. s3dlio's own BytesView: refcount clone. MUST come first: BytesView also implements
     //    the buffer protocol, which used to shadow this branch (issue #238).
     if let Ok(bytes_view) = data.cast::<PyBytesView>() {
-        return Ok(bytes_view.try_borrow()?.bytes.clone());
+        return Ok(plain(bytes_view.try_borrow()?.bytes.clone()));
     }
 
     // 2. Exact `bytes`: immutable, kept alive by a reference (no export needed).
     if let Ok(exact) = data.cast_exact::<PyBytes>() {
-        return Ok(bytes_from_pybytes(exact));
+        return Ok(plain(bytes_from_pybytes(exact)));
     }
 
     // 3. Any C-contiguous buffer, whatever its item type: hold the export. (Arrays of
@@ -473,18 +686,22 @@ pub(crate) fn put_payload_from_py(
     if let Some(export) = RawExport::acquire(data)? {
         if export.len() == 0 {
             export.release(py);
-            return Ok(Bytes::new());
+            return Ok(plain(Bytes::new()));
         }
-        let owner = ExportOwner::new(export);
+        let latch = Latch::new();
+        let owner = ExportOwner::new(export, latch.clone());
         return match usage {
-            PayloadUse::Blocking | PayloadUse::Borrowed => Ok(Bytes::from_owner(owner)),
+            PayloadUse::Blocking | PayloadUse::Borrowed => Ok(Payload {
+                bytes: Bytes::from_owner(owner),
+                latch: Some(latch),
+            }),
             PayloadUse::Snapshot => {
                 // Copy now (the caller may reuse the buffer as soon as we return). `owner`
                 // keeps the export, so the memory cannot be freed or resized meanwhile; it
                 // is released explicitly right after (this thread holds the GIL again).
                 let copy = snapshot_copy(py, owner.as_ref());
                 owner.release(py);
-                copy
+                copy.map(plain)
             }
         };
     }
@@ -503,7 +720,7 @@ pub(crate) fn put_payload_from_py(
         }
         if let Ok(gathered) = mv.call_method0("tobytes") {
             if let Ok(b) = gathered.cast_exact::<PyBytes>() {
-                return Ok(bytes_from_pybytes(b));
+                return Ok(plain(bytes_from_pybytes(b)));
             }
         }
     }
@@ -515,7 +732,7 @@ pub(crate) fn put_payload_from_py(
     });
     match bytes_result {
         Ok(bytes_obj) => match bytes_obj.cast_exact::<PyBytes>() {
-            Ok(b) => Ok(bytes_from_pybytes(b)),
+            Ok(b) => Ok(plain(bytes_from_pybytes(b))),
             Err(_) => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
                 "__bytes__() returned non-bytes object: {}",
                 bytes_obj.get_type().name()?
@@ -548,7 +765,7 @@ mod tests {
 
     fn exported_ptr(obj: &Bound<'_, PyAny>) -> *const u8 {
         let e = RawExport::acquire(obj).unwrap().expect("buffer");
-        let p = e.0.buf as *const u8;
+        let p = e.view.buf as *const u8;
         e.release(obj.py());
         p
     }
@@ -863,10 +1080,7 @@ mod tests {
         Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let export = RawExport::acquire(ba.as_any()).unwrap().unwrap();
-            let owner = ExportOwner {
-                export: Some(export),
-                queue: Some(queue),
-            };
+            let (owner, _latch) = ExportOwner::with_queue(export, queue);
             let bytes = Bytes::from_owner(owner);
             py.detach(move || drop(bytes));
             std::thread::sleep(Duration::from_millis(100));
@@ -897,10 +1111,7 @@ mod tests {
             for _ in 0..20 {
                 let ba = PyByteArray::new(py, &[1u8; 4096]);
                 let export = RawExport::acquire(ba.as_any()).unwrap().unwrap();
-                let owner = ExportOwner {
-                    export: Some(export),
-                    queue: Some(queue),
-                };
+                let (owner, _latch) = ExportOwner::with_queue(export, queue);
                 let bytes = Bytes::from_owner(owner);
                 py.detach(move || drop(bytes));
                 queue.drain(py);
@@ -923,10 +1134,7 @@ mod tests {
         let ba = Python::attach(|py| {
             let ba = PyByteArray::new(py, &[1u8; 4096]);
             let export = RawExport::acquire(ba.as_any()).unwrap().unwrap();
-            let owner = ExportOwner {
-                export: Some(export),
-                queue: Some(queue),
-            };
+            let (owner, _latch) = ExportOwner::with_queue(export, queue);
             let bytes = Bytes::from_owner(owner);
             py.detach(move || drop(bytes));
             ba.unbind()
@@ -1031,6 +1239,156 @@ mod tests {
                 assert!(got.iter().all(|&b| b == 7));
                 assert!(resizable(ba.as_any()), "export leaked at {len}");
             }
+        });
+    }
+
+    // ---- round 4: the completion barrier --------------------------------------------------
+
+    /// A held export backed by a fresh latch, wrapped as the owner of a `Bytes`.
+    fn borrowed(py: Python<'_>, ba: &Bound<'_, PyByteArray>) -> Payload {
+        put_payload(py, ba.as_any(), PayloadUse::Borrowed).unwrap()
+    }
+
+    /// The owner's drop (the last clone dying ANYWHERE) is the "all readers done" event, and the
+    /// export is released only by a thread holding a real GIL token.
+    #[test]
+    fn last_clone_dropping_signals_the_latch_and_a_token_holder_releases() {
+        init();
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[1u8; 4096]);
+            let p = borrowed(py, &ba);
+            let latch = p.latch.clone().unwrap();
+            let clone = p.bytes.clone();
+            drop(p);
+            assert!(!latch.is_dropped(), "a live clone is still a native reader");
+            py.detach(move || drop(clone)); // last clone dies on a non-GIL thread
+            assert!(latch.is_dropped());
+            assert!(!latch.is_released(), "release needs a py token");
+            assert!(!resizable(ba.as_any()));
+            drain_pending_exports(py);
+            assert!(latch.is_released());
+            assert!(resizable(ba.as_any()));
+        });
+    }
+
+    /// Retained backend clone: a "store" keeps a clone for 300 ms past the put. The blocking
+    /// completion does not return before that clone is gone, and the export is then released.
+    #[test]
+    fn quiesce_blocks_while_a_backend_retains_a_clone_then_releases() {
+        init();
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[3u8; 4096]);
+            let p = borrowed(py, &ba);
+            let latch = p.latch.clone().unwrap();
+            let retained = p.bytes.clone();
+            let started = Instant::now();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                drop(retained);
+            });
+            drop(p); // the "put" itself returned; only the retained clone remains
+            quiesce_blocking(py, &latch);
+            assert!(
+                started.elapsed() >= Duration::from_millis(290),
+                "returned too early"
+            );
+            t.join().unwrap();
+            assert!(latch.is_released());
+            assert!(
+                resizable(ba.as_any()),
+                "export not released after the barrier"
+            );
+        });
+    }
+
+    /// A backend that never lets go: the wait is bounded, the buffer STAYS pinned (a resize
+    /// still fails), the timeout is counted, and the export is released once the clone dies.
+    #[test]
+    fn quiesce_timeout_keeps_the_buffer_pinned_and_counts() {
+        init();
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[3u8; 4096]);
+            let p = borrowed(py, &ba);
+            let latch = p.latch.clone().unwrap();
+            let retained = p.bytes.clone();
+            drop(p);
+            let before = export_stats().quiesce_timeouts;
+            let gave_up = py.detach(|| !latch.wait_dropped_blocking(Duration::from_millis(50)));
+            assert!(gave_up);
+            note_quiesce_timeout();
+            assert_eq!(export_stats().quiesce_timeouts, before + 1);
+            assert!(
+                !resizable(ba.as_any()),
+                "memory still being read was released"
+            );
+            py.detach(move || drop(retained));
+            drain_pending_exports(py);
+            assert!(resizable(ba.as_any()));
+        });
+    }
+
+    /// Error / cancellation before any native work: the Bytes is dropped unread (the future was
+    /// dropped before its first poll). The barrier is satisfied immediately.
+    #[test]
+    fn dropping_the_payload_unread_satisfies_the_barrier() {
+        init();
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[3u8; 4096]);
+            let p = borrowed(py, &ba);
+            let latch = p.latch.clone().unwrap();
+            drop(p);
+            quiesce_blocking(py, &latch);
+            assert!(latch.is_released());
+            assert!(resizable(ba.as_any()));
+        });
+    }
+
+    /// The async wait (cancellation path) returns exactly when the last clone dies.
+    #[tokio::test]
+    async fn async_wait_follows_the_last_clone() {
+        init();
+        let (latch, clone, ba) = Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[3u8; 4096]);
+            let p = borrowed(py, &ba);
+            (p.latch.clone().unwrap(), p.bytes.clone(), ba.unbind())
+        });
+        assert!(!latch.wait_dropped(Duration::from_millis(40)).await);
+        let l2 = latch.clone();
+        let waiter = tokio::spawn(async move { l2.wait_dropped(Duration::from_secs(10)).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(clone); // may run on any thread
+        assert!(waiter.await.unwrap());
+        quiesce_async(latch.clone()).await;
+        assert!(latch.is_released());
+        Python::attach(|py| assert!(resizable(ba.bind(py).as_any())));
+    }
+
+    /// Subinterpreter hosts: after any subinterpreter was created (which makes
+    /// `PyGILState_Check` answer "held" on threads without the GIL) a detached drop must still
+    /// only queue. Skipped (with a message) where `_interpreters` is unavailable.
+    #[test]
+    fn detached_drop_after_a_subinterpreter_was_created_only_queues() {
+        init();
+        Python::attach(|py| {
+            let created = py.run(
+                c_str!(
+                    "try:\n    import _interpreters as _i\nexcept ImportError:\n    import _xxsubinterpreters as _i\nx = _i.create()\n_i.destroy(x)"
+                ),
+                None,
+                None,
+            );
+            if let Err(e) = created {
+                eprintln!("SKIPPED: no subinterpreter module here ({e})");
+                return;
+            }
+            let ba = PyByteArray::new(py, &[1u8; 4096]);
+            let p = borrowed(py, &ba);
+            let latch = p.latch.clone().unwrap();
+            py.detach(move || drop(p)); // a thread WITHOUT the GIL, PyGILState_Check() == 1 now
+            assert!(latch.is_dropped());
+            assert!(!latch.is_released(), "released without a py token");
+            drain_pending_exports(py);
+            assert!(latch.is_released());
         });
     }
 }

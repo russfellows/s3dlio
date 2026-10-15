@@ -8,12 +8,13 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods};
+use pyo3::types::{PyAny, PyDict, PyDictMethods};
 use pyo3::Bound;
 use std::os::raw::c_char;
 
 // Project crates
 use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
+use crate::python_api::put_payload::{put_payload, quiesce_blocking, PayloadUse};
 use crate::python_api::python_core_api::{py_err, require_max_in_flight, PyBytesView};
 
 // ---------------------------------------------------------------------------
@@ -200,44 +201,30 @@ impl PyMultipartUploadWriter {
                 .map_err(|e| py_err(e.context("write failed")));
         }
 
-        // 1) Fast path for any buffer-protocol object (NumPy, memoryview, bytearray, etc.)
-        if let Ok(buf) = data.extract::<pyo3::buffer::PyBuffer<u8>>() {
-            let len = buf.len_bytes();
-            let mut vec = vec![0u8; len];
-            buf.copy_to_slice(py, &mut vec[..])
-                .map_err(|e| PyRuntimeError::new_err(format!("buffer copy failed: {e}")))?;
-
-            let res = if len >= OWNED_THRESHOLD {
-                py.detach(|| inner.write_owned_blocking(vec))
+        // 1) Any other bytes-like object (bytes, bytearray, memoryview, NumPy of any dtype, ...):
+        //    the same conversion as put_bytes(). The buffer is read in place, with the GIL
+        //    released, and NOT copied by the Python layer. The sink then copies it once into
+        //    its part buffers: the parts are uploaded asynchronously and outlive this call, so a
+        //    borrowed Python buffer cannot be handed to them without pinning it until they
+        //    finish. Contract: do not modify the buffer from another thread during the call.
+        let payload = put_payload(py, data, PayloadUse::Blocking).map_err(|e| {
+            if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "write() expects bytes-like (bytes, bytearray, memoryview, NumPy buffer): {e}"
+                ))
             } else {
-                py.detach(|| inner.write_blocking(&vec))
-            };
-            return res
-                .map(|_| len)
-                .map_err(|e| py_err(e.context("write failed")));
-        }
-
-        // 2) Fallback for plain bytes objects
-        if let Ok(bytes) = data.cast::<PyBytes>() {
-            let slice = bytes.as_bytes(); // needs PyBytesMethods import
-            let len = slice.len();
-            if len >= OWNED_THRESHOLD {
-                let vec = slice.to_vec();
-                let res = py.detach(|| inner.write_owned_blocking(vec));
-                return res
-                    .map(|_| len)
-                    .map_err(|e| py_err(e.context("write failed")));
-            } else {
-                let res = py.detach(|| inner.write_blocking(slice));
-                return res
-                    .map(|_| len)
-                    .map_err(|e| py_err(e.context("write failed")));
+                e
             }
+        })?;
+        let len = payload.bytes.len();
+        let res = py.detach(|| inner.write_blocking(payload.bytes.as_ref()));
+        let latch = payload.latch;
+        drop(payload.bytes);
+        if let Some(latch) = latch {
+            quiesce_blocking(py, &latch);
         }
-
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "write() expects bytes-like (bytes, bytearray, memoryview, NumPy buffer)",
-        ))
+        res.map(|_| len)
+            .map_err(|e| py_err(e.context("write failed")))
     }
 
     /// Reserve a Rust-owned buffer and return a writable Python `memoryview`.
