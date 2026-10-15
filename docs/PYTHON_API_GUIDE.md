@@ -256,9 +256,41 @@ with open("local_file.bin", "rb") as f:
 await s3dlio.put_bytes_async("s3://bucket/key", b"data")
 ```
 
-**Data path** (`put_bytes`): a `BytesView` is reused as is; `bytes`, `bytearray`, `memoryview`, numpy arrays and any other contiguous buffer-protocol object are **not copied**: the buffer is held (it cannot be resized or freed meanwhile) and read in place with the **GIL released**, so other Python threads keep running during a large upload. `file://` and `direct://` write straight from that buffer (no second copy). A strided/non-contiguous view, or an object that only provides `__bytes__()`, is copied once with the GIL held.
+**What is copied** (`put_bytes` / `put_bytes_async`), by input type. "Copies" counts copies made *by s3dlio*
+between your memory and the storage client:
 
-**Rule for mutable buffers**: do not modify a `bytearray` / writable `memoryview` / numpy array / mmap from another thread while `put_bytes()` is running; the stored object would mix old and new bytes. `put_bytes_async()` avoids that rule for mutable buffers by taking one snapshot copy (GIL released) when it is called, so the buffer may be reused as soon as the call returns; `bytes` and `BytesView` are never copied.
+| Input | `put_bytes` | `put_bytes_async` (default) | `put_bytes_async(..., borrow=True)` |
+|---|---|---|---|
+| `s3dlio.BytesView`, exact `bytes` | 0 | 0 | 0 |
+| any other **C-contiguous** buffer, any item type (`bytearray`, `memoryview`, numpy `uint8`/`float32`/`bool`/..., `array.array`, ctypes arrays, `mmap`) | 0 | 1 (a snapshot, taken before the call returns, GIL released) | 0 |
+| non-contiguous view (strided, reversed, transposed) | 1 (gathered in logical order by Python, GIL held) | 1 | 1 |
+| object with only `__bytes__()` | 1 (made by Python) | 1 | 1 |
+
+The buffer is read **in place with the GIL released**, so other Python threads keep running during a large
+upload (a 512 MiB PUT used to stall every other thread for about 0.3 s).
+
+Per backend, after that: `s3://`, `az://`, `gs://` (official client) and `file://` hand the same bytes to the
+storage client / `write` with no further s3dlio copy (what the SDKs do internally is outside s3dlio; the legacy
+community GCS client, feature `gcs-community`, copies once). `direct://` (O_DIRECT) writes a **page-aligned**
+source (address a multiple of 4096) straight from your memory in one `write` per at most 2 GiB; any other source
+is copied **once** into an aligned bounce buffer (up to 1 GiB, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`) and written
+with one `write` per bounce buffer. `direct://` GET reads straight into one page-aligned buffer and returns it,
+so `s3dlio.get("direct://...")` followed by `put_bytes("direct://...", data)` is copy-free.
+
+**Contract for buffers that are read in place** (`put_bytes`, and `put_bytes_async(borrow=True)` until the
+awaitable completes):
+
+* the source is *exported*: resizing it from another thread (`bytearray.extend()` / `clear()` / `del ba[:]`)
+  raises `BufferError` until the call (or awaitable) is finished;
+* you must **not modify the bytes** from another thread (or other code sharing the memory) meanwhile: nothing
+  prevents it, and the stored object would mix old and new bytes. This is memory-safe, but not the data you meant;
+* with `borrow=True` you additionally promise not to free the memory (for example ctypes/pinned host memory) until
+  the awaitable has completed, successfully or not. The export is released before the awaitable resolves, so
+  resizing right after the `await` works.
+
+The default `put_bytes_async` takes a snapshot instead, so the buffer can be reused or resized as soon as the call
+returns; the only obligation is not to write to it from another thread *during that copy* (which runs with the
+GIL released). `borrow` is keyword-only: `await s3dlio.put_bytes_async(uri, buf, borrow=True)`.
 
 ### get() — Download Data
 
@@ -462,8 +494,8 @@ raw = bytes(data)
 | `np.frombuffer(data)` | 0 | Shares Rust memory |
 | `torch.frombuffer(data)` | 0 | Shares Rust memory |
 | `bytes(data)` | 1 | Explicit copy to Python heap |
-| `s3dlio.put_bytes(uri, pydata)` | 0 | `bytes`, `bytearray`, `memoryview`, numpy and `BytesView` are written in place with the GIL released (1 copy only for strided views / `__bytes__()`-only objects) |
-| `s3dlio.put_bytes_async(uri, pydata)` | 0 or 1 | `bytes` and `BytesView`: 0. Other mutable buffers: one snapshot copy at call time, made with the GIL released |
+| `s3dlio.put_bytes(uri, pydata)` | 0 | Any C-contiguous buffer is read in place with the GIL released (1 copy only for strided views and `__bytes__()`-only objects); see "put_bytes() — Upload Data" for per-backend details, including `direct://` |
+| `s3dlio.put_bytes_async(uri, pydata)` | 0 or 1 | `bytes`/`BytesView`: 0. Other buffers: 1 snapshot copy (GIL released), or 0 with `borrow=True` |
 
 ---
 

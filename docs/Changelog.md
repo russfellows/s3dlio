@@ -4,31 +4,51 @@
 
 ### Fixed
 
-- **`put_bytes()` / `put_bytes_async()` no longer copy the payload while holding the GIL, and no
-  longer duplicate it on `file://` and `direct://` (#238).** The `BytesView` "zero-copy" branch could
-  never run (`BytesView` exports the Python buffer protocol, so the generic buffer branch took it
-  first), and that branch copied the whole buffer into a new `Vec` with the GIL held: every other
-  Python thread stalled (about 0.3 s per 512 MiB PUT) and peak memory rose by twice the payload on the
-  local backends (the file backends made a second full copy). Now a `BytesView` is detected first and
-  reused as is; `bytes`, `bytearray`, `memoryview`, numpy arrays and other contiguous buffer-protocol
-  objects are written in place with the GIL released (the buffer is held, so it cannot be resized or
-  freed during the call); `put_bytes_async()` takes its snapshot of a mutable buffer with the GIL
-  released, so the caller may still reuse the buffer as soon as the call returns. `file://` and
-  `direct://` write straight from the caller's bytes. **Rule for `put_bytes()`:** do not modify a
-  mutable buffer from another thread while the call runs, or the stored object mixes old and new bytes.
-  A strided (non-contiguous) view and an object that only offers `__bytes__()` are still copied once,
-  with the GIL held.
+- **`put_bytes()` / `put_bytes_async()` no longer copy the payload while holding the GIL, and make no
+  copy at all for any contiguous buffer (#238).** The `BytesView` "zero-copy" branch could never run
+  (`BytesView` exports the Python buffer protocol, so the generic buffer branch took it first), and that
+  branch copied the whole buffer into a new `Vec` with the GIL held: every other Python thread stalled
+  (about 0.3 s per 512 MiB PUT) and peak memory rose by twice the payload on the local backends. Buffers
+  whose item type is not a byte (numpy `float32`/`int8`/`bool`, `array.array`, ctypes `'<B'`) were worse:
+  two copies with the GIL held. Now:
 
-- **`direct://` PUT and GET no longer move 4 KiB per system call (#244).** An O_DIRECT PUT wrote the
-  object one 4 KiB block per `write()` (512 MiB took 45 s, about 11 MiB/s, against 0.79 s on
-  `file://`), and a GET read it 4 KiB per `read()`. A source buffer whose address is page-aligned is now
-  written straight from the caller's memory in one `write` (split only at Linux's 2 GiB per-call limit);
-  any other source is copied through an aligned bounce buffer and written one full buffer at a time
-  (default 64 MiB, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`; see `docs/Environment_Variables.md`). GETs read
-  through the same bounce buffer. The zero-padded last block and the truncation back to the exact size
-  are unchanged, and so is the buffered fallback. `put_multipart` on `direct://` is now the same single
-  write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
+  | Input | `put_bytes` | `put_bytes_async` | `put_bytes_async(borrow=True)` |
+  |---|---|---|---|
+  | `BytesView`, exact `bytes` | 0 copies | 0 | 0 |
+  | any other C-contiguous buffer, any item type | 0 copies, read in place with the GIL released | 1 snapshot copy, GIL released | 0 copies |
+  | non-contiguous view | 1 gather copy (GIL held) | 1 | 1 |
+  | `__bytes__()`-only object | 1 copy | 1 | 1 |
+
+  After that, `s3://`, `az://`, official-client `gs://` and `file://` pass the same bytes on with no
+  further s3dlio copy; the legacy community GCS client (feature `gcs-community`) copies once. `direct://`
+  copies once unless the source is page-aligned (see #244).
+  **New:** `put_bytes_async(uri, data, *, borrow=False)`. `borrow=True` promises not to modify, resize or
+  free the buffer until the awaitable completes; s3dlio then reads it in place instead of taking a snapshot
+  (for example pinned host memory). **Contract for every buffer read in place:** it is exported meanwhile,
+  so `bytearray.extend()/clear()` from another thread raises `BufferError`, and the bytes must not be
+  modified from another thread, or the stored object mixes old and new bytes (memory-safe, but not what you
+  meant). The buffer export is released before the call returns or the awaitable resolves, and never by a
+  Tokio worker waiting for the GIL.
+
+- **`direct://` PUT and GET no longer move 4 KiB per system call, and a GET returns page-aligned memory
+  (#244).** An O_DIRECT PUT wrote the object one 4 KiB block per `write()` (512 MiB took 45 s, about 11 MiB/s,
+  against 0.79 s on `file://`), and a GET read it 4 KiB per `read()`. A page-aligned source buffer is now
+  written straight from the caller's memory in one `write` (split only at Linux's 2 GiB per-call limit); any
+  other source is copied once into an aligned bounce buffer of `min(object size, 1 GiB)`
+  (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`), so an object up to 1 GiB is one copy and one write. A GET reads straight
+  into one page-aligned buffer and returns it, so a `direct://` GET followed by a `direct://` PUT is copy-free.
+  The zero-padded last block, the truncation back to the exact size (skipped when the length is already
+  aligned) and the buffered fallback are unchanged; a failed aligned allocation now retries with a smaller
+  buffer and then falls back to buffered I/O instead of aborting. `put_multipart` on `direct://` is now the same
+  single write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
   also left zero padding inside the object whenever `part_size` was not a multiple of 4096.
+
+- **The `direct://` streaming writer no longer fsyncs on every flush or copies every chunk (#249), and
+  no longer frees an aligned buffer with the wrong layout (#248).** Page-aligned chunks are written from the
+  caller's memory; other data is staged once in a 64 MiB aligned buffer; data is made durable once, at
+  `finalize` (after every write only when `sync_writes` is set). `AlignedBuf::new` now returns a `Result`
+  (and `BufferPool::take` too), and `AlignedBuf` is no longer `Clone` (a clone freed the same memory twice).
+  New `file_store_direct::direct_io_counters()` reports O_DIRECT transfers versus buffered fallbacks.
 
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 

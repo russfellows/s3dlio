@@ -124,7 +124,7 @@ async fn assert_put_does_not_copy(
     } else {
         Bytes::from(vec![0xA7u8; payload])
     };
-    assert_eq!(data.as_ptr() as usize % 4096 == 0, page_aligned);
+    assert_eq!((data.as_ptr() as usize).is_multiple_of(4096), page_aligned);
 
     let live_before = ALLOC.live();
     ALLOC.reset();
