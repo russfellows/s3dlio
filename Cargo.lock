@@ -5219,6 +5219,7 @@ dependencies = [
  "clap",
  "console-subscriber",
  "core_affinity",
+ "crc-fast",
  "crc32c",
  "crc32fast",
  "criterion",
