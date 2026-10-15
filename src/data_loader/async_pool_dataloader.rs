@@ -48,6 +48,12 @@ impl MultiBackendDataset {
     pub async fn from_prefix(prefix_uri: &str) -> Result<Self> {
         let store: Arc<dyn ObjectStore> = Arc::from(store_for_uri_with_helper_rows(prefix_uri)?);
         let uris = store.list(prefix_uri, true).await?;
+        // An `s3://` URI that selects nothing (a bare partial name, #213) is an error,
+        // not a dataset of zero samples. The other backends do not follow the s3://
+        // selection rule yet (#220) and keep returning what they list.
+        if uris.is_empty() && prefix_uri.starts_with("s3://") {
+            return Err(crate::s3_selection::empty_selection_error(prefix_uri));
+        }
 
         Ok(Self { uris, store })
     }

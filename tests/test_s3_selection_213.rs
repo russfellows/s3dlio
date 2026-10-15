@@ -734,3 +734,216 @@ async fn delete_prefix_stays_a_literal_directory_prefix() {
         .expect("delete_prefix");
     assert_eq!(state.remaining_keys(&b), without(&["g*/q"]));
 }
+
+// ----------------------------------------------------------------------------
+// Review follow-ups (F2, F10): pagination end, host-form globs, leading-'/' keys
+// ----------------------------------------------------------------------------
+
+/// A bucket whose name carries one of the mock's behaviour markers, seeded with `keys`.
+fn seeded_marked(marker: &str, keys: &[&str]) -> (u16, MockS3State, String) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let (port, state) = ensure_mock_s3_server();
+    let bucket = format!("sel213-{marker}-{}", N.fetch_add(1, Ordering::SeqCst));
+    state.seed_bucket(&bucket, keys);
+    (port, state, bucket)
+}
+
+/// A server that sends a (constant) continuation token on its LAST page, with
+/// `IsTruncated=false`, must not be paged again: the listing stops on `IsTruncated=false`.
+/// (Without the stop the same token is sent back and the page repeats for ever.)
+#[tokio::test]
+async fn a_last_page_with_a_token_and_is_truncated_false_ends_the_listing() {
+    use common::mock_s3_server::LAST_PAGE_TOKEN_MARKER;
+    let (port, state, b) = seeded_marked(LAST_PAGE_TOKEN_MARKER, CATALOG);
+    for uri in [
+        format!("s3://{b}/dl/"),
+        format!("s3://{b}/dl"),
+        format!("s3://{b}/data/**.npz"),
+    ] {
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            list_all_ways(port, &uri, true),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("list({uri}) did not terminate on IsTruncated=false"));
+        for (which, got) in listed {
+            let mut sorted = got.clone();
+            sorted.dedup();
+            assert_eq!(got, sorted, "{which}({uri}) repeated a page: {got:?}");
+        }
+    }
+    assert!(
+        list_requests(&state, &b)
+            .iter()
+            .all(|r| !r.query.contains("continuation-token")),
+        "a page with IsTruncated=false must not be followed"
+    );
+    // the delete path (strict) stops too, and deletes exactly the directory
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        delete_recursively(port, &format!("s3://{b}/dl/")),
+    )
+    .await
+    .expect("delete -r terminated");
+    assert_eq!(
+        state.remaining_keys(&b),
+        without(&["dl/a.npz", "dl/b.txt", "dl/sub/c.npz"])
+    );
+}
+
+/// The strict error stays: a TRUNCATED page without a token is an incomplete listing, and
+/// a delete must not run on it (exact-name children listing and directory listing alike).
+#[tokio::test]
+async fn a_truncated_page_without_a_token_fails_a_delete_listing() {
+    use common::mock_s3_server::TRUNCATED_NO_TOKEN_MARKER;
+    let many: Vec<String> = (0..1500).map(|i| format!("big/k{i:05}")).collect();
+    let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+    for key in ["big/", "big"] {
+        let (port, state, b) = seeded_marked(TRUNCATED_NO_TOKEN_MARKER, &refs);
+        let store = S3ObjectStore::for_endpoint(&format!("http://127.0.0.1:{port}"))
+            .await
+            .expect("for_endpoint");
+        let uri = format!("s3://{b}/{key}");
+        let report =
+            delete_objects_under_literal_prefix(&store, &uri, None, DeleteMode::Batched, None)
+                .await;
+        let err = report
+            .into_result(&uri, None)
+            .expect_err("an incomplete listing must fail the delete");
+        assert!(format!("{err:#}").contains("truncated"), "{key}: {err:#}");
+        assert!(
+            state.remaining_keys(&b).len() >= many.len() - 1000,
+            "{key}: at most the first page may have been deleted"
+        );
+    }
+}
+
+/// A host-form URI (`s3://host:port/bucket/key`) with a glob selects exactly what the
+/// bucket form selects, and the entries come back in bucket form.
+#[tokio::test]
+async fn a_host_form_uri_with_a_glob_selects_like_the_bucket_form() {
+    use s3dlio::list_pattern::ListPattern;
+    let (port, _s, b) = seeded();
+    let store = S3ObjectStore::for_endpoint(&format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("for_endpoint");
+    let host = format!("s3://127.0.0.1:{port}/{b}");
+    for recursive in [true, false] {
+        assert_eq!(
+            store
+                .list(&format!("{host}/dl/*.npz"), recursive)
+                .await
+                .unwrap(),
+            uris(&b, &["dl/a.npz"]),
+            "recursive={recursive}"
+        );
+        assert_eq!(
+            store
+                .list(&format!("{host}/file.txt*"), recursive)
+                .await
+                .unwrap(),
+            uris(&b, &["file.txt", "file.txt.bak", "file.txt2"]),
+            "recursive={recursive}"
+        );
+        assert_eq!(
+            store
+                .list(&format!("{host}/data/**.npz"), recursive)
+                .await
+                .unwrap(),
+            uris(&b, &["data/sub/deep/z.npz", "data/top.npz"]),
+            "recursive={recursive}"
+        );
+    }
+    // the explicit pattern is relative to the glob's directory, host in the URI or not
+    let uri = format!("{host}/data/**.npz");
+    let mut keys = store.list(&uri, true).await.unwrap();
+    ListPattern::new("^sub/").unwrap().retain(&uri, &mut keys);
+    assert_eq!(keys, uris(&b, &["data/sub/deep/z.npz"]));
+    // and the host-form delete takes the glob matches only
+    let (port, state, b) = seeded();
+    delete_recursively(port, &format!("s3://127.0.0.1:{port}/{b}/dl/*.npz")).await;
+    assert_eq!(state.remaining_keys(&b), without(&["dl/a.npz"]));
+}
+
+/// A key that starts with '/' (`s3://b//x`): the key part is `/x...`, and a glob in it
+/// works the same way (`*` does not cross the following '/').
+#[tokio::test]
+async fn a_leading_slash_key_with_a_glob_selects_by_the_rule() {
+    let keys = ["/x", "/x1", "/x2/y", "x3", "/other"];
+    let (port, state, b) = seeded_marked("lead", &keys);
+    assert_selects(
+        port,
+        &format!("s3://{b}//x*"),
+        true,
+        uris(&b, &["/x", "/x1"]),
+    )
+    .await;
+    assert_selects(
+        port,
+        &format!("s3://{b}//x**"),
+        true,
+        uris(&b, &["/x", "/x1", "/x2/y"]),
+    )
+    .await;
+    // an exact leading-slash name selects only itself
+    assert_selects(port, &format!("s3://{b}//x"), true, uris(&b, &["/x"])).await;
+    delete_recursively(port, &format!("s3://{b}//x*")).await;
+    let mut want: Vec<String> = vec!["/other".into(), "/x2/y".into(), "x3".into()];
+    want.sort();
+    assert_eq!(state.remaining_keys(&b), want);
+}
+
+// ----------------------------------------------------------------------------
+// Dataset constructors: a selection of nothing is an error, never an empty dataset
+// ----------------------------------------------------------------------------
+
+fn assert_empty_selection_message(msg: &str, uri: &str) {
+    assert!(msg.contains(uri), "the message must name the URI: {msg}");
+    assert!(
+        msg.contains("exact object name") && msg.contains("directory"),
+        "the message must say what a URI selects: {msg}"
+    );
+    assert!(
+        msg.contains("'*' selects by prefix")
+            && msg.contains(&format!("{}*", uri.trim_end_matches('/'))),
+        "the message must show the `*` form: {msg}"
+    );
+}
+
+#[test]
+fn s3_bytes_dataset_refuses_a_bare_partial_name() {
+    use s3dlio::data_loader::s3_bytes::S3BytesDataset;
+    let (_p, _s, b) = seeded();
+    for key in ["file.tx", "ru", "nothing"] {
+        let uri = format!("s3://{b}/{key}");
+        let err = match S3BytesDataset::from_prefix(&uri) {
+            Ok(ds) => panic!("{uri} selects nothing but gave {} keys", ds.keys().len()),
+            Err(e) => e.to_string(),
+        };
+        assert_empty_selection_message(&err, &uri);
+    }
+    // the same names with a `*` are a prefix selection and work
+    let ds = S3BytesDataset::from_prefix(&format!("s3://{b}/file.tx*")).expect("glob");
+    assert_eq!(ds.keys().len(), 3); // file.txt, file.txt.bak, file.txt2
+}
+
+#[test]
+fn multi_backend_dataset_refuses_a_bare_partial_name() {
+    use s3dlio::data_loader::async_pool_dataloader::MultiBackendDataset;
+    let (_p, _s, b) = seeded();
+    for key in ["file.tx", "dl2/", "nothing/"] {
+        let uri = format!("s3://{b}/{key}");
+        let res = on_fresh_runtime(MultiBackendDataset::from_prefix(&uri));
+        match (key, res) {
+            ("dl2/", Ok(ds)) => assert_eq!(ds.len(), 1, "a real directory still works"),
+            ("dl2/", Err(e)) => panic!("{uri}: {e:#}"),
+            (_, Ok(ds)) => panic!("{uri} selects nothing but gave {} uris", ds.len()),
+            (_, Err(e)) => assert_empty_selection_message(&format!("{e:#}"), &uri),
+        }
+    }
+    let ds = on_fresh_runtime(MultiBackendDataset::from_prefix(&format!(
+        "s3://{b}/file.tx*"
+    )))
+    .expect("glob");
+    assert_eq!(ds.len(), 3);
+}

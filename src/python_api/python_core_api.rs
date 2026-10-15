@@ -2752,7 +2752,9 @@ impl PyMultiEndpointStore {
         })
     }
 
-    /// List objects under a prefix
+    /// List the objects a URI selects. On `s3://` the key part is an exact name (the object, and
+    /// with `recursive` the keys under `name/`), a directory (`name/`) or a `*` / `**` glob --
+    /// never a bare key prefix (`s3://b/foo` does not select `foobar`; use `s3://b/foo*`).
     fn list<'py>(
         &self,
         py: Python<'py>,

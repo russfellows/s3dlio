@@ -42,6 +42,13 @@ impl S3BytesDataset {
         // Recursively list keys under prefix
         let keys = list_objects_rs(&bucket, &prefix, true)
             .map_err(|e| DatasetError::from(e.to_string()))?;
+        if keys.is_empty() {
+            // A bare partial name selects nothing (#213): fail loudly instead of
+            // handing back a dataset of zero samples.
+            return Err(DatasetError::from(
+                crate::s3_selection::empty_selection_error(uri).to_string(),
+            ));
+        }
 
         Ok(Self {
             bucket,

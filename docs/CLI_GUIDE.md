@@ -124,7 +124,12 @@ directory or an explicit glob -- never a regex and never a bare string prefix:
 In a glob `*` matches any run of characters except `/`, and `**` matches any run including `/`; every
 other character (`.`, `(`, `[`, `+`, `$`, `?`) is literal. With a wildcard an object is selected iff
 its full key matches, so `-r` makes no difference. A wildcard key that ends in `/` is refused.
-Quote wildcard URIs in your shell. Use `-p/--pattern` to narrow the selection with a regex (see
+Quote wildcard URIs in your shell. `*` also matches the empty string, so `s3://b/dir/*` includes a
+folder-marker object `dir/` if one exists (`delete -r 's3://b/dir/*'` removes it too), and `a/**/b`
+needs something between its slashes: it matches `a/x/b` and `a//b`, not `a/b`. There is no escape for a
+literal `*` in a listing or recursive URI: a key literally named `a*b` is reached only by the exact,
+non-recursive operations (`stat`, `delete` without `-r`), which take the key as written.
+Use `-p/--pattern` to narrow the selection with a regex (see
 [Regex Pattern Filtering](#regex-pattern-filtering)). The rule is implemented for `s3://` only;
 `file://`, `direct://`, `gs://` and `az://` are unchanged (tracked in #220).
 

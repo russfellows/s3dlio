@@ -491,9 +491,9 @@ def test_recursive_delete_of_a_directory_name_does_not_cross_into_dl2(mock_facto
         # `*` stays inside one directory level
         ("file.txt*", ["file.txt", "file.txt.bak", "file.txt2", "file.txt.d/x", "file.tx"],
          {"file.txt.d/x", "file.tx"}, ["file.txt", "file.txt.bak", "file.txt2"]),
-        ("d/*", ["d/*", "d/*/x", "d/y", "d2/z"], {"d/*/x", "d2/z"], ["d/*", "d/y"]),
+        ("d/*", ["d/*", "d/*/x", "d/y", "d2/z"], {"d/*/x", "d2/z"}, ["d/*", "d/y"]),
         # `**` crosses '/'
-        ("d/**", ["d/*", "d/*/x", "d/y", "d2/z"], {"d2/z"], ["d/*", "d/*/x", "d/y"]),
+        ("d/**", ["d/*", "d/*/x", "d/y", "d2/z"], {"d2/z"}, ["d/*", "d/*/x", "d/y"]),
         ("d/**.npz", ["d/a.npz", "d/s/b.npz", "d/c.txt"], {"d/c.txt"}, ["d/a.npz", "d/s/b.npz"]),
     ],
 )

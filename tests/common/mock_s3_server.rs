@@ -114,6 +114,16 @@ pub const PUT_FAILS_MARKER: &str = "put-500";
 /// `403 AccessDenied` (a persistent, non-retried failure).
 pub const GET_FORBIDDEN_MARKER: &str = "get-403";
 
+/// Bucket-name marker: a seeded bucket whose name contains this answers its LAST
+/// ListObjectsV2 page (`IsTruncated=false`) with a non-empty `NextContinuationToken`
+/// too, as some S3-compatible servers do. A listing must stop on `IsTruncated=false`.
+pub const LAST_PAGE_TOKEN_MARKER: &str = "last-page-token";
+
+/// Bucket-name marker: a seeded bucket whose name contains this answers every page
+/// that has more keys behind it with `IsTruncated=true` but NO `NextContinuationToken`
+/// (a broken server). A listing that drives a delete must treat that as an error.
+pub const TRUNCATED_NO_TOKEN_MARKER: &str = "truncated-no-token";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -767,6 +777,10 @@ fn seeded_list_response(catalog: &[String], bucket: &str, prefix: &str, query: &
         }
     }
     let next = match (truncated, entries.last()) {
+        _ if bucket.contains(TRUNCATED_NO_TOKEN_MARKER) => String::new(),
+        (false, _) if bucket.contains(LAST_PAGE_TOKEN_MARKER) => {
+            "<NextContinuationToken>constant-last-page-token</NextContinuationToken>".to_string()
+        }
         (true, Some((name, _))) => {
             format!(
                 "<NextContinuationToken>{}</NextContinuationToken>",
