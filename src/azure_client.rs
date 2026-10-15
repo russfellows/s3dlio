@@ -154,10 +154,19 @@ static SERVICE_CLIENTS: std::sync::LazyLock<ServiceClientCache> = std::sync::Laz
 /// (the idempotent-delete contract looks for `BlobNotFound`; see
 /// [`crate::delete_contract::is_not_found`]). `Display` shows only the redacted message and
 /// `source()` is `None`, so printing the chain never shows the unredacted SDK text.
-#[derive(Debug)]
 pub struct AzureRequestError {
     message: String,
     inner: azure_core::Error,
+}
+
+// A derived Debug would print the SDK error, which can hold the request URL (and so a SAS).
+impl std::fmt::Debug for AzureRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureRequestError")
+            .field("message", &self.message)
+            .field("http_status", &self.inner.http_status())
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Display for AzureRequestError {
@@ -218,11 +227,30 @@ fn azure_error(mode: CredentialMode, e: azure_core::Error) -> anyhow::Error {
     anyhow::Error::new(AzureRequestError { message, inner: e })
 }
 
+/// Builds the error the client reports for an SDK error, for tests of its text.
+#[doc(hidden)]
+pub fn request_error_for_test(inner: azure_core::Error) -> anyhow::Error {
+    azure_error(CredentialMode::None, inner)
+}
+
 /// `url` without its query string or fragment, for messages and logs (a query may hold a SAS
 /// token or other secrets).
 pub fn redact_url(url: &str) -> String {
     let end = url.find(['?', '#']).unwrap_or(url.len());
-    url[..end].to_string()
+    let url = &url[..end];
+    // `scheme://user:password@host/...` -> `scheme://host/...`
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+            let authority = authority.rsplit('@').next().unwrap_or(authority);
+            if path.is_empty() && !rest.contains('/') {
+                format!("{scheme}://{authority}")
+            } else {
+                format!("{scheme}://{authority}/{path}")
+            }
+        }
+        None => url.to_string(),
+    }
 }
 
 /// Whether `account` can be used to build a request URL or path safely. Azure storage account
@@ -231,27 +259,43 @@ pub fn redact_url(url: &str) -> String {
 /// or path a request goes to (`/ ? # @ \`, whitespace, control characters, `.`-only names) is
 /// never accepted. Checked before any request is made or credential used.
 pub fn validate_account_name(account: &str) -> Result<()> {
-    let custom_endpoint = [
+    canonical_account_name(account).map(|_| ())
+}
+
+/// The account name to use in a URL: validated, and lowercased when it becomes a host name
+/// (host names are case-insensitive and storage account names are lowercase, so `MyAccount`
+/// means `myaccount`). With a custom endpoint the name is a path segment for an emulator and is
+/// kept exactly as given. Every place that puts an account into a URL goes through this.
+pub fn canonical_account_name(account: &str) -> Result<String> {
+    let custom = custom_endpoint_set();
+    let name = if custom {
+        account.to_string()
+    } else {
+        account.to_ascii_lowercase()
+    };
+    account_name_problem(&name, custom).map_or(Ok(name), |why| {
+        Err(anyhow!("invalid Azure account name {account:?}: {why}"))
+    })
+}
+
+fn custom_endpoint_set() -> bool {
+    [
         crate::constants::ENV_AZURE_STORAGE_ENDPOINT,
         crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL,
     ]
     .iter()
-    .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()));
-    account_name_problem(account, custom_endpoint).map_or(Ok(()), |why| {
-        Err(anyhow!("invalid Azure account name {account:?}: {why}"))
-    })
+    .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
 }
 
 fn account_name_problem(account: &str, custom_endpoint: bool) -> Option<&'static str> {
     if account.is_empty() {
         return Some("it is empty");
     }
-    if account
-        .chars()
-        .any(|c| matches!(c, '/' | '?' | '#' | '@' | '\\') || c.is_whitespace() || c.is_control())
-    {
+    if account.chars().any(|c| {
+        matches!(c, '/' | '?' | '#' | '@' | '\\' | '%') || c.is_whitespace() || c.is_control()
+    }) {
         return Some(
-            "it contains a character that could redirect the request (/ ? # @ \\ or whitespace)",
+            "it contains a character that could redirect the request (/ ? # @ \\ % or whitespace)",
         );
     }
     if custom_endpoint {
@@ -379,8 +423,11 @@ pub struct AzureBlob {
 
 impl AzureBlob {
     /// Public Azure endpoint for an account name.
-    fn account_url_from_account(account: &str) -> String {
-        format!("https://{}.blob.core.windows.net", account)
+    fn account_url_from_account(account: &str) -> Result<String> {
+        Ok(format!(
+            "https://{}.blob.core.windows.net",
+            canonical_account_name(account)?
+        ))
     }
 
     /// Azurite helper, e.g. http://127.0.0.1:10000/{account}
@@ -401,7 +448,8 @@ impl AzureBlob {
     /// Example: AZURE_STORAGE_ENDPOINT=http://localhost:10000 + account="devstoreaccount1"
     ///          → http://localhost:10000/devstoreaccount1
     pub fn with_default_credential(account: &str, container: &str) -> Result<Self> {
-        validate_account_name(account)?;
+        let account = canonical_account_name(account)?;
+        let account = account.as_str();
         // Check for custom endpoint (for Azurite or other emulators/proxies)
         if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
             .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
@@ -416,7 +464,7 @@ impl AzureBlob {
             return Self::with_default_credential_from_url(&account_url, container);
         }
 
-        Self::with_default_credential_from_url(&Self::account_url_from_account(account), container)
+        Self::with_default_credential_from_url(&Self::account_url_from_account(account)?, container)
     }
 
     /// Same, when a full endpoint URL (possibly emulator) is provided.
@@ -1033,20 +1081,26 @@ impl AzureBlob {
 /// is set, otherwise returns the standard Azure Blob endpoint.
 ///
 /// This is extracted as a pure function for testability.
-pub fn resolve_azure_account_url(account: &str) -> String {
-    if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
-        .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
-    {
-        // Use custom endpoint (e.g., http://localhost:10000/account)
-        if endpoint.ends_with('/') {
-            format!("{}{}", endpoint, account)
+///
+/// The account is validated first ([`canonical_account_name`]): a name that could change the
+/// host or path of the URL is an error, before anything is built or sent.
+pub fn resolve_azure_account_url(account: &str) -> Result<String> {
+    let account = canonical_account_name(account)?;
+    Ok(
+        if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
+            .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
+        {
+            // Use custom endpoint (e.g., http://localhost:10000/account)
+            if endpoint.ends_with('/') {
+                format!("{}{}", endpoint, account)
+            } else {
+                format!("{}/{}", endpoint, account)
+            }
         } else {
-            format!("{}/{}", endpoint, account)
-        }
-    } else {
-        // Default: public Azure endpoint
-        format!("https://{}.blob.core.windows.net", account)
-    }
+            // Default: public Azure endpoint
+            format!("https://{}.blob.core.windows.net", account)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,7 +1114,7 @@ pub fn resolve_azure_account_url(account: &str) -> String {
 /// Credentials are chosen exactly as for [`AzureBlob::with_default_credential`]
 /// (`S3DLIO_AZURE_CREDENTIAL`, see [`crate::azure_credential`]).
 pub async fn list_account_containers(account: &str) -> Result<Vec<(String, Option<String>)>> {
-    list_account_containers_at(&resolve_azure_account_url(account)).await
+    list_account_containers_at(&resolve_azure_account_url(account)?).await
 }
 
 /// [`list_account_containers`] against an explicit account URL.
@@ -1283,10 +1337,44 @@ mod tests {
             assert_eq!(account_name_problem(ok, true), None, "{ok}");
         }
         for bad in [
-            "", "a/b", "a?b", "a#b", "a@b", "a\\b", "a b", "a\nb", "..", ".",
+            "", "a/b", "a?b", "a#b", "a@b", "a\\b", "a b", "a\nb", "..", ".", "%2e", "%2e%2e",
+            "a%2fb",
         ] {
             assert!(account_name_problem(bad, true).is_some(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn host_name_accounts_are_lowercased_and_validated_in_one_place() {
+        let _env = clean_azure_env();
+        assert_eq!(canonical_account_name("MyAccount1").unwrap(), "myaccount1");
+        assert_eq!(
+            resolve_azure_account_url("MyAccount1").unwrap(),
+            "https://myaccount1.blob.core.windows.net"
+        );
+        for bad in ["attacker.example#", "a?b", "acct@evil", "x%2fy", "ab", ""] {
+            assert!(canonical_account_name(bad).is_err(), "{bad:?}");
+            assert!(resolve_azure_account_url(bad).is_err(), "{bad:?}");
+            assert!(AzureBlob::account_url_from_account(bad).is_err(), "{bad:?}");
+        }
+        // With a custom endpoint the name is a path segment and keeps its case.
+        std::env::set_var(
+            crate::constants::ENV_AZURE_STORAGE_ENDPOINT,
+            "http://127.0.0.1:1",
+        );
+        assert_eq!(canonical_account_name("DevStore").unwrap(), "DevStore");
+        assert!(canonical_account_name("a%2fb").is_err());
+        std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
+    }
+
+    #[test]
+    fn urls_are_logged_without_their_userinfo_query_or_fragment() {
+        assert_eq!(
+            redact_url("https://user:pw@h:1/a/b?sig=S#f"),
+            "https://h:1/a/b"
+        );
+        assert_eq!(redact_url("http://tok@h"), "http://h");
+        assert_eq!(redact_url("https://h/p@q"), "https://h/p@q");
     }
 
     #[test]
@@ -1481,7 +1569,7 @@ mod tests {
 
     #[test]
     fn test_account_url_from_account() {
-        let url = AzureBlob::account_url_from_account("mystorageaccount");
+        let url = AzureBlob::account_url_from_account("mystorageaccount").unwrap();
         assert_eq!(url, "https://mystorageaccount.blob.core.windows.net");
     }
 
@@ -1499,7 +1587,7 @@ mod tests {
         std::env::remove_var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT);
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
 
-        let url = resolve_azure_account_url("mystorageaccount");
+        let url = resolve_azure_account_url("mystorageaccount").unwrap();
         assert_eq!(url, "https://mystorageaccount.blob.core.windows.net");
     }
 
@@ -1514,7 +1602,7 @@ mod tests {
         );
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
 
-        let url = resolve_azure_account_url("devstoreaccount1");
+        let url = resolve_azure_account_url("devstoreaccount1").unwrap();
         assert_eq!(url, "http://localhost:10000/devstoreaccount1");
 
         // Cleanup
@@ -1532,7 +1620,7 @@ mod tests {
             "http://127.0.0.1:9001",
         );
 
-        let url = resolve_azure_account_url("testaccount");
+        let url = resolve_azure_account_url("testaccount").unwrap();
         assert_eq!(url, "http://127.0.0.1:9001/testaccount");
 
         // Cleanup
@@ -1550,7 +1638,7 @@ mod tests {
         );
         std::env::remove_var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL);
 
-        let url = resolve_azure_account_url("devstoreaccount1");
+        let url = resolve_azure_account_url("devstoreaccount1").unwrap();
         assert_eq!(url, "http://localhost:10000/devstoreaccount1");
 
         // Cleanup
@@ -1571,7 +1659,7 @@ mod tests {
             "http://alternative:9001",
         );
 
-        let url = resolve_azure_account_url("testaccount");
+        let url = resolve_azure_account_url("testaccount").unwrap();
         assert_eq!(url, "http://primary:10000/testaccount");
 
         // Cleanup

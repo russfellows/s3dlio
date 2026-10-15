@@ -291,7 +291,9 @@ fn is_azure_blob_host(uri: &str) -> bool {
     // Strip optional "user@" userinfo and a trailing ":port".
     let host = authority.rsplit('@').next().unwrap_or(authority);
     let host = host.split(':').next().unwrap_or(host);
-    host.ends_with(".blob.core.windows.net")
+    // Host names are case-insensitive.
+    host.to_ascii_lowercase()
+        .ends_with(".blob.core.windows.net")
 }
 
 /// Best-effort scheme inference from a URI.
@@ -2402,8 +2404,8 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
             .ok_or_else(|| anyhow!("missing container in az:// URI"))?;
         let key = it.next().unwrap_or("").to_string();
         // Refuse an account that could redirect the request before anything uses it.
-        crate::azure_client::validate_account_name(account)?;
-        return Ok((account.to_string(), container.to_string(), key));
+        let account = crate::azure_client::canonical_account_name(account)?;
+        return Ok((account, container.to_string(), key));
     }
 
     if is_azure_blob_host(uri) {
@@ -2433,8 +2435,8 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
         if container.is_empty() {
             bail!("missing container in URL path");
         }
-        crate::azure_client::validate_account_name(account)?;
-        return Ok((account.to_string(), container.to_string(), key.to_string()));
+        let account = crate::azure_client::canonical_account_name(account)?;
+        return Ok((account, container.to_string(), key.to_string()));
     }
 
     bail!("not a recognized Azure URI: {}", uri)
@@ -5436,6 +5438,19 @@ mod s3_object_store_tests {
                 "https and az:// must name the same blob for {key:?}"
             );
         }
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn azure_hosts_are_recognised_whatever_their_case() {
+        assert!(is_azure_blob_host(
+            "https://MyAcct.Blob.Core.Windows.NET/c/k"
+        ));
+        assert!(!is_azure_blob_host(
+            "https://evil.example/acct.blob.core.windows.net/k"
+        ));
+        let (account, _, _) = parse_azure_uri("https://MyAcct.Blob.Core.Windows.NET/c/k").unwrap();
+        assert_eq!(account, "myacct", "the host's account is lowercased");
     }
 
     #[cfg(feature = "backend-azure")]

@@ -543,10 +543,94 @@ pub fn warn_unused_sas(mode: CredentialMode) {
 /// Replace every occurrence of the configured SAS token in `text`, so an error message that
 /// echoes a request URL cannot leak it.
 pub fn redact_sas(text: &str) -> String {
-    match sas_token(&process_env) {
-        Ok(token) => text.replace(&token, "<SAS token redacted>"),
-        Err(_) => text.to_string(),
+    redact_with(text, sas_token(&process_env).ok().as_deref())
+}
+
+/// The SAS query parameters (service and account SAS, user-delegation SAS): their values are
+/// credentials or reveal what the credential allows.
+const SAS_PARAMS: &str =
+    "sig|se|st|sp|spr|sv|sr|srt|ss|skoid|sktid|skt|ske|sks|skv|saoid|suoid|scid";
+
+static SAS_PARAM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(&format!(r#"(?i)\b({SAS_PARAMS})=[^&\s"'<>)\]\\]*"#)).expect("valid regex")
+});
+
+/// A URL in text, up to the first `?` or `#`: what follows (the query) is dropped.
+static URL_QUERY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"(?i)(https?://[^\s"'<>)\]\\?#]*)[?#][^\s"'<>)\]\\]*"#)
+        .expect("valid regex")
+});
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(b) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
     }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Remove SAS material from `text`, whatever form it takes: the SDK re-sorts and re-encodes a
+/// query when it sets query pairs, and transport errors print the whole request URL, so an exact
+/// copy of the configured token is not enough. Three layers:
+/// 1. the query (and fragment) of every URL in the text is dropped;
+/// 2. the value of every SAS parameter (`sig`, `se`, ... in raw or encoded `key=value` form) is
+///    replaced;
+/// 3. each value of the configured token is replaced wherever it occurs, as written, decoded,
+///    encoded, and encoded twice (values shorter than 6 characters, like `sp=r`, are left to
+///    layer 2).
+fn redact_with(text: &str, token: Option<&str>) -> String {
+    let mut out = URL_QUERY_RE
+        .replace_all(text, "${1}?<query redacted>")
+        .into_owned();
+    out = SAS_PARAM_RE
+        .replace_all(&out, "${1}=<redacted>")
+        .into_owned();
+    if let Some(token) = token {
+        let mut secrets: Vec<String> = vec![token.to_string()];
+        for pair in token.split('&') {
+            let value = pair.split_once('=').map_or(pair, |(_, v)| v);
+            let decoded = percent_decode(value);
+            let encoded = percent_encode(&decoded);
+            secrets.extend([
+                value.to_string(),
+                decoded.clone(),
+                encoded.clone(),
+                percent_encode(&encoded),
+            ]);
+        }
+        secrets.retain(|v| v.len() >= 6);
+        // Longest first, so a whole token goes before the values inside it.
+        secrets.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        secrets.dedup();
+        for secret in secrets {
+            out = out.replace(&secret, "<redacted>");
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -980,6 +1064,54 @@ mod tests {
             l.local_addr().unwrap()
         };
         assert!(!probe_azure_imds(closed));
+    }
+
+    const TOKEN: &str =
+        "sv=2024-11-04&ss=b&srt=sco&sp=rwdl&se=2099-01-01T00%3A00%3A00Z&sig=abc%2Bdef%2Fghij%3D";
+
+    // The SDK re-sorts and re-encodes a query when it sets query pairs (list, container
+    // operations, stage_block, commit_block_list), and transport errors print the whole URL.
+    #[test]
+    fn redaction_does_not_depend_on_the_exact_token_text() {
+        let texts = [
+            // The token as configured.
+            format!("GET https://h/acct/c/k?{TOKEN} failed"),
+            // Re-sorted, with the query pairs the SDK adds, and the signature double-encoded.
+            "error sending request for url (https://h/acct/c?comp=list&restype=container&sig=abc%252Bdef%252Fghij%253D&sv=2024-11-04&se=2099-01-01T00%253A00%253A00Z)".to_string(),
+            // Decoded forms of the values, with no URL around them.
+            "the signature abc+def/ghij= was refused".to_string(),
+            // Debug-ish rendering.
+            r#"Url { query: Some("restype=container&sig=abc%2Bdef%2Fghij%3D&comp=list") }"#.to_string(),
+        ];
+        for text in texts {
+            let out = redact_with(&text, Some(TOKEN));
+            for leak in [
+                "abc%2Bdef",
+                "abc%252Bdef",
+                "abc+def/ghij=",
+                "ghij",
+                "2099-01-01",
+            ] {
+                assert!(
+                    !out.contains(leak),
+                    "RED: {leak:?} survives in {out:?} (from {text:?})"
+                );
+            }
+        }
+        // Text that merely mentions common words is left alone.
+        let plain = "request failed: connection refused (os error 111) for https://h/acct/c/k";
+        assert_eq!(redact_with(plain, Some(TOKEN)), plain);
+    }
+
+    #[test]
+    fn a_url_loses_its_query_even_without_a_configured_token() {
+        let out = redact_with(
+            "error sending request for url (https://h:1/a/b?x=1&sig=zzz) boom",
+            None,
+        );
+        assert!(!out.contains("zzz") && !out.contains("x=1"), "{out}");
+        assert!(out.contains("https://h:1/a/b"), "{out}");
+        assert!(out.contains("boom"), "text after the URL is kept: {out}");
     }
 
     #[test]
