@@ -16,6 +16,91 @@ pub const DEFAULT_BUFFER_ALIGNMENT: usize = DEFAULT_PAGE_SIZE;
 /// Default minimum I/O size for direct I/O operations (64KB for better performance)
 pub const DEFAULT_MIN_IO_SIZE: usize = 64 * 1024;
 
+/// Default size, in bytes, of the aligned bounce buffer a `direct://` (O_DIRECT) PUT or GET
+/// copies through when the caller's own memory cannot be used directly (64 MiB).
+///
+/// O_DIRECT needs the buffer ADDRESS, the file offset and the length of every I/O to be
+/// multiples of the device alignment (4096). A source whose address is already aligned is
+/// written straight from the caller's memory in one `write` and never uses this buffer.
+/// Any other source (Python `bytes`/`bytearray`, a `Vec`-backed `Bytes`: heap pointers are
+/// only 16-byte aligned) must be copied into an aligned buffer first, and each `write` is
+/// then one full bounce buffer. Before this constant the loop wrote ONE 4 KiB block per
+/// `write` (512 MiB took 45 s, about 11 MiB/s, issue #244).
+///
+/// Trade-off: a bigger buffer means fewer syscalls (a 1 GiB PUT is 16 writes at 64 MiB) but
+/// more extra memory per in-flight PUT/GET; 64 MiB keeps each syscall large enough that the
+/// per-call overhead is negligible next to the device transfer, while 32 concurrent PUTs
+/// still add only 2 GiB. Override with [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`].
+pub const DEFAULT_DIRECT_IO_BOUNCE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Environment variable overriding [`DEFAULT_DIRECT_IO_BOUNCE_SIZE`], in MiB.
+///
+/// Rounded down to a multiple of the O_DIRECT alignment; `0` or an unparseable value
+/// selects the default. Example: `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=256`.
+pub const ENV_DIRECT_IO_BOUNCE_SIZE_MB: &str = "S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB";
+
+/// Resolve the effective `direct://` bounce-buffer size in bytes.
+///
+/// Reads [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`] on each call (one `getenv` per PUT/GET, noise
+/// next to the I/O); falls back to [`DEFAULT_DIRECT_IO_BOUNCE_SIZE`] when unset, zero,
+/// unparseable or too large to express in bytes.
+pub fn direct_io_bounce_size() -> usize {
+    parse_direct_io_bounce_size(std::env::var(ENV_DIRECT_IO_BOUNCE_SIZE_MB).ok().as_deref())
+}
+
+/// Pure parser behind [`direct_io_bounce_size`]: MiB text to bytes, default on anything
+/// unusable (unset, empty, non-numeric, zero, overflow).
+fn parse_direct_io_bounce_size(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .unwrap_or(DEFAULT_DIRECT_IO_BOUNCE_SIZE)
+}
+
+#[cfg(test)]
+mod direct_io_bounce_size_tests {
+    use super::*;
+
+    #[test]
+    fn unusable_values_select_the_default() {
+        for raw in [
+            None,
+            Some(""),
+            Some("abc"),
+            Some("0"),
+            Some("-4"),
+            Some("1.5"),
+        ] {
+            assert_eq!(
+                parse_direct_io_bounce_size(raw),
+                DEFAULT_DIRECT_IO_BOUNCE_SIZE,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            parse_direct_io_bounce_size(Some(&usize::MAX.to_string())),
+            DEFAULT_DIRECT_IO_BOUNCE_SIZE
+        );
+    }
+
+    #[test]
+    fn megabytes_are_converted_to_bytes() {
+        assert_eq!(parse_direct_io_bounce_size(Some("256")), 256 * 1024 * 1024);
+        assert_eq!(parse_direct_io_bounce_size(Some(" 8 ")), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn default_is_large_enough_to_keep_writes_large() {
+        const { assert!(DEFAULT_DIRECT_IO_BOUNCE_SIZE >= 1024 * 1024) };
+    }
+}
+
+/// Largest number of bytes Linux transfers in ONE `read`/`write` system call
+/// (`0x7ffff000`, just under 2 GiB, rounded down to a page): a larger request is
+/// silently shortened by the kernel. A `direct://` transfer bigger than this is issued as
+/// consecutive writes of at most this size.
+pub const MAX_SINGLE_IO_BYTES: usize = 0x7fff_f000;
+
 /// Default multipart upload threshold for S3 (32 MB)
 pub const DEFAULT_S3_MULTIPART_THRESHOLD: usize = 32 * 1024 * 1024;
 

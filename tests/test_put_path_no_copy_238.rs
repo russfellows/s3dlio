@@ -16,7 +16,7 @@ use s3dlio::file_store_direct::{ConfigurableFileSystemObjectStore, FileSystemCon
 use s3dlio::object_store::ObjectStore;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 struct PeakAlloc {
     live: AtomicUsize,
@@ -77,11 +77,17 @@ unsafe impl GlobalAlloc for PeakAlloc {
 #[global_allocator]
 static ALLOC: PeakAlloc = PeakAlloc::new();
 
-static SERIAL: Mutex<()> = Mutex::new(());
+static SERIAL: Mutex<()> = Mutex::const_new(());
 
-const PAYLOAD: usize = 64 * 1024 * 1024;
-/// A put may allocate bookkeeping and (direct://) one bounce buffer, never a payload copy.
-const MAX_EXTRA_FRACTION_PERCENT: usize = 25;
+const MIB: usize = 1024 * 1024;
+/// file:// writes straight from the caller's `Bytes`: no allocation proportional to it.
+const FILE_PAYLOAD: usize = 64 * MIB;
+/// direct:// copies an UNALIGNED source through one bounce buffer (64 MiB by default, see
+/// `constants::DEFAULT_DIRECT_IO_BOUNCE_SIZE`), never through a payload-sized copy: the
+/// payload is 4x the bounce buffer so a full copy cannot hide under the allowance.
+const DIRECT_PAYLOAD: usize = 256 * MIB;
+/// Bookkeeping slack on top of the allowed buffers.
+const SLACK: usize = 8 * MIB;
 
 fn scratch_dir() -> tempfile::TempDir {
     // O_DIRECT is unsupported on tmpfs, so use the cargo target tmp dir, not /tmp.
@@ -91,11 +97,16 @@ fn scratch_dir() -> tempfile::TempDir {
         .expect("temp dir")
 }
 
-async fn assert_put_does_not_copy(store: &dyn ObjectStore, scheme: &str) {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+async fn assert_put_does_not_copy(
+    store: &dyn ObjectStore,
+    scheme: &str,
+    payload: usize,
+    allowance: usize,
+) {
+    let _guard = SERIAL.lock().await;
     let dir = scratch_dir();
     let uri = format!("{scheme}://{}/obj.bin", dir.path().display());
-    let data = Bytes::from(vec![0xA7u8; PAYLOAD]);
+    let data = Bytes::from(vec![0xA7u8; payload]);
 
     let live_before = ALLOC.live();
     ALLOC.reset();
@@ -103,24 +114,30 @@ async fn assert_put_does_not_copy(store: &dyn ObjectStore, scheme: &str) {
     let extra = ALLOC.peak_above_live_at_reset(live_before);
     drop(data);
 
-    let limit = PAYLOAD / 100 * MAX_EXTRA_FRACTION_PERCENT;
+    let limit = allowance + SLACK;
     assert!(
         extra < limit,
-        "{scheme}:// put of {PAYLOAD} bytes allocated {extra} extra bytes at peak \
+        "{scheme}:// put of {payload} bytes allocated {extra} extra bytes at peak \
          (limit {limit}): the payload was copied"
     );
     let size = std::fs::metadata(dir.path().join("obj.bin")).unwrap().len();
-    assert_eq!(size as usize, PAYLOAD);
+    assert_eq!(size as usize, payload);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_put_makes_no_owned_copy() {
     let store = FileSystemObjectStore::new();
-    assert_put_does_not_copy(&store, "file").await;
+    assert_put_does_not_copy(&store, "file", FILE_PAYLOAD, 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_put_makes_no_payload_sized_copy() {
     let store = ConfigurableFileSystemObjectStore::new(FileSystemConfig::direct_io());
-    assert_put_does_not_copy(&store, "direct").await;
+    assert_put_does_not_copy(
+        &store,
+        "direct",
+        DIRECT_PAYLOAD,
+        s3dlio::constants::direct_io_bounce_size(),
+    )
+    .await;
 }

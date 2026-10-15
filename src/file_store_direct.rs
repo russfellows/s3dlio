@@ -19,7 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, info, trace, warn};
 
 use crate::constants::{
-    DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD, DEFAULT_MIN_IO_SIZE, DEFAULT_PAGE_SIZE,
+    direct_io_bounce_size, DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD, DEFAULT_MIN_IO_SIZE,
+    DEFAULT_PAGE_SIZE, MAX_SINGLE_IO_BYTES,
 };
 use crate::object_store::{CompressionConfig, ObjectMetadata, ObjectStore, ObjectWriter};
 
@@ -221,6 +222,191 @@ fn resize_aligned_buffer(buffer: &mut Vec<u8>, new_size: usize, alignment: usize
         new_buffer.set_len(buffer.len());
     }
     *buffer = new_buffer;
+}
+
+/// Round `n` down to a multiple of `alignment`.
+fn round_down(n: usize, alignment: usize) -> usize {
+    n / alignment * alignment
+}
+
+/// Round `n` up to a multiple of `alignment`.
+fn round_up(n: usize, alignment: usize) -> usize {
+    n.div_ceil(alignment) * alignment
+}
+
+/// One planned I/O system call of an O_DIRECT transfer (issue #244).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectIoStep {
+    /// Write `len` bytes straight from the caller's memory at `data[offset..]`, to file
+    /// offset `offset`. Both the source address and `len` are alignment multiples.
+    FromSource { offset: usize, len: usize },
+    /// Copy `data_len` payload bytes (at `offset` in the payload and in the file) through
+    /// the aligned bounce buffer, zero-fill it up to `io_len` (a multiple of the alignment)
+    /// and transfer `io_len` bytes in one system call.
+    ViaBounce {
+        offset: usize,
+        data_len: usize,
+        io_len: usize,
+    },
+}
+
+/// Plan the bounce-buffer transfers covering `len` bytes: consecutive steps of at most
+/// `bounce_size` (rounded down to the alignment, never below one alignment unit); only the
+/// last step can be shorter, and its `io_len` is padded up to the alignment.
+fn plan_bounce_steps(len: usize, alignment: usize, bounce_size: usize) -> Vec<DirectIoStep> {
+    let alignment = alignment.max(1);
+    let bounce = round_down(bounce_size, alignment).max(alignment);
+    let mut steps = Vec::with_capacity(len.div_ceil(bounce));
+    let mut offset = 0;
+    while offset < len {
+        let data_len = (len - offset).min(bounce);
+        steps.push(DirectIoStep::ViaBounce {
+            offset,
+            data_len,
+            io_len: round_up(data_len, alignment),
+        });
+        offset += data_len;
+    }
+    steps
+}
+
+/// Plan an O_DIRECT write of `len` bytes whose first byte is at address `src_addr`.
+///
+/// * Source address aligned: the alignment-multiple prefix is written straight from the
+///   caller's memory with no copy, as ONE step (split only at `max_single_io`, the kernel's
+///   per-call limit); the unaligned tail, if any, is one zero-padded bounce block.
+/// * Source address not aligned (O_DIRECT forbids using it): bounce-buffer-sized steps.
+///
+/// The caller truncates the file back to `len` afterwards, removing the tail padding.
+pub(crate) fn plan_direct_write(
+    len: usize,
+    src_addr: usize,
+    alignment: usize,
+    bounce_size: usize,
+    max_single_io: usize,
+) -> Vec<DirectIoStep> {
+    let alignment = alignment.max(1);
+    if !src_addr.is_multiple_of(alignment) {
+        return plan_bounce_steps(len, alignment, bounce_size);
+    }
+    let max_io = round_down(max_single_io, alignment).max(alignment);
+    let aligned_len = round_down(len, alignment);
+    let mut steps = Vec::new();
+    let mut offset = 0;
+    while offset < aligned_len {
+        let step_len = (aligned_len - offset).min(max_io);
+        steps.push(DirectIoStep::FromSource {
+            offset,
+            len: step_len,
+        });
+        offset += step_len;
+    }
+    if aligned_len < len {
+        steps.push(DirectIoStep::ViaBounce {
+            offset: aligned_len,
+            data_len: len - aligned_len,
+            io_len: alignment,
+        });
+    }
+    steps
+}
+
+/// Write all of `data` to `file` (opened with O_DIRECT) following [`plan_direct_write`],
+/// then truncate the file to `data.len()`.
+///
+/// `write_all_at` resumes after a short write, so a partial write is never lost; if a short
+/// write leaves the next offset unaligned the kernel refuses it (EINVAL) and the caller's
+/// buffered fallback rewrites the whole file.
+#[cfg(unix)]
+pub(crate) fn write_all_direct(
+    file: &std::fs::File,
+    data: &[u8],
+    alignment: usize,
+    bounce_size: usize,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    let steps = plan_direct_write(
+        data.len(),
+        data.as_ptr() as usize,
+        alignment,
+        bounce_size,
+        MAX_SINGLE_IO_BYTES,
+    );
+    let bounce_len = steps
+        .iter()
+        .filter_map(|s| match s {
+            DirectIoStep::ViaBounce { io_len, .. } => Some(*io_len),
+            DirectIoStep::FromSource { .. } => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let mut bounce = (bounce_len > 0).then(|| AlignedBuf::new(bounce_len, alignment));
+
+    for step in steps {
+        match step {
+            DirectIoStep::FromSource { offset, len } => {
+                file.write_all_at(&data[offset..offset + len], offset as u64)?;
+            }
+            DirectIoStep::ViaBounce {
+                offset,
+                data_len,
+                io_len,
+            } => {
+                let Some(bounce) = bounce.as_mut() else {
+                    bail!("internal error: bounce step planned without a bounce buffer");
+                };
+                let buf = &mut bounce.as_mut_slice()[..io_len];
+                buf[..data_len].copy_from_slice(&data[offset..offset + data_len]);
+                buf[data_len..].fill(0);
+                file.write_all_at(buf, offset as u64)?;
+            }
+        }
+    }
+
+    // Remove the zero padding of the last block.
+    file.set_len(data.len() as u64)?;
+    Ok(())
+}
+
+/// Read `file_size` bytes from `file` (opened with O_DIRECT) in bounce-buffer-sized reads.
+#[cfg(unix)]
+pub(crate) fn read_all_direct(
+    file: &std::fs::File,
+    file_size: usize,
+    alignment: usize,
+    bounce_size: usize,
+) -> Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    let mut result = Vec::with_capacity(file_size);
+    let steps = plan_bounce_steps(file_size, alignment, bounce_size);
+    let bounce_len = steps
+        .iter()
+        .filter_map(|s| match s {
+            DirectIoStep::ViaBounce { io_len, .. } => Some(*io_len),
+            DirectIoStep::FromSource { .. } => None,
+        })
+        .max()
+        .unwrap_or(0);
+    if bounce_len == 0 {
+        return Ok(result);
+    }
+    let mut bounce = AlignedBuf::new(bounce_len, alignment);
+
+    let mut total = 0usize;
+    while total < file_size {
+        // Always request a whole number of alignment units, at an aligned offset.
+        let want = round_up((file_size - total).min(bounce_len), alignment).min(bounce_len);
+        let n = file.read_at(&mut bounce.as_mut_slice()[..want], total as u64)?;
+        if n == 0 {
+            break; // EOF (file shrank)
+        }
+        let take = n.min(file_size - total);
+        result.extend_from_slice(&bounce.as_slice()[..take]);
+        total += take;
+    }
+    Ok(result)
 }
 
 /// Streaming writer for direct I/O filesystem operations
@@ -769,26 +955,6 @@ impl ConfigurableFileSystemObjectStore {
         })
     }
 
-    /// Align buffer for O_DIRECT operations
-    fn align_buffer(&self, data: &[u8]) -> Vec<u8> {
-        if !self.config.direct_io {
-            return data.to_vec();
-        }
-
-        let alignment = self.config.alignment;
-        let aligned_size = data.len().div_ceil(alignment) * alignment;
-        let mut aligned_buffer = create_aligned_buffer(aligned_size, alignment);
-        unsafe {
-            aligned_buffer.set_len(aligned_size);
-            aligned_buffer[..data.len()].copy_from_slice(data);
-            // Zero out the padding
-            if data.len() < aligned_size {
-                aligned_buffer[data.len()..].fill(0);
-            }
-        }
-        aligned_buffer
-    }
-
     /// Create OpenOptions with appropriate flags for the configuration
     fn create_open_options(&self, read: bool, write: bool) -> fs::OpenOptions {
         let mut options = fs::OpenOptions::new();
@@ -855,44 +1021,21 @@ impl ConfigurableFileSystemObjectStore {
         {
             let path = path.to_owned();
             let alignment = self.config.alignment;
+            let bounce_size = direct_io_bounce_size();
 
             // Use spawn_blocking to run sync I/O in thread pool
             tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
                 use std::fs::OpenOptions;
-                use std::io::Read;
                 use std::os::unix::fs::OpenOptionsExt;
 
-                let mut file = OpenOptions::new()
+                let file = OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_DIRECT)
                     .open(&path)?;
 
-                // Read in aligned chunks using aligned buffer.
-                // Pre-size `result` to `file_size` (issue #148, audit §3.3c)
-                // — `file_size` is known before the loop, and growing a
-                // `Vec` from zero here would incur log2(file_size /
-                // alignment) reallocations that we can avoid with a single
-                // up-front allocation.
-                let mut result = Vec::with_capacity(file_size);
-                let mut temp_buffer = create_aligned_buffer(alignment, alignment);
-                unsafe {
-                    temp_buffer.set_len(alignment);
-                }
-                let mut total_read = 0;
-
-                while total_read < file_size {
-                    let bytes_read = file.read(&mut temp_buffer)?;
-                    if bytes_read == 0 {
-                        break;
-                    }
-
-                    let copy_size = std::cmp::min(bytes_read, file_size - total_read);
-                    result.extend_from_slice(&temp_buffer[..copy_size]);
-                    total_read += copy_size;
-                }
-
-                result.truncate(file_size);
-                Ok(result)
+                // Large aligned reads (one bounce buffer each), not one 4 KiB read per
+                // system call (issue #244).
+                read_all_direct(&file, file_size, alignment, bounce_size)
             })
             .await?
         }
@@ -954,11 +1097,11 @@ impl ConfigurableFileSystemObjectStore {
             let path = path.to_owned();
             let alignment = self.config.alignment;
             let sync_writes = self.config.sync_writes;
+            let bounce_size = direct_io_bounce_size();
 
             // Use spawn_blocking for sync I/O
             tokio::task::spawn_blocking(move || -> Result<()> {
                 use std::fs::OpenOptions;
-                use std::io::Write;
                 use std::os::unix::fs::OpenOptionsExt;
 
                 let mut flags = libc::O_DIRECT;
@@ -966,48 +1109,16 @@ impl ConfigurableFileSystemObjectStore {
                     flags |= libc::O_SYNC;
                 }
 
-                let mut file = OpenOptions::new()
+                let file = OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(true)
                     .custom_flags(flags)
                     .open(&path)?;
 
-                // Write data in aligned chunks
-                let mut written = 0;
-
-                // Create single aligned buffer for all writes
-                let mut aligned_chunk = create_aligned_buffer(alignment, alignment);
-                unsafe {
-                    aligned_chunk.set_len(alignment);
-                }
-
-                while written < data.len() {
-                    let remaining = data.len() - written;
-                    let chunk_size = std::cmp::min(remaining, alignment);
-
-                    // Clear and copy data to aligned buffer
-                    unsafe {
-                        aligned_chunk.set_len(0);
-                        aligned_chunk.set_len(alignment);
-                    }
-                    aligned_chunk[..chunk_size]
-                        .copy_from_slice(&data[written..written + chunk_size]);
-                    if chunk_size < alignment {
-                        aligned_chunk[chunk_size..].fill(0);
-                    }
-
-                    // Write full aligned chunk
-                    file.write_all(&aligned_chunk)?;
-                    written += chunk_size;
-                }
-
-                file.flush()?;
-
-                // Truncate to original size
-                file.set_len(data.len() as u64)?;
-
-                Ok(())
+                // One write for the whole aligned body when `data` is aligned, otherwise
+                // bounce-buffer-sized writes (issue #244); never one 4 KiB block per call.
+                write_all_direct(&file, data.as_ref(), alignment, bounce_size)
             })
             .await?
         }
@@ -1331,37 +1442,11 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
             part_size
         );
 
-        if !self.config.direct_io {
-            // Fallback to regular put for non-direct I/O
-            return self.put(uri, data).await;
-        }
-
-        // For O_DIRECT multipart, write in aligned chunks
-        let chunk_size = part_size.unwrap_or(self.config.min_io_size);
-
-        let path = Self::uri_to_path(uri)?;
-
-        // Create parent directories if they don't exist
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        let options = self.create_open_options(false, true);
-        let mut file = options.open(&path).await?;
-
-        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
-        let data_slice = data.as_ref();
-        for chunk in data_slice.chunks(chunk_size) {
-            let aligned_chunk = self.align_buffer(chunk);
-            file.write_all(&aligned_chunk).await?;
-        }
-
-        file.flush().await?;
-
-        // Truncate to exact size
-        file.set_len(data_slice.len() as u64).await?;
-
-        Ok(())
+        // A local file has no parts: "multipart" is the same single write as `put`, with
+        // the same large aligned O_DIRECT writes and buffered fallback. (It used to write
+        // `part_size` chunks - 4 KiB by default - each zero-padded to the alignment, which
+        // also put padding INSIDE the file when `part_size` was not an alignment multiple.)
+        self.put(uri, data).await
     }
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
@@ -1807,5 +1892,232 @@ mod path_to_uri_scheme_tests {
             "recursive list() on a direct:// store must return direct:// \
              URIs, got: {recursive:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod direct_io_chunking_tests {
+    //! Issue #244: a `direct://` PUT wrote ONE 4 KiB block per `write()` (512 MiB took 45 s).
+    //! The planner tests are the structural proof (how many system calls, how large); the
+    //! round-trip tests use a REAL O_DIRECT file (no buffered fallback in between).
+    use super::*;
+
+    const A: usize = 4096;
+    const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * MIB;
+    const BOUNCE: usize = 64 * MIB;
+    const MAX_IO: usize = MAX_SINGLE_IO_BYTES;
+
+    fn covered(steps: &[DirectIoStep], len: usize) {
+        // Steps are contiguous from 0, in order, and cover exactly `len` payload bytes.
+        let mut next = 0;
+        for s in steps {
+            let (offset, data_len, io_len) = match *s {
+                DirectIoStep::FromSource { offset, len } => (offset, len, len),
+                DirectIoStep::ViaBounce {
+                    offset,
+                    data_len,
+                    io_len,
+                } => (offset, data_len, io_len),
+            };
+            assert_eq!(offset, next, "gap or overlap in {steps:?}");
+            assert_eq!(offset % A, 0, "every I/O offset must be aligned");
+            assert_eq!(io_len % A, 0, "every I/O length must be aligned");
+            assert!(data_len > 0 && data_len <= io_len);
+            next += data_len;
+        }
+        assert_eq!(next, len);
+    }
+
+    #[test]
+    fn aligned_gib_source_is_one_write() {
+        let steps = plan_direct_write(GIB, 7 * A, A, BOUNCE, MAX_IO);
+        assert_eq!(
+            steps,
+            vec![DirectIoStep::FromSource {
+                offset: 0,
+                len: GIB
+            }]
+        );
+    }
+
+    #[test]
+    fn aligned_source_is_split_only_at_the_kernel_per_call_limit() {
+        let len = 3 * GIB;
+        let steps = plan_direct_write(len, 0, A, BOUNCE, MAX_IO);
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        for s in &steps {
+            match s {
+                DirectIoStep::FromSource { len, .. } => assert!(*len <= MAX_IO),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        covered(&steps, len);
+    }
+
+    #[test]
+    fn aligned_source_with_unaligned_length_has_one_padded_tail_block() {
+        let steps = plan_direct_write(GIB + 1, 0, A, BOUNCE, MAX_IO);
+        assert_eq!(
+            steps,
+            vec![
+                DirectIoStep::FromSource {
+                    offset: 0,
+                    len: GIB
+                },
+                DirectIoStep::ViaBounce {
+                    offset: GIB,
+                    data_len: 1,
+                    io_len: A
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unaligned_source_is_written_in_bounce_sized_writes() {
+        let len = 512 * MIB;
+        let steps = plan_direct_write(len, 16, A, BOUNCE, MAX_IO);
+        assert_eq!(steps.len(), 8, "512 MiB at 64 MiB per write");
+        for s in &steps {
+            assert!(matches!(s, DirectIoStep::ViaBounce { io_len, .. } if *io_len == BOUNCE));
+        }
+        covered(&steps, len);
+    }
+
+    /// The regression itself: the old loop issued len/4096 writes.
+    #[test]
+    fn a_512_mib_payload_is_never_written_in_chunks_below_one_mib() {
+        for src_addr in [0usize, 16, A, A + 1] {
+            let len = 512 * MIB;
+            let steps = plan_direct_write(len, src_addr, A, BOUNCE, MAX_IO);
+            assert!(steps.len() <= 16, "{} writes for {len} bytes", steps.len());
+            let (last, rest) = steps.split_last().unwrap();
+            for s in rest.iter().chain(std::iter::once(last)) {
+                let io = match s {
+                    DirectIoStep::FromSource { len, .. } => *len,
+                    DirectIoStep::ViaBounce { io_len, .. } => *io_len,
+                };
+                assert!(io >= MIB, "{s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tail_and_degenerate_sizes_are_planned_exactly() {
+        for src_addr in [0usize, 16] {
+            assert!(plan_direct_write(0, src_addr, A, BOUNCE, MAX_IO).is_empty());
+            for len in [1, 4095, 4096, 4097, MIB + 3, 33 * MIB, 64 * MIB + 1] {
+                let steps = plan_direct_write(len, src_addr, A, BOUNCE, MAX_IO);
+                covered(&steps, len);
+                assert!(steps.len() <= 2, "{len} -> {steps:?}");
+            }
+        }
+        // A bounce smaller than the alignment is clamped to one alignment unit.
+        let steps = plan_direct_write(3 * A + 5, 1, A, 1, MAX_IO);
+        assert_eq!(steps.len(), 4);
+        covered(&steps, 3 * A + 5);
+    }
+
+    #[test]
+    fn planner_covers_every_size_around_the_boundaries() {
+        let bounce = 8 * A;
+        for src_addr in [0usize, 1] {
+            for len in 0..(40 * A) {
+                covered(&plan_direct_write(len, src_addr, A, bounce, 16 * A), len);
+            }
+        }
+    }
+
+    // --- real O_DIRECT round trips -------------------------------------------------
+
+    #[cfg(unix)]
+    mod real_files {
+        use super::*;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        /// O_DIRECT is unsupported on tmpfs; the cargo target dir is on a real filesystem.
+        fn dir() -> tempfile::TempDir {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+            std::fs::create_dir_all(&base).unwrap();
+            tempfile::Builder::new()
+                .prefix("direct-chunking-244-")
+                .tempdir_in(base)
+                .unwrap()
+        }
+
+        fn pattern(len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|i| (i.wrapping_mul(131) ^ (i >> 8).wrapping_mul(7)) as u8)
+                .collect()
+        }
+
+        fn open_direct_write(path: &Path) -> std::fs::File {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)
+                .expect("this filesystem must support O_DIRECT (not tmpfs)")
+        }
+
+        const SIZES: [usize; 8] = [0, 1, 4095, 4096, 4097, MIB + 3, 33 * MIB, 64 * MIB + 5];
+
+        fn check(len: usize, aligned_src: bool, bounce: usize) {
+            let d = dir();
+            let path = d.path().join("f.bin");
+            let raw = pattern(len);
+
+            // An aligned copy of the payload, or the plain Vec (16-byte aligned heap).
+            let mut aligned = AlignedBuf::new(len.max(1), A);
+            let data: &[u8] = if aligned_src {
+                aligned.as_mut_slice()[..len].copy_from_slice(&raw);
+                &aligned.as_slice()[..len]
+            } else {
+                &raw
+            };
+            if aligned_src {
+                assert_eq!(data.as_ptr() as usize % A, 0);
+            }
+
+            let file = open_direct_write(&path);
+            write_all_direct(&file, data, A, bounce).expect("O_DIRECT write");
+            drop(file);
+            assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, len);
+            assert_eq!(std::fs::read(&path).unwrap(), raw, "len {len}");
+
+            if len > 0 {
+                let rf = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .unwrap();
+                let back = read_all_direct(&rf, len, A, bounce).expect("O_DIRECT read");
+                assert_eq!(back, raw, "read back, len {len}");
+            }
+        }
+
+        #[test]
+        fn roundtrip_matrix_unaligned_source() {
+            for len in SIZES {
+                check(len, false, BOUNCE);
+            }
+        }
+
+        #[test]
+        fn roundtrip_matrix_aligned_source() {
+            for len in SIZES {
+                check(len, true, BOUNCE);
+            }
+        }
+
+        #[test]
+        fn roundtrip_with_a_small_bounce_buffer_uses_many_steps_correctly() {
+            for len in [1, 4097, MIB + 3, 5 * MIB + 17] {
+                check(len, false, 64 * A);
+                check(len, true, 64 * A);
+            }
+        }
     }
 }
