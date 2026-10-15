@@ -47,6 +47,57 @@ from torch.utils.data import IterableDataset, Dataset
 from .. import _pymod as _core
 
 
+def _s3_head_and_key(uri: str):
+    """Split ``s3://[host:port/]bucket/key`` into (``s3://[host:port/]bucket/``, key).
+
+    Returns None when the URI has no ``/`` after the bucket.
+    """
+    first, sep, after = uri[len("s3://") :].partition("/")
+    if not sep:
+        return None
+    if ":" in first or first.startswith("["):  # server form: s3://host:port/bucket/key
+        bucket, sep, key = after.partition("/")
+        if not sep:
+            return None
+        return f"s3://{first}/{bucket}/", key
+    return f"s3://{first}/", after
+
+
+def _list_by_key_prefix(uri: str):
+    """List every object whose KEY STARTS WITH the key part of ``uri``.
+
+    s3torchconnector's ``prefix`` is an S3 key prefix, while an ``s3://`` URI given to
+    ``s3dlio.list`` selects an exact name, a directory (``K/``) or a ``*`` glob. This
+    layer keeps the upstream prefix meaning:
+
+    * no ``*`` in the key: list ``uri + "**"`` (``**`` crosses ``/``; the S3 request
+      prefix is the prefix itself), so ``s3://b/train/img_`` returns ``train/img_0``,
+      ``train/img_1/x``, ... A key that is empty or ends in ``/`` is a directory and is
+      listed as it is.
+    * ``*`` in the key: a ``*`` is an ordinary key character in a prefix, but a listing
+      URI cannot carry a literal ``*``. List the directory part of the text before the
+      first ``*`` recursively and keep the keys that start with the prefix.
+
+    Other schemes are listed recursively, unchanged.
+    """
+    if not uri.startswith("s3://"):
+        return _core.list(uri, recursive=True)
+    parts = _s3_head_and_key(uri)
+    if parts is None:
+        return _core.list(uri, recursive=True)
+    head, key = parts
+    if "*" not in key:
+        if key == "" or key.endswith("/"):
+            return _core.list(uri, recursive=True)
+        return _core.list(uri + "**", recursive=True)
+    parent = key[: key.rfind("/", 0, key.index("*")) + 1]
+    return [
+        entry
+        for entry in _core.list(head + parent, recursive=True)
+        if entry[len("s3://") :].partition("/")[2].startswith(key)
+    ]
+
+
 class _BytesViewIO(io.RawIOBase):
     """
     Zero-copy file-like wrapper around s3dlio BytesView.
@@ -279,7 +330,9 @@ class S3IterableDataset(IterableDataset):
     ):
         """
         Args:
-            uri: Full URI to prefix (e.g., "s3://bucket/prefix/")
+            uri: Full URI to an S3 key prefix (e.g., "s3://bucket/prefix/"). As in
+                s3torchconnector the prefix is a key prefix: ``s3://bucket/train/img_``
+                includes every key that starts with ``train/img_``.
             region: AWS region (optional, can use AWS_REGION env var or config)
             enable_sharding: Automatically shard dataset across distributed workers
             **loader_kwargs: Additional arguments for s3dlio loader (prefetch, shuffle, etc.)
@@ -297,7 +350,7 @@ class S3IterableDataset(IterableDataset):
 
         # Pre-list object keys so we can reconstruct full URIs during iteration
         # This uses the global client cache (DashMap) — fast after first call
-        self._keys = _core.list(uri, recursive=True)
+        self._keys = _list_by_key_prefix(uri)
 
     def _convert_loader_kwargs(self, kwargs):
         """Convert s3torchconnector kwargs to s3dlio format."""
@@ -391,7 +444,9 @@ class S3MapDataset(Dataset):
     def __init__(self, uri: str, region: Optional[str] = None, **kwargs):
         """
         Args:
-            uri: Full URI to prefix (e.g., "s3://bucket/prefix/")
+            uri: Full URI to an S3 key prefix (e.g., "s3://bucket/prefix/"). As in
+                s3torchconnector the prefix is a key prefix: ``s3://bucket/train/img_``
+                includes every key that starts with ``train/img_``.
             region: AWS region (optional, can use AWS_REGION env var)
             **kwargs: Additional arguments for s3dlio (reader_mode, etc.)
         """
@@ -404,7 +459,7 @@ class S3MapDataset(Dataset):
 
         # List all object URIs upfront for random access
         # Uses global client cache — fast after first call
-        self._full_uris = _core.list(uri, recursive=True)
+        self._full_uris = _list_by_key_prefix(uri)
 
     @classmethod
     def from_prefix(
@@ -708,7 +763,9 @@ class S3Client:
 
         Args:
             bucket (str): Bucket name
-            prefix (str): Key prefix (can be full s3:// URI)
+            prefix (str): S3 key prefix, as in s3torchconnector: every key that starts
+                with it is listed (``train/img_`` returns ``train/img_0``,
+                ``train/img_1/x``, ...). A full URI is listed as a directory.
 
         Yields:
             ListObjectResult with object_info list
@@ -740,8 +797,9 @@ class S3Client:
                 self.object_info = object_infos
 
         try:
-            # Use the native list function (uses global client cache)
-            objects = _core.list(uri, recursive=True)
+            # Use the native list function (uses global client cache); `prefix` is an
+            # S3 key prefix, as in s3torchconnector
+            objects = _list_by_key_prefix(uri)
             object_infos = [ObjectInfo(obj) for obj in objects]
             yield ListObjectResult(object_infos)
         except Exception:
