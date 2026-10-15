@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **Arrow backend: `list(uri, recursive=True)` now lists every object under the prefix (#245).**
+  With the optional `arrow-backend` feature, a recursive listing returned only the direct children of
+  the prefix and silently omitted objects in deeper "subdirectories", unlike the native S3, GCS and
+  Azure stores. `recursive=True` now returns every object at any depth (and no directory entries);
+  `recursive=False` is unchanged (the objects and directory entries directly under the prefix). The
+  prefix still selects only its own directory: `p` never lists `pfoo/...` or `p2/...`.
+
 - **Arrow backend: `delete_prefix` now deletes the objects at every depth under the prefix (#232).**
   With the optional `arrow-backend` feature, `delete_prefix("s3://b/p")` listed only the immediate
   children of `p`, so `p/b/c` and `p/b/d/e` were left behind while the call returned success. It now

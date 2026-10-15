@@ -207,22 +207,32 @@ fn key_path(url_path: &str, is_prefix: bool) -> Result<Path> {
 
 /// List the entries under `base` in `store` as full URIs rebuilt from `url`, the URL the
 /// listing was requested with.
+///
+/// `recursive` lists every object under `base` at any depth and no directory entries
+/// (issue #245). Otherwise only the direct children are listed: the objects and the
+/// directory entries (common prefixes). `object_store` matches a prefix per path segment,
+/// so `p` selects `p/...` and never `pfoo/...` or `p2/...`.
 async fn list_under(
     store: &dyn AosObjectStore,
     base: &Path,
     url: &Url,
     recursive: bool,
 ) -> Result<Vec<String>> {
-    let mut out = Vec::new();
+    use futures::StreamExt as _;
 
+    let mut out = Vec::new();
     if recursive {
-        // Simple implementation: collect all objects manually
-        let result = store.list_with_delimiter(Some(base)).await?;
-        for obj in result.objects {
-            out.push(ArrowObjectStore::rebuild_full_uri(url, base, &obj.location));
+        // An empty prefix is the whole store (the bucket root).
+        let prefix = (!base.as_ref().is_empty()).then_some(base);
+        let mut entries = store.list(prefix);
+        while let Some(entry) = entries.next().await {
+            let meta = entry?;
+            out.push(ArrowObjectStore::rebuild_full_uri(
+                url,
+                base,
+                &meta.location,
+            ));
         }
-        // For recursive, we'd need to recursively list common_prefixes too
-        // For now, keep it simple and just list direct objects
     } else {
         let result = store.list_with_delimiter(Some(base)).await?;
         for obj in result.objects {
@@ -1173,5 +1183,45 @@ mod tests {
                 "q/z".to_string()
             ]
         );
+    }
+
+    // #245: `recursive=true` lists every object under the prefix at any depth, with no
+    // directory entries; `recursive=false` keeps the direct children (objects and
+    // directory entries). Segment matching holds: `p` never selects `pfoo` or `p2`.
+    #[tokio::test]
+    async fn recursive_listing_returns_every_depth_and_only_the_prefix() {
+        let store = seeded(&["p/a", "p/b/c", "p/b/d/e", "pfoo/x", "p2/y"]).await;
+        let deep = vec![
+            "s3://b/p/a".to_string(),
+            "s3://b/p/b/c".to_string(),
+            "s3://b/p/b/d/e".to_string(),
+        ];
+        for uri in ["s3://b/p", "s3://b/p/"] {
+            assert_eq!(s3_list(&store, uri, true).await, deep, "recursive {uri}");
+            assert_eq!(
+                s3_list(&store, uri, false).await,
+                vec!["s3://b/p/a".to_string(), "s3://b/p/b".to_string()],
+                "non-recursive {uri}"
+            );
+        }
+        // The bucket root, recursively: every object.
+        assert_eq!(s3_list(&store, "s3://b/", true).await.len(), 5);
+    }
+
+    // Every URI a recursive listing returns addresses a real object, deep keys included.
+    #[tokio::test]
+    async fn recursive_listed_uris_round_trip_for_deep_keys() {
+        let store = seeded(&["p/a", "p/b/c", "p/b/d/e", "q/z"]).await;
+        let uris = s3_list(&store, "s3://b/p/", true).await;
+        assert_eq!(uris.len(), 3);
+        for uri in uris {
+            let url = Url::parse(&uri).expect("url");
+            let (_bucket, key) =
+                s3_target(&url, &uri, false).expect("a listed URI parses as an object");
+            store
+                .get(&key)
+                .await
+                .unwrap_or_else(|e| panic!("{uri} does not address a listed object: {e}"));
+        }
     }
 }
