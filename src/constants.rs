@@ -129,15 +129,18 @@ pub fn max_retry_attempts() -> u32 {
 /// (`crate::object_size_cache`), including the process-global one used by
 /// the S3 read path.
 ///
-/// 1 Mi (1,048,576) entries.  A cache entry costs on the order of 150 bytes
-/// (the URI, an expiry timestamp, an eviction-order record), so a full cache
-/// is roughly 150 MB -- reached only by a process that has stat'ed or read
-/// more than a million distinct objects within the cache TTL.  The limit is
-/// deliberately large: the cache exists so that the second and later epochs
-/// of a training run skip the per-object HEAD, and when the dataset has more
-/// objects than the limit, the oldest sizes are dropped first, so a dataset
-/// larger than the limit is only partly cached.  Override with
-/// `S3DLIO_SIZE_CACHE_MAX_ENTRIES`.
+/// 1 Mi (1,048,576) entries.  A cache entry costs roughly 200 bytes for a
+/// ~60-character URI (hash-map bucket and load-factor slack, the shared URI
+/// allocation, and a 32-byte write-order list node; 150-300 bytes depending
+/// on URI length), so a full cache is on the order of 200-300 MB -- reached
+/// only by a process that has stat'ed or read more than a million distinct
+/// objects within the cache TTL.
+///
+/// Eviction is oldest-written-first, not least-recently-read.  A loop that
+/// cycles over more distinct objects than the limit (an epoch over a dataset
+/// larger than the limit) evicts each size just before it is needed again and
+/// gets almost no cache hits.  For such datasets raise the limit above the
+/// object count.  Override with `S3DLIO_SIZE_CACHE_MAX_ENTRIES`.
 pub const DEFAULT_SIZE_CACHE_MAX_ENTRIES: usize = 1_048_576;
 
 /// Environment variable name for the size-cache entry limit.
@@ -145,17 +148,26 @@ pub const DEFAULT_SIZE_CACHE_MAX_ENTRIES: usize = 1_048_576;
 /// See [`DEFAULT_SIZE_CACHE_MAX_ENTRIES`].  Read by [`size_cache_max_entries()`].
 pub const ENV_SIZE_CACHE_MAX_ENTRIES: &str = "S3DLIO_SIZE_CACHE_MAX_ENTRIES";
 
-/// Resolve the effective size-cache entry limit.
-///
-/// Reads [`ENV_SIZE_CACHE_MAX_ENTRIES`] on each call (cheap; called only when
-/// a cache is constructed); falls back to [`DEFAULT_SIZE_CACHE_MAX_ENTRIES`]
-/// when unset or unparseable.  Clamped to a minimum of 1.
-pub fn size_cache_max_entries() -> usize {
-    std::env::var(ENV_SIZE_CACHE_MAX_ENTRIES)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+/// Parse a raw `S3DLIO_SIZE_CACHE_MAX_ENTRIES` value: unset or unparseable
+/// gives [`DEFAULT_SIZE_CACHE_MAX_ENTRIES`], and the result is at least 1.
+pub(crate) fn parse_size_cache_max_entries(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse().ok())
         .unwrap_or(DEFAULT_SIZE_CACHE_MAX_ENTRIES)
         .max(1)
+}
+
+/// Resolve the effective size-cache entry limit.
+///
+/// Reads [`ENV_SIZE_CACHE_MAX_ENTRIES`] ONCE per process (like the other
+/// cached `S3DLIO_*` settings): size caches are built per store, possibly per
+/// request, so the environment is not consulted again after the first call --
+/// set the variable before the first cache is created.  Unset or unparseable
+/// uses [`DEFAULT_SIZE_CACHE_MAX_ENTRIES`]; clamped to a minimum of 1.
+pub fn size_cache_max_entries() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_size_cache_max_entries(std::env::var(ENV_SIZE_CACHE_MAX_ENTRIES).ok().as_deref())
+    })
 }
 
 /// Resolve the MPI/distributed-training world size for this process.
@@ -1007,34 +1019,35 @@ mod connect_timeout_tests {
 mod size_cache_limit_tests {
     use super::*;
 
-    fn with_var<F: FnOnce()>(value: Option<&str>, body: F) {
-        let _guard = crate::test_env::lock();
-        let _env = crate::test_env::EnvRestore::capture(&[ENV_SIZE_CACHE_MAX_ENTRIES]);
-        match value {
-            Some(v) => std::env::set_var(ENV_SIZE_CACHE_MAX_ENTRIES, v),
-            None => std::env::remove_var(ENV_SIZE_CACHE_MAX_ENTRIES),
-        }
-        body();
-    }
-
     #[test]
     fn test_size_cache_limit_default_when_unset() {
-        with_var(None, || {
-            assert_eq!(size_cache_max_entries(), DEFAULT_SIZE_CACHE_MAX_ENTRIES);
-        });
+        assert_eq!(
+            parse_size_cache_max_entries(None),
+            DEFAULT_SIZE_CACHE_MAX_ENTRIES
+        );
     }
 
     #[test]
     fn test_size_cache_limit_honors_override() {
-        with_var(Some("1234"), || assert_eq!(size_cache_max_entries(), 1234));
+        assert_eq!(parse_size_cache_max_entries(Some("1234")), 1234);
+        assert_eq!(parse_size_cache_max_entries(Some(" 77 ")), 77);
     }
 
     #[test]
     fn test_size_cache_limit_garbage_falls_back_and_zero_clamps() {
-        with_var(Some("lots"), || {
-            assert_eq!(size_cache_max_entries(), DEFAULT_SIZE_CACHE_MAX_ENTRIES);
-        });
-        with_var(Some("0"), || assert_eq!(size_cache_max_entries(), 1));
+        assert_eq!(
+            parse_size_cache_max_entries(Some("lots")),
+            DEFAULT_SIZE_CACHE_MAX_ENTRIES
+        );
+        assert_eq!(parse_size_cache_max_entries(Some("0")), 1);
+    }
+
+    #[test]
+    fn test_size_cache_limit_is_read_once() {
+        // Whatever the first reader saw is what every later call returns.
+        let first = size_cache_max_entries();
+        assert_eq!(size_cache_max_entries(), first);
+        assert!(first >= 1);
     }
 }
 

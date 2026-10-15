@@ -238,7 +238,7 @@ Sizes learned by HEAD/stat are cached (per process for the S3 read path, per sto
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `S3DLIO_SIZE_CACHE_TTL_SECS` | `3600` | Time-to-live of the process-global S3 size cache, in seconds.  An entry older than this counts as a miss and is removed when it is next looked up. |
-| `S3DLIO_SIZE_CACHE_MAX_ENTRIES` | `1048576` | Maximum number of entries in a size cache (issue #241).  When a new URI arrives at the limit the entry written longest ago (the one closest to expiry) is evicted.  A full cache costs roughly 150 MB.  Read when a cache is created; unparseable values use the default, `0` is raised to `1`.  Raise it for datasets with more than about a million objects, otherwise the oldest sizes are dropped and re-stat'ed. |
+| `S3DLIO_SIZE_CACHE_MAX_ENTRIES` | `1048576` | Maximum number of entries in a size cache (issue #241).  When a new URI arrives at the limit the entry written longest ago (the one closest to expiry) is evicted.  A full cache costs roughly 200 bytes per entry for ~60-character URIs (200-300 MB at the default).  Read once per process, before the first cache is created; unparseable values use the default, `0` is raised to `1`.  Eviction is oldest-written-first, not least-recently-read: an epoch loop over more distinct objects than the limit gets almost no hits, so for datasets above about a million objects set this above the object count. |
 
 ## Range GET Optimization
 

@@ -3,64 +3,139 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+
+/// "No slot" marker for the intrusive list links.
+const NIL: usize = usize::MAX;
 
 /// Cached object size with timestamp for TTL expiration
 #[derive(Debug, Clone)]
 struct CachedSize {
     /// Object size in bytes
     size: u64,
-    /// When this entry was cached
+    /// When this entry was (last) written
     cached_at: Instant,
-    /// Insertion sequence number: identifies this entry's record in
-    /// [`Inner::order`] (a newer `put` of the same URI gets a newer number).
-    seq: u64,
+    /// Index of this entry's node in [`Inner::nodes`]
+    slot: usize,
+}
+
+/// One link of the write-order list. `key` is `None` while the slot is free.
+#[derive(Debug)]
+struct Node {
+    key: Option<Arc<str>>,
+    prev: usize,
+    next: usize,
 }
 
 /// The map plus the order in which entries were (last) written.
 ///
-/// `order` holds one `(uri, seq)` record per `put`, oldest first. A record is
-/// *live* when the map still holds that URI with the same `seq`; any other
-/// record (the entry was overwritten, expired or evicted) is stale and is
-/// skipped when it reaches the front. Because every entry has the same TTL,
-/// oldest-written is also first-to-expire, so the front of `order` is always
-/// both the best eviction candidate and the next entry to expire.
-#[derive(Debug, Default)]
+/// The order is a doubly-linked list stored in a slab (`nodes`, with a free
+/// list), oldest write at `head`, newest at `tail`. Every map entry has exactly
+/// one node and every node belongs to exactly one entry, so there are never
+/// stale records and nothing ever needs a compaction pass: insert, overwrite
+/// (unlink + relink at the tail), expiry removal and eviction are all O(1).
+/// Because each write stamps `cached_at` while the node moves to the tail, the
+/// list is sorted by `cached_at`: with one shared TTL the head is both the
+/// entry written longest ago and the first to expire, and the expired entries
+/// are always a prefix of the list.
+#[derive(Debug)]
 struct Inner {
     map: HashMap<Arc<str>, CachedSize>,
-    order: VecDeque<(Arc<str>, u64)>,
-    next_seq: u64,
+    nodes: Vec<Node>,
+    free: Vec<usize>,
+    head: usize,
+    tail: usize,
 }
 
 impl Inner {
-    /// Is `(uri, seq)` the current record of a live map entry?
-    fn is_live(&self, uri: &str, seq: u64) -> bool {
-        self.map.get(uri).is_some_and(|e| e.seq == seq)
-    }
-
-    /// Drop stale records when they outnumber live entries 2:1, so overwrites
-    /// and expiry-removals cannot grow `order` without bound. O(len) once per
-    /// at least `max_entries` writes: amortised O(1) per `put`.
-    fn compact_order_if_needed(&mut self, max_entries: usize) {
-        if self.order.len() > 2 * max_entries.max(self.map.len()) {
-            let map = &self.map;
-            self.order
-                .retain(|(uri, seq)| map.get(uri.as_ref()).is_some_and(|e| e.seq == *seq));
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            nodes: Vec::new(),
+            free: Vec::new(),
+            head: NIL,
+            tail: NIL,
         }
     }
 
-    /// Evict the oldest live entry. Returns false when the cache is empty.
-    fn evict_oldest(&mut self) -> bool {
-        while let Some((uri, seq)) = self.order.pop_front() {
-            if self.is_live(&uri, seq) {
-                self.map.remove(uri.as_ref());
-                return true;
+    /// Detach `slot` from the list (it stays allocated).
+    fn unlink(&mut self, slot: usize) {
+        let (prev, next) = (self.nodes[slot].prev, self.nodes[slot].next);
+        if prev == NIL {
+            self.head = next;
+        } else {
+            self.nodes[prev].next = next;
+        }
+        if next == NIL {
+            self.tail = prev;
+        } else {
+            self.nodes[next].prev = prev;
+        }
+        self.nodes[slot].prev = NIL;
+        self.nodes[slot].next = NIL;
+    }
+
+    /// Attach a detached `slot` at the tail (newest).
+    fn push_back(&mut self, slot: usize) {
+        self.nodes[slot].prev = self.tail;
+        self.nodes[slot].next = NIL;
+        if self.tail == NIL {
+            self.head = slot;
+        } else {
+            self.nodes[self.tail].next = slot;
+        }
+        self.tail = slot;
+    }
+
+    /// Allocate a node for `key` (reusing a free slot) and attach it at the tail.
+    fn alloc_back(&mut self, key: Arc<str>) -> usize {
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                self.nodes[slot].key = Some(key);
+                slot
             }
+            None => {
+                self.nodes.push(Node {
+                    key: Some(key),
+                    prev: NIL,
+                    next: NIL,
+                });
+                self.nodes.len() - 1
+            }
+        };
+        self.push_back(slot);
+        slot
+    }
+
+    /// Detach `slot` and put it on the free list.
+    fn release(&mut self, slot: usize) {
+        self.unlink(slot);
+        self.nodes[slot].key = None;
+        self.free.push(slot);
+    }
+
+    /// Remove the entry for `uri` from map and list. O(1).
+    fn remove(&mut self, uri: &str) -> Option<CachedSize> {
+        let entry = self.map.remove(uri)?;
+        self.release(entry.slot);
+        Some(entry)
+    }
+
+    /// Evict the entry written longest ago. Returns false when empty. O(1).
+    fn evict_oldest(&mut self) -> bool {
+        if self.head == NIL {
+            return false;
         }
-        false
+        let slot = self.head;
+        if let Some(key) = self.nodes[slot].key.take() {
+            self.map.remove(key.as_ref());
+        }
+        self.unlink(slot);
+        self.free.push(slot);
+        true
     }
 }
 
@@ -105,9 +180,16 @@ impl Inner {
 /// [`ObjectSizeCache::with_max_entries`]), and an expired entry is removed as
 /// soon as `get` finds it. When a new URI arrives at the limit the entry that
 /// was written longest ago is evicted. All entries share one TTL, so that is
-/// also the entry closest to expiry: expired entries always go first, and
-/// no scan is needed (O(1) amortised per `put`). Overwriting a URI refreshes
-/// its timestamp and moves it to the newest position.
+/// also the entry closest to expiry: expired entries always go first. Every
+/// operation is O(1) (a slab-backed linked list gives the write order; no
+/// scan and no compaction pass exists). Overwriting a URI updates it in place
+/// (no allocation), refreshes its timestamp and moves it to the newest
+/// position.
+///
+/// Eviction is oldest-written-first, not "least recently read": a loop that
+/// cycles over more distinct URIs than the limit evicts each entry just
+/// before it is needed again and gets almost no hits. Raise the limit
+/// (`S3DLIO_SIZE_CACHE_MAX_ENTRIES`) above the dataset's object count.
 #[derive(Debug)]
 pub struct ObjectSizeCache {
     /// Internal cache storage (URI → cached size + timestamp) and write order
@@ -144,7 +226,7 @@ impl ObjectSizeCache {
     /// from `S3DLIO_SIZE_CACHE_MAX_ENTRIES`.
     pub fn with_max_entries(ttl: Duration, max_entries: usize) -> Self {
         Self {
-            cache: Arc::new(RwLock::new(Inner::default())),
+            cache: Arc::new(RwLock::new(Inner::new())),
             ttl,
             max_entries: max_entries.max(1),
         }
@@ -208,8 +290,7 @@ impl ObjectSizeCache {
         match cache.map.get(uri) {
             Some(entry) if entry.cached_at.elapsed() < self.ttl => Some(entry.size),
             Some(_) => {
-                cache.map.remove(uri);
-                // Its record in `order` is now stale and is skipped lazily.
+                cache.remove(uri);
                 None
             }
             None => None,
@@ -239,30 +320,37 @@ impl ObjectSizeCache {
     pub async fn put(&self, uri: String, size: u64) {
         let mut cache = self.cache.write().await;
         tracing::trace!("Caching: {} → {} bytes", uri, size);
+        let now = Instant::now();
 
-        // Make room for a new URI. Overwriting an existing URI does not grow
-        // the map, so it never evicts anything.
-        if !cache.map.contains_key(uri.as_str()) {
-            while cache.map.len() >= self.max_entries {
-                if !cache.evict_oldest() {
-                    break;
-                }
-            }
+        // Overwrite: update in place -- one hash, no allocation, no new list
+        // node -- and move the node to the newest position. (`HashMap::entry`
+        // would need an owned `Arc<str>` key up front, i.e. an allocation on
+        // every overwrite, which is the common case in the skip-HEAD path.)
+        if let Some(entry) = cache.map.get_mut(uri.as_str()) {
+            entry.size = size;
+            entry.cached_at = now;
+            let slot = entry.slot;
+            cache.unlink(slot);
+            cache.push_back(slot);
+            return;
         }
 
-        let seq = cache.next_seq;
-        cache.next_seq += 1;
+        // New URI: make room, then insert.
+        while cache.map.len() >= self.max_entries {
+            if !cache.evict_oldest() {
+                break;
+            }
+        }
         let key: Arc<str> = Arc::from(uri);
+        let slot = cache.alloc_back(Arc::clone(&key));
         cache.map.insert(
-            Arc::clone(&key),
+            key,
             CachedSize {
                 size,
-                cached_at: Instant::now(),
-                seq,
+                cached_at: now,
+                slot,
             },
         );
-        cache.order.push_back((key, seq));
-        cache.compact_order_if_needed(self.max_entries);
     }
 
     /// Clear expired entries from cache
@@ -284,16 +372,24 @@ impl ObjectSizeCache {
     pub async fn clear_expired(&self) {
         let mut cache = self.cache.write().await;
         let before_count = cache.map.len();
-        let ttl = self.ttl;
-        cache.map.retain(|uri, entry| {
-            let expired = entry.cached_at.elapsed() >= ttl;
-            if expired {
-                tracing::debug!("Removing expired cache entry: {}", uri);
+        // The list is ordered by write time, so the expired entries are a
+        // prefix: pop from the head until the first live entry.
+        while cache.head != NIL {
+            let slot = cache.head;
+            let Some(key) = cache.nodes[slot].key.clone() else {
+                break;
+            };
+            let expired = cache
+                .map
+                .get(key.as_ref())
+                .is_some_and(|e| e.cached_at.elapsed() >= self.ttl);
+            if !expired {
+                break;
             }
-            !expired
-        });
+            tracing::debug!("Removing expired cache entry: {}", key);
+            cache.remove(key.as_ref());
+        }
         let after_count = cache.map.len();
-        cache.compact_order_if_needed(self.max_entries);
         let removed = before_count - after_count;
         if removed > 0 {
             tracing::info!(
@@ -309,8 +405,7 @@ impl ObjectSizeCache {
     /// Useful for testing or when you want to force fresh stats.
     pub async fn clear(&self) {
         let mut cache = self.cache.write().await;
-        cache.map.clear();
-        cache.order.clear();
+        *cache = Inner::new();
         tracing::debug!("Cleared all cache entries");
     }
 
@@ -643,32 +738,6 @@ mod tests {
 
     // ── Issue #241: the cache is bounded and prunes expired entries ──────
 
-    /// The limit comes from `S3DLIO_SIZE_CACHE_MAX_ENTRIES` for `new()`: the
-    /// map must stop at the limit however many distinct URIs are written.
-    #[tokio::test]
-    async fn test_env_limit_bounds_the_cache() {
-        let _guard = crate::test_env::lock_async().await;
-        let _env =
-            crate::test_env::EnvRestore::capture(&[crate::constants::ENV_SIZE_CACHE_MAX_ENTRIES]);
-        std::env::set_var(crate::constants::ENV_SIZE_CACHE_MAX_ENTRIES, "50");
-        let cache = ObjectSizeCache::new(Duration::from_secs(60));
-
-        for i in 0..200u64 {
-            cache.put(format!("s3://bucket/object-{i}"), i).await;
-        }
-
-        let stats = cache.stats().await;
-        assert_eq!(
-            stats.total_entries, 50,
-            "200 distinct URIs written with a limit of 50 must leave exactly 50"
-        );
-        // The oldest were dropped, the newest kept.
-        assert_eq!(cache.get("s3://bucket/object-0").await, None);
-        assert_eq!(cache.get("s3://bucket/object-149").await, None);
-        assert_eq!(cache.get("s3://bucket/object-150").await, Some(150));
-        assert_eq!(cache.get("s3://bucket/object-199").await, Some(199));
-    }
-
     /// `get` removes an expired entry it finds; before the fix it only
     /// reported a miss and left the entry in the map.
     #[tokio::test]
@@ -744,24 +813,122 @@ mod tests {
         assert_eq!(cache.stats().await.total_entries, 2);
     }
 
-    /// Repeated overwrites and expiry removals must not grow the internal
-    /// write-order queue without bound either.
-    #[tokio::test]
-    async fn test_write_order_queue_stays_bounded() {
-        let cache = ObjectSizeCache::with_max_entries(Duration::from_secs(60), 10);
-        for i in 0..10_000u64 {
-            cache.put("s3://bucket/same".to_string(), i).await;
+    /// Walk the write-order list and check it against the map: same size,
+    /// every node's key maps back to that node's slot, `cached_at`
+    /// non-decreasing head to tail, and the slab has no leaked slots.
+    fn assert_consistent(inner: &Inner) {
+        let mut seen = 0usize;
+        let mut slot = inner.head;
+        let mut prev = NIL;
+        let mut last_at: Option<Instant> = None;
+        while slot != NIL {
+            let node = &inner.nodes[slot];
+            assert_eq!(node.prev, prev, "broken back link at slot {slot}");
+            let key = node.key.as_ref().expect("listed node has a key");
+            let entry = inner.map.get(key.as_ref()).expect("listed key is in map");
+            assert_eq!(entry.slot, slot, "map slot disagrees with list");
+            if let Some(t) = last_at {
+                assert!(entry.cached_at >= t, "list not sorted by write time");
+            }
+            last_at = Some(entry.cached_at);
+            seen += 1;
+            prev = slot;
+            slot = node.next;
         }
-        for i in 0..10_000u64 {
-            cache.put(format!("s3://bucket/object-{}", i % 25), i).await;
+        assert_eq!(prev, inner.tail, "tail disagrees with the list");
+        assert_eq!(seen, inner.map.len(), "list and map sizes differ");
+        assert_eq!(
+            inner.nodes.len(),
+            inner.map.len() + inner.free.len(),
+            "slab leaked a slot"
+        );
+    }
+
+    /// Overwriting a handful of keys a million times (the skip-HEAD pattern:
+    /// every GET re-puts a cached size) creates no stale records, grows
+    /// nothing, and never needs an O(limit) pass: the structure stays
+    /// exactly one node per entry.
+    #[tokio::test]
+    async fn test_million_overwrites_keep_structure_bounded() {
+        let cache = ObjectSizeCache::with_max_entries(Duration::from_secs(60), 10);
+        for i in 0..1_000_000u64 {
+            cache.put(format!("s3://bucket/object-{}", i % 3), i).await;
         }
         let inner = cache.cache.read().await;
-        assert!(inner.map.len() <= 10);
+        assert_eq!(inner.map.len(), 3);
+        assert_eq!(inner.nodes.len(), 3, "overwrites must reuse their node");
+        assert!(inner.free.is_empty());
+        assert_consistent(&inner);
+    }
+
+    /// Expiry removal followed by re-insertion (a new epoch after the TTL)
+    /// recycles slots instead of growing the slab.
+    #[tokio::test]
+    async fn test_expiry_churn_recycles_slots() {
+        let cache = ObjectSizeCache::with_max_entries(Duration::from_millis(20), 100);
+        for _ in 0..10 {
+            for i in 0..50u64 {
+                cache.put(format!("s3://bucket/object-{i}"), i).await;
+            }
+            sleep(Duration::from_millis(30)).await;
+            for i in 0..50u64 {
+                assert_eq!(cache.get(&format!("s3://bucket/object-{i}")).await, None);
+            }
+        }
+        let inner = cache.cache.read().await;
+        assert_eq!(inner.map.len(), 0);
         assert!(
-            inner.order.len() <= 2 * 10 + 1,
-            "write-order queue grew to {}",
-            inner.order.len()
+            inner.nodes.len() <= 50,
+            "slab grew to {}",
+            inner.nodes.len()
         );
+        assert_consistent(&inner);
+    }
+
+    /// clear_expired removes exactly the expired prefix; an entry refreshed
+    /// by an overwrite is newer and survives.
+    #[tokio::test]
+    async fn test_clear_expired_spares_refreshed_entries() {
+        let cache = ObjectSizeCache::with_max_entries(Duration::from_millis(120), 10);
+        cache.put("s3://bucket/a".to_string(), 1).await;
+        cache.put("s3://bucket/b".to_string(), 2).await;
+        sleep(Duration::from_millis(80)).await;
+        cache.put("s3://bucket/a".to_string(), 3).await; // refresh a
+        sleep(Duration::from_millis(80)).await; // b is 160 ms old, a is 80 ms
+        cache.clear_expired().await;
+        assert_eq!(cache.get("s3://bucket/a").await, Some(3));
+        assert_eq!(cache.get("s3://bucket/b").await, None);
+        assert_consistent(&*cache.cache.read().await);
+    }
+
+    /// A deterministic pseudo-random mix of put / get / clear_expired keeps
+    /// the list, map and slab consistent and the size within the limit.
+    #[tokio::test]
+    async fn test_random_operations_keep_invariants() {
+        let cache = ObjectSizeCache::with_max_entries(Duration::from_millis(5), 16);
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for step in 0..5_000u32 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let key = format!("s3://bucket/k{}", (x >> 33) % 40);
+            match (x >> 20) % 5 {
+                0..=2 => cache.put(key, step as u64).await,
+                3 => {
+                    let _ = cache.get(&key).await;
+                }
+                _ => cache.clear_expired().await,
+            }
+            if step % 500 == 0 {
+                sleep(Duration::from_millis(6)).await;
+            }
+            if step % 97 == 0 {
+                let inner = cache.cache.read().await;
+                assert!(inner.map.len() <= 16);
+                assert_consistent(&inner);
+            }
+        }
+        assert_consistent(&*cache.cache.read().await);
     }
 
     #[tokio::test]
@@ -770,7 +937,7 @@ mod tests {
         cache.put("s3://bucket/a".to_string(), 1).await;
         cache.put("s3://bucket/b".to_string(), 2).await;
         cache.clear().await;
-        assert_eq!(cache.cache.read().await.order.len(), 0);
+        assert_eq!(cache.cache.read().await.nodes.len(), 0);
         cache.put("s3://bucket/c".to_string(), 3).await;
         assert_eq!(cache.get("s3://bucket/c").await, Some(3));
     }

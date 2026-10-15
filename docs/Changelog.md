@@ -8,9 +8,12 @@
   the per-store size caches) never removed anything: an expired entry was treated as a miss but left in
   memory, and nothing called the cleanup routine, so a long-running process that touched many distinct
   objects (a KV-cache tier, a data loader over a very large dataset) kept growing. A lookup that finds
-  an expired entry now removes it, and the cache holds at most 1,048,576 entries (about 150 MB); when a
-  new object arrives at the limit the entry written longest ago, which is also the one closest to
-  expiry, is evicted. Set `S3DLIO_SIZE_CACHE_MAX_ENTRIES` to change the limit. The TTL
+  an expired entry now removes it, and the cache holds at most 1,048,576 entries (roughly 200-300 MB
+  when full); when a new object arrives at the limit the entry written longest ago, which is also the
+  one closest to expiry, is evicted. Every cache operation stays O(1) (an overwrite updates in place,
+  nothing scans or compacts under the lock). Eviction is oldest-written-first, so an epoch loop over more
+  distinct objects than the limit gets almost no hits: set `S3DLIO_SIZE_CACHE_MAX_ENTRIES` (read once per
+  process) above the object count for such datasets. The TTL
   (`S3DLIO_SIZE_CACHE_TTL_SECS`) and cache hits behave as before.
 
 - **A GET of a missing or forbidden object no longer retries (#240).** The retry loop around S3 GETs

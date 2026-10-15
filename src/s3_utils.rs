@@ -2452,9 +2452,13 @@ pub(crate) async fn get_object_uri_optimized_rows(uri: &str, rows: Rows) -> Resu
         debug!("skip_head: plain GET (no HEAD) for {}", uri);
         let bytes = get_object_rows(&bucket, &key, rows).await?;
         // Cache the actual size so future calls can range-split if warranted.
-        get_size_cache()
-            .put(uri.to_string(), bytes.len() as u64)
-            .await;
+        // Skip the write when the cache already holds this size: `put` takes
+        // the cache's write lock, and this runs once per GET.
+        let size = bytes.len() as u64;
+        let cache = get_size_cache();
+        if cache.get(uri).await != Some(size) {
+            cache.put(uri.to_string(), size).await;
+        }
         return Ok(bytes);
     }
 
