@@ -31,7 +31,12 @@ CONTAINER = "ctr"
 
 def _body_for(path):
     """Distinct, deterministic content per blob path."""
-    return (path.encode() + b"|") * 40
+    unit = path.encode() + b"|"
+    if (
+        "big" in path
+    ):  # a multi-MiB blob: many chunks, so a buffer that grows would show
+        return unit * (3 * 1024 * 1024 // len(unit) + 1)
+    return unit * 40
 
 
 class _FakeBlobService(BaseHTTPRequestHandler):
@@ -129,3 +134,48 @@ def test_get_many_azure_requests_the_full_object_path(fake_blob_endpoint):
         assert bytes(data) == _body_for(f"/{ACCOUNT}/{CONTAINER}/{key}"), uri
     paths = {p for _, p in fake_blob_endpoint}
     assert paths == {f"/{ACCOUNT}/{CONTAINER}/{k}" for k in keys}, paths
+
+
+def test_get_many_azure_multi_mib_blobs_come_back_intact(fake_blob_endpoint):
+    _require_azure_backend()
+    keys = [f"dir/big-{i}.bin" for i in range(3)]
+    uris = [f"az://{ACCOUNT}/{CONTAINER}/{k}" for k in keys]
+    got = s3dlio.get_many(uris, max_in_flight=2)
+    for (uri, data), key in zip(got, keys):
+        want = _body_for(f"/{ACCOUNT}/{CONTAINER}/{key}")
+        assert len(want) > 3 * 1024 * 1024
+        assert bytes(data) == want, uri
+
+
+def test_get_many_azure_writes_op_log_rows(fake_blob_endpoint, tmp_path):
+    _require_azure_backend()
+    keys = [f"dir/log-{i}.bin" for i in range(6)]
+    uris = [f"az://{ACCOUNT}/{CONTAINER}/{k}" for k in keys]
+    s3dlio.init_op_log(str(tmp_path / "oplog.tsv.zst"))
+    try:
+        s3dlio.get_many(uris, max_in_flight=3)
+    finally:
+        s3dlio.finalize_op_log()
+    stats = s3dlio.op_log_stats()
+    # One GET row per object, as get() writes.
+    assert stats["accepted"] >= len(uris), stats
+
+
+def test_get_many_azure_refuses_a_uri_without_a_key(fake_blob_endpoint):
+    _require_azure_backend()
+    fake_blob_endpoint.clear()
+    with pytest.raises(RuntimeError, match="no key specified"):
+        s3dlio.get_many(
+            [f"az://{ACCOUNT}/{CONTAINER}/ok.bin", f"az://{ACCOUNT}/{CONTAINER}/"]
+        )
+    assert fake_blob_endpoint == [], (
+        "no request may be made for a batch with a keyless URI"
+    )
+
+
+def test_get_many_azure_error_names_the_failing_uri(fake_blob_endpoint):
+    _require_azure_backend()
+    missing = f"az://{ACCOUNT}/other-container/missing.bin"  # the fake answers 404
+    with pytest.raises(RuntimeError) as info:
+        s3dlio.get_many([missing])
+    assert missing in str(info.value), str(info.value)
