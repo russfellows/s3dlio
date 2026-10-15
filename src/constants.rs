@@ -1026,21 +1026,78 @@ pub const EXPORT_QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// at least 0.001; unusable values select the default).
 pub const ENV_EXPORT_QUIESCE_TIMEOUT_SECS: &str = "S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS";
 
-/// The effective quiesce timeout (reads [`ENV_EXPORT_QUIESCE_TIMEOUT_SECS`] on each call).
+/// The effective quiesce timeout (reads [`ENV_EXPORT_QUIESCE_TIMEOUT_SECS`] on each call). A set
+/// but unusable value falls back to the default, with a one-time warning.
 pub fn export_quiesce_timeout() -> std::time::Duration {
-    parse_export_quiesce_timeout(
-        std::env::var(ENV_EXPORT_QUIESCE_TIMEOUT_SECS)
-            .ok()
-            .as_deref(),
-    )
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match std::env::var(ENV_EXPORT_QUIESCE_TIMEOUT_SECS) {
+        Err(_) => EXPORT_QUIESCE_TIMEOUT,
+        Ok(raw) => parse_export_quiesce_timeout_checked(&raw).unwrap_or_else(|| {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "s3dlio: ignoring {ENV_EXPORT_QUIESCE_TIMEOUT_SECS}={raw:?} (expected seconds \
+                     between 0.001 and 86400); using the default {EXPORT_QUIESCE_TIMEOUT:?}"
+                );
+            }
+            EXPORT_QUIESCE_TIMEOUT
+        }),
+    }
 }
 
-/// Pure parser behind [`export_quiesce_timeout`].
-pub fn parse_export_quiesce_timeout(raw: Option<&str>) -> std::time::Duration {
-    raw.and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.001 && *v <= 86_400.0)
+/// Parse a seconds value: `Some` only for a finite number in `0.001..=86400`.
+pub fn parse_export_quiesce_timeout_checked(raw: &str) -> Option<std::time::Duration> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && (0.001..=86_400.0).contains(v))
         .map(std::time::Duration::from_secs_f64)
+}
+
+/// Pure parser behind [`export_quiesce_timeout`] (default on anything unusable).
+pub fn parse_export_quiesce_timeout(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(parse_export_quiesce_timeout_checked)
         .unwrap_or(EXPORT_QUIESCE_TIMEOUT)
+}
+
+#[cfg(test)]
+mod export_quiesce_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn usable_values_are_parsed() {
+        let secs = |s: &str| parse_export_quiesce_timeout(Some(s));
+        assert_eq!(secs("5"), Duration::from_secs(5));
+        assert_eq!(
+            secs(" 5 "),
+            Duration::from_secs(5),
+            "surrounding whitespace"
+        );
+        assert_eq!(secs("+5"), Duration::from_secs(5));
+        assert_eq!(secs("1e-3"), Duration::from_millis(1));
+        assert_eq!(secs("0.001"), Duration::from_millis(1));
+        assert_eq!(secs("2.5"), Duration::from_millis(2500));
+        assert_eq!(secs("86400"), Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn unusable_values_select_the_default() {
+        for raw in [
+            "", "0", "-1", "-0.5", "0.0009", "NaN", "nan", "inf", "-inf", "infinity", "86401",
+            "1e9", "garbage", "5s", "1,5",
+        ] {
+            assert_eq!(
+                parse_export_quiesce_timeout(Some(raw)),
+                EXPORT_QUIESCE_TIMEOUT,
+                "{raw:?}"
+            );
+            assert!(
+                parse_export_quiesce_timeout_checked(raw).is_none(),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(parse_export_quiesce_timeout(None), EXPORT_QUIESCE_TIMEOUT);
+    }
 }
 
 /// Payload size below which the default `put_bytes_async` snapshot is copied with the GIL

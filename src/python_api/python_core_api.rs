@@ -5,8 +5,8 @@
 
 use super::async_bridge::future_into_py;
 use super::put_payload::{
-    export_stats, hold_for_call, latch_ready, put_payload, quiesce_async, quiesce_blocking, Latch,
-    PayloadUse,
+    export_stats, hold_for_call, latch_ready, note_internal_error, put_payload, quiesce_async,
+    quiesce_blocking, Latch, PayloadUse,
 };
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
@@ -1513,7 +1513,7 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
     // raises ExportStillReferencedError. The wait is not interruptible by signals.
     if let Some(latch) = &payload.latch {
         if quiesce_blocking(py, latch).is_err() {
-            return Err(still_referenced_error(result.err().map(|e| e.to_string())));
+            return Err(still_referenced_error(&put_outcome_text(&result)));
         }
     }
     result
@@ -1528,13 +1528,35 @@ create_exception!(
      buffer stays pinned: do not modify, resize or free it."
 );
 
-fn still_referenced_error(put_error: Option<String>) -> PyErr {
+fn still_referenced_error(outcome: &str) -> PyErr {
+    ExportStillReferencedError::new_err(still_referenced_message(outcome))
+}
+
+/// The message of a barrier timeout: names the timeout value and what the put itself did.
+fn still_referenced_message(outcome: &str) -> String {
     let timeout = crate::constants::export_quiesce_timeout();
-    ExportStillReferencedError::new_err(format!(
-        "a storage backend still references the buffer {timeout:?} after the put finished; the \
-         buffer stays pinned - do not modify, resize or free it{}",
-        put_error.map_or(String::new(), |e| format!(" (the put itself failed: {e})"))
-    ))
+    format!(
+        "a storage backend still references the buffer {timeout:?} after the put finished \
+         ({outcome}); the buffer stays pinned - do not modify, resize or free it \
+         (S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS)"
+    )
+}
+
+/// The message of an INTERNAL failure of the barrier machinery (not a backend that holds on):
+/// the buffer's state is unknown, so it stays pinned.
+fn barrier_internal_message(outcome: &str, detail: &str) -> String {
+    format!(
+        "internal error in the buffer completion barrier ({detail}; {outcome}); the buffer may \
+         still be referenced and stays pinned - do not modify, resize or free it"
+    )
+}
+
+/// What the blocking `put_bytes` did, for error messages.
+fn put_outcome_text(result: &PyResult<()>) -> String {
+    match result {
+        Ok(()) => "the put itself succeeded".to_string(),
+        Err(e) => format!("the put itself failed: {e}"),
+    }
 }
 
 /// Async version of put_bytes() - accepts any bytes-like object
@@ -1557,7 +1579,10 @@ fn still_referenced_error(put_error: Option<String>) -> PyErr {
 ///   after every native reader of the buffer is done and the export has been released: a
 ///   cancellation is delivered to the caller after that point, not before, so reusing the
 ///   buffer after `CancelledError` is safe. (Cancelling therefore waits for a running native
-///   write to finish; the wait is bounded, see `s3dlio._put_export_stats()`.)
+///   write to finish; the wait is bounded, see `s3dlio._put_export_stats()`. Await the
+///   future itself: `asyncio.shield(fut)` bypasses the guard (the shield is cancelled at once
+///   while the put still reads the buffer), and `wait_for(fut, t)` can take up to `t` plus the
+///   quiesce timeout.)
 ///   Use it for large buffers you own for the duration of the call (for example pinned host
 ///   memory).
 /// * A non-contiguous view: one gather copy with the GIL held; `__bytes__()`-only object:
@@ -1597,7 +1622,9 @@ fn put_bytes_async<'py>(
             Err(e) => {
                 drop(data_owned); // nothing was spawned: this releases the (queued) export...
                 if quiesce_blocking(py, latch).is_err() {
-                    return Err(still_referenced_error(Some(e.to_string())));
+                    return Err(still_referenced_error(&format!(
+                        "the put could not be started: {e}"
+                    )));
                 }
                 return Err(e);
             }
@@ -1614,7 +1641,7 @@ fn put_bytes_async<'py>(
     let fail = |py: Python<'py>, latch: &Option<std::sync::Arc<Latch>>, e: PyErr| -> PyErr {
         if let Some(latch) = latch {
             if quiesce_blocking(py, latch).is_err() {
-                return still_referenced_error(Some(e.to_string()));
+                return still_referenced_error(&format!("the put could not be started: {e}"));
             }
         }
         e
@@ -1623,9 +1650,36 @@ fn put_bytes_async<'py>(
         Ok(i) => i,
         Err(e) => return Err(fail(py, &latch, e)),
     };
-    match guard {
-        None => Ok(inner),
-        Some(g) => g.instantiate(py, inner).map_err(|e| fail(py, &latch, e)),
+    match (guard, &latch) {
+        (Some(g), Some(latch)) => wrap_in_guard(py, g, inner, latch),
+        _ => Ok(inner),
+    }
+}
+
+/// Wrap the already-spawned put future `inner` in the `GuardedFuture`.
+///
+/// If the wrapper cannot be built (the Python class call fails: out of memory) the put is already
+/// running, so the put is cancelled first (queued work is dropped) and the call falls back to the
+/// blocking wait for the native readers before it raises. **That fallback blocks the event-loop
+/// thread** for as long as a running native write takes to finish, bounded by the quiesce timeout
+/// (`S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`); it can only happen on that failure.
+fn wrap_in_guard<'py>(
+    py: Python<'py>,
+    guard: PreparedGuard<'py>,
+    inner: Bound<'py, PyAny>,
+    latch: &std::sync::Arc<Latch>,
+) -> PyResult<Bound<'py, PyAny>> {
+    match guard.instantiate(py, inner.clone()) {
+        Ok(f) => Ok(f),
+        Err(e) => {
+            let _ = inner.call_method0("cancel");
+            if quiesce_blocking(py, latch).is_err() {
+                return Err(still_referenced_error(&format!(
+                    "the put could not be started: {e}"
+                )));
+            }
+            Err(e)
+        }
     }
 }
 
@@ -1639,24 +1693,28 @@ const PUT_GUARD_PY: &std::ffi::CStr = c_str!(
     "import asyncio
 
 class GuardedFuture(asyncio.Future):
-    def __init__(self, inner, latch_ready, quiesce, still_referenced):
+    def __init__(self, inner, latch_ready, quiesce, make_error):
         super().__init__(loop=inner.get_loop())
         self._inner = inner
         self._latch_ready = latch_ready
         self._quiesce = quiesce
-        self._still_referenced = still_referenced
+        self._make_error = make_error
         self._cancel_msg = None
         self._finishing = False
         inner.add_done_callback(self._inner_done)
 
     def cancel(self, msg=None):
         # Request cancellation of the put; this future stays pending until no native reader of
-        # the borrowed buffer remains, then ends cancelled (see _complete).
-        if self.done():
+        # the borrowed buffer remains, then ends cancelled (see _complete). When the put is
+        # already over (inner done: its outcome is fixed and only the barrier is pending) return
+        # False: a Task awaiting this future then records the cancellation itself and raises
+        # CancelledError right after the barrier completes, instead of the outcome being lost.
+        if self.done() or self._finishing:
+            return False
+        if not self._inner.cancel():
             return False
         if self._cancel_msg is None:
             self._cancel_msg = msg
-        self._inner.cancel()
         return True
 
     def _inner_done(self, inner):
@@ -1690,11 +1748,16 @@ class GuardedFuture(asyncio.Future):
 
     def _complete(self, outcome, timed_out):
         kind, value = outcome
-        if timed_out:
-            err = self._still_referenced(
-                'a storage backend still references the buffer after the put finished; '
-                'the buffer stays pinned - do not modify, resize or free it'
+        if timed_out is not False:
+            text = (
+                'the put itself succeeded' if kind == 0
+                else 'the put itself failed: %r' % (value,) if kind == 1
+                else 'the put was cancelled'
             )
+            if timed_out is True:
+                err = self._make_error('timeout', text, '')
+            else:
+                err = self._make_error('internal', text, repr(timed_out))
             if kind == 1:
                 err.__cause__ = value
             asyncio.Future.set_exception(self, err)
@@ -1712,7 +1775,7 @@ struct PreparedGuard<'py> {
     class: Bound<'py, PyAny>,
     latch_ready: Bound<'py, PyAny>,
     quiesce: Bound<'py, PyAny>,
-    still_referenced: Bound<'py, PyAny>,
+    make_error: Bound<'py, PyAny>,
 }
 
 impl<'py> PreparedGuard<'py> {
@@ -1720,7 +1783,7 @@ impl<'py> PreparedGuard<'py> {
     fn instantiate(self, py: Python<'py>, inner: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let _ = py;
         self.class
-            .call1((inner, self.latch_ready, self.quiesce, self.still_referenced))
+            .call1((inner, self.latch_ready, self.quiesce, self.make_error))
     }
 }
 
@@ -1764,11 +1827,33 @@ fn prepare_guard<'py>(
             Ok(fut.unbind())
         },
     )?;
+    // Builds the exception for a barrier failure: ('timeout'|'internal', outcome text, detail).
+    let make_error_fn = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
+              -> PyResult<Py<PyAny>> {
+            let kind: String = args.get_item(0)?.extract()?;
+            let outcome: String = args.get_item(1)?.extract()?;
+            let detail: String = args.get_item(2)?.extract()?;
+            let msg = if kind == "internal" {
+                note_internal_error();
+                barrier_internal_message(&outcome, &detail)
+            } else {
+                still_referenced_message(&outcome)
+            };
+            Ok(ExportStillReferencedError::new_err(msg)
+                .into_value(args.py())
+                .into_any())
+        },
+    )?;
     Ok(PreparedGuard {
         class,
         latch_ready: latch_ready_fn.into_any(),
         quiesce: quiesce_fn.into_any(),
-        still_referenced: py.get_type::<ExportStillReferencedError>().into_any(),
+        make_error: make_error_fn.into_any(),
     })
 }
 
@@ -1780,6 +1865,7 @@ fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("quiesce_timeouts", s.quiesce_timeouts)?;
     d.set_item("queued", s.queued)?;
+    d.set_item("internal_errors", s.internal_errors)?;
     Ok(d)
 }
 
@@ -4236,5 +4322,73 @@ mod write_chunk_uses_the_shared_payload_conversion_tests {
             body.contains("held.release(py)"),
             "the export must be released directly with the GIL token before returning"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- the borrowed-put guard (round 6).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod borrowed_put_guard_tests {
+    use super::*;
+    use pyo3::types::PyDict;
+
+    /// A guard whose class constructor raises, over a plain asyncio future standing in for the
+    /// spawned put.
+    fn failing_guard<'py>(py: Python<'py>) -> (PreparedGuard<'py>, Bound<'py, PyAny>) {
+        let locals = PyDict::new(py);
+        py.run(
+            c_str!(
+                "import asyncio\nloop = asyncio.new_event_loop()\ninner = loop.create_future()\nclass Boom:\n    def __init__(self, *a):\n        raise RuntimeError('boom')\nnoop = lambda *a: None"
+            ),
+            None,
+            Some(&locals),
+        )
+        .unwrap();
+        let get = |k: &str| locals.get_item(k).unwrap().unwrap();
+        (
+            PreparedGuard {
+                class: get("Boom"),
+                latch_ready: get("noop"),
+                quiesce: get("noop"),
+                make_error: get("noop"),
+            },
+            get("inner"),
+        )
+    }
+
+    /// Round 6, item 4: when the wrapper cannot be built after the put was spawned, the put is
+    /// CANCELLED before the (blocking) fallback wait, and the original error is raised.
+    #[test]
+    fn constructor_failure_cancels_the_put_then_waits_and_raises_the_original_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (guard, inner) = failing_guard(py);
+            let latch = Latch::new();
+            latch.mark_dropped();
+            latch.mark_released(); // no native reader: the fallback wait returns at once
+            let err = wrap_in_guard(py, guard, inner.clone(), &latch).expect_err("must fail");
+            assert!(err.to_string().contains("boom"), "{err}");
+            let cancelled: bool = inner.call_method0("cancelled").unwrap().extract().unwrap();
+            assert!(cancelled, "the already-spawned put was not cancelled");
+        });
+    }
+
+    #[test]
+    fn barrier_error_messages_name_the_timeout_and_the_put_outcome() {
+        let m = still_referenced_message("the put itself failed: disk full");
+        assert!(m.contains("30s"), "{m}");
+        assert!(m.contains("the put itself failed: disk full"), "{m}");
+        assert!(m.contains("do not modify"), "{m}");
+        let i = barrier_internal_message("the put itself succeeded", "RuntimeError('x')");
+        assert!(i.starts_with("internal error"), "{i}");
+        assert!(
+            i.contains("RuntimeError('x')") && i.contains("succeeded"),
+            "{i}"
+        );
+        assert!(!i.contains("still references"), "{i}");
+        let before = export_stats().internal_errors;
+        note_internal_error();
+        assert_eq!(export_stats().internal_errors, before + 1);
     }
 }

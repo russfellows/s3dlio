@@ -168,6 +168,13 @@ struct LatchState {
 /// Times a wait for native readers gave up (a backend kept a clone past the timeout).
 static QUIESCE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static QUIESCE_WARNED: AtomicBool = AtomicBool::new(false);
+/// Failures of the barrier machinery itself (not a backend that holds on).
+static BARRIER_INTERNAL_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Count an internal failure of the barrier (the buffer stays pinned).
+pub(crate) fn note_internal_error() {
+    BARRIER_INTERNAL_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Record that a backend did not drop its clone in time: the export STAYS PINNED (memory that is
 /// still being read is never released); log once, count always.
@@ -196,13 +203,13 @@ impl Latch {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn mark_dropped(&self) {
+    pub(crate) fn mark_dropped(&self) {
         self.lock().dropped = true;
         self.cv.notify_all();
         self.notify.notify_one();
     }
 
-    fn mark_released(&self) {
+    pub(crate) fn mark_released(&self) {
         self.lock().released = true;
     }
 
@@ -210,7 +217,6 @@ impl Latch {
         self.lock().dropped
     }
 
-    #[cfg(test)]
     pub(crate) fn is_released(&self) -> bool {
         self.lock().released
     }
@@ -253,7 +259,9 @@ pub(crate) struct QuiesceTimedOut;
 pub(crate) fn latch_ready(py: Python<'_>, latch: &Latch) -> bool {
     if latch.is_dropped() {
         drain_pending_exports(py);
-        true
+        // Ready only when the export has REALLY been released: a dropped owner whose export is
+        // not in the queue that was drained (or was abandoned) falls through to the quiesce path.
+        latch.is_released()
     } else {
         false
     }
@@ -302,12 +310,15 @@ pub(crate) struct ExportStats {
     pub(crate) quiesce_timeouts: u64,
     /// Exports waiting in the release queue right now.
     pub(crate) queued: usize,
+    /// Internal failures of the barrier machinery (buffer left pinned).
+    pub(crate) internal_errors: u64,
 }
 
 pub(crate) fn export_stats() -> ExportStats {
     ExportStats {
         quiesce_timeouts: QUIESCE_TIMEOUTS.load(Ordering::Relaxed),
         queued: QUEUE.get().map_or(0, |q| q.count.load(Ordering::Acquire)),
+        internal_errors: BARRIER_INTERNAL_ERRORS.load(Ordering::Relaxed),
     }
 }
 
@@ -1598,6 +1609,29 @@ mod tests {
             drop(p);
             assert!(latch_ready(py, &latch));
             assert!(latch.is_released());
+            assert!(resizable(ba.as_any()));
+        });
+    }
+
+    /// Round 6, item 5: `latch_ready` needs the export to be really RELEASED, not just the owner
+    /// dropped. Here the owner is dropped into a queue that the global drain does not touch.
+    #[test]
+    fn latch_ready_requires_released_as_well_as_dropped() {
+        init();
+        let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_flag(false), true);
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[3u8; 4096]);
+            let export = RawExport::acquire(ba.as_any()).unwrap().unwrap();
+            let (owner, latch) = ExportOwner::with_queue(export, queue);
+            let bytes = Bytes::from_owner(owner);
+            py.detach(move || drop(bytes));
+            assert!(latch.is_dropped());
+            assert!(
+                !latch_ready(py, &latch),
+                "ready although the export is still held"
+            );
+            queue.drain(py); // the queue that actually holds it
+            assert!(latch_ready(py, &latch));
             assert!(resizable(ba.as_any()));
         });
     }
