@@ -4,13 +4,24 @@
 
 **0.9.124 was merged but never published to PyPI, so 0.9.126 is the first published release after
 0.9.122 and it also contains every 0.9.124 change (see "Version 0.9.124" below).** This release fixes
-ten issues: #198, #208, #211, #213, #216, #218, #228, #229, #231 and #234.
+eleven issues: #198, #208, #211, #213, #216, #218, #228, #229, #231, #234 and #236.
 
 Read the two behaviour changes before upgrading: an `s3://` URI now selects the exact name, its
 directory or an explicit `*` glob and never a regex or a longer sibling (#213), and object keys that
 begin with `/` or contain `//` are used exactly as written in every layer (#198).
 
 ### Fixed
+
+- **Multipart uploads to GCS's S3-compatible endpoint no longer fail with an unexplained error (#236).**
+  Starting a multipart upload (`create_s3_writer` plain or compressed, `put_multipart`, anything that
+  begins a multipart upload) failed on Google Cloud Storage's S3-interoperability endpoint with
+  `CreateMultipartUpload failed ... service error: unknown (no message)`. The start-upload request has
+  no body, and over the default HTTPS HTTP/1.1 transport it was sent without a `Content-Length` header;
+  GCS answers that with `411 Length Required` (HTTP/2, opted in with `S3DLIO_HTTPS_H2=1`, was not
+  affected). A POST, PUT or PATCH with an empty body now carries `Content-Length: 0`, for every endpoint
+  (as RFC 9110 expects); requests with a body, and GET/HEAD/DELETE, are unchanged, and the header is
+  not part of the request signature. A service error with no readable S3 error body now also names the
+  HTTP status, for example `service error: unknown (no message) -- HTTP 411 Length Required`.
 
 - **Compressed buffered writers no longer upload a truncated, undecodable object (#218, silent
   data loss).** A buffered writer with zstd compression (`get_writer_with_compression`, or
