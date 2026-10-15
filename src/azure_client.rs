@@ -84,7 +84,9 @@ impl AzureBlob {
         format!("http://{}:{}/{}", host, port, account)
     }
 
-    /// Build with Entra ID (AAD) default chain (env, managed identity, etc).
+    /// Build with the Azure developer-tool credential (`az login`, then `azd auth login`) for
+    /// `https` endpoints; `http` endpoints (emulators) get no credential. Account-key, SAS and
+    /// service-principal environment variables are not read (see #239).
     ///
     /// Supports custom endpoints via environment variables for local emulators and proxies:
     /// - `AZURE_STORAGE_ENDPOINT`: Primary endpoint URL (e.g., http://localhost:10000)

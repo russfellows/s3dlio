@@ -1,5 +1,19 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Azure: the documentation no longer tells you to authenticate with `AZURE_STORAGE_KEY` (#239).**
+  The docs (`PYTHON_API_GUIDE.md`, `Environment_Variables.md`, `CLI_GUIDE.md`) said an Azure account key,
+  `AZURE_STORAGE_ACCOUNT`, or the service-principal variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
+  `AZURE_TENANT_ID`) authenticate s3dlio to Azure. None of them is read: s3dlio uses the Azure developer-tool
+  credential (`az login`, then `azd auth login`) for `https` endpoints and sends no credential to `http`
+  endpoints such as Azurite; the account always comes from the `az://account/container/key` URI. Account-key
+  (Shared Key) authentication was **not** implemented: the Azure SDK in use (`azure_storage_blob` 1.0.0,
+  `azure_core` 1.1.0, `azure_identity` 1.0.0) can only sign requests with bearer tokens, and signing requests
+  by hand was deliberately not done. The docs now state exactly this. Behaviour is unchanged.
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published

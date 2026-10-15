@@ -554,11 +554,21 @@ gcloud auth application-default login
 ```
 
 **Azure Blob Storage:**
+
+The storage account comes from the URI (`az://account/container/key`). Authentication
+against an `https` endpoint uses the Azure developer-tool credential: sign in with
+`az login` (Azure CLI) or `azd auth login` (Azure Developer CLI) before starting Python.
+Account keys (`AZURE_STORAGE_KEY`), SAS tokens, connection strings and service-principal
+environment variables (`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`/`AZURE_TENANT_ID`) are
+**not** supported: the Azure SDK s3dlio is built on (`azure_storage_blob` 1.0) has no Shared Key
+signing, and s3dlio does not read those variables.
+```bash
+az login          # or: azd auth login
+```
 ```python
 import os
-os.environ['AZURE_STORAGE_ACCOUNT'] = 'myaccount'
-os.environ['AZURE_STORAGE_KEY'] = 'mykey'
-# Optional custom endpoint:
+# Optional custom endpoint. An http:// endpoint (Azurite) is used without credentials;
+# an https:// endpoint still uses the az login / azd credential.
 os.environ['AZURE_STORAGE_ENDPOINT'] = 'http://127.0.0.1:10000'  # Azurite
 ```
 

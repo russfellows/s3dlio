@@ -431,13 +431,17 @@ When a URI's first segment is a server (an explicit `host:port`, see above), s3d
 
 ## Azure Blob Storage Configuration
 
+**Authentication.** The storage account is taken from the URI (`az://account/container/key`).
+For an `https` endpoint s3dlio authenticates with the Azure developer-tool credential: run
+`az login` (Azure CLI) or `azd auth login` (Azure Developer CLI) first. For an `http` endpoint
+(for example Azurite) no credential is sent. s3dlio does **not** read `AZURE_STORAGE_ACCOUNT`,
+`AZURE_STORAGE_KEY`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`, SAS tokens or
+connection strings; setting them has no effect. Account-key (Shared Key) authentication is not
+available because the Azure SDK in use (`azure_storage_blob` 1.0 / `azure_core` 1.1) only signs
+requests with bearer tokens (tracked in #239).
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AZURE_STORAGE_ACCOUNT` | (unset) | Azure storage account name |
-| `AZURE_STORAGE_KEY` | (unset) | Azure storage account key |
-| `AZURE_CLIENT_ID` | (unset) | Azure AD client ID (for service principal auth) |
-| `AZURE_CLIENT_SECRET` | (unset) | Azure AD client secret |
-| `AZURE_TENANT_ID` | (unset) | Azure AD tenant ID |
 | `AZURE_STORAGE_ENDPOINT` | (unset) | **Custom Azure endpoint** (e.g., `http://localhost:10000` for Azurite) |
 | `AZURE_BLOB_ENDPOINT_URL` | (unset) | Alternative for `AZURE_STORAGE_ENDPOINT` |
 | `S3DLIO_AZURE_DOWNLOAD_MODE` | `auto` | Download strategy: `auto`, `azure-sdk`, `s3dlio`, or `sequential` |

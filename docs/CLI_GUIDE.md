@@ -522,8 +522,10 @@ s3-cli --op-log sorted.tsv.zst ls -r s3://bucket/
 ### Azure Configuration
 | Variable | Description |
 |----------|-------------|
-| `AZURE_STORAGE_ACCOUNT` | Storage account name |
 | `AZURE_STORAGE_ENDPOINT` | Custom endpoint (Azurite, etc.) |
+
+The account comes from the URI (`az://account/container/key`); authenticate with `az login` or
+`azd auth login`. See `Environment_Variables.md` for details.
 
 ### GCS Configuration
 | Variable | Description |
