@@ -4,7 +4,7 @@
 
 **0.9.124 was merged but never published to PyPI, so 0.9.126 is the first published release after
 0.9.122 and it also contains every 0.9.124 change (see "Version 0.9.124" below).** This release fixes
-six issues: #198, #208, #211, #213, #216 and #218.
+seven issues: #198, #208, #211, #213, #216, #218 and #228.
 
 Read the two behaviour changes before upgrading: an `s3://` URI now selects the exact name, its
 directory or an explicit `*` glob and never a regex or a longer sibling (#213), and object keys that
@@ -47,6 +47,11 @@ begin with `/` or contain `//` are used exactly as written in every layer (#198)
   `S3DLIO_RT_THREADS`, `S3DLIO_MAX_RETRY_ATTEMPTS`, ...) now share one crate-wide lock and restore the
   variables and atomics in a `Drop` guard, so a failed assertion can no longer leak them into later tests.
   No production behaviour changes.
+- **A directory removed through s3dlio now appears in the op-log (#228).** A directory removed through
+  s3dlio, recursive or not (a recursive removal of a whole tree included), now appears in the op-log as
+  one `DELETE_PREFIX` row on the directory (count 0; the error text if the removal failed). Before, the
+  removal left no row at all. This is not a format change: `DELETE_PREFIX` is an existing op name.
+  `mkdir` is still not recorded.
 - **Object keys are used exactly as written in every layer (#198).** See the details below.
 
 ### Changed — which objects an `s3://` URI selects: the exact name, its directory, or an explicit `*` glob; never a regex, never a bare prefix (INTENTIONAL BEHAVIOUR CHANGE) (#213)
