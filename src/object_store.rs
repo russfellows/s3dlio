@@ -18,35 +18,6 @@ use tokio::sync::OnceCell;
 use tracing::trace;
 use tracing::{debug, info, warn};
 
-// Helper function for integrity validation: the bare, lowercase CRC-32C hex of `data`.
-fn compute_checksum(data: &[u8]) -> String {
-    let mut hasher = Crc32c::new();
-    hasher.update(data);
-    format!("{:08x}", hasher.finalize())
-}
-
-/// The CRC-32C hex an expected-checksum string asks for (issue #259).
-///
-/// The canonical form is `<algorithm>:<hex>`, the one writers report and checkpoint
-/// manifests store (`crc32c:e3069283`). The algorithm name is matched case-insensitively
-/// and only `crc32c` is supported: any other algorithm is an error that says so, never a
-/// "mismatch". A bare hex string (no `:`) is accepted as CRC-32C, for callers that compute
-/// it themselves. The hex digits are compared case-insensitively.
-fn expected_crc32c_hex(expected: &str) -> Result<String> {
-    let expected = expected.trim();
-    match expected.split_once(':') {
-        None => Ok(expected.to_ascii_lowercase()),
-        Some((alg, hex)) if alg.trim().eq_ignore_ascii_case("crc32c") => {
-            Ok(hex.trim().to_ascii_lowercase())
-        }
-        Some((alg, _)) => bail!(
-            "unsupported checksum algorithm '{}' in expected checksum '{}' (supported: crc32c)",
-            alg.trim(),
-            expected
-        ),
-    }
-}
-
 // --- S3 ----------------------------------------------------------------------
 use crate::delete_batch_plan::{
     aggregate_failures, global_client_server, group_uris_by_bucket, parse_s3_uri_for_server,
@@ -450,33 +421,29 @@ pub trait ObjectStore: Send + Sync {
     }
 
     /// Get object with integrity validation.
-    /// Returns the data and validates it against the expected checksum if provided.
+    ///
+    /// `expected_checksum` is `<algorithm>:<hex>` (what writers report and manifests
+    /// store; only `crc32c` is supported) or bare CRC-32C hex; see
+    /// [`crate::checksum::parse_expected_crc32c`]. An unsupported or malformed value is an
+    /// error before anything is fetched. Returns the data once it matches.
     async fn get_with_validation(
         &self,
         uri: &str,
         expected_checksum: Option<&str>,
     ) -> Result<Bytes> {
-        // An unsupported algorithm is refused before any data is fetched.
-        let wanted = expected_checksum.map(expected_crc32c_hex).transpose()?;
-        let data = self.get(uri).await?;
-
-        if let (Some(expected), Some(wanted)) = (expected_checksum, wanted) {
-            let actual = compute_checksum(&data);
-            if actual != wanted {
-                bail!(
-                    "Integrity validation failed for {}: expected {}, got {}",
-                    uri,
-                    expected,
-                    actual
-                );
-            }
+        if let Some(expected) = expected_checksum {
+            crate::checksum::parse_expected_crc32c(expected)?;
         }
-
+        let data = self.get(uri).await?;
+        if let Some(expected) = expected_checksum {
+            crate::checksum::verify_crc32c(&data, expected, uri)?;
+        }
         Ok(data)
     }
 
     /// Get byte range with integrity validation.
-    /// For partial reads, validates against the partial data checksum if provided.
+    /// For partial reads, validates against the partial data checksum if provided
+    /// (same checksum forms as [`ObjectStore::get_with_validation`]).
     async fn get_range_with_validation(
         &self,
         uri: &str,
@@ -484,48 +451,31 @@ pub trait ObjectStore: Send + Sync {
         length: Option<u64>,
         expected_checksum: Option<&str>,
     ) -> Result<Bytes> {
-        let wanted = expected_checksum.map(expected_crc32c_hex).transpose()?;
-        let data = self.get_range(uri, offset, length).await?;
-
-        if let (Some(expected), Some(wanted)) = (expected_checksum, wanted) {
-            let actual = compute_checksum(&data);
-            if actual != wanted {
-                bail!(
-                    "Integrity validation failed for range {}[{}:{}]: expected {}, got {}",
-                    uri,
-                    offset,
-                    offset + data.len() as u64,
-                    expected,
-                    actual
-                );
-            }
+        if let Some(expected) = expected_checksum {
+            crate::checksum::parse_expected_crc32c(expected)?;
         }
-
+        let data = self.get_range(uri, offset, length).await?;
+        if let Some(expected) = expected_checksum {
+            let what = format!("range {}[{}:{}]", uri, offset, offset + data.len() as u64);
+            crate::checksum::verify_crc32c(&data, expected, &what)?;
+        }
         Ok(data)
     }
 
     /// Load and validate checkpoint data with integrity checking.
     /// This method is specifically designed for checkpoint loading scenarios.
+    /// (Same checksum forms as [`ObjectStore::get_with_validation`].)
     async fn load_checkpoint_with_validation(
         &self,
         checkpoint_uri: &str,
         expected_checksum: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let wanted = expected_checksum.map(expected_crc32c_hex).transpose()?;
-        // Get checkpoint data
+        if let Some(expected) = expected_checksum {
+            crate::checksum::parse_expected_crc32c(expected)?;
+        }
         let data = self.get(checkpoint_uri).await?;
-
-        // Validate integrity if checksum provided
-        if let (Some(expected), Some(wanted)) = (expected_checksum, wanted) {
-            let actual = compute_checksum(&data);
-            if actual != wanted {
-                bail!(
-                    "Checkpoint integrity validation failed for {}: expected checksum {}, got {}",
-                    checkpoint_uri,
-                    expected,
-                    actual
-                );
-            }
+        if let Some(expected) = expected_checksum {
+            crate::checksum::verify_crc32c(&data, expected, checkpoint_uri)?;
         }
 
         // Convert Bytes to Vec<u8> for backward compatibility
