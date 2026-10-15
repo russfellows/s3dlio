@@ -406,6 +406,14 @@ pub trait ObjectStore: Send + Sync {
     async fn delete_batch(&self, uris: &[String]) -> Result<()>;
 
     /// Delete all objects under a prefix.
+    ///
+    /// The prefix names a directory-like name, never a string prefix of longer
+    /// names (#231).  On every object store (S3, Azure, GCS) a non-empty key
+    /// prefix that does not end in `/` gets one `/` appended before listing, so
+    /// `delete_prefix(".../foo")` deletes only objects under `foo/`, never
+    /// siblings such as `foobar`, `foo.bak` or `foo2/...`.  An empty key prefix
+    /// (the bucket / container root) deletes everything.  The prefix is matched
+    /// literally: no wildcard.
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()>;
 
     /// Create a top-level container (S3: bucket; Azure: container; File: directory).
@@ -1854,10 +1862,8 @@ impl ObjectStore for S3ObjectStore {
         use futures::stream::StreamExt;
         debug!("S3ObjectStore::delete_prefix prefix='{}'", uri_prefix);
 
-        let (bucket, mut key_prefix) = self.parse_uri_for_this_store(uri_prefix)?;
-        if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
-            key_prefix.push('/');
-        }
+        let (bucket, key_prefix) = self.parse_uri_for_this_store(uri_prefix)?;
+        let key_prefix = directory_prefix(&key_prefix);
 
         if let Some(client) = &self.client {
             let listed = Self::list_with_client(client, &bucket, &key_prefix, true).await?;
@@ -2274,9 +2280,31 @@ impl ObjectWriter for S3BufferedWriter {
     }
 }
 
+/// The listing prefix `delete_prefix` uses on every object store (#231): a
+/// non-empty key that does not end in `/` gets one `/` appended, so the name
+/// selects only the objects under it and never longer siblings (`foo` selects
+/// `foo/...`, not `foobar` or `foo.bak`).  An empty key (bucket / container
+/// root) is unchanged.  The key is treated literally; nothing else is altered.
+/// Shared by the S3, Azure and GCS stores so they cannot drift.
+fn directory_prefix(key: &str) -> String {
+    let mut prefix = key.to_string();
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    prefix
+}
+
 // ============================================================================
 // Azure adapter
 // ============================================================================
+/// `(account, container, listing_prefix)` for an Azure `delete_prefix` URI.
+/// A pure step (no client, no request) so the listing prefix can be tested.
+#[cfg(feature = "backend-azure")]
+fn azure_delete_prefix_target(uri_prefix: &str) -> Result<(String, String, String)> {
+    let (account, container, key) = parse_azure_uri(uri_prefix)?;
+    Ok((account, container, directory_prefix(&key)))
+}
+
 #[cfg(feature = "backend-azure")]
 fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     // Supports:
@@ -2841,7 +2869,8 @@ impl ObjectStore for AzureObjectStore {
         use futures::stream::StreamExt;
         debug!("AzureObjectStore::delete_prefix prefix='{}'", uri_prefix);
 
-        let (cli, _acct, _cont, key_prefix) = Self::client_for_prefix(uri_prefix)?;
+        let (account, container, key_prefix) = azure_delete_prefix_target(uri_prefix)?;
+        let cli = AzureBlob::with_default_credential(&account, &container)?;
 
         // Use streaming list to avoid loading millions of keys into memory
         let mut stream = cli.list_stream(Some(&key_prefix));
@@ -3216,6 +3245,29 @@ impl Default for GcsObjectStore {
     }
 }
 
+/// `(bucket, listing_prefix)` for a GCS `delete_prefix` URI.  A pure step (no
+/// client, no request) so the listing prefix can be tested (#231).
+#[cfg(feature = "backend-gcs")]
+fn gcs_delete_prefix_target(uri_prefix: &str) -> Result<(String, String)> {
+    let (bucket, key_prefix) = parse_gcs_uri(uri_prefix).or_else(|_| {
+        // Handle bucket-only URIs
+        if let Some(rest) = uri_prefix
+            .strip_prefix("gs://")
+            .or_else(|| uri_prefix.strip_prefix("gcs://"))
+        {
+            let bucket = rest.trim_end_matches('/').to_string();
+            if !bucket.is_empty() {
+                return Ok((bucket, String::new()));
+            }
+        }
+        bail!(
+            "Invalid GCS URI for delete_prefix operation: {}",
+            uri_prefix
+        )
+    })?;
+    Ok((bucket, directory_prefix(&key_prefix)))
+}
+
 #[cfg(feature = "backend-gcs")]
 impl GcsObjectStore {
     pub fn new() -> Self {
@@ -3473,22 +3525,7 @@ impl ObjectStore for GcsObjectStore {
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         debug!("GcsObjectStore::delete_prefix prefix='{}'", uri_prefix);
-        let (bucket, key_prefix) = parse_gcs_uri(uri_prefix).or_else(|_| {
-            // Handle bucket-only URIs
-            if let Some(rest) = uri_prefix
-                .strip_prefix("gs://")
-                .or_else(|| uri_prefix.strip_prefix("gcs://"))
-            {
-                let bucket = rest.trim_end_matches('/').to_string();
-                if !bucket.is_empty() {
-                    return Ok((bucket, String::new()));
-                }
-            }
-            bail!(
-                "Invalid GCS URI for delete_prefix operation: {}",
-                uri_prefix
-            )
-        })?;
+        let (bucket, key_prefix) = gcs_delete_prefix_target(uri_prefix)?;
 
         let client = self.get_client().await?;
 
@@ -5321,5 +5358,52 @@ mod delete_batch_grouping_tests {
             .collect();
         let err = group_uris_by_bucket(&uris, azure_group_key).unwrap_err();
         assert!(format!("{err:#}").contains("s3://nope/b"));
+    }
+}
+
+// #231: `delete_prefix` must never select longer siblings.  S3, Azure and GCS
+// all compute their listing prefix through `directory_prefix`.  Azure and GCS
+// have no mock server, so the pure target-computation step each store's
+// `delete_prefix` calls is tested here.
+#[cfg(test)]
+mod delete_prefix_listing_tests {
+    use super::*;
+
+    #[test]
+    fn directory_prefix_appends_one_slash_to_a_non_empty_key() {
+        assert_eq!(directory_prefix("foo"), "foo/");
+        assert_eq!(directory_prefix("foo/"), "foo/");
+        assert_eq!(directory_prefix(""), "");
+        assert_eq!(directory_prefix("a//b"), "a//b/");
+        assert_eq!(directory_prefix("/x"), "/x/");
+        assert_eq!(directory_prefix("a/b"), "a/b/");
+        // Literal: wildcard characters are not interpreted.
+        assert_eq!(directory_prefix("foo*"), "foo*/");
+    }
+
+    #[cfg(feature = "backend-gcs")]
+    #[test]
+    fn gcs_delete_prefix_lists_only_under_the_directory() {
+        let t = |u: &str| gcs_delete_prefix_target(u).expect(u);
+        assert_eq!(t("gs://b/foo"), ("b".to_string(), "foo/".to_string()));
+        assert_eq!(t("gs://b/foo/"), ("b".to_string(), "foo/".to_string()));
+        assert_eq!(t("gs://b"), ("b".to_string(), String::new()));
+        assert_eq!(t("gs://b/"), ("b".to_string(), String::new()));
+        assert_eq!(t("gcs://b/foo"), ("b".to_string(), "foo/".to_string()));
+        assert!(gcs_delete_prefix_target("gs://").is_err());
+        assert!(gcs_delete_prefix_target("s3://b/foo").is_err());
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn azure_delete_prefix_lists_only_under_the_directory() {
+        let t = |u: &str| azure_delete_prefix_target(u).expect(u);
+        let want = |p: &str| ("acct".to_string(), "c".to_string(), p.to_string());
+        assert_eq!(t("az://acct/c/foo"), want("foo/"));
+        assert_eq!(t("az://acct/c/foo/"), want("foo/"));
+        assert_eq!(t("az://acct/c"), want(""));
+        assert_eq!(t("az://acct/c/"), want(""));
+        assert_eq!(t("https://acct.blob.core.windows.net/c/foo"), want("foo/"));
+        assert!(azure_delete_prefix_target("s3://b/foo").is_err());
     }
 }

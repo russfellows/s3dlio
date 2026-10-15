@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Azure and GCS `delete_prefix` now deletes only objects under `<prefix>/`, as on S3 (#231).** Before, it also deleted sibling objects whose names merely started with the prefix (`delete_prefix("gs://b/foo")` also removed `foobar`, `foo.bak`, `foo2/...`).
+
 - **`mkdir` / `rmdir` no longer fail outside `file://` (#229).** They used to work only on
   `file://`; on `direct://`, `s3://`, `az://` and `gs://` they failed with "not implemented for
   this backend", although the docs promised them, and so did the DLIO adapters' `create_node`
