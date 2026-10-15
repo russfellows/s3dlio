@@ -1,6 +1,14 @@
 # s3dlio Changelog
 
-## Unreleased
+## [0.9.126] - 2026-10-15
+
+**0.9.124 was merged but never published to PyPI, so 0.9.126 is the first published release after
+0.9.122 and it also contains every 0.9.124 change (see "Version 0.9.124" below).** This release fixes
+six issues: #198, #208, #211, #213, #216 and #218.
+
+Read the two behaviour changes before upgrading: an `s3://` URI now selects the exact name, its
+directory or an explicit `*` glob and never a regex or a longer sibling (#213), and object keys that
+begin with `/` or contain `//` are used exactly as written in every layer (#198).
 
 ### Fixed
 
@@ -15,8 +23,31 @@
   object could not be decompressed. Small payloads were unaffected, which is why it went unnoticed. `finalize()` now appends the end of the stream to what was already collected. Data
   written through an affected writer before this fix, if large, is not recoverable from the stored
   object; write it again. `file://`, `direct://` and the arrow-backend writers were not affected.
-
-Fixes #213.
+- **A per-endpoint store runs every operation on ITS server, whatever the object size (#208).** A store
+  that holds a client of its own (`S3ObjectStore::for_endpoint`, or an `s3://host:port/...` URI) read
+  large objects (the concurrent range GET above the threshold), uploaded with `put_multipart` and
+  finalised a buffered writer through the process-wide client, the server `AWS_ENDPOINT_URL` names.
+  Since 0.9.122 those paths were rejected with a "not yet supported" error unless the store's server was
+  the process-wide one. They now use the store's own client for the size lookup, the single-range
+  fallback, every ranged GET, and CreateMultipartUpload / UploadPart / CompleteMultipartUpload /
+  AbortMultipartUpload. A URI that names a DIFFERENT server than the store's is still refused.
+- **A concurrency, chunk or worker limit of 0 is an error instead of a hang or a crash (#211).** A caller
+  limit of 0 built a semaphore with no permits (the first acquire never completed) or, for a chunk size
+  of 0, pushed range after range until memory ran out. Every entry point that takes such a limit now
+  refuses 0 first, with an error naming the parameter and the range ("max_in_flight must be an integer
+  >= 1 ... got 0"); nothing is substituted. Python raises `ValueError` before any work starts for `put`,
+  `put_async`, `get_many*`, `put_many*`, `download`, `upload`, `mp_get` (`jobs` and `procs`; `procs=0`
+  used to divide by zero) and `MultipartUploadWriter(..., max_in_flight=0)`. Rust: the parallel get/put
+  helpers, the concurrent range GET (`max_concurrency` and `chunk_size` of `Some(0)`, on the
+  process-wide path AND the per-endpoint path), `s3_copy::upload_files|download_objects|download_objects_matching`,
+  `generic_upload_files`, `generic_download_objects[_with_summary]`,
+  `generic_download_objects_matching_with_summary`, `pre_stat_objects`, `RangeEngine::download`,
+  `mp::run_get_shards`. The CLI rejects 0 for `-j/--jobs` and `--concurrent`. `put(num=0)` is unchanged.
+- **Test-only (#216):** unit tests that set process environment variables (`OMPI_COMM_WORLD_SIZE`,
+  `S3DLIO_RT_THREADS`, `S3DLIO_MAX_RETRY_ATTEMPTS`, ...) now share one crate-wide lock and restore the
+  variables and atomics in a `Drop` guard, so a failed assertion can no longer leak them into later tests.
+  No production behaviour changes.
+- **Object keys are used exactly as written in every layer (#198).** See the details below.
 
 ### Changed — which objects an `s3://` URI selects: the exact name, its directory, or an explicit `*` glob; never a regex, never a bare prefix (INTENTIONAL BEHAVIOUR CHANGE) (#213)
 
@@ -119,7 +150,9 @@ key is removed.
   normalisation: the namespace loses its trailing `/` and the name its leading `/`, so
   `put_data("/train/f.npz")` under `s3://b/base` still writes `base/train/f.npz` (not `base//train/f.npz`).
   It is not established that DLIO supplies object keys rather than such names, and re-keying them would
-  make existing datasets disappear. No DLIO config needs to change.
+  make existing datasets disappear. Namespace-relative names are unchanged from 0.9.124;
+  full-URI names are used exactly, so a full URI containing `//` addresses the exact key (a full-URI
+  id such as `s3://b//dir/` now lists the prefix `/dir/`, where 0.9.124 listed `dir/`).
 - **`s3dlio.compat.s3torchconnector`**: `S3Item.key` for `s3://b//k` is `/k` (was `k`), as AWS's own
   `s3torchconnector` does (its `parse_s3_uri` splits at the first `/` and strips nothing);
   `S3Client.put_object` / `get_object` / `list_objects` address the key and prefix exactly (a
@@ -139,6 +172,18 @@ key is removed.
 - **Op-log replay onto a target** (`translate_uri`): a row for the object `/x` (logged `bkt//x`) replays
   to `<target>//x`, no longer `<target>/x`. Rows that are not a shape s3dlio writes (hand-written,
   legacy `S3Ops` `endpoint`+bare key) still lose one leading `/` of `file`, as pinned since #184.
+
+### Added
+
+- `s3-cli download -p/--pattern <REGEX>` and `s3-cli get -p/--pattern <REGEX>`: the explicit regex
+  that replaces the one those commands used to read out of the URI (#213, details above).
+- Library (#213): `s3dlio::s3_selection` (the one selection rule), `s3dlio::list_pattern::ListPattern`,
+  `s3_copy::download_objects_matching(src_uri, pattern, ...)` and
+  `generic_download_objects_matching_with_summary(..., pattern, ...)`.
+- Library (#208): `S3ObjectStore` per-endpoint reads and writes need no new API; the helpers
+  `get_object_concurrent_range_with_client` and `put_object_multipart_with_client` are crate-private.
+- Test support: the in-process mock S3 can be seeded with a bucket catalog that honours prefix,
+  delimiter, `max-keys` and paging, and removes the keys a delete names.
 
 ## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
 
@@ -226,7 +271,7 @@ entry). **Code that relied on the old implicit expansion will now delete less; p
 - The op-log records an exact delete as one `DELETE` row, as before; no `HEAD` row is added.
   `recursive=True` records one `LIST` row plus one `DELETE` row per object (replayable), not
   `DELETE_BATCH`.
-- (The prefix rule in this entry is superseded in the next release: see "Unreleased", #213 -- `foo` selects the object `foo` and `foo/...`, never `foobar`.)
+- (The prefix rule in this entry is superseded in 0.9.126: see [0.9.126], #213 -- `foo` selects the object `foo` and `foo/...`, never `foobar`.)
 - `delete(uri, recursive=True)` deletes the real objects under the literal prefix: listed with no
   delimiter, objects only, nothing appended (`foo` also matches `foobar`), `*` and `?` literal (the last
   URI segment used to be read as a regex). It needs list permission. A prefix with no objects is a
@@ -260,7 +305,7 @@ implicit expansion will now delete less; add `-r` where you mean "everything und
   given it adds that only the object named by the exact URI was targeted and to use `-r` for
   everything under a prefix. On a **versioned bucket** a delete adds a delete marker and does not erase
   earlier versions.
-- (The `delete -r s3://bkt/foo` prefix rule below is superseded in the next release: see "Unreleased", #213.)
+- (The `delete -r s3://bkt/foo` prefix rule below is superseded in 0.9.126: see [0.9.126], #213.)
 - `delete -r s3://bkt/foo/` deletes the real objects under the literal prefix `foo/` (recursive listing
   with no delimiter; synthetic common-prefix entries are never delete candidates). It needs list
   permission. `delete -r s3://bkt/foo` uses the literal prefix `foo`, so it also matches `foobar` (no
