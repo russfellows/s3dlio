@@ -1,5 +1,12 @@
 # s3dlio Changelog
 
+## Unreleased
+
+- **Op-log records `rmdir` (#228).** A directory removed through s3dlio, including a recursive
+  removal of a whole tree, now appears in the op-log as a `DELETE_PREFIX` row on the directory
+  (count 0; the error text if the removal failed). Before, the removal left no row at all. This
+  is not a format change: `DELETE_PREFIX` is an existing op name. `mkdir` is still not recorded.
+
 ## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
 
 Fixes 12 issues: #167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215.

@@ -64,8 +64,11 @@ records it, the rows and requests per operation, and the proposals for operation
 write no row. On a logged store `copy` and `rename` are recorded as the real requests
 they are on S3/Azure/GCS (`copy` = GET + PUT, `rename` = GET + PUT + DELETE) and
 `pre_stat_*` as one HEAD per object; only a native operation (the `rename(2)` of
-`file://` / `direct://`) and `mkdir`, `rmdir`, `update_metadata`, `update_properties`
-(which have no op name in the format) are forwarded without a row.
+`file://` / `direct://`) and `mkdir`, `update_metadata`, `update_properties` (which have
+no op name in the format) are forwarded without a row. `rmdir`, recursive or not, is
+recorded as one `DELETE_PREFIX` row on the directory URI (count 0, no first byte, the
+error text if it fails), the same shape `delete_prefix` writes; no new op name, so the
+format is unchanged (#228).
 
 ### Known gaps
 
