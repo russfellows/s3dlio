@@ -342,6 +342,8 @@ fn get_range_threshold_bytes() -> u64 {
 /// and cause redundant HEAD requests on every subsequent epoch.
 /// Populated by get_object_uri_optimized_async() on each HEAD and by the
 /// pre-stat phase in get_objects_parallel(). Cache hits skip HEAD entirely.
+/// Bounded (issue #241): at most S3DLIO_SIZE_CACHE_MAX_ENTRIES entries, oldest
+/// evicted first; an expired entry is removed when a lookup finds it.
 fn get_size_cache() -> &'static Arc<ObjectSizeCache> {
     GLOBAL_SIZE_CACHE.get_or_init(|| {
         let ttl_secs = std::env::var("S3DLIO_SIZE_CACHE_TTL_SECS")

@@ -125,6 +125,39 @@ pub fn max_retry_attempts() -> u32 {
         .max(1)
 }
 
+/// Default maximum number of entries in an [`ObjectSizeCache`]
+/// (`crate::object_size_cache`), including the process-global one used by
+/// the S3 read path.
+///
+/// 1 Mi (1,048,576) entries.  A cache entry costs on the order of 150 bytes
+/// (the URI, an expiry timestamp, an eviction-order record), so a full cache
+/// is roughly 150 MB -- reached only by a process that has stat'ed or read
+/// more than a million distinct objects within the cache TTL.  The limit is
+/// deliberately large: the cache exists so that the second and later epochs
+/// of a training run skip the per-object HEAD, and when the dataset has more
+/// objects than the limit, the oldest sizes are dropped first, so a dataset
+/// larger than the limit is only partly cached.  Override with
+/// `S3DLIO_SIZE_CACHE_MAX_ENTRIES`.
+pub const DEFAULT_SIZE_CACHE_MAX_ENTRIES: usize = 1_048_576;
+
+/// Environment variable name for the size-cache entry limit.
+///
+/// See [`DEFAULT_SIZE_CACHE_MAX_ENTRIES`].  Read by [`size_cache_max_entries()`].
+pub const ENV_SIZE_CACHE_MAX_ENTRIES: &str = "S3DLIO_SIZE_CACHE_MAX_ENTRIES";
+
+/// Resolve the effective size-cache entry limit.
+///
+/// Reads [`ENV_SIZE_CACHE_MAX_ENTRIES`] on each call (cheap; called only when
+/// a cache is constructed); falls back to [`DEFAULT_SIZE_CACHE_MAX_ENTRIES`]
+/// when unset or unparseable.  Clamped to a minimum of 1.
+pub fn size_cache_max_entries() -> usize {
+    std::env::var(ENV_SIZE_CACHE_MAX_ENTRIES)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(DEFAULT_SIZE_CACHE_MAX_ENTRIES)
+        .max(1)
+}
+
 /// Resolve the MPI/distributed-training world size for this process.
 ///
 /// Checked env vars (first one found wins):
@@ -967,6 +1000,41 @@ mod connect_timeout_tests {
         with_var(Some(""), || {
             assert_eq!(connect_timeout_secs(), DEFAULT_CONNECT_TIMEOUT_SECS);
         });
+    }
+}
+
+#[cfg(test)]
+mod size_cache_limit_tests {
+    use super::*;
+
+    fn with_var<F: FnOnce()>(value: Option<&str>, body: F) {
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&[ENV_SIZE_CACHE_MAX_ENTRIES]);
+        match value {
+            Some(v) => std::env::set_var(ENV_SIZE_CACHE_MAX_ENTRIES, v),
+            None => std::env::remove_var(ENV_SIZE_CACHE_MAX_ENTRIES),
+        }
+        body();
+    }
+
+    #[test]
+    fn test_size_cache_limit_default_when_unset() {
+        with_var(None, || {
+            assert_eq!(size_cache_max_entries(), DEFAULT_SIZE_CACHE_MAX_ENTRIES);
+        });
+    }
+
+    #[test]
+    fn test_size_cache_limit_honors_override() {
+        with_var(Some("1234"), || assert_eq!(size_cache_max_entries(), 1234));
+    }
+
+    #[test]
+    fn test_size_cache_limit_garbage_falls_back_and_zero_clamps() {
+        with_var(Some("lots"), || {
+            assert_eq!(size_cache_max_entries(), DEFAULT_SIZE_CACHE_MAX_ENTRIES);
+        });
+        with_var(Some("0"), || assert_eq!(size_cache_max_entries(), 1));
     }
 }
 

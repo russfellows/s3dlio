@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- **The object size cache no longer grows without bound (#241).** The process-global size cache (and
+  the per-store size caches) never removed anything: an expired entry was treated as a miss but left in
+  memory, and nothing called the cleanup routine, so a long-running process that touched many distinct
+  objects (a KV-cache tier, a data loader over a very large dataset) kept growing. A lookup that finds
+  an expired entry now removes it, and the cache holds at most 1,048,576 entries (about 150 MB); when a
+  new object arrives at the limit the entry written longest ago, which is also the one closest to
+  expiry, is evicted. Set `S3DLIO_SIZE_CACHE_MAX_ENTRIES` to change the limit. The TTL
+  (`S3DLIO_SIZE_CACHE_TTL_SECS`) and cache hits behave as before.
+
 - **A GET of a missing or forbidden object no longer retries (#240).** The retry loop around S3 GETs
   (`S3DLIO_MAX_RETRY_ATTEMPTS`, 100 ms x attempt backoff) retried every error, including a definite
   answer from the server such as `404 NoSuchKey` or `403 AccessDenied`, so each GET of a missing key
