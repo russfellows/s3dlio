@@ -17,7 +17,9 @@ use crate::s3_client::global_rt_handle;
 /// This buffer is allocated with specific alignment requirements (typically 4096 bytes)
 /// to satisfy O_DIRECT constraints when file I/O is needed, while also being optimal
 /// for memory-only operations.
-#[derive(Debug, Clone)]
+///
+/// Deliberately NOT `Clone`: a derived clone would copy the pointer and free it twice.
+#[derive(Debug)]
 pub struct AlignedBuf {
     ptr: NonNull<u8>,
     len: usize,
@@ -28,19 +30,27 @@ unsafe impl Send for AlignedBuf {}
 unsafe impl Sync for AlignedBuf {}
 
 impl AlignedBuf {
-    /// Create a new aligned buffer with the specified size and alignment
+    /// Create a new aligned buffer with the specified size and alignment.
+    ///
+    /// The memory is NOT initialised. Returns an error (never panics) when `align` is not
+    /// a non-zero power of two, the size overflows, or the allocation fails, so callers
+    /// can fall back to a smaller buffer or to buffered I/O.
     ///
     /// # Arguments
-    /// * `len` - Buffer size in bytes
+    /// * `len` - Buffer size in bytes (0 is allowed: an empty buffer that owns no memory)
     /// * `align` - Alignment requirement (typically 4096 for O_DIRECT)
-    pub fn new(len: usize, align: usize) -> Self {
-        let layout =
-            Layout::from_size_align(len, align).expect("Invalid layout for aligned buffer");
-        let ptr = unsafe {
-            let raw_ptr = alloc(layout);
-            NonNull::new(raw_ptr).expect("Failed to allocate aligned buffer")
-        };
-        Self { ptr, len, layout }
+    pub fn new(len: usize, align: usize) -> Result<Self, AlignedAllocError> {
+        let err = AlignedAllocError { len, align };
+        let layout = Layout::from_size_align(len, align).map_err(|_| err)?;
+        if len == 0 {
+            // `alloc` with a zero-size layout is undefined behaviour: own nothing.
+            let ptr = NonNull::new(align as *mut u8).ok_or(err)?;
+            return Ok(Self { ptr, len, layout });
+        }
+        // SAFETY: `layout` has a non-zero size.
+        let raw_ptr = unsafe { alloc(layout) };
+        let ptr = NonNull::new(raw_ptr).ok_or(err)?;
+        Ok(Self { ptr, len, layout })
     }
 
     /// Get a mutable slice view of the buffer
@@ -81,11 +91,35 @@ impl AlignedBuf {
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        unsafe {
-            dealloc(self.ptr.as_ptr(), self.layout);
+        if self.layout.size() != 0 {
+            // SAFETY: allocated in `new` with exactly this layout.
+            unsafe {
+                dealloc(self.ptr.as_ptr(), self.layout);
+            }
         }
     }
 }
+
+/// An aligned allocation could not be made (bad alignment, size overflow or out of memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignedAllocError {
+    /// Requested size in bytes.
+    pub len: usize,
+    /// Requested alignment in bytes.
+    pub align: usize,
+}
+
+impl std::fmt::Display for AlignedAllocError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot allocate {} bytes aligned to {}",
+            self.len, self.align
+        )
+    }
+}
+
+impl std::error::Error for AlignedAllocError {}
 
 /// High-performance buffer pool for aligned buffers
 ///
@@ -130,7 +164,9 @@ impl BufferPool {
         let pool_clone = pool.clone();
         global_rt_handle().spawn(async move {
             for _ in 0..capacity {
-                let buf = AlignedBuf::new(buf_len, align);
+                let Ok(buf) = AlignedBuf::new(buf_len, align) else {
+                    break; // out of memory: `take()` reports it to the caller that needs a buffer
+                };
                 if pool_clone.tx.send(buf).await.is_err() {
                     break; // Pool was dropped
                 }
@@ -140,15 +176,17 @@ impl BufferPool {
         pool
     }
 
-    /// Take a buffer from the pool (blocks if none available)
-    pub async fn take(&self) -> AlignedBuf {
+    /// Take a buffer from the pool (blocks if none available).
+    ///
+    /// Errors (instead of aborting) when the pool is empty and a new buffer cannot be allocated.
+    pub async fn take(&self) -> Result<AlignedBuf, AlignedAllocError> {
         // Acquire permit first to ensure we don't exceed capacity
         let _permit = self.permits.acquire().await.expect("Pool semaphore closed");
 
         // Try to get a buffer from the pool
         let mut rx = self.rx.lock().await;
         if let Ok(buf) = rx.try_recv() {
-            buf
+            Ok(buf)
         } else {
             // Pool is temporarily empty, allocate a new one
             AlignedBuf::new(self.buf_len, self.align)
@@ -226,7 +264,7 @@ mod tests {
 
     #[test]
     fn aligned_buf_creation() {
-        let mut buf = AlignedBuf::new(8192, 4096);
+        let mut buf = AlignedBuf::new(8192, 4096).unwrap();
         assert_eq!(buf.len(), 8192);
         assert_eq!(buf.align(), 4096);
         assert_eq!(buf.as_ptr() as usize % 4096, 0); // Check alignment
@@ -246,7 +284,7 @@ mod tests {
             let pool = BufferPool::new(2, 4096, 4096);
 
             // Take buffer
-            let mut buf1 = pool.take().await;
+            let mut buf1 = pool.take().await.unwrap();
             assert_eq!(buf1.len(), 4096);
 
             // Modify buffer
@@ -256,7 +294,7 @@ mod tests {
             pool.give(buf1);
 
             // Take again - should get a buffer (possibly reused)
-            let buf2 = pool.take().await;
+            let buf2 = pool.take().await.unwrap();
             assert_eq!(buf2.len(), 4096);
         })
         .await;
@@ -276,5 +314,31 @@ mod tests {
         assert_eq!(config.capacity, 32);
         assert_eq!(config.buffer_size, 8 * 1024 * 1024);
         assert_eq!(config.alignment, 4096);
+    }
+}
+
+#[cfg(test)]
+mod aligned_alloc_tests {
+    use super::*;
+
+    /// Round 2, item 3: allocation problems are errors, never panics or aborts.
+    #[test]
+    fn impossible_allocations_are_errors_not_panics() {
+        assert!(AlignedBuf::new(usize::MAX, 4096).is_err(), "size overflow");
+        assert!(
+            AlignedBuf::new(1 << 20, 3).is_err(),
+            "alignment not a power of two"
+        );
+        assert!(AlignedBuf::new(1 << 20, 0).is_err(), "zero alignment");
+        let e = AlignedBuf::new(usize::MAX / 2, 4096).unwrap_err();
+        assert_eq!(e.align, 4096);
+        assert!(e.to_string().contains("4096"));
+    }
+
+    #[test]
+    fn zero_length_buffer_owns_nothing_and_drops_cleanly() {
+        let b = AlignedBuf::new(0, 4096).unwrap();
+        assert!(b.is_empty());
+        assert!(b.as_slice().is_empty());
     }
 }

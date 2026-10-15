@@ -28,10 +28,10 @@ async fn test_buffer_pool_initialization() -> Result<()> {
     // This is the correct design for high-performance use cases
 
     // Test that we can take and return buffers
-    let buf1 = pool.take().await;
+    let buf1 = pool.take().await.unwrap();
     assert_eq!(buf1.len(), 64 * 1024 * 1024, "Pool buffer should be 64MB");
 
-    let buf2 = pool.take().await;
+    let buf2 = pool.take().await.unwrap();
     assert_eq!(buf2.len(), 64 * 1024 * 1024, "Pool buffer should be 64MB");
 
     // Return buffers — give() is non-blocking (try_send), no .await needed
@@ -48,7 +48,7 @@ async fn test_buffer_pool_initialization() -> Result<()> {
             "Should be able to take buffer {} from pool",
             i + 1
         );
-        buffers.push(buf.unwrap());
+        buffers.push(buf.unwrap().expect("pool buffer"));
     }
 
     // Return all buffers to pool for reuse — give() is non-blocking (try_send)

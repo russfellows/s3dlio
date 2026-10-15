@@ -12,7 +12,9 @@
 // use a REAL filesystem under the cargo target dir (O_DIRECT is unsupported on tmpfs).
 
 use bytes::Bytes;
-use s3dlio::file_store_direct::{ConfigurableFileSystemObjectStore, FileSystemConfig};
+use s3dlio::file_store_direct::{
+    direct_io_counters, ConfigurableFileSystemObjectStore, FileSystemConfig,
+};
 use s3dlio::memory::AlignedBuf;
 use s3dlio::object_store::ObjectStore;
 use std::time::{Duration, Instant};
@@ -24,9 +26,14 @@ const MIB: usize = 1024 * 1024;
 const ALIGN: usize = 4096;
 
 fn scratch_dir() -> tempfile::TempDir {
+    // O_DIRECT is unsupported on tmpfs: S3DLIO_TEST_DIR (a real filesystem) or the cargo target dir.
+    let base = std::env::var_os("S3DLIO_TEST_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_TARGET_TMPDIR").into());
+    std::fs::create_dir_all(&base).unwrap();
     tempfile::Builder::new()
         .prefix("direct-chunking-244-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .tempdir_in(base)
         .expect("temp dir")
 }
 
@@ -62,7 +69,7 @@ impl AsRef<[u8]> for AlignedOwner {
 }
 
 fn aligned_bytes(raw: &[u8]) -> Bytes {
-    let mut buf = AlignedBuf::new(raw.len().max(1), ALIGN);
+    let mut buf = AlignedBuf::new(raw.len().max(1), ALIGN).unwrap();
     buf.as_mut_slice()[..raw.len()].copy_from_slice(raw);
     let b = Bytes::from_owner(AlignedOwner(buf, raw.len()));
     if !raw.is_empty() {
@@ -96,9 +103,20 @@ async fn put_and_get_use_few_large_system_calls() {
         ("unaligned", Bytes::from(raw.clone())),
         ("aligned", aligned_bytes(&raw)),
     ] {
+        let c0 = direct_io_counters();
         let (w0, _) = syscalls();
         s.put(&uri, payload).await.expect("put");
         let (w1, _) = syscalls();
+        let c1 = direct_io_counters();
+        assert_eq!(
+            c1.direct_puts - c0.direct_puts,
+            1,
+            "{label}: not an O_DIRECT put"
+        );
+        assert_eq!(
+            c1.put_fallbacks, c0.put_fallbacks,
+            "{label}: buffered fallback taken"
+        );
         assert!(
             w1 - w0 < budget,
             "{label}: direct:// put of {len} bytes issued {} write() calls (budget {budget}); \
@@ -110,6 +128,21 @@ async fn put_and_get_use_few_large_system_calls() {
         let (_, r0) = syscalls();
         let back = s.get(&uri).await.expect("get");
         let (_, r1) = syscalls();
+        let c2 = direct_io_counters();
+        assert_eq!(
+            c2.direct_gets - c1.direct_gets,
+            1,
+            "{label}: not an O_DIRECT get"
+        );
+        assert_eq!(
+            c2.get_fallbacks, c1.get_fallbacks,
+            "{label}: buffered fallback taken"
+        );
+        assert_eq!(
+            back.as_ptr() as usize % ALIGN,
+            0,
+            "{label}: GET result not page-aligned"
+        );
         assert!(
             r1 - r0 < budget,
             "{label}: direct:// get of {len} bytes issued {} read() calls (budget {budget})",
@@ -183,4 +216,52 @@ async fn throughput_sanity_256_mib_put() {
         took < Duration::from_secs(10),
         "256 MiB direct:// put took {took:?} (sanity limit 10 s)"
     );
+}
+
+/// Round 2, item 4: a direct:// GET returns the aligned buffer it read into, so putting it
+/// straight back is the single-write path (no bounce copy).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_result_is_page_aligned_and_reput_is_a_single_write() {
+    let _g = SERIAL.lock().await;
+    let dir = scratch_dir();
+    let s = store();
+    let len = 64 * MIB + 4093;
+    let raw = pattern(len);
+    let a = format!("direct://{}/a.bin", dir.path().display());
+    let b = format!("direct://{}/b.bin", dir.path().display());
+    s.put(&a, Bytes::from(raw.clone())).await.expect("put");
+
+    let (_, r0) = syscalls();
+    let got = s.get(&a).await.expect("get");
+    let (_, r1) = syscalls();
+    assert!(r1 - r0 < 64, "GET issued {} read() calls", r1 - r0);
+    assert_eq!(got.as_ptr() as usize % ALIGN, 0);
+    assert!(got.as_ref() == raw.as_slice());
+
+    let c0 = direct_io_counters();
+    let (w0, _) = syscalls();
+    s.put(&b, got.clone()).await.expect("re-put");
+    let (w1, _) = syscalls();
+    assert_eq!(direct_io_counters().direct_puts - c0.direct_puts, 1);
+    // aligned prefix in one write + one padded tail block (+ a few unrelated syscalls)
+    assert!(w1 - w0 < 32, "re-put issued {} write() calls", w1 - w0);
+    let back = s.get(&b).await.expect("get b");
+    assert!(back.as_ref() == raw.as_slice());
+}
+
+/// A file that shrinks between stat and read, and an empty / tiny file, still read correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_of_tiny_and_empty_objects() {
+    let _g = SERIAL.lock().await;
+    let dir = scratch_dir();
+    let s = store();
+    for len in [0usize, 1, 100, 4095] {
+        let uri = format!("direct://{}/t-{len}.bin", dir.path().display());
+        let raw = pattern(len);
+        s.put(&uri, Bytes::from(raw.clone())).await.unwrap();
+        assert!(
+            s.get(&uri).await.unwrap().as_ref() == raw.as_slice(),
+            "{len}"
+        );
+    }
 }

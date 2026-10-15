@@ -16,27 +16,38 @@ pub const DEFAULT_BUFFER_ALIGNMENT: usize = DEFAULT_PAGE_SIZE;
 /// Default minimum I/O size for direct I/O operations (64KB for better performance)
 pub const DEFAULT_MIN_IO_SIZE: usize = 64 * 1024;
 
-/// Default size, in bytes, of the aligned bounce buffer a `direct://` (O_DIRECT) PUT or GET
-/// copies through when the caller's own memory cannot be used directly (64 MiB).
+/// Bytes in one MiB, for the `*_MB` environment variables.
+pub const BYTES_PER_MIB: usize = 1024 * 1024;
+
+/// Default cap, in bytes, on the aligned bounce buffer a `direct://` (O_DIRECT) PUT copies
+/// through when the caller's own memory cannot be used directly (1 GiB).
 ///
 /// O_DIRECT needs the buffer ADDRESS, the file offset and the length of every I/O to be
 /// multiples of the device alignment (4096). A source whose address is already aligned is
 /// written straight from the caller's memory in one `write` and never uses this buffer.
 /// Any other source (Python `bytes`/`bytearray`, a `Vec`-backed `Bytes`: heap pointers are
-/// only 16-byte aligned) must be copied into an aligned buffer first, and each `write` is
-/// then one full bounce buffer. Before this constant the loop wrote ONE 4 KiB block per
-/// `write` (512 MiB took 45 s, about 11 MiB/s, issue #244).
+/// only 16-byte aligned) must be copied into an aligned buffer first. The buffer is sized
+/// `min(round_up(object size), this cap)`, so an unaligned object up to the cap is ONE copy and
+/// ONE `write`; a larger one is written one full buffer at a time. Before this change the
+/// loop wrote ONE 4 KiB block per `write` (512 MiB took 45 s, about 11 MiB/s, issue #244).
 ///
-/// Trade-off: a bigger buffer means fewer syscalls (a 1 GiB PUT is 16 writes at 64 MiB) but
-/// more extra memory per in-flight PUT/GET; 64 MiB keeps each syscall large enough that the
-/// per-call overhead is negligible next to the device transfer, while 32 concurrent PUTs
-/// still add only 2 GiB. Override with [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`].
-pub const DEFAULT_DIRECT_IO_BOUNCE_SIZE: usize = 64 * 1024 * 1024;
+/// Trade-off: a bigger cap means fewer syscalls but more temporary memory per in-flight
+/// unaligned PUT (up to the cap, never more than the object itself; the pages are only
+/// touched as they are filled). 1 GiB keeps every object up to 1 GiB a single write.
+/// Lower it with [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`] when many large PUTs run at once.
+/// GETs do not use a bounce buffer: they read straight into one aligned buffer.
+pub const DEFAULT_DIRECT_IO_BOUNCE_SIZE: usize = 1024 * BYTES_PER_MIB;
+
+/// Size, in bytes, of the aligned staging buffer a `direct://` STREAMING writer
+/// (`DirectIOWriter`) fills before each O_DIRECT write (64 MiB). Smaller than
+/// [`DEFAULT_DIRECT_IO_BOUNCE_SIZE`] because a stream's final size is unknown and many
+/// writers may be open at once; a page-aligned chunk bypasses it entirely.
+pub const DEFAULT_DIRECT_IO_WRITER_STAGING_SIZE: usize = 64 * BYTES_PER_MIB;
 
 /// Environment variable overriding [`DEFAULT_DIRECT_IO_BOUNCE_SIZE`], in MiB.
 ///
 /// Rounded down to a multiple of the O_DIRECT alignment; `0` or an unparseable value
-/// selects the default. Example: `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=256`.
+/// selects the default (1 GiB). Example: `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=256`.
 pub const ENV_DIRECT_IO_BOUNCE_SIZE_MB: &str = "S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB";
 
 /// Resolve the effective `direct://` bounce-buffer size in bytes.
@@ -53,7 +64,7 @@ pub fn direct_io_bounce_size() -> usize {
 fn parse_direct_io_bounce_size(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&mb| mb > 0)
-        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .and_then(|mb| mb.checked_mul(BYTES_PER_MIB))
         .unwrap_or(DEFAULT_DIRECT_IO_BOUNCE_SIZE)
 }
 
@@ -85,13 +96,16 @@ mod direct_io_bounce_size_tests {
 
     #[test]
     fn megabytes_are_converted_to_bytes() {
-        assert_eq!(parse_direct_io_bounce_size(Some("256")), 256 * 1024 * 1024);
-        assert_eq!(parse_direct_io_bounce_size(Some(" 8 ")), 8 * 1024 * 1024);
+        assert_eq!(
+            parse_direct_io_bounce_size(Some("256")),
+            256 * BYTES_PER_MIB
+        );
+        assert_eq!(parse_direct_io_bounce_size(Some(" 8 ")), 8 * BYTES_PER_MIB);
     }
 
     #[test]
     fn default_is_large_enough_to_keep_writes_large() {
-        const { assert!(DEFAULT_DIRECT_IO_BOUNCE_SIZE >= 1024 * 1024) };
+        const { assert!(DEFAULT_DIRECT_IO_BOUNCE_SIZE >= BYTES_PER_MIB) };
     }
 }
 
