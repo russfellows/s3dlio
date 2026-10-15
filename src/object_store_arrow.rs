@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use crate::checksum::Crc32c;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use crc32fast::Hasher;
 // Note: Futures stream traits not needed for simple implementation
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -671,7 +671,7 @@ struct ArrowWriter {
     buffer: Vec<u8>,
 
     // metrics & integrity
-    hasher: Hasher,
+    hasher: Crc32c,
     bytes_written: u64,
     compressed_bytes: u64,
 
@@ -711,7 +711,7 @@ impl ArrowWriter {
             store,
             path: final_path,
             buffer: Vec::new(),
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             bytes_written: 0,
             compressed_bytes: 0,
             compression,

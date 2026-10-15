@@ -4,9 +4,9 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use anyhow::Result;
-use crc32fast::Hasher;
 use s3dlio::checkpoint::manifest::ShardMeta;
 use s3dlio::checkpoint::{Manifest, Reader};
+use s3dlio::checksum::Crc32c as Hasher;
 use s3dlio::store_for_uri;
 use tempfile::TempDir;
 

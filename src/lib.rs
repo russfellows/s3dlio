@@ -25,6 +25,7 @@ pub use api::*;
 // ===== Internal Modules (Implementation) =====
 // These are public for internal use but may change without notice
 
+pub mod checksum; // CRC-32C: the checksum every writer reports (#256)
 pub mod config;
 pub mod constants;
 pub mod data_formats;

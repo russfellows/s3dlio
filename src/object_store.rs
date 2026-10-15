@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use crate::checksum::Crc32c;
 use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use crc32fast::Hasher;
 use futures::stream::{Stream, StreamExt};
 use regex::Regex;
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 // Helper function for integrity validation
 fn compute_checksum(data: &[u8]) -> String {
-    let mut hasher = Hasher::new();
+    let mut hasher = Crc32c::new();
     hasher.update(data);
     format!("{:08x}", hasher.finalize())
 }
@@ -1035,7 +1035,7 @@ pub struct BufferedObjectWriter<'a> {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
 }
 
 impl<'a> BufferedObjectWriter<'a> {
@@ -1046,7 +1046,7 @@ impl<'a> BufferedObjectWriter<'a> {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
         }
     }
 }
@@ -2154,7 +2154,7 @@ pub struct S3BufferedWriter {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
     compressed_bytes: u64,
@@ -2177,7 +2177,7 @@ impl S3BufferedWriter {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             compression,
             compressor,
             compressed_bytes: 0,
@@ -3060,7 +3060,7 @@ pub struct AzureBufferedWriter {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
     compressed_bytes: u64,
@@ -3083,7 +3083,7 @@ impl AzureBufferedWriter {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             compression,
             compressor,
             compressed_bytes: 0,
@@ -3693,7 +3693,7 @@ pub struct GcsBufferedWriter {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
     compressed_bytes: u64,
@@ -3716,7 +3716,7 @@ impl GcsBufferedWriter {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             compression,
             compressor,
             compressed_bytes: 0,
