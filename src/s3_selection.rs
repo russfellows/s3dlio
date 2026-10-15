@@ -72,7 +72,6 @@ pub enum S3Selection {
 /// A compiled glob over full keys (see the [module docs](self)).
 #[derive(Debug, Clone)]
 pub struct GlobSelection {
-    glob: String,
     request_prefix: String,
     matcher: Regex,
     one_level: bool,
@@ -102,32 +101,6 @@ impl S3Selection {
         }
         Ok(Self::Glob(GlobSelection::new(key)?))
     }
-
-    /// The S3 `prefix` a listing for this selection starts from, for the pattern
-    /// base only: the text before the first `*`, or the whole key.
-    pub fn request_prefix(&self) -> &str {
-        match self {
-            Self::Dir(k) | Self::Exact(k) => k,
-            Self::Glob(g) => &g.request_prefix,
-        }
-    }
-
-    /// Whether `key` (a raw object key) is selected by this selection, ignoring
-    /// whether the operation descends: a `Dir` selects what starts with it, an
-    /// `Exact` the key itself and everything under `key/`, a `Glob` the full-key
-    /// matches.
-    pub fn selects(&self, key: &str) -> bool {
-        match self {
-            Self::Dir(k) => key.starts_with(k.as_str()),
-            Self::Exact(k) => {
-                key == k
-                    || key
-                        .strip_prefix(k.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-            }
-            Self::Glob(g) => g.matcher.is_match(key),
-        }
-    }
 }
 
 impl GlobSelection {
@@ -136,16 +109,10 @@ impl GlobSelection {
         let request_prefix = glob[..first_star].to_string();
         let one_level = !glob.contains("**") && !glob[first_star..].contains('/');
         Ok(Self {
-            glob: glob.to_string(),
             request_prefix,
             matcher: glob_to_regex(glob)?,
             one_level,
         })
-    }
-
-    /// The glob text.
-    pub fn glob(&self) -> &str {
-        &self.glob
     }
 }
 
@@ -231,9 +198,15 @@ fn pages(
                     }
                 }
             }
+            let truncated = resp.is_truncated();
+            // The last page: some servers still send a (constant or empty)
+            // continuation token on it, so `IsTruncated=false` ends the listing.
+            if truncated == Some(false) {
+                return;
+            }
             match resp.next_continuation_token() {
                 Some(next) => cont = Some(next.to_string()),
-                None if strict && resp.is_truncated().unwrap_or(false) => {
+                None if strict && truncated.unwrap_or(false) => {
                     yield Err(anyhow::anyhow!(
                         "list_objects_v2 for bucket '{}' prefix '{}' was truncated but gave \
                          no continuation token; the listing is incomplete",
@@ -427,7 +400,10 @@ mod tests {
             ("data/a*b*c", "data/a"),
             ("*", ""),
         ] {
-            assert_eq!(S3Selection::parse(k).unwrap().request_prefix(), p, "{k}");
+            match S3Selection::parse(k).unwrap() {
+                S3Selection::Glob(g) => assert_eq!(g.request_prefix, p, "{k}"),
+                other => panic!("{k} is not a glob: {other:?}"),
+            }
         }
     }
 
@@ -475,22 +451,5 @@ mod tests {
         assert!(one("data/*.npz"));
         assert!(!one("data/**.npz"));
         assert!(!one("data/*/x"));
-    }
-
-    #[test]
-    fn selects_follows_the_rule() {
-        let exact = S3Selection::parse("run.1").unwrap();
-        assert!(exact.selects("run.1"));
-        assert!(exact.selects("run.1/x"));
-        assert!(!exact.selects("run.1.old"));
-        assert!(!exact.selects("run.1.d/x"));
-        assert!(!exact.selects("run_1"));
-        assert!(!exact.selects("prerun.1"));
-        let dir = S3Selection::parse("dl/").unwrap();
-        assert!(dir.selects("dl/a"));
-        assert!(!dir.selects("dl2/x"));
-        let g = S3Selection::parse("file.txt*").unwrap();
-        assert!(g.selects("file.txt") && g.selects("file.txt.bak") && g.selects("file.txt2"));
-        assert!(!g.selects("file.txt/x"));
     }
 }

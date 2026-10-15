@@ -25,8 +25,10 @@
 //! 3. otherwise the parent directory of `P` -- everything up to and including its
 //!    last `/` -- for any other entry (`s3://b/data/run.1` and the object
 //!    `s3://b/data/run.1` -> `run.1`); and
-//! 4. for a wildcard URI, the directory part of the text before its first `*`
-//!    (`s3://b/data/file*` -> `data/`, `s3://b/data/*/x` -> `data/`).
+//! 4. for an `s3://` wildcard URI, the directory part of the text before its first `*`
+//!    (`s3://b/data/file*` -> `data/`, `s3://b/data/*/x` -> `data/`). Other schemes
+//!    (`file://`, `gs://`, `az://`) do not read `*` as a wildcard yet (#220), so rules
+//!    1-3 apply to them as they are.
 //!
 //! An entry that does not start with the base is matched as it is.
 //!
@@ -78,9 +80,13 @@ impl ListPattern {
 /// callers (`download_objects_matching`). The result is always a suffix of `entry`.
 pub fn relative_to_listing_base<'a>(listing_prefix: &str, entry: &'a str) -> &'a str {
     if let Some((prefix_key, entry_key)) = s3_key_parts(listing_prefix, entry) {
-        return strip_listing_base(&prefix_key, entry_key).unwrap_or(entry);
+        return strip_listing_base(&prefix_key, entry_key, true).unwrap_or(entry);
     }
-    strip_listing_base(listing_prefix, entry).unwrap_or(entry)
+    // Only `s3://` URIs (and the raw keys of the S3 callers, which have no scheme)
+    // follow the wildcard rule; the other backends do not yet (#220).
+    let wildcards_are_globs =
+        !listing_prefix.contains("://") || listing_prefix.starts_with("s3://");
+    strip_listing_base(listing_prefix, entry, wildcards_are_globs).unwrap_or(entry)
 }
 
 /// The key of `listing_prefix` and the key part of `entry` (a suffix of it), when both
@@ -100,16 +106,25 @@ fn s3_key_parts<'a>(listing_prefix: &str, entry: &'a str) -> Option<(String, &'a
 }
 
 /// The listing-base rule over plain strings (a key, or a whole URI).
-fn strip_listing_base<'a>(listing_prefix: &str, entry: &'a str) -> Option<&'a str> {
-    // A wildcard URI (`data/file*`, `data/*/x`): the base is the directory part of the
-    // text before the first `*`, whatever the entry looks like.
-    if let Some(star) = listing_prefix.find('*') {
-        let before_star = &listing_prefix[..star];
-        let parent = match before_star.rfind('/') {
-            Some(slash) => &before_star[..=slash],
-            None => "",
-        };
-        return entry.strip_prefix(parent);
+///
+/// `wildcards_are_globs` is true for `s3://` listings only: there a `*` in
+/// `listing_prefix` is a glob (`data/file*`, `data/*/x`) and the base is the directory
+/// part of the text before the first `*`, whatever the entry looks like. For any other
+/// backend a `*` is an ordinary character and the plain rules below apply.
+fn strip_listing_base<'a>(
+    listing_prefix: &str,
+    entry: &'a str,
+    wildcards_are_globs: bool,
+) -> Option<&'a str> {
+    if wildcards_are_globs {
+        if let Some(star) = listing_prefix.find('*') {
+            let before_star = &listing_prefix[..star];
+            let parent = match before_star.rfind('/') {
+                Some(slash) => &before_star[..=slash],
+                None => "",
+            };
+            return entry.strip_prefix(parent);
+        }
     }
     if listing_prefix.ends_with('/') {
         return entry.strip_prefix(listing_prefix);
@@ -223,6 +238,32 @@ mod tests {
         );
         assert_eq!(relative_to_listing_base("s3://b/*", "s3://b/top"), "top");
         assert_eq!(relative_to_listing_base("data/f*", "data/f1"), "f1");
+    }
+
+    #[test]
+    fn a_star_in_a_non_s3_uri_is_an_ordinary_character() {
+        // rules 1-3 only, exactly as before the s3:// wildcard rule (d35a510)
+        assert_eq!(
+            relative_to_listing_base("file:///d/a*", "file:///d/a*/x"),
+            "x"
+        );
+        assert_eq!(
+            relative_to_listing_base("file:///d/a*", "file:///d/a*"),
+            "a*"
+        );
+        assert_eq!(
+            relative_to_listing_base("file:///d/a*", "file:///d/ab"),
+            "ab"
+        );
+        assert_eq!(
+            relative_to_listing_base("gs://b/data/f*", "gs://b/data/f1"),
+            "f1"
+        );
+        // the s3 reading of the same text differs: the base is the directory before the star
+        assert_eq!(
+            relative_to_listing_base("s3://b/d/a*", "s3://b/d/a*/x"),
+            "a*/x"
+        );
     }
 
     #[test]
