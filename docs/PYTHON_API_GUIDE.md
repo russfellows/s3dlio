@@ -256,7 +256,9 @@ with open("local_file.bin", "rb") as f:
 await s3dlio.put_bytes_async("s3://bucket/key", b"data")
 ```
 
-**Data path**: `Python bytes` → `Bytes::copy_from_slice` (one unavoidable copy from Python heap) → `Bytes` (Arc-counted, zero-copy through upload pipeline).
+**Data path** (`put_bytes`): a `BytesView` is reused as is; `bytes`, `bytearray`, `memoryview`, numpy arrays and any other contiguous buffer-protocol object are **not copied**: the buffer is held (it cannot be resized or freed meanwhile) and read in place with the **GIL released**, so other Python threads keep running during a large upload. `file://` and `direct://` write straight from that buffer (no second copy). A strided/non-contiguous view, or an object that only provides `__bytes__()`, is copied once with the GIL held.
+
+**Rule for mutable buffers**: do not modify a `bytearray` / writable `memoryview` / numpy array / mmap from another thread while `put_bytes()` is running; the stored object would mix old and new bytes. `put_bytes_async()` avoids that rule for mutable buffers by taking one snapshot copy (GIL released) when it is called, so the buffer may be reused as soon as the call returns; `bytes` and `BytesView` are never copied.
 
 ### get() — Download Data
 
@@ -460,7 +462,8 @@ raw = bytes(data)
 | `np.frombuffer(data)` | 0 | Shares Rust memory |
 | `torch.frombuffer(data)` | 0 | Shares Rust memory |
 | `bytes(data)` | 1 | Explicit copy to Python heap |
-| `s3dlio.put_bytes(uri, pydata)` | 1 | Unavoidable Python→Rust copy |
+| `s3dlio.put_bytes(uri, pydata)` | 0 | `bytes`, `bytearray`, `memoryview`, numpy and `BytesView` are written in place with the GIL released (1 copy only for strided views / `__bytes__()`-only objects) |
+| `s3dlio.put_bytes_async(uri, pydata)` | 0 or 1 | `bytes` and `BytesView`: 0. Other mutable buffers: one snapshot copy at call time, made with the GIL released |
 
 ---
 

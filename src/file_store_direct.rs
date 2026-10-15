@@ -905,7 +905,7 @@ impl ConfigurableFileSystemObjectStore {
     }
 
     /// Write file with O_DIRECT if configured
-    async fn write_file_direct(&self, path: &Path, data: &[u8]) -> Result<()> {
+    async fn write_file_direct(&self, path: &Path, data: Bytes) -> Result<()> {
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
@@ -913,11 +913,11 @@ impl ConfigurableFileSystemObjectStore {
 
         if !self.config.direct_io {
             // Fallback to normal tokio write
-            return Ok(fs::write(path, data).await?);
+            return Self::write_file_buffered(path, data).await;
         }
 
         // Try O_DIRECT write, fall back to regular write if it fails
-        match self.try_write_file_direct(path, data).await {
+        match self.try_write_file_direct(path, data.clone()).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 warn!(
@@ -925,26 +925,33 @@ impl ConfigurableFileSystemObjectStore {
                     path.display(),
                     e
                 );
-                Ok(fs::write(path, data).await?)
+                Self::write_file_buffered(path, data).await
             }
         }
     }
 
+    /// Buffered write of `data` without duplicating it (`tokio::fs::write` would copy
+    /// its input into an owned buffer, issue #238).
+    async fn write_file_buffered(path: &Path, data: Bytes) -> Result<()> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || std::fs::write(&path, data.as_ref())).await??;
+        Ok(())
+    }
+
     /// Try to write file with O_DIRECT, may fail due to alignment or filesystem support
-    async fn try_write_file_direct(&self, path: &Path, data: &[u8]) -> Result<()> {
+    async fn try_write_file_direct(&self, path: &Path, data: Bytes) -> Result<()> {
         if data.is_empty() {
-            return Ok(fs::write(path, data).await?);
+            return Self::write_file_buffered(path, data).await;
         }
 
         // For small files, use regular I/O
         if data.len() < self.config.min_io_size {
-            return Ok(fs::write(path, data).await?);
+            return Self::write_file_buffered(path, data).await;
         }
 
         #[cfg(unix)]
         {
             let path = path.to_owned();
-            let data = data.to_vec();
             let alignment = self.config.alignment;
             let sync_writes = self.config.sync_writes;
 
@@ -1008,7 +1015,7 @@ impl ConfigurableFileSystemObjectStore {
         #[cfg(not(unix))]
         {
             // Fallback for non-Unix systems
-            Ok(fs::write(path, data).await?)
+            Self::write_file_buffered(path, data).await
         }
     }
 
@@ -1310,7 +1317,7 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         );
 
         // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
-        self.write_file_direct(&path, data.as_ref()).await
+        self.write_file_direct(&path, data).await
     }
 
     async fn put_multipart(&self, uri: &str, data: Bytes, part_size: Option<usize>) -> Result<()> {

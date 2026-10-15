@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 // Import all module APIs
 
 mod async_bridge;
+mod put_payload;
 mod python_advanced_api;
 mod python_aiml_api;
 mod python_core_api;

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use super::async_bridge::future_into_py;
+use super::put_payload::{put_payload_from_py, PayloadUse};
 use bytes::Bytes;
 use pyo3::buffer::PyBuffer;
 use pyo3::conversion::IntoPyObjectExt;
@@ -1430,14 +1431,25 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 }
 
 // ---------------------------------------------------------------------------
-// put_bytes() - Zero-copy put from Python bytes to any backend
+// put_bytes() - Put from a Python bytes-like object to any backend
 // ---------------------------------------------------------------------------
 
-/// Put bytes data to any storage backend with zero-copy from Python.
+/// Put bytes data to any storage backend.
 ///
-/// This function accepts Python bytes/bytearray and writes them to the specified
-/// URI without copying the data on the Rust side. The data is borrowed directly
-/// from Python's memory buffer.
+/// What is copied (details and the safety argument: `put_payload.rs`):
+/// * `s3dlio.BytesView`: not copied (reference-count clone).
+/// * `bytes`, `bytearray`, `memoryview`, numpy arrays and other contiguous
+///   buffer-protocol objects: not copied. The buffer is held (it cannot be resized or
+///   freed) and read in place **with the GIL released**, so other Python threads keep
+///   running during a large PUT.
+/// * Non-contiguous (strided) views and objects that only provide `__bytes__()`: one
+///   copy, made with the GIL held.
+///
+/// The call blocks until the object is written. **Do not modify a mutable buffer
+/// (bytearray, writable memoryview, numpy array, mmap) from another thread while the
+/// call is running**: the upload would contain a mix of old and new bytes (the process
+/// stays memory-safe). On `file://` and `direct://` the store also writes straight from
+/// that buffer, so the payload is never duplicated.
 ///
 /// # Arguments
 /// * `uri` - Full URI including scheme (s3://, az://, gs://, file://, direct://)
@@ -1469,48 +1481,7 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult<()> {
     let uri = uri.to_owned();
 
-    // Use same conversion logic as put_bytes_async for consistency
-    let data_owned = if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-        // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
-        let len = buffer.len_bytes();
-        let mut vec = vec![0u8; len];
-        buffer.copy_to_slice(py, &mut vec[..]).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!("Buffer copy failed: {}", e))
-        })?;
-
-        Bytes::from(vec)
-    } else if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
-        // s3dlio's own BytesView - zero-copy Arc clone (optimal)
-        bytes_view.bytes.clone()
-    } else if let Ok(py_bytes) = data.cast::<PyBytes>() {
-        // PyBytes - direct copy
-        Bytes::copy_from_slice(py_bytes.as_bytes())
-    } else {
-        // Last resort: Try __bytes__() method or bytes() conversion
-        let bytes_result = data.call_method0("__bytes__").or_else(|_| {
-            let bytes_type = py.get_type::<PyBytes>();
-            bytes_type.call1((data,))
-        });
-
-        match bytes_result {
-            Ok(bytes_obj) => {
-                if let Ok(py_bytes) = bytes_obj.cast::<PyBytes>() {
-                    Bytes::copy_from_slice(py_bytes.as_bytes())
-                } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                        "__bytes__() returned non-bytes object: {}",
-                        bytes_obj.get_type().name()?
-                    )));
-                }
-            }
-            Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                    "Cannot convert data to bytes: {}. Expected bytes-like object",
-                    e
-                )));
-            }
-        }
-    };
+    let data_owned = put_payload_from_py(py, data, PayloadUse::Blocking)?;
 
     py.detach(move || {
         // Build the store on the caller thread BEFORE submit_io (issue #173).
@@ -1524,10 +1495,12 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
 /// Async version of put_bytes() - accepts any bytes-like object
 ///
 /// Accepts (in order of optimization):
-/// 1. Buffer protocol objects (dgen_py.BytesView, numpy arrays, bytearray, memoryview) - optimized copy
-/// 2. s3dlio's own BytesView - zero-copy Arc clone
-/// 3. Python bytes - direct copy
-/// 4. Any object with __bytes__() method - converted via bytes()
+/// 1. s3dlio's own BytesView - no copy (Arc clone)
+/// 2. Python `bytes` - no copy (immutable; the buffer is held until the write is done)
+/// 3. Other buffer protocol objects (numpy arrays, bytearray, memoryview, mmap) - ONE
+///    snapshot copy taken when the call is made, with the GIL released, so the caller may
+///    reuse or resize the buffer as soon as this function returns
+/// 4. Non-contiguous views / any object with __bytes__() - one copy with the GIL held
 ///
 /// Design philosophy: Be liberal in what you accept, optimize based on what you get.
 /// Never reject valid data - match the permissiveness of minio/boto3/s3torch.
@@ -1539,50 +1512,7 @@ fn put_bytes_async<'py>(
 ) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
 
-    // Try optimal paths first, fall back gracefully
-    let data_owned = if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-        // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
-        // This is the most common path for external buffer objects
-        let len = buffer.len_bytes();
-        let mut vec = vec![0u8; len];
-        buffer.copy_to_slice(py, &mut vec[..]).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!("Buffer copy failed: {}", e))
-        })?;
-
-        Bytes::from(vec)
-    } else if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
-        // s3dlio's own BytesView - zero-copy Arc clone (optimal)
-        bytes_view.bytes.clone()
-    } else if let Ok(py_bytes) = data.cast::<PyBytes>() {
-        // PyBytes - direct copy
-        Bytes::copy_from_slice(py_bytes.as_bytes())
-    } else {
-        // Last resort: Try __bytes__() method or bytes() conversion
-        // This handles any custom objects that can be converted to bytes
-        let bytes_result = data.call_method0("__bytes__").or_else(|_| {
-            // If __bytes__() doesn't exist, try bytes(data)
-            let bytes_type = py.get_type::<PyBytes>();
-            bytes_type.call1((data,))
-        });
-
-        match bytes_result {
-            Ok(bytes_obj) => {
-                if let Ok(py_bytes) = bytes_obj.cast::<PyBytes>() {
-                    Bytes::copy_from_slice(py_bytes.as_bytes())
-                } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                        "__bytes__() returned non-bytes object: {}",
-                        bytes_obj.get_type().name()?
-                    )));
-                }
-            }
-            Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("Cannot convert data to bytes: {}. Expected bytes-like object (bytes, bytearray, memoryview, BytesView, numpy array, or object with __bytes__() method)", e)
-                ));
-            }
-        }
-    };
+    let data_owned = put_payload_from_py(py, data, PayloadUse::Deferred)?;
 
     future_into_py(py, async move {
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
