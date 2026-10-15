@@ -208,6 +208,9 @@ fn key_path(url_path: &str, is_prefix: bool) -> Result<Path> {
 /// List the entries under `base` in `store` as full URIs rebuilt from `url`, the URL the
 /// listing was requested with.
 ///
+/// The location `base` itself is not an entry under it (see [`delete_under`]) and is
+/// skipped.
+///
 /// `recursive` lists every object under `base` at any depth and no directory entries
 /// (issue #245). Otherwise only the direct children are listed: the objects and the
 /// directory entries (common prefixes). `object_store` matches a prefix per path segment,
@@ -227,6 +230,9 @@ async fn list_under(
         let mut entries = store.list(prefix);
         while let Some(entry) = entries.next().await {
             let meta = entry?;
+            if meta.location == *base {
+                continue;
+            }
             out.push(ArrowObjectStore::rebuild_full_uri(
                 url,
                 base,
@@ -236,9 +242,15 @@ async fn list_under(
     } else {
         let result = store.list_with_delimiter(Some(base)).await?;
         for obj in result.objects {
+            if obj.location == *base {
+                continue;
+            }
             out.push(ArrowObjectStore::rebuild_full_uri(url, base, &obj.location));
         }
         for prefix in result.common_prefixes {
+            if prefix == *base {
+                continue;
+            }
             out.push(ArrowObjectStore::rebuild_full_uri(url, base, &prefix));
         }
     }
@@ -246,6 +258,11 @@ async fn list_under(
 }
 
 /// Delete every object under `base` in `store`, at any depth (issue #232).
+///
+/// The location `base` itself is never deleted: S3 returns the folder marker object `p/`
+/// as the location `p` (`object_store` strips the trailing '/'), which is the prefix, not
+/// an entry under it, and deleting it would delete the unrelated object `p`. A marker
+/// object therefore cannot be addressed through `object_store` and may remain.
 ///
 /// `object_store` evaluates a prefix on a path-segment basis: `p` covers `p/a` and
 /// `p/b/c` but never `pfoo/x` or `p2/y`, so an unrelated sibling is never selected. The
@@ -258,7 +275,13 @@ async fn delete_under(store: &dyn AosObjectStore, base: &Path) -> Result<()> {
 
     // An empty prefix is the whole store (the bucket root).
     let prefix = (!base.as_ref().is_empty()).then_some(base);
-    let locations = store.list(prefix).map(|entry| entry.map(|m| m.location));
+    let skip = base.clone();
+    let locations = store
+        .list(prefix)
+        .map(|entry| entry.map(|m| m.location))
+        .filter(move |entry| {
+            std::future::ready(!matches!(entry, Ok(location) if *location == skip))
+        });
     let mut results = store.delete_stream(locations.boxed());
 
     let mut deleted = 0usize;
@@ -1092,65 +1115,111 @@ mod tests {
         assert_eq!(remaining(&store).await, vec!["other/x".to_string()]);
     }
 
-    /// An in-memory store whose bulk delete refuses every key containing `bad`.
+    /// An in-memory store that behaves like S3 in the ways the adapter must survive:
+    /// - its delete refuses every key containing `bad`;
+    /// - when `marker` is set, a listing of the prefix `marker` also returns the object at
+    ///   `marker` itself. That is how a folder marker object `p/` comes back from S3: its
+    ///   key is parsed with `Path::parse`, which strips the trailing '/', so the location
+    ///   is `p`, the prefix.
     #[derive(Debug)]
-    struct RefusesBadKeys(aos::memory::InMemory);
+    struct Probe {
+        inner: aos::memory::InMemory,
+        marker: Option<Path>,
+    }
 
-    impl std::fmt::Display for RefusesBadKeys {
+    impl Probe {
+        fn new(inner: aos::memory::InMemory) -> Self {
+            Self {
+                inner,
+                marker: None,
+            }
+        }
+
+        fn with_marker(inner: aos::memory::InMemory, marker: &str) -> Self {
+            Self {
+                inner,
+                marker: Some(Path::from(marker)),
+            }
+        }
+
+        /// The marker's own entry, when `prefix` is the marker.
+        fn marker_for(&self, prefix: Option<&Path>) -> Option<Path> {
+            match (&self.marker, prefix) {
+                (Some(m), Some(p)) if m == p => Some(m.clone()),
+                _ => None,
+            }
+        }
+    }
+
+    impl std::fmt::Display for Probe {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "RefusesBadKeys")
+            write!(f, "Probe")
         }
     }
 
     #[async_trait]
-    impl AosObjectStore for RefusesBadKeys {
+    impl AosObjectStore for Probe {
         async fn put_opts(
             &self,
             location: &Path,
             payload: PutPayload,
             opts: aos::PutOptions,
         ) -> aos::Result<aos::PutResult> {
-            self.0.put_opts(location, payload, opts).await
+            self.inner.put_opts(location, payload, opts).await
         }
         async fn put_multipart_opts(
             &self,
             location: &Path,
             opts: aos::PutMultipartOptions,
         ) -> aos::Result<Box<dyn aos::MultipartUpload>> {
-            self.0.put_multipart_opts(location, opts).await
+            self.inner.put_multipart_opts(location, opts).await
         }
         async fn get_opts(
             &self,
             location: &Path,
             options: GetOptions,
         ) -> aos::Result<aos::GetResult> {
-            self.0.get_opts(location, options).await
+            self.inner.get_opts(location, options).await
         }
         fn delete_stream(
             &self,
             locations: futures::stream::BoxStream<'static, aos::Result<Path>>,
         ) -> futures::stream::BoxStream<'static, aos::Result<Path>> {
-            let inner = self.0.delete_stream(
-                locations
-                    .map(|l| match l {
-                        Ok(p) if p.as_ref().contains("bad") => Err(aos::Error::Generic {
-                            store: "RefusesBadKeys",
-                            source: format!("refused {p}").into(),
-                        }),
-                        other => other,
-                    })
-                    .boxed(),
-            );
-            inner.boxed()
+            self.inner
+                .delete_stream(
+                    locations
+                        .map(|l| match l {
+                            Ok(p) if p.as_ref().contains("bad") => Err(aos::Error::Generic {
+                                store: "Probe",
+                                source: format!("refused {p}").into(),
+                            }),
+                            other => other,
+                        })
+                        .boxed(),
+                )
+                .boxed()
         }
         fn list(
             &self,
             prefix: Option<&Path>,
         ) -> futures::stream::BoxStream<'static, aos::Result<aos::ObjectMeta>> {
-            self.0.list(prefix)
+            let listed = self.inner.list(prefix);
+            match self.marker_for(prefix) {
+                Some(marker) => {
+                    let inner = self.inner.clone();
+                    futures::stream::once(async move { inner.head(&marker).await })
+                        .chain(listed)
+                        .boxed()
+                }
+                None => listed,
+            }
         }
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> aos::Result<aos::ListResult> {
-            self.0.list_with_delimiter(prefix).await
+            let mut result = self.inner.list_with_delimiter(prefix).await?;
+            if let Some(marker) = self.marker_for(prefix) {
+                result.objects.push(self.inner.head(&marker).await?);
+            }
+            Ok(result)
         }
         async fn copy_opts(
             &self,
@@ -1158,7 +1227,7 @@ mod tests {
             to: &Path,
             options: aos::CopyOptions,
         ) -> aos::Result<()> {
-            self.0.copy_opts(from, to, options).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -1166,7 +1235,7 @@ mod tests {
     // objects left behind while the call returns Ok). The good objects are still deleted.
     #[tokio::test]
     async fn delete_prefix_reports_objects_it_could_not_delete() {
-        let store = RefusesBadKeys(seeded(&["p/a", "p/bad1", "p/x/bad2", "p/x/c", "q/z"]).await);
+        let store = Probe::new(seeded(&["p/a", "p/bad1", "p/x/bad2", "p/x/c", "q/z"]).await);
         let (base, _url) = s3_prefix("s3://b/p/");
         let err = delete_under(&store, &base).await.expect_err("must fail");
         let msg = format!("{err:#}");
@@ -1176,7 +1245,7 @@ mod tests {
             "{msg}"
         );
         assert_eq!(
-            remaining(&store.0).await,
+            remaining(&store.inner).await,
             vec![
                 "p/bad1".to_string(),
                 "p/x/bad2".to_string(),
@@ -1223,5 +1292,30 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{uri} does not address a listed object: {e}"));
         }
+    }
+
+    // F1: S3 stores the folder marker `p/` as an object. `object_store` parses listed keys
+    // with `Path::parse`, which strips a trailing '/', so the marker comes back with the
+    // location `p` -- the prefix itself (`Probe::with_marker`). It is not an entry UNDER the
+    // prefix: it must not be listed as a child, and above all `delete_prefix` must not
+    // delete the unrelated object `p` that shares its Path.
+    #[tokio::test]
+    async fn the_prefix_itself_is_not_an_entry_under_the_prefix() {
+        for recursive in [false, true] {
+            let store = Probe::with_marker(seeded(&["p", "p/a"]).await, "p");
+            let (base, url) = s3_prefix("s3://b/p/");
+            let mut got = list_under(&store, &base, &url, recursive)
+                .await
+                .expect("list");
+            got.sort();
+            assert_eq!(got, vec!["s3://b/p/a".to_string()], "recursive={recursive}");
+        }
+        let store = Probe::with_marker(seeded(&["p", "p/a", "p/b/c", "other"]).await, "p");
+        let (base, _url) = s3_prefix("s3://b/p/");
+        delete_under(&store, &base).await.expect("delete_prefix");
+        assert_eq!(
+            remaining(&store.inner).await,
+            vec!["other".to_string(), "p".to_string()]
+        );
     }
 }
