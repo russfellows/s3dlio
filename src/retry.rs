@@ -64,8 +64,8 @@ use crate::constants::max_retry_attempts;
 /// the final service error, and the OUTER loop in this module must still treat the same
 /// codes as transient, or it stops after the SDK's budget instead of starting its own.
 /// A unit test (`aws_runtime_code_tables_are_all_retryable`) compares this constant with
-/// the pinned crate's tables, so an SDK upgrade that adds a code fails the build here
-/// until the constant is updated.
+/// the pinned crate's tables. It fails `cargo test` (the build itself still succeeds) when
+/// an SDK upgrade changes those tables; the fix is to update the constants here.
 const AWS_RUNTIME_THROTTLING_ERROR_CODES: &[&str] = &[
     "Throttling",
     "ThrottlingException",

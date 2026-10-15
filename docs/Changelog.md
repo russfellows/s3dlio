@@ -8,9 +8,17 @@
   `direct://`, the data-generating streaming writer, S3, Azure, GCS and the Arrow backend) reported
   its checksum as `crc32c:<hex>` but computed CRC-32 (IEEE) with `crc32fast`, so the value never
   matched a GCS `crc32c` or an S3 `x-amz-checksum-crc32c`, and the label named the wrong algorithm.
-  The value is now CRC-32C (Castagnoli), computed with the hardware-accelerated `crc32c` crate
-  (SSE4.2 / ARMv8 CRC, software fallback; the crate was already in `Cargo.lock`); the label is
-  unchanged. **The hex digits differ for every input**: for the bytes `123456789` the writers used to
+  The value is now CRC-32C (Castagnoli), computed with the `crc-fast` crate (already in `Cargo.lock`
+  through the AWS SDK): SIMD code chosen at run time from the CPU (PCLMULQDQ / VPCLMULQDQ on x86-64,
+  PMULL and the CRC32 instructions on aarch64, software fallback), so no build flag is needed and a
+  wheel gets the fast path. Throughput was measured, not assumed (`examples/bench_crc32c.rs`): the
+  `crc32c` crate, the obvious choice, is about half as fast as the `crc32fast` it replaces on x86-64
+  without build flags (it detects SSE4.2 at run time, but its hardware loop makes a non-inlinable call
+  per 8 bytes, so it only runs well when the whole build enables `+sse4.2`), which would have slowed
+  every `write_chunk`; `crc-fast` is about 3x to 4x faster than `crc32fast` for buffers that fit in
+  cache and equal to it when memory-bound (measured on an x86-64 AVX-512 host; aarch64 was not
+  measured). `s3dlio::checksum::crc32c_implementation()` reports which code the CPU selected. The
+  `crc32c` crate remains only as an independent oracle in the tests. The label is unchanged. **The hex digits differ for every input**: for the bytes `123456789` the writers used to
   report `crc32c:cbf43926` and now report `crc32c:e3069283`. Anything that stored a checksum from an
   earlier release and compares it with a new one (for example a checkpoint manifest written before
   and read with validation after) must recompute it. The integrity-validation helper
@@ -38,8 +46,22 @@
   `validate_checkpoint_integrity`) now take `<algorithm>:<hex>`: the algorithm is parsed
   (case-insensitive), `crc32c` is supported, and any other algorithm is an immediate, clear error
   ("unsupported checksum algorithm ..."), reported before anything is fetched and never as a mismatch.
-  A bare hex string is still accepted as CRC-32C, and hex digits compare case-insensitively. Corrupted
-  data still fails validation.
+  **A bare hex string now means CRC-32C** (it was CRC-32 before #256 changed the writers): a caller
+  that computed a CRC-32 with `crc32fast` and passes it bare will now see a mismatch, and a mismatch
+  message says `(CRC-32C; checksums written before the #256 fix were CRC-32)` so an old stored value is
+  recognisable. The hex part must be 1 to 8 hexadecimal digits in either case; fewer than 8 are read as
+  the number they spell (`crc32c:0` is the empty object's checksum). A `0x` prefix, an empty value, more
+  than 8 digits, a further `:` or any other character is a "malformed checksum" error, never a
+  mismatch. Corrupted data still fails validation.
+
+- **Validating a compressed checkpoint shard works (#259).** Writers hash the uncompressed bytes they
+  are given, but the shard in the store is the compressed `.zst` object, and the reader validated the
+  stored bytes, so a compressed shard could never pass validation once the checksum format was
+  accepted. The checkpoint reader (`read_shard_with_validation`, `read_all_shards_with_validation`,
+  the concurrent variants and `validate_checkpoint_integrity`) now fetches a `.zst` shard,
+  decompresses it and compares the decompressed bytes. Also, `Writer::finalize_writer_to_shard_meta`
+  now records a compressing writer's shard under its stored name (`...bin.zst`); it used to look for
+  the name without the extension and fail.
 
 - **The retry loop keeps its own attempts for every error code the AWS SDK retries (#240
   follow-up).** The first version of the #240 classifier listed only some of the codes the pinned AWS
@@ -48,8 +70,12 @@
   `LimitExceededException`, `PriorRequestNotComplete` and `EC2ThrottledException` on a 4xx status were
   judged definite, so after the SDK had spent its own attempts the s3dlio loop gave up instead of
   starting its own attempts. The classifier now carries the SDK's complete throttling and transient
-  tables (a unit test compares them with the pinned crate, so an SDK upgrade that adds a code fails the
-  build until the table is updated) plus the S3-specific codes it always had.
+  tables (a unit test compares them with the pinned crate, so after an SDK upgrade that changes the
+  tables `cargo test` fails until the constants are updated) plus the S3-specific codes it always had.
+  Consequence to know: a persistent throttling or quota error with one of these codes (for example a
+  hard `LimitExceededException`) now uses the outer retry budget too, 3 attempts with 100 ms and 200 ms
+  of backoff between them (`S3DLIO_MAX_RETRY_ATTEMPTS`), on top of the SDK's own attempts, before the
+  error is returned; it used to fail after the SDK's attempts alone.
 
 - **The object size cache no longer grows without bound (#241).** The process-global size cache (and
   the per-store size caches) never removed anything: an expired entry was treated as a miss but left in
