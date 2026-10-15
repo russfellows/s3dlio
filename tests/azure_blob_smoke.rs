@@ -8,11 +8,11 @@
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use crc32fast::Hasher as Crc32;
 use futures::stream;
 use rand::distr::Alphanumeric;
 use rand::{rng, Rng};
 use s3dlio::azure_client::AzureBlob; // direct client tests
+use s3dlio::checksum::Crc32c as Crc32;
 use s3dlio::object_store::store_for_uri;
 use std::env; // NEW: factory-based smoke
 

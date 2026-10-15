@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use crate::checksum::Crc32c;
 use crate::memory::{AlignedBuf, BufferPool, BufferPoolConfig};
 use crate::object_store::WriterOptions;
 use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use crc32fast::Hasher;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -231,7 +231,7 @@ pub struct DirectIOWriter {
     bytes_written: u64,
     finalized: bool,
     buffer: Vec<u8>, // Buffer for alignment and minimum I/O size requirements
-    hasher: Hasher,
+    hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
     compressed_bytes: u64,
@@ -322,7 +322,7 @@ impl DirectIOWriter {
             bytes_written: 0,
             finalized: false,
             buffer,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             compression,
             compressor,
             compressed_bytes: 0,

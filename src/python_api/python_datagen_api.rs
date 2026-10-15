@@ -372,7 +372,8 @@ impl PyGenerator {
 ///
 /// This replaces `numpy.savez()` for object-store workloads, eliminating the
 /// Python-side CRC32 bottleneck (~178 ms for 140 MiB using software `zlib.crc32`).
-/// Rust's `crc32fast` uses SSE4.2/NEON and runs at 4–8 GB/s, giving a ~5× speedup.
+/// Rust's `crc32fast` (used for the NPZ container's CRC-32 only) uses PCLMULQDQ folding on
+/// x86 and the CRC instructions on ARM, and runs at 4–8 GB/s, giving a ~5× speedup.
 ///
 /// The generated archive matches numpy's format and is loadable by `numpy.load()`.
 ///

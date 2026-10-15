@@ -9,9 +9,10 @@ import yaml
 import struct
 import tempfile
 import os
-import zlib
 import sys
 from termcolor import colored
+
+from crc32c_pure import crc32c  # TFRecord checksums are CRC-32C, not zlib's CRC-32 (#258)
 
 SUCCESS_ICON = colored('✅', 'green')
 ERROR_ICON = colored('❌', 'red')
@@ -153,7 +154,7 @@ def verify_tfrecord_object(s3_client, bucket_name, key, index_key):
             cursor += 4
 
             # Verify length CRC
-            computed_len_crc = zlib.crc32(length_bytes) & 0xFFFFFFFF
+            computed_len_crc = crc32c(length_bytes)
             if unmask_crc(masked_len_crc) != computed_len_crc:
                 print(f"{ERROR_ICON} Invalid length CRC: {masked_len_crc} != {computed_len_crc}")
                 continue
@@ -173,7 +174,7 @@ def verify_tfrecord_object(s3_client, bucket_name, key, index_key):
             cursor += 4
 
             # Verify data CRC
-            computed_data_crc = zlib.crc32(data_block) & 0xFFFFFFFF
+            computed_data_crc = crc32c(data_block)
             if unmask_crc(masked_crc=masked_data_crc) != computed_data_crc:
                 print(f"{ERROR_ICON} Invalid data CRC: {masked_data_crc} != {computed_data_crc}")
                 continue

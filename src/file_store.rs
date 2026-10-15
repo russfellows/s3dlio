@@ -7,6 +7,7 @@ use tracing::{debug, info, trace};
 // FileSystemObjectStore implementation for POSIX file I/O
 // This provides the same ObjectStore interface for local filesystem operations
 
+use crate::checksum::Crc32c;
 use crate::data_loader::options::PageCacheMode;
 use crate::object_store::WriterOptions;
 use crate::page_cache::apply_page_cache_hint;
@@ -14,7 +15,6 @@ use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use crc32fast::Hasher;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -90,7 +90,7 @@ pub struct FileSystemWriter {
     bytes_written: u64,
     compressed_bytes: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
 }
@@ -140,7 +140,7 @@ impl FileSystemWriter {
             bytes_written: 0,
             compressed_bytes: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             compression,
             compressor,
         })

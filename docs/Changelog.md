@@ -2,7 +2,80 @@
 
 ## Unreleased
 
+### Changed (BEHAVIOUR CHANGE)
+
+- **The writers' `crc32c:` checksum is now a real CRC-32C (#256).** Every streaming writer (file,
+  `direct://`, the data-generating streaming writer, S3, Azure, GCS and the Arrow backend) reported
+  its checksum as `crc32c:<hex>` but computed CRC-32 (IEEE) with `crc32fast`, so the value never
+  matched a GCS `crc32c` or an S3 `x-amz-checksum-crc32c`, and the label named the wrong algorithm.
+  The value is now CRC-32C (Castagnoli), computed with the `crc-fast` crate (already in `Cargo.lock`
+  through the AWS SDK): SIMD code chosen at run time from the CPU (PCLMULQDQ / VPCLMULQDQ on x86-64,
+  PMULL and the CRC32 instructions on aarch64, software fallback), so no build flag is needed and a
+  wheel gets the fast path. Throughput was measured, not assumed (`examples/bench_crc32c.rs`): the
+  `crc32c` crate, the obvious choice, is about half as fast as the `crc32fast` it replaces on x86-64
+  without build flags (it detects SSE4.2 at run time, but its hardware loop makes a non-inlinable call
+  per 8 bytes, so it only runs well when the whole build enables `+sse4.2`), which would have slowed
+  every `write_chunk`; `crc-fast` is about 3x to 4x faster than `crc32fast` for buffers that fit in
+  cache and equal to it when memory-bound (measured on an x86-64 AVX-512 host; aarch64 was not
+  measured). `s3dlio::checksum::crc32c_implementation()` reports which code the CPU selected. The
+  `crc32c` crate remains only as an independent oracle in the tests. The label is unchanged. **The hex digits differ for every input**: for the bytes `123456789` the writers used to
+  report `crc32c:cbf43926` and now report `crc32c:e3069283`. Anything that stored a checksum from an
+  earlier release and compares it with a new one (for example a checkpoint manifest written before
+  and read with validation after) must recompute it. The integrity-validation helper
+  (`get_with_validation` / `get_range_with_validation`) uses the same algorithm, so a value a writer
+  reports still validates the object it wrote. New: `s3dlio::checksum` (`Crc32c`, `crc32c_of`,
+  `crc32c_label`). The ZIP/NPZ container CRC is unchanged (that format requires CRC-32).
+
+- **TFRecord files s3dlio generates now carry CRC-32C checksums (#258).** The TFRecord format
+  requires CRC-32C (Castagnoli) for both the length checksum and the data checksum of every record,
+  masked as `((crc >> 15) | (crc << 17)) + 0xa282ead8`. The masking was right, but the CRC underneath
+  was CRC-32 (IEEE), so a reader that verifies checksums (TensorFlow, TensorBoard) rejected the files
+  as corrupt, and one that does not verify accepted them, which hid the problem. The bytes of every
+  generated TFRecord change (the 4-byte checksum fields; the record layout, the sizes and the index are
+  the same). The test compares the output with a reference written by an independent bitwise CRC-32C
+  and accepted by TensorBoard's TFRecord reader, which verifies the checksums and rejects the old output
+  with a header-CRC error. Files written by earlier releases keep their wrong checksums.
+
 ### Fixed
+
+- **`get_with_validation` accepts the checksum form that writers and manifests produce (#259).**
+  Writers report `crc32c:<hex>` and the checkpoint manifest stores that value, but validation compared
+  it with the bare hex of the data, so validating a value a writer had reported failed for intact data
+  ("expected crc32c:e3069283, got e3069283"). `get_with_validation`, `get_range_with_validation` and
+  `load_checkpoint_with_validation` (and so the checkpoint reader's validating reads and
+  `validate_checkpoint_integrity`) now take `<algorithm>:<hex>`: the algorithm is parsed
+  (case-insensitive), `crc32c` is supported, and any other algorithm is an immediate, clear error
+  ("unsupported checksum algorithm ..."), reported before anything is fetched and never as a mismatch.
+  **A bare hex string now means CRC-32C** (it was CRC-32 before #256 changed the writers): a caller
+  that computed a CRC-32 with `crc32fast` and passes it bare will now see a mismatch, and a mismatch
+  message says `(CRC-32C; checksums written before the #256 fix were CRC-32)` so an old stored value is
+  recognisable. The hex part must be 1 to 8 hexadecimal digits in either case; fewer than 8 are read as
+  the number they spell (`crc32c:0` is the empty object's checksum). A `0x` prefix, an empty value, more
+  than 8 digits, a further `:` or any other character is a "malformed checksum" error, never a
+  mismatch. Corrupted data still fails validation.
+
+- **Validating a compressed checkpoint shard works (#259).** Writers hash the uncompressed bytes they
+  are given, but the shard in the store is the compressed `.zst` object, and the reader validated the
+  stored bytes, so a compressed shard could never pass validation once the checksum format was
+  accepted. The checkpoint reader (`read_shard_with_validation`, `read_all_shards_with_validation`,
+  the concurrent variants and `validate_checkpoint_integrity`) now fetches a `.zst` shard,
+  decompresses it and compares the decompressed bytes. Also, `Writer::finalize_writer_to_shard_meta`
+  now records a compressing writer's shard under its stored name (`...bin.zst`); it used to look for
+  the name without the extension and fail.
+
+- **The retry loop keeps its own attempts for every error code the AWS SDK retries (#240
+  follow-up).** The first version of the #240 classifier listed only some of the codes the pinned AWS
+  SDK (aws-runtime 1.7.5) treats as transient or throttling. `RequestTimeoutException`,
+  `ThrottledException`, `RequestThrottledException`, `TransactionInProgressException`,
+  `LimitExceededException`, `PriorRequestNotComplete` and `EC2ThrottledException` on a 4xx status were
+  judged definite, so after the SDK had spent its own attempts the s3dlio loop gave up instead of
+  starting its own attempts. The classifier now carries the SDK's complete throttling and transient
+  tables (a unit test compares them with the pinned crate, so after an SDK upgrade that changes the
+  tables `cargo test` fails until the constants are updated) plus the S3-specific codes it always had.
+  Consequence to know: a persistent throttling or quota error with one of these codes (for example a
+  hard `LimitExceededException`) now uses the outer retry budget too, 3 attempts with 100 ms and 200 ms
+  of backoff between them (`S3DLIO_MAX_RETRY_ATTEMPTS`), on top of the SDK's own attempts, before the
+  error is returned; it used to fail after the SDK's attempts alone.
 
 - **The object size cache no longer grows without bound (#241).** The process-global size cache (and
   the per-store size caches) never removed anything: an expired entry was treated as a miss but left in
@@ -49,7 +122,8 @@
   With the optional `arrow-backend` feature, `delete_prefix("s3://b/p")` listed only the immediate
   children of `p`, so `p/b/c` and `p/b/d/e` were left behind while the call returned success. It now
   lists everything under `p/` recursively (streamed, never collected whole) and deletes it with S3
-  `DeleteObjects` requests of up to 1000 keys each, 10 requests in flight at a time. `pfoo/x` and
+  `DeleteObjects` requests of up to 1000 keys each, 10 requests in flight at a time (that bound is
+  specific to S3: see the note below). `pfoo/x` and
   `p2/y` are not touched, and neither is an object named exactly `p`. A key counts as failed unless the
   store confirmed it deleted, so a request that fails as a whole counts every key in it; a failed
   listing is one failure, ends the listing and is reported as "listing incomplete". If anything fails
@@ -61,7 +135,12 @@
   addressed through the Arrow backend's `object_store` layer, which strips the trailing `/`: the
   marker `p/` is never reported as an entry of `p/` and is not deleted, and a nested marker `p/sub/`
   is listed as `s3://b/p/sub` and may remain after `delete_prefix` (the delete of the key `p/sub`
-  reports success while `p/sub/` stays).
+  reports success while `p/sub/` stays). (3) The "10 requests in flight" bound is S3's. It counts
+  chunks of up to 1000 keys, and one chunk is one request only for S3 `DeleteObjects`; the other
+  stores split a chunk inside `object_store` 0.13.2's `delete_stream`, which multiplies the bound per
+  outer chunk: Azure sends batch requests of 256 keys (up to 4 per chunk, so up to 40 in flight), and
+  GCS and plain HTTP send one DELETE per object, 10 at a time per chunk (up to 100 in flight); S3 with
+  bulk delete disabled deletes per object, 20 per chunk (up to 200 in flight).
 
 - **Arrow backend: listing an `s3://` URI with a key prefix no longer returns doubled URIs (#222).**
   With the optional `arrow-backend` feature, listing `s3://b/dir/` returned `s3://b/dir/dir/x` for the

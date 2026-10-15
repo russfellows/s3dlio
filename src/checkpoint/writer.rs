@@ -236,6 +236,14 @@ impl<'a> Writer<'a> {
         writer: Box<dyn crate::object_store::ObjectWriter>,
     ) -> Result<ShardMeta> {
         let checksum = writer.checksum();
+        // A compressing writer stores the shard under the compression extension
+        // (`shard.bin.zst`), and the manifest must name the stored object.
+        let compression = writer.compression();
+        let key = if compression.is_enabled() && !key.ends_with(compression.extension()) {
+            format!("{key}{}", compression.extension())
+        } else {
+            key
+        };
         writer.finalize().await?;
         self.finalize_shard_meta_with_checksum(layout, key, checksum)
             .await

@@ -23,7 +23,7 @@ mod common;
 
 use common::mock_s3_server::{
     ensure_mock_s3_server, key_path, unique_test_key, GET_FORBIDDEN_MARKER, GET_NOT_FOUND_MARKER,
-    GET_UNAVAILABLE_MARKER, SIZED_OBJECT_MARKER,
+    GET_TIMEOUT_FAILURES, GET_TIMEOUT_THEN_OK_MARKER, GET_UNAVAILABLE_MARKER, SIZED_OBJECT_MARKER,
 };
 use s3dlio::object_store::{ObjectStore, S3ObjectStore};
 use std::time::{Duration, Instant};
@@ -133,6 +133,59 @@ async fn global_client_range_get_of_missing_key_is_one_request() {
     assert_eq!(c.get_calls, 1, "global-path 404 must cost exactly one GET");
 
     concurrent_range_chunks_do_not_retry_a_404(&state).await;
+    concurrent_range_chunk_recovers_after_the_sdk_budget_is_spent(&state).await;
+}
+
+/// The chunk loop's own retry (follow-up to #240): the server answers the first
+/// [`GET_TIMEOUT_FAILURES`] requests for the chunk with `400 RequestTimeoutException`.
+/// The AWS SDK recognises that code and spends its whole attempt budget on it, so the
+/// error the chunk loop sees is the SDK's final one. It must still start another
+/// attempt, which then succeeds; a classifier that calls the code definite stops there.
+async fn concurrent_range_chunk_recovers_after_the_sdk_budget_is_spent(
+    state: &common::mock_s3_server::MockS3State,
+) {
+    let key = unique_test_key(&format!(
+        "{SIZED_OBJECT_MARKER}-{GET_TIMEOUT_THEN_OK_MARKER}"
+    ));
+
+    let data = s3dlio::s3_utils::get_object_concurrent_range_async(
+        &uri_for(&key),
+        0,
+        None,
+        Some(4),
+        Some(1),
+    )
+    .await
+    .expect("a later outer attempt must succeed once the SDK budget is spent");
+    assert!(!data.is_empty());
+    let c = state.counts_for(&key_path(BUCKET, &key));
+    assert!(
+        c.get_calls > GET_TIMEOUT_FAILURES,
+        "the chunk was retried past the failing requests, saw {} GETs",
+        c.get_calls
+    );
+}
+
+/// The whole-object GET loop (`retry_get_body`): after the SDK's inner budget is spent
+/// on `400 RequestTimeoutException`, the outer loop starts another attempt and the GET
+/// succeeds.
+#[tokio::test]
+async fn request_timeout_exception_is_retried_by_the_outer_loop() {
+    let (port, state) = init();
+    let store = endpoint_store(port).await;
+    let key = unique_test_key(GET_TIMEOUT_THEN_OK_MARKER);
+
+    let data = store
+        .get(&uri_for(&key))
+        .await
+        .expect("the outer loop must outlast the SDK's attempts");
+    assert_eq!(&data[..], b"mock");
+    let c = state.counts_for(&key_path(BUCKET, &key));
+    assert!(
+        c.get_calls > GET_TIMEOUT_FAILURES,
+        "more requests than the failing ones, saw {}",
+        c.get_calls
+    );
 }
 
 /// Body of the concurrent-range check, run from the global-client test below

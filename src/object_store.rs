@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use crate::checksum::Crc32c;
 use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use crc32fast::Hasher;
 use futures::stream::{Stream, StreamExt};
 use regex::Regex;
 use std::collections::HashMap;
@@ -17,13 +17,6 @@ use tokio::sync::OnceCell;
 #[cfg(feature = "backend-gcs")]
 use tracing::trace;
 use tracing::{debug, info, warn};
-
-// Helper function for integrity validation
-fn compute_checksum(data: &[u8]) -> String {
-    let mut hasher = Hasher::new();
-    hasher.update(data);
-    format!("{:08x}", hasher.finalize())
-}
 
 // --- S3 ----------------------------------------------------------------------
 use crate::delete_batch_plan::{
@@ -428,31 +421,29 @@ pub trait ObjectStore: Send + Sync {
     }
 
     /// Get object with integrity validation.
-    /// Returns the data and validates it against the expected checksum if provided.
+    ///
+    /// `expected_checksum` is `<algorithm>:<hex>` (what writers report and manifests
+    /// store; only `crc32c` is supported) or bare CRC-32C hex; see
+    /// [`crate::checksum::parse_expected_crc32c`]. An unsupported or malformed value is an
+    /// error before anything is fetched. Returns the data once it matches.
     async fn get_with_validation(
         &self,
         uri: &str,
         expected_checksum: Option<&str>,
     ) -> Result<Bytes> {
-        let data = self.get(uri).await?;
-
         if let Some(expected) = expected_checksum {
-            let actual = compute_checksum(&data);
-            if actual != expected {
-                bail!(
-                    "Integrity validation failed for {}: expected {}, got {}",
-                    uri,
-                    expected,
-                    actual
-                );
-            }
+            crate::checksum::parse_expected_crc32c(expected)?;
         }
-
+        let data = self.get(uri).await?;
+        if let Some(expected) = expected_checksum {
+            crate::checksum::verify_crc32c(&data, expected, uri)?;
+        }
         Ok(data)
     }
 
     /// Get byte range with integrity validation.
-    /// For partial reads, validates against the partial data checksum if provided.
+    /// For partial reads, validates against the partial data checksum if provided
+    /// (same checksum forms as [`ObjectStore::get_with_validation`]).
     async fn get_range_with_validation(
         &self,
         uri: &str,
@@ -460,46 +451,31 @@ pub trait ObjectStore: Send + Sync {
         length: Option<u64>,
         expected_checksum: Option<&str>,
     ) -> Result<Bytes> {
-        let data = self.get_range(uri, offset, length).await?;
-
         if let Some(expected) = expected_checksum {
-            let actual = compute_checksum(&data);
-            if actual != expected {
-                bail!(
-                    "Integrity validation failed for range {}[{}:{}]: expected {}, got {}",
-                    uri,
-                    offset,
-                    offset + data.len() as u64,
-                    expected,
-                    actual
-                );
-            }
+            crate::checksum::parse_expected_crc32c(expected)?;
         }
-
+        let data = self.get_range(uri, offset, length).await?;
+        if let Some(expected) = expected_checksum {
+            let what = format!("range {}[{}:{}]", uri, offset, offset + data.len() as u64);
+            crate::checksum::verify_crc32c(&data, expected, &what)?;
+        }
         Ok(data)
     }
 
     /// Load and validate checkpoint data with integrity checking.
     /// This method is specifically designed for checkpoint loading scenarios.
+    /// (Same checksum forms as [`ObjectStore::get_with_validation`].)
     async fn load_checkpoint_with_validation(
         &self,
         checkpoint_uri: &str,
         expected_checksum: Option<&str>,
     ) -> Result<Vec<u8>> {
-        // Get checkpoint data
-        let data = self.get(checkpoint_uri).await?;
-
-        // Validate integrity if checksum provided
         if let Some(expected) = expected_checksum {
-            let actual = compute_checksum(&data);
-            if actual != expected {
-                bail!(
-                    "Checkpoint integrity validation failed for {}: expected checksum {}, got {}",
-                    checkpoint_uri,
-                    expected,
-                    actual
-                );
-            }
+            crate::checksum::parse_expected_crc32c(expected)?;
+        }
+        let data = self.get(checkpoint_uri).await?;
+        if let Some(expected) = expected_checksum {
+            crate::checksum::verify_crc32c(&data, expected, checkpoint_uri)?;
         }
 
         // Convert Bytes to Vec<u8> for backward compatibility
@@ -1035,7 +1011,7 @@ pub struct BufferedObjectWriter<'a> {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
 }
 
 impl<'a> BufferedObjectWriter<'a> {
@@ -1046,7 +1022,7 @@ impl<'a> BufferedObjectWriter<'a> {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
         }
     }
 }
@@ -2154,7 +2130,7 @@ pub struct S3BufferedWriter {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
     compressed_bytes: u64,
@@ -2177,7 +2153,7 @@ impl S3BufferedWriter {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             compression,
             compressor,
             compressed_bytes: 0,
@@ -3060,7 +3036,7 @@ pub struct AzureBufferedWriter {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
     compressed_bytes: u64,
@@ -3083,7 +3059,7 @@ impl AzureBufferedWriter {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             compression,
             compressor,
             compressed_bytes: 0,
@@ -3693,7 +3669,7 @@ pub struct GcsBufferedWriter {
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
     compressed_bytes: u64,
@@ -3716,7 +3692,7 @@ impl GcsBufferedWriter {
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             compression,
             compressor,
             compressed_bytes: 0,
