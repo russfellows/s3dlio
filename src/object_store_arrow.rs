@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use url::{Position, Url};
 
-use crate::delete_contract::DELETE_REQUESTS_IN_FLIGHT;
+use crate::delete_contract::{DELETE_REQUESTS_IN_FLIGHT, DELETE_REQUEST_KEYS};
 
 use crate::object_store::{
     CompressionConfig,
@@ -216,9 +216,12 @@ fn key_path(url_path: &str, is_prefix: bool) -> Result<Path> {
 /// `recursive` lists every object under `base` at any depth and no directory entries
 /// (issue #245), streamed as the backend returns its pages: nothing is buffered, so a
 /// listing of any size runs in constant memory. Otherwise only the direct children are
-/// listed, objects first and then the directory entries (common prefixes); the backend
-/// answers that in one response. `object_store` matches a prefix per path segment, so `p`
-/// selects `p/...` and never `pfoo/...` or `p2/...`.
+/// listed, objects first and then the directory entries (common prefixes):
+/// `list_with_delimiter` requests the pages one at a time but returns only after all of
+/// them have arrived, so memory is O(direct children) and nothing is yielded before the
+/// last page. `object_store` matches a prefix per path segment, so `p` selects `p/...`
+/// and never `pfoo/...` or `p2/...`. Folder marker objects appear under their stripped
+/// name (`p/sub/` as `s3://b/p/sub`) and cannot be addressed afterwards.
 fn list_stream_under(
     store: Arc<dyn AosObjectStore>,
     base: Path,
@@ -280,59 +283,157 @@ async fn list_under(
 ///
 /// The location `base` itself is never deleted: S3 returns the folder marker object `p/`
 /// as the location `p` (`object_store` strips the trailing '/'), which is the prefix, not
-/// an entry under it, and deleting it would delete the unrelated object `p`. A marker
-/// object therefore cannot be addressed through `object_store` and may remain.
+/// an entry under it, and deleting it would delete the unrelated object `p`. Folder
+/// marker objects (`p/`, and `p/sub/` which lists as `p/sub`) cannot be addressed through
+/// `object_store`: they may remain, and a delete of the location `p/sub` reports success
+/// for the key `p/sub` (which does not exist) while `p/sub/` stays.
 ///
 /// `object_store` evaluates a prefix on a path-segment basis: `p` covers `p/a` and
 /// `p/b/c` but never `pfoo/x` or `p2/y`, so an unrelated sibling is never selected. The
 /// listing is recursive (`list_with_delimiter` returns the immediate children only) and
-/// is consumed as a stream, never collected. Each listed object gets its own DELETE
-/// request, [`DELETE_REQUESTS_IN_FLIGHT`] at a time, as the native backends do: the
-/// bulk `DeleteObjects` request that `delete_stream` sends on S3 is not supported by every
-/// S3-compatible endpoint (Google Cloud Storage's S3 interoperability endpoint rejects it)
-/// and one failure in it would count as a single failure for up to 1000 objects.
+/// is consumed as a stream, never collected whole.
 ///
-/// A failure does not stop the others. Every failed object, and every listing error, is
-/// counted on its own; the call fails if there is any, quoting the first few.
+/// The S3 store in `object_store` has no single-object DELETE: every delete, even of one
+/// key, is a `DeleteObjects` request (`POST ?delete`), and `delete_stream` sends one per
+/// 1000 keys. Deleting key by key would therefore cost a request per key. The keys are
+/// grouped here into chunks of [`DELETE_REQUEST_KEYS`] (the `DeleteObjects` limit), each
+/// chunk is one `delete_stream` call, and [`DELETE_REQUESTS_IN_FLIGHT`] chunks run at a
+/// time. An endpoint without `DeleteObjects` (Google Cloud Storage's S3 interoperability
+/// endpoint) is NOT supported for delete by this backend: every request fails and so does
+/// the call, naming the keys. Use `gs://` for GCS.
+///
+/// A failure does not stop the others. A key counts as failed unless the store confirmed
+/// it deleted, so a request that fails as a whole counts every key in it. A listing error
+/// ends the listing, counts as one failure and fails the call ("listing incomplete").
 async fn delete_under(store: &dyn AosObjectStore, base: &Path) -> Result<()> {
+    delete_under_in_chunks(store, base, DELETE_REQUEST_KEYS).await
+}
+
+/// What deleting one chunk of keys (or finding the listing broken) came to.
+#[derive(Default)]
+struct DeleteOutcome {
+    deleted: usize,
+    failed: usize,
+    failed_keys: Vec<String>,
+    causes: Vec<String>,
+    listing_error: Option<String>,
+}
+
+/// Delete one chunk of keys with one `delete_stream` call.
+async fn delete_chunk(store: &dyn AosObjectStore, keys: Vec<Path>) -> DeleteOutcome {
+    use futures::StreamExt as _;
+
+    let mut results =
+        store.delete_stream(futures::stream::iter(keys.clone().into_iter().map(Ok)).boxed());
+    let mut confirmed: std::collections::HashSet<Path> = std::collections::HashSet::new();
+    let mut outcome = DeleteOutcome::default();
+    while let Some(result) = results.next().await {
+        match result {
+            Ok(path) => {
+                confirmed.insert(path);
+            }
+            Err(e) => {
+                if outcome.causes.len() < MAX_NAMED_DELETE_FAILURES {
+                    outcome.causes.push(e.to_string());
+                }
+            }
+        }
+    }
+    for key in keys {
+        if confirmed.contains(&key) {
+            outcome.deleted += 1;
+        } else {
+            outcome.failed += 1;
+            if outcome.failed_keys.len() < MAX_NAMED_DELETE_FAILURES {
+                outcome.failed_keys.push(key.to_string());
+            }
+        }
+    }
+    outcome
+}
+
+/// [`delete_under`] with the number of keys per delete request given.
+async fn delete_under_in_chunks(
+    store: &dyn AosObjectStore,
+    base: &Path,
+    chunk_keys: usize,
+) -> Result<()> {
     use futures::StreamExt as _;
 
     // An empty prefix is the whole store (the bucket root).
     let prefix = (!base.as_ref().is_empty()).then_some(base);
-    let outcomes = store
-        .list(prefix)
-        .filter(|entry| std::future::ready(!matches!(entry, Ok(meta) if meta.location == *base)))
-        .map(|entry| async move {
+    let mut listing = store.list(prefix);
+    // Chunks of keys, or the error that ended the listing.
+    let chunks = async_stream::stream! {
+        let mut chunk: Vec<Path> = Vec::new();
+        while let Some(entry) = listing.next().await {
             match entry {
-                Ok(meta) => store
-                    .delete(&meta.location)
-                    .await
-                    .map_err(|e| format!("{}: {e}", meta.location)),
-                Err(e) => Err(format!("listing: {e}")),
+                Ok(meta) if meta.location == *base => {}
+                Ok(meta) => {
+                    chunk.push(meta.location);
+                    if chunk.len() >= chunk_keys {
+                        yield Ok(std::mem::take(&mut chunk));
+                    }
+                }
+                Err(e) => {
+                    if !chunk.is_empty() {
+                        yield Ok(std::mem::take(&mut chunk));
+                    }
+                    yield Err(e.to_string());
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            yield Ok(chunk);
+        }
+    };
+    let outcomes = chunks
+        .map(|chunk| async move {
+            match chunk {
+                Ok(keys) => delete_chunk(store, keys).await,
+                Err(listing_error) => DeleteOutcome {
+                    failed: 1,
+                    listing_error: Some(listing_error),
+                    ..Default::default()
+                },
             }
         })
         .buffer_unordered(DELETE_REQUESTS_IN_FLIGHT);
     tokio::pin!(outcomes);
 
-    let mut deleted = 0usize;
-    let mut failures: Vec<String> = Vec::new();
-    let mut failed = 0usize;
+    let mut total = DeleteOutcome::default();
     while let Some(outcome) = outcomes.next().await {
-        match outcome {
-            Ok(()) => deleted += 1,
-            Err(what) => {
-                failed += 1;
-                if failures.len() < MAX_NAMED_DELETE_FAILURES {
-                    failures.push(what);
-                }
+        total.deleted += outcome.deleted;
+        total.failed += outcome.failed;
+        total.listing_error = total.listing_error.or(outcome.listing_error);
+        for key in outcome.failed_keys {
+            if total.failed_keys.len() < MAX_NAMED_DELETE_FAILURES {
+                total.failed_keys.push(key);
+            }
+        }
+        for cause in outcome.causes {
+            if total.causes.len() < MAX_NAMED_DELETE_FAILURES {
+                total.causes.push(cause);
             }
         }
     }
-    if failed > 0 {
+    if total.failed > 0 {
+        let listing = match &total.listing_error {
+            Some(e) => format!("; listing incomplete: {e}"),
+            None => String::new(),
+        };
+        let keys = if total.failed_keys.is_empty() {
+            String::new()
+        } else {
+            format!("; first failed keys: {}", total.failed_keys.join(", "))
+        };
         bail!(
-            "delete_prefix: {failed} failed under {:?} ({deleted} deleted); first errors: {}",
+            "delete_prefix: {} failed under {:?} ({} deleted){listing}{keys}; first errors: {}",
+            total.failed,
             base.as_ref(),
-            failures.join("; ")
+            total.deleted,
+            total.causes.join("; ")
         );
     }
     Ok(())
@@ -1156,9 +1257,15 @@ mod tests {
     struct Probe {
         inner: aos::memory::InMemory,
         marker: Option<Path>,
-        /// Like the GCS S3-interop endpoint: a delete request naming more than one key
-        /// (`DeleteObjects`, `POST ?delete`) fails for every key in it.
-        bulk_unsupported: bool,
+        /// Like the GCS S3-interop endpoint: ANY `DeleteObjects` request (`POST ?delete`)
+        /// fails. On the S3 client every delete is one, even for a single key
+        /// (`ObjectStoreExt::delete` is `delete_stream` of one location), and a request
+        /// that fails as a whole yields ONE error, not one per key.
+        rejects_delete_objects: bool,
+        /// A delete request naming this key fails as a whole (one error for the request).
+        reject_requests_containing: Option<String>,
+        /// The number of keys in each delete request this store received.
+        requests: Arc<std::sync::Mutex<Vec<usize>>>,
         /// A listing that ends with an error item, like a failed continuation page.
         list_error: bool,
         /// A listing that returns its entries and then never ends (a huge listing).
@@ -1172,7 +1279,9 @@ mod tests {
             Self {
                 inner,
                 marker: None,
-                bulk_unsupported: false,
+                rejects_delete_objects: false,
+                reject_requests_containing: None,
+                requests: Arc::default(),
                 list_error: false,
                 list_never_ends: false,
                 in_flight: Arc::default(),
@@ -1185,6 +1294,13 @@ mod tests {
                 marker: Some(Path::from(marker)),
                 ..Self::new(inner)
             }
+        }
+
+        /// The sizes of the delete requests received, sorted.
+        fn request_sizes(&self) -> Vec<usize> {
+            let mut sizes = self.requests.lock().expect("requests").clone();
+            sizes.sort_unstable();
+            sizes
         }
 
         /// The most delete requests that were in flight at the same time.
@@ -1237,7 +1353,9 @@ mod tests {
         ) -> futures::stream::BoxStream<'static, aos::Result<Path>> {
             use std::sync::atomic::Ordering::SeqCst;
             let inner = self.inner.clone();
-            let bulk_unsupported = self.bulk_unsupported;
+            let rejects = self.rejects_delete_objects;
+            let reject_containing = self.reject_requests_containing.clone();
+            let requests = self.requests.clone();
             let (current, max) = (self.in_flight.clone(), self.max_in_flight.clone());
             let refused = |why: String| aos::Error::Generic {
                 store: "Probe",
@@ -1245,11 +1363,17 @@ mod tests {
             };
             futures::stream::once(async move {
                 let items: Vec<aos::Result<Path>> = locations.collect().await;
-                if bulk_unsupported && items.len() > 1 {
-                    return items
-                        .into_iter()
-                        .map(|_| Err(refused("bulk delete is not supported".to_string())))
-                        .collect::<Vec<_>>();
+                requests.lock().expect("requests").push(items.len());
+                if rejects && !items.is_empty() {
+                    return vec![Err(refused("DeleteObjects is not supported".to_string()))];
+                }
+                if let Some(key) = &reject_containing {
+                    if items
+                        .iter()
+                        .any(|i| matches!(i, Ok(p) if p.as_ref() == key))
+                    {
+                        return vec![Err(refused("the request failed".to_string()))];
+                    }
                 }
                 let now = current.fetch_add(1, SeqCst) + 1;
                 max.fetch_max(now, SeqCst);
@@ -1380,34 +1504,84 @@ mod tests {
         }
     }
 
-    // F2: the GCS S3-interop endpoint rejects `DeleteObjects`, which a bulk delete sends.
-    // `delete_prefix` must work with one delete request per object, as it did before #232.
+    // On S3 every delete is a `DeleteObjects` request that takes up to 1000 keys. The
+    // adapter forms its own chunks of that size: 2500 objects are 3 requests, not 2500.
     #[tokio::test]
-    async fn delete_prefix_sends_one_delete_request_per_object() {
-        let keys: Vec<String> = (0..25).map(|i| format!("p/d{}/k{i}", i % 3)).collect();
+    async fn delete_prefix_batches_keys_into_delete_objects_requests() {
+        let keys: Vec<String> = (0..2500).map(|i| format!("p/d{}/k{i}", i % 7)).collect();
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let mut store = Probe::new(seeded(&refs).await);
-        store.bulk_unsupported = true;
+        let store = Probe::new(seeded(&refs).await);
         let (base, _url) = s3_prefix("s3://b/p/");
         delete_under(&store, &base).await.expect("delete_prefix");
+        let sizes = store.request_sizes();
+        assert_eq!(
+            (
+                sizes.len(),
+                sizes.iter().sum::<usize>(),
+                sizes.last().copied()
+            ),
+            (3, 2500, Some(1000)),
+            "request sizes (count, total, largest)"
+        );
+        assert_eq!(sizes[0], 500);
         assert_eq!(remaining(&store.inner).await, Vec::<String>::new());
     }
 
-    // At most DELETE_REQUESTS_IN_FLIGHT requests at once (the repo-wide bound), and the
-    // deletes do overlap.
+    // The GCS S3-interop endpoint rejects every `DeleteObjects`. The Arrow backend cannot
+    // delete there: the call must fail, name the keys and count each as failed, never
+    // report success.
+    #[tokio::test]
+    async fn delete_prefix_on_an_endpoint_without_delete_objects_fails_naming_each_key() {
+        let mut store = Probe::new(seeded(&["p/a", "p/b/c", "p/d"]).await);
+        store.rejects_delete_objects = true;
+        let (base, _url) = s3_prefix("s3://b/p/");
+        let err = delete_under(&store, &base).await.expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("3 failed"), "{msg}");
+        for key in ["p/a", "p/b/c", "p/d"] {
+            assert!(msg.contains(key), "{key} must be named: {msg}");
+        }
+        assert!(msg.contains("DeleteObjects is not supported"), "{msg}");
+        assert_eq!(remaining(&store.inner).await.len(), 3);
+    }
+
+    // At most DELETE_REQUESTS_IN_FLIGHT delete REQUESTS at once (the repo-wide bound), and
+    // they do overlap. Chunks of 5 keys make 12 requests from 60 objects.
     #[tokio::test]
     async fn delete_prefix_bounds_and_uses_request_concurrency() {
         let keys: Vec<String> = (0..60).map(|i| format!("p/k{i}")).collect();
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
         let store = Probe::new(seeded(&refs).await);
         let (base, _url) = s3_prefix("s3://b/p/");
-        delete_under(&store, &base).await.expect("delete_prefix");
+        delete_under_in_chunks(&store, &base, 5)
+            .await
+            .expect("delete_prefix");
+        assert_eq!(store.request_sizes(), vec![5; 12]);
         let max = store.max_in_flight();
         assert!(
             (2..=crate::delete_contract::DELETE_REQUESTS_IN_FLIGHT).contains(&max),
             "max in flight {max}"
         );
         assert_eq!(remaining(&store.inner).await, Vec::<String>::new());
+    }
+
+    // A request that fails as a whole yields ONE error; every key of its chunk is still
+    // counted as failed, and the other chunks' keys are deleted.
+    #[tokio::test]
+    async fn a_failed_request_counts_every_key_of_its_chunk() {
+        let keys: Vec<String> = (0..12).map(|i| format!("p/k{i:02}")).collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut store = Probe::new(seeded(&refs).await);
+        store.reject_requests_containing = Some("p/k07".to_string());
+        let (base, _url) = s3_prefix("s3://b/p/");
+        let err = delete_under_in_chunks(&store, &base, 4)
+            .await
+            .expect_err("must fail");
+        let msg = format!("{err:#}");
+        // The chunk holding k07 is one of three of 4 keys: all 4 failed, 8 deleted.
+        assert!(msg.contains("4 failed"), "{msg}");
+        assert!(msg.contains("(8 deleted)"), "{msg}");
+        assert_eq!(remaining(&store.inner).await.len(), 4);
     }
 
     // Every failed object counts on its own, however many requests there are, and the
@@ -1423,6 +1597,7 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("7 failed"), "{msg}");
         assert!(msg.contains("20 deleted"), "{msg}");
+        assert!(!msg.contains("listing incomplete"), "{msg}");
         assert_eq!(
             msg.matches("refused").count(),
             MAX_NAMED_DELETE_FAILURES,
@@ -1441,6 +1616,7 @@ mod tests {
         let err = delete_under(&store, &base).await.expect_err("must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("1 failed"), "{msg}");
+        assert!(msg.contains("listing incomplete"), "{msg}");
         assert!(msg.contains("listing page failed"), "{msg}");
         assert_eq!(remaining(&store.inner).await, Vec::<String>::new());
     }
@@ -1493,9 +1669,10 @@ mod tests {
 
     // `rebuild_full_uri` with the `base` the adapter really derives: `s3://` goes through
     // `s3_target` (as `parse_as` does) and every other scheme through
-    // `object_store::parse_url`, whose store and prefix path `parse_as` uses. Building these
-    // stores makes no request. A hand-written `base` could agree with the code under test
-    // by construction; these cannot.
+    // `ObjectStoreScheme::parse`, the function `object_store::parse_url` takes its path
+    // from. No store is built, so the test depends on no environment variable. A
+    // hand-written `base` could agree with the code under test by construction; these
+    // cannot.
     #[test]
     fn rebuild_full_uri_matches_the_base_the_parser_derives() {
         let cases = [
@@ -1531,9 +1708,13 @@ mod tests {
             let base = if url.scheme() == "s3" {
                 s3_target(&url, listing, true).expect("s3_target").1
             } else {
-                // The same call `parse_as` makes; the store it builds is dropped unused.
-                aos::parse_url(&url)
-                    .unwrap_or_else(|e| panic!("parse_url({listing}): {e}"))
+                // `parse_url` takes its prefix path from `ObjectStoreScheme::parse` and only
+                // then builds the store (from environment variables such as
+                // GOOGLE_APPLICATION_CREDENTIALS, which a test must not depend on). The
+                // path is the part `parse_as` uses, so it is derived the same way, without
+                // building a store.
+                aos::ObjectStoreScheme::parse(&url)
+                    .unwrap_or_else(|e| panic!("ObjectStoreScheme::parse({listing}): {e}"))
                     .1
             };
             let location = base.clone().join("x");
