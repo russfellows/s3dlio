@@ -1,0 +1,652 @@
+"""Python adapters keep the object key exactly: s3dlio issue #198.
+
+The rule (the core's since #172): a URI's key is used exactly as written. Of
+``s3://b//k`` only the ONE ``/`` that separates the bucket from the key is
+structural, so the object is ``/k``; ``/x`` and ``x``, or ``a//b`` and ``a/b``,
+are different objects. The adapters above the core (the DLIO storage classes
+and the s3torchconnector compat layer) used to ``lstrip('/')`` keys, so for a
+key that begins with ``/`` they addressed or reported a different object.
+
+One deliberate exception (the D2 ruling): a DLIO NAME that is relative to the
+configured namespace is a filesystem-style name, and ``S3dlioStorage`` keeps its
+0.9.124 normalisation (``/train/f.npz`` under ``s3://b/base`` is the key
+``base/train/f.npz``, not ``base//train/f.npz``): it is not established that DLIO
+supplies object keys rather than such names. A FULL URI (``s3://b//k``) is exact.
+
+Every test drives the real ``s3dlio`` extension module in a FRESH interpreter
+(the S3 client is process-global) against a recording in-process mock S3
+server (the one from ``test_python_delete_contract_212``) and asserts the exact
+keys the adapters put on the wire. The DLIO classes import ``dlio_benchmark``,
+which is not a dependency of this repo, so the child interpreter fakes just
+enough of its import surface.
+
+Run against the wheel under test:
+``uv run --no-project --with <wheel> --with pytest pytest tests/test_python_exact_keys_198.py``.
+"""
+
+import importlib.util
+import json
+import sys
+import textwrap
+
+import pytest
+
+from test_oplog_lifecycle import run_scenario
+from test_python_delete_contract_212 import MockS3, env_for
+
+# Keys that are legal S3 keys and name three different objects.
+KEYS = ["/x", "a//b", "x"]
+
+
+@pytest.fixture
+def mock_factory():
+    mocks = []
+
+    def make(keys=()):
+        m = MockS3(keys)
+        mocks.append(m)
+        return m
+
+    yield make
+    for m in mocks:
+        m.close()
+
+
+def keys_requested(mock, method):
+    """The object key of every `method` request that names one, in order."""
+    return [
+        r["path"].lstrip("/").partition("/")[2]
+        for r in mock.requests(method)
+        if "list-type" not in r["query"]
+    ]
+
+
+def keys_on_the_wire(mock, method):
+    """The DISTINCT object keys `method` requests named (the core may repeat a HEAD)."""
+    return sorted(set(keys_requested(mock, method)))
+
+
+def list_prefixes(mock):
+    return [r["query"].get("prefix", "") for r in mock.lists()]
+
+
+def run_child(mock, body, *args):
+    proc = run_scenario(textwrap.dedent(body), *args, env=env_for(mock))
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, (
+        f"child failed: rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    return json.loads(lines[-1][len("RESULT ") :])
+
+
+# ----------------------------------------------------------------------------
+# A fake `dlio_benchmark`, installed in the child before the DLIO classes import
+# ----------------------------------------------------------------------------
+
+FAKE_DLIO = """
+    import json, sys, types
+
+    def install_fake_dlio_benchmark():
+        def mod(name):
+            m = types.ModuleType(name)
+            sys.modules[name] = m
+            return m
+
+        mod("dlio_benchmark")
+        mod("dlio_benchmark.common")
+        mod("dlio_benchmark.common.constants").MODULE_STORAGE = "storage"
+        enums = mod("dlio_benchmark.common.enumerations")
+        enums.NamespaceType = types.SimpleNamespace(FLAT="flat")
+        enums.MetadataType = types.SimpleNamespace(FILE="file", DIRECTORY="directory")
+        mod("dlio_benchmark.storage")
+        handler = mod("dlio_benchmark.storage.storage_handler")
+
+        class Namespace:
+            def __init__(self, name, ns_type):
+                self.name = name
+
+        class DataStorage:
+            def __init__(self, framework=None):
+                self._args = types.SimpleNamespace()
+
+        handler.Namespace = Namespace
+        handler.DataStorage = DataStorage
+        mod("dlio_benchmark.storage.s3_storage").S3Storage = DataStorage
+        mod("dlio_benchmark.utils")
+
+        class Passthrough:
+            def __call__(self, fn):
+                return fn
+
+        class Profile:
+            def __init__(self, module):
+                self.log = Passthrough()
+                self.log_init = Passthrough()
+
+        mod("dlio_benchmark.utils.utility").Profile = Profile
+
+    install_fake_dlio_benchmark()
+"""
+
+# The compat module imports torch.utils.data at import time; torch is an optional extra
+# of s3dlio and not needed here, so a minimal stand-in is installed when it is absent.
+FAKE_TORCH = """
+    import sys, types
+
+    try:
+        import torch.utils.data
+    except ImportError:
+        torch = types.ModuleType("torch")
+        utils = types.ModuleType("torch.utils")
+        data = types.ModuleType("torch.utils.data")
+        data.Dataset = type("Dataset", (), {})
+        data.IterableDataset = type("IterableDataset", (), {})
+        torch.utils = utils
+        utils.data = data
+        sys.modules.update(
+            {"torch": torch, "torch.utils": utils, "torch.utils.data": data}
+        )
+"""
+
+
+# Modules that bind the stand-in `torch` when it is installed; all are put back (or
+# removed) when the test ends so no later test in the session sees the stub.
+_TORCH_STUB_SCOPE = (
+    "torch",
+    "torch.utils",
+    "torch.utils.data",
+    "s3dlio.compat",
+    "s3dlio.compat.s3torchconnector",
+)
+
+
+@pytest.fixture
+def fake_torch_in_process():
+    """Install the stand-in `torch` in this process for one test, then undo it.
+
+    A real torch, when present, is used and left alone."""
+    before = {name: sys.modules.get(name) for name in _TORCH_STUB_SCOPE}
+    s3dlio_pkg = sys.modules.get("s3dlio")
+    compat_attr = getattr(s3dlio_pkg, "compat", None)
+    exec(textwrap.dedent(FAKE_TORCH), {})
+    # The stand-in is a bare ModuleType, so it has no `__file__`; a real torch does.
+    stub_installed = before["torch"] is None and not hasattr(
+        sys.modules["torch"], "__file__"
+    )
+    try:
+        yield
+    finally:
+        if stub_installed:
+            for name, previous in before.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
+            pkg = sys.modules.get("s3dlio")
+            if pkg is not None:
+                if compat_attr is None:
+                    if hasattr(pkg, "compat"):
+                        delattr(pkg, "compat")
+                else:
+                    pkg.compat = compat_attr
+
+
+# Run a list of [method, args...] calls on `S3dlioStorage(namespace)`.
+DLIO_STORAGE_CHILD = (
+    FAKE_DLIO
+    + """
+    from s3dlio.integrations.dlio.s3dlio_storage import S3dlioStorage
+
+    spec = json.loads(sys.argv[1])
+    storage = S3dlioStorage(spec["namespace"])
+    out = []
+    for name, *args in spec["calls"]:
+        try:
+            if name == "put_data":
+                args[1] = args[1].encode()
+            value = getattr(storage, name)(*args)
+            if name == "get_data":
+                value = len(bytes(value))
+            out.append({"call": name, "value": value})
+        except BaseException as e:
+            out.append({"call": name, "exc": type(e).__name__, "msg": str(e)})
+    print("RESULT " + json.dumps(out, default=str))
+"""
+)
+
+# `S3PyTorchConnectorStorage.walk_node(uri)`.
+DLIO_TORCH_CHILD = (
+    FAKE_DLIO
+    + """
+    from s3dlio.integrations.dlio.s3_torch_storage import S3PyTorchConnectorStorage
+
+    storage = S3PyTorchConnectorStorage("s3://bkt")
+    print("RESULT " + json.dumps(storage.walk_node(sys.argv[1])))
+"""
+)
+
+
+def storage_calls(mock, namespace, *calls):
+    return run_child(
+        mock,
+        DLIO_STORAGE_CHILD,
+        json.dumps({"namespace": namespace, "calls": list(calls)}),
+    )
+
+
+# ----------------------------------------------------------------------------
+# 1. DLIO s3dlio_storage: put/get/delete/exists address the exact key
+# ----------------------------------------------------------------------------
+
+
+# A namespace-relative NAME and the key 0.9.124 (and this release) gives it.
+RELATIVE_NAMES = [
+    ("/x", "x"),
+    ("//x", "x"),
+    ("a//b", "a//b"),
+    ("x", "x"),
+]
+
+
+@pytest.mark.parametrize("name,rel", RELATIVE_NAMES)
+@pytest.mark.parametrize(
+    "namespace,base",
+    [
+        ("s3://bkt", ""),
+        ("s3://bkt/", ""),
+        ("s3://bkt/base", "base/"),
+        ("s3://bkt/base/", "base/"),
+    ],
+)
+def test_dlio_storage_namespace_relative_names_keep_the_0_9_124_normalisation(
+    mock_factory, namespace, base, name, rel
+):
+    """A namespace-relative name loses its leading `/` (as in 0.9.124); `a//b` is left alone."""
+    mock = mock_factory([base + rel])
+    out = storage_calls(
+        mock,
+        namespace,
+        ["put_data", name, "payload"],
+        ["get_data", name],
+        ["isfile", name],
+        ["delete_node", name],
+    )
+    assert [o.get("exc") for o in out] == [None] * 4, out
+    expected = base + rel
+    assert keys_on_the_wire(mock, "PUT") == [expected], mock.render()
+    assert keys_on_the_wire(mock, "GET") == [expected], mock.render()
+    assert keys_on_the_wire(mock, "HEAD") == [expected], mock.render()
+    assert mock.sent_delete_keys() == [expected], mock.render()
+
+
+def test_dlio_storage_relative_train_file_reads_and_writes_base_slash_train(
+    mock_factory,
+):
+    """The D2 ruling: `/train/f.npz` under `s3://b/base` is the key `base/train/f.npz`."""
+    mock = mock_factory(["base/train/f.npz"])
+    out = storage_calls(
+        mock,
+        "s3://bkt/base",
+        ["put_data", "/train/f.npz", "payload"],
+        ["get_data", "/train/f.npz"],
+    )
+    assert [o.get("exc") for o in out] == [None] * 2, out
+    assert keys_on_the_wire(mock, "PUT") == ["base/train/f.npz"], mock.render()
+    assert keys_on_the_wire(mock, "GET") == ["base/train/f.npz"], mock.render()
+
+
+def test_dlio_storage_full_uri_reads_and_writes_the_exact_key(mock_factory):
+    """A FULL URI is exact (#198): `s3://bkt//k` is the key `/k`, whatever the namespace."""
+    mock = mock_factory(["/k"])
+    out = storage_calls(
+        mock,
+        "s3://bkt/base",
+        ["put_data", "s3://bkt//k", "payload"],
+        ["get_data", "s3://bkt//k"],
+        ["isfile", "s3://bkt//k"],
+        ["delete_node", "s3://bkt//k"],
+    )
+    assert [o.get("exc") for o in out] == [None] * 4, out
+    assert keys_on_the_wire(mock, "PUT") == ["/k"], mock.render()
+    assert keys_on_the_wire(mock, "GET") == ["/k"], mock.render()
+    assert keys_on_the_wire(mock, "HEAD") == ["/k"], mock.render()
+    assert mock.sent_delete_keys() == ["/k"], mock.render()
+
+
+def test_dlio_storage_relative_names_with_and_without_leading_slash_are_one_object(
+    mock_factory,
+):
+    """0.9.124: `/x` and `x` are the same object; `a//b` and `a/b` are still two."""
+    mock = mock_factory()
+    storage_calls(
+        mock,
+        "s3://bkt/base",
+        ["put_data", "/x", "slash"],
+        ["put_data", "x", "plain"],
+        ["put_data", "a//b", "double"],
+        ["put_data", "a/b", "single"],
+    )
+    assert mock.keys == {"base/x", "base/a//b", "base/a/b"}, sorted(mock.keys)
+
+
+def test_dlio_storage_full_uris_pass_through(mock_factory):
+    mock = mock_factory()
+    storage_calls(mock, "s3://bkt/base", ["put_data", "s3://bkt//x", "d"])
+    assert mock.keys == {"/x"}, sorted(mock.keys)
+
+
+def test_dlio_storage_namespace_trailing_slashes_are_dropped_as_in_0_9_124(
+    mock_factory,
+):
+    """`s3://bkt/p//` is the base `p`: every trailing `/` of the namespace is dropped."""
+    mock = mock_factory()
+    storage_calls(mock, "s3://bkt/p//", ["put_data", "x", "d"])
+    assert mock.keys == {"p/x"}, sorted(mock.keys)
+
+
+# ----------------------------------------------------------------------------
+# 1b. DLIO s3dlio_storage: namespace-relative names are the 0.9.124 function, verbatim
+# ----------------------------------------------------------------------------
+
+
+class Oracle0_9_124:
+    """The namespace-relative name handling of v0.9.124, copied VERBATIM from commit
+    2bfac2a (`python/s3dlio/integrations/dlio/s3dlio_storage.py`), the oracle the
+    D2 ruling pins: `__init__` set `self.prefix = namespace` and
+    `self.base_path = parsed.path.lstrip("/")`; `_make_uri` and `get_uri` are below;
+    `walk_node` (and `get_node`'s directory probe) made the listing URI by adding a
+    final "/" to `_make_uri(id)` when it had none (`_dir_uri` is that step)."""
+
+    def __init__(self, namespace):
+        from urllib.parse import urlparse
+
+        self.prefix = namespace
+        self.base_path = urlparse(namespace).path.lstrip("/")
+
+    def _make_uri(self, path: str) -> str:
+        """Convert a relative path to a full URI."""
+        if path.startswith(("s3://", "az://", "gs://", "file://", "direct://")):
+            return path
+        # Combine with prefix
+        prefix = self.prefix.rstrip("/")
+        path = path.lstrip("/")
+        if path:
+            return f"{prefix}/{path}"
+        return prefix
+
+    def get_uri(self, id):
+        """Return the id as a full URI."""
+        return self._make_uri(id)
+
+    def _dir_uri(self, path: str) -> str:
+        uri = self._make_uri(path)
+        # Ensure ends with / for directory listing
+        if not uri.endswith("/"):
+            uri += "/"
+        return uri
+
+
+EQUIV_NAMESPACES = [
+    "s3://b",
+    "s3://b/",
+    "s3://b/base",
+    "s3://b/base/",
+    "s3://b/base//",
+    "file:///tmp/x",
+    "direct:///tmp/x",
+    "az://acct/c/base",
+]
+EQUIV_NAMES = [
+    "train/f.npz",
+    "/train/f.npz",
+    "//train/f.npz",
+    "a//b",
+    "x/",
+    "",
+    # full URIs are exact, and pass through unchanged in 0.9.124 too
+    "s3://b//k",
+    "s3://b/a//b",
+    "file:///tmp/y//z",
+]
+
+# Every (namespace, name) on the CURRENT adapter, in a fresh interpreter.
+DLIO_EQUIV_CHILD = (
+    FAKE_DLIO
+    + """
+    from s3dlio.integrations.dlio.s3dlio_storage import S3dlioStorage
+
+    spec = json.loads(sys.argv[1])
+    out = []
+    for ns in spec["namespaces"]:
+        storage = S3dlioStorage(ns)
+        row = {"namespace": ns, "base_path": storage.base_path, "names": {}}
+        for name in spec["names"]:
+            row["names"][name] = {
+                "make": storage._make_uri(name),
+                "dir": storage._dir_uri(name),
+                "get_uri": storage.get_uri(name),
+            }
+        out.append(row)
+    print("RESULT " + json.dumps(out))
+"""
+)
+
+
+def test_dlio_storage_namespace_relative_names_equal_the_0_9_124_functions(
+    mock_factory,
+):
+    """For a grid of namespaces x names, `_make_uri` / `_dir_uri` / `get_uri` /
+    `base_path` equal the verbatim v0.9.124 implementation above (D2 option C)."""
+    mock = mock_factory()
+    rows = run_child(
+        mock,
+        DLIO_EQUIV_CHILD,
+        json.dumps({"namespaces": EQUIV_NAMESPACES, "names": EQUIV_NAMES}),
+    )
+    assert [r["namespace"] for r in rows] == EQUIV_NAMESPACES
+    mismatches = []
+    for row in rows:
+        oracle = Oracle0_9_124(row["namespace"])
+        if row["base_path"] != oracle.base_path:
+            mismatches.append(
+                (row["namespace"], "base_path", row["base_path"], oracle.base_path)
+            )
+        for name, got in row["names"].items():
+            want = {
+                "make": oracle._make_uri(name),
+                "dir": oracle._dir_uri(name),
+                "get_uri": oracle.get_uri(name),
+            }
+            for field, value in want.items():
+                if got[field] != value:
+                    mismatches.append(
+                        (row["namespace"], name, field, got[field], value)
+                    )
+    assert not mismatches, mismatches
+
+
+def test_oracle_pins_the_documented_0_9_124_results():
+    """The oracle itself: the named D2 example, so a mis-copied oracle cannot pass vacuously."""
+    o = Oracle0_9_124("s3://b/base")
+    assert o._make_uri("/train/f.npz") == "s3://b/base/train/f.npz"
+    assert o._make_uri("s3://b//k") == "s3://b//k"
+    assert Oracle0_9_124("s3://b/base//")._make_uri("") == "s3://b/base"
+    assert Oracle0_9_124("s3://b/base//")._dir_uri("") == "s3://b/base/"
+
+
+# ----------------------------------------------------------------------------
+# 2. DLIO s3dlio_storage: walk_node lists relative names that re-address the object
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "namespace,prefix,seeded,names",
+    [
+        ("s3://bkt/base", "base/", ["base/x", "base/y", "base2/z"], ["x", "y"]),
+        ("s3://bkt/base/", "base/", ["base/x", "base/y", "base2/z"], ["x", "y"]),
+        # trailing `/` of the namespace are dropped, as in 0.9.124: the base is `base/`
+        ("s3://bkt/base//", "base/", ["base/x", "base/y", "base2/z"], ["x", "y"]),
+        ("s3://bkt//", "", ["x", "y"], ["x", "y"]),
+    ],
+)
+def test_dlio_storage_walk_node_lists_the_namespace_prefix_and_names_round_trip(
+    mock_factory, namespace, prefix, seeded, names
+):
+    mock = mock_factory(seeded)
+    out = storage_calls(mock, namespace, ["walk_node", ""])
+    assert not out[0].get("exc"), out
+    assert sorted(out[0]["value"]) == names, (out, mock.render())
+    assert list_prefixes(mock) == [prefix], mock.render()
+
+    # Re-joining each listed name must address exactly the object that was listed.
+    mock2 = mock_factory(seeded)
+    heads = storage_calls(mock2, namespace, *[["isfile", n] for n in names])
+    assert [h.get("exc") for h in heads] == [None] * len(names), heads
+    assert keys_on_the_wire(mock2, "HEAD") == sorted(prefix + n for n in names), (
+        mock2.render()
+    )
+
+
+# ----------------------------------------------------------------------------
+# 3. DLIO s3_torch_storage.walk_node: the listing prefix is the exact key prefix
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "uri,prefix,seeded,expected",
+    [
+        ("s3://bkt//d/", "/d/", ["/d/x", "/d/y", "d/other"], ["x", "y"]),
+        ("s3://bkt/d//e/", "d//e/", ["d//e/x", "d/e/y"], ["x"]),
+        ("s3://bkt/d", "d/", ["d/x", "dd/y"], ["x"]),
+        ("s3://bkt/d/", "d/", ["d/x", "/d/z"], ["x"]),
+        ("s3://bkt//", "/", ["/x", "x"], ["x"]),
+    ],
+)
+def test_dlio_torch_walk_node_lists_the_exact_prefix(
+    mock_factory, uri, prefix, seeded, expected
+):
+    mock = mock_factory(seeded)
+    names = run_child(mock, DLIO_TORCH_CHILD, uri)
+    assert list_prefixes(mock) == [prefix], mock.render()
+    assert sorted(names) == sorted(expected), (names, mock.render())
+
+
+# ----------------------------------------------------------------------------
+# 4. s3torchconnector compat: S3Item.key and the S3Client helpers
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "uri,bucket,key",
+    [
+        ("s3://bkt//k", "bkt", "/k"),
+        ("s3://bkt/a//b", "bkt", "a//b"),
+        ("s3://bkt/x", "bkt", "x"),
+        ("s3://bkt/dir/x", "bkt", "dir/x"),
+        ("s3://bkt///k", "bkt", "//k"),
+        ("gs://bkt//k", "bkt", "/k"),
+        ("gs://bkt/a//b", "bkt", "a//b"),
+        ("az://acct/cont//k", "acct/cont", "/k"),
+        ("az://acct/cont/a//b", "acct/cont", "a//b"),
+        ("az://acct/cont/x", "acct/cont", "x"),
+    ],
+)
+def test_compat_s3item_reports_the_exact_key(fake_torch_in_process, uri, bucket, key):
+    from s3dlio.compat.s3torchconnector import S3Item
+
+    item = S3Item(uri, b"")
+    assert (item.bucket, item.key) == (bucket, key)
+
+
+def test_compat_s3item_matches_the_upstream_parse_s3_uri_contract(
+    fake_torch_in_process,
+):
+    """AWS's s3torchconnector `parse_s3_uri` (awslabs/s3-connector-for-pytorch,
+    s3torchconnector/src/s3torchconnector/_s3dataset_common.py) does
+    ``uri[len("s3://"):].split("/", maxsplit=1)``: bucket and key, nothing stripped, so
+    `s3://b//k` is bucket `b`, key `/k`. Mirror it exactly."""
+    from s3dlio.compat.s3torchconnector import S3Item
+
+    def upstream(uri):
+        rest = uri[len("s3://") :]
+        parts = rest.split("/", maxsplit=1)
+        return (parts[0], "") if len(parts) == 1 else (parts[0], parts[1])
+
+    for uri in [
+        "s3://b//k",
+        "s3://b/a//b",
+        "s3://b/x",
+        "s3://b/",
+        "s3://b",
+        "s3://b///",
+    ]:
+        item = S3Item(uri, b"")
+        assert (item.bucket, item.key) == upstream(uri), uri
+
+
+COMPAT_CHILD = (
+    FAKE_TORCH
+    + """
+    import json
+    from s3dlio.compat.s3torchconnector import S3Client
+
+    bucket, op, key = sys.argv[1:4]
+    client = S3Client()
+    if op == "put":
+        w = client.put_object(bucket, key)
+        w.write(b"data")
+        w.close()
+    elif op == "get":
+        client.get_object(bucket, key).read()
+    elif op == "list":
+        for result in client.list_objects(bucket, key):
+            pass
+    print("RESULT {}")
+"""
+)
+
+
+@pytest.mark.parametrize("key", KEYS)
+def test_compat_client_put_and_get_address_the_exact_key(mock_factory, key):
+    mock = mock_factory([key])
+    run_child(mock, COMPAT_CHILD, "bkt", "put", key)
+    run_child(mock, COMPAT_CHILD, "bkt", "get", key)
+    assert keys_on_the_wire(mock, "PUT") == [key], mock.render()
+    assert keys_on_the_wire(mock, "GET") == [key], mock.render()
+
+
+@pytest.mark.parametrize(
+    "bucket,prefix,wanted",
+    [
+        ("bkt", "/d/", "/d/"),
+        ("bkt", "a//b/", "a//b/"),
+        ("bkt", "d/", "d/"),
+        ("bkt", "", ""),
+        ("bkt", "s3://bkt//d", "/d/"),
+        ("bkt", "s3://bkt//", "/"),
+        ("bkt", "s3://bkt/a//b/", "a//b/"),
+        ("bkt", "s3://bkt/d", "d/"),
+    ],
+)
+def test_compat_list_objects_lists_the_exact_prefix(
+    mock_factory, bucket, prefix, wanted
+):
+    mock = mock_factory(["/d/x", "a//b/y", "d/z"])
+    run_child(mock, COMPAT_CHILD, bucket, "list", prefix)
+    assert list_prefixes(mock) == [wanted], mock.render()
+
+
+def test_fake_torch_is_scoped_to_the_test_that_installs_it():
+    """The stand-in `torch` and the modules that bound it are gone after the test."""
+    if hasattr(sys.modules.get("torch"), "__file__"):
+        pytest.skip("a real torch is already imported; no stand-in is used")
+    if importlib.util.find_spec("torch") is not None:
+        pytest.skip("a real torch is installed; no stand-in is used")
+    names = ("torch", "torch.utils", "torch.utils.data")
+    assert not any(n in sys.modules for n in names)
+    fixture = fake_torch_in_process.__wrapped__()
+    next(fixture)
+    assert all(n in sys.modules for n in names)
+    fixture.close()
+    assert not any(n in sys.modules for n in names)
+    assert "s3dlio.compat.s3torchconnector" not in sys.modules

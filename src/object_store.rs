@@ -2293,12 +2293,14 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
             .split('.')
             .next()
             .ok_or_else(|| anyhow!("bad Azure host"))?;
-        let mut segs = path.split('/').filter(|s| !s.is_empty());
-        let container = segs
-            .next()
-            .ok_or_else(|| anyhow!("missing container in URL path"))?;
-        let key = segs.collect::<Vec<_>>().join("/");
-        return Ok((account.to_string(), container.to_string(), key));
+        // The first path segment is the container; the single `/` after it is the
+        // separator, and the rest is the key exactly as written (issue #198), like the
+        // `az://` form above: `c//k` is the container `c` and the key `/k`.
+        let (container, key) = path.split_once('/').unwrap_or((path, ""));
+        if container.is_empty() {
+            bail!("missing container in URL path");
+        }
+        return Ok((account.to_string(), container.to_string(), key.to_string()));
     }
 
     bail!("not a recognized Azure URI: {}", uri)
@@ -4927,6 +4929,54 @@ mod s3_object_store_tests {
         assert_eq!(account, "myacct");
         assert_eq!(container, "container");
         assert_eq!(key, "key/nested");
+    }
+
+    // Issue #198: the https form of an Azure URI names the same blob as the az:// form,
+    // key included. Only the single `/` that separates the container from the key is
+    // structural; an empty segment (`c//k`, key `/k`) is part of the key.
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_https_uri_keeps_the_key_exactly() {
+        for key in ["x", "/x", "a//b", "//x", "a/b/", "dir/"] {
+            let https = format!("https://acct.blob.core.windows.net/cont/{key}");
+            let az = format!("az://acct/cont/{key}");
+            let (h_account, h_container, h_key) = parse_azure_uri(&https).expect("https parses");
+            let (a_account, a_container, a_key) = parse_azure_uri(&az).expect("az parses");
+            assert_eq!(h_key, key, "{https}");
+            assert_eq!(
+                (h_account, h_container, h_key),
+                (a_account, a_container, a_key),
+                "https and az:// must name the same blob for {key:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_https_uri_container_only_has_an_empty_key() {
+        for uri in [
+            "https://acct.blob.core.windows.net/cont",
+            "https://acct.blob.core.windows.net/cont/",
+        ] {
+            let (account, container, key) = parse_azure_uri(uri).expect("parses");
+            assert_eq!(
+                (account.as_str(), container.as_str(), key.as_str()),
+                ("acct", "cont", "")
+            );
+        }
+    }
+
+    // An empty container is not a container: refuse it rather than shift the key left.
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_https_uri_without_a_container_is_an_error() {
+        for uri in [
+            "https://acct.blob.core.windows.net",
+            "https://acct.blob.core.windows.net/",
+            "https://acct.blob.core.windows.net//k",
+        ] {
+            assert!(parse_azure_uri(uri).is_err(), "{uri}");
+        }
     }
 
     // ── E2 (audit #154 bug 4.3) — s3_endpoint_url_from_uri ────────────────────

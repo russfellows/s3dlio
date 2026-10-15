@@ -104,6 +104,42 @@ rewritten `tests/test_object_store_list_filter.rs` (it pinned the #154 regex con
 mock S3 can be seeded with a bucket catalog that honours prefix, delimiter, `max-keys` and paging, and
 removes the keys a delete names.
 
+### Fixed — object keys are used exactly as written in every layer (#198, the rest of the issue)
+
+After #172 the core addresses `s3://b//k` as the key `/k`. These layers still normalised keys, so for a
+key that begins with `/` or contains `//` they addressed or reported a different object than the core.
+**Behaviour change:** in the layers below (except namespace-relative DLIO names, see the first bullet),
+`/x` and `x`, or `a//b` and `a/b`, are now different objects. Only the ONE `/` that separates a base from a
+key is removed.
+
+- **DLIO integration** (`s3dlio_storage.py`, `s3_torch_storage.py`): a name that is a FULL URI
+  (`s3://`, `az://`, `gs://`, `file://`, `direct://`) is used exactly (`put_data("s3://b//k")` writes the
+  key `/k`), and `s3_torch_storage.walk_node` lists the exact prefix of the full URI it is given.
+  A name that is relative to the configured namespace keeps its existing (0.9.124) filesystem-style
+  normalisation: the namespace loses its trailing `/` and the name its leading `/`, so
+  `put_data("/train/f.npz")` under `s3://b/base` still writes `base/train/f.npz` (not `base//train/f.npz`).
+  It is not established that DLIO supplies object keys rather than such names, and re-keying them would
+  make existing datasets disappear. No DLIO config needs to change.
+- **`s3dlio.compat.s3torchconnector`**: `S3Item.key` for `s3://b//k` is `/k` (was `k`), as AWS's own
+  `s3torchconnector` does (its `parse_s3_uri` splits at the first `/` and strips nothing);
+  `S3Client.put_object` / `get_object` / `list_objects` address the key and prefix exactly (a
+  `list_objects` prefix URI loses no trailing `/`; one `/` is appended only if it has none).
+- **Azure https URI form**: `https://acct.blob.core.windows.net/c//k` is the container `c`, key `/k`,
+  the same key as `az://acct/c//k` (it was key `k`). A URL with an empty container
+  (`https://acct.blob.core.windows.net//k`) is an error; this is NOT parity with `az://`, where
+  `az://acct//k` still parses to the container `""` and key `k`.
+  A trailing `/` is part of the key: `https://acct.blob.core.windows.net/c/dir/` now addresses the
+  key `dir/` (it was `dir`). So `get` / `stat` / `delete` of a URI ending in `/` address `k/`, no
+  longer `k`, and listing `.../c/dir/` no longer matches `dir2/...`.
+- **arrow-backend** (`--no-default-features --features arrow-backend`): `object_store`'s `Path::from`
+  drops empty segments, so `s3://b//x` addressed the object `x` and `s3://b/a//b` addressed `a/b`.
+  Such keys, and an object key ending in `/`, are now refused with an error naming the key instead of
+  addressing another object (`object_store::path::Path` cannot represent them). A listing prefix may
+  still end in `/`.
+- **Op-log replay onto a target** (`translate_uri`): a row for the object `/x` (logged `bkt//x`) replays
+  to `<target>//x`, no longer `<target>/x`. Rows that are not a shape s3dlio writes (hand-written,
+  legacy `S3Ops` `endpoint`+bare key) still lose one leading `/` of `file`, as pinned since #184.
+
 ## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
 
 Fixes 12 issues: #167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215.
