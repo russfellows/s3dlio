@@ -4036,7 +4036,13 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
 /// container / bucket out of it), so each read is handed the URI exactly as the caller wrote
 /// it. Issue #242: `get_many` used to strip the scheme and container and pass a bare key,
 /// which those stores cannot parse, so every key failed.
-#[cfg(any(test, feature = "extension-module"))]
+///
+/// Error semantics are those of the S3 reader (`get_objects_parallel`, #148 3.2): the call
+/// does not return while any task it spawned is still running, and it returns the first
+/// error observed, as `GET <uri>: <cause>` (the cause chain is kept; print it with `{:#}`).
+/// One difference: once a read has failed, reads that have not yet started are skipped
+/// instead of downloaded, so a failed batch stops spending bandwidth after the reads already
+/// in flight finish. Dropping the returned future aborts every task (they live in a `JoinSet`).
 pub(crate) async fn get_many_with_stores<F>(
     uris: Vec<String>,
     max_in_flight: usize,
@@ -4045,36 +4051,61 @@ pub(crate) async fn get_many_with_stores<F>(
 where
     F: Fn(&str) -> Result<Box<dyn ObjectStore>> + Send + Sync + 'static,
 {
-    use futures::stream::FuturesUnordered;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
 
     crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     let store_for = Arc::new(store_for);
     let sem = Arc::new(Semaphore::new(max_in_flight));
-    let mut futs = FuturesUnordered::new();
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut tasks: JoinSet<Result<Option<(usize, String, Bytes)>>> = JoinSet::new();
 
     for (index, uri) in uris.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
         let store_for = Arc::clone(&store_for);
-        futs.push(tokio::spawn(async move {
+        let failed = Arc::clone(&failed);
+        tasks.spawn(async move {
             let _permit = sem
                 .acquire_owned()
                 .await
                 .map_err(|e| anyhow!("get_many semaphore closed: {e}"))?;
-            let store = store_for(&uri)?;
-
-            let bytes = store.get(&uri).await?;
-            Ok::<_, anyhow::Error>((index, uri, bytes))
-        }));
+            if failed.load(Ordering::Acquire) {
+                return Ok(None); // an earlier read failed: do not start this one
+            }
+            let read = async {
+                let store = store_for(&uri)?;
+                store.get(&uri).await
+            }
+            .await;
+            match read {
+                Ok(bytes) => Ok(Some((index, uri, bytes))),
+                Err(e) => {
+                    failed.store(true, Ordering::Release);
+                    Err(e.context(format!("GET {uri}")))
+                }
+            }
+        });
     }
 
     let mut out = Vec::new();
-    while let Some(res) = futs.next().await {
-        let item = res
-            .map_err(|e| anyhow!("Task join error: {}", e))?
-            .map_err(|e| anyhow!("Get error: {}", e))?;
-        out.push(item);
+    let mut first_err: Option<anyhow::Error> = None;
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(Some(item))) => out.push(item),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                first_err.get_or_insert(e);
+            }
+            Err(join_err) => {
+                failed.store(true, Ordering::Release);
+                first_err.get_or_insert(anyhow!("get_many read task failed: {join_err}"));
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
 
     // Maintain input order
@@ -5710,17 +5741,42 @@ mod get_many_with_stores_tests {
 
     type Seen = Arc<Mutex<Vec<String>>>;
 
+    /// How many reads the fake store has started and finished.
+    #[derive(Default)]
+    struct Reads {
+        started: std::sync::atomic::AtomicUsize,
+        completed: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Reads {
+        fn snapshot(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (self.started.load(SeqCst), self.completed.load(SeqCst))
+        }
+    }
+
     struct UriOnlyStore {
         seen: Seen,
+        reads: Arc<Reads>,
     }
 
     #[async_trait]
     impl ObjectStore for UriOnlyStore {
         async fn get(&self, uri: &str) -> Result<Bytes> {
+            use std::sync::atomic::Ordering::SeqCst;
             self.seen.lock().unwrap().push(uri.to_string());
+            self.reads.started.fetch_add(1, SeqCst);
             if !uri.contains("://") {
                 bail!("invalid object URI '{uri}': missing scheme");
             }
+            // A URI ending in "bad" fails at once; one ending in "slow" takes a while.
+            if uri.ends_with("bad") {
+                bail!("backend refused {uri}");
+            }
+            if uri.ends_with("slow") {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            self.reads.completed.fetch_add(1, SeqCst);
             Ok(Bytes::from(format!("body-of:{uri}")))
         }
         async fn get_range(&self, _: &str, _: u64, _: Option<u64>) -> Result<Bytes> {
@@ -5774,10 +5830,19 @@ mod get_many_with_stores_tests {
     fn factory(
         seen: &Seen,
     ) -> impl Fn(&str) -> Result<Box<dyn ObjectStore>> + Send + Sync + 'static {
+        counting_factory(seen, &Arc::default())
+    }
+
+    fn counting_factory(
+        seen: &Seen,
+        reads: &Arc<Reads>,
+    ) -> impl Fn(&str) -> Result<Box<dyn ObjectStore>> + Send + Sync + 'static {
         let seen = Arc::clone(seen);
+        let reads = Arc::clone(reads);
         move |_uri: &str| {
             Ok(Box::new(UriOnlyStore {
                 seen: Arc::clone(&seen),
+                reads: Arc::clone(&reads),
             }) as Box<dyn ObjectStore>)
         }
     }
@@ -5818,6 +5883,41 @@ mod get_many_with_stores_tests {
         let failing = |_: &str| -> Result<Box<dyn ObjectStore>> { bail!("no such backend") };
         let err = get_many_with_stores(uris, 1, failing).await.unwrap_err();
         assert!(format!("{err:#}").contains("no such backend"), "{err:#}");
+    }
+
+    // Issue #242 review: an error used to return at once and drop the JoinHandles, so the
+    // reads still in flight (and the ones not yet started) kept running after the call had
+    // returned. Like the S3 path (#148 3.2) the call now waits for the reads already started
+    // before it returns the first error, and starts no more after the first error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_read_runs_after_get_many_returns_an_error() {
+        let seen: Seen = Arc::default();
+        let reads: Arc<Reads> = Arc::default();
+        let mut uris = vec!["az://acct/c/first-bad".to_string()];
+        uris.extend((0..8).map(|i| format!("az://acct/c/obj{i}-slow")));
+
+        let err = get_many_with_stores(uris, 3, counting_factory(&seen, &reads))
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("az://acct/c/first-bad") && message.contains("backend refused"),
+            "the error names the failing URI and keeps the cause: {message}"
+        );
+
+        let at_return = reads.snapshot();
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        let later = reads.snapshot();
+        assert_eq!(
+            at_return, later,
+            "RED: reads started/completed changed after get_many returned: \
+             {at_return:?} -> {later:?}"
+        );
+        assert_eq!(
+            at_return.0,
+            at_return.1 + 1,
+            "every read that started finished, except the one that failed: {at_return:?}"
+        );
     }
 
     #[tokio::test]
