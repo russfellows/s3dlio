@@ -190,9 +190,11 @@ export AWS_ENDPOINT_URL=http://minio:9000  # For custom endpoints
 
 ### For Azure Blob Storage
 
+Authenticate with the Azure CLI; s3dlio does not read account-key variables. The storage account
+is part of the URI (`az://account/container/path`).
+
 ```bash
-export AZURE_STORAGE_ACCOUNT_NAME=your_account
-export AZURE_STORAGE_ACCOUNT_KEY=your_key
+az login          # or: azd auth login
 ```
 
 ### For Google Cloud Storage
@@ -296,11 +298,10 @@ storage:
 ```yaml
 storage:
   storage_type: s3dlio
-  storage_root: az://mycontainer/dlio-data
+  storage_root: az://myaccount/mycontainer/dlio-data
 
-# Set environment:
-# AZURE_STORAGE_ACCOUNT_NAME=myaccount
-# AZURE_STORAGE_ACCOUNT_KEY=mykey
+# Authenticate beforehand with `az login` (or `azd auth login`);
+# account-key environment variables are not read.
 ```
 
 ### Local Filesystem with O_DIRECT

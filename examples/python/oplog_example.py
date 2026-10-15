@@ -25,10 +25,10 @@ Usage:
     export AWS_SECRET_ACCESS_KEY=...
     python examples/oplog_example.py s3://mybucket/test-prefix/
     
-    # Using Azure (requires Azure credentials)
-    export AZURE_STORAGE_ACCOUNT=...
-    export AZURE_STORAGE_KEY=...
-    python examples/oplog_example.py az://mycontainer/test-prefix/
+    # Using Azure (requires `az login` or `azd auth login`; account keys and
+    # AZURE_STORAGE_* variables are not read by s3dlio)
+    az login
+    python examples/oplog_example.py az://myaccount/mycontainer/test-prefix/
     
     # Using GCS (requires GCS credentials)
     export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json

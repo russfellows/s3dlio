@@ -365,8 +365,9 @@ python tests/test_modular_api_regression.py
 # S3 backend tests
 AWS_ENDPOINT_URL=http://localhost:9000 cargo test s3_ --release
 
-# Azure backend tests (requires credentials)
-AZURE_STORAGE_ACCOUNT=myaccount cargo test azure_ --release
+# Azure backend tests (unit tests run offline; live tests need `az login`).
+# s3dlio reads no AZURE_STORAGE_ACCOUNT / AZURE_STORAGE_KEY variables.
+cargo test azure_ --release --features backend-azure
 
 # GCS backend tests (requires credentials)
 GOOGLE_APPLICATION_CREDENTIALS=key.json cargo test gcs_ --release

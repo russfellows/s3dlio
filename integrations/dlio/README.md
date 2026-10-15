@@ -74,9 +74,9 @@ export AWS_ENDPOINT_URL="http://localhost:9000"  # For MinIO
 # Google Cloud Storage
 export GOOGLE_APPLICATION_CREDENTIALS="/path/to/credentials.json"
 
-# Azure Blob Storage
-export AZURE_STORAGE_ACCOUNT_NAME="myaccount"
-export AZURE_STORAGE_ACCOUNT_KEY="your-key"
+# Azure Blob Storage: sign in with the Azure CLI (account keys are not read by s3dlio);
+# the account is part of the URI, az://account/container/path
+az login          # or: azd auth login
 ```
 
 ## Performance Comparison

@@ -21,6 +21,14 @@
   (Shared Key) authentication was **not** implemented: the Azure SDK in use (`azure_storage_blob` 1.0.0,
   `azure_core` 1.1.0, `azure_identity` 1.0.0) can only sign requests with bearer tokens, and signing requests
   by hand was deliberately not done. The docs now state exactly this. Behaviour is unchanged.
+  The same wrong instructions (`AZURE_STORAGE_ACCOUNT_NAME` / `AZURE_STORAGE_ACCOUNT_KEY`, `AZURE_STORAGE_KEY`,
+  `AZURE_CLIENT_*`, `AZURE_TENANT_ID`, and `az://container/...` URIs without an account) were also removed from
+  `S3TORCHCONNECTOR_MIGRATION.md`, `integration/DLIO_BENCHMARK_INTEGRATION.md`, `testing/BACKEND-TESTING.md`,
+  `integrations/dlio/README.md`, `examples/python/oplog_example.py`, `python/tests/manual_cloud_backend_test.py`
+  and the docstrings of `s3dlio.integrations.dlio.*` and `s3dlio.compat.s3torchconnector` (those Python modules
+  only described the variables; they never read them, so their behaviour is unchanged). `tests/test_op_log_all_backends.sh`
+  no longer requires the unused `AZURE_STORAGE_ACCESS_KEY` to run its Azure step; it needs only `AZURE_STORAGE_ACCOUNT`
+  (used to build the `az://` URI) and an `az login` session.
 
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 

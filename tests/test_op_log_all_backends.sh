@@ -95,7 +95,9 @@ echo ""
 echo "========================================"
 echo "Test 3: Azure Blob Storage az:// backend"
 echo "========================================"
-if [ -n "$AZURE_STORAGE_ACCOUNT" ] && [ -n "$AZURE_STORAGE_ACCESS_KEY" ]; then
+# s3dlio reads no account-key variable; credentials come from `az login` (or `azd auth login`).
+# AZURE_STORAGE_ACCOUNT is only used here to build the az://account/container/ URI.
+if [ -n "$AZURE_STORAGE_ACCOUNT" ]; then
   AZURE_CONTAINER="${AZURE_CONTAINER:-s3dlio-test}"
   AZURE_PREFIX="az://${AZURE_STORAGE_ACCOUNT}/${AZURE_CONTAINER}/oplog-test/"
   
@@ -114,7 +116,7 @@ if [ -n "$AZURE_STORAGE_ACCOUNT" ] && [ -n "$AZURE_STORAGE_ACCESS_KEY" ]; then
     echo "INFO: No Azure test performed"
   fi
 else
-  echo "SKIPPED: No Azure credentials available (AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_ACCESS_KEY not set)"
+  echo "SKIPPED: AZURE_STORAGE_ACCOUNT (the storage account name for the az:// URI) is not set"
 fi
 
 echo ""
