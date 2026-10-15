@@ -300,11 +300,19 @@ awaitable completes):
   write, so the cancellation is delivered to you only AFTER that write finished: the awaitable of a `borrow=True`
   put is a `Future` whose `cancel()` cancels the put but defers its own terminal state until then
   (`asyncio.timeout()` and `asyncio.wait_for()` therefore also wait for the write before they raise);
+* **await the future itself.** Buffer reuse after `CancelledError` is safe only when the `put_bytes_async(...,
+  borrow=True)` future is awaited directly (or through `wait_for` / `asyncio.timeout`, which cancel *it*).
+  `asyncio.shield(fut)` bypasses the guard: the shield's outer future is cancelled at once while the put still
+  reads the buffer, and nothing waits for the barrier. Do not shield a borrowed put (if you must, await `fut`
+  again after the cancellation before touching the buffer). Likewise `asyncio.wait_for(fut, t)` can take up to
+  `t` plus the quiesce timeout (a running native write must finish first), and `asyncio.timeout(t)` likewise;
 * **the wait is bounded and not interruptible.** The wait for native readers lasts at most 30 s
   (`S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`) and is not interrupted by signals / `KeyboardInterrupt` (the buffer must not
   be released while it can still be read). If a backend still holds the payload after that, the call raises
-  `s3dlio.ExportStillReferencedError` (data may or may not have been written) instead of succeeding or raising a
-  plain `CancelledError`: the buffer stays pinned (a resize raises `BufferError`), **do not reuse it**; a warning is
+  `s3dlio.ExportStillReferencedError` (data may or may not have been written; the message names the timeout and
+  what the put itself did, and the put's own error is chained as `__cause__`) instead of succeeding or raising a
+  plain `CancelledError`. An internal failure of the barrier machinery raises the same class with an "internal
+  error" message (counted in `_put_export_stats()["internal_errors"]`): the buffer stays pinned (a resize raises `BufferError`), **do not reuse it**; a warning is
   logged once and `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it. Blocking `put_bytes` waits the same
   way before it returns or raises;
 * buffers whose item format is `O` (Python objects) or `P` (pointers) are refused with a `TypeError`: their bytes are

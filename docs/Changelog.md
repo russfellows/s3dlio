@@ -76,6 +76,15 @@
   single write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
   also left zero padding inside the object whenever `part_size` was not a multiple of 4096.
 
+- **Round-6 edges of the borrowed-buffer barrier.** `GuardedFuture.cancel()` returns `False` once the put is
+  already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
+  the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really
+  released, not only its owner dropped; if the wrapper cannot be built after the put was spawned, the put is
+  cancelled before the (event-loop-blocking, quiesce-timeout-bounded) fallback wait; `ExportStillReferencedError`
+  names the timeout and what the put did, and an internal barrier failure says so and is counted
+  (`_put_export_stats()["internal_errors"]`); a set but unusable `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` warns once
+  and falls back to the default. Documented: `asyncio.shield()` of a borrowed put bypasses the guard, and
+  `wait_for(fut, t)` can take up to `t` plus the quiesce timeout.
 - **Round-5 hardening of the borrowed-buffer barrier and the direct pool.** (1) The awaitable of
   `put_bytes_async(borrow=True)` is now a `Future` subclass, not a Task running a coroutine: a coroutine body
   never runs when its Task is cancelled before the first step, which let `CancelledError` reach the caller while a
