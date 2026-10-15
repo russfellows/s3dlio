@@ -56,19 +56,41 @@ use aws_smithy_runtime_api::client::result::SdkError;
 
 use crate::constants::max_retry_attempts;
 
-/// S3 error codes that mean "try again later" whatever the HTTP status the
-/// server attached to them (S3 itself reports `RequestTimeout` as a 400 and
-/// some S3-compatible servers report `SlowDown` as a 4xx).
-const TRANSIENT_S3_ERROR_CODES: &[&str] = &[
-    "SlowDown",
+/// The throttling error codes the AWS SDK's own retry classifier recognises:
+/// `aws_runtime::retries::classifiers::THROTTLING_ERRORS`, copied from **aws-runtime
+/// 1.7.5** (the version `Cargo.lock` pins; `src/retries/classifiers.rs`).
+///
+/// The SDK retries these inside one operation; when its attempts are spent it returns
+/// the final service error, and the OUTER loop in this module must still treat the same
+/// codes as transient, or it stops after the SDK's budget instead of starting its own.
+/// A unit test (`aws_runtime_code_tables_are_all_retryable`) compares this constant with
+/// the pinned crate's tables, so an SDK upgrade that adds a code fails the build here
+/// until the constant is updated.
+const AWS_RUNTIME_THROTTLING_ERROR_CODES: &[&str] = &[
     "Throttling",
     "ThrottlingException",
-    "RequestThrottled",
-    "RequestLimitExceeded",
+    "ThrottledException",
+    "RequestThrottledException",
     "TooManyRequestsException",
     "ProvisionedThroughputExceededException",
+    "TransactionInProgressException",
+    "RequestLimitExceeded",
     "BandwidthLimitExceeded",
-    "RequestTimeout",
+    "LimitExceededException",
+    "RequestThrottled",
+    "SlowDown",
+    "PriorRequestNotComplete",
+    "EC2ThrottledException",
+];
+
+/// The transient error codes the AWS SDK's retry classifier recognises:
+/// `aws_runtime::retries::classifiers::TRANSIENT_ERRORS`, copied from **aws-runtime
+/// 1.7.5** (see [`AWS_RUNTIME_THROTTLING_ERROR_CODES`]). `RequestTimeoutException` is
+/// the one the first version of this classifier missed.
+const AWS_RUNTIME_TRANSIENT_ERROR_CODES: &[&str] = &["RequestTimeout", "RequestTimeoutException"];
+
+/// Codes s3dlio treats as transient on top of the SDK's tables.
+const S3DLIO_EXTRA_TRANSIENT_CODES: &[&str] = &[
     "InternalError",
     "ServiceUnavailable",
     // Credential expiry: the SDK re-resolves its identity (and may refresh
@@ -79,15 +101,25 @@ const TRANSIENT_S3_ERROR_CODES: &[&str] = &[
     "OperationAborted",
 ];
 
+/// Is `code` an S3 / AWS error code that means "try again later" whatever HTTP status
+/// the server attached to it (S3 itself reports `RequestTimeout` as a 400 and some
+/// S3-compatible servers report `SlowDown` as a 4xx)?
+fn is_transient_error_code(code: &str) -> bool {
+    AWS_RUNTIME_THROTTLING_ERROR_CODES.contains(&code)
+        || AWS_RUNTIME_TRANSIENT_ERROR_CODES.contains(&code)
+        || S3DLIO_EXTRA_TRANSIENT_CODES.contains(&code)
+}
+
 /// Is an HTTP status, with an optional S3 error code, worth retrying?
 ///
-/// Transient: 408, 429, every 5xx, and any status carrying one of
-/// [`TRANSIENT_S3_ERROR_CODES`]. Definite (not retried): every other 3xx and
+/// Transient: 408, 429, every 5xx, and any status carrying one of the codes
+/// [`is_transient_error_code`] accepts (the AWS SDK's throttling and transient tables
+/// plus a few S3-specific ones). Definite (not retried): every other 3xx and
 /// 4xx (400, 401, 403, 404, 405, 409, 412, 416, ...). Statuses outside
 /// 300-599 cannot be a definite client error, so they are retried.
 pub(crate) fn status_is_retryable(status: u16, code: Option<&str>) -> bool {
     if let Some(code) = code {
-        if TRANSIENT_S3_ERROR_CODES.contains(&code) {
+        if is_transient_error_code(code) {
             return true;
         }
     }
@@ -390,6 +422,58 @@ mod tests {
                 "{status} {code} is a definite answer and must not be retried"
             );
         }
+    }
+
+    /// The pinned SDK's own tables are all retryable at the outer classifier, on the
+    /// statuses real services attach to them (a 400 and a 403 are the ones that would
+    /// otherwise be "definite"). Compares against the crate itself so an SDK upgrade
+    /// that adds a code cannot silently shrink the outer retry budget.
+    #[test]
+    fn aws_runtime_code_tables_are_all_retryable() {
+        use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
+        for code in THROTTLING_ERRORS.iter().chain(TRANSIENT_ERRORS) {
+            for status in [400u16, 403, 409] {
+                assert!(
+                    service_failure(status, code).is_retryable(),
+                    "{status} {code} is in aws-runtime's tables and must be retried"
+                );
+            }
+            assert!(is_transient_error_code(code), "{code}");
+        }
+        // The copied constants cover the crate's tables exactly: nothing missing, and
+        // nothing left over that the SDK no longer lists.
+        let mut ours: Vec<&str> = AWS_RUNTIME_THROTTLING_ERROR_CODES
+            .iter()
+            .chain(AWS_RUNTIME_TRANSIENT_ERROR_CODES)
+            .copied()
+            .collect();
+        let mut theirs: Vec<&str> = THROTTLING_ERRORS
+            .iter()
+            .chain(TRANSIENT_ERRORS)
+            .copied()
+            .collect();
+        ours.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(
+            ours, theirs,
+            "update the constants from the pinned aws-runtime"
+        );
+    }
+
+    /// Blue's probe: a 400 `RequestTimeoutException` is the final error of an SDK
+    /// operation whose attempts are spent; the outer loop must still retry it.
+    #[test]
+    fn request_timeout_exception_is_retryable() {
+        assert!(service_failure(400, "RequestTimeoutException").is_retryable());
+        assert!(service_failure(400, "ThrottledException").is_retryable());
+        assert!(service_failure(403, "RequestThrottledException").is_retryable());
+        assert!(service_failure(400, "TransactionInProgressException").is_retryable());
+        assert!(service_failure(400, "LimitExceededException").is_retryable());
+        assert!(service_failure(400, "PriorRequestNotComplete").is_retryable());
+        assert!(service_failure(400, "EC2ThrottledException").is_retryable());
+        // Codes that really are definite stay definite.
+        assert!(!service_failure(400, "InvalidArgument").is_retryable());
+        assert!(!service_failure(400, "RequestTimeTooSkewed").is_retryable());
     }
 
     #[test]

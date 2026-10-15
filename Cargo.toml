@@ -175,6 +175,8 @@ tokio-sync   = "^0.1.8"
 futures-util  = "^0.3"
 async-trait   = "^0.1"   # needed by the mock datasets
 criterion     = { version = "0.5", features = ["html_reports"] }
+# retry.rs compares its copy of the SDK's retryable-code tables with the pinned crate
+aws-runtime = "1"
 # RFC conformance tests for redirect_client (uses http 1.x — same version as production dep)
 aws-smithy-types = "^1"        # needed for SdkBody::empty() in test fixtures
 

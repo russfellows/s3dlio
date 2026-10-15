@@ -5204,6 +5204,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
+ "aws-runtime",
  "aws-sdk-s3",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",

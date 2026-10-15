@@ -124,6 +124,18 @@ pub const GET_NOT_FOUND_MARKER: &str = "get-404";
 /// be retried).
 pub const GET_UNAVAILABLE_MARKER: &str = "get-503";
 
+/// Key substring marker that makes the mock server answer the FIRST
+/// [`GET_TIMEOUT_FAILURES`] GetObject requests for that key with
+/// `400 RequestTimeoutException` and every later one normally. The AWS SDK's own retry
+/// layer recognises this code and spends its whole attempt budget on it, so the error
+/// the s3dlio code sees is the SDK's FINAL one; the later success proves the OUTER
+/// retry loop still starts another attempt (issue #240 follow-up).
+pub const GET_TIMEOUT_THEN_OK_MARKER: &str = "get-timeout-then-ok";
+
+/// How many requests [`GET_TIMEOUT_THEN_OK_MARKER`] keys fail: the SDK's attempt
+/// budget (`S3DLIO_MAX_RETRY_ATTEMPTS=3`, pinned by the tests that use the marker).
+pub const GET_TIMEOUT_FAILURES: usize = 3;
+
 /// Bucket-name marker: a seeded bucket whose name contains this answers its LAST
 /// ListObjectsV2 page (`IsTruncated=false`) with a non-empty `NextContinuationToken`
 /// too, as some S3-compatible servers do. A listing must stop on `IsTruncated=false`.
@@ -592,6 +604,9 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         }
         if path.contains(GET_UNAVAILABLE_MARKER) {
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "SlowDown");
+        }
+        if path.contains(GET_TIMEOUT_THEN_OK_MARKER) && attempt <= GET_TIMEOUT_FAILURES {
+            return error_response(StatusCode::BAD_REQUEST, "RequestTimeoutException");
         }
         if path.contains(GET_FAILS_ONCE_MARKER) && attempt == 1 {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockTransientGetFailure");
