@@ -14,7 +14,7 @@ use std::os::raw::c_char;
 
 // Project crates
 use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
-use crate::python_api::put_payload::{put_payload, quiesce_blocking, PayloadUse};
+use crate::python_api::put_payload::hold_for_call;
 use crate::python_api::python_core_api::{py_err, require_max_in_flight, PyBytesView};
 
 // ---------------------------------------------------------------------------
@@ -207,22 +207,18 @@ impl PyMultipartUploadWriter {
         //    its part buffers: the parts are uploaded asynchronously and outlive this call, so a
         //    borrowed Python buffer cannot be handed to them without pinning it until they
         //    finish. Contract: do not modify the buffer from another thread during the call.
-        let payload = put_payload(py, data, PayloadUse::Blocking).map_err(|e| {
+        let held = hold_for_call(py, data).map_err(|e| {
             if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
                 pyo3::exceptions::PyTypeError::new_err(format!(
-                    "write() expects bytes-like (bytes, bytearray, memoryview, NumPy buffer): {e}"
+                    "write() expects bytes-like (bytes, bytearray, memoryview, NumPy buffer) or an object with __bytes__(): {e}"
                 ))
             } else {
                 e
             }
         })?;
-        let len = payload.bytes.len();
-        let res = py.detach(|| inner.write_blocking(payload.bytes.as_ref()));
-        let latch = payload.latch;
-        drop(payload.bytes);
-        if let Some(latch) = latch {
-            quiesce_blocking(py, &latch);
-        }
+        let len = held.len();
+        let res = py.detach(|| inner.write_blocking(held.as_slice()));
+        held.release(py);
         res.map(|_| len)
             .map_err(|e| py_err(e.context("write failed")))
     }

@@ -5,10 +5,12 @@
 
 use super::async_bridge::future_into_py;
 use super::put_payload::{
-    export_stats, put_payload, quiesce_async, quiesce_blocking, Latch, PayloadUse,
+    export_stats, hold_for_call, latch_ready, put_payload, quiesce_async, quiesce_blocking, Latch,
+    PayloadUse,
 };
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
+use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::ffi::c_str;
@@ -1503,15 +1505,36 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
         submit_io(async move { put_verified_with_retry(store.as_ref(), &uri, data_owned).await })
     });
     // The put is over (it succeeded, failed, or the store gave up), but a backend may still hold
-    // a clone of the payload (an SDK/hyper task, a detached writer). Wait, with the GIL released,
-    // until the LAST clone is gone (the owner's drop), then release the export with this
-    // thread's real GIL token: the call does not return while any native reader can still
-    // touch the caller's buffer. Bounded; on timeout the buffer stays pinned (see
-    // `EXPORT_QUIESCE_TIMEOUT`).
+    // a clone of the payload (an SDK/hyper task, a detached writer). Wait until the LAST clone is
+    // gone (the owner's drop), then release the export with this thread's real GIL token: the
+    // call does not return while any native reader can still touch the caller's buffer. When the
+    // store already dropped everything (the usual case) this is just a drain under the GIL.
+    // Bounded (see `export_quiesce_timeout`); on timeout the buffer stays pinned and the call
+    // raises ExportStillReferencedError. The wait is not interruptible by signals.
     if let Some(latch) = &payload.latch {
-        quiesce_blocking(py, latch);
+        if quiesce_blocking(py, latch).is_err() {
+            return Err(still_referenced_error(result.err().map(|e| e.to_string())));
+        }
     }
     result
+}
+
+create_exception!(
+    _pymod,
+    ExportStillReferencedError,
+    PyRuntimeError,
+    "A storage backend still references a borrowed Python buffer long after the put finished \
+     (S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS). The data may or may not have been written, and the \
+     buffer stays pinned: do not modify, resize or free it."
+);
+
+fn still_referenced_error(put_error: Option<String>) -> PyErr {
+    let timeout = crate::constants::export_quiesce_timeout();
+    ExportStillReferencedError::new_err(format!(
+        "a storage backend still references the buffer {timeout:?} after the put finished; the \
+         buffer stays pinned - do not modify, resize or free it{}",
+        put_error.map_or(String::new(), |e| format!(" (the put itself failed: {e})"))
+    ))
 }
 
 /// Async version of put_bytes() - accepts any bytes-like object
@@ -1529,8 +1552,8 @@ pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult
 ///   awaitable completes. By passing `borrow=True` the caller PROMISES not to modify, resize
 ///   or free the buffer until the awaitable has completed (successfully or not); until
 ///   then `bytearray.extend()/clear()` raise `BufferError` and any write to the bytes is a
-///   data race (the bytes uploaded are undefined). The awaitable (an `asyncio.Task` for
-///   `borrow=True`) completes - with the result, with an error, or with `CancelledError` - only
+///   data race (the bytes uploaded are undefined). The awaitable (a `Future` whose `cancel()`
+///   defers its own end, for `borrow=True`) completes - with the result, with an error, or with `CancelledError` - only
 ///   after every native reader of the buffer is done and the export has been released: a
 ///   cancellation is delivered to the caller after that point, not before, so reusing the
 ///   buffer after `CancelledError` is safe. (Cancelling therefore waits for a running native
@@ -1558,62 +1581,156 @@ fn put_bytes_async<'py>(
         PayloadUse::Snapshot
     };
     let payload = put_payload(py, data, usage)?;
+    let latch = payload.latch;
     let data_owned = payload.bytes;
+
+    // A payload that borrows the caller's memory may still be read by native code (a blocking
+    // file write that a cancelled future cannot stop, a backend task) after the Python future
+    // has become terminal. So the awaitable is a `GuardedFuture` whose cancel() cancels the put
+    // but whose own completion - result, error OR cancellation - is delayed until every native
+    // reader is done and the export has been released with a real GIL token.
+    // Everything that can fail is prepared BEFORE the native put is spawned.
+    let guard = match &latch {
+        None => None,
+        Some(latch) => match prepare_guard(py, latch.clone()) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                drop(data_owned); // nothing was spawned: this releases the (queued) export...
+                if quiesce_blocking(py, latch).is_err() {
+                    return Err(still_referenced_error(Some(e.to_string())));
+                }
+                return Err(e);
+            }
+        },
+    };
 
     let inner = future_into_py(py, async move {
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
         put_verified_with_retry(store.as_ref(), &uri, data_owned)
             .await
             .map_err(py_err)
-    })?;
-
-    // A payload that borrows the caller's memory may still be read by native code (a blocking
-    // file write that a cancelled future cannot stop, a backend task) after the Python future
-    // has become terminal. So the awaitable is wrapped: its completion - success, error OR
-    // cancellation - is delayed until every native reader is done and the export has been
-    // released with a real GIL token.
-    match payload.latch {
+    });
+    // On EVERY error path from here the barrier is kept: the blocking wait + drain below.
+    let fail = |py: Python<'py>, latch: &Option<std::sync::Arc<Latch>>, e: PyErr| -> PyErr {
+        if let Some(latch) = latch {
+            if quiesce_blocking(py, latch).is_err() {
+                return still_referenced_error(Some(e.to_string()));
+            }
+        }
+        e
+    };
+    let inner = match inner {
+        Ok(i) => i,
+        Err(e) => return Err(fail(py, &latch, e)),
+    };
+    match guard {
         None => Ok(inner),
-        Some(latch) => guarded_awaitable(py, inner, latch),
+        Some(g) => g.instantiate(py, inner).map_err(|e| fail(py, &latch, e)),
     }
 }
 
 /// The Python helper that makes an awaitable's completion wait for the export barrier.
+///
+/// Not a coroutine: a coroutine body never runs if its Task is cancelled before the first step,
+/// which would let the caller see `CancelledError` while a native write still reads the buffer.
+/// A `Future` subclass has no such window: `cancel()` is called on it directly, cancels the put,
+/// and defers the future's own terminal state until the barrier says no reader remains.
 const PUT_GUARD_PY: &std::ffi::CStr = c_str!(
     "import asyncio
 
-async def _wait_quiet(quiesce):
-    fut = asyncio.ensure_future(quiesce())
-    while True:
-        try:
-            await asyncio.shield(fut)
-            return
-        except asyncio.CancelledError:
-            if fut.done():
-                return
-            # cancelled again while waiting for the native readers: keep waiting
+class GuardedFuture(asyncio.Future):
+    def __init__(self, inner, latch_ready, quiesce, still_referenced):
+        super().__init__(loop=inner.get_loop())
+        self._inner = inner
+        self._latch_ready = latch_ready
+        self._quiesce = quiesce
+        self._still_referenced = still_referenced
+        self._cancel_msg = None
+        self._finishing = False
+        inner.add_done_callback(self._inner_done)
 
-async def guard(inner, quiesce):
-    # Cancelling this task cancels `inner` (the put), but the cancellation is only delivered
-    # to the caller AFTER `quiesce()` says no native reader of the borrowed buffer remains.
-    try:
-        result = await inner
-    except BaseException:
-        await _wait_quiet(quiesce)
-        raise
-    await _wait_quiet(quiesce)
-    return result
+    def cancel(self, msg=None):
+        # Request cancellation of the put; this future stays pending until no native reader of
+        # the borrowed buffer remains, then ends cancelled (see _complete).
+        if self.done():
+            return False
+        if self._cancel_msg is None:
+            self._cancel_msg = msg
+        self._inner.cancel()
+        return True
+
+    def _inner_done(self, inner):
+        if self._finishing:
+            return
+        self._finishing = True
+        try:
+            if inner.cancelled():
+                outcome = (2, None)
+            else:
+                exc = inner.exception()
+                outcome = (1, exc) if exc is not None else (0, inner.result())
+        except BaseException as e:
+            outcome = (1, e)
+        try:
+            if self._latch_ready():
+                self._complete(outcome, False)
+                return
+            waiter = self._quiesce()
+        except BaseException as e:
+            self._complete(outcome, e)
+            return
+        waiter.add_done_callback(lambda w: self._quiesced(outcome, w))
+
+    def _quiesced(self, outcome, waiter):
+        try:
+            timed_out = bool(waiter.result())
+        except BaseException as e:
+            timed_out = e
+        self._complete(outcome, timed_out)
+
+    def _complete(self, outcome, timed_out):
+        kind, value = outcome
+        if timed_out:
+            err = self._still_referenced(
+                'a storage backend still references the buffer after the put finished; '
+                'the buffer stays pinned - do not modify, resize or free it'
+            )
+            if kind == 1:
+                err.__cause__ = value
+            asyncio.Future.set_exception(self, err)
+        elif kind == 0:
+            asyncio.Future.set_result(self, value)
+        elif kind == 1:
+            asyncio.Future.set_exception(self, value)
+        else:
+            asyncio.Future.cancel(self, self._cancel_msg)
 "
 );
 
-fn guarded_awaitable<'py>(
+/// Everything the guard needs that can fail to build; made before the put is spawned.
+struct PreparedGuard<'py> {
+    class: Bound<'py, PyAny>,
+    latch_ready: Bound<'py, PyAny>,
+    quiesce: Bound<'py, PyAny>,
+    still_referenced: Bound<'py, PyAny>,
+}
+
+impl<'py> PreparedGuard<'py> {
+    /// Wrap the `inner` put future (cannot fail for lack of resources prepared above).
+    fn instantiate(self, py: Python<'py>, inner: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let _ = py;
+        self.class
+            .call1((inner, self.latch_ready, self.quiesce, self.still_referenced))
+    }
+}
+
+fn prepare_guard<'py>(
     py: Python<'py>,
-    inner: Bound<'py, PyAny>,
     latch: std::sync::Arc<Latch>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<PreparedGuard<'py>> {
     static GUARD: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-    let guard = match GUARD.get() {
-        Some(g) => g.clone_ref(py),
+    let class = match GUARD.get() {
+        Some(g) => g.bind(py).clone(),
         None => {
             let module = PyModule::from_code(
                 py,
@@ -1621,11 +1738,20 @@ fn guarded_awaitable<'py>(
                 c_str!("s3dlio_put_guard.py"),
                 c_str!("_s3dlio_put_guard"),
             )?;
-            let f = module.getattr("guard")?.unbind();
-            GUARD.get_or_init(|| f).clone_ref(py)
+            let f = module.getattr("GuardedFuture")?.unbind();
+            GUARD.get_or_init(|| f).bind(py).clone()
         }
     };
-    let quiesce = pyo3::types::PyCFunction::new_closure(
+    let l1 = latch.clone();
+    let latch_ready_fn = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
+              -> PyResult<bool> { Ok(latch_ready(args.py(), &l1)) },
+    )?;
+    let quiesce_fn = pyo3::types::PyCFunction::new_closure(
         py,
         None,
         None,
@@ -1633,15 +1759,17 @@ fn guarded_awaitable<'py>(
               _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
               -> PyResult<Py<PyAny>> {
             let latch = latch.clone();
-            let fut = future_into_py(args.py(), async move {
-                quiesce_async(latch).await;
-                Ok(())
-            })?;
+            // resolves to True when the wait TIMED OUT
+            let fut = future_into_py(args.py(), async move { Ok(quiesce_async(latch).await) })?;
             Ok(fut.unbind())
         },
     )?;
-    let coro = guard.bind(py).call1((inner, quiesce))?;
-    py.import("asyncio")?.call_method1("ensure_future", (coro,))
+    Ok(PreparedGuard {
+        class,
+        latch_ready: latch_ready_fn.into_any(),
+        quiesce: quiesce_fn.into_any(),
+        still_referenced: py.get_type::<ExportStillReferencedError>().into_any(),
+    })
 }
 
 /// Counters of the buffer-export barrier (diagnostics and tests):
@@ -2496,15 +2624,12 @@ impl PyObjectWriter {
     ///
     /// Calls on one writer from several threads run one after another.
     fn write_chunk(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let payload = put_payload(py, data, PayloadUse::Blocking)?;
-        let result = self.write_detached(py, payload.bytes.as_ref());
+        // Strict: bytes-like or `__bytes__()` only (never an int or an arbitrary iterable).
+        let held = hold_for_call(py, data)?;
+        let result = self.write_detached(py, held.as_slice());
         // The write took a borrowed slice (nothing keeps a clone), so the export is free now:
-        // release it with this thread's GIL token before returning.
-        let latch = payload.latch;
-        drop(payload.bytes);
-        if let Some(latch) = latch {
-            quiesce_blocking(py, &latch);
-        }
+        // release it directly with this thread's GIL token (no queue, no releaser wake-up).
+        held.release(py);
         result
     }
 
@@ -3252,6 +3377,10 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(put_bytes_async, m)?)?;
     m.add_function(wrap_pyfunction!(_put_export_stats, m)?)?;
+    m.add(
+        "ExportStillReferencedError",
+        m.py().get_type::<ExportStillReferencedError>(),
+    )?;
     m.add_function(wrap_pyfunction!(mkdir, m)?)?;
     m.add_function(wrap_pyfunction!(mkdir_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
@@ -4092,8 +4221,8 @@ mod write_chunk_uses_the_shared_payload_conversion_tests {
         let end = rest.find("\n    }\n").expect("end of write_chunk");
         let body = &rest[..end];
         assert!(
-            body.contains("put_payload("),
-            "write_chunk must use put_payload"
+            body.contains("hold_for_call("),
+            "write_chunk must use the strict shared conversion"
         );
         assert!(
             body.contains("write_detached("),
@@ -4104,8 +4233,8 @@ mod write_chunk_uses_the_shared_payload_conversion_tests {
             "write_chunk must not build its own slice or write with the GIL held"
         );
         assert!(
-            body.contains("quiesce_blocking("),
-            "the export must be released before returning"
+            body.contains("held.release(py)"),
+            "the export must be released directly with the GIL token before returning"
         );
     }
 }

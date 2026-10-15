@@ -70,6 +70,10 @@ pub const ENV_DIRECT_IO_BOUNCE_WHEN_BUSY: &str = "S3DLIO_DIRECT_IO_BOUNCE_WHEN_B
 /// into the destination). Which is faster depends on load; this stays `direct` until measured.
 pub const ENV_DIRECT_IO_GET_MODE: &str = "S3DLIO_DIRECT_IO_GET_MODE";
 
+/// A failed creation of a NUMA node's bounce pool is retried after this long (30 s); until then
+/// requests use per-call buffers.
+pub const BOUNCE_POOL_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How often a request waiting for a bounce buffer re-checks whether it was cancelled (25 ms).
 pub const BOUNCE_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
@@ -1009,11 +1013,35 @@ pub const ASYNC_EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// matters when nobody drains (for example a cancelled awaitable).
 pub const EXPORT_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// How long a put waits, after the store finished with it, for every native reader of a
-/// borrowed Python buffer to let go (30 s). If a backend still holds a clone of the payload after
-/// this, the buffer stays PINNED (never released while it can still be read), the event is logged
-/// once and counted (`s3dlio._put_export_stats()["quiesce_timeouts"]`), and the call completes.
+/// Default for how long a put waits, after the store finished with it, for every native reader
+/// of a borrowed Python buffer to let go (30 s). If a backend still holds a clone of the payload
+/// after this, the buffer stays PINNED (never released while it can still be read), the event is
+/// logged once and counted (`s3dlio._put_export_stats()["quiesce_timeouts"]`), and the call
+/// raises `ExportStillReferencedError`: the data may have been written, but the buffer must not
+/// be reused. Override with [`ENV_EXPORT_QUIESCE_TIMEOUT_SECS`]. The wait is not interruptible
+/// by signals.
 pub const EXPORT_QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Environment variable overriding [`EXPORT_QUIESCE_TIMEOUT`], in seconds (fractions allowed,
+/// at least 0.001; unusable values select the default).
+pub const ENV_EXPORT_QUIESCE_TIMEOUT_SECS: &str = "S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS";
+
+/// The effective quiesce timeout (reads [`ENV_EXPORT_QUIESCE_TIMEOUT_SECS`] on each call).
+pub fn export_quiesce_timeout() -> std::time::Duration {
+    parse_export_quiesce_timeout(
+        std::env::var(ENV_EXPORT_QUIESCE_TIMEOUT_SECS)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parser behind [`export_quiesce_timeout`].
+pub fn parse_export_quiesce_timeout(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.001 && *v <= 86_400.0)
+        .map(std::time::Duration::from_secs_f64)
+        .unwrap_or(EXPORT_QUIESCE_TIMEOUT)
+}
 
 /// Payload size below which the default `put_bytes_async` snapshot is copied with the GIL
 /// held (256 KiB): releasing and re-taking the GIL costs more than copying that much.

@@ -262,10 +262,21 @@ where
             // Release buffer exports queued by a finished `put_bytes_async(borrow=True)` BEFORE
             // the result reaches Python, so the caller can resize its buffer right after the
             // `await`. This thread is a blocking-pool thread that attaches to Python anyway.
+            // Drain and deliver in ONE attach scope (the delivery closure re-enters it cheaply).
             if super::put_payload::exports_pending() {
-                let _ = Python::try_attach(super::put_payload::drain_pending_exports);
+                let mut f = Some(f);
+                let _ = Python::try_attach(|py| {
+                    super::put_payload::drain_pending_exports(py);
+                    if let Some(f) = f.take() {
+                        f();
+                    }
+                });
+                if let Some(f) = f {
+                    f(); // attaching was refused; deliver as before
+                }
+            } else {
+                f();
             }
-            f();
             drop(ticket);
         }),
         None => {
