@@ -114,6 +114,16 @@ pub const PUT_FAILS_MARKER: &str = "put-500";
 /// `403 AccessDenied` (a persistent, non-retried failure).
 pub const GET_FORBIDDEN_MARKER: &str = "get-403";
 
+/// Bucket-name marker: a seeded bucket whose name contains this answers its LAST
+/// ListObjectsV2 page (`IsTruncated=false`) with a non-empty `NextContinuationToken`
+/// too, as some S3-compatible servers do. A listing must stop on `IsTruncated=false`.
+pub const LAST_PAGE_TOKEN_MARKER: &str = "last-page-token";
+
+/// Bucket-name marker: a seeded bucket whose name contains this answers every page
+/// that has more keys behind it with `IsTruncated=true` but NO `NextContinuationToken`
+/// (a broken server). A listing that drives a delete must treat that as an error.
+pub const TRUNCATED_NO_TOKEN_MARKER: &str = "truncated-no-token";
+
 /// Call counts scoped to a single S3 key. `cargo test` runs integration
 /// tests in the same binary concurrently by default, so a single set of
 /// process-global counters would let one test observe another test's
@@ -155,9 +165,47 @@ pub struct RecordedRequest {
 pub struct MockS3State {
     per_path: Arc<Mutex<HashMap<String, PathCallCounts>>>,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    /// Seeded buckets (see [`MockS3State::seed_bucket`]): bucket -> sorted keys.
+    catalogs: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl MockS3State {
+    /// Seed `bucket` with exactly `keys`. ListObjectsV2 on a seeded bucket is
+    /// answered from this catalog the way S3 answers it: only keys that start
+    /// with `prefix`; with `delimiter`, keys whose remainder (after the prefix)
+    /// contains the delimiter collapse into one `CommonPrefixes` entry; results
+    /// come back in UTF-8 key order, `max-keys` per page, with
+    /// `continuation-token` paging. A bucket that was never seeded keeps the
+    /// legacy synthetic answer (`{prefix}bar` and `{prefix}other/deep.dat`).
+    pub fn seed_bucket(&self, bucket: &str, keys: &[&str]) {
+        let mut sorted: Vec<String> = keys.iter().map(|k| (*k).to_string()).collect();
+        sorted.sort();
+        sorted.dedup();
+        self.catalogs
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), sorted);
+    }
+
+    /// The seeded catalog of `bucket`, if it has one.
+    fn catalog(&self, bucket: &str) -> Option<Vec<String>> {
+        self.catalogs.lock().unwrap().get(bucket).cloned()
+    }
+
+    /// The keys still in the seeded `bucket`, sorted. A seeded bucket loses the keys that
+    /// DeleteObjects / DeleteObject name (a key carrying [`DELETE_FAILS_MARKER`] is never
+    /// removed), so a test can assert exactly what survived a delete.
+    pub fn remaining_keys(&self, bucket: &str) -> Vec<String> {
+        self.catalog(bucket).unwrap_or_default()
+    }
+
+    /// Remove `key` from the seeded catalog of `bucket`, if there is one.
+    fn remove_key(&self, bucket: &str, key: &str) {
+        if let Some(keys) = self.catalogs.lock().unwrap().get_mut(bucket) {
+            keys.retain(|k| k != key);
+        }
+    }
+
     fn record(&self, key_path: &str, f: impl FnOnce(&mut PathCallCounts)) {
         let mut map = self.per_path.lock().unwrap();
         let entry = map.entry(key_path.to_string()).or_default();
@@ -367,6 +415,7 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
                      <Message>mock server injected per-object delete failure</Message></Error>"
                 ));
             } else {
+                state.remove_key(path.trim_matches('/'), key);
                 deleted_xml.push_str(&format!("<Deleted><Key>{key}</Key></Deleted>"));
             }
         }
@@ -379,19 +428,18 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
 
     // ListObjectsV2: GET /{bucket}?list-type=2&prefix=...
     //
-    // Always returns exactly two synthetic keys under whatever prefix was
-    // requested: "{prefix}bar" and "{prefix}other/deep.dat" — chosen so a
-    // test can pass a `key_prefix` ending in `/bar` and get one key whose
-    // tail-past-prefix matches the resulting regex ("bar") and one whose
-    // tail doesn't ("other/deep.dat"), directly reproducing the B7 dead-
-    // filter scenario from the audit (`list("s3://bucket/foo/bar")`
-    // returning `foo/other/deep.dat` alongside `foo/bar`).
+    // A bucket seeded with `MockS3State::seed_bucket` is answered from its
+    // catalog (prefix, delimiter and paging honoured, like S3). Every other
+    // bucket gets exactly two synthetic keys under whatever prefix was
+    // requested -- "{prefix}bar" and "{prefix}other/deep.dat" -- which older
+    // tests rely on to see the prefix the client SENT.
     if method == Method::GET && query.contains("list-type=2") {
-        let prefix = query
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("prefix="))
-            .map(percent_decode)
-            .unwrap_or_default();
+        let prefix = query_param(&query, "prefix").unwrap_or_default();
+        let bucket = path.trim_matches('/').split('/').next().unwrap_or("");
+        if let Some(catalog) = state.catalog(bucket) {
+            let xml = seeded_list_response(&catalog, bucket, &prefix, &query);
+            return xml_response(StatusCode::OK, &xml);
+        }
         let xml = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
              <Name>mock-bucket</Name><Prefix>{prefix}</Prefix>\
@@ -443,6 +491,9 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     // DeleteObject: DELETE .../{key} (no uploadId -- that is the abort above).
     if method == Method::DELETE {
         state.record(&path, |c| c.delete_calls += 1);
+        if let Some((bucket, key)) = path.trim_start_matches('/').split_once('/') {
+            state.remove_key(bucket, &percent_decode(key));
+        }
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(Full::new(Bytes::new()))
@@ -659,4 +710,91 @@ fn extract_xml_tag_values(xml: &str, tag: &str) -> Vec<String> {
         }
     }
     values
+}
+
+/// The decoded value of query parameter `name`, if present.
+fn query_param(query: &str, name: &str) -> Option<String> {
+    let want = format!("{name}=");
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(want.as_str()))
+        .map(percent_decode)
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// A ListObjectsV2 answer built from a seeded, sorted catalog (see
+/// [`MockS3State::seed_bucket`]).
+fn seeded_list_response(catalog: &[String], bucket: &str, prefix: &str, query: &str) -> String {
+    let delimiter = query_param(query, "delimiter").filter(|d| !d.is_empty());
+    let max_keys: usize = query_param(query, "max-keys")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let token = query_param(query, "continuation-token");
+
+    // (name, is_common_prefix), in key order, common prefixes collapsed.
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    for key in catalog {
+        let Some(rest) = key.strip_prefix(prefix) else {
+            continue;
+        };
+        match delimiter
+            .as_deref()
+            .and_then(|d| rest.find(d).map(|i| (d, i)))
+        {
+            Some((d, i)) => {
+                let common = format!("{prefix}{}", &rest[..i + d.len()]);
+                if entries.last().map(|(n, _)| n.as_str()) != Some(common.as_str()) {
+                    entries.push((common, true));
+                }
+            }
+            None => entries.push((key.clone(), false)),
+        }
+    }
+    if let Some(after) = &token {
+        entries.retain(|(name, _)| name.as_str() > after.as_str());
+    }
+    let truncated = entries.len() > max_keys;
+    entries.truncate(max_keys);
+
+    let mut contents = String::new();
+    let mut common_prefixes = String::new();
+    for (name, is_common) in &entries {
+        if *is_common {
+            common_prefixes.push_str(&format!(
+                "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+                xml_escape(name)
+            ));
+        } else {
+            contents.push_str(&format!(
+                "<Contents><Key>{}</Key><Size>4</Size></Contents>",
+                xml_escape(name)
+            ));
+        }
+    }
+    let next = match (truncated, entries.last()) {
+        _ if bucket.contains(TRUNCATED_NO_TOKEN_MARKER) => String::new(),
+        (false, _) if bucket.contains(LAST_PAGE_TOKEN_MARKER) => {
+            "<NextContinuationToken>constant-last-page-token</NextContinuationToken>".to_string()
+        }
+        (true, Some((name, _))) => {
+            format!(
+                "<NextContinuationToken>{}</NextContinuationToken>",
+                xml_escape(name)
+            )
+        }
+        _ => String::new(),
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
+         <Name>{bucket}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount>\
+         <MaxKeys>{max_keys}</MaxKeys><IsTruncated>{truncated}</IsTruncated>{next}\
+         {contents}{common_prefixes}</ListBucketResult>",
+        xml_escape(prefix),
+        entries.len()
+    )
 }

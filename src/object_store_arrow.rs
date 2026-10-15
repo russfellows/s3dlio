@@ -51,8 +51,13 @@ impl ArrowObjectStore {
         Box::new(Self)
     }
 
-    /// parse a full URI into (store, path) using explicit S3 configuration.
+    /// parse a full URI naming ONE OBJECT into (store, path) using explicit S3 configuration.
     fn parse(uri: &str) -> Result<(Arc<dyn AosObjectStore>, Path, Url)> {
+        Self::parse_as(uri, false)
+    }
+
+    /// The shared parser; `is_prefix` is true when the URI names a listing prefix.
+    fn parse_as(uri: &str, is_prefix: bool) -> Result<(Arc<dyn AosObjectStore>, Path, Url)> {
         let url = Url::parse(uri).context("invalid URI")?;
 
         match url.scheme() {
@@ -61,7 +66,8 @@ impl ArrowObjectStore {
                 let bucket = url
                     .host_str()
                     .ok_or_else(|| anyhow::anyhow!("No bucket in S3 URL"))?;
-                let path = Path::from(url.path().trim_start_matches('/'));
+                let path = key_path(url.path(), is_prefix)
+                    .with_context(|| format!("cannot address {uri}"))?;
 
                 // Build S3 client explicitly to control credentials
                 let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
@@ -109,7 +115,7 @@ impl ArrowObjectStore {
     /// convenience for prefix listing: if the URI is a "directory-like" prefix,
     /// just parse it; listing handles both object prefixes and virtual directories.
     fn parse_prefix(prefix: &str) -> Result<(Arc<dyn AosObjectStore>, Path, Url)> {
-        Self::parse(prefix)
+        Self::parse_as(prefix, true)
     }
 
     /// Build a full URI string for a returned `location` using the original scheme/authority.
@@ -170,6 +176,33 @@ impl ArrowObjectStore {
             metadata: user_meta,
         }
     }
+}
+
+/// The `object_store` [`Path`] for the key in an `s3://` URI's path component.
+///
+/// Keys are used exactly as written (issue #198): the first `/` of `url_path` is the
+/// separator between the bucket and the key, and everything after it is the key.
+/// `object_store::path::Path` cannot hold a key with an empty segment: `Path::from` drops
+/// the empty segments, so the objects `/x`, `x`, and `a//b`, `a/b` would silently collapse
+/// onto one another. Such a key is therefore refused with an error that names the
+/// problem, never mapped onto a different object.
+///
+/// A listing prefix (`is_prefix`) may end in one `/`, the directory delimiter. An object
+/// key may not (`dir/` is a different object than `dir`).
+fn key_path(url_path: &str, is_prefix: bool) -> Result<Path> {
+    let key = url_path.strip_prefix('/').unwrap_or(url_path);
+    let body = match key.strip_suffix('/') {
+        Some(dir) if is_prefix && !dir.is_empty() => dir,
+        _ => key,
+    };
+    if !body.is_empty() && body.split('/').any(str::is_empty) {
+        bail!(
+            "the key {key:?} has an empty path segment (a leading '/', a '//', or a trailing \
+             '/' on an object key), which the Arrow object_store backend cannot represent; \
+             using it would address a different object"
+        );
+    }
+    Ok(Path::from(body))
 }
 
 /// Read `length` bytes from `offset` (to the end of the object if `length` is `None`).
@@ -336,6 +369,23 @@ impl S3DlioObjectStore for ArrowObjectStore {
             store.delete(&obj.location).await?;
         }
 
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229). A prefix exists once
+    /// objects are written under it, so there is nothing to create. (A marker object
+    /// is also impossible here: `object_store::path::Path` cannot represent a key
+    /// ending in `/`.) The URI is validated; NO request is sent.
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        Url::parse(uri).context("invalid URI")?;
+        Ok(())
+    }
+
+    /// No-op, `recursive` or not: an object store has no directories (issue #229), so
+    /// there is nothing to remove. The URI is validated; NO request is sent and
+    /// nothing is deleted. Use [`S3DlioObjectStore::delete_prefix`] to delete objects.
+    async fn rmdir(&self, uri: &str, _recursive: bool) -> Result<()> {
+        Url::parse(uri).context("invalid URI")?;
         Ok(())
     }
 
@@ -665,6 +715,128 @@ mod tests {
         assert_eq!(&got[..], b"789");
     }
 
+    // -- issue #198: keys are used exactly as written ------------------------------------
+
+    // The reproduction: `object_store::path::Path` cannot hold a key with an empty
+    // segment. `Path::from` silently drops the empty segments, so `/x` IS `x` and `a//b`
+    // IS `a/b`: two different S3 objects collapse onto one. `Path::parse` refuses them.
+    #[tokio::test]
+    async fn object_store_path_drops_empty_segments_so_it_cannot_name_such_keys() {
+        assert_eq!(Path::from("/x"), Path::from("x"));
+        assert_eq!(Path::from("a//b"), Path::from("a/b"));
+        assert_eq!(Path::from("a/b/"), Path::from("a/b"));
+        // `Path::parse` does not help: it refuses `a//b` and trims the leading `/` of `/x`.
+        assert!(Path::parse("a//b").is_err());
+        assert_eq!(Path::parse("/x").expect("parse trims"), Path::from("x"));
+
+        // The consequence at the store level: writing the object `/x` is reading `x`.
+        let store = aos::memory::InMemory::new();
+        store
+            .put(
+                &Path::from("/x"),
+                PutPayload::from(Bytes::from_static(b"slash-x")),
+            )
+            .await
+            .expect("put");
+        let got = store
+            .get(&Path::from("x"))
+            .await
+            .expect("`x` aliases `/x` in object_store")
+            .bytes()
+            .await
+            .expect("bytes");
+        assert_eq!(&got[..], b"slash-x");
+    }
+
+    #[test]
+    fn key_path_keeps_representable_keys_exactly() {
+        // `s3://b/<key>`: the URL path is `/<key>`; one `/` is the separator.
+        assert_eq!(key_path("/x", false).expect("x"), Path::from("x"));
+        assert_eq!(key_path("/a/b", false).expect("a/b"), Path::from("a/b"));
+        assert_eq!(key_path("/x.bin", false).expect("x.bin").as_ref(), "x.bin");
+        // The bucket itself: no key.
+        assert_eq!(key_path("", true).expect("bucket"), Path::from(""));
+        assert_eq!(key_path("/", true).expect("bucket"), Path::from(""));
+        // A listing prefix may end in the directory delimiter.
+        assert_eq!(key_path("/dir/", true).expect("dir/"), Path::from("dir"));
+        assert_eq!(key_path("/a/b/", true).expect("a/b/"), Path::from("a/b"));
+    }
+
+    #[test]
+    fn key_path_rejects_keys_object_store_cannot_represent() {
+        for (url_path, why) in [
+            ("//x", "key `/x`"),
+            ("//", "key `/`"),
+            ("/a//b", "key `a//b`"),
+            ("///x", "key `//x`"),
+            ("//a/b/", "prefix `/a/b/`"),
+        ] {
+            for is_prefix in [false, true] {
+                let err = key_path(url_path, is_prefix)
+                    .expect_err(&format!("{why} (prefix={is_prefix}) must be refused"));
+                let msg = format!("{err:#}");
+                assert!(msg.contains("empty path segment"), "{why}: {msg}");
+            }
+        }
+        // A key that ends in `/` names a different object than the Path it would become.
+        let err = key_path("/dir/", false).expect_err("object key `dir/` must be refused");
+        assert!(format!("{err:#}").contains("empty path segment"), "{err:#}");
+    }
+
+    // Through the public surface: refused before any credential lookup or request.
+    #[tokio::test]
+    async fn operations_refuse_unrepresentable_keys_instead_of_addressing_another_object() {
+        let store = ArrowObjectStore::new();
+        for uri in ["s3://bucket//x", "s3://bucket/a//b", "s3://bucket///x"] {
+            let msg = |e: anyhow::Error| format!("{e:#}");
+            let all = [
+                store.get(uri).await.map(|_| ()).map_err(msg),
+                store
+                    .get_range(uri, 0, Some(1))
+                    .await
+                    .map(|_| ())
+                    .map_err(msg),
+                store.put(uri, Bytes::from_static(b"d")).await.map_err(msg),
+                store.stat(uri).await.map(|_| ()).map_err(msg),
+                store.delete(uri).await.map_err(msg),
+                store.list(uri, false).await.map(|_| ()).map_err(msg),
+                store.delete_batch(&[uri.to_string()]).await.map_err(msg),
+            ];
+            for r in all {
+                let m = r.expect_err(&format!("{uri} must be refused"));
+                assert!(m.contains("empty path segment"), "{uri}: {m}");
+                assert!(m.contains(uri), "the error must name the URI: {m}");
+            }
+        }
+    }
+
+    // The prefix/object split reaches the parser: `s3://b/dir/` is a valid LISTING prefix
+    // (the most common call shape for `list` / `delete_prefix`) and an invalid OBJECT key.
+    // The refusal tests above only prove errors; this one proves the success side of the
+    // `parse_prefix` -> `parse_as(.., true)` wiring. Building the client needs credentials
+    // but makes no request. Env use is serialised by the crate-wide test guard and restored
+    // on drop.
+    #[test]
+    fn parse_prefix_accepts_a_trailing_slash_that_parse_refuses() {
+        let _guard = crate::test_env::lock();
+        let _env =
+            crate::test_env::EnvRestore::capture(&["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]);
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test-access-key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+        }
+
+        let prefix = ArrowObjectStore::parse_prefix("s3://b/dir/");
+        let object = ArrowObjectStore::parse("s3://b/dir/");
+
+        let (_store, path, _url) = prefix.expect("`s3://b/dir/` is a valid listing prefix");
+        assert_eq!(path, Path::from("dir"));
+        let err = object.err().expect("`s3://b/dir/` is not an object key");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty path segment"), "{msg}");
+        assert!(msg.contains("s3://b/dir/"), "{msg}");
+    }
+
     // list_stream reports a listing failure as a single Err item, like `list`.
     #[tokio::test]
     async fn list_stream_yields_error_for_unusable_prefix() {
@@ -672,5 +844,19 @@ mod tests {
         let items: Vec<Result<String>> = store.list_stream("not a uri", false).collect().await;
         assert_eq!(items.len(), 1);
         assert!(items[0].is_err());
+    }
+
+    // #229: mkdir / rmdir are no-ops on an object store -- Ok, no request (no store is
+    // even built), the URI is only validated.
+    #[tokio::test]
+    async fn mkdir_and_rmdir_are_noops_and_validate_the_uri() {
+        let store = ArrowObjectStore::new();
+        for uri in ["s3://bucket/dir", "s3://bucket/dir/", "s3://bucket/"] {
+            store.mkdir(uri).await.unwrap();
+            store.rmdir(uri, true).await.unwrap();
+            store.rmdir(uri, false).await.unwrap();
+        }
+        assert!(store.mkdir("not a uri").await.is_err());
+        assert!(store.rmdir("not a uri", true).await.is_err());
     }
 }

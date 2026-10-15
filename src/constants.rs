@@ -927,24 +927,18 @@ mod h2_window_tests {
 mod connect_timeout_tests {
     use super::*;
 
-    // These tests mutate process-global env; they run serially within the
-    // same module (cargo's default per-thread test execution would race).
-    // We use a Mutex to enforce serial access across the few tests below.
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // These tests mutate process-global env, so each takes the crate-wide
+    // guard `crate::test_env` (issue #216): a lock private to this module
+    // cannot protect variables that tests in other modules also touch.
 
     fn with_var<F: FnOnce()>(value: Option<&str>, body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
-        let prev = std::env::var(ENV_CONNECT_TIMEOUT_SECS).ok();
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&[ENV_CONNECT_TIMEOUT_SECS]);
         match value {
             Some(v) => std::env::set_var(ENV_CONNECT_TIMEOUT_SECS, v),
             None => std::env::remove_var(ENV_CONNECT_TIMEOUT_SECS),
         }
         body();
-        match prev {
-            Some(v) => std::env::set_var(ENV_CONNECT_TIMEOUT_SECS, v),
-            None => std::env::remove_var(ENV_CONNECT_TIMEOUT_SECS),
-        }
     }
 
     #[test]
@@ -979,22 +973,15 @@ mod connect_timeout_tests {
 #[cfg(test)]
 mod max_retry_tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_var<F: FnOnce()>(value: Option<&str>, body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
-        let prev = std::env::var(ENV_MAX_RETRY_ATTEMPTS).ok();
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&[ENV_MAX_RETRY_ATTEMPTS]);
         match value {
             Some(v) => std::env::set_var(ENV_MAX_RETRY_ATTEMPTS, v),
             None => std::env::remove_var(ENV_MAX_RETRY_ATTEMPTS),
         }
         body();
-        match prev {
-            Some(v) => std::env::set_var(ENV_MAX_RETRY_ATTEMPTS, v),
-            None => std::env::remove_var(ENV_MAX_RETRY_ATTEMPTS),
-        }
     }
 
     #[test]
@@ -1039,27 +1026,21 @@ mod max_retry_tests {
 #[cfg(test)]
 mod mpi_thread_budget_tests {
     use super::*;
-    use std::sync::Mutex;
 
     // mpi_world_size() checks 3 env vars; these tests mutate all of them and
-    // must run serially both against each other and against any other test
-    // in this binary that touches the same vars (none currently do).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // must run serially both against each other and against every other test
+    // in this binary that touches the same vars (effective_thread_budget_tests
+    // and s3_client's mpi_aware_runtime_sizing_tests do).  That is why they take
+    // the crate-wide guard `crate::test_env`, not a lock of their own (#216).
     const VARS: [&str; 3] = ["OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "WORLD_SIZE"];
 
     fn with_clean_env<F: FnOnce()>(body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
-        let prev: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&VARS);
         for v in VARS {
             std::env::remove_var(v);
         }
         body();
-        for (v, p) in VARS.iter().zip(prev) {
-            match p {
-                Some(val) => std::env::set_var(v, val),
-                None => std::env::remove_var(v),
-            }
-        }
     }
 
     #[test]
@@ -1154,9 +1135,7 @@ mod mpi_thread_budget_tests {
 mod effective_thread_budget_tests {
     use super::*;
     use std::sync::atomic::Ordering;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
     const VARS: [&str; 5] = [
         "S3DLIO_RT_THREADS",
         "S3DLIO_RT_THREADS_UNSAFE",
@@ -1166,25 +1145,45 @@ mod effective_thread_budget_tests {
     ];
 
     fn with_clean_env<F: FnOnce()>(body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
-        let prev: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&VARS);
+        let _limit = crate::test_env::AtomicRestore::capture(&crate::s3_client::RT_THREADS_LIMIT);
         for v in VARS {
             std::env::remove_var(v);
         }
         // effective_thread_budget delegates to clamped_env_rt_threads, which
         // reads RT_THREADS_LIMIT.  Reset it so a prior test in the same
         // binary doesn't leak a nonzero limit into these assertions.
-        let prev_limit = crate::s3_client::RT_THREADS_LIMIT.swap(0, Ordering::Relaxed);
+        crate::s3_client::RT_THREADS_LIMIT.store(0, Ordering::Relaxed);
 
         body();
+    }
 
-        for (v, p) in VARS.iter().zip(prev) {
-            match p {
-                Some(val) => std::env::set_var(v, val),
-                None => std::env::remove_var(v),
-            }
-        }
-        crate::s3_client::RT_THREADS_LIMIT.store(prev_limit, Ordering::Relaxed);
+    /// #216: a failed assertion inside the body must not leak the variables or
+    /// RT_THREADS_LIMIT into later tests (the tokio guard never poisons).
+    #[test]
+    fn with_clean_env_restores_when_the_body_panics() {
+        let snapshot = || {
+            let _guard = crate::test_env::lock();
+            let vars: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+            (
+                vars,
+                crate::s3_client::RT_THREADS_LIMIT.load(Ordering::Relaxed),
+            )
+        };
+        let before = snapshot();
+
+        let outcome = std::panic::catch_unwind(|| {
+            with_clean_env(|| {
+                std::env::set_var("S3DLIO_RT_THREADS", "2");
+                std::env::set_var("OMPI_COMM_WORLD_SIZE", "4");
+                crate::s3_client::RT_THREADS_LIMIT.store(28, Ordering::Relaxed);
+                panic!("simulated failed assertion");
+            });
+        });
+        assert!(outcome.is_err(), "the body was expected to panic");
+
+        assert_eq!(snapshot(), before, "state leaked out of a panicking body");
     }
 
     #[test]

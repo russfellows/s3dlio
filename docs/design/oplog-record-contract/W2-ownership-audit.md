@@ -114,7 +114,8 @@ GET; that probe has never had a row of its own and is not counted below.
 | logged store `copy` | file:// | `GET`, `PUT` | read, write | same |
 | logged store `rename` | file://, direct:// | none (`rename(2)` is native; no op name describes it) | one `rename(2)` | same, `oplog_logged_store_file_transparent` |
 | logged store `pre_stat_objects`, `pre_stat_and_cache` | file:// | one `HEAD` per URI | one `stat` per URI | `oplog_rows_copy_rename_prestat` |
-| logged store `mkdir`, `rmdir`, `update_metadata`, `update_properties` | all | none (no op name; forwarded) | the backend's own | `oplog_logged_store_forwards_every_method` |
+| logged store `mkdir`, `update_metadata`, `update_properties` | all | none (no op name; forwarded) | the backend's own | `oplog_logged_store_forwards_every_method` |
+| logged store `rmdir` (recursive or not) | file://, direct:// | 1 `DELETE_PREFIX` on the directory URI (count 0, no first_byte; error text on failure; #228); object stores (s3://, az://, gs://) write no row, `rmdir` deletes nothing there (#229) | the backend's own | `oplog_rmdir_rows`, `oplog_logged_store_forwards_every_method` |
 | helper `put_object_async`, `put_object_uri_async` | S3 | 1 `PUT` | 1 PUT | `oplog_helper_rows_golden` |
 | helper `get_object*`, `get_range`, `get_objects_parallel*` (small object) | S3 | 1 `GET` per object | 1 GET (+ size probe) per object | same |
 | helper `get_object_uri_optimized_async`, `get_objects_parallel*` (large object) | S3 | none | ranged GETs | `..._large_object` |

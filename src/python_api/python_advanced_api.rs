@@ -14,7 +14,7 @@ use std::os::raw::c_char;
 
 // Project crates
 use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
-use crate::python_api::python_core_api::{py_err, PyBytesView};
+use crate::python_api::python_core_api::{py_err, require_max_in_flight, PyBytesView};
 
 // ---------------------------------------------------------------------------
 // Multipart upload code
@@ -92,6 +92,10 @@ impl PyMultipartUploadWriter {
         content_type: Option<String>,
         abort_on_drop: Option<bool>,
     ) -> PyResult<Self> {
+        // Issue #211: a limit of 0 is a ValueError, raised before anything else.
+        if let Some(mif) = max_in_flight {
+            require_max_in_flight("max_in_flight", mif)?;
+        }
         let mut cfg = MultipartUploadConfig::default();
         if let Some(ps) = part_size {
             cfg.part_size = ps;
@@ -134,6 +138,10 @@ impl PyMultipartUploadWriter {
         content_type: Option<String>,
         abort_on_drop: Option<bool>,
     ) -> PyResult<Self> {
+        // Issue #211: a limit of 0 is a ValueError, raised before anything else.
+        if let Some(mif) = max_in_flight {
+            require_max_in_flight("max_in_flight", mif)?;
+        }
         let mut cfg = MultipartUploadConfig::default();
         if let Some(ps) = part_size {
             cfg.part_size = ps;

@@ -17,7 +17,8 @@ use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::object_store::{store_for_uri, ObjectStore};
 use crate::progress::ProgressCallback;
 use crate::s3_utils::{
-    create_bucket_for_uri_async, get_object, list_objects, parse_s3_uri_full, put_object_async,
+    create_bucket_for_uri_async, get_object, list_objects_with_pattern, parse_s3_uri_full,
+    put_object_async,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -39,6 +40,8 @@ pub async fn upload_files<P: AsRef<Path>>(
     do_create_bucket: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     let dest = parse_s3_uri_full(dest_prefix)?;
     let (bucket, key_prefix) = (dest.bucket, dest.key);
     // Allow empty prefix (bucket root) or a non-empty prefix that ends with '/'
@@ -152,8 +155,19 @@ pub async fn upload_files<P: AsRef<Path>>(
     result
 }
 
-/// Download one key, every key under a prefix, or glob/regex-match objects into `dest_dir/`,
-/// creating files with their original basenames, up to `max_in_flight` at once.
+/// Download every object the `s3://` URI `src_uri` selects (issue #213)
+/// into `dest_dir/`, creating files with their original basenames, up to
+/// `max_in_flight` at once.
+///
+/// The URI is never a regular expression and never a bare prefix (the rule is in
+/// [`crate::s3_selection`]): `s3://b/dir/` downloads everything under `dir/`;
+/// `s3://b/dir/file.txt` downloads exactly `dir/file.txt` (and, when `recursive`,
+/// everything under `dir/file.txt/`) and NEVER `dir/file.txt.bak`; `*` / `**` make an
+/// explicit glob over the full key (`s3://b/dir/file.txt*` does select
+/// `dir/file.txt.bak`); `.`, `(`, `[` and the like are ordinary characters. To narrow
+/// the selection by regular expression use [`download_objects_matching`].
+///
+/// With `recursive == false` the "directories" among the selected entries are skipped.
 pub async fn download_objects(
     src_uri: &str,
     dest_dir: &Path,
@@ -161,29 +175,44 @@ pub async fn download_objects(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
-    let (bucket, mut key_pattern) = parse_s3_uri_for_global_client(src_uri)?;
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
+    download_objects_matching(
+        src_uri,
+        None,
+        dest_dir,
+        max_in_flight,
+        recursive,
+        progress_callback,
+    )
+    .await
+}
 
-    /*
-     * Old
-     *
-    // If the pattern is not a glob/regex and not a prefix, it's a single key.
-    // Otherwise, use our powerful list_objects function to find all matching keys.
-    let keys = if !key_pattern.ends_with('/') && !key_pattern.contains('*') && !key_pattern.contains('?') {
-        vec![key_pattern.clone()]
-    } else {
-        // Use the `recursive` parameter passed in from the caller
-        list_objects(&bucket, &key_pattern, recursive)?
-    };
-    */
+/// [`download_objects`] narrowed by an EXPLICIT regular expression (issue #213).
+///
+/// `src_uri` selects the objects ([`download_objects`]); `pattern`, when given, is matched
+/// (unanchored) against each listed key relative to the listing base (see
+/// [`crate::list_pattern`]), so `("s3://b/dl/", r"\.npz$")` downloads the `.npz`
+/// objects under `dl/`. An invalid pattern fails before anything is listed.
+///
+/// It lists through a blocking call on s3dlio's own global runtime, so it must not be called
+/// from a task running on that runtime (the same constraint as [`download_objects`]).
+pub async fn download_objects_matching(
+    src_uri: &str,
+    pattern: Option<&str>,
+    dest_dir: &Path,
+    max_in_flight: usize,
+    recursive: bool,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<()> {
+    // Issue #211: a limit of 0 builds a semaphore with no permits and hangs.  This is the
+    // implementation `download_objects` delegates to (and a public entry of its own), so the
+    // guard lives here: before the URI is parsed, anything is listed or a directory is made.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
+    let (bucket, key_prefix) = parse_s3_uri_for_global_client(src_uri)?;
 
-    // New, simpler
-    // If the path ends with a slash, automatically append a wildcard to search inside it.
-    if key_pattern.ends_with('/') {
-        key_pattern.push_str(".*");
-    }
-
-    // List the objects using the potentially modified pattern.
-    let keys = list_objects(&bucket, &key_pattern, recursive)?;
+    // List the objects the URI selects, narrowed by the explicit pattern.
+    let keys = list_objects_with_pattern(&bucket, &key_prefix, pattern, recursive)?;
 
     if keys.is_empty() {
         bail!("No objects matched for download");

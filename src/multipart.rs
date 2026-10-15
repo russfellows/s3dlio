@@ -188,8 +188,30 @@ impl MultipartUploadSink {
         run_on_global_rt(async move { Self::new_async(&bucket, &key, cfg).await })
     }
 
+    /// Create a new MPU sink for bucket + key on a caller-chosen client
+    /// (issue #208): a per-endpoint store passes ITS client.
+    pub(crate) fn new_with_client(
+        client: Client,
+        bucket: &str,
+        key: &str,
+        cfg: MultipartUploadConfig,
+    ) -> Result<Self> {
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        run_on_global_rt(
+            async move { Self::new_async_with_client(client, &bucket, &key, cfg).await },
+        )
+    }
+
     /// Async constructor: issues CreateMultipartUpload and starts coordinator task.
     pub async fn new_async(bucket: &str, key: &str, cfg: MultipartUploadConfig) -> Result<Self> {
+        // Reject a bad config before anything needs credentials.
+        Self::validate_config(&cfg)?;
+        let client = aws_s3_client_async().await?;
+        Self::new_async_with_client(client, bucket, key, cfg).await
+    }
+
+    fn validate_config(cfg: &MultipartUploadConfig) -> Result<()> {
         if cfg.part_size < MIN_S3_MULTIPART_PART_SIZE {
             bail!("part_size must be at least 5 MiB for S3 Multipart Upload");
         }
@@ -198,12 +220,27 @@ impl MultipartUploadSink {
                 bail!("max_in_flight must be >= 1");
             }
         }
+        Ok(())
+    }
+
+    /// [`MultipartUploadSink::new_async`] on a caller-chosen client.
+    ///
+    /// The sink keeps `client` for the whole upload: CreateMultipartUpload, every
+    /// UploadPart, CompleteMultipartUpload and AbortMultipartUpload (on drop or
+    /// `abort_blocking`) all use it, so an abort always reaches the server that
+    /// holds the upload.
+    pub(crate) async fn new_async_with_client(
+        client: Client,
+        bucket: &str,
+        key: &str,
+        cfg: MultipartUploadConfig,
+    ) -> Result<Self> {
+        Self::validate_config(&cfg)?;
 
         let resolved_mif = cfg
             .max_in_flight
             .unwrap_or_else(|| auto_max_in_flight(cfg.part_size));
 
-        let client = aws_s3_client_async().await?;
         let mut req = client.create_multipart_upload().bucket(bucket).key(key);
         if let Some(ct) = &cfg.content_type {
             req = req.content_type(ct);

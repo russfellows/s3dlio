@@ -73,7 +73,12 @@ def _after_scheme(uri: str) -> str:
 
 def list_keys(uri: str) -> List[str]:
     """
-    Return object keys (relative paths) under the given URI prefix.
+    Return object keys (relative paths) for the objects the URI selects.
+
+    On ``s3://`` the key part of the URI selects an exact name, a directory or a ``*``
+    glob, not a bare key prefix: ``s3://b/dir/`` lists what is in the directory, while
+    ``s3://b/dir`` selects the object ``dir`` and the directory entry ``dir/`` (and never
+    ``dir2``); ``s3://b/dir*`` selects by prefix. This lists one level (non-recursive).
 
     Works with all URI schemes: file://, s3://, az://, gs://, direct://
 
@@ -82,7 +87,7 @@ def list_keys(uri: str) -> List[str]:
     key minus that prefix, with no other normalisation. A leading ``/`` or an empty
     segment (``a//b``) in a key is part of the key, so ``uri + key`` (for a ``uri`` that
     ends in ``/``) is the URI of the object listed. One separator is dropped when the
-    URI does not end in ``/`` (``s3://b/dir`` lists ``dir/x`` as ``x``).
+    URI does not end in ``/``.
 
     Example:
         keys = list_keys("file:///data/prefix/")  # Returns ['file1.bin', 'file2.bin']
@@ -103,7 +108,7 @@ def list_keys(uri: str) -> List[str]:
             if prefix and not prefix.endswith("/") and key.startswith("/"):
                 key = key[1:]
         else:
-            # Fallback (e.g. the URI carries a pattern): just get the filename
+            # Fallback (a listed entry that does not start with the listed prefix): just get the filename
             key = path.rsplit("/", 1)[-1] if "/" in path else path
 
         if key:
@@ -114,7 +119,12 @@ def list_keys(uri: str) -> List[str]:
 
 def list_full_uris(uri: str) -> List[str]:
     """
-    Return fully-qualified URIs under the given prefix.
+    Return fully-qualified URIs of the objects the URI selects.
+
+    On ``s3://`` the key part selects an exact name (the object ``K`` and the directory
+    entry ``K/``), a directory (``K/``) or a ``*`` / ``**`` glob; it is never a bare key
+    prefix (``s3://b/foo`` does not select ``foobar``; use ``s3://b/foo*``). This lists
+    one level (non-recursive).
 
     Works with all URI schemes: file://, s3://, az://, gs://, direct://
     Preserves the original scheme in the returned URIs.

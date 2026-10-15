@@ -152,6 +152,8 @@ class S3dlioStorage(DataStorage):
         parsed = urlparse(namespace)
         self.scheme = parsed.scheme or "s3"
         self.bucket = parsed.netloc
+        # The namespace is a filesystem-style location: leading "/" are dropped, as in
+        # 0.9.124 (a full URI passed to a method is the exception, see _make_uri).
         self.base_path = parsed.path.lstrip("/")
 
         # Get storage options from config if available
@@ -294,7 +296,21 @@ class S3dlioStorage(DataStorage):
             return self._select_endpoint_via_strategy(endpoint_uris, "round_robin")
 
     def _make_uri(self, path: str) -> str:
-        """Convert a relative path to a full URI."""
+        """Convert a namespace-relative name to a full URI.
+
+        Two different rules apply, on purpose (issue #198):
+
+        * A FULL URI (``s3://``, ``az://``, ``gs://``, ``file://``, ``direct://``) is
+          used exactly as written: of ``s3://b//k`` only the ``/`` after the bucket
+          is a separator, so the object is ``/k``.
+        * A NAMESPACE-RELATIVE name is a filesystem-style name, as in 0.9.124: the
+          namespace loses every trailing ``/`` and the name loses every leading ``/``,
+          so ``/train/f.npz`` under ``s3://b/base`` is ``base/train/f.npz``
+          (never ``base//train/f.npz``). Other duplicate separators in the middle
+          of the name (``a//b``) are left alone, exactly as 0.9.124 left them.
+          It is not established that DLIO supplies object keys rather than such
+          names, and re-keying them would make existing datasets disappear.
+        """
         if path.startswith(("s3://", "az://", "gs://", "file://", "direct://")):
             return path
         # Combine with prefix
@@ -303,6 +319,11 @@ class S3dlioStorage(DataStorage):
         if path:
             return f"{prefix}/{path}"
         return prefix
+
+    def _dir_uri(self, path: str) -> str:
+        """The URI to list for the "directory" ``path``: ``_make_uri`` plus a final "/"."""
+        uri = self._make_uri(path)
+        return uri if uri.endswith("/") else uri + "/"
 
     @dlp.log
     def get_uri(self, id):
@@ -324,10 +345,12 @@ class S3dlioStorage(DataStorage):
 
         Audit #153 bug 3.4 (C2): previously ANY exception from
         s3dlio.mkdir was swallowed into `return True` whenever
-        exist_ok=True -- an auth failure, a network error, or (common
-        for cloud backends, where mkdir is frequently unimplemented) a
-        "not implemented" error was all silently treated as "already
-        exists, success". Only a genuine already-exists signal
+        exist_ok=True -- an auth failure, a network error, or any other
+        error was silently treated as "already exists, success". On
+        object stores (s3://, az://, gs://) mkdir is a no-op that
+        succeeds (nothing is created; a prefix exists once an object is
+        written under it); on file:// and direct:// it creates the
+        directory. Only a genuine already-exists signal
         (FileExistsError) is now treated as success; everything else
         propagates regardless of exist_ok.
         """
@@ -351,8 +374,7 @@ class S3dlioStorage(DataStorage):
 
         # Check if it's a "directory" by listing children
         try:
-            check_uri = uri if uri.endswith("/") else uri + "/"
-            children = s3dlio.list(check_uri)
+            children = s3dlio.list(self._dir_uri(id))
             if children:
                 return MetadataType.DIRECTORY
         except Exception:
@@ -365,11 +387,8 @@ class S3dlioStorage(DataStorage):
         """
         List objects under a path. Returns relative filenames.
         """
-        uri = self._make_uri(id)
-
         # Ensure ends with / for directory listing
-        if not uri.endswith("/"):
-            uri += "/"
+        uri = self._dir_uri(id)
 
         try:
             # s3dlio.list returns full URIs

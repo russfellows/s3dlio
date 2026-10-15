@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
-// Regression tests for s3dlio issues #210 and #167 and the architect-approved
+// Regression tests for s3dlio issues #210 and #167 and the
 // `s3-cli delete` contract:
 //
 //   delete s3://bkt/foo     ONE delete request for exactly the key `foo`: no HEAD,
@@ -12,7 +12,8 @@
 //   either, object absent   exit 0 (S3 deletes are idempotent); a real failure
 //                           (403 on the DELETE) is a non-zero exit naming the key
 //   delete -r s3://bkt/foo/ deletes the REAL objects under the literal prefix `foo/`
-//   delete -r s3://bkt/foo  literal prefix `foo` (also matches `foobar`)
+//   delete -r s3://bkt/foo  the object `foo` and everything under `foo/` -- NEVER `foobar`
+//                           (issue #213; `foo*` is the explicit glob that selects `foobar`)
 //   -p/--pattern            only with -r; filters inside the -r selection
 //
 // Each test drives the real `s3-cli` binary against a recording in-process mock
@@ -662,38 +663,206 @@ both_modes!(
 );
 
 // ----------------------------------------------------------------------------
-// 6. -r foo (no slash): literal prefix `foo`, so `foobar` goes too -- and nothing
-//    that merely CONTAINS `foo` (no regex inferred from the key).
+// 6. -r foo (no slash): the object `foo` and what is under `foo/` -- never `foobar`
+//    (issue #213), and nothing that merely CONTAINS `foo` (no regex inferred).
 // ----------------------------------------------------------------------------
-both_modes!(t6_recursive_no_slash_is_literal_prefix, |mode| {
-    let f = Fixture::new(
-        mode,
-        &[
-            "foo",
-            "foobar",
-            "foo/a",
-            "afoo",
-            "other/foo.txt",
-            "f.o.o",
-            "other/x",
-        ],
-    );
-    let r = f.run(&["-r"], "foo");
-    assert_eq!(r.code, 0, "{}", f.ctx(&r));
-    assert_eq!(
-        deleted_request_keys(&f),
-        set(&["foo", "foobar", "foo/a"]),
-        "{}",
-        f.ctx(&r)
-    );
-    assert_eq!(
-        f.mock.keys(),
-        set(&["afoo", "other/foo.txt", "f.o.o", "other/x"]),
-        "{}",
-        f.ctx(&r)
-    );
-    f.assert_decoy_untouched();
-});
+both_modes!(
+    t6_recursive_no_slash_is_the_exact_object_and_its_directory,
+    |mode| {
+        let f = Fixture::new(
+            mode,
+            &[
+                "foo",
+                "foobar",
+                "foo/a",
+                "afoo",
+                "other/foo.txt",
+                "f.o.o",
+                "other/x",
+            ],
+        );
+        let r = f.run(&["-r"], "foo");
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_eq!(
+            deleted_request_keys(&f),
+            set(&["foo", "foo/a"]),
+            "{}",
+            f.ctx(&r)
+        );
+        assert_eq!(
+            f.mock.keys(),
+            set(&["foobar", "afoo", "other/foo.txt", "f.o.o", "other/x"]),
+            "{}",
+            f.ctx(&r)
+        );
+        f.assert_decoy_untouched();
+    }
+);
+
+// ----------------------------------------------------------------------------
+// 6b. THE safety case (issue #213): `delete -r s3://bkt/file.txt` removes file.txt and
+//     nothing else -- file.txt.bak, file.txt2, file.txt.d/x and the rest all survive.
+// ----------------------------------------------------------------------------
+const SIBLINGS: &[&str] = &[
+    "file.txt",
+    "file.txt.bak",
+    "file.txt2",
+    "file.txt.d/x",
+    "dl/a",
+    "dl/sub/b",
+    "dl2/x",
+    "run.1",
+    "run.1/child",
+    "run.1.old",
+    "run.1.d/x",
+    "prerun.1",
+    "run_1",
+];
+
+both_modes!(
+    t6b_recursive_delete_of_file_txt_leaves_file_txt_bak,
+    |mode| {
+        let f = Fixture::new(mode, SIBLINGS);
+        let r = f.run(&["-r"], "file.txt");
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_eq!(
+            deleted_request_keys(&f),
+            set(&["file.txt"]),
+            "{}",
+            f.ctx(&r)
+        );
+        let mut want: BTreeSet<String> = set(SIBLINGS);
+        want.remove("file.txt");
+        assert_eq!(f.mock.keys(), want, "remaining keys\n{}", f.ctx(&r));
+        // the selection is two probes (the object, then its directory's pages), each a request
+        // that cannot return siblings: a max-keys=1 probe for `file.txt`, and the listing of
+        // `file.txt/` -- never a listing whose prefix is `file.txt`
+        let lists: Vec<Req> = f.mock.log().into_iter().filter(Req::is_list).collect();
+        let param = |l: &Req, name: &str| -> Option<String> {
+            let want = format!("{name}=");
+            l.query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(want.as_str()).map(str::to_string))
+        };
+        let probes: Vec<&Req> = lists
+            .iter()
+            .filter(|l| param(l, "prefix").as_deref() == Some("file.txt"))
+            .collect();
+        assert_eq!(probes.len(), 1, "{}", f.ctx(&r));
+        assert_eq!(
+            param(probes[0], "max-keys").as_deref(),
+            Some("1"),
+            "{}",
+            f.ctx(&r)
+        );
+        assert!(
+            lists
+                .iter()
+                .any(|l| param(l, "prefix").as_deref() == Some("file.txt%2F")),
+            "{}",
+            f.ctx(&r)
+        );
+        assert_eq!(lists.len(), 2, "{}", f.ctx(&r));
+        f.assert_decoy_untouched();
+    }
+);
+
+both_modes!(
+    t6c_recursive_delete_of_run_dot_1_takes_the_object_and_its_directory,
+    |mode| {
+        let f = Fixture::new(mode, SIBLINGS);
+        let r = f.run(&["-r"], "run.1");
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_eq!(
+            deleted_request_keys(&f),
+            set(&["run.1", "run.1/child"]),
+            "{}",
+            f.ctx(&r)
+        );
+        let mut want: BTreeSet<String> = set(SIBLINGS);
+        want.remove("run.1");
+        want.remove("run.1/child");
+        assert_eq!(f.mock.keys(), want, "remaining keys\n{}", f.ctx(&r));
+        f.assert_decoy_untouched();
+    }
+);
+
+both_modes!(
+    t6d_recursive_delete_of_a_directory_name_does_not_cross_into_dl2,
+    |mode| {
+        let f = Fixture::new(mode, SIBLINGS);
+        let r = f.run(&["-r"], "dl");
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_eq!(
+            deleted_request_keys(&f),
+            set(&["dl/a", "dl/sub/b"]),
+            "{}",
+            f.ctx(&r)
+        );
+        assert!(f.mock.keys().contains("dl2/x"), "{}", f.ctx(&r));
+        // a key that is not there and has no directory: nothing is deleted
+        let r = f.run(&["-r"], "file");
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert!(f.mock.keys().contains("file.txt"), "{}", f.ctx(&r));
+        f.assert_decoy_untouched();
+    }
+);
+
+both_modes!(
+    t6e_recursive_delete_with_a_wildcard_is_an_explicit_glob,
+    |mode| {
+        let f = Fixture::new(mode, SIBLINGS);
+        // `file.txt*`: file.txt, file.txt.bak, file.txt2 -- the same directory level only
+        let r = f.run(&["-r"], "file.txt*");
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_eq!(
+            deleted_request_keys(&f),
+            set(&["file.txt", "file.txt.bak", "file.txt2"]),
+            "{}",
+            f.ctx(&r)
+        );
+        assert!(f.mock.keys().contains("file.txt.d/x"), "{}", f.ctx(&r));
+        f.assert_decoy_untouched();
+
+        // `**` crosses '/', `*` does not
+        let f = Fixture::new(mode, SIBLINGS);
+        let r = f.run(&["-r"], "dl/*");
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_eq!(deleted_request_keys(&f), set(&["dl/a"]), "{}", f.ctx(&r));
+        let f = Fixture::new(mode, SIBLINGS);
+        let r = f.run(&["-r"], "dl/**");
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_eq!(
+            deleted_request_keys(&f),
+            set(&["dl/a", "dl/sub/b"]),
+            "{}",
+            f.ctx(&r)
+        );
+    }
+);
+
+both_modes!(
+    t6f_delete_without_r_never_reads_a_star_as_a_wildcard,
+    |mode| {
+        let f = Fixture::new(mode, SIBLINGS);
+        let r = f.run(&[], "file.txt*");
+        assert_eq!(r.code, 0, "{}", f.ctx(&r));
+        assert_one_delete_no_lookup(&f, &r, "file.txt*");
+        assert_eq!(f.mock.keys(), set(SIBLINGS), "{}", f.ctx(&r));
+    }
+);
+
+both_modes!(
+    t6g_recursive_delete_refuses_a_wildcard_key_ending_in_slash,
+    |mode| {
+        let f = Fixture::new(mode, SIBLINGS);
+        let r = f.run(&["-r"], "dl/*/");
+        assert_ne!(r.code, 0, "{}", f.ctx(&r));
+        assert!(r.out.contains("not defined"), "{}", f.ctx(&r));
+        assert!(deleted_request_keys(&f).is_empty(), "{}", f.ctx(&r));
+        assert_eq!(f.mock.keys(), set(SIBLINGS), "{}", f.ctx(&r));
+    }
+);
 
 // ----------------------------------------------------------------------------
 // 7. A real failure of the delete request is an error, never "already absent"

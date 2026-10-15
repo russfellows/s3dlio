@@ -35,9 +35,11 @@ pub mod progress;
 // NOTE: sharded_client.rs and range_engine.rs (the S3-specific variant) were
 // removed in v0.9.90.  They were never-completed stubs with no callers.  The
 // production range engine is range_engine_generic.rs — see that file for context.
+pub mod list_pattern; // (#213): the explicit client-side regex filter for listings
 pub mod mp;
 pub mod multi_endpoint;
 pub mod range_engine_generic; // Universal stream-based range engine (v0.9.2+)
+pub mod s3_selection; // (#213): which objects an s3:// URI selects
 pub mod uri_utils; // v0.9.14: Multi-endpoint URI expansion utilities // v0.9.14: Multi-endpoint load balancing with thread/process control
 
 // Hardware detection and optimization (v0.9.35+: always available, runtime detection)
@@ -218,7 +220,8 @@ pub use object_store::{infer_scheme, ObjectMetadata, ObjectStore, Scheme};
 // Native backend specific exports
 #[cfg(feature = "native-backends")]
 pub use object_store::{
-    direct_io_store_for_uri, generic_download_objects, generic_download_objects_with_summary,
+    direct_io_store_for_uri, generic_download_objects,
+    generic_download_objects_matching_with_summary, generic_download_objects_with_summary,
     generic_upload_files, generic_upload_files_with_summary, high_performance_store_for_uri,
     store_for_uri, store_for_uri_with_config, store_for_uri_with_high_performance_cloud,
     S3ObjectStore, TransferSummary,
@@ -260,6 +263,11 @@ pub use crate::s3_logger::{
 // Bring in Python wrappers from python_api.rs when building as extension.
 #[cfg(feature = "extension-module")]
 mod python_api;
+
+// The ONE crate-wide guard for unit tests that touch process environment
+// variables (issue #216).
+#[cfg(test)]
+mod test_env;
 
 // ---------------------------------------------------------------------------
 // PyO3 module init -----------------------------------------------------------

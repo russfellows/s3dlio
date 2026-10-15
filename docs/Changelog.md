@@ -1,5 +1,265 @@
 # s3dlio Changelog
 
+## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
+
+**Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published
+release is 0.9.112. 0.9.126 is therefore the first published release after 0.9.112, and it contains
+every change in 0.9.114, 0.9.120, 0.9.122 and 0.9.124 (see their sections below).** This release fixes
+eleven issues: #198, #208, #211, #213, #216, #218, #228, #229, #231, #234 and #236.
+
+Read the two behaviour changes before upgrading: an `s3://` URI now selects the exact name, its
+directory or an explicit `*` glob and never a regex or a longer sibling (#213), and object keys that
+begin with `/` or contain `//` are used exactly as written in every layer (#198).
+
+### Fixed
+
+- **Multipart uploads to GCS's S3-compatible endpoint no longer fail with an unexplained error (#236).**
+  Starting a multipart upload (`create_s3_writer` plain or compressed, `put_multipart`, anything that
+  begins a multipart upload) failed on Google Cloud Storage's S3-interoperability endpoint with
+  `CreateMultipartUpload failed ... service error: unknown (no message)`. The start-upload request has
+  no body, and over the default HTTPS HTTP/1.1 transport it was sent without a `Content-Length` header;
+  GCS answers that with `411 Length Required` (HTTP/2, opted in with `S3DLIO_HTTPS_H2=1`, was not
+  affected). A POST, PUT or PATCH with an empty body now carries `Content-Length: 0`, for every endpoint
+  (as RFC 9110 expects); requests with a body, and GET/HEAD/DELETE, are unchanged, and the header is
+  not part of the request signature. A service error with no readable S3 error body now also names the
+  HTTP status, for example `service error: unknown (no message) -- HTTP 411 Length Required`.
+
+- **Compressed buffered writers no longer upload a truncated, undecodable object (#218, silent
+  data loss).** A buffered writer with zstd compression (`get_writer_with_compression`, or
+  `create_writer` / `create_s3_writer` with compression) for `s3://` -- the process-wide store and a
+  per-endpoint store alike -- and the matching Azure (`az://`) and GCS (`gs://`) writers, replaced
+  the compressed data it had collected with only the last few bytes of the zstd stream when
+  `finalize()` ran. zstd emits compressed blocks while it is still being fed, so any payload large
+  enough for that (a 32 KiB payload was fine; a 6 MiB one was uploaded as a 197-byte object) was
+  stored without the frame header and every early block, the upload reported success, and the
+  object could not be decompressed. Small payloads were unaffected, which is why it went unnoticed. `finalize()` now appends the end of the stream to what was already collected. Data
+  written through an affected writer before this fix, if large, is not recoverable from the stored
+  object; write it again. `file://`, `direct://` and the arrow-backend writers were not affected.
+- **A per-endpoint store runs every operation on ITS server, whatever the object size (#208).** A store
+  that holds a client of its own (`S3ObjectStore::for_endpoint`, or an `s3://host:port/...` URI) read
+  large objects (the concurrent range GET above the threshold), uploaded with `put_multipart` and
+  finalised a buffered writer through the process-wide client, the server `AWS_ENDPOINT_URL` names.
+  Since 0.9.122 those paths were rejected with a "not yet supported" error unless the store's server was
+  the process-wide one. They now use the store's own client for the size lookup, the single-range
+  fallback, every ranged GET, and CreateMultipartUpload / UploadPart / CompleteMultipartUpload /
+  AbortMultipartUpload. A URI that names a DIFFERENT server than the store's is still refused.
+- **A concurrency, chunk or worker limit of 0 is an error instead of a hang or a crash (#211).** A caller
+  limit of 0 built a semaphore with no permits (the first acquire never completed) or, for a chunk size
+  of 0, pushed range after range until memory ran out. Every entry point that takes such a limit now
+  refuses 0 first, with an error naming the parameter and the range ("max_in_flight must be an integer
+  >= 1 ... got 0"); nothing is substituted. Python raises `ValueError` before any work starts for `put`,
+  `put_async`, `get_many*`, `put_many*`, `download`, `upload`, `mp_get` (`jobs` and `procs`; `procs=0`
+  used to divide by zero) and `MultipartUploadWriter(..., max_in_flight=0)`. Rust: the parallel get/put
+  helpers, the concurrent range GET (`max_concurrency` and `chunk_size` of `Some(0)`, on the
+  process-wide path AND the per-endpoint path), `s3_copy::upload_files|download_objects|download_objects_matching`,
+  `generic_upload_files`, `generic_download_objects[_with_summary]`,
+  `generic_download_objects_matching_with_summary`, `pre_stat_objects`, `RangeEngine::download`,
+  `mp::run_get_shards`. The CLI rejects 0 for `-j/--jobs` and `--concurrent`. `put(num=0)` is unchanged.
+- **Test-only (#216):** unit tests that set process environment variables (`OMPI_COMM_WORLD_SIZE`,
+  `S3DLIO_RT_THREADS`, `S3DLIO_MAX_RETRY_ATTEMPTS`, ...) now share one crate-wide lock and restore the
+  variables and atomics in a `Drop` guard, so a failed assertion can no longer leak them into later tests.
+  No production behaviour changes.
+- **A directory removed through s3dlio now appears in the op-log (#228).** A directory removed through
+  s3dlio, recursive or not (a recursive removal of a whole tree included), now appears in the op-log as
+  one `DELETE_PREFIX` row on the directory (count 0; the error text if the removal failed). Before, the
+  removal left no row at all. This is not a format change: `DELETE_PREFIX` is an existing op name.
+  `mkdir` is still not recorded. The replayer reports a `DELETE_PREFIX` row as unsupported for exact
+  replay and replay stops at the first such row, so an op-log that contains a `file://` or `direct://`
+  `rmdir` now contains one.
+- **`mkdir` / `rmdir` no longer fail outside `file://` (#229).** They used to work only on
+  `file://`; on `direct://`, `s3://`, `az://` and `gs://` they failed with "not implemented for
+  this backend", although the docs promised them, and so did the DLIO adapters' `create_node`
+  (Python `s3dlio.mkdir()`). Now:
+  - `direct://` behaves exactly like `file://` (O_DIRECT does not apply to directories): `mkdir`
+    creates the directory and its parents; `rmdir` removes an empty directory (a non-empty one is
+    an error and nothing is removed), or the whole tree with `recursive=True`; a missing
+    directory is success.
+  - On object stores (`s3://`, `az://`, `gs://`, and the arrow backend) both calls do nothing and
+    succeed: an object store has no directories, a prefix exists once an object is written under
+    it. The URI is checked, no request is sent, no marker object is written and `rmdir` deletes
+    nothing, `recursive` or not. To remove the objects under a prefix use `delete(uri,
+    recursive=True)` / `s3-cli delete -r`.
+  - Op-log: `mkdir` writes no row on any backend. `rmdir` writes its one `DELETE_PREFIX` row
+    (#228) on `file://` and `direct://`, but not on object stores, where it deletes nothing.
+  - For Rust API users: `ObjectStore::rmdir` and `mkdir` on `s3://`, `az://` and `gs://` now
+    succeed without doing anything (they used to return a "not implemented" error); code that
+    relied on `rmdir` to delete objects must call `delete_prefix` (or `delete -r` /
+    `delete(recursive=True)`).
+- **Azure and GCS `delete_prefix` now deletes only objects under `<prefix>/`, as on S3 (#231).**
+  Before, it also deleted sibling objects whose names merely started with the prefix
+  (`delete_prefix("gs://b/foo")` also removed `foobar`, `foo.bak`, `foo2/...`).
+- **Host-form `s3-cli download` / `s3-cli get` fetch every object from the server that listed it
+  (#234).** With a URI that names a server (`s3://host:port/bucket/prefix/`) the listing ran on that
+  server, but each listed object was then fetched through a store built from the bucket-form URI the
+  listing returned, that is, through the process-wide client: the server `AWS_ENDPOINT_URL` names, or
+  AWS. The listing succeeded and the GETs went to the wrong server (other bytes, or failures). The
+  library's `generic_download_objects[_matching]_with_summary` had the same shape. Every listed object
+  is now fetched through the same store instance that listed it; a URI without a server (the
+  process-wide store) behaves as before.
+- **Object keys are used exactly as written in every layer (#198).** See the details below.
+
+### Changed — which objects an `s3://` URI selects: the exact name, its directory, or an explicit `*` glob; never a regex, never a bare prefix (INTENTIONAL BEHAVIOUR CHANGE) (#213)
+
+**Read this before upgrading.** On S3, `list`, `list_stream`, `s3-cli ls`, `s3-cli get`,
+`s3-cli download` / `cp` (S3 to local), `s3_copy::download_objects` and `S3BytesDataset::from_prefix`
+used to split the URI at its last `/`, send only the left part to the server and compile the right
+part as an UNANCHORED regular expression over the keys that came back; in non-recursive mode every
+common prefix was added unfiltered. So `s3://b/data/run.1` also matched `data/run_1` and
+`data/prerun.1`, `s3://b/foo` listed `afoo` and every top-level folder, and a key containing `(` or
+`[` failed with "Invalid regex pattern". This change converts S3 (`s3://`) only. The other backends
+(`file://`, `direct://`, `gs://`, `az://`) are unchanged and do NOT yet follow this rule (for
+example `gs://` and `az://` non-recursive listings keep their own directory-style handling of a
+prefix without a trailing `/`); that is tracked in #220.
+
+The key part `K` of `s3://bucket/K` now selects, for every listing-style operation (`ls`, Python
+`list()`, `download`, `get`, `s3_copy::download_objects`, `S3BytesDataset::from_prefix`,
+`ObjectStore::list` / `list_stream`) and for `delete -r` / `delete(recursive=True)`:
+
+- **A name** (no `*`, not ending in `/`): the object whose key is exactly `K` and, for operations
+  that descend (recursive listing, `download -r`, `delete -r`), every key under `K/`. Non-recursive
+  `ls` shows the object `K` (if it exists) and the directory entry `K/` (if anything is under it).
+  It NEVER selects `K.bak`, `K2`, `Kfoo` or `K.d/`. So `s3://b/file.txt` selects `file.txt` and not
+  `file.txt.bak`; `s3://b/dl` selects `dl/...` and not `dl2/...`; `s3://b/data/run.1` selects
+  `data/run.1` and `data/run.1/...`, and not `run.1.old`, `run_1` or `prerun.1`. `.`, `(`, `)`,
+  `[`, `+`, `$`, `?` in a URI are ordinary characters and never fail to parse.
+- **A directory** (`K` ends in `/`) or the bucket root (empty `K`): everything under it, as before.
+- **A wildcard** (`K` contains `*`): an explicit glob over the FULL key. `*` matches any run of
+  characters except `/`; `**` matches any run including `/`; every other character is literal.
+  `s3://b/file.txt*` selects `file.txt`, `file.txt.bak` and `file.txt2` (not `file.txt.d/x`);
+  `s3://b/data/**.npz` selects every `.npz` under `data/`. With a wildcard an object is selected
+  iff its full key matches the glob: `-r` makes no difference and a matching "directory" is not
+  descended into. A wildcard key that ENDS in `/` (`s3://b/data/*/`) is refused with an error and
+  nothing is listed or deleted. To pass a wildcard through a shell, quote the URI.
+- **`delete -r` follows the same rule**: `s3-cli delete -r s3://b/file.txt` and Python
+  `delete("s3://b/file.txt", recursive=True)` delete `file.txt` and never `file.txt.bak`;
+  `delete -r s3://b/file.txt*` deletes both. (0.9.124 deleted by LITERAL prefix: `delete -r
+  s3://b/foo` also deleted `foobar`; that is what this release changes.) Delete without `-r` is
+  unchanged: one request for exactly the key named, and a `*` in it is an ordinary key character.
+- **To select with a regex use the explicit option**: Python `list(uri, recursive, pattern=...)`
+  and `s3-cli ls|download|get --pattern`. It is applied AFTER the selection above and is a Rust
+  regex matched (unanchored) against the entry relative to the listing base: the URI key itself when
+  it ends with `/`; the directory `K/` for an entry under it; otherwise the parent directory of `K`
+  (everything up to its last `/`); for a wildcard URI, the directory part of the text before the
+  first `*`. For host-form URIs (`s3://host:port/bkt/dl/`) the base is taken from the key parts, so
+  it agrees with the entries a listing returns (`s3://bkt/dl/...`). One shared implementation
+  (`s3dlio::list_pattern::ListPattern`) serves Python, the CLI and
+  `s3_copy::download_objects_matching(src_uri, pattern, ...)`. An invalid pattern fails before any
+  request. (Python `list()` compiled the pattern after listing; it now raises
+  `Invalid regex pattern: '...'` first.) `delete -r --pattern` is unchanged: it is matched against
+  the listed object URI.
+- `s3_copy::download_objects` no longer appends `.*` to a URI ending in `/`. A URI that used to be a
+  regex or glob in the last segment (for example `s3://b/dir/.*\.npz`) is no longer a regex: use a
+  `*` glob (`s3://b/dir/*.npz`) or split it into the directory and a pattern
+  (`download_objects_matching("s3://b/dir/", Some(r"\.npz$"), ...)`).
+- Callers that passed a bare key prefix without a trailing `/` and relied on it matching every key
+  that starts with it (`dl` also matching `dl2/x`) must now say so with a `*`
+  (`s3://b/dl*`) or end the directory with `/`.
+- **New: `s3-cli download -p/--pattern <REGEX>` and `s3-cli get -p/--pattern <REGEX>`.** The
+  explicit replacement for the regex those commands used to read from the URI. It reuses
+  `ListPattern` inside the existing backend-aware paths (so it also works on `file://`,
+  `direct://`, `gs://`, `az://`; it is not the S3-only `download_objects_matching`), is matched
+  against the entry relative to the listing base like `ls --pattern`, and is compiled before
+  anything is listed: an invalid regex exits non-zero with no request sent and no directory
+  created. `get --pattern` cannot be combined with `--keylist` or `--offset/--length`. Without
+  `--pattern` the behaviour is unchanged. Library: new
+  `generic_download_objects_matching_with_summary(..., pattern: Option<&ListPattern>, ...)`;
+  `generic_download_objects[_with_summary]` keep their signatures.
+- **Consequences of the glob rule worth knowing.** (1) `*` also matches the empty string, so
+  `s3://b/dir/*` selects a folder-marker object `dir/` itself if one exists (`ls` shows it,
+  `delete -r 's3://b/dir/*'` removes it). (2) `a/**/b` needs something between its slashes: it selects
+  `a/x/b` and `a//b` but NOT `a/b`; use `a/**` with `--pattern`, or name `a/b` itself. (3) There is no
+  escape for a literal `*` in a listing or recursive URI: a key literally named `a*b` can only be
+  addressed by the exact, non-recursive operations (`s3-cli stat`, `s3-cli delete` without `-r`, and
+  the Python `get`, `stat` and `delete` without `recursive=True`, which take the key as written). `delete -r 's3://b/a*'` is a glob over `a...` in one directory level, which is much
+  broader than the old literal prefix `a*`.
+- **Dataset constructors fail on an empty selection.** `S3BytesDataset::from_prefix[_with_opts]` and
+  `MultiBackendDataset::from_prefix` (and so `dataset_for_uri`, `PyS3Dataset`, `PyS3AsyncDataLoader`)
+  return an error instead of a dataset of zero samples when an `s3://` URI selects nothing, for
+  example a bare partial name such as `s3://b/train/img_`. The message names the URI and says that a URI
+  selects an exact name or a directory and that `*` selects by prefix (`s3://b/train/img_*`).
+- **`s3dlio.compat.s3torchconnector` keeps the upstream PREFIX meaning.** Its `prefix` is an S3 key
+  prefix, as in AWS's s3torchconnector: `S3Client.list_objects(bucket, "train/img_")`,
+  `S3IterableDataset.from_prefix("s3://b/train/img_")` and `S3MapDataset.from_prefix(...)` return every
+  key that starts with the prefix (`train/img_1/x` included). A prefix without `*` is listed as
+  `<prefix>**`; a prefix that itself contains `*` (a literal character in a key prefix) is read by
+  listing the directory part of the text before the first `*` and keeping the keys that start with it.
+- **Requests.** The server does the narrowing and no sibling is paged through: a name costs one
+  `max-keys=1` probe (the object `K` sorts before every other key that starts with `K`) plus the
+  listing of `K/` (recursive) or one more `max-keys=1` probe (non-recursive); a directory is its
+  listing; a wildcard is the listing of the text before the first `*`, with the `/` delimiter when
+  the glob cannot cross a `/`. No `HEAD` is sent.
+- The `--help` text of `ls`, `download`, `get` and `delete`, `docs/CLI_GUIDE.md` (including the
+  "Common Patterns" regex examples, which now match relative to the listing base),
+  `docs/PYTHON_API_GUIDE.md`, and the glob examples in `docs/testing/BACKEND-TESTING.md` and
+  `docs/supplemental/OPLOG-GUIDE.md` state the rule. Library: new `s3dlio::s3_selection`;
+  `delete_contract::delete_objects_under_literal_prefix` keeps its (public) name, but its URI is
+  selected by this rule on `s3://`; `ObjectStore::delete_prefix` is unchanged (it appends `/` and
+  reads the prefix literally).
+
+Tests: `tests/test_s3_selection_213.rs`, `tests/test_list_literal_prefix_213.rs`,
+`tests/s3_cli_ls_literal_prefix_213.rs`, `tests/s3_cli_download_pattern_213.rs`,
+`tests/test_python_list_literal_213.py`, the delete-contract tests
+(`tests/test_delete_contract_210_167.rs`, `tests/test_python_delete_contract_212.py`), and the
+rewritten `tests/test_object_store_list_filter.rs` (it pinned the #154 regex contract). The in-process
+mock S3 can be seeded with a bucket catalog that honours prefix, delimiter, `max-keys` and paging, and
+removes the keys a delete names.
+
+### Fixed — object keys are used exactly as written in every layer (#198, the rest of the issue)
+
+After #172 the core addresses `s3://b//k` as the key `/k`. These layers still normalised keys, so for a
+key that begins with `/` or contains `//` they addressed or reported a different object than the core.
+**Behaviour change:** in the layers below (except namespace-relative DLIO names, see the first bullet),
+`/x` and `x`, or `a//b` and `a/b`, are now different objects. Only the ONE `/` that separates a base from a
+key is removed.
+
+- **DLIO integration** (`s3dlio_storage.py`, `s3_torch_storage.py`): a name that is a FULL URI
+  (`s3://`, `az://`, `gs://`, `file://`, `direct://`) is used exactly (`put_data("s3://b//k")` writes the
+  key `/k`), and `s3_torch_storage.walk_node` lists the exact prefix of the full URI it is given.
+  A name that is relative to the configured namespace keeps its existing (0.9.124) filesystem-style
+  normalisation: the namespace loses its trailing `/` and the name its leading `/`, so
+  `put_data("/train/f.npz")` under `s3://b/base` still writes `base/train/f.npz` (not `base//train/f.npz`).
+  It is not established that DLIO supplies object keys rather than such names, and re-keying them would
+  make existing datasets disappear. Namespace-relative names are unchanged from 0.9.124;
+  full-URI names are used exactly, so a full URI containing `//` addresses the exact key (a full-URI
+  id such as `s3://b//dir/` now lists the prefix `/dir/`, where 0.9.124 listed `dir/`).
+- **`s3dlio.compat.s3torchconnector`**: `S3Item.key` for `s3://b//k` is `/k` (was `k`), as AWS's own
+  `s3torchconnector` does (its `parse_s3_uri` splits at the first `/` and strips nothing);
+  `S3Client.put_object` / `get_object` / `list_objects` address the key and prefix exactly (a
+  `list_objects` prefix URI loses no trailing `/`; one `/` is appended only if it has none).
+- **Azure https URI form**: `https://acct.blob.core.windows.net/c//k` is the container `c`, key `/k`,
+  the same key as `az://acct/c//k` (it was key `k`). A URL with an empty container
+  (`https://acct.blob.core.windows.net//k`) is an error; this is NOT parity with `az://`, where
+  `az://acct//k` still parses to the container `""` and key `k`.
+  A trailing `/` is part of the key: `https://acct.blob.core.windows.net/c/dir/` now addresses the
+  key `dir/` (it was `dir`). So `get` / `stat` / `delete` of a URI ending in `/` address `k/`, no
+  longer `k`, and listing `.../c/dir/` no longer matches `dir2/...`.
+- **arrow-backend** (`--no-default-features --features arrow-backend`): `object_store`'s `Path::from`
+  drops empty segments, so `s3://b//x` addressed the object `x` and `s3://b/a//b` addressed `a/b`.
+  Such keys, and an object key ending in `/`, are now refused with an error naming the key instead of
+  addressing another object (`object_store::path::Path` cannot represent them). A listing prefix may
+  still end in `/`.
+- **Op-log replay onto a target** (`translate_uri`): a row for the object `/x` (logged `bkt//x`) replays
+  to `<target>//x`, no longer `<target>/x`. Rows that are not a shape s3dlio writes (hand-written,
+  legacy `S3Ops` `endpoint`+bare key) still lose one leading `/` of `file`, as pinned since #184.
+
+### Added
+
+- `s3-cli download -p/--pattern <REGEX>` and `s3-cli get -p/--pattern <REGEX>`: the explicit regex
+  that replaces the one those commands used to read out of the URI (#213, details above).
+- Library (#213): `s3dlio::s3_selection` (the one selection rule), `s3dlio::list_pattern::ListPattern`,
+  `s3_copy::download_objects_matching(src_uri, pattern, ...)` and
+  `generic_download_objects_matching_with_summary(..., pattern, ...)`.
+- Library (#208): `S3ObjectStore` per-endpoint reads and writes need no new API; the helpers
+  `get_object_concurrent_range_with_client` and `put_object_multipart_with_client` are crate-private.
+- Test support: the in-process mock S3 can be seeded with a bucket catalog that honours prefix,
+  delimiter, `max-keys` and paging, and removes the keys a delete names.
+
+### Build
+
+- The declared minimum Rust version (`rust-version` in `Cargo.toml`) is now 1.94.1. It said 1.88, but
+  the AWS SDK crates in `Cargo.lock` already require Rust 1.94.1, so an older toolchain could not build
+  s3dlio anyway; the manifest now says so up front. The README badge and prerequisites match.
+
 ## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
 
 Fixes 12 issues: #167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215.

@@ -7,7 +7,7 @@ use super::async_bridge::future_into_py;
 use bytes::Bytes;
 use pyo3::buffer::PyBuffer;
 use pyo3::conversion::IntoPyObjectExt;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods};
@@ -617,6 +617,16 @@ pub fn py_err<E: std::fmt::Display>(error: E) -> PyErr {
     PyRuntimeError::new_err(error_chain_message(&error))
 }
 
+/// Issue #211: reject a caller-supplied concurrency limit of 0 at once with a
+/// `ValueError` that names the parameter and the valid range.  A limit of 0
+/// would build a semaphore with no permits and hang the call forever.  Call
+/// this FIRST in every entry point that takes such a limit; it never
+/// substitutes another value.
+pub(crate) fn require_max_in_flight(name: &str, value: usize) -> PyResult<()> {
+    crate::concurrency::require_concurrency_at_least_one(name, value)
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// Multi-process GET for maximum throughput (Python API)
 ///
 /// Args:
@@ -675,6 +685,8 @@ pub fn mp_get(
     num: usize,
     template: &str,
 ) -> PyResult<Py<PyAny>> {
+    require_max_in_flight("procs", procs)?;
+    require_max_in_flight("jobs", jobs)?;
     use crate::mp::{run_get_shards, MpGetConfigBuilder};
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -1088,10 +1100,13 @@ pub fn put(
     data_gen_mode: &str,
     chunk_size: usize,
 ) -> PyResult<()> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let template = template.unwrap_or("object-{}");
     let uris = build_uri_list(prefix, template, num)?;
-    let jobs = max_in_flight.min(num);
+    // `num == 0` uploads nothing; keep the derived job count >= 1 so the
+    // (already validated) limit is not mistaken for a caller-supplied 0.
+    let jobs = max_in_flight.min(num.max(1));
     let obj = str_to_obj(object_type);
     let algorithm = str_to_data_gen_algorithm(data_gen_algorithm);
     let mode = str_to_data_gen_mode(data_gen_mode);
@@ -1131,10 +1146,13 @@ pub(crate) fn put_async_py<'p>(
     data_gen_mode: &'p str,
     chunk_size: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let template = template.unwrap_or("object-{}");
     let uris = build_uri_list(prefix, template, num)?;
-    let jobs = max_in_flight.min(num);
+    // `num == 0` uploads nothing; keep the derived job count >= 1 so the
+    // (already validated) limit is not mistaken for a caller-supplied 0.
+    let jobs = max_in_flight.min(num.max(1));
     let obj = str_to_obj(object_type);
     let algorithm = str_to_data_gen_algorithm(data_gen_algorithm);
     let mode = str_to_data_gen_mode(data_gen_mode);
@@ -1226,6 +1244,13 @@ pub fn configure_s3(
 }
 
 // --- `list` function
+//
+// On s3:// `uri` is never a regular expression and never a bare prefix (issue #213, rule in
+// `crate::s3_selection`): `s3://b/K` lists the object `K` (and, recursive, what is under `K/`)
+// and NEVER `K.bak`; a trailing `/` lists a directory; `*` / `**` make an explicit glob over the
+// full key. `.`, `(`, `[`, `+`, `$` and `?` in it are ordinary characters. `pattern` is the one explicit way to
+// select by regular expression; it is matched against each listed entry relative to the
+// listing base (`crate::list_pattern`), the same rule `s3-cli ls --pattern` uses.
 #[pyfunction]
 #[pyo3(signature = (uri, recursive = false, pattern = None))]
 pub fn list(
@@ -1234,6 +1259,12 @@ pub fn list(
     recursive: bool,
     pattern: Option<&str>,
 ) -> PyResult<Vec<String>> {
+    // Compile an explicit pattern first: an invalid one fails before any request is made.
+    let filter = pattern
+        .map(crate::list_pattern::ListPattern::new)
+        .transpose()
+        .map_err(py_err)?;
+
     // Universal list using ObjectStore - works with all backends (S3, GCS, Azure, File, DirectIO)
     let uri_owned = uri.to_owned();
 
@@ -1245,20 +1276,9 @@ pub fn list(
         submit_io(async move { store.list(&uri_owned, recursive).await })
     })?;
 
-    // Apply client-side regex filtering against the relative path (after the listing prefix).
-    // Pattern sees only the key portion after the URI prefix, e.g. "llama3-8b/" not the full URI.
-    if let Some(pat) = pattern {
-        use regex::Regex;
-        let re = Regex::new(pat).map_err(py_err)?;
-        let base = if uri.ends_with('/') {
-            uri.to_owned()
-        } else {
-            format!("{}/", uri)
-        };
-        keys.retain(|k| {
-            let relative = k.strip_prefix(base.as_str()).unwrap_or(k.as_str());
-            re.is_match(relative)
-        });
+    // Apply the explicit client-side regex against the path relative to the listing base.
+    if let Some(filter) = &filter {
+        filter.retain(uri, &mut keys);
     }
 
     Ok(keys)
@@ -1576,11 +1596,19 @@ fn put_bytes_async<'py>(
 // mkdir() - Create directory/prefix for any backend
 // ---------------------------------------------------------------------------
 
-/// Create a directory (file://, direct://) or prefix marker (s3://, az://, gs://).
+/// Create a directory (file://, direct://). A no-op on object stores (s3://, az://, gs://).
 ///
 /// # Backend Behavior
-/// - `file://`, `direct://`: Creates actual directory using create_dir_all()
-/// - `s3://`, `az://`, `gs://`: Creates empty marker object (no-op for some backends)
+/// - `file://`, `direct://`: Creates the directory and any missing parents using
+///   create_dir_all(); an existing directory is success. `direct://` behaves exactly
+///   like `file://` (O_DIRECT does not apply to directory operations).
+/// - `s3://`, `az://`, `gs://`: **does nothing and returns `None`.** An object store has
+///   no directories: a prefix exists as soon as an object is written under it, so there
+///   is nothing to create. The URI is validated, no request is sent and no marker
+///   object is written. To remove the objects under a prefix use
+///   `delete(uri, recursive=True)`.
+///
+/// Never recorded in the op-log.
 ///
 /// # Arguments
 /// * `uri` - Full URI including scheme and trailing slash recommended for clarity
@@ -1592,7 +1620,8 @@ fn put_bytes_async<'py>(
 /// # Create local directory
 /// s3dlio.mkdir("file:///tmp/mydata/subdir/")
 ///
-/// # Create S3 prefix marker
+/// # On object stores (s3://, az://, gs://) this is a no-op that succeeds:
+/// # nothing is created, a prefix exists once an object is written under it
 /// s3dlio.mkdir("s3://bucket/prefix/")
 /// ```
 #[pyfunction]
@@ -1626,6 +1655,7 @@ pub fn get_many_stats(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<(usize, usize)> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     py.detach(|| {
         let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
         let total: usize = res.iter().map(|(_, b)| b.len()).sum();
@@ -1640,6 +1670,7 @@ pub fn get_many_stats_async<'p>(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     future_into_py(py, async move {
         let (count, total) = task::spawn_blocking(move || {
             let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
@@ -1660,6 +1691,7 @@ pub(crate) fn get_many_async_py<'p>(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     future_into_py(py, async move {
         // get_objects_parallel returns Vec<(String, Bytes)> - keep as Bytes for zero-copy
         let pairs: Vec<(String, Bytes)> = task::spawn_blocking(move || {
@@ -1775,6 +1807,7 @@ pub fn download(
     max_in_flight: usize,
     recursive: bool,
 ) -> PyResult<()> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     let dir = PathBuf::from(dest_dir);
     let src_uri_owned = src_uri.to_owned();
     // The `download_objects` function in `s3_copy.rs` needs a `recursive` flag.
@@ -1796,6 +1829,7 @@ pub fn get_many(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<Vec<(String, PyBytesView)>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     use crate::object_store::{infer_scheme, Scheme};
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::sync::Arc;
@@ -1979,11 +2013,13 @@ pub fn get_many(
 ///   the key ``a*``. Nothing is listed, globbed or expanded, no parent is
 ///   consulted, and no ``/`` is added.
 ///
-/// ``delete(uri, recursive=True)`` deletes the real objects whose key starts
-/// with the LITERAL prefix given: listed without a delimiter, objects only (a
-/// "directory" is never a deletion target), no ``/`` appended, so the prefix
-/// ``foo`` also matches ``foobar``; add the trailing ``/`` yourself to mean a
-/// directory. A prefix with no objects is a no-op. Each selected object gets
+/// ``delete(uri, recursive=True)`` deletes the real objects the ``s3://`` URI
+/// selects (issue #213): listed without a delimiter, objects only (a
+/// "directory" is never a deletion target). ``foo`` selects the object ``foo``
+/// and everything under ``foo/`` and NEVER ``foobar`` or ``foo.bak``; ``foo/``
+/// selects everything under it; ``*`` makes an explicit glob over the full key
+/// (``*`` stays in one directory level, ``**`` crosses ``/``), so ``foo*`` selects
+/// ``foo``, ``foo.bak`` and ``foobar``. A selection with no objects is a no-op. Each selected object gets
 /// its own delete request (several in flight at once), so the op-log records
 /// one ``LIST`` row and one ``DELETE`` row per object. If a delete request or
 /// the listing fails, no further delete request is sent (requests already in
@@ -2044,6 +2080,7 @@ pub fn upload(
     max_in_flight: usize,
     create_bucket: bool,
 ) -> PyResult<()> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     let paths: Vec<PathBuf> = src_patterns.into_iter().map(PathBuf::from).collect();
     let dest_prefix_owned = dest_prefix.to_owned();
     py.detach(|| {
@@ -2123,7 +2160,8 @@ type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
 ///
 /// # Arguments
 /// * `items` - List of (uri, data) tuples: uri is a string, data is bytes
-/// * `max_in_flight` - Maximum concurrent put operations (default: 64)
+/// * `max_in_flight` - Maximum concurrent put operations (default: 64); must be
+///   an integer >= 1, otherwise `ValueError` is raised at once (issue #211)
 ///
 /// # Zero-copy path
 /// Each Python bytes is copied once into Bytes (unavoidable — Python GIL →
@@ -2148,6 +2186,7 @@ pub fn put_many(
     items: Vec<(String, Vec<u8>)>,
     max_in_flight: usize,
 ) -> PyResult<()> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::Semaphore;
 
@@ -2208,6 +2247,7 @@ pub fn put_many_async<'py>(
     items: Vec<(String, Vec<u8>)>,
     max_in_flight: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::Semaphore;
 
@@ -2721,7 +2761,9 @@ impl PyMultiEndpointStore {
         })
     }
 
-    /// List objects under a prefix
+    /// List the objects a URI selects. On `s3://` the key part is an exact name (the object, and
+    /// with `recursive` the keys under `name/`), a directory (`name/`) or a `*` / `**` glob --
+    /// never a bare key prefix (`s3://b/foo` does not select `foobar`; use `s3://b/foo*`).
     fn list<'py>(
         &self,
         py: Python<'py>,

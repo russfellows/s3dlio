@@ -54,8 +54,14 @@ pub enum RowUriError {
 struct RowParts<'a> {
     /// Exact URI the original call used.
     uri: String,
-    /// Path below the bucket/container, as the original key (may carry leading slashes).
+    /// The key below the bucket/container exactly as logged (a leading `/` or an empty segment
+    /// is part of the key); for `file://` / `direct://` rows, the absolute path without its root `/`.
     relative: &'a str,
+}
+
+/// Remove the single structural `/` at the start of `s`, if any (never more than one).
+fn drop_separator(s: &str) -> &str {
+    s.strip_prefix('/').unwrap_or(s)
 }
 
 fn is_local_scheme(endpoint: &str) -> bool {
@@ -87,7 +93,7 @@ fn split_row<'a>(endpoint: &str, file: &'a str) -> Result<RowParts<'a>, RowUriEr
     if is_local_scheme(endpoint) {
         return Ok(RowParts {
             uri: format!("{endpoint}{file}"),
-            relative: file,
+            relative: drop_separator(file),
         });
     }
 
@@ -203,6 +209,10 @@ pub fn row_uri(endpoint: &str, file: &str) -> Result<String, RowUriError> {
 /// target supplies the destination, so the original URI is not needed and the row is not an
 /// error. (Replay *without* a target does need the original URI; see [`row_uri`].)
 ///
+/// The key is kept exactly as logged (issue #198): only the one `/` that separates it from the
+/// container is removed, so the row for the object `/x` (`file = bkt//x`) replays to
+/// `<target>//x`, not `<target>/x`.
+///
 /// # Arguments
 /// * `file` - The row's `file` column
 /// * `endpoint` - The row's `endpoint` column
@@ -218,23 +228,38 @@ pub fn row_uri(endpoint: &str, file: &str) -> Result<String, RowUriError> {
 /// // hand-written row: file carries the endpoint as a prefix
 /// let result = translate_uri("/bucket/data/file.bin", "/bucket/", "s3://newbucket").unwrap();
 /// assert_eq!(result, "s3://newbucket/data/file.bin");
+///
+/// // a key that begins with '/' keeps it
+/// let result = translate_uri("srcbkt//x", "s3://srcbkt", "s3://replaybkt/").unwrap();
+/// assert_eq!(result, "s3://replaybkt//x");
 /// ```
 pub fn translate_uri(file: &str, endpoint: &str, target: &str) -> Result<String> {
-    let relative = if !endpoint.is_empty() && starts_with_unit(file, endpoint) {
-        &file[endpoint.len()..]
+    // The key is kept exactly as logged (issue #198): `bkt//k` is the object `/k`, and it
+    // replays as `<target>//k`. Only the ONE `/` that separates the key from what precedes
+    // it is removed.
+    let key = if !endpoint.is_empty() && starts_with_unit(file, endpoint) {
+        let rest = &file[endpoint.len()..];
+        // An endpoint ending in `/` already consumed the separator, except a bare scheme
+        // (`file://`), whose trailing slashes belong to the scheme, not to the path.
+        if endpoint.ends_with('/') && !endpoint.ends_with("://") {
+            rest
+        } else {
+            drop_separator(rest)
+        }
     } else if let Ok(parts) = split_row(endpoint, file) {
         parts.relative
     } else {
         // Not a shape s3dlio writes (a legacy `S3Ops` row with no bucket, an empty or schemeless
         // endpoint, ...). A target supplies the destination, so the original URI is not needed:
-        // translate exactly as every earlier version did.
-        file.strip_prefix(endpoint).unwrap_or(file)
+        // translate as every earlier version did, which dropped the leading `/` of a path-like
+        // `file` (pinned by reader_uri_184.rs). Such a row cannot be told apart from a legacy
+        // row whose key really begins with `/`, so only that one `/` is dropped.
+        drop_separator(file.strip_prefix(endpoint).unwrap_or(file))
     };
-    let clean = relative.trim_start_matches('/');
 
     // Construct new URI with target
     let target_clean = target.trim_end_matches('/');
-    Ok(format!("{}/{}", target_clean, clean))
+    Ok(format!("{}/{}", target_clean, key))
 }
 
 #[cfg(test)]

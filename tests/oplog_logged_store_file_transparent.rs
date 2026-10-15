@@ -70,7 +70,8 @@ async fn logging_does_not_change_file_backend_behaviour() {
 
     finalize_op_logger();
 
-    // The only call with an op name is the PUT: the forwarded calls write no row.
+    // The calls with an op name are the rmdir (one DELETE_PREFIX row, #228) and the
+    // PUT: the other forwarded calls (mkdir, rename, update_metadata) write no row.
     let raw = std::fs::read(&oplog).unwrap();
     let text = String::from_utf8(zstd::decode_all(raw.as_slice()).unwrap()).unwrap();
     let ops: Vec<&str> = text
@@ -78,5 +79,5 @@ async fn logging_does_not_change_file_backend_behaviour() {
         .skip(1)
         .map(|l| l.split('\t').nth(2).unwrap())
         .collect();
-    assert_eq!(ops, ["PUT"], "rows: {text}");
+    assert_eq!(ops, ["DELETE_PREFIX", "PUT"], "rows: {text}");
 }

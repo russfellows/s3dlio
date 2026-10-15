@@ -34,7 +34,6 @@ use crate::s3_utils::{
     create_bucket_async as s3_create_bucket_async,
     delete_bucket_async as s3_delete_bucket_async,
     delete_objects_async as s3_delete_objects_async,
-    format_sdk_error,
     get_object_range_uri_async as s3_get_object_range_uri_async,
     // The S3 backend of a store writes no row of its own: the store's caller records the call (issue #169).
     get_object_uri_optimized_rows as s3_get_object_uri_optimized_rows,
@@ -351,15 +350,16 @@ pub trait ObjectStore: Send + Sync {
     /// Stat a single object (HEAD-like).
     async fn stat(&self, uri: &str) -> Result<ObjectMetadata>;
 
-    /// Stream the URIs of the REAL objects whose key starts with the literal
-    /// prefix named by `uri_prefix`, recursively (no delimiter, no regex, no
-    /// synthetic directory entries).
+    /// Stream the URIs of the REAL objects selected by `uri_prefix`, recursively (no
+    /// delimiter, no regex, no synthetic directory entries).
     ///
     /// Used by `s3-cli delete -r` and the Python `delete(..., recursive=True)`.
-    /// The S3 store overrides it with a literal `ListObjectsV2` that yields only
-    /// `Contents` entries.  The default (other
-    /// backends) streams their existing recursive listing and only accepts a
-    /// prefix ending in `/`, so a bare name is never read as a pattern.
+    /// The S3 store applies the `s3://` selection rule (issue #213,
+    /// `crate::s3_selection`): `s3://b/K` with no `*` selects the object `K` and
+    /// everything under `K/` -- never `K.bak`; a trailing `/` selects everything under
+    /// it; `*` / `**` make an explicit glob over the full key. Only `Contents` entries are
+    /// yielded.  The default (other backends) streams their existing recursive listing and
+    /// only accepts a prefix ending in `/`, so a bare name is never read as a pattern.
     fn list_objects_with_prefix<'a>(
         &'a self,
         uri_prefix: &'a str,
@@ -406,6 +406,14 @@ pub trait ObjectStore: Send + Sync {
     async fn delete_batch(&self, uris: &[String]) -> Result<()>;
 
     /// Delete all objects under a prefix.
+    ///
+    /// The prefix names a directory-like name, never a string prefix of longer
+    /// names (#231).  On every object store (S3, Azure, GCS) a non-empty key
+    /// prefix that does not end in `/` gets one `/` appended before listing, so
+    /// `delete_prefix(".../foo")` deletes only objects under `foo/`, never
+    /// siblings such as `foobar`, `foo.bak` or `foo2/...`.  An empty key prefix
+    /// (the bucket / container root) deletes everything.  The prefix is matched
+    /// literally: no wildcard.
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()>;
 
     /// Create a top-level container (S3: bucket; Azure: container; File: directory).
@@ -679,6 +687,9 @@ pub trait ObjectStore: Send + Sync {
     ) -> Result<std::collections::HashMap<String, u64>> {
         use futures::stream::{self, StreamExt};
 
+        // Issue #211: `buffer_unordered(0)` never polls anything and hangs.
+        crate::concurrency::require_concurrency_at_least_one("max_concurrent", max_concurrent)?;
+
         tracing::debug!(
             "Pre-statting {} objects (concurrent, max={})",
             uris.len(),
@@ -772,11 +783,18 @@ pub trait ObjectStore: Send + Sync {
     // Metadata Operations (v0.10.0+)
     // =========================================================================
 
-    /// Create a directory (POSIX) or prefix marker (cloud).
+    /// Create a directory.
     ///
     /// **Backend behavior**:
-    /// - `file://`, `direct://`: Creates actual directory with `create_dir_all()`
-    /// - `s3://`, `gs://`, `az://`: Creates empty marker object (e.g., `.keep`)
+    /// - `file://`, `direct://`: creates the directory and any missing parents
+    ///   (`create_dir_all`); an existing directory is success. `direct://` is the
+    ///   `file://` behaviour -- O_DIRECT has no meaning for a directory.
+    /// - `s3://`, `gs://`, `az://`: a **no-op**. An object store has no directories;
+    ///   a prefix exists once objects are written under it, so there is nothing to
+    ///   create. The URI is validated, NO request is sent and no marker object is
+    ///   written.
+    ///
+    /// Never recorded in the op-log.
     ///
     /// # Arguments
     /// * `uri` - Full URI including scheme (e.g., "file:///tmp/dir", "s3://bucket/prefix/")
@@ -785,15 +803,26 @@ pub trait ObjectStore: Send + Sync {
         bail!("mkdir not implemented for this backend")
     }
 
-    /// Remove a directory (POSIX) or delete all objects under prefix (cloud).
+    /// Remove a directory.
     ///
     /// **Backend behavior**:
-    /// - `file://`, `direct://`: Removes directory (must be empty unless `recursive=true`)
-    /// - `s3://`, `gs://`, `az://`: Deletes all objects under prefix
+    /// - `file://`, `direct://`: `recursive == false` removes only an EMPTY directory
+    ///   (a non-empty one is an error and nothing is removed); `recursive == true`
+    ///   removes the whole tree. A missing directory is success. `direct://` is the
+    ///   `file://` behaviour.
+    /// - `s3://`, `gs://`, `az://`: a **no-op**, `recursive` or not. An object store
+    ///   has no directories, so there is nothing to remove. The URI is validated, NO
+    ///   request is sent and NOTHING is deleted. To delete the objects under a prefix
+    ///   use [`ObjectStore::delete_prefix`] (Python `delete(uri, recursive=True)`,
+    ///   `s3-cli delete -r`).
+    ///
+    /// Recorded in the op-log as one `DELETE_PREFIX` row on `file://` and `direct://`
+    /// only (issue #228); an object-store `rmdir` deletes nothing and writes no row.
     ///
     /// # Arguments
     /// * `uri` - Full URI including scheme
-    /// * `recursive` - If true, delete recursively; if false, fail if not empty
+    /// * `recursive` - `file://` / `direct://`: if true, remove the whole tree; if
+    ///   false, fail if not empty. Ignored on object stores.
     async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
         let _ = (uri, recursive);
         bail!("rmdir not implemented for this backend")
@@ -1274,39 +1303,24 @@ impl S3ObjectStore {
             .with_context(|| format!("S3 URI '{uri}' cannot be used with this store"))
     }
 
-    /// Gate for every operation that is handed to a helper which uses the
-    /// PROCESS-WIDE S3 client (multipart upload, concurrent-range GET, the
-    /// buffered writer's final upload).  Those helpers always talk to the global
-    /// server, whatever URI form they are given -- a bucket-form URI names no
-    /// server, so the URI check cannot catch it.  A per-endpoint store bound to
-    /// any other server must therefore refuse, before any request is made,
-    /// rather than run the operation on the wrong server (issue #197).  Per-endpoint
-    /// multipart and concurrent-range support is issue #208.
+    /// The buffered writer for `uri` on THIS store (issue #208).
     ///
-    /// A store on the process-wide client, or a per-endpoint store whose server IS
-    /// the global server, passes.
-    fn ensure_global_helper_reaches_this_store(&self, operation: &str) -> Result<()> {
-        let Some(url) = self.endpoint_url.as_deref() else {
-            return Ok(());
-        };
-        let mine = StoreServer::from_endpoint_url(url)
-            .context("S3ObjectStore endpoint URL is not usable")?;
-        match global_client_server() {
-            Some(global) if global.is_same_server(&mine) => Ok(()),
-            Some(global) => bail!(
-                "{operation} is not yet supported on a per-endpoint S3 store (issue #208): this \
-                 store talks to {}, but {operation} uses the process-wide S3 client, which talks \
-                 to {}",
-                mine.display(),
-                global.display()
-            ),
-            None => bail!(
-                "{operation} is not yet supported on a per-endpoint S3 store (issue #208): this \
-                 store talks to {}, but {operation} uses the process-wide S3 client, which talks \
-                 to the default AWS endpoint",
-                mine.display()
-            ),
-        }
+    /// A URI naming another server is refused (#197).  A per-endpoint store hands
+    /// the writer its own client and the bucket/key it parsed, so the writer's final
+    /// multipart upload -- create, parts, complete, and abort on a failure -- goes
+    /// to the store's server; a store on the process-wide client builds the writer
+    /// exactly as before.
+    fn buffered_writer_for(
+        &self,
+        uri: &str,
+        compression: CompressionConfig,
+    ) -> Result<Box<dyn ObjectWriter>> {
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+        let writer = S3BufferedWriter::new_with_compression(uri.to_string(), compression);
+        Ok(Box::new(match &self.client {
+            Some(client) => writer.with_target(client.clone(), bucket, key),
+            None => writer,
+        }))
     }
 
     /// Delete every key of one bucket group (issue #179).
@@ -1396,86 +1410,54 @@ impl S3ObjectStore {
         Ok(())
     }
 
-    /// List objects using a given client (shared implementation for list() and list_stream()).
+    /// List what the key part `key` of an `s3://` URI selects, using a given client (shared
+    /// implementation for list() and list_stream()).
+    ///
+    /// The rule (issue #213) is `crate::s3_selection`: a key with no `*` that does not end
+    /// in `/` selects that exact object and (when `recursive`) everything under `key/`,
+    /// never `key.bak`; a key ending in `/` selects everything under it; a key with `*` is
+    /// a glob over the full key. Non-recursive, directories appear as `.../` entries.
+    /// There is no client-side regex here; an explicit one is applied by the caller
+    /// (`ListPattern`).
     async fn list_with_client(
         client: &aws_sdk_s3::Client,
         bucket: &str,
-        key_prefix: &str,
+        key: &str,
         recursive: bool,
     ) -> Result<Vec<String>> {
-        use regex::Regex;
-        let (prefix_str, pattern_str) = match key_prefix.rfind('/') {
-            Some(idx) => {
-                let (p, pat) = key_prefix.split_at(idx + 1);
-                (p.to_string(), pat.to_string())
-            }
-            None => (String::new(), key_prefix.to_string()),
-        };
-        let final_pattern = if pattern_str.is_empty() {
-            ".*".to_string()
-        } else {
-            pattern_str
-        };
-        let re = Regex::new(&final_pattern)
-            .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
-        let delimiter = if recursive {
-            None
-        } else {
-            Some("/".to_string())
-        };
-
+        use futures::StreamExt;
+        let mut stream = crate::s3_selection::select_key_stream(
+            client.clone(),
+            bucket.to_string(),
+            key,
+            recursive,
+            false,
+        );
         let mut keys = Vec::new();
-        let mut cont: Option<String> = None;
-        loop {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix_str.as_str());
-            if let Some(ref d) = delimiter {
-                req = req.delimiter(d.as_str());
-            }
-            if let Some(ref t) = cont {
-                req = req.continuation_token(t.as_str());
-            }
-            let resp = req.send().await.map_err(|e| {
-                anyhow::anyhow!(
-                    "list_objects_v2 failed for bucket '{}': {}",
-                    bucket,
-                    format_sdk_error(&e)
-                )
-            })?;
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    // Locked contract (audit #154 f24, docs/implementation-plans/
-                    // v0.9.109-audit-fix-plan.md bug B7): the regex must match
-                    // against the key's tail PAST the prefix, not the whole
-                    // key. `key.starts_with(&prefix_str)` was always true here
-                    // (S3 was already queried with `prefix(prefix_str)`), which
-                    // made the `||` a vacuous OR and the regex dead code —
-                    // every key under the prefix passed regardless of whether
-                    // it matched `final_pattern`.
-                    let tail_matches = key
-                        .strip_prefix(prefix_str.as_str())
-                        .map(|rest| re.is_match(rest))
-                        .unwrap_or(false);
-                    if tail_matches {
-                        keys.push(format!("s3://{}/{}", bucket, key));
-                    }
-                }
-            }
-            // In non-recursive mode, include common prefixes (virtual directories).
-            if !recursive {
-                for cp in resp.common_prefixes() {
-                    if let Some(prefix_key) = cp.prefix() {
-                        keys.push(format!("s3://{}/{}", bucket, prefix_key));
-                    }
-                }
-            }
-            if resp.is_truncated().unwrap_or(false) {
-                cont = resp.next_continuation_token().map(|s| s.to_string());
-            } else {
-                break;
-            }
+        while let Some(item) = stream.next().await {
+            keys.push(format!("s3://{}/{}", bucket, item?));
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// The keys under the LITERAL prefix `prefix` (`s3://bucket/<key>` URIs), read as a plain
+    /// S3 key prefix: no wildcard, no exact-object rule. Used by `delete_prefix`, whose
+    /// prefix always ends in `/`.
+    async fn list_literal_prefix_with_client(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>> {
+        use futures::StreamExt;
+        let mut stream = crate::s3_selection::literal_prefix_key_stream(
+            client.clone(),
+            bucket.to_string(),
+            prefix.to_string(),
+        );
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            keys.push(format!("s3://{}/{}", bucket, item?));
         }
         keys.sort();
         Ok(keys)
@@ -1635,8 +1617,17 @@ impl ObjectStore for S3ObjectStore {
             part_size
         );
         // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
-        self.ensure_global_helper_reaches_this_store("multipart upload")?;
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+
+        // Issue #208: a per-endpoint store uploads (create, parts, complete, abort)
+        // with its OWN client.
+        if let Some(client) = &self.client {
+            return crate::s3_utils::put_object_multipart_with_client(
+                client, &bucket, &key, data, part_size,
+            )
+            .await;
+        }
+
         s3_put_object_multipart_uri_async(uri, data, part_size).await
     }
 
@@ -1836,14 +1827,13 @@ impl ObjectStore for S3ObjectStore {
         use futures::stream::StreamExt;
         debug!("S3ObjectStore::delete_prefix prefix='{}'", uri_prefix);
 
-        let (bucket, mut key_prefix) = self.parse_uri_for_this_store(uri_prefix)?;
-        if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
-            key_prefix.push('/');
-        }
+        let (bucket, key_prefix) = self.parse_uri_for_this_store(uri_prefix)?;
+        let key_prefix = directory_prefix(&key_prefix);
 
         if let Some(client) = &self.client {
-            let listed = Self::list_with_client(client, &bucket, &key_prefix, true).await?;
-            // `list_with_client` returns `s3://<bucket>/<key>`: strip that
+            let listed =
+                Self::list_literal_prefix_with_client(client, &bucket, &key_prefix).await?;
+            // `list_literal_prefix_with_client` returns `s3://<bucket>/<key>`: strip that
             // head rather than re-parsing (a re-parse could misread the key,
             // and a listing entry that does not parse must be an error, never
             // a key silently left out of the delete).
@@ -1875,8 +1865,14 @@ impl ObjectStore for S3ObjectStore {
             return Ok(());
         }
 
-        // Use streaming list to avoid loading millions of keys into memory
-        let mut stream = s3_list_objects_stream(bucket.clone(), key_prefix, true).await?;
+        // Use streaming list to avoid loading millions of keys into memory. The prefix is
+        // LITERAL here (it always ends in '/'): a '*' in it is a key character, not a glob.
+        let global_client = crate::s3_client::aws_s3_client_async().await?;
+        let mut stream = crate::s3_selection::literal_prefix_key_stream(
+            global_client,
+            bucket.clone(),
+            key_prefix,
+        );
         let mut batch = Vec::with_capacity(1000);
         let mut total_deleted = 0;
 
@@ -1906,6 +1902,39 @@ impl ObjectStore for S3ObjectStore {
         Ok(())
     }
 
+    /// No-op: an object store has no directories (issue #229). A prefix exists once
+    /// objects are written under it, so there is nothing to create. The URI is
+    /// validated; NO request is sent and no object (marker or otherwise) is written.
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        self.parse_uri_for_this_store(uri)?;
+        debug!(
+            "S3ObjectStore::mkdir is a no-op on an object store: '{}'",
+            uri
+        );
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229), so there is nothing to
+    /// remove -- `recursive` or not. The URI is validated; NO request is sent and
+    /// nothing is deleted. To delete the objects under a prefix use
+    /// [`ObjectStore::delete_prefix`] (Python `delete(uri, recursive=True)`,
+    /// `s3-cli delete -r`).
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        let _ = recursive;
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        self.parse_uri_for_this_store(uri)?;
+        debug!(
+            "S3ObjectStore::rmdir is a no-op on an object store: '{}'",
+            uri
+        );
+        Ok(())
+    }
+
     async fn create_container(&self, name: &str) -> Result<()> {
         // A per-endpoint store (built for `s3://host:port/...`) must create the
         // bucket on ITS server, not on the global singleton's (issue #194).
@@ -1924,11 +1953,8 @@ impl ObjectStore for S3ObjectStore {
 
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
         // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
-        // The writer's final upload is a multipart upload on the process-wide client.
-        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer that collects chunks then uses put_multipart
-        Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
+        self.buffered_writer_for(uri, CompressionConfig::None)
     }
 
     async fn get_writer_with_compression(
@@ -1936,15 +1962,8 @@ impl ObjectStore for S3ObjectStore {
         uri: &str,
         compression: CompressionConfig,
     ) -> Result<Box<dyn ObjectWriter>> {
-        // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
-        // The writer's final upload is a multipart upload on the process-wide client.
-        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer with compression support
-        Ok(Box::new(S3BufferedWriter::new_with_compression(
-            uri.to_string(),
-            compression,
-        )))
+        self.buffered_writer_for(uri, compression)
     }
 
     async fn create_writer(
@@ -1952,19 +1971,8 @@ impl ObjectStore for S3ObjectStore {
         uri: &str,
         options: WriterOptions,
     ) -> Result<Box<dyn ObjectWriter>> {
-        // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
-        // The writer's final upload is a multipart upload on the process-wide client.
-        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer that collects chunks then uses put_multipart
-        if let Some(compression) = options.compression {
-            Ok(Box::new(S3BufferedWriter::new_with_compression(
-                uri.to_string(),
-                compression,
-            )))
-        } else {
-            Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
-        }
+        self.buffered_writer_for(uri, options.compression.unwrap_or(CompressionConfig::None))
     }
 
     async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
@@ -1973,7 +1981,7 @@ impl ObjectStore for S3ObjectStore {
         }
 
         // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
         // Get object size from cache or stat (v0.9.10: cache optimization)
         let object_size = self.get_object_size(uri).await?;
 
@@ -1985,9 +1993,20 @@ impl ObjectStore for S3ObjectStore {
                 "Using concurrent range GET for large object: {} bytes",
                 object_size
             );
-            // Use concurrent range GET for large objects (process-wide client)
-            self.ensure_global_helper_reaches_this_store("concurrent range GET")?;
-            crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await
+            // Use concurrent range GET for large objects.  A per-endpoint store
+            // reads with its OWN client (issue #208), whatever the object size.
+            match &self.client {
+                Some(client) => {
+                    crate::s3_utils::get_object_concurrent_range_with_client(
+                        client, &bucket, &key, 0, None, None, None,
+                    )
+                    .await
+                }
+                None => {
+                    crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None)
+                        .await
+                }
+            }
         } else {
             debug!("Using standard GET for small object: {} bytes", object_size);
             // Use standard GET for small objects
@@ -2003,11 +2022,15 @@ impl ObjectStore for S3ObjectStore {
         chunk_size: Option<usize>,
         max_concurrency: Option<usize>,
     ) -> Result<Bytes> {
+        // Issue #211: a limit of 0 is an error whatever the transfer size, so the
+        // small-transfer path (which ignores the limits) accepts exactly what the
+        // concurrent path accepts. Nothing is sent for a 0.
+        crate::s3_utils::require_concurrent_range_limits(chunk_size, max_concurrency)?;
         if !uri.starts_with("s3://") {
             bail!("S3ObjectStore expected s3:// URI");
         }
         // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
 
         let transfer_size = match length {
             Some(len) => len,
@@ -2026,16 +2049,32 @@ impl ObjectStore for S3ObjectStore {
                 "Using concurrent range GET for large transfer: {} bytes",
                 transfer_size
             );
-            // Use concurrent range GET for large transfers (process-wide client)
-            self.ensure_global_helper_reaches_this_store("concurrent range GET")?;
-            crate::s3_utils::get_object_concurrent_range_async(
-                uri,
-                offset,
-                length,
-                chunk_size,
-                max_concurrency,
-            )
-            .await
+            // Use concurrent range GET for large transfers.  A per-endpoint store
+            // reads with its OWN client (issue #208), whatever the transfer size.
+            match &self.client {
+                Some(client) => {
+                    crate::s3_utils::get_object_concurrent_range_with_client(
+                        client,
+                        &bucket,
+                        &key,
+                        offset,
+                        length,
+                        chunk_size,
+                        max_concurrency,
+                    )
+                    .await
+                }
+                None => {
+                    crate::s3_utils::get_object_concurrent_range_async(
+                        uri,
+                        offset,
+                        length,
+                        chunk_size,
+                        max_concurrency,
+                    )
+                    .await
+                }
+            }
         } else {
             debug!(
                 "Using standard range GET for small transfer: {} bytes",
@@ -2098,9 +2137,20 @@ impl ObjectStore for S3ObjectStore {
     }
 }
 
+/// Where a per-endpoint store's buffered writer uploads (issue #208): the store's own
+/// client and the bucket/key the store parsed from the writer's URI.
+struct S3WriterTarget {
+    client: std::sync::Arc<aws_sdk_s3::Client>,
+    bucket: String,
+    key: String,
+}
+
 /// Buffered writer for S3 that collects chunks and uses multipart upload
 pub struct S3BufferedWriter {
     uri: String,
+    /// `Some` for a writer made by a per-endpoint store: the final upload goes to
+    /// that store's server.  `None`: the process-wide client, as `uri` names it.
+    target: Option<S3WriterTarget>,
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
@@ -2123,6 +2173,7 @@ impl S3BufferedWriter {
 
         Self {
             uri,
+            target: None,
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
@@ -2131,6 +2182,35 @@ impl S3BufferedWriter {
             compressor,
             compressed_bytes: 0,
         }
+    }
+
+    /// Upload to a per-endpoint store's server: `client`, with the `bucket`/`key` the
+    /// store parsed from this writer's URI (issue #208).
+    fn with_target(
+        mut self,
+        client: std::sync::Arc<aws_sdk_s3::Client>,
+        bucket: String,
+        key: String,
+    ) -> Self {
+        self.target = Some(S3WriterTarget {
+            client,
+            bucket,
+            key,
+        });
+        self
+    }
+
+    /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
+    /// header and every block the encoder already emitted during `write_chunk` are in
+    /// `buffer`; the encoder's final output is APPENDED to them, never assigned over them
+    /// (issue #218).
+    fn seal_compression(&mut self) -> Result<()> {
+        if let Some(compressor) = self.compressor.take() {
+            let tail = compressor.finish()?;
+            self.buffer.extend_from_slice(&tail);
+        }
+        self.compressed_bytes = self.buffer.len() as u64;
+        Ok(())
     }
 }
 
@@ -2164,18 +2244,29 @@ impl ObjectWriter for S3BufferedWriter {
         }
         self.finalized = true;
 
-        // Finalize compression if enabled
-        if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
-        }
-
-        self.compressed_bytes = self.buffer.len() as u64;
+        self.seal_compression()?;
 
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
         if self.compression.is_enabled() && !final_uri.ends_with(self.compression.extension()) {
             final_uri.push_str(self.compression.extension());
+        }
+
+        // A writer made by a per-endpoint store uploads with that store's client
+        // (issue #208): create, parts, complete and abort all reach its server.
+        if let Some(target) = self.target.take() {
+            let mut key = target.key;
+            if self.compression.is_enabled() && !key.ends_with(self.compression.extension()) {
+                key.push_str(self.compression.extension());
+            }
+            return crate::s3_utils::put_object_multipart_with_client(
+                &target.client,
+                &target.bucket,
+                &key,
+                Bytes::from(std::mem::take(&mut self.buffer)),
+                None,
+            )
+            .await;
         }
 
         // Use S3 multipart upload for the buffered data
@@ -2223,9 +2314,31 @@ impl ObjectWriter for S3BufferedWriter {
     }
 }
 
+/// The listing prefix `delete_prefix` uses on every object store (#231): a
+/// non-empty key that does not end in `/` gets one `/` appended, so the name
+/// selects only the objects under it and never longer siblings (`foo` selects
+/// `foo/...`, not `foobar` or `foo.bak`).  An empty key (bucket / container
+/// root) is unchanged.  The key is treated literally; nothing else is altered.
+/// Shared by the S3, Azure and GCS stores so they cannot drift.
+fn directory_prefix(key: &str) -> String {
+    let mut prefix = key.to_string();
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    prefix
+}
+
 // ============================================================================
 // Azure adapter
 // ============================================================================
+/// `(account, container, listing_prefix)` for an Azure `delete_prefix` URI.
+/// A pure step (no client, no request) so the listing prefix can be tested.
+#[cfg(feature = "backend-azure")]
+fn azure_delete_prefix_target(uri_prefix: &str) -> Result<(String, String, String)> {
+    let (account, container, key) = parse_azure_uri(uri_prefix)?;
+    Ok((account, container, directory_prefix(&key)))
+}
+
 #[cfg(feature = "backend-azure")]
 fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
     // Supports:
@@ -2263,12 +2376,14 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
             .split('.')
             .next()
             .ok_or_else(|| anyhow!("bad Azure host"))?;
-        let mut segs = path.split('/').filter(|s| !s.is_empty());
-        let container = segs
-            .next()
-            .ok_or_else(|| anyhow!("missing container in URL path"))?;
-        let key = segs.collect::<Vec<_>>().join("/");
-        return Ok((account.to_string(), container.to_string(), key));
+        // The first path segment is the container; the single `/` after it is the
+        // separator, and the rest is the key exactly as written (issue #198), like the
+        // `az://` form above: `c//k` is the container `c` and the key `/k`.
+        let (container, key) = path.split_once('/').unwrap_or((path, ""));
+        if container.is_empty() {
+            bail!("missing container in URL path");
+        }
+        return Ok((account.to_string(), container.to_string(), key.to_string()));
     }
 
     bail!("not a recognized Azure URI: {}", uri)
@@ -2790,7 +2905,8 @@ impl ObjectStore for AzureObjectStore {
         use futures::stream::StreamExt;
         debug!("AzureObjectStore::delete_prefix prefix='{}'", uri_prefix);
 
-        let (cli, _acct, _cont, key_prefix) = Self::client_for_prefix(uri_prefix)?;
+        let (account, container, key_prefix) = azure_delete_prefix_target(uri_prefix)?;
+        let cli = AzureBlob::with_default_credential(&account, &container)?;
 
         // Use streaming list to avoid loading millions of keys into memory
         let mut stream = cli.list_stream(Some(&key_prefix));
@@ -2822,6 +2938,33 @@ impl ObjectStore for AzureObjectStore {
         debug!(
             "Azure delete_prefix deleted {} objects total",
             total_deleted
+        );
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229). A prefix exists once
+    /// objects are written under it, so there is nothing to create. The URI is
+    /// validated; NO request is sent and no object (marker or otherwise) is written.
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        parse_azure_uri(uri)?;
+        debug!(
+            "AzureObjectStore::mkdir is a no-op on an object store: '{}'",
+            uri
+        );
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229), so there is nothing to
+    /// remove -- `recursive` or not. The URI is validated; NO request is sent and
+    /// nothing is deleted. To delete the objects under a prefix use
+    /// [`ObjectStore::delete_prefix`] (Python `delete(uri, recursive=True)`,
+    /// `s3-cli delete -r`).
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        let _ = recursive;
+        parse_azure_uri(uri)?;
+        debug!(
+            "AzureObjectStore::rmdir is a no-op on an object store: '{}'",
+            uri
         );
         Ok(())
     }
@@ -2946,6 +3089,19 @@ impl AzureBufferedWriter {
             compressed_bytes: 0,
         }
     }
+
+    /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
+    /// header and every block the encoder already emitted during `write_chunk` are in
+    /// `buffer`; the encoder's final output is APPENDED to them, never assigned over them
+    /// (issue #218).
+    fn seal_compression(&mut self) -> Result<()> {
+        if let Some(compressor) = self.compressor.take() {
+            let tail = compressor.finish()?;
+            self.buffer.extend_from_slice(&tail);
+        }
+        self.compressed_bytes = self.buffer.len() as u64;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2979,13 +3135,7 @@ impl ObjectWriter for AzureBufferedWriter {
         }
         self.finalized = true;
 
-        // Finalize compression if enabled
-        if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
-        }
-
-        self.compressed_bytes = self.buffer.len() as u64;
+        self.seal_compression()?;
 
         // Append compression extension if needed
         let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
@@ -3136,6 +3286,29 @@ impl Default for GcsObjectStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `(bucket, listing_prefix)` for a GCS `delete_prefix` URI.  A pure step (no
+/// client, no request) so the listing prefix can be tested (#231).
+#[cfg(feature = "backend-gcs")]
+fn gcs_delete_prefix_target(uri_prefix: &str) -> Result<(String, String)> {
+    let (bucket, key_prefix) = parse_gcs_uri(uri_prefix).or_else(|_| {
+        // Handle bucket-only URIs
+        if let Some(rest) = uri_prefix
+            .strip_prefix("gs://")
+            .or_else(|| uri_prefix.strip_prefix("gcs://"))
+        {
+            let bucket = rest.trim_end_matches('/').to_string();
+            if !bucket.is_empty() {
+                return Ok((bucket, String::new()));
+            }
+        }
+        bail!(
+            "Invalid GCS URI for delete_prefix operation: {}",
+            uri_prefix
+        )
+    })?;
+    Ok((bucket, directory_prefix(&key_prefix)))
 }
 
 #[cfg(feature = "backend-gcs")]
@@ -3395,22 +3568,7 @@ impl ObjectStore for GcsObjectStore {
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         debug!("GcsObjectStore::delete_prefix prefix='{}'", uri_prefix);
-        let (bucket, key_prefix) = parse_gcs_uri(uri_prefix).or_else(|_| {
-            // Handle bucket-only URIs
-            if let Some(rest) = uri_prefix
-                .strip_prefix("gs://")
-                .or_else(|| uri_prefix.strip_prefix("gcs://"))
-            {
-                let bucket = rest.trim_end_matches('/').to_string();
-                if !bucket.is_empty() {
-                    return Ok((bucket, String::new()));
-                }
-            }
-            bail!(
-                "Invalid GCS URI for delete_prefix operation: {}",
-                uri_prefix
-            )
-        })?;
+        let (bucket, key_prefix) = gcs_delete_prefix_target(uri_prefix)?;
 
         let client = self.get_client().await?;
 
@@ -3427,6 +3585,33 @@ impl ObjectStore for GcsObjectStore {
         }
 
         debug!("GCS delete_prefix deleted {} objects total", total_deleted);
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229). A prefix exists once
+    /// objects are written under it, so there is nothing to create. The URI is
+    /// validated; NO request is sent and no object (marker or otherwise) is written.
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        parse_gcs_uri(uri)?;
+        debug!(
+            "GcsObjectStore::mkdir is a no-op on an object store: '{}'",
+            uri
+        );
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229), so there is nothing to
+    /// remove -- `recursive` or not. The URI is validated; NO request is sent and
+    /// nothing is deleted. To delete the objects under a prefix use
+    /// [`ObjectStore::delete_prefix`] (Python `delete(uri, recursive=True)`,
+    /// `s3-cli delete -r`).
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        let _ = recursive;
+        parse_gcs_uri(uri)?;
+        debug!(
+            "GcsObjectStore::rmdir is a no-op on an object store: '{}'",
+            uri
+        );
         Ok(())
     }
 
@@ -3537,6 +3722,19 @@ impl GcsBufferedWriter {
             compressed_bytes: 0,
         }
     }
+
+    /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
+    /// header and every block the encoder already emitted during `write_chunk` are in
+    /// `buffer`; the encoder's final output is APPENDED to them, never assigned over them
+    /// (issue #218).
+    fn seal_compression(&mut self) -> Result<()> {
+        if let Some(compressor) = self.compressor.take() {
+            let tail = compressor.finish()?;
+            self.buffer.extend_from_slice(&tail);
+        }
+        self.compressed_bytes = self.buffer.len() as u64;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -3570,13 +3768,7 @@ impl ObjectWriter for GcsBufferedWriter {
         }
         self.finalized = true;
 
-        // Finalize compression if enabled
-        if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
-        }
-
-        self.compressed_bytes = self.buffer.len() as u64;
+        self.seal_compression()?;
 
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
@@ -4295,6 +4487,8 @@ pub async fn generic_upload_files_with_summary<P: AsRef<Path>>(
     max_in_flight: usize,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<TransferSummary> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Expand patterns (globs, regex, and single paths)
     let mut paths = Vec::new();
     for pat in patterns {
@@ -4517,6 +4711,12 @@ pub async fn generic_download_objects(
 }
 
 /// Generic download function with detailed transfer summary.
+///
+/// `src_uri` selects the objects; on `s3://` the rule is [`crate::s3_selection`] (issue #213):
+/// a name selects that object (and its `name/` directory when recursive) and never
+/// `name.bak`, a trailing `/` a directory, `*` / `**` an explicit glob.
+/// Use [`generic_download_objects_matching_with_summary`] to narrow the selection with an
+/// explicit regex.
 pub async fn generic_download_objects_with_summary(
     src_uri: &str,
     dest_dir: &Path,
@@ -4524,10 +4724,51 @@ pub async fn generic_download_objects_with_summary(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<TransferSummary> {
-    let store = store_for_uri_with_logger(src_uri, global_logger())?;
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
+    generic_download_objects_matching_with_summary(
+        src_uri,
+        dest_dir,
+        max_in_flight,
+        recursive,
+        None,
+        progress_callback,
+    )
+    .await
+}
+
+/// [`generic_download_objects_with_summary`] with an optional explicit regex filter.
+///
+/// Backend-aware (S3, Azure, GCS, `file://`, `direct://`): the listing goes through the
+/// store chosen by `src_uri`. When `pattern` is given, the listed entries are narrowed with
+/// [`ListPattern::retain`] (the pattern is matched against the entry relative to the listing
+/// base of `src_uri`) BEFORE the destination directory is created or anything is downloaded.
+/// Compile the [`ListPattern`] before calling, so an invalid regex fails without any request.
+pub async fn generic_download_objects_matching_with_summary(
+    src_uri: &str,
+    dest_dir: &Path,
+    max_in_flight: usize,
+    recursive: bool,
+    pattern: Option<&crate::list_pattern::ListPattern>,
+    progress_callback: Option<Arc<ProgressCallback>>,
+) -> Result<TransferSummary> {
+    // Issue #211: a limit of 0 builds a semaphore with no permits and hangs.  This is the
+    // implementation every backend-aware download funnels through (and a public entry of
+    // its own), so the guard lives here: before the store is chosen, anything is listed or
+    // the destination directory is created.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
+    // Issue #234: the store that lists is the store that fetches.  A host-form URI lists on a
+    // per-endpoint store, whose entries come back in bucket form; a store built from such an
+    // entry would use the process-wide client (another server).  The per-endpoint store
+    // accepts the bucket-form URIs of its own bucket and uses its own client for them.
+    let store: Arc<dyn ObjectStore> =
+        Arc::from(store_for_uri_with_logger(src_uri, global_logger())?);
 
     // List objects to download
-    let keys = store.list(src_uri, recursive).await?;
+    let mut keys = store.list(src_uri, recursive).await?;
+    if let Some(pattern) = pattern {
+        pattern.retain(src_uri, &mut keys);
+    }
 
     if keys.is_empty() {
         bail!("No objects matched for download");
@@ -4552,7 +4793,7 @@ pub async fn generic_download_objects_with_summary(
 
     for uri in keys.clone() {
         let sem = sem.clone();
-        let store = store_for_uri_with_logger(&uri, global_logger())?; // Each task gets its own store instance
+        let store = Arc::clone(&store);
         let progress = progress_callback.clone();
         let out_dir = dest_dir.to_path_buf();
 
@@ -4846,6 +5087,54 @@ mod s3_object_store_tests {
         assert_eq!(key, "key/nested");
     }
 
+    // Issue #198: the https form of an Azure URI names the same blob as the az:// form,
+    // key included. Only the single `/` that separates the container from the key is
+    // structural; an empty segment (`c//k`, key `/k`) is part of the key.
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_https_uri_keeps_the_key_exactly() {
+        for key in ["x", "/x", "a//b", "//x", "a/b/", "dir/"] {
+            let https = format!("https://acct.blob.core.windows.net/cont/{key}");
+            let az = format!("az://acct/cont/{key}");
+            let (h_account, h_container, h_key) = parse_azure_uri(&https).expect("https parses");
+            let (a_account, a_container, a_key) = parse_azure_uri(&az).expect("az parses");
+            assert_eq!(h_key, key, "{https}");
+            assert_eq!(
+                (h_account, h_container, h_key),
+                (a_account, a_container, a_key),
+                "https and az:// must name the same blob for {key:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_https_uri_container_only_has_an_empty_key() {
+        for uri in [
+            "https://acct.blob.core.windows.net/cont",
+            "https://acct.blob.core.windows.net/cont/",
+        ] {
+            let (account, container, key) = parse_azure_uri(uri).expect("parses");
+            assert_eq!(
+                (account.as_str(), container.as_str(), key.as_str()),
+                ("acct", "cont", "")
+            );
+        }
+    }
+
+    // An empty container is not a container: refuse it rather than shift the key left.
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn parse_azure_https_uri_without_a_container_is_an_error() {
+        for uri in [
+            "https://acct.blob.core.windows.net",
+            "https://acct.blob.core.windows.net/",
+            "https://acct.blob.core.windows.net//k",
+        ] {
+            assert!(parse_azure_uri(uri).is_err(), "{uri}");
+        }
+    }
+
     // ── E2 (audit #154 bug 4.3) — s3_endpoint_url_from_uri ────────────────────
     //
     // RED-then-GREEN regression test: pre-fix, scheme selection was purely
@@ -5003,6 +5292,57 @@ mod s3_object_store_tests {
             #[allow(deprecated)]
             None => std::env::remove_var(key),
         }
+    }
+}
+
+// =============================================================================
+// Issue #229: mkdir / rmdir are successful NO-OPS on object stores
+// =============================================================================
+//
+// An object store has no directories, so `mkdir` and `rmdir` (recursive or not)
+// validate the URI and return Ok without any request. Azure and GCS have no mock
+// server in this repository: these unit tests run the REAL store (no client is ever
+// built, so no credentials or network are needed) and prove the no-op and the URI
+// validation. They are not an end-to-end exercise against the cloud service.
+#[cfg(test)]
+mod issue229_object_store_dir_noop_tests {
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[cfg(feature = "backend-azure")]
+    #[tokio::test]
+    async fn azure_mkdir_rmdir_are_noops_and_validate_the_uri() {
+        let store = AzureObjectStore::new();
+        for uri in [
+            "az://acct/cont/dir",
+            "az://acct/cont/dir/",
+            "az://acct/cont/",
+        ] {
+            store.mkdir(uri).await.unwrap();
+            store.rmdir(uri, true).await.unwrap();
+            store.rmdir(uri, false).await.unwrap();
+        }
+        assert!(store.mkdir("az://acct").await.is_err(), "no container");
+        assert!(
+            store.rmdir("s3://b/dir", true).await.is_err(),
+            "wrong scheme"
+        );
+    }
+
+    #[cfg(feature = "backend-gcs")]
+    #[tokio::test]
+    async fn gcs_mkdir_rmdir_are_noops_and_validate_the_uri() {
+        let store = GcsObjectStore::new();
+        for uri in ["gs://bkt/dir", "gs://bkt/dir/", "gs://bkt/", "gs://bkt"] {
+            store.mkdir(uri).await.unwrap();
+            store.rmdir(uri, true).await.unwrap();
+            store.rmdir(uri, false).await.unwrap();
+        }
+        assert!(store.mkdir("gs:///dir").await.is_err(), "empty bucket");
+        assert!(
+            store.rmdir("s3://b/dir", true).await.is_err(),
+            "wrong scheme"
+        );
     }
 }
 
@@ -5165,5 +5505,139 @@ mod delete_batch_grouping_tests {
             .collect();
         let err = group_uris_by_bucket(&uris, azure_group_key).unwrap_err();
         assert!(format!("{err:#}").contains("s3://nope/b"));
+    }
+}
+
+// ============================================================================
+// Issue #218: closing a compressed buffered writer must keep what the encoder
+// already emitted.  The S3, Azure and GCS writers share the same shape: write_chunk
+// moves the encoder's output into `buffer`, and the frame is closed before upload.
+// The cloud upload itself needs a server (S3 is covered end to end in
+// tests/test_issue208_per_endpoint_client.rs), so these check the bytes the writer
+// would upload.
+// ============================================================================
+#[cfg(test)]
+mod compressed_writer_seal_tests_218 {
+    use super::*;
+
+    /// 64 KiB stretches alternating incompressible and compressible bytes.
+    fn mixed_payload(n: usize) -> Vec<u8> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(n);
+        let mut random = true;
+        while out.len() < n {
+            let stretch = (64 * 1024).min(n - out.len());
+            if random {
+                for _ in 0..stretch {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    out.push((state >> 24) as u8);
+                }
+            } else {
+                out.extend(b"the quick brown fox; ".iter().cycle().take(stretch));
+            }
+            random = !random;
+        }
+        out
+    }
+
+    /// One complete zstd frame that decodes to `data`.
+    fn assert_complete_frame_of(sealed: &[u8], data: &[u8]) {
+        let frame = zstd::zstd_safe::find_frame_compressed_size(sealed).unwrap_or_else(|e| {
+            panic!(
+                "the {} sealed bytes are not a complete zstd frame: {}",
+                sealed.len(),
+                zstd::zstd_safe::get_error_name(e)
+            )
+        });
+        assert_eq!(frame, sealed.len(), "the frame must be the whole buffer");
+        let plain = zstd::decode_all(sealed).expect("the sealed bytes decode");
+        assert!(plain == data, "decoded bytes differ from the written bytes");
+    }
+
+    macro_rules! seal_test {
+        ($name:ident, $writer:ty, $($cfg:meta),*) => {
+            $(#[$cfg])*
+            #[tokio::test]
+            async fn $name() {
+                for len in [32 * 1024, 6 * 1024 * 1024 + 123] {
+                    let data = mixed_payload(len);
+                    let mut w = <$writer>::new_with_compression(
+                        "unused://bucket/key".to_string(),
+                        CompressionConfig::zstd_default(),
+                    );
+                    for chunk in data.chunks(64 * 1024) {
+                        w.write_chunk(chunk).await.expect("write_chunk");
+                    }
+                    w.seal_compression().expect("seal");
+                    assert_complete_frame_of(&w.buffer, &data);
+                    assert_eq!(w.compressed_bytes, w.buffer.len() as u64, "{len}");
+                }
+            }
+        };
+    }
+
+    seal_test!(
+        s3_writer_seal_keeps_the_early_blocks,
+        S3BufferedWriter,
+        cfg(all())
+    );
+    seal_test!(
+        azure_writer_seal_keeps_the_early_blocks,
+        AzureBufferedWriter,
+        cfg(feature = "backend-azure")
+    );
+    seal_test!(
+        gcs_writer_seal_keeps_the_early_blocks,
+        GcsBufferedWriter,
+        cfg(feature = "backend-gcs")
+    );
+}
+
+// #231: `delete_prefix` must never select longer siblings.  S3, Azure and GCS
+// all compute their listing prefix through `directory_prefix`.  Azure and GCS
+// have no mock server, so the pure target-computation step each store's
+// `delete_prefix` calls is tested here.
+#[cfg(test)]
+mod delete_prefix_listing_tests {
+    use super::*;
+
+    #[test]
+    fn directory_prefix_appends_one_slash_to_a_non_empty_key() {
+        assert_eq!(directory_prefix("foo"), "foo/");
+        assert_eq!(directory_prefix("foo/"), "foo/");
+        assert_eq!(directory_prefix(""), "");
+        assert_eq!(directory_prefix("a//b"), "a//b/");
+        assert_eq!(directory_prefix("/x"), "/x/");
+        assert_eq!(directory_prefix("a/b"), "a/b/");
+        // Literal: wildcard characters are not interpreted.
+        assert_eq!(directory_prefix("foo*"), "foo*/");
+    }
+
+    #[cfg(feature = "backend-gcs")]
+    #[test]
+    fn gcs_delete_prefix_lists_only_under_the_directory() {
+        let t = |u: &str| gcs_delete_prefix_target(u).expect(u);
+        assert_eq!(t("gs://b/foo"), ("b".to_string(), "foo/".to_string()));
+        assert_eq!(t("gs://b/foo/"), ("b".to_string(), "foo/".to_string()));
+        assert_eq!(t("gs://b"), ("b".to_string(), String::new()));
+        assert_eq!(t("gs://b/"), ("b".to_string(), String::new()));
+        assert_eq!(t("gcs://b/foo"), ("b".to_string(), "foo/".to_string()));
+        assert!(gcs_delete_prefix_target("gs://").is_err());
+        assert!(gcs_delete_prefix_target("s3://b/foo").is_err());
+    }
+
+    #[cfg(feature = "backend-azure")]
+    #[test]
+    fn azure_delete_prefix_lists_only_under_the_directory() {
+        let t = |u: &str| azure_delete_prefix_target(u).expect(u);
+        let want = |p: &str| ("acct".to_string(), "c".to_string(), p.to_string());
+        assert_eq!(t("az://acct/c/foo"), want("foo/"));
+        assert_eq!(t("az://acct/c/foo/"), want("foo/"));
+        assert_eq!(t("az://acct/c"), want(""));
+        assert_eq!(t("az://acct/c/"), want(""));
+        assert_eq!(t("https://acct.blob.core.windows.net/c/foo"), want("foo/"));
+        assert!(azure_delete_prefix_target("s3://b/foo").is_err());
     }
 }

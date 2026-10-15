@@ -8,12 +8,12 @@
 
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
 //use aws_sdk_s3::primitives::ByteStream;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 #[cfg(feature = "extension-module")]
 use pyo3::{FromPyObject, PyAny};
-use regex::Regex;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +35,7 @@ use tracing::{debug, info};
 use crate::config::Config;
 use crate::config::ObjectType;
 use crate::data_gen::generate_object;
+use crate::list_pattern::ListPattern;
 
 // S3 client creation
 use crate::retry::retry_get_body;
@@ -63,13 +64,24 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     parts.join(": ")
 }
 
+/// Text appended to a service error that has no parsable S3 error body, naming
+/// the HTTP status (issue #236), e.g. `" — HTTP 411 Length Required"`.
+pub(crate) fn no_error_body_status_note(status: u16) -> String {
+    match http::StatusCode::from_u16(status) {
+        Ok(sc) => match sc.canonical_reason() {
+            Some(reason) => format!(" — HTTP {status} {reason}"),
+            None => format!(" — HTTP {status}"),
+        },
+        Err(_) => format!(" — HTTP {status}"),
+    }
+}
+
 /// Format an `SdkError` from any S3 operation into a human-readable message that
 /// includes the error category, the underlying cause, and — where applicable —
 /// a concrete hint about what the user should check.
-pub(crate) fn format_sdk_error<E, R>(e: &SdkError<E, R>) -> String
+pub(crate) fn format_sdk_error<E>(e: &SdkError<E, HttpResponse>) -> String
 where
     E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
-    R: std::fmt::Debug,
 {
     match e {
         SdkError::DispatchFailure(d) => {
@@ -134,7 +146,8 @@ where
             .to_string(),
 
         SdkError::ServiceError(s) => {
-            let code = s.err().code().unwrap_or("unknown");
+            let code_opt = s.err().code();
+            let code = code_opt.unwrap_or("unknown");
             let msg = s.err().message().unwrap_or("no message");
             let hint = match code {
                 "NoSuchBucket" => " — bucket does not exist; check the bucket name in the URI",
@@ -154,7 +167,15 @@ where
                 "NoSuchKey" => " — object key does not exist",
                 _ => "",
             };
-            format!("service error: {code} ({msg}){hint}")
+            // Issue #236: when the response carried no parsable S3 error body
+            // (e.g. GCS's HTML "411 Length Required" page) the code and message
+            // are both unknown; name the HTTP status so the cause is not hidden.
+            let status_note = if code_opt.is_none() {
+                no_error_body_status_note(s.raw().status().as_u16())
+            } else {
+                String::new()
+            };
+            format!("service error: {code} ({msg}){hint}{status_note}")
         }
 
         SdkError::ResponseError(_) => {
@@ -181,10 +202,12 @@ where
 /// network failures (e.g. `azure_client.rs`, `google_gcs_client.rs`,
 /// `file_store_direct.rs`).  Those should get an equivalent helper +
 /// audit pass in a follow-up — track separately from #506.
-pub(crate) fn sdk_anyhow<E, R>(ctx: impl std::fmt::Display, e: SdkError<E, R>) -> anyhow::Error
+pub(crate) fn sdk_anyhow<E>(
+    ctx: impl std::fmt::Display,
+    e: SdkError<E, HttpResponse>,
+) -> anyhow::Error
 where
     E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
-    R: std::fmt::Debug,
 {
     anyhow::anyhow!("{}: {}", ctx, format_sdk_error(&e))
 }
@@ -203,10 +226,9 @@ pub(crate) trait SdkResultExt<T> {
     fn sdk_context(self, ctx: impl std::fmt::Display) -> anyhow::Result<T>;
 }
 
-impl<T, E, R> SdkResultExt<T> for std::result::Result<T, SdkError<E, R>>
+impl<T, E> SdkResultExt<T> for std::result::Result<T, SdkError<E, HttpResponse>>
 where
     E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
-    R: std::fmt::Debug,
 {
     fn sdk_context(self, ctx: impl std::fmt::Display) -> anyhow::Result<T> {
         self.map_err(|e| sdk_anyhow(ctx, e))
@@ -1131,119 +1153,64 @@ pub struct BucketInfo {
     pub creation_date: String,
 }
 
-/// List keys under a path, with regex matching on the final path component.
-/// Handles S3 pagination automatically.
+/// List the keys an `s3://` URI selects (issue #213; the rule is in
+/// [`crate::s3_selection`]). Handles S3 pagination automatically.
+///
+/// `path` is the whole key part of the URI: empty or ending in `/` lists everything
+/// under it; a key with no `*` selects the object with exactly that key and, when
+/// `recursive`, everything under `path/` (never `path.bak`); a key with `*` is a glob
+/// over the full key. It is never read as a regular expression.
 ///
 /// **DEPRECATED**: This S3-specific function will be removed in v1.0.0.
 /// For backend-agnostic code, use `ObjectStore::list()` via `store_for_uri()`.
-///
-/// # Migration
-/// ```ignore
-/// // Old (S3-specific):
-/// let objects = list_objects("bucket", "prefix/", true)?;
-///
-/// // New (Universal):
-/// use s3dlio::api::{store_for_uri, ObjectStore};
-/// let store = store_for_uri("s3://bucket/prefix/")?;
-/// let objects = store.list("", true, None).await?;
-/// ```
 pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<Vec<String>> {
+    list_objects_with_pattern(bucket, path, None, recursive)
+}
+
+/// [`list_objects`] narrowed by an EXPLICIT client-side regex (issue #213).
+///
+/// `prefix` is the key part of the URI (see [`list_objects`]); `pattern`, if any, is
+/// matched against each returned key relative to the listing base (see
+/// [`crate::list_pattern`]). An invalid pattern is an error before any request is sent.
+pub(crate) fn list_objects_with_pattern(
+    bucket: &str,
+    prefix: &str,
+    pattern: Option<&str>,
+    recursive: bool,
+) -> Result<Vec<String>> {
+    // Compile before anything is sent.
+    let filter = pattern.map(ListPattern::new).transpose()?;
     // Clone inputs to move them into the async block
     let bucket = bucket.to_string();
-    let path = path.to_string();
+    let prefix = prefix.to_string();
 
     // Use the new tokio runtime framework
     run_on_global_rt(async move {
-        // 1. Determine the S3 prefix and the regex pattern from the input path.
-        let (prefix, pattern) = match path.rfind('/') {
-            Some(index) => {
-                let (p, pat) = path.split_at(index + 1);
-                (p, pat)
-            }
-            None => ("", path.as_str()),
-        };
-
-        // If the pattern is empty (e.g., path ends in "/"), default to matching everything.
-        let final_pattern = if pattern.is_empty() { ".*" } else { pattern };
-
-        // Use the recursive flag as-is - don't auto-enable recursion
-        let effective_recursive = recursive;
-
-        // 2. Compile the regex.
-        let re = Regex::new(final_pattern)
-            .with_context(|| format!("Invalid regex pattern: '{}'", final_pattern))?;
-
         // NOTE: Legacy S3Ops logging call removed here (was: `let _ = build_ops_async()...`)
         // It caused all Python list() calls to hang on non-AWS endpoints (IMDSv2 timeout).
         // See docs/bugs/PYTHON_LIST_HANG_BUG_REPORT.md for full root cause analysis.
 
         let client = aws_s3_client_async().await?;
-        let mut keys = Vec::new();
-        let mut cont: Option<String> = None;
-
-        // 3. Set the delimiter for the S3 API call based on the effective recursive flag.
-        let delimiter = if effective_recursive { None } else { Some("/") };
-
         debug!(
-            "list_objects: bucket='{}', prefix='{}', pattern='{}', recursive={}, effective_recursive={}",
-            bucket, prefix, final_pattern, recursive, effective_recursive
+            "list_objects: bucket='{}', key='{}', recursive={}",
+            bucket, prefix, recursive
         );
 
-        loop {
-            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix);
-
-            if let Some(d) = delimiter {
-                req_builder = req_builder.delimiter(d);
-            }
-
-            if let Some(token) = &cont {
-                req_builder = req_builder.continuation_token(token);
-                debug!("  loop: continuation_token={:?}", cont);
-            }
-
-            let resp = req_builder
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("list_objects_v2 failed: {}", format_sdk_error(&e)))?;
-            debug!(
-                "  page received: {} contents, {} common prefixes",
-                resp.contents().len(),
-                resp.common_prefixes().len()
-            );
-
-            // 4. Filter and collect results based on the regex.
-
-            // Handle objects (files)
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    if let Some(basename) = key.strip_prefix(prefix) {
-                        if re.is_match(basename) {
-                            debug!("    matched key: '{}'", key);
-                            keys.push(key.to_string());
-                        }
-                    }
-                }
-            }
-
-            // In non-recursive mode, yield common prefixes as directory entries.
-            if !effective_recursive {
-                for common_prefix in resp.common_prefixes() {
-                    if let Some(prefix_key) = common_prefix.prefix() {
-                        debug!("    common prefix (directory): '{}'", prefix_key);
-                        keys.push(prefix_key.to_string());
-                    }
-                }
-            }
-
-            if let Some(next) = resp.next_continuation_token() {
-                cont = Some(next.to_string());
-                debug!("  next_continuation_token='{}'", cont.as_ref().unwrap());
-            } else {
-                debug!("  no more pages, breaking");
-                break;
-            }
+        let mut keys = Vec::new();
+        let mut stream = crate::s3_selection::select_key_stream(
+            client,
+            bucket.clone(),
+            &prefix,
+            recursive,
+            false,
+        );
+        while let Some(item) = stream.next().await {
+            keys.push(item?);
         }
 
+        if let Some(filter) = &filter {
+            filter.retain(&prefix, &mut keys);
+        }
         info!("list_objects result: {} total keys", keys.len());
         keys.sort(); // Sort for consistent output
         Ok(keys)
@@ -1253,6 +1220,10 @@ pub(crate) fn list_objects(bucket: &str, path: &str, recursive: bool) -> Result<
 /// Streaming version of list_objects that yields results as they arrive.
 /// Returns a stream of keys (without the s3:// prefix) for memory efficiency.
 /// Callers can format URIs as needed: format!("s3://{}/{}", bucket, key)
+///
+/// `path` is the whole key part of the URI and selects objects exactly as
+/// [`list_objects`] describes (issue #213; [`crate::s3_selection`]). An unusable key
+/// (a wildcard key ending in `/`) is the stream's first item, an `Err`.
 ///
 /// **Implementation note**: Uses an inline `async_stream::stream!` (no `tokio::spawn`)
 /// so all S3 and tracing calls run on the caller's task. This avoids the tracing-subscriber
@@ -1267,100 +1238,13 @@ pub async fn list_objects_stream(
         bucket, path, recursive
     );
 
-    // Determine the S3 prefix and regex pattern from the input path.
-    // Do this eagerly (before returning the stream) so callers get parse errors immediately.
-    let (prefix_str, pattern_str) = match path.rfind('/') {
-        Some(index) => {
-            let (p, pat) = path.split_at(index + 1);
-            (p.to_string(), pat.to_string())
-        }
-        None => (String::new(), path.clone()),
-    };
-    let final_pattern = if pattern_str.is_empty() {
-        ".*".to_string()
-    } else {
-        pattern_str
-    };
-    let re = Regex::new(&final_pattern)
-        .with_context(|| format!("Invalid regex pattern '{}'", final_pattern))?;
-
-    let delimiter = if recursive {
-        None
-    } else {
-        Some("/".to_string())
-    };
-
-    debug!(
-        "list_objects_stream: prefix='{}', pattern='{}', recursive={}, delimiter={:?}",
-        prefix_str, final_pattern, recursive, delimiter
-    );
-
-    // Build the client eagerly too — any credential errors surface before the stream starts.
+    // Build the client eagerly too -- any credential errors surface before the stream starts.
     let client = aws_s3_client_async().await?;
 
-    // Return an inline pinned stream: no tokio::spawn, runs entirely on the caller's task.
-    // This avoids tracing-subscriber deadlocks when RUST_LOG=debug/trace is set.
-    Ok(Box::pin(async_stream::stream! {
-        let mut cont: Option<String> = None;
-        let mut page_count: u32 = 0;
-        let mut total_keys: u64 = 0;
-
-        loop {
-            let mut req_builder = client.list_objects_v2().bucket(&bucket).prefix(prefix_str.as_str());
-
-            if let Some(ref d) = delimiter {
-                req_builder = req_builder.delimiter(d.as_str());
-            }
-
-            if let Some(ref token) = cont {
-                req_builder = req_builder.continuation_token(token.as_str());
-            }
-
-            let resp = match req_builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(anyhow::anyhow!("list_objects_v2 failed: {}", format_sdk_error(&e)));
-                    return;
-                }
-            };
-
-            page_count += 1;
-            debug!(
-                "  page {}: {} contents, {} common prefixes",
-                page_count, resp.contents().len(), resp.common_prefixes().len()
-            );
-
-            // Yield matching objects from this page.
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    if let Some(basename) = key.strip_prefix(prefix_str.as_str()) {
-                        if re.is_match(basename) {
-                            yield Ok(key.to_string());
-                        }
-                    }
-                }
-            }
-
-            // In non-recursive mode, yield common prefixes as directory entries.
-            if !recursive {
-                for common_prefix in resp.common_prefixes() {
-                    if let Some(prefix_key) = common_prefix.prefix() {
-                        debug!("    common prefix (directory): '{}'", prefix_key);
-                        yield Ok(prefix_key.to_string());
-                    }
-                }
-            }
-
-            total_keys += resp.contents().len() as u64;
-
-            if let Some(next) = resp.next_continuation_token() {
-                cont = Some(next.to_string());
-            } else {
-                debug!("  list_objects_stream done: {} pages, {} total keys streamed", page_count, total_keys);
-                break;
-            }
-        }
-    }))
+    // The selection runs on the caller's task: no tokio::spawn (see the note above).
+    Ok(crate::s3_selection::select_key_stream(
+        client, bucket, &path, recursive, false,
+    ))
 }
 
 /// NEW: Async GET by byte-range on full s3:// URI.
@@ -1419,6 +1303,26 @@ pub(crate) async fn get_object_range_async(
     }
 
     let client = aws_s3_client_async().await?;
+    get_object_range_with_client(&client, bucket, key, offset, length).await
+}
+
+/// [`get_object_range_async`] on a caller-chosen client (issue #208): a
+/// per-endpoint store passes ITS client, so the read goes to the store's own
+/// server, never to the process-wide one.  `get_object_range_async` is this
+/// with the process-wide client.
+pub(crate) async fn get_object_range_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Bytes> {
+    // The same zero-length contract as `get_object_range_async`, for a caller
+    // that reaches this function directly.
+    if length == Some(0) {
+        return Ok(Bytes::new());
+    }
+
     let mut range = format!("bytes={}-", offset);
     if let Some(len) = length {
         if len > 0 {
@@ -1541,6 +1445,36 @@ pub fn get_range(bucket: &str, key: &str, offset: u64, length: Option<u64>) -> R
 // Concurrent Range GET Operations (Phase 1 Optimization)
 // -----------------------------------------------------------------------------
 
+/// Issue #211: an explicit `chunk_size` of 0 never advances the range-splitting
+/// loop, which would push ranges forever (unbounded memory).  Refuse it before
+/// any request is made; `None` still means "pick the optimal size".
+fn require_chunk_size_at_least_one(chunk_size: Option<usize>) -> Result<()> {
+    if chunk_size == Some(0) {
+        bail!(
+            "chunk_size must be an integer >= 1 (valid range: 1 or more), got 0: \
+             a chunk of 0 bytes can never cover the requested range"
+        );
+    }
+    Ok(())
+}
+
+/// Issue #211: the caller limits of a concurrent range GET.  An explicit
+/// `max_concurrency` of `Some(0)` and an explicit `chunk_size` of `Some(0)` are
+/// errors naming the parameter; `None` still means "pick the optimal value".
+///
+/// Every route into the range engine calls this BEFORE it builds a client or sends
+/// a request: the public wrapper, [`get_object_concurrent_range_with_client`] (used
+/// by a per-endpoint store, issue #208) and `S3ObjectStore::get_range_optimized`.
+pub(crate) fn require_concurrent_range_limits(
+    chunk_size: Option<usize>,
+    max_concurrency: Option<usize>,
+) -> Result<()> {
+    if let Some(n) = max_concurrency {
+        crate::concurrency::require_concurrency_at_least_one("max_concurrency", n)?;
+    }
+    require_chunk_size_at_least_one(chunk_size)
+}
+
 /// High-performance concurrent range GET for large objects.
 /// Automatically determines optimal chunk size and concurrency based on object size.
 /// Uses pre-allocated buffers and concurrent range requests for maximum throughput.
@@ -1562,17 +1496,57 @@ pub async fn get_object_concurrent_range_async(
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
 ) -> Result<Bytes> {
+    // Issue #211: an explicit limit of 0 would hang a large-object GET; refuse
+    // it up front, before any client is built, whatever the object size turns out
+    // to be.
+    require_concurrent_range_limits(chunk_size, max_concurrency)?;
     let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET concurrent range: no key specified");
     }
 
-    // Get object size first
     let client = aws_s3_client_async().await?;
+    get_object_concurrent_range_with_client(
+        &client,
+        &bucket,
+        &key,
+        offset,
+        length,
+        chunk_size,
+        max_concurrency,
+    )
+    .await
+}
+
+/// [`get_object_concurrent_range_async`] on a caller-chosen client and an
+/// already-parsed `(bucket, key)` (issue #208).
+///
+/// A per-endpoint store passes ITS client, so the size lookup, the single-range
+/// fallback and every concurrent ranged GET go to the store's own server -- the
+/// same server whatever the object size.  Nothing here consults the process-wide
+/// client; `get_object_concurrent_range_async` is this with that client.
+pub(crate) async fn get_object_concurrent_range_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: Option<u64>,
+    chunk_size: Option<usize>,
+    max_concurrency: Option<usize>,
+) -> Result<Bytes> {
+    // Issue #211 (and #208, which made this the per-endpoint store's entry): the
+    // limits are validated here too, so a caller that holds its own client cannot
+    // reach the range-splitting loop with a 0.
+    require_concurrent_range_limits(chunk_size, max_concurrency)?;
+    if key.is_empty() {
+        bail!("Cannot GET concurrent range: no key specified");
+    }
+
+    // Get object size first
     let head_resp = client
         .head_object()
-        .bucket(&bucket)
-        .key(&key)
+        .bucket(bucket)
+        .key(key)
         .send()
         .await
         .sdk_context(format!(
@@ -1616,7 +1590,11 @@ pub async fn get_object_concurrent_range_async(
     // Use single request for small objects
     if total_bytes <= effective_chunk_size as u64 {
         debug!("Using single range request for {} bytes", total_bytes);
-        return get_object_range_uri_async(uri, start_offset, Some(total_bytes)).await;
+        // Straight to the bucket/key core on THIS client: a re-built `s3://` URI
+        // would be re-parsed (a dotted or IP-shaped bucket misread as a host) and
+        // sent through the process-wide client (issue #208).
+        return get_object_range_with_client(client, bucket, key, start_offset, Some(total_bytes))
+            .await;
     }
 
     // Use concurrent ranges for large objects
@@ -1629,9 +1607,9 @@ pub async fn get_object_concurrent_range_async(
     );
 
     concurrent_range_get_impl(
-        &client,
-        &bucket,
-        &key,
+        client,
+        bucket,
+        key,
         start_offset,
         end_offset,
         effective_chunk_size,
@@ -1984,64 +1962,29 @@ pub async fn stat_object_uri_async(uri: &str) -> Result<ObjectStat> {
     stat_object(&bucket, &key).await
 }
 
-/// Stream the URIs (`s3://bucket/key`) of the REAL objects whose key starts
-/// with the literal `prefix`: no delimiter (so the server never answers with
-/// `CommonPrefixes`), no regex, no key rewriting.  Only the `Contents` entries
-/// of each page are yielded -- synthetic entries are never recognised by shape
-/// (a real object may end in `/` and have size 0), they simply never appear.
+/// Stream the URIs (`s3://bucket/key`) of the REAL objects the key part `key`
+/// selects, recursively (issue #213; the rule is in [`crate::s3_selection`]): a key
+/// with no `*` that does not end in `/` selects that exact object and everything under
+/// `key/` -- never `key.bak`; a key ending in `/` (or empty) selects everything under
+/// it; a key with `*` is a glob over the full key.
+///
+/// There is no delimiter (so the server never answers with `CommonPrefixes`), no
+/// regex, no key rewriting. Only objects are yielded -- synthetic entries are never
+/// recognised by shape (a real object may end in `/` and have size 0), they simply
+/// never appear.
 ///
 /// A truncated page without a continuation token is an error, never a silently
 /// short listing.
 pub(crate) fn list_object_uris_with_prefix_stream(
     client: aws_sdk_s3::Client,
     bucket: String,
-    prefix: String,
+    key: String,
 ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
-    Box::pin(async_stream::stream! {
-        let mut cont: Option<String> = None;
-        loop {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(bucket.as_str())
-                .prefix(prefix.as_str());
-            if let Some(ref token) = cont {
-                req = req.continuation_token(token.as_str());
-            }
-            let resp = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(anyhow::anyhow!(
-                        "list_objects_v2 failed for bucket '{}' prefix '{}': {}",
-                        bucket,
-                        prefix,
-                        format_sdk_error(&e)
-                    ));
-                    return;
-                }
-            };
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    yield Ok(format!("s3://{bucket}/{key}"));
-                }
-            }
-            if resp.is_truncated().unwrap_or(false) {
-                match resp.next_continuation_token() {
-                    Some(next) => cont = Some(next.to_string()),
-                    None => {
-                        yield Err(anyhow::anyhow!(
-                            "list_objects_v2 for bucket '{}' prefix '{}' was truncated but gave \
-                             no continuation token; the listing is incomplete",
-                            bucket,
-                            prefix
-                        ));
-                        return;
-                    }
-                }
-            } else {
-                return;
-            }
-        }
-    })
+    let uri_bucket = bucket.clone();
+    Box::pin(
+        crate::s3_selection::select_key_stream(client, bucket, &key, true, true)
+            .map(move |item| item.map(|k| format!("s3://{uri_bucket}/{k}"))),
+    )
 }
 
 /*
@@ -2278,6 +2221,8 @@ pub fn get_object_uri(uri: &str) -> anyhow::Result<Bytes> {
 ///   On subsequent epochs the cache is already warm; zero HEADs issued.
 /// - O(N log N) sort: replaced O(N²) linear scan with a pre-built HashMap index.
 pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec<(String, Bytes)>> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Issue #197: refuse the whole batch up front if any URI names another server.
     crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec();
@@ -2395,6 +2340,8 @@ pub fn get_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<Vec<(String, Bytes)>> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Issue #197: refuse the whole batch up front if any URI names another server.
     crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec(); // own for 'static
@@ -2558,6 +2505,7 @@ async fn get_object_with_known_size_async(
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
 ) -> Result<Bytes> {
+    require_chunk_size_at_least_one(chunk_size)?;
     let start_offset = offset;
     let end_offset = match length {
         Some(len) => std::cmp::min(start_offset + len, object_size),
@@ -2630,6 +2578,8 @@ pub fn put_objects_with_random_data_and_type_with_progress(
     config: Config,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<()> {
+    // Issue #211: a limit of 0 would hang; refuse it before generating data.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     info!(
         "put_objects: type={:?}, size={} bytes, uris={} parallelism={}",
         config.object_type,
@@ -2693,8 +2643,51 @@ pub async fn put_object_multipart_uri_async(
         data.len(),
         part_size
     );
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
+    put_object_multipart_on(None, bucket, key, data, part_size).await
+}
+
+/// Multipart upload of `data` to `bucket`/`key` on a caller-chosen client
+/// (issue #208).
+///
+/// A per-endpoint store passes ITS client.  The sink keeps that client for the
+/// whole upload, so CreateMultipartUpload, every UploadPart, CompleteMultipartUpload
+/// and -- when the upload fails or is dropped unfinished -- AbortMultipartUpload all
+/// go to the one server that holds the upload.
+pub(crate) async fn put_object_multipart_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    data: Bytes,
+    part_size: Option<usize>,
+) -> Result<()> {
+    debug!(
+        "put_object_multipart_with_client: s3://{}/{}, {} bytes, part_size={:?}",
+        bucket,
+        key,
+        data.len(),
+        part_size
+    );
+    put_object_multipart_on(
+        Some(client.clone()),
+        bucket.to_string(),
+        key.to_string(),
+        data,
+        part_size,
+    )
+    .await
+}
+
+/// The one multipart-upload driver.  `client` is the client to upload with;
+/// `None` is the process-wide client (resolved by the sink's own constructor).
+async fn put_object_multipart_on(
+    client: Option<aws_sdk_s3::Client>,
+    bucket: String,
+    key: String,
+    data: Bytes,
+    part_size: Option<usize>,
+) -> Result<()> {
     use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
-    let uri_owned = uri.to_string();
     let cfg = MultipartUploadConfig {
         part_size: part_size.unwrap_or(16 * 1024 * 1024), // 16 MiB default
         ..Default::default()
@@ -2704,7 +2697,10 @@ pub async fn put_object_multipart_uri_async(
     // Without this, objects larger than max_in_flight × part_size panic because
     // blocking_send() on a full channel would stall a worker.
     tokio::task::spawn_blocking(move || {
-        let mut sink = MultipartUploadSink::from_uri(&uri_owned, cfg)?;
+        let mut sink = match client {
+            Some(client) => MultipartUploadSink::new_with_client(client, &bucket, &key, cfg)?,
+            None => MultipartUploadSink::new(&bucket, &key, cfg)?,
+        };
         sink.write_blocking(&data)?;
         sink.finish_blocking()?;
         Ok::<(), anyhow::Error>(())
@@ -2736,6 +2732,8 @@ pub(crate) fn put_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> anyhow::Result<()> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Get the global logger once, outside the async block
     let logger = global_logger();
 
@@ -3168,6 +3166,19 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
+    fn issue236_no_error_body_status_note_names_the_http_status() {
+        assert_eq!(
+            no_error_body_status_note(411),
+            " — HTTP 411 Length Required"
+        );
+        assert_eq!(
+            no_error_body_status_note(503),
+            " — HTTP 503 Service Unavailable"
+        );
+        assert_eq!(no_error_body_status_note(599), " — HTTP 599");
+    }
+
+    #[test]
     fn test_sdk_anyhow_keeps_context_in_top_message() {
         // We do not need a real SdkError to exercise the helper's shape:
         // construct an anyhow::Error via the same anyhow! macro the helper
@@ -3375,5 +3386,146 @@ mod tests {
             arn.contains("ARN") && arn.contains("not supported"),
             "{arn}"
         );
+    }
+    // -------------------------------------------------------------------------
+    // Issue #211: chunk_size = Some(0) must be rejected before any request
+    // -------------------------------------------------------------------------
+
+    /// Drive `fut` on its own thread and runtime and wait a bounded time.  The
+    /// range-splitting loop is synchronous, so a task timeout could not stop
+    /// it; a separate thread lets the test report "did not return" instead of
+    /// freezing.  `None` = no answer in time.
+    fn run_bounded_chunk<T: Send + 'static>(
+        make: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>
+            + Send
+            + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let _ = tx.send(rt.block_on(make()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    }
+
+    fn assert_chunk_size_rejected(what: &str, got: Option<Result<Bytes>>) {
+        let res = got.unwrap_or_else(|| {
+            panic!("{what}: did not return with chunk_size Some(0) (loops forever)")
+        });
+        let msg = format!(
+            "{:#}",
+            res.expect_err("chunk_size Some(0) must be an error")
+        );
+        assert!(msg.contains("chunk_size"), "{what}: {msg}");
+        assert!(msg.contains(">= 1"), "{what}: {msg}");
+    }
+
+    #[test]
+    fn concurrent_range_async_rejects_chunk_size_zero() {
+        let got = run_bounded_chunk(|| {
+            Box::pin(get_object_concurrent_range_async(
+                "s3://b/k",
+                0,
+                None,
+                Some(0),
+                None,
+            ))
+        });
+        assert_chunk_size_rejected("get_object_concurrent_range_async", got);
+    }
+
+    #[test]
+    fn concurrent_range_sync_rejects_chunk_size_zero() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(get_object_concurrent_range(
+                "s3://b/k",
+                0,
+                None,
+                Some(0),
+                None,
+            ));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).ok();
+        assert_chunk_size_rejected("get_object_concurrent_range", got);
+    }
+
+    #[test]
+    fn known_size_get_rejects_chunk_size_zero() {
+        // The object is known to be 4096 bytes, so no HEAD is needed and the
+        // split loop is reached at once on an unguarded build.
+        let got = run_bounded_chunk(|| {
+            Box::pin(get_object_with_known_size_async(
+                "b",
+                "k",
+                4096,
+                0,
+                None,
+                Some(0),
+                None,
+            ))
+        });
+        assert_chunk_size_rejected("get_object_with_known_size_async", got);
+    }
+
+    #[test]
+    fn chunk_size_none_and_positive_are_accepted() {
+        assert!(require_chunk_size_at_least_one(None).is_ok());
+        assert!(require_chunk_size_at_least_one(Some(1)).is_ok());
+        assert!(require_chunk_size_at_least_one(Some(8 * 1024 * 1024)).is_ok());
+    }
+
+    /// A client that cannot reach anything (nothing listens on port 1): if a zero limit were
+    /// not refused before the HEAD, the error would be a connection failure, which names
+    /// neither the parameter nor `>= 1`.
+    fn offline_client() -> aws_sdk_s3::Client {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_config::BehaviorVersion::v2026_01_12())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "a", "b", None, None, "test",
+            ))
+            .endpoint_url("http://127.0.0.1:1")
+            .force_path_style(true)
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    }
+
+    /// Issue #211 / #208: the per-endpoint entry validates its own limits.
+    #[test]
+    fn concurrent_range_with_client_rejects_zero_limits() {
+        for (chunk, conc, param) in [
+            (None, Some(0usize), "max_concurrency"),
+            (Some(0usize), None, "chunk_size"),
+            (Some(0), Some(0), "max_concurrency"),
+        ] {
+            let got = run_bounded_chunk(move || {
+                Box::pin(async move {
+                    get_object_concurrent_range_with_client(
+                        &offline_client(),
+                        "b",
+                        "k",
+                        0,
+                        None,
+                        chunk,
+                        conc,
+                    )
+                    .await
+                })
+            });
+            let res = got.unwrap_or_else(|| panic!("{param}: did not return (hang)"));
+            let msg = format!("{:#}", res.expect_err("a limit of 0 must be an error"));
+            assert!(msg.contains(param), "{msg}");
+            assert!(msg.contains(">= 1"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn concurrent_range_limits_accept_none_and_positive() {
+        assert!(require_concurrent_range_limits(None, None).is_ok());
+        assert!(require_concurrent_range_limits(Some(1), Some(1)).is_ok());
     }
 }
