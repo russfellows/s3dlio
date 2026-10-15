@@ -25,6 +25,11 @@ np = pytest.importorskip("numpy")
 
 MIB = 1024 * 1024
 PAYLOAD_MIB = 256
+# QUIET-HOST bound: the stall tests assert that another Python thread is never delayed by more
+# than this while a 256 MiB put runs. Measured stalls are 1-3 ms; a copy under the GIL is
+# 150-300 ms. On a busy host (other builds, CI neighbours) scheduler noise alone can exceed
+# 50 ms, so run these on a quiet host; a failure that shows a stall of a few tens of ms with no
+# RSS growth is host noise, a stall of 150 ms or more is the bug.
 MAX_STALL_SECONDS = 0.050
 MAX_RSS_GROWTH_FRACTION = 0.25
 MIN_RSS_GROWTH_FRACTION = 0.8  # a snapshot copy is visible as ~1.0x
@@ -126,6 +131,29 @@ def work_dir():
     base = os.environ.get("S3DLIO_TEST_DIR") or None
     with tempfile.TemporaryDirectory(dir=base) as d:
         yield d
+
+
+def _odirect_supported(directory):
+    """True when `directory` is on a filesystem that accepts O_DIRECT (not tmpfs)."""
+    flag = getattr(os, "O_DIRECT", None)
+    if flag is None:
+        return False
+    path = os.path.join(directory, ".odirect_probe")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | flag, 0o600)
+    except OSError:
+        return False
+    os.close(fd)
+    os.unlink(path)
+    return True
+
+
+def require_odirect(directory):
+    if not _odirect_supported(directory):
+        pytest.skip(
+            f"{directory} does not support O_DIRECT (tmpfs?); set S3DLIO_TEST_DIR to a "
+            "directory on a real filesystem"
+        )
 
 
 # --- item 1: any item type is zero-copy and does not stall other threads -----------------
@@ -234,6 +262,8 @@ async def _aput(uri, payload, **kw):
 @pytest.mark.parametrize("scheme", ["file", "direct"])
 @pytest.mark.parametrize("size", SIZES)
 def test_roundtrip_every_exporter_and_mode(work_dir, scheme, size):
+    if scheme == "direct":
+        require_odirect(work_dir)
     raw = _pattern(size)
     for name, payload, expected in _exporters(raw):
         uri = f"{scheme}://{work_dir}/rt-{name}-{size}.bin"
@@ -287,6 +317,7 @@ def test_borrow_is_keyword_only(work_dir):
 
 
 def test_direct_get_result_is_page_aligned(work_dir):
+    require_odirect(work_dir)
     raw = _pattern(8 * MIB + 5)
     uri = f"direct://{work_dir}/g.bin"
     s3dlio.put_bytes(uri, raw)
@@ -298,3 +329,34 @@ def test_direct_get_result_is_page_aligned(work_dir):
     uri2 = f"direct://{work_dir}/g2.bin"
     s3dlio.put_bytes(uri2, view)
     assert _readback(uri2) == raw
+
+
+# --- buffers of Python objects / pointers are refused ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "make", [lambda: (ctypes.c_void_p * 8)(), lambda: (ctypes.py_object * 2)()]
+)
+def test_arrays_of_pointers_or_objects_are_refused(work_dir, make):
+    payload = make()
+    uri = f"file://{work_dir}/p.bin"
+    with pytest.raises(TypeError, match="Python objects or pointers"):
+        s3dlio.put_bytes(uri, payload)
+    for kw in ({}, {"borrow": True}):
+        with pytest.raises(TypeError, match="Python objects or pointers"):
+            asyncio.run(_aput(uri, payload, **kw))
+    assert not os.path.exists(f"{work_dir}/p.bin")
+
+
+def test_small_default_async_snapshot_is_independent(work_dir):
+    # below the GIL-held copy threshold (256 KiB): still a true snapshot
+    ba = bytearray(b"a" * 1000)
+
+    async def go():
+        aw = s3dlio.put_bytes_async(f"file://{work_dir}/s.bin", ba)
+        ba[:] = b"b" * 1000
+        ba.extend(b"more")
+        await aw
+
+    asyncio.run(go())
+    assert _readback(f"file://{work_dir}/s.bin") == b"a" * 1000

@@ -77,6 +77,15 @@ unsafe impl GlobalAlloc for PeakAlloc {
 #[global_allocator]
 static ALLOC: PeakAlloc = PeakAlloc::new();
 
+/// O_DIRECT config WITHOUT the pre-allocating range-read buffer pool: `direct_io()` spawns a task
+/// that allocates 32 x 64 MiB in the background, which the peak-memory measurement must not see.
+fn direct_config() -> FileSystemConfig {
+    FileSystemConfig {
+        direct_io: true,
+        ..FileSystemConfig::default()
+    }
+}
+
 struct AlignedOwner(s3dlio::memory::AlignedBuf);
 impl AsRef<[u8]> for AlignedOwner {
     fn as_ref(&self) -> &[u8] {
@@ -89,22 +98,19 @@ static SERIAL: Mutex<()> = Mutex::const_new(());
 const MIB: usize = 1024 * 1024;
 /// file:// writes straight from the caller's `Bytes`: no allocation proportional to it.
 const FILE_PAYLOAD: usize = 64 * MIB;
-/// direct:// copies an UNALIGNED source ONCE, into an aligned bounce buffer (sized to the
-/// object, capped at 1 GiB), never twice; a page-aligned source is written in place.
-const DIRECT_PAYLOAD: usize = 128 * MIB;
+/// direct:// copies an UNALIGNED source ONCE, through the shared warm bounce pool, never twice
+/// and never into an object-sized buffer: the extra memory is the pool (one pair of
+/// `direct_io_bounce_size()` buffers per NUMA node). The payload is far larger than the pool so a
+/// full copy cannot hide under the allowance.
+const DIRECT_PAYLOAD: usize = 512 * MIB;
 /// Bookkeeping slack on top of the allowed buffers.
 const SLACK: usize = 8 * MIB;
 
-fn scratch_dir() -> tempfile::TempDir {
-    // O_DIRECT is unsupported on tmpfs: S3DLIO_TEST_DIR (a real filesystem) or the cargo target dir.
-    let base = std::env::var_os("S3DLIO_TEST_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| env!("CARGO_TARGET_TMPDIR").into());
-    std::fs::create_dir_all(&base).unwrap();
-    tempfile::Builder::new()
-        .prefix("put-no-copy-238-")
-        .tempdir_in(base)
-        .expect("temp dir")
+#[path = "common/odirect.rs"]
+mod odirect;
+
+fn scratch_dir() -> Option<tempfile::TempDir> {
+    odirect::odirect_scratch_dir("put-no-copy-238-")
 }
 
 async fn assert_put_does_not_copy(
@@ -115,7 +121,7 @@ async fn assert_put_does_not_copy(
     page_aligned: bool,
 ) {
     let _guard = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let uri = format!("{scheme}://{}/obj.bin", dir.path().display());
     let data = if page_aligned {
         let mut buf = s3dlio::memory::AlignedBuf::new(payload, 4096).unwrap();
@@ -149,14 +155,15 @@ async fn file_put_makes_no_owned_copy() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_put_of_an_unaligned_source_makes_exactly_one_copy() {
-    let store = ConfigurableFileSystemObjectStore::new(FileSystemConfig::direct_io());
-    // One bounce buffer the size of the object (+ slack), not two copies.
-    assert_put_does_not_copy(&store, "direct", DIRECT_PAYLOAD, DIRECT_PAYLOAD, false).await;
+async fn direct_put_of_an_unaligned_source_uses_only_the_bounded_pool() {
+    let store = ConfigurableFileSystemObjectStore::new(direct_config());
+    // The pool of this node: 2 buffers (one ping-pong pair) of the configured size.
+    let pool = 2 * s3dlio::constants::direct_io_bounce_size();
+    assert_put_does_not_copy(&store, "direct", DIRECT_PAYLOAD, pool, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_put_of_a_page_aligned_source_makes_no_copy() {
-    let store = ConfigurableFileSystemObjectStore::new(FileSystemConfig::direct_io());
+    let store = ConfigurableFileSystemObjectStore::new(direct_config());
     assert_put_does_not_copy(&store, "direct", DIRECT_PAYLOAD, 0, true).await;
 }

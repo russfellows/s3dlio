@@ -25,16 +25,11 @@ static SERIAL: Mutex<()> = Mutex::const_new(());
 const MIB: usize = 1024 * 1024;
 const ALIGN: usize = 4096;
 
-fn scratch_dir() -> tempfile::TempDir {
-    // O_DIRECT is unsupported on tmpfs: S3DLIO_TEST_DIR (a real filesystem) or the cargo target dir.
-    let base = std::env::var_os("S3DLIO_TEST_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| env!("CARGO_TARGET_TMPDIR").into());
-    std::fs::create_dir_all(&base).unwrap();
-    tempfile::Builder::new()
-        .prefix("direct-chunking-244-")
-        .tempdir_in(base)
-        .expect("temp dir")
+#[path = "common/odirect.rs"]
+mod odirect;
+
+fn scratch_dir() -> Option<tempfile::TempDir> {
+    odirect::odirect_scratch_dir("direct-chunking-244-")
 }
 
 fn store() -> ConfigurableFileSystemObjectStore {
@@ -85,7 +80,7 @@ fn aligned_bytes(raw: &[u8]) -> Bytes {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn put_and_get_use_few_large_system_calls() {
     let _g = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let s = store();
     assert!(
         ConfigurableFileSystemObjectStore::test_direct_io_support(dir.path()).await,
@@ -156,7 +151,7 @@ async fn put_and_get_use_few_large_system_calls() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn roundtrip_size_matrix_on_a_real_filesystem() {
     let _g = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let s = store();
     for len in [0usize, 1, 4095, 4096, 4097, MIB + 3, 33 * MIB] {
         let raw = pattern(len);
@@ -177,7 +172,7 @@ async fn roundtrip_size_matrix_on_a_real_filesystem() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn put_multipart_with_an_unaligned_part_size_has_no_padding_inside() {
     let _g = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let s = store();
     let raw = pattern(3 * MIB + 17);
     let uri = format!("direct://{}/mp.bin", dir.path().display());
@@ -205,7 +200,7 @@ async fn put_multipart_with_an_unaligned_part_size_has_no_padding_inside() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn throughput_sanity_256_mib_put() {
     let _g = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let s = store();
     let data = Bytes::from(vec![0x5Au8; 256 * MIB]);
     let uri = format!("direct://{}/t.bin", dir.path().display());
@@ -223,7 +218,7 @@ async fn throughput_sanity_256_mib_put() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_result_is_page_aligned_and_reput_is_a_single_write() {
     let _g = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let s = store();
     let len = 64 * MIB + 4093;
     let raw = pattern(len);
@@ -253,7 +248,7 @@ async fn get_result_is_page_aligned_and_reput_is_a_single_write() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_of_tiny_and_empty_objects() {
     let _g = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let s = store();
     for len in [0usize, 1, 100, 4095] {
         let uri = format!("direct://{}/t-{len}.bin", dir.path().display());

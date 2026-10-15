@@ -25,6 +25,8 @@ MIB = 1024 * 1024
 PAYLOAD_MIB = 256
 # A memcpy of 256 MiB while holding the GIL stalls the other thread for ~150-300 ms.
 # Without the copy the other thread is only delayed by scheduler noise.
+# QUIET-HOST bound (see test_put_bytes_zero_copy_238.py): measured stalls are 1-3 ms, a copy under
+# the GIL is 150-300 ms; on a busy host scheduler noise alone can exceed 50 ms.
 MAX_STALL_SECONDS = 0.050
 # Peak RSS may grow by at most this fraction of the payload during a blocking put
 # (the bug made it grow by 1.0x for file://, one copy in put_bytes and one in the store).
@@ -188,9 +190,24 @@ def _readback(uri):
     return bytes(memoryview(s3dlio.get(uri)))
 
 
+def _skip_without_odirect(work_dir, scheme):
+    if scheme == "direct":
+        flag = getattr(os, "O_DIRECT", 0)
+        try:
+            fd = os.open(
+                os.path.join(work_dir, ".probe"), os.O_WRONLY | os.O_CREAT | flag
+            )
+            os.close(fd)
+        except OSError:
+            pytest.skip(
+                f"{work_dir} does not support O_DIRECT (tmpfs?); set S3DLIO_TEST_DIR to a real filesystem"
+            )
+
+
 @pytest.mark.parametrize("scheme", ["file", "direct"])
 @pytest.mark.parametrize("size", SIZES)
 def test_roundtrip_every_exporter(work_dir, scheme, size):
+    _skip_without_odirect(work_dir, scheme)
     raw = _pattern(size)
     for name, payload in _exporters(raw):
         uri = f"{scheme}://{work_dir}/rt-{name}-{size}.bin"
@@ -201,6 +218,7 @@ def test_roundtrip_every_exporter(work_dir, scheme, size):
 @pytest.mark.parametrize("scheme", ["file", "direct"])
 @pytest.mark.parametrize("size", SIZES)
 def test_roundtrip_bytesview_and_async(work_dir, scheme, size):
+    _skip_without_odirect(work_dir, scheme)
     raw = _pattern(size)
     seed = f"file://{work_dir}/seed-{size}.bin"
     s3dlio.put_bytes(seed, raw)

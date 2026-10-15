@@ -23,6 +23,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 const SLOTS: usize = 1 << 14;
+/// Marks a freed slot: the probe chain through it continues (a plain 0 would end the chain
+/// and hide later entries); `record` may reuse it.
+const TOMBSTONE: usize = usize::MAX;
 const OVER_ALIGNED: usize = 64;
 const BIG: usize = 1024 * 1024;
 
@@ -60,9 +63,11 @@ impl Tracking {
             let start = (ptr as usize >> 6) % SLOTS;
             for i in 0..SLOTS {
                 let slot = (start + i) % SLOTS;
-                if self.ptrs[slot]
-                    .compare_exchange(0, ptr as usize, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
+                let cur = self.ptrs[slot].load(Ordering::Acquire);
+                if (cur == 0 || cur == TOMBSTONE)
+                    && self.ptrs[slot]
+                        .compare_exchange(cur, ptr as usize, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
                 {
                     self.aligns[slot].store(layout.align(), Ordering::Release);
                     return;
@@ -81,7 +86,7 @@ impl Tracking {
                 if self.aligns[slot].load(Ordering::Acquire) != layout.align() {
                     self.mismatches.fetch_add(1, Ordering::Relaxed);
                 }
-                self.ptrs[slot].store(0, Ordering::Release);
+                self.ptrs[slot].store(TOMBSTONE, Ordering::Release);
                 return;
             }
             if p == 0 {
@@ -131,15 +136,11 @@ static SERIAL: Mutex<()> = Mutex::const_new(());
 const MIB: usize = 1024 * 1024;
 const ALIGN: usize = 4096;
 
-fn scratch_dir() -> tempfile::TempDir {
-    let base = std::env::var_os("S3DLIO_TEST_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| env!("CARGO_TARGET_TMPDIR").into());
-    std::fs::create_dir_all(&base).unwrap();
-    tempfile::Builder::new()
-        .prefix("direct-writer-248-249-")
-        .tempdir_in(base)
-        .expect("temp dir")
+#[path = "common/odirect.rs"]
+mod odirect;
+
+fn scratch_dir() -> Option<tempfile::TempDir> {
+    odirect::odirect_scratch_dir("direct-writer-248-249-")
 }
 
 fn syscw() -> u64 {
@@ -148,6 +149,16 @@ fn syscw() -> u64 {
         .find_map(|l| l.strip_prefix("syscw:"))
         .and_then(|v| v.trim().parse().ok())
         .expect("syscw")
+}
+
+/// O_DIRECT config WITHOUT the pre-allocating range-read buffer pool: `FileSystemConfig::direct_io()`
+/// spawns a task that allocates 32 x 64 MiB in the background, which these allocation counts must
+/// not see.
+fn direct_config() -> FileSystemConfig {
+    FileSystemConfig {
+        direct_io: true,
+        ..FileSystemConfig::default()
+    }
 }
 
 fn aligned_chunk(len: usize, fill: u8) -> AlignedBuf {
@@ -159,12 +170,12 @@ fn aligned_chunk(len: usize, fill: u8) -> AlignedBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn writer_frees_every_aligned_allocation_with_its_own_layout() {
     let _g = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let path = dir.path().join("w.bin");
     let before = ALLOC.mismatches.load(Ordering::Relaxed);
     {
         let mut w = Box::new(
-            DirectIOWriter::new(path.clone(), FileSystemConfig::direct_io())
+            DirectIOWriter::new(path.clone(), direct_config())
                 .await
                 .unwrap(),
         );
@@ -178,7 +189,7 @@ async fn writer_frees_every_aligned_allocation_with_its_own_layout() {
     // Also a writer that is dropped after cancel.
     {
         let mut w = Box::new(
-            DirectIOWriter::new(dir.path().join("c.bin"), FileSystemConfig::direct_io())
+            DirectIOWriter::new(dir.path().join("c.bin"), direct_config())
                 .await
                 .unwrap(),
         );
@@ -195,12 +206,12 @@ async fn writer_frees_every_aligned_allocation_with_its_own_layout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_aligned_chunks_are_written_without_any_copy() {
     let _g = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let path = dir.path().join("w.bin");
     let chunk = aligned_chunk(64 * MIB, 0xAB);
 
     let mut w = Box::new(
-        DirectIOWriter::new(path.clone(), FileSystemConfig::direct_io())
+        DirectIOWriter::new(path.clone(), direct_config())
             .await
             .unwrap(),
     );
@@ -226,11 +237,11 @@ async fn page_aligned_chunks_are_written_without_any_copy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unaligned_chunks_make_no_per_chunk_copy() {
     let _g = SERIAL.lock().await;
-    let dir = scratch_dir();
+    let Some(dir) = scratch_dir() else { return };
     let path = dir.path().join("w.bin");
     let data = Bytes::from(vec![0x5Au8; 16 * MIB]);
     let mut w = Box::new(
-        DirectIOWriter::new(path.clone(), FileSystemConfig::direct_io())
+        DirectIOWriter::new(path.clone(), direct_config())
             .await
             .unwrap(),
     );
