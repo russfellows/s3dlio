@@ -8,6 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
 //use aws_sdk_s3::primitives::ByteStream;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
@@ -63,13 +64,24 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     parts.join(": ")
 }
 
+/// Text appended to a service error that has no parsable S3 error body, naming
+/// the HTTP status (issue #236), e.g. `" — HTTP 411 Length Required"`.
+pub(crate) fn no_error_body_status_note(status: u16) -> String {
+    match http::StatusCode::from_u16(status) {
+        Ok(sc) => match sc.canonical_reason() {
+            Some(reason) => format!(" — HTTP {status} {reason}"),
+            None => format!(" — HTTP {status}"),
+        },
+        Err(_) => format!(" — HTTP {status}"),
+    }
+}
+
 /// Format an `SdkError` from any S3 operation into a human-readable message that
 /// includes the error category, the underlying cause, and — where applicable —
 /// a concrete hint about what the user should check.
-pub(crate) fn format_sdk_error<E, R>(e: &SdkError<E, R>) -> String
+pub(crate) fn format_sdk_error<E>(e: &SdkError<E, HttpResponse>) -> String
 where
     E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
-    R: std::fmt::Debug,
 {
     match e {
         SdkError::DispatchFailure(d) => {
@@ -134,7 +146,8 @@ where
             .to_string(),
 
         SdkError::ServiceError(s) => {
-            let code = s.err().code().unwrap_or("unknown");
+            let code_opt = s.err().code();
+            let code = code_opt.unwrap_or("unknown");
             let msg = s.err().message().unwrap_or("no message");
             let hint = match code {
                 "NoSuchBucket" => " — bucket does not exist; check the bucket name in the URI",
@@ -154,7 +167,15 @@ where
                 "NoSuchKey" => " — object key does not exist",
                 _ => "",
             };
-            format!("service error: {code} ({msg}){hint}")
+            // Issue #236: when the response carried no parsable S3 error body
+            // (e.g. GCS's HTML "411 Length Required" page) the code and message
+            // are both unknown; name the HTTP status so the cause is not hidden.
+            let status_note = if code_opt.is_none() {
+                no_error_body_status_note(s.raw().status().as_u16())
+            } else {
+                String::new()
+            };
+            format!("service error: {code} ({msg}){hint}{status_note}")
         }
 
         SdkError::ResponseError(_) => {
@@ -181,10 +202,12 @@ where
 /// network failures (e.g. `azure_client.rs`, `google_gcs_client.rs`,
 /// `file_store_direct.rs`).  Those should get an equivalent helper +
 /// audit pass in a follow-up — track separately from #506.
-pub(crate) fn sdk_anyhow<E, R>(ctx: impl std::fmt::Display, e: SdkError<E, R>) -> anyhow::Error
+pub(crate) fn sdk_anyhow<E>(
+    ctx: impl std::fmt::Display,
+    e: SdkError<E, HttpResponse>,
+) -> anyhow::Error
 where
     E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
-    R: std::fmt::Debug,
 {
     anyhow::anyhow!("{}: {}", ctx, format_sdk_error(&e))
 }
@@ -203,10 +226,9 @@ pub(crate) trait SdkResultExt<T> {
     fn sdk_context(self, ctx: impl std::fmt::Display) -> anyhow::Result<T>;
 }
 
-impl<T, E, R> SdkResultExt<T> for std::result::Result<T, SdkError<E, R>>
+impl<T, E> SdkResultExt<T> for std::result::Result<T, SdkError<E, HttpResponse>>
 where
     E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
-    R: std::fmt::Debug,
 {
     fn sdk_context(self, ctx: impl std::fmt::Display) -> anyhow::Result<T> {
         self.map_err(|e| sdk_anyhow(ctx, e))
@@ -3142,6 +3164,19 @@ mod tests {
     // a bare `"dispatch failure"` reaching the caller is the symptom we are
     // explicitly preventing here.
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn issue236_no_error_body_status_note_names_the_http_status() {
+        assert_eq!(
+            no_error_body_status_note(411),
+            " — HTTP 411 Length Required"
+        );
+        assert_eq!(
+            no_error_body_status_note(503),
+            " — HTTP 503 Service Unavailable"
+        );
+        assert_eq!(no_error_body_status_note(599), " — HTTP 599");
+    }
 
     #[test]
     fn test_sdk_anyhow_keeps_context_in_top_message() {

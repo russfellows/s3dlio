@@ -240,6 +240,9 @@ impl HttpConnector for ReqwestHttpConnector {
             for (name, value) in &parts.headers {
                 builder = builder.header(name.as_str(), value.as_bytes());
             }
+            if needs_explicit_zero_content_length(&parts.method, &parts.headers, req_body.len()) {
+                builder = builder.header(reqwest::header::CONTENT_LENGTH, "0");
+            }
             if let Some(timeout) = read_timeout {
                 builder = builder.timeout(timeout);
             }
@@ -282,6 +285,13 @@ impl HttpConnector for ReqwestHttpConnector {
                     let mut rb = http1_client.request(method.clone(), &url);
                     for (name, value) in &parts.headers {
                         rb = rb.header(name.as_str(), value.as_bytes());
+                    }
+                    if needs_explicit_zero_content_length(
+                        &parts.method,
+                        &parts.headers,
+                        req_body.len(),
+                    ) {
+                        rb = rb.header(reqwest::header::CONTENT_LENGTH, "0");
                     }
                     if let Some(timeout) = read_timeout {
                         rb = rb.timeout(timeout);
@@ -378,6 +388,29 @@ impl HttpConnector for ReqwestHttpConnector {
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory function
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether a request must be given an explicit `Content-Length: 0` (issue #236).
+///
+/// True only for a method that normally carries a body (POST, PUT, PATCH)
+/// whose body is known to be empty and which has neither a `Content-Length`
+/// nor a `Transfer-Encoding` header already.  The empty-body `POST ?uploads`
+/// (CreateMultipartUpload) otherwise goes out over HTTP/1.1 with no length
+/// header, and GCS's S3-interop endpoint rejects it with 411 Length Required.
+/// GET/HEAD/DELETE and requests with a body are never changed.  On HTTP/2 the
+/// header is harmless.
+pub(crate) fn needs_explicit_zero_content_length(
+    method: &http::Method,
+    headers: &http::HeaderMap,
+    body_len: usize,
+) -> bool {
+    body_len == 0
+        && matches!(
+            *method,
+            http::Method::POST | http::Method::PUT | http::Method::PATCH
+        )
+        && !headers.contains_key(http::header::CONTENT_LENGTH)
+        && !headers.contains_key(http::header::TRANSFER_ENCODING)
+}
 
 /// Select which client to use for a request and whether this is an auto-probe attempt.
 ///
@@ -1638,5 +1671,51 @@ mod tests {
             "S3DLIO_H2C=1 alone must not enable https_h2 — that's what \
              S3DLIO_HTTPS_H2 or S3DLIO_ENABLE_HTTP2 are for"
         );
+    }
+
+    // ── needs_explicit_zero_content_length (issue #236) ───────────────────
+
+    #[test]
+    fn issue236_zero_content_length_only_for_empty_body_methods() {
+        let none = http::HeaderMap::new();
+        for m in [http::Method::POST, http::Method::PUT, http::Method::PATCH] {
+            assert!(needs_explicit_zero_content_length(&m, &none, 0), "{m}");
+            assert!(
+                !needs_explicit_zero_content_length(&m, &none, 1),
+                "{m} with body"
+            );
+        }
+        for m in [
+            http::Method::GET,
+            http::Method::HEAD,
+            http::Method::DELETE,
+            http::Method::OPTIONS,
+        ] {
+            assert!(!needs_explicit_zero_content_length(&m, &none, 0), "{m}");
+        }
+    }
+
+    #[test]
+    fn issue236_zero_content_length_not_added_when_already_framed() {
+        let mut cl = http::HeaderMap::new();
+        cl.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("0"),
+        );
+        assert!(!needs_explicit_zero_content_length(
+            &http::Method::POST,
+            &cl,
+            0
+        ));
+        let mut te = http::HeaderMap::new();
+        te.insert(
+            http::header::TRANSFER_ENCODING,
+            http::HeaderValue::from_static("chunked"),
+        );
+        assert!(!needs_explicit_zero_content_length(
+            &http::Method::POST,
+            &te,
+            0
+        ));
     }
 }
