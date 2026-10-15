@@ -1965,6 +1965,10 @@ impl ObjectStore for S3ObjectStore {
         chunk_size: Option<usize>,
         max_concurrency: Option<usize>,
     ) -> Result<Bytes> {
+        // Issue #211: a limit of 0 is an error whatever the transfer size, so the
+        // small-transfer path (which ignores the limits) accepts exactly what the
+        // concurrent path accepts. Nothing is sent for a 0.
+        crate::s3_utils::require_concurrent_range_limits(chunk_size, max_concurrency)?;
         if !uri.starts_with("s3://") {
             bail!("S3ObjectStore expected s3:// URI");
         }
@@ -4606,6 +4610,11 @@ pub async fn generic_download_objects_matching_with_summary(
     pattern: Option<&crate::list_pattern::ListPattern>,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<TransferSummary> {
+    // Issue #211: a limit of 0 builds a semaphore with no permits and hangs.  This is the
+    // implementation every backend-aware download funnels through (and a public entry of
+    // its own), so the guard lives here: before the store is chosen, anything is listed or
+    // the destination directory is created.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     let store = store_for_uri_with_logger(src_uri, global_logger())?;
 
     // List objects to download

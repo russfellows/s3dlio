@@ -1436,6 +1436,23 @@ fn require_chunk_size_at_least_one(chunk_size: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+/// Issue #211: the caller limits of a concurrent range GET.  An explicit
+/// `max_concurrency` of `Some(0)` and an explicit `chunk_size` of `Some(0)` are
+/// errors naming the parameter; `None` still means "pick the optimal value".
+///
+/// Every route into the range engine calls this BEFORE it builds a client or sends
+/// a request: the public wrapper, [`get_object_concurrent_range_with_client`] (used
+/// by a per-endpoint store, issue #208) and `S3ObjectStore::get_range_optimized`.
+pub(crate) fn require_concurrent_range_limits(
+    chunk_size: Option<usize>,
+    max_concurrency: Option<usize>,
+) -> Result<()> {
+    if let Some(n) = max_concurrency {
+        crate::concurrency::require_concurrency_at_least_one("max_concurrency", n)?;
+    }
+    require_chunk_size_at_least_one(chunk_size)
+}
+
 /// High-performance concurrent range GET for large objects.
 /// Automatically determines optimal chunk size and concurrency based on object size.
 /// Uses pre-allocated buffers and concurrent range requests for maximum throughput.
@@ -1458,11 +1475,9 @@ pub async fn get_object_concurrent_range_async(
     max_concurrency: Option<usize>,
 ) -> Result<Bytes> {
     // Issue #211: an explicit limit of 0 would hang a large-object GET; refuse
-    // it up front whatever the object size turns out to be.
-    if let Some(n) = max_concurrency {
-        crate::concurrency::require_concurrency_at_least_one("max_concurrency", n)?;
-    }
-    require_chunk_size_at_least_one(chunk_size)?;
+    // it up front, before any client is built, whatever the object size turns out
+    // to be.
+    require_concurrent_range_limits(chunk_size, max_concurrency)?;
     let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET concurrent range: no key specified");
@@ -1497,6 +1512,10 @@ pub(crate) async fn get_object_concurrent_range_with_client(
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
 ) -> Result<Bytes> {
+    // Issue #211 (and #208, which made this the per-endpoint store's entry): the
+    // limits are validated here too, so a caller that holds its own client cannot
+    // reach the range-splitting loop with a 0.
+    require_concurrent_range_limits(chunk_size, max_concurrency)?;
     if key.is_empty() {
         bail!("Cannot GET concurrent range: no key specified");
     }
@@ -3422,5 +3441,56 @@ mod tests {
         assert!(require_chunk_size_at_least_one(None).is_ok());
         assert!(require_chunk_size_at_least_one(Some(1)).is_ok());
         assert!(require_chunk_size_at_least_one(Some(8 * 1024 * 1024)).is_ok());
+    }
+
+    /// A client that cannot reach anything (nothing listens on port 1): if a zero limit were
+    /// not refused before the HEAD, the error would be a connection failure, which names
+    /// neither the parameter nor `>= 1`.
+    fn offline_client() -> aws_sdk_s3::Client {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_config::BehaviorVersion::v2026_01_12())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "a", "b", None, None, "test",
+            ))
+            .endpoint_url("http://127.0.0.1:1")
+            .force_path_style(true)
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    }
+
+    /// Issue #211 / #208: the per-endpoint entry validates its own limits.
+    #[test]
+    fn concurrent_range_with_client_rejects_zero_limits() {
+        for (chunk, conc, param) in [
+            (None, Some(0usize), "max_concurrency"),
+            (Some(0usize), None, "chunk_size"),
+            (Some(0), Some(0), "max_concurrency"),
+        ] {
+            let got = run_bounded_chunk(move || {
+                Box::pin(async move {
+                    get_object_concurrent_range_with_client(
+                        &offline_client(),
+                        "b",
+                        "k",
+                        0,
+                        None,
+                        chunk,
+                        conc,
+                    )
+                    .await
+                })
+            });
+            let res = got.unwrap_or_else(|| panic!("{param}: did not return (hang)"));
+            let msg = format!("{:#}", res.expect_err("a limit of 0 must be an error"));
+            assert!(msg.contains(param), "{msg}");
+            assert!(msg.contains(">= 1"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn concurrent_range_limits_accept_none_and_positive() {
+        assert!(require_concurrent_range_limits(None, None).is_ok());
+        assert!(require_concurrent_range_limits(Some(1), Some(1)).is_ok());
     }
 }

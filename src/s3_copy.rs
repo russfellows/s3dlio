@@ -205,6 +205,10 @@ pub async fn download_objects_matching(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
+    // Issue #211: a limit of 0 builds a semaphore with no permits and hangs.  This is the
+    // implementation `download_objects` delegates to (and a public entry of its own), so the
+    // guard lives here: before the URI is parsed, anything is listed or a directory is made.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     let (bucket, key_prefix) = parse_s3_uri_for_global_client(src_uri)?;
 
     // List the objects the URI selects, narrowed by the explicit pattern.
