@@ -214,7 +214,7 @@ How DLIO storage methods map to s3dlio functions:
 | `get_data(id, offset, length)` | `s3dlio.get_range(uri, offset, length)` | Read byte range |
 | `walk_node(id)` | `s3dlio.list(uri)` | List objects |
 | `isfile(id)` | `s3dlio.exists(uri)` | Check if object exists |
-| `create_node(id)` | `s3dlio.mkdir(uri)` | Create directory/prefix |
+| `create_node(id)` | `s3dlio.mkdir(uri)` | Create directory (`file://`, `direct://`); no-op on `s3://`, `az://`, `gs://` |
 | `delete_node(id)` | `s3dlio.delete(uri)` | Delete object |
 | `get_node(id)` | `s3dlio.stat(uri)` | Get object metadata |
 
@@ -448,7 +448,7 @@ s3dlio v0.9.30+ includes all functions needed for DLIO with zero-copy performanc
 |---------|--------|-------|
 | `exists()` | ✅ v0.9.26+ | Direct existence check |
 | `put_bytes()` | ✅ v0.9.26+ | Zero-copy write from Python |
-| `mkdir()` | ✅ v0.9.26+ | Create directories/prefixes |
+| `mkdir()` | ✅ v0.9.26+ | Create directories (no-op on object stores, #229) |
 | `stat()` | ✅ Available | Returns metadata dict |
 | `get()` / `get_range()` | ✅ Available | Zero-copy read (v0.9.30+) |
 | `list()` | ✅ Available | Returns full URIs |

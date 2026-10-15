@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **`mkdir` / `rmdir` no longer fail outside `file://` (#229).** They used to work only on
+  `file://`; on `direct://`, `s3://`, `az://` and `gs://` they failed with "not implemented for
+  this backend", although the docs promised them, and so did the DLIO adapters' `create_node`
+  (Python `s3dlio.mkdir()`). Now:
+  - `direct://` behaves exactly like `file://` (O_DIRECT does not apply to directories): `mkdir`
+    creates the directory and its parents; `rmdir` removes an empty directory (a non-empty one is
+    an error and nothing is removed), or the whole tree with `recursive=True`; a missing
+    directory is success.
+  - On object stores (`s3://`, `az://`, `gs://`, and the arrow backend) both calls do nothing and
+    succeed: an object store has no directories, a prefix exists once an object is written under
+    it. The URI is checked, no request is sent, no marker object is written and `rmdir` deletes
+    nothing, `recursive` or not. To remove the objects under a prefix use `delete(uri,
+    recursive=True)` / `s3-cli delete -r`.
+  - Op-log: `mkdir` writes no row on any backend. `rmdir` still writes its one `DELETE_PREFIX`
+    row (#228) on `file://` and `direct://`, but no longer on object stores, where it deletes
+    nothing.
+
 - **Op-log records `rmdir` (#228).** A directory removed through s3dlio, including a recursive
   removal of a whole tree, now appears in the op-log as a `DELETE_PREFIX` row on the directory
   (count 0; the error text if the removal failed). Before, the removal left no row at all. This

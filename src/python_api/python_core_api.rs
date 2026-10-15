@@ -1576,11 +1576,19 @@ fn put_bytes_async<'py>(
 // mkdir() - Create directory/prefix for any backend
 // ---------------------------------------------------------------------------
 
-/// Create a directory (file://, direct://) or prefix marker (s3://, az://, gs://).
+/// Create a directory (file://, direct://). A no-op on object stores (s3://, az://, gs://).
 ///
 /// # Backend Behavior
-/// - `file://`, `direct://`: Creates actual directory using create_dir_all()
-/// - `s3://`, `az://`, `gs://`: Creates empty marker object (no-op for some backends)
+/// - `file://`, `direct://`: Creates the directory and any missing parents using
+///   create_dir_all(); an existing directory is success. `direct://` behaves exactly
+///   like `file://` (O_DIRECT does not apply to directory operations).
+/// - `s3://`, `az://`, `gs://`: **does nothing and returns `None`.** An object store has
+///   no directories: a prefix exists as soon as an object is written under it, so there
+///   is nothing to create. The URI is validated, no request is sent and no marker
+///   object is written. To remove the objects under a prefix use
+///   `delete(uri, recursive=True)`.
+///
+/// Never recorded in the op-log.
 ///
 /// # Arguments
 /// * `uri` - Full URI including scheme and trailing slash recommended for clarity
