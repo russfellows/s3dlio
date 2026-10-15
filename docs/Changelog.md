@@ -22,15 +22,20 @@
 - **Arrow backend: `delete_prefix` now deletes the objects at every depth under the prefix (#232).**
   With the optional `arrow-backend` feature, `delete_prefix("s3://b/p")` listed only the immediate
   children of `p`, so `p/b/c` and `p/b/d/e` were left behind while the call returned success. It now
-  lists everything under `p/` recursively and deletes each object with its own DELETE request (ten at
-  a time, like the other backends; the bulk multi-object delete is not used because some
-  S3-compatible endpoints, such as Google Cloud Storage's S3 interoperability endpoint, reject it).
-  `pfoo/x` and `p2/y` are not touched, and neither is an object named exactly `p`. If any object
-  cannot be deleted, or the listing fails, the call returns an error that says how many operations
-  failed and quotes the first errors, instead of success. Limit: a folder marker object named
-  `p/` (a key ending in `/`) cannot be addressed through the Arrow backend's `object_store` layer
-  (it reports the key as `p`, the prefix itself), so the marker may remain after `delete_prefix`;
-  listing likewise never reports the prefix itself as an entry.
+  lists everything under `p/` recursively (streamed, never collected whole) and deletes it with S3
+  `DeleteObjects` requests of up to 1000 keys each, 10 requests in flight at a time. `pfoo/x` and
+  `p2/y` are not touched, and neither is an object named exactly `p`. A key counts as failed unless the
+  store confirmed it deleted, so a request that fails as a whole counts every key in it; a failed
+  listing is one failure, ends the listing and is reported as "listing incomplete". If anything fails
+  the call returns an error with the number of failures, the first failed keys and the first errors,
+  instead of success. Limits: (1) endpoints without `DeleteObjects`, such as Google Cloud Storage's S3
+  interoperability endpoint, are not supported by the Arrow backend's `delete` / `delete_prefix` (its
+  S3 client has no single-object DELETE): the call fails with an error that names the keys; use
+  `gs://` for GCS, which deletes per object. (2) Folder marker objects (keys ending in `/`) cannot be
+  addressed through the Arrow backend's `object_store` layer, which strips the trailing `/`: the
+  marker `p/` is never reported as an entry of `p/` and is not deleted, and a nested marker `p/sub/`
+  is listed as `s3://b/p/sub` and may remain after `delete_prefix` (the delete of the key `p/sub`
+  reports success while `p/sub/` stays).
 
 - **Arrow backend: listing an `s3://` URI with a key prefix no longer returns doubled URIs (#222).**
   With the optional `arrow-backend` feature, listing `s3://b/dir/` returned `s3://b/dir/dir/x` for the
