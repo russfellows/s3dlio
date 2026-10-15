@@ -9,8 +9,27 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
+/// The key of `file` below the dataset `root`: its path relative to the root with
+/// `/` separators (`sub/b.bin`), or just its file name when `file` is the root itself
+/// (a dataset URI naming one file) or lies outside it.
+pub(crate) fn root_relative_key(root: &Path, file: &Path) -> String {
+    match file.strip_prefix(root) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        _ => file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
+}
+
 #[derive(Clone)]
 pub struct FileSystemBytesDataset {
+    /// The path the dataset URI named: a directory, or the one file.
+    root: PathBuf,
     files: Vec<PathBuf>,
     reader_mode: ReaderMode,
     // Note: part_size and max_inflight_parts are stored for future use
@@ -33,6 +52,7 @@ impl FileSystemBytesDataset {
         let files = Self::collect_files(&path)?;
 
         Ok(Self {
+            root: path,
             files,
             reader_mode: opts.reader_mode,
             part_size: opts.part_size,
@@ -140,12 +160,13 @@ impl Dataset for FileSystemBytesDataset {
     }
 
     fn keys(&self) -> Option<Vec<String>> {
-        // Return file paths as strings (just the filename, not full path)
+        // Each key is the file's path below the dataset root (`sub/b.bin`), so a
+        // consumer can fetch exactly the file that was listed (#223). When the root
+        // is itself one file, the key is that file's name.
         Some(
             self.files
                 .iter()
-                .filter_map(|p| p.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
+                .map(|p| root_relative_key(&self.root, p))
                 .collect(),
         )
     }
@@ -218,5 +239,29 @@ mod tests {
         assert_ne!(data1, data2);
 
         // TempDir automatically cleans up when dropped
+    }
+
+    #[test]
+    fn keys_are_paths_below_the_root_issue_223() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir_all(temp_dir.path().join("sub/deeper")).unwrap();
+        fs::write(temp_dir.path().join("a.bin"), b"a").unwrap();
+        fs::write(temp_dir.path().join("sub/b.bin"), b"b").unwrap();
+        fs::write(temp_dir.path().join("sub/deeper/c.bin"), b"c").unwrap();
+
+        for suffix in ["", "/"] {
+            let uri = format!("file://{}{}", temp_dir.path().display(), suffix);
+            let dataset = FileSystemBytesDataset::from_uri(&uri).unwrap();
+            assert_eq!(
+                dataset.keys().unwrap(),
+                vec!["a.bin", "sub/b.bin", "sub/deeper/c.bin"],
+                "uri {uri}"
+            );
+        }
+
+        // A root naming one file keys it by its name.
+        let uri = format!("file://{}", temp_dir.path().join("sub/b.bin").display());
+        let dataset = FileSystemBytesDataset::from_uri(&uri).unwrap();
+        assert_eq!(dataset.keys().unwrap(), vec!["b.bin"]);
     }
 }

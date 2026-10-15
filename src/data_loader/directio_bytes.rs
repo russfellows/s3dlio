@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use crate::data_loader::fs_bytes::root_relative_key;
 use crate::data_loader::options::{LoaderOptions, ReaderMode};
 use crate::data_loader::{Dataset, DatasetError};
 use crate::object_store::store_for_uri;
@@ -12,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct DirectIOBytesDataset {
+    /// The path the dataset URI named: a directory, or the one file.
+    root: PathBuf,
     files: Vec<String>, // Store as URIs with direct:// scheme
     reader_mode: ReaderMode,
     #[allow(dead_code)]
@@ -32,6 +35,7 @@ impl DirectIOBytesDataset {
         let files = Self::collect_files(&path)?;
 
         Ok(Self {
+            root: path,
             files,
             reader_mode: opts.reader_mode,
             part_size: opts.part_size,
@@ -138,15 +142,15 @@ impl Dataset for DirectIOBytesDataset {
     }
 
     fn keys(&self) -> Option<Vec<String>> {
-        // Return just the filenames, stripping the direct:// prefix and path
+        // Each key is the file's path below the dataset root (`sub/b.bin`), so a
+        // consumer can fetch exactly the file that was listed (#223). When the root
+        // is itself one file, the key is that file's name.
         Some(
             self.files
                 .iter()
                 .filter_map(|uri| {
-                    // Strip "direct://" prefix and get just the filename
                     uri.strip_prefix("direct://")
-                        .and_then(|p| Path::new(p).file_name())
-                        .map(|s| s.to_string_lossy().into_owned())
+                        .map(|p| root_relative_key(&self.root, Path::new(p)))
                 })
                 .collect(),
         )
@@ -211,5 +215,28 @@ mod tests {
         let contents: Vec<&[u8]> = vec![&content1[..], &content2[..]];
         assert!(contents.contains(&b"content 1".as_slice()));
         assert!(contents.contains(&b"content 2".as_slice()));
+    }
+
+    #[test]
+    fn keys_are_paths_below_the_root_issue_223() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir_all(temp_dir.path().join("sub/deeper")).unwrap();
+        fs::write(temp_dir.path().join("a.bin"), b"a").unwrap();
+        fs::write(temp_dir.path().join("sub/b.bin"), b"b").unwrap();
+        fs::write(temp_dir.path().join("sub/deeper/c.bin"), b"c").unwrap();
+
+        for suffix in ["", "/"] {
+            let uri = format!("direct://{}{}", temp_dir.path().display(), suffix);
+            let dataset = DirectIOBytesDataset::from_uri(&uri).unwrap();
+            assert_eq!(
+                dataset.keys().unwrap(),
+                vec!["a.bin", "sub/b.bin", "sub/deeper/c.bin"],
+                "uri {uri}"
+            );
+        }
+
+        let uri = format!("direct://{}", temp_dir.path().join("sub/b.bin").display());
+        let dataset = DirectIOBytesDataset::from_uri(&uri).unwrap();
+        assert_eq!(dataset.keys().unwrap(), vec!["b.bin"]);
     }
 }

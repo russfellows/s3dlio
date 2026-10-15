@@ -1,5 +1,21 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Python `ObjectStoreMapDataset` fetches each item by the exact key it listed (#223).** A dataset rooted
+  below the bucket root asked the server for the wrong object: `ObjectStoreMapDataset("s3://bkt/dir/")`
+  listed `dir/x` but requested `dir/dir/x` (the dataset's own key prefix was added a second time), so
+  every item failed to read, or read a different object if `dir/dir/x` existed. `s3://bkt//` and
+  `s3://bkt/dir//` behave the same way: the key that was listed is the key that is fetched, with a
+  leading or doubled `/` kept exactly. The same mistake hit `file://` and `direct://` datasets in two more
+  ways, fixed together: files in sub-directories were listed by bare file name and so were looked up in the
+  top directory, and a dataset whose URI names one file looked for `<file>/<file>`. The listed key of a
+  `file://` / `direct://` dataset is now the file's path below the dataset root (`sub/b.bin`; for a root
+  that names one file, its name), and that is also what `ObjectStoreMapDataset` reports as the item key.
+  The bucket-root behaviour (`s3://bkt/`) is unchanged.
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published
