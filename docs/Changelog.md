@@ -1,5 +1,35 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`put_bytes()` / `put_bytes_async()` no longer copy the payload while holding the GIL, and no
+  longer duplicate it on `file://` and `direct://` (#238).** The `BytesView` "zero-copy" branch could
+  never run (`BytesView` exports the Python buffer protocol, so the generic buffer branch took it
+  first), and that branch copied the whole buffer into a new `Vec` with the GIL held: every other
+  Python thread stalled (about 0.3 s per 512 MiB PUT) and peak memory rose by twice the payload on the
+  local backends (the file backends made a second full copy). Now a `BytesView` is detected first and
+  reused as is; `bytes`, `bytearray`, `memoryview`, numpy arrays and other contiguous buffer-protocol
+  objects are written in place with the GIL released (the buffer is held, so it cannot be resized or
+  freed during the call); `put_bytes_async()` takes its snapshot of a mutable buffer with the GIL
+  released, so the caller may still reuse the buffer as soon as the call returns. `file://` and
+  `direct://` write straight from the caller's bytes. **Rule for `put_bytes()`:** do not modify a
+  mutable buffer from another thread while the call runs, or the stored object mixes old and new bytes.
+  A strided (non-contiguous) view and an object that only offers `__bytes__()` are still copied once,
+  with the GIL held.
+
+- **`direct://` PUT and GET no longer move 4 KiB per system call (#244).** An O_DIRECT PUT wrote the
+  object one 4 KiB block per `write()` (512 MiB took 45 s, about 11 MiB/s, against 0.79 s on
+  `file://`), and a GET read it 4 KiB per `read()`. A source buffer whose address is page-aligned is now
+  written straight from the caller's memory in one `write` (split only at Linux's 2 GiB per-call limit);
+  any other source is copied through an aligned bounce buffer and written one full buffer at a time
+  (default 64 MiB, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`; see `docs/Environment_Variables.md`). GETs read
+  through the same bounce buffer. The zero-padded last block and the truncation back to the exact size
+  are unchanged, and so is the buffered fallback. `put_multipart` on `direct://` is now the same single
+  write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
+  also left zero padding inside the object whenever `part_size` was not a multiple of 4096.
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published
