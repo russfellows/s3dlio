@@ -285,6 +285,7 @@ fn get_skip_head() -> bool {
     // Lazily check env var once and latch if set.
     static ENV_CHECKED: OnceLock<bool> = OnceLock::new();
     *ENV_CHECKED.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         let from_env = std::env::var("S3DLIO_SKIP_HEAD")
             .ok()
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
@@ -302,6 +303,7 @@ fn get_skip_head() -> bool {
 /// (S3ObjectStore::get() honours this too — now consistent on ALL paths).
 fn get_range_opt_enabled() -> bool {
     *RANGE_OPT_ENABLED.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
             .ok()
             .map(|v| {
@@ -319,6 +321,7 @@ fn get_range_opt_enabled() -> bool {
 /// Set above file size (e.g. 1000 for 147 MiB files) to force single-GET.
 fn get_range_threshold_bytes() -> u64 {
     *RANGE_THRESHOLD_BYTES.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         let mb = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -337,6 +340,7 @@ fn get_range_threshold_bytes() -> u64 {
 /// pre-stat phase in get_objects_parallel(). Cache hits skip HEAD entirely.
 fn get_size_cache() -> &'static Arc<ObjectSizeCache> {
     GLOBAL_SIZE_CACHE.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         let ttl_secs = std::env::var("S3DLIO_SIZE_CACHE_TTL_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())

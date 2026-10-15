@@ -278,8 +278,10 @@ mod test_env;
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     Python::initialize();
 
-    // Apply the `.env` policy FIRST: before any thread exists and before anything below
-    // (thread-pool sizing, the first I/O call) reads an environment variable (#243).
+    // Apply the `.env` policy FIRST: before anything below (thread-pool sizing, the first
+    // I/O call) reads an environment variable (#243). This is the first thing s3dlio
+    // does at import, and `s3dlio/torch.py` imports this module before `torch`; but
+    // anything the host imported or started before `import s3dlio` is outside our reach.
     dotenv::apply();
 
     // Auto-size every process-wide thread pool (global Tokio runtime,

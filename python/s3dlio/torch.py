@@ -30,11 +30,14 @@ import threading
 import queue
 from typing import Iterable, Dict, Any, Sequence, Optional, Tuple
 
-import torch
-from torch.utils.data import IterableDataset, Dataset, get_worker_info
-
+# The native module goes FIRST: its initialisation applies the `.env` policy
+# (S3DLIO_LOAD_DOTENV, issue #243), so a `.env` that is switched on is loaded before
+# this wrapper imports torch (which may itself start native threads and read settings).
 # import _pymod as _core  # native module built by maturin
 from . import _pymod as _core
+
+import torch  # noqa: E402 -- after the native module on purpose, see above
+from torch.utils.data import IterableDataset, Dataset, get_worker_info  # noqa: E402
 
 
 # -----------------------------------------------------------------------------

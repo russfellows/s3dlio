@@ -693,9 +693,13 @@ file is decided by one switch, `S3DLIO_LOAD_DOTENV`, and the default depends on 
   by the file; the file only fills in what is missing.
 - The switch is read from the real environment (not from a `.env`) once per process, and the file is
   loaded once, at the first of: `s3-cli` start-up; Python `import s3dlio`; for Rust, the first use of the
-  global runtime, `store_for_uri*`, an S3 / Azure / GCS client or a bucket/container listing. That is
-  before s3dlio reads any setting, so `S3DLIO_RT_THREADS`, `S3DLIO_OPLOG_*`, the range-GET settings and
-  the endpoint/region all see the file's values.
+  global runtime, `store_for_uri*`, an S3 / Azure / GCS client, an S3 dataset, `Logger::new` or a bucket/
+  container listing. That is before s3dlio reads those settings, so `S3DLIO_RT_THREADS`,
+  `S3DLIO_OPLOG_*`, the range-GET settings and the endpoint/region see the file's values. Limits: a
+  `torch` (or anything) that your application imported before `import s3dlio` has already run, and
+  s3dlio cannot know whether its host already has threads, so for a race-free environment load the file
+  (or set the real environment) at the very start of your process. Only `s3-cli` loads it first thing on
+  its main thread, before its Tokio runtime exists.
 - To have the file's values even earlier (before your own code calls anything in s3dlio), load it
   yourself: Rust `s3dlio::dotenv::load_env_file("path/to/.env")?`, or in Python `python-dotenv`'s
   `load_dotenv()` **before** `import s3dlio`.

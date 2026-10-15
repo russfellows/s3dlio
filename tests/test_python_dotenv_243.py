@@ -130,3 +130,45 @@ def test_a_named_file_is_loaded_at_import(tmp_path):
     out = run(tmp_path, str(named))
     assert out["marker"] == "from-named", out
     assert out["rt_workers"] == 5, out
+
+
+FAKE_TORCH_INIT = """
+import ctypes, os
+_libc = ctypes.CDLL(None)
+_libc.getenv.restype = ctypes.c_char_p
+_value = _libc.getenv(b"S3DLIO_243_MARKER")
+os.environ["FAKE_TORCH_SAW"] = "<unset>" if _value is None else _value.decode()
+"""
+
+FAKE_TORCH_DATA = """
+class Dataset:
+    pass
+
+
+class IterableDataset:
+    pass
+
+
+def get_worker_info():
+    return None
+"""
+
+
+def test_the_file_is_loaded_before_s3dlios_own_torch_import(tmp_path):
+    # s3dlio/torch.py used to import torch before the native module, so a torch-enabled
+    # install loaded the file only after torch's import. A stand-in torch reports what it
+    # could see of the environment at the moment s3dlio imports it.
+    fakes = tmp_path / "fakes"
+    (fakes / "torch" / "utils" / "data").mkdir(parents=True)
+    (fakes / "torch" / "__init__.py").write_text(FAKE_TORCH_INIT)
+    (fakes / "torch" / "utils" / "__init__.py").write_text("")
+    (fakes / "torch" / "utils" / "data" / "__init__.py").write_text(FAKE_TORCH_DATA)
+    (tmp_path / ".env").write_text(DOTENV)
+    env = {"S3DLIO_LOAD_DOTENV": "1", "PYTHONPATH": str(fakes)}
+    proc = run_scenario(
+        'print("SAW " + os.environ.get("FAKE_TORCH_SAW", "<torch never imported>"))',
+        cwd=tmp_path,
+        env=env,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "SAW from-dotenv" in proc.stdout, proc.stdout

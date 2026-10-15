@@ -41,9 +41,18 @@ Set `S3DLIO_LOAD_DOTENV=1` (or a path) to keep that behaviour.
 
   | Program | The file is read at |
   |---------|---------------------|
-  | `s3-cli` | start-up, before the command line is parsed |
-  | Python | `import s3dlio` (the extension module's initialisation, before any thread or pool is created) |
-  | Rust | the first use of the global runtime (`run_on_global_rt` and everything built on it), `store_for_uri*`, an S3 / Azure / GCS client, a bucket or container listing, or the Arrow backend set-up |
+  | `s3-cli` | start-up, before the command line is parsed and before the Tokio runtime is built |
+  | Python | `import s3dlio`: the native module's initialisation, the first thing it does. `s3dlio/torch.py` imports the native module before `torch`, so the file is loaded before s3dlio's own torch import. A `torch` (or anything else) that the application imported **before** `import s3dlio` has already run: torch-side settings are not covered. |
+  | Rust | the first use of any entry point that reads a setting: the global runtime, `configure_thread_pools`, `store_for_uri*`, an S3 / Azure / GCS client, the S3 dataset constructors, `Logger::new`, the process-wide endpoint, a bucket or container listing, the Arrow backend set-up, and the latched knobs (`S3DLIO_UNSIGNED_PAYLOAD`, `S3DLIO_SKIP_HEAD`, `S3DLIO_ENABLE_RANGE_OPTIMIZATION`, `S3DLIO_RANGE_THRESHOLD_MB`, `S3DLIO_SIZE_CACHE_TTL_SECS`, `S3DLIO_GCS_RAPID`) |
+
+  **What this does not promise.** s3dlio cannot know whether its host is multi-threaded. A Python
+  application, an inference server or a Rust program may already have threads when it first calls
+  s3dlio, and setting an environment variable is not safe against another thread that is inside C
+  `getenv` at that moment. Only `s3-cli` loads the file as its first act on its main thread, with no
+  other thread running. A host that needs the file's values, or a race-free environment, before its own
+  threads start should load the file (or set the real environment) at the very start of the process.
+  Forked children inherit the parent's resolved policy and the file it already loaded: set the switch
+  before importing s3dlio and forking, or use a freshly spawned process when the policy must differ.
 
   (Python's `os.environ` is a copy taken when the interpreter starts, so it does not show variables
   that s3dlio loads from the file; s3dlio and other native code read the real process environment.)

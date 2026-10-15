@@ -1390,6 +1390,7 @@ mod delete_objects_panic_accounting_tests {
 /// The variable can be set in the shell **or** come from a `.env` file when
 /// `S3DLIO_LOAD_DOTENV` enables one (see [`crate::dotenv`]).
 pub(crate) fn read_rapid_mode() -> RapidMode {
+    crate::dotenv::apply();
     // Priority 1: env var (explicit user override, always wins)
     if let Ok(v) = std::env::var("S3DLIO_GCS_RAPID") {
         return match v.to_lowercase().as_str() {

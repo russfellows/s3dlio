@@ -59,6 +59,7 @@ pub(crate) fn resolve_s3_endpoint_override(
 /// this, so the global client, the store cache key and the diagnostics cannot
 /// disagree about which server a request goes to.
 pub fn s3_endpoint_url_from_env() -> Option<String> {
+    crate::dotenv::apply();
     resolve_s3_endpoint_override(
         env::var(ENV_ENDPOINT_URL_S3).ok().as_deref(),
         env::var(ENV_ENDPOINT_URL).ok().as_deref(),
@@ -173,6 +174,8 @@ pub fn configure_for_concurrency(n: usize) {
 /// earlier automatic call, as long as it happens before the first actual S3
 /// operation / `create_async_loader` call, exactly as already documented.
 pub fn configure_thread_pools(threads: usize) {
+    // The MPI world-size variables sized below, and the pools built, come after the policy.
+    crate::dotenv::apply();
     let threads = if threads > 0 {
         threads
     } else {
@@ -218,6 +221,8 @@ pub fn configure_thread_pools(threads: usize) {
 pub fn unsigned_payload_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
+        // The value is latched for the process: the policy must come first (#243).
+        crate::dotenv::apply();
         std::env::var(crate::constants::ENV_UNSIGNED_PAYLOAD)
             .map(|v| {
                 matches!(
@@ -247,7 +252,7 @@ fn missing_credentials_error() -> anyhow::Error {
 pub(crate) fn global_rt_handle() -> &'static Handle {
     RT_HANDLE.get_or_init(|| {
         // The `.env` policy applies before the runtime reads S3DLIO_RT_THREADS and before
-        // any worker thread exists, so loading it cannot race with their `getenv` (#243).
+        // this runtime's own worker threads exist (#243). Host threads may already exist.
         crate::dotenv::apply();
         let (tx, rx) = mpsc::sync_channel(1);
         thread::Builder::new()

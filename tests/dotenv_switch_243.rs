@@ -63,6 +63,35 @@ fn probe_child() {
             let _ = s3dlio::s3_client::run_on_global_rt(async { Ok::<(), anyhow::Error>(()) });
             "n/a".to_string()
         }
+        // The first-use reads Blue found (#243 review): each is made the FIRST s3dlio
+        // call of the process, with the setting only in the `.env`.
+        "s3_dataset" => {
+            // A host-form URI is parsed against AWS_ENDPOINT_URL before anything lists.
+            match s3dlio::data_loader::S3BytesDataset::from_prefix("s3://127.0.0.1:1/bkt/p") {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            }
+        }
+        "pool" => {
+            s3dlio::s3_client::configure_thread_pools(0);
+            format!("rayon={}", rayon::current_num_threads())
+        }
+        "unsigned" => format!("unsigned={}", s3dlio::s3_client::unsigned_payload_enabled()),
+        "logger" => {
+            let path = std::env::current_dir().unwrap().join("oplog.tsv.zst");
+            let logger = s3dlio::s3_logger::Logger::new(path.to_str().unwrap()).unwrap();
+            format!("lossless={}", logger.stats().lossless)
+        }
+        "skip_head" => {
+            // Own runtime: the global one would apply the policy by itself.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let uri = std::env::var("S3DLIO_243_URI").unwrap();
+            let r = rt.block_on(s3dlio::s3_utils::get_object_uri_optimized_async(&uri));
+            format!("get={}", r.is_ok())
+        }
         "store_file" => {
             let _ = s3dlio::object_store::store_for_uri("file:///");
             "n/a".to_string()
@@ -151,8 +180,13 @@ const DOTENV: &str = "AWS_ACCESS_KEY_ID=dotenv-key\n\
                       S3DLIO_243_PRESET=from-dotenv\n";
 
 fn dir_with_dotenv(name: &str) -> PathBuf {
+    dir_with_dotenv_plus(name, "")
+}
+
+/// A scratch directory whose `.env` is the standard one plus `extra` lines.
+fn dir_with_dotenv_plus(name: &str, extra: &str) -> PathBuf {
     let dir = scratch(name);
-    std::fs::write(dir.join(".env"), DOTENV).unwrap();
+    std::fs::write(dir.join(".env"), format!("{DOTENV}{extra}")).unwrap();
     dir
 }
 
@@ -260,6 +294,99 @@ fn assert_entry_loads(entry: &str, extra: &[(&str, &str)]) {
     let p = probe(&dir, &env);
     assert_eq!(p.marker, "from-dotenv", "entry {entry}: {p:?}");
     assert_eq!(p.preset, "real-env", "entry {entry}: {p:?}");
+}
+
+// -- first-use reads: the setting exists ONLY in the .env, the API is the first call --
+
+#[test]
+fn s3_dataset_host_form_uri_sees_the_endpoint_from_the_file() {
+    let dir = dir_with_dotenv_plus("first-dataset", "AWS_ENDPOINT_URL=http://127.0.0.1:1\n");
+    let p = probe(
+        &dir,
+        &[
+            ("S3DLIO_LOAD_DOTENV", "1"),
+            ("S3DLIO_243_ENTRY", "s3_dataset"),
+        ],
+    );
+    // Parsing must not fail for want of the endpoint the file supplies; what is left is
+    // the connection to the (closed) port.
+    assert!(
+        !p.client
+            .contains("cannot be used with the process-wide S3 client"),
+        "the host-form URI was parsed before the file was loaded: {p:?}"
+    );
+}
+
+#[test]
+fn thread_pool_sizing_sees_the_world_size_from_the_file() {
+    if std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        < 2
+    {
+        eprintln!("SKIPPED: one CPU cannot show a smaller pool");
+        return;
+    }
+    // A world size above any CPU count makes the per-process budget 1.
+    let dir = dir_with_dotenv_plus("first-pool", "WORLD_SIZE=100000\n");
+    let p = probe(
+        &dir,
+        &[("S3DLIO_LOAD_DOTENV", "1"), ("S3DLIO_243_ENTRY", "pool")],
+    );
+    assert_eq!(p.client, "rayon=1", "{p:?}");
+}
+
+#[test]
+fn unsigned_payload_switch_is_read_after_the_file_loads() {
+    let dir = dir_with_dotenv_plus("first-unsigned", "S3DLIO_UNSIGNED_PAYLOAD=1\n");
+    let p = probe(
+        &dir,
+        &[
+            ("S3DLIO_LOAD_DOTENV", "1"),
+            ("S3DLIO_243_ENTRY", "unsigned"),
+        ],
+    );
+    assert_eq!(p.client, "unsigned=true", "{p:?}");
+}
+
+#[test]
+fn logger_settings_come_from_the_file() {
+    let dir = dir_with_dotenv_plus("first-logger", "S3DLIO_OPLOG_LOSSLESS=1\n");
+    let p = probe(
+        &dir,
+        &[("S3DLIO_LOAD_DOTENV", "1"), ("S3DLIO_243_ENTRY", "logger")],
+    );
+    assert_eq!(p.client, "lossless=true", "{p:?}");
+}
+
+#[test]
+fn a_latched_get_setting_sees_the_file_on_the_first_get() {
+    // S3DLIO_SKIP_HEAD is latched for the process on its first read. The endpoint and
+    // credentials are in the real environment; only the switch is in the file.
+    let (port, state) = ensure_mock_s3_server();
+    let key = common::mock_s3_server::unique_test_key("dotenv243-skip-head");
+    let dir = dir_with_dotenv_plus("first-skip-head", "S3DLIO_SKIP_HEAD=1\n");
+    let uri = format!("s3://dotenv243-bkt/{key}");
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let p = probe(
+        &dir,
+        &[
+            ("S3DLIO_LOAD_DOTENV", "1"),
+            ("S3DLIO_243_ENTRY", "skip_head"),
+            ("S3DLIO_243_URI", &uri),
+            ("AWS_ENDPOINT_URL", &endpoint),
+            ("AWS_ACCESS_KEY_ID", "test-access-key"),
+            ("AWS_SECRET_ACCESS_KEY", "test-secret-key"),
+            ("AWS_REGION", "us-east-1"),
+        ],
+    );
+    let reqs = state.requests_containing(&key);
+    assert!(!reqs.is_empty(), "the GET never reached the mock: {p:?}");
+    let heads: Vec<_> = reqs.iter().filter(|r| r.method == "HEAD").collect();
+    assert!(
+        heads.is_empty(),
+        "S3DLIO_SKIP_HEAD from the file must be seen by the first get: {reqs:?}"
+    );
 }
 
 #[test]
@@ -426,6 +553,65 @@ fn s3_cli_reports_a_missing_named_file_on_stderr() {
     // No log subscriber exists when s3-cli loads the file, so main prints the problem.
     assert!(stderr.contains("S3DLIO_LOAD_DOTENV"), "stderr={stderr}");
     assert!(stderr.contains(missing), "stderr={stderr}");
+}
+
+/// The CLI loads the file before its Tokio runtime exists: a Tokio setting that only the
+/// `.env` carries (TOKIO_WORKER_THREADS, read when the runtime is built) must size it.
+#[cfg(target_os = "linux")]
+#[test]
+fn s3_cli_loads_dotenv_before_the_runtime_is_built() {
+    // A server that accepts and never answers keeps `s3-cli ls` alive while we look.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir = scratch("cli-runtime");
+    std::fs::write(
+        dir.join(".env"),
+        format!(
+            "AWS_ENDPOINT_URL=http://127.0.0.1:{port}\nAWS_ACCESS_KEY_ID=k\n\
+             AWS_SECRET_ACCESS_KEY=s\nAWS_REGION=us-east-1\nTOKIO_WORKER_THREADS=3\n"
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_s3-cli"))
+        .args(["ls", "s3://cli243-runtime/"])
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .spawn()
+        .expect("spawn s3-cli");
+    let pid = child.id();
+    let count_workers = || {
+        std::fs::read_dir(format!("/proc/{pid}/task"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| std::fs::read_to_string(e.path().join("comm")).ok())
+                    .filter(|c| {
+                        c.trim().starts_with("tokio-rt-worker")
+                            || c.trim().starts_with("tokio-runtime-w")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let mut workers = 0;
+    for _ in 0..100 {
+        workers = count_workers();
+        if workers > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Stop it with SIGTERM (never a forced kill) and reap it.
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    let _ = child.wait();
+    drop(listener);
+    assert_eq!(
+        workers, 3,
+        "the runtime must be built after the .env is loaded (TOKIO_WORKER_THREADS=3)"
+    );
 }
 
 #[test]

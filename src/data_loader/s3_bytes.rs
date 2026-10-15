@@ -36,6 +36,8 @@ impl S3BytesDataset {
 
     /// NEW: honor LoaderOptions (reader strategy + part params)
     pub fn from_prefix_with_opts(uri: &str, opts: &LoaderOptions) -> Result<Self, DatasetError> {
+        // The policy comes first: parsing a host-form URI reads AWS_ENDPOINT_URL (#243).
+        crate::dotenv::apply();
         let (bucket, prefix) =
             parse_s3_uri_for_global_client(uri).map_err(|e| DatasetError::from(e.to_string()))?;
 

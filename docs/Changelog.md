@@ -24,9 +24,15 @@
   bucket listing, GCS container listing, the Arrow backend set-up and the `s3-cli` start-up) now go
   through one helper, which also runs at the start of every library entry point: the Python extension
   module's initialisation (`import s3dlio`), the global runtime, `store_for_uri*` and the Azure and GCS
-  client constructors. So a `.env` that is switched on is in place before s3dlio reads any setting
-  (`S3DLIO_RT_THREADS`, `S3DLIO_OPLOG_*`, the range-GET settings, `AWS_ENDPOINT_URL`, `AWS_REGION`, ...)
-  and before s3dlio starts a thread, not only when the first S3 client is built. `s3-cli` prints a
+  client constructors, the S3 dataset constructors, `configure_thread_pools`, `Logger::new` and the
+  latched tuning knobs (unsigned payload, skip-HEAD, range optimisation, size cache, GCS RAPID). So a
+  `.env` that is switched on is in place before s3dlio reads those settings (`S3DLIO_RT_THREADS`,
+  `S3DLIO_OPLOG_*`, the range-GET settings, `AWS_ENDPOINT_URL`, `AWS_REGION`, ...), not only when the
+  first S3 client is built. `s3-cli` now loads the file before it builds its Tokio runtime; in Python
+  the native module (which loads it) is imported before s3dlio's own `torch` import. Not promised:
+  s3dlio cannot know whether its host already has threads or has already imported `torch`; a host that
+  needs a race-free environment loads the file (or sets the real environment) at the very start of the
+  process, and forked children inherit the parent's resolved policy. `s3-cli` prints a
   warning on stderr when `S3DLIO_LOAD_DOTENV` names a file it cannot read. Documented in the README and
   `docs/Environment_Variables.md`.
 

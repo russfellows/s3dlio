@@ -586,6 +586,7 @@ impl MultiEndpointStore {
         strategy: LoadBalanceStrategy,
         default_thread_count: Option<usize>,
     ) -> Result<Self> {
+        crate::dotenv::apply();
         let raw = std::env::var("S3_ENDPOINT_URIS")
             .map_err(|_| anyhow!("S3_ENDPOINT_URIS environment variable is not set"))?;
         let uris =

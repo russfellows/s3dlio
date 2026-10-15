@@ -38,11 +38,26 @@
 //!
 //! Once per process, at the first of these (so before s3dlio reads any setting):
 //!
-//! * `s3-cli`: start-up, before the command line is parsed;
-//! * Python: `import s3dlio` (the extension module's initialisation, before any thread
-//!   or pool is created);
-//! * Rust: the first use of the global runtime, `store_for_uri*`, an S3 / Azure / GCS
-//!   client, a bucket or container listing, or the Arrow backend set-up.
+//! * `s3-cli`: start-up, before the command line is parsed and before the Tokio runtime
+//!   is built;
+//! * Python: `import s3dlio`: the extension module's initialisation, the first thing it
+//!   does, which also runs before the optional `torch` import inside `s3dlio/torch.py`
+//!   (a `torch` the application imported before `import s3dlio` is outside s3dlio's
+//!   reach, so torch-side settings are not covered);
+//! * Rust: the first use of any entry point that reads a setting: the global runtime,
+//!   `configure_thread_pools`, `store_for_uri*`, an S3 / Azure / GCS client, the S3
+//!   dataset constructors, `Logger::new`, the process-wide endpoint, a bucket or
+//!   container listing, the Arrow backend set-up, and the latched tuning knobs
+//!   (`S3DLIO_UNSIGNED_PAYLOAD`, `S3DLIO_SKIP_HEAD`, `S3DLIO_ENABLE_RANGE_OPTIMIZATION`,
+//!   `S3DLIO_RANGE_THRESHOLD_MB`, `S3DLIO_SIZE_CACHE_TTL_SECS`, `S3DLIO_GCS_RAPID`).
+//!
+//! **What this does not promise.** s3dlio cannot know whether its host is multi-threaded:
+//! a Python application, an inference server or a Rust program may already have threads
+//! when it first calls s3dlio, and setting an environment variable is not safe against
+//! another thread that is inside C `getenv` at that moment. Only `s3-cli` (which loads the
+//! file as its first act, on its main thread) has no other threads. A host that needs the
+//! file's values, or a race-free environment, before its own threads start loads the file
+//! itself (or sets the real environment) at the very start of the process.
 //!
 //! An application that wants a file's values even earlier (before it calls anything in
 //! s3dlio) can call [`load_env_file`] itself, or in Python load it with `python-dotenv`
