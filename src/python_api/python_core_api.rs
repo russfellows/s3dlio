@@ -7,7 +7,7 @@ use super::async_bridge::future_into_py;
 use bytes::Bytes;
 use pyo3::buffer::PyBuffer;
 use pyo3::conversion::IntoPyObjectExt;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods};
@@ -617,6 +617,16 @@ pub fn py_err<E: std::fmt::Display>(error: E) -> PyErr {
     PyRuntimeError::new_err(error_chain_message(&error))
 }
 
+/// Issue #211: reject a caller-supplied concurrency limit of 0 at once with a
+/// `ValueError` that names the parameter and the valid range.  A limit of 0
+/// would build a semaphore with no permits and hang the call forever.  Call
+/// this FIRST in every entry point that takes such a limit; it never
+/// substitutes another value.
+pub(crate) fn require_max_in_flight(name: &str, value: usize) -> PyResult<()> {
+    crate::concurrency::require_concurrency_at_least_one(name, value)
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// Multi-process GET for maximum throughput (Python API)
 ///
 /// Args:
@@ -675,6 +685,8 @@ pub fn mp_get(
     num: usize,
     template: &str,
 ) -> PyResult<Py<PyAny>> {
+    require_max_in_flight("procs", procs)?;
+    require_max_in_flight("jobs", jobs)?;
     use crate::mp::{run_get_shards, MpGetConfigBuilder};
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -1088,10 +1100,13 @@ pub fn put(
     data_gen_mode: &str,
     chunk_size: usize,
 ) -> PyResult<()> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let template = template.unwrap_or("object-{}");
     let uris = build_uri_list(prefix, template, num)?;
-    let jobs = max_in_flight.min(num);
+    // `num == 0` uploads nothing; keep the derived job count >= 1 so the
+    // (already validated) limit is not mistaken for a caller-supplied 0.
+    let jobs = max_in_flight.min(num.max(1));
     let obj = str_to_obj(object_type);
     let algorithm = str_to_data_gen_algorithm(data_gen_algorithm);
     let mode = str_to_data_gen_mode(data_gen_mode);
@@ -1131,10 +1146,13 @@ pub(crate) fn put_async_py<'p>(
     data_gen_mode: &'p str,
     chunk_size: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     let sz = size.unwrap_or(DEFAULT_OBJECT_SIZE);
     let template = template.unwrap_or("object-{}");
     let uris = build_uri_list(prefix, template, num)?;
-    let jobs = max_in_flight.min(num);
+    // `num == 0` uploads nothing; keep the derived job count >= 1 so the
+    // (already validated) limit is not mistaken for a caller-supplied 0.
+    let jobs = max_in_flight.min(num.max(1));
     let obj = str_to_obj(object_type);
     let algorithm = str_to_data_gen_algorithm(data_gen_algorithm);
     let mode = str_to_data_gen_mode(data_gen_mode);
@@ -1626,6 +1644,7 @@ pub fn get_many_stats(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<(usize, usize)> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     py.detach(|| {
         let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
         let total: usize = res.iter().map(|(_, b)| b.len()).sum();
@@ -1640,6 +1659,7 @@ pub fn get_many_stats_async<'p>(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     future_into_py(py, async move {
         let (count, total) = task::spawn_blocking(move || {
             let res = get_objects_parallel(&uris, max_in_flight).map_err(py_err)?;
@@ -1660,6 +1680,7 @@ pub(crate) fn get_many_async_py<'p>(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<Bound<'p, PyAny>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     future_into_py(py, async move {
         // get_objects_parallel returns Vec<(String, Bytes)> - keep as Bytes for zero-copy
         let pairs: Vec<(String, Bytes)> = task::spawn_blocking(move || {
@@ -1775,6 +1796,7 @@ pub fn download(
     max_in_flight: usize,
     recursive: bool,
 ) -> PyResult<()> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     let dir = PathBuf::from(dest_dir);
     let src_uri_owned = src_uri.to_owned();
     // The `download_objects` function in `s3_copy.rs` needs a `recursive` flag.
@@ -1796,6 +1818,7 @@ pub fn get_many(
     uris: Vec<String>,
     max_in_flight: usize,
 ) -> PyResult<Vec<(String, PyBytesView)>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     use crate::object_store::{infer_scheme, Scheme};
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::sync::Arc;
@@ -2044,6 +2067,7 @@ pub fn upload(
     max_in_flight: usize,
     create_bucket: bool,
 ) -> PyResult<()> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     let paths: Vec<PathBuf> = src_patterns.into_iter().map(PathBuf::from).collect();
     let dest_prefix_owned = dest_prefix.to_owned();
     py.detach(|| {
@@ -2123,7 +2147,8 @@ type PreparedPut = (String, Bytes, anyhow::Result<Arc<dyn ObjectStore>>);
 ///
 /// # Arguments
 /// * `items` - List of (uri, data) tuples: uri is a string, data is bytes
-/// * `max_in_flight` - Maximum concurrent put operations (default: 64)
+/// * `max_in_flight` - Maximum concurrent put operations (default: 64); must be
+///   an integer >= 1, otherwise `ValueError` is raised at once (issue #211)
 ///
 /// # Zero-copy path
 /// Each Python bytes is copied once into Bytes (unavoidable — Python GIL →
@@ -2148,6 +2173,7 @@ pub fn put_many(
     items: Vec<(String, Vec<u8>)>,
     max_in_flight: usize,
 ) -> PyResult<()> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::Semaphore;
 
@@ -2208,6 +2234,7 @@ pub fn put_many_async<'py>(
     items: Vec<(String, Vec<u8>)>,
     max_in_flight: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
+    require_max_in_flight("max_in_flight", max_in_flight)?;
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::Semaphore;
 

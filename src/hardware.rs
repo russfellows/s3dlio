@@ -329,9 +329,8 @@ mod tests {
 
     // recommended_data_gen_threads() reads S3DLIO_RT_THREADS (via
     // crate::constants::effective_thread_budget); serialize against other
-    // tests touching the same var.
-    use std::sync::Mutex as StdMutex;
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+    // tests touching the same var via the crate-wide guard `crate::test_env`
+    // (issue #216).
 
     /// Reproduces the CPU-oversubscription bug class for the third data-
     /// generation path: `s3dlio.generate_data()` / `generate_data_with_threads()`
@@ -345,16 +344,11 @@ mod tests {
     /// the checkpoint runtime.
     #[test]
     fn recommended_data_gen_threads_honors_explicit_thread_budget_when_no_override() {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
-        let prev = std::env::var("S3DLIO_RT_THREADS").ok();
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&["S3DLIO_RT_THREADS"]);
         std::env::set_var("S3DLIO_RT_THREADS", "2");
 
         let threads = recommended_data_gen_threads(None, None);
-
-        match prev {
-            Some(v) => std::env::set_var("S3DLIO_RT_THREADS", v),
-            None => std::env::remove_var("S3DLIO_RT_THREADS"),
-        }
 
         assert_eq!(
             threads, 2,
@@ -368,16 +362,11 @@ mod tests {
     fn recommended_data_gen_threads_explicit_override_still_wins() {
         // max_threads=Some(n) must still be an unconditional override,
         // regardless of S3DLIO_RT_THREADS.
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
-        let prev = std::env::var("S3DLIO_RT_THREADS").ok();
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&["S3DLIO_RT_THREADS"]);
         std::env::set_var("S3DLIO_RT_THREADS", "2");
 
         let threads = recommended_data_gen_threads(None, Some(5));
-
-        match prev {
-            Some(v) => std::env::set_var("S3DLIO_RT_THREADS", v),
-            None => std::env::remove_var("S3DLIO_RT_THREADS"),
-        }
 
         assert_eq!(threads, 5);
     }

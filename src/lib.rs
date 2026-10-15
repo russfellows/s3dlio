@@ -261,6 +261,11 @@ pub use crate::s3_logger::{
 #[cfg(feature = "extension-module")]
 mod python_api;
 
+// The ONE crate-wide guard for unit tests that touch process environment
+// variables (issue #216).
+#[cfg(test)]
+mod test_env;
+
 // ---------------------------------------------------------------------------
 // PyO3 module init -----------------------------------------------------------
 // ---------------------------------------------------------------------------

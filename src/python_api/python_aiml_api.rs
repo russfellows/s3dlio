@@ -3443,12 +3443,11 @@ pub fn register_aiml_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(all(test, feature = "extension-module"))]
 mod checkpoint_runtime_sizing_tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
 
     // build_checkpoint_runtime() reads S3DLIO_RT_THREADS; serialize against
-    // any other test in this binary that touches the same env var.
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+    // any other test in this binary that touches the same env var via the
+    // crate-wide guard `crate::test_env` (issue #216).
 
     /// Reproduces the CPU-oversubscription bug found while chasing the DLIO
     /// unet3d npz-datagen slowdown, applied to checkpointing specifically:
@@ -3469,8 +3468,8 @@ mod checkpoint_runtime_sizing_tests {
     /// all 3 concurrently in a single wave and finish much faster.
     #[test]
     fn build_checkpoint_runtime_honors_explicit_thread_budget() {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
-        let prev = std::env::var("S3DLIO_RT_THREADS").ok();
+        let _guard = crate::test_env::lock();
+        let _env = crate::test_env::EnvRestore::capture(&["S3DLIO_RT_THREADS"]);
         std::env::set_var("S3DLIO_RT_THREADS", "2");
 
         let rt = build_checkpoint_runtime().expect("build checkpoint runtime");
@@ -3490,11 +3489,6 @@ mod checkpoint_runtime_sizing_tests {
             while set.join_next().await.is_some() {}
         });
         let elapsed = start.elapsed();
-
-        match prev {
-            Some(v) => std::env::set_var("S3DLIO_RT_THREADS", v),
-            None => std::env::remove_var("S3DLIO_RT_THREADS"),
-        }
 
         // 2 workers, 3 tasks of 150ms each -> 2 waves -> >= ~300ms. An
         // unconstrained pool (this host's real core count) would run all 3

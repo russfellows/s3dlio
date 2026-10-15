@@ -39,6 +39,8 @@ pub async fn upload_files<P: AsRef<Path>>(
     do_create_bucket: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     let dest = parse_s3_uri_full(dest_prefix)?;
     let (bucket, key_prefix) = (dest.bucket, dest.key);
     // Allow empty prefix (bucket root) or a non-empty prefix that ends with '/'
@@ -161,6 +163,8 @@ pub async fn download_objects(
     recursive: bool,
     progress_callback: Option<Arc<ProgressCallback>>,
 ) -> Result<()> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     let (bucket, mut key_pattern) = parse_s3_uri_for_global_client(src_uri)?;
 
     /*

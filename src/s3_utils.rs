@@ -1561,6 +1561,19 @@ pub fn get_range(bucket: &str, key: &str, offset: u64, length: Option<u64>) -> R
 // Concurrent Range GET Operations (Phase 1 Optimization)
 // -----------------------------------------------------------------------------
 
+/// Issue #211: an explicit `chunk_size` of 0 never advances the range-splitting
+/// loop, which would push ranges forever (unbounded memory).  Refuse it before
+/// any request is made; `None` still means "pick the optimal size".
+fn require_chunk_size_at_least_one(chunk_size: Option<usize>) -> Result<()> {
+    if chunk_size == Some(0) {
+        bail!(
+            "chunk_size must be an integer >= 1 (valid range: 1 or more), got 0: \
+             a chunk of 0 bytes can never cover the requested range"
+        );
+    }
+    Ok(())
+}
+
 /// High-performance concurrent range GET for large objects.
 /// Automatically determines optimal chunk size and concurrency based on object size.
 /// Uses pre-allocated buffers and concurrent range requests for maximum throughput.
@@ -1582,6 +1595,12 @@ pub async fn get_object_concurrent_range_async(
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
 ) -> Result<Bytes> {
+    // Issue #211: an explicit limit of 0 would hang a large-object GET; refuse
+    // it up front whatever the object size turns out to be.
+    if let Some(n) = max_concurrency {
+        crate::concurrency::require_concurrency_at_least_one("max_concurrency", n)?;
+    }
+    require_chunk_size_at_least_one(chunk_size)?;
     let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
     if key.is_empty() {
         bail!("Cannot GET concurrent range: no key specified");
@@ -2334,6 +2353,8 @@ pub fn get_object_uri(uri: &str) -> anyhow::Result<Bytes> {
 ///   On subsequent epochs the cache is already warm; zero HEADs issued.
 /// - O(N log N) sort: replaced O(N²) linear scan with a pre-built HashMap index.
 pub fn get_objects_parallel(uris: &[String], max_in_flight: usize) -> Result<Vec<(String, Bytes)>> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Issue #197: refuse the whole batch up front if any URI names another server.
     crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec();
@@ -2451,6 +2472,8 @@ pub fn get_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<Vec<(String, Bytes)>> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Issue #197: refuse the whole batch up front if any URI names another server.
     crate::delete_batch_plan::validate_uris_for_global_client(uris)?;
     let uris = uris.to_vec(); // own for 'static
@@ -2614,6 +2637,7 @@ async fn get_object_with_known_size_async(
     chunk_size: Option<usize>,
     max_concurrency: Option<usize>,
 ) -> Result<Bytes> {
+    require_chunk_size_at_least_one(chunk_size)?;
     let start_offset = offset;
     let end_offset = match length {
         Some(len) => std::cmp::min(start_offset + len, object_size),
@@ -2686,6 +2710,8 @@ pub fn put_objects_with_random_data_and_type_with_progress(
     config: Config,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> Result<()> {
+    // Issue #211: a limit of 0 would hang; refuse it before generating data.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     info!(
         "put_objects: type={:?}, size={} bytes, uris={} parallelism={}",
         config.object_type,
@@ -2838,6 +2864,8 @@ pub(crate) fn put_objects_parallel_with_progress(
     max_in_flight: usize,
     progress_callback: Option<Arc<crate::progress::ProgressCallback>>,
 ) -> anyhow::Result<()> {
+    // Issue #211: a limit of 0 would hang; refuse it before anything else.
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
     // Get the global logger once, outside the async block
     let logger = global_logger();
 
@@ -3477,5 +3505,95 @@ mod tests {
             arn.contains("ARN") && arn.contains("not supported"),
             "{arn}"
         );
+    }
+    // -------------------------------------------------------------------------
+    // Issue #211: chunk_size = Some(0) must be rejected before any request
+    // -------------------------------------------------------------------------
+
+    /// Drive `fut` on its own thread and runtime and wait a bounded time.  The
+    /// range-splitting loop is synchronous, so a task timeout could not stop
+    /// it; a separate thread lets the test report "did not return" instead of
+    /// freezing.  `None` = no answer in time.
+    fn run_bounded_chunk<T: Send + 'static>(
+        make: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>
+            + Send
+            + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let _ = tx.send(rt.block_on(make()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    }
+
+    fn assert_chunk_size_rejected(what: &str, got: Option<Result<Bytes>>) {
+        let res = got.unwrap_or_else(|| {
+            panic!("{what}: did not return with chunk_size Some(0) (loops forever)")
+        });
+        let msg = format!(
+            "{:#}",
+            res.expect_err("chunk_size Some(0) must be an error")
+        );
+        assert!(msg.contains("chunk_size"), "{what}: {msg}");
+        assert!(msg.contains(">= 1"), "{what}: {msg}");
+    }
+
+    #[test]
+    fn concurrent_range_async_rejects_chunk_size_zero() {
+        let got = run_bounded_chunk(|| {
+            Box::pin(get_object_concurrent_range_async(
+                "s3://b/k",
+                0,
+                None,
+                Some(0),
+                None,
+            ))
+        });
+        assert_chunk_size_rejected("get_object_concurrent_range_async", got);
+    }
+
+    #[test]
+    fn concurrent_range_sync_rejects_chunk_size_zero() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(get_object_concurrent_range(
+                "s3://b/k",
+                0,
+                None,
+                Some(0),
+                None,
+            ));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).ok();
+        assert_chunk_size_rejected("get_object_concurrent_range", got);
+    }
+
+    #[test]
+    fn known_size_get_rejects_chunk_size_zero() {
+        // The object is known to be 4096 bytes, so no HEAD is needed and the
+        // split loop is reached at once on an unguarded build.
+        let got = run_bounded_chunk(|| {
+            Box::pin(get_object_with_known_size_async(
+                "b",
+                "k",
+                4096,
+                0,
+                None,
+                Some(0),
+                None,
+            ))
+        });
+        assert_chunk_size_rejected("get_object_with_known_size_async", got);
+    }
+
+    #[test]
+    fn chunk_size_none_and_positive_are_accepted() {
+        assert!(require_chunk_size_at_least_one(None).is_ok());
+        assert!(require_chunk_size_at_least_one(Some(1)).is_ok());
+        assert!(require_chunk_size_at_least_one(Some(8 * 1024 * 1024)).is_ok());
     }
 }

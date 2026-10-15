@@ -684,13 +684,12 @@ pub async fn create_s3_client_for_endpoint(
 #[cfg(test)]
 mod mpi_aware_runtime_sizing_tests {
     use super::*;
-    use std::sync::Mutex;
 
     // get_runtime_threads() reads process-global env vars and atomics
-    // (CONCURRENCY_HINT, RT_THREADS_LIMIT); serialize these tests both
-    // against each other and reset the atomics we touch so we don't leak
-    // state into other tests in this binary.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // (CONCURRENCY_HINT, RT_THREADS_LIMIT); serialize these tests against every
+    // other test touching them via the crate-wide guard `crate::test_env`
+    // (issue #216) and reset the atomics we touch so we don't leak state into
+    // other tests in this binary.
     const VARS: [&str; 5] = [
         "S3DLIO_RT_THREADS",
         "S3DLIO_RT_THREADS_UNSAFE",
@@ -700,24 +699,48 @@ mod mpi_aware_runtime_sizing_tests {
     ];
 
     fn with_clean_state<F: FnOnce()>(body: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
-        let prev: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+        let _guard = crate::test_env::lock();
+        // Restore guards drop (and so restore) on unwind too, before `_guard`
+        // releases the lock (#216).
+        let _env = crate::test_env::EnvRestore::capture(&VARS);
+        let _hint = crate::test_env::AtomicRestore::capture(&CONCURRENCY_HINT);
+        let _limit = crate::test_env::AtomicRestore::capture(&RT_THREADS_LIMIT);
         for v in VARS {
             std::env::remove_var(v);
         }
-        let prev_hint = CONCURRENCY_HINT.swap(0, Ordering::Relaxed);
-        let prev_limit = RT_THREADS_LIMIT.swap(0, Ordering::Relaxed);
+        CONCURRENCY_HINT.store(0, Ordering::Relaxed);
+        RT_THREADS_LIMIT.store(0, Ordering::Relaxed);
 
         body();
+    }
 
-        for (v, p) in VARS.iter().zip(prev) {
-            match p {
-                Some(val) => std::env::set_var(v, val),
-                None => std::env::remove_var(v),
-            }
-        }
-        CONCURRENCY_HINT.store(prev_hint, Ordering::Relaxed);
-        RT_THREADS_LIMIT.store(prev_limit, Ordering::Relaxed);
+    /// #216: a failed assertion inside the body must not leak the variables or
+    /// the two atomics into later tests (the tokio guard never poisons).
+    #[test]
+    fn with_clean_state_restores_when_the_body_panics() {
+        let snapshot = || {
+            let _guard = crate::test_env::lock();
+            let vars: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+            (
+                vars,
+                CONCURRENCY_HINT.load(Ordering::Relaxed),
+                RT_THREADS_LIMIT.load(Ordering::Relaxed),
+            )
+        };
+        let before = snapshot();
+
+        let outcome = std::panic::catch_unwind(|| {
+            with_clean_state(|| {
+                std::env::set_var("WORLD_SIZE", "5");
+                std::env::set_var("S3DLIO_RT_THREADS", "9");
+                CONCURRENCY_HINT.store(9, Ordering::Relaxed);
+                RT_THREADS_LIMIT.store(9, Ordering::Relaxed);
+                panic!("simulated failed assertion");
+            });
+        });
+        assert!(outcome.is_err(), "the body was expected to panic");
+
+        assert_eq!(snapshot(), before, "state leaked out of a panicking body");
     }
 
     /// Reproduces the CPU-oversubscription bug found while chasing the DLIO
