@@ -16,9 +16,9 @@ Full-backend builds support the stable Azure Blob Storage Rust SDK 1.0 API.
 
 - **v0.9.126** — Exact URI selection; routing, upload fixes — [PR #237](https://github.com/russfellows/s3dlio/pull/237)
 - **v0.9.124** (not on PyPI) — Exact delete contract, op-log safety — [PR #217](https://github.com/russfellows/s3dlio/pull/217)
-- **v0.9.122** — One op-log row per call — [PR #209](https://github.com/russfellows/s3dlio/pull/209)
+- **v0.9.122** (not on PyPI) — One op-log row per call — [PR #209](https://github.com/russfellows/s3dlio/pull/209)
 - **v0.9.120** (not on PyPI) — Routing, hang and crash fixes — [PR #206](https://github.com/russfellows/s3dlio/pull/206)
-- **v0.9.114** — Azure SDK stable 1.x — [PR #164](https://github.com/russfellows/s3dlio/pull/164)
+- **v0.9.114** (not on PyPI) — Azure SDK stable 1.x — [PR #164](https://github.com/russfellows/s3dlio/pull/164)
 - **v0.9.112** — Runtime clamp, MPI-aware thread pools — [PR #163](https://github.com/russfellows/s3dlio/pull/163)
 - **v0.9.110** — 39-bug multi-agent audit fixes — [PR #159](https://github.com/russfellows/s3dlio/pull/159)
 - **v0.9.108** — Performance and concurrency audit — [PR #149](https://github.com/russfellows/s3dlio/pull/149)

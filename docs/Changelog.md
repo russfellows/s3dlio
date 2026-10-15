@@ -2,8 +2,9 @@
 
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
-**0.9.124 was merged but never published to PyPI, so 0.9.126 is the first published release after
-0.9.122 and it also contains every 0.9.124 change (see "Version 0.9.124" below).** This release fixes
+**Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published
+release is 0.9.112. 0.9.126 is therefore the first published release after 0.9.112, and it contains
+every change in 0.9.114, 0.9.120, 0.9.122 and 0.9.124 (see their sections below).** This release fixes
 eleven issues: #198, #208, #211, #213, #216, #218, #228, #229, #231, #234 and #236.
 
 Read the two behaviour changes before upgrading: an `s3://` URI now selects the exact name, its
