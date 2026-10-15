@@ -1,5 +1,21 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Compressed buffered writers no longer upload a truncated, undecodable object (#218, silent
+  data loss).** A buffered writer with zstd compression (`get_writer_with_compression`, or
+  `create_writer` / `create_s3_writer` with compression) for `s3://` -- the process-wide store and a
+  per-endpoint store alike -- and the matching Azure (`az://`) and GCS (`gs://`) writers, replaced
+  the compressed data it had collected with only the last few bytes of the zstd stream when
+  `finalize()` ran. zstd emits compressed blocks while it is still being fed, so any payload large
+  enough for that (a 32 KiB payload was fine; a 6 MiB one was uploaded as a 197-byte object) was
+  stored without the frame header and every early block, the upload reported success, and the
+  object could not be decompressed. Small payloads were unaffected, which is why it went unnoticed. `finalize()` now appends the end of the stream to what was already collected. Data
+  written through an affected writer before this fix, if large, is not recoverable from the stored
+  object; write it again. `file://`, `direct://` and the arrow-backend writers were not affected.
+
 ## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
 
 Fixes 12 issues: #167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215.

@@ -1274,39 +1274,24 @@ impl S3ObjectStore {
             .with_context(|| format!("S3 URI '{uri}' cannot be used with this store"))
     }
 
-    /// Gate for every operation that is handed to a helper which uses the
-    /// PROCESS-WIDE S3 client (multipart upload, concurrent-range GET, the
-    /// buffered writer's final upload).  Those helpers always talk to the global
-    /// server, whatever URI form they are given -- a bucket-form URI names no
-    /// server, so the URI check cannot catch it.  A per-endpoint store bound to
-    /// any other server must therefore refuse, before any request is made,
-    /// rather than run the operation on the wrong server (issue #197).  Per-endpoint
-    /// multipart and concurrent-range support is issue #208.
+    /// The buffered writer for `uri` on THIS store (issue #208).
     ///
-    /// A store on the process-wide client, or a per-endpoint store whose server IS
-    /// the global server, passes.
-    fn ensure_global_helper_reaches_this_store(&self, operation: &str) -> Result<()> {
-        let Some(url) = self.endpoint_url.as_deref() else {
-            return Ok(());
-        };
-        let mine = StoreServer::from_endpoint_url(url)
-            .context("S3ObjectStore endpoint URL is not usable")?;
-        match global_client_server() {
-            Some(global) if global.is_same_server(&mine) => Ok(()),
-            Some(global) => bail!(
-                "{operation} is not yet supported on a per-endpoint S3 store (issue #208): this \
-                 store talks to {}, but {operation} uses the process-wide S3 client, which talks \
-                 to {}",
-                mine.display(),
-                global.display()
-            ),
-            None => bail!(
-                "{operation} is not yet supported on a per-endpoint S3 store (issue #208): this \
-                 store talks to {}, but {operation} uses the process-wide S3 client, which talks \
-                 to the default AWS endpoint",
-                mine.display()
-            ),
-        }
+    /// A URI naming another server is refused (#197).  A per-endpoint store hands
+    /// the writer its own client and the bucket/key it parsed, so the writer's final
+    /// multipart upload -- create, parts, complete, and abort on a failure -- goes
+    /// to the store's server; a store on the process-wide client builds the writer
+    /// exactly as before.
+    fn buffered_writer_for(
+        &self,
+        uri: &str,
+        compression: CompressionConfig,
+    ) -> Result<Box<dyn ObjectWriter>> {
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+        let writer = S3BufferedWriter::new_with_compression(uri.to_string(), compression);
+        Ok(Box::new(match &self.client {
+            Some(client) => writer.with_target(client.clone(), bucket, key),
+            None => writer,
+        }))
     }
 
     /// Delete every key of one bucket group (issue #179).
@@ -1635,8 +1620,17 @@ impl ObjectStore for S3ObjectStore {
             part_size
         );
         // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
-        self.ensure_global_helper_reaches_this_store("multipart upload")?;
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
+
+        // Issue #208: a per-endpoint store uploads (create, parts, complete, abort)
+        // with its OWN client.
+        if let Some(client) = &self.client {
+            return crate::s3_utils::put_object_multipart_with_client(
+                client, &bucket, &key, data, part_size,
+            )
+            .await;
+        }
+
         s3_put_object_multipart_uri_async(uri, data, part_size).await
     }
 
@@ -1924,11 +1918,8 @@ impl ObjectStore for S3ObjectStore {
 
     async fn get_writer(&self, uri: &str) -> Result<Box<dyn ObjectWriter>> {
         // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
-        // The writer's final upload is a multipart upload on the process-wide client.
-        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer that collects chunks then uses put_multipart
-        Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
+        self.buffered_writer_for(uri, CompressionConfig::None)
     }
 
     async fn get_writer_with_compression(
@@ -1936,15 +1927,8 @@ impl ObjectStore for S3ObjectStore {
         uri: &str,
         compression: CompressionConfig,
     ) -> Result<Box<dyn ObjectWriter>> {
-        // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
-        // The writer's final upload is a multipart upload on the process-wide client.
-        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer with compression support
-        Ok(Box::new(S3BufferedWriter::new_with_compression(
-            uri.to_string(),
-            compression,
-        )))
+        self.buffered_writer_for(uri, compression)
     }
 
     async fn create_writer(
@@ -1952,19 +1936,8 @@ impl ObjectStore for S3ObjectStore {
         uri: &str,
         options: WriterOptions,
     ) -> Result<Box<dyn ObjectWriter>> {
-        // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
-        // The writer's final upload is a multipart upload on the process-wide client.
-        self.ensure_global_helper_reaches_this_store("buffered writer upload")?;
         // For S3, use buffered writer that collects chunks then uses put_multipart
-        if let Some(compression) = options.compression {
-            Ok(Box::new(S3BufferedWriter::new_with_compression(
-                uri.to_string(),
-                compression,
-            )))
-        } else {
-            Ok(Box::new(S3BufferedWriter::new(uri.to_string())))
-        }
+        self.buffered_writer_for(uri, options.compression.unwrap_or(CompressionConfig::None))
     }
 
     async fn get_optimized(&self, uri: &str) -> Result<Bytes> {
@@ -1973,7 +1946,7 @@ impl ObjectStore for S3ObjectStore {
         }
 
         // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
         // Get object size from cache or stat (v0.9.10: cache optimization)
         let object_size = self.get_object_size(uri).await?;
 
@@ -1985,9 +1958,20 @@ impl ObjectStore for S3ObjectStore {
                 "Using concurrent range GET for large object: {} bytes",
                 object_size
             );
-            // Use concurrent range GET for large objects (process-wide client)
-            self.ensure_global_helper_reaches_this_store("concurrent range GET")?;
-            crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None).await
+            // Use concurrent range GET for large objects.  A per-endpoint store
+            // reads with its OWN client (issue #208), whatever the object size.
+            match &self.client {
+                Some(client) => {
+                    crate::s3_utils::get_object_concurrent_range_with_client(
+                        client, &bucket, &key, 0, None, None, None,
+                    )
+                    .await
+                }
+                None => {
+                    crate::s3_utils::get_object_concurrent_range_async(uri, 0, None, None, None)
+                        .await
+                }
+            }
         } else {
             debug!("Using standard GET for small object: {} bytes", object_size);
             // Use standard GET for small objects
@@ -2007,7 +1991,7 @@ impl ObjectStore for S3ObjectStore {
             bail!("S3ObjectStore expected s3:// URI");
         }
         // Issue #197: a URI naming another server is an error, never run here.
-        self.parse_uri_for_this_store(uri)?;
+        let (bucket, key) = self.parse_uri_for_this_store(uri)?;
 
         let transfer_size = match length {
             Some(len) => len,
@@ -2026,16 +2010,32 @@ impl ObjectStore for S3ObjectStore {
                 "Using concurrent range GET for large transfer: {} bytes",
                 transfer_size
             );
-            // Use concurrent range GET for large transfers (process-wide client)
-            self.ensure_global_helper_reaches_this_store("concurrent range GET")?;
-            crate::s3_utils::get_object_concurrent_range_async(
-                uri,
-                offset,
-                length,
-                chunk_size,
-                max_concurrency,
-            )
-            .await
+            // Use concurrent range GET for large transfers.  A per-endpoint store
+            // reads with its OWN client (issue #208), whatever the transfer size.
+            match &self.client {
+                Some(client) => {
+                    crate::s3_utils::get_object_concurrent_range_with_client(
+                        client,
+                        &bucket,
+                        &key,
+                        offset,
+                        length,
+                        chunk_size,
+                        max_concurrency,
+                    )
+                    .await
+                }
+                None => {
+                    crate::s3_utils::get_object_concurrent_range_async(
+                        uri,
+                        offset,
+                        length,
+                        chunk_size,
+                        max_concurrency,
+                    )
+                    .await
+                }
+            }
         } else {
             debug!(
                 "Using standard range GET for small transfer: {} bytes",
@@ -2098,9 +2098,20 @@ impl ObjectStore for S3ObjectStore {
     }
 }
 
+/// Where a per-endpoint store's buffered writer uploads (issue #208): the store's own
+/// client and the bucket/key the store parsed from the writer's URI.
+struct S3WriterTarget {
+    client: std::sync::Arc<aws_sdk_s3::Client>,
+    bucket: String,
+    key: String,
+}
+
 /// Buffered writer for S3 that collects chunks and uses multipart upload
 pub struct S3BufferedWriter {
     uri: String,
+    /// `Some` for a writer made by a per-endpoint store: the final upload goes to
+    /// that store's server.  `None`: the process-wide client, as `uri` names it.
+    target: Option<S3WriterTarget>,
     buffer: Vec<u8>,
     bytes_written: u64,
     finalized: bool,
@@ -2123,6 +2134,7 @@ impl S3BufferedWriter {
 
         Self {
             uri,
+            target: None,
             buffer: Vec::new(),
             bytes_written: 0,
             finalized: false,
@@ -2131,6 +2143,35 @@ impl S3BufferedWriter {
             compressor,
             compressed_bytes: 0,
         }
+    }
+
+    /// Upload to a per-endpoint store's server: `client`, with the `bucket`/`key` the
+    /// store parsed from this writer's URI (issue #208).
+    fn with_target(
+        mut self,
+        client: std::sync::Arc<aws_sdk_s3::Client>,
+        bucket: String,
+        key: String,
+    ) -> Self {
+        self.target = Some(S3WriterTarget {
+            client,
+            bucket,
+            key,
+        });
+        self
+    }
+
+    /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
+    /// header and every block the encoder already emitted during `write_chunk` are in
+    /// `buffer`; the encoder's final output is APPENDED to them, never assigned over them
+    /// (issue #218).
+    fn seal_compression(&mut self) -> Result<()> {
+        if let Some(compressor) = self.compressor.take() {
+            let tail = compressor.finish()?;
+            self.buffer.extend_from_slice(&tail);
+        }
+        self.compressed_bytes = self.buffer.len() as u64;
+        Ok(())
     }
 }
 
@@ -2164,18 +2205,29 @@ impl ObjectWriter for S3BufferedWriter {
         }
         self.finalized = true;
 
-        // Finalize compression if enabled
-        if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
-        }
-
-        self.compressed_bytes = self.buffer.len() as u64;
+        self.seal_compression()?;
 
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
         if self.compression.is_enabled() && !final_uri.ends_with(self.compression.extension()) {
             final_uri.push_str(self.compression.extension());
+        }
+
+        // A writer made by a per-endpoint store uploads with that store's client
+        // (issue #208): create, parts, complete and abort all reach its server.
+        if let Some(target) = self.target.take() {
+            let mut key = target.key;
+            if self.compression.is_enabled() && !key.ends_with(self.compression.extension()) {
+                key.push_str(self.compression.extension());
+            }
+            return crate::s3_utils::put_object_multipart_with_client(
+                &target.client,
+                &target.bucket,
+                &key,
+                Bytes::from(std::mem::take(&mut self.buffer)),
+                None,
+            )
+            .await;
         }
 
         // Use S3 multipart upload for the buffered data
@@ -2946,6 +2998,19 @@ impl AzureBufferedWriter {
             compressed_bytes: 0,
         }
     }
+
+    /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
+    /// header and every block the encoder already emitted during `write_chunk` are in
+    /// `buffer`; the encoder's final output is APPENDED to them, never assigned over them
+    /// (issue #218).
+    fn seal_compression(&mut self) -> Result<()> {
+        if let Some(compressor) = self.compressor.take() {
+            let tail = compressor.finish()?;
+            self.buffer.extend_from_slice(&tail);
+        }
+        self.compressed_bytes = self.buffer.len() as u64;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2979,13 +3044,7 @@ impl ObjectWriter for AzureBufferedWriter {
         }
         self.finalized = true;
 
-        // Finalize compression if enabled
-        if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
-        }
-
-        self.compressed_bytes = self.buffer.len() as u64;
+        self.seal_compression()?;
 
         // Append compression extension if needed
         let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
@@ -3537,6 +3596,19 @@ impl GcsBufferedWriter {
             compressed_bytes: 0,
         }
     }
+
+    /// Close the zstd frame (if compressing) and fix `compressed_bytes`.  The frame
+    /// header and every block the encoder already emitted during `write_chunk` are in
+    /// `buffer`; the encoder's final output is APPENDED to them, never assigned over them
+    /// (issue #218).
+    fn seal_compression(&mut self) -> Result<()> {
+        if let Some(compressor) = self.compressor.take() {
+            let tail = compressor.finish()?;
+            self.buffer.extend_from_slice(&tail);
+        }
+        self.compressed_bytes = self.buffer.len() as u64;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -3570,13 +3642,7 @@ impl ObjectWriter for GcsBufferedWriter {
         }
         self.finalized = true;
 
-        // Finalize compression if enabled
-        if let Some(compressor) = self.compressor.take() {
-            let compressed_data = compressor.finish()?;
-            self.buffer = compressed_data;
-        }
-
-        self.compressed_bytes = self.buffer.len() as u64;
+        self.seal_compression()?;
 
         // Append compression extension if needed
         let mut final_uri = self.uri.clone();
@@ -5166,4 +5232,91 @@ mod delete_batch_grouping_tests {
         let err = group_uris_by_bucket(&uris, azure_group_key).unwrap_err();
         assert!(format!("{err:#}").contains("s3://nope/b"));
     }
+}
+
+// ============================================================================
+// Issue #218: closing a compressed buffered writer must keep what the encoder
+// already emitted.  The S3, Azure and GCS writers share the same shape: write_chunk
+// moves the encoder's output into `buffer`, and the frame is closed before upload.
+// The cloud upload itself needs a server (S3 is covered end to end in
+// tests/test_issue208_per_endpoint_client.rs), so these check the bytes the writer
+// would upload.
+// ============================================================================
+#[cfg(test)]
+mod compressed_writer_seal_tests_218 {
+    use super::*;
+
+    /// 64 KiB stretches alternating incompressible and compressible bytes.
+    fn mixed_payload(n: usize) -> Vec<u8> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(n);
+        let mut random = true;
+        while out.len() < n {
+            let stretch = (64 * 1024).min(n - out.len());
+            if random {
+                for _ in 0..stretch {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    out.push((state >> 24) as u8);
+                }
+            } else {
+                out.extend(b"the quick brown fox; ".iter().cycle().take(stretch));
+            }
+            random = !random;
+        }
+        out
+    }
+
+    /// One complete zstd frame that decodes to `data`.
+    fn assert_complete_frame_of(sealed: &[u8], data: &[u8]) {
+        let frame = zstd::zstd_safe::find_frame_compressed_size(sealed).unwrap_or_else(|e| {
+            panic!(
+                "the {} sealed bytes are not a complete zstd frame: {}",
+                sealed.len(),
+                zstd::zstd_safe::get_error_name(e)
+            )
+        });
+        assert_eq!(frame, sealed.len(), "the frame must be the whole buffer");
+        let plain = zstd::decode_all(sealed).expect("the sealed bytes decode");
+        assert!(plain == data, "decoded bytes differ from the written bytes");
+    }
+
+    macro_rules! seal_test {
+        ($name:ident, $writer:ty, $($cfg:meta),*) => {
+            $(#[$cfg])*
+            #[tokio::test]
+            async fn $name() {
+                for len in [32 * 1024, 6 * 1024 * 1024 + 123] {
+                    let data = mixed_payload(len);
+                    let mut w = <$writer>::new_with_compression(
+                        "unused://bucket/key".to_string(),
+                        CompressionConfig::zstd_default(),
+                    );
+                    for chunk in data.chunks(64 * 1024) {
+                        w.write_chunk(chunk).await.expect("write_chunk");
+                    }
+                    w.seal_compression().expect("seal");
+                    assert_complete_frame_of(&w.buffer, &data);
+                    assert_eq!(w.compressed_bytes, w.buffer.len() as u64, "{len}");
+                }
+            }
+        };
+    }
+
+    seal_test!(
+        s3_writer_seal_keeps_the_early_blocks,
+        S3BufferedWriter,
+        cfg(all())
+    );
+    seal_test!(
+        azure_writer_seal_keeps_the_early_blocks,
+        AzureBufferedWriter,
+        cfg(feature = "backend-azure")
+    );
+    seal_test!(
+        gcs_writer_seal_keeps_the_early_blocks,
+        GcsBufferedWriter,
+        cfg(feature = "backend-gcs")
+    );
 }

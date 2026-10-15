@@ -1419,6 +1419,26 @@ pub(crate) async fn get_object_range_async(
     }
 
     let client = aws_s3_client_async().await?;
+    get_object_range_with_client(&client, bucket, key, offset, length).await
+}
+
+/// [`get_object_range_async`] on a caller-chosen client (issue #208): a
+/// per-endpoint store passes ITS client, so the read goes to the store's own
+/// server, never to the process-wide one.  `get_object_range_async` is this
+/// with the process-wide client.
+pub(crate) async fn get_object_range_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Bytes> {
+    // The same zero-length contract as `get_object_range_async`, for a caller
+    // that reaches this function directly.
+    if length == Some(0) {
+        return Ok(Bytes::new());
+    }
+
     let mut range = format!("bytes={}-", offset);
     if let Some(len) = length {
         if len > 0 {
@@ -1567,12 +1587,44 @@ pub async fn get_object_concurrent_range_async(
         bail!("Cannot GET concurrent range: no key specified");
     }
 
-    // Get object size first
     let client = aws_s3_client_async().await?;
+    get_object_concurrent_range_with_client(
+        &client,
+        &bucket,
+        &key,
+        offset,
+        length,
+        chunk_size,
+        max_concurrency,
+    )
+    .await
+}
+
+/// [`get_object_concurrent_range_async`] on a caller-chosen client and an
+/// already-parsed `(bucket, key)` (issue #208).
+///
+/// A per-endpoint store passes ITS client, so the size lookup, the single-range
+/// fallback and every concurrent ranged GET go to the store's own server -- the
+/// same server whatever the object size.  Nothing here consults the process-wide
+/// client; `get_object_concurrent_range_async` is this with that client.
+pub(crate) async fn get_object_concurrent_range_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: Option<u64>,
+    chunk_size: Option<usize>,
+    max_concurrency: Option<usize>,
+) -> Result<Bytes> {
+    if key.is_empty() {
+        bail!("Cannot GET concurrent range: no key specified");
+    }
+
+    // Get object size first
     let head_resp = client
         .head_object()
-        .bucket(&bucket)
-        .key(&key)
+        .bucket(bucket)
+        .key(key)
         .send()
         .await
         .sdk_context(format!(
@@ -1616,7 +1668,11 @@ pub async fn get_object_concurrent_range_async(
     // Use single request for small objects
     if total_bytes <= effective_chunk_size as u64 {
         debug!("Using single range request for {} bytes", total_bytes);
-        return get_object_range_uri_async(uri, start_offset, Some(total_bytes)).await;
+        // Straight to the bucket/key core on THIS client: a re-built `s3://` URI
+        // would be re-parsed (a dotted or IP-shaped bucket misread as a host) and
+        // sent through the process-wide client (issue #208).
+        return get_object_range_with_client(client, bucket, key, start_offset, Some(total_bytes))
+            .await;
     }
 
     // Use concurrent ranges for large objects
@@ -1629,9 +1685,9 @@ pub async fn get_object_concurrent_range_async(
     );
 
     concurrent_range_get_impl(
-        &client,
-        &bucket,
-        &key,
+        client,
+        bucket,
+        key,
         start_offset,
         end_offset,
         effective_chunk_size,
@@ -2693,8 +2749,51 @@ pub async fn put_object_multipart_uri_async(
         data.len(),
         part_size
     );
+    let (bucket, key) = crate::delete_batch_plan::parse_s3_uri_for_global_client(uri)?;
+    put_object_multipart_on(None, bucket, key, data, part_size).await
+}
+
+/// Multipart upload of `data` to `bucket`/`key` on a caller-chosen client
+/// (issue #208).
+///
+/// A per-endpoint store passes ITS client.  The sink keeps that client for the
+/// whole upload, so CreateMultipartUpload, every UploadPart, CompleteMultipartUpload
+/// and -- when the upload fails or is dropped unfinished -- AbortMultipartUpload all
+/// go to the one server that holds the upload.
+pub(crate) async fn put_object_multipart_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    data: Bytes,
+    part_size: Option<usize>,
+) -> Result<()> {
+    debug!(
+        "put_object_multipart_with_client: s3://{}/{}, {} bytes, part_size={:?}",
+        bucket,
+        key,
+        data.len(),
+        part_size
+    );
+    put_object_multipart_on(
+        Some(client.clone()),
+        bucket.to_string(),
+        key.to_string(),
+        data,
+        part_size,
+    )
+    .await
+}
+
+/// The one multipart-upload driver.  `client` is the client to upload with;
+/// `None` is the process-wide client (resolved by the sink's own constructor).
+async fn put_object_multipart_on(
+    client: Option<aws_sdk_s3::Client>,
+    bucket: String,
+    key: String,
+    data: Bytes,
+    part_size: Option<usize>,
+) -> Result<()> {
     use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
-    let uri_owned = uri.to_string();
     let cfg = MultipartUploadConfig {
         part_size: part_size.unwrap_or(16 * 1024 * 1024), // 16 MiB default
         ..Default::default()
@@ -2704,7 +2803,10 @@ pub async fn put_object_multipart_uri_async(
     // Without this, objects larger than max_in_flight × part_size panic because
     // blocking_send() on a full channel would stall a worker.
     tokio::task::spawn_blocking(move || {
-        let mut sink = MultipartUploadSink::from_uri(&uri_owned, cfg)?;
+        let mut sink = match client {
+            Some(client) => MultipartUploadSink::new_with_client(client, &bucket, &key, cfg)?,
+            None => MultipartUploadSink::new(&bucket, &key, cfg)?,
+        };
         sink.write_blocking(&data)?;
         sink.finish_blocking()?;
         Ok::<(), anyhow::Error>(())
