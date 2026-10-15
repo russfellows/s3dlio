@@ -273,44 +273,90 @@ impl BufferPool {
         Ok(pool)
     }
 
-    /// Take a buffer from the pool (blocks if none available).
+    /// Take a buffer from the pool (waits if `capacity` buffers are already checked out).
+    ///
+    /// The returned [`PooledBuf`] is an RAII lease: it carries the semaphore permit and gives
+    /// the buffer back (and frees the permit) when it is DROPPED, however that happens (success,
+    /// error, panic, a cancelled future). The number of buffers alive is therefore bounded by
+    /// `capacity`: idle buffers plus checked-out ones. (Earlier the permit was released when
+    /// `take` returned, so any number of buffers could be checked out at once.)
     ///
     /// Errors (instead of aborting) when the pool is closed, or empty with a new buffer that
     /// cannot be allocated.
-    pub async fn take(&self) -> Result<AlignedBuf, BufferPoolError> {
-        // Acquire permit first to ensure we don't exceed capacity
-        let _permit = self
+    pub async fn take(&self) -> Result<PooledBuf, BufferPoolError> {
+        let permit = self
             .permits
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| BufferPoolError::Closed)?;
 
-        // Try to get a buffer from the pool
-        let mut rx = self.rx.lock().await;
-        if let Ok(buf) = rx.try_recv() {
-            Ok(buf)
-        } else {
+        // Try to get an idle buffer from the pool
+        let idle = self.rx.lock().await.try_recv().ok();
+        let buf = match idle {
+            Some(buf) => buf,
             // Pool is temporarily empty, allocate a new one
-            Ok(AlignedBuf::new(self.buf_len, self.align)?)
-        }
+            None => AlignedBuf::new(self.buf_len, self.align)?,
+        };
+        Ok(PooledBuf {
+            buf: Some(buf),
+            tx: self.tx.clone(),
+            buf_len: self.buf_len,
+            align: self.align,
+            _permit: permit,
+        })
     }
 
-    /// Return a buffer to the pool for reuse
-    ///
-    /// Uses `try_send` (non-blocking): if the pool channel is already at capacity
-    /// (e.g. because all pre-allocated buffers are present), the returned buffer is
-    /// simply dropped rather than blocking the caller forever.
-    pub fn give(&self, buf: AlignedBuf) {
-        // Only return buffers with the correct size and alignment
-        if buf.len() == self.buf_len && buf.align() == self.align {
-            let _ = self.tx.try_send(buf); // Non-blocking: drop if pool is full
-        }
-        // If buffer doesn't match pool parameters, just drop it
+    /// Return a buffer to the pool now (equivalent to dropping it).
+    pub fn give(&self, buf: PooledBuf) {
+        drop(buf);
     }
 
     /// Get pool statistics
     pub fn capacity(&self) -> usize {
         self.permits.available_permits()
+    }
+}
+
+/// A buffer checked out of a [`BufferPool`]: dereferences to the [`AlignedBuf`], and on drop
+/// returns it to the pool and releases its permit. See [`BufferPool::take`].
+#[derive(Debug)]
+pub struct PooledBuf {
+    buf: Option<AlignedBuf>,
+    tx: mpsc::Sender<AlignedBuf>,
+    buf_len: usize,
+    align: usize,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for PooledBuf {
+    type Target = AlignedBuf;
+    fn deref(&self) -> &AlignedBuf {
+        // `buf` is `Some` until `drop`.
+        self.buf
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("PooledBuf used after drop"))
+    }
+}
+
+impl std::ops::DerefMut for PooledBuf {
+    fn deref_mut(&mut self) -> &mut AlignedBuf {
+        self.buf
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("PooledBuf used after drop"))
+    }
+}
+
+impl Drop for PooledBuf {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            // Only buffers with the pool's size and alignment are reused. `try_send` never
+            // blocks: if the idle queue is full the buffer is simply freed. The permit is
+            // released after this body, i.e. after the buffer is back in the pool.
+            if buf.len() == self.buf_len && buf.align() == self.align {
+                let _ = self.tx.try_send(buf);
+            }
+        }
     }
 }
 
@@ -490,6 +536,50 @@ mod aligned_init_tests {
             .with_capacity(0)
             .build()
             .is_err());
+    }
+
+    /// Round 4: the permit travels with the buffer. With capacity 2, a third `take` must wait
+    /// until one of the first two is dropped; idle + checked-out buffers never exceed capacity.
+    #[tokio::test]
+    async fn checked_out_buffers_are_bounded_by_capacity() {
+        let pool = BufferPool::new(2, 4096, 4096).unwrap();
+        let a = pool.take().await.unwrap();
+        let b = pool.take().await.unwrap();
+        assert_eq!(
+            pool.capacity(),
+            0,
+            "no permit left while two buffers are out"
+        );
+        let third = tokio::time::timeout(std::time::Duration::from_millis(150), pool.take()).await;
+        assert!(
+            third.is_err(),
+            "a third buffer was handed out beyond capacity"
+        );
+        drop(a);
+        let c = tokio::time::timeout(std::time::Duration::from_secs(2), pool.take())
+            .await
+            .expect("dropping a lease frees its permit")
+            .unwrap();
+        assert_eq!(pool.capacity(), 0);
+        drop((b, c));
+        assert_eq!(pool.capacity(), 2);
+    }
+
+    /// A cancelled holder (its future dropped while it holds a lease) frees the permit too.
+    #[tokio::test]
+    async fn dropping_a_waiting_or_holding_task_frees_the_budget() {
+        let pool = BufferPool::new(1, 4096, 4096).unwrap();
+        let p2 = pool.clone();
+        let holder = tokio::spawn(async move {
+            let _b = p2.take().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(pool.capacity(), 0);
+        holder.abort();
+        let _ = holder.await;
+        let again = tokio::time::timeout(std::time::Duration::from_secs(2), pool.take()).await;
+        assert!(again.is_ok(), "an aborted holder leaked its permit");
     }
 
     #[tokio::test]

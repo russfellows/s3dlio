@@ -32,8 +32,16 @@
 //!   neither direction can starve the other; `fallback` instead gives the request a private
 //!   buffer of one bounce size (serial copy-then-I/O, no pipelining; extra memory is bounded by
 //!   one buffer per concurrent request beyond the pool). Both are counted in [`bounce_stats`].
-//! * **Small objects** (bounce need at most [`DIRECT_IO_POOL_MIN_OBJECT`]) skip the pool and use
-//!   a private buffer of their own size: waiting for a shared pair would cost more than the copy.
+//! * **Small objects** lease ONE buffer (not a pair) of the same pool; a transfer of more than
+//!   one buffer leases two atomically. Nothing but the (opt-in) `fallback` policy allocates
+//!   bounce memory beyond the pool, and the page-sized zero-padded tail block of an aligned PUT
+//!   (one 4 KiB buffer per concurrent aligned PUT).
+//! * **Leases are RAII and owned by the blocking closure that does the I/O**: a cancelled
+//!   future can never return a buffer to the pool while a blocking write or read still uses it.
+//!   Buffers are acquired all-or-nothing in strict FIFO order (no hold-one/wait-for-one
+//!   deadlock); a waiting request polls its cancel flag and abandons the wait before any I/O.
+//! * The hard bound is observable: [`BounceStats::peak_leased_bytes`] is updated at the moment
+//!   of every lease and never exceeds [`bounce_memory_cap`] with the default `wait` policy.
 //! * The GET destination is a raw pointer, so the same code fills the buffer a GET returns (a
 //!   fresh page-aligned allocation) or, later, a buffer supplied by the caller (`get_into`),
 //!   which may be unaligned.
@@ -42,15 +50,14 @@
 //! through [`__bench_configure`] so the benchmark can compare them with the pool.
 
 use crate::constants::{
-    direct_io_bounce_size, parse_direct_io_bounce_pairs, DEFAULT_PAGE_SIZE,
-    DIRECT_IO_POOL_MIN_OBJECT, ENV_DIRECT_IO_BOUNCE_PAIRS, ENV_DIRECT_IO_BOUNCE_WHEN_BUSY,
-    ENV_DIRECT_IO_GET_MODE,
+    direct_io_bounce_size, parse_direct_io_bounce_pairs, BOUNCE_CANCEL_POLL, DEFAULT_PAGE_SIZE,
+    ENV_DIRECT_IO_BOUNCE_PAIRS, ENV_DIRECT_IO_BOUNCE_WHEN_BUSY, ENV_DIRECT_IO_GET_MODE,
 };
 use crate::memory::{AlignedAllocError, AlignedBuf};
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
@@ -185,6 +192,16 @@ struct Counters {
     wait_ns: [AtomicU64; 2],
     fallbacks: [AtomicU64; 2],
     pools_created: AtomicU64,
+    /// Bytes of pool buffers leased right now / at the peak.
+    leased_bytes: AtomicU64,
+    peak_leased_bytes: AtomicU64,
+    /// Bytes of pool buffers allocated (resident) so far.
+    allocated_bytes: AtomicU64,
+    /// Bytes of private fallback buffers alive right now / at the peak (opt-in policy; outside the cap).
+    fallback_live_bytes: AtomicU64,
+    peak_fallback_bytes: AtomicU64,
+    /// Waits abandoned because the request was cancelled.
+    cancelled_waits: AtomicU64,
 }
 
 static COUNTERS: Counters = Counters {
@@ -193,7 +210,18 @@ static COUNTERS: Counters = Counters {
     wait_ns: [AtomicU64::new(0), AtomicU64::new(0)],
     fallbacks: [AtomicU64::new(0), AtomicU64::new(0)],
     pools_created: AtomicU64::new(0),
+    leased_bytes: AtomicU64::new(0),
+    peak_leased_bytes: AtomicU64::new(0),
+    allocated_bytes: AtomicU64::new(0),
+    fallback_live_bytes: AtomicU64::new(0),
+    peak_fallback_bytes: AtomicU64::new(0),
+    cancelled_waits: AtomicU64::new(0),
 };
+
+fn add_gauge(live: &AtomicU64, peak: &AtomicU64, n: u64) {
+    let now = live.fetch_add(n, Ordering::AcqRel) + n;
+    peak.fetch_max(now, Ordering::AcqRel);
+}
 
 /// Snapshot of the pool's use, per direction (`[put, get]`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -208,6 +236,21 @@ pub struct BounceStats {
     pub fallbacks: [u64; 2],
     /// Node pools created so far (each allocates `pairs x 2 x size` bytes).
     pub pools_created: u64,
+    /// Bytes of pool buffers leased by requests right now.
+    pub leased_bytes: u64,
+    /// The highest `leased_bytes` ever seen: with the default `wait` policy it can never exceed
+    /// [`bounce_memory_cap`] (a hard bound, counted at the moment of the lease, independent of
+    /// throughput).
+    pub peak_leased_bytes: u64,
+    /// Bytes of pool buffers allocated so far (idle + leased): at most the cap.
+    pub allocated_bytes: u64,
+    /// Bytes of private fallback buffers alive now (`BusyPolicy::Fallback` only: deliberately
+    /// outside the cap, one buffer per such request).
+    pub fallback_live_bytes: u64,
+    /// Highest `fallback_live_bytes` seen.
+    pub peak_fallback_bytes: u64,
+    /// Waits for a buffer abandoned because the request was cancelled.
+    pub cancelled_waits: u64,
 }
 
 /// Current pool statistics.
@@ -220,6 +263,12 @@ pub fn bounce_stats() -> BounceStats {
         wait_ns: l(&COUNTERS.wait_ns),
         fallbacks: l(&COUNTERS.fallbacks),
         pools_created: COUNTERS.pools_created.load(Ordering::Relaxed),
+        leased_bytes: COUNTERS.leased_bytes.load(Ordering::Relaxed),
+        peak_leased_bytes: COUNTERS.peak_leased_bytes.load(Ordering::Relaxed),
+        allocated_bytes: COUNTERS.allocated_bytes.load(Ordering::Relaxed),
+        fallback_live_bytes: COUNTERS.fallback_live_bytes.load(Ordering::Relaxed),
+        peak_fallback_bytes: COUNTERS.peak_fallback_bytes.load(Ordering::Relaxed),
+        cancelled_waits: COUNTERS.cancelled_waits.load(Ordering::Relaxed),
     }
 }
 
@@ -231,6 +280,36 @@ pub fn bounce_memory_cap() -> usize {
     let cfg = config();
     topology().nodes() * cfg.pairs_per_node * 2 * cfg.buffer_size
 }
+
+/// A request was cancelled while it waited for bounce buffers: no I/O was started.
+#[derive(Debug)]
+pub struct BounceCancelled;
+
+impl std::fmt::Display for BounceCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "direct:// transfer cancelled while waiting for a bounce buffer"
+        )
+    }
+}
+
+impl std::error::Error for BounceCancelled {}
+
+/// Whether `e` (or anything in its chain) is a [`BounceCancelled`] wrapped in an `io::Error`.
+pub(crate) fn is_cancelled(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<BounceCancelled>().is_some()
+            || c.downcast_ref::<io::Error>()
+                .and_then(|io| io.get_ref())
+                .is_some_and(|inner| inner.is::<BounceCancelled>())
+    })
+}
+
+/// A cancel flag that is never set (callers that cannot be cancelled).
+#[cfg(test)]
+pub(crate) static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------------------
 // NUMA topology
@@ -400,24 +479,24 @@ fn topology() -> &'static Topology {
 // ---------------------------------------------------------------------------------------
 
 struct PoolState {
-    /// Indices of idle pairs.
+    /// Indices of idle buffers.
     free: Vec<usize>,
-    /// FIFO of waiting requests (ticket numbers), shared by both directions.
-    waiters: VecDeque<u64>,
+    /// FIFO of waiting requests `(ticket, buffers needed)`, shared by both directions.
+    waiters: VecDeque<(u64, usize)>,
     next_ticket: u64,
 }
 
 /// A raw buffer pointer that may cross threads (exclusively owned by the leaseholder).
 #[derive(Clone, Copy)]
 pub(crate) struct SendPtr(pub(crate) *mut u8);
-// SAFETY: a lease gives one request exclusive use of the pair; the pointers are only used
+// SAFETY: a lease gives one request exclusive use of its buffers; the pointers are only used
 // while the lease (or the private buffer) is alive.
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
 /// The warm buffers of one NUMA node.
 pub(crate) struct NodePool {
-    /// `2 x pairs` buffers; pair `i` is buffers `2i` and `2i+1`.
+    /// `2 x pairs` buffers.
     bufs: Vec<AlignedBuf>,
     size: usize,
     align: usize,
@@ -426,25 +505,56 @@ pub(crate) struct NodePool {
     busy: BusyPolicy,
 }
 
-/// Exclusive use of one buffer pair; returned to the pool on drop.
+/// Exclusive use of one or two pool buffers, acquired atomically; returned (and the bytes
+/// un-counted) on drop, however the request ends: success, error, panic, or its future being
+/// cancelled (the lease is owned by the blocking closure that does the I/O, so it outlives a
+/// cancelled future and is dropped only after the last native use).
 pub(crate) struct Lease<'a> {
     pool: &'a NodePool,
-    pair: usize,
+    idx: [usize; 2],
+    n: usize,
 }
 
 impl Lease<'_> {
-    pub(crate) fn ptrs(&self) -> [SendPtr; 2] {
-        let p = |i: usize| SendPtr(self.pool.bufs[2 * self.pair + i].as_ptr() as *mut u8);
-        [p(0), p(1)]
+    /// The leased buffers (one or two).
+    pub(crate) fn ptrs(&self) -> ([SendPtr; 2], usize) {
+        let p = |i: usize| SendPtr(self.pool.bufs[self.idx[i]].as_ptr() as *mut u8);
+        ([p(0), p(if self.n > 1 { 1 } else { 0 })], self.n)
     }
 }
 
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
+        COUNTERS
+            .leased_bytes
+            .fetch_sub((self.n * self.pool.size) as u64, Ordering::AcqRel);
         let mut st = self.pool.lock();
-        st.free.push(self.pair);
+        st.free.extend_from_slice(&self.idx[..self.n]);
         drop(st);
         self.pool.cv.notify_all();
+    }
+}
+
+/// A private fallback buffer (opt-in `fallback` policy): counted, outside the cap.
+struct FallbackBuf(AlignedBuf);
+
+impl FallbackBuf {
+    fn new(len: usize, align: usize) -> Option<Self> {
+        let b = AlignedBuf::new(len, align).ok()?;
+        add_gauge(
+            &COUNTERS.fallback_live_bytes,
+            &COUNTERS.peak_fallback_bytes,
+            len as u64,
+        );
+        Some(Self(b))
+    }
+}
+
+impl Drop for FallbackBuf {
+    fn drop(&mut self) {
+        COUNTERS
+            .fallback_live_bytes
+            .fetch_sub(self.0.len() as u64, Ordering::AcqRel);
     }
 }
 
@@ -509,6 +619,9 @@ impl NodePool {
             Self::build_buffers(cfg.pairs_per_node, cfg.buffer_size, align, None)?
         };
         COUNTERS.pools_created.fetch_add(1, Ordering::Relaxed);
+        COUNTERS
+            .allocated_bytes
+            .fetch_add((bufs.len() * cfg.buffer_size) as u64, Ordering::Relaxed);
         Ok(Self::from_buffers(bufs, cfg.buffer_size, align, cfg.busy))
     }
 
@@ -518,13 +631,13 @@ impl NodePool {
         align: usize,
         busy: BusyPolicy,
     ) -> Self {
-        let pairs = bufs.len() / 2;
+        let n = bufs.len();
         Self {
             bufs,
             size,
             align,
             state: Mutex::new(PoolState {
-                free: (0..pairs).collect(),
+                free: (0..n).collect(),
                 waiters: VecDeque::new(),
                 next_ticket: 0,
             }),
@@ -539,43 +652,81 @@ impl NodePool {
         self.bufs.len() * self.size
     }
 
-    /// Lease a pair, or `None` when every pair is busy and the policy is `Fallback`.
-    ///
-    /// With `Wait`, requests of both directions queue in one FIFO (a request only takes a
-    /// pair when it is at the head), so neither direction can starve the other.
-    pub(crate) fn acquire(&self, dir: Direction) -> Option<Lease<'_>> {
+    /// Lease `need` (1 or 2) buffers ATOMICALLY: either all of them at once or none, so two
+    /// requests can never each hold one buffer while waiting for the other (no hold-one /
+    /// wait-for-one deadlock). With the `Wait` policy requests of both directions queue in one
+    /// strict FIFO (a request only takes buffers when it is at the head and enough are free), so
+    /// neither direction can starve the other and a large request is not overtaken forever by
+    /// small ones. The wait polls `cancel` and gives up with [`BounceCancelled`] before any I/O
+    /// has started. `Ok(None)`: every buffer is busy and the policy is `Fallback`.
+    pub(crate) fn acquire(
+        &self,
+        dir: Direction,
+        need: usize,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<Lease<'_>>, BounceCancelled> {
+        let need = need.clamp(1, self.bufs.len());
         let started = Instant::now();
         let d = dir.idx();
         let mut st = self.lock();
+        if cancel.load(Ordering::Acquire) {
+            COUNTERS.cancelled_waits.fetch_add(1, Ordering::Relaxed);
+            return Err(BounceCancelled);
+        }
         let mut waited = false;
-        if st.free.is_empty() || !st.waiters.is_empty() {
+        if st.free.len() < need || !st.waiters.is_empty() {
             if self.busy == BusyPolicy::Fallback {
                 COUNTERS.fallbacks[d].fetch_add(1, Ordering::Relaxed);
-                return None;
+                return Ok(None);
             }
             let ticket = st.next_ticket;
             st.next_ticket += 1;
-            st.waiters.push_back(ticket);
+            st.waiters.push_back((ticket, need));
             waited = true;
-            while !(st.waiters.front() == Some(&ticket) && !st.free.is_empty()) {
-                st = self.cv.wait(st).unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    st.waiters.retain(|(t, _)| *t != ticket);
+                    drop(st);
+                    self.cv.notify_all(); // the next waiter may now be at the head
+                    COUNTERS.cancelled_waits.fetch_add(1, Ordering::Relaxed);
+                    return Err(BounceCancelled);
+                }
+                if st.waiters.front().map(|(t, _)| *t) == Some(ticket) && st.free.len() >= need {
+                    break;
+                }
+                st = self
+                    .cv
+                    .wait_timeout(st, BOUNCE_CANCEL_POLL)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
             st.waiters.pop_front();
         }
-        let Some(pair) = st.free.pop() else {
-            return None; // unreachable: checked above
-        };
-        let more = !st.free.is_empty() && !st.waiters.is_empty();
+        let mut idx = [0usize; 2];
+        for slot in idx.iter_mut().take(need) {
+            // `free.len() >= need` was checked above; an empty pop cannot happen.
+            *slot = st.free.pop().unwrap_or(0);
+        }
+        let more = !st.waiters.is_empty() && !st.free.is_empty();
         drop(st);
         if more {
-            self.cv.notify_all(); // the next waiter can take the next free pair
+            self.cv.notify_all(); // the next waiter may be able to take what is left
         }
+        add_gauge(
+            &COUNTERS.leased_bytes,
+            &COUNTERS.peak_leased_bytes,
+            (need * self.size) as u64,
+        );
         COUNTERS.leases[d].fetch_add(1, Ordering::Relaxed);
         if waited {
             COUNTERS.waited[d].fetch_add(1, Ordering::Relaxed);
             COUNTERS.wait_ns[d].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
-        Some(Lease { pool: self, pair })
+        Ok(Some(Lease {
+            pool: self,
+            idx,
+            n: need,
+        }))
     }
 }
 
@@ -806,45 +957,63 @@ pub(crate) unsafe fn pingpong_get(
 
 /// Where a bounce transfer's buffers come from.
 enum Source<'a> {
-    Pair(Lease<'a>),
-    Private(AlignedBuf),
+    Leased(Lease<'a>),
+    Private(FallbackBuf),
 }
 
-/// Lease a pair of the current node's pool, or make a private buffer of one bounce size when the
-/// pool is busy with the `Fallback` policy. `None`: no pool is usable (use a per-call buffer).
-fn source(dir: Direction, align: usize) -> Option<Source<'static>> {
-    let pool = pool_for_current_node()?;
+/// Lease the buffers a transfer of `bytes` needs from the current node's pool (two for a
+/// transfer of more than one buffer, so the copy and the I/O can overlap; one otherwise), or a
+/// private one-buffer fallback when the pool is busy with the `Fallback` policy.
+/// `Ok(None)`: no pool is usable (use a per-call buffer).
+fn source<'a>(
+    dir: Direction,
+    bytes: usize,
+    align: usize,
+    cancel: &AtomicBool,
+) -> Result<Option<Source<'a>>, BounceCancelled> {
+    let Some(pool) = pool_for_current_node() else {
+        return Ok(None);
+    };
     if !pool.align.is_multiple_of(align.max(1)) {
-        return None;
+        return Ok(None);
     }
-    match pool.acquire(dir) {
-        Some(lease) => Some(Source::Pair(lease)),
-        None => AlignedBuf::new(pool.size, pool.align)
-            .ok()
-            .map(Source::Private),
-    }
+    let need = if bytes > pool.size { 2 } else { 1 };
+    Ok(match pool.acquire(dir, need, cancel)? {
+        Some(lease) => Some(Source::Leased(lease)),
+        None => FallbackBuf::new(pool.size, pool.align).map(Source::Private),
+    })
+}
+
+fn cancelled_io(e: BounceCancelled) -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, e)
 }
 
 /// PUT `chunks` of `data` through the shared pool. Returns `Ok(false)` when the pool cannot be
 /// used (the caller falls back to a per-call buffer). Every chunk is at most one bounce buffer.
+/// The lease is held (and dropped) here, inside the caller's blocking closure, so it outlives a
+/// cancelled future and is returned only after the last write; `cancel` only abandons the WAIT
+/// for buffers.
 pub(crate) fn pooled_put(
     chunks: &[PutChunk],
     data: &[u8],
     align: usize,
+    cancel: &AtomicBool,
     write_at: &(dyn Fn(u64, &[u8]) -> io::Result<()> + Sync),
 ) -> io::Result<bool> {
-    let Some(src) = source(Direction::Put, align) else {
+    let total: usize = chunks.iter().map(|c| c.data_len).sum();
+    let Some(src) = source(Direction::Put, total, align, cancel).map_err(cancelled_io)? else {
         return Ok(false);
     };
-    let ptrs;
+    let arr;
     let one;
     let bufs: &[SendPtr] = match &src {
-        Source::Pair(lease) => {
-            ptrs = lease.ptrs();
-            &ptrs
+        Source::Leased(lease) => {
+            let (p, n) = lease.ptrs();
+            arr = p;
+            &arr[..n]
         }
         Source::Private(b) => {
-            one = [SendPtr(b.as_ptr() as *mut u8)];
+            one = [SendPtr(b.0.as_ptr() as *mut u8)];
             &one
         }
     };
@@ -861,30 +1030,27 @@ pub(crate) unsafe fn pooled_get(
     file_size: usize,
     align: usize,
     dest: SendPtr,
+    cancel: &AtomicBool,
     read_at: &(dyn Fn(SendPtr, usize, u64) -> io::Result<usize> + Sync),
 ) -> io::Result<bool> {
-    let Some(src) = source(Direction::Get, align) else {
+    let Some(src) = source(Direction::Get, file_size, align, cancel).map_err(cancelled_io)? else {
         return Ok(false);
     };
-    let ptrs;
+    let arr;
     let one;
     let (bufs, size): (&[SendPtr], usize) = match &src {
-        Source::Pair(lease) => {
-            ptrs = lease.ptrs();
-            (&ptrs, lease.pool.size)
+        Source::Leased(lease) => {
+            let (p, n) = lease.ptrs();
+            arr = p;
+            (&arr[..n], lease.pool.size)
         }
         Source::Private(b) => {
-            one = [SendPtr(b.as_ptr() as *mut u8)];
-            (&one, b.len())
+            one = [SendPtr(b.0.as_ptr() as *mut u8)];
+            (&one, b.0.len())
         }
     };
     pingpong_get(file_size, align, size, dest, bufs, read_at, &|_| {})?;
     Ok(true)
-}
-
-/// Whether a transfer needing `bytes` of bounce space should use the shared pool.
-pub(crate) fn use_pool_for(bytes: usize) -> bool {
-    bytes > DIRECT_IO_POOL_MIN_OBJECT
 }
 
 #[cfg(test)]
@@ -1197,7 +1363,7 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
     }
 
-    // ---- the pool: fairness, cap, busy policy ----
+    // ---- the pool: fairness, cap, busy policy, atomic acquisition, cancellation ----
 
     fn pool(pairs: usize, busy: BusyPolicy) -> Arc<NodePool> {
         let bufs = (0..2 * pairs)
@@ -1206,14 +1372,20 @@ mod tests {
         Arc::new(NodePool::from_buffers(bufs, 4 * A, A, busy))
     }
 
+    fn lease(p: &NodePool, dir: Direction, need: usize) -> Lease<'_> {
+        p.acquire(dir, need, &NEVER_CANCELLED)
+            .expect("not cancelled")
+            .expect("wait policy always leases")
+    }
+
     #[test]
     fn pool_memory_is_exactly_pairs_times_two_times_size() {
         assert_eq!(pool(3, BusyPolicy::Wait).memory_bytes(), 3 * 2 * 4 * A);
     }
 
     #[test]
-    fn never_more_leases_than_pairs() {
-        let p = pool(2, BusyPolicy::Wait);
+    fn never_more_buffers_leased_than_the_pool_has() {
+        let p = pool(2, BusyPolicy::Wait); // 4 buffers
         let live = Arc::new(AtomicUsize::new(0));
         let max = Arc::new(AtomicUsize::new(0));
         let hs: Vec<_> = (0..12)
@@ -1225,12 +1397,13 @@ mod tests {
                     } else {
                         Direction::Get
                     };
+                    let need = 1 + i % 2;
                     for _ in 0..20 {
-                        let l = p.acquire(dir).expect("wait policy always leases");
-                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        let l = lease(&p, dir, need);
+                        let now = live.fetch_add(need, Ordering::SeqCst) + need;
                         max.fetch_max(now, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_micros(200));
-                        live.fetch_sub(1, Ordering::SeqCst);
+                        live.fetch_sub(need, Ordering::SeqCst);
                         drop(l);
                     }
                 })
@@ -1240,18 +1413,18 @@ mod tests {
             h.join().unwrap();
         }
         assert!(
-            max.load(Ordering::SeqCst) <= 2,
-            "{} pairs in use at once",
+            max.load(Ordering::SeqCst) <= 4,
+            "{} buffers in use",
             max.load(Ordering::SeqCst)
         );
     }
 
-    /// Strict FIFO across directions: with one pair held, a PUT and then a GET queue up; they
-    /// must get the pair in that order (and a stream of PUTs cannot overtake the waiting GET).
+    /// Strict FIFO across directions: with every buffer held, a PUT and then a GET queue up;
+    /// they get the buffers in that order.
     #[test]
     fn waiters_are_served_in_arrival_order_across_directions() {
         let p = pool(1, BusyPolicy::Wait);
-        let held = p.acquire(Direction::Put).unwrap();
+        let held = lease(&p, Direction::Put, 2);
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut hs = Vec::new();
         for (i, dir) in [
@@ -1265,7 +1438,7 @@ mod tests {
         {
             let (p2, order) = (p.clone(), order.clone());
             hs.push(std::thread::spawn(move || {
-                let l = p2.acquire(dir).unwrap();
+                let l = lease(&p2, dir, 2);
                 order.lock().unwrap().push(i);
                 drop(l);
             }));
@@ -1281,37 +1454,61 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
     }
 
+    /// A request for both buffers is not overtaken forever by single-buffer requests: with one
+    /// buffer free and a two-buffer request at the head, a later single-buffer request waits.
     #[test]
-    fn fallback_policy_returns_none_when_every_pair_is_busy_and_counts_it() {
-        let p = pool(1, BusyPolicy::Fallback);
-        let before = bounce_stats().fallbacks;
-        let held = p.acquire(Direction::Get).unwrap();
-        assert!(p.acquire(Direction::Put).is_none());
-        assert!(p.acquire(Direction::Get).is_none());
-        let after = bounce_stats().fallbacks;
-        assert!(after[0] > before[0] && after[1] > before[1]);
-        drop(held);
-        assert!(p.acquire(Direction::Put).is_some(), "free again");
+    fn a_large_request_is_not_overtaken_by_later_small_ones() {
+        let p = pool(1, BusyPolicy::Wait); // 2 buffers
+        let one = lease(&p, Direction::Get, 1); // 1 buffer free
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (p2, o2) = (p.clone(), order.clone());
+        let big = std::thread::spawn(move || {
+            let l = lease(&p2, Direction::Put, 2);
+            o2.lock().unwrap().push("big");
+            drop(l);
+        });
+        while p.lock().waiters.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (p3, o3) = (p.clone(), order.clone());
+        let small = std::thread::spawn(move || {
+            let l = lease(&p3, Direction::Get, 1);
+            o3.lock().unwrap().push("small");
+            drop(l);
+        });
+        while p.lock().waiters.len() < 2 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "the small request overtook the head of the queue"
+        );
+        drop(one);
+        big.join().unwrap();
+        small.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["big", "small"]);
     }
 
+    /// Atomic acquisition: requests for one AND for two buffers, many threads, one pair - the
+    /// classic hold-one/wait-for-one deadlock cannot happen.
     #[test]
-    fn mixed_traffic_completes_under_one_pair_without_deadlock() {
+    fn mixed_one_and_two_buffer_requests_never_deadlock() {
         let p = pool(1, BusyPolicy::Wait);
         let done = Arc::new(AtomicBool::new(false));
-        let d2 = done.clone();
-        let p2 = p.clone();
+        let (d2, p2) = (done.clone(), p.clone());
         let t = std::thread::spawn(move || {
             let hs: Vec<_> = (0..16)
                 .map(|i| {
                     let p = p2.clone();
                     std::thread::spawn(move || {
-                        for _ in 0..10 {
+                        for _ in 0..25 {
                             let dir = if i % 3 == 0 {
                                 Direction::Get
                             } else {
                                 Direction::Put
                             };
-                            drop(p.acquire(dir).unwrap());
+                            drop(lease(&p, dir, 1 + i % 2));
                         }
                     })
                 })
@@ -1321,7 +1518,7 @@ mod tests {
             }
             d2.store(true, Ordering::SeqCst);
         });
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !done.load(Ordering::SeqCst) {
             assert!(Instant::now() < deadline, "mixed traffic deadlocked");
             std::thread::sleep(Duration::from_millis(5));
@@ -1329,9 +1526,86 @@ mod tests {
         t.join().unwrap();
     }
 
+    /// A waiting request whose cancel flag is set gives up (no I/O started), is removed from the
+    /// queue, and does not block the requests behind it.
     #[test]
-    fn small_objects_skip_the_pool() {
-        assert!(!use_pool_for(DIRECT_IO_POOL_MIN_OBJECT));
-        assert!(use_pool_for(DIRECT_IO_POOL_MIN_OBJECT + 1));
+    fn a_cancelled_waiter_abandons_the_wait_and_unblocks_the_queue() {
+        let p = pool(1, BusyPolicy::Wait);
+        let held = lease(&p, Direction::Put, 2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (p2, c2) = (p.clone(), cancel.clone());
+        let victim = std::thread::spawn(move || p2.acquire(Direction::Get, 2, &c2).map(|_| ()));
+        while p.lock().waiters.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (p3, got) = (p.clone(), Arc::new(AtomicBool::new(false)));
+        let g2 = got.clone();
+        let behind = std::thread::spawn(move || {
+            drop(lease(&p3, Direction::Put, 2));
+            g2.store(true, Ordering::SeqCst);
+        });
+        while p.lock().waiters.len() < 2 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let before = bounce_stats().cancelled_waits;
+        cancel.store(true, Ordering::Release);
+        let r = victim.join().unwrap();
+        assert!(r.is_err(), "the cancelled waiter must not get a lease");
+        assert!(bounce_stats().cancelled_waits > before);
+        assert_eq!(
+            p.lock().waiters.len(),
+            1,
+            "the cancelled ticket must leave the queue"
+        );
+        drop(held);
+        behind.join().unwrap();
+        assert!(got.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_request_already_cancelled_never_starts() {
+        let p = pool(1, BusyPolicy::Wait);
+        let cancelled = AtomicBool::new(true);
+        assert!(p.acquire(Direction::Put, 2, &cancelled).is_err());
+        // and it took nothing
+        assert_eq!(p.lock().free.len(), 2);
+    }
+
+    /// RAII on every exit: a lease dropped while unwinding from a panic frees its buffers.
+    #[test]
+    fn a_panicking_holder_returns_its_buffers() {
+        let p = pool(1, BusyPolicy::Wait);
+        let p2 = p.clone();
+        let r = std::thread::spawn(move || {
+            let _l = lease(&p2, Direction::Put, 2);
+            panic!("holder panics while leasing");
+        })
+        .join();
+        assert!(r.is_err());
+        assert_eq!(p.lock().free.len(), 2);
+        drop(lease(&p, Direction::Get, 2));
+    }
+
+    #[test]
+    fn fallback_policy_returns_none_when_every_buffer_is_busy_and_counts_it() {
+        let p = pool(1, BusyPolicy::Fallback);
+        let before = bounce_stats().fallbacks;
+        let held = lease_f(&p, Direction::Get, 2).expect("free pool leases");
+        assert!(p
+            .acquire(Direction::Put, 2, &NEVER_CANCELLED)
+            .unwrap()
+            .is_none());
+        assert!(p
+            .acquire(Direction::Get, 1, &NEVER_CANCELLED)
+            .unwrap()
+            .is_none());
+        let after = bounce_stats().fallbacks;
+        assert!(after[0] > before[0] && after[1] > before[1]);
+        drop(held);
+        assert!(lease_f(&p, Direction::Put, 2).is_some(), "free again");
+    }
+
+    fn lease_f(p: &NodePool, dir: Direction, need: usize) -> Option<Lease<'_>> {
+        p.acquire(dir, need, &NEVER_CANCELLED).unwrap()
     }
 }

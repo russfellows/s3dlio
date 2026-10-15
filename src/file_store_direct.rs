@@ -411,13 +411,19 @@ fn per_call_bounce_put(
 /// write leaves the next offset unaligned the kernel refuses it (EINVAL) and the caller's
 /// buffered fallback rewrites the whole file.
 #[cfg(unix)]
-pub(crate) fn write_all_direct(file: &std::fs::File, data: &[u8], alignment: usize) -> Result<()> {
+pub(crate) fn write_all_direct(
+    file: &std::fs::File,
+    data: &[u8],
+    alignment: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     write_all_direct_with(
         file,
         data,
         alignment,
         crate::direct_bounce::config().put,
         &AlignedBuf::new,
+        cancel,
     )
 }
 
@@ -428,8 +434,9 @@ fn write_all_direct_with(
     alignment: usize,
     strategy: crate::direct_bounce::PutStrategy,
     alloc: AllocFn<'_>,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
-    use crate::direct_bounce::{pooled_put, use_pool_for, PutChunk, PutStrategy};
+    use crate::direct_bounce::{pooled_put, PutChunk, PutStrategy};
 
     let alignment = alignment.max(1);
     let cap = match strategy {
@@ -445,9 +452,11 @@ fn write_all_direct_with(
     );
 
     let mut chunks = Vec::new();
+    let mut from_source = false;
     for step in &steps {
         match *step {
             DirectIoStep::FromSource { offset, len } => {
+                from_source = true;
                 write_all_at(file, &data[offset..offset + len], offset as u64)?;
             }
             DirectIoStep::ViaBounce {
@@ -463,10 +472,11 @@ fn write_all_direct_with(
     }
 
     if let Some(first) = chunks.first() {
-        let need = chunks.iter().map(|c| c.io_len).max().unwrap_or(0);
+        // A page-aligned source only bounces its padded tail block (one page): that never
+        // leases pool buffers, it would only make aligned PUTs queue behind unaligned ones.
         let pooled = matches!(strategy, PutStrategy::Pooled)
-            && use_pool_for(need)
-            && pooled_put(&chunks, data, alignment, &|off, bytes| {
+            && !from_source
+            && pooled_put(&chunks, data, alignment, cancel, &|off, bytes| {
                 write_all_at(file, bytes, off)
             })?;
         if !pooled {
@@ -542,18 +552,17 @@ pub(crate) unsafe fn read_all_direct_into(
     file_size: usize,
     alignment: usize,
     dest: *mut u8,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     use crate::direct_bounce::{pooled_get, SendPtr};
 
     let alignment = alignment.max(1);
     let dest = SendPtr(dest);
     let read_at = |buf, len, off| pread_raw(file, buf, len, off);
-    if crate::direct_bounce::use_pool_for(file_size)
-        && pooled_get(file_size, alignment, dest, &read_at)?
-    {
+    if pooled_get(file_size, alignment, dest, cancel, &read_at)? {
         return Ok(());
     }
-    // No pool (small object, or it could not be created): one private bounce buffer.
+    // No pool (it could not be created): one private bounce buffer.
     let size = crate::direct_bounce::config()
         .buffer_size
         .min(round_up(file_size, alignment));
@@ -578,12 +587,14 @@ pub(crate) fn read_all_direct(
     file: &std::fs::File,
     file_size: usize,
     alignment: usize,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Bytes> {
     read_all_direct_with(
         file,
         file_size,
         alignment,
         crate::direct_bounce::config().get,
+        cancel,
     )
 }
 
@@ -593,6 +604,7 @@ fn read_all_direct_with(
     file_size: usize,
     alignment: usize,
     strategy: crate::direct_bounce::GetStrategy,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Bytes> {
     use crate::direct_bounce::{pooled_get, GetStrategy, SendPtr};
 
@@ -607,8 +619,7 @@ fn read_all_direct_with(
 
     // SAFETY: `dest` is valid for `capacity >= file_size` bytes and exclusively ours.
     let pooled = matches!(strategy, GetStrategy::Pooled)
-        && crate::direct_bounce::use_pool_for(file_size)
-        && unsafe { pooled_get(file_size, alignment, dest, &read_at)? };
+        && unsafe { pooled_get(file_size, alignment, dest, cancel, &read_at)? };
     if !pooled {
         let max_io = round_down(MAX_SINGLE_IO_BYTES, alignment).max(alignment);
         let mut total = 0usize;
@@ -637,6 +648,27 @@ fn read_all_direct_with(
         buf,
         len: file_size,
     }))
+}
+
+/// Sets its flag when dropped: held by the async fn of a `direct://` transfer so that, if the
+/// future is dropped (cancelled), a blocking closure still WAITING for bounce buffers gives up
+/// before it starts any I/O. A closure that already holds buffers runs to completion (and drops
+/// its lease) regardless.
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelOnDrop {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+    fn flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Streaming writer for direct I/O filesystem operations
@@ -1260,6 +1292,7 @@ impl ConfigurableFileSystemObjectStore {
         // For O_DIRECT, we need to be careful about alignment and may need to fall back
         match self.try_read_file_direct(path).await {
             Ok(data) => Ok(data),
+            Err(e) if crate::direct_bounce::is_cancelled(&e) => Err(e),
             Err(e) => {
                 // If O_DIRECT fails, fall back to regular I/O
                 GET_FALLBACKS.fetch_add(1, Ordering::Relaxed);
@@ -1295,6 +1328,8 @@ impl ConfigurableFileSystemObjectStore {
         {
             let path = path.to_owned();
             let alignment = self.alignment();
+            let cancel_guard = CancelOnDrop::new();
+            let cancel = cancel_guard.flag();
 
             // Use spawn_blocking to run sync I/O in thread pool
             tokio::task::spawn_blocking(move || -> Result<Bytes> {
@@ -1308,7 +1343,7 @@ impl ConfigurableFileSystemObjectStore {
 
                 // One read per at most 2 GiB into one aligned buffer, not one 4 KiB read
                 // per system call (issue #244).
-                let data = read_all_direct(&file, file_size, alignment)?;
+                let data = read_all_direct(&file, file_size, alignment, &cancel)?;
                 DIRECT_GETS.fetch_add(1, Ordering::Relaxed);
                 Ok(data)
             })
@@ -1337,6 +1372,7 @@ impl ConfigurableFileSystemObjectStore {
         // Try O_DIRECT write, fall back to regular write if it fails
         match self.try_write_file_direct(path, data.clone()).await {
             Ok(()) => Ok(()),
+            Err(e) if crate::direct_bounce::is_cancelled(&e) => Err(e),
             Err(e) => {
                 PUT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 warn!(
@@ -1373,6 +1409,8 @@ impl ConfigurableFileSystemObjectStore {
             let path = path.to_owned();
             let alignment = self.alignment();
             let sync_writes = self.config.sync_writes;
+            let cancel_guard = CancelOnDrop::new();
+            let cancel = cancel_guard.flag();
 
             // Use spawn_blocking for sync I/O
             tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1393,7 +1431,7 @@ impl ConfigurableFileSystemObjectStore {
 
                 // One write for the whole aligned body when `data` is aligned, otherwise
                 // bounce-buffer-sized writes (issue #244); never one 4 KiB block per call.
-                write_all_direct(&file, data.as_ref(), alignment)?;
+                write_all_direct(&file, data.as_ref(), alignment, &cancel)?;
                 DIRECT_PUTS.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             })
@@ -1513,8 +1551,12 @@ impl ConfigurableFileSystemObjectStore {
             .checked_next_multiple_of(self.alignment())
             .ok_or_else(too_big)?;
 
-        // Borrow aligned buffer from pool if available, otherwise allocate fresh (v0.9.9+)
-        let mut aligned: AlignedBuf = if let Some(pool) = &self.config.buffer_pool {
+        // Borrow aligned buffer from pool if available, otherwise allocate fresh (v0.9.9+).
+        // The pooled buffer is an RAII lease: it (and its permit) go back to the pool when
+        // `lease` is dropped, on every exit including cancellation.
+        let mut lease: Option<crate::memory::PooledBuf> = None;
+        let mut own: Option<AlignedBuf> = None;
+        if let Some(pool) = &self.config.buffer_pool {
             let b = pool.take().await?;
             // Grow buffer if pooled buffer is too small
             if b.len() < aligned_length {
@@ -1523,13 +1565,17 @@ impl ConfigurableFileSystemObjectStore {
                     b.len(),
                     aligned_length
                 );
-                AlignedBuf::new(aligned_length, self.alignment())?
-            } else {
-                b
+                own = Some(AlignedBuf::new(aligned_length, self.alignment())?);
             }
+            lease = Some(b);
         } else {
             // No pool configured, allocate fresh buffer
-            AlignedBuf::new(aligned_length, self.alignment())?
+            own = Some(AlignedBuf::new(aligned_length, self.alignment())?);
+        }
+        let aligned: &mut AlignedBuf = match (own.as_mut(), lease.as_deref_mut()) {
+            (Some(o), _) => o,
+            (None, Some(l)) => l,
+            (None, None) => bail!("internal error: no range-read buffer"),
         };
 
         let options = self.create_open_options(true, false);
@@ -1559,14 +1605,7 @@ impl ConfigurableFileSystemObjectStore {
         out.extend_from_slice(&aligned.as_slice()[start..end]);
         let result = out.freeze();
 
-        // Return aligned buffer to pool for reuse (v0.9.9+)
-        // give() is non-blocking (try_send): if the pool channel is full because
-        // a fallback-allocated buffer was used while the pre-alloc had already
-        // filled the channel, we simply drop the buffer rather than deadlocking.
-        if let Some(pool) = &self.config.buffer_pool {
-            pool.give(aligned);
-        }
-
+        // The pooled lease (if any) returns to the pool when it drops at the end of this fn.
         Ok(result)
     }
 
@@ -2187,7 +2226,7 @@ mod direct_io_chunking_tests {
     //! round-trip tests use a REAL O_DIRECT file (no buffered fallback in between).
     use super::*;
     use crate::constants::{DEFAULT_DIRECT_IO_BOUNCE_SIZE, DEFAULT_DIRECT_IO_WRITER_STAGING_SIZE};
-    use crate::direct_bounce::{GetStrategy, PutStrategy};
+    use crate::direct_bounce::{GetStrategy, PutStrategy, NEVER_CANCELLED};
 
     const A: usize = 4096;
     const MIB: usize = 1024 * 1024;
@@ -2403,7 +2442,7 @@ mod direct_io_chunking_tests {
             }
 
             let file = open_direct_write(&path);
-            write_all_direct_with(&file, data, A, strategy, &AlignedBuf::new)
+            write_all_direct_with(&file, data, A, strategy, &AlignedBuf::new, &NEVER_CANCELLED)
                 .expect("O_DIRECT write");
             drop(file);
             assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, len);
@@ -2416,7 +2455,8 @@ mod direct_io_chunking_tests {
                     .open(&path)
                     .unwrap();
                 for get in [GetStrategy::Direct, GetStrategy::Pooled] {
-                    let back = read_all_direct_with(&rf, len, A, get).expect("O_DIRECT read");
+                    let back = read_all_direct_with(&rf, len, A, get, &NEVER_CANCELLED)
+                        .expect("O_DIRECT read");
                     assert_eq!(
                         back.as_ref(),
                         raw.as_slice(),
@@ -2488,8 +2528,16 @@ mod direct_io_chunking_tests {
                 for off in [0usize, 3, 16, A + 1] {
                     let mut dest = vec![0x77u8; len + off + 8];
                     // SAFETY: dest has room for len bytes at off.
-                    unsafe { read_all_direct_into(&rf, len, A, dest.as_mut_ptr().add(off)) }
-                        .unwrap();
+                    unsafe {
+                        read_all_direct_into(
+                            &rf,
+                            len,
+                            A,
+                            dest.as_mut_ptr().add(off),
+                            &NEVER_CANCELLED,
+                        )
+                    }
+                    .unwrap();
                     assert_eq!(&dest[off..off + len], raw.as_slice(), "len {len} off {off}");
                     assert!(dest[..off].iter().all(|&b| b == 0x77));
                     assert!(dest[off + len..].iter().all(|&b| b == 0x77));
@@ -2510,12 +2558,15 @@ mod direct_io_chunking_tests {
                 .open(&path)
                 .unwrap();
             for get in [GetStrategy::Direct, GetStrategy::Pooled] {
-                let e = read_all_direct_with(&rf, 16 * MIB, A, get)
+                let e = read_all_direct_with(&rf, 16 * MIB, A, get, &NEVER_CANCELLED)
                     .expect_err("claimed size is larger than the file");
                 assert!(!e.to_string().is_empty(), "{get:?}");
             }
             let mut dest = vec![0u8; 16 * MIB];
-            assert!(unsafe { read_all_direct_into(&rf, 16 * MIB, A, dest.as_mut_ptr()) }.is_err());
+            assert!(unsafe {
+                read_all_direct_into(&rf, 16 * MIB, A, dest.as_mut_ptr(), &NEVER_CANCELLED)
+            }
+            .is_err());
         }
 
         /// Round 2, item 3: a failed bounce allocation retries with half the size, and only
@@ -2535,7 +2586,7 @@ mod direct_io_chunking_tests {
                     AlignedBuf::new(len, align)
                 }
             };
-            write_all_direct_with(&file, &raw, A, PER_CALL_64MIB, &limited)
+            write_all_direct_with(&file, &raw, A, PER_CALL_64MIB, &limited, &NEVER_CANCELLED)
                 .expect("smaller bounce");
             drop(file);
             assert_eq!(std::fs::read(&path).unwrap(), raw);
@@ -2544,7 +2595,15 @@ mod direct_io_chunking_tests {
             let path = d.path().join("b.bin");
             let file = open_direct_write(&path);
             let never = |len: usize, align: usize| Err(AlignedAllocError { len, align });
-            assert!(write_all_direct_with(&file, &raw, A, PER_CALL_64MIB, &never).is_err());
+            assert!(write_all_direct_with(
+                &file,
+                &raw,
+                A,
+                PER_CALL_64MIB,
+                &never,
+                &NEVER_CANCELLED
+            )
+            .is_err());
         }
 
         /// Round 2, item 5 (#249): the stream is made durable once, at finalize, not per flush.

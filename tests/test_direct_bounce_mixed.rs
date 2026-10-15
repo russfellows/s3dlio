@@ -81,9 +81,11 @@ async fn mixed_gets_and_puts_share_one_pair_without_starving_or_corrupting() {
                             "GET content differs (object {i})"
                         );
                     } else {
-                        // Rewrite the same bytes so concurrent GETs stay verifiable.
+                        // PUTs go to files of their own: a PUT truncates its target, so a
+                        // concurrent GET of the same file would legitimately see a partial one.
+                        let target = format!("direct://{base}/w{t}-{i}.bin");
                         store
-                            .put(&uri, Bytes::from(pattern(len, i)))
+                            .put(&target, Bytes::from(pattern(len, i)))
                             .await
                             .expect("put");
                     }
