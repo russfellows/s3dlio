@@ -893,6 +893,45 @@ async fn a_leading_slash_key_with_a_glob_selects_by_the_rule() {
     assert_eq!(state.remaining_keys(&b), want);
 }
 
+/// A key with an interior '//' (`s3://b/a//b`): the key is `a//b`, exactly as written. The
+/// exact name selects only itself (and what is under `a//b/`), never `a/b` or `a//bc`, and a
+/// glob over `a//` keeps the doubled separator.
+#[tokio::test]
+async fn an_interior_double_slash_key_is_selected_exactly() {
+    let keys = ["a//b", "a//b/c", "a//bc", "a/b", "a//d", "a//e/f", "a/x"];
+    let (port, state, b) = seeded_marked("inner", &keys);
+    // the exact name: the object, and the directory under it when descending
+    assert_selects(
+        port,
+        &format!("s3://{b}/a//b"),
+        true,
+        uris(&b, &["a//b", "a//b/c"]),
+    )
+    .await;
+    // `*` stays within one directory level below `a//`
+    assert_selects(
+        port,
+        &format!("s3://{b}/a//*"),
+        true,
+        uris(&b, &["a//b", "a//bc", "a//d"]),
+    )
+    .await;
+    assert_selects(
+        port,
+        &format!("s3://{b}/a//**"),
+        true,
+        uris(&b, &["a//b", "a//b/c", "a//bc", "a//d", "a//e/f"]),
+    )
+    .await;
+    delete_recursively(port, &format!("s3://{b}/a//b")).await;
+    let mut want: Vec<String> = ["a//bc", "a/b", "a//d", "a//e/f", "a/x"]
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
+    want.sort();
+    assert_eq!(state.remaining_keys(&b), want);
+}
+
 // ----------------------------------------------------------------------------
 // Dataset constructors: a selection of nothing is an error, never an empty dataset
 // ----------------------------------------------------------------------------
