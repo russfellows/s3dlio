@@ -772,11 +772,18 @@ pub trait ObjectStore: Send + Sync {
     // Metadata Operations (v0.10.0+)
     // =========================================================================
 
-    /// Create a directory (POSIX) or prefix marker (cloud).
+    /// Create a directory.
     ///
     /// **Backend behavior**:
-    /// - `file://`, `direct://`: Creates actual directory with `create_dir_all()`
-    /// - `s3://`, `gs://`, `az://`: Creates empty marker object (e.g., `.keep`)
+    /// - `file://`, `direct://`: creates the directory and any missing parents
+    ///   (`create_dir_all`); an existing directory is success. `direct://` is the
+    ///   `file://` behaviour -- O_DIRECT has no meaning for a directory.
+    /// - `s3://`, `gs://`, `az://`: a **no-op**. An object store has no directories;
+    ///   a prefix exists once objects are written under it, so there is nothing to
+    ///   create. The URI is validated, NO request is sent and no marker object is
+    ///   written.
+    ///
+    /// Never recorded in the op-log.
     ///
     /// # Arguments
     /// * `uri` - Full URI including scheme (e.g., "file:///tmp/dir", "s3://bucket/prefix/")
@@ -785,15 +792,26 @@ pub trait ObjectStore: Send + Sync {
         bail!("mkdir not implemented for this backend")
     }
 
-    /// Remove a directory (POSIX) or delete all objects under prefix (cloud).
+    /// Remove a directory.
     ///
     /// **Backend behavior**:
-    /// - `file://`, `direct://`: Removes directory (must be empty unless `recursive=true`)
-    /// - `s3://`, `gs://`, `az://`: Deletes all objects under prefix
+    /// - `file://`, `direct://`: `recursive == false` removes only an EMPTY directory
+    ///   (a non-empty one is an error and nothing is removed); `recursive == true`
+    ///   removes the whole tree. A missing directory is success. `direct://` is the
+    ///   `file://` behaviour.
+    /// - `s3://`, `gs://`, `az://`: a **no-op**, `recursive` or not. An object store
+    ///   has no directories, so there is nothing to remove. The URI is validated, NO
+    ///   request is sent and NOTHING is deleted. To delete the objects under a prefix
+    ///   use [`ObjectStore::delete_prefix`] (Python `delete(uri, recursive=True)`,
+    ///   `s3-cli delete -r`).
+    ///
+    /// Recorded in the op-log as one `DELETE_PREFIX` row on `file://` and `direct://`
+    /// only (issue #228); an object-store `rmdir` deletes nothing and writes no row.
     ///
     /// # Arguments
     /// * `uri` - Full URI including scheme
-    /// * `recursive` - If true, delete recursively; if false, fail if not empty
+    /// * `recursive` - `file://` / `direct://`: if true, remove the whole tree; if
+    ///   false, fail if not empty. Ignored on object stores.
     async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
         let _ = (uri, recursive);
         bail!("rmdir not implemented for this backend")
@@ -1906,6 +1924,39 @@ impl ObjectStore for S3ObjectStore {
         Ok(())
     }
 
+    /// No-op: an object store has no directories (issue #229). A prefix exists once
+    /// objects are written under it, so there is nothing to create. The URI is
+    /// validated; NO request is sent and no object (marker or otherwise) is written.
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        self.parse_uri_for_this_store(uri)?;
+        debug!(
+            "S3ObjectStore::mkdir is a no-op on an object store: '{}'",
+            uri
+        );
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229), so there is nothing to
+    /// remove -- `recursive` or not. The URI is validated; NO request is sent and
+    /// nothing is deleted. To delete the objects under a prefix use
+    /// [`ObjectStore::delete_prefix`] (Python `delete(uri, recursive=True)`,
+    /// `s3-cli delete -r`).
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        let _ = recursive;
+        if !uri.starts_with("s3://") {
+            bail!("S3ObjectStore expected s3:// URI");
+        }
+        self.parse_uri_for_this_store(uri)?;
+        debug!(
+            "S3ObjectStore::rmdir is a no-op on an object store: '{}'",
+            uri
+        );
+        Ok(())
+    }
+
     async fn create_container(&self, name: &str) -> Result<()> {
         // A per-endpoint store (built for `s3://host:port/...`) must create the
         // bucket on ITS server, not on the global singleton's (issue #194).
@@ -2826,6 +2877,33 @@ impl ObjectStore for AzureObjectStore {
         Ok(())
     }
 
+    /// No-op: an object store has no directories (issue #229). A prefix exists once
+    /// objects are written under it, so there is nothing to create. The URI is
+    /// validated; NO request is sent and no object (marker or otherwise) is written.
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        parse_azure_uri(uri)?;
+        debug!(
+            "AzureObjectStore::mkdir is a no-op on an object store: '{}'",
+            uri
+        );
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229), so there is nothing to
+    /// remove -- `recursive` or not. The URI is validated; NO request is sent and
+    /// nothing is deleted. To delete the objects under a prefix use
+    /// [`ObjectStore::delete_prefix`] (Python `delete(uri, recursive=True)`,
+    /// `s3-cli delete -r`).
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        let _ = recursive;
+        parse_azure_uri(uri)?;
+        debug!(
+            "AzureObjectStore::rmdir is a no-op on an object store: '{}'",
+            uri
+        );
+        Ok(())
+    }
+
     async fn create_container(&self, name: &str) -> Result<()> {
         // interpret "name" as "{account}/{container}"
         let mut it = name.splitn(2, '/');
@@ -3427,6 +3505,33 @@ impl ObjectStore for GcsObjectStore {
         }
 
         debug!("GCS delete_prefix deleted {} objects total", total_deleted);
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229). A prefix exists once
+    /// objects are written under it, so there is nothing to create. The URI is
+    /// validated; NO request is sent and no object (marker or otherwise) is written.
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        parse_gcs_uri(uri)?;
+        debug!(
+            "GcsObjectStore::mkdir is a no-op on an object store: '{}'",
+            uri
+        );
+        Ok(())
+    }
+
+    /// No-op: an object store has no directories (issue #229), so there is nothing to
+    /// remove -- `recursive` or not. The URI is validated; NO request is sent and
+    /// nothing is deleted. To delete the objects under a prefix use
+    /// [`ObjectStore::delete_prefix`] (Python `delete(uri, recursive=True)`,
+    /// `s3-cli delete -r`).
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        let _ = recursive;
+        parse_gcs_uri(uri)?;
+        debug!(
+            "GcsObjectStore::rmdir is a no-op on an object store: '{}'",
+            uri
+        );
         Ok(())
     }
 
@@ -5003,6 +5108,57 @@ mod s3_object_store_tests {
             #[allow(deprecated)]
             None => std::env::remove_var(key),
         }
+    }
+}
+
+// =============================================================================
+// Issue #229: mkdir / rmdir are successful NO-OPS on object stores
+// =============================================================================
+//
+// An object store has no directories, so `mkdir` and `rmdir` (recursive or not)
+// validate the URI and return Ok without any request. Azure and GCS have no mock
+// server in this repository: these unit tests run the REAL store (no client is ever
+// built, so no credentials or network are needed) and prove the no-op and the URI
+// validation. They are not an end-to-end exercise against the cloud service.
+#[cfg(test)]
+mod issue229_object_store_dir_noop_tests {
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[cfg(feature = "backend-azure")]
+    #[tokio::test]
+    async fn azure_mkdir_rmdir_are_noops_and_validate_the_uri() {
+        let store = AzureObjectStore::new();
+        for uri in [
+            "az://acct/cont/dir",
+            "az://acct/cont/dir/",
+            "az://acct/cont/",
+        ] {
+            store.mkdir(uri).await.unwrap();
+            store.rmdir(uri, true).await.unwrap();
+            store.rmdir(uri, false).await.unwrap();
+        }
+        assert!(store.mkdir("az://acct").await.is_err(), "no container");
+        assert!(
+            store.rmdir("s3://b/dir", true).await.is_err(),
+            "wrong scheme"
+        );
+    }
+
+    #[cfg(feature = "backend-gcs")]
+    #[tokio::test]
+    async fn gcs_mkdir_rmdir_are_noops_and_validate_the_uri() {
+        let store = GcsObjectStore::new();
+        for uri in ["gs://bkt/dir", "gs://bkt/dir/", "gs://bkt/", "gs://bkt"] {
+            store.mkdir(uri).await.unwrap();
+            store.rmdir(uri, true).await.unwrap();
+            store.rmdir(uri, false).await.unwrap();
+        }
+        assert!(store.mkdir("gs:///dir").await.is_err(), "empty bucket");
+        assert!(
+            store.rmdir("s3://b/dir", true).await.is_err(),
+            "wrong scheme"
+        );
     }
 }
 
