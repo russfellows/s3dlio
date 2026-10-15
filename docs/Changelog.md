@@ -253,6 +253,12 @@ key is removed.
 - Test support: the in-process mock S3 can be seeded with a bucket catalog that honours prefix,
   delimiter, `max-keys` and paging, and removes the keys a delete names.
 
+### Build
+
+- The declared minimum Rust version (`rust-version` in `Cargo.toml`) is now 1.94.1. It said 1.88, but
+  the AWS SDK crates in `Cargo.lock` already require Rust 1.94.1, so an older toolchain could not build
+  s3dlio anyway; the manifest now says so up front. The README badge and prerequisites match.
+
 ## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
 
 Fixes 12 issues: #167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215.

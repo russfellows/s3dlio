@@ -1,36 +1,33 @@
 # s3dlio - Universal Storage I/O Library
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/russfellows/s3dlio)
+[![CI](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml)
 [![Rust Tests](https://img.shields.io/badge/rust%20tests-1272-brightgreen)](docs/Changelog.md)
 [![Version](https://img.shields.io/badge/version-0.9.126-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
+[![Rust](https://img.shields.io/badge/rust-1.94.1%2B-orange)](https://www.rust-lang.org)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org)
 
 High-performance, multi-protocol storage library for AI/ML workloads with universal copy operations across S3, Azure, GCS, local file systems, and DirectIO.
 
 Full-backend builds support the stable Azure Blob Storage Rust SDK 1.0 API.
 
-> **v0.9.126 — Exact `s3://` selection, per-endpoint stores, no zero-limit hangs, no truncated compressed uploads.** 0.9.124 was never published to PyPI, so this is the first published release after 0.9.122 and also contains the 0.9.124 changes below. An `s3://` URI now selects the exact object it names and its `key/` directory, or an explicit `*` / `**` glob, and `-r` follows the same rule (a name never selects `name.bak` or `name2/`); the regex that `ls`, `get` and `download` used to read out of the URI is the explicit `--pattern` option (also new on `download` and `get`). A per-endpoint store (`s3://host:port/...`) now runs large reads, multipart and writer uploads on its own server (#208); a concurrency, chunk or worker limit of 0 is an error instead of a hang (#211); a zstd-compressed buffered writer no longer uploads a truncated object (#218, silent data loss); object keys beginning with `/` or containing `//` are used exactly in the op-log replay, Azure https form, arrow-backend and Python compat layers (#198). Fixes #198, #208, #211, #213, #216, #218, #228, #229, #231, #234, #236. **Behaviour changes are listed in [docs/Changelog.md](docs/Changelog.md).**
+## Recent Releases
 
-> **v0.9.124 (prior, not published to PyPI) — Exact delete contract, Python API fixes, safer op-log rows.** `s3-cli delete` and Python `delete()` now send ONE DELETE for exactly the key named (no HEAD, no listing; a missing object is success; a trailing `/` is never recursive); `-r` / `recursive=True` deletes the real objects under the literal prefix, and a directory is refused without `-r`. Python `list()`, `stat()` and writer calls release the GIL while blocking, async entry points reuse the shared store cache, and `list_keys` returns keys as written. Op-log rows with a TAB, LF or CR in an identity field, or an unformattable timestamp, are rejected and counted (`op_log_stats()` gains `rejected_unsafe_field`, `normalized_error_text`, `rejected_unformattable`); `file:x` op-log destinations are rejected. `build_pyo3.sh` now fails loudly and requires both cp312 and cp313 wheels. 12 issues fixed (#167, #186, #188, #190, #191, #201, #203, #204, #207, #210, #212, #215). **Behaviour changes are listed in [docs/Changelog.md](docs/Changelog.md).**
+- **v0.9.126** — Exact URI selection; routing, upload fixes — [PR #237](https://github.com/russfellows/s3dlio/pull/237)
+- **v0.9.124** (not on PyPI) — Exact delete contract, op-log safety — [PR #217](https://github.com/russfellows/s3dlio/pull/217)
+- **v0.9.122** — One op-log row per call — [PR #209](https://github.com/russfellows/s3dlio/pull/209)
+- **v0.9.120** (not on PyPI) — Routing, hang and crash fixes — [PR #206](https://github.com/russfellows/s3dlio/pull/206)
+- **v0.9.114** — Azure SDK stable 1.x — [PR #164](https://github.com/russfellows/s3dlio/pull/164)
+- **v0.9.112** — Runtime clamp, MPI-aware thread pools — [PR #163](https://github.com/russfellows/s3dlio/pull/163)
+- **v0.9.110** — 39-bug multi-agent audit fixes — [PR #159](https://github.com/russfellows/s3dlio/pull/159)
+- **v0.9.108** — Performance and concurrency audit — [PR #149](https://github.com/russfellows/s3dlio/pull/149)
+- **v0.9.106** — Write verification now opt-in — [PR #147](https://github.com/russfellows/s3dlio/pull/147)
+- **v0.9.104** — Write integrity verification and retry — [PR #145](https://github.com/russfellows/s3dlio/pull/145)
+- **v0.9.102** — SDK error diagnostics, retry knobs — [PR #144](https://github.com/russfellows/s3dlio/pull/144)
 
-> **v0.9.122 (prior) — Each op-log call is recorded once; every operation reaches the server its URI names.** 14 issues fixed (#169, #174, #177, #181, #182, #183, #184, #187, #189, #196, #197, #199, #200, #202). See [docs/Changelog.md](docs/Changelog.md).
+Full history, behaviour changes and migration notes: **[docs/Changelog.md](docs/Changelog.md)**.
 
-> **v0.9.120 (prior, not published to PyPI) — Correct routing, no sync hang, no exit crash, op-log lifecycle.** Requests now always reach the server, bucket and key the URI names. Changes: an `s3://X/` names a server only with an explicit `:port`; a leading `/` in a key is kept; `delete_batch` never deletes in the wrong bucket or on the wrong server; the Python store cache is keyed by server; `MultiEndpointStore` uses https on TLS ports. Sync Python calls on host-form URIs no longer hang, and the interpreter no longer crashes at exit after async calls. The op-log accepts `file://` destinations, and `op_log_stats()` reports dropped and unwritten records. 11 issues fixed (#168, #170–#173, #178–#180, #192–#194). **Behaviour changes are listed in [docs/Changelog.md](docs/Changelog.md).**
->
-> **v0.9.112 (prior) — Tokio-runtime sanity clamp + MPI-aware thread pools + FFI-boundary hardening**
->
-> Three independent hardening changes in one release. **(1) Tokio-runtime sanity clamp on `S3DLIO_RT_THREADS`:** DLIO's `ObjStoreLibStorage.__init__` computes `S3DLIO_RT_THREADS = write_threads * 3 // 2`, and with Hydra's default `write_threads=1` that resolves to `S3DLIO_RT_THREADS=1` — which pre-0.9.112 s3dlio faithfully obeyed by building a 1-worker Tokio runtime, then serialized every concurrent multipart-upload part on it (10× throughput loss on unet3d datagen: 214 MB/s → 1928 MB/s live-measured after fix). s3dlio now clamps env-var values below `RT_THREADS_LIMIT/4` back up to the configured target with a stderr warning; `S3DLIO_RT_THREADS_UNSAFE=1` bypasses for legitimate low-thread scenarios. **(2) MPI-aware thread pool auto-init:** every s3dlio-owned pool (Tokio runtime, checkpoint runtime, Rayon global, dgen-rs) is now sized to `num_cpus / world_size` at import time via `_pymod`'s auto-call to `configure_thread_pools(0)`, closing the CPU-oversubscription class of bug where N ranks on the same host each independently claim the full core count. **(3) FFI-boundary hardening (storage#755, s3dlio#161, s3dlio#162):** error conversion at the PyO3 boundary previously discarded the full `anyhow` cause chain; fixed at 25+ sites so a DLIO run that died with only `RuntimeError: concurrent range chunk failed` now surfaces the real underlying cause. Also: unknown-length dataset iteration raises instead of silently yielding nothing; 7 of 9 writer `block_on()` call sites migrated off a reentrancy-panic risk; 3 sync-iterator classes switched to a non-poisoning mutex; `MultiEndpointStore` gained explicit per-endpoint pinning. Full details: [docs/Changelog.md](docs/Changelog.md) + [docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md](docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md).
->
-> **v0.9.110 (prior):** Multi-agent bug audit fix release — 39 fixes across 6 phases (issues #151–#157). Closes a coordinated 7-issue, 39-bug audit of s3dlio HEAD, fanning out specialized reviewers by subsystem then adversarially verifying every finding: silent data corruption in range/multipart paths (Phase A), wrong-data-returned bugs reachable from the public API (Phase B), silent exception-swallowing (Phase C), backend correctness/hygiene across S3/Azure/GCS (Phase D), URI-parsing and scheme-detection edge cases (Phase E), and dead/mismatched env-var knobs (Phase F).
->
-> **v0.9.108 (prior):** Performance & concurrency audit — 17 fixes across 4 phases (issue #148). **BREAKING for `https://`:** no longer negotiates HTTP/2 by default (now matches `http://` — HTTP/1.1 unless opted in via `S3DLIO_HTTPS_H2=1`/`S3DLIO_ENABLE_HTTP2=1`).
->
-> **v0.9.106 (prior):** Write verification (`S3DLIO_PUT_VERIFY`, `S3DLIO_MPU_PUT_VERIFY`) changed from always-on to opt-in (mlcommons/storage#593 follow-up).
->
-> **v0.9.102 (prior):** SDK error-chain diagnostics + cold-start timeout / retry knobs (mlcommons/storage#506).
 
 ## 📦 Installation
 
@@ -225,50 +222,14 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 - **High Performance**: High-throughput multi GB/s reads and writes on platforms with sufficient network and storage capabilities
 - **Zero-Copy Architecture**: `bytes::Bytes` throughout for minimal memory overhead
 - **Multi-Protocol**: S3, Azure Blob, GCS, file://, direct:// (O_DIRECT)
-- **HTTP/2 Support (opt-in)**: HTTP/2 is available but **HTTP/1.1 is the default** — HTTP/2 is almost always slower for bulk storage workloads. Opt in by setting `S3DLIO_H2C=1`. Both TLS ALPN (`https://`) and cleartext h2c (`http://`) are supported when enabled. See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
+- **HTTP/2 Support (opt-in)**: **HTTP/1.1 is the default** — HTTP/2 is almost always slower for bulk storage workloads. Opt in with `S3DLIO_HTTPS_H2=1` (TLS ALPN, `https://`), `S3DLIO_H2C=1` (cleartext h2c, `http://`), or `S3DLIO_ENABLE_HTTP2=1` (both). See [docs/HTTP2_ALPN_INVESTIGATION.md](docs/HTTP2_ALPN_INVESTIGATION.md).
 - **Python & Rust**: Native Rust library with zero-copy Python bindings (PyO3), bytearray support for efficient memory management
-- **Multi-Endpoint Load Balancing**: RoundRobin/LeastConnections across storage endpoints
+- **Multi-Endpoint Load Balancing**: RoundRobin/LeastConnections across storage endpoints; a per-endpoint URI (`s3://host:port/bucket/key`) runs every operation on that server
+- **Precise Object Selection**: an `s3://` URI selects exactly the object it names plus its `name/` directory — never `name.bak` — with explicit `*` / `**` globs and `--pattern` regex filtering; `delete -r` follows the same rule
+- **Operation Tracing (Op-Log)**: zstd-compressed TSV trace of every storage operation, one row per call, with a replay tool
 - **AI/ML Ready**: PyTorch DataLoader integration, TFRecord/NPZ format support
 - **Parquet DataLoader**: Per-row-group epoch-aware DataLoader for any s3dlio storage backend (S3, Azure Blob, GCS, file://, direct://). Epoch-2 zero re-fetch speedup (2.5×+), Raw + Arrow IPC decode modes, 8-worker concurrency with shared metadata caches — [see guide](docs/Parquet_Data-Loader.md)
 - **High-Speed Data Generation**: 50+ GB/s test data with configurable compression/dedup
-
-## 🌟 Latest Release
-
-**v0.9.126** — Exact `s3://` selection (#213), per-endpoint stores run every operation on their own server (#208), a limit of 0 is an error not a hang (#211), compressed-writer truncation fixed (#218), exact keys in every layer (#198), test env lock (#216), a removed directory is one op-log `DELETE_PREFIX` row (#228), `mkdir`/`rmdir` work on every backend (#229), Azure/GCS `delete_prefix` stays under `prefix/` (#231), host-form `download`/`get` fetch from the server that listed (#234), multipart uploads to GCS's S3-compatible endpoint work again (#236). First published release after 0.9.122; includes 0.9.124. See [docs/Changelog.md](docs/Changelog.md).
-
-**v0.9.124 (prior; not published to PyPI)** — Exact delete contract for s3-cli and Python, Python GIL and store-cache fixes, op-log row safety (12 issues). See [docs/Changelog.md](docs/Changelog.md).
-
-**v0.9.122 (prior)** — Each op-log call recorded once, server routing for every operation, replay and Azure credential fixes (14 issues). See [docs/Changelog.md](docs/Changelog.md).
-
-**v0.9.120 (prior; not published to PyPI)** — Correct server/bucket/key routing, sync-hang and exit-crash fixes, op-log lifecycle and drop detection (11 issues). See [docs/Changelog.md](docs/Changelog.md).
-
-**v0.9.112 (prior)** — Tokio-runtime sanity clamp on `S3DLIO_RT_THREADS` + MPI-aware thread pool auto-init + FFI-boundary hardening (storage#755, #161, #162). See [docs/Changelog.md](docs/Changelog.md) and [docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md](docs/investigation/DLIO_UNET3D_DATAGEN_BOTTLENECK_INVESTIGATION_2026-07-10.md).
-
-**Recent highlights:**
-- **v0.9.126** — `s3://` selection: exact name, its directory or `*`/`**` glob, `--pattern` regex (#213); per-endpoint store routing (#208); zero limits rejected (#211); compressed writer fix (#218); exact keys (#198); test env lock (#216); op-log records a removed directory as DELETE_PREFIX (#228); `mkdir`/`rmdir` on every backend (#229); Azure/GCS `delete_prefix` (#231); host-form download/get fetch (#234); multipart upload start sends Content-Length: 0 (GCS, #236); 11 issues
-- **v0.9.124 (not published to PyPI)** — Delete contract: exact delete is one DELETE, `-r` uses the literal prefix (#210, #167, #212); Python GIL release and shared store cache (#201, #204); op-log row safety (#186, #190, #191); arrow-backend fixes (#207); `build_pyo3.sh` fails loudly (#188); 12 issues
-- **v0.9.122** — Op-log accuracy: one row per S3 call (#169, #174, #177, #181, #182, #189); `AWS_ENDPOINT_URL_S3` precedence (#183); server routing for every operation (#196, #197, #199, #200); op-log replay fixes (#184, #187); Azure credential fix (#202)
-- **v0.9.120** — Routing correctness (#171, #172, #178, #179, #180, #193, #194), sync-hang fix (#173), exit-crash fix (#192), op-log `file://` destinations, lifecycle and `op_log_stats()` (#168, #170); 961 tests passing
-- **v0.9.112** — Three independent hardening changes: (1) sanity clamp on `S3DLIO_RT_THREADS` — values below `RT_THREADS_LIMIT/4` are treated as downstream miscomputation and clamped up (live-measured 9× throughput recovery on the DLIO unet3d datagen bottleneck: 214 → 1928 MB/s at NP=1); new `S3DLIO_RT_THREADS_UNSAFE=1` escape hatch. (2) MPI-aware thread pool auto-init at import time — every s3dlio-owned pool (Tokio runtime, checkpoint runtime, Rayon global, dgen-rs) is now sized to `num_cpus / world_size` without any opt-in. (3) FFI-boundary hardening (storage#755, #161, #162): error-chain preservation across 25+ PyO3 boundary sites, unknown-length dataset iteration raises instead of silently yielding nothing, 7 of 9 writer `block_on()` sites migrated off a reentrancy-panic risk, 3 sync-iterator classes switched to a non-poisoning mutex, `MultiEndpointStore` explicit per-endpoint pinning + fan-out replication; 762 tests passing
-- **v0.9.110** - Phase D+E+F of the audit (17 bugs): backend correctness/hygiene (GCS retry backoff, RAPID-bucket cache poisoning, Azure 50K-block cap, community-GCS multipart stub), URI/scheme-detection edge cases, dead/mismatched env-var knobs; new `S3DLIO_S3_ENDPOINT_TLS_PORTS`; 748 tests passing
-- **v0.9.109** - Phase A+B+C of the audit (22 bugs): silent data corruption in range/multipart paths, wrong-data-returned bugs, silent exception-swallowing; new `S3DLIO_S3_ENDPOINT_HINT_TLDS` + DLIO multipart env vars
-- **v0.9.98** - **Parquet DataLoader** (`ParquetRowGroupDataset`): per-row-group Dataset, epoch-2 zero-re-fetch (2.5× speedup proven), Raw + ArrowIpc decode modes, 8-worker shared caches; 648 tests passing
-- **v0.9.97** - `XorStream` (dedup-safe, ~15 GB/s/core); `S3DLIO_UNSIGNED_PAYLOAD` opt-in for private S3-compatible endpoints; 613 tests passing
-- **v0.9.92** - MPU coordinator task, auto-scale, async write/flush/finish safety fixes, MAX_MULTIPART_PARTS guard; 580 tests passing
-- **v0.9.90** - Full NVIDIA AIStore support (`S3DLIO_FOLLOW_REDIRECTS=1`) with all TLS security policies; HTTP/2 available (opt-in via `S3DLIO_H2C=1`, **not the default**); 5 issues closed (#126, #133, #134, #135, #136); 559 tests passing
-- **v0.9.86** - Redirect follower for NVIDIA AIStore (S3 path); HTTPS→HTTP downgrade prevention; 21 new redirect tests; redirect security analysis documented
-- **v0.9.84** - HEAD elimination (ObjectSizeCache); OnceLock env-var caching; lock-free range assembly; `AWS_CA_BUNDLE_PATH` → `AWS_CA_BUNDLE`; structured tracing
-- **v0.9.80** - Python list hang fix (IMDSv2 legacy call removed); tracing deadlock fix (`tokio::spawn` → inline stream); async S3 delete/bucket helpers; deprecated Python APIs cleaned up
-
-📖 **[Complete Changelog](docs/Changelog.md)** - Full version history, migration guides, API details
-
----
-
-## 📚 Version History
-
-For detailed release notes and migration guides, see the [Complete Changelog](docs/Changelog.md).
-
----
 
 ## Storage Backend Support
 
@@ -281,12 +242,12 @@ s3dlio provides unified storage operations across all backends with consistent U
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations with **RangeEngine** support
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance with **RangeEngine**
 
-### Concurrent Range GET Performance Features (v0.9.3+, Updated v0.9.60)
+### Concurrent Range GET Performance Features
 Concurrent range downloads hide network latency by parallelizing HTTP range requests.
 
 **All backends support concurrent range GETs — but via two different mechanisms:**
 
-**Mechanism 1 — S3 built-in (on by default, v0.9.60+)**
+**Mechanism 1 — S3 built-in (on by default)**
 - ✅ **Amazon S3**: Concurrent range splitting enabled by default via `S3DLIO_ENABLE_RANGE_OPTIMIZATION` (default: on). Uses `get_object_concurrent_range_async()` — fires parallel `GetObject(Range: bytes=N-M)` requests via the AWS SDK with lock-free chunk assembly. Controlled by `S3DLIO_RANGE_THRESHOLD_MB` (default: 32 MiB) and `S3DLIO_RANGE_CONCURRENCY` (default: auto-scaled). Disable with `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0`.
 
 **Mechanism 2 — RangeEngine (per-store config flag, must enable explicitly)**
@@ -295,7 +256,7 @@ Concurrent range downloads hide network latency by parallelizing HTTP range requ
 - ⚠️ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
 - ⚠️ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
 
-**RangeEngine config flag defaults (v0.9.6+):**
+**RangeEngine config flag defaults:**
 - **Status**: `enable_range_engine: false` by default in all per-store config structs
 - **Reason**: Extra HEAD request on every GET causes ~50% slowdown for small-object workloads
 - **Threshold**: 32 MiB default (tunable per-store via `RangeEngineConfig::min_split_size`)
@@ -399,8 +360,8 @@ pip install s3dlio
 
 - **[CLI Guide](docs/CLI_GUIDE.md)** - Complete command-line interface reference with examples
 - **[Python API Guide](docs/PYTHON_API_GUIDE.md)** - Complete Python library reference with examples
-- **[Parquet DataLoader Guide](docs/Parquet_Data-Loader.md)** - Epoch-aware per-row-group Parquet DataLoader (v0.9.98+)
-- **[Multi-Endpoint Guide](docs/MULTI_ENDPOINT_GUIDE.md)** - Load balancing across multiple storage endpoints (v0.9.14+)
+- **[Parquet DataLoader Guide](docs/Parquet_Data-Loader.md)** - Epoch-aware per-row-group Parquet DataLoader
+- **[Multi-Endpoint Guide](docs/MULTI_ENDPOINT_GUIDE.md)** - Load balancing across multiple storage endpoints
 - **[Rust API Guide v0.9.0](docs/api/rust-api-v0.9.0.md)** - Complete Rust library reference with migration guide
 - **[Changelog](docs/Changelog.md)** - Version history and release notes
 - **[Adaptive Tuning Guide](docs/ADAPTIVE-TUNING.md)** - Optional performance auto-tuning
@@ -441,7 +402,7 @@ s3-cli upload "/files/data_*.csv" az://container/data/
 # Regex patterns for listing (use single quotes to prevent shell expansion)
 s3-cli ls -r s3://bucket/ -p '.*\.txt$'           # Only .txt files
 s3-cli ls -r gs://bucket/ -p '.*\.(csv|json)$'    # CSV or JSON files
-s3-cli ls -r az://acct/cont/ -p '.*/data_.*'      # Files with "data_" in path
+s3-cli ls -r az://acct/cont/ -p '(^|/)data_'      # Names starting with "data_" (pattern is matched relative to the listed prefix)
 
 # Count objects matching pattern (with progress indicator)
 s3-cli ls -rc gs://bucket/data/ -p '.*\.npz$'
@@ -495,7 +456,7 @@ s3dlio.put("s3://bucket/test-data-{}.bin", num=1000, size=4194304,
           data_gen_mode="streaming")  # 2.6-3.5x faster for most cases
 ```
 
-**XorStream — dedup-safe data generation (v0.9.97+):**
+**XorStream — dedup-safe data generation:**
 
 `XorStream` generates unique, incompressible data at ~15 GB/s per core without Rayon
 thread management overhead. Every `fill()` / `generate()` call is guaranteed to produce a
@@ -543,7 +504,7 @@ for t in threads: t.join()
 | Very large objects (≥ 256 MiB) | `Generator.fill_chunk()` |
 
 
-**Multi-Endpoint Load Balancing (v0.9.14+):**
+**Multi-Endpoint Load Balancing:**
 ```python
 # Distribute I/O across multiple storage endpoints
 store = s3dlio.create_multi_endpoint_store(
@@ -566,7 +527,7 @@ for i, s in enumerate(stats):
 ```
 📖 **[Complete Multi-Endpoint Guide](docs/MULTI_ENDPOINT_GUIDE.md)** - Load balancing, configuration, use cases
 
-### 📦 Parquet DataLoader — Epoch-Aware Training (v0.9.98+)
+### 📦 Parquet DataLoader — Epoch-Aware Training
 
 The Parquet DataLoader provides per-row-group streaming for Parquet files on **any
 s3dlio-accessible storage** — S3, Azure Blob, GCS, `file://`, and `direct://` (O_DIRECT;
@@ -679,7 +640,7 @@ See [S3DLIO OpLog Implementation](docs/S3DLIO_OPLOG_IMPLEMENTATION_SUMMARY.md) f
 ## Building from Source
 
 ### Prerequisites
-- **Rust 1.88+**: [Install Rust toolchain](https://www.rust-lang.org/tools/install)
+- **Rust 1.94.1+**: [Install Rust toolchain](https://www.rust-lang.org/tools/install)
 - **Python 3.12+**: For Python library development
 - **UV** (recommended): [Install UV](https://docs.astral.sh/uv/getting-started/installation/)
 - **OpenSSL**: Required (`libssl-dev` on Ubuntu)
@@ -746,7 +707,7 @@ podman build -t s3dlio .
 
 - **🖥️ CLI Guide**: [docs/CLI_GUIDE.md](docs/CLI_GUIDE.md) - Complete command-line reference
 - **🐍 Python API**: [docs/PYTHON_API_GUIDE.md](docs/PYTHON_API_GUIDE.md) - Python library reference
-- **� Parquet DataLoader**: [docs/Parquet_Data-Loader.md](docs/Parquet_Data-Loader.md) - Epoch-aware Parquet DataLoader guide (v0.9.98+)
+- **📦 Parquet DataLoader**: [docs/Parquet_Data-Loader.md](docs/Parquet_Data-Loader.md) - Epoch-aware Parquet DataLoader guide
 - **�📚 API Documentation**: [docs/api/](docs/api/)
 - **📝 Changelog**: [docs/Changelog.md](docs/Changelog.md)
 - **🧪 Testing Guide**: [docs/TESTING-GUIDE.md](docs/TESTING-GUIDE.md)
