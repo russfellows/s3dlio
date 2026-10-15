@@ -273,9 +273,13 @@ Per backend, after that: `s3://`, `az://`, `gs://` (official client) and `file:/
 storage client / `write` with no further s3dlio copy (what the SDKs do internally is outside s3dlio; the legacy
 community GCS client, feature `gcs-community`, copies once). `direct://` (O_DIRECT) writes a **page-aligned**
 source (address a multiple of 4096) straight from your memory in one `write` per at most 2 GiB; any other source
-is copied **once** into an aligned bounce buffer (up to 1 GiB, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`) and written
-with one `write` per bounce buffer. `direct://` GET reads straight into one page-aligned buffer and returns it,
-so `s3dlio.get("direct://...")` followed by `put_bytes("direct://...", data)` is copy-free.
+is copied **once** through a warm, reused, page-aligned bounce buffer (64 MiB by default, shared per NUMA node,
+ping-pong so the copy of the next chunk overlaps the write of the current one; see
+`docs/Environment_Variables.md`). The last partial block of a PUT is always bounced (a zero-padded 4 KiB block).
+`direct://` GET returns page-aligned memory (by default read straight into one fresh aligned buffer), so for
+objects of at least `min_io_size` (4 KiB) on a store with the range engine off (the default),
+`s3dlio.get("direct://...")` followed by `put_bytes("direct://...", data)` needs no bounce copy of the body
+(only that final padded block). Smaller objects use buffered I/O.
 
 **Contract for buffers that are read in place** (`put_bytes`, and `put_bytes_async(borrow=True)` until the
 awaitable completes):
@@ -286,7 +290,17 @@ awaitable completes):
   prevents it, and the stored object would mix old and new bytes. This is memory-safe, but not the data you meant;
 * with `borrow=True` you additionally promise not to free the memory (for example ctypes/pinned host memory) until
   the awaitable has completed, successfully or not. The export is released before the awaitable resolves, so
-  resizing right after the `await` works.
+  resizing right after the `await` works for `file://` and `direct://` (the store has dropped its last reference
+  by then). For `s3://`, `gs://` and `az://` this is best effort: an SDK may keep a clone of the request body for
+  a short moment after the call completes, in which case a resize immediately after the `await` can still raise
+  `BufferError` for an instant; retry, or do not resize buffers you passed with `borrow=True`;
+* **cancelling the awaitable does not stop the request.** A blocking file write or an in-flight HTTP body may keep
+  reading the buffer until it finishes. The export is held until then (so the buffer cannot be freed or resized and
+  a resize raises `BufferError`), but you must not modify its bytes until the request is known to have ended.
+  Cancellation only abandons the result;
+* buffers whose item format is `O` (Python objects) or `P` (pointers) are refused with a `TypeError`: their bytes are
+  addresses, not data. A structured numpy dtype with padding is uploaded as its raw memory, padding bytes
+  included (they are whatever was in memory).
 
 The default `put_bytes_async` takes a snapshot instead, so the buffer can be reused or resized as soon as the call
 returns; the only obligation is not to write to it from another thread *during that copy* (which runs with the

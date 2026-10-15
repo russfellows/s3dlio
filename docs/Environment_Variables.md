@@ -116,11 +116,41 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 | `S3DLIO_OPERATION_TIMEOUT_SECS` | `60` | Full request/response cycle timeout in seconds (excluding the connect handshake).  60 s is sufficient for ~6 GB at 100 MB/s and ~60 GB at 1 GB/s.  Raise for very large single objects or slow networks. |
 | `S3DLIO_MAX_RETRY_ATTEMPTS` | `3` | Maximum number of attempts (1 initial + N−1 retries) per operation before propagating the error.  Governs **two** retry layers: (a) the AWS SDK's own retry (matches the SDK's default) which covers `send()`-phase failures such as connect / dispatch errors, and (b) since v0.9.108 (issue #148 Phase 4) the shared `retry_get_body` helper which covers **body-transfer** failures — once the reqwest connector streams response bodies to the SDK (`SdkBody::from_body_1_x`), smithy's retry no longer covers errors that surface while the caller consumes the streaming body, so a bounded-linear-backoff retry loop with the same attempt budget is applied at four caller sites (`S3Ops::get_object`/`get_object_range`, `S3ObjectStore::get`/`get_range` direct-client paths, and the range-chunk task inside `concurrent_range_get_impl`).  Set to `1` for **fast-fail at warmup** (no retries; surface a dispatch failure in one connect budget instead of three) — useful for debugging mlcommons/storage#506-style cold-start issues.  Set to `5` or higher to ride out flaky-network bursts.  Clamped to a minimum of 1; the SDK rejects 0. |
 
-### Direct I/O (`direct://`) bounce buffer
+### Direct I/O (`direct://`) shared bounce-buffer pool
+
+O_DIRECT needs page-aligned memory. A `direct://` PUT whose source address is already page-aligned (pinned
+buffers, the result of a `direct://` GET) is written straight from the caller's memory in one `write` per at most
+2 GiB: no copy, no pool. Every other transfer is copied through **warm, reused, page-aligned bounce buffers**:
+
+* **One pool per NUMA node, shared by PUTs and GETs.** A request uses the pool of the node its thread runs on
+  (`sched_getcpu` mapped through `/sys/devices/system/node/node*/cpulist`); a host with one node, no sysfs, or a
+  non-Linux OS has one pool. A node's pool is created lazily on its first use: its buffers are allocated and
+  first-touched on that node (an `mbind` to the node, best effort, plus first touch from a thread pinned to the
+  node's CPUs) and then kept for the life of the process.
+* **Ping-pong pairs.** A request leases one pair (2 buffers) for its whole duration. PUT: chunk `k+1` is copied
+  into one buffer while chunk `k` is written from the other, then they swap (the write runs on a helper thread).
+  GET: chunk `k+1` is read into one buffer while chunk `k` is copied out of the other into the destination.
+* **Bounded memory.** Total bounce memory is exactly **`nodes x pairs x 2 x size`** (default: 2 x 64 MiB = 128 MiB
+  per NUMA node, in total, for ALL requests in both directions). That is the global cap.
+* **When every pair of the node is in use** the request either **waits** (default) in strict FIFO order shared by
+  PUTs and GETs, so neither direction can starve the other, or, with `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY=fallback`,
+  uses a private buffer of one bounce size for this request (serial copy-then-I/O, no pipelining; extra memory is
+  bounded by one buffer per concurrent request beyond the pool).
+* Objects whose bounce need is at most 1 MiB skip the pool and use a private buffer of their own size.
+* A GET can instead read straight into one fresh page-aligned buffer of the object's size (zero copies, but fresh
+  page faults on every call): `S3DLIO_DIRECT_IO_GET_MODE=direct`, the current default. `pooled` sends GETs through
+  the pool (warm buffers, one copy into the destination). Which is faster depends on load; the default stays
+  `direct` until measured. The result of either is page-aligned memory.
 
 | Variable | Default | Description |
 |---|---|---|
-| `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` | `1024` | Cap, in MiB, on the aligned bounce buffer a `direct://` (O_DIRECT) PUT copies through when the caller's memory is not page-aligned. The buffer is `min(object size rounded up to 4096, cap)`, so an unaligned object up to the cap is **one copy and one `write`**; a larger one is written one full buffer at a time. A source whose address is already page-aligned (for example pinned, page-aligned buffers, or the result of a `direct://` GET) is written straight from the caller's memory in one `write` (split only at the 2 GiB Linux per-call limit) and does not use this buffer. A larger cap means fewer syscalls but more temporary memory per in-flight unaligned PUT (pages are only touched as they are filled); lower it when many large `direct://` PUTs run at once. Rounded down to the O_DIRECT alignment (4096); `0` or an unparseable value selects the default. `direct://` GETs do not use it: they read straight into one aligned buffer. The streaming `direct://` writer stages up to 64 MiB. Before v0.9.128 `direct://` wrote 4 KiB per system call (issue #244). |
+| `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` | `64` | Size of one bounce buffer in MiB, clamped to 4..=64 (`0` or unparseable selects 64). Bigger means fewer syscalls per object; the memory cap grows with it. |
+| `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE` | `1` | Ping-pong pairs (2 buffers each) per NUMA node, 1..=64. More pairs let more requests use warm buffers at once, at `2 x size` more memory per pair per node. |
+| `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY` | `wait` | `wait` (FIFO across PUTs and GETs) or `fallback` (private one-buffer fallback), see above. |
+| `S3DLIO_DIRECT_IO_GET_MODE` | `direct` | `direct` (fresh aligned buffer, zero copies) or `pooled` (through the shared pool). |
+
+The streaming `direct://` writer (`DirectIOWriter`) stages up to 64 MiB in its own aligned buffer; a page-aligned
+chunk bypasses it. Before v0.9.128 `direct://` wrote and read 4 KiB per system call (issue #244).
 
 ## Data Integrity: Write Verification and Retry (v0.9.104+, opt-in as of v0.9.106)
 

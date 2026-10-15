@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed (API)
+
+- `memory::AlignedBuf::new(len, align)` now returns `Result<AlignedBuf, AlignedAllocError>` instead of
+  panicking or aborting on a bad alignment, a size overflow or an out-of-memory condition. New
+  `AlignedBuf::new_zeroed` and unsafe `AlignedBuf::assume_init`; the slice accessors never expose
+  uninitialised memory (the first `as_slice`/`as_mut_slice` zero-fills a buffer that was only filled through
+  the raw pointer).
+- `AlignedBuf` is no longer `Clone` (the derived clone copied the pointer and freed it twice).
+- `memory::BufferPool::new` and `BufferPoolConfig::build` return `Result<_, BufferPoolError>` (a capacity of 0
+  is an error instead of a panic) and `BufferPool::take` returns `Result<AlignedBuf, BufferPoolError>` (a closed
+  pool or a failed allocation is an error instead of a panic).
+- `put_bytes_async` gained the keyword-only argument `borrow=False` (see below); positional calls are unchanged.
+- New public `file_store_direct::direct_io_counters()` / `DirectIoCounters`: how many `direct://` transfers
+  really used O_DIRECT versus the buffered fallback that silently takes over when a filesystem refuses O_DIRECT.
+  This has an operational use (a user who chose `direct://` for speed can detect that they are not getting it),
+  so it is public and documented, not test-only.
+
 ### Fixed
 
 - **`put_bytes()` / `put_bytes_async()` no longer copy the payload while holding the GIL, and make no
@@ -27,16 +44,23 @@
   (for example pinned host memory). **Contract for every buffer read in place:** it is exported meanwhile,
   so `bytearray.extend()/clear()` from another thread raises `BufferError`, and the bytes must not be
   modified from another thread, or the stored object mixes old and new bytes (memory-safe, but not what you
-  meant). The buffer export is released before the call returns or the awaitable resolves, and never by a
-  Tokio worker waiting for the GIL.
+  meant). The buffer export is released before the call returns or the awaitable resolves for `file://` and
+  `direct://` (best effort for `s3://`, `gs://`, `az://`, where an SDK may keep a body clone for an instant), and
+  never by a Tokio worker waiting for the GIL. Cancelling the awaitable does not stop a request that is already
+  running; the buffer stays exported until it ends. Buffers of Python objects or pointers (`O`/`P` formats) are
+  refused with a `TypeError`.
 
 - **`direct://` PUT and GET no longer move 4 KiB per system call, and a GET returns page-aligned memory
   (#244).** An O_DIRECT PUT wrote the object one 4 KiB block per `write()` (512 MiB took 45 s, about 11 MiB/s,
   against 0.79 s on `file://`), and a GET read it 4 KiB per `read()`. A page-aligned source buffer is now
   written straight from the caller's memory in one `write` (split only at Linux's 2 GiB per-call limit); any
-  other source is copied once into an aligned bounce buffer of `min(object size, 1 GiB)`
-  (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`), so an object up to 1 GiB is one copy and one write. A GET reads straight
-  into one page-aligned buffer and returns it, so a `direct://` GET followed by a `direct://` PUT is copy-free.
+  other source is copied once through a warm, reused, page-aligned bounce buffer from a process-wide pool, one
+  ping-pong pair per NUMA node shared by PUTs and GETs (the copy of chunk k+1 overlaps the write of chunk k;
+  64 MiB buffers by default, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` 4..=64, `..._PAIRS_PER_NODE`, `..._WHEN_BUSY`;
+  total bounce memory is `nodes x pairs x 2 x size`, see `docs/Environment_Variables.md`). A GET returns
+  page-aligned memory: by default it reads straight into one fresh aligned buffer, so a `direct://` GET followed
+  by a `direct://` PUT needs no bounce copy of the body for objects of at least `min_io_size` (only the final
+  zero-padded 4 KiB block is bounced); `S3DLIO_DIRECT_IO_GET_MODE=pooled` reads through the pool instead.
   The zero-padded last block, the truncation back to the exact size (skipped when the length is already
   aligned) and the buffered fallback are unchanged; a failed aligned allocation now retries with a smaller
   buffer and then falls back to buffered I/O instead of aborting. `put_multipart` on `direct://` is now the same
