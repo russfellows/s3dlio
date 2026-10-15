@@ -157,8 +157,8 @@ async fn file_put_makes_no_owned_copy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_put_of_an_unaligned_source_uses_only_the_bounded_pool() {
     let store = ConfigurableFileSystemObjectStore::new(direct_config());
-    // The pool of this node: 2 buffers (one ping-pong pair) of the configured size.
-    let pool = 2 * s3dlio::constants::direct_io_bounce_size();
+    // The whole pool (every NUMA node of the host): nodes x pairs x 2 buffers of the configured size.
+    let pool = s3dlio::direct_bounce::bounce_memory_cap();
     assert_put_does_not_copy(&store, "direct", DIRECT_PAYLOAD, pool, false).await;
 }
 

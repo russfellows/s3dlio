@@ -50,8 +50,9 @@
 //! through [`__bench_configure`] so the benchmark can compare them with the pool.
 
 use crate::constants::{
-    direct_io_bounce_size, parse_direct_io_bounce_pairs, BOUNCE_CANCEL_POLL, DEFAULT_PAGE_SIZE,
-    ENV_DIRECT_IO_BOUNCE_PAIRS, ENV_DIRECT_IO_BOUNCE_WHEN_BUSY, ENV_DIRECT_IO_GET_MODE,
+    direct_io_bounce_size, parse_direct_io_bounce_pairs, BOUNCE_CANCEL_POLL, BOUNCE_POOL_RETRY,
+    DEFAULT_PAGE_SIZE, ENV_DIRECT_IO_BOUNCE_PAIRS, ENV_DIRECT_IO_BOUNCE_WHEN_BUSY,
+    ENV_DIRECT_IO_GET_MODE,
 };
 use crate::memory::{AlignedAllocError, AlignedBuf};
 use std::collections::VecDeque;
@@ -322,16 +323,26 @@ pub(crate) fn parse_cpulist(s: &str) -> Option<Vec<usize>> {
         match part.split_once('-') {
             Some((a, b)) => {
                 let (a, b): (usize, usize) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
-                if b < a || b - a > 1 << 20 {
+                if b < a || b > MAX_CPU_INDEX {
                     return None;
                 }
                 cpus.extend(a..=b);
             }
-            None => cpus.push(part.trim().parse().ok()?),
+            None => {
+                let cpu: usize = part.trim().parse().ok()?;
+                if cpu > MAX_CPU_INDEX {
+                    return None;
+                }
+                cpus.push(cpu);
+            }
         }
     }
     Some(cpus)
 }
+
+/// Largest CPU index accepted from a sysfs cpulist: the kernel supports at most 8192 CPUs, so a
+/// larger number is a corrupt file, not a machine (it would size the CPU->node table).
+const MAX_CPU_INDEX: usize = 65_535;
 
 /// CPUs of each NUMA node, and the reverse map.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,7 +456,9 @@ fn pin_current_thread(cpus: &[usize]) {
 /// without privileges or on kernels without NUMA, in which case first touch decides).
 #[cfg(target_os = "linux")]
 fn mbind_to_node(ptr: *mut u8, len: usize, node: usize) {
-    const MPOL_BIND: libc::c_long = 2;
+    // PREFERRED, not BIND: when the node is short of memory the kernel falls back to another node
+    // instead of failing the page fault or invoking the OOM killer.
+    const MPOL_PREFERRED: libc::c_long = 1;
     let words = node / 64 + 1;
     let mut mask = vec![0 as libc::c_ulong; words];
     mask[node / 64] |= 1 << (node % 64);
@@ -455,7 +468,7 @@ fn mbind_to_node(ptr: *mut u8, len: usize, node: usize) {
             libc::SYS_mbind,
             ptr as libc::c_long,
             len as libc::c_long,
-            MPOL_BIND,
+            MPOL_PREFERRED,
             mask.as_ptr() as libc::c_long,
             (words * 64) as libc::c_long,
             0 as libc::c_long,
@@ -601,19 +614,29 @@ impl NodePool {
         let bufs = if topo.nodes() > 1 {
             let node_id = topo.node_ids[idx];
             let cpus = topo.node_cpus[idx].clone();
-            std::thread::scope(|s| {
-                s.spawn(|| {
+            std::thread::scope(|s| -> Result<Vec<AlignedBuf>, AlignedAllocError> {
+                let fail = AlignedAllocError {
+                    len: cfg.buffer_size,
+                    align,
+                };
+                let (tx, rx) = mpsc::channel();
+                spawn_helper(s, move || {
                     #[cfg(target_os = "linux")]
                     pin_current_thread(&cpus);
                     #[cfg(not(target_os = "linux"))]
                     let _ = &cpus;
-                    Self::build_buffers(cfg.pairs_per_node, cfg.buffer_size, align, Some(node_id))
+                    let _ = tx.send(Self::build_buffers(
+                        cfg.pairs_per_node,
+                        cfg.buffer_size,
+                        align,
+                        Some(node_id),
+                    ));
                 })
-                .join()
-                .unwrap_or(Err(AlignedAllocError {
-                    len: cfg.buffer_size,
-                    align,
-                }))
+                .map_err(|e| {
+                    warn!("s3dlio: cannot start the bounce-pool allocation thread: {e}");
+                    fail
+                })?;
+                rx.recv().unwrap_or(Err(fail))
             })?
         } else {
             Self::build_buffers(cfg.pairs_per_node, cfg.buffer_size, align, None)?
@@ -644,6 +667,15 @@ impl NodePool {
             cv: Condvar::new(),
             busy,
         }
+    }
+
+    /// A new pool with fresh buffers of the same shape (tests).
+    #[cfg(test)]
+    fn clone_for_test(&self) -> NodePool {
+        let bufs = (0..self.bufs.len())
+            .map(|_| AlignedBuf::new_zeroed(self.size, self.align).unwrap())
+            .collect();
+        NodePool::from_buffers(bufs, self.size, self.align, self.busy)
     }
 
     /// Bytes this pool holds (its share of the global cap).
@@ -730,26 +762,71 @@ impl NodePool {
     }
 }
 
+/// One node's pool and the state of creating it. A failed creation is NOT remembered forever:
+/// it is retried after [`BOUNCE_POOL_RETRY`] (memory may have been freed meanwhile).
+struct Slot {
+    pool: OnceLock<NodePool>,
+    last_failure: Mutex<Option<Instant>>,
+}
+
+impl Slot {
+    fn new() -> Self {
+        Self {
+            pool: OnceLock::new(),
+            last_failure: Mutex::new(None),
+        }
+    }
+
+    /// The pool, creating it with `create` if absent and the last failure is old enough.
+    fn get_or_create(
+        &self,
+        retry: std::time::Duration,
+        create: impl FnOnce() -> Result<NodePool, AlignedAllocError>,
+    ) -> Option<&NodePool> {
+        if let Some(p) = self.pool.get() {
+            return Some(p);
+        }
+        // Serialises creation: concurrent first users wait for one creator.
+        let mut last = self
+            .last_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(p) = self.pool.get() {
+            return Some(p);
+        }
+        if last.is_some_and(|t| t.elapsed() < retry) {
+            return None;
+        }
+        match create() {
+            Ok(p) => {
+                let _ = self.pool.set(p);
+                self.pool.get()
+            }
+            Err(e) => {
+                warn!(
+                    "s3dlio: cannot create the direct:// bounce pool ({e}); using per-call buffers, \
+                     retrying in {retry:?}"
+                );
+                *last = Some(Instant::now());
+                None
+            }
+        }
+    }
+}
+
 /// The pool of the node the calling thread runs on, creating it on first use. `None` when it
 /// could not be created (the caller then uses a private buffer).
 fn pool_for_current_node() -> Option<&'static NodePool> {
-    static POOLS: OnceLock<Vec<OnceLock<Option<NodePool>>>> = OnceLock::new();
+    static POOLS: OnceLock<Vec<Slot>> = OnceLock::new();
     let topo = topology();
-    let pools = POOLS.get_or_init(|| (0..topo.nodes()).map(|_| OnceLock::new()).collect());
+    let pools = POOLS.get_or_init(|| (0..topo.nodes()).map(|_| Slot::new()).collect());
     let idx = current_cpu().map_or(0, |c| topo.node_of_cpu(c));
+    let idx = idx.min(pools.len() - 1);
     let cfg = config();
-    pools[idx.min(pools.len() - 1)]
-        .get_or_init(|| {
-            let align = DEFAULT_PAGE_SIZE.max(crate::file_store_direct::system_page_size());
-            match NodePool::create(topo, idx, cfg, align) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    warn!("s3dlio: cannot create the direct:// bounce pool ({e}); using per-call buffers");
-                    None
-                }
-            }
-        })
-        .as_ref()
+    pools[idx].get_or_create(BOUNCE_POOL_RETRY, || {
+        let align = DEFAULT_PAGE_SIZE.max(crate::file_store_direct::system_page_size());
+        NodePool::create(topo, idx, cfg, align)
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -786,22 +863,47 @@ impl Worker {
 fn with_worker<R>(
     op: &(dyn Fn(&Job) -> io::Result<usize> + Sync),
     body: impl FnOnce(&Worker) -> R,
-) -> R {
+) -> io::Result<R> {
     std::thread::scope(|s| {
         let (jobs, job_rx) = mpsc::channel::<Job>();
         let (done_tx, done) = mpsc::channel::<io::Result<usize>>();
-        s.spawn(move || {
+        spawn_helper(s, move || {
             for job in job_rx {
                 if done_tx.send(op(&job)).is_err() {
                     break;
                 }
             }
-        });
+        })?;
         let worker = Worker { jobs, done };
         let out = body(&worker);
         drop(worker); // closes the job channel: the helper exits
-        out
+        Ok(out)
     })
+}
+
+// Test hook: make helper-thread creation fail (per thread, so parallel tests cannot interfere).
+#[cfg(test)]
+thread_local! {
+    static FAIL_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Spawn a scoped helper thread; failure (EAGAIN, a thread limit) is an `io::Error`, never a
+/// panic like `Scope::spawn`.
+fn spawn_helper<'scope, 'env, F>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    f: F,
+) -> io::Result<()>
+where
+    F: FnOnce() + Send + 'scope,
+{
+    #[cfg(test)]
+    if FAIL_SPAWN.with(|f| f.get()) {
+        return Err(io::Error::other("injected thread spawn failure"));
+    }
+    std::thread::Builder::new()
+        .name("s3dlio-bounce-io".into())
+        .spawn_scoped(scope, f)
+        .map(|_| ())
 }
 
 /// One chunk of a PUT through a bounce buffer.
@@ -876,7 +978,7 @@ pub(crate) fn pingpong_put(
             }
         }
         result
-    })
+    })?
 }
 
 /// GET `file_size` bytes chunk by chunk through `bufs` into `dest` (one buffer: serial; two:
@@ -948,7 +1050,7 @@ pub(crate) unsafe fn pingpong_get(
             std::ptr::copy_nonoverlapping(bufs[k % 2].0, dest.0.add(k * size), take(k));
         }
         Ok(())
-    })
+    })?
 }
 
 // ---------------------------------------------------------------------------------------
@@ -992,18 +1094,22 @@ fn cancelled_io(e: BounceCancelled) -> io::Error {
 /// used (the caller falls back to a per-call buffer). Every chunk is at most one bounce buffer.
 /// The lease is held (and dropped) here, inside the caller's blocking closure, so it outlives a
 /// cancelled future and is returned only after the last write; `cancel` only abandons the WAIT
-/// for buffers.
+/// for buffers. `after_lease` runs once the buffers are leased and before the first write (it
+/// opens/truncates the target), so a request cancelled while waiting never touches the object.
 pub(crate) fn pooled_put(
     chunks: &[PutChunk],
     data: &[u8],
     align: usize,
     cancel: &AtomicBool,
+    after_lease: &(dyn Fn() -> io::Result<()> + Sync),
     write_at: &(dyn Fn(u64, &[u8]) -> io::Result<()> + Sync),
 ) -> io::Result<bool> {
     let total: usize = chunks.iter().map(|c| c.data_len).sum();
     let Some(src) = source(Direction::Put, total, align, cancel).map_err(cancelled_io)? else {
         return Ok(false);
     };
+    // The buffers are ours: only now create/truncate the target (see `write_all_direct_with`).
+    after_lease()?;
     let arr;
     let one;
     let bufs: &[SendPtr] = match &src {
@@ -1372,6 +1478,15 @@ mod tests {
         Arc::new(NodePool::from_buffers(bufs, 4 * A, A, busy))
     }
 
+    /// Wait for `cond` for at most 10 s - a regression fails the test instead of hanging CI.
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn lease(p: &NodePool, dir: Direction, need: usize) -> Lease<'_> {
         p.acquire(dir, need, &NEVER_CANCELLED)
             .expect("not cancelled")
@@ -1443,9 +1558,7 @@ mod tests {
                 drop(l);
             }));
             // let thread i enqueue before thread i+1 starts
-            while p.lock().waiters.len() < i + 1 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            wait_until("the waiter to enqueue", || p.lock().waiters.len() > i);
         }
         drop(held);
         for h in hs {
@@ -1467,18 +1580,14 @@ mod tests {
             o2.lock().unwrap().push("big");
             drop(l);
         });
-        while p.lock().waiters.is_empty() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_until("the first waiter", || !p.lock().waiters.is_empty());
         let (p3, o3) = (p.clone(), order.clone());
         let small = std::thread::spawn(move || {
             let l = lease(&p3, Direction::Get, 1);
             o3.lock().unwrap().push("small");
             drop(l);
         });
-        while p.lock().waiters.len() < 2 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_until("the second waiter", || p.lock().waiters.len() >= 2);
         std::thread::sleep(Duration::from_millis(60));
         assert!(
             order.lock().unwrap().is_empty(),
@@ -1535,18 +1644,14 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let (p2, c2) = (p.clone(), cancel.clone());
         let victim = std::thread::spawn(move || p2.acquire(Direction::Get, 2, &c2).map(|_| ()));
-        while p.lock().waiters.is_empty() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_until("the first waiter", || !p.lock().waiters.is_empty());
         let (p3, got) = (p.clone(), Arc::new(AtomicBool::new(false)));
         let g2 = got.clone();
         let behind = std::thread::spawn(move || {
             drop(lease(&p3, Direction::Put, 2));
             g2.store(true, Ordering::SeqCst);
         });
-        while p.lock().waiters.len() < 2 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_until("the second waiter", || p.lock().waiters.len() >= 2);
         let before = bounce_stats().cancelled_waits;
         cancel.store(true, Ordering::Release);
         let r = victim.join().unwrap();
@@ -1607,5 +1712,78 @@ mod tests {
 
     fn lease_f(p: &NodePool, dir: Direction, need: usize) -> Option<Lease<'_>> {
         p.acquire(dir, need, &NEVER_CANCELLED).unwrap()
+    }
+
+    // ---- round 5 --------------------------------------------------------------------------
+
+    /// Helper-thread creation failure is an error, not a panic, in both engines.
+    #[test]
+    fn a_failed_helper_thread_spawn_is_an_error_not_a_panic() {
+        let len = 4 * 4 * A;
+        let data = pattern(len);
+        let chunks = chunks_for(len, 4 * A);
+        let (_keep, p) = bufs(2, 4 * A);
+        FAIL_SPAWN.with(|f| f.set(true));
+        let put = pingpong_put(&chunks, &data, &p, &|_, _| Ok(()), &|_| {});
+        let file = pattern(len);
+        let mut dest = vec![0u8; len];
+        let read = fake_read(&file);
+        let get = unsafe {
+            pingpong_get(
+                len,
+                A,
+                4 * A,
+                SendPtr(dest.as_mut_ptr()),
+                &p,
+                &read,
+                &|_| {},
+            )
+        };
+        FAIL_SPAWN.with(|f| f.set(false));
+        assert!(put.unwrap_err().to_string().contains("injected"));
+        assert!(get.unwrap_err().to_string().contains("injected"));
+        // and a single-chunk transfer needs no helper at all
+        let one = chunks_for(A, 4 * A);
+        FAIL_SPAWN.with(|f| f.set(true));
+        let r = pingpong_put(&one, &data, &p, &|_, _| Ok(()), &|_| {});
+        FAIL_SPAWN.with(|f| f.set(false));
+        r.unwrap();
+    }
+
+    #[test]
+    fn cpulist_indexes_are_capped() {
+        assert_eq!(parse_cpulist("0-3"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(parse_cpulist("65535"), Some(vec![65_535]));
+        assert_eq!(parse_cpulist("65536"), None);
+        assert_eq!(parse_cpulist("0-4294967295"), None);
+        assert_eq!(parse_cpulist("999999999999"), None);
+    }
+
+    /// A failed pool creation is retried after the retry interval, not remembered forever.
+    #[test]
+    fn a_failed_pool_creation_is_retried_later() {
+        let slot = Slot::new();
+        let calls = AtomicUsize::new(0);
+        let fail = || -> Result<NodePool, AlignedAllocError> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(AlignedAllocError { len: 1, align: 1 })
+        };
+        let retry = Duration::from_millis(80);
+        assert!(slot.get_or_create(retry, fail).is_none());
+        assert!(
+            slot.get_or_create(retry, fail).is_none(),
+            "within the retry interval"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "not retried too early");
+        std::thread::sleep(Duration::from_millis(120));
+        let ok = || -> Result<NodePool, AlignedAllocError> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(pool(1, BusyPolicy::Wait).clone_for_test())
+        };
+        assert!(slot.get_or_create(retry, ok).is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // and once it exists it is never created again
+        assert!(slot.get_or_create(retry, fail).is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

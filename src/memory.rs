@@ -277,9 +277,12 @@ impl BufferPool {
     ///
     /// The returned [`PooledBuf`] is an RAII lease: it carries the semaphore permit and gives
     /// the buffer back (and frees the permit) when it is DROPPED, however that happens (success,
-    /// error, panic, a cancelled future). The number of buffers alive is therefore bounded by
-    /// `capacity`: idle buffers plus checked-out ones. (Earlier the permit was released when
-    /// `take` returned, so any number of buffers could be checked out at once.)
+    /// error, panic, a cancelled future). At most `capacity` buffers are CHECKED OUT at any
+    /// time. (Earlier the permit was released when `take` returned, so any number of buffers
+    /// could be checked out at once.) Idle buffers wait in the pool in addition: the asynchronous
+    /// prefill started by `new` can add up to `capacity` of them while callers have already
+    /// allocated some on demand, so the buffers alive can briefly reach `2 x capacity` (prefilled
+    /// buffers are untouched until used: they cost address space, not resident memory).
     ///
     /// Errors (instead of aborting) when the pool is closed, or empty with a new buffer that
     /// cannot be allocated.
@@ -299,7 +302,7 @@ impl BufferPool {
             None => AlignedBuf::new(self.buf_len, self.align)?,
         };
         Ok(PooledBuf {
-            buf: Some(buf),
+            buf: std::mem::ManuallyDrop::new(buf),
             tx: self.tx.clone(),
             buf_len: self.buf_len,
             align: self.align,
@@ -322,7 +325,8 @@ impl BufferPool {
 /// returns it to the pool and releases its permit. See [`BufferPool::take`].
 #[derive(Debug)]
 pub struct PooledBuf {
-    buf: Option<AlignedBuf>,
+    /// Taken exactly once, in `drop` (so it is always present while the value can be used).
+    buf: std::mem::ManuallyDrop<AlignedBuf>,
     tx: mpsc::Sender<AlignedBuf>,
     buf_len: usize,
     align: usize,
@@ -332,30 +336,25 @@ pub struct PooledBuf {
 impl std::ops::Deref for PooledBuf {
     type Target = AlignedBuf;
     fn deref(&self) -> &AlignedBuf {
-        // `buf` is `Some` until `drop`.
-        self.buf
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("PooledBuf used after drop"))
+        &self.buf
     }
 }
 
 impl std::ops::DerefMut for PooledBuf {
     fn deref_mut(&mut self) -> &mut AlignedBuf {
-        self.buf
-            .as_mut()
-            .unwrap_or_else(|| unreachable!("PooledBuf used after drop"))
+        &mut self.buf
     }
 }
 
 impl Drop for PooledBuf {
     fn drop(&mut self) {
-        if let Some(buf) = self.buf.take() {
-            // Only buffers with the pool's size and alignment are reused. `try_send` never
-            // blocks: if the idle queue is full the buffer is simply freed. The permit is
-            // released after this body, i.e. after the buffer is back in the pool.
-            if buf.len() == self.buf_len && buf.align() == self.align {
-                let _ = self.tx.try_send(buf);
-            }
+        // SAFETY: `buf` is taken only here, and `drop` runs once.
+        let buf = unsafe { std::mem::ManuallyDrop::take(&mut self.buf) };
+        // Only buffers with the pool's size and alignment are reused. `try_send` never blocks:
+        // if the idle queue is full the buffer is simply freed. The permit is released after this
+        // body, i.e. after the buffer is back in the pool.
+        if buf.len() == self.buf_len && buf.align() == self.align {
+            let _ = self.tx.try_send(buf);
         }
     }
 }

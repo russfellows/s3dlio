@@ -109,6 +109,21 @@ async fn peak_live_bounce_bytes_never_exceed_the_cap_under_mixed_cancelled_traff
     }
     let before = bounce_stats();
 
+    // Independent sampler: polls the live leased bytes every 100 us on a plain thread, so the
+    // bound is also checked by observation, not only by the gauge updated at each lease.
+    let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampled_peak = Arc::new(AtomicUsize::new(0));
+    let sampler = {
+        let (sampling, sampled_peak) = (sampling.clone(), sampled_peak.clone());
+        std::thread::spawn(move || {
+            while sampling.load(Ordering::Relaxed) {
+                let now = bounce_stats().leased_bytes as usize;
+                sampled_peak.fetch_max(now, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        })
+    };
+
     let storm = async {
         let mut tasks = Vec::new();
         for t in 0..32u64 {
@@ -178,6 +193,14 @@ async fn peak_live_bounce_bytes_never_exceed_the_cap_under_mixed_cancelled_traff
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    sampling.store(false, Ordering::Relaxed);
+    sampler.join().expect("sampler");
+    assert!(
+        sampled_peak.load(Ordering::Relaxed) <= cap,
+        "sampler: leased bytes {} > cap {cap}",
+        sampled_peak.load(Ordering::Relaxed)
+    );
+
     let after = bounce_stats();
     eprintln!(
         "ops completed {done}, cancelled {cancelled}; peak leased {} B, allocator peak {} B, \
@@ -203,4 +226,30 @@ async fn peak_live_bounce_bytes_never_exceed_the_cap_under_mixed_cancelled_traff
     assert_eq!(after.leased_bytes, 0, "a lease was not returned");
     assert_eq!(after.fallback_live_bytes, 0);
     assert!(after.leases[0] > before.leases[0] && after.leases[1] > before.leases[1]);
+
+    the_allocator_tracker_detects_an_overshoot();
+}
+
+/// Negative control (run at the end of the main test, when nothing else allocates pool-sized
+/// buffers): the allocator tracker CAN fail. Allocating one pool-sized buffer more than
+/// the cap must push its peak above the cap; otherwise the bound assertion above proves nothing.
+fn the_allocator_tracker_detects_an_overshoot() {
+    let cap_buffers = 4usize;
+    let layout = Layout::from_size_align(BUF, 4096).unwrap();
+    let before_live = ALLOC.live.load(Ordering::SeqCst);
+    ALLOC.peak.store(before_live, Ordering::SeqCst);
+    let held: Vec<*mut u8> = (0..cap_buffers + 1)
+        // SAFETY: layout has a non-zero size; every pointer is freed below with the same layout.
+        .map(|_| unsafe { std::alloc::alloc(layout) })
+        .collect();
+    let peak = ALLOC.peak.load(Ordering::SeqCst) - before_live;
+    for p in held {
+        // SAFETY: allocated above with `layout`.
+        unsafe { std::alloc::dealloc(p, layout) };
+    }
+    assert!(
+        peak > cap_buffers * BUF,
+        "the tracker did not see {} extra bytes",
+        BUF
+    );
 }

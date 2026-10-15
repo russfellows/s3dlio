@@ -412,13 +412,13 @@ fn per_call_bounce_put(
 /// buffered fallback rewrites the whole file.
 #[cfg(unix)]
 pub(crate) fn write_all_direct(
-    file: &std::fs::File,
+    open: &(dyn Fn() -> std::io::Result<std::fs::File> + Sync),
     data: &[u8],
     alignment: usize,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     write_all_direct_with(
-        file,
+        open,
         data,
         alignment,
         crate::direct_bounce::config().put,
@@ -427,9 +427,12 @@ pub(crate) fn write_all_direct(
     )
 }
 
+/// `open` creates/truncates and opens the target (O_DIRECT). It is called only once the transfer
+/// can really start - for a pooled PUT after the bounce buffers have been leased, so a request
+/// cancelled while it waits for them never truncates an existing object.
 #[cfg(unix)]
 fn write_all_direct_with(
-    file: &std::fs::File,
+    open: &(dyn Fn() -> std::io::Result<std::fs::File> + Sync),
     data: &[u8],
     alignment: usize,
     strategy: crate::direct_bounce::PutStrategy,
@@ -437,6 +440,7 @@ fn write_all_direct_with(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     use crate::direct_bounce::{pooled_put, PutChunk, PutStrategy};
+    use std::sync::OnceLock;
 
     let alignment = alignment.max(1);
     let cap = match strategy {
@@ -452,13 +456,10 @@ fn write_all_direct_with(
     );
 
     let mut chunks = Vec::new();
-    let mut from_source = false;
+    let mut direct_steps = Vec::new();
     for step in &steps {
         match *step {
-            DirectIoStep::FromSource { offset, len } => {
-                from_source = true;
-                write_all_at(file, &data[offset..offset + len], offset as u64)?;
-            }
+            DirectIoStep::FromSource { offset, len } => direct_steps.push((offset, len)),
             DirectIoStep::ViaBounce {
                 offset,
                 data_len,
@@ -471,22 +472,45 @@ fn write_all_direct_with(
         }
     }
 
-    if let Some(first) = chunks.first() {
-        // A page-aligned source only bounces its padded tail block (one page): that never
-        // leases pool buffers, it would only make aligned PUTs queue behind unaligned ones.
-        let pooled = matches!(strategy, PutStrategy::Pooled)
-            && !from_source
-            && pooled_put(&chunks, data, alignment, cancel, &|off, bytes| {
-                write_all_at(file, bytes, off)
-            })?;
-        if !pooled {
-            per_call_bounce_put(file, data, first.offset, alignment, cap, alloc)?;
+    let file_cell: OnceLock<std::fs::File> = OnceLock::new();
+    let ensure_open = || -> std::io::Result<()> {
+        if file_cell.get().is_none() {
+            let _ = file_cell.set(open()?);
+        }
+        Ok(())
+    };
+    let file = || -> std::io::Result<&std::fs::File> {
+        file_cell
+            .get()
+            .ok_or_else(|| std::io::Error::other("direct write before the file was opened"))
+    };
+
+    // A page-aligned source only bounces its padded tail block (one page): that never leases
+    // pool buffers, it would only make aligned PUTs queue behind unaligned ones.
+    let pooled = matches!(strategy, PutStrategy::Pooled)
+        && direct_steps.is_empty()
+        && !chunks.is_empty()
+        && pooled_put(
+            &chunks,
+            data,
+            alignment,
+            cancel,
+            &ensure_open,
+            &|off, bytes| write_all_at(file()?, bytes, off),
+        )?;
+    if !pooled {
+        ensure_open()?;
+        for &(offset, len) in &direct_steps {
+            write_all_at(file()?, &data[offset..offset + len], offset as u64)?;
+        }
+        if let Some(first) = chunks.first() {
+            per_call_bounce_put(file()?, data, first.offset, alignment, cap, alloc)?;
         }
     }
 
     // Remove the zero padding of the last block (none when the length is aligned).
     if !data.len().is_multiple_of(alignment) {
-        file.set_len(data.len() as u64)?;
+        file()?.set_len(data.len() as u64)?;
     }
     Ok(())
 }
@@ -546,7 +570,13 @@ fn pread_raw(
 /// # Safety
 /// `dest` must be valid for `file_size` bytes of writes and not be used meanwhile.
 #[cfg(unix)]
-#[allow(dead_code)] // the public get_into that calls it is a later step
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "building block of the later public get_into; only tests call it so far"
+    )
+)]
 pub(crate) unsafe fn read_all_direct_into(
     file: &std::fs::File,
     file_size: usize,
@@ -642,8 +672,8 @@ fn read_all_direct_with(
             bail!("direct read returned {total} of {file_size} bytes (file shrank)");
         }
     }
-    // SAFETY: every byte of `[0, file_size)` was written by the reads above.
-    unsafe { buf.assume_init() };
+    // `AlignedBytes` exposes only `[0, file_size)` (all written by the reads above) through a raw
+    // pointer, never through the safe slice accessors, so `buf` need not be marked initialised.
     Ok(Bytes::from_owner(AlignedBytes {
         buf,
         len: file_size,
@@ -1258,6 +1288,7 @@ impl ConfigurableFileSystemObjectStore {
     }
 
     /// Create OpenOptions with appropriate flags for the configuration
+    #[cfg(not(unix))]
     fn create_open_options(&self, read: bool, write: bool) -> fs::OpenOptions {
         let mut options = fs::OpenOptions::new();
         options.read(read).write(write);
@@ -1422,16 +1453,19 @@ impl ConfigurableFileSystemObjectStore {
                     flags |= libc::O_SYNC;
                 }
 
-                let file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .custom_flags(flags)
-                    .open(&path)?;
+                let open = || {
+                    OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .custom_flags(flags)
+                        .open(&path)
+                };
 
                 // One write for the whole aligned body when `data` is aligned, otherwise
-                // bounce-buffer-sized writes (issue #244); never one 4 KiB block per call.
-                write_all_direct(&file, data.as_ref(), alignment, &cancel)?;
+                // bounce-buffer-sized writes (issue #244); never one 4 KiB block per call. The
+                // object is only created/truncated once a transfer can start.
+                write_all_direct(&open, data.as_ref(), alignment, &cancel)?;
                 DIRECT_PUTS.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             })
@@ -1572,41 +1606,86 @@ impl ConfigurableFileSystemObjectStore {
             // No pool configured, allocate fresh buffer
             own = Some(AlignedBuf::new(aligned_length, self.alignment())?);
         }
-        let aligned: &mut AlignedBuf = match (own.as_mut(), lease.as_deref_mut()) {
-            (Some(o), _) => o,
-            (None, Some(l)) => l,
-            (None, None) => bail!("internal error: no range-read buffer"),
-        };
+        // The read is done with `pread` straight into the buffer's raw memory by a blocking task
+        // that OWNS the buffer (and so the pool permit): the kernel is the only writer, nothing
+        // zero-fills a fresh buffer first, and a cancelled future cannot hand the buffer back to
+        // the pool while the read is still running.
+        #[cfg(unix)]
+        {
+            use crate::direct_bounce::SendPtr;
+            use std::os::unix::fs::OpenOptionsExt;
 
-        let options = self.create_open_options(true, false);
-        let mut file = options.open(path).await?;
-
-        file.seek(std::io::SeekFrom::Start(aligned_offset)).await?;
-        // Loop until we've filled the aligned buffer or reached EOF.
-        // A single read() call may return far fewer bytes than requested,
-        // especially for large ranges (O_DIRECT imposes per-call limits).
-        let mut bytes_read = 0;
-        while bytes_read < aligned_length {
-            let n = file
-                .read(&mut aligned.as_mut_slice()[bytes_read..aligned_length])
-                .await?;
-            if n == 0 {
-                break;
-            } // EOF
-            bytes_read += n;
+            let path = path.to_owned();
+            let direct = self.config.direct_io;
+            let want_len = usize::try_from(read_length).map_err(|_| too_big())?;
+            tokio::task::spawn_blocking(move || -> Result<Bytes> {
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                if direct {
+                    options.custom_flags(libc::O_DIRECT);
+                }
+                let file = options.open(&path)?;
+                let ptr = match (own.as_mut(), lease.as_deref_mut()) {
+                    (Some(o), _) => o.as_mut_ptr(),
+                    (None, Some(l)) => l.as_mut_ptr(),
+                    (None, None) => bail!("internal error: no range-read buffer"),
+                };
+                // Loop until the aligned range is filled or EOF: one read() may return far less
+                // than requested (O_DIRECT imposes per-call limits).
+                let mut bytes_read = 0usize;
+                while bytes_read < aligned_length {
+                    // SAFETY: `[bytes_read, aligned_length)` lies inside the buffer.
+                    let dst = SendPtr(unsafe { ptr.add(bytes_read) });
+                    let n = pread_raw(
+                        &file,
+                        dst,
+                        aligned_length - bytes_read,
+                        aligned_offset + bytes_read as u64,
+                    )?;
+                    if n == 0 {
+                        break; // EOF
+                    }
+                    bytes_read += n;
+                }
+                // Extract the requested subrange: only bytes the kernel wrote ([0, bytes_read)).
+                let start = offset_adjustment.min(bytes_read);
+                let end = start.saturating_add(want_len).min(bytes_read);
+                let mut out = BytesMut::with_capacity(end - start);
+                // SAFETY: `[start, end)` is inside `[0, bytes_read)`, which pread initialised.
+                out.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(ptr.add(start), end - start)
+                });
+                Ok(out.freeze())
+            })
+            .await?
         }
 
-        // Extract the requested subrange (single small copy vs entire buffer copy)
-        let start = offset_adjustment.min(bytes_read);
-        let end = start.saturating_add(read_length as usize).min(bytes_read);
-        let needed = end.saturating_sub(start);
-
-        let mut out = BytesMut::with_capacity(needed);
-        out.extend_from_slice(&aligned.as_slice()[start..end]);
-        let result = out.freeze();
-
-        // The pooled lease (if any) returns to the pool when it drops at the end of this fn.
-        Ok(result)
+        #[cfg(not(unix))]
+        {
+            let aligned: &mut AlignedBuf = match (own.as_mut(), lease.as_deref_mut()) {
+                (Some(o), _) => o,
+                (None, Some(l)) => l,
+                (None, None) => bail!("internal error: no range-read buffer"),
+            };
+            let options = self.create_open_options(true, false);
+            let mut file = options.open(path).await?;
+            file.seek(std::io::SeekFrom::Start(aligned_offset)).await?;
+            let mut bytes_read = 0;
+            while bytes_read < aligned_length {
+                let n = file
+                    .read(&mut aligned.as_mut_slice()[bytes_read..aligned_length])
+                    .await?;
+                if n == 0 {
+                    break;
+                }
+                bytes_read += n;
+            }
+            let start = offset_adjustment.min(bytes_read);
+            let end = start.saturating_add(read_length as usize).min(bytes_read);
+            let mut out = BytesMut::with_capacity(end - start);
+            out.extend_from_slice(&aligned.as_slice()[start..end]);
+            Ok(out.freeze())
+        }
     }
 
     /// Get file using RangeEngine for concurrent downloads
@@ -2442,8 +2521,15 @@ mod direct_io_chunking_tests {
             }
 
             let file = open_direct_write(&path);
-            write_all_direct_with(&file, data, A, strategy, &AlignedBuf::new, &NEVER_CANCELLED)
-                .expect("O_DIRECT write");
+            write_all_direct_with(
+                &|| file.try_clone(),
+                data,
+                A,
+                strategy,
+                &AlignedBuf::new,
+                &NEVER_CANCELLED,
+            )
+            .expect("O_DIRECT write");
             drop(file);
             assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, len);
             assert_eq!(std::fs::read(&path).unwrap(), raw, "len {len}");
@@ -2586,8 +2672,15 @@ mod direct_io_chunking_tests {
                     AlignedBuf::new(len, align)
                 }
             };
-            write_all_direct_with(&file, &raw, A, PER_CALL_64MIB, &limited, &NEVER_CANCELLED)
-                .expect("smaller bounce");
+            write_all_direct_with(
+                &|| file.try_clone(),
+                &raw,
+                A,
+                PER_CALL_64MIB,
+                &limited,
+                &NEVER_CANCELLED,
+            )
+            .expect("smaller bounce");
             drop(file);
             assert_eq!(std::fs::read(&path).unwrap(), raw);
 
@@ -2596,7 +2689,7 @@ mod direct_io_chunking_tests {
             let file = open_direct_write(&path);
             let never = |len: usize, align: usize| Err(AlignedAllocError { len, align });
             assert!(write_all_direct_with(
-                &file,
+                &|| file.try_clone(),
                 &raw,
                 A,
                 PER_CALL_64MIB,
