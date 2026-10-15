@@ -11,8 +11,13 @@
   the raw pointer).
 - `AlignedBuf` is no longer `Clone` (the derived clone copied the pointer and freed it twice).
 - `memory::BufferPool::new` and `BufferPoolConfig::build` return `Result<_, BufferPoolError>` (a capacity of 0
-  is an error instead of a panic) and `BufferPool::take` returns `Result<AlignedBuf, BufferPoolError>` (a closed
-  pool or a failed allocation is an error instead of a panic).
+  is an error instead of a panic). `BufferPool::take` returns `Result<PooledBuf, BufferPoolError>`:
+  `PooledBuf` is an RAII lease that dereferences to `AlignedBuf` and carries the semaphore permit, returning
+  the buffer to the pool and freeing the permit when it is dropped (`give()` just drops it). Earlier the
+  permit was released when `take()` returned, so any number of buffers could be checked out at once; now
+  idle + checked-out buffers never exceed the capacity, also when a holder is cancelled.
+- The streaming writer's `write_chunk()` / `write_owned_bytes()` and `MultipartUploadWriter.write()` raise
+  `TypeError` (was `RuntimeError` for the streaming writer) for an object that is not bytes-like.
 - `put_bytes_async` gained the keyword-only argument `borrow=False` (see below); positional calls are unchanged.
 - New public `file_store_direct::direct_io_counters()` / `DirectIoCounters`: how many `direct://` transfers
   really used O_DIRECT versus the buffered fallback that silently takes over when a filesystem refuses O_DIRECT.
@@ -43,11 +48,15 @@
   free the buffer until the awaitable completes; s3dlio then reads it in place instead of taking a snapshot
   (for example pinned host memory). **Contract for every buffer read in place:** it is exported meanwhile,
   so `bytearray.extend()/clear()` from another thread raises `BufferError`, and the bytes must not be
-  modified from another thread, or the stored object mixes old and new bytes (memory-safe, but not what you
-  meant). The buffer export is released before the call returns or the awaitable resolves for `file://` and
-  `direct://` (best effort for `s3://`, `gs://`, `az://`, where an SDK may keep a body clone for an instant), and
-  never by a Tokio worker waiting for the GIL. Cancelling the awaitable does not stop a request that is already
-  running; the buffer stays exported until it ends. Buffers of Python objects or pointers (`O`/`P` formats) are
+  modified from another thread: that is a data race (the bytes uploaded are undefined; the memory is not
+  freed or resized meanwhile, which does not make a concurrent write safe). **Completion barrier:** a put
+  does not complete - normally, with an error, or by cancellation - until every native reader of the buffer
+  is done and the export has really been released with a real GIL token (never by a Tokio worker waiting
+  for the GIL, and never inferred from `PyGILState_Check`). `put_bytes` waits after the store returned;
+  the awaitable of `put_bytes_async(borrow=True)` is an `asyncio.Task` whose cancellation is delivered only
+  after that point, so reusing the buffer after `CancelledError` is safe (cancelling waits for a running
+  native write to finish). The wait is bounded (30 s): if a backend never drops its clone, the buffer stays
+  pinned, a warning is logged once and `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it. Buffers of Python objects or pointers (`O`/`P` formats) are
   refused with a `TypeError`.
 
 - **`direct://` PUT and GET no longer move 4 KiB per system call, and a GET returns page-aligned memory
@@ -66,6 +75,18 @@
   buffer and then falls back to buffered I/O instead of aborting. `put_multipart` on `direct://` is now the same
   single write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
   also left zero padding inside the object whenever `part_size` was not a multiple of 4096.
+
+- **The remaining Python write paths no longer copy the payload with the GIL held (#254).** The streaming
+  writer's `write_chunk()` (which kept the GIL for the whole write of any mutable buffer) and
+  `write_owned_bytes()` (which copied the buffer into a `Vec` with the GIL held) now use the same payload
+  conversion as `put_bytes()`: any C-contiguous buffer of any item type is read in place, with NO copy made by
+  the Python layer and the GIL RELEASED; the export is released before the call returns. `write_owned_bytes()` is
+  now the same as `write_chunk()`. `MultipartUploadWriter.write()` borrows the buffer the same way and copies it
+  once, with the GIL released, into its part buffers (parts are uploaded asynchronously and outlive the call, so
+  a borrowed Python buffer cannot be handed to them). The same contract as `put_bytes()` applies: do not modify
+  the buffer from another thread during the call (a data race). **Not changed:** the legacy community GCS client
+  (`gcs-community`, `gcs_client.rs`) still does `data.to_vec()` per PUT; its dependency is not available to
+  build offline here, so the one-line change is left for a build that can compile that feature.
 
 - **The `direct://` streaming writer no longer fsyncs on every flush or copies every chunk (#249), and
   no longer frees an aligned buffer with the wrong layout (#248).** Page-aligned chunks are written from the

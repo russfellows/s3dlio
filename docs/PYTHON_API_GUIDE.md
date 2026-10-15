@@ -287,17 +287,23 @@ awaitable completes):
 * the source is *exported*: resizing it from another thread (`bytearray.extend()` / `clear()` / `del ba[:]`)
   raises `BufferError` until the call (or awaitable) is finished;
 * you must **not modify the bytes** from another thread (or other code sharing the memory) meanwhile: nothing
-  prevents it, and the stored object would mix old and new bytes. This is memory-safe, but not the data you meant;
+  prevents it, and it is a **data race**: the bytes uploaded are undefined (and the behaviour is undefined in the
+  Rust sense). The memory is never freed or resized meanwhile because the buffer stays exported, but that does not
+  make a concurrent write safe;
 * with `borrow=True` you additionally promise not to free the memory (for example ctypes/pinned host memory) until
   the awaitable has completed, successfully or not. The export is released before the awaitable resolves, so
   resizing right after the `await` works for `file://` and `direct://` (the store has dropped its last reference
   by then). For `s3://`, `gs://` and `az://` this is best effort: an SDK may keep a clone of the request body for
   a short moment after the call completes, in which case a resize immediately after the `await` can still raise
   `BufferError` for an instant; retry, or do not resize buffers you passed with `borrow=True`;
-* **cancelling the awaitable does not stop the request.** A blocking file write or an in-flight HTTP body may keep
-  reading the buffer until it finishes. The export is held until then (so the buffer cannot be freed or resized and
-  a resize raises `BufferError`), but you must not modify its bytes until the request is known to have ended.
-  Cancellation only abandons the result;
+* **completion is a safe-reuse point, cancellation included.** A put does not complete - with its result, with an
+  error, or with `CancelledError` - until every native reader of the buffer is done and the export has been
+  released. Cancelling the awaitable does not stop a running native write (a blocking file write, an in-flight
+  HTTP body), so the cancellation is delivered to you only AFTER that write finished (the awaitable of a
+  `borrow=True` put is an `asyncio.Task` wrapping the put); the wait is bounded (30 s). If a backend still holds
+  the payload after that, the buffer stays pinned (a resize raises `BufferError`), a warning is logged once and
+  `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it. Blocking `put_bytes` waits the same way before it
+  returns or raises;
 * buffers whose item format is `O` (Python objects) or `P` (pointers) are refused with a `TypeError`: their bytes are
   addresses, not data. A structured numpy dtype with padding is uploaded as its raw memory, padding bytes
   included (they are whatever was in memory).

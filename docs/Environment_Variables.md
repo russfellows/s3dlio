@@ -136,7 +136,15 @@ buffers, the result of a `direct://` GET) is written straight from the caller's 
   PUTs and GETs, so neither direction can starve the other, or, with `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY=fallback`,
   uses a private buffer of one bounce size for this request (serial copy-then-I/O, no pipelining; extra memory is
   bounded by one buffer per concurrent request beyond the pool).
-* Objects whose bounce need is at most 1 MiB skip the pool and use a private buffer of their own size.
+* A transfer of at most one buffer leases ONE buffer; a larger one leases two, ATOMICALLY (all or none, in
+  strict FIFO order: no request ever holds one buffer while waiting for another, so mixed traffic cannot
+  deadlock). Leases are RAII and are owned by the blocking closure that does the I/O: a cancelled request
+  can never return a buffer to the pool while a blocking write or read still uses it, and a request that is
+  still WAITING when it is cancelled gives up before any I/O starts.
+* **Hard bound.** With the default `wait` policy the bytes of pool buffers leased at any instant never exceed the
+  cap (`nodes x pairs x 2 x size`); `BounceStats::peak_leased_bytes` records the peak at every lease, so a test can
+  prove it independent of throughput. (`fallback` deliberately allocates beyond the cap and counts those bytes
+  separately; the zero-padded 4 KiB tail block of a page-aligned PUT is one page per concurrent PUT.)
 * A GET can instead read straight into one fresh page-aligned buffer of the object's size (zero copies, but fresh
   page faults on every call): `S3DLIO_DIRECT_IO_GET_MODE=direct`, the current default. `pooled` sends GETs through
   the pool (warm buffers, one copy into the destination). Which is faster depends on load; the default stays
