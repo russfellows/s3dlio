@@ -24,7 +24,7 @@ use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
 use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::list_containers::list_containers as list_containers_rs;
 use crate::object_store::{
-    store_for_uri, store_for_uri_with_logger, store_routing_endpoint_for_uri,
+    get_many_with_stores, store_for_uri, store_for_uri_with_logger, store_routing_endpoint_for_uri,
 };
 use crate::s3_client::run_on_global_rt;
 use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger, op_log_stats};
@@ -1930,54 +1930,12 @@ pub fn get_many(
                     .collect())
             }
             Scheme::Azure | Scheme::Gcs => {
-                // Use store_for_uri for Azure and GCS
-                // Submit to global runtime (io_uring pattern — never calls block_on)
-                let uris_clone = uris.clone();
-                let res = submit_io(async move {
-                    let sem = Arc::new(Semaphore::new(max_in_flight));
-                    let mut futs = FuturesUnordered::new();
-
-                    for uri in uris_clone.iter().cloned() {
-                        let sem = Arc::clone(&sem);
-                        futs.push(tokio::spawn(async move {
-                            let _permit = sem.acquire_owned().await.unwrap();
-
-                            // Use store_for_uri to get appropriate backend
-                            let store = store_for_uri(&uri)?;
-
-                            // Extract the key from the URI
-                            let key = if let Some(idx) = uri.find("://") {
-                                if let Some(slash_idx) = uri[idx + 3..].find('/') {
-                                    &uri[idx + 3 + slash_idx + 1..]
-                                } else {
-                                    ""
-                                }
-                            } else {
-                                &uri
-                            };
-
-                            if key.is_empty() {
-                                anyhow::bail!("Cannot GET: no key specified in URI: {}", uri);
-                            }
-
-                            let bytes = store.get(key).await?;
-                            Ok::<_, anyhow::Error>((uri, bytes))
-                        }));
-                    }
-
-                    let mut out = Vec::new();
-                    while let Some(res) = futs.next().await {
-                        let (uri, bytes) = res
-                            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
-                            .map_err(|e| anyhow::anyhow!("Get error: {}", e))?;
-                        out.push((uri, bytes));
-                    }
-
-                    // Maintain input order
-                    out.sort_by_key(|(u, _)| uris_clone.iter().position(|x| x == u).unwrap());
-                    Ok::<_, anyhow::Error>(out)
-                })?;
-
+                // Every Azure/GCS store's `get` takes the FULL object URI (#242), so each read
+                // is handed the URI as written. Submit to global runtime (io_uring pattern —
+                // never calls block_on).
+                let res = submit_io(get_many_with_stores(uris.clone(), max_in_flight, |uri| {
+                    store_for_uri(uri)
+                }))?;
                 Ok(res
                     .into_iter()
                     .map(|(u, b)| (u, PyBytesView::new(b)))

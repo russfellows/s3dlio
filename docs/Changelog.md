@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- **`get_many()` on `az://` and `gs://` URIs no longer fails for every key (#242).** The function
+  stripped the scheme and container/bucket and handed the Azure and GCS stores only a bare object
+  key, but those stores read the account/container/bucket from the full URI, so every read errored
+  while the same URI worked with `get()`. Each read is now given the full URI. The read loop moved
+  into `object_store::get_many_with_stores` (which also keeps input order by position, so repeated
+  URIs are safe). `get_many` of `file://`/`direct://` already passed full URIs and is unchanged.
+  Not changed here: `get_many_async()` and `get_many_stats()` send every URI through the S3-only
+  reader and refuse non-S3 URIs up front.
 - **Azure: the documentation no longer tells you to authenticate with `AZURE_STORAGE_KEY` (#239).**
   The docs (`PYTHON_API_GUIDE.md`, `Environment_Variables.md`, `CLI_GUIDE.md`) said an Azure account key,
   `AZURE_STORAGE_ACCOUNT`, or the service-principal variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,

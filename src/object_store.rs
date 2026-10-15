@@ -4028,6 +4028,63 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
     store_for_uri_with_logger(uri, None)
 }
 
+/// Read many objects concurrently, each through the store `store_for` returns for its URI,
+/// and return `(uri, bytes)` pairs in input order. At most `max_in_flight` reads run at once.
+///
+/// Used by the Python `get_many` for `az://` and `gs://`. Every store's `get` takes the
+/// FULL object URI (`AzureObjectStore::get` and `GcsObjectStore::get` parse the account /
+/// container / bucket out of it), so each read is handed the URI exactly as the caller wrote
+/// it. Issue #242: `get_many` used to strip the scheme and container and pass a bare key,
+/// which those stores cannot parse, so every key failed.
+#[cfg(any(test, feature = "extension-module"))]
+pub(crate) async fn get_many_with_stores<F>(
+    uris: Vec<String>,
+    max_in_flight: usize,
+    store_for: F,
+) -> Result<Vec<(String, Bytes)>>
+where
+    F: Fn(&str) -> Result<Box<dyn ObjectStore>> + Send + Sync + 'static,
+{
+    use futures::stream::FuturesUnordered;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
+    let store_for = Arc::new(store_for);
+    let sem = Arc::new(Semaphore::new(max_in_flight));
+    let mut futs = FuturesUnordered::new();
+
+    for (index, uri) in uris.into_iter().enumerate() {
+        let sem = Arc::clone(&sem);
+        let store_for = Arc::clone(&store_for);
+        futs.push(tokio::spawn(async move {
+            let _permit = sem
+                .acquire_owned()
+                .await
+                .map_err(|e| anyhow!("get_many semaphore closed: {e}"))?;
+            let store = store_for(&uri)?;
+
+            let bytes = store.get(&uri).await?;
+            Ok::<_, anyhow::Error>((index, uri, bytes))
+        }));
+    }
+
+    let mut out = Vec::new();
+    while let Some(res) = futs.next().await {
+        let item = res
+            .map_err(|e| anyhow!("Task join error: {}", e))?
+            .map_err(|e| anyhow!("Get error: {}", e))?;
+        out.push(item);
+    }
+
+    // Maintain input order
+    out.sort_by_key(|(index, _, _)| *index);
+    Ok(out
+        .into_iter()
+        .map(|(_, uri, bytes)| (uri, bytes))
+        .collect())
+}
+
 /// [`store_for_uri`] for the library entry points that always built an unlogged
 /// store and relied on the S3 backend's own row (checkpoint save/load, the
 /// concurrent shard reader, `MultiBackendDataset`, Python
@@ -5639,5 +5696,137 @@ mod delete_prefix_listing_tests {
         assert_eq!(t("az://acct/c/"), want(""));
         assert_eq!(t("https://acct.blob.core.windows.net/c/foo"), want("foo/"));
         assert!(azure_delete_prefix_target("s3://b/foo").is_err());
+    }
+}
+
+// Issue #242: the Python `get_many` for `az://` / `gs://` must hand each store the full URI.
+// A real Azure or GCS service is not available to unit tests, so the store is a fake that
+// behaves like the real ones in the one way that matters: `get` only accepts a URI with a
+// scheme (the real stores parse the account/container/bucket out of it) and records it.
+#[cfg(test)]
+mod get_many_with_stores_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    type Seen = Arc<Mutex<Vec<String>>>;
+
+    struct UriOnlyStore {
+        seen: Seen,
+    }
+
+    #[async_trait]
+    impl ObjectStore for UriOnlyStore {
+        async fn get(&self, uri: &str) -> Result<Bytes> {
+            self.seen.lock().unwrap().push(uri.to_string());
+            if !uri.contains("://") {
+                bail!("invalid object URI '{uri}': missing scheme");
+            }
+            Ok(Bytes::from(format!("body-of:{uri}")))
+        }
+        async fn get_range(&self, _: &str, _: u64, _: Option<u64>) -> Result<Bytes> {
+            bail!("unused")
+        }
+        async fn put(&self, _: &str, _: Bytes) -> Result<()> {
+            bail!("unused")
+        }
+        async fn put_multipart(&self, _: &str, _: Bytes, _: Option<usize>) -> Result<()> {
+            bail!("unused")
+        }
+        async fn list(&self, _: &str, _: bool) -> Result<Vec<String>> {
+            bail!("unused")
+        }
+        fn list_stream<'a>(
+            &'a self,
+            _: &'a str,
+            _: bool,
+        ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+            Box::pin(futures::stream::empty())
+        }
+        async fn stat(&self, _: &str) -> Result<ObjectMetadata> {
+            bail!("unused")
+        }
+        fn list_objects_with_prefix<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>> {
+            Box::pin(futures::stream::empty())
+        }
+        async fn delete(&self, _: &str) -> Result<()> {
+            bail!("unused")
+        }
+        async fn delete_batch(&self, _: &[String]) -> Result<()> {
+            bail!("unused")
+        }
+        async fn delete_prefix(&self, _: &str) -> Result<()> {
+            bail!("unused")
+        }
+        async fn create_container(&self, _: &str) -> Result<()> {
+            bail!("unused")
+        }
+        async fn delete_container(&self, _: &str) -> Result<()> {
+            bail!("unused")
+        }
+        async fn get_writer(&self, _: &str) -> Result<Box<dyn ObjectWriter>> {
+            bail!("unused")
+        }
+    }
+
+    fn factory(
+        seen: &Seen,
+    ) -> impl Fn(&str) -> Result<Box<dyn ObjectStore>> + Send + Sync + 'static {
+        let seen = Arc::clone(seen);
+        move |_uri: &str| {
+            Ok(Box::new(UriOnlyStore {
+                seen: Arc::clone(&seen),
+            }) as Box<dyn ObjectStore>)
+        }
+    }
+
+    #[tokio::test]
+    async fn azure_and_gcs_uris_reach_the_store_unchanged_and_come_back_in_order() {
+        let uris: Vec<String> = (0..12)
+            .flat_map(|i| {
+                [
+                    format!("az://acct/container/dir/obj{i}.bin"),
+                    format!("gs://bucket/dir/obj{i}.bin"),
+                ]
+            })
+            .collect();
+        let seen: Seen = Arc::default();
+        let got = get_many_with_stores(uris.clone(), 3, factory(&seen))
+            .await
+            .expect("every full URI is accepted by the store");
+
+        assert_eq!(got.len(), uris.len());
+        for (i, (uri, bytes)) in got.iter().enumerate() {
+            assert_eq!(uri, &uris[i], "results stay in input order");
+            assert_eq!(bytes.as_ref(), format!("body-of:{uri}").as_bytes());
+        }
+        let mut seen = seen.lock().unwrap().clone();
+        let mut want = uris;
+        seen.sort();
+        want.sort();
+        assert_eq!(
+            seen, want,
+            "the store was handed the full URIs, not bare keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_error_names_the_failing_read() {
+        let uris = vec!["az://acct/container/ok".to_string()];
+        let failing = |_: &str| -> Result<Box<dyn ObjectStore>> { bail!("no such backend") };
+        let err = get_many_with_stores(uris, 1, failing).await.unwrap_err();
+        assert!(format!("{err:#}").contains("no such backend"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn zero_max_in_flight_is_refused() {
+        let seen: Seen = Arc::default();
+        let err = get_many_with_stores(vec!["gs://b/k".to_string()], 0, factory(&seen))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("max_in_flight"), "{err:#}");
+        assert!(seen.lock().unwrap().is_empty());
     }
 }
