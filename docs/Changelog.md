@@ -15,14 +15,22 @@
   the prefix and silently omitted objects in deeper "subdirectories", unlike the native S3, GCS and
   Azure stores. `recursive=True` now returns every object at any depth (and no directory entries);
   `recursive=False` is unchanged (the objects and directory entries directly under the prefix). The
-  prefix still selects only its own directory: `p` never lists `pfoo/...` or `p2/...`.
+  prefix still selects only its own directory: `p` never lists `pfoo/...` or `p2/...`. A recursive
+  `list_stream` now yields entries as the backend returns them instead of after the whole listing has
+  been collected in memory.
 
 - **Arrow backend: `delete_prefix` now deletes the objects at every depth under the prefix (#232).**
   With the optional `arrow-backend` feature, `delete_prefix("s3://b/p")` listed only the immediate
   children of `p`, so `p/b/c` and `p/b/d/e` were left behind while the call returned success. It now
-  lists everything under `p/` recursively and deletes it with the store's bulk delete. Only objects
-  under `p/` are touched (`pfoo/x` and `p2/y` are not), and if any object cannot be deleted the call
-  returns an error that says how many and quotes the first errors, instead of success.
+  lists everything under `p/` recursively and deletes each object with its own DELETE request (ten at
+  a time, like the other backends; the bulk multi-object delete is not used because some
+  S3-compatible endpoints, such as Google Cloud Storage's S3 interoperability endpoint, reject it).
+  `pfoo/x` and `p2/y` are not touched, and neither is an object named exactly `p`. If any object
+  cannot be deleted, or the listing fails, the call returns an error that says how many operations
+  failed and quotes the first errors, instead of success. Limit: a folder marker object named
+  `p/` (a key ending in `/`) cannot be addressed through the Arrow backend's `object_store` layer
+  (it reports the key as `p`, the prefix itself), so the marker may remain after `delete_prefix`;
+  listing likewise never reports the prefix itself as an entry.
 
 - **Arrow backend: listing an `s3://` URI with a key prefix no longer returns doubled URIs (#222).**
   With the optional `arrow-backend` feature, listing `s3://b/dir/` returned `s3://b/dir/dir/x` for the
@@ -30,7 +38,10 @@
   listing code appended the listing URL's path to a location that already contained it. The returned
   URI is now `s3://b/dir/x`, for nested prefixes, a prefix without a trailing `/` (which lists that
   directory and never a sibling such as `dir2/`) and the bucket root, and the same correction applies
-  to every URL form the backend builds a store for (`gs://`, `az://`, path-style `https://` endpoints).
+  to every URL form the backend builds a store for (`gs://`, `abfss://`, path-style `https://`
+  endpoints). This holds for plain keys. Keys with a space, `%`, `?`, `#`, a leading `/` or `.` /
+  `..` segments are not yet guaranteed to round-trip through a listed URI on the Arrow backend (a
+  separate, known limit that this fix does not change).
 
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 

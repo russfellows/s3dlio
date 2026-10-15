@@ -1491,6 +1491,60 @@ mod tests {
         assert!(list_under(probe, base, url, true).await.is_err());
     }
 
+    // `rebuild_full_uri` with the `base` the adapter really derives: `s3://` goes through
+    // `s3_target` (as `parse_as` does) and every other scheme through
+    // `object_store::parse_url`, whose store and prefix path `parse_as` uses. Building these
+    // stores makes no request. A hand-written `base` could agree with the code under test
+    // by construction; these cannot.
+    #[test]
+    fn rebuild_full_uri_matches_the_base_the_parser_derives() {
+        let cases = [
+            ("s3://b/dir/", "s3://b/dir/x"),
+            ("s3://b/dir", "s3://b/dir/x"),
+            ("s3://b/a/b/c/", "s3://b/a/b/c/x"),
+            ("s3://b/", "s3://b/x"),
+            ("s3://b", "s3://b/x"),
+            ("s3a://b/dir/", "s3a://b/dir/x"),
+            ("gs://b/dir/", "gs://b/dir/x"),
+            ("gs://b/", "gs://b/x"),
+            (
+                "abfss://c@acct.dfs.core.windows.net/a/b/",
+                "abfss://c@acct.dfs.core.windows.net/a/b/x",
+            ),
+            (
+                "https://s3.us-east-1.amazonaws.com/bkt/dir/",
+                "https://s3.us-east-1.amazonaws.com/bkt/dir/x",
+            ),
+            (
+                "https://s3.us-east-1.amazonaws.com/bkt/",
+                "https://s3.us-east-1.amazonaws.com/bkt/x",
+            ),
+            (
+                "https://acct.blob.core.windows.net/cont/dir/",
+                "https://acct.blob.core.windows.net/cont/dir/x",
+            ),
+            ("https://example.com/dir/", "https://example.com/dir/x"),
+            ("memory:///dir/", "memory:///dir/x"),
+        ];
+        for (listing, expected) in cases {
+            let url = Url::parse(listing).expect("url");
+            let base = if url.scheme() == "s3" {
+                s3_target(&url, listing, true).expect("s3_target").1
+            } else {
+                // The same call `parse_as` makes; the store it builds is dropped unused.
+                aos::parse_url(&url)
+                    .unwrap_or_else(|e| panic!("parse_url({listing}): {e}"))
+                    .1
+            };
+            let location = base.clone().join("x");
+            assert_eq!(
+                ArrowObjectStore::rebuild_full_uri(&url, &base, &location),
+                expected,
+                "listing {listing} (base {base:?})"
+            );
+        }
+    }
+
     // F1: S3 stores the folder marker `p/` as an object. `object_store` parses listed keys
     // with `Path::parse`, which strips a trailing '/', so the marker comes back with the
     // location `p` -- the prefix itself (`Probe::with_marker`). It is not an entry UNDER the
