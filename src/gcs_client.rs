@@ -46,7 +46,8 @@ impl GcsClient {
     /// This now uses a cached global client for efficiency - authentication only happens once.
     ///
     /// The credentials are automatically discovered from:
-    /// - GOOGLE_APPLICATION_CREDENTIALS env var (loaded by dotenvy)
+    /// - GOOGLE_APPLICATION_CREDENTIALS env var (from the environment, or from a `.env` file
+    ///   when `S3DLIO_LOAD_DOTENV` enables one)
     /// - Metadata server (if running on GCP)
     /// - gcloud CLI credentials
     ///
@@ -56,6 +57,7 @@ impl GcsClient {
     ///
     /// When a custom endpoint is set, anonymous authentication is used (typical for emulators).
     pub async fn new() -> Result<Self> {
+        crate::dotenv::apply();
         let client = GCS_CLIENT
             .get_or_try_init(|| async {
                 // Check for custom endpoint (for fake-gcs-server or other emulators/proxies)

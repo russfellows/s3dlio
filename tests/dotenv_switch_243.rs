@@ -48,11 +48,40 @@ fn probe_child() {
             .with_writer(std::io::stdout)
             .try_init();
     }
-    // The first client build is the point where the library used to load `.env`.
-    let _ = s3dlio::s3_client::aws_s3_client();
-    let client = match s3dlio::s3_client::aws_s3_client() {
-        Ok(_) => "ok".to_string(),
-        Err(e) => format!("err:{e}"),
+    // Which library entry point runs first (every one of them must apply the policy
+    // before it reads any setting). The default is the S3 client build.
+    let entry = std::env::var("S3DLIO_243_ENTRY").unwrap_or_else(|_| "client".to_string());
+    let client = match entry.as_str() {
+        "client" => {
+            let _ = s3dlio::s3_client::aws_s3_client();
+            match s3dlio::s3_client::aws_s3_client() {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            }
+        }
+        "runtime" => {
+            let _ = s3dlio::s3_client::run_on_global_rt(async { Ok::<(), anyhow::Error>(()) });
+            "n/a".to_string()
+        }
+        "store_file" => {
+            let _ = s3dlio::object_store::store_for_uri("file:///");
+            "n/a".to_string()
+        }
+        #[cfg(feature = "backend-azure")]
+        "azure" => {
+            let _ = s3dlio::azure_client::AzureBlob::with_default_credential("acct", "cont");
+            "n/a".to_string()
+        }
+        #[cfg(feature = "backend-gcs")]
+        "gcs" => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = rt.block_on(s3dlio::google_gcs_client::GcsClient::new());
+            "n/a".to_string()
+        }
+        other => panic!("unknown S3DLIO_243_ENTRY {other}"),
     };
     let var = |n: &str| std::env::var(n).unwrap_or_else(|_| "<unset>".to_string());
     println!(
@@ -161,7 +190,7 @@ fn library_does_not_load_dotenv_by_default() {
 #[test]
 fn library_switch_off_never_loads() {
     let dir = dir_with_dotenv("lib-off");
-    for v in ["0", "false", "FALSE"] {
+    for v in ["0", "false", "FALSE", "no", "Off"] {
         assert_not_loaded(&probe(&dir, &[("S3DLIO_LOAD_DOTENV", v)]), v);
     }
 }
@@ -169,7 +198,7 @@ fn library_switch_off_never_loads() {
 #[test]
 fn library_switch_on_loads_the_working_directory_dotenv() {
     let dir = dir_with_dotenv("lib-on");
-    for v in ["1", "true", "True"] {
+    for v in ["1", "true", "True", "yes", "ON"] {
         assert_loaded(&probe(&dir, &[("S3DLIO_LOAD_DOTENV", v)]), v);
     }
 }
@@ -205,15 +234,70 @@ fn library_switch_naming_a_missing_file_loads_nothing_and_does_not_crash() {
 const HINT: &str = "S3DLIO_LOAD_DOTENV=1";
 
 #[test]
+fn missing_credentials_error_names_the_ignored_dotenv() {
+    // A Python user otherwise sees only "Missing ..." and never learns that the .env in
+    // the working directory is being ignored.
+    let dir = dir_with_dotenv("lib-err-hint");
+    let p = probe(&dir, &[]);
+    assert!(
+        p.client.contains("Missing AWS_ACCESS_KEY_ID") && p.client.contains(HINT),
+        "the error must say how to load the .env: {p:?}"
+    );
+    // An explicit decision to load nothing gets the plain message.
+    let p = probe(&dir, &[("S3DLIO_LOAD_DOTENV", "0")]);
+    assert!(
+        p.client.contains("Missing AWS_ACCESS_KEY_ID") && !p.client.contains(HINT),
+        "no hint after an explicit 0: {p:?}"
+    );
+}
+
+/// Every library entry point applies the policy before it reads any setting, so a
+/// program whose FIRST call is that entry still gets the file's values.
+fn assert_entry_loads(entry: &str, extra: &[(&str, &str)]) {
+    let dir = dir_with_dotenv(&format!("entry-{entry}"));
+    let mut env = vec![("S3DLIO_LOAD_DOTENV", "1"), ("S3DLIO_243_ENTRY", entry)];
+    env.extend_from_slice(extra);
+    let p = probe(&dir, &env);
+    assert_eq!(p.marker, "from-dotenv", "entry {entry}: {p:?}");
+    assert_eq!(p.preset, "real-env", "entry {entry}: {p:?}");
+}
+
+#[test]
+fn global_runtime_entry_loads_the_file() {
+    assert_entry_loads("runtime", &[]);
+}
+
+#[test]
+fn store_factory_entry_loads_the_file() {
+    assert_entry_loads("store_file", &[]);
+}
+
+#[cfg(feature = "backend-azure")]
+#[test]
+fn azure_client_entry_loads_the_file() {
+    assert_entry_loads("azure", &[]);
+}
+
+#[cfg(feature = "backend-gcs")]
+#[test]
+fn gcs_client_entry_loads_the_file() {
+    assert_entry_loads("gcs", &[]);
+}
+
+#[test]
 fn library_logs_a_one_time_hint_when_a_dotenv_exists_but_is_not_loaded() {
     let dir = dir_with_dotenv("lib-hint");
     let out = probe_stdout(&dir, &[("S3DLIO_243_LOG", "1")]);
+    // (The failed client build's own error text also carries the hint, on the PROBE
+    // line; the log line is the INFO one.)
+    let info_hints = out
+        .lines()
+        .filter(|l| l.contains("INFO") && l.contains(HINT))
+        .count();
     assert_eq!(
-        out.matches(HINT).count(),
-        1,
+        info_hints, 1,
         "exactly one hint, although the client was built twice\n{out}"
     );
-    assert!(out.contains("INFO"), "{out}");
 }
 
 #[test]
@@ -221,7 +305,13 @@ fn library_logs_no_hint_without_a_dotenv_or_with_an_explicit_off() {
     let empty = scratch("lib-hint-none");
     // `.env` discovery also looks in parent directories; a developer's own `.env` above
     // the repository would make "no .env" untrue here, so that half is skipped then.
-    if !empty.ancestors().any(|d| d.join(".env").is_file()) {
+    if let Some(parent_env) = empty.ancestors().find(|d| d.join(".env").is_file()) {
+        eprintln!(
+            "SKIPPED the no-.env half: {} has a .env, which discovery finds from {}",
+            parent_env.display(),
+            empty.display()
+        );
+    } else {
         let out = probe_stdout(&empty, &[("S3DLIO_243_LOG", "1")]);
         assert!(!out.contains(HINT), "no .env, no hint\n{out}");
     }
@@ -322,6 +412,20 @@ fn s3_cli_switch_path_loads_that_file_instead_of_dotenv() {
     );
     assert!(ok, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("obj-a"), "stdout={stdout}");
+}
+
+#[test]
+fn s3_cli_reports_a_missing_named_file_on_stderr() {
+    let (port, state) = ensure_mock_s3_server();
+    state.seed_bucket("cli243-missing", &["obj-a"]);
+    let dir = cli_dir("cli-missing", port);
+    let missing = dir.join("no-such.env");
+    let missing = missing.to_str().unwrap();
+    let (_ok, _stdout, stderr) =
+        s3_cli_ls(&dir, "cli243-missing", &[("S3DLIO_LOAD_DOTENV", missing)]);
+    // No log subscriber exists when s3-cli loads the file, so main prints the problem.
+    assert!(stderr.contains("S3DLIO_LOAD_DOTENV"), "stderr={stderr}");
+    assert!(stderr.contains(missing), "stderr={stderr}");
 }
 
 #[test]

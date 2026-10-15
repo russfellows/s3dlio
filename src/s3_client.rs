@@ -7,7 +7,7 @@
 //! Owns a single global multi-thread Tokio runtime and the global S3 client.
 //!
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
@@ -229,11 +229,26 @@ pub fn unsigned_payload_enabled() -> bool {
     })
 }
 
+/// The error for missing S3 credentials. When a `.env` file exists that s3dlio did not
+/// load (the library default, #243), the message says how to enable it: a Python user
+/// otherwise sees only "Missing ..." and never learns that the file is being ignored.
+fn missing_credentials_error() -> anyhow::Error {
+    match crate::dotenv::not_loaded_hint() {
+        Some(hint) => {
+            anyhow::anyhow!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY ({hint})")
+        }
+        None => anyhow::anyhow!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY"),
+    }
+}
+
 // Create (once) a background multi-thread Tokio runtime and return its Handle.
 // pub(crate) so that other modules (e.g. memory.rs) can spawn onto the same
 // runtime, ensuring consistent async behaviour across all URI schemes.
 pub(crate) fn global_rt_handle() -> &'static Handle {
     RT_HANDLE.get_or_init(|| {
+        // The `.env` policy applies before the runtime reads S3DLIO_RT_THREADS and before
+        // any worker thread exists, so loading it cannot race with their `getenv` (#243).
+        crate::dotenv::apply();
         let (tx, rx) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name("s3dlio-rt".to_string())
@@ -487,7 +502,7 @@ pub async fn aws_s3_client_async() -> Result<Client> {
 
             if env::var("AWS_ACCESS_KEY_ID").is_err() || env::var("AWS_SECRET_ACCESS_KEY").is_err()
             {
-                bail!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
+                return Err(missing_credentials_error());
             }
             info!("Initializing S3 client");
 
@@ -618,7 +633,7 @@ pub async fn create_s3_client_for_endpoint(
     crate::dotenv::apply();
 
     if env::var("AWS_ACCESS_KEY_ID").is_err() || env::var("AWS_SECRET_ACCESS_KEY").is_err() {
-        bail!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
+        return Err(missing_credentials_error());
     }
 
     let region = RegionProviderChain::first_try(env::var("AWS_REGION").ok().map(Region::new))

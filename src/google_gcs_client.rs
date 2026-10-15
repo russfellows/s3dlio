@@ -249,10 +249,12 @@ impl GcsClient {
     /// This uses cached global clients for efficiency - authentication only happens once.
     ///
     /// The credentials are automatically discovered from:
-    /// - GOOGLE_APPLICATION_CREDENTIALS env var (loaded by dotenvy)
+    /// - GOOGLE_APPLICATION_CREDENTIALS env var (from the environment, or from a `.env` file
+    ///   when `S3DLIO_LOAD_DOTENV` enables one)
     /// - Metadata server (if running on GCP)
     /// - gcloud CLI credentials
     pub async fn new() -> Result<Self> {
+        crate::dotenv::apply();
         let storage = GCS_STORAGE
             .get_or_try_init(|| async {
                 debug!("Initializing GCS Storage client (first time only)");
@@ -1385,8 +1387,8 @@ mod delete_objects_panic_accounting_tests {
 /// | `false` / `0` / `no`        | `ForceOff`       |
 /// | anything else               | `Auto`           |
 ///
-/// The variable can be set in the shell **or** loaded from a `.env` file via
-/// the [`dotenvy`] crate before the binary initializes its GCS client.
+/// The variable can be set in the shell **or** come from a `.env` file when
+/// `S3DLIO_LOAD_DOTENV` enables one (see [`crate::dotenv`]).
 pub(crate) fn read_rapid_mode() -> RapidMode {
     // Priority 1: env var (explicit user override, always wins)
     if let Ok(v) = std::env::var("S3DLIO_GCS_RAPID") {

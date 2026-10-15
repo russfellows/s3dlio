@@ -310,6 +310,7 @@ async fn list_gcs_async(project: &str) -> Result<Vec<ContainerInfo>> {
 
 #[cfg(feature = "backend-azure")]
 fn list_azure_containers(uri: &str) -> Result<Vec<ContainerInfo>> {
+    crate::dotenv::apply();
     let account = uri
         .strip_prefix("az://")
         .map(|s| s.trim_end_matches('/'))

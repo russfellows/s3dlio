@@ -13,12 +13,12 @@
 //!
 //! | value                  | meaning                                                         |
 //! |------------------------|-----------------------------------------------------------------|
-//! | `1` / `true`           | load `.env` from the working directory (or the nearest parent)  |
-//! | `0` / `false`          | never load a `.env` file                                        |
+//! | `1` / `true` / `yes` / `on`  | load `.env` from the working directory (or the nearest parent) |
+//! | `0` / `false` / `no` / `off` | never load a `.env` file                                       |
 //! | anything else          | a file path: load exactly that file                             |
 //! | unset / empty          | the default of the running program (below)                      |
 //!
-//! `1`/`true`/`0`/`false` are case-insensitive. Surrounding whitespace is ignored.
+//! The words are case-insensitive. Surrounding whitespace is ignored.
 //!
 //! # Defaults
 //!
@@ -36,12 +36,17 @@
 //!
 //! # When the file is read
 //!
-//! `s3-cli` loads it at start-up, before anything else reads the environment. A library
-//! loads it (once per process) the first time s3dlio builds an S3 client, lists buckets
-//! or containers, or sets up the Arrow backend. Settings that s3dlio reads *earlier* than
-//! that (for example the runtime thread count) do not see values that come only from the
-//! `.env` file; an application that needs the file's values everywhere should call
-//! [`load_env_file`] itself at start-up.
+//! Once per process, at the first of these (so before s3dlio reads any setting):
+//!
+//! * `s3-cli`: start-up, before the command line is parsed;
+//! * Python: `import s3dlio` (the extension module's initialisation, before any thread
+//!   or pool is created);
+//! * Rust: the first use of the global runtime, `store_for_uri*`, an S3 / Azure / GCS
+//!   client, a bucket or container listing, or the Arrow backend set-up.
+//!
+//! An application that wants a file's values even earlier (before it calls anything in
+//! s3dlio) can call [`load_env_file`] itself, or in Python load it with `python-dotenv`
+//! before `import s3dlio`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,9 +83,15 @@ pub(crate) fn parse_switch(value: &str) -> Option<DotenvMode> {
     let value = value.trim();
     if value.is_empty() {
         None
-    } else if value == "1" || value.eq_ignore_ascii_case("true") {
+    } else if ["1", "true", "yes", "on"]
+        .iter()
+        .any(|t| value.eq_ignore_ascii_case(t))
+    {
         Some(DotenvMode::WorkingDir)
-    } else if value == "0" || value.eq_ignore_ascii_case("false") {
+    } else if ["0", "false", "no", "off"]
+        .iter()
+        .any(|t| value.eq_ignore_ascii_case(t))
+    {
         Some(DotenvMode::Off)
     } else {
         Some(DotenvMode::File(PathBuf::from(value)))
@@ -96,12 +107,35 @@ pub(crate) fn resolve_mode(switch: Option<&str>, default: DotenvDefault) -> Dote
     })
 }
 
+/// What to tell a user whose credentials are missing while a `.env` file exists that
+/// s3dlio did not load because of the library default; `None` when that is not the
+/// situation (the file is loaded, loading was switched off explicitly, or no `.env`).
+pub(crate) fn not_loaded_hint() -> Option<String> {
+    if *process_mode() != DotenvMode::Off || switch_is_set() || dotenvy::dotenv_iter().is_err() {
+        return None;
+    }
+    Some(NOT_LOADED_HINT.to_string())
+}
+
+const NOT_LOADED_HINT: &str =
+    "a .env file was found in the working directory (or a parent) but is \
+    not loaded: s3dlio does not read .env files when used as a library. Set \
+    S3DLIO_LOAD_DOTENV=1 to load it, S3DLIO_LOAD_DOTENV=/path/to/file to load a specific \
+    file, or call s3dlio::dotenv::load_env_file()";
+
+/// True when the switch is set to a non-empty value (an explicit decision).
+fn switch_is_set() -> bool {
+    std::env::var(LOAD_DOTENV_ENV)
+        .map(|v| parse_switch(&v).is_some())
+        .unwrap_or(false)
+}
+
 /// Set by [`load_for_cli`] before anything resolves the mode.
 static CLI_DEFAULT: AtomicBool = AtomicBool::new(false);
 /// The switch, read once.
 static MODE: OnceLock<DotenvMode> = OnceLock::new();
-/// The load itself happens once per process too.
-static APPLIED: OnceLock<()> = OnceLock::new();
+/// The load itself happens once per process too; holds the problem it met, if any.
+static APPLIED: OnceLock<Option<String>> = OnceLock::new();
 
 fn process_mode() -> &'static DotenvMode {
     MODE.get_or_init(|| {
@@ -131,43 +165,49 @@ pub fn load_env_file<P: AsRef<Path>>(path: P) -> Result<()> {
 
 /// What the `s3-cli` binary calls first, before it parses its arguments or builds any
 /// client: make `.env` loading the default (the switch still wins) and apply it.
-pub fn load_for_cli() {
+///
+/// Returns the problem the load met (a file named by `S3DLIO_LOAD_DOTENV` that cannot be
+/// read), because no log subscriber exists yet at that point: the caller prints it.
+#[doc(hidden)]
+pub fn load_for_cli() -> Option<String> {
     CLI_DEFAULT.store(true, Ordering::SeqCst);
-    apply();
+    apply_inner().clone()
 }
 
-/// Apply the `.env` policy of this process. Called from every site that used to call
-/// `dotenvy::dotenv()` itself; cheap and idempotent (the switch is read once and the
-/// file is loaded at most once per process).
+/// Apply the `.env` policy of this process. Called at the start of every library entry
+/// point (and from the sites that used to call `dotenvy::dotenv()` themselves); cheap and
+/// idempotent (the switch is read once and the file is loaded at most once per process).
 pub(crate) fn apply() {
-    APPLIED.get_or_init(|| apply_mode(process_mode()));
+    apply_inner();
 }
 
-fn apply_mode(mode: &DotenvMode) {
+fn apply_inner() -> &'static Option<String> {
+    APPLIED.get_or_init(|| {
+        let problem = apply_mode(process_mode());
+        if let Some(p) = &problem {
+            warn!("{p}");
+        }
+        problem
+    })
+}
+
+/// Do what `mode` says; returns the problem, if any.
+fn apply_mode(mode: &DotenvMode) -> Option<String> {
     match mode {
         DotenvMode::WorkingDir => {
             // Same as before #243: a missing file is not an error.
             let _ = dotenvy::dotenv();
+            None
         }
-        DotenvMode::File(path) => {
-            if let Err(e) = load_env_file(path) {
-                warn!("{LOAD_DOTENV_ENV} names {}: {e:#}", path.display());
-            }
-        }
+        DotenvMode::File(path) => load_env_file(path)
+            .err()
+            .map(|e| format!("{LOAD_DOTENV_ENV} names {}: {e:#}", path.display())),
         DotenvMode::Off => {
             // Only the unset (default) case is worth a hint; an explicit `0` is a decision.
-            if std::env::var(LOAD_DOTENV_ENV)
-                .map(|v| parse_switch(&v).is_none())
-                .unwrap_or(true)
-                && dotenvy::dotenv_iter().is_ok()
-            {
-                info!(
-                    "a .env file was found in the working directory (or a parent) but is not \
-                     loaded: s3dlio does not read .env files when used as a library. Set \
-                     {LOAD_DOTENV_ENV}=1 to load it, {LOAD_DOTENV_ENV}=/path/to/file to load a \
-                     specific file, or call s3dlio::dotenv::load_env_file()."
-                );
+            if !switch_is_set() && dotenvy::dotenv_iter().is_ok() {
+                info!("{NOT_LOADED_HINT}.");
             }
+            None
         }
     }
 }
@@ -180,10 +220,14 @@ mod tests {
 
     #[test]
     fn switch_values_parse() {
-        for v in ["1", "true", "TRUE", "True", " 1 ", "\ttrue\n"] {
+        for v in [
+            "1", "true", "TRUE", "True", " 1 ", "\ttrue\n", "yes", "YES", "on", "On",
+        ] {
             assert_eq!(parse_switch(v), Some(DotenvMode::WorkingDir), "{v:?}");
         }
-        for v in ["0", "false", "FALSE", "False", " 0 "] {
+        for v in [
+            "0", "false", "FALSE", "False", " 0 ", "no", "No", "off", "OFF",
+        ] {
             assert_eq!(parse_switch(v), Some(DotenvMode::Off), "{v:?}");
         }
         for v in ["", "   ", "\n"] {
@@ -199,8 +243,8 @@ mod tests {
         );
         // Only the documented spellings are booleans: anything else is a path.
         assert_eq!(
-            parse_switch("yes"),
-            Some(DotenvMode::File(PathBuf::from("yes")))
+            parse_switch("maybe"),
+            Some(DotenvMode::File(PathBuf::from("maybe")))
         );
     }
 
@@ -248,21 +292,37 @@ mod tests {
         }
     }
 
-    fn scratch_dir(name: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("tmp")
-            .join(format!("dotenv243-{name}-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A scratch directory under target/tmp, removed when dropped (also when the test
+    /// fails and unwinds).
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("tmp")
+                .join(format!("dotenv243-{name}-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
     fn load_env_file_sets_missing_variables_and_never_overrides_set_ones() {
         let _g = lock();
         let _restore = EnvRestore::capture(&["S3DLIO_243_UNIT_NEW", "S3DLIO_243_UNIT_SET"]);
-        let dir = scratch_dir("explicit");
-        let file = dir.join("custom.env");
+        let dir = ScratchDir::new("explicit");
+        let file = dir.path().join("custom.env");
         fs::write(
             &file,
             "S3DLIO_243_UNIT_NEW=from-file\nS3DLIO_243_UNIT_SET=from-file\n",
@@ -279,7 +339,6 @@ mod tests {
             "from-real-env",
             "the real environment wins over the file"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -295,18 +354,20 @@ mod tests {
     fn file_mode_loads_exactly_that_file() {
         let _g = lock();
         let _restore = EnvRestore::capture(&["S3DLIO_243_UNIT_FILE_MODE"]);
-        let dir = scratch_dir("filemode");
-        let file = dir.join("named.env");
+        let dir = ScratchDir::new("filemode");
+        let file = dir.path().join("named.env");
         fs::write(&file, "S3DLIO_243_UNIT_FILE_MODE=named\n").unwrap();
         std::env::remove_var("S3DLIO_243_UNIT_FILE_MODE");
 
-        apply_mode(&DotenvMode::File(file));
+        assert_eq!(apply_mode(&DotenvMode::File(file)), None);
         assert_eq!(std::env::var("S3DLIO_243_UNIT_FILE_MODE").unwrap(), "named");
 
         // A missing file named by the switch is a warning, not a panic or an error.
-        apply_mode(&DotenvMode::File(dir.join("missing.env")));
-        // `Off` never touches the environment.
-        apply_mode(&DotenvMode::Off);
-        fs::remove_dir_all(&dir).ok();
+        let problem = apply_mode(&DotenvMode::File(dir.path().join("missing.env")));
+        let problem = problem.expect("a missing named file is reported");
+        assert!(problem.contains("S3DLIO_LOAD_DOTENV"), "{problem}");
+        assert!(problem.contains("missing.env"), "{problem}");
+        // `Off` never touches the environment and has no problem to report.
+        assert_eq!(apply_mode(&DotenvMode::Off), None);
     }
 }

@@ -750,7 +750,10 @@ fn parse_human_size(input: &str) -> std::result::Result<usize, String> {
 async fn main() -> Result<()> {
     // s3-cli loads a `.env` file by default (variables already set are never overridden).
     // `S3DLIO_LOAD_DOTENV=0` turns that off, `=<path>` loads that file instead (issue #243).
-    s3dlio::dotenv::load_for_cli();
+    // No log subscriber exists yet, so a problem with the named file is printed here.
+    if let Some(problem) = s3dlio::dotenv::load_for_cli() {
+        eprintln!("warning: {problem}");
+    }
 
     let cli = Cli::parse();
 

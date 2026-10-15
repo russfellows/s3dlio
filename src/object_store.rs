@@ -4098,6 +4098,9 @@ pub fn store_for_uri_with_logger(
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
 
+    // The `.env` policy applies before any store reads a setting (#243).
+    crate::dotenv::apply();
+
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => FileSystemObjectStore::boxed(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
@@ -4164,6 +4167,9 @@ pub fn store_for_uri_with_config_and_logger(
 ) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
+
+    // The `.env` policy applies before any store reads a setting (#243).
+    crate::dotenv::apply();
 
     let store: Box<dyn ObjectStore> = match (infer_scheme(uri), config) {
         (Scheme::File, Some(crate::api::StorageConfig::File(cfg))) => {

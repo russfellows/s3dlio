@@ -278,6 +278,10 @@ mod test_env;
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     Python::initialize();
 
+    // Apply the `.env` policy FIRST: before any thread exists and before anything below
+    // (thread-pool sizing, the first I/O call) reads an environment variable (#243).
+    dotenv::apply();
+
     // Auto-size every process-wide thread pool (global Tokio runtime,
     // pyo3-async-runtimes runtime, Rayon global pool) from MPI/distributed-
     // training env vars, unconditionally -- so every caller gets a
