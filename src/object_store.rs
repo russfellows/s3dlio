@@ -2401,6 +2401,8 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
             .next()
             .ok_or_else(|| anyhow!("missing container in az:// URI"))?;
         let key = it.next().unwrap_or("").to_string();
+        // Refuse an account that could redirect the request before anything uses it.
+        crate::azure_client::validate_account_name(account)?;
         return Ok((account.to_string(), container.to_string(), key));
     }
 
@@ -2431,6 +2433,7 @@ fn parse_azure_uri(uri: &str) -> Result<(String, String, String)> {
         if container.is_empty() {
             bail!("missing container in URL path");
         }
+        crate::azure_client::validate_account_name(account)?;
         return Ok((account.to_string(), container.to_string(), key.to_string()));
     }
 

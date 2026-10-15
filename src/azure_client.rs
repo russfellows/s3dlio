@@ -149,6 +149,130 @@ static SERVICE_CLIENTS: std::sync::LazyLock<ServiceClientCache> = std::sync::Laz
     ServiceClientCache::new(crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX)
 });
 
+/// An Azure SDK error with a message that names the credential mode (for a 401/403) and has any
+/// SAS token removed, while the typed SDK error stays available to callers that classify errors
+/// (the idempotent-delete contract looks for `BlobNotFound`; see
+/// [`crate::delete_contract::is_not_found`]). `Display` shows only the redacted message and
+/// `source()` is `None`, so printing the chain never shows the unredacted SDK text.
+#[derive(Debug)]
+pub struct AzureRequestError {
+    message: String,
+    inner: azure_core::Error,
+}
+
+impl std::fmt::Display for AzureRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AzureRequestError {}
+
+impl AzureRequestError {
+    /// The request failed because the blob does not exist.
+    pub fn is_blob_not_found(&self) -> bool {
+        azure_error_is_blob_not_found(&self.inner)
+    }
+
+    /// The HTTP status of the failed request, if there was a response.
+    pub fn http_status(&self) -> Option<azure_core::http::StatusCode> {
+        self.inner.http_status()
+    }
+}
+
+/// Whether an SDK error is the service answering 404 `BlobNotFound`.
+pub fn azure_error_is_blob_not_found(e: &azure_core::Error) -> bool {
+    matches!(
+        e.kind(),
+        azure_core::error::ErrorKind::HttpResponse { status, error_code, .. }
+            if *status == azure_core::http::StatusCode::NotFound
+                && error_code.as_deref() == Some("BlobNotFound")
+    )
+}
+
+/// Wrap an SDK error as an [`AzureRequestError`]: the message includes the cause chain (the
+/// SDK's top-level text is often generic, "non-transport error occurred ...") and, for a 401 or
+/// 403, the credential mode that was used (a bare "403" does not say which identity was
+/// refused); a configured SAS token is removed.
+fn azure_error(mode: CredentialMode, e: azure_core::Error) -> anyhow::Error {
+    let rejected = matches!(
+        e.http_status(),
+        Some(azure_core::http::StatusCode::Unauthorized | azure_core::http::StatusCode::Forbidden)
+    );
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    let text = azure_credential::redact_sas(&text);
+    let message = if rejected {
+        format!("Azure credential mode {mode} was used and the request was rejected: {text}")
+    } else {
+        text
+    };
+    anyhow::Error::new(AzureRequestError { message, inner: e })
+}
+
+/// `url` without its query string or fragment, for messages and logs (a query may hold a SAS
+/// token or other secrets).
+pub fn redact_url(url: &str) -> String {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    url[..end].to_string()
+}
+
+/// Whether `account` can be used to build a request URL or path safely. Azure storage account
+/// names are 3-24 lowercase letters and digits. With a custom endpoint (an emulator or proxy)
+/// that rule is relaxed (emulators may use other names), but a name that could change which host
+/// or path a request goes to (`/ ? # @ \`, whitespace, control characters, `.`-only names) is
+/// never accepted. Checked before any request is made or credential used.
+pub fn validate_account_name(account: &str) -> Result<()> {
+    let custom_endpoint = [
+        crate::constants::ENV_AZURE_STORAGE_ENDPOINT,
+        crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL,
+    ]
+    .iter()
+    .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()));
+    account_name_problem(account, custom_endpoint).map_or(Ok(()), |why| {
+        Err(anyhow!("invalid Azure account name {account:?}: {why}"))
+    })
+}
+
+fn account_name_problem(account: &str, custom_endpoint: bool) -> Option<&'static str> {
+    if account.is_empty() {
+        return Some("it is empty");
+    }
+    if account
+        .chars()
+        .any(|c| matches!(c, '/' | '?' | '#' | '@' | '\\') || c.is_whitespace() || c.is_control())
+    {
+        return Some(
+            "it contains a character that could redirect the request (/ ? # @ \\ or whitespace)",
+        );
+    }
+    if custom_endpoint {
+        return (account == "." || account == "..").then_some("it is a path segment");
+    }
+    let well_formed = (3..=24).contains(&account.len())
+        && account
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    (!well_formed).then_some("storage account names are 3-24 lowercase letters and digits")
+}
+
+/// A host the machine itself serves: `localhost` or a loopback address.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The (cached) service client for `account_url`, and the credential mode it uses.
 ///
 /// The mode comes from `S3DLIO_AZURE_CREDENTIAL` (see [`crate::azure_credential`]):
@@ -158,14 +282,27 @@ static SERVICE_CLIENTS: std::sync::LazyLock<ServiceClientCache> = std::sync::Laz
 ///   from which the SDK derives every request URL; `none` attaches nothing;
 /// * `auto` on an `http` endpoint (an emulator such as Azurite) is `none`, as before.
 fn service_client_for_url(account_url: &str) -> Result<(Arc<BlobServiceClient>, CredentialMode)> {
-    let mut service_url = Url::parse(account_url)
-        .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?;
+    let mut service_url = Url::parse(account_url).map_err(|e| {
+        anyhow!(
+            "invalid Azure account URL '{}': {e}",
+            redact_url(account_url)
+        )
+    })?;
     let https = service_url.scheme() == "https";
     let mode = azure_credential::mode_for_endpoint(https)?;
     azure_credential::warn_unused_sas(mode);
 
-    // The cache key never contains the SAS token itself, only a hash of it.
-    let plain_url = service_url.to_string();
+    // The cache key never contains the SAS token itself, only a hash of it. Messages and logs
+    // use the URL without any query string.
+    let plain_url = redact_url(service_url.as_str());
+    if mode == CredentialMode::Sas
+        && !https
+        && !service_url.host_str().is_some_and(is_loopback_host)
+    {
+        bail!(
+            "Azure credential mode sas: refusing to send the SAS token over plain http to {plain_url}; use an https endpoint (http is allowed only for localhost / loopback emulators)"
+        );
+    }
     let mut key = format!("{mode}|{plain_url}");
     if mode == CredentialMode::Sas {
         use std::hash::{Hash, Hasher};
@@ -264,6 +401,7 @@ impl AzureBlob {
     /// Example: AZURE_STORAGE_ENDPOINT=http://localhost:10000 + account="devstoreaccount1"
     ///          → http://localhost:10000/devstoreaccount1
     pub fn with_default_credential(account: &str, container: &str) -> Result<Self> {
+        validate_account_name(account)?;
         // Check for custom endpoint (for Azurite or other emulators/proxies)
         if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
             .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
@@ -274,7 +412,7 @@ impl AzureBlob {
             } else {
                 format!("{}/{}", endpoint, account)
             };
-            tracing::info!("Using custom Azure endpoint: {}", account_url);
+            tracing::info!("Using custom Azure endpoint: {}", redact_url(&account_url));
             return Self::with_default_credential_from_url(&account_url, container);
         }
 
@@ -295,34 +433,7 @@ impl AzureBlob {
     /// was used (a bare "403" does not say which identity was refused), and any configured
     /// SAS token is removed from the message.
     fn auth_err(&self, e: azure_core::Error) -> anyhow::Error {
-        let rejected = matches!(
-            e.http_status(),
-            Some(
-                azure_core::http::StatusCode::Unauthorized
-                    | azure_core::http::StatusCode::Forbidden
-            )
-        );
-        // The SDK's top-level message is often generic ("non-transport error occurred ..."); the
-        // cause (a failed token request, the response body) is in the source chain.
-        let mut text = e.to_string();
-        let mut source = std::error::Error::source(&e);
-        while let Some(cause) = source {
-            let cause_text = cause.to_string();
-            if !text.contains(&cause_text) {
-                text.push_str(": ");
-                text.push_str(&cause_text);
-            }
-            source = cause.source();
-        }
-        let text = crate::azure_credential::redact_sas(&text);
-        if rejected {
-            anyhow!(
-                "Azure credential mode {} was used and the request was rejected: {text}",
-                self.credential_mode
-            )
-        } else {
-            anyhow!(text)
-        }
+        azure_error(self.credential_mode, e)
     }
 
     /// Blob service (rarely needed directly).
@@ -598,7 +709,15 @@ impl AzureBlob {
         let container = self.container_client()?;
         for name in blobs {
             let b = container.blob_client(name);
-            b.delete(None).await.map_err(|e| self.auth_err(e))?;
+            match b.delete(None).await {
+                Ok(_) => {}
+                // Already gone is the state a delete asks for (S3's DeleteObjects treats a
+                // missing key the same way); only the service's own `BlobNotFound` counts.
+                Err(e) if azure_error_is_blob_not_found(&e) => {
+                    debug!("AzureBlob::delete_objects: '{name}' was already absent");
+                }
+                Err(e) => return Err(self.auth_err(e)),
+            }
         }
         Ok(())
     }
@@ -946,15 +1065,15 @@ pub async fn list_account_containers(account: &str) -> Result<Vec<(String, Optio
 
 /// [`list_account_containers`] against an explicit account URL.
 async fn list_account_containers_at(account_url: &str) -> Result<Vec<(String, Option<String>)>> {
-    let (service_client, _mode) = service_client_for_url(account_url)?;
+    let (service_client, mode) = service_client_for_url(account_url)?;
 
     let mut containers: Vec<(String, Option<String>)> = Vec::new();
     let mut pager = service_client
         .list_containers(None)
-        .map_err(|e| anyhow!("Azure list_containers failed: {}", e))?;
+        .map_err(|e| azure_error(mode, e))?;
 
     while let Some(item) = pager.next().await {
-        let item = item.map_err(|e| anyhow!("Azure list_containers item error: {e}"))?;
+        let item = item.map_err(|e| azure_error(mode, e))?;
         let name = item.name.unwrap_or_default();
         let date = item
             .properties
@@ -1099,6 +1218,82 @@ mod tests {
             );
         }
         assert_eq!(sequential_partition_size(floor as u64 * 4), floor * 4);
+    }
+
+    #[test]
+    fn account_names_are_validated_strictly_without_a_custom_endpoint() {
+        for good in ["abc", "devstoreaccount1", "a1b2c3", "x".repeat(24).as_str()] {
+            assert_eq!(account_name_problem(good, false), None, "{good}");
+        }
+        for bad in [
+            "",
+            "ab",
+            "UPPER",
+            "evil.example",
+            "with-dash",
+            "under_score",
+            "a?b",
+            "a#b",
+            "a/b",
+            "a@b",
+            "a\\b",
+            "a b",
+            "a\tb",
+            &"x".repeat(25),
+            "attacker.example#",
+        ] {
+            assert!(account_name_problem(bad, false).is_some(), "{bad:?}");
+        }
+    }
+
+    // With a custom endpoint (an emulator) the naming rule is relaxed, but nothing that could
+    // change the host or path of a request is accepted.
+    #[test]
+    fn account_names_with_a_custom_endpoint_still_refuse_redirecting_characters() {
+        for ok in ["devstoreaccount1", "Dev_Store-1", "evil.example", "ab"] {
+            assert_eq!(account_name_problem(ok, true), None, "{ok}");
+        }
+        for bad in [
+            "", "a/b", "a?b", "a#b", "a@b", "a\\b", "a b", "a\nb", "..", ".",
+        ] {
+            assert!(account_name_problem(bad, true).is_some(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn urls_are_logged_without_their_query_or_fragment() {
+        assert_eq!(
+            redact_url("http://h:1/acct?sv=1&sig=SECRET#frag"),
+            "http://h:1/acct"
+        );
+        assert_eq!(
+            redact_url("https://acct.blob.core.windows.net"),
+            "https://acct.blob.core.windows.net"
+        );
+        assert_eq!(redact_url("not a url?sig=SECRET"), "not a url");
+    }
+
+    #[test]
+    fn only_localhost_and_loopback_addresses_are_local() {
+        for local in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.9.9.9",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(is_loopback_host(local), "{local}");
+        }
+        for remote in [
+            "203.0.113.9",
+            "10.0.0.1",
+            "example.com",
+            "0.0.0.0",
+            "localhost.evil.com",
+        ] {
+            assert!(!is_loopback_host(remote), "{remote}");
+        }
     }
 
     #[test]

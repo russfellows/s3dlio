@@ -105,12 +105,13 @@ pub fn is_not_found(err: &anyhow::Error) -> bool {
         }
         #[cfg(feature = "backend-azure")]
         if let Some(az) = cause.downcast_ref::<azure_core::Error>() {
-            return matches!(
-                az.kind(),
-                azure_core::error::ErrorKind::HttpResponse { status, error_code, .. }
-                    if *status == azure_core::http::StatusCode::NotFound
-                        && error_code.as_deref() == Some("BlobNotFound")
-            );
+            return crate::azure_client::azure_error_is_blob_not_found(az);
+        }
+        // The Azure client wraps SDK errors (to name the credential mode and redact a SAS token)
+        // and keeps the typed error inside.
+        #[cfg(feature = "backend-azure")]
+        if let Some(az) = cause.downcast_ref::<crate::azure_client::AzureRequestError>() {
+            return az.is_blob_not_found();
         }
         #[cfg(feature = "backend-gcs")]
         if let Some(g) = cause.downcast_ref::<google_cloud_gax::error::Error>() {
