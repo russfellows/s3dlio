@@ -889,7 +889,7 @@ mod tests {
 
         let (_store, path, _url) = prefix.expect("`s3://b/dir/` is a valid listing prefix");
         assert_eq!(path, Path::from("dir"));
-        let err = object.err().expect("`s3://b/dir/` is not an object key");
+        let err = object.expect_err("`s3://b/dir/` is not an object key");
         let msg = format!("{err:#}");
         assert!(msg.contains("empty path segment"), "{msg}");
         assert!(msg.contains("s3://b/dir/"), "{msg}");

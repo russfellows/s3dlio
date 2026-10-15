@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **Arrow backend: `cargo clippy --tests` is clean for the library's own tests (#246).** The test
+  `parse_prefix_accepts_a_trailing_slash_that_parse_refuses` used `.err().expect(..)`, which
+  `clippy::err_expect` rejects when tests are linted (CI lints without `--tests`). It now uses
+  `expect_err`. No behaviour change. (The integration tests under `tests/` use native-backend APIs and
+  do not compile under `--no-default-features --features arrow-backend`; that is unchanged.)
+
 - **Arrow backend: `list(uri, recursive=True)` now lists every object under the prefix (#245).**
   With the optional `arrow-backend` feature, a recursive listing returned only the direct children of
   the prefix and silently omitted objects in deeper "subdirectories", unlike the native S3, GCS and
