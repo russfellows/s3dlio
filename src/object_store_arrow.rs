@@ -11,7 +11,7 @@ use crc32fast::Hasher;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use url::Url;
+use url::{Position, Url};
 
 use crate::object_store::{
     CompressionConfig,
@@ -62,15 +62,10 @@ impl ArrowObjectStore {
 
         match url.scheme() {
             "s3" => {
-                // Extract bucket and path from URL
-                let bucket = url
-                    .host_str()
-                    .ok_or_else(|| anyhow::anyhow!("No bucket in S3 URL"))?;
-                let path = key_path(url.path(), is_prefix)
-                    .with_context(|| format!("cannot address {uri}"))?;
+                let (bucket, path) = s3_target(&url, uri, is_prefix)?;
 
                 // Build S3 client explicitly to control credentials
-                let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+                let mut builder = AmazonS3Builder::new().with_bucket_name(&bucket);
 
                 // Use credentials from environment
                 if let (Ok(access_key), Ok(secret_key)) = (
@@ -118,37 +113,33 @@ impl ArrowObjectStore {
         Self::parse_as(prefix, true)
     }
 
-    /// Build a full URI string for a returned `location` using the original scheme/authority.
-    /// Example: scheme+host from input URL + '/' + returned path.
-    fn rebuild_full_uri(base_url: &Url, location: &Path) -> String {
-        // Preserve scheme+authority (+ bucket/account in host/path, as provided by parse_url config).
-        // Fall back to base for everything before path; append location's string.
-        let mut rebuilt = String::new();
-        if let Some(scheme) = Some(base_url.scheme()) {
-            rebuilt.push_str(scheme);
-            rebuilt.push_str("://");
-        }
-        // authority (host[:port]) if any
-        if let Some(host) = base_url.host_str() {
-            rebuilt.push_str(host);
-        }
-        // carry through base_url.path "bucket" portion if present (e.g., https endpoints)
-        // Note: parse_url usually embeds bucket/container into store config,
-        // but for https-style endpoints keep the path prefix from the URL up to the "prefix" we parsed.
-        // Keep it simple: append base path minus any trailing slash.
-        let base_path = base_url.path().trim_end_matches('/').to_string();
-        // Avoid duplicate slashes on pure virtual schemes like s3://bucket
-        if !base_path.is_empty() && !base_path.starts_with('/') {
-            rebuilt.push('/');
-        }
-        if !base_path.is_empty() {
-            rebuilt.push_str(&base_path);
-        }
-        if !rebuilt.ends_with('/') {
-            rebuilt.push('/');
-        }
+    /// Build the full URI of a listed `location` from the URL the listing was requested with.
+    ///
+    /// Every location `object_store` returns is relative to the STORE ROOT, not to the
+    /// listing URL: for `s3://b/dir/` the store is the bucket `b` and the location of
+    /// `dir/x` is `dir/x`, which already contains the listing prefix `dir` (`base`). The
+    /// URL's own key path must therefore not be appended again (issue #222). What the
+    /// store root adds in front of the key is the part of the URL path before `base`:
+    /// nothing for `s3://`, `gs://`, `az://`, `memory://` (the bucket or container is the
+    /// URL's authority), but the bucket for a path-style endpoint such as
+    /// `https://s3.us-east-1.amazonaws.com/bucket/dir/`.
+    fn rebuild_full_uri(base_url: &Url, base: &Path, location: &Path) -> String {
+        // `scheme://[userinfo@]host[:port]`, kept exactly as given (`az://container@account`).
+        let authority = &base_url[..Position::BeforePath];
+        // The root of the store is the URL path minus the trailing `base.parts()` segments.
+        let url_segments: Vec<&str> = base_url
+            .path_segments()
+            .map(|segments| segments.filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        let root_len = url_segments.len().saturating_sub(base.parts().count());
 
-        // Append Arrow location (never starts with '/')
+        let mut rebuilt = String::from(authority);
+        rebuilt.push('/');
+        for segment in &url_segments[..root_len] {
+            rebuilt.push_str(segment);
+            rebuilt.push('/');
+        }
+        // Arrow locations never start with '/'.
         rebuilt.push_str(location.as_ref());
         rebuilt
     }
@@ -178,6 +169,15 @@ impl ArrowObjectStore {
     }
 }
 
+/// The bucket and the key (or listing prefix) an `s3://bucket/key` URL names.
+fn s3_target(url: &Url, uri: &str, is_prefix: bool) -> Result<(String, Path)> {
+    let bucket = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("No bucket in S3 URL"))?;
+    let path = key_path(url.path(), is_prefix).with_context(|| format!("cannot address {uri}"))?;
+    Ok((bucket.to_string(), path))
+}
+
 /// The `object_store` [`Path`] for the key in an `s3://` URI's path component.
 ///
 /// Keys are used exactly as written (issue #198): the first `/` of `url_path` is the
@@ -203,6 +203,47 @@ fn key_path(url_path: &str, is_prefix: bool) -> Result<Path> {
         );
     }
     Ok(Path::from(body))
+}
+
+/// List the entries under `base` in `store` as full URIs rebuilt from `url`, the URL the
+/// listing was requested with.
+async fn list_under(
+    store: &dyn AosObjectStore,
+    base: &Path,
+    url: &Url,
+    recursive: bool,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+
+    if recursive {
+        // Simple implementation: collect all objects manually
+        let result = store.list_with_delimiter(Some(base)).await?;
+        for obj in result.objects {
+            out.push(ArrowObjectStore::rebuild_full_uri(url, base, &obj.location));
+        }
+        // For recursive, we'd need to recursively list common_prefixes too
+        // For now, keep it simple and just list direct objects
+    } else {
+        let result = store.list_with_delimiter(Some(base)).await?;
+        for obj in result.objects {
+            out.push(ArrowObjectStore::rebuild_full_uri(url, base, &obj.location));
+        }
+        for prefix in result.common_prefixes {
+            out.push(ArrowObjectStore::rebuild_full_uri(url, base, &prefix));
+        }
+    }
+    Ok(out)
+}
+
+/// Delete the objects under `base` in `store`.
+async fn delete_under(store: &dyn AosObjectStore, base: &Path) -> Result<()> {
+    // Simple implementation: list objects and delete them one by one
+    let result = store.list_with_delimiter(Some(base)).await?;
+    for obj in result.objects {
+        store.delete(&obj.location).await?;
+    }
+
+    Ok(())
 }
 
 /// Read `length` bytes from `offset` (to the end of the object if `length` is `None`).
@@ -267,26 +308,7 @@ impl S3DlioObjectStore for ArrowObjectStore {
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         let (store, base, url) = Self::parse_prefix(uri_prefix)?;
-        let mut out = Vec::new();
-
-        if recursive {
-            // Simple implementation: collect all objects manually
-            let result = store.list_with_delimiter(Some(&base)).await?;
-            for obj in result.objects {
-                out.push(Self::rebuild_full_uri(&url, &obj.location));
-            }
-            // For recursive, we'd need to recursively list common_prefixes too
-            // For now, keep it simple and just list direct objects
-        } else {
-            let result = store.list_with_delimiter(Some(&base)).await?;
-            for obj in result.objects {
-                out.push(Self::rebuild_full_uri(&url, &obj.location));
-            }
-            for prefix in result.common_prefixes {
-                out.push(Self::rebuild_full_uri(&url, &prefix));
-            }
-        }
-        Ok(out)
+        list_under(store.as_ref(), &base, &url, recursive).await
     }
 
     // Same semantics as `list`: the buffered result is yielded item by item, like the
@@ -362,14 +384,7 @@ impl S3DlioObjectStore for ArrowObjectStore {
 
     async fn delete_prefix(&self, uri_prefix: &str) -> Result<()> {
         let (store, base, _url) = Self::parse_prefix(uri_prefix)?;
-
-        // Simple implementation: list objects and delete them one by one
-        let result = store.list_with_delimiter(Some(&base)).await?;
-        for obj in result.objects {
-            store.delete(&obj.location).await?;
-        }
-
-        Ok(())
+        delete_under(store.as_ref(), &base).await
     }
 
     /// No-op: an object store has no directories (issue #229). A prefix exists once
@@ -858,5 +873,142 @@ mod tests {
         }
         assert!(store.mkdir("not a uri").await.is_err());
         assert!(store.rmdir("not a uri", true).await.is_err());
+    }
+
+    // -- issues #222 and #232: listing URIs and recursive prefix delete -------------------
+
+    /// An in-memory store holding an empty object at each key.
+    async fn seeded(keys: &[&str]) -> aos::memory::InMemory {
+        let store = aos::memory::InMemory::new();
+        for key in keys {
+            store
+                .put(
+                    &Path::from(*key),
+                    PutPayload::from(Bytes::from_static(b"d")),
+                )
+                .await
+                .expect("seed");
+        }
+        store
+    }
+
+    /// The (prefix path, URL) the adapter derives from an `s3://` listing URI.
+    fn s3_prefix(uri: &str) -> (Path, Url) {
+        let url = Url::parse(uri).expect("url");
+        let (_bucket, base) = s3_target(&url, uri, true).expect("s3_target");
+        (base, url)
+    }
+
+    async fn s3_list(store: &aos::memory::InMemory, uri: &str, recursive: bool) -> Vec<String> {
+        let (base, url) = s3_prefix(uri);
+        let mut got = list_under(store, &base, &url, recursive)
+            .await
+            .expect("list");
+        got.sort();
+        got
+    }
+
+    // #222: the reproduction from the issue. `dir/x` listed through `s3://b/dir/` came back
+    // as `s3://b/dir/dir/x`.
+    #[tokio::test]
+    async fn s3_listing_with_a_key_prefix_does_not_double_the_prefix() {
+        let store = seeded(&["dir/x"]).await;
+        for recursive in [false, true] {
+            assert_eq!(
+                s3_list(&store, "s3://b/dir/", recursive).await,
+                vec!["s3://b/dir/x".to_string()],
+                "recursive={recursive}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_listing_nested_prefixes_return_the_exact_key() {
+        let store = seeded(&["a/b/c/x", "a/b/c/y", "a/b/other", "a/z"]).await;
+        assert_eq!(
+            s3_list(&store, "s3://b/a/b/c/", false).await,
+            vec!["s3://b/a/b/c/x".to_string(), "s3://b/a/b/c/y".to_string()]
+        );
+        // One level up: the objects and the directory entry, each addressed by its full key.
+        assert_eq!(
+            s3_list(&store, "s3://b/a/b/", false).await,
+            vec!["s3://b/a/b/c".to_string(), "s3://b/a/b/other".to_string()]
+        );
+    }
+
+    // A prefix without a trailing slash is the exact name's directory (#213): it lists
+    // `dir/...` and never `dir2/...`, `dir.bak/...` or the sibling object `dirx`.
+    #[tokio::test]
+    async fn s3_listing_a_prefix_without_trailing_slash_lists_its_directory_only() {
+        let store = seeded(&["dir/x", "dir/sub/y", "dir2/w", "dir.bak/v", "dirx"]).await;
+        let expected = vec!["s3://b/dir/sub".to_string(), "s3://b/dir/x".to_string()];
+        assert_eq!(s3_list(&store, "s3://b/dir", false).await, expected);
+        assert_eq!(s3_list(&store, "s3://b/dir/", false).await, expected);
+    }
+
+    #[tokio::test]
+    async fn s3_listing_the_bucket_root_returns_keys_under_the_bucket() {
+        let store = seeded(&["x", "dir/y"]).await;
+        let expected = vec!["s3://b/dir".to_string(), "s3://b/x".to_string()];
+        assert_eq!(s3_list(&store, "s3://b/", false).await, expected);
+        assert_eq!(s3_list(&store, "s3://b", false).await, expected);
+    }
+
+    // The point of the issue: a listed URI must address the listed object.
+    #[tokio::test]
+    async fn s3_listed_uris_round_trip_to_the_listed_objects() {
+        let store = seeded(&["dir/x", "dir/y", "a/b/c/z"]).await;
+        for (listing, count) in [("s3://b/dir/", 2), ("s3://b/a/b/c/", 1)] {
+            let uris = s3_list(&store, listing, false).await;
+            assert_eq!(uris.len(), count);
+            for uri in uris {
+                let url = Url::parse(&uri).expect("url");
+                let (_bucket, key) =
+                    s3_target(&url, &uri, false).expect("a listed URI parses as an object");
+                store
+                    .get(&key)
+                    .await
+                    .unwrap_or_else(|e| panic!("{uri} does not address a listed object: {e}"));
+            }
+        }
+    }
+
+    // `rebuild_full_uri` for every URI shape `parse_url` serves: the URL's own path
+    // (`base`) is already part of each listed location, so only the part of the URL path
+    // BEFORE the key (the store root, e.g. `/bucket` of a path-style https endpoint) is kept.
+    #[test]
+    fn rebuild_full_uri_is_correct_for_every_scheme() {
+        let key = |s: &str| Path::from(s);
+        let cases: [(&str, &str, &str, &str); 10] = [
+            // (listing URL, key prefix the store sees, listed location, expected URI)
+            ("s3://b/dir/", "dir", "dir/x", "s3://b/dir/x"),
+            ("s3://b/", "", "x", "s3://b/x"),
+            ("s3://b", "", "x", "s3://b/x"),
+            ("s3a://b/a/b/", "a/b", "a/b/x", "s3a://b/a/b/x"),
+            ("gs://b/dir/", "dir", "dir/x", "gs://b/dir/x"),
+            ("az://c/dir/", "dir", "dir/x", "az://c/dir/x"),
+            ("az://c@acct/dir/", "dir", "dir/x", "az://c@acct/dir/x"),
+            (
+                "https://s3.us-east-1.amazonaws.com/bkt/dir/",
+                "dir",
+                "dir/x",
+                "https://s3.us-east-1.amazonaws.com/bkt/dir/x",
+            ),
+            (
+                "https://example.com/dir/",
+                "dir",
+                "dir/x",
+                "https://example.com/dir/x",
+            ),
+            ("memory:///dir/", "dir", "dir/x", "memory:///dir/x"),
+        ];
+        for (url, base, location, expected) in cases {
+            let url = Url::parse(url).expect("url");
+            assert_eq!(
+                ArrowObjectStore::rebuild_full_uri(&url, &key(base), &key(location)),
+                expected,
+                "listing {url}"
+            );
+        }
     }
 }

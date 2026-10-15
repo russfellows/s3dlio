@@ -1,5 +1,17 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Arrow backend: listing an `s3://` URI with a key prefix no longer returns doubled URIs (#222).**
+  With the optional `arrow-backend` feature, listing `s3://b/dir/` returned `s3://b/dir/dir/x` for the
+  object `dir/x`; feeding that URI back into get or delete addressed an object that does not exist. The
+  listing code appended the listing URL's path to a location that already contained it. The returned
+  URI is now `s3://b/dir/x`, for nested prefixes, a prefix without a trailing `/` (which lists that
+  directory and never a sibling such as `dir2/`) and the bucket root, and the same correction applies
+  to every URL form the backend builds a store for (`gs://`, `az://`, path-style `https://` endpoints).
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published
