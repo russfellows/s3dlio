@@ -209,7 +209,14 @@ pub(crate) fn sdk_anyhow<E>(
 where
     E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
 {
-    anyhow::anyhow!("{}: {}", ctx, format_sdk_error(&e))
+    // The typed `SdkError` is flattened into text here, so carry the
+    // transient/definite verdict along (issue #240): `retry_get_body` needs
+    // it and could not recover it from the message.
+    let retryable = crate::retry::sdk_error_is_retryable(&e);
+    anyhow::Error::new(crate::retry::SdkFailure::new(
+        format!("{}: {}", ctx, format_sdk_error(&e)),
+        retryable,
+    ))
 }
 
 /// `Result<T, SdkError<…>>` extension trait that provides `.sdk_context(ctx)?`

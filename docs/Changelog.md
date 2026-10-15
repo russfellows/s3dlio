@@ -1,5 +1,18 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A GET of a missing or forbidden object no longer retries (#240).** The retry loop around S3 GETs
+  (`S3DLIO_MAX_RETRY_ATTEMPTS`, 100 ms x attempt backoff) retried every error, including a definite
+  answer from the server such as `404 NoSuchKey` or `403 AccessDenied`, so each GET of a missing key
+  sent several requests and waited at least 300 ms before returning the error. A definite client error
+  (400, 401, 403, 404, 405, 409, 412, 416 and other non-transient 4xx) is now returned after one request
+  with no backoff. Transient failures are retried as before: connection and dispatch errors, timeouts,
+  5xx, 408, 429, S3 throttling codes such as `SlowDown`, and errors while the response body streams. An
+  error that cannot be classified is still retried. The AWS SDK's own retry layer is unchanged.
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published
