@@ -2706,10 +2706,11 @@ impl ObjectStore for AzureObjectStore {
         match self.download_mode_for_size(object_size) {
             AzureDownloadMode::S3dlio => self.get_with_range_engine(uri, object_size).await,
             AzureDownloadMode::AzureSdk => {
-                cli.get_with_sdk_concurrency(
+                cli.get_with_sdk_concurrency_sized(
                     &key,
                     Some(self.config.sdk_download_concurrency),
                     Some(self.config.sdk_download_part_size),
+                    Some(object_size),
                 )
                 .await
             }

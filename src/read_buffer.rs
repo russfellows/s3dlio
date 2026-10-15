@@ -1,0 +1,128 @@
+// src/read_buffer.rs
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
+
+//! The destination buffer for a streamed GET (GCS HTTP, Azure): sized once from the length
+//! the server announced, so every received byte is copied exactly once.
+//!
+//! Issue #252: the GET paths started a 1 MiB `BytesMut` and let it double, so an object over
+//! 1 MiB was copied again at every growth step (about one extra full copy of the object, plus
+//! allocator churn). Growth is still allowed when the server sends more than it announced
+//! (it must not lose data), it is just no longer the normal case.
+
+use bytes::Bytes;
+
+/// An in-memory accumulator for one object read.
+pub(crate) struct ReadBuffer {
+    data: Vec<u8>,
+    reallocations: usize,
+}
+
+impl ReadBuffer {
+    /// A buffer with room for `expected_len` bytes, the length the server announced
+    /// (`Content-Length`, the object size, or the requested range). An announced length that
+    /// cannot be allocated is not an error: the buffer starts empty and grows as data arrives.
+    pub(crate) fn with_expected_len(expected_len: u64) -> Self {
+        let mut data = Vec::new();
+        if let Ok(len) = usize::try_from(expected_len) {
+            // Best effort: on failure (an absurd announced length) fall back to growth.
+            let _ = data.try_reserve_exact(len);
+        }
+        Self {
+            data,
+            reallocations: 0,
+        }
+    }
+
+    /// Append one received chunk.
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
+        let before = self.data.capacity();
+        self.data.extend_from_slice(chunk);
+        if self.data.capacity() != before {
+            self.reallocations += 1;
+        }
+    }
+
+    /// Bytes received so far.
+    pub(crate) fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// How many times the buffer had to grow after it was created.
+    #[cfg(test)]
+    pub(crate) fn reallocations(&self) -> usize {
+        self.reallocations
+    }
+
+    /// The received bytes, without copying them again.
+    pub(crate) fn into_bytes(self) -> Bytes {
+        Bytes::from(self.data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: usize = 1024 * 1024;
+
+    /// Feed `total` bytes in `chunk`-sized pieces, as an HTTP body arrives.
+    fn fill(buffer: &mut ReadBuffer, total: usize, chunk: usize) {
+        let piece = vec![0xA5u8; chunk];
+        let mut sent = 0;
+        while sent < total {
+            let n = chunk.min(total - sent);
+            buffer.push(&piece[..n]);
+            sent += n;
+        }
+    }
+
+    // Issue #252: an 8 MiB object announced by the server is received into one allocation.
+    #[test]
+    fn a_known_length_is_received_without_reallocation() {
+        let total = 8 * MIB;
+        let mut buffer = ReadBuffer::with_expected_len(total as u64);
+        let start = buffer.data.as_ptr();
+        fill(&mut buffer, total, 64 * 1024);
+
+        assert_eq!(
+            buffer.reallocations(),
+            0,
+            "RED: an 8 MiB read grew its buffer {} time(s) (each growth copies everything \
+             received so far)",
+            buffer.reallocations()
+        );
+        assert_eq!(buffer.len(), total);
+        assert_eq!(buffer.data.as_ptr(), start);
+        let bytes = buffer.into_bytes();
+        assert_eq!(bytes.as_ptr(), start, "into_bytes must not copy");
+        assert!(bytes.iter().all(|&b| b == 0xA5));
+    }
+
+    // More data than announced is kept, not lost or truncated.
+    #[test]
+    fn a_longer_than_announced_body_is_still_received_whole() {
+        let mut buffer = ReadBuffer::with_expected_len(3 * MIB as u64);
+        fill(&mut buffer, 5 * MIB, 128 * 1024);
+        assert_eq!(buffer.len(), 5 * MIB);
+        assert_eq!(buffer.into_bytes().len(), 5 * MIB);
+    }
+
+    // A shorter body (the object changed, or a range ran past the end) is returned as received.
+    #[test]
+    fn a_shorter_than_announced_body_is_returned_as_received() {
+        let mut buffer = ReadBuffer::with_expected_len(6 * MIB as u64);
+        fill(&mut buffer, MIB + 17, 4096);
+        assert_eq!(buffer.reallocations(), 0);
+        assert_eq!(buffer.into_bytes().len(), MIB + 17);
+    }
+
+    // An announced length that cannot be allocated must not abort the process.
+    #[test]
+    fn an_impossible_announced_length_falls_back_to_growth() {
+        let mut buffer = ReadBuffer::with_expected_len(u64::MAX);
+        fill(&mut buffer, 3 * 4096, 4096);
+        assert_eq!(buffer.into_bytes().len(), 3 * 4096);
+    }
+}

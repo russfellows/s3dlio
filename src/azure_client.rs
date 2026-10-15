@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::data_loader::parallel_fetch::DropCancel;
+use crate::read_buffer::ReadBuffer;
 
 use azure_core::credentials::TokenCredential;
 use azure_core::http::{NoFormat, RequestContent, Url, XmlFormat};
@@ -43,6 +44,35 @@ fn shared_credential() -> Result<Arc<dyn TokenCredential>> {
     }
     let credential: Arc<dyn TokenCredential> = DeveloperToolsCredential::new(None)?;
     Ok(Arc::clone(AZURE_CREDENTIAL.get_or_init(|| credential)))
+}
+
+/// Receive a download body into one buffer sized from `expected_len` (see
+/// [`AzureBlob::get_with_sdk_concurrency_sized`]); without a length it grows as data arrives.
+///
+/// The SDK's `ResponseBody::collect()` appends to an empty `BytesMut` with `reserve`, so a large
+/// blob is copied again at every growth step; `collect_into` needs the exact length up front and
+/// fails if the blob is larger. Reading the stream here keeps one copy per byte and still
+/// tolerates a size that changed since the `stat`.
+async fn collect_body<S>(body: S, expected_len: Option<u64>) -> Result<Bytes>
+where
+    S: Stream<Item = azure_core::Result<Bytes>> + Unpin,
+{
+    let buffer = fill_read_buffer(
+        body,
+        ReadBuffer::with_expected_len(expected_len.unwrap_or(0)),
+    )
+    .await?;
+    Ok(buffer.into_bytes())
+}
+
+async fn fill_read_buffer<S>(mut body: S, mut buffer: ReadBuffer) -> Result<ReadBuffer>
+where
+    S: Stream<Item = azure_core::Result<Bytes>> + Unpin,
+{
+    while let Some(chunk) = body.next().await {
+        buffer.push(&chunk?);
+    }
+    Ok(buffer)
 }
 
 /// Process-wide `BlobServiceClient`s, one per account URL.
@@ -241,7 +271,8 @@ impl AzureBlob {
             ..Default::default()
         };
         let resp = blob.download(Some(opts)).await?;
-        let body = resp.body.collect().await?;
+        let expected = end.map(|e| e - start + 1);
+        let body = collect_body(resp.body, expected).await?;
         debug!(
             "AzureBlob::get_range success: key='{}', {} bytes",
             key,
@@ -257,7 +288,7 @@ impl AzureBlob {
 
     pub async fn get_sequential(&self, key: &str, object_size: u64) -> Result<Bytes> {
         let partition_size = usize::try_from(object_size).unwrap_or(usize::MAX).max(1);
-        self.get_with_sdk_concurrency(key, Some(1), Some(partition_size))
+        self.get_with_sdk_concurrency_sized(key, Some(1), Some(partition_size), Some(object_size))
             .await
     }
 
@@ -266,6 +297,21 @@ impl AzureBlob {
         key: &str,
         concurrency: Option<usize>,
         partition_size: Option<usize>,
+    ) -> Result<Bytes> {
+        self.get_with_sdk_concurrency_sized(key, concurrency, partition_size, None)
+            .await
+    }
+
+    /// [`Self::get_with_sdk_concurrency`] when the blob's size is known (from a `stat`):
+    /// the destination buffer is allocated once at that size, so each received byte is copied
+    /// once (issue #252; the SDK's own `collect()` grows its buffer as chunks arrive). If the
+    /// blob turns out larger the buffer grows, so a stale size never loses data.
+    pub async fn get_with_sdk_concurrency_sized(
+        &self,
+        key: &str,
+        concurrency: Option<usize>,
+        partition_size: Option<usize>,
+        expected_len: Option<u64>,
     ) -> Result<Bytes> {
         debug!(
             "AzureBlob::get container='{}', key='{}'",
@@ -278,7 +324,7 @@ impl AzureBlob {
             ..Default::default()
         };
         let resp = blob.download(Some(options)).await?;
-        let body = resp.body.collect().await?;
+        let body = collect_body(resp.body, expected_len).await?;
         debug!(
             "AzureBlob::get success: key='{}', {} bytes",
             key,
@@ -774,6 +820,39 @@ mod tests {
             .iter()
             .filter(|built| built.as_str() == url)
             .count()
+    }
+
+    // Issue #252: a known-size download is received into one allocation. The SDK's
+    // ResponseBody::collect() grows a BytesMut chunk by chunk.
+    #[tokio::test]
+    async fn collect_body_receives_a_known_size_blob_without_growth() {
+        let chunk = Bytes::from(vec![0x5Au8; 64 * 1024]);
+        let chunks = 128; // 8 MiB
+        let body =
+            futures::stream::iter((0..chunks).map(|_| Ok::<_, azure_core::Error>(chunk.clone())));
+        let expected = (chunk.len() * chunks) as u64;
+        let buffer = fill_read_buffer(body, ReadBuffer::with_expected_len(expected))
+            .await
+            .unwrap();
+        assert_eq!(
+            buffer.reallocations(),
+            0,
+            "RED: an 8 MiB body grew its buffer {} time(s)",
+            buffer.reallocations()
+        );
+        assert_eq!(buffer.len() as u64, expected);
+
+        // A body larger than the stale size is kept whole.
+        let body =
+            futures::stream::iter((0..chunks).map(|_| Ok::<_, azure_core::Error>(chunk.clone())));
+        let got = collect_body(body, Some(expected / 2)).await.unwrap();
+        assert_eq!(got.len() as u64, expected);
+        // No size known at all.
+        let body = futures::stream::iter((0..4).map(|_| Ok::<_, azure_core::Error>(chunk.clone())));
+        assert_eq!(
+            collect_body(body, None).await.unwrap().len(),
+            4 * chunk.len()
+        );
     }
 
     // Issue #242 review: every get/stat/get_range used to build a new BlobServiceClient (a new
