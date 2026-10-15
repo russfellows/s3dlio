@@ -30,6 +30,50 @@
   `Box<dyn Error + Send + Sync>`, `&str` and `String` (the last four always retry), so existing callers
   keep compiling unless they use another error type.
 
+- **Arrow backend: `cargo clippy --tests` is clean for the library's own tests (#246).** The test
+  `parse_prefix_accepts_a_trailing_slash_that_parse_refuses` used `.err().expect(..)`, which
+  `clippy::err_expect` rejects when tests are linted (CI lints without `--tests`). It now uses
+  `expect_err`. No behaviour change. (The integration tests under `tests/` use native-backend APIs and
+  do not compile under `--no-default-features --features arrow-backend`; that is unchanged.)
+
+- **Arrow backend: `list(uri, recursive=True)` now lists every object under the prefix (#245).**
+  With the optional `arrow-backend` feature, a recursive listing returned only the direct children of
+  the prefix and silently omitted objects in deeper "subdirectories", unlike the native S3, GCS and
+  Azure stores. `recursive=True` now returns every object at any depth (and no directory entries);
+  `recursive=False` is unchanged (the objects and directory entries directly under the prefix). The
+  prefix still selects only its own directory: `p` never lists `pfoo/...` or `p2/...`. A recursive
+  `list_stream` now yields entries as the backend returns them instead of after the whole listing has
+  been collected in memory.
+
+- **Arrow backend: `delete_prefix` now deletes the objects at every depth under the prefix (#232).**
+  With the optional `arrow-backend` feature, `delete_prefix("s3://b/p")` listed only the immediate
+  children of `p`, so `p/b/c` and `p/b/d/e` were left behind while the call returned success. It now
+  lists everything under `p/` recursively (streamed, never collected whole) and deletes it with S3
+  `DeleteObjects` requests of up to 1000 keys each, 10 requests in flight at a time. `pfoo/x` and
+  `p2/y` are not touched, and neither is an object named exactly `p`. A key counts as failed unless the
+  store confirmed it deleted, so a request that fails as a whole counts every key in it; a failed
+  listing is one failure, ends the listing and is reported as "listing incomplete". If anything fails
+  the call returns an error with the number of failures, the first failed keys and the first errors,
+  instead of success. Limits: (1) endpoints without `DeleteObjects`, such as Google Cloud Storage's S3
+  interoperability endpoint, are not supported by the Arrow backend's `delete` / `delete_prefix` (its
+  S3 client has no single-object DELETE): the call fails with an error that names the keys; use
+  `gs://` for GCS, which deletes per object. (2) Folder marker objects (keys ending in `/`) cannot be
+  addressed through the Arrow backend's `object_store` layer, which strips the trailing `/`: the
+  marker `p/` is never reported as an entry of `p/` and is not deleted, and a nested marker `p/sub/`
+  is listed as `s3://b/p/sub` and may remain after `delete_prefix` (the delete of the key `p/sub`
+  reports success while `p/sub/` stays).
+
+- **Arrow backend: listing an `s3://` URI with a key prefix no longer returns doubled URIs (#222).**
+  With the optional `arrow-backend` feature, listing `s3://b/dir/` returned `s3://b/dir/dir/x` for the
+  object `dir/x`; feeding that URI back into get or delete addressed an object that does not exist. The
+  listing code appended the listing URL's path to a location that already contained it. The returned
+  URI is now `s3://b/dir/x`, for nested prefixes, a prefix without a trailing `/` (which lists that
+  directory and never a sibling such as `dir2/`) and the bucket root, and the same correction applies
+  to every URL form the backend builds a store for (`gs://`, `abfss://`, path-style `https://`
+  endpoints). This holds for plain keys. Keys with a space, `%`, `?`, `#`, a leading `/` or `.` /
+  `..` segments are not yet guaranteed to round-trip through a listed URI on the Arrow backend (a
+  separate, known limit that this fix does not change).
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published
