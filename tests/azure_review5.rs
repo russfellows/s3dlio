@@ -153,7 +153,9 @@ async fn a_sas_token_is_not_sent_over_http_to_a_remote_host() {
     let err = store.stat(&uri("a.bin")).await.unwrap_err();
     let message = format!("{err:#}");
     assert!(
-        message.contains("SAS") && message.contains("http") && !message.contains("abc"),
+        message.contains("refusing to send the SAS token over plain http")
+            && message.contains("203.0.113.9")
+            && !message.contains("abc"),
         "RED: {message}"
     );
 }

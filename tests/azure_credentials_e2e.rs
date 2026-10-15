@@ -425,6 +425,23 @@ async fn exercise(store: &AzureObjectStore, account: &str, key: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn credential_modes_end_to_end() {
+    // Start from a known environment whatever the developer's shell holds: nothing that selects
+    // a credential or an endpoint may leak in.
+    for (name, _) in std::env::vars() {
+        if name.starts_with("AZURE_")
+            || name.starts_with("S3DLIO_AZURE_")
+            || matches!(
+                name.as_str(),
+                "IDENTITY_ENDPOINT"
+                    | "IDENTITY_HEADER"
+                    | "IMDS_ENDPOINT"
+                    | "MSI_ENDPOINT"
+                    | "MSI_SECRET"
+            )
+        {
+            std::env::remove_var(name);
+        }
+    }
     let dir = tempfile::tempdir().unwrap();
     let (acceptor, ca_path) = tls_material(dir.path());
     // The SDK's TLS stack (reqwest + rustls platform verifier) trusts this CA.

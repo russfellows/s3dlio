@@ -9,7 +9,7 @@
 //!
 //! | mode                 | what is used                                                         |
 //! |----------------------|----------------------------------------------------------------------|
-//! | `auto`               | the first of the rows below whose variables are present (see below)  |
+//! | `auto`               | a fallback chain over the rows below (see below)                      |
 //! | `workload-identity`  | `WorkloadIdentityCredential` (AKS federated token)                    |
 //! | `client-secret`      | `ClientSecretCredential` (service principal secret)                   |
 //! | `client-certificate` | `ClientCertificateCredential` (PKCS#12; feature `azure-client-certificate`) |
@@ -18,12 +18,16 @@
 //! | `sas`                | no bearer token; `S3DLIO_AZURE_SAS_TOKEN` is appended to every URL    |
 //! | `none`               | no credential at all (anonymous access, Azurite)                      |
 //!
-//! `auto` order: workload identity (`AZURE_FEDERATED_TOKEN_FILE` + `AZURE_CLIENT_ID` +
+//! `auto` is a real fallback chain, like the Azure SDKs' `DefaultAzureCredential`: it tries, in
+//! order, workload identity (`AZURE_FEDERATED_TOKEN_FILE` + `AZURE_CLIENT_ID` +
 //! `AZURE_TENANT_ID`), client secret (`AZURE_CLIENT_ID` + `AZURE_TENANT_ID` +
 //! `AZURE_CLIENT_SECRET`), client certificate (`AZURE_CLIENT_ID` + `AZURE_TENANT_ID` +
 //! `AZURE_CLIENT_CERTIFICATE_PATH`), managed identity (`IDENTITY_ENDPOINT` or `MSI_ENDPOINT`
-//! set, or the instance metadata service identifies an Azure VM), then the developer tools. `auto` never
-//! picks `sas` or `none`.
+//! set, or the instance metadata service identifies an Azure VM), then the developer tools, and
+//! uses the first that yields a token. A candidate whose variables are not set is skipped; one
+//! that fails (a managed identity that is not assigned, a rejected secret) falls through to the
+//! next. The winner is remembered for the process; if every candidate fails the error lists
+//! each one and why. `auto` never picks `sas` or `none`.
 //!
 //! Each credential is built once per process and shared, so the SDK's token cache (and, for
 //! the non-CLI modes, its refresh) is used and no process is spawned per request.
@@ -97,10 +101,7 @@ impl CredentialMode {
 
     /// Whether this mode authenticates with a bearer token (and so needs an https endpoint).
     pub fn uses_bearer_token(self) -> bool {
-        !matches!(
-            self,
-            CredentialMode::Auto | CredentialMode::Sas | CredentialMode::None
-        )
+        !matches!(self, CredentialMode::Sas | CredentialMode::None)
     }
 }
 
@@ -129,26 +130,45 @@ pub fn configured_mode(env: EnvLookup<'_>) -> Result<CredentialMode> {
     }
 }
 
-/// What `auto` resolves to. `imds_reachable` is asked only when no other mode's variables are
-/// present and no managed-identity endpoint variable is set.
-pub fn resolve_auto(env: EnvLookup<'_>, imds_reachable: &dyn Fn() -> bool) -> CredentialMode {
+/// The `auto` chain, in order.
+const AUTO_CHAIN: [CredentialMode; 5] = [
+    CredentialMode::WorkloadIdentity,
+    CredentialMode::ClientSecret,
+    CredentialMode::ClientCertificate,
+    CredentialMode::ManagedIdentity,
+    CredentialMode::Cli,
+];
+
+/// Whether the variables a chain member needs are present. Managed identity is decided by the
+/// caller (host markers or the metadata probe); the developer tools need none.
+fn auto_member_configured(mode: CredentialMode, env: EnvLookup<'_>) -> bool {
     let client_and_tenant = present(env, ENV_AZURE_CLIENT_ID) && present(env, ENV_AZURE_TENANT_ID);
-    if client_and_tenant && present(env, ENV_AZURE_FEDERATED_TOKEN_FILE) {
-        return CredentialMode::WorkloadIdentity;
+    match mode {
+        CredentialMode::WorkloadIdentity => {
+            client_and_tenant && present(env, ENV_AZURE_FEDERATED_TOKEN_FILE)
+        }
+        CredentialMode::ClientSecret => client_and_tenant && present(env, ENV_AZURE_CLIENT_SECRET),
+        CredentialMode::ClientCertificate => {
+            client_and_tenant && present(env, ENV_AZURE_CLIENT_CERTIFICATE_PATH)
+        }
+        CredentialMode::ManagedIdentity => {
+            present(env, ENV_AZURE_IDENTITY_ENDPOINT) || present(env, ENV_AZURE_MSI_ENDPOINT)
+        }
+        _ => true,
     }
-    if client_and_tenant && present(env, ENV_AZURE_CLIENT_SECRET) {
-        return CredentialMode::ClientSecret;
-    }
-    if client_and_tenant && present(env, ENV_AZURE_CLIENT_CERTIFICATE_PATH) {
-        return CredentialMode::ClientCertificate;
-    }
-    if present(env, ENV_AZURE_IDENTITY_ENDPOINT)
-        || present(env, ENV_AZURE_MSI_ENDPOINT)
-        || imds_reachable()
-    {
-        return CredentialMode::ManagedIdentity;
-    }
-    CredentialMode::Cli
+}
+
+/// The members of the `auto` chain that apply, in order, given the environment and whether the
+/// instance metadata service identifies an Azure VM. (The running chain asks the metadata
+/// service lazily; this is the same decision, for inspection and tests.)
+pub fn auto_candidates(env: EnvLookup<'_>, imds_is_azure: bool) -> Vec<CredentialMode> {
+    AUTO_CHAIN
+        .into_iter()
+        .filter(|mode| {
+            auto_member_configured(*mode, env)
+                || (*mode == CredentialMode::ManagedIdentity && imds_is_azure)
+        })
+        .collect()
 }
 
 /// Whether `response` is what the Azure instance metadata service answers to
@@ -164,17 +184,18 @@ fn is_azure_imds_response(response: &[u8]) -> bool {
     status_ok && text.contains("\"compute\"")
 }
 
-/// Ask the instance metadata service at `addr` whether this is an Azure VM. Bounded by
-/// `AZURE_IMDS_PROBE_TIMEOUT_MS` for the connection and for each read.
+/// Ask the instance metadata service at `addr` whether this is an Azure VM.
+///
+/// Bounded: the connection gets `AZURE_IMDS_PROBE_TIMEOUT_MS` and then the whole read gets the
+/// same again as one deadline (a server that drips bytes cannot extend it), so the worst case
+/// is twice that. Blocking: the `auto` chain runs it on the blocking thread pool, never on a runtime worker.
 fn probe_azure_imds(addr: std::net::SocketAddr) -> bool {
     use std::io::{Read, Write};
     let timeout = std::time::Duration::from_millis(AZURE_IMDS_PROBE_TIMEOUT_MS);
     let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
         return false;
     };
-    if stream.set_read_timeout(Some(timeout)).is_err()
-        || stream.set_write_timeout(Some(timeout)).is_err()
-    {
+    if stream.set_write_timeout(Some(timeout)).is_err() {
         return false;
     }
     let request = format!(
@@ -184,9 +205,25 @@ fn probe_azure_imds(addr: std::net::SocketAddr) -> bool {
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
+    let deadline = std::time::Instant::now() + timeout;
     let mut response = Vec::new();
-    // The document is well under the cap; stop at the cap, EOF or the read timeout.
-    let _ = stream.take(16 * 1024).read_to_end(&mut response);
+    let mut chunk = [0u8; 2048];
+    // The document is well under the cap; stop at the cap, EOF or the deadline.
+    while response.len() < 16 * 1024 {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        if stream
+            .set_read_timeout(Some(left.max(std::time::Duration::from_millis(1))))
+            .is_err()
+        {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+        }
+    }
     is_azure_imds_response(&response)
 }
 
@@ -195,29 +232,148 @@ fn azure_imds_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from(([169, 254, 169, 254], 80))
 }
 
-fn imds_reachable() -> bool {
-    probe_azure_imds(azure_imds_addr())
-}
-
-/// The concrete mode (never `Auto`) for a request to an `https` (or `http`) endpoint, from the
-/// process environment.
-///
-/// `auto` is resolved on every call from the variables, except that the instance-metadata probe
-/// runs once per process. `auto` on an `http` endpoint (an emulator such as Azurite) is `none`,
-/// without probing: a bearer token cannot be sent over http anyway.
+/// The configured mode for a request to an `https` (or `http`) endpoint, from the process
+/// environment. `auto` on an `http` endpoint (an emulator such as Azurite) is `none`: a bearer
+/// token cannot be sent over http anyway, so nothing is probed or tried.
 pub fn mode_for_endpoint(https: bool) -> Result<CredentialMode> {
-    static IMDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let probe = || *IMDS.get_or_init(imds_reachable);
     Ok(match configured_mode(&process_env)? {
         CredentialMode::Auto if !https => CredentialMode::None,
-        CredentialMode::Auto => {
-            let chosen = resolve_auto(&process_env, &probe);
-            static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-            LOGGED.get_or_init(|| info!("Azure credential mode auto resolved to {chosen}"));
-            chosen
-        }
-        explicit => explicit,
+        mode => mode,
     })
+}
+
+type CredentialSource =
+    Arc<dyn Fn(CredentialMode) -> Result<Arc<dyn TokenCredential>> + Send + Sync>;
+
+/// The `auto` credential: tries the chain members that apply, in order, at the first token
+/// request, and remembers the first that yields a token.
+struct AutoCredential {
+    env: Arc<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    /// Does the instance metadata service identify an Azure VM? (blocking)
+    imds_is_azure: Arc<dyn Fn() -> bool + Send + Sync>,
+    credential_for: CredentialSource,
+    winner: Mutex<Option<(CredentialMode, Arc<dyn TokenCredential>)>>,
+}
+
+impl fmt::Debug for AutoCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AutoCredential").finish_non_exhaustive()
+    }
+}
+
+impl AutoCredential {
+    fn production() -> Self {
+        Self {
+            env: Arc::new(process_env),
+            imds_is_azure: Arc::new(|| probe_azure_imds(azure_imds_addr())),
+            credential_for: Arc::new(credential_for),
+            winner: Mutex::new(None),
+        }
+    }
+
+    fn winner(&self) -> Option<(CredentialMode, Arc<dyn TokenCredential>)> {
+        self.winner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    async fn try_member(
+        &self,
+        mode: CredentialMode,
+        scopes: &[&str],
+        options: &Option<TokenRequestOptions<'_>>,
+        tried: &mut Vec<String>,
+    ) -> Option<AccessToken> {
+        let credential = match (self.credential_for)(mode) {
+            Ok(c) => c,
+            Err(e) => {
+                tried.push(format!("{mode}: {e:#}"));
+                return None;
+            }
+        };
+        match credential.get_token(scopes, options.clone()).await {
+            Ok(token) => {
+                info!("Azure credential mode auto: using {mode}");
+                *self.winner.lock().unwrap_or_else(|e| e.into_inner()) = Some((mode, credential));
+                Some(token)
+            }
+            Err(e) => {
+                let mut text = e.to_string();
+                let mut source = std::error::Error::source(&e);
+                while let Some(cause) = source {
+                    let cause_text = cause.to_string();
+                    if !text.contains(&cause_text) {
+                        text.push_str(": ");
+                        text.push_str(&cause_text);
+                    }
+                    source = cause.source();
+                }
+                tried.push(format!("{mode}: {text}"));
+                None
+            }
+        }
+    }
+
+    /// Run the metadata probe on the blocking pool.
+    async fn imds_says_azure(&self) -> bool {
+        let probe = Arc::clone(&self.imds_is_azure);
+        tokio::task::spawn_blocking(move || probe())
+            .await
+            .unwrap_or(false)
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenCredential for AutoCredential {
+    async fn get_token(
+        &self,
+        scopes: &[&str],
+        options: Option<TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        if let Some((_, credential)) = self.winner() {
+            return credential.get_token(scopes, options).await;
+        }
+        let env: &(dyn Fn(&str) -> Option<String> + Send + Sync) = &*self.env;
+        let mut tried: Vec<String> = Vec::new();
+        let mut managed_identity_tried = false;
+        for mode in AUTO_CHAIN {
+            let applies = if mode == CredentialMode::ManagedIdentity {
+                auto_member_configured(mode, env) || self.imds_says_azure().await
+            } else {
+                auto_member_configured(mode, env)
+            };
+            if !applies {
+                continue;
+            }
+            managed_identity_tried |= mode == CredentialMode::ManagedIdentity;
+            if let Some(token) = self.try_member(mode, scopes, &options, &mut tried).await {
+                return Ok(token);
+            }
+        }
+        // Nothing worked and the metadata service did not look like Azure: look once more (the
+        // service can come up late on a fresh VM) before giving up.
+        if !managed_identity_tried && self.imds_says_azure().await {
+            if let Some(token) = self
+                .try_member(
+                    CredentialMode::ManagedIdentity,
+                    scopes,
+                    &options,
+                    &mut tried,
+                )
+                .await
+            {
+                return Ok(token);
+            }
+        }
+        Err(azure_core::Error::with_message(
+            azure_core::error::ErrorKind::Credential,
+            format!(
+                "no credential in the chain yielded a token; tried: {}",
+                tried.join("; ")
+            ),
+        ))
+    }
 }
 
 /// The SAS token for `sas` mode, without a leading `?`. The error never contains the token.
@@ -305,7 +461,8 @@ fn build(mode: CredentialMode, env: EnvLookup<'_>) -> Result<Arc<dyn TokenCreden
             azure_identity::WorkloadIdentityCredential::new(None).map_err(ctx)?
         }
         CredentialMode::ClientCertificate => build_client_certificate(env)?,
-        CredentialMode::Auto | CredentialMode::Sas | CredentialMode::None => {
+        CredentialMode::Auto => Arc::new(AutoCredential::production()),
+        CredentialMode::Sas | CredentialMode::None => {
             bail!("Azure credential mode {mode} has no bearer-token credential")
         }
     };
@@ -437,9 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_follows_the_documented_order() {
-        let never = || false;
-        let always = || true;
+    fn auto_candidates_follow_the_documented_order() {
         let id = [(ENV_AZURE_CLIENT_ID, "c"), (ENV_AZURE_TENANT_ID, "t")];
         let with = |extra: &[(&'static str, &'static str)]| -> Vec<(&'static str, &'static str)> {
             let mut v = id.to_vec();
@@ -452,61 +607,245 @@ mod tests {
             (ENV_AZURE_CLIENT_CERTIFICATE_PATH, "/c.pfx"),
             (ENV_AZURE_IDENTITY_ENDPOINT, "http://x"),
         ]);
-        // Workload identity beats everything.
+        use CredentialMode::*;
+        // Everything configured: the whole chain, in order.
         assert_eq!(
-            resolve_auto(&env_of(&all), &always),
-            CredentialMode::WorkloadIdentity
+            auto_candidates(&env_of(&all), false),
+            vec![
+                WorkloadIdentity,
+                ClientSecret,
+                ClientCertificate,
+                ManagedIdentity,
+                Cli
+            ]
         );
-        // Without the token file: client secret, then certificate, then managed identity.
+        // Members whose variables are missing are skipped, the rest keep their order.
         let no_federated: Vec<_> = all
             .iter()
             .copied()
             .filter(|(k, _)| *k != ENV_AZURE_FEDERATED_TOKEN_FILE)
             .collect();
         assert_eq!(
-            resolve_auto(&env_of(&no_federated), &always),
-            CredentialMode::ClientSecret
-        );
-        let no_secret: Vec<_> = no_federated
-            .iter()
-            .copied()
-            .filter(|(k, _)| *k != ENV_AZURE_CLIENT_SECRET)
-            .collect();
-        assert_eq!(
-            resolve_auto(&env_of(&no_secret), &always),
-            CredentialMode::ClientCertificate
-        );
-        let no_cert: Vec<_> = no_secret
-            .iter()
-            .copied()
-            .filter(|(k, _)| *k != ENV_AZURE_CLIENT_CERTIFICATE_PATH)
-            .collect();
-        assert_eq!(
-            resolve_auto(&env_of(&no_cert), &never),
-            CredentialMode::ManagedIdentity
+            auto_candidates(&env_of(&no_federated), false),
+            vec![ClientSecret, ClientCertificate, ManagedIdentity, Cli]
         );
         // A partial service principal (no tenant) is not one.
         let partial = [(ENV_AZURE_CLIENT_ID, "c"), (ENV_AZURE_CLIENT_SECRET, "s")];
-        assert_eq!(resolve_auto(&env_of(&partial), &never), CredentialMode::Cli);
-        // Managed identity from the host markers or the metadata service; the probe is only
-        // consulted when nothing else decides.
+        assert_eq!(auto_candidates(&env_of(&partial), false), vec![Cli]);
+        // Managed identity from a host marker, or because the metadata service says Azure.
         assert_eq!(
-            resolve_auto(&env_of(&[(ENV_AZURE_MSI_ENDPOINT, "http://m")]), &|| {
-                panic!("the probe must not run when MSI_ENDPOINT is set")
+            auto_candidates(&env_of(&[(ENV_AZURE_MSI_ENDPOINT, "http://m")]), false),
+            vec![ManagedIdentity, Cli]
+        );
+        assert_eq!(
+            auto_candidates(&env_of(&[]), true),
+            vec![ManagedIdentity, Cli]
+        );
+        // Nothing at all: the developer tools. `auto` never picks sas or none.
+        assert_eq!(auto_candidates(&env_of(&[]), false), vec![Cli]);
+        assert_eq!(
+            auto_candidates(&env_of(&[(ENV_AZURE_SAS_TOKEN, "sv=1&sig=x")]), false),
+            vec![Cli]
+        );
+    }
+
+    /// A scripted credential: returns a token, or fails, and counts its calls.
+    #[derive(Debug)]
+    struct Scripted {
+        token: Option<&'static str>,
+        error: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenCredential for Scripted {
+        async fn get_token(
+            &self,
+            _scopes: &[&str],
+            _options: Option<TokenRequestOptions<'_>>,
+        ) -> azure_core::Result<AccessToken> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.token {
+                Some(t) => Ok(AccessToken::new(
+                    t,
+                    azure_core::time::OffsetDateTime::now_utc()
+                        + azure_core::time::Duration::hours(1),
+                )),
+                None => Err(azure_core::Error::with_message(
+                    azure_core::error::ErrorKind::Credential,
+                    self.error,
+                )),
+            }
+        }
+    }
+
+    type Calls = std::collections::HashMap<CredentialMode, Arc<std::sync::atomic::AtomicUsize>>;
+
+    /// An `AutoCredential` over scripted members. `script`: (mode, token or error).
+    fn scripted_auto(
+        env: Vec<(&'static str, &'static str)>,
+        imds: Arc<std::sync::atomic::AtomicUsize>,
+        imds_answers: Vec<bool>,
+        script: Vec<(CredentialMode, Result<&'static str, &'static str>)>,
+    ) -> (AutoCredential, Calls) {
+        let mut calls = Calls::new();
+        let mut members = std::collections::HashMap::new();
+        for (mode, outcome) in script {
+            let counter: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+            calls.insert(mode, Arc::clone(&counter));
+            let credential: Arc<dyn TokenCredential> = Arc::new(Scripted {
+                token: outcome.ok(),
+                error: outcome.err().unwrap_or(""),
+                calls: counter,
+            });
+            members.insert(mode, credential);
+        }
+        let env: Vec<(String, String)> = env
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let auto = AutoCredential {
+            env: Arc::new(move |name| env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())),
+            imds_is_azure: Arc::new(move || {
+                let n = imds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                imds_answers.get(n).copied().unwrap_or(false)
             }),
-            CredentialMode::ManagedIdentity
+            credential_for: Arc::new(move |mode| {
+                members
+                    .get(&mode)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("{mode} is not available"))
+            }),
+            winner: Mutex::new(None),
+        };
+        (auto, calls)
+    }
+
+    fn called(calls: &Calls, mode: CredentialMode) -> usize {
+        calls
+            .get(&mode)
+            .map_or(0, |c| c.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    // `auto` is a fallback chain: a managed identity that is not assigned falls through to the
+    // developer tools, and the winner is used (alone) from then on.
+    #[tokio::test]
+    async fn auto_falls_through_failing_members_and_remembers_the_winner() {
+        use CredentialMode::{Cli, ManagedIdentity};
+        let imds: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let (auto, calls) = scripted_auto(
+            vec![(ENV_AZURE_IDENTITY_ENDPOINT, "http://x")],
+            imds,
+            vec![],
+            vec![
+                (ManagedIdentity, Err("identity not assigned to this VM")),
+                (Cli, Ok("cli-token")),
+            ],
+        );
+        let token = auto
+            .get_token(&["s"], None)
+            .await
+            .expect("falls through to the CLI");
+        assert_eq!(token.token.secret(), "cli-token");
+        assert_eq!(
+            (called(&calls, ManagedIdentity), called(&calls, Cli)),
+            (1, 1)
+        );
+
+        // Later requests go straight to the winner.
+        auto.get_token(&["s"], None).await.unwrap();
+        assert_eq!(
+            (called(&calls, ManagedIdentity), called(&calls, Cli)),
+            (1, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_prefers_the_earlier_member_when_it_works() {
+        use CredentialMode::{Cli, ClientSecret};
+        let (auto, calls) = scripted_auto(
+            vec![
+                (ENV_AZURE_CLIENT_ID, "c"),
+                (ENV_AZURE_TENANT_ID, "t"),
+                (ENV_AZURE_CLIENT_SECRET, "s"),
+            ],
+            Arc::default(),
+            vec![],
+            vec![(ClientSecret, Ok("secret-token")), (Cli, Ok("cli-token"))],
+        );
+        let token = auto.get_token(&["s"], None).await.unwrap();
+        assert_eq!(token.token.secret(), "secret-token");
+        assert_eq!(
+            called(&calls, Cli),
+            0,
+            "the developer tools were not touched"
+        );
+    }
+
+    // If every member fails the error lists each one and why; a metadata service that answers
+    // late is looked at once more before giving up.
+    #[tokio::test]
+    async fn auto_error_lists_every_member_tried_and_re_probes_once() {
+        use CredentialMode::{Cli, ClientSecret, ManagedIdentity};
+        let imds: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let (auto, calls) = scripted_auto(
+            vec![
+                (ENV_AZURE_CLIENT_ID, "c"),
+                (ENV_AZURE_TENANT_ID, "t"),
+                (ENV_AZURE_CLIENT_SECRET, "s"),
+            ],
+            Arc::clone(&imds),
+            vec![false, true], // not Azure at first, Azure on the second look
+            vec![
+                (ClientSecret, Err("AADSTS7000215 invalid client secret")),
+                (ManagedIdentity, Err("identity not assigned")),
+                (Cli, Err("az not found on PATH")),
+            ],
+        );
+        let err = auto.get_token(&["s"], None).await.unwrap_err().to_string();
+        for needle in [
+            "client-secret: AADSTS7000215",
+            "cli: az not found on PATH",
+            "managed-identity: identity not assigned",
+        ] {
+            assert!(err.contains(needle), "{needle} missing from: {err}");
+        }
+        assert_eq!(
+            imds.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "probed twice, no more"
         );
         assert_eq!(
-            resolve_auto(&env_of(&[]), &always),
-            CredentialMode::ManagedIdentity
+            called(&calls, ManagedIdentity),
+            1,
+            "tried after the second probe"
         );
-        // Nothing at all: the developer tools.
-        assert_eq!(resolve_auto(&env_of(&[]), &never), CredentialMode::Cli);
-        // `auto` never picks sas or none, even with a SAS token present.
-        assert_eq!(
-            resolve_auto(&env_of(&[(ENV_AZURE_SAS_TOKEN, "sv=1&sig=x")]), &never),
-            CredentialMode::Cli
+    }
+
+    // The probe never blocks longer than its bound, even against a server that drips bytes.
+    #[test]
+    fn the_metadata_probe_is_bounded_in_time() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                for _ in 0..40 {
+                    if conn.write_all(b"x").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        assert!(!probe_azure_imds(addr));
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(2 * AZURE_IMDS_PROBE_TIMEOUT_MS + 700),
+            "the probe took {took:?}"
         );
+        drop(server);
     }
 
     #[test]
@@ -644,10 +983,7 @@ mod tests {
     #[test]
     fn only_bearer_token_modes_need_https() {
         for mode in CredentialMode::ALL {
-            let expected = !matches!(
-                mode,
-                CredentialMode::Auto | CredentialMode::Sas | CredentialMode::None
-            );
+            let expected = !matches!(mode, CredentialMode::Sas | CredentialMode::None);
             assert_eq!(mode.uses_bearer_token(), expected, "{mode}");
         }
     }
