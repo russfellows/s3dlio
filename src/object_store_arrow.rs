@@ -207,56 +207,73 @@ fn key_path(url_path: &str, is_prefix: bool) -> Result<Path> {
     Ok(Path::from(body))
 }
 
-/// List the entries under `base` in `store` as full URIs rebuilt from `url`, the URL the
-/// listing was requested with.
+/// The entries under `base` in `store` as a stream of full URIs rebuilt from `url`, the URL
+/// the listing was requested with.
 ///
 /// The location `base` itself is not an entry under it (see [`delete_under`]) and is
 /// skipped.
 ///
 /// `recursive` lists every object under `base` at any depth and no directory entries
-/// (issue #245). Otherwise only the direct children are listed: the objects and the
-/// directory entries (common prefixes). `object_store` matches a prefix per path segment,
-/// so `p` selects `p/...` and never `pfoo/...` or `p2/...`.
-async fn list_under(
-    store: &dyn AosObjectStore,
-    base: &Path,
-    url: &Url,
+/// (issue #245), streamed as the backend returns its pages: nothing is buffered, so a
+/// listing of any size runs in constant memory. Otherwise only the direct children are
+/// listed, objects first and then the directory entries (common prefixes); the backend
+/// answers that in one response. `object_store` matches a prefix per path segment, so `p`
+/// selects `p/...` and never `pfoo/...` or `p2/...`.
+fn list_stream_under(
+    store: Arc<dyn AosObjectStore>,
+    base: Path,
+    url: Url,
     recursive: bool,
-) -> Result<Vec<String>> {
+) -> futures::stream::BoxStream<'static, Result<String>> {
     use futures::StreamExt as _;
 
-    let mut out = Vec::new();
     if recursive {
         // An empty prefix is the whole store (the bucket root).
-        let prefix = (!base.as_ref().is_empty()).then_some(base);
-        let mut entries = store.list(prefix);
-        while let Some(entry) = entries.next().await {
-            let meta = entry?;
-            if meta.location == *base {
-                continue;
-            }
-            out.push(ArrowObjectStore::rebuild_full_uri(
-                url,
-                base,
-                &meta.location,
-            ));
-        }
+        let prefix = (!base.as_ref().is_empty()).then(|| base.clone());
+        store
+            .list(prefix.as_ref())
+            .filter_map(move |entry| {
+                std::future::ready(match entry {
+                    Ok(meta) if meta.location == base => None,
+                    Ok(meta) => Some(Ok(ArrowObjectStore::rebuild_full_uri(
+                        &url,
+                        &base,
+                        &meta.location,
+                    ))),
+                    Err(e) => Some(Err(anyhow::Error::new(e))),
+                })
+            })
+            .boxed()
     } else {
-        let result = store.list_with_delimiter(Some(base)).await?;
-        for obj in result.objects {
-            if obj.location == *base {
-                continue;
+        async_stream::try_stream! {
+            let result = store.list_with_delimiter(Some(&base)).await?;
+            for obj in result.objects {
+                if obj.location != base {
+                    yield ArrowObjectStore::rebuild_full_uri(&url, &base, &obj.location);
+                }
             }
-            out.push(ArrowObjectStore::rebuild_full_uri(url, base, &obj.location));
-        }
-        for prefix in result.common_prefixes {
-            if prefix == *base {
-                continue;
+            for prefix in result.common_prefixes {
+                if prefix != base {
+                    yield ArrowObjectStore::rebuild_full_uri(&url, &base, &prefix);
+                }
             }
-            out.push(ArrowObjectStore::rebuild_full_uri(url, base, &prefix));
         }
+        .boxed()
     }
-    Ok(out)
+}
+
+/// [`list_stream_under`], collected.
+async fn list_under(
+    store: Arc<dyn AosObjectStore>,
+    base: Path,
+    url: Url,
+    recursive: bool,
+) -> Result<Vec<String>> {
+    use futures::TryStreamExt as _;
+
+    list_stream_under(store, base, url, recursive)
+        .try_collect()
+        .await
 }
 
 /// Delete every object under `base` in `store`, at any depth (issue #232).
@@ -386,21 +403,23 @@ impl S3DlioObjectStore for ArrowObjectStore {
 
     async fn list(&self, uri_prefix: &str, recursive: bool) -> Result<Vec<String>> {
         let (store, base, url) = Self::parse_prefix(uri_prefix)?;
-        list_under(store.as_ref(), &base, &url, recursive).await
+        list_under(store, base, url, recursive).await
     }
 
-    // Same semantics as `list`: the buffered result is yielded item by item, like the
-    // file:// backend does. The backend call itself is not paged by this adapter.
+    // Same entries as `list`, yielded as the backend returns them: a recursive listing is
+    // never buffered whole (issue #245 follow-up).
     fn list_stream<'a>(
         &'a self,
         uri_prefix: &'a str,
         recursive: bool,
     ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<String>> + Send + 'a>> {
         Box::pin(async_stream::stream! {
-            match self.list(uri_prefix, recursive).await {
-                Ok(uris) => {
-                    for uri in uris {
-                        yield Ok(uri);
+            use futures::StreamExt as _;
+            match Self::parse_prefix(uri_prefix) {
+                Ok((store, base, url)) => {
+                    let mut uris = list_stream_under(store, base, url, recursive);
+                    while let Some(uri) = uris.next().await {
+                        yield uri;
                     }
                 }
                 Err(e) => yield Err(e),
@@ -990,7 +1009,7 @@ mod tests {
 
     async fn s3_list(store: &aos::memory::InMemory, uri: &str, recursive: bool) -> Vec<String> {
         let (base, url) = s3_prefix(uri);
-        let mut got = list_under(store, &base, &url, recursive)
+        let mut got = list_under(Arc::new(store.clone()), base, url, recursive)
             .await
             .expect("list");
         got.sort();
@@ -1142,6 +1161,8 @@ mod tests {
         bulk_unsupported: bool,
         /// A listing that ends with an error item, like a failed continuation page.
         list_error: bool,
+        /// A listing that returns its entries and then never ends (a huge listing).
+        list_never_ends: bool,
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
         max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1153,6 +1174,7 @@ mod tests {
                 marker: None,
                 bulk_unsupported: false,
                 list_error: false,
+                list_never_ends: false,
                 in_flight: Arc::default(),
                 max_in_flight: Arc::default(),
             }
@@ -1264,6 +1286,9 @@ mod tests {
                         },
                     ))))
                     .boxed();
+            }
+            if self.list_never_ends {
+                listed = listed.chain(futures::stream::pending()).boxed();
             }
             match self.marker_for(prefix) {
                 Some(marker) => {
@@ -1420,6 +1445,52 @@ mod tests {
         assert_eq!(remaining(&store.inner).await, Vec::<String>::new());
     }
 
+    // F3: a recursive listing is a stream, not a buffer: the first entries arrive while the
+    // backend is still listing. The store here returns two entries and then never ends; a
+    // buffering implementation never yields.
+    #[tokio::test]
+    async fn recursive_list_stream_yields_entries_before_the_listing_ends() {
+        let mut probe = Probe::new(seeded(&["p/a", "p/b"]).await);
+        probe.list_never_ends = true;
+        let (base, url) = s3_prefix("s3://b/p/");
+        let mut stream = list_stream_under(Arc::new(probe), base, url, true);
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("entries must arrive before the listing ends")
+                .expect("item")
+                .expect("ok");
+            got.push(next);
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["s3://b/p/a".to_string(), "s3://b/p/b".to_string()]
+        );
+    }
+
+    // The stream and `list` return the same entries; a listing error comes through as an Err
+    // item after the entries that preceded it.
+    #[tokio::test]
+    async fn list_stream_under_matches_list_under_and_reports_errors() {
+        let mut probe = Probe::new(seeded(&["p/a", "p/b/c"]).await);
+        probe.list_error = true;
+        let probe = Arc::new(probe);
+        let (base, url) = s3_prefix("s3://b/p/");
+        let items: Vec<Result<String>> =
+            list_stream_under(probe.clone(), base.clone(), url.clone(), true)
+                .collect()
+                .await;
+        assert_eq!(items.iter().filter(|i| i.is_ok()).count(), 2);
+        assert_eq!(items.iter().filter(|i| i.is_err()).count(), 1);
+        assert!(
+            items.last().expect("items").is_err(),
+            "the error comes last"
+        );
+        assert!(list_under(probe, base, url, true).await.is_err());
+    }
+
     // F1: S3 stores the folder marker `p/` as an object. `object_store` parses listed keys
     // with `Path::parse`, which strips a trailing '/', so the marker comes back with the
     // location `p` -- the prefix itself (`Probe::with_marker`). It is not an entry UNDER the
@@ -1428,11 +1499,9 @@ mod tests {
     #[tokio::test]
     async fn the_prefix_itself_is_not_an_entry_under_the_prefix() {
         for recursive in [false, true] {
-            let store = Probe::with_marker(seeded(&["p", "p/a"]).await, "p");
+            let store = Arc::new(Probe::with_marker(seeded(&["p", "p/a"]).await, "p"));
             let (base, url) = s3_prefix("s3://b/p/");
-            let mut got = list_under(&store, &base, &url, recursive)
-                .await
-                .expect("list");
+            let mut got = list_under(store, base, url, recursive).await.expect("list");
             got.sort();
             assert_eq!(got, vec!["s3://b/p/a".to_string()], "recursive={recursive}");
         }
