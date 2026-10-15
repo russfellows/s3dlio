@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
-// Regression tests for s3dlio issues #210 and #167 and the architect-approved
+// Regression tests for s3dlio issues #210 and #167 and the
 // `s3-cli delete` contract:
 //
 //   delete s3://bkt/foo     ONE delete request for exactly the key `foo`: no HEAD,

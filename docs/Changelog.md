@@ -120,8 +120,9 @@ The key part `K` of `s3://bucket/K` now selects, for every listing-style operati
   nothing is listed or deleted. To pass a wildcard through a shell, quote the URI.
 - **`delete -r` follows the same rule**: `s3-cli delete -r s3://b/file.txt` and Python
   `delete("s3://b/file.txt", recursive=True)` delete `file.txt` and never `file.txt.bak`;
-  `delete -r s3://b/file.txt*` deletes both. Delete without `-r` is unchanged: one request for
-  exactly the key named, and a `*` in it is an ordinary key character.
+  `delete -r s3://b/file.txt*` deletes both. (0.9.124 deleted by LITERAL prefix: `delete -r
+  s3://b/foo` also deleted `foobar`; that is what this release changes.) Delete without `-r` is
+  unchanged: one request for exactly the key named, and a `*` in it is an ordinary key character.
 - **To select with a regex use the explicit option**: Python `list(uri, recursive, pattern=...)`
   and `s3-cli ls|download|get --pattern`. It is applied AFTER the selection above and is a Rust
   regex matched (unanchored) against the entry relative to the listing base: the URI key itself when
@@ -327,11 +328,9 @@ entry). **Code that relied on the old implicit expansion will now delete less; p
 - The op-log records an exact delete as one `DELETE` row, as before; no `HEAD` row is added.
   `recursive=True` records one `LIST` row plus one `DELETE` row per object (replayable), not
   `DELETE_BATCH`.
-- `delete(uri, recursive=True)` deletes the real objects the URI selects: listed objects only (synthetic
-  common-prefix entries are never candidates). On `s3://`, `foo` selects the object `foo` and the keys
-  under `foo/`, never `foobar`; `foo/` selects everything under it; `*` and `**` are globs; every
-  other character is literal and the last URI segment is no longer read as a regex. It needs list
-  permission. A prefix with no objects is a
+- `delete(uri, recursive=True)` deletes the real objects under the literal prefix: listed with no
+  delimiter, objects only, nothing appended (`foo` also matches `foobar`), `*` and `?` literal (the last
+  URI segment used to be read as a regex). It needs list permission. A prefix with no objects is a
   no-op. Each selected object is deleted with its own request (up to 10 in flight), as before;
   batching (DeleteObjects) is deferred for Python. After a failed request or a listing error no further
   delete request is sent (requests already in flight finish) and the `RuntimeError` says how many
@@ -362,10 +361,10 @@ implicit expansion will now delete less; add `-r` where you mean "everything und
   given it adds that only the object named by the exact URI was targeted and to use `-r` for
   everything under a prefix. On a **versioned bucket** a delete adds a delete marker and does not erase
   earlier versions.
-- `delete -r s3://bkt/foo/` deletes the real objects under `foo/` (recursive listing with no delimiter;
-  synthetic common-prefix entries are never delete candidates). It needs list permission.
-  `delete -r s3://bkt/foo` deletes the object `foo` and the keys under `foo/`, never `foobar`;
-  `delete -r s3://bkt/foo*` is a glob. Key characters other than `*` are never read as a regex.
+- `delete -r s3://bkt/foo/` deletes the real objects under the literal prefix `foo/` (recursive listing
+  with no delimiter; synthetic common-prefix entries are never delete candidates). It needs list
+  permission. `delete -r s3://bkt/foo` uses the literal prefix `foo`, so it also matches `foobar` (no
+  `/` is appended). Key characters are never read as a regex or wildcard.
 - `-p/--pattern` is accepted only with `-r` and filters the `-r` selection; without `-r` it is an error.
 - A listing error part-way through a recursive delete does not send the partly filled batch in which
   it occurred: those keys are counted as "NOT attempted" in the message. Batches that were already

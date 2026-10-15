@@ -401,9 +401,9 @@ s3dlio.delete("s3://bucket/logs/2026/", recursive=True)  # every object whose ke
 
 **Compatibility change (intentional).** Earlier versions deleted every listed entry for a URI ending
 in `/` or containing `*` or `?` (including synthetic common-prefix entries) and treated the last
-segment of a recursive URI as a regex. Code that relied on that must now pass `recursive=True` (and a
-a URI that selects them: `name/`, or `name*`) or name the object. The lower-level `ObjectStore.delete`, `delete_batch` and
-`delete_prefix` are unchanged.
+segment of a recursive URI as a regex. Code that relied on that must now pass `recursive=True` with a URI
+that selects them (`name/`, or `name*`) or name the object. The lower-level `ObjectStore.delete`,
+`delete_batch` and `delete_prefix` are unchanged.
 
 ### mkdir() — Create Directory
 

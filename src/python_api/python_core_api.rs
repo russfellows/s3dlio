@@ -1620,7 +1620,8 @@ fn put_bytes_async<'py>(
 /// # Create local directory
 /// s3dlio.mkdir("file:///tmp/mydata/subdir/")
 ///
-/// # Create S3 prefix marker
+/// # On object stores (s3://, az://, gs://) this is a no-op that succeeds:
+/// # nothing is created, a prefix exists once an object is written under it
 /// s3dlio.mkdir("s3://bucket/prefix/")
 /// ```
 #[pyfunction]

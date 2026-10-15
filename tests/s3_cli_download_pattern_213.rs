@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
-// Issue #213, reviewer ruling D3/D4, through the real `s3-cli` binary.
+// Issue #213: the s3:// selection rule and the explicit `--pattern`, through the real
+// `s3-cli` binary.
 //
 // `s3-cli download` and `s3-cli get` treat an `s3://` URI as the exact object it names
 // and its `key/` directory (`s3://b/file.txt` selects `file.txt` and NEVER `file.txt.bak`);

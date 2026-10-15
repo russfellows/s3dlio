@@ -298,7 +298,7 @@ class S3dlioStorage(DataStorage):
     def _make_uri(self, path: str) -> str:
         """Convert a namespace-relative name to a full URI.
 
-        Two different rules apply, on purpose (issue #198 and its D2 ruling):
+        Two different rules apply, on purpose (issue #198):
 
         * A FULL URI (``s3://``, ``az://``, ``gs://``, ``file://``, ``direct://``) is
           used exactly as written: of ``s3://b//k`` only the ``/`` after the bucket
@@ -345,10 +345,12 @@ class S3dlioStorage(DataStorage):
 
         Audit #153 bug 3.4 (C2): previously ANY exception from
         s3dlio.mkdir was swallowed into `return True` whenever
-        exist_ok=True -- an auth failure, a network error, or (common
-        for cloud backends, where mkdir is frequently unimplemented) a
-        "not implemented" error was all silently treated as "already
-        exists, success". Only a genuine already-exists signal
+        exist_ok=True -- an auth failure, a network error, or any other
+        error was silently treated as "already exists, success". On
+        object stores (s3://, az://, gs://) mkdir is a no-op that
+        succeeds (nothing is created; a prefix exists once an object is
+        written under it); on file:// and direct:// it creates the
+        directory. Only a genuine already-exists signal
         (FileExistsError) is now treated as success; everything else
         propagates regardless of exist_ok.
         """

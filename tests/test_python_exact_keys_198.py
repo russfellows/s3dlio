@@ -7,7 +7,7 @@ are different objects. The adapters above the core (the DLIO storage classes
 and the s3torchconnector compat layer) used to ``lstrip('/')`` keys, so for a
 key that begins with ``/`` they addressed or reported a different object.
 
-One deliberate exception (the D2 ruling): a DLIO NAME that is relative to the
+One deliberate exception: a DLIO NAME that is relative to the
 configured namespace is a filesystem-style name, and ``S3dlioStorage`` keeps its
 0.9.124 normalisation (``/train/f.npz`` under ``s3://b/base`` is the key
 ``base/train/f.npz``, not ``base//train/f.npz``): it is not established that DLIO
@@ -282,7 +282,7 @@ def test_dlio_storage_namespace_relative_names_keep_the_0_9_124_normalisation(
 def test_dlio_storage_relative_train_file_reads_and_writes_base_slash_train(
     mock_factory,
 ):
-    """The D2 ruling: `/train/f.npz` under `s3://b/base` is the key `base/train/f.npz`."""
+    """A namespace-relative name: `/train/f.npz` under `s3://b/base` is the key `base/train/f.npz`."""
     mock = mock_factory(["base/train/f.npz"])
     out = storage_calls(
         mock,
@@ -351,8 +351,8 @@ def test_dlio_storage_namespace_trailing_slashes_are_dropped_as_in_0_9_124(
 
 class Oracle0_9_124:
     """The namespace-relative name handling of v0.9.124, copied VERBATIM from commit
-    2bfac2a (`python/s3dlio/integrations/dlio/s3dlio_storage.py`), the oracle the
-    D2 ruling pins: `__init__` set `self.prefix = namespace` and
+    2bfac2a (`python/s3dlio/integrations/dlio/s3dlio_storage.py`), the oracle
+    this test pins: `__init__` set `self.prefix = namespace` and
     `self.base_path = parsed.path.lstrip("/")`; `_make_uri` and `get_uri` are below;
     `walk_node` (and `get_node`'s directory probe) made the listing URI by adding a
     final "/" to `_make_uri(id)` when it had none (`_dir_uri` is that step)."""
@@ -436,7 +436,7 @@ def test_dlio_storage_namespace_relative_names_equal_the_0_9_124_functions(
     mock_factory,
 ):
     """For a grid of namespaces x names, `_make_uri` / `_dir_uri` / `get_uri` /
-    `base_path` equal the verbatim v0.9.124 implementation above (D2 option C)."""
+    `base_path` equal the verbatim v0.9.124 implementation above."""
     mock = mock_factory()
     rows = run_child(
         mock,
@@ -466,7 +466,7 @@ def test_dlio_storage_namespace_relative_names_equal_the_0_9_124_functions(
 
 
 def test_oracle_pins_the_documented_0_9_124_results():
-    """The oracle itself: the named D2 example, so a mis-copied oracle cannot pass vacuously."""
+    """The oracle itself: the documented example, so a mis-copied oracle cannot pass vacuously."""
     o = Oracle0_9_124("s3://b/base")
     assert o._make_uri("/train/f.npz") == "s3://b/base/train/f.npz"
     assert o._make_uri("s3://b//k") == "s3://b//k"

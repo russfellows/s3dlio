@@ -688,8 +688,7 @@ impl ObjectStore for LoggedObjectStore {
     //   not happen (issue #229).
     // * `mkdir` (every backend), `update_metadata`, `update_properties`: forwarded
     //   SILENTLY. They have no op name in the format, and adding one is a format
-    //   change that needs the architect's approval (a `mkdir` can be inferred from
-    //   the writes that follow it). `mkdir` on an object store is a no-op that
+    //   change (a `mkdir` can be inferred from the writes that follow it). `mkdir` on an object store is a no-op that
     //   sends no request (issue #229).
     // ------------------------------------------------------------------
 

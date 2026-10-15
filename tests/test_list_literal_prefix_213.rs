@@ -19,7 +19,7 @@
 //   * `s3://b/foo` (non-recursive) listed every top-level folder, because common
 //     prefixes were added unfiltered.
 //
-// The contract (architect ruling, #213): `s3://b/K` with no `*` selects the object
+// The selection rule (#213): `s3://b/K` with no `*` selects the object
 // `K` and, when descending, everything under `K/` -- NEVER `K.bak`, `K2`, `Kfoo`, or
 // `K.d/`. A regular expression only ever comes from an explicit pattern (`pattern=` /
 // `--pattern`, or `s3_copy::download_objects_matching`). The wildcard rule has its own
@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Every key of the shared catalog. Chosen so each assertion has a decoy that a
 /// regex reading of the same URI would let through.
 const CATALOG: &[&str] = &[
-    // the reviewer's example: literal prefix `data/run.1`
+    // a name with a `.`: the exact name `data/run.1`, not a prefix or a regex
     "data/run.1",
     "data/run.1.old",
     "data/run.1/child",
@@ -143,7 +143,7 @@ async fn assert_lists(port: u16, uri: &str, recursive: bool, want: Vec<String>) 
 }
 
 // ----------------------------------------------------------------------------
-// The reviewer's example: literal PREFIX, not regex, not exact
+// A name with a `.`: the exact name and its directory, not a regex and not a bare prefix
 // ----------------------------------------------------------------------------
 
 #[tokio::test]

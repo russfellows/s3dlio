@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
-// Issue #213, architect ruling: "Selecting `file.txt` can NOT also select `file.txt.bak`.
-// If the pattern is `file.txt*` then fine. If it is not, NOT fine."
+// Issue #213: the s3:// selection rule. Selecting `file.txt` never also selects
+// `file.txt.bak`; only the explicit glob `file.txt*` does.
 //
 // The rule for an `s3://` URI whose key part is `K` (src/s3_selection.rs):
 //
@@ -31,7 +31,7 @@ use s3dlio::delete_contract::{delete_objects_under_literal_prefix, DeleteMode};
 use s3dlio::object_store::{ObjectStore, S3ObjectStore};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Every decoy the architect named, plus a directory and wildcard fixtures.
+/// Decoys that a bare-prefix or regex reading would let through, plus a directory and wildcard fixtures.
 const CATALOG: &[&str] = &[
     "file.txt",
     "file.txt.bak",

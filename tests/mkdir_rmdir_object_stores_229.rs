@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 //
-// s3dlio #229 (architect ruling): an object store has no directories -- a prefix
+// s3dlio #229: an object store has no directories -- a prefix
 // exists once objects are written under it -- so `mkdir` and `rmdir` on `s3://`
 // (and `az://`, `gs://`) are successful NO-OPS. They validate the URI and send ZERO
 // requests: no marker object is written, and `rmdir` (recursive or not) deletes
