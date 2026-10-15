@@ -4043,13 +4043,17 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
 /// One difference: once a read has failed, reads that have not yet started are skipped
 /// instead of downloaded, so a failed batch stops spending bandwidth after the reads already
 /// in flight finish. Dropping the returned future aborts every task (they live in a `JoinSet`).
+///
+/// `store_for` runs on whichever runtime worker polls the task, so it must not call
+/// `run_on_global_rt` (it would block a global-runtime worker on a task for that runtime;
+/// issue #173). Return cached stores; building one must be synchronous and runtime-free.
 pub(crate) async fn get_many_with_stores<F>(
     uris: Vec<String>,
     max_in_flight: usize,
     store_for: F,
 ) -> Result<Vec<(String, Bytes)>>
 where
-    F: Fn(&str) -> Result<Box<dyn ObjectStore>> + Send + Sync + 'static,
+    F: Fn(&str) -> Result<std::sync::Arc<dyn ObjectStore>> + Send + Sync + 'static,
 {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -5829,21 +5833,21 @@ mod get_many_with_stores_tests {
 
     fn factory(
         seen: &Seen,
-    ) -> impl Fn(&str) -> Result<Box<dyn ObjectStore>> + Send + Sync + 'static {
+    ) -> impl Fn(&str) -> Result<Arc<dyn ObjectStore>> + Send + Sync + 'static {
         counting_factory(seen, &Arc::default())
     }
 
     fn counting_factory(
         seen: &Seen,
         reads: &Arc<Reads>,
-    ) -> impl Fn(&str) -> Result<Box<dyn ObjectStore>> + Send + Sync + 'static {
+    ) -> impl Fn(&str) -> Result<Arc<dyn ObjectStore>> + Send + Sync + 'static {
         let seen = Arc::clone(seen);
         let reads = Arc::clone(reads);
         move |_uri: &str| {
-            Ok(Box::new(UriOnlyStore {
+            Ok(Arc::new(UriOnlyStore {
                 seen: Arc::clone(&seen),
                 reads: Arc::clone(&reads),
-            }) as Box<dyn ObjectStore>)
+            }) as Arc<dyn ObjectStore>)
         }
     }
 
@@ -5880,7 +5884,7 @@ mod get_many_with_stores_tests {
     #[tokio::test]
     async fn a_store_error_names_the_failing_read() {
         let uris = vec!["az://acct/container/ok".to_string()];
-        let failing = |_: &str| -> Result<Box<dyn ObjectStore>> { bail!("no such backend") };
+        let failing = |_: &str| -> Result<Arc<dyn ObjectStore>> { bail!("no such backend") };
         let err = get_many_with_stores(uris, 1, failing).await.unwrap_err();
         assert!(format!("{err:#}").contains("no such backend"), "{err:#}");
     }
