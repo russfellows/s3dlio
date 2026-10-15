@@ -7,16 +7,15 @@ use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::azure_credential::{self, CredentialMode};
 use crate::data_loader::parallel_fetch::DropCancel;
 use crate::read_buffer::ReadBuffer;
 
-use azure_core::credentials::TokenCredential;
 use azure_core::http::{NoFormat, RequestContent, Url, XmlFormat};
-use azure_identity::DeveloperToolsCredential;
 
 use azure_storage_blob::clients::{
     BlobClient, BlobContainerClient, BlobServiceClient, BlobServiceClientOptions, BlockBlobClient,
@@ -28,23 +27,6 @@ use azure_storage_blob::models::{
     BlockBlobClientStageBlockOptions, BlockList, BlockListType, BlockLookupList, HttpRange,
 };
 use tracing::{debug, warn};
-
-// Global credential cache to avoid repeated authentication
-static AZURE_CREDENTIAL: OnceLock<Arc<dyn TokenCredential>> = OnceLock::new();
-
-/// The process-wide credential for https endpoints, created on first use.
-///
-/// Creation is synchronous and fallible: a failure is returned (and nothing is cached, so a
-/// later call retries). Two threads racing on the first call may each create a credential;
-/// one is kept and both get it. No runtime is needed, so this is safe on any Tokio runtime
-/// flavour, or none.
-fn shared_credential() -> Result<Arc<dyn TokenCredential>> {
-    if let Some(credential) = AZURE_CREDENTIAL.get() {
-        return Ok(Arc::clone(credential));
-    }
-    let credential: Arc<dyn TokenCredential> = DeveloperToolsCredential::new(None)?;
-    Ok(Arc::clone(AZURE_CREDENTIAL.get_or_init(|| credential)))
-}
 
 /// Receive a download body into one buffer sized from `expected_len` (see
 /// [`AzureBlob::get_with_sdk_concurrency_sized`]); without a length it grows as data arrives.
@@ -75,32 +57,60 @@ where
     Ok(buffer)
 }
 
-/// Process-wide `BlobServiceClient`s, one per account URL.
+/// Process-wide `BlobServiceClient`s, one per account URL and credential mode.
 ///
 /// A client owns the HTTP pipeline: its connection pool, TLS state and the bearer-token
 /// cache of its authorization policy. Building one per operation threw all of that away,
-/// so every object paid a new TCP/TLS handshake and a new `az account get-access-token`
-/// process (twice: HEAD and GET). The map is bounded by
+/// so every object paid a new TCP/TLS handshake and a new token request (for the CLI mode, a
+/// new `az account get-access-token` process, twice: HEAD and GET). The map is bounded by
 /// [`crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX`]; at the limit one entry is evicted
 /// (a client still in use stays alive through its `Arc`). Building a client is synchronous
 /// and does no I/O, so it is done under the lock and every caller gets the same client.
-static SERVICE_CLIENTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, Arc<BlobServiceClient>>>,
-> = std::sync::LazyLock::new(Default::default);
+type ServiceClientCache =
+    std::sync::Mutex<std::collections::HashMap<String, (Arc<BlobServiceClient>, CredentialMode)>>;
+static SERVICE_CLIENTS: std::sync::LazyLock<ServiceClientCache> =
+    std::sync::LazyLock::new(Default::default);
 
-/// The (cached) service client for `account_url`. A bearer-token credential is attached only
-/// for an `https` endpoint; an `http` endpoint (an emulator such as Azurite) gets none, since
-/// the SDK refuses a credential on a non-https URL.
-fn service_client_for_url(account_url: &str) -> Result<Arc<BlobServiceClient>> {
-    let service_url = Url::parse(account_url)
+/// The (cached) service client for `account_url`, and the credential mode it uses.
+///
+/// The mode comes from `S3DLIO_AZURE_CREDENTIAL` (see [`crate::azure_credential`]):
+/// * a bearer-token mode attaches the process-wide credential for that mode, and needs an
+///   `https` endpoint (the SDK refuses a bearer token on http);
+/// * `sas` attaches no credential and appends `S3DLIO_AZURE_SAS_TOKEN` to the endpoint URL,
+///   from which the SDK derives every request URL; `none` attaches nothing;
+/// * `auto` on an `http` endpoint (an emulator such as Azurite) is `none`, as before.
+fn service_client_for_url(account_url: &str) -> Result<(Arc<BlobServiceClient>, CredentialMode)> {
+    let mut service_url = Url::parse(account_url)
         .map_err(|e| anyhow!("invalid Azure account URL '{account_url}': {e}"))?;
-    let key = service_url.to_string();
-    let mut clients = SERVICE_CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(client) = clients.get(&key) {
-        return Ok(Arc::clone(client));
+    let https = service_url.scheme() == "https";
+    let mode = azure_credential::mode_for_endpoint(https)?;
+    azure_credential::warn_unused_sas(mode);
+
+    // The cache key never contains the SAS token itself, only a hash of it.
+    let plain_url = service_url.to_string();
+    let mut key = format!("{mode}|{plain_url}");
+    if mode == CredentialMode::Sas {
+        use std::hash::{Hash, Hasher};
+        let token = azure_credential::sas_token(&|n| std::env::var(n).ok())?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        token.hash(&mut hasher);
+        key.push_str(&format!("|sas:{:016x}", hasher.finish()));
+        service_url.set_query(Some(&token));
     }
-    let credential = if service_url.scheme() == "https" {
-        Some(shared_credential()?)
+
+    let mut clients = SERVICE_CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((client, mode)) = clients.get(&key) {
+        return Ok((Arc::clone(client), *mode));
+    }
+    let credential = if mode.uses_bearer_token() {
+        if !https {
+            bail!(
+                "Azure credential mode {mode} sends a bearer token and needs an https endpoint, \
+                 but the endpoint is {plain_url}; use S3DLIO_AZURE_CREDENTIAL=none or sas for \
+                 an http endpoint such as Azurite"
+            );
+        }
+        Some(azure_credential::credential_for(mode)?)
     } else {
         None
     };
@@ -108,22 +118,22 @@ fn service_client_for_url(account_url: &str) -> Result<Arc<BlobServiceClient>> {
     SERVICE_CLIENT_BUILD_LOG
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(key.clone());
+        .push(plain_url);
     let client = Arc::new(
         BlobServiceClient::new(
             service_url,
             credential,
             Some(BlobServiceClientOptions::default()),
         )
-        .map_err(|e| anyhow!(e))?,
+        .map_err(|e| anyhow!(azure_credential::redact_sas(&e.to_string())))?,
     );
     if clients.len() >= crate::constants::AZURE_SERVICE_CLIENT_CACHE_MAX {
         if let Some(evict) = clients.keys().next().cloned() {
             clients.remove(&evict);
         }
     }
-    clients.insert(key, Arc::clone(&client));
-    Ok(client)
+    clients.insert(key, (Arc::clone(&client), mode));
+    Ok((client, mode))
 }
 
 #[cfg(test)]
@@ -163,6 +173,8 @@ pub struct AzureBlobProperties {
 /// High-level client bound to one container.
 pub struct AzureBlob {
     service_client: Arc<BlobServiceClient>,
+    /// The credential mode this client authenticates with (named in authorization errors).
+    credential_mode: CredentialMode,
     pub container: String,
 }
 
@@ -178,10 +190,9 @@ impl AzureBlob {
         format!("http://{}:{}/{}", host, port, account)
     }
 
-    /// Build with the Azure developer-tool credential (`az login`, then `azd auth login`; the
-    /// `az` / `azd` executable must be on `PATH`) for `https` endpoints; `http` endpoints
-    /// (emulators) get no credential. Account-key, SAS and
-    /// service-principal environment variables are not read (see #239).
+    /// Build with the credential mode selected by `S3DLIO_AZURE_CREDENTIAL` (default `auto`; see
+    /// [`crate::azure_credential`]). Account-key (Shared Key) authentication is not supported by
+    /// the SDK. `auto` on an `http` endpoint (emulators) sends no credential.
     ///
     /// Supports custom endpoints via environment variables for local emulators and proxies:
     /// - `AZURE_STORAGE_ENDPOINT`: Primary endpoint URL (e.g., http://localhost:10000)
@@ -210,10 +221,46 @@ impl AzureBlob {
 
     /// Same, when a full endpoint URL (possibly emulator) is provided.
     pub fn with_default_credential_from_url(account_url: &str, container: &str) -> Result<Self> {
+        let (service_client, credential_mode) = service_client_for_url(account_url)?;
         Ok(Self {
-            service_client: service_client_for_url(account_url)?,
+            service_client,
+            credential_mode,
             container: container.to_string(),
         })
+    }
+
+    /// Turn an SDK error into an `anyhow` error. A 401 or 403 names the credential mode that
+    /// was used (a bare "403" does not say which identity was refused), and any configured
+    /// SAS token is removed from the message.
+    fn auth_err(&self, e: azure_core::Error) -> anyhow::Error {
+        let rejected = matches!(
+            e.http_status(),
+            Some(
+                azure_core::http::StatusCode::Unauthorized
+                    | azure_core::http::StatusCode::Forbidden
+            )
+        );
+        // The SDK's top-level message is often generic ("non-transport error occurred ..."); the
+        // cause (a failed token request, the response body) is in the source chain.
+        let mut text = e.to_string();
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            let cause_text = cause.to_string();
+            if !text.contains(&cause_text) {
+                text.push_str(": ");
+                text.push_str(&cause_text);
+            }
+            source = cause.source();
+        }
+        let text = crate::azure_credential::redact_sas(&text);
+        if rejected {
+            anyhow!(
+                "Azure credential mode {} was used and the request was rejected: {text}",
+                self.credential_mode
+            )
+        } else {
+            anyhow!(text)
+        }
     }
 
     /// Blob service (rarely needed directly).
@@ -250,7 +297,10 @@ impl AzureBlob {
         let blob = self.blob_client(key)?;
         let data = request_content_from_bytes(body);
         let options = (!overwrite).then(|| BlobClientUploadOptions::default().if_not_exists());
-        let _resp = blob.upload(data, options).await?;
+        let _resp = blob
+            .upload(data, options)
+            .await
+            .map_err(|e| self.auth_err(e))?;
         Ok(())
     }
 
@@ -271,7 +321,10 @@ impl AzureBlob {
             parallel: NonZeroUsize::new(1),
             ..Default::default()
         };
-        let resp = blob.download(Some(opts)).await?;
+        let resp = blob
+            .download(Some(opts))
+            .await
+            .map_err(|e| self.auth_err(e))?;
         let expected = end.map(|e| e - start + 1);
         let body = collect_body(resp.body, expected).await?;
         debug!(
@@ -324,7 +377,10 @@ impl AzureBlob {
             partition_size: partition_size.and_then(NonZeroUsize::new),
             ..Default::default()
         };
-        let resp = blob.download(Some(options)).await?;
+        let resp = blob
+            .download(Some(options))
+            .await
+            .map_err(|e| self.auth_err(e))?;
         let body = collect_body(resp.body, expected_len).await?;
         debug!(
             "AzureBlob::get success: key='{}', {} bytes",
@@ -343,7 +399,8 @@ impl AzureBlob {
         let blob = self.blob_client(key)?;
         let resp = blob
             .get_properties(Some(BlobClientGetPropertiesOptions::default()))
-            .await?;
+            .await
+            .map_err(|e| self.auth_err(e))?;
         let content_length = resp.content_length()?.unwrap_or(0);
         let etag = resp.etag()?.map(|e| e.to_string());
         let last_modified = resp.last_modified()?.map(|dt| dt.to_string());
@@ -377,7 +434,7 @@ impl AzureBlob {
 
         // In 0.7.0, pager yields Result<BlobItemInternal> directly
         while let Some(item_result) = pager.next().await {
-            let item = item_result?;
+            let item = item_result.map_err(|e| self.auth_err(e))?;
             if let Some(name) = item.name {
                 out.push(name);
             }
@@ -419,7 +476,7 @@ impl AzureBlob {
                 let item = match item_result {
                     Ok(i) => i,
                     Err(e) => {
-                        yield Err(e.into());
+                        yield Err(self.auth_err(e));
                         return;
                     }
                 };
@@ -442,7 +499,7 @@ impl AzureBlob {
         let container = self.container_client()?;
         for name in blobs {
             let b = container.blob_client(name);
-            b.delete(None).await?;
+            b.delete(None).await.map_err(|e| self.auth_err(e))?;
         }
         Ok(())
     }
@@ -469,7 +526,8 @@ impl AzureBlob {
                 body,
                 Some(BlockBlobClientStageBlockOptions::default()),
             )
-            .await?;
+            .await
+            .map_err(|e| self.auth_err(e))?;
         Ok(())
     }
 
@@ -494,7 +552,8 @@ impl AzureBlob {
         let body: RequestContent<BlockLookupList, XmlFormat> = lookup.try_into()?;
         let _resp = bb
             .commit_block_list(body, Some(BlockBlobClientCommitBlockListOptions::default()))
-            .await?;
+            .await
+            .map_err(|e| self.auth_err(e))?;
         Ok(())
     }
 
@@ -505,7 +564,10 @@ impl AzureBlob {
             self.container, key
         );
         let bb = self.block_blob_client(key)?;
-        let resp = bb.get_block_list(BlockListType::Committed, None).await?;
+        let resp = bb
+            .get_block_list(BlockListType::Committed, None)
+            .await
+            .map_err(|e| self.auth_err(e))?;
         // In 0.7.0, Response::into_model() deserializes directly (not async)
         let list: BlockList = resp.into_model()?;
         let mut out = Vec::new();
@@ -636,6 +698,7 @@ impl AzureBlob {
     fn clone_for_upload(&self) -> Self {
         Self {
             service_client: Arc::clone(&self.service_client),
+            credential_mode: self.credential_mode,
             container: self.container.clone(),
         }
     }
@@ -726,15 +789,18 @@ impl AzureBlob {
     #[allow(dead_code)]
     pub async fn create_container_if_missing(&self) -> Result<()> {
         let container = self.container_client()?;
-        if !container.exists().await? {
-            container.create(None).await?;
+        if !container.exists().await.map_err(|e| self.auth_err(e))? {
+            container.create(None).await.map_err(|e| self.auth_err(e))?;
         }
         Ok(())
     }
 
     #[allow(dead_code)]
     pub async fn delete_container(&self) -> Result<()> {
-        self.container_client()?.delete(None).await?;
+        self.container_client()?
+            .delete(None)
+            .await
+            .map_err(|e| self.auth_err(e))?;
         Ok(())
     }
 }
@@ -773,16 +839,15 @@ pub fn resolve_azure_account_url(account: &str) -> String {
 ///
 /// Returns `Vec<(container_name, Option<last_modified_string>)>`.
 ///
-/// Credentials are the same as for [`AzureBlob::with_default_credential`]: for an `https`
-/// endpoint the Azure developer-tool credential (`az login`, then `azd auth login`; the `az` /
-/// `azd` executables must be on `PATH`); for an `http` endpoint (Azurite) none.
+/// Credentials are chosen exactly as for [`AzureBlob::with_default_credential`]
+/// (`S3DLIO_AZURE_CREDENTIAL`, see [`crate::azure_credential`]).
 pub async fn list_account_containers(account: &str) -> Result<Vec<(String, Option<String>)>> {
     list_account_containers_at(&resolve_azure_account_url(account)).await
 }
 
 /// [`list_account_containers`] against an explicit account URL.
 async fn list_account_containers_at(account_url: &str) -> Result<Vec<(String, Option<String>)>> {
-    let service_client = service_client_for_url(account_url)?;
+    let (service_client, _mode) = service_client_for_url(account_url)?;
 
     let mut containers: Vec<(String, Option<String>)> = Vec::new();
     let mut pager = service_client

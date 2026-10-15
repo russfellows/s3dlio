@@ -783,6 +783,32 @@ pub const ENV_AZURE_STORAGE_ENDPOINT: &str = "AZURE_STORAGE_ENDPOINT";
 pub const ENV_AZURE_BLOB_ENDPOINT_URL: &str = "AZURE_BLOB_ENDPOINT_URL";
 
 // =============================================================================
+// Azure credential selection (issue #253)
+// =============================================================================
+
+/// Selects the Azure credential: auto | cli | managed-identity | client-secret |
+/// client-certificate | workload-identity | sas | none (case-insensitive).
+pub const ENV_AZURE_CREDENTIAL: &str = "S3DLIO_AZURE_CREDENTIAL";
+/// The SAS token appended to every Azure request URL in `sas` mode (leading `?` optional).
+pub const ENV_AZURE_SAS_TOKEN: &str = "S3DLIO_AZURE_SAS_TOKEN";
+/// Standard Azure identity variables s3dlio reads (see docs/Environment_Variables.md).
+pub const ENV_AZURE_CLIENT_ID: &str = "AZURE_CLIENT_ID";
+pub const ENV_AZURE_TENANT_ID: &str = "AZURE_TENANT_ID";
+pub const ENV_AZURE_CLIENT_SECRET: &str = "AZURE_CLIENT_SECRET";
+pub const ENV_AZURE_CLIENT_CERTIFICATE_PATH: &str = "AZURE_CLIENT_CERTIFICATE_PATH";
+pub const ENV_AZURE_CLIENT_CERTIFICATE_PASSWORD: &str = "AZURE_CLIENT_CERTIFICATE_PASSWORD";
+pub const ENV_AZURE_FEDERATED_TOKEN_FILE: &str = "AZURE_FEDERATED_TOKEN_FILE";
+/// Set by Azure App Service / Arc / Functions hosts that offer a managed-identity endpoint.
+pub const ENV_AZURE_IDENTITY_ENDPOINT: &str = "IDENTITY_ENDPOINT";
+/// Set by Azure ML / Cloud Shell hosts that offer a managed-identity endpoint.
+pub const ENV_AZURE_MSI_ENDPOINT: &str = "MSI_ENDPOINT";
+
+/// How long `auto` waits (for the connection, and for each read) when it asks the Azure instance
+/// metadata service (169.254.169.254:80) whether this is an Azure VM. On a VM the answer is
+/// immediate; elsewhere the connection fails or times out. Asked once per process.
+pub const AZURE_IMDS_PROBE_TIMEOUT_MS: u64 = 250;
+
+// =============================================================================
 // GCS gRPC Read Timeout / Progress Constants
 // =============================================================================
 

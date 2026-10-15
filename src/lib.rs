@@ -74,6 +74,8 @@ pub mod object_store_arrow;
 
 #[cfg(feature = "backend-azure")]
 pub mod azure_client;
+#[cfg(feature = "backend-azure")]
+pub mod azure_credential; // Azure credential selection (#253)
 pub mod checkpoint;
 pub mod data_gen;
 pub mod data_gen_alt; // Alternative data generation with ChaCha20

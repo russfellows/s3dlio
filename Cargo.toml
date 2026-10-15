@@ -209,6 +209,7 @@ s3 = []
 native-backends = []                    # Current AWS/Azure implementations -- mutually exclusive with arrow-backend, see note above
 backend-aws = []
 backend-azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_blob"]
+azure-client-certificate = ["backend-azure", "azure_identity/client_certificate"]  # client-certificate credential for Azure; links OpenSSL (not in full-backends / the default wheel)
 backend-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-gax-internal"]
 full-backends = ["backend-aws", "backend-azure", "backend-gcs"]
 gcs-community = ["backend-gcs", "dep:gcloud-storage"]  # Legacy community GCS client (JSON API, no RAPID support; conflicts with official GCS client)
