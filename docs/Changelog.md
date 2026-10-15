@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **Arrow backend: `delete_prefix` now deletes the objects at every depth under the prefix (#232).**
+  With the optional `arrow-backend` feature, `delete_prefix("s3://b/p")` listed only the immediate
+  children of `p`, so `p/b/c` and `p/b/d/e` were left behind while the call returned success. It now
+  lists everything under `p/` recursively and deletes it with the store's bulk delete. Only objects
+  under `p/` are touched (`pfoo/x` and `p2/y` are not), and if any object cannot be deleted the call
+  returns an error that says how many and quotes the first errors, instead of success.
+
 - **Arrow backend: listing an `s3://` URI with a key prefix no longer returns doubled URIs (#222).**
   With the optional `arrow-backend` feature, listing `s3://b/dir/` returned `s3://b/dir/dir/x` for the
   object `dir/x`; feeding that URI back into get or delete addressed an object that does not exist. The

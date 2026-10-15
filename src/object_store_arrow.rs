@@ -235,16 +235,49 @@ async fn list_under(
     Ok(out)
 }
 
-/// Delete the objects under `base` in `store`.
+/// Delete every object under `base` in `store`, at any depth (issue #232).
+///
+/// `object_store` evaluates a prefix on a path-segment basis: `p` covers `p/a` and
+/// `p/b/c` but never `pfoo/x` or `p2/y`, so an unrelated sibling is never selected. The
+/// listing is recursive (`list_with_delimiter` returns the immediate children only) and
+/// is handed to `delete_stream`, which the S3, GCS and Azure stores serve with their bulk
+/// delete. A failure does not stop the others; the call fails if any object listed was
+/// not confirmed deleted, naming the first few.
 async fn delete_under(store: &dyn AosObjectStore, base: &Path) -> Result<()> {
-    // Simple implementation: list objects and delete them one by one
-    let result = store.list_with_delimiter(Some(base)).await?;
-    for obj in result.objects {
-        store.delete(&obj.location).await?;
-    }
+    use futures::StreamExt as _;
 
+    // An empty prefix is the whole store (the bucket root).
+    let prefix = (!base.as_ref().is_empty()).then_some(base);
+    let locations = store.list(prefix).map(|entry| entry.map(|m| m.location));
+    let mut results = store.delete_stream(locations.boxed());
+
+    let mut deleted = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    let mut failed = 0usize;
+    while let Some(result) = results.next().await {
+        match result {
+            Ok(_) => deleted += 1,
+            Err(e) => {
+                failed += 1;
+                if failures.len() < MAX_NAMED_DELETE_FAILURES {
+                    failures.push(format!("{e}"));
+                }
+            }
+        }
+    }
+    if failed > 0 {
+        bail!(
+            "delete_prefix: {failed} objects under {:?} not confirmed deleted ({deleted} \
+             deleted); first errors: {}",
+            base.as_ref(),
+            failures.join("; ")
+        );
+    }
     Ok(())
 }
+
+/// How many individual delete errors `delete_prefix` quotes in its error.
+const MAX_NAMED_DELETE_FAILURES: usize = 5;
 
 /// Read `length` bytes from `offset` (to the end of the object if `length` is `None`).
 async fn read_range(
@@ -892,6 +925,17 @@ mod tests {
         store
     }
 
+    /// Every key left in `store`, sorted.
+    async fn remaining(store: &aos::memory::InMemory) -> Vec<String> {
+        let mut keys: Vec<String> = store
+            .list(None)
+            .map(|m| m.expect("list").location.to_string())
+            .collect()
+            .await;
+        keys.sort();
+        keys
+    }
+
     /// The (prefix path, URL) the adapter derives from an `s3://` listing URI.
     fn s3_prefix(uri: &str) -> (Path, Url) {
         let url = Url::parse(uri).expect("url");
@@ -1010,5 +1054,124 @@ mod tests {
                 "listing {url}"
             );
         }
+    }
+
+    // #232: `p/b/c` and `p/b/d/e` are not immediate children of `p` and were left behind
+    // while the call returned success. Siblings that merely share the name's characters
+    // (`pfoo`, `p2`) are not under `p/` and must survive.
+    #[tokio::test]
+    async fn delete_prefix_removes_every_depth_and_only_the_prefix() {
+        for prefix in ["s3://b/p", "s3://b/p/"] {
+            let store = seeded(&["p/a", "p/b/c", "p/b/d/e", "pfoo/x", "p2/y"]).await;
+            let (base, _url) = s3_prefix(prefix);
+            delete_under(&store, &base).await.expect("delete_prefix");
+            assert_eq!(
+                remaining(&store).await,
+                vec!["p2/y".to_string(), "pfoo/x".to_string()],
+                "prefix {prefix}"
+            );
+        }
+    }
+
+    // A prefix that holds nothing is not an error and deletes nothing.
+    #[tokio::test]
+    async fn delete_prefix_on_an_empty_prefix_is_a_noop() {
+        let store = seeded(&["other/x"]).await;
+        let (base, _url) = s3_prefix("s3://b/none/");
+        delete_under(&store, &base).await.expect("delete_prefix");
+        assert_eq!(remaining(&store).await, vec!["other/x".to_string()]);
+    }
+
+    /// An in-memory store whose bulk delete refuses every key containing `bad`.
+    #[derive(Debug)]
+    struct RefusesBadKeys(aos::memory::InMemory);
+
+    impl std::fmt::Display for RefusesBadKeys {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RefusesBadKeys")
+        }
+    }
+
+    #[async_trait]
+    impl AosObjectStore for RefusesBadKeys {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: aos::PutOptions,
+        ) -> aos::Result<aos::PutResult> {
+            self.0.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: aos::PutMultipartOptions,
+        ) -> aos::Result<Box<dyn aos::MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> aos::Result<aos::GetResult> {
+            self.0.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, aos::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, aos::Result<Path>> {
+            let inner = self.0.delete_stream(
+                locations
+                    .map(|l| match l {
+                        Ok(p) if p.as_ref().contains("bad") => Err(aos::Error::Generic {
+                            store: "RefusesBadKeys",
+                            source: format!("refused {p}").into(),
+                        }),
+                        other => other,
+                    })
+                    .boxed(),
+            );
+            inner.boxed()
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, aos::Result<aos::ObjectMeta>> {
+            self.0.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> aos::Result<aos::ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: aos::CopyOptions,
+        ) -> aos::Result<()> {
+            self.0.copy_opts(from, to, options).await
+        }
+    }
+
+    // A delete that fails for some objects must not be reported as success (the #232 shape:
+    // objects left behind while the call returns Ok). The good objects are still deleted.
+    #[tokio::test]
+    async fn delete_prefix_reports_objects_it_could_not_delete() {
+        let store = RefusesBadKeys(seeded(&["p/a", "p/bad1", "p/x/bad2", "p/x/c", "q/z"]).await);
+        let (base, _url) = s3_prefix("s3://b/p/");
+        let err = delete_under(&store, &base).await.expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("2 objects"), "{msg}");
+        assert!(
+            msg.contains("refused p/bad1") || msg.contains("refused p/x/bad2"),
+            "{msg}"
+        );
+        assert_eq!(
+            remaining(&store.0).await,
+            vec![
+                "p/bad1".to_string(),
+                "p/x/bad2".to_string(),
+                "q/z".to_string()
+            ]
+        );
     }
 }
