@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, Semaphore};
 
 // Import global runtime handle so BufferPool pre-allocation uses the same
@@ -19,11 +19,22 @@ use crate::s3_client::global_rt_handle;
 /// for memory-only operations.
 ///
 /// Deliberately NOT `Clone`: a derived clone would copy the pointer and free it twice.
+///
+/// # Initialisation
+/// [`AlignedBuf::new`] does not touch the memory (so a 1 GiB buffer costs nothing until it is
+/// used, and every page is first touched by the thread that fills it). Raw access
+/// ([`as_ptr`](Self::as_ptr), [`as_mut_ptr`](Self::as_mut_ptr)) therefore sees uninitialised
+/// bytes until you write them. The *slice* accessors ([`as_slice`](Self::as_slice),
+/// [`as_mut_slice`](Self::as_mut_slice)) never expose uninitialised memory: the first call
+/// zero-fills the buffer, once, unless the owner declared it fully written with the unsafe
+/// [`assume_init`](Self::assume_init). [`AlignedBuf::new_zeroed`] zero-fills eagerly.
 #[derive(Debug)]
 pub struct AlignedBuf {
     ptr: NonNull<u8>,
     len: usize,
     layout: Layout,
+    /// Set once every byte is initialised (zero-filled or declared written).
+    init: OnceLock<()>,
 }
 
 unsafe impl Send for AlignedBuf {}
@@ -45,21 +56,68 @@ impl AlignedBuf {
         if len == 0 {
             // `alloc` with a zero-size layout is undefined behaviour: own nothing.
             let ptr = NonNull::new(align as *mut u8).ok_or(err)?;
-            return Ok(Self { ptr, len, layout });
+            return Ok(Self {
+                ptr,
+                len,
+                layout,
+                init: OnceLock::from(()),
+            });
         }
         // SAFETY: `layout` has a non-zero size.
         let raw_ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(raw_ptr).ok_or(err)?;
-        Ok(Self { ptr, len, layout })
+        Ok(Self {
+            ptr,
+            len,
+            layout,
+            init: OnceLock::new(),
+        })
     }
 
-    /// Get a mutable slice view of the buffer
+    /// Like [`new`](Self::new) but the memory is zero-filled (touching every page).
+    pub fn new_zeroed(len: usize, align: usize) -> Result<Self, AlignedAllocError> {
+        let err = AlignedAllocError { len, align };
+        let layout = Layout::from_size_align(len, align).map_err(|_| err)?;
+        if len == 0 {
+            return Self::new(0, align);
+        }
+        // SAFETY: `layout` has a non-zero size.
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(err)?;
+        Ok(Self {
+            ptr,
+            len,
+            layout,
+            init: OnceLock::from(()),
+        })
+    }
+
+    /// Declare every byte of the buffer initialised (the owner wrote all of it through the raw
+    /// pointer), so the slice accessors need not zero-fill it first.
+    ///
+    /// # Safety
+    /// All `len()` bytes must have been written.
+    pub unsafe fn assume_init(&self) {
+        let _ = self.init.set(());
+    }
+
+    fn ensure_init(&self) {
+        self.init.get_or_init(|| {
+            // SAFETY: `ptr` is a live allocation of `len` bytes owned by `self`.
+            unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
+        });
+    }
+
+    /// Get a mutable slice view of the buffer (zero-fills it first if it was never written).
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.ensure_init();
+        // SAFETY: initialised above, `len` bytes owned by `self`.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
-    /// Get an immutable slice view of the buffer
+    /// Get an immutable slice view of the buffer (zero-fills it first if it was never written).
     pub fn as_slice(&self) -> &[u8] {
+        self.ensure_init();
+        // SAFETY: initialised above, `len` bytes owned by `self`.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
@@ -121,6 +179,35 @@ impl std::fmt::Display for AlignedAllocError {
 
 impl std::error::Error for AlignedAllocError {}
 
+/// A [`BufferPool`] could not be created or could not hand out a buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferPoolError {
+    /// `capacity` was 0: such a pool could never hand out a buffer.
+    ZeroCapacity,
+    /// The pool was shut down while waiting for a buffer.
+    Closed,
+    /// A new buffer could not be allocated.
+    Alloc(AlignedAllocError),
+}
+
+impl std::fmt::Display for BufferPoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroCapacity => write!(f, "buffer pool capacity must be at least 1"),
+            Self::Closed => write!(f, "buffer pool is closed"),
+            Self::Alloc(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for BufferPoolError {}
+
+impl From<AlignedAllocError> for BufferPoolError {
+    fn from(e: AlignedAllocError) -> Self {
+        Self::Alloc(e)
+    }
+}
+
 /// High-performance buffer pool for aligned buffers
 ///
 /// Maintains a pool of pre-allocated aligned buffers to eliminate allocation
@@ -142,7 +229,17 @@ impl BufferPool {
     /// * `capacity` - Number of buffers to maintain in the pool
     /// * `buf_len` - Size of each buffer in bytes
     /// * `align` - Alignment requirement (use 4096 for O_DIRECT compatibility)
-    pub fn new(capacity: usize, buf_len: usize, align: usize) -> Arc<Self> {
+    ///
+    /// # Errors
+    /// [`BufferPoolError::ZeroCapacity`] when `capacity` is 0.
+    pub fn new(
+        capacity: usize,
+        buf_len: usize,
+        align: usize,
+    ) -> Result<Arc<Self>, BufferPoolError> {
+        if capacity == 0 {
+            return Err(BufferPoolError::ZeroCapacity);
+        }
         let (tx, rx) = mpsc::channel(capacity);
         let permits = Arc::new(Semaphore::new(capacity));
 
@@ -173,15 +270,20 @@ impl BufferPool {
             }
         });
 
-        pool
+        Ok(pool)
     }
 
     /// Take a buffer from the pool (blocks if none available).
     ///
-    /// Errors (instead of aborting) when the pool is empty and a new buffer cannot be allocated.
-    pub async fn take(&self) -> Result<AlignedBuf, AlignedAllocError> {
+    /// Errors (instead of aborting) when the pool is closed, or empty with a new buffer that
+    /// cannot be allocated.
+    pub async fn take(&self) -> Result<AlignedBuf, BufferPoolError> {
         // Acquire permit first to ensure we don't exceed capacity
-        let _permit = self.permits.acquire().await.expect("Pool semaphore closed");
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| BufferPoolError::Closed)?;
 
         // Try to get a buffer from the pool
         let mut rx = self.rx.lock().await;
@@ -189,7 +291,7 @@ impl BufferPool {
             Ok(buf)
         } else {
             // Pool is temporarily empty, allocate a new one
-            AlignedBuf::new(self.buf_len, self.align)
+            Ok(AlignedBuf::new(self.buf_len, self.align)?)
         }
     }
 
@@ -235,7 +337,7 @@ impl Default for BufferPoolConfig {
 
 impl BufferPoolConfig {
     /// Create a buffer pool from this configuration
-    pub fn build(self) -> Arc<BufferPool> {
+    pub fn build(self) -> Result<Arc<BufferPool>, BufferPoolError> {
         BufferPool::new(self.capacity, self.buffer_size, self.alignment)
     }
 
@@ -281,7 +383,7 @@ mod tests {
         // A hang here means give() is blocking on a full channel (deadlock) —
         // that is a real production bug, not just a test issue.
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let pool = BufferPool::new(2, 4096, 4096);
+            let pool = BufferPool::new(2, 4096, 4096).unwrap();
 
             // Take buffer
             let mut buf1 = pool.take().await.unwrap();
@@ -340,5 +442,60 @@ mod aligned_alloc_tests {
         let b = AlignedBuf::new(0, 4096).unwrap();
         assert!(b.is_empty());
         assert!(b.as_slice().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod aligned_init_tests {
+    use super::*;
+
+    /// Round 3: slice accessors never expose uninitialised memory.
+    #[test]
+    fn slices_over_a_fresh_buffer_are_zero() {
+        let mut b = AlignedBuf::new(1 << 20, 4096).unwrap();
+        // Poison the raw memory first, as a recycled allocation might look.
+        unsafe { std::ptr::write_bytes(b.as_mut_ptr(), 0xEE, b.len()) };
+        // (assume_init was NOT called, so the first slice access zero-fills.)
+        assert!(b.as_slice().iter().all(|&x| x == 0));
+        b.as_mut_slice()[7] = 9;
+        assert_eq!(b.as_slice()[7], 9, "zero-fill must happen only once");
+    }
+
+    #[test]
+    fn assume_init_keeps_what_the_owner_wrote() {
+        let mut b = AlignedBuf::new(8192, 4096).unwrap();
+        unsafe {
+            std::ptr::write_bytes(b.as_mut_ptr(), 0x5A, 8192);
+            b.assume_init();
+        }
+        assert!(b.as_slice().iter().all(|&x| x == 0x5A));
+    }
+
+    #[test]
+    fn new_zeroed_is_zero_and_aligned() {
+        let b = AlignedBuf::new_zeroed(1 << 20, 4096).unwrap();
+        assert_eq!(b.as_ptr() as usize % 4096, 0);
+        assert!(b.as_slice().iter().all(|&x| x == 0));
+        assert!(AlignedBuf::new_zeroed(usize::MAX, 4096).is_err());
+        assert!(AlignedBuf::new_zeroed(0, 4096).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_pool_is_an_error_not_a_panic() {
+        assert_eq!(
+            BufferPool::new(0, 4096, 4096).unwrap_err(),
+            BufferPoolError::ZeroCapacity
+        );
+        assert!(BufferPoolConfig::default()
+            .with_capacity(0)
+            .build()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_pool_take_is_an_error_not_a_panic() {
+        let pool = BufferPool::new(1, 4096, 4096).unwrap();
+        pool.permits.close();
+        assert_eq!(pool.take().await.unwrap_err(), BufferPoolError::Closed);
     }
 }

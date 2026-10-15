@@ -20,9 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, info, trace, warn};
 
 use crate::constants::{
-    direct_io_bounce_size, DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD,
-    DEFAULT_DIRECT_IO_WRITER_STAGING_SIZE, DEFAULT_MIN_IO_SIZE, DEFAULT_PAGE_SIZE,
-    MAX_SINGLE_IO_BYTES,
+    DEFAULT_DIRECTIO_RANGE_ENGINE_THRESHOLD, DEFAULT_DIRECT_IO_WRITER_STAGING_SIZE,
+    DEFAULT_MIN_IO_SIZE, DEFAULT_PAGE_SIZE, MAX_SINGLE_IO_BYTES,
 };
 use crate::object_store::{CompressionConfig, ObjectMetadata, ObjectStore, ObjectWriter};
 
@@ -81,14 +80,13 @@ impl FileSystemConfig {
 
         // Create buffer pool for DirectIO operations (v0.9.9+)
         // Pool size matches range concurrency to avoid blocking
-        let buffer_pool = Some(
-            BufferPoolConfig {
-                capacity: 32,                  // 32 buffers in pool
-                buffer_size: 64 * 1024 * 1024, // 64MB per buffer (matches chunk_size)
-                alignment: page_size,
-            }
-            .build(),
-        );
+        let buffer_pool = BufferPoolConfig {
+            capacity: 32,                  // 32 buffers in pool
+            buffer_size: 64 * 1024 * 1024, // 64MB per buffer (matches chunk_size)
+            alignment: page_size,
+        }
+        .build()
+        .ok();
 
         Self {
             direct_io: true,
@@ -112,14 +110,13 @@ impl FileSystemConfig {
         let page_size = get_system_page_size();
 
         // Create buffer pool for high-performance DirectIO (v0.9.9+)
-        let buffer_pool = Some(
-            BufferPoolConfig {
-                capacity: 32,
-                buffer_size: 64 * 1024 * 1024,
-                alignment: page_size,
-            }
-            .build(),
-        );
+        let buffer_pool = BufferPoolConfig {
+            capacity: 32,
+            buffer_size: 64 * 1024 * 1024,
+            alignment: page_size,
+        }
+        .build()
+        .ok();
 
         Self {
             direct_io: true,
@@ -137,6 +134,12 @@ impl FileSystemConfig {
             buffer_pool,
         }
     }
+}
+
+/// Get the system page size for proper O_DIRECT alignment
+/// The system page size (the O_DIRECT alignment default).
+pub(crate) fn system_page_size() -> usize {
+    get_system_page_size()
 }
 
 /// Get the system page size for proper O_DIRECT alignment
@@ -289,6 +292,8 @@ pub fn direct_io_counters() -> DirectIoCounters {
 thread_local! {
     /// fsync calls made by this thread's direct writers (test hook for issue #249).
     static SYNC_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Writes a direct writer made straight from the caller's memory (test hook).
+    static FROM_CALLER_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// `fsync`, counted in tests.
@@ -326,19 +331,24 @@ fn blocking_io<R>(f: impl FnOnce() -> R) -> R {
 /// Allocation function used for bounce buffers (injectable so tests can simulate failure).
 type AllocFn<'a> = &'a dyn Fn(usize, usize) -> Result<AlignedBuf, AlignedAllocError>;
 
-/// Plan and allocate the bounce buffer for `len` bytes, halving the bounce size when the
-/// allocation fails (down to one alignment unit) instead of aborting.
+/// PUT `data[base..]` through a private, per-call bounce buffer (the path for small objects, for
+/// the benchmark's per-call strategy, and when the shared pool is unavailable). The buffer holds
+/// one chunk; when it cannot be allocated the chunk size is halved (down to one alignment unit)
+/// instead of aborting, and only then does this return an error (the caller falls back to
+/// buffered I/O). Chunks are copied and written one after the other.
 #[cfg(unix)]
-fn plan_with_bounce(
-    len: usize,
-    src_addr: usize,
+fn per_call_bounce_put(
+    file: &std::fs::File,
+    data: &[u8],
+    base: usize,
     alignment: usize,
     bounce_size: usize,
     alloc: AllocFn<'_>,
-) -> Result<(Vec<DirectIoStep>, Option<AlignedBuf>)> {
+) -> Result<()> {
+    let len = data.len() - base;
     let mut bounce_size = bounce_size;
     loop {
-        let steps = plan_direct_write(len, src_addr, alignment, bounce_size, MAX_SINGLE_IO_BYTES);
+        let steps = plan_bounce_steps(len, alignment, bounce_size);
         let need = steps
             .iter()
             .filter_map(|s| match s {
@@ -347,11 +357,8 @@ fn plan_with_bounce(
             })
             .max()
             .unwrap_or(0);
-        if need == 0 {
-            return Ok((steps, None));
-        }
-        match alloc(need, alignment) {
-            Ok(buf) => return Ok((steps, Some(buf))),
+        let mut buf = match alloc(need, alignment) {
+            Ok(b) => b,
             Err(e) => {
                 let smaller = round_down(need / 2, alignment);
                 if smaller < alignment {
@@ -361,27 +368,57 @@ fn plan_with_bounce(
                     "cannot allocate a {need} byte O_DIRECT bounce buffer; retrying with {smaller}"
                 );
                 bounce_size = smaller;
+                continue;
+            }
+        };
+        for step in steps {
+            if let DirectIoStep::ViaBounce {
+                offset,
+                data_len,
+                io_len,
+            } = step
+            {
+                // SAFETY: the buffer holds at least `io_len` bytes (sized for the largest
+                // step); `[0, data_len)` is copied from `data`, `[data_len, io_len)` is
+                // zero-filled, so the `io_len` bytes read below are initialised.
+                let out = unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(base + offset),
+                        buf.as_mut_ptr(),
+                        data_len,
+                    );
+                    std::ptr::write_bytes(buf.as_mut_ptr().add(data_len), 0, io_len - data_len);
+                    std::slice::from_raw_parts(buf.as_ptr(), io_len)
+                };
+                write_all_at(file, out, (base + offset) as u64)?;
             }
         }
+        return Ok(());
     }
 }
 
-/// Write all of `data` to `file` (opened with O_DIRECT) following [`plan_direct_write`],
-/// then truncate the file to `data.len()` when the last block was padded.
+/// Write all of `data` to `file` (opened with O_DIRECT), then truncate the file to
+/// `data.len()` when the last block was padded.
+///
+/// * A page-aligned source is written straight from the caller's memory, as one `write` per at
+///   most 2 GiB; the unaligned tail is one zero-padded block.
+/// * Any other source goes through the bounce buffers chosen by the process-wide
+///   [`crate::direct_bounce`] configuration: the shared warm ping-pong pool by default (the copy
+///   of chunk `k+1` overlaps the write of chunk `k`), or a private per-call buffer for small
+///   objects and when the pool is unavailable.
 ///
 /// `write_all_at` resumes after a short write, so a partial write is never lost; if a short
 /// write leaves the next offset unaligned the kernel refuses it (EINVAL) and the caller's
-/// buffered fallback rewrites the whole file. A failed bounce-buffer allocation retries with
-/// half the size instead of panicking; only when even one alignment unit cannot be had does
-/// it return an error (and the caller falls back to buffered I/O).
+/// buffered fallback rewrites the whole file.
 #[cfg(unix)]
-pub(crate) fn write_all_direct(
-    file: &std::fs::File,
-    data: &[u8],
-    alignment: usize,
-    bounce_size: usize,
-) -> Result<()> {
-    write_all_direct_with(file, data, alignment, bounce_size, &AlignedBuf::new)
+pub(crate) fn write_all_direct(file: &std::fs::File, data: &[u8], alignment: usize) -> Result<()> {
+    write_all_direct_with(
+        file,
+        data,
+        alignment,
+        crate::direct_bounce::config().put,
+        &AlignedBuf::new,
+    )
 }
 
 #[cfg(unix)]
@@ -389,19 +426,27 @@ fn write_all_direct_with(
     file: &std::fs::File,
     data: &[u8],
     alignment: usize,
-    bounce_size: usize,
+    strategy: crate::direct_bounce::PutStrategy,
     alloc: AllocFn<'_>,
 ) -> Result<()> {
-    let (steps, mut bounce) = plan_with_bounce(
+    use crate::direct_bounce::{pooled_put, use_pool_for, PutChunk, PutStrategy};
+
+    let alignment = alignment.max(1);
+    let cap = match strategy {
+        PutStrategy::Pooled => crate::direct_bounce::config().buffer_size,
+        PutStrategy::PerCall { cap } => cap,
+    };
+    let steps = plan_direct_write(
         data.len(),
         data.as_ptr() as usize,
         alignment,
-        bounce_size,
-        alloc,
-    )?;
+        cap,
+        MAX_SINGLE_IO_BYTES,
+    );
 
-    for step in steps {
-        match step {
+    let mut chunks = Vec::new();
+    for step in &steps {
+        match *step {
             DirectIoStep::FromSource { offset, len } => {
                 write_all_at(file, &data[offset..offset + len], offset as u64)?;
             }
@@ -409,29 +454,28 @@ fn write_all_direct_with(
                 offset,
                 data_len,
                 io_len,
-            } => {
-                let Some(bounce) = bounce.as_mut() else {
-                    bail!("internal error: bounce step planned without a bounce buffer");
-                };
-                // SAFETY: the buffer holds at least `io_len` bytes (it was sized for the
-                // largest bounce step); `[0, data_len)` is copied from `data`, `[data_len,
-                // io_len)` is zero-filled, so the `io_len` bytes read below are initialised.
-                let buf = unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(offset),
-                        bounce.as_mut_ptr(),
-                        data_len,
-                    );
-                    std::ptr::write_bytes(bounce.as_mut_ptr().add(data_len), 0, io_len - data_len);
-                    std::slice::from_raw_parts(bounce.as_ptr(), io_len)
-                };
-                write_all_at(file, buf, offset as u64)?;
-            }
+            } => chunks.push(PutChunk {
+                offset,
+                data_len,
+                io_len,
+            }),
+        }
+    }
+
+    if let Some(first) = chunks.first() {
+        let need = chunks.iter().map(|c| c.io_len).max().unwrap_or(0);
+        let pooled = matches!(strategy, PutStrategy::Pooled)
+            && use_pool_for(need)
+            && pooled_put(&chunks, data, alignment, &|off, bytes| {
+                write_all_at(file, bytes, off)
+            })?;
+        if !pooled {
+            per_call_bounce_put(file, data, first.offset, alignment, cap, alloc)?;
         }
     }
 
     // Remove the zero padding of the last block (none when the length is aligned).
-    if !data.len().is_multiple_of(alignment.max(1)) {
+    if !data.len().is_multiple_of(alignment) {
         file.set_len(data.len() as u64)?;
     }
     Ok(())
@@ -453,40 +497,146 @@ impl AsRef<[u8]> for AlignedBytes {
     }
 }
 
-/// Read `file_size` bytes from `file` (opened with O_DIRECT) straight into ONE page-aligned
-/// buffer, one `read` per at most [`MAX_SINGLE_IO_BYTES`], and return that buffer as `Bytes`.
-/// An allocation failure is returned as an error so the caller can fall back to buffered I/O.
+/// `pread` into raw memory, retrying EINTR. Returns the bytes read (0 at EOF).
+#[cfg(unix)]
+fn pread_raw(
+    file: &std::fs::File,
+    buf: crate::direct_bounce::SendPtr,
+    len: usize,
+    offset: u64,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: the caller guarantees `buf` is valid for `len` bytes of writes.
+        let n = unsafe {
+            libc::pread(
+                file.as_raw_fd(),
+                buf.0 as *mut libc::c_void,
+                len,
+                offset as libc::off_t,
+            )
+        };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// Read `file_size` bytes of `file` (opened with O_DIRECT) into `dest` (any alignment) through
+/// the shared bounce pool: the read of chunk `k+1` overlaps the copy of chunk `k`. This is the
+/// building block of a caller-supplied-buffer GET (`get_into`).
+///
+/// Errors when the file is shorter than `file_size` (it shrank), so the caller can fall back to
+/// a buffered read.
+///
+/// # Safety
+/// `dest` must be valid for `file_size` bytes of writes and not be used meanwhile.
+#[cfg(unix)]
+#[allow(dead_code)] // the public get_into that calls it is a later step
+pub(crate) unsafe fn read_all_direct_into(
+    file: &std::fs::File,
+    file_size: usize,
+    alignment: usize,
+    dest: *mut u8,
+) -> Result<()> {
+    use crate::direct_bounce::{pooled_get, SendPtr};
+
+    let alignment = alignment.max(1);
+    let dest = SendPtr(dest);
+    let read_at = |buf, len, off| pread_raw(file, buf, len, off);
+    if crate::direct_bounce::use_pool_for(file_size)
+        && pooled_get(file_size, alignment, dest, &read_at)?
+    {
+        return Ok(());
+    }
+    // No pool (small object, or it could not be created): one private bounce buffer.
+    let size = crate::direct_bounce::config()
+        .buffer_size
+        .min(round_up(file_size, alignment));
+    let buf = AlignedBuf::new(size, alignment)?;
+    let ptr = [SendPtr(buf.as_ptr() as *mut u8)];
+    crate::direct_bounce::pingpong_get(file_size, alignment, size, dest, &ptr, &read_at, &|_| {})?;
+    Ok(())
+}
+
+/// Read `file_size` bytes from `file` (opened with O_DIRECT) and return them as `Bytes` backed by
+/// ONE page-aligned buffer (so a later `direct://` PUT of the result is copy-free).
+///
+/// By default (`S3DLIO_DIRECT_IO_GET_MODE=direct`) the buffer is read into directly, one `pread`
+/// per at most [`MAX_SINGLE_IO_BYTES`]: zero copies, but fresh pages are faulted in on every
+/// call. With `pooled` the object goes through the shared warm bounce pool instead (one copy into
+/// the destination). Which is faster depends on load; see `docs/Environment_Variables.md`.
+///
+/// Errors when the file is shorter than `file_size` (it shrank), so the caller's buffered
+/// fallback re-reads it, and when the aligned allocation fails.
 #[cfg(unix)]
 pub(crate) fn read_all_direct(
     file: &std::fs::File,
     file_size: usize,
     alignment: usize,
 ) -> Result<Bytes> {
-    use std::os::unix::fs::FileExt;
+    read_all_direct_with(
+        file,
+        file_size,
+        alignment,
+        crate::direct_bounce::config().get,
+    )
+}
+
+#[cfg(unix)]
+fn read_all_direct_with(
+    file: &std::fs::File,
+    file_size: usize,
+    alignment: usize,
+    strategy: crate::direct_bounce::GetStrategy,
+) -> Result<Bytes> {
+    use crate::direct_bounce::{pooled_get, GetStrategy, SendPtr};
 
     if file_size == 0 {
         return Ok(Bytes::new());
     }
+    let alignment = alignment.max(1);
     let capacity = round_up(file_size, alignment);
     let buf = AlignedBuf::new(capacity, alignment)?;
-    let max_io = round_down(MAX_SINGLE_IO_BYTES, alignment).max(alignment);
+    let dest = SendPtr(buf.as_ptr() as *mut u8);
+    let read_at = |b, len, off| pread_raw(file, b, len, off);
 
-    let mut total = 0usize;
-    while total < file_size {
-        // Whole alignment units at an aligned offset; the last read may come back short at EOF.
-        let want = (capacity - total).min(max_io);
-        // SAFETY: `[total, total + want)` lies inside the allocation; the kernel overwrites it.
-        let dst =
-            unsafe { std::slice::from_raw_parts_mut(buf.as_ptr().add(total) as *mut u8, want) };
-        match file.read_at(dst, total as u64) {
-            Ok(0) => break, // EOF (file shrank)
-            Ok(n) => total += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
+    // SAFETY: `dest` is valid for `capacity >= file_size` bytes and exclusively ours.
+    let pooled = matches!(strategy, GetStrategy::Pooled)
+        && crate::direct_bounce::use_pool_for(file_size)
+        && unsafe { pooled_get(file_size, alignment, dest, &read_at)? };
+    if !pooled {
+        let max_io = round_down(MAX_SINGLE_IO_BYTES, alignment).max(alignment);
+        let mut total = 0usize;
+        while total < file_size {
+            // Whole alignment units at an aligned offset; the last read may come back short at EOF.
+            let want = (capacity - total).min(max_io);
+            // SAFETY: `[total, total + want)` lies inside the allocation; the kernel fills it.
+            let n = pread_raw(
+                file,
+                SendPtr(unsafe { dest.0.add(total) }),
+                want,
+                total as u64,
+            )?;
+            if n == 0 {
+                break; // EOF
+            }
+            total += n;
+        }
+        if total < file_size {
+            bail!("direct read returned {total} of {file_size} bytes (file shrank)");
         }
     }
-    let len = total.min(file_size);
-    Ok(Bytes::from_owner(AlignedBytes { buf, len }))
+    // SAFETY: every byte of `[0, file_size)` was written by the reads above.
+    unsafe { buf.assume_init() };
+    Ok(Bytes::from_owner(AlignedBytes {
+        buf,
+        len: file_size,
+    }))
 }
 
 /// Streaming writer for direct I/O filesystem operations
@@ -500,6 +650,15 @@ pub(crate) fn read_all_direct(
 ///
 /// Data is made durable ONCE, at `finalize` (like the other backends), unless
 /// `FileSystemConfig::sync_writes` is set, which asks for an fsync after every write.
+///
+/// A chunk that starts off a page boundary after earlier data was staged is topped up to the
+/// next boundary and the rest is written from the caller's memory when that rest happens to start
+/// page-aligned; otherwise it keeps going through the staging buffer (one copy).
+///
+/// **Partial files.** The file is created when the writer is. If a write fails, or the writer is
+/// dropped without `finalize()`, the file stays on disk holding only what had been flushed (a
+/// multiple of the staging size; the staged remainder is lost) and is NOT removed. Call
+/// `cancel()` to delete it.
 pub struct DirectIOWriter {
     /// Buffered mode (`direct_io == false`).
     file: Option<fs::File>,
@@ -652,52 +811,92 @@ impl DirectIOWriter {
         let alignment = self.config.alignment.max(1);
         let max_io = round_down(MAX_SINGLE_IO_BYTES, alignment).max(alignment);
         while !data.is_empty() {
+            // Data is already staged (an earlier chunk ended off a block boundary): top the
+            // staging buffer up to the next boundary, write it, and carry on from the caller's
+            // memory - but only when the rest of this chunk starts page-aligned, which depends
+            // on the caller's buffer (otherwise the chunk keeps going through the staging
+            // buffer: one copy).
+            if self.staged != 0 {
+                let gap = self.staged.next_multiple_of(alignment) - self.staged;
+                if data.len() >= gap + alignment
+                    && (data.as_ptr() as usize + gap).is_multiple_of(alignment)
+                {
+                    if gap > 0 {
+                        self.copy_into_staging(&data[..gap])?;
+                    }
+                    let staged = self.staged;
+                    self.flush_staging(staged)?;
+                    self.staged = 0;
+                    data = &data[gap..];
+                    continue;
+                }
+            }
             if self.staged == 0
                 && data.len() >= alignment
                 && (data.as_ptr() as usize).is_multiple_of(alignment)
             {
                 // Straight from the caller's memory: no copy.
                 let n = round_down(data.len(), alignment).min(max_io);
+                #[cfg(test)]
+                FROM_CALLER_WRITES.with(|c| c.set(c.get() + 1));
                 self.write_direct(&data[..n])?;
                 data = &data[n..];
                 continue;
             }
-            if self.staging.is_none() {
-                // Allocation failure is an error to the caller, never a panic; halve until it fits.
-                let mut cap = self.staging_cap;
-                let buf = loop {
-                    match AlignedBuf::new(cap, alignment) {
-                        Ok(b) => break b,
-                        Err(e) => {
-                            cap = round_down(cap / 2, alignment);
-                            if cap < alignment {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                };
-                self.staging_cap = buf.len();
-                self.staging = Some(buf);
-            }
+            self.ensure_staging()?;
             let cap = self.staging_cap;
             let k = (cap - self.staged).min(data.len());
-            if let Some(staging) = self.staging.as_mut() {
-                // SAFETY: `staged + k <= cap` stays inside the allocation.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        staging.as_mut_ptr().add(self.staged),
-                        k,
-                    );
-                }
-            }
-            self.staged += k;
+            self.copy_into_staging(&data[..k])?;
             data = &data[k..];
             if self.staged == cap {
                 self.flush_staging(cap)?;
                 self.staged = 0;
             }
         }
+        Ok(())
+    }
+
+    /// Allocate the staging buffer on first use.
+    fn ensure_staging(&mut self) -> Result<()> {
+        if self.staging.is_some() {
+            return Ok(());
+        }
+        let alignment = self.config.alignment.max(1);
+        // Allocation failure is an error to the caller, never a panic; halve until it fits.
+        let mut cap = self.staging_cap;
+        let buf = loop {
+            match AlignedBuf::new(cap, alignment) {
+                Ok(b) => break b,
+                Err(e) => {
+                    cap = round_down(cap / 2, alignment);
+                    if cap < alignment {
+                        return Err(e.into());
+                    }
+                }
+            }
+        };
+        self.staging_cap = buf.len();
+        self.staging = Some(buf);
+        Ok(())
+    }
+
+    /// Append `data` to the staging buffer (which must have room: `staged + len <= cap`).
+    fn copy_into_staging(&mut self, data: &[u8]) -> Result<()> {
+        self.ensure_staging()?;
+        if self.staged + data.len() > self.staging_cap {
+            bail!("internal error: staging buffer overflow");
+        }
+        if let Some(staging) = self.staging.as_mut() {
+            // SAFETY: `staged + data.len() <= cap` stays inside the allocation.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    staging.as_mut_ptr().add(self.staged),
+                    data.len(),
+                );
+            }
+        }
+        self.staged += data.len();
         Ok(())
     }
 }
@@ -922,6 +1121,11 @@ impl ConfigurableFileSystemObjectStore {
     }
 
     /// Convert a URI to a filesystem path (accepts both file:// and direct:// schemes)
+    /// The O_DIRECT alignment, never 0 (a 0 in the config would divide by zero).
+    fn alignment(&self) -> usize {
+        self.config.alignment.max(1)
+    }
+
     fn uri_to_path(uri: &str) -> Result<PathBuf> {
         let path = if let Some(stripped) = uri.strip_prefix("file://") {
             stripped // Strip "file://" prefix
@@ -1090,7 +1294,7 @@ impl ConfigurableFileSystemObjectStore {
         #[cfg(unix)]
         {
             let path = path.to_owned();
-            let alignment = self.config.alignment;
+            let alignment = self.alignment();
 
             // Use spawn_blocking to run sync I/O in thread pool
             tokio::task::spawn_blocking(move || -> Result<Bytes> {
@@ -1167,9 +1371,8 @@ impl ConfigurableFileSystemObjectStore {
         #[cfg(unix)]
         {
             let path = path.to_owned();
-            let alignment = self.config.alignment;
+            let alignment = self.alignment();
             let sync_writes = self.config.sync_writes;
-            let bounce_size = direct_io_bounce_size();
 
             // Use spawn_blocking for sync I/O
             tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1190,7 +1393,7 @@ impl ConfigurableFileSystemObjectStore {
 
                 // One write for the whole aligned body when `data` is aligned, otherwise
                 // bounce-buffer-sized writes (issue #244); never one 4 KiB block per call.
-                write_all_direct(&file, data.as_ref(), alignment, bounce_size)?;
+                write_all_direct(&file, data.as_ref(), alignment)?;
                 DIRECT_PUTS.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             })
@@ -1270,7 +1473,7 @@ impl ConfigurableFileSystemObjectStore {
         length: Option<u64>,
     ) -> Result<Bytes> {
         // O_DIRECT range read requires careful alignment
-        let alignment = self.config.alignment as u64;
+        let alignment = self.alignment() as u64;
         let aligned_offset = (offset / alignment) * alignment;
         let offset_adjustment = (offset - aligned_offset) as usize;
 
@@ -1299,8 +1502,16 @@ impl ConfigurableFileSystemObjectStore {
             }
         };
 
-        let total_length = offset_adjustment + read_length as usize;
-        let aligned_length = total_length.div_ceil(self.config.alignment) * self.config.alignment;
+        // Checked arithmetic: a huge offset/length must be an error, not a wrapped size.
+        let too_big =
+            || anyhow::anyhow!("range read of {read_length} bytes at offset {offset} is too large");
+        let total_length = usize::try_from(read_length)
+            .ok()
+            .and_then(|l| offset_adjustment.checked_add(l))
+            .ok_or_else(too_big)?;
+        let aligned_length = total_length
+            .checked_next_multiple_of(self.alignment())
+            .ok_or_else(too_big)?;
 
         // Borrow aligned buffer from pool if available, otherwise allocate fresh (v0.9.9+)
         let mut aligned: AlignedBuf = if let Some(pool) = &self.config.buffer_pool {
@@ -1312,13 +1523,13 @@ impl ConfigurableFileSystemObjectStore {
                     b.len(),
                     aligned_length
                 );
-                AlignedBuf::new(aligned_length, self.config.alignment)?
+                AlignedBuf::new(aligned_length, self.alignment())?
             } else {
                 b
             }
         } else {
             // No pool configured, allocate fresh buffer
-            AlignedBuf::new(aligned_length, self.config.alignment)?
+            AlignedBuf::new(aligned_length, self.alignment())?
         };
 
         let options = self.create_open_options(true, false);
@@ -1975,7 +2186,8 @@ mod direct_io_chunking_tests {
     //! The planner tests are the structural proof (how many system calls, how large); the
     //! round-trip tests use a REAL O_DIRECT file (no buffered fallback in between).
     use super::*;
-    use crate::constants::DEFAULT_DIRECT_IO_BOUNCE_SIZE;
+    use crate::constants::{DEFAULT_DIRECT_IO_BOUNCE_SIZE, DEFAULT_DIRECT_IO_WRITER_STAGING_SIZE};
+    use crate::direct_bounce::{GetStrategy, PutStrategy};
 
     const A: usize = 4096;
     const MIB: usize = 1024 * 1024;
@@ -2049,16 +2261,17 @@ mod direct_io_chunking_tests {
         );
     }
 
-    /// Round 2, item 3: with the default cap an unaligned object up to 1 GiB is ONE write.
+    /// The per-call arm with a 1 GiB cap (kept for comparison): an unaligned object up to 1 GiB
+    /// is ONE write; the default pooled chunk is 64 MiB, so 1 GiB is 16 pipelined writes.
     #[test]
-    fn default_bounce_makes_an_unaligned_gib_one_write() {
-        assert_eq!(DEFAULT_DIRECT_IO_BOUNCE_SIZE, GIB);
+    fn per_call_gib_cap_is_one_write_and_the_default_pool_chunk_is_64_mib() {
         for len in [MIB + 3, 512 * MIB, GIB] {
-            let steps = plan_direct_write(len, 16, A, DEFAULT_DIRECT_IO_BOUNCE_SIZE, MAX_IO);
+            let steps = plan_direct_write(len, 16, A, GIB, MAX_IO);
             assert_eq!(steps.len(), 1, "{len}: {steps:?}");
         }
-        let steps = plan_direct_write(GIB + 1, 16, A, DEFAULT_DIRECT_IO_BOUNCE_SIZE, MAX_IO);
-        assert_eq!(steps.len(), 2);
+        assert_eq!(DEFAULT_DIRECT_IO_BOUNCE_SIZE, 64 * MIB);
+        let steps = plan_direct_write(GIB, 16, A, DEFAULT_DIRECT_IO_BOUNCE_SIZE, MAX_IO);
+        assert_eq!(steps.len(), 16);
     }
 
     #[test]
@@ -2123,18 +2336,35 @@ mod direct_io_chunking_tests {
         use super::*;
         use std::os::unix::fs::OpenOptionsExt;
 
-        /// O_DIRECT is unsupported on tmpfs; the cargo target dir is on a real filesystem.
-        fn dir() -> tempfile::TempDir {
+        /// A scratch dir on a filesystem that supports O_DIRECT (`S3DLIO_TEST_DIR`, else the
+        /// cargo target dir). O_DIRECT is unsupported on tmpfs: then the test is SKIPPED with a
+        /// message instead of failing in an unwrap.
+        fn dir() -> Option<tempfile::TempDir> {
             let base = std::env::var_os("S3DLIO_TEST_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| {
                     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp")
                 });
             std::fs::create_dir_all(&base).unwrap();
-            tempfile::Builder::new()
+            let d = tempfile::Builder::new()
                 .prefix("direct-chunking-244-")
                 .tempdir_in(base)
-                .unwrap()
+                .unwrap();
+            let probe = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(d.path().join("probe"));
+            if let Err(e) = probe {
+                eprintln!(
+                    "SKIPPED: {} does not support O_DIRECT ({e}); set S3DLIO_TEST_DIR to a \
+                     directory on a real filesystem (not tmpfs)",
+                    d.path().display()
+                );
+                return None;
+            }
+            Some(d)
         }
 
         fn pattern(len: usize) -> Vec<u8> {
@@ -2155,8 +2385,8 @@ mod direct_io_chunking_tests {
 
         const SIZES: [usize; 8] = [0, 1, 4095, 4096, 4097, MIB + 3, 33 * MIB, 64 * MIB + 5];
 
-        fn check(len: usize, aligned_src: bool, bounce: usize) {
-            let d = dir();
+        fn check(len: usize, aligned_src: bool, strategy: PutStrategy) {
+            let Some(d) = dir() else { return };
             let path = d.path().join("f.bin");
             let raw = pattern(len);
 
@@ -2173,7 +2403,8 @@ mod direct_io_chunking_tests {
             }
 
             let file = open_direct_write(&path);
-            write_all_direct(&file, data, A, bounce).expect("O_DIRECT write");
+            write_all_direct_with(&file, data, A, strategy, &AlignedBuf::new)
+                .expect("O_DIRECT write");
             drop(file);
             assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, len);
             assert_eq!(std::fs::read(&path).unwrap(), raw, "len {len}");
@@ -2184,43 +2415,114 @@ mod direct_io_chunking_tests {
                     .custom_flags(libc::O_DIRECT)
                     .open(&path)
                     .unwrap();
-                let back = read_all_direct(&rf, len, A).expect("O_DIRECT read");
-                assert_eq!(back.as_ref(), raw.as_slice(), "read back, len {len}");
-                assert_eq!(
-                    back.as_ptr() as usize % A,
-                    0,
-                    "a direct GET must return page-aligned memory (len {len})"
-                );
+                for get in [GetStrategy::Direct, GetStrategy::Pooled] {
+                    let back = read_all_direct_with(&rf, len, A, get).expect("O_DIRECT read");
+                    assert_eq!(
+                        back.as_ref(),
+                        raw.as_slice(),
+                        "read back {get:?}, len {len}"
+                    );
+                    assert_eq!(
+                        back.as_ptr() as usize % A,
+                        0,
+                        "a direct GET must return page-aligned memory ({get:?}, len {len})"
+                    );
+                }
+            }
+        }
+
+        const PER_CALL_1GIB: PutStrategy = PutStrategy::PerCall { cap: GIB };
+        const PER_CALL_64MIB: PutStrategy = PutStrategy::PerCall { cap: BOUNCE };
+
+        #[test]
+        fn roundtrip_matrix_unaligned_source_pooled() {
+            for len in SIZES {
+                check(len, false, PutStrategy::Pooled);
             }
         }
 
         #[test]
-        fn roundtrip_matrix_unaligned_source() {
+        fn roundtrip_matrix_unaligned_source_per_call() {
             for len in SIZES {
-                check(len, false, BOUNCE);
+                check(len, false, PER_CALL_1GIB);
+                check(len, false, PER_CALL_64MIB);
             }
         }
 
         #[test]
         fn roundtrip_matrix_aligned_source() {
             for len in SIZES {
-                check(len, true, BOUNCE);
+                check(len, true, PutStrategy::Pooled);
+                check(len, true, PER_CALL_64MIB);
             }
+        }
+
+        /// Three pooled chunks through a real O_DIRECT file (default 64 MiB buffers).
+        #[test]
+        fn pooled_put_of_many_chunks_roundtrips() {
+            check(130 * MIB + 7, false, PutStrategy::Pooled);
         }
 
         #[test]
         fn roundtrip_with_a_small_bounce_buffer_uses_many_steps_correctly() {
             for len in [1, 4097, MIB + 3, 5 * MIB + 17] {
-                check(len, false, 64 * A);
-                check(len, true, 64 * A);
+                check(len, false, PutStrategy::PerCall { cap: 64 * A });
+                check(len, true, PutStrategy::PerCall { cap: 64 * A });
             }
+        }
+
+        /// A caller-supplied destination of any alignment is filled through the shared pool
+        /// (the building block of `get_into`), for objects above and below the pool threshold.
+        #[test]
+        fn read_into_an_unaligned_destination_through_the_pool() {
+            let Some(d) = dir() else { return };
+            for len in [4097, MIB + 3, 70 * MIB + 11] {
+                let raw = pattern(len);
+                let path = d.path().join("g.bin");
+                std::fs::write(&path, &raw).unwrap();
+                let rf = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .unwrap();
+                for off in [0usize, 3, 16, A + 1] {
+                    let mut dest = vec![0x77u8; len + off + 8];
+                    // SAFETY: dest has room for len bytes at off.
+                    unsafe { read_all_direct_into(&rf, len, A, dest.as_mut_ptr().add(off)) }
+                        .unwrap();
+                    assert_eq!(&dest[off..off + len], raw.as_slice(), "len {len} off {off}");
+                    assert!(dest[..off].iter().all(|&b| b == 0x77));
+                    assert!(dest[off + len..].iter().all(|&b| b == 0x77));
+                }
+            }
+        }
+
+        /// A file that is shorter than its size claims (it shrank) is an error in every GET
+        /// strategy, so the caller's buffered fallback re-reads it.
+        #[test]
+        fn a_file_that_shrank_is_an_error_so_the_buffered_fallback_rereads() {
+            let Some(d) = dir() else { return };
+            let path = d.path().join("s.bin");
+            std::fs::write(&path, pattern(8 * MIB)).unwrap();
+            let rf = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(&path)
+                .unwrap();
+            for get in [GetStrategy::Direct, GetStrategy::Pooled] {
+                let e = read_all_direct_with(&rf, 16 * MIB, A, get)
+                    .expect_err("claimed size is larger than the file");
+                assert!(!e.to_string().is_empty(), "{get:?}");
+            }
+            let mut dest = vec![0u8; 16 * MIB];
+            assert!(unsafe { read_all_direct_into(&rf, 16 * MIB, A, dest.as_mut_ptr()) }.is_err());
         }
 
         /// Round 2, item 3: a failed bounce allocation retries with half the size, and only
         /// gives up (an error, never a panic) when not even one alignment unit can be had.
         #[test]
         fn bounce_allocation_failure_falls_back_to_a_smaller_buffer_then_errors() {
-            let d = dir();
+            let Some(d) = dir() else { return };
             let raw = pattern(5 * MIB + 17);
 
             // Allocation of anything over 1 MiB "fails": the write must still succeed.
@@ -2233,7 +2535,8 @@ mod direct_io_chunking_tests {
                     AlignedBuf::new(len, align)
                 }
             };
-            write_all_direct_with(&file, &raw, A, 64 * MIB, &limited).expect("smaller bounce");
+            write_all_direct_with(&file, &raw, A, PER_CALL_64MIB, &limited)
+                .expect("smaller bounce");
             drop(file);
             assert_eq!(std::fs::read(&path).unwrap(), raw);
 
@@ -2241,13 +2544,13 @@ mod direct_io_chunking_tests {
             let path = d.path().join("b.bin");
             let file = open_direct_write(&path);
             let never = |len: usize, align: usize| Err(AlignedAllocError { len, align });
-            assert!(write_all_direct_with(&file, &raw, A, 64 * MIB, &never).is_err());
+            assert!(write_all_direct_with(&file, &raw, A, PER_CALL_64MIB, &never).is_err());
         }
 
         /// Round 2, item 5 (#249): the stream is made durable once, at finalize, not per flush.
         #[tokio::test]
         async fn streaming_writer_syncs_once_not_per_flush() {
-            let d = dir();
+            let Some(d) = dir() else { return };
             let path = d.path().join("w.bin");
             let cfg = FileSystemConfig::direct_io();
             let before = SYNC_CALLS.with(|c| c.get());
@@ -2269,7 +2572,7 @@ mod direct_io_chunking_tests {
         /// `sync_writes` is the explicit request for per-write durability and is honoured.
         #[tokio::test]
         async fn streaming_writer_honours_sync_writes() {
-            let d = dir();
+            let Some(d) = dir() else { return };
             let path = d.path().join("w.bin");
             let cfg = FileSystemConfig {
                 sync_writes: true,
@@ -2290,6 +2593,133 @@ mod direct_io_chunking_tests {
                 "sync_writes must fsync after each write ({syncs})"
             );
             assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, 12 * MIB);
+        }
+
+        /// Round 3, item 8: after an unaligned chunk, a big chunk whose rest starts page-aligned
+        /// is topped up to the boundary and written from the caller's memory (no staging copy).
+        #[tokio::test]
+        async fn streaming_writer_tops_up_then_writes_from_the_callers_memory() {
+            let Some(d) = dir() else { return };
+            let path = d.path().join("t.bin");
+            let cfg = FileSystemConfig {
+                direct_io: true,
+                ..FileSystemConfig::default()
+            };
+            let mut w = Box::new(DirectIOWriter::new(path.clone(), cfg).await.unwrap());
+            let head = pattern(100); // staged: 100 bytes
+            w.write_chunk(&head).await.unwrap();
+            // The big chunk starts 100 bytes into a page-aligned buffer, so after a 3996-byte
+            // top-up the rest starts exactly on a page boundary.
+            let big = pattern(3 * MIB + 500);
+            let mut buf = AlignedBuf::new_zeroed(4 * MIB, A).unwrap();
+            buf.as_mut_slice()[100..100 + big.len()].copy_from_slice(&big);
+            let before = FROM_CALLER_WRITES.with(|c| c.get());
+            w.write_chunk(&buf.as_slice()[100..100 + big.len()])
+                .await
+                .unwrap();
+            assert!(
+                FROM_CALLER_WRITES.with(|c| c.get()) > before,
+                "the rest of the chunk was copied through staging"
+            );
+            w.finalize().await.unwrap();
+            let mut expect = head;
+            expect.extend_from_slice(&big);
+            assert_eq!(std::fs::read(&path).unwrap(), expect);
+        }
+
+        /// A chunk whose rest does NOT start page-aligned keeps going through staging (the
+        /// documented limit) and is still correct.
+        #[tokio::test]
+        async fn streaming_writer_unalignable_chunk_after_staged_data_is_still_correct() {
+            let Some(d) = dir() else { return };
+            let path = d.path().join("u.bin");
+            let cfg = FileSystemConfig {
+                direct_io: true,
+                ..FileSystemConfig::default()
+            };
+            let mut w = Box::new(DirectIOWriter::new(path.clone(), cfg).await.unwrap());
+            let head = pattern(100);
+            w.write_chunk(&head).await.unwrap();
+            let big = pattern(2 * MIB + 3);
+            let before = FROM_CALLER_WRITES.with(|c| c.get());
+            w.write_chunk(&big).await.unwrap(); // Vec memory: 16-byte aligned only
+            assert_eq!(FROM_CALLER_WRITES.with(|c| c.get()), before);
+            w.finalize().await.unwrap();
+            let mut expect = head;
+            expect.extend_from_slice(&big);
+            assert_eq!(std::fs::read(&path).unwrap(), expect);
+        }
+
+        /// Round 3, item 7: documented partial-file behaviour. A writer dropped before
+        /// `finalize()` leaves what was flushed (a multiple of the staging size); `cancel()`
+        /// removes the file.
+        #[tokio::test]
+        async fn dropped_writer_leaves_a_partial_file_and_cancel_removes_it() {
+            let Some(d) = dir() else { return };
+            let cfg = FileSystemConfig {
+                direct_io: true,
+                ..FileSystemConfig::default()
+            };
+            let staging = round_down(DEFAULT_DIRECT_IO_WRITER_STAGING_SIZE, A);
+
+            let kept = d.path().join("kept.bin");
+            let mut w = Box::new(
+                DirectIOWriter::new(kept.clone(), cfg.clone())
+                    .await
+                    .unwrap(),
+            );
+            let data = pattern(staging + 6 * MIB);
+            w.write_chunk(&data).await.unwrap();
+            drop(w); // no finalize
+            let on_disk = std::fs::read(&kept).unwrap();
+            assert_eq!(
+                on_disk.len(),
+                staging,
+                "only the flushed staging buffers remain"
+            );
+            assert_eq!(on_disk, data[..staging]);
+
+            let gone = d.path().join("gone.bin");
+            let mut w = Box::new(DirectIOWriter::new(gone.clone(), cfg).await.unwrap());
+            w.write_chunk(&data).await.unwrap();
+            w.cancel().await.unwrap();
+            assert!(!gone.exists(), "cancel() must remove the partial file");
+        }
+
+        /// Round 3, item 7: a configured alignment of 0 is clamped to 1, never a division by zero.
+        #[tokio::test]
+        async fn alignment_zero_in_the_config_does_not_panic() {
+            let Some(d) = dir() else { return };
+            let cfg = FileSystemConfig {
+                direct_io: true,
+                alignment: 0,
+                ..FileSystemConfig::default()
+            };
+            let store = ConfigurableFileSystemObjectStore::new(cfg);
+            let uri = format!("direct://{}/z.bin", d.path().display());
+            let raw = pattern(3 * MIB + 5);
+            store.put(&uri, Bytes::from(raw.clone())).await.unwrap();
+            assert_eq!(store.get(&uri).await.unwrap().as_ref(), raw.as_slice());
+            let part = store.get_range(&uri, 1000, Some(5000)).await.unwrap();
+            assert_eq!(part.as_ref(), &raw[1000..6000]);
+        }
+
+        /// Round 3, item 7: offset + length arithmetic is checked: an absurd range is an error,
+        /// not a wrapped size (debug builds used to panic on the overflow).
+        #[tokio::test]
+        async fn absurd_range_is_an_error_not_an_overflow() {
+            let Some(d) = dir() else { return };
+            let store = ConfigurableFileSystemObjectStore::new(FileSystemConfig {
+                direct_io: true,
+                ..FileSystemConfig::default()
+            });
+            let path = d.path().join("r.bin");
+            std::fs::write(&path, pattern(MIB)).unwrap();
+            let e = store
+                .try_read_range_direct(&path, 4097, Some(u64::MAX))
+                .await
+                .expect_err("range of u64::MAX bytes");
+            assert!(e.to_string().contains("too large"), "{e}");
         }
     }
 }
