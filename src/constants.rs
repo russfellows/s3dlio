@@ -861,10 +861,22 @@ pub const ENV_AZURE_IDENTITY_ENDPOINT: &str = "IDENTITY_ENDPOINT";
 /// Set by Azure ML / Cloud Shell hosts that offer a managed-identity endpoint.
 pub const ENV_AZURE_MSI_ENDPOINT: &str = "MSI_ENDPOINT";
 
-/// How long `auto` waits (for the connection, and for each read) when it asks the Azure instance
-/// metadata service (169.254.169.254:80) whether this is an Azure VM. On a VM the answer is
-/// immediate; elsewhere the connection fails or times out. Asked once per process.
+/// How long `auto` waits for the Azure instance metadata service (169.254.169.254:80) when it
+/// asks whether this is an Azure VM: this long to connect, then this long (one overall
+/// deadline) to read the answer, so a probe takes at most twice this (0.5 s). On a VM the
+/// answer is immediate; elsewhere the connection fails or times out. The probe runs on the
+/// blocking pool, and only when no other chain member decides first.
 pub const AZURE_IMDS_PROBE_TIMEOUT_MS: u64 = 250;
+
+/// How long a "the metadata service does not look like Azure" answer is believed, in seconds, so
+/// a failing `auto` chain does not probe again on every request.
+pub const AZURE_IMDS_NEGATIVE_CACHE_SECS: u64 = 30;
+
+/// Deadline for `auto`'s managed-identity attempt, in milliseconds (the SDK's own retry schedule
+/// for a metadata service that answers 404/410/5xx is about 72 s). Override with
+/// `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`.
+pub const DEFAULT_AZURE_AUTO_MI_TIMEOUT_MS: u64 = 5000;
+pub const ENV_AZURE_AUTO_MI_TIMEOUT_MS: &str = "S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS";
 
 // =============================================================================
 // GCS gRPC Read Timeout / Progress Constants

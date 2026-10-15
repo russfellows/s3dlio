@@ -37,6 +37,27 @@
 
 ### Fixed
 
+- **Container listing could send credentials to another host (#253 review, security).** `list-buckets az://...`
+  and Python `list_containers` put the raw text after `az://` into a host name, so `az://attacker.example#` built a
+  request to attacker.example carrying the bearer token or SAS. Every place that turns an account into a URL now
+  goes through one check: 3-24 lowercase letters and digits (upper case is accepted and lowercased, as host names
+  are case-insensitive), or with a custom endpoint any name free of `/ ? # @ \ %`, whitespace and control
+  characters. `%` is refused outright, so `%2e%2e` and `%2f` cannot smuggle a dot segment or a slash. Nothing is
+  sent and no credential is built for a refused name. `resolve_azure_account_url` now returns a `Result`, and
+  `is_azure_blob_host` ignores case.
+- **SAS material no longer survives in error text (#253 review).** The SDK re-sorts and re-encodes the query on
+  operations that set query pairs (list, container operations, block staging and commit), and transport errors print
+  the whole request URL, so replacing the exact token text missed them. Error text now loses the query of every URL in
+  it, every SAS parameter value (`sig`, `se`, `sp`, `skoid`, ...), and each value of the configured token as written,
+  decoded, encoded and double-encoded. `AzureRequestError` has a redacting `Debug`, and `redact_url` also strips
+  userinfo.
+- **`auto` no longer waits out the SDK's retry schedule on a VM without an identity (#253 review).** The managed
+  identity attempt in `auto` has a deadline (`S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`, default 5000 ms; the SDK retries a
+  404/410/5xx from the metadata service for about 72 s), after which `auto` moves on to `az`/`azd`. A "not Azure"
+  answer from the metadata probe is cached for 30 s (a failing chain no longer probes twice per request); a cached
+  `auto` winner that starts failing makes that request run the chain again, so a working member further down is found
+  without a restart; a configured service principal that fails before `auto` falls through is logged at `warn`. The
+  client-certificate file is read and parsed on the blocking pool at the first token request, not on a runtime worker.
 - **Deleting an `az://` object that is already gone succeeds again (#253 review).** Wrapping Azure errors to
   name the credential mode and hide a SAS token turned them into plain text, so the delete contract no longer
   recognised `BlobNotFound` and `delete`/`delete -r` failed for a blob that was already missing (or vanished

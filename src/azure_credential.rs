@@ -37,10 +37,11 @@ use azure_core::credentials::{AccessToken, Secret, TokenCredential, TokenRequest
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::constants::{
-    AZURE_IMDS_PROBE_TIMEOUT_MS, ENV_AZURE_CLIENT_CERTIFICATE_PATH, ENV_AZURE_CLIENT_ID,
+    AZURE_IMDS_NEGATIVE_CACHE_SECS, AZURE_IMDS_PROBE_TIMEOUT_MS, DEFAULT_AZURE_AUTO_MI_TIMEOUT_MS,
+    ENV_AZURE_AUTO_MI_TIMEOUT_MS, ENV_AZURE_CLIENT_CERTIFICATE_PATH, ENV_AZURE_CLIENT_ID,
     ENV_AZURE_CLIENT_SECRET, ENV_AZURE_CREDENTIAL, ENV_AZURE_FEDERATED_TOKEN_FILE,
     ENV_AZURE_IDENTITY_ENDPOINT, ENV_AZURE_MSI_ENDPOINT, ENV_AZURE_SAS_TOKEN, ENV_AZURE_TENANT_ID,
 };
@@ -249,18 +250,40 @@ type CredentialSource =
 
 /// The `auto` credential: tries the chain members that apply, in order, at the first token
 /// request, and remembers the first that yields a token.
+///
+/// The winner is kept for the life of the process, but not trusted blindly: if the cached winner
+/// later fails to produce a token (a revoked secret, `az` logged out), the chain is run once more
+/// for that request, so a working member further down is found without a restart; only if the
+/// whole chain fails is the request an error. (The members' own credentials are still built once
+/// per process: a rotated secret, certificate or token file needs a restart; see
+/// [`credential_for`].)
 struct AutoCredential {
     env: SharedEnv,
     /// Does the instance metadata service identify an Azure VM? (blocking)
     imds_is_azure: Arc<dyn Fn() -> bool + Send + Sync>,
     credential_for: CredentialSource,
     winner: Mutex<Option<(CredentialMode, Arc<dyn TokenCredential>)>>,
+    /// When a "this is not Azure" answer from the metadata service stops being believed.
+    imds_negative_until: Mutex<Option<std::time::Instant>>,
+    /// How long such an answer is believed.
+    imds_negative_ttl: std::time::Duration,
 }
 
 impl fmt::Debug for AutoCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AutoCredential").finish_non_exhaustive()
     }
+}
+
+/// Members whose variables the user set on purpose: a failure there is worth a warning, since
+/// `auto` silently moving on to the developer login can hide a misconfigured service principal.
+fn is_explicitly_configured_member(mode: CredentialMode) -> bool {
+    matches!(
+        mode,
+        CredentialMode::WorkloadIdentity
+            | CredentialMode::ClientSecret
+            | CredentialMode::ClientCertificate
+    )
 }
 
 impl AutoCredential {
@@ -270,6 +293,8 @@ impl AutoCredential {
             imds_is_azure: Arc::new(|| probe_azure_imds(azure_imds_addr())),
             credential_for: Arc::new(credential_for),
             winner: Mutex::new(None),
+            imds_negative_until: Mutex::new(None),
+            imds_negative_ttl: std::time::Duration::from_secs(AZURE_IMDS_NEGATIVE_CACHE_SECS),
         }
     }
 
@@ -280,6 +305,20 @@ impl AutoCredential {
             .clone()
     }
 
+    /// The deadline for one managed-identity attempt: the SDK retries a 404/410/5xx from the
+    /// instance metadata service with back-off for about 72 s, which is far too long to wait
+    /// before trying the next member. `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS` overrides the default.
+    fn member_deadline(&self, mode: CredentialMode) -> Option<std::time::Duration> {
+        if mode != CredentialMode::ManagedIdentity {
+            return None;
+        }
+        let ms = (self.env)(ENV_AZURE_AUTO_MI_TIMEOUT_MS)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_AZURE_AUTO_MI_TIMEOUT_MS);
+        Some(std::time::Duration::from_millis(ms))
+    }
+
     async fn try_member(
         &self,
         mode: CredentialMode,
@@ -287,14 +326,33 @@ impl AutoCredential {
         options: &Option<TokenRequestOptions<'_>>,
         tried: &mut Vec<String>,
     ) -> Option<AccessToken> {
-        let credential = match (self.credential_for)(mode) {
-            Ok(c) => c,
+        // Building a credential can read files (a certificate), so it is not done on a worker.
+        let build = Arc::clone(&self.credential_for);
+        let credential = match tokio::task::spawn_blocking(move || build(mode)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return self.member_failed(mode, format!("{e:#}"), tried),
             Err(e) => {
-                tried.push(format!("{mode}: {e:#}"));
-                return None;
+                return self.member_failed(mode, format!("construction panicked: {e}"), tried)
             }
         };
-        match credential.get_token(scopes, options.clone()).await {
+        let attempt = credential.get_token(scopes, options.clone());
+        let outcome = match self.member_deadline(mode) {
+            Some(limit) => match tokio::time::timeout(limit, attempt).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    let ms = limit.as_millis();
+                    return self.member_failed(
+                        mode,
+                        format!(
+                            "no token within {ms} ms ({ENV_AZURE_AUTO_MI_TIMEOUT_MS}); the identity endpoint did not answer in time, or kept retrying a 404/5xx"
+                        ),
+                        tried,
+                    );
+                }
+            },
+            None => attempt.await,
+        };
+        match outcome {
             Ok(token) => {
                 info!("Azure credential mode auto: using {mode}");
                 *self.winner.lock().unwrap_or_else(|e| e.into_inner()) = Some((mode, credential));
@@ -311,31 +369,60 @@ impl AutoCredential {
                     }
                     source = cause.source();
                 }
-                tried.push(format!("{mode}: {text}"));
-                None
+                self.member_failed(mode, text, tried)
             }
         }
     }
 
-    /// Run the metadata probe on the blocking pool.
-    async fn imds_says_azure(&self) -> bool {
-        let probe = Arc::clone(&self.imds_is_azure);
-        tokio::task::spawn_blocking(move || probe())
-            .await
-            .unwrap_or(false)
+    fn member_failed(
+        &self,
+        mode: CredentialMode,
+        why: String,
+        tried: &mut Vec<String>,
+    ) -> Option<AccessToken> {
+        if is_explicitly_configured_member(mode) {
+            warn!(
+                "Azure credential mode auto: {mode} is configured (its variables are set) but failed: {why}; falling through to the next member"
+            );
+        } else {
+            debug!("Azure credential mode auto: {mode} yielded no token: {why}");
+        }
+        tried.push(format!("{mode}: {why}"));
+        None
     }
-}
 
-#[async_trait::async_trait]
-impl TokenCredential for AutoCredential {
-    async fn get_token(
+    /// Does the metadata service identify an Azure VM? Runs the blocking probe on the blocking
+    /// pool. A "no" is believed for `imds_negative_ttl` (so a failing request does not probe
+    /// twice, nor does every request after it); a "yes" is never cached because it is followed
+    /// by a winner.
+    async fn imds_says_azure(&self) -> bool {
+        if let Some(until) = *self
+            .imds_negative_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            if std::time::Instant::now() < until {
+                return false;
+            }
+        }
+        let probe = Arc::clone(&self.imds_is_azure);
+        let azure = tokio::task::spawn_blocking(move || probe())
+            .await
+            .unwrap_or(false);
+        *self
+            .imds_negative_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            (!azure).then(|| std::time::Instant::now() + self.imds_negative_ttl);
+        azure
+    }
+
+    /// Run the chain; the first member that yields a token wins and is remembered.
+    async fn run_chain(
         &self,
         scopes: &[&str],
-        options: Option<TokenRequestOptions<'_>>,
-    ) -> azure_core::Result<AccessToken> {
-        if let Some((_, credential)) = self.winner() {
-            return credential.get_token(scopes, options).await;
-        }
+        options: &Option<TokenRequestOptions<'_>>,
+    ) -> std::result::Result<AccessToken, Vec<String>> {
         let env: &(dyn Fn(&str) -> Option<String> + Send + Sync) = &*self.env;
         let mut tried: Vec<String> = Vec::new();
         let mut managed_identity_tried = false;
@@ -349,32 +436,57 @@ impl TokenCredential for AutoCredential {
                 continue;
             }
             managed_identity_tried |= mode == CredentialMode::ManagedIdentity;
-            if let Some(token) = self.try_member(mode, scopes, &options, &mut tried).await {
+            if let Some(token) = self.try_member(mode, scopes, options, &mut tried).await {
                 return Ok(token);
             }
         }
-        // Nothing worked and the metadata service did not look like Azure: look once more (the
-        // service can come up late on a fresh VM) before giving up.
+        // Nothing worked and the metadata service did not look like Azure when asked: ask again
+        // if that answer has gone stale (the service can come up late on a fresh VM).
         if !managed_identity_tried && self.imds_says_azure().await {
             if let Some(token) = self
-                .try_member(
-                    CredentialMode::ManagedIdentity,
-                    scopes,
-                    &options,
-                    &mut tried,
-                )
+                .try_member(CredentialMode::ManagedIdentity, scopes, options, &mut tried)
                 .await
             {
                 return Ok(token);
             }
         }
-        Err(azure_core::Error::with_message(
-            azure_core::error::ErrorKind::Credential,
-            format!(
-                "no credential in the chain yielded a token; tried: {}",
-                tried.join("; ")
-            ),
-        ))
+        Err(tried)
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenCredential for AutoCredential {
+    async fn get_token(
+        &self,
+        scopes: &[&str],
+        options: Option<TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        let mut earlier: Option<String> = None;
+        if let Some((mode, credential)) = self.winner() {
+            match credential.get_token(scopes, options.clone()).await {
+                Ok(token) => return Ok(token),
+                Err(e) => {
+                    warn!("Azure credential mode auto: the credential in use ({mode}) failed ({e}); trying the chain again");
+                    *self.winner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    earlier = Some(format!("{mode} (previously working): {e}"));
+                }
+            }
+        }
+        match self.run_chain(scopes, &options).await {
+            Ok(token) => Ok(token),
+            Err(mut tried) => {
+                if let Some(first) = earlier {
+                    tried.insert(0, first);
+                }
+                Err(azure_core::Error::with_message(
+                    azure_core::error::ErrorKind::Credential,
+                    format!(
+                        "no credential in the chain yielded a token; tried: {}",
+                        tried.join("; ")
+                    ),
+                ))
+            }
+        }
     }
 }
 
@@ -474,32 +586,99 @@ fn build(mode: CredentialMode, env: EnvLookup<'_>) -> Result<Arc<dyn TokenCreden
     }))
 }
 
+/// The client-certificate credential. Reading the `.pfx` and parsing the PKCS#12 are blocking
+/// work (file I/O, key derivation), so they are not done where the credential is built (which
+/// can be a runtime worker) but on the blocking pool at the first token request, and the result
+/// is kept. A failure is not kept: the next request tries again, reading the variables again, so
+/// a wrong password or path can be corrected without a restart (once it loads, it is final).
+#[cfg(feature = "azure-client-certificate")]
+struct LazyCertificateCredential {
+    inner: tokio::sync::OnceCell<Arc<dyn TokenCredential>>,
+}
+
+#[cfg(feature = "azure-client-certificate")]
+impl fmt::Debug for LazyCertificateCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LazyCertificateCredential")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "azure-client-certificate")]
+impl LazyCertificateCredential {
+    /// Blocking: read the variables, then read and parse the certificate.
+    fn load() -> Result<Arc<dyn TokenCredential>> {
+        use azure_core::credentials::SecretBytes;
+        let mode = CredentialMode::ClientCertificate;
+        let env: EnvLookup<'_> = &process_env;
+        let path = required(env, ENV_AZURE_CLIENT_CERTIFICATE_PATH, mode)?;
+        let tenant = required(env, ENV_AZURE_TENANT_ID, mode)?;
+        let client_id = required(env, ENV_AZURE_CLIENT_ID, mode)?;
+        let password =
+            env(crate::constants::ENV_AZURE_CLIENT_CERTIFICATE_PASSWORD).filter(|p| !p.is_empty());
+        let bytes = std::fs::read(&path)
+            .map_err(|e| anyhow!("Azure credential mode {mode}: cannot read {path}: {e}"))?;
+        azure_identity::ClientCertificateCredential::new(
+            tenant,
+            client_id,
+            SecretBytes::new(bytes),
+            Some(azure_identity::ClientCertificateCredentialOptions {
+                password: password.map(Secret::new),
+                ..Default::default()
+            }),
+        )
+        .map(|c| c as Arc<dyn TokenCredential>)
+        .map_err(|e| {
+            anyhow!(
+                "Azure credential mode {mode}: {e} (the certificate must be a PKCS#12 / .pfx file \
+                 with an RSA key; set {} if it has a password)",
+                crate::constants::ENV_AZURE_CLIENT_CERTIFICATE_PASSWORD
+            )
+        })
+    }
+}
+
+#[cfg(feature = "azure-client-certificate")]
+#[async_trait::async_trait]
+impl TokenCredential for LazyCertificateCredential {
+    async fn get_token(
+        &self,
+        scopes: &[&str],
+        options: Option<TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        let credential = self
+            .inner
+            .get_or_try_init(|| async {
+                tokio::task::spawn_blocking(Self::load)
+                    .await
+                    .map_err(|e| anyhow!("certificate loading panicked: {e}"))?
+            })
+            .await
+            .map_err(|e| {
+                azure_core::Error::with_message(
+                    azure_core::error::ErrorKind::Credential,
+                    format!("{e:#}"),
+                )
+            })?;
+        credential.get_token(scopes, options).await
+    }
+}
+
+/// Validates the variables now (cheap) and defers the file read and parse to the first token
+/// request, on the blocking pool.
 #[cfg(feature = "azure-client-certificate")]
 fn build_client_certificate(env: EnvLookup<'_>) -> Result<Arc<dyn TokenCredential>> {
-    use azure_core::credentials::SecretBytes;
     let mode = CredentialMode::ClientCertificate;
-    let path = required(env, ENV_AZURE_CLIENT_CERTIFICATE_PATH, mode)?;
-    let bytes = std::fs::read(&path)
-        .map_err(|e| anyhow!("Azure credential mode {mode}: cannot read {path}: {e}"))?;
-    let password =
-        env(crate::constants::ENV_AZURE_CLIENT_CERTIFICATE_PASSWORD).filter(|p| !p.is_empty());
-    azure_identity::ClientCertificateCredential::new(
-        required(env, ENV_AZURE_TENANT_ID, mode)?,
-        required(env, ENV_AZURE_CLIENT_ID, mode)?,
-        SecretBytes::new(bytes),
-        Some(azure_identity::ClientCertificateCredentialOptions {
-            password: password.map(Secret::new),
-            ..Default::default()
-        }),
-    )
-    .map(|c| c as Arc<dyn TokenCredential>)
-    .map_err(|e| {
-        anyhow!(
-            "Azure credential mode {mode}: {e} (the certificate must be a PKCS#12 / .pfx file \
-             with an RSA key; set {} if it has a password)",
-            crate::constants::ENV_AZURE_CLIENT_CERTIFICATE_PASSWORD
-        )
-    })
+    for name in [
+        ENV_AZURE_CLIENT_CERTIFICATE_PATH,
+        ENV_AZURE_TENANT_ID,
+        ENV_AZURE_CLIENT_ID,
+    ] {
+        required(env, name, mode)?;
+    }
+    Ok(Arc::new(LazyCertificateCredential {
+        inner: tokio::sync::OnceCell::new(),
+    }))
 }
 
 #[cfg(not(feature = "azure-client-certificate"))]
@@ -741,6 +920,10 @@ mod tests {
         token: Option<&'static str>,
         error: &'static str,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// Answer only after this long (a stalled endpoint).
+        delay: std::time::Duration,
+        /// Fail every call from this one on, even though `token` is set.
+        fail_after: usize,
     }
 
     #[async_trait::async_trait]
@@ -750,8 +933,11 @@ mod tests {
             _scopes: &[&str],
             _options: Option<TokenRequestOptions<'_>>,
         ) -> azure_core::Result<AccessToken> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match self.token {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            match self.token.filter(|_| n < self.fail_after) {
                 Some(t) => Ok(AccessToken::new(
                     t,
                     azure_core::time::OffsetDateTime::now_utc()
@@ -774,15 +960,37 @@ mod tests {
         imds_answers: Vec<bool>,
         script: Vec<(CredentialMode, Result<&'static str, &'static str>)>,
     ) -> (AutoCredential, Calls) {
+        scripted_auto_with(
+            env,
+            imds,
+            imds_answers,
+            std::time::Duration::from_secs(30),
+            script,
+            |_| (std::time::Duration::ZERO, usize::MAX),
+        )
+    }
+
+    /// As [`scripted_auto`], with the negative-probe lifetime and a (delay, fail_after) per member.
+    fn scripted_auto_with(
+        env: Vec<(&'static str, &'static str)>,
+        imds: Arc<std::sync::atomic::AtomicUsize>,
+        imds_answers: Vec<bool>,
+        negative_ttl: std::time::Duration,
+        script: Vec<(CredentialMode, Result<&'static str, &'static str>)>,
+        shape: impl Fn(CredentialMode) -> (std::time::Duration, usize),
+    ) -> (AutoCredential, Calls) {
         let mut calls = Calls::new();
         let mut members = std::collections::HashMap::new();
         for (mode, outcome) in script {
             let counter: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
             calls.insert(mode, Arc::clone(&counter));
+            let (delay, fail_after) = shape(mode);
             let credential: Arc<dyn TokenCredential> = Arc::new(Scripted {
                 token: outcome.ok(),
                 error: outcome.err().unwrap_or(""),
                 calls: counter,
+                delay,
+                fail_after,
             });
             members.insert(mode, credential);
         }
@@ -803,6 +1011,8 @@ mod tests {
                     .ok_or_else(|| anyhow!("{mode} is not available"))
             }),
             winner: Mutex::new(None),
+            imds_negative_until: Mutex::new(None),
+            imds_negative_ttl: negative_ttl,
         };
         (auto, calls)
     }
@@ -874,7 +1084,7 @@ mod tests {
     async fn auto_error_lists_every_member_tried_and_re_probes_once() {
         use CredentialMode::{Cli, ClientSecret, ManagedIdentity};
         let imds: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
-        let (auto, calls) = scripted_auto(
+        let (auto, calls) = scripted_auto_with(
             vec![
                 (ENV_AZURE_CLIENT_ID, "c"),
                 (ENV_AZURE_TENANT_ID, "t"),
@@ -882,11 +1092,13 @@ mod tests {
             ],
             Arc::clone(&imds),
             vec![false, true], // not Azure at first, Azure on the second look
+            std::time::Duration::ZERO, // a "no" is not believed for any time
             vec![
                 (ClientSecret, Err("AADSTS7000215 invalid client secret")),
                 (ManagedIdentity, Err("identity not assigned")),
                 (Cli, Err("az not found on PATH")),
             ],
+            |_| (std::time::Duration::ZERO, usize::MAX),
         );
         let err = auto.get_token(&["s"], None).await.unwrap_err().to_string();
         for needle in [
@@ -905,6 +1117,105 @@ mod tests {
             called(&calls, ManagedIdentity),
             1,
             "tried after the second probe"
+        );
+    }
+
+    // A "not Azure" answer is believed for a while: a failing chain does not probe twice per
+    // request, nor again on the next request.
+    #[tokio::test]
+    async fn a_negative_metadata_answer_is_cached_for_a_short_time() {
+        use CredentialMode::Cli;
+        let imds: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let (auto, _) = scripted_auto(
+            vec![],
+            Arc::clone(&imds),
+            vec![false, false, false],
+            vec![(Cli, Err("az not found on PATH"))],
+        );
+        for _ in 0..3 {
+            assert!(auto.get_token(&["s"], Option::None).await.is_err());
+        }
+        assert_eq!(
+            imds.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one probe, believed"
+        );
+    }
+
+    // The managed-identity attempt has a deadline: a stalled endpoint does not hold up the
+    // developer tools.
+    #[tokio::test]
+    async fn the_managed_identity_attempt_has_a_deadline() {
+        use CredentialMode::{Cli, ManagedIdentity};
+        let (auto, calls) = scripted_auto_with(
+            vec![
+                (ENV_AZURE_IDENTITY_ENDPOINT, "http://x"),
+                (ENV_AZURE_AUTO_MI_TIMEOUT_MS, "200"),
+            ],
+            Arc::default(),
+            vec![],
+            std::time::Duration::from_secs(30),
+            vec![(ManagedIdentity, Ok("mi-token")), (Cli, Ok("cli-token"))],
+            |mode| {
+                if mode == ManagedIdentity {
+                    (std::time::Duration::from_secs(30), usize::MAX) // stalls for 30 s
+                } else {
+                    (std::time::Duration::ZERO, usize::MAX)
+                }
+            },
+        );
+        let started = std::time::Instant::now();
+        let token = auto.get_token(&["s"], Option::None).await.unwrap();
+        assert_eq!(token.token.secret(), "cli-token");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(called(&calls, Cli), 1);
+    }
+
+    // If the cached winner later fails, the chain is run again for that request.
+    #[tokio::test]
+    async fn a_failing_winner_is_replaced_by_another_member_without_a_restart() {
+        use CredentialMode::{Cli, ClientSecret};
+        let (auto, calls) = scripted_auto_with(
+            vec![
+                (ENV_AZURE_CLIENT_ID, "c"),
+                (ENV_AZURE_TENANT_ID, "t"),
+                (ENV_AZURE_CLIENT_SECRET, "s"),
+            ],
+            Arc::default(),
+            vec![],
+            std::time::Duration::from_secs(30),
+            vec![(ClientSecret, Ok("secret-token")), (Cli, Ok("cli-token"))],
+            // The client secret works for two calls, then is revoked.
+            |mode| {
+                if mode == ClientSecret {
+                    (std::time::Duration::ZERO, 2)
+                } else {
+                    (std::time::Duration::ZERO, usize::MAX)
+                }
+            },
+        );
+        for _ in 0..2 {
+            let t = auto.get_token(&["s"], Option::None).await.unwrap();
+            assert_eq!(t.token.secret(), "secret-token");
+        }
+        assert_eq!(called(&calls, Cli), 0);
+        // The winner now fails: this request goes down the chain again and lands on the CLI.
+        let t = auto.get_token(&["s"], Option::None).await.unwrap();
+        assert_eq!(
+            t.token.secret(),
+            "cli-token",
+            "RED: the failing winner was not replaced"
+        );
+        // ... which is the winner from then on.
+        auto.get_token(&["s"], Option::None).await.unwrap();
+        assert_eq!(
+            called(&calls, ClientSecret),
+            4,
+            "asked once more by the re-run (the failing call + the chain), not by later requests"
         );
     }
 

@@ -464,9 +464,15 @@ are not set: `workload-identity` needs `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIE
 `GET /metadata/instance` with an Azure instance document (Google Cloud and AWS VMs answer that address too and are not
 taken for Azure); `cli` always applies. A member that fails to produce a token (an identity not assigned to the VM, a
 rejected secret, `az` not installed) is passed over and the next is tried. The member that works is remembered for the
-process. If none works the error lists each member tried and why. The metadata probe runs off the async runtime's
-workers and is bounded: at most 250 ms to connect plus 250 ms to read the answer (so under 0.5 s), once per failed
-token request, never memoised as a "no". **Changed in this release:** before, the default was `az`/`azd` only and the
+process, but not trusted blindly: if it later fails to produce a token, the chain is run again for that request, so a
+working member further down is found without a restart. If none works the error lists each member tried and why. A
+configured service principal (workload identity, client secret, client certificate) that fails is logged at `warn`
+level before `auto` moves on. The managed-identity attempt has its own deadline, `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`
+(default 5000): the SDK retries a 404/410/5xx from the instance metadata service with back-off for about 72 s, which
+is too long to wait before trying `az`. The metadata probe runs off the async runtime's workers and is bounded: at
+most 250 ms to connect plus one 250 ms deadline to read the answer (under 0.5 s). It runs only when nothing else
+decides the managed-identity question, and a "not Azure" answer is believed for 30 s, so a failing chain does not
+probe on every request. **Changed in this release:** before, the default was `az`/`azd` only and the
 `AZURE_*` service-principal variables were ignored; with `auto` they are now honoured, and a host that is on Azure
 tries its managed identity before `az`. Set `S3DLIO_AZURE_CREDENTIAL=cli` for the old behaviour.
 
@@ -485,6 +491,7 @@ use (`azure_storage_blob` 1.0 / `azure_core` 1.1) can only sign requests with be
 |----------|---------|-------------|
 | `S3DLIO_AZURE_CREDENTIAL` | `auto` | Credential mode (above) |
 | `S3DLIO_AZURE_SAS_TOKEN` | (unset) | SAS token for `sas` mode |
+| `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS` | `5000` | In `auto`, how long to wait for a managed-identity token before trying the next member |
 | `AZURE_STORAGE_ENDPOINT` | (unset) | **Custom Azure endpoint** (e.g., `http://localhost:10000` for Azurite) |
 | `AZURE_BLOB_ENDPOINT_URL` | (unset) | Alternative for `AZURE_STORAGE_ENDPOINT` |
 | `S3DLIO_AZURE_DOWNLOAD_MODE` | `auto` | Download strategy: `auto`, `azure-sdk`, `s3dlio`, or `sequential` |
