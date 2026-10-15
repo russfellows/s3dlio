@@ -178,8 +178,9 @@ impl AzureBlob {
         format!("http://{}:{}/{}", host, port, account)
     }
 
-    /// Build with the Azure developer-tool credential (`az login`, then `azd auth login`) for
-    /// `https` endpoints; `http` endpoints (emulators) get no credential. Account-key, SAS and
+    /// Build with the Azure developer-tool credential (`az login`, then `azd auth login`; the
+    /// `az` / `azd` executable must be on `PATH`) for `https` endpoints; `http` endpoints
+    /// (emulators) get no credential. Account-key, SAS and
     /// service-principal environment variables are not read (see #239).
     ///
     /// Supports custom endpoints via environment variables for local emulators and proxies:

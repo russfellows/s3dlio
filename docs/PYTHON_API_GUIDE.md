@@ -487,9 +487,13 @@ await s3dlio.put_many_async(items)
 
 ```python
 uris = ["s3://bucket/file1", "s3://bucket/file2", "s3://bucket/file3"]
-results = s3dlio.get_many(uris, workers=64)
+results = s3dlio.get_many(uris, max_in_flight=64)
 
-# Async version
+# az:// and gs:// work too (all URIs in one call must use the same scheme)
+results = s3dlio.get_many(["az://myaccount/container/a.bin", "az://myaccount/container/b.bin"])
+results = s3dlio.get_many(["gs://bucket/a.bin", "gs://bucket/b.bin"])
+
+# Async version (s3:// only: get_many_async() and get_many_stats() read through the S3 client)
 results = await s3dlio.get_many_async(uris)
 
 # O_DIRECT reads — bypass page cache (v0.9.95: now correctly uses O_DIRECT)
@@ -557,7 +561,9 @@ gcloud auth application-default login
 
 The storage account comes from the URI (`az://account/container/key`). Authentication
 against an `https` endpoint uses the Azure developer-tool credential: sign in with
-`az login` (Azure CLI) or `azd auth login` (Azure Developer CLI) before starting Python.
+`az login` (Azure CLI) or `azd auth login` (Azure Developer CLI) before starting Python;
+the `az` / `azd` executable must be on `PATH` for the process that runs s3dlio (it is invoked to
+obtain tokens).
 Account keys (`AZURE_STORAGE_KEY`), SAS tokens, connection strings and service-principal
 environment variables (`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`/`AZURE_TENANT_ID`) are
 **not** supported: the Azure SDK s3dlio is built on (`azure_storage_blob` 1.0) has no Shared Key
@@ -977,7 +983,7 @@ with ThreadPoolExecutor(max_workers=16) as pool:
 
 ```python
 uris = s3dlio.list("s3://bucket/dataset/")
-s3dlio.get_many_stats(uris, concurrency=100)
+s3dlio.get_many_stats(uris, max_in_flight=100)
 
 # Subsequent gets use cached sizes (2.5x faster)
 for uri in uris:
@@ -1209,8 +1215,8 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `put_many_async(items)` | Async batch upload | Coroutine |
 | `get(uri)` | Download object | BytesView |
 | `get_range(uri, offset, length=None)` | Server-side range request | BytesView |
-| `get_many(uris, workers)` | Parallel download | List[BytesView] |
-| `get_many_async(uris)` | Async parallel download | Coroutine |
+| `get_many(uris, max_in_flight=64)` | Parallel download (s3://, az://, gs://, file://, direct://) | List[(uri, BytesView)] |
+| `get_many_async(uris, max_in_flight=64)` | Async parallel download (s3:// only) | Coroutine |
 | `list(uri, recursive=False, pattern=None)` | List objects | List[str] |
 | `stat(uri)` | Get metadata | dict |
 | `stat_async(uri)` | Async metadata | Coroutine |

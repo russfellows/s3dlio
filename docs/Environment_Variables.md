@@ -433,7 +433,8 @@ When a URI's first segment is a server (an explicit `host:port`, see above), s3d
 
 **Authentication.** The storage account is taken from the URI (`az://account/container/key`).
 For an `https` endpoint s3dlio authenticates with the Azure developer-tool credential: run
-`az login` (Azure CLI) or `azd auth login` (Azure Developer CLI) first. For an `http` endpoint
+`az login` (Azure CLI) or `azd auth login` (Azure Developer CLI) first; the `az` / `azd`
+executable must be on `PATH` of the s3dlio process, which runs it to obtain tokens. For an `http` endpoint
 (for example Azurite) no credential is sent. s3dlio does **not** read `AZURE_STORAGE_ACCOUNT`,
 `AZURE_STORAGE_KEY`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`, SAS tokens or
 connection strings; setting them has no effect. Account-key (Shared Key) authentication is not

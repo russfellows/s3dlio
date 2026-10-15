@@ -207,12 +207,12 @@ dd if=/dev/urandom of=/tmp/test_100mb.bin bs=1M count=100
 
 # Upload to each backend
 s3-cli put /tmp/test_100mb.bin s3://bucket/test_100mb.bin
-s3-cli put /tmp/test_100mb.bin az://container/test_100mb.bin
+s3-cli put /tmp/test_100mb.bin az://myaccount/container/test_100mb.bin
 s3-cli put /tmp/test_100mb.bin gs://bucket/test_100mb.bin
 
 # Download and verify (automatic range detection)
 s3-cli get s3://bucket/test_100mb.bin /tmp/s3_download.bin
-s3-cli get az://container/test_100mb.bin /tmp/azure_download.bin
+s3-cli get az://myaccount/container/test_100mb.bin /tmp/azure_download.bin
 s3-cli get gs://bucket/test_100mb.bin /tmp/gcs_download.bin
 
 # Verify checksums match

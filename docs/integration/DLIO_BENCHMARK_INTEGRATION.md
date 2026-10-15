@@ -121,7 +121,7 @@ def get_storage(storage_type, namespace, framework=None):
 storage:
   storage_type: s3dlio              # Use s3dlio backend
   storage_root: s3://bucket/prefix  # S3
-  # storage_root: az://container/prefix  # Azure
+  # storage_root: az://myaccount/container/prefix  # Azure
   # storage_root: gs://bucket/prefix     # GCS  
   # storage_root: file:///mnt/data       # Local filesystem
 ```
@@ -358,7 +358,7 @@ dataset:
 
 # Azure Blob Storage
 dataset:
-  data_folder: az://mycontainer/data
+  data_folder: az://myaccount/mycontainer/data
 
 # Local filesystem
 dataset:

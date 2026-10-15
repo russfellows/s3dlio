@@ -256,7 +256,7 @@ class S3PyTorchConnectorStorage(S3Storage):
         S3DLIO_MULTIPART_MAX_IN_FLIGHT, S3DLIO_DISABLE_MULTIPART).
 
         Args:
-            id: Full URI (e.g., s3://bucket/key, az://container/blob, file:///path)
+            id: Full URI (e.g., s3://bucket/key, az://account/container/blob, file:///path)
             data: bytes or BytesIO object
             offset: Not supported (full object write only)
             length: Not supported (full object write only)
@@ -305,7 +305,7 @@ class S3PyTorchConnectorStorage(S3Storage):
         Read data from storage.
 
         Args:
-            id: Full URI (e.g., s3://bucket/key, az://container/blob, file:///path)
+            id: Full URI (e.g., s3://bucket/key, az://account/container/blob, file:///path)
             data: Ignored (buffer not needed with s3dlio)
             offset: Start byte offset (optional)
             length: Number of bytes to read (optional)

@@ -103,17 +103,23 @@ if [ -n "$AZURE_STORAGE_ACCOUNT" ]; then
   
   echo "Testing with Azure container: $AZURE_PREFIX"
   
-  ./target/release/s3-cli --op-log /tmp/test_op_log_azure_list.tsv.zst ls \
+  # A stale log from an earlier run must not pass for this run's log.
+  AZURE_OP_LOG=/tmp/test_op_log_azure_list.tsv.zst
+  rm -f "$AZURE_OP_LOG"
+
+  # `set -e`: a failing LIST (no `az login`, container missing, no permission) fails the test.
+  ./target/release/s3-cli --op-log "$AZURE_OP_LOG" ls \
     "$AZURE_PREFIX" \
-    -r || echo "Azure LIST operation failed (container may not exist or no permissions)"
-  
-  if [ -f /tmp/test_op_log_azure_list.tsv.zst ]; then
+    -r
+
+  if [ -f "$AZURE_OP_LOG" ]; then
     echo ""
     echo "SUCCESS: Op-log created for az:// LIST operation"
     echo "First 10 lines of op-log:"
-    zstd -dc /tmp/test_op_log_azure_list.tsv.zst | head -10
+    zstd -dc "$AZURE_OP_LOG" | head -10
   else
-    echo "INFO: No Azure test performed"
+    echo "FAILURE: No op-log created for az:// backend"
+    exit 1
   fi
 else
   echo "SKIPPED: AZURE_STORAGE_ACCOUNT (the storage account name for the az:// URI) is not set"

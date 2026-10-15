@@ -7,11 +7,33 @@
 - **`get_many()` on `az://` and `gs://` URIs no longer fails for every key (#242).** The function
   stripped the scheme and container/bucket and handed the Azure and GCS stores only a bare object
   key, but those stores read the account/container/bucket from the full URI, so every read errored
-  while the same URI worked with `get()`. Each read is now given the full URI. The read loop moved
-  into `object_store::get_many_with_stores` (which also keeps input order by position, so repeated
-  URIs are safe). `get_many` of `file://`/`direct://` already passed full URIs and is unchanged.
-  Not changed here: `get_many_async()` and `get_many_stats()` send every URI through the S3-only
-  reader and refuse non-S3 URIs up front.
+  while the same URI worked with `get()`. Each read is now given the full URI. Further changes to the
+  same call, found in review:
+  - A failed batch no longer leaves reads running. The call waits for the reads already in flight
+    and returns the first error as `GET <uri>: <cause>`; reads that had not started are skipped
+    (the S3 reader also drains before returning, but it does not skip). Previously it returned at
+    once and the other downloads, and for Azure the `az` token processes, kept running.
+  - The stores come from the process-wide store cache (#204) and the calls write op-log rows like
+    `get()` does (#174). Before, each URI built a new store and no row was written.
+  - A URI that names no object (`az://acct/container`, `gs://bucket/`) is refused before any read
+    starts: `Cannot GET: no key specified in URI`.
+  - `get_many` of `file://`/`direct://` already passed full URIs and is unchanged. `get_many_async()` and
+    `get_many_stats()` still send every URI through the S3-only reader and refuse non-S3 URIs.
+  Covered by unit tests with a fake store and, for Azure, a Python test against a local fake Blob
+  endpoint; there is no local stand-in for GCS, so `gs://` is covered by the unit tests only.
+- **Azure: one HTTP client per account URL instead of one per operation (#242 review).** Every
+  `get`/`stat`/`get_range` built a new Azure service client, with a new connection pool, TLS state and
+  an empty bearer-token cache. Clients are now cached per account URL (at most 64) and reused, so
+  connections and the SDK's token cache are shared. `list_account_containers` no longer attaches a
+  credential to an `http://` endpoint (the SDK refused it with "must use https"). Not measured against
+  live Azure (no network access in the test runs); the unit tests count client constructions.
+- **GCS and Azure GETs copy each byte once (#252).** The GCS HTTP read started a 1 MiB buffer and let it
+  double, so an object over 1 MiB was copied again at each growth step; the Azure reads used the SDK's
+  `collect()`, which also grows chunk by chunk. Both now receive into one buffer sized from the object
+  size in the response (GCS, clamped to the requested range) or the stat size / requested range
+  (Azure); if the server sends more than announced the buffer still grows. A test counts buffer growth
+  (an 8 MiB body: 3 growths before, 0 now). The GCS gRPC read already sized its buffer from the object
+  size and is unchanged. Throughput was not measured.
 - **Azure: the documentation no longer tells you to authenticate with `AZURE_STORAGE_KEY` (#239).**
   The docs (`PYTHON_API_GUIDE.md`, `Environment_Variables.md`, `CLI_GUIDE.md`) said an Azure account key,
   `AZURE_STORAGE_ACCOUNT`, or the service-principal variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
@@ -28,7 +50,12 @@
   and the docstrings of `s3dlio.integrations.dlio.*` and `s3dlio.compat.s3torchconnector` (those Python modules
   only described the variables; they never read them, so their behaviour is unchanged). `tests/test_op_log_all_backends.sh`
   no longer requires the unused `AZURE_STORAGE_ACCESS_KEY` to run its Azure step; it needs only `AZURE_STORAGE_ACCOUNT`
-  (used to build the `az://` URI) and an `az login` session.
+  (used to build the `az://` URI) and an `az login` session; its Azure step now removes any old log first and
+  fails when `s3-cli` fails, instead of printing a message and continuing. Examples that wrote `az://container/...`
+  without the account now write `az://account/container/...` (also in `MULTI_ENDPOINT_GUIDE.md`, the CLI help and the
+  `put_bytes` docstring). `PYTHON_API_GUIDE.md` now lists `max_in_flight` (not `workers`/`concurrency`) for
+  `get_many`/`get_many_stats`, says that `get_many` works on `az://` and `gs://`, and says the `az`/`azd` executable
+  must be on `PATH`.
 
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
