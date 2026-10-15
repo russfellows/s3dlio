@@ -131,15 +131,20 @@ async fn global_client_range_get_of_missing_key_is_one_request() {
     assert!(format!("{err:#}").contains("NoSuchKey"), "{err:#}");
     let c = state.counts_for(&key_path(BUCKET, &key));
     assert_eq!(c.get_calls, 1, "global-path 404 must cost exactly one GET");
+
+    concurrent_range_chunks_do_not_retry_a_404(&state).await;
 }
 
+/// Body of the concurrent-range check, run from the global-client test below
+/// (both use the process-global client, and tests in this binary run on separate
+/// runtimes, so sharing one test keeps a pooled connection from a finished
+/// runtime from triggering an SDK-level retry that would blur the count).
+///
 /// The concurrent range-GET path has its own per-chunk retry loop (it cannot
 /// use `retry_get_body`); it must also stop at a definite answer. The key
 /// carries both the sized-object marker (so HEAD succeeds with 16 bytes and the
 /// chunked path is entered) and the 404 marker (so every chunk GET is a 404).
-#[tokio::test]
-async fn concurrent_range_chunks_do_not_retry_a_404() {
-    let (_, state) = init();
+async fn concurrent_range_chunks_do_not_retry_a_404(state: &common::mock_s3_server::MockS3State) {
     let key = unique_test_key(&format!("{SIZED_OBJECT_MARKER}-{GET_NOT_FOUND_MARKER}"));
 
     let start = Instant::now();
