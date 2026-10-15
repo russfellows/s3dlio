@@ -4757,7 +4757,12 @@ pub async fn generic_download_objects_matching_with_summary(
     // its own), so the guard lives here: before the store is chosen, anything is listed or
     // the destination directory is created.
     crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
-    let store = store_for_uri_with_logger(src_uri, global_logger())?;
+    // Issue #234: the store that lists is the store that fetches.  A host-form URI lists on a
+    // per-endpoint store, whose entries come back in bucket form; a store built from such an
+    // entry would use the process-wide client (another server).  The per-endpoint store
+    // accepts the bucket-form URIs of its own bucket and uses its own client for them.
+    let store: Arc<dyn ObjectStore> =
+        Arc::from(store_for_uri_with_logger(src_uri, global_logger())?);
 
     // List objects to download
     let mut keys = store.list(src_uri, recursive).await?;
@@ -4788,7 +4793,7 @@ pub async fn generic_download_objects_matching_with_summary(
 
     for uri in keys.clone() {
         let sem = sem.clone();
-        let store = store_for_uri_with_logger(&uri, global_logger())?; // Each task gets its own store instance
+        let store = Arc::clone(&store);
         let progress = progress_callback.clone();
         let out_dir = dest_dir.to_path_buf();
 

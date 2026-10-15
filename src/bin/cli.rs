@@ -1695,7 +1695,11 @@ async fn get_cmd(
     } else {
         None
     };
-    let store = store_for_uri_with_logger(uri_str, logger)?;
+    // Issue #234: the store that LISTS also FETCHES.  A host-form URI
+    // (`s3://host:port/bucket/...`) lists on a per-endpoint store whose entries come back in
+    // bucket form; a second store built from such an entry would use the process-wide
+    // client, that is, another server.
+    let store: Arc<dyn ObjectStore> = Arc::from(store_for_uri_with_logger(uri_str, logger)?);
 
     // When the URI is a directory prefix (ends with '/'), list recursively even if the
     // user did not pass -r.  A directory URI with recursive=false returns only the
@@ -1845,7 +1849,7 @@ async fn get_cmd(
             .acquire_owned()
             .await
             .expect("semaphore closed");
-        let logger = global_logger();
+        let list_store = Arc::clone(&store);
         let done_task = Arc::clone(&keys_done);
         let bytes_task = Arc::clone(&bytes_done);
         let multi = multi_store.clone();
@@ -1855,8 +1859,7 @@ async fn get_cmd(
             let data = if let Some(store) = multi {
                 store.get(&key).await?
             } else {
-                let store = store_for_uri_with_logger(&key, logger)?;
-                store.get(&key).await?
+                list_store.get(&key).await?
             };
             let byte_count = data.len() as u64;
             // Update shared progress atomics on success so the background task

@@ -69,9 +69,21 @@ begin with `/` or contain `//` are used exactly as written in every layer (#198)
     recursive=True)` / `s3-cli delete -r`.
   - Op-log: `mkdir` writes no row on any backend. `rmdir` writes its one `DELETE_PREFIX` row
     (#228) on `file://` and `direct://`, but not on object stores, where it deletes nothing.
+  - For Rust API users: `ObjectStore::rmdir` and `mkdir` on `s3://`, `az://` and `gs://` now
+    succeed without doing anything (they used to return a "not implemented" error); code that
+    relied on `rmdir` to delete objects must call `delete_prefix` (or `delete -r` /
+    `delete(recursive=True)`).
 - **Azure and GCS `delete_prefix` now deletes only objects under `<prefix>/`, as on S3 (#231).**
   Before, it also deleted sibling objects whose names merely started with the prefix
   (`delete_prefix("gs://b/foo")` also removed `foobar`, `foo.bak`, `foo2/...`).
+- **Host-form `s3-cli download` / `s3-cli get` fetch every object from the server that listed it
+  (#234).** With a URI that names a server (`s3://host:port/bucket/prefix/`) the listing ran on that
+  server, but each listed object was then fetched through a store built from the bucket-form URI the
+  listing returned, that is, through the process-wide client: the server `AWS_ENDPOINT_URL` names, or
+  AWS. The listing succeeded and the GETs went to the wrong server (other bytes, or failures). The
+  library's `generic_download_objects[_matching]_with_summary` had the same shape. Every listed object
+  is now fetched through the same store instance that listed it; a URI without a server (the
+  process-wide store) behaves as before.
 - **Object keys are used exactly as written in every layer (#198).** See the details below.
 
 ### Changed — which objects an `s3://` URI selects: the exact name, its directory, or an explicit `*` glob; never a regex, never a bare prefix (INTENTIONAL BEHAVIOUR CHANGE) (#213)
