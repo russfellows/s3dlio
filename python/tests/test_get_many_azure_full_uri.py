@@ -20,7 +20,7 @@ import threading
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import pytest
 import s3dlio
@@ -43,6 +43,7 @@ class _FakeBlobService(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     seen: ClassVar[list] = []
     seen_lock: ClassVar[threading.Lock] = threading.Lock()
+    queries: ClassVar[list] = []
 
     def log_message(self, *args):  # keep pytest output quiet
         pass
@@ -53,6 +54,7 @@ class _FakeBlobService(BaseHTTPRequestHandler):
         )  # the SDK sends "/" in a blob name as %2F
         with self.seen_lock:
             self.seen.append((self.command, path))
+            self.queries.append(urlsplit(self.path).query)
         prefix = f"/{ACCOUNT}/{CONTAINER}/"
         if not path.startswith(prefix):
             self.send_response(404)
@@ -95,6 +97,7 @@ class _FakeBlobService(BaseHTTPRequestHandler):
 @pytest.fixture()
 def fake_blob_endpoint(monkeypatch):
     _FakeBlobService.seen = []
+    _FakeBlobService.queries = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeBlobService)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -179,3 +182,46 @@ def test_get_many_azure_error_names_the_failing_uri(fake_blob_endpoint):
     with pytest.raises(RuntimeError) as info:
         s3dlio.get_many([missing])
     assert missing in str(info.value), str(info.value)
+
+
+def test_azure_sas_mode_sends_the_token_on_every_request(
+    fake_blob_endpoint, monkeypatch
+):
+    _require_azure_backend()
+    monkeypatch.setenv("S3DLIO_AZURE_CREDENTIAL", "sas")
+    monkeypatch.setenv("S3DLIO_AZURE_SAS_TOKEN", "?sv=2024-11-04&sig=abc%2Bdef")
+    fake_blob_endpoint.clear()
+    _FakeBlobService.queries.clear()
+    got = s3dlio.get_many([f"az://{ACCOUNT}/{CONTAINER}/dir/sas-0.bin"])
+    assert len(got) == 1
+    assert _FakeBlobService.queries, "no request reached the fake endpoint"
+    for query in _FakeBlobService.queries:
+        assert "sv=2024-11-04" in query and "sig=abc%2Bdef" in query, query
+
+
+def test_azure_unknown_credential_mode_is_an_error_naming_the_valid_ones(
+    fake_blob_endpoint, monkeypatch
+):
+    _require_azure_backend()
+    monkeypatch.setenv("S3DLIO_AZURE_CREDENTIAL", "password")
+    with pytest.raises(RuntimeError) as info:
+        s3dlio.get(f"az://{ACCOUNT}/{CONTAINER}/dir/x.bin")
+    message = str(info.value)
+    for mode in (
+        "auto",
+        "managed-identity",
+        "client-secret",
+        "workload-identity",
+        "sas",
+        "none",
+    ):
+        assert mode in message, message
+
+
+def test_azure_bearer_token_mode_on_http_endpoint_says_it_needs_https(
+    fake_blob_endpoint, monkeypatch
+):
+    _require_azure_backend()
+    monkeypatch.setenv("S3DLIO_AZURE_CREDENTIAL", "managed-identity")
+    with pytest.raises(RuntimeError, match="https"):
+        s3dlio.get(f"az://{ACCOUNT}/{CONTAINER}/dir/x.bin")
