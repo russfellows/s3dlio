@@ -447,6 +447,47 @@ impl FileSystemObjectStore {
     }
 }
 
+/// Create a directory and any missing parents (`mkdir -p`); an existing directory is
+/// success. Shared by the `file://` and `direct://` stores: O_DIRECT has no meaning
+/// for a directory operation, so `direct://` behaves exactly like `file://` (#229).
+pub(crate) async fn mkdir_path(path: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("Failed to create directory: {}", path.display()))
+}
+
+/// Remove a directory. `recursive == false` removes only an EMPTY directory (a
+/// non-empty one is an error and nothing is removed); `recursive == true` removes
+/// the whole tree. A directory that does not exist is success, so the call is
+/// idempotent. Shared by the `file://` and `direct://` stores (#229).
+pub(crate) async fn rmdir_path(path: &Path, recursive: bool) -> Result<()> {
+    let result = if recursive {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_dir(path).await
+    };
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Directory doesn't exist - treat as success (idempotent operation)
+            tracing::debug!(
+                "Directory already removed or never existed: {}",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(e) if recursive => Err(e)
+            .with_context(|| format!("Failed to remove directory recursively: {}", path.display())),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "Failed to remove directory (not empty?): {}",
+                path.display()
+            )
+        }),
+    }
+}
+
 #[async_trait]
 impl ObjectStore for FileSystemObjectStore {
     async fn get(&self, uri: &str) -> Result<Bytes> {
@@ -868,48 +909,12 @@ impl ObjectStore for FileSystemObjectStore {
 
     async fn mkdir(&self, uri: &str) -> Result<()> {
         let path = Self::uri_to_path(uri)?;
-
-        tokio::fs::create_dir_all(&path)
-            .await
-            .with_context(|| format!("Failed to create directory: {}", path.display()))?;
-
-        Ok(())
+        mkdir_path(&path).await
     }
 
     async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
         let path = Self::uri_to_path(uri)?;
-
-        let result = if recursive {
-            tokio::fs::remove_dir_all(&path).await
-        } else {
-            tokio::fs::remove_dir(&path).await
-        };
-
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Directory doesn't exist - treat as success (idempotent operation)
-                tracing::debug!(
-                    "Directory already removed or never existed: {}",
-                    path.display()
-                );
-                Ok(())
-            }
-            Err(e) => {
-                if recursive {
-                    Err(e).with_context(|| {
-                        format!("Failed to remove directory recursively: {}", path.display())
-                    })
-                } else {
-                    Err(e).with_context(|| {
-                        format!(
-                            "Failed to remove directory (not empty?): {}",
-                            path.display()
-                        )
-                    })
-                }
-            }
-        }
+        rmdir_path(&path, recursive).await
     }
 
     async fn update_metadata(&self, _uri: &str, _metadata: &HashMap<String, String>) -> Result<()> {

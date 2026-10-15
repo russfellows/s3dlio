@@ -405,12 +405,21 @@ segment of a recursive URI as a regex. Code that relied on that must now pass `r
 a URI that selects them: `name/`, or `name*`) or name the object. The lower-level `ObjectStore.delete`, `delete_batch` and
 `delete_prefix` are unchanged.
 
-### mkdir() — Create Directory / Prefix
+### mkdir() — Create Directory
 
 ```python
-s3dlio.mkdir("file:///data/output/subdir")
+s3dlio.mkdir("file:///data/output/subdir")      # creates the directory (and parents)
+s3dlio.mkdir("direct:///data/output/subdir")    # same as file://
+s3dlio.mkdir("s3://bucket/prefix/")             # no-op: returns None, sends no request
 await s3dlio.mkdir_async("s3://bucket/prefix/")
 ```
+
+`file://` and `direct://` create a real directory (`mkdir -p`; an existing directory is
+success). On `s3://`, `az://` and `gs://` `mkdir()` **does nothing**: an object store has no
+directories, a prefix exists as soon as an object is written under it, so there is nothing to
+create. The URI is checked, no request is sent and no marker object is written. To remove the
+objects under a prefix use `s3dlio.delete(uri, recursive=True)`. `mkdir` is never recorded in
+the op-log.
 
 ---
 
@@ -1199,7 +1208,7 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `exists(uri)` | Check existence | bool |
 | `exists_async(uri)` | Async existence check | Coroutine |
 | `delete(uri)` | Delete object | None |
-| `mkdir(uri)` | Create directory/prefix | None |
+| `mkdir(uri)` | Create directory (`file://`, `direct://`); no-op on object stores | None |
 | `mkdir_async(uri)` | Async mkdir | Coroutine |
 | `upload(src_uri, dest_uri)` | Bulk upload files | None |
 | `download(src_uri, dest_dir)` | Bulk download files | None |

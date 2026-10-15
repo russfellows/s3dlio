@@ -372,6 +372,23 @@ impl S3DlioObjectStore for ArrowObjectStore {
         Ok(())
     }
 
+    /// No-op: an object store has no directories (issue #229). A prefix exists once
+    /// objects are written under it, so there is nothing to create. (A marker object
+    /// is also impossible here: `object_store::path::Path` cannot represent a key
+    /// ending in `/`.) The URI is validated; NO request is sent.
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        Url::parse(uri).context("invalid URI")?;
+        Ok(())
+    }
+
+    /// No-op, `recursive` or not: an object store has no directories (issue #229), so
+    /// there is nothing to remove. The URI is validated; NO request is sent and
+    /// nothing is deleted. Use [`S3DlioObjectStore::delete_prefix`] to delete objects.
+    async fn rmdir(&self, uri: &str, _recursive: bool) -> Result<()> {
+        Url::parse(uri).context("invalid URI")?;
+        Ok(())
+    }
+
     async fn create_container(&self, _name: &str) -> Result<()> {
         // Not supported by Arrow's ObjectStore trait
         bail!("create_container is not supported by the Arrow object_store backend");
@@ -837,5 +854,19 @@ mod tests {
         let items: Vec<Result<String>> = store.list_stream("not a uri", false).collect().await;
         assert_eq!(items.len(), 1);
         assert!(items[0].is_err());
+    }
+
+    // #229: mkdir / rmdir are no-ops on an object store -- Ok, no request (no store is
+    // even built), the URI is only validated.
+    #[tokio::test]
+    async fn mkdir_and_rmdir_are_noops_and_validate_the_uri() {
+        let store = ArrowObjectStore::new();
+        for uri in ["s3://bucket/dir", "s3://bucket/dir/", "s3://bucket/"] {
+            store.mkdir(uri).await.unwrap();
+            store.rmdir(uri, true).await.unwrap();
+            store.rmdir(uri, false).await.unwrap();
+        }
+        assert!(store.mkdir("not a uri").await.is_err());
+        assert!(store.rmdir("not a uri", true).await.is_err());
     }
 }

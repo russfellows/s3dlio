@@ -1,10 +1,10 @@
 # s3dlio Changelog
 
-## [0.9.126] - 2026-10-15
+## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **0.9.124 was merged but never published to PyPI, so 0.9.126 is the first published release after
 0.9.122 and it also contains every 0.9.124 change (see "Version 0.9.124" below).** This release fixes
-seven issues: #198, #208, #211, #213, #216, #218 and #228.
+ten issues: #198, #208, #211, #213, #216, #218, #228, #229, #231 and #234.
 
 Read the two behaviour changes before upgrading: an `s3://` URI now selects the exact name, its
 directory or an explicit `*` glob and never a regex or a longer sibling (#213), and object keys that
@@ -51,7 +51,27 @@ begin with `/` or contain `//` are used exactly as written in every layer (#198)
   s3dlio, recursive or not (a recursive removal of a whole tree included), now appears in the op-log as
   one `DELETE_PREFIX` row on the directory (count 0; the error text if the removal failed). Before, the
   removal left no row at all. This is not a format change: `DELETE_PREFIX` is an existing op name.
-  `mkdir` is still not recorded.
+  `mkdir` is still not recorded. The replayer reports a `DELETE_PREFIX` row as unsupported for exact
+  replay and replay stops at the first such row, so an op-log that contains a `file://` or `direct://`
+  `rmdir` now contains one.
+- **`mkdir` / `rmdir` no longer fail outside `file://` (#229).** They used to work only on
+  `file://`; on `direct://`, `s3://`, `az://` and `gs://` they failed with "not implemented for
+  this backend", although the docs promised them, and so did the DLIO adapters' `create_node`
+  (Python `s3dlio.mkdir()`). Now:
+  - `direct://` behaves exactly like `file://` (O_DIRECT does not apply to directories): `mkdir`
+    creates the directory and its parents; `rmdir` removes an empty directory (a non-empty one is
+    an error and nothing is removed), or the whole tree with `recursive=True`; a missing
+    directory is success.
+  - On object stores (`s3://`, `az://`, `gs://`, and the arrow backend) both calls do nothing and
+    succeed: an object store has no directories, a prefix exists once an object is written under
+    it. The URI is checked, no request is sent, no marker object is written and `rmdir` deletes
+    nothing, `recursive` or not. To remove the objects under a prefix use `delete(uri,
+    recursive=True)` / `s3-cli delete -r`.
+  - Op-log: `mkdir` writes no row on any backend. `rmdir` writes its one `DELETE_PREFIX` row
+    (#228) on `file://` and `direct://`, but not on object stores, where it deletes nothing.
+- **Azure and GCS `delete_prefix` now deletes only objects under `<prefix>/`, as on S3 (#231).**
+  Before, it also deleted sibling objects whose names merely started with the prefix
+  (`delete_prefix("gs://b/foo")` also removed `foobar`, `foo.bak`, `foo2/...`).
 - **Object keys are used exactly as written in every layer (#198).** See the details below.
 
 ### Changed — which objects an `s3://` URI selects: the exact name, its directory, or an explicit `*` glob; never a regex, never a bare prefix (INTENTIONAL BEHAVIOUR CHANGE) (#213)

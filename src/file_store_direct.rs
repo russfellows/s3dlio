@@ -1533,6 +1533,24 @@ impl ObjectStore for ConfigurableFileSystemObjectStore {
         Ok(())
     }
 
+    /// `mkdir` is the `file://` behaviour (`create_dir_all`): O_DIRECT is irrelevant
+    /// to a directory operation. Not recorded in the op-log (#229).
+    async fn mkdir(&self, uri: &str) -> Result<()> {
+        if !Self::is_valid_file_uri(uri) {
+            bail!("FileSystemObjectStore expected file:// or direct:// URI");
+        }
+        crate::file_store::mkdir_path(&Self::uri_to_path(uri)?).await
+    }
+
+    /// `rmdir` is the `file://` behaviour: `remove_dir` (empty directories only) or
+    /// `remove_dir_all`; a missing directory is success (#229).
+    async fn rmdir(&self, uri: &str, recursive: bool) -> Result<()> {
+        if !Self::is_valid_file_uri(uri) {
+            bail!("FileSystemObjectStore expected file:// or direct:// URI");
+        }
+        crate::file_store::rmdir_path(&Self::uri_to_path(uri)?, recursive).await
+    }
+
     /// `rename` is the filesystem's atomic `rename(2)` (below), not copy + delete.
     fn has_native_rename(&self) -> bool {
         true
