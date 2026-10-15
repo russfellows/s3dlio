@@ -18,7 +18,28 @@
   reports still validates the object it wrote. New: `s3dlio::checksum` (`Crc32c`, `crc32c_of`,
   `crc32c_label`). The ZIP/NPZ container CRC is unchanged (that format requires CRC-32).
 
+- **TFRecord files s3dlio generates now carry CRC-32C checksums (#258).** The TFRecord format
+  requires CRC-32C (Castagnoli) for both the length checksum and the data checksum of every record,
+  masked as `((crc >> 15) | (crc << 17)) + 0xa282ead8`. The masking was right, but the CRC underneath
+  was CRC-32 (IEEE), so a reader that verifies checksums (TensorFlow, TensorBoard) rejected the files
+  as corrupt, and one that does not verify accepted them, which hid the problem. The bytes of every
+  generated TFRecord change (the 4-byte checksum fields; the record layout, the sizes and the index are
+  the same). The test compares the output with a reference written by an independent bitwise CRC-32C
+  and accepted by TensorBoard's TFRecord reader, which verifies the checksums and rejects the old output
+  with a header-CRC error. Files written by earlier releases keep their wrong checksums.
+
 ### Fixed
+
+- **`get_with_validation` accepts the checksum form that writers and manifests produce (#259).**
+  Writers report `crc32c:<hex>` and the checkpoint manifest stores that value, but validation compared
+  it with the bare hex of the data, so validating a value a writer had reported failed for intact data
+  ("expected crc32c:e3069283, got e3069283"). `get_with_validation`, `get_range_with_validation` and
+  `load_checkpoint_with_validation` (and so the checkpoint reader's validating reads and
+  `validate_checkpoint_integrity`) now take `<algorithm>:<hex>`: the algorithm is parsed
+  (case-insensitive), `crc32c` is supported, and any other algorithm is an immediate, clear error
+  ("unsupported checksum algorithm ..."), reported before anything is fetched and never as a mismatch.
+  A bare hex string is still accepted as CRC-32C, and hex digits compare case-insensitively. Corrupted
+  data still fails validation.
 
 - **The retry loop keeps its own attempts for every error code the AWS SDK retries (#240
   follow-up).** The first version of the #240 classifier listed only some of the codes the pinned AWS

@@ -18,11 +18,33 @@ use tokio::sync::OnceCell;
 use tracing::trace;
 use tracing::{debug, info, warn};
 
-// Helper function for integrity validation
+// Helper function for integrity validation: the bare, lowercase CRC-32C hex of `data`.
 fn compute_checksum(data: &[u8]) -> String {
     let mut hasher = Crc32c::new();
     hasher.update(data);
     format!("{:08x}", hasher.finalize())
+}
+
+/// The CRC-32C hex an expected-checksum string asks for (issue #259).
+///
+/// The canonical form is `<algorithm>:<hex>`, the one writers report and checkpoint
+/// manifests store (`crc32c:e3069283`). The algorithm name is matched case-insensitively
+/// and only `crc32c` is supported: any other algorithm is an error that says so, never a
+/// "mismatch". A bare hex string (no `:`) is accepted as CRC-32C, for callers that compute
+/// it themselves. The hex digits are compared case-insensitively.
+fn expected_crc32c_hex(expected: &str) -> Result<String> {
+    let expected = expected.trim();
+    match expected.split_once(':') {
+        None => Ok(expected.to_ascii_lowercase()),
+        Some((alg, hex)) if alg.trim().eq_ignore_ascii_case("crc32c") => {
+            Ok(hex.trim().to_ascii_lowercase())
+        }
+        Some((alg, _)) => bail!(
+            "unsupported checksum algorithm '{}' in expected checksum '{}' (supported: crc32c)",
+            alg.trim(),
+            expected
+        ),
+    }
 }
 
 // --- S3 ----------------------------------------------------------------------
@@ -434,11 +456,13 @@ pub trait ObjectStore: Send + Sync {
         uri: &str,
         expected_checksum: Option<&str>,
     ) -> Result<Bytes> {
+        // An unsupported algorithm is refused before any data is fetched.
+        let wanted = expected_checksum.map(expected_crc32c_hex).transpose()?;
         let data = self.get(uri).await?;
 
-        if let Some(expected) = expected_checksum {
+        if let (Some(expected), Some(wanted)) = (expected_checksum, wanted) {
             let actual = compute_checksum(&data);
-            if actual != expected {
+            if actual != wanted {
                 bail!(
                     "Integrity validation failed for {}: expected {}, got {}",
                     uri,
@@ -460,11 +484,12 @@ pub trait ObjectStore: Send + Sync {
         length: Option<u64>,
         expected_checksum: Option<&str>,
     ) -> Result<Bytes> {
+        let wanted = expected_checksum.map(expected_crc32c_hex).transpose()?;
         let data = self.get_range(uri, offset, length).await?;
 
-        if let Some(expected) = expected_checksum {
+        if let (Some(expected), Some(wanted)) = (expected_checksum, wanted) {
             let actual = compute_checksum(&data);
-            if actual != expected {
+            if actual != wanted {
                 bail!(
                     "Integrity validation failed for range {}[{}:{}]: expected {}, got {}",
                     uri,
@@ -486,13 +511,14 @@ pub trait ObjectStore: Send + Sync {
         checkpoint_uri: &str,
         expected_checksum: Option<&str>,
     ) -> Result<Vec<u8>> {
+        let wanted = expected_checksum.map(expected_crc32c_hex).transpose()?;
         // Get checkpoint data
         let data = self.get(checkpoint_uri).await?;
 
         // Validate integrity if checksum provided
-        if let Some(expected) = expected_checksum {
+        if let (Some(expected), Some(wanted)) = (expected_checksum, wanted) {
             let actual = compute_checksum(&data);
-            if actual != expected {
+            if actual != wanted {
                 bail!(
                     "Checkpoint integrity validation failed for {}: expected checksum {}, got {}",
                     checkpoint_uri,
