@@ -194,7 +194,40 @@ def test_cancel_synchronously_right_after_the_call(work_dir):
     assert seen["released"] is True
 
 
-def test_asyncio_timeout_zero_is_deferred_until_the_native_write_finished(work_dir):
+async def _expect_deferred_timeout(make_body, fifo, ba, original, seen):
+    """A timeout cancels the put at the very start, so the native write may or may not have begun
+    when it fires. The invariant, either way: the timeout is raised only once no native reader
+    of the buffer remains."""
+    t = asyncio.ensure_future(make_body())
+    await asyncio.sleep(0.6)
+    seen["terminal_early"] = t.done()
+    if seen["terminal_early"]:
+        # nothing may still be reading the buffer: a reader must see no bytes
+        seen["late_bytes"] = nonblocking_drain(fifo, 0.5)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(t, 30)
+    else:
+        seen["pinned"] = not resizable(ba)
+        reader = Reader(fifo)
+        reader.start()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(t, 30)
+        seen["data"] = reader.join()
+    seen["released"] = resizable(ba)
+
+
+def _check_deferred(seen, original):
+    if seen["terminal_early"]:
+        assert seen.get("late_bytes") == b"", (
+            "the timeout fired while a native write still read the buffer"
+        )
+    else:
+        assert seen["pinned"] is True
+        assert seen["data"] == original
+    assert seen["released"] is True
+
+
+def test_asyncio_timeout_zero_ends_only_when_no_native_reader_remains(work_dir):
     original = b"timeout-zero" * 20_000
     fifo, ba = stuck_put(work_dir, original)
     seen = {}
@@ -204,27 +237,13 @@ def test_asyncio_timeout_zero_is_deferred_until_the_native_write_finished(work_d
             async with asyncio.timeout(0):
                 await s3dlio.put_bytes_async(f"file://{fifo}", ba, borrow=True)
 
-        t = asyncio.ensure_future(body())
-        await asyncio.sleep(0.6)
-        seen["terminal_early"] = t.done()
-        seen["pinned"] = not resizable(ba)
-        reader = Reader(fifo)
-        reader.start()
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(t, 30)
-        seen["data"] = reader.join()
-        seen["released"] = resizable(ba)
+        await _expect_deferred_timeout(body, fifo, ba, original, seen)
 
     run_bounded(go, fifo)
-    assert seen["terminal_early"] is False, (
-        "timeout(0) ended under a running native write"
-    )
-    assert seen["pinned"] is True
-    assert seen["data"] == original
-    assert seen["released"] is True
+    _check_deferred(seen, original)
 
 
-def test_wait_for_zero_is_deferred_until_the_native_write_finished(work_dir):
+def test_wait_for_zero_ends_only_when_no_native_reader_remains(work_dir):
     original = b"wait-for-zero" * 20_000
     fifo, ba = stuck_put(work_dir, original)
     seen = {}
@@ -235,8 +254,27 @@ def test_wait_for_zero_is_deferred_until_the_native_write_finished(work_dir):
                 s3dlio.put_bytes_async(f"file://{fifo}", ba, borrow=True), 0
             )
 
+        await _expect_deferred_timeout(body, fifo, ba, original, seen)
+
+    run_bounded(go, fifo)
+    _check_deferred(seen, original)
+
+
+def test_timeout_after_the_native_write_started_waits_for_it(work_dir):
+    """Deterministic variant: the write IS running (stuck opening the FIFO) when the timeout fires."""
+    original = b"started-then-timeout" * 10_000
+    fifo, ba = stuck_put(work_dir, original)
+    seen = {}
+
+    async def go():
+        async def body():
+            async with asyncio.timeout(0.5):
+                await s3dlio.put_bytes_async(f"file://{fifo}", ba, borrow=True)
+
         t = asyncio.ensure_future(body())
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(
+            1.5
+        )  # the timeout (0.5 s) has fired; the write is still stuck
         seen["terminal_early"] = t.done()
         seen["pinned"] = not resizable(ba)
         reader = Reader(fifo)
@@ -247,9 +285,7 @@ def test_wait_for_zero_is_deferred_until_the_native_write_finished(work_dir):
         seen["released"] = resizable(ba)
 
     run_bounded(go, fifo)
-    assert seen["terminal_early"] is False, (
-        "wait_for(.., 0) ended under a running native write"
-    )
+    assert seen["terminal_early"] is False, "timeout ended under a running native write"
     assert seen["pinned"] is True
     assert seen["data"] == original
     assert seen["released"] is True
