@@ -15,8 +15,9 @@ For S3 (s3://):
     # For MinIO/Ceph: export AWS_ENDPOINT_URL="http://localhost:9000"
 
 For Azure Blob (az://):
-    # Sign in with the Azure CLI (or: azd auth login). Service-principal variables
-    # (AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET) and account keys are not read.
+    # Sign in with the Azure CLI (or: azd auth login), or select a mode with
+    # S3DLIO_AZURE_CREDENTIAL: managed-identity, client-secret (AZURE_TENANT_ID / AZURE_CLIENT_ID /
+    # AZURE_CLIENT_SECRET), workload-identity, sas (S3DLIO_AZURE_SAS_TOKEN). Account keys are not read.
     az login
 
 For GCS (gs://):

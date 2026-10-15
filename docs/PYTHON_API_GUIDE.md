@@ -559,22 +559,27 @@ gcloud auth application-default login
 
 **Azure Blob Storage:**
 
-The storage account comes from the URI (`az://account/container/key`). Authentication
-against an `https` endpoint uses the Azure developer-tool credential: sign in with
-`az login` (Azure CLI) or `azd auth login` (Azure Developer CLI) before starting Python;
-the `az` / `azd` executable must be on `PATH` for the process that runs s3dlio (it is invoked to
-obtain tokens).
-Account keys (`AZURE_STORAGE_KEY`), SAS tokens, connection strings and service-principal
-environment variables (`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`/`AZURE_TENANT_ID`) are
-**not** supported: the Azure SDK s3dlio is built on (`azure_storage_blob` 1.0) has no Shared Key
-signing, and s3dlio does not read those variables.
-```bash
-az login          # or: azd auth login
-```
+The storage account comes from the URI (`az://account/container/key`). Set
+`S3DLIO_AZURE_CREDENTIAL` to choose the credential (default `auto`): `workload-identity`, `client-secret`,
+`client-certificate` (needs a build with the cargo feature `azure-client-certificate`), `managed-identity`,
+`cli` (`az login` / `azd auth login`; the `az` / `azd` executable must be on `PATH`), `sas`, or `none`.
+`auto` takes the first of workload identity, client secret, client certificate, managed identity and `cli`
+whose variables are present. A bearer-token mode needs an `https` endpoint. Account keys (Shared Key) and
+connection strings are **not** supported (the Azure SDK s3dlio is built on, `azure_storage_blob` 1.0, signs
+only with bearer tokens or a SAS). The full table of modes and the variables each reads is in
+[Environment_Variables.md](Environment_Variables.md#azure-blob-storage-configuration).
 ```python
 import os
-# Optional custom endpoint. An http:// endpoint (Azurite) is used without credentials;
-# an https:// endpoint still uses the az login / azd credential.
+# Service principal (the same variables the Azure SDKs use):
+os.environ['AZURE_TENANT_ID'] = '<tenant>'
+os.environ['AZURE_CLIENT_ID'] = '<app id>'
+os.environ['AZURE_CLIENT_SECRET'] = '<secret>'          # auto -> client-secret
+# Managed identity on an Azure VM / App Service / AKS node:
+#   os.environ['S3DLIO_AZURE_CREDENTIAL'] = 'managed-identity'
+# SAS token:
+#   os.environ['S3DLIO_AZURE_CREDENTIAL'] = 'sas'
+#   os.environ['S3DLIO_AZURE_SAS_TOKEN'] = 'sv=...&sig=...'
+# Optional custom endpoint. Azurite (http://) needs no credential:
 os.environ['AZURE_STORAGE_ENDPOINT'] = 'http://127.0.0.1:10000'  # Azurite
 ```
 

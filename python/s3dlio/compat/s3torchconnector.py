@@ -28,8 +28,9 @@ Environment variables (same as s3torchconnector):
     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY - S3 credentials
     AWS_ENDPOINT_URL - Custom endpoint (MinIO, Ceph, etc.)
     AWS_REGION - Default region (if not specified in from_prefix)
-    Azure (az://account/container/key): no credential variables; sign in with `az login`
-        (or `azd auth login`). AZURE_STORAGE_ACCOUNT_NAME / _KEY are not read by s3dlio.
+    Azure (az://account/container/key): S3DLIO_AZURE_CREDENTIAL selects the credential (default
+        auto: service principal, managed identity or `az login`). AZURE_STORAGE_ACCOUNT_NAME / _KEY
+        are not read by s3dlio.
     GOOGLE_APPLICATION_CREDENTIALS - GCS service account JSON path
 """
 

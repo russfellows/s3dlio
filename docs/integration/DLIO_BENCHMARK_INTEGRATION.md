@@ -190,7 +190,9 @@ export AWS_ENDPOINT_URL=http://minio:9000  # For custom endpoints
 
 ### For Azure Blob Storage
 
-Authenticate with the Azure CLI; s3dlio does not read account-key variables. The storage account
+Authenticate with the Azure CLI, or pick a mode with `S3DLIO_AZURE_CREDENTIAL` (managed identity,
+service principal, workload identity, SAS; see `Environment_Variables.md`); s3dlio does not read account-key
+variables. The storage account
 is part of the URI (`az://account/container/path`).
 
 ```bash
@@ -300,8 +302,8 @@ storage:
   storage_type: s3dlio
   storage_root: az://myaccount/mycontainer/dlio-data
 
-# Authenticate beforehand with `az login` (or `azd auth login`);
-# account-key environment variables are not read.
+# Authenticate beforehand with `az login` (or `azd auth login`), or set S3DLIO_AZURE_CREDENTIAL
+# (managed-identity, client-secret, workload-identity, sas); account-key variables are not read.
 ```
 
 ### Local Filesystem with O_DIRECT

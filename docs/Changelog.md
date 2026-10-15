@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Added
+
+- **Azure credential modes: managed identity, service principal, workload identity and SAS (#253).**
+  The Azure backend used only the `az`/`azd` developer login, so it could not authenticate on Azure VMs, AKS pods or
+  in CI. `S3DLIO_AZURE_CREDENTIAL` now selects `auto` (default), `cli`, `managed-identity`, `client-secret`,
+  `client-certificate`, `workload-identity`, `sas` or `none` (case-insensitive; an unknown value is an error listing
+  the valid ones). `auto` takes the first whose variables are present: workload identity
+  (`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`), client secret (`AZURE_CLIENT_ID`,
+  `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`), client certificate (`AZURE_CLIENT_CERTIFICATE_PATH`), managed identity
+  (`IDENTITY_ENDPOINT`/`MSI_ENDPOINT` set, or the instance metadata service identifies an Azure VM), then `az`/`azd`.
+  `AZURE_AUTHORITY_HOST` (https only) is honoured by the SDK for the Entra ID modes. `sas` appends
+  `S3DLIO_AZURE_SAS_TOKEN` to every request URL (the SDK keeps the query on GET, HEAD, PUT, DELETE and LIST; tested).
+  Each credential is created once per process and shared by the cached per-account client (#242 follow-up), so the SDK
+  caches and refreshes tokens; only the `cli` mode runs a process, per token request. A 401/403 and a failed token request
+  name the mode (`Azure credential mode <m>: ...`); the SAS token is removed from messages. A bearer-token mode on an
+  `http` endpoint is refused with a message saying it needs https (use `sas`/`none` for Azurite); `auto` on `http` sends no
+  credential, as before. The `client-certificate` mode needs the new cargo feature `azure-client-certificate` (it links
+  OpenSSL, so it is not in `full-backends` or the default wheel) and a PKCS#12 `.pfx` with an RSA key; without the
+  feature the mode reports that. Shared Key (account key) is still not supported: `azure_storage_blob` 1.0 cannot sign with
+  it. Tested end to end against local fake Entra ID, App Service managed-identity and Blob services (HTTPS with a throwaway
+  CA): managed identity, client secret, `auto`, workload identity, client certificate and SAS, including one token
+  request per credential for many blob requests. Not tested: real Azure, the real instance-metadata address (the SDK
+  hard-codes it; the probe is tested against a local stand-in), and a real AKS federated token. The `auto` metadata probe
+  checks for an Azure instance document: an earlier draft accepted any connection to 169.254.169.254, which on a Google
+  Cloud VM selected managed identity and made an Azure test wait about 400 s.
+
 ### Fixed
 
 - **`get_many()` on `az://` and `gs://` URIs no longer fails for every key (#242).** The function
@@ -34,7 +60,7 @@
   (Azure); if the server sends more than announced the buffer still grows. A test counts buffer growth
   (an 8 MiB body: 3 growths before, 0 now). The GCS gRPC read already sized its buffer from the object
   size and is unchanged. Throughput was not measured.
-- **Azure: the documentation no longer tells you to authenticate with `AZURE_STORAGE_KEY` (#239).**
+- **Azure: the documentation no longer tells you to authenticate with `AZURE_STORAGE_KEY` (#239).** (The service-principal, managed-identity and SAS modes this entry says were missing were added afterwards, see #253 above.)
   The docs (`PYTHON_API_GUIDE.md`, `Environment_Variables.md`, `CLI_GUIDE.md`) said an Azure account key,
   `AZURE_STORAGE_ACCOUNT`, or the service-principal variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
   `AZURE_TENANT_ID`) authenticate s3dlio to Azure. None of them is read: s3dlio uses the Azure developer-tool

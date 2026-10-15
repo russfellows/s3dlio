@@ -129,8 +129,9 @@ class S3dlioStorage(DataStorage):
         AWS_ENDPOINT_URL: Custom endpoint (set by multi-endpoint logic or config)
 
     Azure credentials:
-        No environment variables. Sign in with `az login` (or `azd auth login`); the
-        account comes from the az://account/container/path URI. s3dlio does not read
+        S3DLIO_AZURE_CREDENTIAL selects the credential (default auto: service principal,
+        managed identity or `az login`); the account comes from the
+        az://account/container/path URI. s3dlio does not read
         AZURE_STORAGE_ACCOUNT_NAME / AZURE_STORAGE_ACCOUNT_KEY.
 
     Environment Variables (for GCS):

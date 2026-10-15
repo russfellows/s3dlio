@@ -432,17 +432,40 @@ When a URI's first segment is a server (an explicit `host:port`, see above), s3d
 ## Azure Blob Storage Configuration
 
 **Authentication.** The storage account is taken from the URI (`az://account/container/key`).
-For an `https` endpoint s3dlio authenticates with the Azure developer-tool credential: run
-`az login` (Azure CLI) or `azd auth login` (Azure Developer CLI) first; the `az` / `azd`
-executable must be on `PATH` of the s3dlio process, which runs it to obtain tokens. For an `http` endpoint
-(for example Azurite) no credential is sent. s3dlio does **not** read `AZURE_STORAGE_ACCOUNT`,
-`AZURE_STORAGE_KEY`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`, SAS tokens or
-connection strings; setting them has no effect. Account-key (Shared Key) authentication is not
-available because the Azure SDK in use (`azure_storage_blob` 1.0 / `azure_core` 1.1) only signs
-requests with bearer tokens (tracked in #239).
+`S3DLIO_AZURE_CREDENTIAL` selects how s3dlio authenticates (case-insensitive; an unknown value is an
+error that lists the valid ones):
+
+| Value | What is used | Variables read |
+|-------|--------------|----------------|
+| `auto` (default) | The first of the rows below whose variables are present, in this order: workload identity, client secret, client certificate, managed identity, `cli`. Never picks `sas` or `none`. On an `http` endpoint (Azurite) `auto` sends no credential. | see below |
+| `workload-identity` | AKS / Entra workload identity (federated token) | `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` |
+| `client-secret` | Service principal with a secret | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` |
+| `client-certificate` | Service principal with a certificate: a PKCS#12 (`.pfx`) file with an RSA key. **Only in builds with the cargo feature `azure-client-certificate`** (it links OpenSSL; not in `full-backends` or the default wheel) | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE_PATH`, optional `AZURE_CLIENT_CERTIFICATE_PASSWORD`, optional `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN` (read by the SDK) |
+| `managed-identity` | Azure VM (instance metadata service), App Service, Arc, Functions managed identity | optional `AZURE_CLIENT_ID` (a user-assigned identity); the SDK reads `IDENTITY_ENDPOINT`, `IDENTITY_HEADER`, `IMDS_ENDPOINT`, `MSI_ENDPOINT`, `MSI_SECRET` |
+| `cli` | `az login`, then `azd auth login` (the `az` / `azd` executable must be on `PATH`; it is run for every token request) | none |
+| `sas` | No bearer token; `S3DLIO_AZURE_SAS_TOKEN` is appended to every request URL (works over `http` and `https`) | `S3DLIO_AZURE_SAS_TOKEN` |
+| `none` | No credential (anonymous access, Azurite) | none |
+
+`auto` picks `workload-identity` when `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`
+are all set; else `client-secret` when `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_SECRET` are set;
+else `client-certificate` when `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_CERTIFICATE_PATH` are set;
+else `managed-identity` when `IDENTITY_ENDPOINT` or `MSI_ENDPOINT` is set, or the instance metadata service
+at 169.254.169.254:80 answers `GET /metadata/instance` with an Azure instance document within 250 ms (asked once
+per process; Google Cloud and AWS VMs answer that address too, and are not taken for Azure); else `cli`.
+
+`AZURE_AUTHORITY_HOST` (default `https://login.microsoftonline.com`; it must be `https`) is read by the SDK for
+`client-secret`, `client-certificate` and `workload-identity`. Each credential is created once per process and shared,
+so the SDK caches and refreshes tokens; only `cli` runs a process (per token request, not per object). A request
+rejected with 401 or 403 and a failed token request both name the credential mode in the error.
+A bearer-token mode needs an `https` endpoint (the SDK refuses a token over `http`); use `sas` or `none` for an
+`http` endpoint. The SAS token is never logged and is removed from error messages. Not read: `AZURE_STORAGE_ACCOUNT`,
+`AZURE_STORAGE_KEY` and connection strings. Account-key (Shared Key) authentication is **not supported**: the Azure SDK in
+use (`azure_storage_blob` 1.0 / `azure_core` 1.1) can only sign requests with bearer tokens or use a SAS.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `S3DLIO_AZURE_CREDENTIAL` | `auto` | Credential mode (above) |
+| `S3DLIO_AZURE_SAS_TOKEN` | (unset) | SAS token for `sas` mode |
 | `AZURE_STORAGE_ENDPOINT` | (unset) | **Custom Azure endpoint** (e.g., `http://localhost:10000` for Azurite) |
 | `AZURE_BLOB_ENDPOINT_URL` | (unset) | Alternative for `AZURE_STORAGE_ENDPOINT` |
 | `S3DLIO_AZURE_DOWNLOAD_MODE` | `auto` | Download strategy: `auto`, `azure-sdk`, `s3dlio`, or `sequential` |

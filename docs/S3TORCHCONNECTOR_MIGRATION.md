@@ -144,8 +144,9 @@ os.environ["AWS_ENDPOINT_URL"] = "http://minio:9000"
 ### Azure Blob Storage
 
 The account is part of the URI (`az://account/container/prefix/`). Authenticate first with
-`az login` (or `azd auth login`); account keys and `AZURE_STORAGE_ACCOUNT_*` variables are not
-read by s3dlio.
+`az login` (or `azd auth login`), or choose another mode with `S3DLIO_AZURE_CREDENTIAL` (managed
+identity, service principal, workload identity, SAS); account keys and `AZURE_STORAGE_ACCOUNT_*` variables
+are not read by s3dlio.
 ```python
 dataset = S3IterableDataset.from_prefix("az://myaccount/container/prefix/")
 ```
@@ -178,7 +179,7 @@ export AWS_ENDPOINT_URL=http://endpoint:9000  # For MinIO/Ceph
 
 ### Azure
 Azure does not use environment variables for credentials in s3dlio (this differs from
-s3torchconnector's S3 setup): sign in with `az login` or `azd auth login`, and put the account in the
+s3torchconnector's S3 setup): sign in with `az login` or `azd auth login` (or set `S3DLIO_AZURE_CREDENTIAL`), and put the account in the
 URI (`az://account/container/prefix/`). `AZURE_STORAGE_ACCOUNT_NAME` / `AZURE_STORAGE_ACCOUNT_KEY` are
 not read. See `Environment_Variables.md`.
 ```bash

@@ -60,8 +60,9 @@ class S3PyTorchConnectorStorage(S3Storage):
         AWS_ENDPOINT_URL (for MinIO, Ceph, etc.)
 
     Azure (az://):
-        No credential variables: sign in with `az login` (or `azd auth login`); the account
-        comes from the az://account/container/path URI (account-key variables are not read).
+        S3DLIO_AZURE_CREDENTIAL selects the credential (default auto: service principal, managed
+        identity or `az login`); the account comes from the az://account/container/path URI
+        (account-key variables are not read).
         AZURE_STORAGE_ENDPOINT (optional)
 
     GCS (gs://):

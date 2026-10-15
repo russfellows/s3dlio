@@ -237,7 +237,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 s3dlio provides unified storage operations across all backends with consistent URI patterns:
 
 - **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations (5+ GB/s reads, 2.5+ GB/s writes) with built-in concurrent range GETs (on by default)
-- **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with **RangeEngine** (30-50% faster for large blobs)
+- **☁️ Azure Blob Storage**: `az://account/container/prefix/` - Complete Azure integration with **RangeEngine** (30-50% faster for large blobs). Authentication: managed identity, workload identity, service principal (secret or certificate), SAS, or `az login`, selected with `S3DLIO_AZURE_CREDENTIAL` (default `auto`; see [Environment Variables](docs/Environment_Variables.md#azure-blob-storage-configuration)). Shared Key (account key) is not supported.
 - **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - Production ready with **RangeEngine** and full ObjectStore integration
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations with **RangeEngine** support
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance with **RangeEngine**
@@ -541,7 +541,7 @@ import s3dlio
 
 # Works with any s3dlio URI — just change the prefix:
 #   "s3://bucket/train/"           Amazon S3 / MinIO / Ceph
-#   "az://container/train/"        Azure Blob Storage
+#   "az://account/container/train/"  Azure Blob Storage
 #   "gs://bucket/train/"           Google Cloud Storage
 #   "file:///mnt/data/train/"      Local filesystem
 #   "direct:///mnt/nvme/train/"    Local O_DIRECT (bypass page cache)
