@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use crate::checksum::crc32c_of;
 use anyhow::Result;
 use bytes::Bytes;
-use crc32fast::Hasher;
 use std::io::{Cursor, Write};
 
-/* ---------- low‑level helpers, unchanged ---------- */
+/* ---------- low‑level helpers ---------- */
+// The TFRecord format uses CRC-32C (Castagnoli) for both the length CRC and the data CRC,
+// masked as `((crc >> 15) | (crc << 17)) + 0xa282ead8` (issue #258; it used CRC-32 before).
 fn mask_crc(crc: u32) -> u32 {
     crc.rotate_right(15).wrapping_add(0xa282_ead8)
 }
@@ -18,15 +20,11 @@ fn write_raw_record<W: Write>(w: &mut W, data: &[u8]) -> std::io::Result<usize> 
     w.write_all(&len_buf)?;
 
     // 2 masked len‑CRC
-    let mut h = Hasher::new();
-    h.update(&len_buf);
-    w.write_all(&mask_crc(h.finalize()).to_le_bytes())?;
+    w.write_all(&mask_crc(crc32c_of(&len_buf)).to_le_bytes())?;
 
     // 3 data + 4 masked data‑CRC
     w.write_all(data)?;
-    let mut h = Hasher::new();
-    h.update(data);
-    w.write_all(&mask_crc(h.finalize()).to_le_bytes())?;
+    w.write_all(&mask_crc(crc32c_of(data)).to_le_bytes())?;
 
     Ok(8 + 4 + data.len() + 4)
 }
