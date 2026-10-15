@@ -308,7 +308,13 @@ of characters except `/`, `**` matches any run including `/`, everything else is
 `list("s3://b/file.txt*")` returns `file.txt`, `file.txt.bak` and `file.txt2`;
 `list("s3://b/data/**.npz")` every `.npz` under `data/`. With a wildcard an object is selected iff its
 full key matches, so `recursive` makes no difference; a wildcard key ending in `/` raises
-`RuntimeError`. `download()` follows the same rule. Earlier versions split the URI at its last `/` and
+`RuntimeError`. `*` also matches the empty string, so `list("s3://b/dir/*")` includes a folder-marker
+object `dir/` if one exists; `a/**/b` needs something between its slashes (it matches `a/x/b` and
+`a//b`, not `a/b`). There is no escape for a literal `*` in a listing or `recursive=True` URI: a key
+literally named `a*b` is reached by the exact, non-recursive calls (`get`, `stat`, `delete` without
+`recursive=True`), which take the key as written. `download()` follows the same rule.
+`s3dlio.compat.s3torchconnector` is the exception by design: its `prefix` arguments keep the
+upstream key-PREFIX meaning (`train/img_` returns every key that starts with it). Earlier versions split the URI at its last `/` and
 compiled the rest as an unanchored regex. Only `s3://` follows this rule; `file://`, `direct://`,
 `gs://` and `az://` listings are unchanged (tracked in #220).
 
@@ -396,7 +402,7 @@ s3dlio.delete("s3://bucket/logs/2026/", recursive=True)  # every object whose ke
 **Compatibility change (intentional).** Earlier versions deleted every listed entry for a URI ending
 in `/` or containing `*` or `?` (including synthetic common-prefix entries) and treated the last
 segment of a recursive URI as a regex. Code that relied on that must now pass `recursive=True` (and a
-literal prefix) or name the object. The lower-level `ObjectStore.delete`, `delete_batch` and
+a URI that selects them: `name/`, or `name*`) or name the object. The lower-level `ObjectStore.delete`, `delete_batch` and
 `delete_prefix` are unchanged.
 
 ### mkdir() — Create Directory / Prefix

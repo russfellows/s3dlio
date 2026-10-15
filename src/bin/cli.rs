@@ -1259,7 +1259,8 @@ async fn main() -> Result<()> {
 }
 
 /// Generic list command that works with any storage backend.
-/// The URI is a literal key prefix; an explicit `--pattern` regex filters the result client-side.
+/// On s3:// the URI selects an exact name (the object plus `name/...`), a directory (`name/`) or an
+/// explicit `*` / `**` glob; an explicit `--pattern` regex filters the result client-side.
 /// Uses streaming for memory efficiency and visible progress
 async fn generic_list_cmd(
     uri: &str,
@@ -1291,7 +1292,7 @@ async fn generic_list_cmd(
     let store = store_for_uri_with_logger(uri, logger)?;
 
     // Compile the explicit --pattern, if any, before anything is listed. The URI itself is a
-    // LITERAL key prefix, never a regex (issue #213). The pattern is matched against the
+    // exact name / directory / glob, never a regex (issue #213). The pattern is matched against the
     // entry relative to the listing base (see `s3dlio::list_pattern`), e.g. listing
     // s3://bucket/prefix/ and key s3://bucket/prefix/foo/bar -> the pattern sees "foo/bar".
     let filter = pattern.map(ListPattern::new).transpose()?;
@@ -1440,8 +1441,8 @@ async fn stat_cmd(uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// Get command: downloads the objects under a literal key prefix, optionally narrowed by an
-/// explicit `--pattern` regex.
+/// Get command: downloads the objects the URI selects (on s3://: the exact name plus `name/...`, a
+/// directory `name/`, or a `*` / `**` glob), optionally narrowed by an explicit `--pattern` regex.
 #[allow(clippy::too_many_arguments)]
 async fn get_cmd(
     uri: Option<&str>,
@@ -1458,10 +1459,10 @@ async fn get_cmd(
     let concurrency = concurrent.unwrap_or(jobs);
 
     // Compile the explicit --pattern before anything else: an invalid regex fails here, with no
-    // request sent (#213). The URI itself is a literal key prefix, never a regex.
+    // request sent (#213). The URI itself is an exact name, a directory or a glob, never a regex.
     let filter = pattern.map(ListPattern::new).transpose()?;
     if filter.is_some() && (keylist.is_some() || offset.is_some() || length.is_some()) {
-        bail!("--pattern selects among the objects listed under a URI prefix; it cannot be combined with --keylist or --offset/--length");
+        bail!("--pattern selects among the objects the URI selects; it cannot be combined with --keylist or --offset/--length");
     }
 
     // Pre-tune GCS subchannels to match concurrency before the first GCS client init.
@@ -1863,7 +1864,7 @@ async fn get_cmd(
     if keys_seen == 0 {
         updater.abort();
         pb.finish_and_clear();
-        bail!("No objects found under the key prefix '{}'", uri_str);
+        bail!("No objects found for '{}' (a URI selects an exact name or a directory; use '*' to select by prefix)", uri_str);
     }
 
     // Phase 2: drain all in-flight downloads and collect errors.

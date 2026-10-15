@@ -69,6 +69,25 @@ The key part `K` of `s3://bucket/K` now selects, for every listing-style operati
   `--pattern` the behaviour is unchanged. Library: new
   `generic_download_objects_matching_with_summary(..., pattern: Option<&ListPattern>, ...)`;
   `generic_download_objects[_with_summary]` keep their signatures.
+- **Consequences of the glob rule worth knowing.** (1) `*` also matches the empty string, so
+  `s3://b/dir/*` selects a folder-marker object `dir/` itself if one exists (`ls` shows it,
+  `delete -r 's3://b/dir/*'` removes it). (2) `a/**/b` needs something between its slashes: it selects
+  `a/x/b` and `a//b` but NOT `a/b`; use `a/**` with `--pattern`, or name `a/b` itself. (3) There is no
+  escape for a literal `*` in a listing or recursive URI: a key literally named `a*b` can only be
+  addressed by the exact, non-recursive operations (`s3-cli stat`, `s3-cli delete` without `-r`, and
+  the Python `get`, `stat` and `delete` without `recursive=True`, which take the key as written). `delete -r 's3://b/a*'` is a glob over `a...` in one directory level, which is much
+  broader than the old literal prefix `a*`.
+- **Dataset constructors fail on an empty selection.** `S3BytesDataset::from_prefix[_with_opts]` and
+  `MultiBackendDataset::from_prefix` (and so `dataset_for_uri`, `PyS3Dataset`, `PyS3AsyncDataLoader`)
+  return an error instead of a dataset of zero samples when an `s3://` URI selects nothing, for
+  example a bare partial name such as `s3://b/train/img_`. The message names the URI and says that a URI
+  selects an exact name or a directory and that `*` selects by prefix (`s3://b/train/img_*`).
+- **`s3dlio.compat.s3torchconnector` keeps the upstream PREFIX meaning.** Its `prefix` is an S3 key
+  prefix, as in AWS's s3torchconnector: `S3Client.list_objects(bucket, "train/img_")`,
+  `S3IterableDataset.from_prefix("s3://b/train/img_")` and `S3MapDataset.from_prefix(...)` return every
+  key that starts with the prefix (`train/img_1/x` included). A prefix without `*` is listed as
+  `<prefix>**`; a prefix that itself contains `*` (a literal character in a key prefix) is read by
+  listing the directory part of the text before the first `*` and keeping the keys that start with it.
 - **Requests.** The server does the narrowing and no sibling is paged through: a name costs one
   `max-keys=1` probe (the object `K` sorts before every other key that starts with `K`) plus the
   listing of `K/` (recursive) or one more `max-keys=1` probe (non-recursive); a directory is its
@@ -176,10 +195,11 @@ entry). **Code that relied on the old implicit expansion will now delete less; p
 - The op-log records an exact delete as one `DELETE` row, as before; no `HEAD` row is added.
   `recursive=True` records one `LIST` row plus one `DELETE` row per object (replayable), not
   `DELETE_BATCH`.
-- (The prefix rule in this entry is superseded in the next release: see "Unreleased", #213 -- `foo` selects the object `foo` and `foo/...`, never `foobar`.)
-- `delete(uri, recursive=True)` deletes the real objects under the literal prefix: listed with no
-  delimiter, objects only, nothing appended (`foo` also matches `foobar`), `*` and `?` literal (the last
-  URI segment used to be read as a regex). It needs list permission. A prefix with no objects is a
+- `delete(uri, recursive=True)` deletes the real objects the URI selects: listed objects only (synthetic
+  common-prefix entries are never candidates). On `s3://`, `foo` selects the object `foo` and the keys
+  under `foo/`, never `foobar`; `foo/` selects everything under it; `*` and `**` are globs; every
+  other character is literal and the last URI segment is no longer read as a regex. It needs list
+  permission. A prefix with no objects is a
   no-op. Each selected object is deleted with its own request (up to 10 in flight), as before;
   batching (DeleteObjects) is deferred for Python. After a failed request or a listing error no further
   delete request is sent (requests already in flight finish) and the `RuntimeError` says how many
@@ -210,11 +230,10 @@ implicit expansion will now delete less; add `-r` where you mean "everything und
   given it adds that only the object named by the exact URI was targeted and to use `-r` for
   everything under a prefix. On a **versioned bucket** a delete adds a delete marker and does not erase
   earlier versions.
-- (The `delete -r s3://bkt/foo` prefix rule below is superseded in the next release: see "Unreleased", #213.)
-- `delete -r s3://bkt/foo/` deletes the real objects under the literal prefix `foo/` (recursive listing
-  with no delimiter; synthetic common-prefix entries are never delete candidates). It needs list
-  permission. `delete -r s3://bkt/foo` uses the literal prefix `foo`, so it also matches `foobar` (no
-  `/` is appended). Key characters are never read as a regex or wildcard.
+- `delete -r s3://bkt/foo/` deletes the real objects under `foo/` (recursive listing with no delimiter;
+  synthetic common-prefix entries are never delete candidates). It needs list permission.
+  `delete -r s3://bkt/foo` deletes the object `foo` and the keys under `foo/`, never `foobar`;
+  `delete -r s3://bkt/foo*` is a glob. Key characters other than `*` are never read as a regex.
 - `-p/--pattern` is accepted only with `-r` and filters the `-r` selection; without `-r` it is an error.
 - A listing error part-way through a recursive delete does not send the partly filled batch in which
   it occurred: those keys are counted as "NOT attempted" in the message. Batches that were already
