@@ -208,6 +208,24 @@ mod tests {
     }
 
     #[test]
+    fn base_of_a_wildcard_uri_is_the_directory_before_the_first_star() {
+        assert_eq!(
+            relative_to_listing_base("s3://b/data/file*", "s3://b/data/file.txt.bak"),
+            "file.txt.bak"
+        );
+        assert_eq!(
+            relative_to_listing_base("s3://b/data/**.npz", "s3://b/data/sub/c.npz"),
+            "sub/c.npz"
+        );
+        assert_eq!(
+            relative_to_listing_base("s3://b/data/*/x", "s3://b/data/a/x"),
+            "a/x"
+        );
+        assert_eq!(relative_to_listing_base("s3://b/*", "s3://b/top"), "top");
+        assert_eq!(relative_to_listing_base("data/f*", "data/f1"), "f1");
+    }
+
+    #[test]
     fn an_entry_outside_the_base_is_matched_whole() {
         assert_eq!(
             relative_to_listing_base("s3://b/dl/", "s3://b/other/x"),

@@ -19,9 +19,12 @@
 //!   object was removed" (S3 does not say whether the key existed; on a
 //!   versioned bucket a delete adds a delete marker and erases no version).
 //! * **Recursive delete.**  [`delete_objects_under_literal_prefix`] deletes the
-//!   REAL objects whose key starts with the literal prefix given
-//!   ([`ObjectStore::list_objects_with_prefix`]: no delimiter, objects only,
-//!   no `/` appended -- the prefix `foo` also matches `foobar`).
+//!   REAL objects the URI selects ([`ObjectStore::list_objects_with_prefix`]: no
+//!   delimiter, objects only).  On `s3://` the selection is the rule of
+//!   [`crate::s3_selection`] (issue #213): `foo` selects the object `foo` and
+//!   everything under `foo/` -- never `foobar`; a trailing `/` selects everything
+//!   under it; `*` / `**` make an explicit glob over the full key.  On the other
+//!   backends the URI must end in `/`.
 //!
 //! The functions here select and delete; the callers decide how to word the
 //! outcome (the CLI prints, Python raises).  A recursive delete needs list
@@ -262,9 +265,11 @@ pub enum DeleteMode {
     PerObject,
 }
 
-/// Delete the real objects under the literal prefix `uri`, listed recursively
-/// ([`ObjectStore::list_objects_with_prefix`]: no delimiter, objects only, no
-/// `/` appended), optionally narrowed by `filter`.  The selection is the same
+/// Delete the real objects `uri` selects, listed recursively
+/// ([`ObjectStore::list_objects_with_prefix`]: no delimiter, objects only),
+/// optionally narrowed by `filter`.  The function name predates issue #213 and is
+/// kept (it is public): on `s3://` the URI is no longer a bare prefix -- `foo` never
+/// selects `foobar` (see [`crate::s3_selection`]).  The selection is the same
 /// for both [`DeleteMode`]s; only the way each selected object is deleted differs.
 ///
 /// After any failure (a delete request, a per-key error, the listing) no

@@ -195,7 +195,7 @@ enum Command {
         /// Full S3 URI (e.g. s3://bucket/prefix/key)
         uri: String,
     },
-    /// Delete one exact object, or with -r every object under a literal key prefix.
+    /// Delete one exact object, or with -r the objects an s3:// URI selects.
     ///
     /// Without -r, `delete s3://bkt/foo` and `delete s3://bkt/foo/` send ONE delete
     /// request for exactly that key (a trailing slash does not mean "recursive"); the
@@ -203,12 +203,15 @@ enum Command {
     /// success (S3 does not report whether it existed); real failures such as access
     /// denied are reported. On file:// and direct://, a directory is refused without -r.
     ///
-    /// With -r, `delete -r s3://bkt/foo/` deletes every object whose key starts with
-    /// `foo/`, nested ones included. `delete -r s3://bkt/foo` uses the literal prefix
-    /// `foo`, so it ALSO deletes `foobar`; add the `/` to stay inside a folder.
+    /// With -r on s3://, `delete -r s3://bkt/foo/` deletes every object under `foo/`, nested ones
+    /// included. `delete -r s3://bkt/foo` deletes the object `foo` and everything under `foo/` and
+    /// NEVER `foobar` or `foo.bak`: a name selects only itself. `*` makes an explicit glob over the full
+    /// key (`*` stays in one directory level, `**` crosses `/`): `delete -r 's3://bkt/foo*'` deletes
+    /// `foo`, `foo.bak` and `foobar`. A wildcard key ending in `/` is refused and nothing is deleted.
     #[clap(visible_alias = "rm")]
     Delete {
-        /// S3 URI of the exact object, or with -r the literal key prefix.
+        /// S3 URI of the exact object, or with -r the selection: a name (the object and its `name/`
+        /// directory, never `name.bak`), a directory (`name/`), or a `*` / `**` glob.
         uri: String,
 
         /// Accepted for compatibility but currently unused: DeleteObjects requests
@@ -216,7 +219,7 @@ enum Command {
         #[arg(short = 'j', long = "jobs", default_value_t = 1000, value_parser = parse_jobs)]
         jobs: usize,
 
-        /// Delete every object under the literal key prefix (listed recursively).
+        /// Delete every object the URI selects (listed recursively).
         #[clap(short, long)]
         recursive: bool,
 
@@ -227,17 +230,18 @@ enum Command {
     },
     /// Download one or many objects concurrently.
     ///
-    /// On s3:// the URI is a literal key PREFIX, never a glob or regex: `get s3://b/file.txt`
-    /// downloads `file.txt` AND anything else that starts with `file.txt` (such as
-    /// `file.txt.bak`), and `get s3://b/dl` also selects `dl2/...`. End the URI with `/`
-    /// (`s3://b/dl/`) to select only the contents of that directory. To narrow the selection
-    /// with a regex use `--pattern`, which is matched against the object name relative to the
+    /// On s3:// the URI is a name, never a bare prefix and never a regex: `get s3://b/file.txt`
+    /// downloads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` downloads everything under
+    /// `dl/` (never `dl2/`); `get s3://b/dl/` the contents of that directory. `*` makes an explicit
+    /// glob over the full key (`*` stays in one directory level, `**` crosses `/`):
+    /// `get 's3://b/file.txt*'` downloads `file.txt`, `file.txt.bak` and `file.txt2`. To narrow the
+    /// selection with a regex use `--pattern`, matched against the object name relative to the
     /// listing base (for `s3://b/dl/` and key `dl/sub/c.npz` the pattern sees `sub/c.npz`).
-    /// The literal-prefix rule is implemented for s3:// only; file://, direct://, gs:// and
-    /// az:// do not yet follow it (tracked in #220).
+    /// This rule is implemented for s3:// only; file://, direct://, gs:// and az:// do not yet
+    /// follow it (tracked in #220).
     Get {
-        /// S3 URI - a literal key prefix (NOT a glob or regex): a full key, or a prefix ending with `/`.
-        /// `s3://b/file.txt` also selects `file.txt.bak`; end with `/` to select a directory's contents.
+        /// S3 URI: a full key (selects only that object, and with -r what is under `key/`), a directory
+        /// ending with `/`, or a `*` / `**` glob. `s3://b/file.txt` never selects `file.txt.bak`.
         uri: Option<String>,
 
         /// Regex (client-side) that narrows the selection; matched against each listed
@@ -351,16 +355,18 @@ enum Command {
     },
     /// Download objects from any storage backend (S3, Azure, GCS, file://, direct://)
     ///
-    /// On s3:// the source URI is a literal key PREFIX, never a glob or regex:
-    /// `download s3://b/file.txt dir` also downloads `file.txt.bak`, and `download s3://b/dl dir`
-    /// also selects `dl2/...`. End the URI with `/` (`s3://b/dl/`) to select only the contents of
-    /// that directory. To narrow the selection with a regex use `--pattern`, which is matched
-    /// against the object name relative to the listing base (for `s3://b/dl/` and key
-    /// `dl/sub/c.npz` the pattern sees `sub/c.npz`). The literal-prefix rule is implemented for
-    /// s3:// only; file://, direct://, gs:// and az:// do not yet follow it (tracked in #220).
+    /// On s3:// the source URI is a name, never a bare prefix and never a regex:
+    /// `download s3://b/file.txt dir` downloads `file.txt` and NEVER `file.txt.bak`;
+    /// `download -r s3://b/dl dir` downloads everything under `dl/` (never `dl2/`). `*` makes an
+    /// explicit glob over the full key (`*` stays in one directory level, `**` crosses `/`):
+    /// `download 's3://b/file.txt*' dir` downloads `file.txt`, `file.txt.bak` and `file.txt2`. To
+    /// narrow the selection with a regex use `--pattern`, matched against the object name relative
+    /// to the listing base (for `s3://b/dl/` and key `dl/sub/c.npz` the pattern sees `sub/c.npz`).
+    /// This rule is implemented for s3:// only; file://, direct://, gs:// and az:// do not yet
+    /// follow it (tracked in #220).
     Download {
-        /// Source URI: a literal key prefix (NOT a glob or regex): a full key, or a prefix ending with '/'.
-        /// `s3://b/file.txt` also selects `file.txt.bak`; end with '/' to select a directory's contents.
+        /// Source URI: a full key (only that object, and with -r what is under `key/`), a directory
+        /// ending with '/', or a `*` / `**` glob. `s3://b/file.txt` never selects `file.txt.bak`.
         src: String,
         /// Local directory to write into
         dest_dir: PathBuf,
@@ -402,17 +408,20 @@ enum Command {
 
     /// List objects at a storage URI (s3://, az://, gs://, file://, direct://)
     ///
-    /// On s3:// the URI is a literal key PREFIX, never a regex: `ls s3://b/file.txt` also lists
-    /// `file.txt.bak`, and `ls s3://b/dl` also lists `dl2/`. End the URI with `/` (`s3://b/dl/`)
-    /// to list only the contents of that directory. To filter with a regex use `--pattern`,
-    /// matched against the entry relative to the listing base. The literal-prefix rule is
-    /// implemented for s3:// only; file://, direct://, gs:// and az:// do not yet follow it
-    /// (tracked in #220).
+    /// On s3:// the URI is a name, never a bare prefix and never a regex: `ls s3://b/file.txt` lists
+    /// `file.txt` and NEVER `file.txt.bak`; `ls s3://b/dl` lists the directory entry `dl/` (never
+    /// `dl2/`), `ls -r s3://b/dl` everything under `dl/`; `ls s3://b/dl/` the contents of `dl/`.
+    /// `*` makes an explicit glob over the full key (`*` stays in one directory level, `**`
+    /// crosses `/`; `-r` makes no difference): `ls 's3://b/file.txt*'` lists `file.txt`,
+    /// `file.txt.bak` and `file.txt2`. A wildcard key ending in `/` is refused. To filter with a
+    /// regex use `--pattern`, applied after the selection and matched against the entry relative to
+    /// the listing base. This rule is implemented for s3:// only; file://, direct://, gs:// and
+    /// az:// do not yet follow it (tracked in #220).
     #[clap(name = "list", visible_alias = "ls")]
     GenericList {
         /// Storage URI (e.g. s3://bucket/prefix/, az://account/container/, gs://bucket/prefix/, file:///path/);
-        /// on s3:// a literal key prefix (`s3://b/file.txt` also selects `file.txt.bak`; end with `/`
-        /// for a directory's contents), never a regex (use --pattern to filter)
+        /// on s3:// a name (`s3://b/file.txt` never selects `file.txt.bak`), a directory (end with `/`),
+        /// or a `*` / `**` glob; never a regex (use --pattern to filter)
         uri: String,
 
         /// List objects recursively
@@ -1935,10 +1944,10 @@ async fn get_cmd(
 ///   is success (S3 deletes are idempotent) and any actual failure (403, 5xx,
 ///   network) is an error.  Nothing is listed and nothing is expanded -- a
 ///   trailing slash alone never authorizes a recursive delete.
-/// * `delete -r s3://bkt/foo/` deletes the real objects whose key starts with
-///   the literal prefix `foo/`, nested ones included.  `delete -r s3://bkt/foo`
-///   uses the literal prefix `foo` (so it also matches `foobar`; no `/` is
-///   appended).
+/// * `delete -r s3://bkt/foo/` deletes the real objects under `foo/`, nested
+///   ones included.  `delete -r s3://bkt/foo` deletes the object `foo` and
+///   everything under `foo/` -- never `foobar` (issue #213; `foo*` is the
+///   explicit glob that selects it).  `*` / `**` select by glob over the full key.
 /// * `-p/--pattern` only filters the `-r` selection; it is an error without `-r`.
 ///
 /// This is an intentional compatibility change from the earlier implicit
@@ -1997,7 +2006,7 @@ async fn delete_exact_object(
     Ok(())
 }
 
-/// `delete -r <uri>`: delete the real objects under the literal prefix, listed
+/// `delete -r <uri>`: delete the real objects the URI selects (name, directory or glob), listed
 /// recursively (no delimiter), optionally narrowed by `filter` (the pattern text
 /// and its compiled regex, matched against the listed object URI).
 ///
@@ -2009,7 +2018,7 @@ async fn delete_prefix_objects(
     uri: &str,
     filter: Option<(&str, &regex::Regex)>,
 ) -> Result<()> {
-    info!("Deleting objects under literal prefix: {}", uri);
+    info!("Deleting the objects selected by: {}", uri);
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_bar()

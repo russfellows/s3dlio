@@ -153,18 +153,19 @@ pub async fn upload_files<P: AsRef<Path>>(
     result
 }
 
-/// Download every object whose key starts with the LITERAL prefix named by `src_uri`
+/// Download every object the `s3://` URI `src_uri` selects (issue #213)
 /// into `dest_dir/`, creating files with their original basenames, up to
 /// `max_in_flight` at once.
 ///
-/// The URI is a literal key prefix, never a regular expression (issue #213):
-/// `s3://b/dir/` downloads everything under `dir/`; `s3://b/dir/file.txt` downloads
-/// `dir/file.txt` and any other key that starts with it (`dir/file.txt.bak`); `.`,
-/// `(`, `[`, `*` and the like are ordinary characters. To select by regular
-/// expression use [`download_objects_matching`].
+/// The URI is never a regular expression and never a bare prefix (the rule is in
+/// [`crate::s3_selection`]): `s3://b/dir/` downloads everything under `dir/`;
+/// `s3://b/dir/file.txt` downloads exactly `dir/file.txt` (and, when `recursive`,
+/// everything under `dir/file.txt/`) and NEVER `dir/file.txt.bak`; `*` / `**` make an
+/// explicit glob over the full key (`s3://b/dir/file.txt*` does select
+/// `dir/file.txt.bak`); `.`, `(`, `[` and the like are ordinary characters. To narrow
+/// the selection by regular expression use [`download_objects_matching`].
 ///
-/// With `recursive == false` only the direct children of the prefix are listed (and
-/// the "directories" among them are skipped).
+/// With `recursive == false` the "directories" among the selected entries are skipped.
 pub async fn download_objects(
     src_uri: &str,
     dest_dir: &Path,
@@ -185,7 +186,7 @@ pub async fn download_objects(
 
 /// [`download_objects`] narrowed by an EXPLICIT regular expression (issue #213).
 ///
-/// `src_uri` is the literal key prefix to list; `pattern`, when given, is matched
+/// `src_uri` selects the objects ([`download_objects`]); `pattern`, when given, is matched
 /// (unanchored) against each listed key relative to the listing base (see
 /// [`crate::list_pattern`]), so `("s3://b/dl/", r"\.npz$")` downloads the `.npz`
 /// objects under `dl/`. An invalid pattern fails before anything is listed.
@@ -202,7 +203,7 @@ pub async fn download_objects_matching(
 ) -> Result<()> {
     let (bucket, key_prefix) = parse_s3_uri_for_global_client(src_uri)?;
 
-    // List the objects under the literal prefix, narrowed by the explicit pattern.
+    // List the objects the URI selects, narrowed by the explicit pattern.
     let keys = list_objects_with_pattern(&bucket, &key_prefix, pattern, recursive)?;
 
     if keys.is_empty() {

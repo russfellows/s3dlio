@@ -4493,7 +4493,9 @@ pub async fn generic_download_objects(
 
 /// Generic download function with detailed transfer summary.
 ///
-/// `src_uri` is the listing prefix; on `s3://` it is a LITERAL key prefix (issue #213).
+/// `src_uri` selects the objects; on `s3://` the rule is [`crate::s3_selection`] (issue #213):
+/// a name selects that object (and its `name/` directory when recursive) and never
+/// `name.bak`, a trailing `/` a directory, `*` / `**` an explicit glob.
 /// Use [`generic_download_objects_matching_with_summary`] to narrow the selection with an
 /// explicit regex.
 pub async fn generic_download_objects_with_summary(
