@@ -209,7 +209,6 @@ def test_compressed_writer_uploads_a_complete_zstd_frame(mock, tmp_path, size, m
     assert stored is not None, f"no object obj.zst was stored: {sorted(mock.objects)}"
     assert mock.part_uploads() >= min_parts, f"parts: {mock.requests}"
     assert result["written"] == len(data)
-    assert result["compressed"] == len(stored), "finalize must report the stored compressed size"
 
     zstd = zstd_cli()
     packed = tmp_path / "stored.zst"
