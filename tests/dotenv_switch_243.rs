@@ -557,9 +557,30 @@ fn s3_cli_reports_a_missing_named_file_on_stderr() {
 
 /// The CLI loads the file before its Tokio runtime exists: a Tokio setting that only the
 /// `.env` carries (TOKIO_WORKER_THREADS, read when the runtime is built) must size it.
+///
+/// Tokio names its worker threads and its blocking-pool threads alike, so the count of
+/// runtime threads is `workers + however many blocking threads were started` (the blocking
+/// pool starts threads lazily, a few at most for `s3-cli ls` waiting on a silent server).
+/// The test therefore uses a worker count far below the host's default (the default is one
+/// worker per CPU) and bounds the stable count: it must be at least the configured workers
+/// and no more than the workers plus a small allowance for blocking threads, which is
+/// still well below the CPU count. On a host with too few CPUs for that gap it skips.
 #[cfg(target_os = "linux")]
 #[test]
 fn s3_cli_loads_dotenv_before_the_runtime_is_built() {
+    const WORKERS: usize = 2;
+    const BLOCKING_ALLOWANCE: usize = 3;
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if cpus < WORKERS + BLOCKING_ALLOWANCE + 3 {
+        eprintln!(
+            "SKIPPED: {cpus} CPUs leave no gap between TOKIO_WORKER_THREADS={WORKERS} \
+             (+{BLOCKING_ALLOWANCE} possible blocking threads) and the default of one worker per CPU"
+        );
+        return;
+    }
+
     // A server that accepts and never answers keeps `s3-cli ls` alive while we look.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -568,7 +589,7 @@ fn s3_cli_loads_dotenv_before_the_runtime_is_built() {
         dir.join(".env"),
         format!(
             "AWS_ENDPOINT_URL=http://127.0.0.1:{port}\nAWS_ACCESS_KEY_ID=k\n\
-             AWS_SECRET_ACCESS_KEY=s\nAWS_REGION=us-east-1\nTOKIO_WORKER_THREADS=3\n"
+             AWS_SECRET_ACCESS_KEY=s\nAWS_REGION=us-east-1\nTOKIO_WORKER_THREADS={WORKERS}\n"
         ),
     )
     .unwrap();
@@ -581,7 +602,7 @@ fn s3_cli_loads_dotenv_before_the_runtime_is_built() {
         .spawn()
         .expect("spawn s3-cli");
     let pid = child.id();
-    let count_workers = || {
+    let count_runtime_threads = || {
         std::fs::read_dir(format!("/proc/{pid}/task"))
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
@@ -594,13 +615,21 @@ fn s3_cli_loads_dotenv_before_the_runtime_is_built() {
             })
             .unwrap_or(0)
     };
-    let mut workers = 0;
-    for _ in 0..100 {
-        workers = count_workers();
-        if workers > 0 {
-            break;
+    // Wait until the count is non-zero and unchanged for a full second (or give up).
+    let mut count = 0;
+    let mut stable_polls = 0;
+    for _ in 0..150 {
+        let now = count_runtime_threads();
+        if now > 0 && now == count {
+            stable_polls += 1;
+            if stable_polls >= 10 {
+                break;
+            }
+        } else {
+            stable_polls = 0;
+            count = now;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     // Stop it with SIGTERM (never a forced kill) and reap it.
     let _ = Command::new("kill")
@@ -608,9 +637,14 @@ fn s3_cli_loads_dotenv_before_the_runtime_is_built() {
         .status();
     let _ = child.wait();
     drop(listener);
-    assert_eq!(
-        workers, 3,
-        "the runtime must be built after the .env is loaded (TOKIO_WORKER_THREADS=3)"
+    assert!(
+        stable_polls >= 10,
+        "the thread count never settled (last {count})"
+    );
+    assert!(
+        (WORKERS..=WORKERS + BLOCKING_ALLOWANCE).contains(&count),
+        "the runtime must be built after the .env is loaded (TOKIO_WORKER_THREADS={WORKERS}): \
+         {count} runtime threads on a {cpus}-CPU host"
     );
 }
 
