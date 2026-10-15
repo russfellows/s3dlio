@@ -4,7 +4,7 @@
 
 Fixes #213.
 
-### Changed — a storage URI is a LITERAL key prefix, never a regex (INTENTIONAL BEHAVIOUR CHANGE) (#213)
+### Changed — which objects an `s3://` URI selects: the exact name, its directory, or an explicit `*` glob; never a regex, never a bare prefix (INTENTIONAL BEHAVIOUR CHANGE) (#213)
 
 **Read this before upgrading.** On S3, `list`, `list_stream`, `s3-cli ls`, `s3-cli get`,
 `s3-cli download` / `cp` (S3 to local), `s3_copy::download_objects` and `S3BytesDataset::from_prefix`
@@ -17,35 +17,48 @@ common prefix was added unfiltered. So `s3://b/data/run.1` also matched `data/ru
 example `gs://` and `az://` non-recursive listings keep their own directory-style handling of a
 prefix without a trailing `/`); that is tracked in #220.
 
-Now the whole key part of the URI is the S3 prefix:
+The key part `K` of `s3://bucket/K` now selects, for every listing-style operation (`ls`, Python
+`list()`, `download`, `get`, `s3_copy::download_objects`, `S3BytesDataset::from_prefix`,
+`ObjectStore::list` / `list_stream`) and for `delete -r` / `delete(recursive=True)`:
 
-- `s3://b/data/run.1` lists `data/run.1`, `data/run.1.old` and `data/run.1/...` (every key that
-  STARTS WITH the prefix: literal prefix is not exact matching) and not `data/run_1` or
-  `data/prerun.1`. `.`, `(`, `)`, `[`, `+`, `$`, `?` in a URI are ordinary characters and never
-  fail to parse.
-- Non-recursive: `s3://b/foo` returns `foo`, `foobar` and the directory `foo/`, not `afoo`
-  and not unrelated folders. S3 filters both objects and common prefixes by the prefix.
+- **A name** (no `*`, not ending in `/`): the object whose key is exactly `K` and, for operations
+  that descend (recursive listing, `download -r`, `delete -r`), every key under `K/`. Non-recursive
+  `ls` shows the object `K` (if it exists) and the directory entry `K/` (if anything is under it).
+  It NEVER selects `K.bak`, `K2`, `Kfoo` or `K.d/`. So `s3://b/file.txt` selects `file.txt` and not
+  `file.txt.bak`; `s3://b/dl` selects `dl/...` and not `dl2/...`; `s3://b/data/run.1` selects
+  `data/run.1` and `data/run.1/...`, and not `run.1.old`, `run_1` or `prerun.1`. `.`, `(`, `)`,
+  `[`, `+`, `$`, `?` in a URI are ordinary characters and never fail to parse.
+- **A directory** (`K` ends in `/`) or the bucket root (empty `K`): everything under it, as before.
+- **A wildcard** (`K` contains `*`): an explicit glob over the FULL key. `*` matches any run of
+  characters except `/`; `**` matches any run including `/`; every other character is literal.
+  `s3://b/file.txt*` selects `file.txt`, `file.txt.bak` and `file.txt2` (not `file.txt.d/x`);
+  `s3://b/data/**.npz` selects every `.npz` under `data/`. With a wildcard an object is selected
+  iff its full key matches the glob: `-r` makes no difference and a matching "directory" is not
+  descended into. A wildcard key that ENDS in `/` (`s3://b/data/*/`) is refused with an error and
+  nothing is listed or deleted. To pass a wildcard through a shell, quote the URI.
+- **`delete -r` follows the same rule**: `s3-cli delete -r s3://b/file.txt` and Python
+  `delete("s3://b/file.txt", recursive=True)` delete `file.txt` and never `file.txt.bak`;
+  `delete -r s3://b/file.txt*` deletes both. Delete without `-r` is unchanged: one request for
+  exactly the key named, and a `*` in it is an ordinary key character.
 - **To select with a regex use the explicit option**: Python `list(uri, recursive, pattern=...)`
-  and `s3-cli ls --pattern`. The feature is still a Rust regex matched (unanchored) against the entry
-  relative to the listing base, but the base is now defined for every S3 prefix: the prefix itself
-  when it ends with `/`; the directory `P/` for an entry under it; otherwise the parent directory of
-  `P` (everything up to its last `/`). This differs from before for a prefix WITHOUT a trailing `/`:
-  an entry that merely starts with the prefix (`s3://b/dl` and `s3://b/dlx`, `s3://b/data/run.1` and
-  `s3://b/data/run.1.old`) used to be matched against the whole URI and is now matched against
-  `dlx` / `run.1.old`, so a pattern such as `^s3://` no longer matches it. For host-form URIs
-  (`s3://host:port/bkt/dl/`) the base is taken from the key parts, so it agrees with the entries a
-  listing returns (`s3://bkt/dl/...`). One shared implementation (`s3dlio::list_pattern::ListPattern`) now
-  serves Python, the CLI and the new `s3_copy::download_objects_matching(src_uri, pattern, ...)`.
-  An invalid pattern fails before any request. (Python `list()` raised the raw regex error and
-  compiled the pattern after listing; it now raises `Invalid regex pattern: '...'` first.)
-- `s3_copy::download_objects` no longer appends `.*` to a URI ending in `/`; it downloads the
-  literal prefix. A URI that used to be a regex or glob in the last segment (for example
-  `s3://b/dir/.*\.npz`) is now a literal prefix: split it into the prefix and a pattern
-  (`download_objects_matching("s3://b/dir/", Some(r"\.npz$"), ...)`). `s3-cli download` and
-  `s3-cli get` URIs are literal prefixes as well (their `--help` text no longer promises globs and
-  regexes) and now have the explicit option below.
-- Callers that passed a bare key prefix without a trailing `/` now get the keys that start with it
-  (`dl` also matches `dl2/x`, as in `aws s3 ls s3://b/dl`), not the directory-regex behaviour.
+  and `s3-cli ls|download|get --pattern`. It is applied AFTER the selection above and is a Rust
+  regex matched (unanchored) against the entry relative to the listing base: the URI key itself when
+  it ends with `/`; the directory `K/` for an entry under it; otherwise the parent directory of `K`
+  (everything up to its last `/`); for a wildcard URI, the directory part of the text before the
+  first `*`. For host-form URIs (`s3://host:port/bkt/dl/`) the base is taken from the key parts, so
+  it agrees with the entries a listing returns (`s3://bkt/dl/...`). One shared implementation
+  (`s3dlio::list_pattern::ListPattern`) serves Python, the CLI and
+  `s3_copy::download_objects_matching(src_uri, pattern, ...)`. An invalid pattern fails before any
+  request. (Python `list()` compiled the pattern after listing; it now raises
+  `Invalid regex pattern: '...'` first.) `delete -r --pattern` is unchanged: it is matched against
+  the listed object URI.
+- `s3_copy::download_objects` no longer appends `.*` to a URI ending in `/`. A URI that used to be a
+  regex or glob in the last segment (for example `s3://b/dir/.*\.npz`) is no longer a regex: use a
+  `*` glob (`s3://b/dir/*.npz`) or split it into the directory and a pattern
+  (`download_objects_matching("s3://b/dir/", Some(r"\.npz$"), ...)`).
+- Callers that passed a bare key prefix without a trailing `/` and relied on it matching every key
+  that starts with it (`dl` also matching `dl2/x`) must now say so with a `*`
+  (`s3://b/dl*`) or end the directory with `/`.
 - **New: `s3-cli download -p/--pattern <REGEX>` and `s3-cli get -p/--pattern <REGEX>`.** The
   explicit replacement for the regex those commands used to read from the URI. It reuses
   `ListPattern` inside the existing backend-aware paths (so it also works on `file://`,
@@ -56,19 +69,26 @@ Now the whole key part of the URI is the S3 prefix:
   `--pattern` the behaviour is unchanged. Library: new
   `generic_download_objects_matching_with_summary(..., pattern: Option<&ListPattern>, ...)`;
   `generic_download_objects[_with_summary]` keep their signatures.
-- **Prefix behaviour is documented, deliberately, and kept.** On `s3://` a URI is a key PREFIX, not
-  an exact key and not "exact if present, otherwise prefix": `s3-cli ls|get|download s3://b/file.txt`
-  also selects `file.txt.bak`, and `s3://b/dl` also selects `dl2/...`. End the URI with `/` to
-  select a directory's contents only; use `--pattern` to filter by name. The `--help` text of `ls`,
-  `download` and `get`, `docs/CLI_GUIDE.md`, and the glob examples in `docs/testing/BACKEND-TESTING.md`
-  and `docs/supplemental/OPLOG-GUIDE.md` now say so. Other backends still do not follow the
-  literal-prefix rule (#220).
+- **Requests.** The server does the narrowing and no sibling is paged through: a name costs one
+  `max-keys=1` probe (the object `K` sorts before every other key that starts with `K`) plus the
+  listing of `K/` (recursive) or one more `max-keys=1` probe (non-recursive); a directory is its
+  listing; a wildcard is the listing of the text before the first `*`, with the `/` delimiter when
+  the glob cannot cross a `/`. No `HEAD` is sent.
+- The `--help` text of `ls`, `download`, `get` and `delete`, `docs/CLI_GUIDE.md` (including the
+  "Common Patterns" regex examples, which now match relative to the listing base),
+  `docs/PYTHON_API_GUIDE.md`, and the glob examples in `docs/testing/BACKEND-TESTING.md` and
+  `docs/supplemental/OPLOG-GUIDE.md` state the rule. Library: new `s3dlio::s3_selection`;
+  `delete_contract::delete_objects_under_literal_prefix` keeps its (public) name, but its URI is
+  selected by this rule on `s3://`; `ObjectStore::delete_prefix` is unchanged (it appends `/` and
+  reads the prefix literally).
 
-Tests: `tests/test_list_literal_prefix_213.rs`, `tests/s3_cli_ls_literal_prefix_213.rs`,
-`tests/s3_cli_download_pattern_213.rs`,
-`tests/test_python_list_literal_213.py`, and the rewritten `tests/test_object_store_list_filter.rs`
-(it pinned the #154 regex contract). The in-process mock S3 can now be seeded with a bucket catalog
-that honours prefix, delimiter and paging.
+Tests: `tests/test_s3_selection_213.rs`, `tests/test_list_literal_prefix_213.rs`,
+`tests/s3_cli_ls_literal_prefix_213.rs`, `tests/s3_cli_download_pattern_213.rs`,
+`tests/test_python_list_literal_213.py`, the delete-contract tests
+(`tests/test_delete_contract_210_167.rs`, `tests/test_python_delete_contract_212.py`), and the
+rewritten `tests/test_object_store_list_filter.rs` (it pinned the #154 regex contract). The in-process
+mock S3 can be seeded with a bucket catalog that honours prefix, delimiter, `max-keys` and paging, and
+removes the keys a delete names.
 
 ## Version 0.9.124 — Exact delete contract (s3-cli and Python), Python API GIL/store-cache fixes, op-log row safety, arrow-backend and build-script fixes
 
@@ -156,6 +176,7 @@ entry). **Code that relied on the old implicit expansion will now delete less; p
 - The op-log records an exact delete as one `DELETE` row, as before; no `HEAD` row is added.
   `recursive=True` records one `LIST` row plus one `DELETE` row per object (replayable), not
   `DELETE_BATCH`.
+- (The prefix rule in this entry is superseded in the next release: see "Unreleased", #213 -- `foo` selects the object `foo` and `foo/...`, never `foobar`.)
 - `delete(uri, recursive=True)` deletes the real objects under the literal prefix: listed with no
   delimiter, objects only, nothing appended (`foo` also matches `foobar`), `*` and `?` literal (the last
   URI segment used to be read as a regex). It needs list permission. A prefix with no objects is a
@@ -189,6 +210,7 @@ implicit expansion will now delete less; add `-r` where you mean "everything und
   given it adds that only the object named by the exact URI was targeted and to use `-r` for
   everything under a prefix. On a **versioned bucket** a delete adds a delete marker and does not erase
   earlier versions.
+- (The `delete -r s3://bkt/foo` prefix rule below is superseded in the next release: see "Unreleased", #213.)
 - `delete -r s3://bkt/foo/` deletes the real objects under the literal prefix `foo/` (recursive listing
   with no delimiter; synthetic common-prefix entries are never delete candidates). It needs list
   permission. `delete -r s3://bkt/foo` uses the literal prefix `foo`, so it also matches `foobar` (no

@@ -249,10 +249,11 @@ s3dlio.upload(['test.txt'], 'direct:///tmp/directio/prefix/')
 s3dlio.download('direct:///tmp/directio/prefix/', './directio_copy/')
 ```
 
-On `s3://` a URI is a key PREFIX, never a glob: `s3://bucket/prefix/` selects every object under
-`prefix/`, while `s3://bucket/prefix` (no trailing `/`) would also select `prefix2/...` and
-`prefix.bak`. Glob forms such as `prefix/*.txt` are not expanded (older versions of this guide
-showed them). The other backends do not yet follow the literal-prefix rule (tracked in #220); the
+On `s3://` a URI is a name, a directory or an explicit glob (#213): `s3://bucket/prefix/` selects every
+object under `prefix/`, `s3://bucket/prefix` (no trailing `/`) selects only the object `prefix` and what
+is under `prefix/` (never `prefix2/...` or `prefix.bak`), and `s3://bucket/prefix*` /
+`s3://bucket/prefix/*.txt` are globs (`*` stays in one directory level, `**` crosses `/`). The other
+backends do not yet follow this rule (tracked in #220); the
 examples above use a directory prefix for all of them. To select by name, use the CLI's explicit
 regex option, which is matched against the name relative to the listing base:
 

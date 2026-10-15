@@ -414,7 +414,7 @@ cargo test -p s3dlio-oplog -- --nocapture
 ### Generate OpLog from s3dlio Operations
 
 ```bash
-# Using s3-cli with --op-log flag.  The URI is a literal key prefix; select the .bin objects
+# Using s3-cli with --op-log flag.  The URI selects by name or directory, never by regex; select the .bin objects
 # under data/ with the explicit --pattern regex (not a glob in the URI).
 s3-cli get s3://bucket/data/ --pattern '\.bin$' \
     --op-log workload.tsv.zst \

@@ -111,19 +111,22 @@ All commands use consistent URI formats across backends:
 
 List objects in any storage backend with optional filtering and counting.
 
-**On `s3://` a URI is a key PREFIX.** `s3://b/file.txt` selects `file.txt` and also `file.txt.bak`;
-`s3://b/dl` also selects `dl2/...`. End the URI with `/` (`s3://b/dl/`) to select a directory's
-contents only. Use `--pattern` to filter with a regex, matched against the name relative to the
-listing base.
+**Which objects an `s3://` URI selects (#213).** The key part `K` of `s3://bucket/K` is a name, a
+directory or an explicit glob -- never a regex and never a bare string prefix:
 
-For `s3://` URIs the URI is a **literal key prefix**, never a regex (#213): `s3-cli ls s3://b/data/run.1`
-lists `data/run.1`, `data/run.1.old` and `data/run.1/` (everything that starts with `data/run.1`),
-but not `data/run_1` or `data/prerun.1`; `.`, `(`, `[`, `+`, `$`, `?` in the URI are ordinary
-characters. Without `-r`, matching objects and matching "directories" are listed:
-`s3-cli ls s3://b/foo` shows `foo`, `foobar` and `foo/`, not `afoo` and not unrelated folders. To
-filter with a regex use `-p/--pattern` (see [Regex Pattern Filtering](#regex-pattern-filtering)).
-This literal-prefix rule is implemented for `s3://` only; `file://`, `direct://`, `gs://` and
-`az://` listings are unchanged (tracked in #220).
+| URI key | Selects |
+|---------|---------|
+| `file.txt` (no `*`, no trailing `/`) | the object `file.txt` and, when descending (`-r`), everything under `file.txt/`. **Never** `file.txt.bak`, `file.txt2` or `file.txt.d/`. Without `-r`, `ls` shows `file.txt` and the directory entry `file.txt/` |
+| `dl/` (trailing `/`) or empty | everything under `dl/` (or the whole bucket) |
+| `file.txt*` | an explicit glob over the FULL key: `file.txt`, `file.txt.bak`, `file.txt2` (same directory level) |
+| `data/**.npz` | every `.npz` under `data/`, at any depth |
+
+In a glob `*` matches any run of characters except `/`, and `**` matches any run including `/`; every
+other character (`.`, `(`, `[`, `+`, `$`, `?`) is literal. With a wildcard an object is selected iff
+its full key matches, so `-r` makes no difference. A wildcard key that ends in `/` is refused.
+Quote wildcard URIs in your shell. Use `-p/--pattern` to narrow the selection with a regex (see
+[Regex Pattern Filtering](#regex-pattern-filtering)). The rule is implemented for `s3://` only;
+`file://`, `direct://`, `gs://` and `az://` are unchanged (tracked in #220).
 
 ```bash
 s3-cli ls [OPTIONS] <URI>
@@ -152,7 +155,7 @@ s3-cli ls -rc az://account/container/
 # Filter with regex pattern
 s3-cli ls -r s3://bucket/ -p '.*\.txt$'        # Only .txt files
 s3-cli ls -r gs://bucket/ -p '.*\.(csv|json)$' # CSV or JSON files
-s3-cli ls -r az://acct/cont/ -p '.*/data_.*'   # Files with "data_" in path
+s3-cli ls -r az://acct/cont/ -p '(^|/)data_'  # Names starting with "data_" (pattern sees the path relative to the listing base)
 ```
 
 **Progress Display (with `-c`):**
@@ -215,15 +218,15 @@ s3-cli upload -j 64 /data/*.npz gs://bucket/training/
 
 Download objects from any storage backend to local filesystem.
 
-**On `s3://` the source URI is a key PREFIX, never a glob or regex.** `s3-cli download s3://b/file.txt ./out/`
-downloads `file.txt` and also `file.txt.bak`; `s3://b/dl` also selects `dl2/...`. End the URI with `/`
-(`s3://b/dl/`) to select a directory's contents only. To filter with a regex use `-p/--pattern`
-(see [Regex Pattern Filtering](#regex-pattern-filtering)); it is matched against the name relative to
-the listing base, so for `s3://b/dl/` and the key `dl/sub/c.npz` the pattern sees `sub/c.npz`. The
-pattern is compiled before anything is listed: an invalid regex fails with nothing sent and no
-directory created. This works on every backend (`file://` and `direct://` included). The
-literal-prefix rule is implemented for `s3://` only; `file://`, `direct://`, `gs://` and `az://` do not
-yet follow it (tracked in #220).
+On `s3://` the source URI selects as described under [ls](#ls---list-objects): `s3-cli download
+s3://b/file.txt ./out/` downloads `file.txt` and NEVER `file.txt.bak`; `download -r s3://b/dl` downloads
+everything under `dl/` (never `dl2/`); `download 's3://b/file.txt*'` downloads `file.txt`, `file.txt.bak`
+and `file.txt2`. To filter with a regex use `-p/--pattern`
+(see [Regex Pattern Filtering](#regex-pattern-filtering)); it is applied after the selection and matched
+against the name relative to the listing base, so for `s3://b/dl/` and the key `dl/sub/c.npz` the pattern
+sees `sub/c.npz`. The pattern is compiled before anything is listed: an invalid regex fails with nothing
+sent and no directory created. `--pattern` works on every backend (`file://` and `direct://` included);
+the selection rule is implemented for `s3://` only.
 
 ```bash
 s3-cli download [OPTIONS] <SOURCE_URI> <LOCAL_PATH>
@@ -239,9 +242,11 @@ s3-cli download [OPTIONS] <SOURCE_URI> <LOCAL_PATH>
 **Examples:**
 
 ```bash
-# Download one object (the URI is a literal key prefix: any other key that starts
-# with "file.txt" is downloaded too, e.g. file.txt.bak)
+# Download one object (only file.txt; file.txt.bak is NOT downloaded)
 s3-cli download s3://bucket/file.txt ./local/
+
+# Download file.txt, file.txt.bak, file.txt2 ... (explicit wildcard; quote it)
+s3-cli download 's3://bucket/file.txt*' ./local/
 
 # Download entire prefix
 s3-cli download gs://bucket/data/ ./local-data/
@@ -249,7 +254,7 @@ s3-cli download gs://bucket/data/ ./local-data/
 # Download with high concurrency
 s3-cli download -j 128 s3://bucket/large-dataset/ ./dataset/
 
-# Only the .npz objects under data/ (explicit regex; the URI itself is a literal prefix)
+# Only the .npz objects under data/ (explicit regex; the URI itself is never a regex)
 s3-cli download -r -p '\.npz$' s3://bucket/data/ ./npz-only/
 ```
 
@@ -257,7 +262,8 @@ s3-cli download -r -p '\.npz$' s3://bucket/data/ ./npz-only/
 
 ### delete - Delete Objects
 
-Delete one exact object, or, with `-r`, every object under a literal key prefix. Alias: `rm`.
+Delete one exact object, or, with `-r`, the objects an `s3://` URI selects (a name, a directory or a
+`*` glob; see [ls](#ls---list-objects)). Alias: `rm`.
 
 ```bash
 s3-cli delete [OPTIONS] <URI>
@@ -273,7 +279,8 @@ which is sent to that server):
 | either, object already missing | Success (exit 0), as with S3's own idempotent DELETE. Nothing is listed and nothing else is deleted. |
 | either, the delete request fails (403, 5xx, network) | Non-zero exit, `failed to delete <uri>: <cause>`. A failure is never read as "already absent". |
 | `delete -r s3://bkt/foo/` | Deletes the real objects whose key starts with `foo/`, nested ones included (`foo/a`, `foo/b/c`, and the marker `foo/` if present). Never `foobar`. |
-| `delete -r s3://bkt/foo` | Deletes the real objects whose key starts with the literal text `foo`. **This also matches `foobar` and `foo2/x`.** No `/` is appended for you. Write `foo/` to stay inside the folder. |
+| `delete -r s3://bkt/foo` | Deletes the object `foo` and everything under `foo/`. **Never `foobar`, `foo.bak` or `foo2/x`** (the same rule as `ls`). |
+| `delete -r 's3://bkt/foo*'` | Explicit glob over the full key: `foo`, `foobar`, `foo.bak` (same directory level; not `foo/child`). `**` crosses `/`. A wildcard key ending in `/` is refused, nothing is deleted. |
 
 How it works:
 
@@ -286,9 +293,10 @@ How it works:
 - **Directories.** On `file://` and `direct://`, an exact delete of a path that is a directory fails
   with `<uri> is a directory; use -r / recursive=True to delete everything under it` and deletes
   nothing (use `-r` with a trailing `/`). A regular file is deleted; a missing path is success.
-- **Recursive delete.** The prefix is listed with no delimiter, so only real objects are returned
+- **Recursive delete.** The selection is listed with no delimiter, so only real objects are returned
   (synthetic "directory" entries are never delete candidates), then deleted in batches of up to
-  1,000 keys. Characters in the key are literal: `*`, `.`, `[` and so on are never read as a pattern.
+  1,000 keys. A name selects itself and its `name/` directory; `*` / `**` are the only wildcards, and
+  `.`, `[`, `?` and so on are never read as a pattern. Without `-r` a `*` is an ordinary key character.
 - **`-p/--pattern`** is a client-side regex that narrows the `-r` selection (it is matched against
   each listed object URI, `s3://bkt/key`). It is an error without `-r`.
 - **Reporting.** S3 reports a key that does not exist as "deleted", so the command never claims a
@@ -324,7 +332,7 @@ How it works:
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `-r, --recursive` | Delete every object under the literal key prefix (recursive listing) |
+| `-r, --recursive` | Delete every object the URI selects (exact name and its directory, a directory, or a `*` glob; recursive listing) |
 | `-p, --pattern <REGEX>` | With `-r` only: narrow the selection to URIs matching the regex |
 | `-j, --jobs <N>` | Accepted for compatibility; currently not used (batches are 1,000 keys) |
 
@@ -340,8 +348,12 @@ s3-cli delete s3://bucket/dir/
 # Delete everything under the folder dir/
 s3-cli delete -r s3://bucket/temp-data/
 
-# CAUTION: the literal prefix "temp" also matches temp-data/..., temporary.txt, tempest/...
+# Deletes the object "temp" and everything under temp/ -- NOT temp-data/..., temporary.txt, tempest/...
 s3-cli delete -r s3://bucket/temp
+
+# Explicit wildcard: temp, temp-data, temporary.txt, tempest ... (same directory level; quote it)
+s3-cli delete -r 's3://bucket/temp*'
+
 
 # Delete only .log objects under a folder
 s3-cli delete -r s3://bucket/logs/ -p '\.log$'
@@ -362,13 +374,14 @@ mean "everything under".
 
 Download objects with advanced options for maximum throughput.
 
-**On `s3://` the URI is a key PREFIX, never a glob or regex.** `s3-cli get s3://b/file.txt` downloads
-`file.txt` and also `file.txt.bak`; `s3://b/dl` also selects `dl2/...`. End the URI with `/`
-(`s3://b/dl/`) to select a directory's contents only. To filter with a regex use `-p/--pattern`,
-matched against the name relative to the listing base (for `s3://b/dl/` and the key `dl/sub/c.npz` the
-pattern sees `sub/c.npz`). An invalid pattern fails before any request is sent. `--pattern` cannot be
-combined with `--keylist` or `--offset/--length`. The literal-prefix rule is implemented for `s3://`
-only; the other backends do not yet follow it (tracked in #220).
+On `s3://` the URI selects as described under [ls](#ls---list-objects): `s3-cli get s3://b/file.txt`
+downloads `file.txt` and NEVER `file.txt.bak`; `get -r s3://b/dl` downloads everything under `dl/`
+(never `dl2/`); `get 's3://b/file.txt*'` downloads `file.txt`, `file.txt.bak` and `file.txt2`. To filter
+with a regex use `-p/--pattern`, applied after the selection and matched against the name relative to
+the listing base (for `s3://b/dl/` and the key `dl/sub/c.npz` the pattern sees `sub/c.npz`). An invalid
+pattern fails before any request is sent. `--pattern` cannot be combined with `--keylist` or
+`--offset/--length`. The selection rule is implemented for `s3://` only; the other backends do not yet
+follow it (tracked in #220).
 
 ```bash
 s3-cli get [OPTIONS] <URI>
@@ -402,19 +415,20 @@ s3-cli put [OPTIONS] <URI>
 
 The `-p/--pattern` option accepts standard Rust regex patterns. Patterns are applied **client-side** after listing, so they work with all backends.
 
-For `s3://` URIs a regex only ever comes from `-p/--pattern`: the URI itself is always a literal key
-prefix (#213; earlier versions read the last segment of an S3 URI as a regex). The pattern is matched
-(unanchored) against each entry **relative to the listing base**, not against the whole URI. The base
-is the prefix when it ends with `/`, the directory `P/` for an entry under a prefix `P` without a
-trailing `/`, and otherwise the parent directory of `P`. For a prefix without a trailing `/` this
-differs from earlier versions, which matched an entry that merely starts with the prefix against the
-whole URI. For a host-form URI (`s3://host:port/bkt/dl/`) the base is taken from the key parts:
+For `s3://` URIs a regex only ever comes from `-p/--pattern`: the URI itself is never a regex (#213;
+earlier versions read the last segment of an S3 URI as a regex). The pattern is applied AFTER the URI has
+selected its objects (see [ls](#ls---list-objects)) and is matched (unanchored) against each entry
+**relative to the listing base**, not against the whole URI. The base is the key itself when it ends with
+`/`, the directory `K/` for an entry under a name `K` without a trailing `/`, the parent directory of `K`
+for the object `K` itself, and, for a wildcard URI, the directory part of the text before the first `*`.
+For a host-form URI (`s3://host:port/bkt/dl/`) the base is taken from the key parts:
 
 | Listed URI | Entry | What the pattern sees |
 |------------|-------|-----------------------|
 | `s3://b/dl/` | `s3://b/dl/sub/c.npz` | `sub/c.npz` |
 | `s3://b/dl` | `s3://b/dl/sub/c.npz` (under the directory `dl`) | `sub/c.npz` |
-| `s3://b/data/run.1` | `s3://b/data/run.1.old` (merely starts with the prefix) | `run.1.old` (relative to the parent directory) |
+| `s3://b/data/run.1` | `s3://b/data/run.1` (the object itself) | `run.1` (relative to the parent directory) |
+| `s3://b/data/file*` | `s3://b/data/file.txt.bak` | `file.txt.bak` (relative to `data/`) |
 
 ### Pattern Syntax
 
@@ -440,14 +454,17 @@ whole URI. For a host-form URI (`s3://host:port/bkt/dl/`) the base is taken from
 -p '.*\.(csv|json)$'    # .csv or .json files
 -p '.*\.(jpg|png|gif)$' # Image files
 
+# The pattern sees the path RELATIVE to the listing base (e.g. "train/a/data_1.bin"),
+# so a file directly in the base has no leading "/": write (^|/) rather than .*/
 # Match filenames
--p '.*/data_.*'         # Files containing "data_" in path
--p '.*/[0-9]+\.bin$'    # Numeric filenames like 123.bin
--p '.*/file_[0-9]{4}\.txt$'  # file_0001.txt through file_9999.txt
+-p '(^|/)data_'         # Names starting with "data_" (at any depth below the base)
+-p '(^|/)[0-9]+\.bin$'  # Numeric filenames like 123.bin
+-p '(^|/)file_[0-9]{4}\.txt$'  # file_0001.txt through file_9999.txt
 
 # Match directories
--p '.*/train/.*'        # Files under any "train" directory
--p '.*/2025-12-.*'      # Files in December 2025 directories
+-p '^train/'            # Files under the top-level "train" directory of the base
+-p '(^|/)train/'        # Files under a "train" directory at any depth
+-p '(^|/)2025-12-'      # Files in December 2025 directories
 ```
 
 ### Shell Quoting
