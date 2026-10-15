@@ -114,6 +114,16 @@ pub const PUT_FAILS_MARKER: &str = "put-500";
 /// `403 AccessDenied` (a persistent, non-retried failure).
 pub const GET_FORBIDDEN_MARKER: &str = "get-403";
 
+/// Key substring marker that makes the mock server answer GetObject with
+/// `404 NoSuchKey` every time (issue #240: a definite answer that must not be
+/// retried by the s3dlio retry loop).
+pub const GET_NOT_FOUND_MARKER: &str = "get-404";
+
+/// Key substring marker that makes the mock server answer GetObject with
+/// `503 SlowDown` every time (issue #240: a transient failure that must still
+/// be retried).
+pub const GET_UNAVAILABLE_MARKER: &str = "get-503";
+
 /// Bucket-name marker: a seeded bucket whose name contains this answers its LAST
 /// ListObjectsV2 page (`IsTruncated=false`) with a non-empty `NextContinuationToken`
 /// too, as some S3-compatible servers do. A listing must stop on `IsTruncated=false`.
@@ -576,6 +586,12 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
         let attempt = state.record_and_get(&path, |c| c.get_calls += 1);
         if path.contains(GET_FORBIDDEN_MARKER) {
             return error_response(StatusCode::FORBIDDEN, "AccessDenied");
+        }
+        if path.contains(GET_NOT_FOUND_MARKER) {
+            return error_response(StatusCode::NOT_FOUND, "NoSuchKey");
+        }
+        if path.contains(GET_UNAVAILABLE_MARKER) {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "SlowDown");
         }
         if path.contains(GET_FAILS_ONCE_MARKER) && attempt == 1 {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MockTransientGetFailure");

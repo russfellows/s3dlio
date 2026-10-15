@@ -106,6 +106,76 @@
   `get_many`/`get_many_stats`, says that `get_many` works on `az://` and `gs://`, and says the `az`/`azd` executable
   must be on `PATH`.
 
+- **The object size cache no longer grows without bound (#241).** The process-global size cache (and
+  the per-store size caches) never removed anything: an expired entry was treated as a miss but left in
+  memory, and nothing called the cleanup routine, so a long-running process that touched many distinct
+  objects (a KV-cache tier, a data loader over a very large dataset) kept growing. A lookup that finds
+  an expired entry now removes it, and the cache holds at most 1,048,576 entries (roughly 200-300 MB
+  when full); when a new object arrives at the limit the entry written longest ago, which is also the
+  one closest to expiry, is evicted. Every cache operation stays O(1) (an overwrite updates in place,
+  nothing scans or compacts under the lock). Eviction is oldest-written-first, so an epoch loop over more
+  distinct objects than the limit gets almost no hits: set `S3DLIO_SIZE_CACHE_MAX_ENTRIES` (read once per
+  process) above the object count for such datasets. The TTL
+  (`S3DLIO_SIZE_CACHE_TTL_SECS`) and cache hits behave as before.
+
+- **A GET of a missing or forbidden object no longer retries (#240).** The retry loop around S3 GETs
+  (`S3DLIO_MAX_RETRY_ATTEMPTS`, 100 ms x attempt backoff) retried every error, including a definite
+  answer from the server such as `404 NoSuchKey` or `403 AccessDenied`, so each GET of a missing key
+  sent several requests and waited at least 300 ms before returning the error. A definite client error
+  (400, 401, 403, 404, 405, 409, 412, 416 and other non-transient 4xx) is now returned after one request
+  with no backoff. Transient failures are retried as before: connection and dispatch errors, timeouts,
+  5xx, 408, 429, S3 throttling codes such as `SlowDown`, and errors while the response body streams. An
+  error that cannot be classified is still retried. The same rule now applies to the per-chunk retry loop
+  of the concurrent range GET. The AWS SDK's own retry layer is unchanged. Library note: the public
+  `s3dlio::retry::retry_get_body` now requires its error type to implement the new `RetryClassify`
+  trait; it is implemented for `anyhow::Error` (S3 errors are classified), `std::io::Error`,
+  `Box<dyn Error + Send + Sync>`, `&str` and `String` (the last four always retry), so existing callers
+  keep compiling unless they use another error type.
+
+- **Arrow backend: `cargo clippy --tests` is clean for the library's own tests (#246).** The test
+  `parse_prefix_accepts_a_trailing_slash_that_parse_refuses` used `.err().expect(..)`, which
+  `clippy::err_expect` rejects when tests are linted (CI lints without `--tests`). It now uses
+  `expect_err`. No behaviour change. (The integration tests under `tests/` use native-backend APIs and
+  do not compile under `--no-default-features --features arrow-backend`; that is unchanged.)
+
+- **Arrow backend: `list(uri, recursive=True)` now lists every object under the prefix (#245).**
+  With the optional `arrow-backend` feature, a recursive listing returned only the direct children of
+  the prefix and silently omitted objects in deeper "subdirectories", unlike the native S3, GCS and
+  Azure stores. `recursive=True` now returns every object at any depth (and no directory entries);
+  `recursive=False` is unchanged (the objects and directory entries directly under the prefix). The
+  prefix still selects only its own directory: `p` never lists `pfoo/...` or `p2/...`. A recursive
+  `list_stream` now yields entries as the backend returns them instead of after the whole listing has
+  been collected in memory.
+
+- **Arrow backend: `delete_prefix` now deletes the objects at every depth under the prefix (#232).**
+  With the optional `arrow-backend` feature, `delete_prefix("s3://b/p")` listed only the immediate
+  children of `p`, so `p/b/c` and `p/b/d/e` were left behind while the call returned success. It now
+  lists everything under `p/` recursively (streamed, never collected whole) and deletes it with S3
+  `DeleteObjects` requests of up to 1000 keys each, 10 requests in flight at a time. `pfoo/x` and
+  `p2/y` are not touched, and neither is an object named exactly `p`. A key counts as failed unless the
+  store confirmed it deleted, so a request that fails as a whole counts every key in it; a failed
+  listing is one failure, ends the listing and is reported as "listing incomplete". If anything fails
+  the call returns an error with the number of failures, the first failed keys and the first errors,
+  instead of success. Limits: (1) endpoints without `DeleteObjects`, such as Google Cloud Storage's S3
+  interoperability endpoint, are not supported by the Arrow backend's `delete` / `delete_prefix` (its
+  S3 client has no single-object DELETE): the call fails with an error that names the keys; use
+  `gs://` for GCS, which deletes per object. (2) Folder marker objects (keys ending in `/`) cannot be
+  addressed through the Arrow backend's `object_store` layer, which strips the trailing `/`: the
+  marker `p/` is never reported as an entry of `p/` and is not deleted, and a nested marker `p/sub/`
+  is listed as `s3://b/p/sub` and may remain after `delete_prefix` (the delete of the key `p/sub`
+  reports success while `p/sub/` stays).
+
+- **Arrow backend: listing an `s3://` URI with a key prefix no longer returns doubled URIs (#222).**
+  With the optional `arrow-backend` feature, listing `s3://b/dir/` returned `s3://b/dir/dir/x` for the
+  object `dir/x`; feeding that URI back into get or delete addressed an object that does not exist. The
+  listing code appended the listing URL's path to a location that already contained it. The returned
+  URI is now `s3://b/dir/x`, for nested prefixes, a prefix without a trailing `/` (which lists that
+  directory and never a sibling such as `dir2/`) and the bucket root, and the same correction applies
+  to every URL form the backend builds a store for (`gs://`, `abfss://`, path-style `https://`
+  endpoints). This holds for plain keys. Keys with a space, `%`, `?`, `#`, a leading `/` or `.` /
+  `..` segments are not yet guaranteed to round-trip through a listed URI on the Arrow backend (a
+  separate, known limit that this fix does not change).
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published
