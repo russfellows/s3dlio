@@ -6,10 +6,12 @@ The contract (the same "contract A" as ``s3-cli delete``, issues #210 / #167):
   no HEAD first, no listing, nothing broader. An already-missing object is
   success (S3's DELETE succeeds for a missing key); a real failure (e.g. 403 on
   the DELETE) raises ``RuntimeError`` naming the key.
-* ``delete(uri, recursive=True)`` deletes the REAL objects under the LITERAL
-  prefix: listed without a delimiter, objects only, no ``/`` appended.
-* ``/``, ``*`` and ``?`` are ordinary key characters, never an instruction to
-  list or glob.
+* ``delete(uri, recursive=True)`` deletes the REAL objects the URI selects (issue
+  #213): the object named exactly ``K`` plus everything under ``K/`` -- never
+  ``K.bak`` -- listed without a delimiter, objects only; a key ending in ``/`` is
+  the directory; ``*`` / ``**`` in a recursive delete's URI are an explicit glob.
+* Without ``recursive``, ``/``, ``*`` and ``?`` are ordinary key characters, never
+  an instruction to list or glob.
 
 Every test drives the real ``s3dlio`` extension module in a FRESH interpreter
 (the S3 client is process-global) against a recording in-process mock S3 server
@@ -429,7 +431,7 @@ def test_star_and_question_mark_missing_object_is_one_literal_delete_not_a_glob(
 
 
 # ----------------------------------------------------------------------------
-# 2. delete(uri, recursive=True): the literal prefix, objects only
+# 2. delete(uri, recursive=True): the selected objects only (issue #213 rule)
 # ----------------------------------------------------------------------------
 
 
@@ -449,33 +451,83 @@ def test_recursive_deletes_the_real_objects_under_the_literal_prefix_only(mock_f
     assert not m.requests("HEAD"), ctx(m, out)
 
 
-def test_recursive_without_trailing_slash_is_the_literal_prefix_and_appends_nothing(mock_factory):
-    """Prefix ``foo`` matches ``foo``, ``foo/...`` and ``foobar``; it is NOT turned into ``foo/``."""
+def test_recursive_without_trailing_slash_is_the_exact_object_and_its_directory(mock_factory):
+    """``foo`` selects the object ``foo`` and ``foo/...``; NEVER ``foobar``. Nothing is
+    appended to the key that is sent for the existence probe."""
     m = mock_factory(["foo", "foo/", "foo/x", "foobar", "fo", "other/x"])
     out = call_delete(m, "s3://bkt/foo", recursive=True)
     assert_returned(out, m)
-    assert m.keys == {"fo", "other/x"}, ctx(m, out)
-    assert [(r["query"].get("prefix"), r["query"].get("delimiter")) for r in m.lists()] == [
-        ("foo", None)
-    ], ctx(m, out)
+    assert m.keys == {"foobar", "fo", "other/x"}, ctx(m, out)
+    assert sorted(m.sent_delete_keys()) == ["foo", "foo/", "foo/x"], ctx(m, out)
+    # two requests, none with a delimiter: a max-keys=1 probe of `foo`, then the pages of `foo/`
+    assert [
+        (r["query"].get("prefix"), r["query"].get("delimiter"), r["query"].get("max-keys"))
+        for r in m.lists()
+    ] == [("foo", None, "1"), ("foo/", None, None)], ctx(m, out)
+
+
+def test_recursive_delete_of_file_txt_leaves_file_txt_bak(mock_factory):
+    """THE safety case: ``delete(s3://b/file.txt, recursive=True)`` removes file.txt and
+    nothing else."""
+    seed = ["file.txt", "file.txt.bak", "file.txt2", "file.txt.d/x", "dl/a", "dl2/x"]
+    m = mock_factory(seed)
+    out = call_delete(m, "s3://bkt/file.txt", recursive=True)
+    assert_returned(out, m)
+    assert m.sent_delete_keys() == ["file.txt"], ctx(m, out)
+    assert m.keys == {"file.txt.bak", "file.txt2", "file.txt.d/x", "dl/a", "dl2/x"}, ctx(m, out)
+
+
+def test_recursive_delete_of_a_directory_name_does_not_cross_into_dl2(mock_factory):
+    m = mock_factory(["dl/a", "dl/sub/b", "dl2/x", "dlx"])
+    out = call_delete(m, "s3://bkt/dl", recursive=True)
+    assert_returned(out, m)
+    assert sorted(m.sent_delete_keys()) == ["dl/a", "dl/sub/b"], ctx(m, out)
+    assert m.keys == {"dl2/x", "dlx"}, ctx(m, out)
+
+
+@pytest.mark.parametrize(
+    "key,seed,survivors,sent",
+    [
+        # `*` stays inside one directory level
+        ("file.txt*", ["file.txt", "file.txt.bak", "file.txt2", "file.txt.d/x", "file.tx"],
+         {"file.txt.d/x", "file.tx"}, ["file.txt", "file.txt.bak", "file.txt2"]),
+        ("d/*", ["d/*", "d/*/x", "d/y", "d2/z"], {"d/*/x", "d2/z"], ["d/*", "d/y"]),
+        # `**` crosses '/'
+        ("d/**", ["d/*", "d/*/x", "d/y", "d2/z"], {"d2/z"], ["d/*", "d/*/x", "d/y"]),
+        ("d/**.npz", ["d/a.npz", "d/s/b.npz", "d/c.txt"], {"d/c.txt"}, ["d/a.npz", "d/s/b.npz"]),
+    ],
+)
+def test_recursive_wildcard_is_an_explicit_glob_over_the_full_key(
+    mock_factory, key, seed, survivors, sent
+):
+    m = mock_factory(seed)
+    out = call_delete(m, f"s3://bkt/{key}", recursive=True)
+    assert_returned(out, m)
+    assert m.keys == survivors, ctx(m, out)
+    assert sorted(m.sent_delete_keys()) == sorted(sent), ctx(m, out)
+
+
+def test_recursive_wildcard_request_prefix_is_the_text_before_the_first_star(mock_factory):
+    m = mock_factory(["a1", "ab", "b"])
+    out = call_delete(m, "s3://bkt/a*", recursive=True)
+    assert_returned(out, m)
+    assert [r["query"].get("prefix") for r in m.lists()] == ["a"], ctx(m, out)
 
 
 @pytest.mark.parametrize(
     "prefix,seed,survivors",
     [
-        ("a*", ["a*", "a*b", "ab", "axb"], {"ab", "axb"}),
-        ("a?", ["a?", "a?b", "ab", "axb"], {"ab", "axb"}),
-        ("d/*", ["d/*", "d/*/x", "d/y"], {"d/y"}),
+        ("a?", ["a?", "a?b", "ab", "axb"], {"a?b", "ab", "axb"}),
+        ("a(b", ["a(b", "a(bc", "a(b/x", "ab"], {"a(bc", "ab"}),
     ],
 )
-def test_recursive_star_and_question_mark_are_literal_prefix_characters(
+def test_recursive_question_mark_and_regex_characters_are_literal(
     mock_factory, prefix, seed, survivors
 ):
     m = mock_factory(seed)
     out = call_delete(m, f"s3://bkt/{prefix}", recursive=True)
     assert_returned(out, m)
     assert m.keys == survivors, ctx(m, out)
-    assert [r["query"].get("prefix") for r in m.lists()] == [prefix], ctx(m, out)
 
 
 def test_recursive_with_nothing_under_the_prefix_is_a_no_op(mock_factory):

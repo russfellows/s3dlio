@@ -4,9 +4,11 @@
 //
 // Issue #213, reviewer ruling D3/D4, through the real `s3-cli` binary.
 //
-// `s3-cli download` and `s3-cli get` treat an `s3://` URI as a LITERAL key prefix
-// (`s3://b/file.txt` also selects `file.txt.bak`). The regex they used to apply
-// implicitly is now available only through the explicit `-p/--pattern` option, which
+// `s3-cli download` and `s3-cli get` treat an `s3://` URI as the exact object it names
+// and its `key/` directory (`s3://b/file.txt` selects `file.txt` and NEVER `file.txt.bak`);
+// `*` / `**` make an explicit glob (`s3://b/file.txt*` does select `file.txt.bak`). The
+// regex they used to apply implicitly is now available only through the explicit
+// `-p/--pattern` option, which
 // reuses `s3dlio::list_pattern::ListPattern` inside the existing backend-aware paths
 // (matched against the entry relative to the listing base).
 //
@@ -147,23 +149,23 @@ fn download_pattern_is_matched_relative_to_the_listing_base() {
 }
 
 #[test]
-fn download_pattern_composes_with_a_literal_prefix_without_slash() {
+fn download_pattern_composes_with_a_key_without_slash() {
     let (port, _s, b) = seeded();
     let dest = fresh_dir("comp");
-    // `s3://b/dl` is a prefix: it covers dl/ AND dl2/. The pattern then narrows it.
+    // `s3://b/dl` selects the directory dl/ (and NOT dl2/). The pattern then narrows it.
     let out = s3_cli(
         port,
         &[
             "download",
             "-r",
             "-p",
-            r"d\.npz$",
+            r"\.npz$",
             &format!("s3://{b}/dl"),
             dest.to_str().unwrap(),
         ],
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(files_in(&dest), set(&["d.npz"]), "{}", text(&out));
+    assert_eq!(files_in(&dest), set(&["a.npz", "c.npz"]), "{}", text(&out));
     let _ = std::fs::remove_dir_all(&dest);
 }
 
@@ -221,15 +223,32 @@ fn download_pattern_matching_nothing_fails_without_creating_the_directory() {
 }
 
 #[test]
-fn download_without_pattern_is_a_literal_prefix() {
+fn download_without_pattern_selects_the_exact_object_only() {
     let (port, _s, b) = seeded();
     let dest = fresh_dir("prefix");
-    // Not exact-match: `file.txt` selects `file.txt.bak` too, but never `other.txt`.
+    // `file.txt` selects `file.txt` and NEVER `file.txt.bak` (or `other.txt`).
     let out = s3_cli(
         port,
         &[
             "download",
             &format!("s3://{b}/file.txt"),
+            dest.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(files_in(&dest), set(&["file.txt"]), "{}", text(&out));
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn download_wildcard_is_an_explicit_glob() {
+    let (port, _s, b) = seeded();
+    let dest = fresh_dir("glob");
+    let out = s3_cli(
+        port,
+        &[
+            "download",
+            &format!("s3://{b}/file.txt*"),
             dest.to_str().unwrap(),
         ],
     );
@@ -241,10 +260,39 @@ fn download_without_pattern_is_a_literal_prefix() {
         text(&out)
     );
     let _ = std::fs::remove_dir_all(&dest);
+
+    // `*` stays inside one directory level; `**` crosses '/'
+    let one = fresh_dir("glob1");
+    let out = s3_cli(
+        port,
+        &[
+            "download",
+            "-r",
+            &format!("s3://{b}/dl/*.npz"),
+            one.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(files_in(&one), set(&["a.npz"]), "{}", text(&out));
+    let _ = std::fs::remove_dir_all(&one);
+
+    let two = fresh_dir("glob2");
+    let out = s3_cli(
+        port,
+        &[
+            "download",
+            "-r",
+            &format!("s3://{b}/dl/**.npz"),
+            two.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(files_in(&two), set(&["a.npz", "c.npz"]), "{}", text(&out));
+    let _ = std::fs::remove_dir_all(&two);
 }
 
 #[test]
-fn download_without_pattern_directory_prefix_does_not_cross_into_dl2() {
+fn download_without_pattern_a_directory_name_does_not_cross_into_dl2() {
     let (port, _s, b) = seeded();
     let with_slash = fresh_dir("slash");
     let out = s3_cli(
@@ -278,8 +326,8 @@ fn download_without_pattern_directory_prefix_does_not_cross_into_dl2() {
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(
         files_in(&bare),
-        set(&["a.npz", "b.txt", "c.npz", "d.npz", "e.txt"]),
-        "s3://b/dl is a prefix and also selects dl2/...: {}",
+        set(&["a.npz", "b.txt", "c.npz"]),
+        "s3://b/dl selects dl/... and never dl2/...: {}",
         text(&out)
     );
     let _ = std::fs::remove_dir_all(&bare);
@@ -361,9 +409,22 @@ fn get_pattern_with_a_keylist_is_refused_before_any_request() {
 }
 
 #[test]
-fn get_without_pattern_is_a_literal_prefix() {
+fn get_without_pattern_selects_the_exact_object_only() {
     let (port, state, b) = seeded();
     let out = s3_cli(port, &["get", &format!("s3://{b}/file.txt")]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        object_gets(&state, &b),
+        set(&["file.txt"]),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn get_wildcard_is_an_explicit_glob() {
+    let (port, state, b) = seeded();
+    let out = s3_cli(port, &["get", &format!("s3://{b}/file.txt*")]);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(
         object_gets(&state, &b),

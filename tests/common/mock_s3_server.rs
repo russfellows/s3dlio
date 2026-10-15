@@ -182,6 +182,20 @@ impl MockS3State {
         self.catalogs.lock().unwrap().get(bucket).cloned()
     }
 
+    /// The keys still in the seeded `bucket`, sorted. A seeded bucket loses the keys that
+    /// DeleteObjects / DeleteObject name (a key carrying [`DELETE_FAILS_MARKER`] is never
+    /// removed), so a test can assert exactly what survived a delete.
+    pub fn remaining_keys(&self, bucket: &str) -> Vec<String> {
+        self.catalog(bucket).unwrap_or_default()
+    }
+
+    /// Remove `key` from the seeded catalog of `bucket`, if there is one.
+    fn remove_key(&self, bucket: &str, key: &str) {
+        if let Some(keys) = self.catalogs.lock().unwrap().get_mut(bucket) {
+            keys.retain(|k| k != key);
+        }
+    }
+
     fn record(&self, key_path: &str, f: impl FnOnce(&mut PathCallCounts)) {
         let mut map = self.per_path.lock().unwrap();
         let entry = map.entry(key_path.to_string()).or_default();
@@ -391,6 +405,7 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
                      <Message>mock server injected per-object delete failure</Message></Error>"
                 ));
             } else {
+                state.remove_key(path.trim_matches('/'), key);
                 deleted_xml.push_str(&format!("<Deleted><Key>{key}</Key></Deleted>"));
             }
         }
@@ -466,6 +481,9 @@ async fn handle(req: Request<Incoming>, state: MockS3State) -> Response<Full<Byt
     // DeleteObject: DELETE .../{key} (no uploadId -- that is the abort above).
     if method == Method::DELETE {
         state.record(&path, |c| c.delete_calls += 1);
+        if let Some((bucket, key)) = path.trim_start_matches('/').split_once('/') {
+            state.remove_key(bucket, &percent_decode(key));
+        }
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(Full::new(Bytes::new()))

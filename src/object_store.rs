@@ -1810,7 +1810,8 @@ impl ObjectStore for S3ObjectStore {
         }
 
         if let Some(client) = &self.client {
-            let listed = Self::list_literal_prefix_with_client(client, &bucket, &key_prefix).await?;
+            let listed =
+                Self::list_literal_prefix_with_client(client, &bucket, &key_prefix).await?;
             // `list_literal_prefix_with_client` returns `s3://<bucket>/<key>`: strip that
             // head rather than re-parsing (a re-parse could misread the key,
             // and a listing entry that does not parse must be an error, never

@@ -2,8 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
-// Regression tests for s3dlio issue #213: a plain S3 URI is a LITERAL key prefix,
-// never a regular expression.
+// Regression tests for s3dlio issue #213: the key part of an `s3://` URI selects the
+// object with exactly that name (and what is under `name/`), a directory (`name/`), or
+// an explicit `*` / `**` glob -- it is never a regular expression and never a bare
+// string prefix.
 //
 // On v0.9.124 the S3 listings (`S3ObjectStore::list` / `list_stream` with a
 // per-endpoint client, with the process-wide client, and the `s3_utils` helpers
@@ -17,11 +19,11 @@
 //   * `s3://b/foo` (non-recursive) listed every top-level folder, because common
 //     prefixes were added unfiltered.
 //
-// The contract: the whole key part of the URI is the prefix (LITERAL PREFIX is
-// not EXACT: `run.1` also lists `run.1.old` and `run.1/…`); S3 applies it, and
-// with the '/' delimiter returns the matching objects AND common prefixes. A
-// regular expression only ever comes from an explicit pattern (`pattern=` /
-// `--pattern`, or `s3_copy::download_objects_matching`).
+// The contract (architect ruling, #213): `s3://b/K` with no `*` selects the object
+// `K` and, when descending, everything under `K/` -- NEVER `K.bak`, `K2`, `Kfoo`, or
+// `K.d/`. A regular expression only ever comes from an explicit pattern (`pattern=` /
+// `--pattern`, or `s3_copy::download_objects_matching`). The wildcard rule has its own
+// tests in `test_s3_selection_213.rs`.
 //
 // The mock S3 server answers from a seeded catalog that honours prefix,
 // delimiter and paging like S3 does (`MockS3State::seed_bucket`).
@@ -135,7 +137,7 @@ async fn assert_lists(port: u16, uri: &str, recursive: bool, want: Vec<String>) 
     for (which, got) in list_both_ways(port, uri, recursive).await {
         assert_eq!(
             got, want,
-            "{which}({uri}, recursive={recursive}): a URI is a LITERAL key prefix"
+            "{which}({uri}, recursive={recursive}): a URI selects the exact object and its directory"
         );
     }
 }
@@ -145,31 +147,25 @@ async fn assert_lists(port: u16, uri: &str, recursive: bool, want: Vec<String>) 
 // ----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn run_dot_1_lists_its_prefix_matches_and_never_a_regex_look_alike() {
+async fn run_dot_1_lists_the_object_and_its_directory_and_never_a_sibling() {
     let (port, _state, b) = seeded_bucket();
     let uri = format!("s3://{b}/data/run.1");
 
-    // recursive: run.1, run.1.old, run.1/child -- NOT run_1, prerun.1, run.2
+    // recursive: run.1 and run.1/child -- NOT run.1.old, run_1, prerun.1, run.2
     assert_lists(
         port,
         &uri,
         true,
-        uris(&b, &["data/run.1", "data/run.1.old", "data/run.1/child"]),
+        uris(&b, &["data/run.1", "data/run.1/child"]),
     )
     .await;
 
-    // non-recursive: the two objects and the one directory `data/run.1/`
-    assert_lists(
-        port,
-        &uri,
-        false,
-        uris(&b, &["data/run.1", "data/run.1.old", "data/run.1/"]),
-    )
-    .await;
+    // non-recursive: the object `data/run.1` and the one directory `data/run.1/`
+    assert_lists(port, &uri, false, uris(&b, &["data/run.1", "data/run.1/"])).await;
 }
 
 #[tokio::test]
-async fn the_whole_key_part_of_the_uri_is_what_the_server_is_asked_for() {
+async fn an_exact_key_is_two_probes_that_cannot_return_siblings() {
     let (port, state, b) = seeded_bucket();
     let store = S3ObjectStore::for_endpoint(&format!("http://127.0.0.1:{port}"))
         .await
@@ -188,19 +184,38 @@ async fn the_whole_key_part_of_the_uri_is_what_the_server_is_asked_for() {
         .into_iter()
         .filter(|r| r.method == "GET" && r.query.contains("list-type=2"))
         .collect();
-    assert_eq!(lists.len(), 2, "one listing request per call: {lists:?}");
+    assert_eq!(
+        lists.len(),
+        4,
+        "two probe requests per non-recursive call: {lists:?}"
+    );
     for r in &lists {
         assert!(
-            r.query.split('&').any(|kv| kv == "prefix=data%2Frun.1"),
-            "the request prefix must be the whole literal key part `data/run.1`, got {:?}",
+            r.query.split('&').any(|kv| kv == "max-keys=1"),
+            "every request is a max-keys=1 probe, so no sibling can be paged through: {:?}",
             r.query
         );
         assert!(
-            r.query.split('&').any(|kv| kv == "delimiter=%2F"),
-            "non-recursive uses the '/' delimiter: {:?}",
+            !r.query.split('&').any(|kv| kv.starts_with("delimiter=")),
+            "a probe needs no delimiter: {:?}",
             r.query
         );
     }
+    let prefixes: std::collections::BTreeSet<String> = lists
+        .iter()
+        .filter_map(|r| {
+            r.query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("prefix=").map(str::to_string))
+        })
+        .collect();
+    assert_eq!(
+        prefixes,
+        ["data%2Frun.1".to_string(), "data%2Frun.1%2F".to_string()]
+            .into_iter()
+            .collect(),
+        "the object `data/run.1` and the directory `data/run.1/`, nothing else"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -211,11 +226,11 @@ async fn the_whole_key_part_of_the_uri_is_what_the_server_is_asked_for() {
 async fn regex_metacharacters_in_the_uri_are_literal_and_never_fail() {
     let (port, _state, b) = seeded_bucket();
     let cases: &[(&str, &[&str])] = &[
-        ("weird/p(", &["weird/p(", "weird/p(x"]),
-        ("weird/q[", &["weird/q[", "weird/q[1]"]),
-        ("weird/r+", &["weird/r+", "weird/r+1"]),
-        ("weird/s$", &["weird/s$", "weird/s$1"]),
-        ("weird/t?", &["weird/t?", "weird/t?1"]),
+        ("weird/p(", &["weird/p("]),
+        ("weird/q[", &["weird/q["]),
+        ("weird/r+", &["weird/r+"]),
+        ("weird/s$", &["weird/s$"]),
+        ("weird/t?", &["weird/t?"]),
     ];
     for (prefix, want) in cases {
         let uri = format!("s3://{b}/{prefix}");
@@ -229,26 +244,26 @@ async fn regex_metacharacters_in_the_uri_are_literal_and_never_fail() {
 // ----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn bare_name_non_recursive_returns_foo_foobar_and_foo_directory_only() {
+async fn bare_name_non_recursive_returns_foo_and_the_foo_directory_only() {
     let (port, _state, b) = seeded_bucket();
-    // NOT afoo, NOT data/, other/, weird/, zeta/, dl/ (unrelated top-level folders)
+    // NOT foobar, afoo, data/, other/, weird/, zeta/, dl/
     assert_lists(
         port,
         &format!("s3://{b}/foo"),
         false,
-        uris(&b, &["foo", "foobar", "foo/"]),
+        uris(&b, &["foo", "foo/"]),
     )
     .await;
 }
 
 #[tokio::test]
-async fn bare_name_recursive_returns_every_object_that_starts_with_it() {
+async fn bare_name_recursive_returns_the_object_and_everything_under_it() {
     let (port, _state, b) = seeded_bucket();
     assert_lists(
         port,
         &format!("s3://{b}/foo"),
         true,
-        uris(&b, &["foo", "foobar", "foo/a", "foo/b/c"]),
+        uris(&b, &["foo", "foo/a", "foo/b/c"]),
     )
     .await;
 }
@@ -279,7 +294,7 @@ async fn a_long_listing_pages_through_every_key() {
     let refs: Vec<&str> = many.iter().map(String::as_str).collect();
     state.seed_bucket(&b, &refs);
     let want: Vec<String> = many.iter().map(|k| format!("s3://{b}/{k}")).collect();
-    let uri = format!("s3://{b}/pg/k");
+    let uri = format!("s3://{b}/pg/");
     for (which, got) in list_both_ways(port, &uri, true).await {
         assert_eq!(got.len(), want.len(), "{which} must follow every page");
         assert_eq!(got, want, "{which}");
@@ -316,7 +331,7 @@ fn downloaded_names(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[test]
-fn s3_bytes_dataset_lists_the_literal_prefix_recursively() {
+fn s3_bytes_dataset_lists_the_exact_object_and_its_directory_recursively() {
     use s3dlio::data_loader::s3_bytes::S3BytesDataset;
     let (_port, _state, b) = seeded_bucket();
     let ds = S3BytesDataset::from_prefix(&format!("s3://{b}/data/run.1")).expect("from_prefix");
@@ -324,15 +339,15 @@ fn s3_bytes_dataset_lists_the_literal_prefix_recursively() {
     keys.sort();
     assert_eq!(
         keys,
-        vec!["data/run.1", "data/run.1.old", "data/run.1/child"],
-        "S3BytesDataset::from_prefix takes the URI as a literal key prefix"
+        vec!["data/run.1", "data/run.1/child"],
+        "S3BytesDataset::from_prefix selects the exact object and what is under it"
     );
 
     // a '(' in the prefix used to fail with "Invalid regex pattern"
     let ds = S3BytesDataset::from_prefix(&format!("s3://{b}/weird/p(")).expect("from_prefix");
     let mut keys = ds.keys().clone();
     keys.sort();
-    assert_eq!(keys, vec!["weird/p(", "weird/p(x"]);
+    assert_eq!(keys, vec!["weird/p("]);
 }
 
 #[test]
@@ -373,7 +388,7 @@ fn download_non_recursive_takes_the_direct_children_only() {
 }
 
 #[test]
-fn download_one_key_downloads_that_object_and_not_regex_look_alikes() {
+fn download_one_key_downloads_that_object_and_its_directory_and_no_sibling() {
     let (_port, _state, b) = seeded_bucket();
     let out = tempfile::tempdir().expect("tempdir");
     on_fresh_runtime(s3dlio::s3_copy::download_objects(
@@ -386,7 +401,7 @@ fn download_one_key_downloads_that_object_and_not_regex_look_alikes() {
     .expect("download");
     assert_eq!(downloaded_names(out.path()), vec!["c.txt"]);
 
-    // `data/run.1` is a literal prefix: run.1 and run.1.old and run.1/child, not run_1 / prerun.1
+    // `data/run.1` is the object and its directory: run.1 and run.1/child, not run.1.old / run_1 / prerun.1
     let out = tempfile::tempdir().expect("tempdir");
     on_fresh_runtime(s3dlio::s3_copy::download_objects(
         &format!("s3://{b}/data/run.1"),
@@ -396,10 +411,7 @@ fn download_one_key_downloads_that_object_and_not_regex_look_alikes() {
         None,
     ))
     .expect("download");
-    assert_eq!(
-        downloaded_names(out.path()),
-        vec!["child", "run.1", "run.1.old"]
-    );
+    assert_eq!(downloaded_names(out.path()), vec!["child", "run.1"]);
 }
 
 #[test]
@@ -504,13 +516,14 @@ async fn host_form_uri_with_a_pattern_selects_relative_to_the_listing_base() {
         );
     }
 
-    // a non-slash prefix of a host-form URI: parent-directory base
+    // a non-slash key of a host-form URI: the object is relative to the parent directory,
+    // what is under it to the directory itself
     let uri = format!("s3://127.0.0.1:{port}/{b}/data/run.1");
     let mut keys = store.list(&uri, true).await.expect("list");
-    ListPattern::new("^run.1.old$")
+    ListPattern::new("^child$")
         .expect("pattern")
         .retain(&uri, &mut keys);
-    assert_eq!(keys, uris(&b, &["data/run.1.old"]), "{uri}");
+    assert_eq!(keys, uris(&b, &["data/run.1/child"]), "{uri}");
 }
 
 #[test]
@@ -570,7 +583,7 @@ async fn a_space_and_a_non_ascii_character_in_a_key_are_literal() {
         port,
         &format!("s3://{b}/sp ace"),
         true,
-        uris(&b, &["sp ace/a b.txt", "sp ace/c.txt", "sp acer"]),
+        uris(&b, &["sp ace/a b.txt", "sp ace/c.txt"]),
     )
     .await;
     assert_lists(
@@ -580,22 +593,21 @@ async fn a_space_and_a_non_ascii_character_in_a_key_are_literal() {
         uris(&b, &["sp ace/a b.txt", "sp ace/c.txt"]),
     )
     .await;
-    // `caf\u{e9}` is a prefix of both non-ASCII keys, not of `cafe.dat`
+    // `uni/caf\u{e9}` names no object and no directory (it is not a prefix match)
+    assert_lists(port, &format!("s3://{b}/uni/caf\u{e9}"), true, vec![]).await;
+    // a non-ASCII key is selected by its exact name only
     assert_lists(
         port,
-        &format!("s3://{b}/uni/caf\u{e9}"),
-        true,
-        uris(
-            &b,
-            &["uni/caf\u{e9}-\u{65e5}\u{672c}.dat", "uni/caf\u{e9}.dat"],
-        ),
+        &format!("s3://{b}/uni/caf\u{e9}-\u{65e5}\u{672c}.dat"),
+        false,
+        uris(&b, &["uni/caf\u{e9}-\u{65e5}\u{672c}.dat"]),
     )
     .await;
     assert_lists(
         port,
-        &format!("s3://{b}/uni/caf\u{e9}-\u{65e5}"),
-        false,
-        uris(&b, &["uni/caf\u{e9}-\u{65e5}\u{672c}.dat"]),
+        &format!("s3://{b}/uni/caf\u{e9}.dat"),
+        true,
+        uris(&b, &["uni/caf\u{e9}.dat"]),
     )
     .await;
 }
@@ -603,15 +615,15 @@ async fn a_space_and_a_non_ascii_character_in_a_key_are_literal() {
 #[test]
 fn download_matching_with_a_non_slash_prefix_and_a_pattern() {
     let (_port, _state, b) = seeded_bucket();
-    // prefix `data/run.1` (no trailing slash): the literal prefix selects run.1, run.1.old,
-    // run.1/child; the pattern is matched against the entry relative to the listing base.
+    // key `data/run.1` (no trailing slash): the selection is the object `run.1` and
+    // `run.1/child`; the pattern is matched against the entry relative to the listing base.
     let cases: &[(&str, &[&str])] = &[
-        // `run.1.old` lies beside `run.1`: relative to the parent `data/`
-        (r"^run\.1\.old$", &["run.1.old"]),
+        // the object lies beside its siblings: relative to the parent `data/`
+        (r"^run\.1$", &["run.1"]),
         // `run.1/child` lies under the directory `run.1/`: relative to it
         (r"^child$", &["child"]),
-        // nothing outside the literal prefix is ever offered to the pattern
-        (r"run_1|prerun", &[]),
+        // nothing outside the selection is ever offered to the pattern
+        (r"run_1|prerun|\.old", &[]),
     ];
     for (pattern, want) in cases {
         let out = tempfile::tempdir().expect("tempdir");

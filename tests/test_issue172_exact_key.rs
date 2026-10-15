@@ -485,10 +485,11 @@ async fn batch_delete_names_the_exact_key(slash: bool) {
 // ----- F7: list ------------------------------------------------------------
 
 /// The mock answers every ListObjectsV2 on an unseeded bucket with `{prefix}bar`
-/// and `{prefix}other/deep.dat`. With the URI prefix `s3://b/<key-prefix>/foo/bar`
-/// the request prefix must be the WHOLE key part, `<key-prefix>/foo/bar`, verbatim
-/// (leading '/' kept; the URI is a literal prefix, issue #213), and the returned
-/// URIs must carry the real, slash-bearing key.
+/// and `{prefix}other/deep.dat`. The URI `s3://b/<key-prefix>/foo/bar` names the object
+/// `<key-prefix>/foo/bar` and its directory `<key-prefix>/foo/bar/` (issue #213): a
+/// recursive list sends the key verbatim for the existence probe (leading '/' kept) and
+/// `<key>/` verbatim for the descendants, and the returned URIs must carry the real,
+/// slash-bearing key.
 async fn list_uses_the_prefix_verbatim_and_returns_real_keys(slash: bool) {
     let (port, state) = init();
     let tag = unique_key("list", false);
@@ -499,15 +500,18 @@ async fn list_uses_the_prefix_verbatim_and_returns_real_keys(slash: bool) {
         format!("{tag}/foo/")
     };
     let uri_prefix = format!("s3://{BUCKET}/{key_prefix}bar");
-    // the mock echoes the request prefix: `{prefix}bar` and `{prefix}other/deep.dat`
+    // the mock echoes the request prefix: `{prefix}bar` and `{prefix}other/deep.dat`; the
+    // probe of `.../bar` finds no object named exactly that, so only the listing of the
+    // directory `.../bar/` contributes
     let want_uris = vec![
-        format!("s3://{BUCKET}/{key_prefix}barbar"),
-        format!("s3://{BUCKET}/{key_prefix}barother/deep.dat"),
+        format!("s3://{BUCKET}/{key_prefix}bar/bar"),
+        format!("s3://{BUCKET}/{key_prefix}bar/other/deep.dat"),
     ];
-    let want_query_prefix = format!(
-        "prefix={}",
-        encode_key_path(&format!("{key_prefix}bar")).replace('/', "%2F")
-    );
+    let want_query_prefixes: Vec<String> =
+        [format!("{key_prefix}bar"), format!("{key_prefix}bar/")]
+            .iter()
+            .map(|p| format!("prefix={}", encode_key_path(p).replace('/', "%2F")))
+            .collect();
 
     // client-present path
     let with_client = S3ObjectStore::for_endpoint(&format!("http://127.0.0.1:{port}"))
@@ -541,9 +545,18 @@ async fn list_uses_the_prefix_verbatim_and_returns_real_keys(slash: bool) {
             "list goes to the bucket root"
         );
         assert!(
-            r.query.split('&').any(|kv| kv == want_query_prefix),
-            "the list prefix must be sent verbatim: want {want_query_prefix:?} in query {:?}",
             r.query
+                .split('&')
+                .any(|kv| want_query_prefixes.iter().any(|w| w == kv)),
+            "the list prefix must be sent verbatim: want one of {want_query_prefixes:?} in \
+             query {:?}",
+            r.query
+        );
+    }
+    for want in &want_query_prefixes {
+        assert!(
+            reqs.iter().any(|r| r.query.split('&').any(|kv| kv == want)),
+            "no request carried {want:?}: {reqs:?}"
         );
     }
 }

@@ -367,10 +367,12 @@ pub(crate) fn literal_prefix_key_stream(
     prefix: String,
 ) -> KeyStream {
     use futures::StreamExt;
-    Box::pin(pages(client, bucket, prefix, false, true).map(|item| match item {
-        Ok(Entry::Object(k)) | Ok(Entry::Dir(k)) => Ok(k),
-        Err(e) => Err(e),
-    }))
+    Box::pin(
+        pages(client, bucket, prefix, false, true).map(|item| match item {
+            Ok(Entry::Object(k)) | Ok(Entry::Dir(k)) => Ok(k),
+            Err(e) => Err(e),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -384,13 +386,31 @@ mod tests {
     #[test]
     fn classification() {
         assert!(matches!(S3Selection::parse("").unwrap(), S3Selection::Dir(k) if k.is_empty()));
-        assert!(matches!(S3Selection::parse("dl/").unwrap(), S3Selection::Dir(_)));
-        assert!(matches!(S3Selection::parse("file.txt").unwrap(), S3Selection::Exact(_)));
-        assert!(matches!(S3Selection::parse("a/b.c").unwrap(), S3Selection::Exact(_)));
-        assert!(matches!(S3Selection::parse("file.txt*").unwrap(), S3Selection::Glob(_)));
-        assert!(matches!(S3Selection::parse("*").unwrap(), S3Selection::Glob(_)));
+        assert!(matches!(
+            S3Selection::parse("dl/").unwrap(),
+            S3Selection::Dir(_)
+        ));
+        assert!(matches!(
+            S3Selection::parse("file.txt").unwrap(),
+            S3Selection::Exact(_)
+        ));
+        assert!(matches!(
+            S3Selection::parse("a/b.c").unwrap(),
+            S3Selection::Exact(_)
+        ));
+        assert!(matches!(
+            S3Selection::parse("file.txt*").unwrap(),
+            S3Selection::Glob(_)
+        ));
+        assert!(matches!(
+            S3Selection::parse("*").unwrap(),
+            S3Selection::Glob(_)
+        ));
         // `?` and the regex characters are ordinary characters.
-        assert!(matches!(S3Selection::parse("a?b(c)[d]+$").unwrap(), S3Selection::Exact(_)));
+        assert!(matches!(
+            S3Selection::parse("a?b(c)[d]+$").unwrap(),
+            S3Selection::Exact(_)
+        ));
     }
 
     #[test]

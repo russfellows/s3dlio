@@ -36,10 +36,10 @@ pub mod progress;
 // removed in v0.9.90.  They were never-completed stubs with no callers.  The
 // production range engine is range_engine_generic.rs — see that file for context.
 pub mod list_pattern; // (#213): the explicit client-side regex filter for listings
-pub mod s3_selection; // (#213): which objects an s3:// URI selects
 pub mod mp;
 pub mod multi_endpoint;
 pub mod range_engine_generic; // Universal stream-based range engine (v0.9.2+)
+pub mod s3_selection; // (#213): which objects an s3:// URI selects
 pub mod uri_utils; // v0.9.14: Multi-endpoint URI expansion utilities // v0.9.14: Multi-endpoint load balancing with thread/process control
 
 // Hardware detection and optimization (v0.9.35+: always available, runtime detection)

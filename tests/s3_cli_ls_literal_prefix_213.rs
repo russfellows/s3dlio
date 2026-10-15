@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
 // Regression tests for s3dlio issue #213 through the real `s3-cli` binary:
-// `s3-cli ls <uri>` lists the URI as a LITERAL key prefix (never a regex), and
-// the regex feature stays, but only through the explicit `-p/--pattern` option.
+// `s3-cli ls <uri>` lists the exact object the key names and its `key/` directory
+// (never `key.bak`, never a regex), `*` / `**` make an explicit glob, and the regex
+// feature stays, but only through the explicit `-p/--pattern` option.
 //
 // The server is the shared in-process mock with a seeded catalog that honours
 // prefix and delimiter like S3 does (tests/common/mock_s3_server.rs).
@@ -33,6 +34,15 @@ const CATALOG: &[&str] = &[
     "dl/a.npz",
     "dl/b.txt",
     "dl/sub/c.npz",
+    // decoys for the exact-name rule
+    "file.txt",
+    "file.txt.bak",
+    "file.txt2",
+    "dl2/x",
+    "run.1.d/x",
+    "data/sub/deep/z.npz",
+    "data/top.npz",
+    "data/top.txt",
 ];
 
 fn seeded() -> (u16, MockS3State, String) {
@@ -95,22 +105,90 @@ fn assert_ls(r: &Ls, bucket: &str, keys: &[&str], what: &str) {
 }
 
 #[test]
-fn ls_run_dot_1_is_a_literal_prefix() {
+fn ls_run_dot_1_is_the_object_and_its_directory_only() {
     let (port, _s, b) = seeded();
     let uri = format!("s3://{b}/data/run.1");
-    // not run_1, not prerun.1
+    // not run.1.old, run.1.d/, run_1, prerun.1
     assert_ls(
         &s3_cli_ls(port, &["-r", &uri]),
         &b,
-        &["data/run.1", "data/run.1.old", "data/run.1/child"],
+        &["data/run.1", "data/run.1/child"],
         "ls -r",
     );
     assert_ls(
         &s3_cli_ls(port, &[&uri]),
         &b,
-        &["data/run.1", "data/run.1.old", "data/run.1/"],
+        &["data/run.1", "data/run.1/"],
         "ls (non-recursive)",
     );
+}
+
+#[test]
+fn ls_file_txt_never_selects_its_siblings() {
+    let (port, _s, b) = seeded();
+    let uri = format!("s3://{b}/file.txt");
+    assert_ls(
+        &s3_cli_ls(port, &[&uri]),
+        &b,
+        &["file.txt"],
+        "ls s3://b/file.txt",
+    );
+    assert_ls(
+        &s3_cli_ls(port, &["-r", &uri]),
+        &b,
+        &["file.txt"],
+        "ls -r s3://b/file.txt",
+    );
+    // `dl` is a directory only: dl/... but never dl2/...
+    assert_ls(
+        &s3_cli_ls(port, &["-r", &format!("s3://{b}/dl")]),
+        &b,
+        &["dl/a.npz", "dl/b.txt", "dl/sub/c.npz"],
+        "ls -r s3://b/dl",
+    );
+}
+
+#[test]
+fn ls_wildcard_is_an_explicit_glob_over_the_full_key() {
+    let (port, _s, b) = seeded();
+    assert_ls(
+        &s3_cli_ls(port, &[&format!("s3://{b}/file.txt*")]),
+        &b,
+        &["file.txt", "file.txt.bak", "file.txt2"],
+        "ls s3://b/file.txt*",
+    );
+    // `*` does not cross '/', `**` does; -r makes no difference for a wildcard URI
+    for flags in [&[][..], &["-r"][..]] {
+        let mut a = flags.to_vec();
+        let one = format!("s3://{b}/data/*.npz");
+        a.push(&one);
+        assert_ls(
+            &s3_cli_ls(port, &a),
+            &b,
+            &["data/top.npz"],
+            "ls s3://b/data/*.npz",
+        );
+        let mut a = flags.to_vec();
+        let two = format!("s3://{b}/data/**.npz");
+        a.push(&two);
+        assert_ls(
+            &s3_cli_ls(port, &a),
+            &b,
+            &["data/sub/deep/z.npz", "data/top.npz"],
+            "ls s3://b/data/**.npz",
+        );
+    }
+    // --pattern narrows the glob selection, relative to the directory before the first `*`
+    assert_ls(
+        &s3_cli_ls(port, &["-p", r"\.bak$", &format!("s3://{b}/file.txt*")]),
+        &b,
+        &["file.txt.bak"],
+        "ls -p '\\.bak$' s3://b/file.txt*",
+    );
+    // a wildcard URI that ends in '/' is refused, nothing listed
+    let r = s3_cli_ls(port, &[&format!("s3://{b}/data/*/")]);
+    assert!(!r.ok, "must be refused: {}", r.stdout);
+    assert!(r.stderr.contains("not defined"), "stderr={}", r.stderr);
 }
 
 #[test]
@@ -119,8 +197,8 @@ fn ls_bare_name_non_recursive_has_no_unrelated_folders() {
     assert_ls(
         &s3_cli_ls(port, &[&format!("s3://{b}/foo")]),
         &b,
-        &["foo", "foobar", "foo/"],
-        "ls s3://b/foo (not afoo, not data/ other/ weird/ dl/)",
+        &["foo", "foo/"],
+        "ls s3://b/foo (not foobar, afoo, data/ other/ weird/ dl/)",
     );
 }
 
@@ -130,7 +208,7 @@ fn ls_regex_metacharacters_in_the_uri_are_literal() {
     assert_ls(
         &s3_cli_ls(port, &["-r", &format!("s3://{b}/weird/p(")]),
         &b,
-        &["weird/p(", "weird/p(x"],
+        &["weird/p("],
         "ls -r s3://b/weird/p(",
     );
 }

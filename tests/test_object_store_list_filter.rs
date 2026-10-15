@@ -10,10 +10,11 @@
 // along with `foo/bar`. The #154 fix made the last URI segment an (unanchored)
 // regex matched against the key tail.
 //
-// Issue #213 REPLACES that contract. A plain URI is a LITERAL key prefix, never
-// a regex; S3 applies the prefix, and the client does no filtering of its own.
+// Issue #213 REPLACES that contract. A plain URI is never a regex: `foo/bar` selects the
+// object `foo/bar` and everything under `foo/bar/` -- never `foo/barn`, `foo/xbar`. The
+// client does no regex filtering of its own.
 // What #154 guaranteed -- `foo/other/deep.dat` does not come back for
-// `foo/bar` -- still holds, now because it does not start with `foo/bar`. The
+// `foo/bar` -- still holds, now because it is neither `foo/bar` nor under `foo/bar/`. The
 // regex feature is kept, but only as an explicit pattern (see
 // `tests/test_list_literal_prefix_213.rs`, `s3_cli_ls_literal_prefix_213.rs` and
 // `tests/test_python_list_literal_213.py`).
@@ -35,11 +36,11 @@ fn unique_prefix(name: &str) -> String {
     format!("{name}-{nanos}-{n}")
 }
 
-/// A key that does not start with the URI's key part is never returned, and the
-/// last segment is a literal prefix: `foo/bar` lists `foo/bar` and `foo/barn`
-/// but not `foo/other/deep.dat`, `foo/xbar` or `foo/b-a-r`.
+/// The URI's key part selects the object with exactly that name and what is under
+/// `name/`: `foo/bar` lists `foo/bar` and `foo/bar/inner` but not `foo/barn`,
+/// `foo/other/deep.dat`, `foo/xbar` or `foo/b-a-r`.
 #[tokio::test]
-async fn list_returns_exactly_the_keys_that_start_with_the_literal_prefix() {
+async fn list_returns_exactly_the_object_and_the_keys_under_its_directory() {
     let (port, state) = ensure_mock_s3_server();
     let store = S3ObjectStore::for_endpoint(&format!("http://127.0.0.1:{port}"))
         .await
@@ -67,17 +68,16 @@ async fn list_returns_exactly_the_keys_that_start_with_the_literal_prefix() {
     let want: Vec<String> = [
         format!("s3://{bucket}/{unique}/foo/bar"),
         format!("s3://{bucket}/{unique}/foo/bar/inner"),
-        format!("s3://{bucket}/{unique}/foo/barn"),
     ]
     .to_vec();
     assert_eq!(
         listed, want,
-        "list() must return exactly the keys that start with the literal prefix"
+        "list() must return exactly the object and the keys under its directory, no sibling"
     );
 }
 
 /// The regex feature is kept, but only as an EXPLICIT pattern applied to the
-/// literal-prefix listing (the shared `ListPattern` behind Python
+/// selected listing (the shared `ListPattern` behind Python
 /// `list(pattern=)` and `s3-cli ls --pattern`): it narrows the result, matched
 /// against the key relative to the listing base, and never changes what is
 /// asked of the server.
