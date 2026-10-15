@@ -265,8 +265,11 @@ def test_azure_deleting_a_missing_blob_succeeds_and_recursive_delete_works(fake)
     )  # again: still fine
 
 
-def test_azure_list_containers_refuses_malformed_accounts_before_any_request(fake, monkeypatch):
-    _require_backends()
+def test_azure_list_containers_refuses_malformed_accounts_before_any_request(
+    fake, monkeypatch
+):
+    _require_backends()  # (this probe itself makes a request to the fake)
+    fake.requests.clear()
     monkeypatch.delenv("AZURE_STORAGE_ENDPOINT")  # the strict, host-name rule
     # A bearer-token mode with no variables: if a credential were built, the error would be about
     # AZURE_TENANT_ID rather than the account.
@@ -275,7 +278,9 @@ def test_azure_list_containers_refuses_malformed_accounts_before_any_request(fak
         with pytest.raises(RuntimeError) as info:
             s3dlio.list_containers(bad)
         message = str(info.value)
-        assert "invalid Azure account" in message and "AZURE_TENANT_ID" not in message, message
+        assert (
+            "invalid Azure account" in message and "AZURE_TENANT_ID" not in message
+        ), message
     assert fake.requests == []
 
 
