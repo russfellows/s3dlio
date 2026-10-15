@@ -80,6 +80,16 @@ pub trait Dataset: Send + Sync + 'static {
         None
     }
 
+    /// The URI that fetches each item, in the same order as [`Dataset::keys`] (#223).
+    ///
+    /// A key identifies an item inside its dataset; this is the URI to hand to a
+    /// reader. It is built by the dataset from the root it already parsed (scheme,
+    /// server, bucket or container), so no caller needs a second URI parser.
+    /// Returns `None` if the dataset does not support it.
+    fn uris(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// Convenience helper.
     fn is_empty(&self) -> bool {
         self.len().map(|n| n == 0).unwrap_or(false)

@@ -14,11 +14,16 @@ use std::path::{Path, PathBuf};
 /// (a dataset URI naming one file) or lies outside it.
 pub(crate) fn root_relative_key(root: &Path, file: &Path) -> String {
     match file.strip_prefix(root) {
-        Ok(rel) if !rel.as_os_str().is_empty() => rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/"),
+        Ok(rel) if !rel.as_os_str().is_empty() => {
+            let mut key = String::new();
+            for c in rel.components() {
+                if !key.is_empty() {
+                    key.push('/');
+                }
+                key.push_str(&c.as_os_str().to_string_lossy());
+            }
+            key
+        }
         _ => file
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -171,6 +176,15 @@ impl Dataset for FileSystemBytesDataset {
         )
     }
 
+    fn uris(&self) -> Option<Vec<String>> {
+        Some(
+            self.files
+                .iter()
+                .map(|p| format!("file://{}", p.to_string_lossy()))
+                .collect(),
+        )
+    }
+
     async fn get(&self, index: usize) -> Result<Self::Item, DatasetError> {
         let path = self.get_file_path(index)?;
 
@@ -257,11 +271,24 @@ mod tests {
                 vec!["a.bin", "sub/b.bin", "sub/deeper/c.bin"],
                 "uri {uri}"
             );
+            // `uris()` is the URI that fetches each key, built from the parsed root.
+            let root = temp_dir.path().display();
+            assert_eq!(
+                dataset.uris().unwrap(),
+                vec![
+                    format!("file://{root}/a.bin"),
+                    format!("file://{root}/sub/b.bin"),
+                    format!("file://{root}/sub/deeper/c.bin"),
+                ],
+                "uri {uri}"
+            );
         }
 
         // A root naming one file keys it by its name.
         let uri = format!("file://{}", temp_dir.path().join("sub/b.bin").display());
         let dataset = FileSystemBytesDataset::from_uri(&uri).unwrap();
         assert_eq!(dataset.keys().unwrap(), vec!["b.bin"]);
+        // The one-file root is fetched as itself, never as `<file>/<file>`.
+        assert_eq!(dataset.uris().unwrap(), vec![uri.clone()]);
     }
 }

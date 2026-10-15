@@ -30,8 +30,8 @@ from test_python_delete_contract_212 import MockS3, env_for
 def mock_factory():
     mocks = []
 
-    def make(keys=()):
-        m = MockS3(keys)
+    def make(keys=(), host="127.0.0.1"):
+        m = MockS3(keys, host)
         mocks.append(m)
         return m
 
@@ -165,43 +165,35 @@ def test_local_single_file_root_reads_that_file(tmp_path, scheme):
 
 
 # ----------------------------------------------------------------------------
-# The fetch-URI builder for every scheme, including those with no dataset backend yet
+# The server form `s3://host:port/bucket/key`: the dataset parsed its own root, so the
+# fetch URI keeps the right bucket (the first path segment is the server's port, not
+# the bucket, here)
 # ----------------------------------------------------------------------------
 
-HELPER = (
-    FAKE_TORCH
-    + """
-    import json
-    from s3dlio.torch import _listed_item_uri
-    cases = json.loads(sys.argv[1])
-    print("RESULT " + json.dumps([_listed_item_uri(root, key) for root, key in cases]))
-"""
-)
-
-URI_CASES = [
-    ("s3://bkt/", "x", "s3://bkt/x"),
-    ("s3://bkt", "x", "s3://bkt/x"),
-    ("s3://bkt/dir/", "dir/x", "s3://bkt/dir/x"),
-    ("s3://bkt/dir", "dir/sub/x", "s3://bkt/dir/sub/x"),
-    ("s3://bkt/dir//", "dir//x", "s3://bkt/dir//x"),
-    ("s3://bkt//", "/a", "s3://bkt//a"),
-    ("s3://bkt//", "//a", "s3://bkt///a"),
-    ("gs://bkt/", "x", "gs://bkt/x"),
-    ("gs://bkt/dir/", "dir/x", "gs://bkt/dir/x"),
-    ("gs://bkt//", "/a", "gs://bkt//a"),
-    ("az://acct/cont/", "x", "az://acct/cont/x"),
-    ("az://acct/cont/dir/", "dir/x", "az://acct/cont/dir/x"),
-    ("az://acct/cont//", "/a", "az://acct/cont//a"),
+SERVER_CASES = [
+    # (dataset path after the server, bucket contents, keys listed and fetched)
+    ("bkt/", ["x", "y/z"], ["x", "y/z"]),
+    ("bkt/dir/", ["dir/x", "dir/sub/y", "other/q"], ["dir/x", "dir/sub/y"]),
+    ("bkt/dir//", ["dir//x", "dir/x"], ["dir//x"]),
+    ("bkt//", ["/a", "/b/c", "z"], ["/a", "/b/c"]),
 ]
 
 
-def test_fetch_uri_is_scheme_plus_bucket_plus_the_listed_key():
-    proc = run_scenario(
-        textwrap.dedent(HELPER), json.dumps([[r, k] for r, k, _ in URI_CASES])
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+@pytest.mark.parametrize("path,contents,expected", SERVER_CASES)
+def test_server_form_items_are_fetched_from_the_right_bucket(
+    mock_factory, host, path, contents, expected
+):
+    try:
+        mock = mock_factory(contents, host)
+    except OSError as e:
+        pytest.skip(f"cannot listen on {host}: {e}")
+    uri = f"s3://{mock.server_name}/{path}"
+    out = run_dataset(uri, env=env_for(mock))
+    detail = f"\n  uri: {uri}\n  outcome: {out}\n  requests:\n    {mock.render()}"
+    assert out["exc"] is None, f"the dataset failed{detail}"
+    assert sorted(out["keys"]) == sorted(expected), f"listed keys{detail}"
+    assert sorted(set(object_keys_requested(mock))) == sorted(expected), (
+        f"object requests must name exactly the listed keys{detail}"
     )
-    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
-    assert proc.returncode == 0 and lines, (
-        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    )
-    got = json.loads(lines[-1][len("RESULT ") :])
-    assert got == [want for _, _, want in URI_CASES]
+    assert len(out["items"]) == len(expected), detail

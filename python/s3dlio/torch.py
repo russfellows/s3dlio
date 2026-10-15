@@ -26,7 +26,6 @@ Stage-0 additions
 from __future__ import annotations
 
 import asyncio
-import os
 import threading
 import queue
 from typing import Iterable, Dict, Any, Sequence, Optional, Tuple
@@ -36,34 +35,6 @@ from torch.utils.data import IterableDataset, Dataset, get_worker_info
 
 # import _pymod as _core  # native module built by maturin
 from . import _pymod as _core
-
-
-def _listed_item_uri(root_uri: str, key: str, root_is_file: bool = False) -> str:
-    """The URI that fetches the object a dataset listed as `key`.
-
-    A dataset lists the objects under `root_uri` and reports each by its KEY:
-
-    * ``s3://`` / ``gs://`` / ``az://``: the full key from the bucket (container)
-      root, prefix included. The fetch URI is the scheme plus the bucket (for az://
-      the account and container) plus that key. The dataset URI's own key prefix is
-      NOT added again: ``s3://bkt/dir/`` listing ``dir/x`` fetches ``s3://bkt/dir/x``,
-      not ``s3://bkt/dir/dir/x`` (issue #223). Keys are exact: a leading or doubled
-      ``/`` is part of the key.
-    * ``file://`` / ``direct://``: the file's path below the root directory. When the
-      root names one file (`root_is_file`) that file is the object.
-    """
-    if "://" in root_uri:
-        scheme, rest = root_uri.split("://", 1)
-    else:
-        scheme, rest = "file", root_uri
-    if scheme in ("file", "direct"):
-        if root_is_file:
-            return f"{scheme}://{rest}"
-        return f"{scheme}://{rest.rstrip('/')}/{key}"
-    # Bucket-relative keys: keep only the container part of the dataset URI.
-    parts = rest.split("/", 2 if scheme == "az" else 1)
-    container = "/".join(parts[:2] if scheme == "az" else parts[:1])
-    return f"{scheme}://{container}/{key}"
 
 
 # -----------------------------------------------------------------------------
@@ -401,17 +372,13 @@ class ObjectStoreMapDataset(Dataset):
             raise ValueError("return_type must be 'tensor', 'bytes', or 'reader'")
         self._return_type = rt
 
-        # A local root that names one file is itself the only object (its key is the
-        # file name); every other key is fetched relative to the root (#223).
-        self._root_is_file = False
-        if "://" not in uri:
-            self._root_is_file = os.path.isfile(uri)
-        elif uri.startswith(("file://", "direct://")):
-            self._root_is_file = os.path.isfile(uri.split("://", 1)[1])
-
         # Use the generic Rust dataset - works with any URI scheme
         self._core_ds = _core.create_dataset(uri, self._opts)
         self._keys: Sequence[str] = self._core_ds.keys()
+        # The URI that fetches each listed item, built by the dataset from the root it
+        # parsed (scheme, server, bucket/container): Python never rebuilds a URI from
+        # the dataset URI and a key, which is how `dir/dir/x` happened (#223).
+        self._uris: Sequence[str] = self._core_ds.uris()
 
     @classmethod
     def from_prefix(cls, uri: str, **kwargs) -> "ObjectStoreMapDataset":
@@ -425,10 +392,8 @@ class ObjectStoreMapDataset(Dataset):
             raise IndexError(index)
         from . import _pymod as _core_mod
 
-        # Fetch exactly the object that was listed (#223): the listed key already
-        # carries the dataset URI's own prefix, so it is not joined onto that prefix.
-        key = self._keys[index]
-        full_uri = _listed_item_uri(self._uri, key, self._root_is_file)
+        # Fetch exactly the object that was listed (#223).
+        full_uri = self._uris[index]
 
         # get() returns BytesView which supports zero-copy memoryview()
         bytesview = _core_mod.get(full_uri)

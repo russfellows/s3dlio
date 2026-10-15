@@ -122,6 +122,16 @@ impl PyDataset {
             .ok_or_else(|| PyRuntimeError::new_err("keys() not supported for this dataset type"))
     }
 
+    /// The URI that fetches each item, in the order of `keys()` (issue #223).
+    ///
+    /// Built by the dataset from the root it parsed, so Python never rebuilds a URI
+    /// from the dataset URI and a listed key.
+    fn uris(&self) -> PyResult<Vec<String>> {
+        self.inner
+            .uris()
+            .ok_or_else(|| PyRuntimeError::new_err("uris() not supported for this dataset type"))
+    }
+
     /// Create a dataset from a pre-built list of URIs — no listing occurs.
     ///
     /// This is the general-purpose alternative to ``PyDataset(uri)`` (which

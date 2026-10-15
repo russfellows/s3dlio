@@ -77,6 +77,16 @@ impl Dataset for S3BytesDataset {
         Some(self.keys.clone())
     }
 
+    fn uris(&self) -> Option<Vec<String>> {
+        // Exactly the URI `get` fetches: the parsed bucket plus the listed key.
+        Some(
+            self.keys
+                .iter()
+                .map(|k| format!("s3://{}/{}", self.bucket, k))
+                .collect(),
+        )
+    }
+
     async fn get(&self, idx: usize) -> Result<Self::Item, DatasetError> {
         let key = self
             .keys

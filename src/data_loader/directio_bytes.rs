@@ -156,6 +156,10 @@ impl Dataset for DirectIOBytesDataset {
         )
     }
 
+    fn uris(&self) -> Option<Vec<String>> {
+        Some(self.files.clone())
+    }
+
     async fn get(&self, index: usize) -> Result<Self::Item, DatasetError> {
         let uri = self.get_file_uri(index)?;
 
@@ -233,10 +237,23 @@ mod tests {
                 vec!["a.bin", "sub/b.bin", "sub/deeper/c.bin"],
                 "uri {uri}"
             );
+            // `uris()` is the URI that fetches each key, built from the parsed root.
+            let root = temp_dir.path().display();
+            assert_eq!(
+                dataset.uris().unwrap(),
+                vec![
+                    format!("direct://{root}/a.bin"),
+                    format!("direct://{root}/sub/b.bin"),
+                    format!("direct://{root}/sub/deeper/c.bin"),
+                ],
+                "uri {uri}"
+            );
         }
 
         let uri = format!("direct://{}", temp_dir.path().join("sub/b.bin").display());
         let dataset = DirectIOBytesDataset::from_uri(&uri).unwrap();
         assert_eq!(dataset.keys().unwrap(), vec!["b.bin"]);
+        // The one-file root is fetched as itself, never as `<file>/<file>`.
+        assert_eq!(dataset.uris().unwrap(), vec![uri.clone()]);
     }
 }
