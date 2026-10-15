@@ -1,5 +1,35 @@
 # s3dlio Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The object size cache no longer grows without bound (#241).** The process-global size cache (and
+  the per-store size caches) never removed anything: an expired entry was treated as a miss but left in
+  memory, and nothing called the cleanup routine, so a long-running process that touched many distinct
+  objects (a KV-cache tier, a data loader over a very large dataset) kept growing. A lookup that finds
+  an expired entry now removes it, and the cache holds at most 1,048,576 entries (roughly 200-300 MB
+  when full); when a new object arrives at the limit the entry written longest ago, which is also the
+  one closest to expiry, is evicted. Every cache operation stays O(1) (an overwrite updates in place,
+  nothing scans or compacts under the lock). Eviction is oldest-written-first, so an epoch loop over more
+  distinct objects than the limit gets almost no hits: set `S3DLIO_SIZE_CACHE_MAX_ENTRIES` (read once per
+  process) above the object count for such datasets. The TTL
+  (`S3DLIO_SIZE_CACHE_TTL_SECS`) and cache hits behave as before.
+
+- **A GET of a missing or forbidden object no longer retries (#240).** The retry loop around S3 GETs
+  (`S3DLIO_MAX_RETRY_ATTEMPTS`, 100 ms x attempt backoff) retried every error, including a definite
+  answer from the server such as `404 NoSuchKey` or `403 AccessDenied`, so each GET of a missing key
+  sent several requests and waited at least 300 ms before returning the error. A definite client error
+  (400, 401, 403, 404, 405, 409, 412, 416 and other non-transient 4xx) is now returned after one request
+  with no backoff. Transient failures are retried as before: connection and dispatch errors, timeouts,
+  5xx, 408, 429, S3 throttling codes such as `SlowDown`, and errors while the response body streams. An
+  error that cannot be classified is still retried. The same rule now applies to the per-chunk retry loop
+  of the concurrent range GET. The AWS SDK's own retry layer is unchanged. Library note: the public
+  `s3dlio::retry::retry_get_body` now requires its error type to implement the new `RetryClassify`
+  trait; it is implemented for `anyhow::Error` (S3 errors are classified), `std::io::Error`,
+  `Box<dyn Error + Send + Sync>`, `&str` and `String` (the last four always retry), so existing callers
+  keep compiling unless they use another error type.
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published
