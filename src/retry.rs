@@ -71,6 +71,12 @@ const TRANSIENT_S3_ERROR_CODES: &[&str] = &[
     "RequestTimeout",
     "InternalError",
     "ServiceUnavailable",
+    // Credential expiry: the SDK re-resolves its identity (and may refresh
+    // STS credentials) on the next attempt, so a later attempt can succeed.
+    "ExpiredToken",
+    "RequestExpired",
+    // S3 documents this one as "retry the request".
+    "OperationAborted",
 ];
 
 /// Is an HTTP status, with an optional S3 error code, worth retrying?
@@ -161,6 +167,21 @@ impl RetryClassify for anyhow::Error {
             Some(f) => f.retryable,
             None => true,
         }
+    }
+}
+
+/// I/O errors carry no server verdict: retried (the pre-#240 behaviour).
+impl RetryClassify for std::io::Error {
+    fn is_retryable(&self) -> bool {
+        true
+    }
+}
+
+/// Opaque boxed errors carry no server verdict: retried (the pre-#240
+/// behaviour).
+impl RetryClassify for Box<dyn std::error::Error + Send + Sync> {
+    fn is_retryable(&self) -> bool {
+        true
     }
 }
 
@@ -384,6 +405,12 @@ mod tests {
             // S3 reports these codes under a 400.
             (400, "RequestTimeout"),
             (400, "SlowDown"),
+            // Credential expiry and S3's "retry me" abort: a later attempt
+            // can succeed once the SDK has refreshed its identity.
+            (400, "ExpiredToken"),
+            (403, "ExpiredToken"),
+            (400, "RequestExpired"),
+            (409, "OperationAborted"),
         ] {
             assert!(
                 service_failure(status, code).is_retryable(),
@@ -406,6 +433,10 @@ mod tests {
         // A body-transfer error and any plain error carry no verdict: retried.
         assert!(anyhow::anyhow!("body stream failed").is_retryable());
         assert!("boom".is_retryable());
+        assert!(String::from("boom").is_retryable());
+        assert!(std::io::Error::other("reset").is_retryable());
+        let boxed: Box<dyn std::error::Error + Send + Sync> = "boom".into();
+        assert!(boxed.is_retryable());
     }
 
     #[test]

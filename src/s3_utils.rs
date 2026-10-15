@@ -1722,7 +1722,7 @@ async fn concurrent_range_get_impl(
             // helper's `FnMut() -> Fut` signature can't share `&mut seg`
             // across attempts without Arc<Mutex> or unsafe. Semantics
             // match: max_retry_attempts() budget + linear 100ms*attempt
-            // backoff.
+            // backoff, and (issue #240) no retry of a definite client error.
             //
             // Silent-data-corruption gate (audit §2.4): `written`
             // MUST be declared inside `attempt_range_chunk_fill` so
@@ -1752,7 +1752,13 @@ async fn concurrent_range_get_impl(
                         break;
                     }
                     Err(e) => {
+                        // Issue #240: same rule as `retry_get_body` -- a
+                        // definite answer (404, 403, 412, ...) ends the loop.
+                        let definite = !crate::retry::RetryClassify::is_retryable(&e);
                         last_err = Some(e);
+                        if definite {
+                            break;
+                        }
                         if attempt < attempts {
                             tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
                         }

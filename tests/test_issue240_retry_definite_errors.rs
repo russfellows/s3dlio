@@ -23,7 +23,7 @@ mod common;
 
 use common::mock_s3_server::{
     ensure_mock_s3_server, key_path, unique_test_key, GET_FORBIDDEN_MARKER, GET_NOT_FOUND_MARKER,
-    GET_UNAVAILABLE_MARKER,
+    GET_UNAVAILABLE_MARKER, SIZED_OBJECT_MARKER,
 };
 use s3dlio::object_store::{ObjectStore, S3ObjectStore};
 use std::time::{Duration, Instant};
@@ -133,10 +133,46 @@ async fn global_client_range_get_of_missing_key_is_one_request() {
     assert_eq!(c.get_calls, 1, "global-path 404 must cost exactly one GET");
 }
 
+/// The concurrent range-GET path has its own per-chunk retry loop (it cannot
+/// use `retry_get_body`); it must also stop at a definite answer. The key
+/// carries both the sized-object marker (so HEAD succeeds with 16 bytes and the
+/// chunked path is entered) and the 404 marker (so every chunk GET is a 404).
+#[tokio::test]
+async fn concurrent_range_chunks_do_not_retry_a_404() {
+    let (_, state) = init();
+    let key = unique_test_key(&format!("{SIZED_OBJECT_MARKER}-{GET_NOT_FOUND_MARKER}"));
+
+    let start = Instant::now();
+    let err = s3dlio::s3_utils::get_object_concurrent_range_async(
+        &uri_for(&key),
+        0,
+        None,
+        Some(4),
+        Some(1),
+    )
+    .await
+    .expect_err("404 must fail");
+    let elapsed = start.elapsed();
+
+    assert!(format!("{err:#}").contains("NoSuchKey"), "{err:#}");
+    let c = state.counts_for(&key_path(BUCKET, &key));
+    // One chunk in flight at a time and the first 404 ends the download, so
+    // exactly one GET. The unfixed loop sent that chunk three times.
+    assert_eq!(c.get_calls, 1, "a 404 chunk must cost exactly one GET");
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "404 took {elapsed:?}; the chunk retry backoff must not run"
+    );
+}
+
 /// A 503 SlowDown is transient: the s3dlio loop must still retry it on top of
 /// the SDK's own attempts. Both layers use the pinned budget of 3, so a 503
-/// that is retried by both reaches the server 3 x 3 = 9 times; one that only
-/// the SDK retried would reach it 3 times.
+/// retried by both reaches the server up to 3 x 3 = 9 times, while one that
+/// only the SDK retried would reach it exactly 3 times.
+///
+/// The upper bound is deliberately not pinned to exactly 9: the SDK's
+/// standard retry mode has its own internals (a shared retry-token bucket, its
+/// own classification of 503/SlowDown) that can change the SDK-side count.
 #[tokio::test]
 async fn throttled_get_is_still_retried_by_the_outer_loop() {
     let (port, state) = init();
@@ -145,9 +181,9 @@ async fn throttled_get_is_still_retried_by_the_outer_loop() {
 
     store.get(&uri_for(&key)).await.expect_err("503 must fail");
     let c = state.counts_for(&key_path(BUCKET, &key));
-    assert_eq!(
-        c.get_calls, 9,
-        "503 must be retried by BOTH layers (3 SDK attempts x 3 outer), saw {}",
+    assert!(
+        c.get_calls > 3 && c.get_calls <= 9,
+        "503 must be retried by BOTH layers (more than the SDK's 3, at most 3 x 3), saw {}",
         c.get_calls
     );
 }

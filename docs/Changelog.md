@@ -20,7 +20,12 @@
   (400, 401, 403, 404, 405, 409, 412, 416 and other non-transient 4xx) is now returned after one request
   with no backoff. Transient failures are retried as before: connection and dispatch errors, timeouts,
   5xx, 408, 429, S3 throttling codes such as `SlowDown`, and errors while the response body streams. An
-  error that cannot be classified is still retried. The AWS SDK's own retry layer is unchanged.
+  error that cannot be classified is still retried. The same rule now applies to the per-chunk retry loop
+  of the concurrent range GET. The AWS SDK's own retry layer is unchanged. Library note: the public
+  `s3dlio::retry::retry_get_body` now requires its error type to implement the new `RetryClassify`
+  trait; it is implemented for `anyhow::Error` (S3 errors are classified), `std::io::Error`,
+  `Box<dyn Error + Send + Sync>`, `&str` and `String` (the last four always retry), so existing callers
+  keep compiling unless they use another error type.
 
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
