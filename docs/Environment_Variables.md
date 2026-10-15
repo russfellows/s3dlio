@@ -45,6 +45,8 @@ Set `S3DLIO_LOAD_DOTENV=1` (or a path) to keep that behaviour.
   | Python | `import s3dlio` (the extension module's initialisation, before any thread or pool is created) |
   | Rust | the first use of the global runtime (`run_on_global_rt` and everything built on it), `store_for_uri*`, an S3 / Azure / GCS client, a bucket or container listing, or the Arrow backend set-up |
 
+  (Python's `os.environ` is a copy taken when the interpreter starts, so it does not show variables
+  that s3dlio loads from the file; s3dlio and other native code read the real process environment.)
   Python users can also load the file themselves **before** `import s3dlio` (see below). An application
   that needs the file's values before its own first call into s3dlio should load it first thing:
 

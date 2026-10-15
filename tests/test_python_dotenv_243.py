@@ -39,9 +39,20 @@ S3DLIO_RT_THREADS=6
 CHILD = """
     import glob, json
 
-    out = {"marker": os.environ.get("S3DLIO_243_MARKER"),
-           "preset": os.environ.get("S3DLIO_243_PRESET")}
+    # Python's os.environ is a snapshot taken at start-up; s3dlio sets the C environment,
+    # so read it the way the Rust code does.
+    import ctypes
+
+    libc = ctypes.CDLL(None)
+    libc.getenv.restype = ctypes.c_char_p
+
+    def c_getenv(name):
+        value = libc.getenv(name.encode())
+        return None if value is None else value.decode()
+
     # Right after the import, before any I/O: has the policy been applied?
+    out = {"marker": c_getenv("S3DLIO_243_MARKER"),
+           "preset": c_getenv("S3DLIO_243_PRESET")}
     try:
         s3dlio.stat("s3://bkt/x")
     except Exception as e:
