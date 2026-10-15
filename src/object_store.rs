@@ -4048,6 +4048,7 @@ pub fn store_for_uri(uri: &str) -> Result<Box<dyn ObjectStore>> {
 /// `store_for` runs on whichever runtime worker polls the task, so it must not call
 /// `run_on_global_rt` (it would block a global-runtime worker on a task for that runtime;
 /// issue #173). Return cached stores; building one must be synchronous and runtime-free.
+#[cfg(any(test, feature = "extension-module"))]
 pub(crate) async fn get_many_with_stores<F>(
     uris: Vec<String>,
     max_in_flight: usize,
@@ -4062,6 +4063,10 @@ where
     use tokio::task::JoinSet;
 
     crate::concurrency::require_concurrency_at_least_one("max_in_flight", max_in_flight)?;
+    // Refuse the whole batch before any read starts if a URI names no object.
+    for uri in &uris {
+        require_object_key(uri)?;
+    }
     let store_for = Arc::new(store_for);
     let sem = Arc::new(Semaphore::new(max_in_flight));
     let failed = Arc::new(AtomicBool::new(false));
@@ -4121,6 +4126,28 @@ where
         .collect())
 }
 
+/// Refuse an `az://`, `gs://`/`gcs://` or Azure `https://` URI that names no object: the
+/// account/container (or bucket) is present but the key is empty (`az://acct/container`,
+/// `az://acct/container/`, `gs://bucket/`). Keys that merely look odd (`dir/`, `//k`) are keys.
+#[cfg(any(test, feature = "extension-module"))]
+fn require_object_key(uri: &str) -> Result<()> {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return Ok(()); // not a URL: left to the store's own parser
+    };
+    // Path segments before the key: account + container (az://, Azure https URLs have
+    // host + container), or the bucket (gs://).
+    let leading = match scheme {
+        "gs" | "gcs" => 1,
+        "az" | "http" | "https" => 2,
+        _ => return Ok(()),
+    };
+    let key = rest.splitn(leading + 1, '/').nth(leading).unwrap_or("");
+    if key.is_empty() {
+        bail!("Cannot GET: no key specified in URI: {uri}");
+    }
+    Ok(())
+}
+
 /// [`store_for_uri`] for the library entry points that always built an unlogged
 /// store and relied on the S3 backend's own row (checkpoint save/load, the
 /// concurrent shard reader, `MultiBackendDataset`, Python
@@ -4164,7 +4191,7 @@ pub(crate) fn container_uri_prefix(uri: &str) -> String {
 /// This enables performance analysis and debugging for all backends (file://, s3://, az://, direct://).
 ///
 /// # Arguments
-/// * `uri` - Storage URI (e.g., "s3://bucket/", "file:///path/", "az://container/")
+/// * `uri` - Storage URI (e.g., "s3://bucket/", "file:///path/", "az://account/container/")
 /// * `logger` - Optional Logger instance for operation tracing
 ///
 /// # Example
@@ -4439,7 +4466,7 @@ pub fn high_performance_store_for_uri_with_logger(
 /// This factory explicitly enables the struct-based RangeEngine for all backends.
 ///
 /// # Arguments
-/// * `uri` - Storage URI (e.g., "s3://bucket/", "az://container/", "gs://bucket/")
+/// * `uri` - Storage URI (e.g., "s3://bucket/", "az://account/container/", "gs://bucket/")
 ///
 /// # Network Scenarios
 ///
@@ -5923,6 +5950,52 @@ mod get_many_with_stores_tests {
             at_return.1 + 1,
             "every read that started finished, except the one that failed: {at_return:?}"
         );
+    }
+
+    // A URI that names no object is refused up front, before any store is built or any read
+    // starts (get_many used to say "no key specified in URI" for these).
+    #[tokio::test]
+    async fn uris_without_an_object_key_are_refused_before_any_read() {
+        for bad in [
+            "az://acct",
+            "az://acct/",
+            "az://acct/container",
+            "az://acct/container/",
+            "gs://bucket",
+            "gs://bucket/",
+            "gcs://bucket",
+            "https://acct.blob.core.windows.net/container",
+            "https://acct.blob.core.windows.net/container/",
+        ] {
+            let seen: Seen = Arc::default();
+            let uris = vec!["az://acct/container/fine".to_string(), bad.to_string()];
+            let err = get_many_with_stores(uris, 2, factory(&seen))
+                .await
+                .expect_err(bad);
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("no key specified") && message.contains(bad),
+                "RED: {bad} was not refused as keyless: {message}"
+            );
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "RED: a read started although {bad} was keyless"
+            );
+        }
+        // Keys that look odd but are keys stay accepted.
+        for ok in [
+            "az://acct/container/k",
+            "az://acct/container/dir/",
+            "az://acct/container//k",
+            "gs://bucket/k",
+            "gs://bucket//k",
+            "https://acct.blob.core.windows.net/container/k",
+        ] {
+            let seen: Seen = Arc::default();
+            get_many_with_stores(vec![ok.to_string()], 1, factory(&seen))
+                .await
+                .unwrap_or_else(|e| panic!("{ok} was refused: {e:#}"));
+        }
     }
 
     #[tokio::test]

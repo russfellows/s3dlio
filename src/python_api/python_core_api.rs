@@ -24,7 +24,7 @@ use crate::config::{Config, DataGenAlgorithm, DataGenMode, ObjectType};
 use crate::delete_batch_plan::parse_s3_uri_for_global_client;
 use crate::list_containers::list_containers as list_containers_rs;
 use crate::object_store::{
-    get_many_with_stores, store_for_uri, store_for_uri_with_logger, store_routing_endpoint_for_uri,
+    get_many_with_stores, store_for_uri_with_logger, store_routing_endpoint_for_uri,
 };
 use crate::s3_client::run_on_global_rt;
 use crate::s3_logger::{finalize_op_logger, global_logger, init_op_logger, op_log_stats};
@@ -1474,7 +1474,7 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 /// s3dlio.put_bytes("file:///tmp/test.bin", b"hello world")
 ///
 /// # Put bytes to Azure
-/// s3dlio.put_bytes("az://container/blob.bin", b"hello world")
+/// s3dlio.put_bytes("az://myaccount/container/blob.bin", b"hello world")
 ///
 /// # Put bytearray or any buffer-like object
 /// data = bytearray(b"hello world")

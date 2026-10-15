@@ -45,6 +45,7 @@ impl ReadBuffer {
     }
 
     /// Bytes received so far.
+    #[cfg(any(feature = "backend-gcs", test))]
     pub(crate) fn len(&self) -> usize {
         self.data.len()
     }
