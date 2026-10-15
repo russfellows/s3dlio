@@ -152,3 +152,29 @@ def test_streaming_write_rejects_non_bytes_like(work_dir):
     with pytest.raises(TypeError):
         w.write_chunk((ctypes.c_void_p * 4)())
     w.finalize()
+
+
+@pytest.mark.parametrize("method", ["write_chunk", "write_owned_bytes"])
+@pytest.mark.parametrize("bad", [5, [1, 2, 3], (i for i in range(3)), "abc", None, 2.5])
+def test_streaming_write_refuses_ints_and_plain_iterables(work_dir, method, bad):
+    path = f"{work_dir}/strict.bin"
+    w = s3dlio.create_filesystem_writer(f"file://{path}", None)
+    with pytest.raises(TypeError):
+        getattr(w, method)(bad)
+    w.finalize()
+    assert os.path.getsize(path) == 0, (
+        "a refused value must write nothing (5 is not 5 zero bytes)"
+    )
+
+
+def test_streaming_write_accepts_objects_with_dunder_bytes(work_dir):
+    class C:
+        def __bytes__(self):
+            return b"hello"
+
+    path = f"{work_dir}/dunder.bin"
+    w = s3dlio.create_filesystem_writer(f"file://{path}", None)
+    w.write_chunk(C())
+    w.finalize()
+    with open(path, "rb") as f:
+        assert f.read() == b"hello"

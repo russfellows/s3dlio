@@ -116,6 +116,12 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 | `S3DLIO_OPERATION_TIMEOUT_SECS` | `60` | Full request/response cycle timeout in seconds (excluding the connect handshake).  60 s is sufficient for ~6 GB at 100 MB/s and ~60 GB at 1 GB/s.  Raise for very large single objects or slow networks. |
 | `S3DLIO_MAX_RETRY_ATTEMPTS` | `3` | Maximum number of attempts (1 initial + N−1 retries) per operation before propagating the error.  Governs **two** retry layers: (a) the AWS SDK's own retry (matches the SDK's default) which covers `send()`-phase failures such as connect / dispatch errors, and (b) since v0.9.108 (issue #148 Phase 4) the shared `retry_get_body` helper which covers **body-transfer** failures — once the reqwest connector streams response bodies to the SDK (`SdkBody::from_body_1_x`), smithy's retry no longer covers errors that surface while the caller consumes the streaming body, so a bounded-linear-backoff retry loop with the same attempt budget is applied at four caller sites (`S3Ops::get_object`/`get_object_range`, `S3ObjectStore::get`/`get_range` direct-client paths, and the range-chunk task inside `concurrent_range_get_impl`).  Set to `1` for **fast-fail at warmup** (no retries; surface a dispatch failure in one connect budget instead of three) — useful for debugging mlcommons/storage#506-style cold-start issues.  Set to `5` or higher to ride out flaky-network bursts.  Clamped to a minimum of 1; the SDK rejects 0. |
 
+### Borrowed Python buffers: completion barrier
+
+| Variable | Default | Description |
+|---|---|---|
+| `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` | `30` | How long a `put_bytes` / `put_bytes_async(borrow=True)` waits, after the store finished, for every native reader of the caller's buffer to let go before it gives up and raises `s3dlio.ExportStillReferencedError` (the buffer then stays pinned: do not reuse it). Fractions allowed (minimum 0.001); unusable values select the default. The wait is not interruptible by signals. |
+
 ### Direct I/O (`direct://`) shared bounce-buffer pool
 
 O_DIRECT needs page-aligned memory. A `direct://` PUT whose source address is already page-aligned (pinned

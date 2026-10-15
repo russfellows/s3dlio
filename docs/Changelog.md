@@ -76,6 +76,25 @@
   single write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
   also left zero padding inside the object whenever `part_size` was not a multiple of 4096.
 
+- **Round-5 hardening of the borrowed-buffer barrier and the direct pool.** (1) The awaitable of
+  `put_bytes_async(borrow=True)` is now a `Future` subclass, not a Task running a coroutine: a coroutine body
+  never runs when its Task is cancelled before the first step, which let `CancelledError` reach the caller while a
+  native write still read the buffer; `cancel()` (including `asyncio.timeout(0)` and `wait_for(.., 0)`) now defers
+  the terminal state until the barrier is satisfied. (2) The guard is built before the put is spawned, and every
+  error path of `put_bytes_async` releases the export before raising. (3) A barrier timeout raises
+  `s3dlio.ExportStillReferencedError` (new; `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`, default 30 s, not signal
+  interruptible) instead of succeeding. (4) The async barrier never attaches to Python by itself (the result
+  delivery, inside the interpreter-exit gate of #192, releases the export); after interpreter shutdown began a
+  `put_bytes` that holds the GIL still releases its export. (5) A `direct://` PUT cancelled while it waits for
+  bounce buffers leaves the previous object intact: the target is created/truncated only after the buffers are
+  leased. (6) The streaming writers accept only buffer-protocol objects and objects with `__bytes__()`:
+  `write_chunk(5)` is a `TypeError` instead of five zero bytes (as are lists and iterables); `put_bytes` is
+  unchanged. (7) Per-call overhead of small puts reduced (no thread hand-offs when the store already dropped the
+  payload). (8) Helper-thread creation failure is an error, not a panic; a failed pool creation is retried after
+  30 s; `mbind` prefers (instead of requires) the node; `direct://` range reads no longer zero-fill the buffer
+  before `pread` and run the read in a blocking task that owns the buffer; CPU indexes read from sysfs are
+  capped.
+
 - **The remaining Python write paths no longer copy the payload with the GIL held (#254).** The streaming
   writer's `write_chunk()` (which kept the GIL for the whole write of any mutable buffer) and
   `write_owned_bytes()` (which copied the buffer into a `Vec` with the GIL held) now use the same payload

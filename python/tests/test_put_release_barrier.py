@@ -46,13 +46,82 @@ def read_fifo(path):
         return f.read()
 
 
+def run_bounded(make_coro, fifo=None, timeout=60):
+    """Run `make_coro()` on its own event loop in a daemon thread and FAIL (not hang) when it
+    does not finish within `timeout` seconds. `fifo`: a stuck native writer is unblocked by
+    attaching a reader so the process can end."""
+    box = {}
+
+    def target():
+        try:
+            box["value"] = asyncio.run(make_coro())
+        except BaseException as e:  # noqa: BLE001 - re-raised in the caller
+            box["error"] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        if fifo is not None:
+            threading.Thread(target=read_fifo, args=(fifo,), daemon=True).start()
+            t.join(10)
+        pytest.fail(f"timed out after {timeout}s: the awaitable never completed (hang)")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+class Reader:
+    """Attaches a reader to a FIFO (so a stuck native writer can finish) and keeps what it read."""
+
+    def __init__(self, path):
+        self.data = None
+        self.thread = threading.Thread(target=self._run, args=(path,), daemon=True)
+
+    def _run(self, path):
+        self.data = read_fifo(path)
+
+    def start(self):
+        self.thread.start()
+
+    def join(self, timeout=30):
+        self.thread.join(timeout)
+        assert not self.thread.is_alive(), "the FIFO reader never finished"
+        return self.data
+
+
+def nonblocking_drain(path, seconds):
+    """Open the FIFO for reading WITHOUT blocking and return whatever arrives within `seconds`
+    (a native writer stuck opening it completes the moment a reader exists)."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    got = bytearray()
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline:
+            try:
+                chunk = os.read(fd, 1 << 20)
+            except BlockingIOError:
+                chunk = None
+            if chunk:
+                got += chunk
+            else:
+                time.sleep(0.01)
+    finally:
+        os.close(fd)
+    return bytes(got)
+
+
+def stuck_put(work_dir, original):
+    fifo = os.path.join(work_dir, "pipe")
+    os.mkfifo(fifo)
+    return fifo, bytearray(original)
+
+
 def test_cancel_after_the_native_write_started_is_not_observable_until_it_finished(
     work_dir,
 ):
-    fifo = os.path.join(work_dir, "pipe")
-    os.mkfifo(fifo)
     original = bytes(range(251)) * 4000
-    ba = bytearray(original)
+    fifo, ba = stuck_put(work_dir, original)
     seen = {}
 
     async def go():
@@ -60,20 +129,18 @@ def test_cancel_after_the_native_write_started_is_not_observable_until_it_finish
         await asyncio.sleep(0.3)  # the blocking writer is stuck opening the FIFO
         task.cancel()
         await asyncio.sleep(0.5)
-        # The caller cannot observe completion or cancellation while the write is still pending,
+        # The caller cannot observe completion or cancellation while the write is pending,
         # and the buffer is still pinned.
         seen["terminal_while_write_pending"] = task.done()
         seen["pinned_while_write_pending"] = not resizable(ba)
-        reader = threading.Thread(
-            target=lambda: seen.__setitem__("data", read_fifo(fifo))
-        )
+        reader = Reader(fifo)
         reader.start()  # lets the pending write run to completion
         with pytest.raises(asyncio.CancelledError):
-            await task
-        reader.join(timeout=30)
+            await asyncio.wait_for(task, 30)
+        seen["data"] = reader.join()
         seen["released_at_cancel"] = resizable(ba)
 
-    asyncio.run(go())
+    run_bounded(go, fifo)
     assert seen["terminal_while_write_pending"] is False, (
         "cancel completed under a running write"
     )
@@ -86,10 +153,110 @@ def test_cancel_after_the_native_write_started_is_not_observable_until_it_finish
     )
 
 
+def test_cancel_synchronously_right_after_the_call(work_dir):
+    """The early window: cancel() before the awaitable ever ran a step. The invariant, whichever
+    way the race with the native writer goes: a terminal awaitable means no native reader is left."""
+    original = bytes(range(250)) * 4000
+    fifo, ba = stuck_put(work_dir, original)
+    seen = {}
+
+    async def go():
+        task = s3dlio.put_bytes_async(f"file://{fifo}", ba, borrow=True)
+        task.cancel()  # synchronously: no loop iteration has happened
+        seen["done_immediately"] = task.done()
+        await asyncio.sleep(0.5)
+        seen["terminal"] = task.done()
+        if seen["terminal"]:
+            # Nothing may still be reading the buffer: a reader must see NO bytes.
+            seen["late_bytes"] = nonblocking_drain(fifo, 0.5)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 30)
+        else:
+            seen["pinned"] = not resizable(ba)
+            reader = Reader(fifo)
+            reader.start()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 30)
+            seen["data"] = reader.join()
+        seen["released"] = resizable(ba)
+
+    run_bounded(go, fifo)
+    assert seen["done_immediately"] is False, (
+        "cancel() made the awaitable terminal at once"
+    )
+    if seen["terminal"]:
+        assert seen.get("late_bytes") == b"", (
+            "the awaitable was terminal while a native write still read the buffer"
+        )
+    else:
+        assert seen["pinned"] is True
+        assert seen["data"] == original
+    assert seen["released"] is True
+
+
+def test_asyncio_timeout_zero_is_deferred_until_the_native_write_finished(work_dir):
+    original = b"timeout-zero" * 20_000
+    fifo, ba = stuck_put(work_dir, original)
+    seen = {}
+
+    async def go():
+        async def body():
+            async with asyncio.timeout(0):
+                await s3dlio.put_bytes_async(f"file://{fifo}", ba, borrow=True)
+
+        t = asyncio.ensure_future(body())
+        await asyncio.sleep(0.6)
+        seen["terminal_early"] = t.done()
+        seen["pinned"] = not resizable(ba)
+        reader = Reader(fifo)
+        reader.start()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(t, 30)
+        seen["data"] = reader.join()
+        seen["released"] = resizable(ba)
+
+    run_bounded(go, fifo)
+    assert seen["terminal_early"] is False, (
+        "timeout(0) ended under a running native write"
+    )
+    assert seen["pinned"] is True
+    assert seen["data"] == original
+    assert seen["released"] is True
+
+
+def test_wait_for_zero_is_deferred_until_the_native_write_finished(work_dir):
+    original = b"wait-for-zero" * 20_000
+    fifo, ba = stuck_put(work_dir, original)
+    seen = {}
+
+    async def go():
+        async def body():
+            return await asyncio.wait_for(
+                s3dlio.put_bytes_async(f"file://{fifo}", ba, borrow=True), 0
+            )
+
+        t = asyncio.ensure_future(body())
+        await asyncio.sleep(0.6)
+        seen["terminal_early"] = t.done()
+        seen["pinned"] = not resizable(ba)
+        reader = Reader(fifo)
+        reader.start()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(t, 30)
+        seen["data"] = reader.join()
+        seen["released"] = resizable(ba)
+
+    run_bounded(go, fifo)
+    assert seen["terminal_early"] is False, (
+        "wait_for(.., 0) ended under a running native write"
+    )
+    assert seen["pinned"] is True
+    assert seen["data"] == original
+    assert seen["released"] is True
+
+
 def test_a_second_cancel_while_waiting_does_not_cut_the_barrier_short(work_dir):
-    fifo = os.path.join(work_dir, "pipe")
-    os.mkfifo(fifo)
-    ba = bytearray(b"x" * 100_000)
+    fifo, ba = stuck_put(work_dir, b"x" * 100_000)
     seen = {}
 
     async def go():
@@ -100,16 +267,25 @@ def test_a_second_cancel_while_waiting_does_not_cut_the_barrier_short(work_dir):
         task.cancel()
         await asyncio.sleep(0.2)
         seen["done"] = task.done()
-        t = threading.Thread(target=lambda: read_fifo(fifo))
-        t.start()
+        reader = Reader(fifo)
+        reader.start()
         with pytest.raises(asyncio.CancelledError):
-            await task
-        t.join(timeout=30)
+            await asyncio.wait_for(task, 30)
+        reader.join()
         seen["released"] = resizable(ba)
 
-    asyncio.run(go())
+    run_bounded(go, fifo)
     assert seen["done"] is False
     assert seen["released"] is True
+
+
+def test_a_put_that_fails_to_start_leaves_no_spurious_buffer_error(work_dir):
+    """put_bytes_async outside an event loop fails AFTER the buffer was exported: the error path
+    must release it before raising (the caller may resize at once)."""
+    ba = bytearray(b"e" * 100_000)
+    with pytest.raises(RuntimeError):
+        s3dlio.put_bytes_async(f"file://{work_dir}/x.bin", ba, borrow=True)
+    assert resizable(ba), "BufferError right after a failed put_bytes_async"
 
 
 def test_cancellation_at_any_moment_leaves_the_buffer_free_and_the_file_whole(work_dir):
@@ -286,3 +462,52 @@ def test_host_that_created_a_subinterpreter_before_using_s3dlio(work_dir):
     if "NO_SUBINTERPRETERS" in r.stdout:
         pytest.skip("this interpreter has no _interpreters/_xxsubinterpreters module")
     assert "OK" in r.stdout
+
+
+QUIESCE_TIMEOUT = r"""
+import asyncio, os, sys, threading
+import s3dlio
+d = sys.argv[1]
+fifo = os.path.join(d, "pipe")
+os.mkfifo(fifo)
+ba = bytearray(b"q" * 100_000)
+out = {}
+async def go():
+    task = s3dlio.put_bytes_async("file://" + fifo, ba, borrow=True)
+    await asyncio.sleep(0.3)
+    task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), 20)
+    except BaseException as e:
+        out["exc"] = type(e).__name__
+        out["is_subclass"] = isinstance(e, s3dlio.ExportStillReferencedError)
+    try:
+        ba.append(0)
+        out["pinned"] = False
+    except BufferError:
+        out["pinned"] = True
+    out["timeouts"] = s3dlio._put_export_stats()["quiesce_timeouts"]
+asyncio.run(go())
+# let the stuck writer finish so the process can end
+t = threading.Thread(target=lambda: open(fifo, "rb").read(), daemon=True)
+t.start(); t.join(10)
+print(out)
+"""
+
+
+def test_quiesce_timeout_raises_a_distinct_error_and_keeps_the_buffer_pinned(work_dir):
+    env = dict(os.environ, S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS="1")
+    r = subprocess.run(
+        [sys.executable, "-c", QUIESCE_TIMEOUT, work_dir],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr[-2000:]
+    out = eval(r.stdout.strip().splitlines()[-1])
+    assert out["exc"] == "ExportStillReferencedError", out
+    assert out["is_subclass"] is True
+    assert out["pinned"] is True, "the buffer must stay pinned after a quiesce timeout"
+    assert out["timeouts"] >= 1

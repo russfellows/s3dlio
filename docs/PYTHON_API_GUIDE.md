@@ -291,26 +291,33 @@ awaitable completes):
   Rust sense). The memory is never freed or resized meanwhile because the buffer stays exported, but that does not
   make a concurrent write safe;
 * with `borrow=True` you additionally promise not to free the memory (for example ctypes/pinned host memory) until
-  the awaitable has completed, successfully or not. The export is released before the awaitable resolves, so
-  resizing right after the `await` works for `file://` and `direct://` (the store has dropped its last reference
-  by then). For `s3://`, `gs://` and `az://` this is best effort: an SDK may keep a clone of the request body for
-  a short moment after the call completes, in which case a resize immediately after the `await` can still raise
-  `BufferError` for an instant; retry, or do not resize buffers you passed with `borrow=True`;
-* **completion is a safe-reuse point, cancellation included.** A put does not complete - with its result, with an
-  error, or with `CancelledError` - until every native reader of the buffer is done and the export has been
-  released. Cancelling the awaitable does not stop a running native write (a blocking file write, an in-flight
-  HTTP body), so the cancellation is delivered to you only AFTER that write finished (the awaitable of a
-  `borrow=True` put is an `asyncio.Task` wrapping the put); the wait is bounded (30 s). If a backend still holds
-  the payload after that, the buffer stays pinned (a resize raises `BufferError`), a warning is logged once and
-  `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it. Blocking `put_bytes` waits the same way before it
-  returns or raises;
+  the awaitable has completed, successfully or not;
+* **completion is a safe-reuse point, cancellation included, on every backend.** A put does not complete - with its
+  result, with an error, or with `CancelledError` - until every native reader of the buffer is done (the last
+  reference to the payload is gone, wherever it lived: a store task, an SDK/HTTP task, a detached file write) and
+  the export has been released. So once the call returns / the `await` finishes (normally, with an error, or by
+  cancellation) the buffer can be resized or reused. Cancelling the awaitable does not stop a running native
+  write, so the cancellation is delivered to you only AFTER that write finished: the awaitable of a `borrow=True`
+  put is a `Future` whose `cancel()` cancels the put but defers its own terminal state until then
+  (`asyncio.timeout()` and `asyncio.wait_for()` therefore also wait for the write before they raise);
+* **the wait is bounded and not interruptible.** The wait for native readers lasts at most 30 s
+  (`S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`) and is not interrupted by signals / `KeyboardInterrupt` (the buffer must not
+  be released while it can still be read). If a backend still holds the payload after that, the call raises
+  `s3dlio.ExportStillReferencedError` (data may or may not have been written) instead of succeeding or raising a
+  plain `CancelledError`: the buffer stays pinned (a resize raises `BufferError`), **do not reuse it**; a warning is
+  logged once and `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it. Blocking `put_bytes` waits the same
+  way before it returns or raises;
 * buffers whose item format is `O` (Python objects) or `P` (pointers) are refused with a `TypeError`: their bytes are
   addresses, not data. A structured numpy dtype with padding is uploaded as its raw memory, padding bytes
   included (they are whatever was in memory).
 
 The default `put_bytes_async` takes a snapshot instead, so the buffer can be reused or resized as soon as the call
-returns; the only obligation is not to write to it from another thread *during that copy* (which runs with the
-GIL released). `borrow` is keyword-only: `await s3dlio.put_bytes_async(uri, buf, borrow=True)`.
+returns. The one obligation: do not write to it from another thread *during that copy*. Up to 256 KiB the copy runs
+with the GIL held, so Python threads cannot interleave; above that it runs with the GIL released (so large copies do
+not stall other threads), and a Python thread, a C extension or a device that writes to the buffer at that moment is
+a **data race** with the copy (the snapshot is then undefined, and the behaviour is undefined in the Rust sense).
+Multi-threaded callers that mutate shared buffers must therefore serialise the call with their writers.
+`borrow` is keyword-only: `await s3dlio.put_bytes_async(uri, buf, borrow=True)`.
 
 ### get() — Download Data
 
