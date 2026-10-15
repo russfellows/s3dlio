@@ -351,7 +351,8 @@ async fn request_counts_per_operation() {
         .expect("for_endpoint");
 
     // (uri, recursive, expected request count, expected prefixes in order)
-    let cases: &[(&str, bool, usize, &[(&str, bool)])] = &[
+    type Shape = &'static [(&'static str, bool)];
+    let cases: &[(&str, bool, usize, Shape)] = &[
         // exact key, descending: the existence probe, then the pages of `K/`
         (
             "file.txt",

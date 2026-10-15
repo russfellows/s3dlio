@@ -308,7 +308,7 @@ pub(crate) fn select_key_stream(
             S3Selection::Exact(exact) => {
                 match probe(&client, &bucket, &exact).await {
                     Ok(found) => {
-                        if found.iter().any(|k| *k == exact) {
+                        if found.contains(&exact) {
                             yield Ok(exact.clone());
                         }
                     }
