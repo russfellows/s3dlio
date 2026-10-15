@@ -538,6 +538,11 @@ print(f"Throughput: {result['throughput_mb_s']} MB/s")
 
 ### Authentication
 
+Settings can also come from a `.env` file, but the Python library does **not** read one by default
+(since 0.9.128): set `S3DLIO_LOAD_DOTENV=1` (the working directory's `.env`) or
+`S3DLIO_LOAD_DOTENV=/path/to/file` in the environment. Variables that are already set are never
+overridden by the file. See [Environment Variables](Environment_Variables.md#env-files-s3dlio_load_dotenv).
+
 **Amazon S3 / S3-Compatible:**
 ```python
 import os

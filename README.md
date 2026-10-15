@@ -622,6 +622,7 @@ s3dlio supports comprehensive configuration through environment variables:
 - **Connection Pool**: `S3DLIO_POOL_MAX_IDLE_PER_HOST=32` - Max idle connections per host (default: 32)
 - **S3 Range GET**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` - Disable concurrent range splitting (enabled by default); `S3DLIO_RANGE_THRESHOLD_MB=64` - Size threshold in MiB (default: 32); `S3DLIO_RANGE_CONCURRENCY=64` - Max concurrent range requests
 - **Operation Logging**: `S3DLIO_OPLOG_LEVEL=2` - S3 operation tracking
+- **`.env` files**: `S3DLIO_LOAD_DOTENV=1|0|<path>` - read a `.env` file (on for `s3-cli`, off for library use; see [`.env` files](#env-files))
 
 📖 [Environment Variables Reference](docs/Environment_Variables.md)
 
@@ -669,6 +670,38 @@ AWS_SECRET_ACCESS_KEY=your-secret-key
 AWS_ENDPOINT_URL=https://your-s3-endpoint
 AWS_REGION=us-east-1
 ```
+
+### `.env` files
+
+These settings can be exported in the shell or put in a `.env` file. Whether s3dlio reads a `.env`
+file is decided by one switch, `S3DLIO_LOAD_DOTENV`, and the default depends on how s3dlio is used:
+
+| Use | Default | Why |
+|-----|---------|-----|
+| `s3-cli` | **on**: `.env` from the working directory | command-line convenience, as always |
+| Library (Rust and Python) | **off** | a `.env` in whatever directory a host process happened to start from must not silently change its credentials, endpoints and `S3DLIO_*` / `AWS_*` settings |
+
+| `S3DLIO_LOAD_DOTENV` | Effect |
+|----------------------|--------|
+| `1` / `true` | load `.env` from the working directory (the nearest parent directory that has one, as before) |
+| `0` / `false` | never load a `.env` file |
+| a file path | load exactly that file |
+| unset | the default above |
+
+- Any environment variable can come from the file (`AWS_*`, `S3DLIO_*`, `AZURE_*`, `GOOGLE_*`).
+- **Precedence: the real environment always wins.** A variable that is already set is never overridden
+  by the file; the file only fills in what is missing.
+- The switch is read from the real environment (not from a `.env`) once per process. `s3-cli` loads the
+  file at start-up; a library loads it once, when it first builds an S3 client or lists buckets, so
+  settings s3dlio reads earlier (for example `S3DLIO_RT_THREADS`) do not see values that exist only in the
+  file. To have the file's values from the start, load it yourself: Rust
+  `s3dlio::dotenv::load_env_file("path/to/.env")?`, or `python-dotenv`'s `load_dotenv()` in Python.
+- When a `.env` exists but is not loaded because of the library default, s3dlio logs one INFO line
+  saying how to enable it.
+
+**Behaviour change for library users (since 0.9.128):** earlier releases loaded `.env` implicitly when the
+first client was built. Set `S3DLIO_LOAD_DOTENV=1` (or a file path) to get that back. Details:
+[Environment Variables Reference](docs/Environment_Variables.md#env-files-s3dlio_load_dotenv).
 Enable comprehensive S3 operation logging compatible with MinIO warp format:
 
 

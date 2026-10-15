@@ -203,7 +203,7 @@ fn list_s3_containers(uri: &str) -> Result<Vec<ContainerInfo>> {
 
 #[cfg(feature = "backend-gcs")]
 fn list_gcs_containers() -> Result<Vec<ContainerInfo>> {
-    dotenvy::dotenv().ok();
+    crate::dotenv::apply();
     let project = std::env::var("GOOGLE_CLOUD_PROJECT")
         .or_else(|_| std::env::var("GCLOUD_PROJECT"))
         .or_else(|_| std::env::var("GCS_PROJECT"))

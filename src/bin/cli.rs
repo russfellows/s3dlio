@@ -748,8 +748,9 @@ fn parse_human_size(input: &str) -> std::result::Result<usize, String> {
 /// Main CLI function
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Loads any variables from .env file that are not already set
-    dotenvy::dotenv().ok();
+    // s3-cli loads a `.env` file by default (variables already set are never overridden).
+    // `S3DLIO_LOAD_DOTENV=0` turns that off, `=<path>` loads that file instead (issue #243).
+    s3dlio::dotenv::load_for_cli();
 
     let cli = Cli::parse();
 

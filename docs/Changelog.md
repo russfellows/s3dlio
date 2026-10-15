@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Changed (BEHAVIOUR CHANGE for library users)
+
+- **s3dlio no longer reads a `.env` file implicitly when used as a library (#243).** Until now every
+  S3 client build (and bucket/container listing) loaded `.env` from the process's current directory into
+  the environment of the whole host process, so which file was used, and which credentials, endpoints and
+  `S3DLIO_*` / `AWS_*` settings an embedded s3dlio (an inference server, a training job, a KV-cache tier)
+  ran with, depended on where the process happened to be started. There is now ONE switch,
+  `S3DLIO_LOAD_DOTENV`, read from the real environment once per process:
+  `1` / `true` loads `.env` from the working directory (the old behaviour), `0` / `false` never loads
+  it, and any other value is a file path to load exactly that file. The default depends on the program:
+  **`s3-cli`: on** (CLI users keep today's behaviour), **library use, Rust and Python: off**.
+  **If you relied on the implicit load in a Rust or Python program, set `S3DLIO_LOAD_DOTENV=1`
+  (or `S3DLIO_LOAD_DOTENV=/path/to/file`), or call the new `s3dlio::dotenv::load_env_file(path)`.**
+  When a `.env` exists but is not loaded because of the library default, s3dlio logs one INFO line
+  saying how to enable it. A variable that is already set in the real environment is never overridden
+  by the file, as before. A new public function, `s3dlio::dotenv::load_env_file(path)`, loads a given
+  `.env` file explicitly (it works whatever the switch says), and the five places that used to call
+  `dotenvy` themselves now go through one helper. Documented in the README and
+  `docs/Environment_Variables.md`.
+
 ### Fixed
 
 - **Python `ObjectStoreMapDataset` fetches each item by the exact key it listed (#223).** A dataset rooted

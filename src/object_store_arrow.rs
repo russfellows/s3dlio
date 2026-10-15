@@ -594,8 +594,8 @@ impl S3DlioObjectWriter for ArrowWriter {
 
 // Set up Arrow environment on module load
 fn setup_arrow_environment() {
-    // Load environment variables from .env file (same as rest of s3dlio)
-    let _ = dotenvy::dotenv();
+    // Apply the `.env` policy (S3DLIO_LOAD_DOTENV; off for library use, issue #243)
+    crate::dotenv::apply();
 
     // Try multiple approaches to disable EC2 metadata service
     unsafe {

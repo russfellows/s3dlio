@@ -1100,7 +1100,7 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
 pub fn list_buckets_at(server: Option<&S3Server>) -> Result<Vec<BucketInfo>> {
     let server = server.cloned();
     run_on_global_rt(async move {
-        dotenvy::dotenv().ok();
+        crate::dotenv::apply();
 
         // Log resolved params for diagnostics (pure helper, no side effects).
         let endpoint_url_for_log = match &server {

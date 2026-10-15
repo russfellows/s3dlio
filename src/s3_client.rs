@@ -483,7 +483,7 @@ pub fn aws_s3_client() -> Result<Client> {
 pub async fn aws_s3_client_async() -> Result<Client> {
     let client_ref = CLIENT
         .get_or_try_init(|| async {
-            dotenvy::dotenv().ok();
+            crate::dotenv::apply();
 
             if env::var("AWS_ACCESS_KEY_ID").is_err() || env::var("AWS_SECRET_ACCESS_KEY").is_err()
             {
@@ -615,7 +615,7 @@ pub async fn create_s3_client_for_endpoint(
     endpoint_url: &str,
     http_client: Option<SharedHttpClient>,
 ) -> Result<Client> {
-    dotenvy::dotenv().ok();
+    crate::dotenv::apply();
 
     if env::var("AWS_ACCESS_KEY_ID").is_err() || env::var("AWS_SECRET_ACCESS_KEY").is_err() {
         bail!("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY");
