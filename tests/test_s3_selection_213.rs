@@ -892,3 +892,58 @@ async fn a_leading_slash_key_with_a_glob_selects_by_the_rule() {
     want.sort();
     assert_eq!(state.remaining_keys(&b), want);
 }
+
+// ----------------------------------------------------------------------------
+// Dataset constructors: a selection of nothing is an error, never an empty dataset
+// ----------------------------------------------------------------------------
+
+fn assert_empty_selection_message(msg: &str, uri: &str) {
+    assert!(msg.contains(uri), "the message must name the URI: {msg}");
+    assert!(
+        msg.contains("exact object name") && msg.contains("directory"),
+        "the message must say what a URI selects: {msg}"
+    );
+    assert!(
+        msg.contains("'*' selects by prefix")
+            && msg.contains(&format!("{}*", uri.trim_end_matches('/'))),
+        "the message must show the `*` form: {msg}"
+    );
+}
+
+#[test]
+fn s3_bytes_dataset_refuses_a_bare_partial_name() {
+    use s3dlio::data_loader::s3_bytes::S3BytesDataset;
+    let (_p, _s, b) = seeded();
+    for key in ["file.tx", "ru", "nothing"] {
+        let uri = format!("s3://{b}/{key}");
+        let err = match S3BytesDataset::from_prefix(&uri) {
+            Ok(ds) => panic!("{uri} selects nothing but gave {} keys", ds.keys().len()),
+            Err(e) => e.to_string(),
+        };
+        assert_empty_selection_message(&err, &uri);
+    }
+    // the same names with a `*` are a prefix selection and work
+    let ds = S3BytesDataset::from_prefix(&format!("s3://{b}/file.tx*")).expect("glob");
+    assert_eq!(ds.keys().len(), 3); // file.txt, file.txt.bak, file.txt2
+}
+
+#[test]
+fn multi_backend_dataset_refuses_a_bare_partial_name() {
+    use s3dlio::data_loader::async_pool_dataloader::MultiBackendDataset;
+    let (_p, _s, b) = seeded();
+    for key in ["file.tx", "dl2/", "nothing/"] {
+        let uri = format!("s3://{b}/{key}");
+        let res = on_fresh_runtime(MultiBackendDataset::from_prefix(&uri));
+        match (key, res) {
+            ("dl2/", Ok(ds)) => assert_eq!(ds.len(), 1, "a real directory still works"),
+            ("dl2/", Err(e)) => panic!("{uri}: {e:#}"),
+            (_, Ok(ds)) => panic!("{uri} selects nothing but gave {} uris", ds.len()),
+            (_, Err(e)) => assert_empty_selection_message(&format!("{e:#}"), &uri),
+        }
+    }
+    let ds = on_fresh_runtime(MultiBackendDataset::from_prefix(&format!(
+        "s3://{b}/file.tx*"
+    )))
+    .expect("glob");
+    assert_eq!(ds.len(), 3);
+}

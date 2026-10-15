@@ -142,6 +142,23 @@ fn glob_to_regex(glob: &str) -> Result<Regex> {
     Regex::new(&re).with_context(|| format!("cannot use '{glob}' as a wildcard key"))
 }
 
+/// The error for a dataset built from an `s3://` URI that selected nothing.
+///
+/// A dataset over zero objects is never what a caller meant, and since #213 a bare
+/// partial name (`s3://b/train/img_`) selects nothing, so say what the URI selects
+/// instead of handing back an empty dataset.
+pub(crate) fn empty_selection_error(uri: &str) -> anyhow::Error {
+    let example = if uri.contains('*') {
+        "s3://b/train/img_*".to_string()
+    } else {
+        format!("{}*", uri.trim_end_matches('/'))
+    };
+    anyhow::anyhow!(
+        "no objects were selected by '{uri}': an s3:// URI selects an exact object name or a \
+         directory (a name ending in '/'), and '*' selects by prefix, e.g. '{example}'"
+    )
+}
+
 /// One entry of a raw listing page.
 enum Entry {
     Object(String),
