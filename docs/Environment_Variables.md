@@ -465,14 +465,16 @@ are not set: `workload-identity` needs `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIE
 taken for Azure); `cli` always applies. A member that fails to produce a token (an identity not assigned to the VM, a
 rejected secret, `az` not installed) is passed over and the next is tried. The member that works is remembered for the
 process, but not trusted blindly: if it later fails to produce a token, the chain is run again for that request, so a
-working member further down is found without a restart (the member that just failed is not asked a second time for that
-request). If none works the error lists each member tried and why. A
+working member further down is found without a restart (the member that just failed is left to the end of that request's
+re-run: asked again only if nothing else works). If none works the error lists each member tried and why. A
 configured service principal (workload identity, client secret, client certificate) that fails is logged at `warn`
 level before `auto` moves on. The managed-identity attempt has its own deadline, `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`
 (default 5000): the SDK retries a 404/410/5xx from the instance metadata service with back-off for about 72 s, which
 is too long to wait before trying `az`. The same deadline applies when a managed identity that already won stalls on a
-later token refresh (the chain is then run again, without asking the managed identity a second time, so a stall costs
-one deadline). **Only managed identity has a deadline of its own.** The other members are bounded by what the Azure SDK
+later token refresh (the chain is then run again with the managed identity left to the end, so a stall costs one deadline
+when another member works, and a lone managed identity still gets its second try). A request forgets the winner only if it
+is still the one that request used, which protects a newer winner of a different mode; a re-installed winner of the same
+mode is the same credential object, so a late failure can still clear it once, costing one extra chain run. **Only managed identity has a deadline of its own.** The other members are bounded by what the Azure SDK
 does: workload identity, client secret and client certificate make HTTPS requests with the SDK's 20 s connect and 60 s
 read timeouts (per request, retries not counted), while `az`/`azd` is a subprocess that `azure_identity` 1.0.0 waits for
 with no timeout at all, so a hung `az` hangs the token request. The metadata probe runs off the async runtime's workers and is bounded: at

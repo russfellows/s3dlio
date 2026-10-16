@@ -55,14 +55,19 @@
 - **`auto` no longer waits out the SDK's retry schedule on a VM without an identity (#253 review).** The managed
   identity attempt in `auto` has a deadline (`S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`, default 5000 ms; the SDK retries a
   404/410/5xx from the metadata service for about 72 s), after which `auto` moves on to `az`/`azd`; the same deadline applies when a managed identity that already won stalls
-  on a later token refresh, after which the chain is run again without asking the managed identity a second time (a
-  stall costs one deadline, not two); a winner is forgotten only by the request that used it, so a slow failure cannot
-  discard a newer winner. Only managed identity has its own deadline: the HTTPS modes rely on the SDK's 20 s connect and
+  on a later token refresh, after which the chain is run again with the managed identity left to the end (a stall
+  costs one deadline when another member works; a lone managed identity still gets its second try); a request forgets the
+  winner only if it is still the one it used, which protects a newer winner of a different mode (a re-installed winner of
+  the same mode is the same credential object and can still be cleared once by a late failure, costing one extra chain
+  run). Only managed identity has its own deadline: the HTTPS modes rely on the SDK's 20 s connect and
   60 s read timeouts, and `az`/`azd` has none in `azure_identity` 1.0.0. A "not Azure"
   answer from the metadata probe is cached for 30 s (a failing chain no longer probes twice per request); a cached
   `auto` winner that starts failing makes that request run the chain again, so a working member further down is found
   without a restart; a configured service principal that fails before `auto` falls through is logged at `warn`. The
   client-certificate file is read and parsed on the blocking pool at the first token request, not on a runtime worker.
+- **`S3DLIO_REQUIRE_FULL_BACKENDS` (test and release validation only).** `python/tests/test_full_backend_azure_gcs.py`
+  fails, instead of skipping, when the wheel lacks the Azure/GCS backends and this variable is set to anything other than
+  empty, `0`, `false`, `no` or `off` (unknown values fail too). Not read by the library; see `docs/Environment_Variables.md`.
 - **Deleting an `az://` object that is already gone succeeds again (#253 review).** Wrapping Azure errors to
   name the credential mode and hide a SAS token turned them into plain text, so the delete contract no longer
   recognised `BlobNotFound` and `delete`/`delete -r` failed for a blob that was already missing (or vanished
