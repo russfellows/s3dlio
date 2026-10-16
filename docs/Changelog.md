@@ -34,7 +34,15 @@
   needs a race-free environment loads the file (or sets the real environment) at the very start of the
   process, and forked children inherit the parent's resolved policy. `import s3dlio` now imports the native module first, outside any `try`, so if it fails the caller sees that error instead of PyO3's "initialized once" message from a second attempt. `s3-cli` prints a
   warning on stderr when `S3DLIO_LOAD_DOTENV` names a file it cannot read. Documented in the README and
-  `docs/Environment_Variables.md`.
+  `docs/Environment_Variables.md`. Review round 7: the file is now also loaded before the
+  independently public entry points that read or change a setting, not only before the S3 client
+  wrapper. Calling `set_s3_endpoint_override` first no longer lets an `AWS_ENDPOINT_URL_S3` that only
+  the file defines override the endpoint you just set; `build_smithy_http_client` /
+  `build_reqwest_http_client*` no longer build an HTTP/1.1 client when the file turns HTTP/2 on;
+  `H2WindowConfig::from_env`, `connect_timeout_secs`, `max_retry_attempts`, `mpi_world_size`,
+  `mpi_aware_thread_budget`, `effective_thread_budget`, `MultiEndpointStore::new` / `from_config`
+  (its `S3DLIO_S3_ENDPOINT_TLS_PORTS` decision), `AzureConfig::default` and the community GCS
+  `resolve_gcs_endpoint` return the file's values when they are the first s3dlio call.
 
 - **`file://` and `direct://` datasets now list their items as paths below the dataset root (#223).**
   `Dataset::keys()` (Rust), `PyDataset.keys()` and `ObjectStoreMapDataset`'s keys (Python), and the item
