@@ -42,6 +42,7 @@ use tracing::{debug, warn};
 ///
 /// Call this early in main() when profiling is needed.
 pub fn init_profiling() -> anyhow::Result<()> {
+    crate::dotenv::apply();
     #[cfg(feature = "profiling")]
     {
         // Check if already initialized

@@ -1270,6 +1270,9 @@ impl Logger {
     /// lossless mode, buffer size and compression level come from the
     /// `S3DLIO_OPLOG_*` environment variables, read once here.
     pub fn new(log_file_path: &str) -> std::io::Result<Self> {
+        // The S3DLIO_OPLOG_* settings below, and the writer thread, come after the
+        // `.env` policy (#243).
+        crate::dotenv::apply();
         let lossless = std::env::var("S3DLIO_OPLOG_LOSSLESS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);

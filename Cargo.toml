@@ -3,7 +3,7 @@ members = [".", "crates/s3dlio-oplog"]
 
 # Workspace-level package metadata that can be inherited by all members
 [workspace.package]
-version = "0.9.126"
+version = "0.9.128"
 edition = "2021"
 rust-version = "1.94.1"
 authors = ["Russ Fellows"]
@@ -119,7 +119,8 @@ num_cpus    = "^1.16"
 chrono      = "^0.4"
 #io          = "^0.02"
 io          = "^0.0"
-crc32fast   = "^1.4"
+crc32fast   = "^1.4"   # ZIP/NPZ container CRC-32 only
+crc-fast    = "^1"     # CRC-32C (CRC-32/ISCSI) for the writers' checksum label (#256); runtime-detected SIMD
 glob        = "^0.3"
 
 # Performance monitoring
@@ -174,6 +175,10 @@ tokio-sync   = "^0.1.8"
 futures-util  = "^0.3"
 async-trait   = "^0.1"   # needed by the mock datasets
 criterion     = { version = "0.5", features = ["html_reports"] }
+# retry.rs compares its copy of the SDK's retryable-code tables with the pinned crate
+aws-runtime = "1"
+# examples/bench_crc32c.rs and checksum.rs tests: an independent CRC-32C implementation
+crc32c = "^0.6"
 # RFC conformance tests for redirect_client (uses http 1.x — same version as production dep)
 aws-smithy-types = "^1"        # needed for SdkBody::empty() in test fixtures
 
@@ -209,6 +214,7 @@ s3 = []
 native-backends = []                    # Current AWS/Azure implementations -- mutually exclusive with arrow-backend, see note above
 backend-aws = []
 backend-azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_blob"]
+azure-client-certificate = ["backend-azure", "azure_identity/client_certificate"]  # client-certificate credential for Azure; links OpenSSL (not in full-backends / the default wheel)
 backend-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-gax-internal"]
 full-backends = ["backend-aws", "backend-azure", "backend-gcs"]
 gcs-community = ["backend-gcs", "dep:gcloud-storage"]  # Legacy community GCS client (JSON API, no RAPID support; conflicts with official GCS client)

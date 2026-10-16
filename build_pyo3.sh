@@ -15,8 +15,9 @@ echo "Building for ${OS}/${ARCH}"
 
 # ── Backend build profile + optional features ─────────────────────────────
 # Positional arg #1 selects which storage backends are compiled into the wheel:
-#   default (or slim): AWS + file/direct only (smaller/faster)
-#   full: current behavior (AWS + Azure + GCS + file/direct)
+#   default: AWS + Azure + file/direct -- the same backend set as the wheels published to PyPI
+#   slim:    AWS + file/direct only (smallest/fastest to build; no Azure, no GCS)
+#   full:    AWS + Azure + GCS + file/direct (GCS is source-build only: it uses git dependencies)
 #
 # Examples:
 #   ./build_pyo3.sh
@@ -39,8 +40,9 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: $0 [default|slim|full] [--profile|-p default|slim|full]"
       echo ""
       echo "Profiles:"
-      echo "  default|slim  AWS + file/direct only (Azure/GCS excluded)"
-      echo "  full          AWS + Azure + GCS + file/direct"
+      echo "  default  AWS + Azure + file/direct (what the PyPI wheels contain; GCS excluded)"
+      echo "  slim     AWS + file/direct only (Azure/GCS excluded)"
+      echo "  full     AWS + Azure + GCS + file/direct"
       echo ""
       echo "Examples:"
       echo "  $0"
@@ -77,8 +79,9 @@ if [[ "$PROFILE_ARG" == "--help" || "$PROFILE_ARG" == "-h" ]]; then
     echo "Usage: $0 [default|slim|full]"
     echo ""
     echo "Profiles:"
-    echo "  default|slim  AWS + file/direct only (Azure/GCS excluded)"
-    echo "  full          AWS + Azure + GCS + file/direct"
+    echo "  default  AWS + Azure + file/direct (what the PyPI wheels contain; GCS excluded)"
+    echo "  slim     AWS + file/direct only (Azure/GCS excluded)"
+    echo "  full     AWS + Azure + GCS + file/direct"
     echo ""
     echo "Optional env vars:"
     echo "  EXTRA_FEATURES=\"numa,hdf5\""
@@ -86,8 +89,15 @@ if [[ "$PROFILE_ARG" == "--help" || "$PROFILE_ARG" == "-h" ]]; then
 fi
 
 case "$PROFILE_ARG" in
-  default|slim)
-    echo "Backend profile: default (AWS + file/direct; Azure/GCS excluded)"
+  default)
+    # maturin uses pyproject.toml's [tool.maturin] features ONLY when no --features is
+    # given on the command line; an explicit --features replaces them. So the Azure
+    # backend must be named here, exactly as the PyPI workflow does.
+    FEATURES="$FEATURES,backend-azure"
+    echo "Backend profile: default (AWS + Azure + file/direct; GCS excluded)"
+    ;;
+  slim)
+    echo "Backend profile: slim (AWS + file/direct; Azure/GCS excluded)"
     ;;
   full)
     FEATURES="$FEATURES,full-backends"

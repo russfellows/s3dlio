@@ -1,8 +1,8 @@
 # s3dlio - Universal Storage I/O Library
 
 [![CI](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/russfellows/s3dlio/actions/workflows/ci.yml)
-[![Rust Tests](https://img.shields.io/badge/rust%20tests-1272-brightgreen)](docs/Changelog.md)
-[![Version](https://img.shields.io/badge/version-0.9.126-blue)](https://github.com/russfellows/s3dlio/releases)
+[![Rust Tests](https://img.shields.io/badge/rust%20tests-1478-brightgreen)](docs/Changelog.md)
+[![Version](https://img.shields.io/badge/version-0.9.128-blue)](https://github.com/russfellows/s3dlio/releases)
 [![PyPI](https://img.shields.io/pypi/v/s3dlio)](https://pypi.org/project/s3dlio/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94.1%2B-orange)](https://www.rust-lang.org)
@@ -14,6 +14,7 @@ Full-backend builds support the stable Azure Blob Storage Rust SDK 1.0 API.
 
 ## Recent Releases
 
+- **v0.9.128** — Zero-copy writes, opt-in `.env`, Azure credentials — [PR #262](https://github.com/russfellows/s3dlio/pull/262)
 - **v0.9.126** — Exact URI selection; routing, upload fixes — [PR #237](https://github.com/russfellows/s3dlio/pull/237)
 - **v0.9.124** (not on PyPI) — Exact delete contract, op-log safety — [PR #217](https://github.com/russfellows/s3dlio/pull/217)
 - **v0.9.122** (not on PyPI) — One op-log row per call — [PR #209](https://github.com/russfellows/s3dlio/pull/209)
@@ -45,8 +46,8 @@ pip install s3dlio
 
 - If using `uv` package manager + `uv` virtual environment: `uv pip install s3dlio`.
 - If using standard `pip` without `uv`: `pip install s3dlio`.
-- The default published wheel is now S3-focused (Azure Blob and GCS are excluded).
-- If you want full backends (S3 + Azure Blob + GCS), build from source with:
+- The PyPI wheels include S3, Azure Blob, file and direct. GCS is not in them (it needs git dependencies).
+- If you also want GCS (S3 + Azure Blob + GCS), build from source with `./build_pyo3.sh full`, or:
 
 ```bash
 # uv workflow:
@@ -56,9 +57,7 @@ uv pip install s3dlio --no-binary s3dlio --config-settings "cargo-extra-args=--f
 pip install s3dlio --no-binary s3dlio --config-settings "cargo-extra-args=--features extension-module,full-backends"
 ```
 
-You can still add a separate package name (for example `s3dlio-full`) later if you want a dedicated prebuilt full wheel distribution.
-
-> Maintainer note: for PyPI uploads, publish the default (`./build_pyo3.sh`) wheel unless intentionally releasing a separate distribution. `full-backends` is currently source-build only via the command above.
+> Maintainer note: the PyPI workflow builds with `--features extension-module,backend-azure`; `./build_pyo3.sh` (default) builds the same backend set. maturin ignores the `features` in `pyproject.toml` whenever `--features` is given on the command line, so keep the two in step. `full-backends` (GCS) is source-build only.
 
 ### Building from Source (Rust)
 
@@ -197,13 +196,14 @@ cargo test
 
 Rust backend feature profiles:
 
-- Default build (`cargo build --release`): S3-focused default backend set.
+- Default build (`cargo build --release`): S3-focused default backend set (Azure needs `--features backend-azure`; the PyPI wheels add it).
 - GCS-enabled build (`--features backend-gcs`): enables GCS in addition to default set.
 - Full cloud build (`--features full-backends`): enables AWS + Azure + GCS.
 
 Python wheel build profiles via `build_pyo3.sh`:
 
-- `default` or `slim`: AWS + file/direct; excludes Azure and GCS.
+- `default`: AWS + Azure + file/direct (the PyPI wheel's backend set); excludes GCS.
+- `slim`: AWS + file/direct only; excludes Azure and GCS.
 - `full`: AWS + Azure + GCS + file/direct.
 - Positional and named forms are equivalent:
     - `./build_pyo3.sh full`
@@ -237,7 +237,7 @@ Example: `EXTRA_FEATURES="numa,hdf5" ./build_pyo3.sh full`.
 s3dlio provides unified storage operations across all backends with consistent URI patterns:
 
 - **🗄️ Amazon S3**: `s3://bucket/prefix/` - High-performance S3 operations (5+ GB/s reads, 2.5+ GB/s writes) with built-in concurrent range GETs (on by default)
-- **☁️ Azure Blob Storage**: `az://container/prefix/` - Complete Azure integration with **RangeEngine** (30-50% faster for large blobs)
+- **☁️ Azure Blob Storage**: `az://account/container/prefix/` - Complete Azure integration with **RangeEngine** (concurrent ranges for large blobs; speed-ups are unmeasured). Authentication: managed identity, workload identity, service principal (secret or certificate), SAS, or `az login`, selected with `S3DLIO_AZURE_CREDENTIAL` (default `auto`; see [Environment Variables](docs/Environment_Variables.md#azure-blob-storage-configuration)). Shared Key (account key) is not supported.
 - **🌐 Google Cloud Storage**: `gs://bucket/prefix/` or `gcs://bucket/prefix/` - Production ready with **RangeEngine** and full ObjectStore integration
 - **📁 Local File System**: `file:///path/to/directory/` - High-speed local file operations with **RangeEngine** support
 - **⚡ DirectIO**: `direct:///path/to/directory/` - Bypass OS cache for maximum I/O performance with **RangeEngine**
@@ -251,8 +251,8 @@ Concurrent range downloads hide network latency by parallelizing HTTP range requ
 - ✅ **Amazon S3**: Concurrent range splitting enabled by default via `S3DLIO_ENABLE_RANGE_OPTIMIZATION` (default: on). Uses `get_object_concurrent_range_async()` — fires parallel `GetObject(Range: bytes=N-M)` requests via the AWS SDK with lock-free chunk assembly. Controlled by `S3DLIO_RANGE_THRESHOLD_MB` (default: 32 MiB) and `S3DLIO_RANGE_CONCURRENCY` (default: auto-scaled). Disable with `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0`.
 
 **Mechanism 2 — RangeEngine (per-store config flag, must enable explicitly)**
-- ✅ **Azure Blob Storage**: 30-50% faster for large files (`enable_range_engine: true` in `AzureConfig`)
-- ✅ **Google Cloud Storage**: 30-50% faster for large files (`enable_range_engine: true` in `GcsConfig`)
+- ✅ **Azure Blob Storage**: concurrent range downloads for large files (`enable_range_engine: true` in `AzureConfig`); the speed-up has not been measured
+- ✅ **Google Cloud Storage**: concurrent range downloads for large files (`enable_range_engine: true` in `GcsConfig`); the speed-up has not been measured
 - ⚠️ **Local File System**: Rarely beneficial due to seek overhead (disabled by default)
 - ⚠️ **DirectIO**: Rarely beneficial due to O_DIRECT overhead (disabled by default)
 
@@ -541,7 +541,7 @@ import s3dlio
 
 # Works with any s3dlio URI — just change the prefix:
 #   "s3://bucket/train/"           Amazon S3 / MinIO / Ceph
-#   "az://container/train/"        Azure Blob Storage
+#   "az://account/container/train/"  Azure Blob Storage
 #   "gs://bucket/train/"           Google Cloud Storage
 #   "file:///mnt/data/train/"      Local filesystem
 #   "direct:///mnt/nvme/train/"    Local O_DIRECT (bypass page cache)
@@ -622,6 +622,7 @@ s3dlio supports comprehensive configuration through environment variables:
 - **Connection Pool**: `S3DLIO_POOL_MAX_IDLE_PER_HOST=32` - Max idle connections per host (default: 32)
 - **S3 Range GET**: `S3DLIO_ENABLE_RANGE_OPTIMIZATION=0` - Disable concurrent range splitting (enabled by default); `S3DLIO_RANGE_THRESHOLD_MB=64` - Size threshold in MiB (default: 32); `S3DLIO_RANGE_CONCURRENCY=64` - Max concurrent range requests
 - **Operation Logging**: `S3DLIO_OPLOG_LEVEL=2` - S3 operation tracking
+- **`.env` files**: `S3DLIO_LOAD_DOTENV=1|0|<path>` - read a `.env` file (on for `s3-cli`, off for library use; see [`.env` files](#env-files))
 
 📖 [Environment Variables Reference](docs/Environment_Variables.md)
 
@@ -669,7 +670,51 @@ AWS_SECRET_ACCESS_KEY=your-secret-key
 AWS_ENDPOINT_URL=https://your-s3-endpoint
 AWS_REGION=us-east-1
 ```
-Enable comprehensive S3 operation logging compatible with MinIO warp format:
+
+### `.env` files
+
+These settings can be exported in the shell or put in a `.env` file. Whether s3dlio reads a `.env`
+file is decided by one switch, `S3DLIO_LOAD_DOTENV`, and the default depends on how s3dlio is used:
+
+| Use | Default | Why |
+|-----|---------|-----|
+| `s3-cli` | **on**: `.env` from the working directory | command-line convenience, as always |
+| Library (Rust and Python) | **off** | a `.env` in whatever directory a host process happened to start from must not silently change its credentials, endpoints and `S3DLIO_*` / `AWS_*` settings |
+
+| `S3DLIO_LOAD_DOTENV` | Effect |
+|----------------------|--------|
+| `1` / `true` / `yes` / `on` (any case) | load `.env` from the working directory (the nearest parent directory that has one, as before) |
+| `0` / `false` / `no` / `off` (any case) | never load a `.env` file |
+| a file path | load exactly that file |
+| unset | the default above |
+
+- Any environment variable can come from the file (`AWS_*`, `S3DLIO_*`, `AZURE_*`, `GOOGLE_*`).
+- **Precedence: the real environment always wins.** A variable that is already set is never overridden
+  by the file; the file only fills in what is missing.
+- The switch is read from the real environment (not from a `.env`) once per process, and the file is
+  loaded once, at the first of: `s3-cli` start-up; Python `import s3dlio`; for Rust, the first use of the
+  global runtime, `store_for_uri*`, an S3 / Azure / GCS client, an S3 dataset, `Logger::new` or a bucket/
+  container listing. That is before s3dlio reads those settings, so `S3DLIO_RT_THREADS`,
+  `S3DLIO_OPLOG_*`, the range-GET settings and the endpoint/region see the file's values. Limits: a
+  `torch` (or anything) that your application imported before `import s3dlio` has already run, and
+  s3dlio cannot know whether its host already has threads, so for a race-free environment load the file
+  (or set the real environment) at the very start of your process. Only `s3-cli` loads it first thing on
+  its main thread, before its Tokio runtime exists.
+- To have the file's values even earlier (before your own code calls anything in s3dlio), load it
+  yourself: Rust `s3dlio::dotenv::load_env_file("path/to/.env")?`, or in Python `python-dotenv`'s
+  `load_dotenv()` **before** `import s3dlio`.
+- When a `.env` exists but is not loaded because of the library default, s3dlio logs one INFO line saying
+  how to enable it, and the "Missing AWS_ACCESS_KEY_ID ..." error carries the same hint (so a Python user
+  who sees only the exception still learns that the file is being ignored).
+- `s3-cli` prints a warning on stderr when `S3DLIO_LOAD_DOTENV` names a file it cannot read.
+
+**Behaviour change for library users (since 0.9.128):** earlier releases loaded `.env` implicitly when the
+first client was built. Set `S3DLIO_LOAD_DOTENV=1` (or a file path) to get that back. Details:
+[Environment Variables Reference](docs/Environment_Variables.md#env-files-s3dlio_load_dotenv).
+
+### Operation Logging (MinIO warp format)
+S3 operation logging compatible with the MinIO warp format is described under
+[Operation Logging (Op-Log)](#operation-logging-op-log) above.
 
 
 ## Advanced Features

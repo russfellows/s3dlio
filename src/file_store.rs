@@ -7,6 +7,7 @@ use tracing::{debug, info, trace};
 // FileSystemObjectStore implementation for POSIX file I/O
 // This provides the same ObjectStore interface for local filesystem operations
 
+use crate::checksum::Crc32c;
 use crate::data_loader::options::PageCacheMode;
 use crate::object_store::WriterOptions;
 use crate::page_cache::apply_page_cache_hint;
@@ -14,7 +15,6 @@ use crate::range_engine_generic::{RangeEngine, RangeEngineConfig};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use crc32fast::Hasher;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -90,7 +90,7 @@ pub struct FileSystemWriter {
     bytes_written: u64,
     compressed_bytes: u64,
     finalized: bool,
-    hasher: Hasher,
+    hasher: Crc32c,
     compression: CompressionConfig,
     compressor: Option<zstd::Encoder<'static, Vec<u8>>>,
 }
@@ -110,17 +110,8 @@ impl FileSystemWriter {
         }
 
         // Determine final path with compression extension if needed
-        let final_path = if compression.is_enabled() {
-            let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            let new_extension = if extension.is_empty() {
-                compression.extension().trim_start_matches('.')
-            } else {
-                &format!("{}{}", extension, compression.extension())
-            };
-            path.with_extension(new_extension)
-        } else {
-            path.clone()
-        };
+        // (the one suffix rule, shared with the checkpoint manifest names)
+        let final_path = compression.stored_path(&path);
 
         // Create and open the file for writing
         let file = fs::File::create(&final_path).await?;
@@ -140,7 +131,7 @@ impl FileSystemWriter {
             bytes_written: 0,
             compressed_bytes: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
             compression,
             compressor,
         })
@@ -607,8 +598,10 @@ impl ObjectStore for FileSystemObjectStore {
             fs::create_dir_all(parent).await?;
         }
 
-        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
-        fs::write(&path, data.as_ref()).await?;
+        // `tokio::fs::write` copies its input into an owned buffer (issue #238), so a
+        // large PUT briefly held two full copies. Move the `Bytes` into a blocking task
+        // and write from its slice: the payload is never duplicated.
+        tokio::task::spawn_blocking(move || std::fs::write(&path, data.as_ref())).await??;
         Ok(())
     }
 

@@ -122,6 +122,16 @@ impl PyDataset {
             .ok_or_else(|| PyRuntimeError::new_err("keys() not supported for this dataset type"))
     }
 
+    /// The URI that fetches each item, in the order of `keys()` (issue #223).
+    ///
+    /// Built by the dataset from the root it parsed, so Python never rebuilds a URI
+    /// from the dataset URI and a listed key.
+    fn uris(&self) -> PyResult<Vec<String>> {
+        self.inner
+            .uris()
+            .ok_or_else(|| PyRuntimeError::new_err("uris() not supported for this dataset type"))
+    }
+
     /// Create a dataset from a pre-built list of URIs — no listing occurs.
     ///
     /// This is the general-purpose alternative to ``PyDataset(uri)`` (which
@@ -1550,6 +1560,122 @@ impl PyCheckpointStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shard metadata <-> Python dict conversions
+//
+// Every Python-facing shard-metadata dict goes through these helpers, so a field of
+// `ShardMeta` cannot be kept by one wrapper and dropped by another (final review F2: the
+// optional writer `checksum` was dropped at every hop). The dict keys are `rank`, `key`, `size`
+// and, when present, `etag` and `checksum`; a missing key and a Python `None` both mean "absent".
+// ---------------------------------------------------------------------------
+
+/// Dict key of the optional `crc32c:<hex>` checksum of the shard's logical (uncompressed) bytes.
+#[cfg(feature = "extension-module")]
+const SHARD_CHECKSUM_KEY: &str = "checksum";
+
+/// Put `rank`, `key`, `size` and the optional `etag` / `checksum` of `shard` into `dict`.
+#[cfg(feature = "extension-module")]
+fn set_shard_meta_items(
+    dict: &Bound<'_, PyDict>,
+    shard: &crate::checkpoint::ShardMeta,
+) -> PyResult<()> {
+    dict.set_item("rank", shard.rank)?;
+    dict.set_item("key", &shard.key)?;
+    dict.set_item("size", shard.size)?;
+    if let Some(etag) = &shard.etag {
+        dict.set_item("etag", etag)?;
+    }
+    if let Some(checksum) = &shard.checksum {
+        dict.set_item(SHARD_CHECKSUM_KEY, checksum)?;
+    }
+    Ok(())
+}
+
+/// The optional checksum of a shard dict: absent, `None` and `""` are `None`; anything but a
+/// string is a `TypeError`; a string that is not a supported `crc32c:<hex>` form is an error here,
+/// so a bad value fails when the checkpoint is finalized, not later when it is restored.
+#[cfg(feature = "extension-module")]
+fn shard_checksum_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<Option<String>> {
+    match dict.get_item(SHARD_CHECKSUM_KEY)? {
+        Some(value) if !value.is_none() => {
+            let checksum = value.extract::<String>()?;
+            if checksum.is_empty() {
+                return Ok(None);
+            }
+            crate::checksum::parse_expected_crc32c(&checksum).map_err(py_err)?;
+            Ok(Some(checksum))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Rebuild a `ShardMeta` from a shard dict (the inverse of [`set_shard_meta_items`]).
+#[cfg(feature = "extension-module")]
+fn shard_meta_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<crate::checkpoint::ShardMeta> {
+    let rank = dict
+        .get_item("rank")?
+        .ok_or_else(|| PyRuntimeError::new_err("Missing rank in shard meta"))?
+        .extract::<u32>()?;
+    let key = dict
+        .get_item("key")?
+        .ok_or_else(|| PyRuntimeError::new_err("Missing key in shard meta"))?
+        .extract::<String>()?;
+    let size = dict
+        .get_item("size")?
+        .ok_or_else(|| PyRuntimeError::new_err("Missing size in shard meta"))?
+        .extract::<u64>()?;
+    let etag = dict
+        .get_item("etag")?
+        .map(|e| e.extract::<String>())
+        .transpose()?;
+    Ok(crate::checkpoint::ShardMeta {
+        rank,
+        key,
+        size,
+        etag,
+        checksum: shard_checksum_from_dict(dict)?,
+    })
+}
+
+/// A manifest as a Python dict; every shard goes through [`set_shard_meta_items`].
+#[cfg(feature = "extension-module")]
+fn manifest_to_pydict<'py>(
+    py: Python<'py>,
+    manifest: &crate::checkpoint::Manifest,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("format_version", manifest.format_version)?;
+    dict.set_item("framework", &manifest.framework)?;
+    dict.set_item("global_step", manifest.global_step)?;
+    dict.set_item("epoch", manifest.epoch)?;
+    dict.set_item("wall_time", &manifest.wall_time)?;
+    dict.set_item("world_size", manifest.world_size)?;
+    dict.set_item("status", &manifest.status)?;
+
+    let shards_list = PyList::empty(py);
+    for shard in &manifest.shards {
+        let shard_dict = PyDict::new(py);
+        set_shard_meta_items(&shard_dict, shard)?;
+        shards_list.append(shard_dict)?;
+    }
+    dict.set_item("shards", shards_list)?;
+    Ok(dict)
+}
+
+/// Read a shard through the validating reader when it carries a checksum, and through the
+/// plain reader when it does not (a manifest written before checksums were kept stays readable).
+#[cfg(feature = "extension-module")]
+async fn read_shard_checked(
+    reader: &crate::checkpoint::Reader<'_>,
+    key: &str,
+    checksum: Option<&str>,
+) -> anyhow::Result<Bytes> {
+    match checksum {
+        Some(_) => reader.read_shard_with_validation(key, checksum).await,
+        None => reader.read_shard(key).await,
+    }
+}
+
 /// Streaming checkpoint writer for zero-copy operations
 #[cfg(feature = "extension-module")]
 #[pyclass]
@@ -1640,17 +1766,22 @@ impl PyCheckpointStream {
             let shard_meta = py
                 .detach(|| {
                     self.runtime.block_on(async {
-                        // Finalize the writer
+                        // Finalize (upload) WITHOUT the store lock, so concurrent streams on
+                        // one store are not serialised for the whole upload.
+                        let checksum = writer.checksum();
                         writer.finalize().await?;
 
-                        // Create shard metadata
+                        // Record the shard under the name it was stored as (a compressing
+                        // store adds `.zst`: R10b).
                         let store_guard = store.lock().await;
                         let ckpt_writer = store_guard.writer(world_size, rank);
                         let layout = crate::checkpoint::paths::KeyLayout::new(
                             "checkpoints".to_string(),
                             step,
                         );
-                        ckpt_writer.finalize_shard_meta(&layout, key).await
+                        ckpt_writer
+                            .finalize_shard_meta_with_checksum(&layout, key, checksum)
+                            .await
                     })
                 })
                 .map_err(|e| py_err(e.context("Finalize failed")))?;
@@ -1659,14 +1790,9 @@ impl PyCheckpointStream {
 
             // Return metadata as Python dict
             let dict = PyDict::new(py);
-            dict.set_item("step", step).ok();
-            dict.set_item("epoch", epoch).ok();
-            dict.set_item("rank", shard_meta.rank).ok();
-            dict.set_item("key", &shard_meta.key).ok();
-            dict.set_item("size", shard_meta.size).ok();
-            if let Some(etag) = &shard_meta.etag {
-                dict.set_item("etag", etag).ok();
-            }
+            dict.set_item("step", step)?;
+            dict.set_item("epoch", epoch)?;
+            set_shard_meta_items(&dict, &shard_meta)?;
             Ok(dict.into())
         } else {
             Err(PyRuntimeError::new_err("No data written to stream"))
@@ -1724,17 +1850,12 @@ impl PyCheckpointWriter {
             })
         })
         .map_err(|e| py_err(e.context("Save shard failed")))
-        .map(|(layout, shard_meta)| {
+        .and_then(|(layout, shard_meta)| {
             let dict = PyDict::new(py);
-            dict.set_item("step", layout.step).ok();
-            dict.set_item("timestamp", &layout.ts).ok();
-            dict.set_item("rank", shard_meta.rank).ok();
-            dict.set_item("key", &shard_meta.key).ok();
-            dict.set_item("size", shard_meta.size).ok();
-            if let Some(etag) = &shard_meta.etag {
-                dict.set_item("etag", etag).ok();
-            }
-            dict.into()
+            dict.set_item("step", layout.step)?;
+            dict.set_item("timestamp", &layout.ts)?;
+            set_shard_meta_items(&dict, &shard_meta)?;
+            Ok(dict.into())
         })
     }
 
@@ -1792,30 +1913,7 @@ impl PyCheckpointWriter {
                 .cast_bound::<PyDict>(py)
                 .map_err(|_| PyRuntimeError::new_err("Shard meta must be a dict"))?;
 
-            let rank = dict
-                .get_item("rank")?
-                .ok_or_else(|| PyRuntimeError::new_err("Missing rank in shard meta"))?
-                .extract::<u32>()?;
-            let key = dict
-                .get_item("key")?
-                .ok_or_else(|| PyRuntimeError::new_err("Missing key in shard meta"))?
-                .extract::<String>()?;
-            let size = dict
-                .get_item("size")?
-                .ok_or_else(|| PyRuntimeError::new_err("Missing size in shard meta"))?
-                .extract::<u64>()?;
-            let etag = dict
-                .get_item("etag")?
-                .map(|e| e.extract::<String>())
-                .transpose()?;
-
-            shards.push(crate::checkpoint::ShardMeta {
-                rank,
-                key,
-                size,
-                etag,
-                checksum: None,
-            });
+            shards.push(shard_meta_from_dict(dict)?);
         }
 
         let store = self.store.clone();
@@ -1860,36 +1958,10 @@ impl PyCheckpointReader {
             })
         })
         .map_err(|e| py_err(e.context("Load manifest failed")))
-        .map(|opt_manifest| {
-            opt_manifest.map(|manifest| {
-                let dict = PyDict::new(py);
-                dict.set_item("format_version", manifest.format_version)
-                    .ok();
-                dict.set_item("framework", &manifest.framework).ok();
-                dict.set_item("global_step", manifest.global_step).ok();
-                dict.set_item("epoch", manifest.epoch).ok();
-                dict.set_item("wall_time", &manifest.wall_time).ok();
-                dict.set_item("world_size", manifest.world_size).ok();
-                dict.set_item("status", &manifest.status).ok();
-
-                let shards_list = PyList::new(
-                    py,
-                    manifest.shards.iter().map(|shard| {
-                        let shard_dict = PyDict::new(py);
-                        shard_dict.set_item("rank", shard.rank).ok();
-                        shard_dict.set_item("key", &shard.key).ok();
-                        shard_dict.set_item("size", shard.size).ok();
-                        if let Some(etag) = &shard.etag {
-                            shard_dict.set_item("etag", etag).ok();
-                        }
-                        shard_dict
-                    }),
-                )
-                .unwrap();
-                dict.set_item("shards", shards_list).ok();
-
-                dict.into()
-            })
+        .and_then(|opt_manifest| {
+            opt_manifest
+                .map(|manifest| manifest_to_pydict(py, &manifest).map(|d| d.into_any().unbind()))
+                .transpose()
         })
     }
 
@@ -1911,7 +1983,7 @@ impl PyCheckpointReader {
             .ok_or_else(|| PyRuntimeError::new_err("Missing shards in manifest"))?;
         let shards_list = shards_item.cast::<PyList>()?;
 
-        let mut target_key = None;
+        let mut target = None;
         for shard_obj in shards_list.iter() {
             let shard_dict = shard_obj.cast::<PyDict>()?;
             let shard_rank = shard_dict
@@ -1919,18 +1991,17 @@ impl PyCheckpointReader {
                 .ok_or_else(|| PyRuntimeError::new_err("Missing rank in shard"))?
                 .extract::<u32>()?;
             if shard_rank == rank {
-                target_key = Some(
-                    shard_dict
-                        .get_item("key")?
-                        .ok_or_else(|| PyRuntimeError::new_err("Missing key in shard"))?
-                        .extract::<String>()?,
-                );
+                let key = shard_dict
+                    .get_item("key")?
+                    .ok_or_else(|| PyRuntimeError::new_err("Missing key in shard"))?
+                    .extract::<String>()?;
+                target = Some((key, shard_checksum_from_dict(shard_dict)?));
                 break;
             }
         }
 
-        let key = target_key
-            .ok_or_else(|| PyRuntimeError::new_err(format!("Rank {} not found", rank)))?;
+        let (key, checksum) =
+            target.ok_or_else(|| PyRuntimeError::new_err(format!("Rank {} not found", rank)))?;
 
         let store = self.store.clone();
 
@@ -1939,7 +2010,7 @@ impl PyCheckpointReader {
                 self.runtime.block_on(async {
                     let store_guard = store.lock().await;
                     let reader = store_guard.reader();
-                    reader.read_shard(&key).await
+                    read_shard_checked(&reader, &key, checksum.as_deref()).await
                 })
             })
             .map_err(|e| py_err(e.context("Read shard failed")))?;
@@ -3500,5 +3571,139 @@ mod checkpoint_runtime_sizing_tests {
              was not applied and the runtime is still using an unconstrained \
              (full-core-count) default"
         );
+    }
+}
+
+/// Final review F2: the shard-metadata <-> dict conversions keep the optional checksum in both
+/// directions (the Python regression `python/tests/test_checkpoint_checksum_f2.py` covers the
+/// whole stream -> manifest -> read path; these pin the conversion functions themselves).
+#[cfg(all(test, feature = "extension-module"))]
+mod shard_meta_conversion_tests {
+    use super::*;
+    use crate::checkpoint::{Manifest, ShardMeta};
+
+    fn init() {
+        Python::initialize();
+    }
+
+    fn shard(checksum: Option<&str>) -> ShardMeta {
+        ShardMeta {
+            rank: 2,
+            key: "shards/ckpt-3-x/rank-2.bin.zst".to_string(),
+            size: 41,
+            etag: Some("\"etag-1\"".to_string()),
+            checksum: checksum.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn checksum_survives_meta_to_dict_to_meta() {
+        init();
+        Python::attach(|py| {
+            let original = shard(Some("crc32c:e3069283"));
+            let dict = PyDict::new(py);
+            set_shard_meta_items(&dict, &original).unwrap();
+            let c: String = dict
+                .get_item("checksum")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(c, "crc32c:e3069283");
+
+            let back = shard_meta_from_dict(&dict).unwrap();
+            assert_eq!(back.rank, original.rank);
+            assert_eq!(back.key, original.key);
+            assert_eq!(back.size, original.size);
+            assert_eq!(back.etag, original.etag);
+            assert_eq!(back.checksum.as_deref(), Some("crc32c:e3069283"));
+        });
+    }
+
+    #[test]
+    fn absent_checksum_stays_absent_in_both_directions() {
+        init();
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            set_shard_meta_items(&dict, &shard(None)).unwrap();
+            assert!(dict.get_item("checksum").unwrap().is_none());
+            assert!(shard_meta_from_dict(&dict).unwrap().checksum.is_none());
+            assert!(shard_checksum_from_dict(&dict).unwrap().is_none());
+
+            // A Python None is the same as absent.
+            dict.set_item("checksum", py.None()).unwrap();
+            assert!(shard_meta_from_dict(&dict).unwrap().checksum.is_none());
+        });
+    }
+
+    #[test]
+    fn non_string_checksum_is_a_type_error() {
+        init();
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            set_shard_meta_items(&dict, &shard(None)).unwrap();
+            dict.set_item("checksum", 12345u32).unwrap();
+            let err = shard_meta_from_dict(&dict).unwrap_err();
+            assert!(err.is_instance_of::<PyTypeError>(py), "{err}");
+        });
+    }
+
+    #[test]
+    fn malformed_checksum_is_refused_and_empty_means_absent() {
+        init();
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            set_shard_meta_items(&dict, &shard(None)).unwrap();
+            for bad in [
+                "md5:abc",
+                "zzz",
+                "crc32c:123456789",
+                "0xe3069283",
+                "crc32c:",
+            ] {
+                dict.set_item("checksum", bad).unwrap();
+                assert!(
+                    shard_meta_from_dict(&dict).is_err(),
+                    "{bad} must be refused"
+                );
+            }
+            dict.set_item("checksum", "").unwrap();
+            assert!(shard_meta_from_dict(&dict).unwrap().checksum.is_none());
+            // Both accepted spellings pass through unchanged.
+            for ok in ["crc32c:e3069283", "e3069283"] {
+                dict.set_item("checksum", ok).unwrap();
+                assert_eq!(
+                    shard_meta_from_dict(&dict).unwrap().checksum.as_deref(),
+                    Some(ok)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn manifest_dict_carries_each_shards_checksum() {
+        init();
+        Python::attach(|py| {
+            let mut manifest = Manifest::new("test".to_string(), 3, 1, 2);
+            manifest.add_shard(shard(Some("crc32c:e3069283")));
+            manifest.add_shard(ShardMeta {
+                rank: 3,
+                ..shard(None)
+            });
+            let dict = manifest_to_pydict(py, &manifest).unwrap();
+            let shards = dict.get_item("shards").unwrap().unwrap();
+            let shards = shards.cast::<PyList>().unwrap();
+            let with = shards.get_item(0).unwrap();
+            let without = shards.get_item(1).unwrap();
+            assert_eq!(
+                shard_checksum_from_dict(with.cast::<PyDict>().unwrap())
+                    .unwrap()
+                    .as_deref(),
+                Some("crc32c:e3069283")
+            );
+            assert!(shard_checksum_from_dict(without.cast::<PyDict>().unwrap())
+                .unwrap()
+                .is_none());
+        });
     }
 }

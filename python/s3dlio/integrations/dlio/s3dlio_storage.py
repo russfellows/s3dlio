@@ -128,9 +128,11 @@ class S3dlioStorage(DataStorage):
         AWS_REGION: S3 region (default: us-east-1)
         AWS_ENDPOINT_URL: Custom endpoint (set by multi-endpoint logic or config)
 
-    Environment Variables (for Azure):
-        AZURE_STORAGE_ACCOUNT_NAME: Azure account name
-        AZURE_STORAGE_ACCOUNT_KEY: Azure account key
+    Azure credentials:
+        S3DLIO_AZURE_CREDENTIAL selects the credential (default auto: service principal,
+        managed identity or `az login`); the account comes from the
+        az://account/container/path URI. s3dlio does not read
+        AZURE_STORAGE_ACCOUNT_NAME / AZURE_STORAGE_ACCOUNT_KEY.
 
     Environment Variables (for GCS):
         GOOGLE_APPLICATION_CREDENTIALS: Path to service account JSON

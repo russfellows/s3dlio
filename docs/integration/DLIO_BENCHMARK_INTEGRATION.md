@@ -121,7 +121,7 @@ def get_storage(storage_type, namespace, framework=None):
 storage:
   storage_type: s3dlio              # Use s3dlio backend
   storage_root: s3://bucket/prefix  # S3
-  # storage_root: az://container/prefix  # Azure
+  # storage_root: az://myaccount/container/prefix  # Azure
   # storage_root: gs://bucket/prefix     # GCS  
   # storage_root: file:///mnt/data       # Local filesystem
 ```
@@ -190,9 +190,13 @@ export AWS_ENDPOINT_URL=http://minio:9000  # For custom endpoints
 
 ### For Azure Blob Storage
 
+Authenticate with the Azure CLI, or pick a mode with `S3DLIO_AZURE_CREDENTIAL` (managed identity,
+service principal, workload identity, SAS; see `Environment_Variables.md`); s3dlio does not read account-key
+variables. The storage account
+is part of the URI (`az://account/container/path`).
+
 ```bash
-export AZURE_STORAGE_ACCOUNT_NAME=your_account
-export AZURE_STORAGE_ACCOUNT_KEY=your_key
+az login          # or: azd auth login
 ```
 
 ### For Google Cloud Storage
@@ -296,11 +300,10 @@ storage:
 ```yaml
 storage:
   storage_type: s3dlio
-  storage_root: az://mycontainer/dlio-data
+  storage_root: az://myaccount/mycontainer/dlio-data
 
-# Set environment:
-# AZURE_STORAGE_ACCOUNT_NAME=myaccount
-# AZURE_STORAGE_ACCOUNT_KEY=mykey
+# Authenticate beforehand with `az login` (or `azd auth login`), or set S3DLIO_AZURE_CREDENTIAL
+# (managed-identity, client-secret, workload-identity, sas); account-key variables are not read.
 ```
 
 ### Local Filesystem with O_DIRECT
@@ -357,7 +360,7 @@ dataset:
 
 # Azure Blob Storage
 dataset:
-  data_folder: az://mycontainer/data
+  data_folder: az://myaccount/mycontainer/data
 
 # Local filesystem
 dataset:
@@ -447,7 +450,7 @@ s3dlio v0.9.30+ includes all functions needed for DLIO with zero-copy performanc
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `exists()` | ✅ v0.9.26+ | Direct existence check |
-| `put_bytes()` | ✅ v0.9.26+ | Zero-copy write from Python |
+| `put_bytes()` | ✅ v0.9.26+ | Writes bytes-like objects without copying them and with the GIL released (since 0.9.128; earlier releases copied with the GIL held) |
 | `mkdir()` | ✅ v0.9.26+ | Create directories (no-op on object stores, #229) |
 | `stat()` | ✅ Available | Returns metadata dict |
 | `get()` / `get_range()` | ✅ Available | Zero-copy read (v0.9.30+) |

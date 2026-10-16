@@ -184,7 +184,11 @@ impl CheckpointStore {
         match reader.load_latest_manifest().await? {
             Some(manifest) => {
                 if manifest.world_size == 1 {
-                    let data = reader.read_shard_by_rank(&manifest, 0).await?;
+                    // Validated against the manifest's checksum when the shard has one (a
+                    // `.zst` shard is decoded first); a checksum-free manifest reads as before.
+                    let data = reader
+                        .read_shard_by_rank_with_validation(&manifest, 0)
+                        .await?;
                     Ok(Some(data))
                 } else {
                     anyhow::bail!("Cannot load multi-rank checkpoint with load_latest(). Use reader() directly.");

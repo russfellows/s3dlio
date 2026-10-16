@@ -25,9 +25,11 @@ pub use api::*;
 // ===== Internal Modules (Implementation) =====
 // These are public for internal use but may change without notice
 
+pub mod checksum; // CRC-32C: the checksum every writer reports (#256)
 pub mod config;
 pub mod constants;
 pub mod data_formats;
+pub mod dotenv; // `.env` handling: the one S3DLIO_LOAD_DOTENV switch (#243)
 pub mod download;
 pub mod memory;
 pub mod object_size_cache; // v0.9.10: Pre-stat size caching for benchmarking
@@ -58,6 +60,8 @@ use pyo3::prelude::*;
 pub(crate) mod delete_batch_plan; // pure URI-grouping helpers for delete_batch (#179)
 pub mod delete_contract; // delete contract A shared by s3-cli and the Python API (#210, #167, #212)
 pub mod object_store;
+#[cfg(any(feature = "backend-azure", feature = "backend-gcs", test))]
+pub(crate) mod read_buffer; // streamed-GET destination buffer, sized once (#252)
 pub(crate) mod redirect_client; // HTTP 307 redirect following (for AIStore compatibility)
 pub mod retry; // v0.9.108+ Phase 4: shared retry helper for body-transfer failures
 pub mod s3_client;
@@ -72,10 +76,13 @@ pub mod object_store_arrow;
 
 #[cfg(feature = "backend-azure")]
 pub mod azure_client;
+#[cfg(feature = "backend-azure")]
+pub mod azure_credential; // Azure credential selection (#253)
 pub mod checkpoint;
 pub mod data_gen;
 pub mod data_gen_alt; // Alternative data generation with ChaCha20
 pub mod data_loader;
+pub mod direct_bounce;
 pub mod file_store;
 pub mod file_store_direct;
 pub mod object_store_logger; // Op-log support for all backends
@@ -276,6 +283,12 @@ mod test_env;
 #[pymodule]
 pub fn _pymod(m: &Bound<PyModule>) -> PyResult<()> {
     Python::initialize();
+
+    // Apply the `.env` policy FIRST: before anything below (thread-pool sizing, the first
+    // I/O call) reads an environment variable (#243). This is the first thing s3dlio
+    // does at import, and `s3dlio/torch.py` imports this module before `torch`; but
+    // anything the host imported or started before `import s3dlio` is outside our reach.
+    dotenv::apply();
 
     // Auto-size every process-wide thread pool (global Tokio runtime,
     // pyo3-async-runtimes runtime, Rayon global pool) from MPI/distributed-

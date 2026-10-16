@@ -1,5 +1,782 @@
 # s3dlio Changelog
 
+## Version 0.9.128 — Zero-copy Python writes, opt-in `.env` loading for library users, Azure credential modes, real CRC-32C, shared `direct://` bounce pool, Arrow-backend and `get_many` fixes
+
+This release fixes twenty issues and part of a twenty-first: #222, #223, #232, #238, #239, #240,
+#241, #242, #243, #244, #245, #246, #248, #249, #252, #253, #255, #256, #258 and #259, and the
+Python write paths of #254 (the legacy community GCS client's one-copy-per-PUT is left as it was,
+see Known limitations). By area: `put_bytes` and the streaming writers read any contiguous buffer
+in place with the GIL released (#238, #254); `direct://` PUT and GET move large buffers per system
+call through a shared bounce pool (#244, #248, #249); `get_many` works on `az://` and `gs://` and
+the Azure and GCS GETs receive into one buffer (#242, #252, #255, #239); Azure gains credential
+modes (#253); the S3 retry loop and the size cache are fixed (#240, #241); writer checksums are a
+real CRC-32C and validation accepts the form writers produce (#256, #258, #259); library use no
+longer reads a `.env` file unless asked (#243); datasets return the key or URI that fetches each
+item (#223); and the Arrow backend lists and deletes recursively and without doubled URIs (#222,
+#232, #245, #246).
+
+**Read the behaviour changes before upgrading.** Each is described in full under "Changed
+(BEHAVIOUR CHANGE)" (the Azure default and the Python checkpoint checksum are described under
+Added and Fixed):
+
+- **`.env` is opt-in for library users (#243).** Rust and Python programs no longer load a `.env`
+  file implicitly; set `S3DLIO_LOAD_DOTENV=1` (or a file path) or call `s3dlio::dotenv::load_env_file`.
+  `s3-cli` keeps loading it.
+- **File and direct datasets use keys below the dataset root (#223).** `sub/b.bin`, not `b.bin`.
+- **Borrowed zero-copy writer contracts (#238, #254).** `put_bytes` and the streaming writers read a
+  contiguous buffer in place with the GIL released, so no other thread may modify it during the call;
+  `put_bytes_async(..., borrow=True)` has a completion barrier; `write_owned_bytes()` and
+  `MultipartUploadWriter.write()` no longer snapshot a mutable buffer, and `copy=True` restores the
+  snapshot.
+- **`crc32c:` labels are a real CRC-32C (#256, #258, #259).** The hex digits change for almost every
+  input (`123456789`: `cbf43926` before, `e3069283` now), a bare hex string means CRC-32C, and
+  generated TFRecord files now carry CRC-32C. Checksums stored by earlier releases must be recomputed.
+- **The `direct://` bounce-pool default is 4 pairs x 16 MiB per NUMA node (was 1 pair x 64 MiB).**
+  Same memory budget; provisional, from a model and not a hardware measurement.
+- **Python checkpoint checksums.** Streamed shards now keep their checksum into the
+  manifest, and `load_latest_manifest()` returns it. `read_shard_by_rank`,
+  `PyCheckpointStore.load_latest()` and `s3dlio.load_checkpoint(uri)` validate against it and raise
+  on a mismatch, and `finalize_distributed_checkpoint` refuses a malformed checksum string.
+- **Azure credential mode defaults to `auto` (#253).** A fallback chain replaces `az`/`azd` only;
+  `S3DLIO_AZURE_CREDENTIAL=cli` restores the old behaviour.
+
+Rust API changes (`AlignedBuf::new` and `BufferPool::take` return a `Result`, `AlignedBuf` is not
+`Clone`, and others) are listed under "Changed (API)".
+
+### Changed (BEHAVIOUR CHANGE)
+
+- **s3dlio no longer reads a `.env` file implicitly when used as a library (#243).** Until now every
+  S3 client build (and bucket/container listing) loaded `.env` from the process's current directory into
+  the environment of the whole host process, so which file was used, and which credentials, endpoints and
+  `S3DLIO_*` / `AWS_*` settings an embedded s3dlio (an inference server, a training job, a KV-cache tier)
+  ran with, depended on where the process happened to be started. There is now ONE switch,
+  `S3DLIO_LOAD_DOTENV`, read from the real environment once per process:
+  `1` / `true` / `yes` / `on` loads `.env` from the working directory (the old behaviour),
+  `0` / `false` / `no` / `off` never loads it, and any other value is a file path to load exactly that file. The default depends on the program:
+  **`s3-cli`: on** (CLI users keep today's behaviour), **library use, Rust and Python: off**.
+  **If you relied on the implicit load in a Rust or Python program, set `S3DLIO_LOAD_DOTENV=1`
+  (or `S3DLIO_LOAD_DOTENV=/path/to/file`), or call the new `s3dlio::dotenv::load_env_file(path)`.**
+  When a `.env` exists but is not loaded because of the library default, s3dlio logs one INFO line
+  saying how to enable it, and the "Missing AWS_ACCESS_KEY_ID ..." error carries the same hint (so a
+  Python user who sees only the exception learns that the file is being ignored). A variable that is
+  already set in the real environment is never overridden by the file, as before. A new public function,
+  `s3dlio::dotenv::load_env_file(path)`, loads a given `.env` file explicitly (it works whatever the
+  switch says). The six places that used to call `dotenvy` themselves (the two S3 client builders,
+  bucket listing, GCS container listing, the Arrow backend set-up and the `s3-cli` start-up) now go
+  through one helper, which also runs at the start of every library entry point: the Python extension
+  module's initialisation (`import s3dlio`), the global runtime, `store_for_uri*` and the Azure and GCS
+  client constructors, the S3 dataset constructors, `configure_thread_pools`, `Logger::new` and the
+  latched tuning knobs (unsigned payload, skip-HEAD, range optimisation, size cache, GCS RAPID). So a
+  `.env` that is switched on is in place before s3dlio reads those settings (`S3DLIO_RT_THREADS`,
+  `S3DLIO_OPLOG_*`, the range-GET settings, `AWS_ENDPOINT_URL`, `AWS_REGION`, ...), not only when the
+  first S3 client is built. `s3-cli` now loads the file before it builds its Tokio runtime; in Python
+  the native module (which loads it) is imported before s3dlio's own `torch` import. Not promised:
+  s3dlio cannot know whether its host already has threads or has already imported `torch`; a host that
+  needs a race-free environment loads the file (or sets the real environment) at the very start of the
+  process, and forked children inherit the parent's resolved policy. `import s3dlio` now imports the native module first, outside any `try`, so if it fails the caller sees that error instead of PyO3's "initialized once" message from a second attempt. `s3-cli` prints a
+  warning on stderr when `S3DLIO_LOAD_DOTENV` names a file it cannot read. Documented in the README and
+  `docs/Environment_Variables.md`. The file is also loaded before the
+  independently public entry points that read or change a setting, not only before the S3 client
+  wrapper. Calling `set_s3_endpoint_override` first no longer lets an `AWS_ENDPOINT_URL_S3` that only
+  the file defines override the endpoint you just set; `build_smithy_http_client` /
+  `build_reqwest_http_client*` no longer build an HTTP/1.1 client when the file turns HTTP/2 on;
+  `H2WindowConfig::from_env`, `connect_timeout_secs`, `max_retry_attempts`, `mpi_world_size`,
+  `mpi_aware_thread_budget`, `effective_thread_budget`, `MultiEndpointStore::new` / `from_config`
+  (its `S3DLIO_S3_ENDPOINT_TLS_PORTS` decision), `AzureConfig::default` and the community GCS
+  `resolve_gcs_endpoint` return the file's values when they are the first s3dlio call. The same holds for
+  `direct_bounce::config()` / `BounceConfig::from_env` and `direct_io_bounce_size` (the direct:// bounce-buffer
+  settings), `ObjectSizeCache::new` (through `constants::size_cache_max_entries`, whose entry limit is latched on
+  its first call), `constants::export_quiesce_timeout`, `azure_client::canonical_account_name` /
+  `validate_account_name` (the custom-endpoint decision) and the Azure credential entry points that read the
+  process environment themselves (`azure_credential::mode_for_endpoint`, `credential_for`).
+
+- **`file://` and `direct://` datasets now list their items as paths below the dataset root (#223).**
+  `Dataset::keys()` (Rust), `PyDataset.keys()` and `ObjectStoreMapDataset`'s keys (Python), and the item
+  identifiers yielded by `PyBytesAsyncDataLoader.items()` / `PyDataset.items()` used to be the bare file
+  name (`b.bin`), whatever directory the file was in, so two files with the same name in different
+  sub-directories were indistinguishable and a name could not be turned back into a path. They are now the
+  path below the dataset root with `/` separators (`sub/b.bin`); a dataset whose URI names one file keeps
+  that file's name. Code that matched or compared those names must use the new form. `s3://` keys are
+  unchanged (the full key from the bucket root). New: `Dataset::uris()` and `PyDataset.uris()` return
+  the URI that fetches each item, in the same order as the keys.
+
+- **The `direct://` bounce pool default is now 4 pairs x 16 MiB per NUMA node (was 1 pair x 64 MiB).**
+  The memory budget is unchanged (128 MiB per NUMA node; 8 pairs / 256 MiB in total on a two-node
+  host). The new shape lets four requests per node use warm buffers at once instead of queueing
+  behind one long transfer. The choice is provisional: it comes from a discrete-event model of the
+  pool, not from a hardware measurement, and is to be confirmed with native counters on hardware.
+  The model's advantage is for unaligned (bounced) scenarios: in a high-concurrency mix of unaligned
+  PUTs it estimates roughly 42 GB/s for 4 x 16 MiB against roughly 18 GB/s for 1 x 64 MiB at the same
+  budget (conditional model estimates, not device measurements). Page-aligned (zero-copy) controls use
+  no bounce memory and tie, and their system-call size does not depend on the bounce size; the
+  streaming writer's 64 MiB staging buffer is independent of it. A bounced object larger than 16 MiB
+  is now moved in more, smaller (16 MiB) writes or reads than with a 64 MiB buffer (up to four times
+  as many for objects of 64 MiB or more; no change for an object that fits in one 16 MiB buffer). To restore the
+  earlier shape set `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=64` and
+  `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE=1`; both variables are unchanged.
+
+- **The writers' `crc32c:` checksum is now a real CRC-32C (#256).** Every streaming writer (file,
+  `direct://`, the data-generating streaming writer, S3, Azure, GCS and the Arrow backend) reported
+  its checksum as `crc32c:<hex>` but computed CRC-32 (IEEE) with `crc32fast`, so the value did not
+  match a GCS `crc32c` or an S3 `x-amz-checksum-crc32c` (apart from the few inputs on which the two
+  algorithms agree, such as the empty object), and the label named the wrong algorithm.
+  The value is now CRC-32C (Castagnoli), computed with the `crc-fast` crate (already in `Cargo.lock`
+  through the AWS SDK): SIMD code chosen at run time from the CPU (PCLMULQDQ / VPCLMULQDQ on x86-64,
+  PMULL and the CRC32 instructions on aarch64, software fallback), so no build flag is needed and a
+  wheel gets the fast path. Throughput was measured, not assumed (`examples/bench_crc32c.rs`): the
+  `crc32c` crate, the obvious choice, is about half as fast as the `crc32fast` it replaces on x86-64
+  without build flags (it detects SSE4.2 at run time, but its hardware loop makes a non-inlinable call
+  per 8 bytes, so it only runs well when the whole build enables `+sse4.2`), which would have slowed
+  every `write_chunk`; `crc-fast` is about 3x to 4x faster than `crc32fast` for buffers that fit in
+  cache and equal to it when memory-bound (measured on an x86-64 AVX-512 host; aarch64 was not
+  measured). `s3dlio::checksum::crc32c_implementation()` reports which code the CPU selected. The
+  `crc32c` crate remains only as an independent oracle in the tests. The label is unchanged.
+  **The hex digits differ for almost every input** (the two algorithms agree on some, such as empty
+  input, where both are zero): for the bytes `123456789` the writers used to report
+  `crc32c:cbf43926` and now report `crc32c:e3069283`. Anything that stored a checksum from an
+  earlier release and compares it with a new one (for example a checkpoint manifest written before
+  and read with validation after) must recompute it. The integrity-validation helper
+  (`get_with_validation` / `get_range_with_validation`) uses the same algorithm, so a value a writer
+  reports still validates the object it wrote. New: `s3dlio::checksum` (`Crc32c`, `crc32c_of`,
+  `crc32c_label`). The ZIP/NPZ container CRC is unchanged (that format requires CRC-32).
+
+- **TFRecord files s3dlio generates now carry CRC-32C checksums (#258).** The TFRecord format
+  requires CRC-32C (Castagnoli) for both the length checksum and the data checksum of every record,
+  masked as `((crc >> 15) | (crc << 17)) + 0xa282ead8`. The masking was right, but the CRC underneath
+  was CRC-32 (IEEE), so a reader that verifies checksums (TensorFlow, TensorBoard) rejected the files
+  as corrupt, and one that does not verify accepted them, which hid the problem. The bytes of every
+  generated TFRecord change (the 4-byte checksum fields; the record layout, the sizes and the index are
+  the same). The test compares the output with a reference written by an independent bitwise CRC-32C
+  and accepted by TensorBoard's TFRecord reader, which verifies the checksums and rejects the old output
+  with a header-CRC error. Files written by earlier releases keep their wrong checksums.
+
+### Added
+
+- **Azure credential modes: managed identity, service principal, workload identity and SAS (#253).**
+  The Azure backend used only the `az`/`azd` developer login, so it could not authenticate on Azure VMs, AKS pods or
+  in CI. `S3DLIO_AZURE_CREDENTIAL` now selects `auto` (default), `cli`, `managed-identity`, `client-secret`,
+  `client-certificate`, `workload-identity`, `sas` or `none` (case-insensitive; an unknown value is an error listing
+  the valid ones). **BEHAVIOUR CHANGE: the default is now `auto`, a fallback chain.** Before, every Azure
+  request used `az`/`azd` only and the `AZURE_*` service-principal variables were ignored. `auto` now tries, in
+  order, workload identity (`AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`), client secret
+  (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`), client certificate (`AZURE_CLIENT_CERTIFICATE_PATH`),
+  managed identity (`IDENTITY_ENDPOINT`/`MSI_ENDPOINT` set, or the instance metadata service identifies an Azure VM),
+  then `az`/`azd`, skips members whose variables are not set, falls through a member that cannot produce a token (for
+  example a VM with no assigned identity goes on to `az`), uses the first that works for the rest of the process, and
+  lists every member tried and why if none works. The Azure metadata probe runs on the blocking pool with an overall
+  bound of under 0.5 s; a negative ("not Azure") result is cached for 30 s, a positive result is not separately
+  cached by the probe helper (the winning credential is what is cached). Set `S3DLIO_AZURE_CREDENTIAL=cli` for the old behaviour.
+  Credentials are created once per mode and kept for the life of the process: a rotated secret, certificate or
+  token file needs a restart.
+  `AZURE_AUTHORITY_HOST` (https only) is honoured by the SDK for the Entra ID modes. `sas` appends
+  `S3DLIO_AZURE_SAS_TOKEN` to every request URL (the SDK keeps the query on GET, HEAD, PUT, DELETE and LIST; tested).
+  Each credential is created once per process and shared by the cached per-account client (#242 follow-up), so the SDK
+  caches and refreshes tokens; only the `cli` mode runs a process, per token request. A 401/403 and a failed token request
+  name the mode (`Azure credential mode <m>: ...`); the SAS token is removed from messages. A bearer-token mode on an
+  `http` endpoint is refused with a message saying it needs https (use `sas`/`none` for Azurite); `auto` on `http` sends no
+  credential, as before. The `client-certificate` mode needs the new cargo feature `azure-client-certificate` (it links
+  OpenSSL, so it is not in `full-backends` or the default wheel) and a PKCS#12 `.pfx` with an RSA key; without the
+  feature the mode reports that. Shared Key (account key) is still not supported: `azure_storage_blob` 1.0 cannot sign with
+  it. Tested end to end against local fake Entra ID, App Service managed-identity and Blob services (HTTPS with a throwaway
+  CA): managed identity, client secret, `auto`, workload identity, client certificate and SAS, including one token
+  request per credential for many blob requests. Tested against real Azure Blob only with the `cli` and `auto` (CLI) credentials. Not tested: managed identity on a real Azure host, the real instance-metadata address (the SDK
+  hard-codes it; the probe is tested against a local stand-in), and a real AKS federated token. The `auto` metadata probe
+  checks for an Azure instance document: an earlier draft accepted any connection to 169.254.169.254, which on a Google
+  Cloud VM selected managed identity and made an Azure test wait about 400 s.
+
+- **`S3DLIO_REQUIRE_FULL_BACKENDS` (test and release validation only).** `python/tests/test_full_backend_azure_gcs.py`
+  fails, instead of skipping, when the wheel lacks the Azure/GCS backends and this variable is set to anything other than
+  empty, `0`, `false`, `no` or `off` (unknown values fail too). Not read by the library; see `docs/Environment_Variables.md`.
+
+### Fixed
+
+- **`direct://` PUT and GET no longer move 4 KiB per system call, and a GET returns page-aligned memory
+  (#244).** An O_DIRECT PUT wrote the object one 4 KiB block per `write()` (512 MiB took 45 s, about 11 MiB/s,
+  against 0.79 s on `file://`), and a GET read it 4 KiB per `read()`. A page-aligned source buffer is now
+  written straight from the caller's memory in one `write` (split only at Linux's 2 GiB per-call limit); any
+  other source is copied once through a warm, reused, page-aligned bounce buffer from a process-wide pool, one
+  ping-pong pairs per NUMA node shared by PUTs and GETs (the copy of chunk k+1 overlaps the write of chunk k;
+  16 MiB buffers and 4 pairs per node by default (see the bounce-pool default entry), `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` 4..=64, `..._PAIRS_PER_NODE`, `..._WHEN_BUSY`;
+  the POOLED bounce memory is `nodes x pairs x 2 x size`; that bound covers the pooled path only, see
+  `docs/Environment_Variables.md`). A GET returns
+  page-aligned memory: by default it reads straight into one fresh aligned buffer, so a `direct://` GET followed
+  by a `direct://` PUT needs no bounce copy of the body for objects of at least `min_io_size` (only the final
+  zero-padded 4 KiB block is bounced); `S3DLIO_DIRECT_IO_GET_MODE=pooled` reads through the pool instead.
+  The zero-padded last block, the truncation back to the exact size (skipped when the length is already
+  aligned) and the buffered fallback are unchanged; a failed aligned allocation now retries with a smaller
+  buffer and then falls back to buffered I/O instead of aborting. `put_multipart` on `direct://` is now the same
+  single write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
+  also left zero padding inside the object whenever `part_size` was not a multiple of 4096.
+
+- **The `direct://` streaming writer no longer fsyncs on every flush or copies every chunk (#249), and
+  no longer frees an aligned buffer with the wrong layout (#248).** Page-aligned chunks are written from the
+  caller's memory; other data is staged once in a 64 MiB aligned buffer; data is made durable once, at
+  `finalize` (after every write only when `sync_writes` is set). `AlignedBuf::new` now returns a `Result`
+  (and `BufferPool::take` too), and `AlignedBuf` is no longer `Clone` (a clone freed the same memory twice).
+  New `file_store_direct::direct_io_counters()` reports O_DIRECT transfers versus buffered fallbacks.
+
+- **`put_bytes()` / `put_bytes_async()` no longer copy the payload while holding the GIL, and make no
+  copy at all for any contiguous buffer (#238).** The `BytesView` "zero-copy" branch could never run
+  (`BytesView` exports the Python buffer protocol, so the generic buffer branch took it first), and that
+  branch copied the whole buffer into a new `Vec` with the GIL held: every other Python thread stalled
+  (about 0.3 s per 512 MiB PUT) and peak memory rose by twice the payload on the local backends. Buffers
+  whose item type is not a byte (numpy `float32`/`int8`/`bool`, `array.array`, ctypes `'<B'`) were worse:
+  two copies with the GIL held. Now:
+
+  | Input | `put_bytes` | `put_bytes_async` | `put_bytes_async(borrow=True)` |
+  |---|---|---|---|
+  | `BytesView`, exact `bytes` | 0 copies | 0 | 0 |
+  | any other C-contiguous buffer, any item type | 0 copies, read in place with the GIL released | 1 snapshot copy, GIL released | 0 copies |
+  | non-contiguous view | 1 gather copy (GIL held) | 1 | 1 |
+  | `__bytes__()`-only object | 1 copy | 1 | 1 |
+
+  After that, `s3://`, `az://`, official-client `gs://` and `file://` pass the same bytes on with no
+  further s3dlio copy; the legacy community GCS client (feature `gcs-community`) copies once. `direct://`
+  copies once unless the source is page-aligned (see #244).
+  **New:** `put_bytes_async(uri, data, *, borrow=False)`. `borrow=True` promises not to modify, resize or
+  free the buffer until the awaitable completes; s3dlio then reads it in place instead of taking a snapshot
+  (for example pinned host memory). **Contract for every buffer read in place:** it is exported meanwhile,
+  so `bytearray.extend()/clear()` from another thread raises `BufferError`, and the bytes must not be
+  modified from another thread: that is a data race (the bytes uploaded are undefined; the memory is not
+  freed or resized meanwhile, which does not make a concurrent write safe). **Completion barrier:** a put
+  does not complete - normally, with an error, or by cancellation - until every native reader of the buffer
+  is done and the export has really been released with a real GIL token (never by a Tokio worker waiting
+  for the GIL, and never inferred from `PyGILState_Check`). `put_bytes` waits after the store returned;
+  the awaitable of `put_bytes_async(borrow=True)` is a `Future` that never reaches a terminal state
+  (result, error or cancellation) until then under the supported consumer operations (`await`, `cancel`,
+  `Task.cancel`, `asyncio.timeout`, `wait_for`; see the borrowed-put entries). Forcing completion with
+  `set_result` / `set_exception` (or the base-class methods) is unsupported and is not covered. So reusing the buffer after `CancelledError`
+  is safe (cancelling waits for a running native write to finish). `put_bytes` waits at most 30 s and then raises
+  `ExportStillReferencedError`; the awaitable warns at each missed deadline and keeps waiting
+  (`s3dlio._put_export_stats()["quiesce_timeouts"]` counts them). Buffers of Python objects or pointers (`O`/`P` formats) are
+  refused with a `TypeError`.
+
+- **The remaining Python write paths no longer copy the payload with the GIL held (#254).** The streaming
+  writer's `write_chunk()` (which kept the GIL for the whole write of any mutable buffer) and
+  `write_owned_bytes()` (which copied the buffer into a `Vec` with the GIL held) now use the same payload
+  conversion as `put_bytes()`: any C-contiguous buffer of any item type is read in place, with NO copy made by
+  the Python layer and the GIL RELEASED; the export is released before the call returns. `write_owned_bytes()` is
+  now the same as `write_chunk()` (a behaviour change: it used to snapshot; `copy=True` restores that, see the
+  borrowed-writer entry). `MultipartUploadWriter.write()` borrows the buffer the same way and copies it
+  once, with the GIL released, into its part buffers (parts are uploaded asynchronously and outlive the call, so
+  a borrowed Python buffer cannot be handed to them). The same contract as `put_bytes()` applies: do not modify
+  the buffer from another thread during the call (a data race). **Not changed:** the legacy community GCS client
+  (`gcs-community`, `gcs_client.rs`) still does `data.to_vec()` per PUT; its dependency is not available to
+  build offline here, so the one-line change is left for a build that can compile that feature.
+
+- **Round-7 (1/6): the autonomous buffer-export releaser thread can no longer be inside CPython at interpreter
+  finalization (Python 3.12 shutdown race), within the 30 s exit bound.** (Other `Python::attach` sites are
+  unchanged: result deliveries stay under the #192 gate with its 2 s drain; attaches inside spawned futures elsewhere
+  are not covered.) The autonomous releaser thread checked the shutdown flag and only then called
+  `Python::try_attach`; an attach already past the check could still be waiting for the GIL when the exit
+  callback returned and Python 3.12 began finalizing (pyo3's `Py_IsFinalizing` check exists only for 3.13+).
+  Every autonomous attach now runs inside an attach gate: the releaser increments an in-flight counter, then
+  checks the shutdown flag (if set it leaves without attaching), and decrements after `try_attach` returned; the
+  exit callback sets the flag, then waits for the counter to reach zero with the GIL released, bounded by 30 s
+  (logged and counted in `_put_export_stats()["shutdown_attach_wait_timeouts"]` if exceeded; exit then continues).
+  New diagnostics in `_put_export_stats()`: `shutdown_attach_waits`, `shutdown_attach_wait_timeouts`,
+  `releaser_attaches`. Tested deterministically on 3.12 and 3.13 with a hidden hook that parks the releaser
+  between the counter increment and `try_attach` while the interpreter exits.
+
+- **Round-7 (2/6): a borrowed put's awaitable can no longer end while a native reader remains or before the
+  export is released (R1, R3, P3).** (R1) When the put had finished but a backend still held a clone, the
+  quiesce timeout produced `ExportStillReferencedError`; an awaiting `Task` that had been cancelled (also a second
+  cancellation, `asyncio.timeout()` or a positive `wait_for()`) replaced that exception with `CancelledError` /
+  `TimeoutError`, so the documented "safe to reuse after cancellation" was false: the buffer could still be read
+  and the caller could overwrite it. Now the awaitable of `put_bytes_async(borrow=True)` never reaches a terminal
+  state - result, exception or cancelled - until the readers are gone and the export is released. At each missed
+  `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` deadline it emits one `RuntimeWarning` (naming the timeout), increments
+  `_put_export_stats()["quiesce_timeouts"]` and keeps waiting. **Behaviour change:** that awaitable no longer
+  raises `ExportStillReferencedError`; a backend that never lets go keeps it pending (and the buffer pinned).
+  The blocking `put_bytes` keeps the error: it is raised in the caller's own stack, where no Task can rewrite it.
+  (R3) Completion used to wait only for the owner's drop; if another thread was mid-release of a batch of exports
+  (an exporter's release callback yielded the GIL) a put could finish while its export was still held and a
+  resize still raised `BufferError`. Release is now independently waitable (blocking and async waiters, GIL
+  released), re-checked after every drain. (P3) If the barrier machinery itself fails (for example
+  `add_done_callback` raising) the awaitable polls every 50 ms, and if that cannot be scheduled blocks, instead of
+  completing or stranding; `_put_export_stats()["internal_errors"]` counts it. Hidden test hooks:
+  `_put_test_retain_next_clone`, `_put_test_retained`, `_put_test_release_retained`.
+
+- **Round-7 (3/6): streaming-writer buffer ownership is explicit; `copy=True` is the snapshot (R7).**
+  **Behaviour change:** `write_owned_bytes()` no longer copies a mutable buffer under the GIL (0.9.126 and earlier
+  did); since 0.9.128 it borrows the buffer exactly like `write_chunk()`, with the GIL released, and
+  `MultipartUploadWriter.write()` does the same. Zero copy stays the default for every contiguous buffer. The
+  contract is now in the Python-visible docstrings of `write_chunk`, `write_owned_bytes` and
+  `MultipartUploadWriter.write` and in the streaming-writer section of `docs/PYTHON_API_GUIDE.md`: the call
+  borrows the buffer without copying, no thread may modify it until the call returns, and it is released before
+  the call returns. New keyword-only `copy=False` on `write_owned_bytes` and `MultipartUploadWriter.write`:
+  `copy=True` snapshots a mutable buffer once under the GIL (exact `bytes` and `BytesView` are immutable and never
+  copied), for callers whose other Python threads may write to the buffer during the call (atomic only against
+  writers that hold the GIL; a writer that releases it - large NumPy operations, `readinto`/`recv_into`, CUDA/torch
+  copies - can still tear the snapshot and must be serialised by the caller). The misleading "kept for
+  compatibility" wording of `write_owned_bytes` is gone.
+
+- **Round-7 (4/6): an oversized `direct://` range read no longer holds a pool buffer it does not use (R5).**
+  A range larger than the range-read pool's buffer (64 MiB by default) first took a pooled buffer and permit, found
+  it too small, allocated its own larger buffer and kept the unused lease for the whole read: 32 such reads held every
+  permit (and 32 x 64 MiB of unused buffers) and delayed unrelated small reads. The path is now chosen by the
+  required size before anything is taken: a range that fits borrows a pooled buffer as before; a larger one takes
+  only a *private-allocation permit* (`BufferPool::acquire_private`, `capacity` of them, separate from the pooled
+  permits, released when the read ends) and allocates its own buffer, so oversized reads are bounded in number but
+  cannot starve reads that fit. New `BufferPool::buffer_len()`, `acquire_private()`, `private_available()`.
+
+- **Round-7 (5/6): the bounce-memory bound is stated for the pooled path only, and the implicit fallback is counted
+  (R6).** Earlier text called `nodes x pairs x 2 x size` the cap on all bounce memory and said nothing but the opt-in
+  `fallback` policy allocates beyond the pool. That was too strong: when a node's pool cannot be created or cannot
+  give the requested alignment, a `direct://` PUT still succeeds - **availability first** -
+  with a private per-call bounce buffer of up to one bounce size, uncounted and outside the cap. Those implicit
+  allocations are now counted in `direct_bounce::bounce_stats()` (new `implicit_fallbacks` per direction,
+  `implicit_fallback_bytes`, and the causes `pool_unavailable` / `alignment_mismatches`), the first is logged, and
+  every "hard cap" statement (module docs, `docs/Environment_Variables.md`, constants, test comments) is narrowed to
+  the pooled path, with the allocations outside it listed (opt-in `fallback` buffers, implicit buffers, aligned-PUT
+  tail block, default-mode GET destination, range-read private buffers, unaligned streaming-writer staging).
+  `bounce_stats()` is no longer hidden from the docs and `BounceStats` is `#[non_exhaustive]`. The benchmark
+  (`examples/direct_bounce_bench.rs`) reports the implicit counters per row and the summary script warns when any is
+  non-zero (that row is not a pooled measurement). Known limits: oversized range reads are admitted by count
+  (`capacity` at a time), not by bytes, and a store without a range pool allocates without admission; the implicit
+  counters are cumulative (no live/peak gauge) and `pool_unavailable` also ticks for pooled-mode GETs that read
+  directly into their destination.
+
+- **Round-7 (6/6): small corrections.** `scripts/direct_bounce_bench_summary.py` now derives the arms from the data
+  (a valid `C32` result used to be silently dropped) and groups by pairs, busy policy and source as well, so runs of
+  different configurations are no longer pooled (`python/tests/test_direct_bounce_bench_summary.py`). The
+  finalize-durability unit test asserts the exact number of fsyncs (2 for an aligned-plus-tail stream, 1 for an
+  aligned-only stream); the old `syncs <= 2` also passed with zero. The legacy range pool's wording says it bounds
+  buffers *checked out*, not all allocations.
+
+- **Round-6 edges of the borrowed-buffer barrier.** `GuardedFuture.cancel()` returns `False` once the put is
+  already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
+  the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really
+  released, not only its owner dropped; if the wrapper cannot be built after the put was spawned, the put is
+  asked to cancel (the cancellation takes effect only after the event-loop-blocking, quiesce-timeout-bounded
+  fallback wait, which can end in `ExportStillReferencedError` while the put still runs); `ExportStillReferencedError`
+  names the timeout and what the put did, and an internal barrier failure says so and is counted
+  (`_put_export_stats()["internal_errors"]`); a set but unusable `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` warns once
+  and falls back to the default. Documented: `asyncio.shield()` of a borrowed put bypasses the guard, and
+  `wait_for(fut, t)` can take up to `t` plus the quiesce timeout.
+
+- **Round-5 hardening of the borrowed-buffer barrier and the direct pool.** (1) The awaitable of
+  `put_bytes_async(borrow=True)` is now a `Future` subclass, not a Task running a coroutine: a coroutine body
+  never runs when its Task is cancelled before the first step, which let `CancelledError` reach the caller while a
+  native write still read the buffer; `cancel()` (including `asyncio.timeout(0)` and `wait_for(.., 0)`) now defers
+  the terminal state until the barrier is satisfied. (2) The guard is built before the put is spawned, and every
+  error path of `put_bytes_async` releases the export before raising. (3) A barrier timeout of the blocking `put_bytes` raises
+  `s3dlio.ExportStillReferencedError` (new; `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`, default 30 s, not signal
+  interruptible) instead of succeeding (the async awaitable no longer raises it; it stays pending and warns instead). (4) The async barrier never attaches to Python by itself (the result
+  delivery, inside the interpreter-exit gate of #192, releases the export); after interpreter shutdown began a
+  `put_bytes` that holds the GIL still releases its export. (5) A `direct://` PUT cancelled while it waits for
+  bounce buffers leaves the previous object intact: the target is created/truncated only after the buffers are
+  leased. (6) The streaming writers accept only buffer-protocol objects and objects with `__bytes__()`:
+  `write_chunk(5)` is a `TypeError` instead of five zero bytes (as are lists and iterables); `put_bytes` is
+  unchanged. (7) Per-call overhead of small puts reduced (no thread hand-offs when the store already dropped the
+  payload). (8) Helper-thread creation failure is an error, not a panic; a failed pool creation is retried after
+  30 s; `mbind` prefers (instead of requires) the node; `direct://` range reads no longer zero-fill the buffer
+  before `pread` and run the read in a blocking task that owns the buffer; CPU indexes read from sysfs are
+  capped.
+
+- **Python `ObjectStoreMapDataset` fetches each item by the exact key it listed (#223).** A dataset rooted
+  below the bucket root asked the server for the wrong object: `ObjectStoreMapDataset("s3://bkt/dir/")`
+  listed `dir/x` but requested `dir/dir/x` (the dataset's own key prefix was added a second time), so
+  every item failed to read, or read a different object if `dir/dir/x` existed. `s3://bkt//` and
+  `s3://bkt/dir//` behave the same way: the key that was listed is the key that is fetched, with a
+  leading or doubled `/` kept exactly. The same mistake hit `file://` and `direct://` datasets in two more
+  ways, fixed together: files in sub-directories were listed by bare file name and so were looked up in the
+  top directory, and a dataset whose URI names one file looked for `<file>/<file>`. The listed key of a
+  `file://` / `direct://` dataset is now the file's path below the dataset root (`sub/b.bin`; for a root
+  that names one file, its name) -- see the behaviour change above. `ObjectStoreMapDataset` no longer
+  builds a URI itself: the dataset, which already parsed its root (scheme, server, bucket or container),
+  returns the URI that fetches each listed item, so the server form `s3://host:port/bucket/dir/` (and
+  `s3://[::1]:port/bucket/dir/`) fetches from the right bucket, at the bucket root and below a prefix,
+  and `s3://bkt/` works as before.
+
+- **Container listing could send credentials to another host (#253 review, security).** `list-buckets az://...`
+  and Python `list_containers` put the raw text after `az://` into a host name, so `az://attacker.example#` built a
+  request to attacker.example carrying the bearer token or SAS. Every place that turns an account into a URL now
+  goes through one check: 3-24 lowercase letters and digits (upper case is accepted and lowercased, as host names
+  are case-insensitive), or with a custom endpoint any name free of `/ ? # @ \ %`, whitespace and control
+  characters. `%` is refused outright, so `%2e%2e` and `%2f` cannot smuggle a dot segment or a slash. Nothing is
+  sent and no credential is built for a refused name. `resolve_azure_account_url` now returns a `Result`, and
+  `is_azure_blob_host` ignores case.
+
+- **Azure hardening (#253 review).** An `az://` account name must be 3-24 lowercase letters and digits (with a
+  custom endpoint such as Azurite the rule is relaxed, but `/ ? # @ \`, whitespace and control characters are
+  never accepted), checked before any request or credential use, so `az://attacker.example#/c/k` cannot redirect a
+  request or a bearer token. A SAS token is refused over plain `http` to anything but `localhost`/loopback.
+  Endpoint and account URLs in log lines and error messages are shown without their query string, and
+  `list_account_containers` errors name the credential mode like blob operations.
+
+- **SAS material no longer survives in error text (#253 review).** The SDK re-sorts and re-encodes the query on
+  operations that set query pairs (list, container operations, block staging and commit), and transport errors print
+  the whole request URL, so replacing the exact token text missed them. Error text now loses the query of every URL in
+  it, every SAS parameter value (`sig`, `se`, `sp`, `skoid`, ...), and each value of the configured token as written,
+  decoded, encoded and double-encoded. `AzureRequestError` has a redacting `Debug`, and `redact_url` also strips
+  userinfo.
+
+- **`azure_credential::redact_sas` and `warn_unused_sas` now read the dotenv file first.** A Rust
+  caller whose first s3dlio call was `redact_sas` missed a SAS token that was set only in an opted-in
+  `.env` file, so a bare token fragment in the text was not redacted. Both helpers now apply the
+  dotenv settings before reading the environment, like the other first-read entry points.
+
+- **`auto` no longer waits out the SDK's retry schedule on a VM without an identity (#253 review).** The managed
+  identity attempt in `auto` has a deadline (`S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`, default 5000 ms; the SDK retries a
+  404/410/5xx from the metadata service for about 72 s), after which `auto` moves on to `az`/`azd`; the same deadline applies when a managed identity that already won stalls
+  on a later token refresh, after which the chain is run again with the managed identity left to the end (a stall
+  costs one deadline when another member works; a lone managed identity still gets its second try); a request forgets the
+  winner only if it is still the one it used, which protects a newer winner of a different mode (a re-installed winner of
+  the same mode is the same credential object and can still be cleared once by a late failure, costing one extra chain
+  run). Only managed identity has its own deadline: the HTTPS modes rely on the SDK's 20 s connect and
+  60 s read timeouts, and `az`/`azd` has none in `azure_identity` 1.0.0. A "not Azure"
+  answer from the metadata probe is cached for 30 s (a failing chain no longer probes twice per request); a cached
+  `auto` winner that starts failing makes that request run the chain again, so a working member further down is found
+  without a restart; a configured service principal that fails before `auto` falls through is logged at `warn`. The
+  client-certificate file is read and parsed on the blocking pool at the first token request, not on a runtime worker.
+
+- **Deleting an `az://` object that is already gone succeeds again (#253 review).** Wrapping Azure errors to
+  name the credential mode and hide a SAS token turned them into plain text, so the delete contract no longer
+  recognised `BlobNotFound` and `delete`/`delete -r` failed for a blob that was already missing (or vanished
+  between the listing and its delete). Errors now keep the typed SDK error inside, and batch deletes treat a
+  missing blob as deleted.
+
+- **Azure `S3DLIO_AZURE_DOWNLOAD_MODE=s3dlio` could return a truncated or empty object as a success
+  when the cached size was stale (final review F1).** The size guard for a cached size asks for one
+  byte more than expected and relies on the RangeEngine rejecting a wrong length, but an object
+  below `min_split_size` is read as a single request and that path accepted any length: a blob
+  cached as 1,024 bytes and overwritten with 1 MiB returned 1,025 bytes from a successful GET, a
+  blob cached as 0 bytes and then grown returned empty without any request, and a blob that shrank
+  returned the short body. The fresh-size retry only runs after an error, so it never ran. The
+  single-request path now requires exactly the planned length (like the multi-range path), and a
+  cached size of 0 is no longer read as an empty object: the read fails and is retried once with a
+  size from a fresh `HEAD` (a size just learned from the service stays a legitimate empty read), so
+  every read of an empty blob in explicit mode now costs one `HEAD` (the retry caches the size 0 again, so
+  the cost does not go away; before this change such a read made no request at all). Default
+  Azure SDK mode is unchanged. Every caller of `RangeEngine::download` shares the exact-length rule;
+  `file://` and `direct://` behaviour did not change. Pre-existing limit, recorded and not changed: an
+  unguarded read trusts a single `HEAD` (no ETag / `If-Match`), so a blob that grows after the `HEAD`
+  returns its first N bytes as a success, and a `HEAD` response without `Content-Length` is read as
+  size 0 (`AzureBlob::stat`).
+
+- **Azure: a stale cached size can no longer turn a download into one request per byte (#242 review).**
+  `AzureObjectStore` caches the size a `HEAD` reports for 60 s. A blob cached as 0 or 1 byte and then
+  enlarged made the sequential download plan one-byte ranges (the SDK keeps the caller's partition size and
+  learns the real length only from the first response), roughly a million serial requests for 1 MiB. Now:
+  the partition size is never below 32 MiB whatever the hint says; the default mode (`Auto` with the Azure
+  SDK engine) and `azure-sdk` make **no `HEAD` at all** (one request for a blob up to 32 MiB; the buffer is
+  sized from the response); the s3dlio RangeEngine, which plans its ranges from the size, uses a cached size
+  without a `HEAD` but guarded: its last range asks for one byte more than planned, so a blob that grew (an
+  over read) or shrank (a short read or a range error) makes the engine fail, and the read is retried once
+  with a size from a fresh `HEAD` (an unchanged blob costs no `HEAD`; before this guard every RangeEngine read
+  started with one); `put`/`put_multipart` forget the written object's cached size and
+  `delete`/`delete_batch`/`delete_prefix` forget exactly the deleted objects' (never the whole cache), under one
+  canonical `az://account/container/key` / `gs://bucket/object` key (Azure and GCS); an Azure range read reserves
+  the response's `Content-Length` and asks for its whole range in one request (an open-ended range uses the 32 MiB
+  default partition, not the SDK's 4 MiB). Tested against a fake Blob service that refuses after 300 requests.
+  Cache growth is bounded separately by the #241 size-cache fix, which this builds on (`ObjectSizeCache` gained
+  `invalidate` and `invalidate_many`).
+
+- **Azure: one HTTP client per account URL instead of one per operation (#242 review).** Every
+  `get`/`stat`/`get_range` built a new Azure service client, with a new connection pool, TLS state and
+  an empty bearer-token cache. Clients are now cached per account URL (at most 64) and reused, so
+  connections and the SDK's token cache are shared. `list_account_containers` no longer attaches a
+  credential to an `http://` endpoint (the SDK refused it with "must use https"). Not measured against
+  live Azure (no network access in the test runs); the unit tests count client constructions.
+  Limit: a cached client keeps its bearer token until it nears expiry (about an hour), so after
+  `az login` as a different identity a running process keeps using the old one until the token
+  refreshes or the process restarts. When more than 64 accounts are used an arbitrary cached client is evicted
+  (it is rebuilt, with a new token request, on next use).
+
+- **`get_many()` on `az://` and `gs://` URIs no longer fails for every key (#242).** The function
+  stripped the scheme and container/bucket and handed the Azure and GCS stores only a bare object
+  key, but those stores read the account/container/bucket from the full URI, so every read errored
+  while the same URI worked with `get()`. Each read is now given the full URI. Further changes to the
+  same call, found in review:
+  - A failed batch no longer leaves reads running. The call waits for the reads already in flight
+    and returns the first error as `GET <uri>: <cause>`; reads that had not started are skipped
+    (the S3 reader also drains before returning, but it does not skip). Previously it returned at
+    once and the other downloads, and for Azure the `az` token processes, kept running.
+  - The stores come from the process-wide store cache (#204) and the calls write op-log rows like
+    `get()` does (#174). Before, each URI built a new store and no row was written.
+  - A URI that names no object (`az://acct/container`, `gs://bucket/`) is refused before any read
+    starts: `Cannot GET: no key specified in URI`.
+  - A read task that panics is reported as `GET <uri>: the read task failed: ...`, with its URI.
+  - `get_many` of `file://`/`direct://` already passed full URIs and is unchanged. `get_many_async()` and
+    `get_many_stats()` still send every URI through the S3-only reader and refuse non-S3 URIs.
+  Covered by unit tests with a fake store and, for Azure, a Python test against a local fake Blob
+  endpoint; there is no local stand-in for GCS, so `gs://` is covered by the unit tests only.
+
+- **GCS HTTP and Azure GETs no longer grow their receive buffer by doubling (#252).** The GCS HTTP read
+  started a 1 MiB buffer and let it double, so an object over 1 MiB was copied again at each growth step
+  (an 8 MiB body: 3 growths); the Azure reads used the SDK's `collect()`, which also grows chunk by chunk.
+  Both now receive into one buffer sized from the object size in the response (GCS, clamped to the requested
+  range) or the length the Azure response announces (`Content-Range`/`Content-Length`), the size hint, or the
+  requested range (an Azure range reserves at most 128 MiB up front). If the server sends more than announced
+  the buffer still grows. The result is **one copy inside s3dlio after the SDK delivers the data**; it does not
+  remove copies the SDK makes itself (Azure partitioned downloads, used above 32 MiB, buffer each partition
+  first). A test counts buffer growth. Throughput was not measured.
+
+- **GCS gRPC range reads reserve the range, not the object (#255).** The gRPC read sized its buffer to the
+  whole object even for a range read, so a 1 MiB range of a multi-TiB object tried to reserve the object, and a
+  negative size from the server wrapped through `as usize`. The buffer and the read timeout are now sized to
+  the bytes the read returns (clamped to the object); a negative size is 0 and the buffer grows as data
+  arrives. Full reads are unchanged. Tested on the sizing function only (no GCS service offline).
+
+- **GCS gRPC full reads cannot abort on an absurd size (#255 follow-up).** The gRPC receive buffer is reserved
+  with `try_reserve` and falls back to growth instead of aborting if the reservation fails.
+
+- **Azure: the documentation no longer tells you to authenticate with `AZURE_STORAGE_KEY` (#239).** (The service-principal, managed-identity and SAS modes this entry says were missing were added afterwards, see #253 above.)
+  The docs (`PYTHON_API_GUIDE.md`, `Environment_Variables.md`, `CLI_GUIDE.md`) said an Azure account key,
+  `AZURE_STORAGE_ACCOUNT`, or the service-principal variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
+  `AZURE_TENANT_ID`) authenticate s3dlio to Azure. None of them is read: s3dlio uses the Azure developer-tool
+  credential (`az login`, then `azd auth login`) for `https` endpoints and sends no credential to `http`
+  endpoints such as Azurite; the account always comes from the `az://account/container/key` URI. Account-key
+  (Shared Key) authentication was **not** implemented: the Azure SDK in use (`azure_storage_blob` 1.0.0,
+  `azure_core` 1.1.0, `azure_identity` 1.0.0) can only sign requests with bearer tokens, and signing requests
+  by hand was deliberately not done. The docs now state exactly this. Behaviour is unchanged.
+  The same wrong instructions (`AZURE_STORAGE_ACCOUNT_NAME` / `AZURE_STORAGE_ACCOUNT_KEY`, `AZURE_STORAGE_KEY`,
+  `AZURE_CLIENT_*`, `AZURE_TENANT_ID`, and `az://container/...` URIs without an account) were also removed from
+  `S3TORCHCONNECTOR_MIGRATION.md`, `integration/DLIO_BENCHMARK_INTEGRATION.md`, `testing/BACKEND-TESTING.md`,
+  `integrations/dlio/README.md`, `examples/python/oplog_example.py`, `python/tests/manual_cloud_backend_test.py`
+  and the docstrings of `s3dlio.integrations.dlio.*` and `s3dlio.compat.s3torchconnector` (those Python modules
+  only described the variables; they never read them, so their behaviour is unchanged). `tests/test_op_log_all_backends.sh`
+  no longer requires the unused `AZURE_STORAGE_ACCESS_KEY` to run its Azure step; it needs only `AZURE_STORAGE_ACCOUNT`
+  (used to build the `az://` URI) and an `az login` session; its Azure step now removes any old log first and
+  fails when `s3-cli` fails, instead of printing a message and continuing. Examples that wrote `az://container/...`
+  without the account now write `az://account/container/...` (also in `MULTI_ENDPOINT_GUIDE.md`, the CLI help and the
+  `put_bytes` docstring). `PYTHON_API_GUIDE.md` now lists `max_in_flight` (not `workers`/`concurrency`) for
+  `get_many`/`get_many_stats`, says that `get_many` works on `az://` and `gs://`, and says the `az`/`azd` executable
+  must be on `PATH`.
+
+- **A GET of a missing or forbidden object no longer retries (#240).** The retry loop around S3 GETs
+  (`S3DLIO_MAX_RETRY_ATTEMPTS`, 100 ms x attempt backoff) retried every error, including a definite
+  answer from the server such as `404 NoSuchKey` or `403 AccessDenied`, so each GET of a missing key
+  sent several requests and waited at least 300 ms before returning the error. A definite client error
+  (400, 401, 403, 404, 405, 409, 412, 416 and other non-transient 4xx) is now returned after one request
+  with no backoff. Transient failures are retried as before: connection and dispatch errors, timeouts,
+  5xx, 408, 429, S3 throttling codes such as `SlowDown`, and errors while the response body streams. An
+  error that cannot be classified is still retried. The same rule now applies to the per-chunk retry loop
+  of the concurrent range GET. The AWS SDK's own retry layer is unchanged. Library note: the public
+  `s3dlio::retry::retry_get_body` now requires its error type to implement the new `RetryClassify`
+  trait; it is implemented for `anyhow::Error` (S3 errors are classified), `std::io::Error`,
+  `Box<dyn Error + Send + Sync>`, `&str` and `String` (the last four always retry), so existing callers
+  keep compiling unless they use another error type.
+
+- **The retry loop keeps its own attempts for every error code the AWS SDK retries (#240
+  follow-up).** The first version of the #240 classifier listed only some of the codes the pinned AWS
+  SDK (aws-runtime 1.7.5) treats as transient or throttling. `RequestTimeoutException`,
+  `ThrottledException`, `RequestThrottledException`, `TransactionInProgressException`,
+  `LimitExceededException`, `PriorRequestNotComplete` and `EC2ThrottledException` on a 4xx status were
+  judged definite, so after the SDK had spent its own attempts the s3dlio loop gave up instead of
+  starting its own attempts. The classifier now carries the SDK's complete throttling and transient
+  tables (a unit test compares them with the pinned crate, so after an SDK upgrade that changes the
+  tables `cargo test` fails until the constants are updated) plus the S3-specific codes it always had.
+  Consequence to know: a persistent throttling or quota error with one of these codes (for example a
+  hard `LimitExceededException`) now uses the outer retry budget too, 3 attempts with 100 ms and 200 ms
+  of backoff between them (`S3DLIO_MAX_RETRY_ATTEMPTS`), on top of the SDK's own attempts, before the
+  error is returned; it used to fail after the SDK's attempts alone.
+
+- **The object size cache no longer grows without bound (#241).** The process-global size cache (and
+  the per-store size caches) never removed anything: an expired entry was treated as a miss but left in
+  memory, and nothing called the cleanup routine, so a long-running process that touched many distinct
+  objects (a KV-cache tier, a data loader over a very large dataset) kept growing. A lookup that finds
+  an expired entry now removes it, and the cache holds at most 1,048,576 entries (roughly 200-300 MB
+  when full); when a new object arrives at the limit the entry written longest ago, which is also the
+  one closest to expiry, is evicted. Every cache operation stays O(1) (an overwrite updates in place,
+  nothing scans or compacts under the lock). Eviction is oldest-written-first, so an epoch loop over more
+  distinct objects than the limit gets almost no hits: set `S3DLIO_SIZE_CACHE_MAX_ENTRIES` (read once per
+  process) above the object count for such datasets. The TTL
+  (`S3DLIO_SIZE_CACHE_TTL_SECS`) and cache hits behave as before.
+
+- **`get_with_validation` accepts the checksum form that writers and manifests produce (#259).**
+  Writers report `crc32c:<hex>` and the checkpoint manifest stores that value, but validation compared
+  it with the bare hex of the data, so validating a value a writer had reported failed for intact data
+  ("expected crc32c:e3069283, got e3069283"). `get_with_validation`, `get_range_with_validation` and
+  `load_checkpoint_with_validation` (and so the checkpoint reader's validating reads and
+  `validate_checkpoint_integrity`) now take `<algorithm>:<hex>`: the algorithm is parsed
+  (case-insensitive), `crc32c` is supported, and any other algorithm is an immediate, clear error
+  ("unsupported checksum algorithm ..."), reported before anything is fetched and never as a mismatch.
+  **A bare hex string now means CRC-32C** (it was CRC-32 before #256 changed the writers): a caller
+  that computed a CRC-32 with `crc32fast` and passes it bare will now see a mismatch, and a mismatch
+  message says `(CRC-32C; checksums written before the #256 fix were CRC-32)` so an old stored value is
+  recognisable. The hex part must be 1 to 8 hexadecimal digits in either case; fewer than 8 are read as
+  the number they spell (`crc32c:0` is the empty object's checksum). A `0x` prefix, an empty value, more
+  than 8 digits, a further `:` or any other character is a "malformed checksum" error, never a
+  mismatch. Corrupted data still fails validation.
+
+- **Validating a compressed checkpoint shard works (#259).** Writers hash the uncompressed bytes they
+  are given, but the shard in the store is the compressed `.zst` object, and the reader validated the
+  stored bytes, so a compressed shard could never pass validation once the checksum format was
+  accepted. The checkpoint reader (`read_shard_with_validation`, `read_all_shards_with_validation`,
+  the concurrent variants and `validate_checkpoint_integrity`) now fetches a `.zst` shard,
+  decompresses it and compares the decompressed bytes. Also, `Writer::finalize_writer_to_shard_meta`
+  now records a compressing writer's shard under its stored name (`...bin.zst`); it used to look for
+  the name without the extension and fail.
+
+- **Python checkpoints kept no checksum.** A streamed shard's writer computes a
+  `crc32c:` of the logical bytes, but the Python layer dropped it at every step: the dict returned by
+  `CheckpointStream.finalize()` had no `checksum`, `finalize_distributed_checkpoint` wrote
+  `"checksum": null` into the manifest (even when the caller supplied one), `load_latest_manifest()`
+  did not return it, and `read_shard_by_rank` read without validation, so a replaced shard (or, for a
+  compressed checkpoint, a different valid zstd stream) came back as if it were the original. The
+  checksum now travels both ways: `finalize()` (and `save_distributed_shard`, when a shard has one)
+  returns `checksum` when there is one, `finalize_distributed_checkpoint` writes it to the manifest
+  (a `None` value means no checksum; a non-string is a `TypeError`), `load_latest_manifest()` returns it,
+  and `read_shard_by_rank` validates against it (after decompression for `.zst` shards) and raises on
+  a mismatch. Manifests and metadata without a checksum behave as before: readable, not validated.
+  `PyCheckpointStore.load_latest()` and `s3dlio.load_checkpoint(uri)` validate too (same rule), and
+  `put_shard` / `put_shard_with_key` on a compressing store now keep the writer's checksum (an
+  uncompressed one-shot save still computes none). A checksum string that is not a supported
+  `crc32c:<hex>` form is refused by `finalize_distributed_checkpoint` instead of publishing a
+  checkpoint that cannot be restored; an empty string means no checksum.
+
+- **A compressed shard is stored, recorded and statted under one name (R10).** A compressing
+  writer for a custom key that already ends in `.zst` (`custom.zst`) stored the object as
+  `custom.zst.zst` in the `file://`, `direct://` and Arrow writers, while `finalize_writer_to_shard_meta`
+  recorded and looked for `custom.zst`: the write succeeded and the helper then failed to find the
+  object, or silently described an older object that already had that name. On S3, Azure and GCS the
+  writers stored `custom.zst` correctly, but `put_shard_with_key` recorded and statted `custom.zst.zst`.
+  There is now one rule, `CompressionConfig::stored_name` (and `stored_path` for filesystem paths): the
+  extension is appended only when the name does not already end with it. Every compressing writer
+  (file, `direct://`, Arrow, S3, Azure, GCS) uses it for the stored name, and the checkpoint writer
+  uses it for the manifest name (`put_shard`, `put_shard_with_key`, `finalize_writer_to_shard_meta`,
+  and now also `finalize_shard_meta` / `finalize_shard_meta_with_checksum` on a Writer that has
+  compression). Ordinary keys are named as before (`plain.bin` is stored and recorded as
+  `plain.bin.zst`); the exceptions are keys already ending in `.zst` (above) and, for `file://`, a name
+  ending in a dot (`a.`), which is now `a..zst`, the same as `direct://` and the manifest.
+
+- **The Python `CheckpointStream.finalize` result names the stored shard.** With a compressing
+  store (`PyCheckpointStore(uri, compression_level=N)`) the streaming writer stores `rank-N.bin.zst`,
+  but `finalize` statted and returned the un-suffixed `rank-N.bin`, so it failed after a successful
+  write or described an older uncompressed object left at that name. It now records the stored name
+  through the same helper as the Rust writer (the shard metadata now also carries the writer's
+  `crc32c:` checksum, which the old path dropped), and `Writer::finalize_shard_meta` /
+  `finalize_shard_meta_with_checksum` do the same for a Writer configured with compression.
+
+  Limits of the naming rule, recorded rather than changed: with compression on, the keys `a` and
+  `a.zst` both store `a.zst` (the second write replaces the first); with compression off, a key ending
+  in `.zst` stores raw bytes under that name, and the checkpoint `Reader`, which decompresses any shard
+  whose name ends in `.zst` (the suffix is spelled out in the reader, not taken from
+  `CompressionConfig::extension()`), cannot read it back.
+
+- **Arrow backend: `list(uri, recursive=True)` now lists every object under the prefix (#245).**
+  With the optional `arrow-backend` feature, a recursive listing returned only the direct children of
+  the prefix and silently omitted objects in deeper "subdirectories", unlike the native S3, GCS and
+  Azure stores. `recursive=True` now returns every object at any depth (and no directory entries);
+  `recursive=False` is unchanged (the objects and directory entries directly under the prefix). The
+  prefix still selects only its own directory: `p` never lists `pfoo/...` or `p2/...`. A recursive
+  `list_stream` now yields entries as the backend returns them instead of after the whole listing has
+  been collected in memory.
+
+- **Arrow backend: `delete_prefix` now deletes the objects at every depth under the prefix (#232).**
+  With the optional `arrow-backend` feature, `delete_prefix("s3://b/p")` listed only the immediate
+  children of `p`, so `p/b/c` and `p/b/d/e` were left behind while the call returned success. It now
+  lists everything under `p/` recursively (streamed, never collected whole) and deletes it with S3
+  `DeleteObjects` requests of up to 1000 keys each, 10 requests in flight at a time (that bound is
+  specific to S3: see the note below). `pfoo/x` and
+  `p2/y` are not touched, and neither is an object named exactly `p`. A key counts as failed unless the
+  store confirmed it deleted, so a request that fails as a whole counts every key in it; a failed
+  listing is one failure, ends the listing and is reported as "listing incomplete". If anything fails
+  the call returns an error with the number of failures, the first failed keys and the first errors,
+  instead of success. Limits: (1) endpoints without `DeleteObjects`, such as Google Cloud Storage's S3
+  interoperability endpoint, are not supported by the Arrow backend's `delete` / `delete_prefix` (its
+  S3 client has no single-object DELETE): the call fails with an error that names the keys; use
+  `gs://` for GCS, which deletes per object. (2) Folder marker objects (keys ending in `/`) cannot be
+  addressed through the Arrow backend's `object_store` layer, which strips the trailing `/`: the
+  marker `p/` is never reported as an entry of `p/` and is not deleted, and a nested marker `p/sub/`
+  is listed as `s3://b/p/sub` and may remain after `delete_prefix` (the delete of the key `p/sub`
+  reports success while `p/sub/` stays). (3) The "10 requests in flight" bound is S3's. It counts
+  chunks of up to 1000 keys, and one chunk is one request only for S3 `DeleteObjects`; the other
+  stores split a chunk inside `object_store` 0.13.2's `delete_stream`, which multiplies the bound per
+  outer chunk: Azure sends batch requests of 256 keys (up to 4 per chunk, so up to 40 in flight), and
+  GCS and plain HTTP send one DELETE per object, 10 at a time per chunk (up to 100 in flight); S3 with
+  bulk delete disabled deletes per object, 20 per chunk (up to 200 in flight).
+
+- **Arrow backend: listing an `s3://` URI with a key prefix no longer returns doubled URIs (#222).**
+  With the optional `arrow-backend` feature, listing `s3://b/dir/` returned `s3://b/dir/dir/x` for the
+  object `dir/x`; feeding that URI back into get or delete addressed an object that does not exist. The
+  listing code appended the listing URL's path to a location that already contained it. The returned
+  URI is now `s3://b/dir/x`, for nested prefixes, a prefix without a trailing `/` (which lists that
+  directory and never a sibling such as `dir2/`) and the bucket root, and the same correction applies
+  to every URL form the backend builds a store for (`gs://`, `abfss://`, path-style `https://`
+  endpoints). This holds for plain keys. Keys with a space, `%`, `?`, `#`, a leading `/` or `.` /
+  `..` segments are not yet guaranteed to round-trip through a listed URI on the Arrow backend (a
+  separate, known limit that this fix does not change).
+
+- **Arrow backend: `cargo clippy --tests` is clean for the library's own tests (#246).** The test
+  `parse_prefix_accepts_a_trailing_slash_that_parse_refuses` used `.err().expect(..)`, which
+  `clippy::err_expect` rejects when tests are linted (CI lints without `--tests`). It now uses
+  `expect_err`. No behaviour change. (The integration tests under `tests/` use native-backend APIs and
+  do not compile under `--no-default-features --features arrow-backend`; that is unchanged.)
+
+### Changed (packaging)
+
+- **The wheels published to PyPI now include the Azure backend.** Earlier wheels carried S3, file
+  and direct only, so `az://` failed with "Azure backend is not enabled" unless you built from
+  source. The PyPI wheels (and a source build of the sdist) now carry S3, Azure, file and direct.
+  GCS is still not in the PyPI wheels (its client uses git dependencies); build it with
+  `./build_pyo3.sh full`. `./build_pyo3.sh` (default) now matches the PyPI set; the new `slim`
+  profile keeps the old S3-only build. CI builds the same feature set and runs the Azure tests of
+  `python/tests/test_full_backend_azure_gcs.py` against that wheel, failing (not skipping) if
+  Azure is missing.
+
+### Changed (API)
+
+- `memory::AlignedBuf::new(len, align)` now returns `Result<AlignedBuf, AlignedAllocError>` instead of
+  panicking or aborting on a bad alignment, a size overflow or an out-of-memory condition. New
+  `AlignedBuf::new_zeroed` and unsafe `AlignedBuf::assume_init`; the slice accessors never expose
+  uninitialised memory (the first `as_slice`/`as_mut_slice` zero-fills a buffer that was only filled through
+  the raw pointer).
+- `AlignedBuf` is no longer `Clone` (the derived clone copied the pointer and freed it twice).
+- `memory::BufferPool::new` and `BufferPoolConfig::build` return `Result<_, BufferPoolError>` (a capacity of 0
+  is an error instead of a panic). `BufferPool::take` returns `Result<PooledBuf, BufferPoolError>`:
+  `PooledBuf` is an RAII lease that dereferences to `AlignedBuf` and carries the semaphore permit, returning
+  the buffer to the pool and freeing the permit when it is dropped (`give()` just drops it). Earlier the
+  permit was released when `take()` returned, so any number of buffers could be checked out at once; now
+  at most `capacity` buffers are checked out at once, also when a holder is cancelled. (The pool bounds
+  checked-out leases, not all allocations: the asynchronous prefill and on-demand allocation can briefly
+  coexist, up to `2 x capacity` buffers alive.)
+- The streaming writer's `write_chunk()` / `write_owned_bytes()` and `MultipartUploadWriter.write()` raise
+  `TypeError` (was `RuntimeError` for the streaming writer) for an object that is not bytes-like.
+- `put_bytes_async` gained the keyword-only argument `borrow=False` (see the #238 entry under Fixed); positional calls are unchanged.
+- New public `file_store_direct::direct_io_counters()` / `DirectIoCounters`: how many `direct://` transfers
+  really used O_DIRECT versus the buffered fallback that silently takes over when a filesystem refuses O_DIRECT.
+  This has an operational use (a user who chose `direct://` for speed can detect that they are not getting it),
+  so it is public and documented, not test-only.
+
+### Known limitations
+
+Limits recorded in the entries above and not changed by this release. The entries carry the full
+statements; this list only points at them.
+
+- **Checksums written before this release keep their wrong values.** Files and manifests written with
+  the old CRC-32 under a `crc32c:` label, and TFRecord files with CRC-32 checksums, are not
+  rewritten (the real CRC-32C and TFRecord entries).
+- **Azure.** Shared Key (account key) authentication is still not supported; credentials are created
+  once per process (a rotated secret needs a restart); a cached client keeps its bearer token until it
+  nears expiry and at most 64 account clients are cached; an unguarded read trusts one `HEAD` (no ETag
+  or `If-Match`) and `AzureBlob::stat` reads a `HEAD` without `Content-Length` as size 0; managed identity on a real Azure host,
+  the real instance-metadata address and a real AKS token were not tested (real Azure Blob was tested with the CLI credential); `client-certificate` needs
+  the `azure-client-certificate` feature.
+- **GCS.** The legacy community GCS client (`gcs-community`) still copies the payload once per PUT
+  (#254); `get_many_async()` and `get_many_stats()` still refuse non-S3 URIs; the `gs://` paths of
+  `get_many` and the gRPC range sizing are covered by unit tests only, and the GET receive-buffer
+  change (#252) was not measured for throughput.
+- **Checkpoint compressed-shard naming.** With compression on, the keys `a` and `a.zst` both
+  store `a.zst`; with compression off, a key ending in `.zst` stores raw bytes under that name and the
+  checkpoint `Reader` cannot read it back.
+- **Arrow backend.** `delete` / `delete_prefix` do not work on endpoints without `DeleteObjects` (GCS
+  S3 interoperability); folder marker objects (keys ending in `/`) are not addressable; the
+  in-flight bound is S3's and is multiplied on other stores; keys with a space, `%`, `?`, `#`, a
+  leading `/` or `.` / `..` segments are not guaranteed to round-trip through a listed URI.
+- **`.env` timing.** s3dlio cannot know whether its host already has threads or has imported `torch`;
+  a host that needs a race-free environment loads the file (or sets the real environment) at the very
+  start of the process.
+- **Borrowed-buffer puts.** `asyncio.shield()` of a borrowed put bypasses the guard, `wait_for(fut, t)`
+  can take up to `t` plus the quiesce timeout, forcing completion with `set_result` / `set_exception`
+  is unsupported, and the blocking `put_bytes` raises `ExportStillReferencedError` after 30 s.
+- **`direct://` bounce memory.** The `nodes x pairs x 2 x size` bound covers the pooled path only;
+  implicit fallback, oversized range reads (admitted by count, not bytes) and other buffers listed in
+  the round-7 entries are outside it, and the implicit counters are cumulative. The 4 x 16 MiB
+  default is provisional and still to be confirmed with native counters on hardware.
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published

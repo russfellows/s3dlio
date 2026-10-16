@@ -30,11 +30,14 @@ import threading
 import queue
 from typing import Iterable, Dict, Any, Sequence, Optional, Tuple
 
-import torch
-from torch.utils.data import IterableDataset, Dataset, get_worker_info
-
+# The native module goes FIRST: its initialisation applies the `.env` policy
+# (S3DLIO_LOAD_DOTENV, issue #243), so a `.env` that is switched on is loaded before
+# this wrapper imports torch (which may itself start native threads and read settings).
 # import _pymod as _core  # native module built by maturin
 from . import _pymod as _core
+
+import torch  # noqa: E402 -- after the native module on purpose, see above
+from torch.utils.data import IterableDataset, Dataset, get_worker_info  # noqa: E402
 
 
 # -----------------------------------------------------------------------------
@@ -372,18 +375,13 @@ class ObjectStoreMapDataset(Dataset):
             raise ValueError("return_type must be 'tensor', 'bytes', or 'reader'")
         self._return_type = rt
 
-        # Parse URI to extract scheme and base path for later reconstruction
-        if "://" in uri:
-            self._scheme, rest = uri.split("://", 1)
-            # Keep the full path as the base (strip trailing slash for consistent joining)
-            self._base = rest.rstrip("/")
-        else:
-            self._scheme = "file"
-            self._base = uri.rstrip("/")
-
         # Use the generic Rust dataset - works with any URI scheme
         self._core_ds = _core.create_dataset(uri, self._opts)
         self._keys: Sequence[str] = self._core_ds.keys()
+        # The URI that fetches each listed item, built by the dataset from the root it
+        # parsed (scheme, server, bucket/container): Python never rebuilds a URI from
+        # the dataset URI and a key, which is how `dir/dir/x` happened (#223).
+        self._uris: Sequence[str] = self._core_ds.uris()
 
     @classmethod
     def from_prefix(cls, uri: str, **kwargs) -> "ObjectStoreMapDataset":
@@ -397,9 +395,8 @@ class ObjectStoreMapDataset(Dataset):
             raise IndexError(index)
         from . import _pymod as _core_mod
 
-        # Reconstruct full URI preserving the original scheme
-        key = self._keys[index]
-        full_uri = f"{self._scheme}://{self._base}/{key}"
+        # Fetch exactly the object that was listed (#223).
+        full_uri = self._uris[index]
 
         # get() returns BytesView which supports zero-copy memoryview()
         bytesview = _core_mod.get(full_uri)

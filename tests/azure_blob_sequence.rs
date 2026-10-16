@@ -110,7 +110,7 @@ async fn sequence_1_upload_and_list() -> Result<()> {
     // Upload 3 blobs (single-shot put)
     let mut created: Vec<String> = Vec::new();
     for i in 0..3 {
-        let key = format!("{}/item-{}.bin", &prefix, i);
+        let key = format!("{}/item-{}.bin", prefix, i);
         // small content with a pattern
         let len = (i + 1) * 4096;
         let mut buf = vec![0u8; len];
@@ -127,7 +127,7 @@ async fn sequence_1_upload_and_list() -> Result<()> {
         "Sequence#1: after upload, count under prefix {prefix}: {}",
         after.len()
     );
-    println!("Sequence#1: created keys: {:?}", &created);
+    println!("Sequence#1: created keys: {:?}", created);
 
     // GET one blob to validate
     let sample = &created[1];

@@ -2,6 +2,97 @@
 
 This document provides a comprehensive reference for all environment variables supported by s3dlio v0.7.5+.
 
+## `.env` files (`S3DLIO_LOAD_DOTENV`)
+
+s3dlio can read a `.env` file (`NAME=value` lines) into the process environment. Whether it does is
+decided by ONE switch, read from the **real process environment** (never from a `.env` file) once per
+process:
+
+| `S3DLIO_LOAD_DOTENV` | Effect |
+|----------------------|--------|
+| `1`, `true`, `yes` or `on` (any case) | Load `.env` from the working directory. As `dotenvy` has always done here, the nearest parent directory that contains a `.env` is used if the working directory has none. |
+| `0`, `false`, `no` or `off` (any case) | Never load a `.env` file. No log line, no hint. |
+| any other non-empty value | A file path: load exactly that file. A path that cannot be read is logged as a warning (`s3-cli` prints it on stderr, because no log subscriber exists yet when it loads the file) and nothing is loaded; the working directory's `.env` is not a fallback. |
+| unset or empty | The default of the running program, below. |
+
+Only the spellings above are booleans; any other value is a file path.
+
+### Defaults
+
+| Program | Default | |
+|---------|---------|--|
+| `s3-cli` | `1` (on) | CLI users keep the convenience; the file is loaded at start-up, before the command line is parsed and before any client exists. |
+| Library: Rust crate, Python package (`import s3dlio`) | `0` (off) | A `.env` in whatever directory the host process was started from would silently change credentials, endpoints and every other `S3DLIO_*` / `AWS_*` setting of the whole process. When a `.env` exists (in the working directory or a parent) but is not loaded because of this default, one INFO line is logged, naming `S3DLIO_LOAD_DOTENV` and `s3dlio::dotenv::load_env_file`, and the error for missing S3 credentials ("Missing AWS_ACCESS_KEY_ID ...") carries the same hint, which is how a Python user sees it. An explicit `0` logs nothing and adds nothing to the error. |
+
+Changed in 0.9.128 (#243): library use used to load `.env` implicitly at the first S3 client build.
+Set `S3DLIO_LOAD_DOTENV=1` (or a path) to keep that behaviour.
+
+### Which variables, and precedence
+
+- **Any** environment variable can come from the file: `AWS_*`, `S3DLIO_*`, `AZURE_*`,
+  `GOOGLE_*`, `RUST_LOG` and so on. (`S3DLIO_LOAD_DOTENV` itself cannot: it decides whether the file
+  is read at all.)
+- **The real environment wins.** A variable that is already set (exported in the shell, set by the
+  parent process, or set by the application before s3dlio ran) is **never overridden** by the file.
+  The file only provides the variables that are missing.
+- *When* the file is read: once per process, at the first of these, which is before s3dlio reads any
+  setting (so `S3DLIO_RT_THREADS`, the writer-side `S3DLIO_OPLOG_*` settings (the op-log reader's
+  `S3DLIO_OPLOG_READ_*` are not covered, see the recorded limits below), `S3DLIO_ENABLE_RANGE_OPTIMIZATION`,
+  `S3DLIO_RANGE_THRESHOLD_MB`, `AWS_ENDPOINT_URL`, `AWS_REGION` ... all see the file's values):
+
+  | Program | The file is read at |
+  |---------|---------------------|
+  | `s3-cli` | start-up, before the command line is parsed and before the Tokio runtime is built |
+  | Python | `import s3dlio`: the native module's initialisation, the first thing it does. `s3dlio/torch.py` imports the native module before `torch`, so the file is loaded before s3dlio's own torch import. A `torch` (or anything else) that the application imported **before** `import s3dlio` has already run: torch-side settings are not covered. |
+  | Rust | the first use of any entry point that reads or changes a setting: the global runtime, `configure_thread_pools`, `store_for_uri*`, an S3 / Azure / GCS client, the S3 dataset constructors, `Logger::new`, the process-wide endpoint and `set_s3_endpoint_override`, a bucket or container listing, the Arrow backend set-up, the public HTTP-client builders (`reqwest_client::build_smithy_http_client`, `build_reqwest_http_client*`), the public setting readers in `constants` (`H2WindowConfig::from_env`, `connect_timeout_secs`, `max_retry_attempts`, `mpi_world_size`, `mpi_aware_thread_budget`, `effective_thread_budget`), `MultiEndpointStore::new` / `from_config`, `AzureConfig::default`, and the latched knobs (`S3DLIO_UNSIGNED_PAYLOAD`, `S3DLIO_SKIP_HEAD`, `S3DLIO_ENABLE_RANGE_OPTIMIZATION`, `S3DLIO_RANGE_THRESHOLD_MB`, `S3DLIO_SIZE_CACHE_TTL_SECS`, `S3DLIO_GCS_RAPID`) |
+
+  **What this does not promise.** s3dlio cannot know whether its host is multi-threaded. A Python
+  application, an inference server or a Rust program may already have threads when it first calls
+  s3dlio, and setting an environment variable is not safe against another thread that is inside C
+  `getenv` at that moment. Only `s3-cli` loads the file as its first act on its main thread, with no
+  other thread running. A host that needs the file's values, or a race-free environment, before its own
+  threads start should load the file (or set the real environment) at the very start of the process.
+  Forked children inherit the parent's resolved policy and the file it already loaded: set the switch
+  before importing s3dlio and forking, or use a freshly spawned process when the policy must differ.
+
+  **Recorded limits (not covered by the file).**
+  - The one-time warning about the retired `S3DLIO_S3_ENDPOINT_HINT_TLDS` variable is read on the first
+    URI classification, before the file is applied: a value that only the file carries never produces
+    that warning if classification is the first s3dlio call. Warning only; no setting is affected.
+  - The separate `s3dlio-oplog` crate (`OpLogStreamReader::from_file`: `S3DLIO_OPLOG_READ_BUF`,
+    `S3DLIO_OPLOG_READ_CHUNK_SIZE`) has no access to s3dlio's file policy and reads the real environment
+    only.
+  - Python helpers that read `os.environ` directly (`s3dlio.integrations.dlio` multipart configuration,
+    `s3dlio.compat.s3torchconnector`) see the interpreter's start-up copy, not variables the file
+    supplied (see the `os.environ` note below).
+  - `reqwest_client::build_reqwest_http_client_with_ca` (and `build_reqwest_http_client`,
+    `warmup_connection_pool`, which call it) apply the policy first like the other public builders, but
+    that protocol choice (HTTP/2 over TLS) has no automated first-call test.
+
+  (Python's `os.environ` is a copy taken when the interpreter starts, so it does not show variables
+  that s3dlio loads from the file; s3dlio and other native code read the real process environment.)
+  Python users can also load the file themselves **before** `import s3dlio` (see below). An application
+  that needs the file's values before its own first call into s3dlio should load it first thing:
+
+```rust
+// Rust: load a specific file explicitly; variables that are already set are kept.
+s3dlio::dotenv::load_env_file("/etc/myapp/s3dlio.env")?;
+```
+
+```python
+# Python: use python-dotenv (or set os.environ yourself) BEFORE importing s3dlio,
+# or run the process with S3DLIO_LOAD_DOTENV=/etc/myapp/s3dlio.env
+from dotenv import load_dotenv
+load_dotenv("/etc/myapp/s3dlio.env")
+import s3dlio
+```
+
+```bash
+S3DLIO_LOAD_DOTENV=1 python train.py                        # the working directory's .env
+S3DLIO_LOAD_DOTENV=/etc/myapp/s3dlio.env python train.py    # exactly that file
+S3DLIO_LOAD_DOTENV=0 s3-cli ls s3://bucket/                 # s3-cli without reading .env
+```
+
 ## HTTP Client & Performance Optimization
 
 ### Redirect Following (for AIStore and other S3-compatible services that use 3xx redirects)
@@ -114,7 +205,72 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 |----------|---------|-------------|
 | `S3DLIO_CONNECT_TIMEOUT_SECS` | `20` | TCP connect timeout in seconds.  Covers only the SYN → SYN-ACK handshake.  Honored by both the reqwest transport and the AWS SDK `TimeoutConfig` layer (unified in v0.9.102).  Default bumped from 10 s to 20 s in v0.9.102 after mlcommons/storage#506 showed the previous 5 s SDK-layer ceiling was the trigger for cold-start dispatch failures.  Raise further (e.g. `30` or `60`) for extreme fan-out scenarios where the endpoint's TCP accept queue is briefly saturated by thousands of concurrent connects. |
 | `S3DLIO_OPERATION_TIMEOUT_SECS` | `60` | Full request/response cycle timeout in seconds (excluding the connect handshake).  60 s is sufficient for ~6 GB at 100 MB/s and ~60 GB at 1 GB/s.  Raise for very large single objects or slow networks. |
-| `S3DLIO_MAX_RETRY_ATTEMPTS` | `3` | Maximum number of attempts (1 initial + N−1 retries) per operation before propagating the error.  Governs **two** retry layers: (a) the AWS SDK's own retry (matches the SDK's default) which covers `send()`-phase failures such as connect / dispatch errors, and (b) since v0.9.108 (issue #148 Phase 4) the shared `retry_get_body` helper which covers **body-transfer** failures — once the reqwest connector streams response bodies to the SDK (`SdkBody::from_body_1_x`), smithy's retry no longer covers errors that surface while the caller consumes the streaming body, so a bounded-linear-backoff retry loop with the same attempt budget is applied at four caller sites (`S3Ops::get_object`/`get_object_range`, `S3ObjectStore::get`/`get_range` direct-client paths, and the range-chunk task inside `concurrent_range_get_impl`).  Set to `1` for **fast-fail at warmup** (no retries; surface a dispatch failure in one connect budget instead of three) — useful for debugging mlcommons/storage#506-style cold-start issues.  Set to `5` or higher to ride out flaky-network bursts.  Clamped to a minimum of 1; the SDK rejects 0. |
+| `S3DLIO_MAX_RETRY_ATTEMPTS` | `3` | Maximum number of attempts (1 initial + N−1 retries) per operation before propagating the error.  Governs **two** retry layers: (a) the AWS SDK's own retry (matches the SDK's default) which covers `send()`-phase failures such as connect / dispatch errors, and (b) since v0.9.108 (issue #148 Phase 4) the shared `retry_get_body` helper which covers **body-transfer** failures — once the reqwest connector streams response bodies to the SDK (`SdkBody::from_body_1_x`), smithy's retry no longer covers errors that surface while the caller consumes the streaming body, so a bounded-linear-backoff retry loop with the same attempt budget is applied at four caller sites (`S3Ops::get_object`/`get_object_range`, `S3ObjectStore::get`/`get_range` direct-client paths, and the range-chunk task inside `concurrent_range_get_impl`).  Set to `1` for **fast-fail at warmup** (no retries; surface a dispatch failure in one connect budget instead of three) — useful for debugging mlcommons/storage#506-style cold-start issues.  Set to `5` or higher to ride out flaky-network bursts.  Clamped to a minimum of 1; the SDK rejects 0.  Which loops honour the transient-only rule (issue #240): the shared `retry_get_body` helper -- used by `S3Ops::get_object` / `get_object_range`, the direct-client paths of `S3ObjectStore::get` / `get_range` (every per-endpoint store), and the global-client ranged GET helper in `s3_utils` -- and the inline per-chunk loop of the concurrent range GET (`get_object_concurrent_range_async`).  Both retry only connection/dispatch errors, timeouts, 5xx, 408, 429, S3 throttling and transient codes (`SlowDown`, `RequestTimeout`, `InternalError`, `ServiceUnavailable`, `ExpiredToken`, `RequestExpired`, `OperationAborted`, ...), and body-transfer (streaming) errors; a definite client error such as 404 `NoSuchKey`, 403 `AccessDenied` or 412 is returned after one request with no backoff.  Errors that cannot be classified are retried.  The AWS SDK's own retry layer (a) is unchanged and not covered by this rule. |
+
+### Borrowed Python buffers: completion barrier
+
+| Variable | Default | Description |
+|---|---|---|
+| `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` | `30` | How long `put_bytes` waits, after the store finished, for every native reader of the caller's buffer to let go before it gives up and raises `s3dlio.ExportStillReferencedError` (the buffer then stays pinned: do not reuse it). The awaitable of `put_bytes_async(borrow=True)` never completes while a reader remains: at every missed deadline it emits a `RuntimeWarning`, counts it (`_put_export_stats()["quiesce_timeouts"]`) and keeps waiting. Fractions allowed (minimum 0.001); unusable values select the default. The blocking wait is not interruptible by signals. |
+
+### Direct I/O (`direct://`) shared bounce-buffer pool
+
+O_DIRECT needs page-aligned memory. A `direct://` PUT whose source address is already page-aligned (pinned
+buffers, the result of a `direct://` GET) is written straight from the caller's memory in one `write` per at most
+2 GiB: no copy, no pool. Every other transfer is copied through **warm, reused, page-aligned bounce buffers**:
+
+* **One pool per NUMA node, shared by PUTs and GETs.** A request uses the pool of the node its thread runs on
+  (`sched_getcpu` mapped through `/sys/devices/system/node/node*/cpulist`); a host with one node, no sysfs, or a
+  non-Linux OS has one pool. A node's pool is created lazily on its first use: its buffers are allocated and
+  first-touched on that node (an `mbind` to the node, best effort, plus first touch from a thread pinned to the
+  node's CPUs) and then kept for the life of the process.
+* **Ping-pong pairs.** A request that moves more than one buffer's worth leases one pair (2 buffers) for its whole duration; a smaller one leases a single buffer (see below). PUT: chunk `k+1` is copied
+  into one buffer while chunk `k` is written from the other, then they swap (the write runs on a helper thread).
+  GET: chunk `k+1` is read into one buffer while chunk `k` is copied out of the other into the destination.
+* **Bounded POOLED memory.** The pool buffers total exactly **`nodes x pairs x 2 x size`** (default: 4 pairs x 2 x 16 MiB =
+  128 MiB per NUMA node; 8 pairs / 256 MiB on a two-node host) for ALL requests in both directions, and every buffer a request leases comes from there.
+  That bound covers the pooled path only; see "Outside the pooled bound" below.
+* **When every pair of the node is in use** the request either **waits** (default) in strict FIFO order shared by
+  PUTs and GETs, so neither direction can starve the other, or, with `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY=fallback`,
+  uses a private buffer of one bounce size for this request (serial copy-then-I/O, no pipelining; extra memory is
+  one buffer per concurrent request beyond the pool, counted in `BounceStats::fallback_live_bytes`).
+* A transfer of at most one buffer leases ONE buffer; a larger one leases two, ATOMICALLY (all or none, in
+  strict FIFO order: no request ever holds one buffer while waiting for another, so mixed traffic cannot
+  deadlock). Leases are RAII and are owned by the blocking closure that does the I/O: a cancelled request
+  can never return a buffer to the pool while a blocking write or read still uses it, and a request that is
+  still WAITING when it is cancelled gives up before any I/O starts.
+* **Bound of the pooled path.** With the default `wait` policy the bytes of pool buffers leased at any instant never
+  exceed the cap (`nodes x pairs x 2 x size`); `BounceStats::peak_leased_bytes` records the peak at every lease, so a
+  test can prove it independent of throughput. This says nothing about the allocations below.
+* **Availability first when the pool cannot serve a request.** If a node's pool cannot be created (out of memory;
+  retried every 30 s) or cannot give the requested alignment, the transfer does NOT fail: it takes a private per-call
+  bounce buffer of up to one bounce size. Those allocations are outside the cap. They are counted
+  (`direct_bounce::bounce_stats()`: `implicit_fallbacks` per direction, `implicit_fallback_bytes`, and the cause in
+  `pool_unavailable` / `alignment_mismatches`) and the first one is logged; their number is bounded only by the number
+  of concurrent requests.
+* **Outside the pooled bound, by design:** the opt-in `fallback` buffers and the implicit ones above (each counted
+  separately), the zero-padded 4 KiB tail block of a page-aligned PUT (one page per concurrent PUT), the object-sized
+  aligned destination a default-mode (`direct`) GET returns, the private buffer of every `direct://` range read (sized
+  to the range; ranges larger than the range pool's buffer are admitted by count only, and a store without a range pool
+  allocates without admission), and the up-to-64 MiB staging buffer of every unaligned `direct://` streaming writer.
+  Only the implicit and `fallback` buffers are counted. Do not read `peak_leased_bytes <= bounce_memory_cap()` as a bound on the process's
+  direct-I/O memory.
+* A GET can instead read straight into one fresh page-aligned buffer of the object's size (zero copies, but fresh
+  page faults on every call): `S3DLIO_DIRECT_IO_GET_MODE=direct`, the current default. `pooled` sends GETs through
+  the pool (warm buffers, one copy into the destination). Which is faster depends on load; the default stays
+  `direct` until measured. The result of either is page-aligned memory.
+
+| Variable | Default | Description |
+|---|---|---|
+| `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` | `16` | Size of one bounce buffer in MiB, clamped to 4..=64 (`0` or unparseable selects 16). Bigger means fewer syscalls per bounced object; the memory cap grows with it. It does not change the size of a page-aligned (zero-copy) transfer. |
+| `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE` | `4` | Ping-pong pairs (2 buffers each) per NUMA node, 1..=64 (`0` or unparseable selects 4). More pairs let more requests use warm buffers at once, at `2 x size` more memory per pair per node. |
+| `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY` | `wait` | `wait` (FIFO across PUTs and GETs) or `fallback` (private one-buffer fallback), see above. |
+| `S3DLIO_DIRECT_IO_GET_MODE` | `direct` | `direct` (fresh aligned buffer, zero copies) or `pooled` (through the shared pool). |
+
+The default pool shape is **4 pairs x 16 MiB per NUMA node** (128 MiB per node, the same budget as the earlier 1 pair x 64 MiB). It is provisional: chosen from a discrete-event model of the pool, not from a hardware measurement, and to be confirmed with native counters on hardware. The model's advantage is for unaligned (bounced) scenarios, for example a high-concurrency mix of unaligned PUTs, where it estimates roughly 42 GB/s for 4 x 16 MiB against roughly 18 GB/s for 1 x 64 MiB at the same budget; page-aligned controls use no bounce memory and tie. A bounced object larger than 16 MiB takes more, smaller writes or reads than with a 64 MiB buffer (page-aligned transfers are unchanged). To restore the earlier shape set `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=64` and `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE=1`.
+
+The streaming `direct://` writer (`DirectIOWriter`) stages up to 64 MiB in its own aligned buffer; a page-aligned
+chunk bypasses it. Before v0.9.128 `direct://` wrote and read 4 KiB per system call (issue #244).
 
 ## Data Integrity: Write Verification and Retry (v0.9.104+, opt-in as of v0.9.106)
 
@@ -229,6 +385,16 @@ export S3DLIO_DISABLE_MULTIPART=true
 export S3DLIO_MULTIPART_PART_SIZE_MB=64
 export S3DLIO_MULTIPART_MAX_IN_FLIGHT=16
 ```
+
+## Object Size Cache
+
+Sizes learned by HEAD/stat are cached (per process for the S3 read path, per store for the
+`ObjectStore` implementations) so repeat reads skip the HEAD.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_SIZE_CACHE_TTL_SECS` | `3600` | Time-to-live of the process-global S3 size cache, in seconds.  An entry older than this counts as a miss and is removed when it is next looked up. |
+| `S3DLIO_SIZE_CACHE_MAX_ENTRIES` | `1048576` | Maximum number of entries in a size cache (issue #241).  When a new URI arrives at the limit the entry written longest ago (the one closest to expiry) is evicted.  A full cache costs roughly 200 bytes per entry for ~60-character URIs (200-300 MB at the default).  Read once per process, before the first cache is created; unparseable values use the default, `0` is raised to `1`.  Eviction is oldest-written-first, not least-recently-read: an epoch loop over more distinct objects than the limit gets almost no hits, so for datasets above about a million objects set this above the object count. |
 
 ## Range GET Optimization
 
@@ -431,18 +597,70 @@ When a URI's first segment is a server (an explicit `host:port`, see above), s3d
 
 ## Azure Blob Storage Configuration
 
+**Authentication.** The storage account is taken from the URI (`az://account/container/key`).
+`S3DLIO_AZURE_CREDENTIAL` selects how s3dlio authenticates (case-insensitive; an unknown value is an
+error that lists the valid ones):
+
+| Value | What is used | Variables read |
+|-------|--------------|----------------|
+| `auto` (default) | A fallback chain, like the Azure SDKs' `DefaultAzureCredential`: tries workload identity, client secret, client certificate, managed identity, then `cli`, in that order, and uses the first that yields a token. Never picks `sas` or `none`. On an `http` endpoint (Azurite) `auto` sends no credential. | see below |
+| `workload-identity` | AKS / Entra workload identity (federated token) | `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` |
+| `client-secret` | Service principal with a secret | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` |
+| `client-certificate` | Service principal with a certificate: a PKCS#12 (`.pfx`) file with an RSA key. **Only in builds with the cargo feature `azure-client-certificate`** (it links OpenSSL; not in `full-backends` or the default wheel) | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_CERTIFICATE_PATH`, optional `AZURE_CLIENT_CERTIFICATE_PASSWORD`, optional `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN` (read by the SDK) |
+| `managed-identity` | Azure VM (instance metadata service), App Service, Arc, Functions managed identity | optional `AZURE_CLIENT_ID` (a user-assigned identity); the SDK reads `IDENTITY_ENDPOINT`, `IDENTITY_HEADER`, `IMDS_ENDPOINT`, `MSI_ENDPOINT`, `MSI_SECRET` |
+| `cli` | `az login`, then `azd auth login` (the `az` / `azd` executable must be on `PATH`; it is run for every token request) | none |
+| `sas` | No bearer token; `S3DLIO_AZURE_SAS_TOKEN` is appended to every request URL (works over `http` and `https`) | `S3DLIO_AZURE_SAS_TOKEN` |
+| `none` | No credential (anonymous access, Azurite) | none |
+
+**How `auto` works.** At the first token request it goes down the chain and skips every member whose variables
+are not set: `workload-identity` needs `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`;
+`client-secret` needs `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_SECRET`; `client-certificate` needs
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_CLIENT_CERTIFICATE_PATH`; `managed-identity` applies when
+`IDENTITY_ENDPOINT` or `MSI_ENDPOINT` is set, or when the instance metadata service at 169.254.169.254:80 answers
+`GET /metadata/instance` with an Azure instance document (Google Cloud and AWS VMs answer that address too and are not
+taken for Azure); `cli` always applies. A member that fails to produce a token (an identity not assigned to the VM, a
+rejected secret, `az` not installed) is passed over and the next is tried. The member that works is remembered for the
+process, but not trusted blindly: if it later fails to produce a token, the chain is run again for that request, so a
+working member further down is found without a restart (the member that just failed is left to the end of that request's
+re-run: asked again only if nothing else works). If none works the error lists each member tried and why. A
+configured service principal (workload identity, client secret, client certificate) that fails is logged at `warn`
+level before `auto` moves on. The managed-identity attempt has its own deadline, `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`
+(default 5000): the SDK retries a 404/410/5xx from the instance metadata service with back-off for about 72 s, which
+is too long to wait before trying `az`. The same deadline applies when a managed identity that already won stalls on a
+later token refresh (the chain is then run again with the managed identity left to the end, so a stall costs one deadline
+when another member works, and a lone managed identity still gets its second try). A request forgets the winner only if it
+is still the one that request used, which protects a newer winner of a different mode; a re-installed winner of the same
+mode is the same credential object, so a late failure can still clear it once, costing one extra chain run. **Only managed identity has a deadline of its own.** The other members are bounded by what the Azure SDK
+does: workload identity, client secret and client certificate make HTTPS requests with the SDK's 20 s connect and 60 s
+read timeouts (per request, retries not counted), while `az`/`azd` is a subprocess that `azure_identity` 1.0.0 waits for
+with no timeout at all, so a hung `az` hangs the token request. The metadata probe runs off the async runtime's workers and is bounded: at
+most 250 ms to connect plus one 250 ms deadline to read the answer (under 0.5 s). It runs only when nothing else
+decides the managed-identity question, and a "not Azure" answer is believed for 30 s, so a failing chain does not
+probe on every request. **Changed in this release:** before, the default was `az`/`azd` only and the
+`AZURE_*` service-principal variables were ignored; with `auto` they are now honoured, and a host that is on Azure
+tries its managed identity before `az`. Set `S3DLIO_AZURE_CREDENTIAL=cli` for the old behaviour.
+
+`AZURE_AUTHORITY_HOST` (default `https://login.microsoftonline.com`; it must be `https`) is read by the SDK for
+`client-secret`, `client-certificate` and `workload-identity`. Each credential is created once per process and shared
+for the life of the process, so the SDK caches and refreshes its tokens; a rotated secret, certificate or federated
+token file is not picked up until the process restarts. The bearer token itself is cached by each cached per-account
+client (at most 64) until it nears expiry. Only `cli` runs a process (per token request, not per object). A request
+rejected with 401 or 403 and a failed token request both name the credential mode in the error.
+A bearer-token mode needs an `https` endpoint (the SDK refuses a token over `http`); use `sas` or `none` for an
+`http` endpoint. The SAS token is never logged and is removed from error messages. Not read: `AZURE_STORAGE_ACCOUNT`,
+`AZURE_STORAGE_KEY` and connection strings. Account-key (Shared Key) authentication is **not supported**: the Azure SDK in
+use (`azure_storage_blob` 1.0 / `azure_core` 1.1) can only sign requests with bearer tokens or use a SAS.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AZURE_STORAGE_ACCOUNT` | (unset) | Azure storage account name |
-| `AZURE_STORAGE_KEY` | (unset) | Azure storage account key |
-| `AZURE_CLIENT_ID` | (unset) | Azure AD client ID (for service principal auth) |
-| `AZURE_CLIENT_SECRET` | (unset) | Azure AD client secret |
-| `AZURE_TENANT_ID` | (unset) | Azure AD tenant ID |
+| `S3DLIO_AZURE_CREDENTIAL` | `auto` | Credential mode (above) |
+| `S3DLIO_AZURE_SAS_TOKEN` | (unset) | SAS token for `sas` mode |
+| `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS` | `5000` | In `auto`, how long to wait for a managed-identity token (first attempt, or the refresh of a managed identity that already won) before trying the next member |
 | `AZURE_STORAGE_ENDPOINT` | (unset) | **Custom Azure endpoint** (e.g., `http://localhost:10000` for Azurite) |
 | `AZURE_BLOB_ENDPOINT_URL` | (unset) | Alternative for `AZURE_STORAGE_ENDPOINT` |
 | `S3DLIO_AZURE_DOWNLOAD_MODE` | `auto` | Download strategy: `auto`, `azure-sdk`, `s3dlio`, or `sequential` |
 | `S3DLIO_AZURE_CONCURRENT_ENGINE` | `azure-sdk` | Concurrent engine selected by `auto`: `azure-sdk` or `s3dlio` |
-| `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB` | `32` | Object size at which `auto` enables its concurrent engine |
+| `S3DLIO_AZURE_DOWNLOAD_THRESHOLD_MB` | `32` | Object size at which `auto` switches from one stream to the concurrent engine. In the default mode (`auto` with the `azure-sdk` engine) no size is looked up: every blob is read with the SDK's managed download, which is one request up to the partition size (`S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB`) and concurrent above it, so the threshold only matters with `S3DLIO_AZURE_CONCURRENT_ENGINE=s3dlio` (or the legacy `enable_range_engine`), where it is compared with a `HEAD` size |
 | `S3DLIO_AZURE_DOWNLOAD_CONCURRENCY` | `16` | Parallel requests used by Azure SDK managed downloads |
 | `S3DLIO_AZURE_DOWNLOAD_PART_SIZE_MB` | `32` | Partition size used by Azure SDK managed downloads |
 
@@ -486,6 +704,12 @@ sai3-bench util ls gs://testbucket/
 export GCS_ENDPOINT_URL=http://localhost:9002
 sai3-bench util ls gs://testbucket/
 ```
+
+## Test and Release-Validation Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3DLIO_REQUIRE_FULL_BACKENDS` | (unset) | Read by `python/tests/test_full_backend_azure_gcs.py` only (not by the library). Unset or empty: the Azure tests are skipped on a wheel built without the Azure backend (and the GCS test on one without GCS). `1`, `true`, `yes` or `on` (case-insensitive): a missing backend **fails** every test, so an all-skipped run cannot pass for a release gate. `0`, `false`, `no` or `off`: skip, explicitly. Any other value is also a failure (a mistyped flag must not turn into a silent skip). Set it for any run meant to exercise a wheel with Azure (the PyPI/`./build_pyo3.sh` default wheel: the Azure tests need only Azure; the one GCS test needs `./build_pyo3.sh full` and is deselected otherwise), and check the run's pass count too. |
 
 ## Usage Examples
 
@@ -641,6 +865,7 @@ export S3DLIO_ENABLE_RANGE_OPTIMIZATION=0    # disable range-split GETs
 
 ## Version History
 
+- **v0.9.128** *(new: `S3DLIO_LOAD_DOTENV`, `S3DLIO_AZURE_CREDENTIAL`, `S3DLIO_AZURE_SAS_TOKEN`, `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`, `S3DLIO_SIZE_CACHE_MAX_ENTRIES`, `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE`, `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY`, `S3DLIO_DIRECT_IO_GET_MODE`, `S3DLIO_REQUIRE_FULL_BACKENDS`; behaviour changes: library use no longer reads `.env`, Azure credential default `auto`, `direct://` bounce-pool default)*: `S3DLIO_LOAD_DOTENV` is the one switch for `.env` loading (`1`/`true`/`yes`/`on`, `0`/`false`/`no`/`off`, or a file path); the default is off for library use (Rust and Python) and on for `s3-cli`. `S3DLIO_AZURE_CREDENTIAL` selects the Azure credential mode (default `auto`, a fallback chain; `cli` restores the old `az`/`azd`-only behaviour), `S3DLIO_AZURE_SAS_TOKEN` supplies the token for `sas` mode, and `S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS` (default 5000) bounds the managed-identity attempt in `auto`; the standard `AZURE_*` variables of each mode are listed in "Azure Blob Storage Configuration" above. `S3DLIO_SIZE_CACHE_MAX_ENTRIES` (default 1048576) bounds the object size cache (#241). `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (default 30) is how long a borrowed Python buffer put waits for its readers (#238). The four `S3DLIO_DIRECT_IO_*` variables size and tune the shared per-NUMA-node `direct://` bounce pool (new default 4 pairs x 16 MiB per node, provisional) and select the GET mode (#244). `S3DLIO_REQUIRE_FULL_BACKENDS` is read only by the Python test `test_full_backend_azure_gcs.py`, never by the library. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.126** *(no new environment variables; behaviour changes are in the changelog)*: an `s3://` URI selects the exact name, its directory or an explicit `*` glob (`--pattern` is the explicit regex); a concurrency, chunk or worker limit of 0 is an error; per-endpoint stores run every operation on their own server; object keys are used exactly as written. First published release after 0.9.112 (0.9.114 through 0.9.124 were not published to PyPI). Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.124** *(no new environment variables; behaviour changes are in the changelog)*: delete contract (exact delete is one DELETE request, `-r` uses the literal prefix, directories refused without `-r`) for `s3-cli delete` and Python `delete()`; op-log `file:x` destinations rejected; op-log rows with a TAB, LF or CR in an identity field rejected and counted; `build_pyo3.sh` requires both cp312 and cp313 wheels. Full changelog: [`docs/Changelog.md`](Changelog.md).
 - **v0.9.122** *(behaviour change: `AWS_ENDPOINT_URL_S3` precedence)*: `AWS_ENDPOINT_URL_S3` now takes precedence over `AWS_ENDPOINT_URL`, as in the AWS SDK; an empty value counts as unset. The op-log helper rows record this effective endpoint. `s3-cli --endpoint-url` and Python `configure_s3(endpoint_url=...)` still win over both. Limitation of `set_s3_endpoint_override`: it writes the process environment (unsafe against native threads that read it concurrently; nothing enforces the ordering), so call it at start-up, before any S3 work or native threads; an override made after the first S3 operation does not move the already-built process-wide client. A server named in a URI (`s3://host:port/bucket`) wins for that URI. Full changelog: [`docs/Changelog.md`](Changelog.md).

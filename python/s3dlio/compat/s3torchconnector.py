@@ -28,7 +28,9 @@ Environment variables (same as s3torchconnector):
     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY - S3 credentials
     AWS_ENDPOINT_URL - Custom endpoint (MinIO, Ceph, etc.)
     AWS_REGION - Default region (if not specified in from_prefix)
-    AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCOUNT_KEY - Azure credentials
+    Azure (az://account/container/key): S3DLIO_AZURE_CREDENTIAL selects the credential (default
+        auto: service principal, managed identity or `az login`). AZURE_STORAGE_ACCOUNT_NAME / _KEY
+        are not read by s3dlio.
     GOOGLE_APPLICATION_CREDENTIALS - GCS service account JSON path
 """
 
@@ -546,8 +548,8 @@ class S3Checkpoint:
         Context manager for writing checkpoint to storage.
 
         torch.save() serializes into an in-memory buffer, then on __exit__
-        the entire payload is uploaded via put_bytes() (one copy from Python
-        heap to Rust Bytes, then zero-copy through the upload pipeline).
+        the entire payload is uploaded via put_bytes() (put_bytes does not copy
+        the payload; building the bytes object is the only copy).
 
         Args:
             uri: Full URI to checkpoint (e.g., "s3://bucket/checkpoint.pt")
@@ -575,8 +577,8 @@ class S3Checkpoint:
                 return self.buffer.seek(offset, whence)
 
             def close(self):
-                # getbuffer() returns a memoryview — no copy
-                # put_bytes does Bytes::copy_from_slice once (unavoidable Python→Rust)
+                # getbuffer() returns a memoryview — no copy; bytes(mv) is the one
+                # copy here (put_bytes itself does not copy a bytes object)
                 mv = self.buffer.getbuffer()
                 _core.put_bytes(self.uri, bytes(mv))
                 mv.release()
@@ -686,8 +688,8 @@ class S3Client:
         Create a writer for uploading object data.
 
         The writer accumulates data in a BytesIO buffer, then uploads
-        via put_bytes() on close() (one unavoidable Python→Rust copy,
-        then zero-copy through the upload pipeline).
+        via put_bytes() on close() (put_bytes does not copy the payload;
+        the bytes(...) / read() that builds it is the only copy).
 
         Args:
             bucket (str): Bucket name
@@ -708,7 +710,7 @@ class S3Client:
                 return self.buffer.write(data)
 
             def close(self):
-                """Upload accumulated data via put_bytes (one copy Python→Rust)"""
+                """Upload accumulated data via put_bytes (read() makes the only copy)"""
                 if self.buffer.tell() > 0:
                     self.buffer.seek(0)
                     payload = self.buffer.read()

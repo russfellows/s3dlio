@@ -109,6 +109,17 @@ S3DLIO_SIZE_CACHE_TTL_SECS=60     # Short TTL if objects are frequently replaced
 Object files in training datasets are immutable for the lifetime of a run. 1 hour is conservative
 and appropriate for all realistic training job durations.
 
+**Bounded size (issue #241):** the cache holds at most `S3DLIO_SIZE_CACHE_MAX_ENTRIES` entries
+(default 1,048,576; roughly 200 bytes per entry for ~60-character URIs, so 200-300 MB when full).
+An expired entry is removed as soon as a lookup finds it, and when a new URI arrives at the limit
+the entry written longest ago is evicted (all entries share one TTL, so that is also the one closest
+to expiry; expired entries go first). Every operation is O(1): the write order is a slab-backed
+linked list, an overwrite updates its entry in place, and nothing ever scans or compacts under the
+lock. Eviction is oldest-written-first, not least-recently-read, so an epoch loop over MORE distinct
+objects than the limit evicts each size just before it is needed again and gets almost no cache hits
+(the same HEADs as with no cache). For datasets above about a million objects, raise
+`S3DLIO_SIZE_CACHE_MAX_ENTRIES` above the object count.
+
 ### 2.5 Mutex Elimination in `concurrent_range_get_impl()`
 
 **Problem:** All concurrent range chunk writers shared a single `Arc<Mutex<BytesMut>>`. With up
@@ -230,6 +241,7 @@ protocol; DLIO uses `get_many()` directly.
 | `S3DLIO_RANGE_THRESHOLD_MB` | `32` | Files above this MB use concurrent range GETs |
 | `S3DLIO_RT_THREADS` | `32` | Tokio async runtime threads per process |
 | `S3DLIO_SIZE_CACHE_TTL_SECS` | `3600` | Object size cache TTL in seconds |
+| `S3DLIO_SIZE_CACHE_MAX_ENTRIES` | `1048576` | Maximum entries in an object size cache; oldest-written evicted first, expired ones removed when found (see § 2.4) |
 
 **Production tuning cheat sheet:**
 

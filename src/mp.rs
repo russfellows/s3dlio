@@ -172,6 +172,7 @@ impl RunSummary {
 
 /// Run a multi-process GET operation with the given configuration
 pub fn run_get_shards(cfg: &MpGetConfig) -> Result<RunSummary> {
+    crate::dotenv::apply();
     // Issue #211: a worker count of 0 would divide by zero when sharding the keys.
     crate::concurrency::require_concurrency_at_least_one("procs", cfg.procs)?;
     // Issue #211: each worker is started with `--concurrent N`; 0 would hang it.

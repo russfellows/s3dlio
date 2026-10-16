@@ -164,3 +164,74 @@ async fn exact_length_chunks_still_succeed() -> Result<()> {
 
     Ok(())
 }
+
+/// The single-request branch (an object below `min_split_size`) holds the same contract as the
+/// concurrent one: the response must be exactly the requested length. Previously any length was
+/// returned as a success, so a caller that guarded a cached size by asking for one byte more
+/// (or whose object had shrunk) got a wrong-length body and no error (Blue final review F1).
+#[tokio::test]
+async fn single_request_short_and_over_reads_are_errors() -> Result<()> {
+    let engine = RangeEngine::new(RangeEngineConfig {
+        chunk_size: 1024 * 1024,
+        max_concurrent_ranges: 4,
+        min_split_size: 1024 * 1024, // 1000 bytes is far below: the single-request branch
+        range_timeout: Duration::from_secs(5),
+    });
+    let object_size = 1000u64;
+    let data = vec![0x5Au8; 4096];
+
+    for (label, returned) in [
+        ("short", 999usize),
+        ("over", 1001),
+        ("empty", 0),
+        ("far over", 4096),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let get_range = {
+            let data = data.clone();
+            let calls = Arc::clone(&calls);
+            move |offset: u64, _length: u64| {
+                let data = data.clone();
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, anyhow::Error>(Bytes::from(
+                        data[offset as usize..offset as usize + returned].to_vec(),
+                    ))
+                }
+            }
+        };
+        let result = engine.download(object_size, get_range, None).await;
+        // Not `expect_err`: its failure message would dump the accepted body.
+        let Err(err) = result else {
+            panic!(
+                "RED: a {label} single-request response ({returned} bytes for {object_size}) was accepted"
+            );
+        };
+        assert!(
+            err.to_string().contains("short/over read"),
+            "{label}: {err:#}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{label}");
+    }
+
+    // The exact length still succeeds, and a size of zero still needs no request.
+    let exact = move |offset: u64, length: u64| {
+        let data = data.clone();
+        async move {
+            Ok::<Bytes, anyhow::Error>(Bytes::from(
+                data[offset as usize..(offset + length) as usize].to_vec(),
+            ))
+        }
+    };
+    let (bytes, stats) = engine.download(object_size, exact, None).await?;
+    assert_eq!(bytes.len(), 1000);
+    assert_eq!(stats.ranges_processed, 1);
+    let never = |_o: u64, _l: u64| async move {
+        Err::<Bytes, anyhow::Error>(anyhow::anyhow!("a zero-size download made a request"))
+    };
+    let (bytes, stats) = engine.download(0, never, None).await?;
+    assert!(bytes.is_empty());
+    assert_eq!(stats.ranges_processed, 0);
+    Ok(())
+}

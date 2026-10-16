@@ -225,6 +225,12 @@ impl RangeEngine {
     /// - Small objects (< min_split_size): Single request
     /// - Large objects: Concurrent range requests with streaming
     ///
+    /// Both strategies enforce the same exact-length contract: `get_range` must return exactly
+    /// the bytes asked for, and a short or over-long read is an error, never a successful
+    /// partial object. A caller that planned from a possibly stale size relies on this (it asks
+    /// for one byte more than it expects and retries with a fresh size when the read fails).
+    /// A zero `object_size` returns an empty object without calling `get_range`.
+    ///
     /// # Arguments
     ///
     /// * `object_size` - Total size of the object in bytes
@@ -313,6 +319,18 @@ impl RangeEngine {
                 )
             })?
             .map_err(|e| anyhow::anyhow!("Single request failed: {}", e))?;
+
+        // The same locked contract as the concurrent path: a short or over read is an error. A
+        // caller that planned from a possibly stale size relies on it (it asks for one byte more
+        // than it expects, and retries with a fresh size when this fails); accepting any length
+        // here returned a truncated or over-long object as a success.
+        if bytes.len() as u64 != object_size {
+            return Err(anyhow::anyhow!(
+                "Single request short/over read: expected {} bytes, got {} bytes",
+                object_size,
+                bytes.len()
+            ));
+        }
 
         let bytes_downloaded = bytes.len() as u64;
         let elapsed = start_time.elapsed();

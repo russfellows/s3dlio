@@ -17,6 +17,38 @@ pub struct Reader<'a> {
     pub base_uri: String,
 }
 
+/// Fetch a shard and decode it, validating `expected_checksum` when there is one.
+///
+/// A checksum a writer reports (and the manifest stores) covers the UNCOMPRESSED shard
+/// bytes. A `.zst` shard is stored compressed, so for those the object is fetched,
+/// decompressed, and the decompressed bytes are checked; checking the stored (compressed)
+/// bytes could never match. An unsupported or malformed checksum is refused before
+/// anything is fetched.
+async fn fetch_shard_validated(
+    store: &dyn ObjectStore,
+    uri: &str,
+    shard_rel_key: &str,
+    expected_checksum: Option<&str>,
+) -> Result<Bytes> {
+    if let Some(expected) = expected_checksum {
+        crate::checksum::parse_expected_crc32c(expected)?;
+    }
+    if shard_rel_key.ends_with(".zst") {
+        use std::io::Read;
+        let stored = store.get(uri).await?;
+        let mut decoder = zstd::Decoder::new(&stored[..])?;
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)?;
+        if let Some(expected) = expected_checksum {
+            crate::checksum::verify_crc32c(&decompressed, expected, uri)?;
+        }
+        Ok(Bytes::from(decompressed))
+    } else {
+        // Return Bytes directly - zero copy!
+        store.get_with_validation(uri, expected_checksum).await
+    }
+}
+
 /// Read one shard by relative key from an owned store handle.
 ///
 /// Functionally equivalent to `Reader::read_shard(_with_validation)?` but
@@ -36,19 +68,22 @@ async fn read_shard_owned(
     expected_checksum: Option<&str>,
 ) -> Result<Bytes> {
     let uri = format!("{}/{}", base_uri, shard_rel_key);
-    let data = match expected_checksum {
-        Some(cs) => store.get_with_validation(&uri, Some(cs)).await?,
-        None => store.get(&uri).await?,
-    };
-
-    if shard_rel_key.ends_with(".zst") {
-        use std::io::Read;
-        let mut decoder = zstd::Decoder::new(&data[..])?;
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
-        Ok(Bytes::from(decompressed))
-    } else {
-        Ok(data)
+    match expected_checksum {
+        Some(_) => {
+            fetch_shard_validated(store.as_ref(), &uri, shard_rel_key, expected_checksum).await
+        }
+        None => {
+            let data = store.get(&uri).await?;
+            if shard_rel_key.ends_with(".zst") {
+                use std::io::Read;
+                let mut decoder = zstd::Decoder::new(&data[..])?;
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed)?;
+                Ok(Bytes::from(decompressed))
+            } else {
+                Ok(data)
+            }
+        }
     }
 }
 
@@ -160,23 +195,8 @@ impl<'a> Reader<'a> {
         expected_checksum: Option<&str>,
     ) -> Result<Bytes> {
         let uri = format!("{}/{}", self.base_uri, shard_rel_key);
-        let data = self
-            .store
-            .get_with_validation(&uri, expected_checksum)
-            .await?;
-
-        // Check if this is a compressed file and decompress if needed
-        if shard_rel_key.ends_with(".zst") {
-            use std::io::Read;
-            let mut decoder = zstd::Decoder::new(&data[..])?;
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed)?;
-            // Convert Vec<u8> to Bytes for consistency
-            Ok(Bytes::from(decompressed))
-        } else {
-            // Return Bytes directly - zero copy!
-            Ok(data)
-        }
+        // A `.zst` shard is decompressed first: the checksum covers the uncompressed bytes.
+        fetch_shard_validated(self.store, &uri, shard_rel_key, expected_checksum).await
     }
 
     /// Read a shard by rank from a manifest

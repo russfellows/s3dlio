@@ -209,7 +209,14 @@ pub(crate) fn sdk_anyhow<E>(
 where
     E: std::fmt::Display + ProvideErrorMetadata + std::error::Error,
 {
-    anyhow::anyhow!("{}: {}", ctx, format_sdk_error(&e))
+    // The typed `SdkError` is flattened into text here, so carry the
+    // transient/definite verdict along (issue #240): `retry_get_body` needs
+    // it and could not recover it from the message.
+    let retryable = crate::retry::sdk_error_is_retryable(&e);
+    anyhow::Error::new(crate::retry::SdkFailure::new(
+        format!("{}: {}", ctx, format_sdk_error(&e)),
+        retryable,
+    ))
 }
 
 /// `Result<T, SdkError<…>>` extension trait that provides `.sdk_context(ctx)?`
@@ -285,6 +292,7 @@ fn get_skip_head() -> bool {
     // Lazily check env var once and latch if set.
     static ENV_CHECKED: OnceLock<bool> = OnceLock::new();
     *ENV_CHECKED.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         let from_env = std::env::var("S3DLIO_SKIP_HEAD")
             .ok()
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
@@ -302,6 +310,7 @@ fn get_skip_head() -> bool {
 /// (S3ObjectStore::get() honours this too — now consistent on ALL paths).
 fn get_range_opt_enabled() -> bool {
     *RANGE_OPT_ENABLED.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
             .ok()
             .map(|v| {
@@ -319,6 +328,7 @@ fn get_range_opt_enabled() -> bool {
 /// Set above file size (e.g. 1000 for 147 MiB files) to force single-GET.
 fn get_range_threshold_bytes() -> u64 {
     *RANGE_THRESHOLD_BYTES.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         let mb = std::env::var("S3DLIO_RANGE_THRESHOLD_MB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -335,8 +345,11 @@ fn get_range_threshold_bytes() -> u64 {
 /// and cause redundant HEAD requests on every subsequent epoch.
 /// Populated by get_object_uri_optimized_async() on each HEAD and by the
 /// pre-stat phase in get_objects_parallel(). Cache hits skip HEAD entirely.
+/// Bounded (issue #241): at most S3DLIO_SIZE_CACHE_MAX_ENTRIES entries, oldest
+/// evicted first; an expired entry is removed when a lookup finds it.
 fn get_size_cache() -> &'static Arc<ObjectSizeCache> {
     GLOBAL_SIZE_CACHE.get_or_init(|| {
+        crate::dotenv::apply(); // latched for the process: the policy first (#243)
         let ttl_secs = std::env::var("S3DLIO_SIZE_CACHE_TTL_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1100,7 +1113,7 @@ pub fn list_buckets() -> Result<Vec<BucketInfo>> {
 pub fn list_buckets_at(server: Option<&S3Server>) -> Result<Vec<BucketInfo>> {
     let server = server.cloned();
     run_on_global_rt(async move {
-        dotenvy::dotenv().ok();
+        crate::dotenv::apply();
 
         // Log resolved params for diagnostics (pure helper, no side effects).
         let endpoint_url_for_log = match &server {
@@ -1713,7 +1726,7 @@ async fn concurrent_range_get_impl(
             // helper's `FnMut() -> Fut` signature can't share `&mut seg`
             // across attempts without Arc<Mutex> or unsafe. Semantics
             // match: max_retry_attempts() budget + linear 100ms*attempt
-            // backoff.
+            // backoff, and (issue #240) no retry of a definite client error.
             //
             // Silent-data-corruption gate (audit §2.4): `written`
             // MUST be declared inside `attempt_range_chunk_fill` so
@@ -1743,7 +1756,13 @@ async fn concurrent_range_get_impl(
                         break;
                     }
                     Err(e) => {
+                        // Issue #240: same rule as `retry_get_body` -- a
+                        // definite answer (404, 403, 412, ...) ends the loop.
+                        let definite = !crate::retry::RetryClassify::is_retryable(&e);
                         last_err = Some(e);
+                        if definite {
+                            break;
+                        }
                         if attempt < attempts {
                             tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
                         }
@@ -1854,6 +1873,8 @@ async fn attempt_range_chunk_fill(
 
 /// Get optimal chunk size based on total transfer size
 fn get_optimal_chunk_size(total_bytes: u64) -> usize {
+    // The `.env` policy first (#243, review R9): `S3DLIO_CHUNK_SIZE` may come from the file.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_CHUNK_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1874,6 +1895,8 @@ fn get_optimal_chunk_size(total_bytes: u64) -> usize {
 
 /// Get optimal concurrency based on total transfer size
 fn get_optimal_concurrency(total_bytes: u64) -> usize {
+    // The `.env` policy first (#243, review R9): `S3DLIO_RANGE_CONCURRENCY` may come from the file.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_RANGE_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -2437,9 +2460,13 @@ pub(crate) async fn get_object_uri_optimized_rows(uri: &str, rows: Rows) -> Resu
         debug!("skip_head: plain GET (no HEAD) for {}", uri);
         let bytes = get_object_rows(&bucket, &key, rows).await?;
         // Cache the actual size so future calls can range-split if warranted.
-        get_size_cache()
-            .put(uri.to_string(), bytes.len() as u64)
-            .await;
+        // Skip the write when the cache already holds this size: `put` takes
+        // the cache's write lock, and this runs once per GET.
+        let size = bytes.len() as u64;
+        let cache = get_size_cache();
+        if cache.get(uri).await != Some(size) {
+            cache.put(uri.to_string(), size).await;
+        }
         return Ok(bytes);
     }
 

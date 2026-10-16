@@ -36,6 +36,8 @@ impl S3BytesDataset {
 
     /// NEW: honor LoaderOptions (reader strategy + part params)
     pub fn from_prefix_with_opts(uri: &str, opts: &LoaderOptions) -> Result<Self, DatasetError> {
+        // The policy comes first: parsing a host-form URI reads AWS_ENDPOINT_URL (#243).
+        crate::dotenv::apply();
         let (bucket, prefix) =
             parse_s3_uri_for_global_client(uri).map_err(|e| DatasetError::from(e.to_string()))?;
 
@@ -75,6 +77,16 @@ impl Dataset for S3BytesDataset {
 
     fn keys(&self) -> Option<Vec<String>> {
         Some(self.keys.clone())
+    }
+
+    fn uris(&self) -> Option<Vec<String>> {
+        // Exactly the URI `get` fetches: the parsed bucket plus the listed key.
+        Some(
+            self.keys
+                .iter()
+                .map(|k| format!("s3://{}/{}", self.bucket, k))
+                .collect(),
+        )
     }
 
     async fn get(&self, idx: usize) -> Result<Self::Item, DatasetError> {

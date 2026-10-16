@@ -343,7 +343,7 @@ enum Command {
         /// One or more local files, directories, glob patterns ('*','?'), or regex patterns
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        /// Destination URI (s3://bucket/, az://container/, gs://bucket/, file:///path/, direct:///path/) **ending with '/'**
+        /// Destination URI (s3://bucket/, az://account/container/, gs://bucket/, file:///path/, direct:///path/) **ending with '/'**
         dest: String,
         /// Maximum parallel uploads (default 32, max 4096).
         /// Accepts human suffixes: k=1,000  m=1,000,000 (e.g. 32, 64, 256).
@@ -745,12 +745,28 @@ fn parse_human_size(input: &str) -> std::result::Result<usize, String> {
         .map_err(|_| format!("invalid size '{}': value exceeds platform size", input))
 }
 
-/// Main CLI function
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Loads any variables from .env file that are not already set
-    dotenvy::dotenv().ok();
+/// Main CLI function.
+///
+/// Synchronous on purpose: the `.env` file is loaded BEFORE the Tokio runtime (and its
+/// worker threads) is built, so the runtime and everything after it see the file's
+/// values and the environment is set while the process has only its main thread
+/// (issue #243). The runtime is built right after.
+fn main() -> Result<()> {
+    // s3-cli loads a `.env` file by default (variables already set are never overridden).
+    // `S3DLIO_LOAD_DOTENV=0` turns that off, `=<path>` loads that file instead (issue #243).
+    // No log subscriber exists yet, so a problem with the named file is printed here.
+    if let Some(problem) = s3dlio::dotenv::load_for_cli() {
+        eprintln!("warning: {problem}");
+    }
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the Tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
 
     // If --endpoint-url was given on the command line, inject it into the

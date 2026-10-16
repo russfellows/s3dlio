@@ -256,7 +256,87 @@ with open("local_file.bin", "rb") as f:
 await s3dlio.put_bytes_async("s3://bucket/key", b"data")
 ```
 
-**Data path**: `Python bytes` → `Bytes::copy_from_slice` (one unavoidable copy from Python heap) → `Bytes` (Arc-counted, zero-copy through upload pipeline).
+**What is copied** (`put_bytes` / `put_bytes_async`), by input type. "Copies" counts copies made *by s3dlio*
+between your memory and the storage client:
+
+| Input | `put_bytes` | `put_bytes_async` (default) | `put_bytes_async(..., borrow=True)` |
+|---|---|---|---|
+| `s3dlio.BytesView`, exact `bytes` | 0 | 0 | 0 |
+| any other **C-contiguous** buffer, any item type (`bytearray`, `memoryview`, numpy `uint8`/`float32`/`bool`/..., `array.array`, ctypes arrays, `mmap`) | 0 | 1 (a snapshot, taken before the call returns, GIL released) | 0 |
+| non-contiguous view (strided, reversed, transposed) | 1 (gathered in logical order by Python, GIL held) | 1 | 1 |
+| object with only `__bytes__()` | 1 (made by Python) | 1 | 1 |
+
+The buffer is read **in place with the GIL released**, so other Python threads keep running during a large
+upload (a 512 MiB PUT used to stall every other thread for about 0.3 s).
+
+Per backend, after that: `s3://`, `az://`, `gs://` (official client) and `file://` hand the same bytes to the
+storage client / `write` with no further s3dlio copy (what the SDKs do internally is outside s3dlio; the legacy
+community GCS client, feature `gcs-community`, copies once). `direct://` (O_DIRECT) writes a **page-aligned**
+source (address a multiple of 4096) straight from your memory in one `write` per at most 2 GiB; any other source
+is copied **once** through a warm, reused, page-aligned bounce buffer (16 MiB by default, 4 pairs per NUMA node,
+shared by PUTs and GETs, ping-pong so the copy of the next chunk overlaps the write of the current one; see
+`docs/Environment_Variables.md`). The last partial block of a PUT is always bounced (a zero-padded 4 KiB block).
+`direct://` GET returns page-aligned memory (by default read straight into one fresh aligned buffer), so for
+objects of at least `min_io_size` (4 KiB) on a store with the range engine off (the default),
+`s3dlio.get("direct://...")` followed by `put_bytes("direct://...", data)` needs no bounce copy of the body
+(only that final padded block). Smaller objects use buffered I/O.
+
+**Contract for buffers that are read in place** (`put_bytes`, and `put_bytes_async(borrow=True)` until the
+awaitable completes):
+
+* the source is *exported*: resizing it from another thread (`bytearray.extend()` / `clear()` / `del ba[:]`)
+  raises `BufferError` until the call (or awaitable) is finished;
+* you must **not modify the bytes** from another thread (or other code sharing the memory) meanwhile: nothing
+  prevents it, and it is a **data race**: the bytes uploaded are undefined (and the behaviour is undefined in the
+  Rust sense). The memory is never freed or resized meanwhile because the buffer stays exported, but that does not
+  make a concurrent write safe;
+* with `borrow=True` you additionally promise not to free the memory (for example ctypes/pinned host memory) until
+  the awaitable has completed, successfully or not;
+* **completion is a safe-reuse point, cancellation included, on every backend (exact statement).** The awaitable
+  of `put_bytes_async(..., borrow=True)` is a `Future` that **never reaches a terminal state - result, exception
+  or cancelled - while any native reader of the buffer remains or before the export has actually been released**
+  (`PyBuffer_Release` has run, so a resize no longer raises `BufferError`). A native reader is any clone of the
+  payload, wherever it lives: a store task, an SDK/HTTP task, a detached file write. The supported consumer
+  operations cannot change that: `await`, `fut.cancel()`, `Task.cancel()` (once or repeatedly), `asyncio.timeout()`
+  and `asyncio.wait_for()` all leave the awaiting task pending until the future ends. The guarantee covers
+  those consumer operations only: the future belongs to s3dlio, so calling its producer methods
+  (`set_result`, `set_exception`, or the base-class `asyncio.Future.set_result` / `cancel`) is unsupported and ends
+  it at once, whether or not a native reader remains. `cancel()` cancels the put, but a running native write cannot
+  be stopped, so the cancellation (or the timeout) reaches you only AFTER that write finished and the export was
+  released. Once the `await` finishes - with a result, an error, `CancelledError` or `TimeoutError` - the buffer
+  can be resized or reused. The same holds when the barrier machinery itself fails (an internal error, for
+  example a callback that cannot be registered): the future then falls back to polling every 50 ms and still
+  completes only after the release; it is counted in `_put_export_stats()["internal_errors"]`. The blocking
+  `put_bytes` returns or raises only after the same condition;
+* **a backend that never lets go keeps the awaitable pending - by design.** Every
+  `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (default 30 s) that a native reader remains, s3dlio emits one
+  `RuntimeWarning` (and a log line) that names the timeout, adds one to `_put_export_stats()["quiesce_timeouts"]`
+  and keeps waiting. It does **not** complete, because an exception cannot carry the "do not reuse" warning past
+  `Task` cancellation (an awaiting task whose cancellation was refused turns any exception into a plain
+  `CancelledError`/`TimeoutError`). If your code must bound the wait, use the counter or the warning to detect it
+  and treat the buffer as owned by s3dlio until the future ends; do not wrap it in `asyncio.shield`;
+* **blocking `put_bytes` keeps `s3dlio.ExportStillReferencedError`.** Its wait is bounded by the same timeout and is
+  not interruptible by signals / `KeyboardInterrupt` (the buffer must not be released while it can still be read).
+  If a backend still holds the payload after that, the call raises `ExportStillReferencedError` (data may or may
+  not have been written; the message names the timeout and what the put itself did, including the text of the put's own error if it failed). The exception is raised directly in the calling thread's own stack: no Future or Task
+  stands between, so asyncio cancellation cannot rewrite it. The buffer stays pinned (a resize raises
+  `BufferError`): **do not reuse it** after this error. The same class is raised by `put_bytes_async` itself, synchronously, if the put could
+  not be started and the readers did not let go in time;
+* **await the future itself.** `asyncio.shield(fut)` bypasses the guard: the shield's outer future is cancelled
+  at once while the put still reads the buffer, and nothing waits for the barrier. Do not shield a borrowed put
+  (if you must, await `fut` again after the cancellation before touching the buffer). `asyncio.wait_for(fut, t)` and
+  `asyncio.timeout(t)` can take up to `t` plus however long a running native write needs;
+* buffers whose item format is `O` (Python objects) or `P` (pointers) are refused with a `TypeError`: their bytes are
+  addresses, not data. A structured numpy dtype with padding is uploaded as its raw memory, padding bytes
+  included (they are whatever was in memory).
+
+The default `put_bytes_async` takes a snapshot instead, so the buffer can be reused or resized as soon as the call
+returns. The one obligation: do not write to it from another thread *during that copy*. Up to 256 KiB the copy runs
+with the GIL held, so Python threads cannot interleave; above that it runs with the GIL released (so large copies do
+not stall other threads), and a Python thread, a C extension or a device that writes to the buffer at that moment is
+a **data race** with the copy (the snapshot is then undefined, and the behaviour is undefined in the Rust sense).
+Multi-threaded callers that mutate shared buffers must therefore serialise the call with their writers.
+`borrow` is keyword-only: `await s3dlio.put_bytes_async(uri, buf, borrow=True)`.
 
 ### get() — Download Data
 
@@ -460,7 +540,8 @@ raw = bytes(data)
 | `np.frombuffer(data)` | 0 | Shares Rust memory |
 | `torch.frombuffer(data)` | 0 | Shares Rust memory |
 | `bytes(data)` | 1 | Explicit copy to Python heap |
-| `s3dlio.put_bytes(uri, pydata)` | 1 | Unavoidable Python→Rust copy |
+| `s3dlio.put_bytes(uri, pydata)` | 0 | Any C-contiguous buffer is read in place with the GIL released (1 copy only for strided views and `__bytes__()`-only objects); see "put_bytes() — Upload Data" for per-backend details, including `direct://` |
+| `s3dlio.put_bytes_async(uri, pydata)` | 0 or 1 | `bytes`/`BytesView`: 0. Other buffers: 1 snapshot copy (GIL released), or 0 with `borrow=True` |
 
 ---
 
@@ -487,9 +568,13 @@ await s3dlio.put_many_async(items)
 
 ```python
 uris = ["s3://bucket/file1", "s3://bucket/file2", "s3://bucket/file3"]
-results = s3dlio.get_many(uris, workers=64)
+results = s3dlio.get_many(uris, max_in_flight=64)
 
-# Async version
+# az:// and gs:// work too (all URIs in one call must use the same scheme)
+results = s3dlio.get_many(["az://myaccount/container/a.bin", "az://myaccount/container/b.bin"])
+results = s3dlio.get_many(["gs://bucket/a.bin", "gs://bucket/b.bin"])
+
+# Async version (s3:// only: get_many_async() and get_many_stats() read through the S3 client)
 results = await s3dlio.get_many_async(uris)
 
 # O_DIRECT reads — bypass page cache (v0.9.95: now correctly uses O_DIRECT)
@@ -538,6 +623,11 @@ print(f"Throughput: {result['throughput_mb_s']} MB/s")
 
 ### Authentication
 
+Settings can also come from a `.env` file, but the Python library does **not** read one by default
+(since 0.9.128): set `S3DLIO_LOAD_DOTENV=1` (the working directory's `.env`) or
+`S3DLIO_LOAD_DOTENV=/path/to/file` in the environment. Variables that are already set are never
+overridden by the file. See [Environment Variables](Environment_Variables.md#env-files-s3dlio_load_dotenv).
+
 **Amazon S3 / S3-Compatible:**
 ```python
 import os
@@ -554,11 +644,29 @@ gcloud auth application-default login
 ```
 
 **Azure Blob Storage:**
+
+The storage account comes from the URI (`az://account/container/key`). Set
+`S3DLIO_AZURE_CREDENTIAL` to choose the credential (default `auto`): `workload-identity`, `client-secret`,
+`client-certificate` (needs a build with the cargo feature `azure-client-certificate`), `managed-identity`,
+`cli` (`az login` / `azd auth login`; the `az` / `azd` executable must be on `PATH`), `sas`, or `none`.
+`auto` is a fallback chain over workload identity, client secret, client certificate, managed identity and `cli`
+(members whose variables are not set are skipped; one that fails to give a token falls through to the next). Credentials
+are created once per process, so rotating a secret needs a restart. A bearer-token mode needs an `https` endpoint. Account keys (Shared Key) and
+connection strings are **not** supported (the Azure SDK s3dlio is built on, `azure_storage_blob` 1.0, signs
+only with bearer tokens or a SAS). The full table of modes and the variables each reads is in
+[Environment_Variables.md](Environment_Variables.md#azure-blob-storage-configuration).
 ```python
 import os
-os.environ['AZURE_STORAGE_ACCOUNT'] = 'myaccount'
-os.environ['AZURE_STORAGE_KEY'] = 'mykey'
-# Optional custom endpoint:
+# Service principal (the same variables the Azure SDKs use):
+os.environ['AZURE_TENANT_ID'] = '<tenant>'
+os.environ['AZURE_CLIENT_ID'] = '<app id>'
+os.environ['AZURE_CLIENT_SECRET'] = '<secret>'          # auto -> client-secret
+# Managed identity on an Azure VM / App Service / AKS node:
+#   os.environ['S3DLIO_AZURE_CREDENTIAL'] = 'managed-identity'
+# SAS token:
+#   os.environ['S3DLIO_AZURE_CREDENTIAL'] = 'sas'
+#   os.environ['S3DLIO_AZURE_SAS_TOKEN'] = 'sv=...&sig=...'
+# Optional custom endpoint. Azurite (http://) needs no credential:
 os.environ['AZURE_STORAGE_ENDPOINT'] = 'http://127.0.0.1:10000'  # Azurite
 ```
 
@@ -649,6 +757,30 @@ stats = writer.finalize()
 print(f"Wrote {stats['bytes_written']} bytes")
 ```
 
+### Buffer ownership of the write calls
+
+`write_chunk(data)`, `write_owned_bytes(data, *, copy=False)` and
+`MultipartUploadWriter.write(data, *, copy=False)` **borrow your buffer without copying it** (zero copy is the
+default for every C-contiguous buffer: `bytearray`, `memoryview`, NumPy of any dtype, `array.array`, ctypes, mmap):
+
+* the call reads your memory in place, with the GIL **released**, so other Python threads keep running;
+* the buffer is *exported* while the call runs (`bytearray.extend()` / `clear()` from another thread raises
+  `BufferError`) and **no thread may modify its bytes until the call returns**: a concurrent write is a data race
+  and the bytes written are undefined (undefined behaviour in the Rust sense, not just torn data);
+* the export is released **before the call returns**, so the buffer is yours again right after;
+* exact `bytes` and `s3dlio.BytesView` are immutable: they never race and are never copied, in any mode;
+* **`copy=True`** (`write_owned_bytes` and `MultipartUploadWriter.write` only) first takes ONE snapshot of a mutable
+  buffer with the GIL held and releases the export, so you may modify or reuse your buffer as soon as the call has
+  started. Use it when another Python thread may write to the buffer during the call. The snapshot is atomic only
+  against writers that **hold the GIL** (pure-Python code): a writer that releases the GIL (a large NumPy
+  operation, `file.readinto(buf)`, `sock.recv_into(buf)`, a CUDA or torch copy into pinned memory) can still tear
+  it, and you must serialise such writers yourself. It costs one copy of the data;
+  `write_chunk` has no `copy` parameter (it always borrows).
+
+**Behaviour change in 0.9.128.** In 0.9.126 and earlier `write_owned_bytes()` copied a mutable buffer under the GIL
+before writing; it now borrows it exactly like `write_chunk()`. If your code relied on the old snapshot (for
+example another thread refills the same `bytearray` while a write is in flight), pass `copy=True`.
+
 ---
 
 ## AI/ML Integration
@@ -671,6 +803,12 @@ loader = DataLoader(dataset, batch_size=32, num_workers=4)
 for batch in loader:
     pass  # Train
 ```
+
+`ObjectStoreMapDataset` fetches every item by the exact object it listed. Keys: for `s3://` (also with
+the server form `s3://host:port/bucket/...`) the key is the full key from the bucket root, prefix included
+(`s3://bkt/dir/` lists `dir/x`); for `file://` and `direct://` it is the path below the dataset root
+(`sub/b.bin`, or just the file name when the URI names one file). `s3dlio.create_dataset(uri).uris()` gives the URI
+that fetches each item.
 
 ### JAX Integration
 
@@ -967,7 +1105,7 @@ with ThreadPoolExecutor(max_workers=16) as pool:
 
 ```python
 uris = s3dlio.list("s3://bucket/dataset/")
-s3dlio.get_many_stats(uris, concurrency=100)
+s3dlio.get_many_stats(uris, max_in_flight=100)
 
 # Subsequent gets use cached sizes (2.5x faster)
 for uri in uris:
@@ -1199,8 +1337,8 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `put_many_async(items)` | Async batch upload | Coroutine |
 | `get(uri)` | Download object | BytesView |
 | `get_range(uri, offset, length=None)` | Server-side range request | BytesView |
-| `get_many(uris, workers)` | Parallel download | List[BytesView] |
-| `get_many_async(uris)` | Async parallel download | Coroutine |
+| `get_many(uris, max_in_flight=64)` | Parallel download (s3://, az://, gs://, file://, direct://) | List[(uri, BytesView)] |
+| `get_many_async(uris, max_in_flight=64)` | Async parallel download (s3:// only) | Coroutine |
 | `list(uri, recursive=False, pattern=None)` | List objects | List[str] |
 | `stat(uri)` | Get metadata | dict |
 | `stat_async(uri)` | Async metadata | Coroutine |
@@ -1262,6 +1400,9 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `create_azure_writer(uri, opts)` | Azure streaming writer |
 | `create_filesystem_writer(uri, opts)` | Local filesystem writer |
 | `create_direct_filesystem_writer(uri, opts)` | Direct I/O writer |
+
+The write calls borrow the buffer for the duration of the call; see "Buffer ownership of the write calls" in the
+Streaming API section (`copy=True` for a snapshot).
 
 ### s3torchconnector Compat Classes
 

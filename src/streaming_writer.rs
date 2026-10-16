@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
+use crate::checksum::Crc32c;
 use anyhow::Result;
 use async_trait::async_trait;
-use crc32fast::Hasher;
 
 use crate::data_gen::{DataGenerator, ObjectGen};
 use crate::object_store::{CompressionConfig, ObjectStore, ObjectWriter, WriterOptions};
@@ -25,7 +25,7 @@ pub struct StreamingDataWriter {
     /// Whether generation is complete
     finalized: bool,
     /// Checksum of generated data (before compression)
-    hasher: Hasher,
+    hasher: Crc32c,
 }
 
 impl StreamingDataWriter {
@@ -59,7 +59,7 @@ impl StreamingDataWriter {
             target_size: size,
             bytes_generated: 0,
             finalized: false,
-            hasher: Hasher::new(),
+            hasher: Crc32c::new(),
         })
     }
 
