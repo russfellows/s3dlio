@@ -122,6 +122,7 @@ fn probe_child() {
             s3dlio::constants::mpi_world_size(),
             s3dlio::constants::effective_thread_budget()
         ),
+        "budget_first" => format!("budget={}", s3dlio::constants::effective_thread_budget()),
         "aware_budget" => format!("aware={}", s3dlio::constants::mpi_aware_thread_budget()),
         "transport" => transport_wire_protocol(),
         "multi_endpoint" => {
@@ -134,6 +135,57 @@ fn probe_child() {
             match store {
                 Ok(s) => format!("urls={:?}", s.get_store_endpoint_urls()),
                 Err(e) => format!("err:{e}"),
+            }
+        }
+        "multi_endpoint_config" => {
+            use s3dlio::multi_endpoint::{
+                EndpointConfig, LoadBalanceStrategy, MultiEndpointStore, MultiEndpointStoreConfig,
+            };
+            let config = MultiEndpointStoreConfig {
+                endpoints: vec![EndpointConfig::new("s3://127.0.0.1:9443/bkt/")],
+                strategy: LoadBalanceStrategy::RoundRobin,
+                default_thread_count: None,
+            };
+            match MultiEndpointStore::from_config(config) {
+                Ok(s) => format!("urls={:?}", s.get_store_endpoint_urls()),
+                Err(e) => format!("err:{e}"),
+            }
+        }
+        "concurrent_threshold" => {
+            // First call is a ranged read with a known length: the threshold decides between
+            // one plain ranged GET and the concurrent path (which sizes the object with a HEAD).
+            use s3dlio::object_store::{ObjectStore, S3ObjectStore};
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let uri = std::env::var("S3DLIO_243_URI").unwrap();
+            let r = rt.block_on(S3ObjectStore::new().get_range_optimized(
+                &uri,
+                0,
+                Some(4 * 1024 * 1024),
+                None,
+                None,
+            ));
+            format!("range={}", r.is_ok())
+        }
+        #[cfg(feature = "backend-azure")]
+        "azure_account_url" => s3dlio::azure_client::resolve_azure_account_url("acct"),
+        #[cfg(feature = "arrow-backend")]
+        "arrow_get" => {
+            use s3dlio::object_store::ObjectStore;
+            use s3dlio::object_store_arrow::ArrowObjectStore;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            match rt.block_on(ArrowObjectStore::new().get("s3://dotenv243-bkt/arrow-key")) {
+                Ok(_) => "arrow=ok".to_string(),
+                Err(e) if e.to_string().contains("credentials not found") => {
+                    "arrow=no-credentials".to_string()
+                }
+                // Anything else happened after the credential check.
+                Err(_) => "arrow=credentials-seen".to_string(),
             }
         }
         #[cfg(feature = "gcs-community")]
@@ -550,6 +602,77 @@ fn timeout_and_retry_helpers_first_call_see_the_file() {
     assert_eq!(p.client, "connect_timeout=37", "{p:?}");
     let p = first_call("r9-retry", "max_retry", "S3DLIO_MAX_RETRY_ATTEMPTS=9\n");
     assert_eq!(p.client, "max_retry=9", "{p:?}");
+}
+
+#[test]
+fn effective_thread_budget_first_call_sees_the_file() {
+    // Called first and alone: no other helper has applied the policy before it.
+    let p = first_call("r9-budget-first", "budget_first", "S3DLIO_RT_THREADS=5\n");
+    assert_eq!(p.client, "budget=5", "{p:?}");
+}
+
+#[test]
+fn multi_endpoint_from_config_first_call_sees_the_tls_ports_from_the_file() {
+    let p = first_call(
+        "r9-multi-endpoint-config",
+        "multi_endpoint_config",
+        "S3DLIO_S3_ENDPOINT_TLS_PORTS=9443\n",
+    );
+    assert_eq!(p.client, "urls=[Some(\"https://127.0.0.1:9443\")]", "{p:?}");
+}
+
+#[test]
+fn ranged_read_with_known_length_sees_the_concurrent_threshold_from_the_file() {
+    // The file lowers the concurrent-range threshold to 1 MiB; a 4 MiB ranged read as the
+    // FIRST call must take the concurrent path, which (unlike the plain ranged GET) sizes the
+    // object with a HEAD first. Endpoint and credentials are in the real environment.
+    let (port, state) = ensure_mock_s3_server();
+    let key = common::mock_s3_server::unique_test_key("dotenv243-sized-obj");
+    let dir = dir_with_dotenv_plus("first-threshold", "S3DLIO_CONCURRENT_THRESHOLD=1048576\n");
+    let uri = format!("s3://dotenv243-bkt/{key}");
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let p = probe(
+        &dir,
+        &[
+            ("S3DLIO_LOAD_DOTENV", "1"),
+            ("S3DLIO_243_ENTRY", "concurrent_threshold"),
+            ("S3DLIO_243_URI", &uri),
+            ("AWS_ENDPOINT_URL", &endpoint),
+            ("AWS_ACCESS_KEY_ID", "test-access-key"),
+            ("AWS_SECRET_ACCESS_KEY", "test-secret-key"),
+            ("AWS_REGION", "us-east-1"),
+        ],
+    );
+    let reqs = state.requests_containing(&key);
+    assert!(!reqs.is_empty(), "nothing reached the mock: {p:?}");
+    assert!(
+        reqs.iter().any(|r| r.method == "HEAD"),
+        "the file's threshold must route the first ranged read down the concurrent path: {reqs:?}"
+    );
+}
+
+#[cfg(feature = "backend-azure")]
+#[test]
+fn azure_account_url_resolver_first_call_sees_the_file() {
+    let p = first_call(
+        "r9-azure-url",
+        "azure_account_url",
+        "AZURE_STORAGE_ENDPOINT=http://127.0.0.1:10000\n",
+    );
+    assert_eq!(p.client, "http://127.0.0.1:10000/acct", "{p:?}");
+}
+
+#[cfg(feature = "arrow-backend")]
+#[test]
+fn arrow_store_first_call_sees_credentials_from_the_file() {
+    // The file carries the credentials (DOTENV); the first call must get past the credential
+    // check (what happens after it is a connection to a closed port, which is fine).
+    let p = first_call(
+        "r9-arrow",
+        "arrow_get",
+        "AWS_ENDPOINT_URL=http://127.0.0.1:1\n",
+    );
+    assert_eq!(p.client, "arrow=credentials-seen", "{p:?}");
 }
 
 #[test]

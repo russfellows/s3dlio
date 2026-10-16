@@ -105,6 +105,8 @@ pub type ObjectMetadata = S3ObjectStat;
 /// Get the threshold size for using concurrent range requests.
 /// Objects/transfers above this size will use concurrent range GET for optimal performance.
 fn get_concurrent_threshold() -> u64 {
+    // The `.env` policy first (#243, review R9/F): `get_range_optimized` with a known length reads this before any client exists.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_CONCURRENT_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1501,6 +1503,8 @@ impl ObjectStore for S3ObjectStore {
         // Range optimization is ENABLED by default (v0.9.60+).
         // Set S3DLIO_ENABLE_RANGE_OPTIMIZATION=0 (or false/no/off/disable) to disable.
         // Setting it to 1/true/yes/on/enable is accepted but has no effect (already on).
+        // The policy first: this read is per call (not latched), so it must see the file.
+        crate::dotenv::apply();
         let use_optimized = std::env::var("S3DLIO_ENABLE_RANGE_OPTIMIZATION")
             .ok()
             .map(|v| {
@@ -4255,6 +4259,9 @@ pub fn direct_io_store_for_uri_with_logger(
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
 
+    // The `.env` policy applies before any store reads a setting (#243), as in `store_for_uri*`.
+    crate::dotenv::apply();
+
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_direct_io(),
         Scheme::Direct => ConfigurableFileSystemObjectStore::boxed_direct_io(),
@@ -4306,6 +4313,9 @@ pub fn high_performance_store_for_uri_with_logger(
 ) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
+
+    // The `.env` policy applies before any store reads a setting (#243), as in `store_for_uri*`.
+    crate::dotenv::apply();
 
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),
@@ -4393,6 +4403,9 @@ pub fn store_for_uri_with_high_performance_cloud_and_logger(
 ) -> Result<Box<dyn ObjectStore>> {
     use crate::object_store_logger::LoggedObjectStore;
     use std::sync::Arc;
+
+    // The `.env` policy applies before any store reads a setting (#243), as in `store_for_uri*`.
+    crate::dotenv::apply();
 
     let store: Box<dyn ObjectStore> = match infer_scheme(uri) {
         Scheme::File => ConfigurableFileSystemObjectStore::boxed_high_performance(),

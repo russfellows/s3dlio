@@ -653,6 +653,8 @@ impl AzureBlob {
 ///
 /// This is extracted as a pure function for testability.
 pub fn resolve_azure_account_url(account: &str) -> String {
+    // The `.env` policy first (#243, review R9/F): a public setting reader (the endpoint may come from the opted-in file).
+    crate::dotenv::apply();
     if let Ok(endpoint) = std::env::var(crate::constants::ENV_AZURE_STORAGE_ENDPOINT)
         .or_else(|_| std::env::var(crate::constants::ENV_AZURE_BLOB_ENDPOINT_URL))
     {
