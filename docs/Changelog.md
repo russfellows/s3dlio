@@ -53,10 +53,11 @@
   does not complete - normally, with an error, or by cancellation - until every native reader of the buffer
   is done and the export has really been released with a real GIL token (never by a Tokio worker waiting
   for the GIL, and never inferred from `PyGILState_Check`). `put_bytes` waits after the store returned;
-  the awaitable of `put_bytes_async(borrow=True)` is an `asyncio.Task` whose cancellation is delivered only
-  after that point, so reusing the buffer after `CancelledError` is safe (cancelling waits for a running
-  native write to finish). The wait is bounded (30 s): if a backend never drops its clone, the buffer stays
-  pinned, a warning is logged once and `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it. Buffers of Python objects or pointers (`O`/`P` formats) are
+  the awaitable of `put_bytes_async(borrow=True)` is a `Future` that never reaches a terminal state
+  (result, error or cancellation) until then (see the round-7 entries), so reusing the buffer after `CancelledError`
+  is safe (cancelling waits for a running native write to finish). `put_bytes` waits at most 30 s and then raises
+  `ExportStillReferencedError`; the awaitable warns at each missed deadline and keeps waiting
+  (`s3dlio._put_export_stats()["quiesce_timeouts"]` counts them). Buffers of Python objects or pointers (`O`/`P` formats) are
   refused with a `TypeError`.
 
 - **`direct://` PUT and GET no longer move 4 KiB per system call, and a GET returns page-aligned memory
@@ -87,6 +88,24 @@
   New diagnostics in `_put_export_stats()`: `shutdown_attach_waits`, `shutdown_attach_wait_timeouts`,
   `releaser_attaches`. Tested deterministically on 3.12 and 3.13 with a hidden hook that parks the releaser
   between the counter increment and `try_attach` while the interpreter exits.
+- **Round-7 (2/6): a borrowed put's awaitable can no longer end while a native reader remains or before the
+  export is released (R1, R3, P3).** (R1) When the put had finished but a backend still held a clone, the
+  quiesce timeout produced `ExportStillReferencedError`; an awaiting `Task` that had been cancelled (also a second
+  cancellation, `asyncio.timeout()` or a positive `wait_for()`) replaced that exception with `CancelledError` /
+  `TimeoutError`, so the documented "safe to reuse after cancellation" was false: the buffer could still be read
+  and the caller could overwrite it. Now the awaitable of `put_bytes_async(borrow=True)` never reaches a terminal
+  state - result, exception or cancelled - until the readers are gone and the export is released. At each missed
+  `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` deadline it emits one `RuntimeWarning` (naming the timeout), increments
+  `_put_export_stats()["quiesce_timeouts"]` and keeps waiting. **Behaviour change:** that awaitable no longer
+  raises `ExportStillReferencedError`; a backend that never lets go keeps it pending (and the buffer pinned).
+  The blocking `put_bytes` keeps the error: it is raised in the caller's own stack, where no Task can rewrite it.
+  (R3) Completion used to wait only for the owner's drop; if another thread was mid-release of a batch of exports
+  (an exporter's release callback yielded the GIL) a put could finish while its export was still held and a
+  resize still raised `BufferError`. Release is now independently waitable (blocking and async waiters, GIL
+  released), re-checked after every drain. (P3) If the barrier machinery itself fails (for example
+  `add_done_callback` raising) the awaitable polls every 50 ms, and if that cannot be scheduled blocks, instead of
+  completing or stranding; `_put_export_stats()["internal_errors"]` counts it. Hidden test hooks:
+  `_put_test_retain_next_clone`, `_put_test_retained`, `_put_test_release_retained`.
 - **Round-6 edges of the borrowed-buffer barrier.** `GuardedFuture.cancel()` returns `False` once the put is
   already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
   the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really
@@ -101,9 +120,9 @@
   never runs when its Task is cancelled before the first step, which let `CancelledError` reach the caller while a
   native write still read the buffer; `cancel()` (including `asyncio.timeout(0)` and `wait_for(.., 0)`) now defers
   the terminal state until the barrier is satisfied. (2) The guard is built before the put is spawned, and every
-  error path of `put_bytes_async` releases the export before raising. (3) A barrier timeout raises
+  error path of `put_bytes_async` releases the export before raising. (3) A barrier timeout of the blocking `put_bytes` raises
   `s3dlio.ExportStillReferencedError` (new; `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`, default 30 s, not signal
-  interruptible) instead of succeeding. (4) The async barrier never attaches to Python by itself (the result
+  interruptible) instead of succeeding (the async awaitable no longer raises it: see round 7). (4) The async barrier never attaches to Python by itself (the result
   delivery, inside the interpreter-exit gate of #192, releases the export); after interpreter shutdown began a
   `put_bytes` that holds the GIL still releases its export. (5) A `direct://` PUT cancelled while it waits for
   bounce buffers leaves the previous object intact: the target is created/truncated only after the buffers are

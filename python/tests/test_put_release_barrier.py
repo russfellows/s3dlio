@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 
 import pytest
 import s3dlio
@@ -561,65 +562,268 @@ def test_host_that_created_a_subinterpreter_before_using_s3dlio(work_dir):
     assert "OK" in r.stdout
 
 
-QUIESCE_TIMEOUT = r"""
-import asyncio, os, sys, threading
-import s3dlio
-d = sys.argv[1]
-fifo = os.path.join(d, "pipe")
-os.mkfifo(fifo)
-ba = bytearray(b"q" * 100_000)
-out = {}
-async def go():
-    task = s3dlio.put_bytes_async("file://" + fifo, ba, borrow=True)
-    await asyncio.sleep(0.3)
-    task.cancel()
-    done, _ = await asyncio.wait({task}, timeout=20)
-    out["done"] = task in done
-    try:
-        task.result()
-    except BaseException as e:
-        out["exc"] = type(e).__name__
-        out["is_subclass"] = isinstance(e, s3dlio.ExportStillReferencedError)
-        out["msg"] = str(e)
-    try:
-        ba.append(0)
-        out["pinned"] = False
-    except BufferError:
-        out["pinned"] = True
-    out["timeouts"] = s3dlio._put_export_stats()["quiesce_timeouts"]
-asyncio.run(go())
-# let the stuck writer finish so the process can end
-t = threading.Thread(target=lambda: open(fifo, "rb").read(), daemon=True)
-t.start(); t.join(10)
-print(out)
-"""
-
-
-def test_quiesce_timeout_raises_a_distinct_error_and_keeps_the_buffer_pinned(work_dir):
-    env = dict(os.environ, S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS="1")
-    r = subprocess.run(
-        [sys.executable, "-c", QUIESCE_TIMEOUT, work_dir],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env=env,
-        check=False,
-    )
-    assert r.returncode == 0, r.stderr[-2000:]
-    out = eval(r.stdout.strip().splitlines()[-1])
-    assert out["done"] is True, out
-    assert out["exc"] == "ExportStillReferencedError", out
-    assert out["is_subclass"] is True
-    assert "1s" in out["msg"], "the message must name the timeout value: " + out["msg"]
-    assert "the put was cancelled" in out["msg"], "and what the put did: " + out["msg"]
-    assert "do not modify" in out["msg"]
-    assert out["pinned"] is True, "the buffer must stay pinned after a quiesce timeout"
-    assert out["timeouts"] >= 1
-
-
 # ---------------------------------------------------------------------------------------------
-# GuardedFuture semantics with controllable stand-ins (the class is whatever a borrowed put returns)
+# R1 / R3 / P3: a borrowed put's awaitable is NEVER terminal (result, exception, cancelled) while a
+# native reader remains or before the export has really been released. At the quiesce deadline it
+# warns, counts, and keeps waiting. Deterministic: the hidden hook _put_test_retain_next_clone()
+# keeps a native clone of the next borrowed payload (like a backend that keeps reading after the
+# put ended) until _put_test_release_retained().
 # ---------------------------------------------------------------------------------------------
+
+DEADLINE = "S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS"
+
+
+async def awaiting(fut):
+    return await fut
+
+
+def borrowed_put_with_retained_clone(path, ba):
+    """Start a borrowed put to a regular file whose native clone is retained past the put's end."""
+    s3dlio._put_test_retain_next_clone()
+    fut = s3dlio.put_bytes_async(f"file://{path}", ba, borrow=True)
+    assert s3dlio._put_test_retained() >= 1
+    return fut
+
+
+async def assert_pending(awaitables, seconds, what):
+    done, _ = await asyncio.wait(set(awaitables), timeout=seconds)
+    assert not done, f"{what}: terminal state observed while a native reader remained"
+
+
+@pytest.fixture
+def short_deadline(monkeypatch):
+    monkeypatch.setenv(DEADLINE, "0.4")
+    yield
+    s3dlio._put_test_release_retained()  # never leave a retained clone behind
+
+
+def run_past_deadline_case(work_dir, wrapper, expected, cancel_again=True):
+    """The inner put finishes at once; the retained clone outlives two quiesce deadlines; the
+    awaiting task is cancelled (twice) / times out; nothing terminal may be seen until release."""
+    original = b"retained-clone" * 8000
+    path = os.path.join(work_dir, "o.bin")
+    ba = bytearray(original)
+    seen = {}
+
+    async def go():
+        before = s3dlio._put_export_stats()["quiesce_timeouts"]
+        fut = borrowed_put_with_retained_clone(path, ba)
+        task = asyncio.ensure_future(wrapper(fut))
+        await asyncio.sleep(0.25)  # the put itself is over; only the barrier is pending
+        assert not fut.done()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await assert_pending([task, fut], 1.3, "after two deadlines")
+            seen["warnings"] = [str(w.message) for w in caught]
+        seen["timeouts"] = s3dlio._put_export_stats()["quiesce_timeouts"] - before
+        seen["pinned"] = not resizable(ba)
+        if cancel_again:
+            task.cancel()  # a further cancellation on top of the first one
+            await assert_pending([task, fut], 0.3, "after repeated cancellation")
+        assert s3dlio._put_test_release_retained() >= 1
+        await finished_with(task, expected)
+        seen["fut_done"] = fut.done()
+        seen["released"] = resizable(ba)
+
+    run_bounded(go)
+    assert seen["pinned"] is True
+    assert seen["timeouts"] >= 2, f"each missed deadline must be counted: {seen}"
+    assert any("400ms" in w and "borrowed" in w for w in seen["warnings"]), seen[
+        "warnings"
+    ]
+    assert seen["fut_done"] is True
+    assert seen["released"] is True, "terminal before the export was released"
+    with open(path, "rb") as f:
+        assert f.read() == original
+
+
+def test_task_cancel_after_finishing_is_not_terminal_past_the_deadline(
+    work_dir, short_deadline
+):
+    async def cancelled_after_start(fut):
+        task = asyncio.ensure_future(awaiting(fut))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        await task
+
+    run_past_deadline_case(work_dir, cancelled_after_start, asyncio.CancelledError)
+
+
+def test_asyncio_timeout_after_finishing_is_not_terminal_past_the_deadline(
+    work_dir, short_deadline
+):
+    async def with_timeout(fut):
+        async with asyncio.timeout(0.4):
+            await fut
+
+    # (no extra cancel: asyncio.timeout turns only ITS OWN cancellation into TimeoutError)
+    run_past_deadline_case(work_dir, with_timeout, TimeoutError, cancel_again=False)
+
+
+def test_wait_for_after_finishing_is_not_terminal_past_the_deadline(
+    work_dir, short_deadline
+):
+    async def with_wait_for(fut):
+        await asyncio.wait_for(fut, 0.4)
+
+    run_past_deadline_case(work_dir, with_wait_for, TimeoutError, cancel_again=False)
+
+
+def test_stuck_native_writer_past_the_deadline_warns_counts_and_keeps_waiting(
+    work_dir, short_deadline
+):
+    """Real stuck writer (FIFO nobody reads) instead of the hook: cancel, outlive the deadline."""
+    original = b"x" * 100_000
+    fifo, ba = stuck_put(work_dir, original)
+    seen = {}
+
+    async def go():
+        before = s3dlio._put_export_stats()["quiesce_timeouts"]
+        task = s3dlio.put_bytes_async(f"file://{fifo}", ba, borrow=True)
+        await asyncio.sleep(0.3)
+        task.cancel()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await assert_pending([task], 1.3, "stuck writer past the deadline")
+            seen["warnings"] = [str(w.message) for w in caught]
+        seen["timeouts"] = s3dlio._put_export_stats()["quiesce_timeouts"] - before
+        seen["pinned"] = not resizable(ba)
+        reader = Reader(fifo)
+        reader.start()
+        await finished_with(task, asyncio.CancelledError)
+        reader.join()
+        seen["released"] = resizable(ba)
+
+    run_bounded(go, fifo)
+    assert seen["pinned"] is True
+    assert seen["timeouts"] >= 1
+    assert any("borrowed" in w for w in seen["warnings"]), seen["warnings"]
+    assert seen["released"] is True
+
+
+def test_blocking_put_keeps_the_distinct_error_when_a_clone_is_retained(
+    work_dir, short_deadline
+):
+    """put_bytes raises ExportStillReferencedError directly in the caller's own stack (no Future
+    or Task sits between, so cancellation machinery cannot rewrite it); the buffer stays pinned."""
+    ba = bytearray(b"sync" * 20_000)
+    s3dlio._put_test_retain_next_clone()
+    with pytest.raises(s3dlio.ExportStillReferencedError) as info:
+        s3dlio.put_bytes(f"file://{work_dir}/sync.bin", ba)
+    assert "400ms" in str(info.value)
+    assert not resizable(ba), "buffer must stay pinned after the error"
+    s3dlio._put_test_release_retained()
+    deadline = time.monotonic() + 10
+    while not resizable(
+        ba
+    ):  # released by the autonomous releaser once the clone is gone
+        assert time.monotonic() < deadline, "export never released after the clone died"
+        time.sleep(0.01)
+
+
+class SlowRelease:
+    """A buffer exporter whose release callback blocks (without the GIL) until told to go on:
+    it opens the schedule in which another drainer's private batch is still being released."""
+
+    def __init__(self, data, entered, proceed):
+        self.data = bytearray(data)
+        self._entered = entered
+        self._proceed = proceed
+
+    def __buffer__(self, flags):
+        return memoryview(self.data)
+
+    def __release_buffer__(self, view):
+        self._entered.set()
+        self._proceed.wait(30)
+        view.release()
+
+
+def test_async_completion_waits_for_the_actual_release_of_a_batched_export(work_dir):
+    """R3: exports A and B sit in one drainer's private batch; A's release callback yields the
+    GIL. Neither awaitable may complete until its own export is really released."""
+    entered, proceed = threading.Event(), threading.Event()
+    a = SlowRelease(b"a" * 50_000, entered, proceed)
+    b = bytearray(b"b" * 50_000)
+    seen = {}
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        fa = borrowed_put_with_retained_clone(os.path.join(work_dir, "a.bin"), a)
+        fb = borrowed_put_with_retained_clone(os.path.join(work_dir, "b.bin"), b)
+        await asyncio.sleep(
+            0.4
+        )  # both writes are over; both barriers wait for the clones
+        assert not fa.done() and not fb.done()
+        assert (
+            s3dlio._put_test_release_retained() == 2
+        )  # queue [A, B], GIL held throughout
+        assert await loop.run_in_executor(None, entered.wait, 15), (
+            "no release callback ran"
+        )
+        # a drainer is now blocked inside A's release callback, B in its private batch
+        await assert_pending([fa, fb], 0.7, "while A's release callback is blocked")
+        seen["b_pinned"] = not resizable(b)
+        proceed.set()
+        done, _ = await asyncio.wait({fa, fb}, timeout=20)
+        assert len(done) == 2, "never completed after the release callback finished"
+        seen["b_released"] = resizable(b)
+        seen["a_released"] = resizable(a.data)
+
+    try:
+        run_bounded(go)
+    finally:
+        proceed.set()
+    assert seen["b_pinned"] is True
+    assert seen["b_released"] is True and seen["a_released"] is True
+
+
+def test_blocking_completion_waits_for_the_actual_release_of_a_batched_export(work_dir):
+    """R3 for put_bytes: the second caller finds the public queue empty (another drainer owns the
+    private batch) and must wait, GIL released, until its export is really released."""
+    entered, proceed = threading.Event(), threading.Event()
+    a = SlowRelease(b"a" * 50_000, entered, proceed)
+    b = bytearray(b"b" * 50_000)
+    finished = {}
+
+    def call(name, buf):
+        s3dlio.put_bytes(f"file://{work_dir}/{name}.bin", buf)
+        finished[name] = time.monotonic()
+
+    s3dlio._put_test_retain_next_clone()
+    ta = threading.Thread(target=call, args=("a", a), daemon=True)
+    ta.start()
+    deadline = time.monotonic() + 15
+    while s3dlio._put_test_retained() < 1:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    s3dlio._put_test_retain_next_clone()
+    tb = threading.Thread(target=call, args=("b", b), daemon=True)
+    tb.start()
+    while s3dlio._put_test_retained() < 2:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    time.sleep(0.3)  # both calls now wait (GIL released) for their retained clone
+    try:
+        assert not finished
+        assert (
+            s3dlio._put_test_release_retained() == 2
+        )  # queue [A, B], GIL held throughout
+        assert entered.wait(15), "no release callback ran"
+        time.sleep(0.7)
+        assert finished == {}, (
+            f"a call returned before its export was released: {finished}"
+        )
+        assert not resizable(b)
+    finally:
+        proceed.set()
+    ta.join(20)
+    tb.join(20)
+    assert not ta.is_alive() and not tb.is_alive()
+    assert resizable(b) and resizable(a.data)
+
+
+# ---- GuardedFuture with stand-in barrier parts (internal failures, P3) ----------------------
 
 
 def guarded_future_class(work_dir):
@@ -633,8 +837,28 @@ def guarded_future_class(work_dir):
     return asyncio.run(go())
 
 
-def fake_error(kind, text, detail):
-    return s3dlio.ExportStillReferencedError(f"{kind}|{text}|{detail}")
+def make_guard(cls, loop, ready, quiesce, block=None, poll=0.02):
+    """A GuardedFuture over a controllable inner future. `ready` is a one-element list read by the
+    stand-in latch_ready; `events` records the (kind, detail) pairs the guard reports."""
+    events = []
+
+    def event(kind, detail):
+        events.append((kind, detail))
+        return f"fake {kind}"
+
+    inner = loop.create_future()
+    fut = cls(inner, lambda: ready[0], quiesce, event, block or (lambda: None), poll)
+    return inner, fut, events
+
+
+async def completes_only_after_ready(inner, fut, ready, events, expect_kind):
+    inner.set_result("uploaded")
+    await asyncio.sleep(0.3)
+    assert not fut.done(), "terminal although the barrier is not satisfied"
+    assert any(k == expect_kind for k, _ in events), events
+    ready[0] = True
+    done, _ = await asyncio.wait({fut}, timeout=10)
+    assert fut in done and fut.result() == "uploaded"
 
 
 def test_cancel_before_the_put_ends_is_deferred_until_the_barrier(work_dir):
@@ -642,13 +866,14 @@ def test_cancel_before_the_put_ends_is_deferred_until_the_barrier(work_dir):
 
     async def go():
         loop = asyncio.get_running_loop()
-        inner = loop.create_future()
         barrier = loop.create_future()
-        fut = cls(inner, lambda: False, lambda: barrier, fake_error)
+        ready = [False]
+        inner, fut, _ = make_guard(cls, loop, ready, lambda: barrier)
         assert fut.cancel() is True
         assert inner.cancelled(), "the put was not asked to cancel"
         await asyncio.sleep(0.05)
         assert not fut.done(), "terminal before the barrier"
+        ready[0] = True
         barrier.set_result(False)
         done, _ = await asyncio.wait({fut}, timeout=10)
         assert fut in done and fut.cancelled()
@@ -665,19 +890,17 @@ def test_cancel_after_the_put_ended_returns_false_so_a_task_still_cancels(work_d
 
     async def go():
         loop = asyncio.get_running_loop()
-        inner = loop.create_future()
         barrier = loop.create_future()
-        fut = cls(inner, lambda: False, lambda: barrier, fake_error)
+        ready = [False]
+        inner, fut, _ = make_guard(cls, loop, ready, lambda: barrier)
         inner.set_result("uploaded")
         await asyncio.sleep(0.05)  # _inner_done ran; waiting for the barrier
         seen["cancel_returned"] = fut.cancel()
 
-        async def waiter():
-            return await fut
-
-        task = asyncio.ensure_future(waiter())
+        task = asyncio.ensure_future(awaiting(fut))
         await asyncio.sleep(0.05)
         task.cancel()
+        ready[0] = True
         barrier.set_result(False)
         await finished_with(task, asyncio.CancelledError)
         seen["future_result"] = fut.result()
@@ -687,49 +910,142 @@ def test_cancel_after_the_put_ended_returns_false_so_a_task_still_cancels(work_d
     assert seen["future_result"] == "uploaded", "the put's own outcome must be kept"
 
 
-def test_barrier_failures_become_distinct_errors_with_the_outcome(work_dir):
+def test_add_done_callback_failing_never_completes_unsafely(work_dir):
+    """P3: waiter.add_done_callback raises (MemoryError): the guard falls back to polling and
+    completes only when the latch is really ready."""
     cls = guarded_future_class(work_dir)
 
-    async def run_case(put_result, barrier_result, ready=False):
-        loop = asyncio.get_running_loop()
-        inner = loop.create_future()
-        barrier = loop.create_future()
-        fut = cls(inner, lambda: ready, lambda: barrier, fake_error)
-        if isinstance(put_result, BaseException):
-            inner.set_exception(put_result)
-        else:
-            inner.set_result(put_result)
-        await asyncio.sleep(0.02)
-        if isinstance(barrier_result, BaseException):
-            barrier.set_exception(barrier_result)
-        else:
-            barrier.set_result(barrier_result)
-        done, _ = await asyncio.wait({fut}, timeout=10)
-        assert fut in done
-        return fut
+    class BadWaiter:
+        def add_done_callback(self, cb):
+            raise MemoryError("callback registration")
 
     async def go():
-        timeout_ok = await run_case("r", True)
-        e = timeout_ok.exception()
-        assert isinstance(e, s3dlio.ExportStillReferencedError)
-        assert str(e) == "timeout|the put itself succeeded|"
+        loop = asyncio.get_running_loop()
+        ready = [False]
+        inner, fut, events = make_guard(cls, loop, ready, lambda: BadWaiter())
+        await completes_only_after_ready(inner, fut, ready, events, "internal")
 
-        timeout_failed = await run_case(OSError("disk full"), True)
-        e = timeout_failed.exception()
-        assert isinstance(e, s3dlio.ExportStillReferencedError)
-        assert "the put itself failed" in str(e) and "disk full" in str(e)
-        assert isinstance(e.__cause__, OSError)
+    run_bounded(go)
 
-        internal = await run_case("r", RuntimeError("quiesce broke"))
-        e = internal.exception()
-        assert isinstance(e, s3dlio.ExportStillReferencedError)
-        assert str(e).startswith("internal|the put itself succeeded|")
-        assert "quiesce broke" in str(e)
 
-        ok = await run_case("r", False)
-        assert ok.result() == "r"
-        fast = await run_case("r", False, ready=True)
-        assert fast.result() == "r"
+def test_quiesce_raising_or_waiter_failing_never_completes_unsafely(work_dir):
+    cls = guarded_future_class(work_dir)
+
+    def raising():
+        raise RuntimeError("quiesce broke")
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        ready = [False]
+        inner, fut, events = make_guard(cls, loop, ready, raising)
+        await completes_only_after_ready(inner, fut, ready, events, "internal")
+
+        ready = [False]
+        broken = loop.create_future()
+        broken.set_exception(RuntimeError("waiter failed"))
+        inner, fut, events = make_guard(cls, loop, ready, lambda: broken)
+        await completes_only_after_ready(inner, fut, ready, events, "internal")
+
+    run_bounded(go)
+
+
+def test_latch_ready_raising_keeps_polling_without_completing(work_dir):
+    cls = guarded_future_class(work_dir)
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        state = {"calls": 0}
+
+        def latch_ready():
+            state["calls"] += 1
+            if state["calls"] < 6:
+                raise RuntimeError("latch_ready broke")
+            return True
+
+        events = []
+        inner = loop.create_future()
+        fut = cls(
+            inner,
+            latch_ready,
+            lambda: loop.create_future(),
+            lambda kind, detail: events.append((kind, detail)) or "x",
+            lambda: None,
+            0.02,
+        )
+        inner.set_result("uploaded")
+        done, _ = await asyncio.wait({fut}, timeout=10)
+        assert fut in done and fut.result() == "uploaded"
+        assert state["calls"] >= 6, "completed before latch_ready said ready"
+
+    run_bounded(go)
+
+
+def test_a_missed_deadline_warns_and_waits_again_instead_of_completing(work_dir):
+    cls = guarded_future_class(work_dir)
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        ready = [False]
+        calls = []
+
+        def quiesce():
+            f = loop.create_future()
+            calls.append(f)
+            loop.call_later(0.02, f.set_result, True)  # True: the wait TIMED OUT
+            return f
+
+        inner, fut, events = make_guard(cls, loop, ready, quiesce)
+        inner.set_result("uploaded")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await asyncio.sleep(0.4)
+        assert not fut.done(), "completed at a missed deadline"
+        assert len(calls) >= 3, "did not wait again after a missed deadline"
+        assert sum(1 for k, _ in events if k == "timeout") >= 3
+        assert len(caught) >= 3, "one warning per missed deadline"
+        ready[0] = True
+        done, _ = await asyncio.wait({fut}, timeout=10)
+        assert fut in done and fut.result() == "uploaded"
+
+    run_bounded(go)
+
+
+def test_failing_to_schedule_a_poll_falls_back_to_a_blocking_wait(work_dir):
+    cls = guarded_future_class(work_dir)
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        ready = [False]
+        blocked = []
+
+        def block():
+            blocked.append(True)
+            ready[0] = (
+                True  # the blocking wait returns only once the export is released
+            )
+
+        real_call_later = loop.call_later
+
+        def no_poll_call_later(delay, callback, *args, **kwargs):
+            if getattr(callback, "__name__", "") == "_poll":
+                raise MemoryError("call_later")
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        loop.call_later = no_poll_call_later  # instance attribute shadows the method
+        try:
+            inner, fut, _events = make_guard(
+                cls,
+                loop,
+                ready,
+                lambda: (_ for _ in ()).throw(RuntimeError("q")),
+                block,
+            )
+            inner.set_result("uploaded")
+            done, _ = await asyncio.wait({fut}, timeout=10)
+            assert fut in done and fut.result() == "uploaded"
+            assert blocked, "the blocking fallback was not used"
+        finally:
+            del loop.call_later
 
     run_bounded(go)
 

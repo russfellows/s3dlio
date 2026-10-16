@@ -120,7 +120,7 @@ S3DLIO_H2C=1 S3DLIO_H2_ADAPTIVE_WINDOW=0 \
 
 | Variable | Default | Description |
 |---|---|---|
-| `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` | `30` | How long a `put_bytes` / `put_bytes_async(borrow=True)` waits, after the store finished, for every native reader of the caller's buffer to let go before it gives up and raises `s3dlio.ExportStillReferencedError` (the buffer then stays pinned: do not reuse it). Fractions allowed (minimum 0.001); unusable values select the default. The wait is not interruptible by signals. |
+| `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` | `30` | How long `put_bytes` waits, after the store finished, for every native reader of the caller's buffer to let go before it gives up and raises `s3dlio.ExportStillReferencedError` (the buffer then stays pinned: do not reuse it). The awaitable of `put_bytes_async(borrow=True)` never completes while a reader remains: at every missed deadline it emits a `RuntimeWarning`, counts it (`_put_export_stats()["quiesce_timeouts"]`) and keeps waiting. Fractions allowed (minimum 0.001); unusable values select the default. The blocking wait is not interruptible by signals. |
 
 ### Direct I/O (`direct://`) shared bounce-buffer pool
 

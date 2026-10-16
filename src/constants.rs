@@ -1021,13 +1021,20 @@ pub const EXPORT_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_
 /// (`s3dlio._put_export_stats()["shutdown_attach_wait_timeouts"]`) and exit continues.
 pub const RELEASER_ATTACH_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How often (50 ms) the awaitable of `put_bytes_async(borrow=True)` re-checks the export barrier
+/// when the barrier machinery itself failed (an internal error, for example a failed callback
+/// registration) and it can no longer be notified: it polls instead of completing unsafely.
+pub const EXPORT_BARRIER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Default for how long a put waits, after the store finished with it, for every native reader
 /// of a borrowed Python buffer to let go (30 s). If a backend still holds a clone of the payload
-/// after this, the buffer stays PINNED (never released while it can still be read), the event is
-/// logged once and counted (`s3dlio._put_export_stats()["quiesce_timeouts"]`), and the call
-/// raises `ExportStillReferencedError`: the data may have been written, but the buffer must not
-/// be reused. Override with [`ENV_EXPORT_QUIESCE_TIMEOUT_SECS`]. The wait is not interruptible
-/// by signals.
+/// after this, the buffer stays PINNED (never released while it can still be read) and the missed
+/// deadline is logged and counted (`s3dlio._put_export_stats()["quiesce_timeouts"]`). The blocking
+/// `put_bytes` then raises `ExportStillReferencedError` (the data may have been written, but the
+/// buffer must not be reused); the awaitable of `put_bytes_async(borrow=True)` does NOT complete:
+/// it warns and keeps waiting for the readers, so cancellation or a timeout wrapper can never turn
+/// a still-borrowed buffer into a reuse point. Override with [`ENV_EXPORT_QUIESCE_TIMEOUT_SECS`].
+/// The blocking wait is not interruptible by signals.
 pub const EXPORT_QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Environment variable overriding [`EXPORT_QUIESCE_TIMEOUT`], in seconds (fractions allowed,

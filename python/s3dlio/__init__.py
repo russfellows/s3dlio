@@ -65,6 +65,9 @@ for _name in dir(_core):
 _put_export_stats = _core._put_export_stats
 # Hidden test hooks of the barrier (used only by python/tests/test_put_release_barrier.py).
 _put_test_queue_export = _core._put_test_queue_export
+_put_test_retain_next_clone = _core._put_test_retain_next_clone
+_put_test_retained = _core._put_test_retained
+_put_test_release_retained = _core._put_test_release_retained
 
 # del _sys, _name, import_module, _native
 del _name

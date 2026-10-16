@@ -48,19 +48,29 @@
 //! reader of the borrowed memory is done and the export has really been released, on every
 //! backend. The per-call [`Latch`] is signalled by the export owner's `Drop`, which runs when
 //! the LAST clone of the `Bytes` dies wherever that happens (Tokio tasks, SDK/hyper tasks,
-//! `spawn_blocking` writers that a cancelled future cannot stop).
+//! `spawn_blocking` writers that a cancelled future cannot stop), and again when
+//! `PyBuffer_Release` has really run. The two events are separate: an export can be dropped but
+//! still owned by a drainer that is mid-release (its release callback can run Python code and
+//! yield the GIL), so completion waits for `released`, notified to blocking and async waiters
+//! alike, and re-checks it after every drain.
 //!
-//! * `put_bytes` checks the latch after the put returned (usually it is already dropped: then
-//!   it only drains, holding the GIL) and otherwise waits with the GIL released.
+//! * `put_bytes` checks the latch after the put returned (usually it is already released: then
+//!   it only drains, holding the GIL) and otherwise waits with the GIL released, first for the
+//!   owner's drop and then, after draining itself, for the release. It is bounded by
+//!   `export_quiesce_timeout()` (30 s, `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`) and not interruptible
+//!   by signals. If a backend never drops its clone the buffer stays pinned (never released while
+//!   it can be read), the missed deadline is logged and counted, and the call raises
+//!   `ExportStillReferencedError` in its own stack, where no Task can rewrite it.
 //! * The awaitable of `put_bytes_async(borrow=True)` is a `Future` subclass
 //!   (`GuardedFuture`, see `python_core_api.rs`), NOT a Task running a coroutine: a coroutine
-//!   body never runs if its Task is cancelled before the first step. Its `cancel()` cancels
-//!   the put but its own terminal state is deferred until the latch is dropped and the export
-//!   released, so `asyncio.timeout(0)` and `wait_for(.., 0)` wait too.
-//! * The wait is bounded by `export_quiesce_timeout()` (30 s, `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`)
-//!   and not interruptible by signals. If a backend never drops its clone the buffer stays pinned
-//!   (never released while it can be read), the event is logged once and counted, and the call
-//!   raises `ExportStillReferencedError`.
+//!   body never runs if its Task is cancelled before the first step. It NEVER reaches a terminal
+//!   state - result, exception, cancelled - while a native reader remains or before the export is
+//!   released: `cancel()` cancels the put but its own terminal state waits for the barrier, so
+//!   `asyncio.timeout(0)`, `wait_for(.., 0)` and repeated `Task.cancel()` wait too. A returned
+//!   exception could not carry "do not reuse" past Task cancellation (a Task whose waiter refused
+//!   cancellation replaces the waiter's exception by `CancelledError`), so at every missed
+//!   deadline it only warns, counts and waits again; a failure of the barrier machinery itself
+//!   falls back to polling (and, if that cannot be scheduled, to a blocking wait).
 //!
 //! # Releasing the export never blocks a runtime thread
 //!
@@ -169,13 +179,17 @@ pub(crate) enum PayloadUse {
 ///   for release (or released explicitly with a `py` token);
 /// * `released`: `PyBuffer_Release` has run.
 ///
-/// The Python-facing completion waits for `dropped` (bounded by `EXPORT_QUIESCE_TIMEOUT`), then
-/// releases the queue with a real `py` token, and only then resolves, raises, or raises
-/// `CancelledError`.
+/// The Python-facing completion waits for `dropped`, releases the queue with a real `py` token,
+/// re-checks `released` (another drainer may own the release) and waits for it, and only then
+/// resolves, raises, or ends cancelled. Each wait is bounded by `export_quiesce_timeout()`; what
+/// happens at the bound differs by caller (see "The completion barrier").
 pub(crate) struct Latch {
     state: Mutex<LatchState>,
     cv: Condvar,
+    /// Wakes the async waiter when `dropped` is set.
     notify: tokio::sync::Notify,
+    /// Wakes the async waiter when `released` is set.
+    notify_released: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -184,9 +198,8 @@ struct LatchState {
     released: bool,
 }
 
-/// Times a wait for native readers gave up (a backend kept a clone past the timeout).
+/// Times a wait for native readers hit its deadline (a backend kept a clone past the timeout).
 static QUIESCE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
-static QUIESCE_WARNED: AtomicBool = AtomicBool::new(false);
 /// Failures of the barrier machinery itself (not a backend that holds on).
 static BARRIER_INTERNAL_ERRORS: AtomicU64 = AtomicU64::new(0);
 
@@ -195,18 +208,24 @@ pub(crate) fn note_internal_error() {
     BARRIER_INTERNAL_ERRORS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Record that a backend did not drop its clone in time: the export STAYS PINNED (memory that is
-/// still being read is never released); log once, count always.
+/// Record that a backend did not drop its clone by the deadline: the export STAYS PINNED (memory
+/// that is still being read is never released). Counted and logged at EVERY missed deadline (one
+/// line per `export_quiesce_timeout()` per waiting call, so the rate is bounded by the timeout).
 fn note_quiesce_timeout() {
-    QUIESCE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-    if !QUIESCE_WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            "s3dlio: a storage backend kept reading a borrowed Python buffer for more than {:?} \
-             after the put finished; the buffer stays pinned (it is released when the backend \
-             lets go). Further occurrences are only counted (see s3dlio._put_export_stats())",
-            export_quiesce_timeout()
-        );
-    }
+    let n = QUIESCE_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!("{}", deadline_warning_text(n));
+}
+
+/// The text of the warning for the `n`-th missed deadline of this process (it names the timeout).
+pub(crate) fn deadline_warning_text(n: u64) -> String {
+    format!(
+        "s3dlio: a storage backend has kept reading a borrowed Python buffer for more than {:?} \
+         after the put finished (missed deadline #{n} in this process); the buffer stays pinned \
+         and a put_bytes_async awaitable keeps waiting - it is never completed while a native \
+         reader remains (put_bytes raises ExportStillReferencedError). \
+         See s3dlio._put_export_stats()",
+        export_quiesce_timeout()
+    )
 }
 
 impl Latch {
@@ -215,6 +234,7 @@ impl Latch {
             state: Mutex::new(LatchState::default()),
             cv: Condvar::new(),
             notify: tokio::sync::Notify::new(),
+            notify_released: tokio::sync::Notify::new(),
         })
     }
 
@@ -228,8 +248,11 @@ impl Latch {
         self.notify.notify_one();
     }
 
+    /// `PyBuffer_Release` has run: wake every blocking and async waiter.
     pub(crate) fn mark_released(&self) {
         self.lock().released = true;
+        self.cv.notify_all();
+        self.notify_released.notify_one();
     }
 
     pub(crate) fn is_dropped(&self) -> bool {
@@ -250,18 +273,46 @@ impl Latch {
         guard.dropped
     }
 
+    /// Block until the export has really been released; `false` on timeout. Call WITHOUT the
+    /// GIL: the thread that owns the release needs it.
+    pub(crate) fn wait_released_blocking(&self, timeout: Duration) -> bool {
+        let guard = self.lock();
+        let (guard, _) = self
+            .cv
+            .wait_timeout_while(guard, timeout, |s| !s.released)
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.released
+    }
+
     /// Async variant of [`wait_dropped_blocking`](Self::wait_dropped_blocking).
     pub(crate) async fn wait_dropped(&self, timeout: Duration) -> bool {
+        self.wait_flag(&self.notify, timeout, Self::is_dropped)
+            .await
+    }
+
+    /// Async variant of [`wait_released_blocking`](Self::wait_released_blocking). It never
+    /// attaches to Python: the release is done by whoever holds the GIL.
+    pub(crate) async fn wait_released(&self, timeout: Duration) -> bool {
+        self.wait_flag(&self.notify_released, timeout, Self::is_released)
+            .await
+    }
+
+    async fn wait_flag(
+        &self,
+        notify: &tokio::sync::Notify,
+        timeout: Duration,
+        is_set: fn(&Self) -> bool,
+    ) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self.is_dropped() {
+            if is_set(self) {
                 return true;
             }
-            if tokio::time::timeout_at(deadline, self.notify.notified())
+            if tokio::time::timeout_at(deadline, notify.notified())
                 .await
                 .is_err()
             {
-                return self.is_dropped();
+                return is_set(self);
             }
         }
     }
@@ -272,35 +323,50 @@ impl Latch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QuiesceTimedOut;
 
-/// `true` when every native reader is done (the owner was dropped); the queued export is then
-/// released with this thread's GIL token (`py`). Never waits. Used on the event-loop thread by
-/// the awaitable of `put_bytes_async(borrow=True)` and as the fast path of the blocking wait.
+/// `true` when every native reader is done AND the export has really been released. The queued
+/// export is released with this thread's GIL token (`py`) when this thread finds it in the queue.
+/// Never waits. Used on the event-loop thread by the awaitable of `put_bytes_async(borrow=True)`
+/// and as the fast path of the blocking wait.
 pub(crate) fn latch_ready(py: Python<'_>, latch: &Latch) -> bool {
     if latch.is_dropped() {
         drain_pending_exports(py);
         // Ready only when the export has REALLY been released: a dropped owner whose export is
-        // not in the queue that was drained (or was abandoned) falls through to the quiesce path.
+        // not in the queue that was drained - another drainer's private batch whose release
+        // callback is still running, or an abandoned export - is not ready.
         latch.is_released()
     } else {
         false
     }
 }
 
-/// Wait until every native reader of the export is done, then release the queue with the real
-/// `py` token. Used by the blocking `put_bytes` before it returns, however the put ended. When
-/// the latch is already dropped (the usual case: file/direct stores and borrowed-slice writers
-/// drop their last clone before returning) this only drains, holding the GIL: no detach, no
-/// wait. Otherwise it waits with the GIL released, bounded by `export_quiesce_timeout()` (this
-/// wait is NOT interruptible by signals/KeyboardInterrupt: the buffer must not be released
-/// while it can still be read). On timeout the export stays pinned, the timeout is counted
-/// and `Err(QuiesceTimedOut)` is returned.
+/// Wait until every native reader of the export is done and the export has REALLY been released.
+/// Used by the blocking `put_bytes` before it returns, however the put ended.
+///
+/// When the latch is already dropped and released (the usual case: file/direct stores and
+/// borrowed-slice writers drop their last clone before returning) this only drains, holding the
+/// GIL: no detach, no wait. Otherwise it waits with the GIL RELEASED: first for the owner's drop,
+/// then (after draining the queue itself) for the release, which another drainer may own - its
+/// release callback can need the GIL, so waiting for it while holding the GIL would deadlock.
+/// One deadline, `export_quiesce_timeout()`, covers both waits (this wait is NOT interruptible by
+/// signals/KeyboardInterrupt: the buffer must not be released while it can still be read). On
+/// timeout the export stays pinned, the timeout is counted and `Err(QuiesceTimedOut)` is
+/// returned; the caller raises it in its own stack, where no Task/Future can rewrite it.
 pub(crate) fn quiesce_blocking(py: Python<'_>, latch: &Latch) -> Result<(), QuiesceTimedOut> {
     if latch_ready(py, latch) {
         return Ok(());
     }
-    let timeout = export_quiesce_timeout();
-    if py.detach(|| latch.wait_dropped_blocking(timeout)) {
-        drain_pending_exports(py);
+    let deadline = std::time::Instant::now() + export_quiesce_timeout();
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+    if !py.detach(|| latch.wait_dropped_blocking(remaining())) {
+        note_quiesce_timeout();
+        return Err(QuiesceTimedOut);
+    }
+    // Dropped: release what is queued with this thread's token, then re-check actual release.
+    if latch_ready(py, latch) {
+        return Ok(());
+    }
+    // The export is owned by a drainer that is mid-release (or sits in no drained queue).
+    if py.detach(|| latch.wait_released_blocking(remaining())) {
         Ok(())
     } else {
         note_quiesce_timeout();
@@ -308,13 +374,23 @@ pub(crate) fn quiesce_blocking(py: Python<'_>, latch: &Latch) -> Result<(), Quie
     }
 }
 
-/// Async counterpart for the awaitable of `put_bytes_async(borrow=True)`: wait for the owner's
-/// drop. Returns `true` on TIMEOUT (a backend still references the buffer; it stays pinned).
+/// Async counterpart for the awaitable of `put_bytes_async(borrow=True)`. One step of the guard's
+/// loop, bounded by `export_quiesce_timeout()`: while the owner has not been dropped it waits for
+/// the drop; once dropped (the caller has drained the queue and the export is still not released:
+/// another drainer is mid-release) it waits for the actual release. Returns `true` on TIMEOUT
+/// (counted and logged; the caller keeps waiting, it never completes on a timeout).
 /// It never attaches to Python: the queued export is released by the result-delivery path of
-/// the awaitable (which runs inside the #192 delivery gate, drains first, and is skipped once
-/// the interpreter is exiting). Runs even when the awaitable was cancelled.
+/// this very awaitable (which runs inside the #192 delivery gate and drains first, and is skipped
+/// once the interpreter is exiting) or by the other drainer. Runs even when the awaitable was
+/// cancelled. The caller re-checks [`latch_ready`] after every step.
 pub(crate) async fn quiesce_async(latch: Arc<Latch>) -> bool {
-    if latch.wait_dropped(export_quiesce_timeout()).await {
+    let timeout = export_quiesce_timeout();
+    let ok = if latch.is_dropped() {
+        latch.wait_released(timeout).await
+    } else {
+        latch.wait_dropped(timeout).await
+    };
+    if ok {
         false
     } else {
         note_quiesce_timeout();
@@ -354,6 +430,36 @@ pub(crate) fn export_stats() -> ExportStats {
             .map_or(0, |q| q.attaches.load(Ordering::Relaxed)),
         test_releaser_parked: TEST_RELEASER_PARKED.load(Ordering::SeqCst),
     }
+}
+
+/// Test hook (hidden `s3dlio._put_test_retain_next_clone`): when armed, the next payload that
+/// holds a buffer export (`Blocking`/`Borrowed`) also keeps one clone of its `Bytes` in
+/// [`TEST_RETAINED`], standing in for a storage backend that keeps reading after the put ended.
+/// [`release_retained_for_test`] drops them in the order they were taken.
+static TEST_RETAIN_NEXT: AtomicBool = AtomicBool::new(false);
+static TEST_RETAINED: Mutex<Vec<Bytes>> = Mutex::new(Vec::new());
+
+pub(crate) fn arm_retain_for_test() {
+    TEST_RETAIN_NEXT.store(true, Ordering::SeqCst);
+}
+
+/// How many clones are retained right now.
+pub(crate) fn retained_for_test() -> usize {
+    TEST_RETAINED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .len()
+}
+
+/// Drop every retained clone, in order. Never touches Python (an `ExportOwner` drop only queues),
+/// so it is safe to call with the GIL held - which also keeps every drainer out until all of
+/// them are queued. Returns how many were dropped.
+pub(crate) fn release_retained_for_test() -> usize {
+    let retained =
+        std::mem::take(&mut *TEST_RETAINED.lock().unwrap_or_else(PoisonError::into_inner));
+    let n = retained.len();
+    drop(retained);
+    n
 }
 
 /// Test hook (hidden `s3dlio._put_test_queue_export`): hold `data` as a blocking payload and drop
@@ -927,10 +1033,19 @@ pub(crate) fn put_payload(
 ) -> PyResult<Payload> {
     Ok(match payload_parts(py, data, usage, false)? {
         Parts::Plain(bytes) => Payload { bytes, latch: None },
-        Parts::Export(owner, latch) => Payload {
-            bytes: Bytes::from_owner(owner),
-            latch: Some(latch),
-        },
+        Parts::Export(owner, latch) => {
+            let bytes = Bytes::from_owner(owner);
+            if TEST_RETAIN_NEXT.swap(false, Ordering::SeqCst) {
+                TEST_RETAINED
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(bytes.clone());
+            }
+            Payload {
+                bytes,
+                latch: Some(latch),
+            }
+        }
     })
 }
 
@@ -1830,5 +1945,68 @@ mod tests {
             assert!(latch_ready(py, &latch));
             assert!(resizable(ba.as_any()));
         });
+    }
+
+    /// A dropped export that another drainer still owns (its release has not run yet): the owner
+    /// is dropped, the public queue is empty, `released` is false. R3: the blocking wait must not
+    /// return before the actual release, and must wait without the GIL (the other drainer's
+    /// release needs it).
+    fn dropped_but_unreleased(
+        queue: &'static ReleaseQueue,
+    ) -> (Arc<Latch>, Py<pyo3::types::PyByteArray>) {
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &[3u8; 4096]);
+            let export = RawExport::acquire(ba.as_any()).unwrap().unwrap();
+            let (owner, latch) = ExportOwner::with_queue(export, queue);
+            let bytes = Bytes::from_owner(owner);
+            py.detach(move || drop(bytes)); // dropped; queued in the test queue only
+            assert!(latch.is_dropped() && !latch.is_released());
+            (latch, ba.unbind())
+        })
+    }
+
+    #[test]
+    fn blocking_quiesce_waits_for_the_actual_release_owned_by_another_drainer() {
+        init();
+        let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
+        let (latch, ba) = dropped_but_unreleased(queue);
+        let other_drainer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            Python::attach(|py| queue.drain(py)); // needs the GIL: the waiter must not hold it
+        });
+        Python::attach(|py| {
+            let started = Instant::now();
+            quiesce_blocking(py, &latch).expect("the other drainer releases it");
+            assert!(
+                started.elapsed() >= Duration::from_millis(290),
+                "returned before the export was actually released"
+            );
+            assert!(latch.is_released());
+            assert!(resizable(ba.bind(py).as_any()));
+        });
+        other_drainer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_quiesce_waits_for_the_actual_release_after_the_owner_dropped() {
+        init();
+        let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
+        let (latch, ba) = dropped_but_unreleased(queue);
+        let other_drainer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            Python::attach(|py| queue.drain(py));
+        });
+        let started = Instant::now();
+        assert!(
+            !quiesce_async(latch.clone()).await,
+            "must not report a timeout"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(290),
+            "completed before the export was actually released"
+        );
+        assert!(latch.is_released());
+        other_drainer.join().unwrap();
+        Python::attach(|py| assert!(resizable(ba.bind(py).as_any())));
     }
 }

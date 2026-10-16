@@ -5,8 +5,8 @@
 
 use super::async_bridge::future_into_py;
 use super::put_payload::{
-    export_stats, hold_for_call, latch_ready, note_internal_error, put_payload, quiesce_async,
-    quiesce_blocking, Latch, PayloadUse,
+    deadline_warning_text, export_stats, hold_for_call, latch_ready, note_internal_error,
+    put_payload, quiesce_async, quiesce_blocking, Latch, PayloadUse,
 };
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
@@ -1461,8 +1461,11 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 ///   make a concurrent write safe).
 ///
 /// The call does not return - normally or with an error - until every native reader of the
-/// buffer is done and the export has been released (bounded wait; on timeout the buffer stays
-/// pinned and `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it).
+/// buffer is done and the export has been released. The wait is bounded
+/// (`S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`, 30 s) and not interruptible by signals; if a backend
+/// still holds the payload then, the call raises `s3dlio.ExportStillReferencedError` directly in
+/// the calling thread (no Future or Task can rewrite it), the buffer stays pinned and must not
+/// be reused, and `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it.
 ///
 /// # Arguments
 /// * `uri` - Full URI including scheme (s3://, az://, gs://, file://, direct://)
@@ -1543,11 +1546,12 @@ fn still_referenced_message(outcome: &str) -> String {
 }
 
 /// The message of an INTERNAL failure of the barrier machinery (not a backend that holds on):
-/// the buffer's state is unknown, so it stays pinned.
-fn barrier_internal_message(outcome: &str, detail: &str) -> String {
+/// the awaitable falls back to polling and stays pending until the export is released.
+fn barrier_internal_message(detail: &str) -> String {
     format!(
-        "internal error in the buffer completion barrier ({detail}; {outcome}); the buffer may \
-         still be referenced and stays pinned - do not modify, resize or free it"
+        "internal error in the buffer completion barrier ({detail}); the buffer may still be \
+         referenced and stays pinned; the awaitable keeps waiting by polling - do not modify, \
+         resize or free the buffer until it completes"
     )
 }
 
@@ -1574,15 +1578,19 @@ fn put_outcome_text(result: &PyResult<()>) -> String {
 ///   awaitable completes. By passing `borrow=True` the caller PROMISES not to modify, resize
 ///   or free the buffer until the awaitable has completed (successfully or not); until
 ///   then `bytearray.extend()/clear()` raise `BufferError` and any write to the bytes is a
-///   data race (the bytes uploaded are undefined). The awaitable (a `Future` whose `cancel()`
-///   defers its own end, for `borrow=True`) completes - with the result, with an error, or with `CancelledError` - only
-///   after every native reader of the buffer is done and the export has been released: a
-///   cancellation is delivered to the caller after that point, not before, so reusing the
-///   buffer after `CancelledError` is safe. (Cancelling therefore waits for a running native
-///   write to finish; the wait is bounded, see `s3dlio._put_export_stats()`. Await the
-///   future itself: `asyncio.shield(fut)` bypasses the guard (the shield is cancelled at once
-///   while the put still reads the buffer), and `wait_for(fut, t)` can take up to `t` plus the
-///   quiesce timeout.)
+///   data race (the bytes uploaded are undefined). The awaitable is a `Future` that NEVER reaches
+///   a terminal state - result, exception or cancelled - while any native reader of the buffer
+///   remains or before the export has actually been released, whatever the caller does:
+///   `Task.cancel()` (also repeated), `asyncio.timeout()` and `wait_for()` leave the awaiting task
+///   pending until the future ends; a cancellation or timeout is delivered only after that point.
+///   So reusing the buffer after the `await` finished - with a result, an error, `CancelledError`
+///   or `TimeoutError` - is safe. Cancelling therefore waits for a running native write to finish.
+///   Every `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (default 30 s) that a reader remains, a
+///   `RuntimeWarning` naming the timeout is emitted, `s3dlio._put_export_stats()["quiesce_timeouts"]`
+///   is incremented and the wait continues (it does not complete). If the barrier machinery itself
+///   fails, it polls instead; it still completes only after the release. (Await the future itself:
+///   `asyncio.shield(fut)` bypasses the guard - the shield is cancelled at once while the put
+///   still reads the buffer.)
 ///   Use it for large buffers you own for the duration of the call (for example pinned host
 ///   memory).
 /// * A non-contiguous view: one gather copy with the GIL held; `__bytes__()`-only object:
@@ -1688,27 +1696,44 @@ fn wrap_in_guard<'py>(
 /// Not a coroutine: a coroutine body never runs if its Task is cancelled before the first step,
 /// which would let the caller see `CancelledError` while a native write still reads the buffer.
 /// A `Future` subclass has no such window: `cancel()` is called on it directly, cancels the put,
-/// and defers the future's own terminal state until the barrier says no reader remains.
+/// and defers the future's own terminal state.
+///
+/// THE CONTRACT: this future never reaches a terminal state (result, exception, cancelled) while
+/// a native reader remains or before the export has really been released - whatever the caller
+/// does (`Task.cancel()` once or repeatedly, `asyncio.timeout`, `wait_for`) and whatever happens
+/// to the barrier machinery. At every quiesce deadline it warns and counts, then waits again. If
+/// the machinery itself fails (the quiesce future cannot be created, `add_done_callback` raises,
+/// the waiter fails, `latch_ready` raises) it falls back to polling with `loop.call_later`, and
+/// if even that cannot be scheduled to a blocking wait on the event-loop thread. A failure is
+/// reported through `event('internal', ...)` and counted, never turned into a completion.
 const PUT_GUARD_PY: &std::ffi::CStr = c_str!(
     "import asyncio
+import warnings
+
+# Failures of the machinery we recover from; KeyboardInterrupt/SystemExit are left alone.
+_RECOVERABLE = (Exception, asyncio.CancelledError)
 
 class GuardedFuture(asyncio.Future):
-    def __init__(self, inner, latch_ready, quiesce, make_error):
+    def __init__(self, inner, latch_ready, quiesce, event, block, poll_interval):
         super().__init__(loop=inner.get_loop())
         self._inner = inner
         self._latch_ready = latch_ready
         self._quiesce = quiesce
-        self._make_error = make_error
+        self._event = event
+        self._block = block
+        self._poll_interval = poll_interval
+        self._outcome = None
         self._cancel_msg = None
         self._finishing = False
         inner.add_done_callback(self._inner_done)
 
     def cancel(self, msg=None):
         # Request cancellation of the put; this future stays pending until no native reader of
-        # the borrowed buffer remains, then ends cancelled (see _complete). When the put is
-        # already over (inner done: its outcome is fixed and only the barrier is pending) return
-        # False: a Task awaiting this future then records the cancellation itself and raises
-        # CancelledError right after the barrier completes, instead of the outcome being lost.
+        # the borrowed buffer remains and the export is released, then ends cancelled (see
+        # _complete). When the put is already over (inner done: its outcome is fixed and only
+        # the barrier is pending) return False: a Task awaiting this future then records the
+        # cancellation itself and raises CancelledError right after the barrier completes,
+        # instead of the outcome being lost.
         if self.done() or self._finishing:
             return False
         if not self._inner.cancel():
@@ -1727,41 +1752,67 @@ class GuardedFuture(asyncio.Future):
             else:
                 exc = inner.exception()
                 outcome = (1, exc) if exc is not None else (0, inner.result())
-        except BaseException as e:
+        except _RECOVERABLE as e:
             outcome = (1, e)
+        self._outcome = outcome
+        self._await_release()
+
+    def _await_release(self):
+        # Completes ONLY when latch_ready() returned True (owner dropped AND export released).
         try:
             if self._latch_ready():
-                self._complete(outcome, False)
+                self._complete()
                 return
-            waiter = self._quiesce()
-        except BaseException as e:
-            self._complete(outcome, e)
+        except _RECOVERABLE as e:
+            self._fallback('latch_ready', e)
             return
-        waiter.add_done_callback(lambda w: self._quiesced(outcome, w))
+        try:
+            waiter = self._quiesce()
+            waiter.add_done_callback(self._quiesced)
+        except _RECOVERABLE as e:
+            self._fallback('quiesce', e)
 
-    def _quiesced(self, outcome, waiter):
+    def _quiesced(self, waiter):
         try:
             timed_out = bool(waiter.result())
-        except BaseException as e:
-            timed_out = e
-        self._complete(outcome, timed_out)
+        except _RECOVERABLE as e:
+            self._fallback('waiter', e)
+            return
+        if timed_out:
+            # Deadline: warn, count (the wait counted it), and wait again. NEVER complete here.
+            try:
+                warnings.warn(self._event('timeout', ''), RuntimeWarning, stacklevel=1)
+            except _RECOVERABLE:
+                pass
+        self._await_release()
 
-    def _complete(self, outcome, timed_out):
-        kind, value = outcome
-        if timed_out is not False:
-            text = (
-                'the put itself succeeded' if kind == 0
-                else 'the put itself failed: %r' % (value,) if kind == 1
-                else 'the put was cancelled'
-            )
-            if timed_out is True:
-                err = self._make_error('timeout', text, '')
-            else:
-                err = self._make_error('internal', text, repr(timed_out))
-            if kind == 1:
-                err.__cause__ = value
-            asyncio.Future.set_exception(self, err)
-        elif kind == 0:
+    def _fallback(self, where, e):
+        try:
+            self._event('internal', '%s: %r' % (where, e))
+        except _RECOVERABLE:
+            pass
+        self._poll()
+
+    def _poll(self):
+        try:
+            if self._latch_ready():
+                self._complete()
+                return
+        except _RECOVERABLE:
+            pass  # keep polling; the first failure was reported by _fallback
+        try:
+            self.get_loop().call_later(self._poll_interval, self._poll)
+        except _RECOVERABLE as e:
+            try:
+                self._event('internal', 'call_later: %r' % (e,))
+                self._block()  # last resort: blocks this thread until the export is released
+            except _RECOVERABLE:
+                return  # nothing safe is left to do: stay pending (ownership first)
+            self._complete()
+
+    def _complete(self):
+        kind, value = self._outcome
+        if kind == 0:
             asyncio.Future.set_result(self, value)
         elif kind == 1:
             asyncio.Future.set_exception(self, value)
@@ -1775,15 +1826,22 @@ struct PreparedGuard<'py> {
     class: Bound<'py, PyAny>,
     latch_ready: Bound<'py, PyAny>,
     quiesce: Bound<'py, PyAny>,
-    make_error: Bound<'py, PyAny>,
+    event: Bound<'py, PyAny>,
+    block: Bound<'py, PyAny>,
 }
 
 impl<'py> PreparedGuard<'py> {
     /// Wrap the `inner` put future (cannot fail for lack of resources prepared above).
     fn instantiate(self, py: Python<'py>, inner: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let _ = py;
-        self.class
-            .call1((inner, self.latch_ready, self.quiesce, self.make_error))
+        self.class.call1((
+            inner,
+            self.latch_ready,
+            self.quiesce,
+            self.event,
+            self.block,
+            crate::constants::EXPORT_BARRIER_POLL_INTERVAL.as_secs_f64(),
+        ))
     }
 }
 
@@ -1806,6 +1864,7 @@ fn prepare_guard<'py>(
         }
     };
     let l1 = latch.clone();
+    let l2 = latch.clone();
     let latch_ready_fn = pyo3::types::PyCFunction::new_closure(
         py,
         None,
@@ -1822,38 +1881,53 @@ fn prepare_guard<'py>(
               _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
               -> PyResult<Py<PyAny>> {
             let latch = latch.clone();
-            // resolves to True when the wait TIMED OUT
+            // resolves to True when the wait hit its deadline
             let fut = future_into_py(args.py(), async move { Ok(quiesce_async(latch).await) })?;
             Ok(fut.unbind())
         },
     )?;
-    // Builds the exception for a barrier failure: ('timeout'|'internal', outcome text, detail).
-    let make_error_fn = pyo3::types::PyCFunction::new_closure(
+    // Reports a barrier event: ('timeout', _) -> the warning text of the missed deadline (the
+    // wait already counted it); ('internal', detail) -> counts and logs the machinery failure.
+    let event_fn = pyo3::types::PyCFunction::new_closure(
         py,
         None,
         None,
         move |args: &Bound<'_, pyo3::types::PyTuple>,
               _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
-              -> PyResult<Py<PyAny>> {
+              -> PyResult<String> {
             let kind: String = args.get_item(0)?.extract()?;
-            let outcome: String = args.get_item(1)?.extract()?;
-            let detail: String = args.get_item(2)?.extract()?;
-            let msg = if kind == "internal" {
+            let detail: String = args.get_item(1)?.extract()?;
+            if kind == "internal" {
                 note_internal_error();
-                barrier_internal_message(&outcome, &detail)
+                let msg = barrier_internal_message(&detail);
+                tracing::warn!("s3dlio: {msg}");
+                Ok(msg)
             } else {
-                still_referenced_message(&outcome)
-            };
-            Ok(ExportStillReferencedError::new_err(msg)
-                .into_value(args.py())
-                .into_any())
+                Ok(deadline_warning_text(export_stats().quiesce_timeouts))
+            }
+        },
+    )?;
+    // Last resort when even a poll cannot be scheduled: wait on THIS thread (GIL released) until
+    // the export is really released, however long a native reader needs.
+    let block_fn = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
+              -> PyResult<()> {
+            while quiesce_blocking(args.py(), &l2).is_err() {
+                // each missed deadline is logged and counted by the wait; keep waiting
+            }
+            Ok(())
         },
     )?;
     Ok(PreparedGuard {
         class,
         latch_ready: latch_ready_fn.into_any(),
         quiesce: quiesce_fn.into_any(),
-        make_error: make_error_fn.into_any(),
+        event: event_fn.into_any(),
+        block: block_fn.into_any(),
     })
 }
 
@@ -1883,6 +1957,26 @@ fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 #[pyo3(signature = (data, park_ms = 0))]
 fn _put_test_queue_export(py: Python<'_>, data: &Bound<'_, PyAny>, park_ms: u64) -> PyResult<()> {
     super::put_payload::test_queue_undrained_export(py, data, park_ms)
+}
+
+/// Hidden test hook: the next borrowed/blocking payload that holds a buffer export keeps one clone
+/// of its bytes, like a backend that keeps reading after the put ended, until
+/// `_put_test_release_retained()`.
+#[pyfunction]
+fn _put_test_retain_next_clone() {
+    super::put_payload::arm_retain_for_test();
+}
+
+/// Hidden test hook: number of clones retained by `_put_test_retain_next_clone()` right now.
+#[pyfunction]
+fn _put_test_retained() -> usize {
+    super::put_payload::retained_for_test()
+}
+
+/// Hidden test hook: drop every retained clone (in order, with the GIL held); returns how many.
+#[pyfunction]
+fn _put_test_release_retained() -> usize {
+    super::put_payload::release_retained_for_test()
 }
 
 // ---------------------------------------------------------------------------
@@ -3480,6 +3574,9 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(put_bytes_async, m)?)?;
     m.add_function(wrap_pyfunction!(_put_export_stats, m)?)?;
     m.add_function(wrap_pyfunction!(_put_test_queue_export, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_test_retain_next_clone, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_test_retained, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_test_release_retained, m)?)?;
     m.add(
         "ExportStillReferencedError",
         m.py().get_type::<ExportStillReferencedError>(),
@@ -4368,7 +4465,8 @@ mod borrowed_put_guard_tests {
                 class: get("Boom"),
                 latch_ready: get("noop"),
                 quiesce: get("noop"),
-                make_error: get("noop"),
+                event: get("noop"),
+                block: get("noop"),
             },
             get("inner"),
         )
@@ -4397,13 +4495,18 @@ mod borrowed_put_guard_tests {
         assert!(m.contains("30s"), "{m}");
         assert!(m.contains("the put itself failed: disk full"), "{m}");
         assert!(m.contains("do not modify"), "{m}");
-        let i = barrier_internal_message("the put itself succeeded", "RuntimeError('x')");
+        let i = barrier_internal_message("RuntimeError('x')");
         assert!(i.starts_with("internal error"), "{i}");
         assert!(
-            i.contains("RuntimeError('x')") && i.contains("succeeded"),
+            i.contains("RuntimeError('x')") && i.contains("keeps waiting"),
             "{i}"
         );
         assert!(!i.contains("still references"), "{i}");
+        let w = deadline_warning_text(3);
+        assert!(
+            w.contains("30s") && w.contains("#3") && w.contains("never completed"),
+            "{w}"
+        );
         let before = export_stats().internal_errors;
         note_internal_error();
         assert_eq!(export_stats().internal_errors, before + 1);
