@@ -2355,8 +2355,8 @@ mod oversized_range_admission_tests {
         tempfile::TempDir::new_in(base).unwrap()
     }
 
-    fn pattern(len: usize, salt: usize) -> Vec<u8> {
-        (0..len).map(|i| ((i * 31 + salt) % 251) as u8).collect()
+    fn pattern(len: usize, seed: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 31 + seed) % 251) as u8).collect()
     }
 
     fn store() -> (
