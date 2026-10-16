@@ -18,7 +18,7 @@
   every `write_chunk`; `crc-fast` is about 3x to 4x faster than `crc32fast` for buffers that fit in
   cache and equal to it when memory-bound (measured on an x86-64 AVX-512 host; aarch64 was not
   measured). `s3dlio::checksum::crc32c_implementation()` reports which code the CPU selected. The
-  `crc32c` crate remains only as an independent oracle in the tests. The label is unchanged. **The hex digits differ for every input**: for the bytes `123456789` the writers used to
+  `crc32c` crate remains only as an independent oracle in the tests. The label is unchanged. **The hex digits differ for almost every input** (the two algorithms agree on some, such as empty input, where both are zero): for the bytes `123456789` the writers used to
   report `crc32c:cbf43926` and now report `crc32c:e3069283`. Anything that stored a checksum from an
   earlier release and compares it with a new one (for example a checkpoint manifest written before
   and read with validation after) must recompute it. The integrity-validation helper
@@ -37,6 +37,18 @@
   with a header-CRC error. Files written by earlier releases keep their wrong checksums.
 
 ### Fixed
+
+- **A compressed shard written under a key that already ends in `.zst` is stored under the name the manifest records (R10).**
+  A compressing writer for a custom key such as `custom.zst` appended a second extension in the file,
+  `direct://` and Arrow writers and stored the object as `custom.zst.zst`, while
+  `finalize_writer_to_shard_meta` recorded and looked for `custom.zst`: the write succeeded and the
+  helper then failed to find the object, or silently described an older object that already had that
+  name (`put_shard_with_key` appended the extension independently and recorded `custom.zst.zst`).
+  There is now one rule, `CompressionConfig::stored_name` (and
+  `stored_path` for filesystem paths): the extension is appended only when the name does not already
+  end with it. Every compressing writer (file, `direct://`, Arrow, S3, Azure, GCS) uses it for the stored
+  name and the checkpoint writer uses it for the manifest name, so the two always agree. Keys that
+  do not end in `.zst` are named exactly as before (`plain.bin` is stored and recorded as `plain.bin.zst`).
 
 - **`get_with_validation` accepts the checksum form that writers and manifests produce (#259).**
   Writers report `crc32c:<hex>` and the checkpoint manifest stores that value, but validation compared
