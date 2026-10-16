@@ -14,7 +14,7 @@ use std::os::raw::c_char;
 
 // Project crates
 use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
-use crate::python_api::put_payload::hold_for_call;
+use crate::python_api::put_payload::{hold_for_call, snapshot_for_call};
 use crate::python_api::python_core_api::{py_err, require_max_in_flight, PyBytesView};
 
 // ---------------------------------------------------------------------------
@@ -171,13 +171,33 @@ impl PyMultipartUploadWriter {
 
     /// Write a bytes-like object (bytes, bytearray, memoryview, NumPy buffer).
     ///
+    /// BORROWS the buffer by default: no copy is made by the Python layer (the sink then copies
+    /// it once into its part buffers, because parts are uploaded asynchronously and outlive the
+    /// call), and the GIL is released for the write. While the call runs the buffer is
+    /// exported (resizing it from another thread raises `BufferError`) and NO thread may modify
+    /// its bytes until the call returns: a concurrent write is a data race and the bytes
+    /// uploaded are undefined. The export is released before the call returns. BEHAVIOUR
+    /// CHANGE in 0.9.128: 0.9.126 and earlier copied a mutable buffer under the GIL first.
+    ///
+    /// Args:
+    ///     data: bytes-like object (or an object with ``__bytes__()``).
+    ///     copy: keyword-only, default False. With ``copy=True`` a mutable buffer is first
+    ///         copied once with the GIL held and the export released, so you may modify or reuse
+    ///         it as soon as the call has started; exact ``bytes`` and ``BytesView`` are
+    ///         immutable and never copied.
+    ///
     /// For large buffers (>= 8 MiB), uses an owned fast path internally to avoid
     /// extra copies. For maximum performance, prefer `reserve()`/`commit()`.
     ///
     /// Returns:
     ///     int: number of bytes accepted.
-    #[pyo3(text_signature = "(self, data, /)")]
-    fn write<'py>(&mut self, py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<usize> {
+    #[pyo3(signature = (data, /, *, copy = false), text_signature = "(self, data, /, *, copy=False)")]
+    fn write<'py>(
+        &mut self,
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        copy: bool,
+    ) -> PyResult<usize> {
         let inner = self
             .inner
             .as_mut()
@@ -207,7 +227,7 @@ impl PyMultipartUploadWriter {
         //    its part buffers: the parts are uploaded asynchronously and outlive this call, so a
         //    borrowed Python buffer cannot be handed to them without pinning it until they
         //    finish. Contract: do not modify the buffer from another thread during the call.
-        let held = hold_for_call(py, data).map_err(|e| {
+        let not_bytes_like = |e: PyErr| {
             if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
                 pyo3::exceptions::PyTypeError::new_err(format!(
                     "write() expects bytes-like (bytes, bytearray, memoryview, NumPy buffer) or an object with __bytes__(): {e}"
@@ -215,7 +235,18 @@ impl PyMultipartUploadWriter {
             } else {
                 e
             }
-        })?;
+        };
+        if copy {
+            // `copy=True`: one snapshot with the GIL held (export released), then the owned
+            // bytes are handed to the sink without another copy of the caller's memory.
+            let snapshot = snapshot_for_call(py, data).map_err(not_bytes_like)?;
+            let len = snapshot.len();
+            return py
+                .detach(|| inner.write_bytes_blocking(snapshot))
+                .map(|_| len)
+                .map_err(|e| py_err(e.context("write failed")));
+        }
+        let held = hold_for_call(py, data).map_err(not_bytes_like)?;
         let len = held.len();
         let res = py.detach(|| inner.write_blocking(held.as_slice()));
         held.release(py);

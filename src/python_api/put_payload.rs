@@ -138,6 +138,10 @@
 //! The streaming writers (`write_chunk`, `write_owned_bytes`, `MultipartUploadWriter.write`)
 //! use the same conversion but are STRICT: only buffer-protocol objects and objects with
 //! `__bytes__()` are accepted (`put_bytes` keeps its `bytes(obj)` fallback).
+//! They BORROW the buffer for the one call (no thread may modify it until the call returns; the
+//! export is released before it returns). `write_owned_bytes(copy=True)` and
+//! `MultipartUploadWriter.write(copy=True)` instead take one snapshot with the GIL held
+//! ([`snapshot_for_call`]); exact `bytes` and `BytesView` are immutable and never copied.
 
 use super::python_core_api::PyBytesView;
 use bytes::Bytes;
@@ -165,6 +169,10 @@ pub(crate) enum PayloadUse {
     /// `put_bytes_async(borrow=True)`: the caller promised not to modify or free the buffer
     /// until the awaitable completes, so it is read in place like `Blocking`.
     Borrowed,
+    /// The streaming writers' `copy=True`: a mutable exporter is copied once, with the GIL held
+    /// for the whole copy (no other Python thread can interleave), and the export is released
+    /// before the write starts. Exact `bytes` and `BytesView` are immutable and still not copied.
+    SnapshotUnderGil,
 }
 
 /// The completion barrier of ONE call that holds a buffer export.
@@ -941,10 +949,11 @@ fn bytes_from_pybytes(b: &Bound<'_, PyBytes>) -> Bytes {
 
 /// One copy of `src` for `put_bytes_async` (default): with the GIL held below
 /// [`SNAPSHOT_GIL_DETACH_THRESHOLD`] (releasing and re-taking the GIL costs more than the copy),
-/// released above it so other threads keep running. An allocation failure is a `MemoryError`,
-/// not an abort.
-fn snapshot_copy(py: Python<'_>, src: &[u8]) -> PyResult<Bytes> {
-    let result = if src.len() < SNAPSHOT_GIL_DETACH_THRESHOLD {
+/// released above it so other threads keep running; with `may_detach == false` (the streaming
+/// writers' `copy=True`) the GIL is held for the whole copy. An allocation failure is a
+/// `MemoryError`, not an abort.
+fn snapshot_copy(py: Python<'_>, src: &[u8], may_detach: bool) -> PyResult<Bytes> {
+    let result = if !may_detach || src.len() < SNAPSHOT_GIL_DETACH_THRESHOLD {
         try_snapshot(src, src.len())
     } else {
         py.detach(|| try_snapshot(src, src.len()))
@@ -1013,6 +1022,21 @@ pub(crate) fn hold_for_call(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult
     payload_parts(py, data, PayloadUse::Blocking, true).map(Held)
 }
 
+/// The streaming writers' `copy=True`: `data` as `Bytes` that nothing else can modify. A mutable
+/// exporter is copied once with the GIL held; exact `bytes` and `BytesView` are returned as they
+/// are (immutable, zero copies). Strict like [`hold_for_call`].
+pub(crate) fn snapshot_for_call(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Bytes> {
+    match payload_parts(py, data, PayloadUse::SnapshotUnderGil, true)? {
+        Parts::Plain(bytes) => Ok(bytes),
+        // Not produced for SnapshotUnderGil; copy defensively rather than assume.
+        Parts::Export(owner, _) => {
+            let copy = snapshot_copy(py, owner.as_ref(), false);
+            owner.release(py);
+            copy
+        }
+    }
+}
+
 /// Convert `data` to the `Bytes` that is written to the store (see the module docs for
 /// exactly what is copied).
 #[cfg(test)]
@@ -1078,11 +1102,12 @@ fn payload_parts(
         let owner = ExportOwner::new(export, latch.clone());
         return match usage {
             PayloadUse::Blocking | PayloadUse::Borrowed => Ok(Parts::Export(owner, latch)),
-            PayloadUse::Snapshot => {
+            PayloadUse::Snapshot | PayloadUse::SnapshotUnderGil => {
                 // Copy now (the caller may reuse the buffer as soon as we return). `owner`
                 // keeps the export, so the memory cannot be freed or resized meanwhile; it
                 // is released explicitly right after (this thread holds the GIL again).
-                let copy = snapshot_copy(py, owner.as_ref());
+                let detach = usage == PayloadUse::Snapshot;
+                let copy = snapshot_copy(py, owner.as_ref(), detach);
                 owner.release(py);
                 copy.map(plain)
             }
@@ -2008,5 +2033,43 @@ mod tests {
         assert!(latch.is_released());
         other_drainer.join().unwrap();
         Python::attach(|py| assert!(resizable(ba.bind(py).as_any())));
+    }
+
+    /// The writers' `copy=True`: a mutable exporter is copied once and independent of the source
+    /// (the export is released at once, later changes are invisible); exact `bytes` and
+    /// `BytesView` are still not copied.
+    #[test]
+    fn snapshot_for_call_copies_mutable_exporters_but_never_immutable_bytes() {
+        init();
+        Python::attach(|py| {
+            let ba = PyByteArray::new(py, &vec![5u8; 1 << 20]);
+            let src = exported_ptr(ba.as_any());
+            let got = snapshot_for_call(py, ba.as_any()).unwrap();
+            assert_ne!(got.as_ptr(), src, "a mutable exporter must be copied");
+            assert!(
+                resizable(ba.as_any()),
+                "the export must be released at once"
+            );
+            ba.call_method1("__setitem__", (0, 6)).unwrap();
+            assert_eq!(got.len(), 1 << 20);
+            assert!(got.iter().all(|&b| b == 5), "snapshot saw a later change");
+
+            let b = PyBytes::new(py, &[9u8; 4096]);
+            let got = snapshot_for_call(py, b.as_any()).unwrap();
+            assert_eq!(
+                got.as_ptr(),
+                b.as_bytes().as_ptr(),
+                "exact bytes was copied"
+            );
+
+            let original = Bytes::from(vec![7u8; 4096]);
+            let ptr = original.as_ptr();
+            let view = Bound::new(py, PyBytesView::new(original)).unwrap();
+            let got = snapshot_for_call(py, view.as_any()).unwrap();
+            assert_eq!(got.as_ptr(), ptr, "BytesView was copied");
+
+            // strict: an int is refused, nothing is written
+            assert!(snapshot_for_call(py, &5i32.into_pyobject(py).unwrap().into_any()).is_err());
+        });
     }
 }

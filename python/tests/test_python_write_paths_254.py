@@ -4,7 +4,8 @@ and the GIL is released for the write.
 
 Memory and GIL-stall measurements run in a fresh interpreter per case (peak RSS is a high-water
 mark). Quiet-host bounds: measured stalls are 1-3 ms against 150-300 ms for a copy under the GIL.
-(The S3 MultipartUploadWriter.write() path needs an S3 endpoint and is not exercised here.)
+(MultipartUploadWriter.write() needs an S3 endpoint to construct and is not run here; see the R7
+section at the end for what is covered.)
 """
 
 import ctypes
@@ -13,6 +14,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 import pytest
 import s3dlio
@@ -178,3 +181,169 @@ def test_streaming_write_accepts_objects_with_dunder_bytes(work_dir):
     w.finalize()
     with open(path, "rb") as f:
         assert f.read() == b"hello"
+
+
+# ---------------------------------------------------------------------------------------------
+# R7: the ownership contract of the streaming writers. write_chunk(), write_owned_bytes() and
+# MultipartUploadWriter.write() BORROW the caller's buffer by default (zero copy, GIL released, no
+# thread may modify the bytes until the call returns); write_owned_bytes() and
+# MultipartUploadWriter.write() take a keyword-only copy=True that snapshots a mutable input under
+# the GIL first. (MultipartUploadWriter.write() needs an S3 endpoint to construct, so only its
+# Python-visible signature and docstring are exercised here; its copy=True logic shares
+# snapshot_for_call() with write_owned_bytes(), which is tested end to end below.)
+# ---------------------------------------------------------------------------------------------
+
+
+class BlockedWrite:
+    """A filesystem writer on a FIFO whose read end is open but not being read: a payload larger
+    than the pipe buffer blocks inside the native write, which makes 'during the call'
+    deterministic (no sleeps decide the outcome; the sleep only gives the thread time to enter). The payload must exceed what tokio's file buffer (2 MiB) absorbs before it blocks."""
+
+    def __init__(self, work_dir, data, method, **kwargs):
+        self.fifo = os.path.join(work_dir, "pipe")
+        os.mkfifo(self.fifo)
+        self.data = data
+        self.rfd = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
+        os.set_blocking(self.rfd, True)
+        self.writer = s3dlio.create_filesystem_writer(f"file://{self.fifo}", None)
+        self.error = None
+        self.thread = threading.Thread(
+            target=self._run, args=(method, kwargs), daemon=True
+        )
+        self.thread.start()
+        deadline = time.monotonic() + 30
+        time.sleep(0.5)  # the write fills the pipe and blocks
+        assert self.thread.is_alive(), f"the write did not block: {self.error!r}"
+        assert time.monotonic() < deadline
+
+    def _run(self, method, kwargs):
+        try:
+            getattr(self.writer, method)(self.data, **kwargs)
+        except BaseException as e:  # noqa: BLE001 - reported to the test
+            self.error = e
+
+    def drain(self, size):
+        got = bytearray()
+        while len(got) < size:
+            chunk = os.read(self.rfd, 1 << 20)
+            assert chunk, "unexpected EOF"
+            got += chunk
+        self.thread.join(30)
+        assert not self.thread.is_alive(), "the write never finished"
+        assert self.error is None, self.error
+        os.close(self.rfd)
+        return bytes(got)
+
+
+def _pattern(n):
+    return bytes((i * 7 + (i >> 9)) & 0xFF for i in range(n))
+
+
+@pytest.mark.parametrize("kind", ["bytearray", "memoryview", "np_uint8"])
+def test_write_owned_bytes_copy_true_snapshots_before_the_write(work_dir, kind):
+    original = _pattern(8 * MIB)
+    ba = bytearray(original)
+    arg = {
+        "bytearray": ba,
+        "memoryview": memoryview(ba),
+        "np_uint8": np.frombuffer(ba, dtype=np.uint8),
+    }[kind]
+    w = BlockedWrite(work_dir, arg, "write_owned_bytes", copy=True)
+    # The native write is blocked and still running. The input was snapshotted first, so the
+    # export is gone (resizable) and changing the source cannot reach the written bytes.
+    if kind == "np_uint8":
+        arg[:] = 0x5A
+    else:
+        ba[:] = b"Z" * len(ba)
+    if kind == "bytearray":
+        ba.append(0)
+        del ba[-1:]
+    assert w.drain(len(original)) == original, "the write saw the later modification"
+
+
+def test_write_owned_bytes_default_borrows_the_buffer_during_the_call(work_dir):
+    """Default (copy=False) is zero copy: the buffer is exported while the call runs (a resize
+    raises BufferError) and is free again once it returned. No modification happens here."""
+    original = _pattern(8 * MIB)
+    ba = bytearray(original)
+    w = BlockedWrite(work_dir, ba, "write_owned_bytes")
+    with pytest.raises(BufferError):
+        ba.append(0)
+    assert w.drain(len(original)) == original
+    ba.append(0)  # released before the call returned
+    del ba[-1:]
+
+
+def test_write_chunk_borrows_and_has_no_copy_parameter(work_dir):
+    original = _pattern(8 * MIB)
+    ba = bytearray(original)
+    w = BlockedWrite(work_dir, ba, "write_chunk")
+    with pytest.raises(BufferError):
+        ba.append(0)
+    assert w.drain(len(original)) == original
+    other = s3dlio.create_filesystem_writer(f"file://{work_dir}/c.bin", None)
+    with pytest.raises(TypeError):
+        other.write_chunk(b"x", copy=True)
+    other.finalize()
+
+
+@pytest.mark.parametrize("copy", [False, True])
+def test_write_owned_bytes_roundtrip_in_both_modes(work_dir, copy):
+    raw = _pattern(300_003)
+    path = f"{work_dir}/rt-{copy}.bin"
+    w = s3dlio.create_filesystem_writer(f"file://{path}", None)
+    w.write_owned_bytes(raw[:100_000], copy=copy)
+    w.write_owned_bytes(bytearray(raw[100_000:200_000]), copy=copy)
+    w.write_owned_bytes(memoryview(bytearray(raw[200_000:])), copy=copy)
+    w.finalize()
+    with open(path, "rb") as f:
+        assert f.read() == raw
+
+
+def test_copy_true_keeps_the_strict_conversion(work_dir):
+    w = s3dlio.create_filesystem_writer(f"file://{work_dir}/s.bin", None)
+    for bad in (5, [1, 2], "abc", None):
+        with pytest.raises(TypeError):
+            w.write_owned_bytes(bad, copy=True)
+    w.finalize()
+    assert os.path.getsize(f"{work_dir}/s.bin") == 0
+
+
+def test_copy_is_keyword_only(work_dir):
+    w = s3dlio.create_filesystem_writer(f"file://{work_dir}/k.bin", None)
+    with pytest.raises(TypeError):
+        w.write_owned_bytes(b"x", True)
+    w.finalize()
+
+
+@pytest.mark.parametrize(
+    "func_name,owner",
+    [
+        ("write_chunk", "PyObjectWriter"),
+        ("write_owned_bytes", "PyObjectWriter"),
+        ("write", "MultipartUploadWriter"),
+    ],
+)
+def test_python_visible_docs_state_the_borrow_contract(work_dir, func_name, owner):
+    """The contract is in the docstring Python users see, not only in comments and the guide."""
+    if owner == "PyObjectWriter":
+        target = type(s3dlio.create_filesystem_writer(f"file://{work_dir}/d.bin", None))
+    else:
+        target = s3dlio.MultipartUploadWriter
+    doc = getattr(target, func_name).__doc__ or ""
+    low = doc.lower()
+    assert "borrow" in low, doc
+    assert "until the call returns" in low, doc
+    assert "modify" in low, doc
+    if func_name != "write_chunk":
+        assert "copy=true" in low, doc
+        assert "0.9.126" in doc, "the behaviour change must be stated"
+
+
+def test_multipart_write_signature_has_keyword_only_copy():
+    import inspect
+
+    sig = inspect.signature(s3dlio.MultipartUploadWriter.write)
+    assert "copy" in sig.parameters, sig
+    p = sig.parameters["copy"]
+    assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is False, sig

@@ -106,6 +106,17 @@
   `add_done_callback` raising) the awaitable polls every 50 ms, and if that cannot be scheduled blocks, instead of
   completing or stranding; `_put_export_stats()["internal_errors"]` counts it. Hidden test hooks:
   `_put_test_retain_next_clone`, `_put_test_retained`, `_put_test_release_retained`.
+- **Round-7 (3/6): streaming-writer buffer ownership is explicit; `copy=True` is the snapshot (R7).**
+  **Behaviour change:** `write_owned_bytes()` no longer copies a mutable buffer under the GIL (0.9.126 and earlier
+  did); since 0.9.128 it borrows the buffer exactly like `write_chunk()`, with the GIL released, and
+  `MultipartUploadWriter.write()` does the same. Zero copy stays the default for every contiguous buffer. The
+  contract is now in the Python-visible docstrings of `write_chunk`, `write_owned_bytes` and
+  `MultipartUploadWriter.write` and in the streaming-writer section of `docs/PYTHON_API_GUIDE.md`: the call
+  borrows the buffer without copying, no thread may modify it until the call returns, and it is released before
+  the call returns. New keyword-only `copy=False` on `write_owned_bytes` and `MultipartUploadWriter.write`:
+  `copy=True` snapshots a mutable buffer once under the GIL (exact `bytes` and `BytesView` are immutable and never
+  copied), for callers whose other threads may write to the buffer during the call. The misleading "kept for
+  compatibility" wording of `write_owned_bytes` is gone.
 - **Round-6 edges of the borrowed-buffer barrier.** `GuardedFuture.cancel()` returns `False` once the put is
   already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
   the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really
@@ -139,7 +150,8 @@
   `write_owned_bytes()` (which copied the buffer into a `Vec` with the GIL held) now use the same payload
   conversion as `put_bytes()`: any C-contiguous buffer of any item type is read in place, with NO copy made by
   the Python layer and the GIL RELEASED; the export is released before the call returns. `write_owned_bytes()` is
-  now the same as `write_chunk()`. `MultipartUploadWriter.write()` borrows the buffer the same way and copies it
+  now the same as `write_chunk()` (a behaviour change: it used to snapshot; `copy=True` restores that, see the
+  round-7 entry). `MultipartUploadWriter.write()` borrows the buffer the same way and copies it
   once, with the GIL released, into its part buffers (parts are uploaded asynchronously and outlive the call, so
   a borrowed Python buffer cannot be handed to them). The same contract as `put_bytes()` applies: do not modify
   the buffer from another thread during the call (a data race). **Not changed:** the legacy community GCS client

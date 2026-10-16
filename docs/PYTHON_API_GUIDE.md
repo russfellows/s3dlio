@@ -728,6 +728,27 @@ stats = writer.finalize()
 print(f"Wrote {stats['bytes_written']} bytes")
 ```
 
+### Buffer ownership of the write calls
+
+`write_chunk(data)`, `write_owned_bytes(data, *, copy=False)` and
+`MultipartUploadWriter.write(data, *, copy=False)` **borrow your buffer without copying it** (zero copy is the
+default for every C-contiguous buffer: `bytearray`, `memoryview`, NumPy of any dtype, `array.array`, ctypes, mmap):
+
+* the call reads your memory in place, with the GIL **released**, so other Python threads keep running;
+* the buffer is *exported* while the call runs (`bytearray.extend()` / `clear()` from another thread raises
+  `BufferError`) and **no thread may modify its bytes until the call returns**: a concurrent write is a data race
+  and the bytes written are undefined (undefined behaviour in the Rust sense, not just torn data);
+* the export is released **before the call returns**, so the buffer is yours again right after;
+* exact `bytes` and `s3dlio.BytesView` are immutable: they never race and are never copied, in any mode;
+* **`copy=True`** (`write_owned_bytes` and `MultipartUploadWriter.write` only) first takes ONE snapshot of a mutable
+  buffer with the GIL held and releases the export, so you may modify or reuse your buffer as soon as the call has
+  started. Use it when another thread may write to the buffer during the call. It costs one copy of the data;
+  `write_chunk` has no `copy` parameter (it always borrows).
+
+**Behaviour change in 0.9.128.** In 0.9.126 and earlier `write_owned_bytes()` copied a mutable buffer under the GIL
+before writing; it now borrows it exactly like `write_chunk()`. If your code relied on the old snapshot (for
+example another thread refills the same `bytearray` while a write is in flight), pass `copy=True`.
+
 ---
 
 ## AI/ML Integration
@@ -1341,6 +1362,9 @@ meta = s3dlio.stat_object("s3://bucket/key")
 | `create_azure_writer(uri, opts)` | Azure streaming writer |
 | `create_filesystem_writer(uri, opts)` | Local filesystem writer |
 | `create_direct_filesystem_writer(uri, opts)` | Direct I/O writer |
+
+The write calls borrow the buffer for the duration of the call; see "Buffer ownership of the write calls" in the
+Streaming API section (`copy=True` for a snapshot).
 
 ### s3torchconnector Compat Classes
 

@@ -6,7 +6,7 @@
 use super::async_bridge::future_into_py;
 use super::put_payload::{
     deadline_warning_text, export_stats, hold_for_call, latch_ready, note_internal_error,
-    put_payload, quiesce_async, quiesce_blocking, Latch, PayloadUse,
+    put_payload, quiesce_async, quiesce_blocking, snapshot_for_call, Latch, PayloadUse,
 };
 use bytes::Bytes;
 use pyo3::conversion::IntoPyObjectExt;
@@ -2798,22 +2798,22 @@ impl PyObjectWriter {
 
 #[pymethods]
 impl PyObjectWriter {
-    /// Write a chunk of bytes to the stream (zero-copy via buffer protocol)
+    /// Write a chunk of bytes to the stream, WITHOUT copying it.
     ///
     /// Accepts any Python object supporting the buffer protocol:
     /// - bytes, bytearray, memoryview
     /// - NumPy arrays (any dtype), PyTorch tensors, ctypes arrays, mmap
     /// - Any object with __buffer__ method
     ///
-    /// The conversion is the same as `put_bytes()`'s (see `put_payload.rs`): a C-contiguous
-    /// buffer is read in place with NO copy made by this Python layer, a non-contiguous view
-    /// is gathered once by Python, an object that only has `__bytes__()` is converted once.
-    ///
-    /// GIL: it is RELEASED for the blocking write, for every kind of buffer. While the call
-    /// runs the buffer is exported (resizing it from another thread raises `BufferError`), and
-    /// you must not modify its bytes from another thread: that is a data race and the data
-    /// written is undefined. (Before 0.9.128 the GIL was held for mutable buffers, which made
-    /// other Python threads wait for the whole write.)
+    /// CONTRACT - the call BORROWS your buffer: no copy is made by this Python layer for a
+    /// C-contiguous buffer (a non-contiguous view is gathered once by Python, an object that
+    /// only has `__bytes__()` is converted once), and the GIL is RELEASED for the whole blocking
+    /// write. While the call runs the buffer is exported (resizing it from another thread raises
+    /// `BufferError`) and NO thread may modify its bytes until the call returns: a concurrent
+    /// write is a data race and the data written is undefined. The export is released before
+    /// the call returns, so the buffer is yours again right after. Exact `bytes` and
+    /// `s3dlio.BytesView` are immutable, so they can never race. (Before 0.9.128 the GIL was
+    /// held for mutable buffers, which made other Python threads wait for the whole write.)
     ///
     /// Whether the writer then copies the data itself depends on the backend (a multipart
     /// writer copies into its part buffers; a file writer does not).
@@ -2829,13 +2829,32 @@ impl PyObjectWriter {
         result
     }
 
-    /// Write owned bytes. Kept for compatibility: since 0.9.128 it is identical to
-    /// `write_chunk()` (no copy is made by the Python layer any more, and the GIL is
-    /// released for the write; see `write_chunk()` for the buffer contract).
+    /// Write bytes the caller owns. BEHAVIOUR CHANGE in 0.9.128: this now BORROWS the buffer
+    /// exactly like `write_chunk()`; in 0.9.126 and earlier it copied a mutable buffer (under
+    /// the GIL) before writing. Pass `copy=True` to get the snapshot back.
+    ///
+    /// * `copy=False` (default): no copy; the buffer is exported and read in place with the GIL
+    ///   released. No thread may modify the buffer until the call returns (a data race
+    ///   otherwise; the data written is undefined); it is released before the call returns.
+    /// * `copy=True`: a mutable buffer (bytearray, memoryview, NumPy, ...) is first copied ONCE
+    ///   with the GIL held, the export is released, and the write then runs on the copy, so you
+    ///   may modify or reuse your buffer as soon as the call has started. Exact `bytes` and
+    ///   `s3dlio.BytesView` are immutable: they are never copied, in either mode.
     ///
     /// The writer is put back after a failed write, so a failed `write_owned_bytes()`
     /// leaves it usable for a retry or a clean `finalize()`.
-    fn write_owned_bytes(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+    #[pyo3(signature = (data, *, copy = false))]
+    fn write_owned_bytes(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        copy: bool,
+    ) -> PyResult<()> {
+        if copy {
+            // Snapshot first (GIL held, export released), then write the private copy.
+            let snapshot = snapshot_for_call(py, data)?;
+            return self.write_detached(py, &snapshot);
+        }
         self.write_chunk(py, data)
     }
 
