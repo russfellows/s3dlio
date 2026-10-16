@@ -60,7 +60,8 @@
   store (`PyCheckpointStore(uri, compression_level=N)`) the streaming writer stores `rank-N.bin.zst`,
   but `finalize` statted and returned the un-suffixed `rank-N.bin`, so it failed after a successful
   write or described an older uncompressed object left at that name. It now records the stored name
-  through the same helper as the Rust writer, and `Writer::finalize_shard_meta` /
+  through the same helper as the Rust writer (the shard metadata now also carries the writer's
+  `crc32c:` checksum, which the old path dropped), and `Writer::finalize_shard_meta` /
   `finalize_shard_meta_with_checksum` do the same for a Writer configured with compression.
 
   Limits of the naming rule, recorded rather than changed: with compression on, the keys `a` and

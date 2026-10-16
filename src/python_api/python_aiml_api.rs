@@ -1640,8 +1640,13 @@ impl PyCheckpointStream {
             let shard_meta = py
                 .detach(|| {
                     self.runtime.block_on(async {
-                        // Finalize the writer and record the shard under the name it was
-                        // stored as (a compressing store adds `.zst`: R10b).
+                        // Finalize (upload) WITHOUT the store lock, so concurrent streams on
+                        // one store are not serialised for the whole upload.
+                        let checksum = writer.checksum();
+                        writer.finalize().await?;
+
+                        // Record the shard under the name it was stored as (a compressing
+                        // store adds `.zst`: R10b).
                         let store_guard = store.lock().await;
                         let ckpt_writer = store_guard.writer(world_size, rank);
                         let layout = crate::checkpoint::paths::KeyLayout::new(
@@ -1649,7 +1654,7 @@ impl PyCheckpointStream {
                             step,
                         );
                         ckpt_writer
-                            .finalize_writer_to_shard_meta(&layout, key, writer)
+                            .finalize_shard_meta_with_checksum(&layout, key, checksum)
                             .await
                     })
                 })
