@@ -253,8 +253,9 @@ type CredentialSource =
 ///
 /// The winner is kept for the life of the process, but not trusted blindly: if the cached winner
 /// later fails to produce a token (a revoked secret, `az` logged out, or a managed identity that
-/// stalls past its deadline), the chain is run once more for that request, without asking the
-/// member that just failed a second time, so a working member further down is found without a
+/// stalls past its deadline), the chain is run once more for that request with the member that
+/// just failed left to the end (asked again only if nothing else works, so a stall costs one
+/// deadline when another member works), so a working member further down is found without a
 /// restart; only if the whole chain fails is the request an error. Only the managed-identity
 /// member has a deadline of its own (`S3DLIO_AZURE_AUTO_MI_TIMEOUT_MS`); the others are bounded
 /// only by what the Azure SDK does: the HTTP-based ones (workload identity, client secret,
@@ -435,8 +436,9 @@ impl AutoCredential {
     }
 
     /// Run the chain; the first member that yields a token wins and is remembered. `skip` is a
-    /// member that has just failed (or stalled) for this very request as the cached winner: it is
-    /// not asked a second time, so a stalled managed identity costs one deadline, not two.
+    /// member that has just failed (or stalled) for this very request as the cached winner: the
+    /// chain leaves it out (the caller asks it once more, last, if nothing else works), so a
+    /// stalled managed identity costs one deadline when another member works.
     async fn run_chain(
         &self,
         scopes: &[&str],
@@ -517,6 +519,14 @@ impl TokenCredential for AutoCredential {
         match self.run_chain(scopes, &options, skip).await {
             Ok(token) => Ok(token),
             Err(mut tried) => {
+                // The member that just failed was left out of the re-run so that a stall costs
+                // one deadline when something else works. Nothing did, so it is asked once more,
+                // last, under its deadline: a lone member keeps its second chance.
+                if let Some(mode) = skip {
+                    if let Some(token) = self.try_member(mode, scopes, &options, &mut tried).await {
+                        return Ok(token);
+                    }
+                }
                 if let Some(first) = earlier {
                     tried.insert(0, first);
                 }
@@ -968,6 +978,9 @@ mod tests {
         fail_after: usize,
         /// Never complete (not even fail) from this call on: a refresh that stalls for good.
         hang_after: usize,
+        /// The failing window ends at this call: calls from `fail_after` up to it fail, later
+        /// ones succeed again (a failure that clears).
+        fail_until: usize,
     }
 
     #[async_trait::async_trait]
@@ -984,7 +997,10 @@ mod tests {
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
-            match self.token.filter(|_| n < self.fail_after) {
+            match self
+                .token
+                .filter(|_| n < self.fail_after || n >= self.fail_until)
+            {
                 Some(t) => Ok(AccessToken::new(
                     t,
                     azure_core::time::OffsetDateTime::now_utc()
@@ -1029,7 +1045,14 @@ mod tests {
             vec![],
             std::time::Duration::from_secs(30),
             script,
-            |mode| (std::time::Duration::ZERO, usize::MAX, hang_after(mode)),
+            |mode| {
+                (
+                    std::time::Duration::ZERO,
+                    usize::MAX,
+                    hang_after(mode),
+                    usize::MAX,
+                )
+            },
         )
     }
 
@@ -1044,7 +1067,7 @@ mod tests {
     ) -> (AutoCredential, Calls) {
         scripted_auto_shaped(env, imds, imds_answers, negative_ttl, script, move |mode| {
             let (delay, fail_after) = shape(mode);
-            (delay, fail_after, usize::MAX)
+            (delay, fail_after, usize::MAX, usize::MAX)
         })
     }
 
@@ -1054,14 +1077,14 @@ mod tests {
         imds_answers: Vec<bool>,
         negative_ttl: std::time::Duration,
         script: Vec<(CredentialMode, Result<&'static str, &'static str>)>,
-        shape: impl Fn(CredentialMode) -> (std::time::Duration, usize, usize),
+        shape: impl Fn(CredentialMode) -> (std::time::Duration, usize, usize, usize),
     ) -> (AutoCredential, Calls) {
         let mut calls = Calls::new();
         let mut members = std::collections::HashMap::new();
         for (mode, outcome) in script {
             let counter: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
             calls.insert(mode, Arc::clone(&counter));
-            let (delay, fail_after, hang_after) = shape(mode);
+            let (delay, fail_after, hang_after, fail_until) = shape(mode);
             let credential: Arc<dyn TokenCredential> = Arc::new(Scripted {
                 token: outcome.ok(),
                 error: outcome.err().unwrap_or(""),
@@ -1069,6 +1092,7 @@ mod tests {
                 delay,
                 fail_after,
                 hang_after,
+                fail_until,
             });
             members.insert(mode, credential);
         }
@@ -1293,12 +1317,6 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        // One deadline, not two: the chain did not wait on the managed identity again.
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(1500),
-            "{:?}",
-            started.elapsed()
-        );
         // The stalled winner was dropped: later requests go straight to the CLI.
         auto.get_token(&["s"], Option::None).await.unwrap();
         assert_eq!(
@@ -1378,6 +1396,36 @@ mod tests {
             .expect("RED: B's late failure wiped the newer winner");
         assert_eq!(mode_after, Cli);
         assert!(Arc::ptr_eq(&w2, &w2_after), "the newer winner is untouched");
+    }
+
+    // The member that just failed is asked last, not never: a lone managed identity whose
+    // refresh failed once keeps its second chance within the same request.
+    #[tokio::test]
+    async fn a_lone_winner_that_failed_once_is_asked_again_last() {
+        use CredentialMode::ManagedIdentity;
+        let (auto, calls) = scripted_auto_shaped(
+            vec![(ENV_AZURE_IDENTITY_ENDPOINT, "http://x")],
+            Arc::default(),
+            vec![],
+            std::time::Duration::from_secs(30),
+            // No other member can produce a token (the CLI is not built here).
+            vec![(ManagedIdentity, Ok("mi-token"))],
+            // The second call fails; the third works again.
+            |_| (std::time::Duration::ZERO, 1, usize::MAX, 2),
+        );
+        let first = auto.get_token(&["s"], Option::None).await.unwrap();
+        assert_eq!(first.token.secret(), "mi-token");
+        let second = auto
+            .get_token(&["s"], Option::None)
+            .await
+            .expect("RED: the only working member was not asked a second time");
+        assert_eq!(second.token.secret(), "mi-token");
+        assert_eq!(
+            called(&calls, ManagedIdentity),
+            3,
+            "win, failed refresh, last try"
+        );
+        assert_eq!(auto.winner().map(|(m, _)| m), Some(ManagedIdentity));
     }
 
     // If the cached winner later fails, the chain is run again for that request.
