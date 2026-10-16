@@ -53,6 +53,19 @@
 
 ### Fixed
 
+- **Azure `S3DLIO_AZURE_DOWNLOAD_MODE=s3dlio` could return a truncated or empty object as a success
+  when the cached size was stale (final review F1).** The size guard for a cached size asks for one
+  byte more than expected and relies on the RangeEngine rejecting a wrong length, but an object
+  below `min_split_size` is read as a single request and that path accepted any length: a blob
+  cached as 1,024 bytes and overwritten with 1 MiB returned 1,025 bytes from a successful GET, a
+  blob cached as 0 bytes and then grown returned empty without any request, and a blob that shrank
+  returned the short body. The fresh-size retry only runs after an error, so it never ran. The
+  single-request path now requires exactly the planned length (like the multi-range path), and a
+  cached size of 0 is no longer read as an empty object: the read fails and is retried once with a
+  size from a fresh `HEAD` (a size just learned from the service stays a legitimate empty read, so
+  reading an object that really is empty costs one extra `HEAD` while its size is cached). Default
+  Azure SDK mode is unchanged. Every caller of `RangeEngine::download` shares the exact-length rule.
+
 - **A compressed shard is stored, recorded and statted under one name (R10).** A compressing
   writer for a custom key that already ends in `.zst` (`custom.zst`) stored the object as
   `custom.zst.zst` in the `file://`, `direct://` and Arrow writers, while `finalize_writer_to_shard_meta`

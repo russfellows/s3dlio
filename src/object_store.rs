@@ -2372,6 +2372,11 @@ fn gcs_size_key(uri: &str) -> String {
 /// one byte more than planned, so a blob that has grown makes that range an over read, and one
 /// that has shrunk a short read or a range error: the caller sees an error instead of a silently
 /// truncated body, at no extra request. An unchanged blob returns exactly the planned bytes.
+///
+/// An object below `min_split_size` is one request, and the engine holds that request to the
+/// same exact length. A CACHED size of 0 is an error too (the engine would return empty without
+/// any request): the caller's fresh-size retry settles it, and a size just learned from the
+/// service (`guarded == false`) stays a legitimate empty read.
 #[cfg(any(feature = "backend-azure", feature = "backend-gcs"))]
 async fn range_engine_download<F, Fut>(
     config: RangeEngineConfig,
@@ -2383,6 +2388,13 @@ where
     F: Fn(u64, u64) -> Fut + Send + Sync + Clone + 'static,
     Fut: std::future::Future<Output = Result<Bytes>> + Send,
 {
+    // The engine reads a zero size as an empty object WITHOUT a request. That is right for a size
+    // just learned from the service, but a cached zero may be stale (the object may have grown),
+    // and returning empty would be a silently wrong success. Fail so the caller re-reads with a
+    // fresh size.
+    if guarded && object_size == 0 {
+        bail!("cached object size 0 cannot be verified without a request; refresh the size");
+    }
     let engine = RangeEngine::new(config);
     let get_range = move |offset: u64, length: u64| {
         let ask = if guarded && offset.checked_add(length) == Some(object_size) {

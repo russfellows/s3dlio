@@ -314,6 +314,18 @@ impl RangeEngine {
             })?
             .map_err(|e| anyhow::anyhow!("Single request failed: {}", e))?;
 
+        // The same locked contract as the concurrent path: a short or over read is an error. A
+        // caller that planned from a possibly stale size relies on it (it asks for one byte more
+        // than it expects, and retries with a fresh size when this fails); accepting any length
+        // here returned a truncated or over-long object as a success.
+        if bytes.len() as u64 != object_size {
+            return Err(anyhow::anyhow!(
+                "Single request short/over read: expected {} bytes, got {} bytes",
+                object_size,
+                bytes.len()
+            ));
+        }
+
         let bytes_downloaded = bytes.len() as u64;
         let elapsed = start_time.elapsed();
 
