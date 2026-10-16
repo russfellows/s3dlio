@@ -293,6 +293,8 @@ pub(crate) fn global_rt_handle() -> &'static Handle {
 /// See [`get_runtime_threads`] for the full rationale of the clamp and
 /// the `S3DLIO_RT_THREADS_UNSAFE=1` escape hatch.
 pub(crate) fn clamped_env_rt_threads() -> Option<usize> {
+    // The `.env` policy first (#243, review R9): reached from the public `effective_thread_budget`.
+    crate::dotenv::apply();
     let n = std::env::var("S3DLIO_RT_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())?;

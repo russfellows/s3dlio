@@ -96,8 +96,8 @@ fn probe_child() {
             let _ = s3dlio::object_store::store_for_uri("file:///");
             "n/a".to_string()
         }
-        // Round 7 (Blue R8): a public setter that inspects the endpoint variables, made the
-        // FIRST s3dlio call with the service endpoint only in the file.
+        // Round 7 (Blue R8/R9): public setters and setting-reading helpers/builders that are
+        // independently public, each made the FIRST s3dlio call with the value only in the file.
         "endpoint_override" => {
             s3dlio::s3_client::set_s3_endpoint_override("http://new:9000");
             format!(
@@ -105,6 +105,47 @@ fn probe_child() {
                 s3dlio::s3_client::s3_endpoint_url_from_env().unwrap_or_else(|| "<none>".into())
             )
         }
+        "h2_window" => {
+            let c = s3dlio::constants::H2WindowConfig::from_env();
+            format!(
+                "adaptive={} stream_mb={} conn_mb={}",
+                c.adaptive, c.stream_window_mb, c.conn_window_mb
+            )
+        }
+        "connect_timeout" => format!(
+            "connect_timeout={}",
+            s3dlio::constants::connect_timeout_secs()
+        ),
+        "max_retry" => format!("max_retry={}", s3dlio::constants::max_retry_attempts()),
+        "thread_budget" => format!(
+            "world={} budget={}",
+            s3dlio::constants::mpi_world_size(),
+            s3dlio::constants::effective_thread_budget()
+        ),
+        "aware_budget" => format!("aware={}", s3dlio::constants::mpi_aware_thread_budget()),
+        "transport" => transport_wire_protocol(),
+        "multi_endpoint" => {
+            // The scheme of a server-named endpoint depends on S3DLIO_S3_ENDPOINT_TLS_PORTS.
+            let store = s3dlio::multi_endpoint::MultiEndpointStore::new(
+                vec!["s3://127.0.0.1:9443/bkt/".to_string()],
+                s3dlio::multi_endpoint::LoadBalanceStrategy::RoundRobin,
+                None,
+            );
+            match store {
+                Ok(s) => format!("urls={:?}", s.get_store_endpoint_urls()),
+                Err(e) => format!("err:{e}"),
+            }
+        }
+        #[cfg(feature = "gcs-community")]
+        "gcs_endpoint" => format!(
+            "gcs_endpoint={:?}",
+            s3dlio::gcs_client::resolve_gcs_endpoint()
+        ),
+        #[cfg(feature = "backend-azure")]
+        "azure_config" => format!(
+            "download_concurrency={}",
+            s3dlio::object_store::AzureConfig::default().sdk_download_concurrency
+        ),
         #[cfg(feature = "backend-azure")]
         "azure" => {
             let _ = s3dlio::azure_client::AzureBlob::with_default_credential("acct", "cont");
@@ -128,6 +169,62 @@ fn probe_child() {
         var("S3DLIO_243_PRESET"),
         var("AWS_ACCESS_KEY_ID"),
     );
+}
+
+/// First bytes a client built by `build_smithy_http_client` puts on the wire towards a
+/// plain-HTTP endpoint: the HTTP/2 prior-knowledge preface (`PRI * HTTP/2.0`) when H2C is
+/// on, an HTTP/1.1 request line otherwise. The client is opaque, so the wire is the proof.
+fn transport_wire_protocol() -> String {
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut buf = [0u8; 24];
+        let mut got = 0;
+        while got < 4 {
+            match sock.read(&mut buf[got..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        String::from_utf8_lossy(&buf[..got]).into_owned()
+    });
+    // reqwest wants a Tokio context to be built in; this is the test's own runtime, not
+    // s3dlio's (whose creation would apply the policy by itself).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    let http = s3dlio::reqwest_client::build_smithy_http_client(None).unwrap();
+    let conf = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .credentials_provider(Credentials::new("k", "s", None, None, "test"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .http_client(http)
+        .build();
+    let client = aws_sdk_s3::Client::from_conf(conf);
+    // The server closes after reading the first bytes, so the call fails; only the wire matters.
+    let _ = rt.block_on(tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        client.list_buckets().send(),
+    ));
+    let first = reader.join().unwrap();
+    format!(
+        "wire={}",
+        if first.starts_with("PRI ") {
+            "h2c"
+        } else {
+            "http1"
+        }
+    )
 }
 
 #[derive(Debug)]
@@ -398,7 +495,7 @@ fn a_latched_get_setting_sees_the_file_on_the_first_get() {
     );
 }
 
-// -- Round 7 (Blue R8): a public setter, FIRST call, the service endpoint only in the file --
+// -- Round 7 (Blue R8, R9): independently public entry points, FIRST call, value only in the file --
 
 #[test]
 fn endpoint_override_first_call_beats_the_files_service_endpoint() {
@@ -413,6 +510,96 @@ fn endpoint_override_first_call_beats_the_files_service_endpoint() {
         ],
     );
     assert_eq!(p.client, "endpoint=http://new:9000", "{p:?}");
+}
+
+fn first_call(name: &str, entry: &str, file_lines: &str) -> Probe {
+    let dir = dir_with_dotenv_plus(name, file_lines);
+    probe(
+        &dir,
+        &[("S3DLIO_LOAD_DOTENV", "1"), ("S3DLIO_243_ENTRY", entry)],
+    )
+}
+
+#[test]
+fn transport_builder_first_call_sees_h2c_from_the_file() {
+    // R9: the client's protocol is fixed at construction; a later load cannot repair it.
+    let p = first_call("r9-transport-on", "transport", "S3DLIO_H2C=1\n");
+    assert_eq!(p.client, "wire=h2c", "{p:?}");
+    // Control: without the setting the very same sequence speaks HTTP/1.1.
+    let p = first_call("r9-transport-off", "transport", "");
+    assert_eq!(p.client, "wire=http1", "{p:?}");
+}
+
+#[test]
+fn h2_window_config_first_call_sees_the_file() {
+    let p = first_call(
+        "r9-h2-window",
+        "h2_window",
+        "S3DLIO_H2_ADAPTIVE_WINDOW=0\nS3DLIO_H2_STREAM_WINDOW_MB=7\nS3DLIO_H2_CONN_WINDOW_MB=9\n",
+    );
+    assert_eq!(p.client, "adaptive=false stream_mb=7 conn_mb=9", "{p:?}");
+}
+
+#[test]
+fn timeout_and_retry_helpers_first_call_see_the_file() {
+    let p = first_call(
+        "r9-connect",
+        "connect_timeout",
+        "S3DLIO_CONNECT_TIMEOUT_SECS=37\n",
+    );
+    assert_eq!(p.client, "connect_timeout=37", "{p:?}");
+    let p = first_call("r9-retry", "max_retry", "S3DLIO_MAX_RETRY_ATTEMPTS=9\n");
+    assert_eq!(p.client, "max_retry=9", "{p:?}");
+}
+
+#[test]
+fn thread_budget_helpers_first_call_see_the_file() {
+    let p = first_call(
+        "r9-budget-rt",
+        "thread_budget",
+        "S3DLIO_RT_THREADS=5\nWORLD_SIZE=3\n",
+    );
+    assert_eq!(p.client, "world=3 budget=5", "{p:?}");
+    // The MPI-aware budget on its own: a world size above any CPU count gives 1.
+    let p = first_call("r9-budget-aware", "aware_budget", "WORLD_SIZE=100000\n");
+    assert_eq!(p.client, "aware=1", "{p:?}");
+}
+
+#[test]
+fn multi_endpoint_store_first_call_sees_the_tls_ports_from_the_file() {
+    // The public constructor decides http versus https for a server-named endpoint before
+    // any client exists.
+    let p = first_call(
+        "r9-multi-endpoint",
+        "multi_endpoint",
+        "S3DLIO_S3_ENDPOINT_TLS_PORTS=9443\n",
+    );
+    assert_eq!(p.client, "urls=[Some(\"https://127.0.0.1:9443\")]", "{p:?}");
+}
+
+#[cfg(feature = "gcs-community")]
+#[test]
+fn community_gcs_endpoint_resolver_first_call_sees_the_file() {
+    let p = first_call(
+        "r9-gcs-endpoint",
+        "gcs_endpoint",
+        "GCS_ENDPOINT_URL=http://gcs.test:4443\n",
+    );
+    assert_eq!(
+        p.client, "gcs_endpoint=Some(\"http://gcs.test:4443\")",
+        "{p:?}"
+    );
+}
+
+#[cfg(feature = "backend-azure")]
+#[test]
+fn azure_config_default_first_call_sees_the_file() {
+    let p = first_call(
+        "r9-azure-config",
+        "azure_config",
+        "S3DLIO_AZURE_DOWNLOAD_CONCURRENCY=11\n",
+    );
+    assert_eq!(p.client, "download_concurrency=11", "{p:?}");
 }
 
 #[test]

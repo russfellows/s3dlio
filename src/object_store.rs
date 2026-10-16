@@ -2532,6 +2532,10 @@ pub struct AzureConfig {
 #[cfg(feature = "backend-azure")]
 impl Default for AzureConfig {
     fn default() -> Self {
+        // The `.env` policy first (#243, review R9): this public `Default` (and
+        // `AzureObjectStore::new`, which uses it) reads the Azure tuning settings before any
+        // Azure client exists.
+        crate::dotenv::apply();
         let download_mode = std::env::var(ENV_AZURE_DOWNLOAD_MODE)
             .ok()
             .and_then(|value| value.parse().ok())
@@ -3941,6 +3945,9 @@ pub(crate) fn s3_endpoint_url_from_authority(authority: &str) -> Result<String> 
 /// beyond the always-TLS default of 443. Comma-separated list of u16 ports in
 /// `S3DLIO_S3_ENDPOINT_TLS_PORTS`; invalid tokens are ignored.
 fn s3_endpoint_tls_ports_from_env() -> std::collections::HashSet<u16> {
+    // The `.env` policy first (#243, review R9): this decides http versus https for a server-named URI, and is reached from
+    // public constructors (`MultiEndpointStore::new`/`from_config`) before any client exists.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_S3_ENDPOINT_TLS_PORTS")
         .ok()
         .map(|raw| {

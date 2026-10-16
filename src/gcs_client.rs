@@ -596,6 +596,8 @@ pub fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
 ///
 /// This is extracted as a pure function for testability.
 pub fn resolve_gcs_endpoint() -> Option<String> {
+    // The `.env` policy first (#243, review R9): a public setting reader.
+    crate::dotenv::apply();
     std::env::var(crate::constants::ENV_GCS_ENDPOINT_URL)
         .ok()
         .or_else(|| {

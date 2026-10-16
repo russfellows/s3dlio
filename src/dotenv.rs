@@ -44,12 +44,22 @@
 //!   does, which also runs before the optional `torch` import inside `s3dlio/torch.py`
 //!   (a `torch` the application imported before `import s3dlio` is outside s3dlio's
 //!   reach, so torch-side settings are not covered);
-//! * Rust: the first use of any entry point that reads a setting: the global runtime,
-//!   `configure_thread_pools`, `store_for_uri*`, an S3 / Azure / GCS client, the S3
-//!   dataset constructors, `Logger::new`, the process-wide endpoint, a bucket or
-//!   container listing, the Arrow backend set-up, and the latched tuning knobs
-//!   (`S3DLIO_UNSIGNED_PAYLOAD`, `S3DLIO_SKIP_HEAD`, `S3DLIO_ENABLE_RANGE_OPTIMIZATION`,
-//!   `S3DLIO_RANGE_THRESHOLD_MB`, `S3DLIO_SIZE_CACHE_TTL_SECS`, `S3DLIO_GCS_RAPID`).
+//! * Rust: the first use of any entry point that reads or changes a setting: the global
+//!   runtime, `configure_thread_pools`, `store_for_uri*`, an S3 / Azure / GCS client, the
+//!   S3 dataset constructors, `Logger::new`, the process-wide endpoint and
+//!   `set_s3_endpoint_override`, a bucket or container listing, the Arrow backend set-up,
+//!   the public HTTP-client builders (`reqwest_client::build_smithy_http_client`,
+//!   `build_reqwest_http_client*`), the public setting readers in `constants`
+//!   (`H2WindowConfig::from_env`, `connect_timeout_secs`, `max_retry_attempts`,
+//!   `mpi_world_size`, `mpi_aware_thread_budget`, `effective_thread_budget`),
+//!   `MultiEndpointStore::new` / `from_config`, `AzureConfig::default`, and the latched
+//!   tuning knobs (`S3DLIO_UNSIGNED_PAYLOAD`, `S3DLIO_SKIP_HEAD`,
+//!   `S3DLIO_ENABLE_RANGE_OPTIMIZATION`, `S3DLIO_RANGE_THRESHOLD_MB`,
+//!   `S3DLIO_SIZE_CACHE_TTL_SECS`, `S3DLIO_GCS_RAPID`).
+//!
+//! A new public entry point that reads a setting (or a value that is fixed once built, such
+//! as an HTTP client) calls `crate::dotenv::apply()` before its first read; the helper is
+//! idempotent and never calls back into any of those entry points, so the order is acyclic.
 //!
 //! **What this does not promise.** s3dlio cannot know whether its host is multi-threaded:
 //! a Python application, an inference server or a Rust program may already have threads
@@ -192,6 +202,10 @@ pub fn load_for_cli() -> Option<String> {
 /// Apply the `.env` policy of this process. Called at the start of every library entry
 /// point (and from the sites that used to call `dotenvy::dotenv()` themselves); cheap and
 /// idempotent (the switch is read once and the file is loaded at most once per process).
+///
+/// Crate-internal entry point: `crate::dotenv::apply()`. It is what code that latches a
+/// setting (for example a process-wide configuration cell) calls first, inside the
+/// initialiser and before the first read.
 pub(crate) fn apply() {
     apply_inner();
 }
