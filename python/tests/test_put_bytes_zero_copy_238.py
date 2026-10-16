@@ -35,7 +35,7 @@ MAX_RSS_GROWTH_FRACTION = 0.25
 MIN_RSS_GROWTH_FRACTION = 0.8  # a snapshot copy is visible as ~1.0x
 
 CHILD = r"""
-import array, asyncio, ctypes, json, os, resource, sys, threading, time
+import array, asyncio, ctypes, json, os, sys, threading, time
 import numpy as np
 import s3dlio
 
@@ -59,7 +59,16 @@ else:
     raise SystemExit("bad kind")
 
 def rss_peak_kib():
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # VmHWM, reset below: ru_maxrss survives fork and exec on Linux, so a child of a large
+    # pytest process would start with the parent's peak and show no growth.
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1])
+    raise RuntimeError("VmHWM not found in /proc/self/status")
+
+with open("/proc/self/clear_refs", "w") as f:
+    f.write("5")  # reset this process's peak RSS to its current RSS
 
 baseline = rss_peak_kib()
 stop = threading.Event()
