@@ -7,8 +7,12 @@ Tests:
 3. Regex pattern support in list()
 """
 
-import s3dlio
+import os
 import sys
+
+import s3dlio
+
+AZURE_ACCOUNT = os.environ.get("AZURE_BLOB_ACCOUNT", "mystorageaccount")
 
 def test_s3():
     """Test S3 backend"""
@@ -72,19 +76,19 @@ def test_azure():
     
     # Test list
     print("\n[Azure] list() - baseline")
-    keys = s3dlio.list("az://egiazurestore1/s3dlio/")
+    keys = s3dlio.list(f"az://{AZURE_ACCOUNT}/s3dlio/")
     print(f"  Found {len(keys)} objects")
     
     # Test list with pattern
     print("\n[Azure] list() with pattern (.*\\.txt$)")
-    keys = s3dlio.list("az://egiazurestore1/s3dlio/", pattern=r'.*\.txt$')
+    keys = s3dlio.list(f"az://{AZURE_ACCOUNT}/s3dlio/", pattern=r'.*\.txt$')
     print(f"  Filtered to {len(keys)} .txt files")
     for key in keys:
         print(f"    - {key}")
     
     # Test stat
     print("\n[Azure] stat() - test.txt")
-    stat = s3dlio.stat("az://egiazurestore1/s3dlio/test.txt")
+    stat = s3dlio.stat(f"az://{AZURE_ACCOUNT}/s3dlio/test.txt")
     print(f"  Size: {stat['size']}")
     print(f"  ETag: {stat['etag']}")
     print(f"  Last Modified: {stat['last_modified']}")

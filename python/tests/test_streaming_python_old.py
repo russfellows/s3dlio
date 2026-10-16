@@ -6,6 +6,7 @@ This test suite verifies that the Python bindings for our streaming API work cor
 across all backends: Filesystem, Azure Blob Storage, and Direct I/O Filesystem.
 """
 
+import os
 import tempfile
 import sys
 from pathlib import Path
@@ -208,7 +209,7 @@ def test_azure_streaming():
 
     # Try to create an Azure writer to see if credentials are available
     test_uri = (
-        "https://egiazurestore1.blob.core.windows.net/s3dlio/python-streaming-test.bin"
+        f"https://{os.environ.get('AZURE_BLOB_ACCOUNT', 'mystorageaccount')}.blob.core.windows.net/s3dlio/python-streaming-test.bin"
     )
     options = s3dlio.PyWriterOptions()
     try:

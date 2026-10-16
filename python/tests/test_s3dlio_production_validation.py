@@ -24,7 +24,7 @@ def test_streaming_api():
     
     with tempfile.TemporaryDirectory() as tmpdir:
         # Set up Azure environment
-        os.environ['AZURE_BLOB_ACCOUNT'] = 'egiazurestore1'
+        os.environ.setdefault('AZURE_BLOB_ACCOUNT', 'mystorageaccount')
         os.environ['AZURE_BLOB_CONTAINER'] = 's3dlio'
         
         test_data = b"Production validation test data! " * 50  # 1700 bytes
@@ -38,7 +38,7 @@ def test_streaming_api():
             },
             {
                 'name': 'Azure Blob',
-                'uri': 'az://egiazurestore1/s3dlio/production_test.txt',
+                'uri': f"az://{os.environ['AZURE_BLOB_ACCOUNT']}/s3dlio/production_test.txt",
                 'creator': s3dlio.create_azure_writer,
                 'data': test_data
             },
