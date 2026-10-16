@@ -571,7 +571,8 @@ mod aligned_init_tests {
     }
 
     /// Round 4: the permit travels with the buffer. With capacity 2, a third `take` must wait
-    /// until one of the first two is dropped; idle + checked-out buffers never exceed capacity.
+    /// until one of the first two is dropped. The pool bounds buffers CHECKED OUT at once, not all
+    /// allocations: the asynchronous prefill and on-demand allocation can coexist (see `take`).
     #[tokio::test]
     async fn checked_out_buffers_are_bounded_by_capacity() {
         let pool = BufferPool::new(2, 4096, 4096).unwrap();

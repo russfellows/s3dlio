@@ -32,6 +32,26 @@ def fio_rows(out):
     return rows
 
 
+# Result fields that distinguish one configuration from another (they must never be pooled):
+# buffer pairs per node, the busy policy and the source (aligned / unaligned). A field a result
+# does not carry reads as "-" so older result files still group.
+CONFIG_FIELDS = ("pairs", "busy", "source")
+
+
+def config_of(r):
+    return tuple(str(r.get(f, r.get("pool", {}).get(f, "-"))) for f in CONFIG_FIELDS)
+
+
+def arm_order(arm):
+    """Sort key for an arm name: A, B, then C<size> numerically, then anything else (aligned...)
+    alphabetically. Arms come from the data, so a C32 (or any other C<size>) is never dropped."""
+    if arm in ("A", "B"):
+        return (0, arm, 0)
+    if arm.startswith("C") and arm[1:].isdigit():
+        return (1, "C", int(arm[1:]))
+    return (2, arm, 0)
+
+
 def med(xs):
     return statistics.median(xs) if xs else 0.0
 
@@ -44,7 +64,7 @@ def main():
         if not line.strip():
             continue
         r = json.loads(line)
-        key = (r["read_pct"], r["size_mib"], r["conc"], r["arm"])
+        key = (r["read_pct"], r["size_mib"], r["conc"], r["arm"], *config_of(r))
         cells[key].append(r)
         if r["pool"]["put_fallbacks"] or r["pool"]["get_fallbacks"]:
             bad.append(("pool fallbacks (busy policy)", key))
@@ -62,20 +82,26 @@ def main():
         for size in sorted({k[1] for k in cells if k[0] == rp}):
             print(f"\n## {label}, {size} MiB objects\n")
             print(
-                "| conc | arm | n | put GiB/s | get GiB/s | total GiB/s | CPU s | CPU s/GiB | "
-                "minor faults | peak RSS MiB | pool wait ms (put/get) | window s |"
+                "| conc | arm | pairs | busy | source | n | put GiB/s | get GiB/s | total GiB/s | "
+                "CPU s | CPU s/GiB | minor faults | peak RSS MiB | pool wait ms (put/get) | "
+                "window s |"
             )
-            print("|---|---|---|---|---|---|---|---|---|---|---|---|")
-            for conc in sorted({k[2] for k in cells if k[0] == rp and k[1] == size}):
-                for arm in ["A", "B", "C4", "C16", "C64", "aligned"]:
-                    rs = cells.get((rp, size, conc, arm))
-                    if not rs:
-                        continue
+            print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+            in_cell = [k for k in cells if k[0] == rp and k[1] == size]
+            for conc in sorted({k[2] for k in in_cell}):
+                # arms and configurations come from the data, one row per distinct key
+                for key in sorted(
+                    (k for k in in_cell if k[2] == conc),
+                    key=lambda k: (arm_order(k[3]), k[4:]),
+                ):
+                    rs = cells[key]
+                    arm, (pairs, busy, source) = key[3], key[4:]
                     tot = med([r["total_gibps"] for r in rs])
                     cpu = med([r["cpu_total_s"] for r in rs])
                     moved = med([r["total_gibps"] * r["window_secs"] for r in rs])
                     print(
-                        f"| {conc} | {arm} | {len(rs)} | {med([r['put_gibps'] for r in rs]):.2f} | "
+                        f"| {conc} | {arm} | {pairs} | {busy} | {source} | {len(rs)} | "
+                        f"{med([r['put_gibps'] for r in rs]):.2f} | "
                         f"{med([r['get_gibps'] for r in rs]):.2f} | {tot:.2f} | {cpu:.1f} | "
                         f"{(cpu / moved) if moved else 0:.2f} | {int(med([r['minflt'] for r in rs]))} | "
                         f"{int(med([r['peak_rss_mib'] for r in rs]))} | "

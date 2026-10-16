@@ -3113,12 +3113,35 @@ mod direct_io_chunking_tests {
             }
             w.finalize().await.unwrap();
             let syncs = SYNC_CALLS.with(|c| c.get()) - before;
-            // One for the O_DIRECT file and one for the buffered tail.
-            assert!(
-                syncs <= 2,
-                "{syncs} fsyncs for one stream (was one per flush)"
+            // EXACTLY two: one for the O_DIRECT file and one for the buffered sub-page tail
+            // (a bound like `<= 2` would also pass with zero, i.e. with durability removed).
+            assert_eq!(
+                syncs, 2,
+                "{syncs} fsyncs for an aligned-plus-tail stream (expected exactly 2)"
             );
             assert_eq!(std::fs::read(&path).unwrap(), raw);
+        }
+
+        /// A stream whose total length is page-aligned has no buffered tail: EXACTLY one fsync.
+        #[tokio::test]
+        async fn streaming_writer_aligned_only_stream_syncs_exactly_once() {
+            let Some(d) = dir() else { return };
+            let path = d.path().join("a.bin");
+            let cfg = FileSystemConfig::direct_io();
+            let before = SYNC_CALLS.with(|c| c.get());
+            let mut w = Box::new(DirectIOWriter::new(path.clone(), cfg).await.unwrap());
+            let mut buf = AlignedBuf::new(4 * MIB, A).unwrap();
+            buf.as_mut_slice().fill(7);
+            for _ in 0..3 {
+                w.write_chunk(buf.as_slice()).await.unwrap();
+            }
+            w.finalize().await.unwrap();
+            let syncs = SYNC_CALLS.with(|c| c.get()) - before;
+            assert_eq!(
+                syncs, 1,
+                "{syncs} fsyncs for an aligned-only stream (expected exactly 1)"
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, 12 * MIB);
         }
 
         /// `sync_writes` is the explicit request for per-write durability and is honoured.

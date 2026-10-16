@@ -15,7 +15,9 @@
   `PooledBuf` is an RAII lease that dereferences to `AlignedBuf` and carries the semaphore permit, returning
   the buffer to the pool and freeing the permit when it is dropped (`give()` just drops it). Earlier the
   permit was released when `take()` returned, so any number of buffers could be checked out at once; now
-  idle + checked-out buffers never exceed the capacity, also when a holder is cancelled.
+  at most `capacity` buffers are checked out at once, also when a holder is cancelled. (The pool bounds
+  checked-out leases, not all allocations: the asynchronous prefill and on-demand allocation can briefly
+  coexist, up to `2 x capacity` buffers alive.)
 - The streaming writer's `write_chunk()` / `write_owned_bytes()` and `MultipartUploadWriter.write()` raise
   `TypeError` (was `RuntimeError` for the streaming writer) for an object that is not bytes-like.
 - `put_bytes_async` gained the keyword-only argument `borrow=False` (see below); positional calls are unchanged.
@@ -137,6 +139,12 @@
   the pooled path, with the allocations outside it listed (opt-in `fallback` buffers, implicit buffers, aligned-PUT
   tail block, default-mode GET destination, unaligned streaming-writer staging). `bounce_stats()` is no longer
   hidden from the docs.
+- **Round-7 (6/6): small corrections.** `scripts/direct_bounce_bench_summary.py` now derives the arms from the data
+  (a valid `C32` result used to be silently dropped) and groups by pairs, busy policy and source as well, so runs of
+  different configurations are no longer pooled (`python/tests/test_direct_bounce_bench_summary.py`). The
+  finalize-durability unit test asserts the exact number of fsyncs (2 for an aligned-plus-tail stream, 1 for an
+  aligned-only stream); the old `syncs <= 2` also passed with zero. The legacy range pool's wording says it bounds
+  buffers *checked out*, not all allocations.
 - **Round-6 edges of the borrowed-buffer barrier.** `GuardedFuture.cancel()` returns `False` once the put is
   already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
   the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really
