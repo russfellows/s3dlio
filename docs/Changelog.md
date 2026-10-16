@@ -386,7 +386,12 @@
   `H2WindowConfig::from_env`, `connect_timeout_secs`, `max_retry_attempts`, `mpi_world_size`,
   `mpi_aware_thread_budget`, `effective_thread_budget`, `MultiEndpointStore::new` / `from_config`
   (its `S3DLIO_S3_ENDPOINT_TLS_PORTS` decision), `AzureConfig::default` and the community GCS
-  `resolve_gcs_endpoint` return the file's values when they are the first s3dlio call.
+  `resolve_gcs_endpoint` return the file's values when they are the first s3dlio call. The same holds for
+  `direct_bounce::config()` / `BounceConfig::from_env` and `direct_io_bounce_size` (the direct:// bounce-buffer
+  settings), `ObjectSizeCache::new` (through `constants::size_cache_max_entries`, whose entry limit is latched on
+  its first call), `constants::export_quiesce_timeout`, `azure_client::canonical_account_name` /
+  `validate_account_name` (the custom-endpoint decision) and the Azure credential entry points that read the
+  process environment themselves (`azure_credential::mode_for_endpoint`, `credential_for`).
 
 - **`file://` and `direct://` datasets now list their items as paths below the dataset root (#223).**
   `Dataset::keys()` (Rust), `PyDataset.keys()` and `ObjectStoreMapDataset`'s keys (Python), and the item

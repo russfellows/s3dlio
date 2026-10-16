@@ -117,6 +117,24 @@ fn probe_child() {
             s3dlio::constants::connect_timeout_secs()
         ),
         "max_retry" => format!("max_retry={}", s3dlio::constants::max_retry_attempts()),
+        "size_cache" => {
+            // The public constructor is the FIRST s3dlio call; the entry limit it latches
+            // (OnceLock) must come from the file. Five puts show the limit in the entry count.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let cache = s3dlio::object_size_cache::ObjectSizeCache::new(
+                    std::time::Duration::from_secs(60),
+                );
+                for i in 0..5 {
+                    cache.put(format!("s3://bkt/k{i}"), 1).await;
+                }
+                format!("entries={}", cache.stats().await.total_entries)
+            })
+        }
+        "export_quiesce" => format!("quiesce={:?}", s3dlio::constants::export_quiesce_timeout()),
         "thread_budget" => format!(
             "world={} budget={}",
             s3dlio::constants::mpi_world_size(),
@@ -610,6 +628,30 @@ fn timeout_and_retry_helpers_first_call_see_the_file() {
     assert_eq!(p.client, "connect_timeout=37", "{p:?}");
     let p = first_call("r9-retry", "max_retry", "S3DLIO_MAX_RETRY_ATTEMPTS=9\n");
     assert_eq!(p.client, "max_retry=9", "{p:?}");
+}
+
+#[test]
+fn size_cache_constructor_first_call_sees_the_limit_from_the_file() {
+    // Blue integration P2-2: ObjectSizeCache::new latches the limit on its first call.
+    let p = first_call(
+        "p22-size-cache",
+        "size_cache",
+        "S3DLIO_SIZE_CACHE_MAX_ENTRIES=2\n",
+    );
+    assert_eq!(p.client, "entries=2", "{p:?}");
+    // Control: without the setting the same five puts are all kept.
+    let p = first_call("p22-size-cache-off", "size_cache", "");
+    assert_eq!(p.client, "entries=5", "{p:?}");
+}
+
+#[test]
+fn export_quiesce_timeout_first_call_sees_the_file() {
+    let p = first_call(
+        "p31-quiesce",
+        "export_quiesce",
+        "S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS=7\n",
+    );
+    assert_eq!(p.client, "quiesce=7s", "{p:?}");
 }
 
 #[test]

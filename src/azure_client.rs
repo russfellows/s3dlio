@@ -267,6 +267,8 @@ pub fn validate_account_name(account: &str) -> Result<()> {
 /// means `myaccount`). With a custom endpoint the name is a path segment for an emulator and is
 /// kept exactly as given. Every place that puts an account into a URL goes through this.
 pub fn canonical_account_name(account: &str) -> Result<String> {
+    // The custom-endpoint decision reads the environment: apply the `.env` policy first (#243).
+    crate::dotenv::apply();
     let custom = custom_endpoint_set();
     let name = if custom {
         account.to_string()

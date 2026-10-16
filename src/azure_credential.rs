@@ -237,6 +237,7 @@ fn azure_imds_addr() -> std::net::SocketAddr {
 /// environment. `auto` on an `http` endpoint (an emulator such as Azurite) is `none`: a bearer
 /// token cannot be sent over http anyway, so nothing is probed or tried.
 pub fn mode_for_endpoint(https: bool) -> Result<CredentialMode> {
+    crate::dotenv::apply();
     Ok(match configured_mode(&process_env)? {
         CredentialMode::Auto if !https => CredentialMode::None,
         mode => mode,
@@ -749,6 +750,7 @@ static CREDENTIALS: std::sync::LazyLock<Mutex<HashMap<CredentialMode, Arc<dyn To
 
 /// The process-wide credential for a concrete bearer-token `mode`, built on first use.
 pub fn credential_for(mode: CredentialMode) -> Result<Arc<dyn TokenCredential>> {
+    crate::dotenv::apply();
     let mut credentials = CREDENTIALS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(credential) = credentials.get(&mode) {
         return Ok(Arc::clone(credential));

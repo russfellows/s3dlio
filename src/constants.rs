@@ -339,6 +339,8 @@ pub(crate) fn parse_size_cache_max_entries(raw: Option<&str>) -> usize {
 pub fn size_cache_max_entries() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
+        // Latched for the process: the `.env` policy first (#243).
+        crate::dotenv::apply();
         parse_size_cache_max_entries(std::env::var(ENV_SIZE_CACHE_MAX_ENTRIES).ok().as_deref())
     })
 }
@@ -1159,6 +1161,7 @@ pub const ENV_EXPORT_QUIESCE_TIMEOUT_SECS: &str = "S3DLIO_EXPORT_QUIESCE_TIMEOUT
 /// but unusable value falls back to the default, with a one-time warning.
 pub fn export_quiesce_timeout() -> std::time::Duration {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    crate::dotenv::apply();
     match std::env::var(ENV_EXPORT_QUIESCE_TIMEOUT_SECS) {
         Err(_) => EXPORT_QUIESCE_TIMEOUT,
         Ok(raw) => parse_export_quiesce_timeout_checked(&raw).unwrap_or_else(|| {
