@@ -1585,26 +1585,32 @@ impl ConfigurableFileSystemObjectStore {
             .checked_next_multiple_of(self.alignment())
             .ok_or_else(too_big)?;
 
-        // Borrow aligned buffer from pool if available, otherwise allocate fresh (v0.9.9+).
-        // The pooled buffer is an RAII lease: it (and its permit) go back to the pool when
-        // `lease` is dropped, on every exit including cancellation.
+        // Choose the path by the REQUIRED size, BEFORE taking anything from the pool (v0.9.9+).
+        // A range that fits a pooled buffer borrows one: an RAII lease, which (with its permit)
+        // goes back to the pool when dropped, on every exit including cancellation. A larger
+        // range cannot use a pooled buffer at all: it takes only a private-allocation permit
+        // (separate from the pooled permits, so oversized reads are bounded in number but neither
+        // hold an unused 64 MiB pool buffer nor starve the reads that fit) and allocates its own
+        // buffer. Without a pool, a fresh buffer is allocated as before.
         let mut lease: Option<crate::memory::PooledBuf> = None;
         let mut own: Option<AlignedBuf> = None;
-        if let Some(pool) = &self.config.buffer_pool {
-            let b = pool.take().await?;
-            // Grow buffer if pooled buffer is too small
-            if b.len() < aligned_length {
+        let mut private_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+        match &self.config.buffer_pool {
+            Some(pool) if aligned_length <= pool.buffer_len() => {
+                lease = Some(pool.take().await?);
+            }
+            Some(pool) => {
                 trace!(
-                    "Pool buffer too small ({} < {}), allocating larger buffer",
-                    b.len(),
-                    aligned_length
+                    "Range of {} bytes exceeds the pool buffer size ({}): private allocation",
+                    aligned_length,
+                    pool.buffer_len()
                 );
+                private_permit = Some(pool.acquire_private().await?);
                 own = Some(AlignedBuf::new(aligned_length, self.alignment())?);
             }
-            lease = Some(b);
-        } else {
-            // No pool configured, allocate fresh buffer
-            own = Some(AlignedBuf::new(aligned_length, self.alignment())?);
+            None => {
+                own = Some(AlignedBuf::new(aligned_length, self.alignment())?);
+            }
         }
         // The read is done with `pread` straight into the buffer's raw memory by a blocking task
         // that OWNS the buffer (and so the pool permit): the kernel is the only writer, nothing
@@ -1619,6 +1625,10 @@ impl ConfigurableFileSystemObjectStore {
             let direct = self.config.direct_io;
             let want_len = usize::try_from(read_length).map_err(|_| too_big())?;
             tokio::task::spawn_blocking(move || -> Result<Bytes> {
+                // The private-allocation permit lives as long as the buffer it admits.
+                let _admission = private_permit;
+                #[cfg(test)]
+                range_read_hold::hold_if_armed(&path);
                 let mut options = std::fs::OpenOptions::new();
                 options.read(true);
                 if direct {
@@ -2149,6 +2159,101 @@ impl ConfigurableFileSystemObjectStore {
     }
 }
 
+/// Test hook for the range-read admission tests: reads of files under an armed prefix park inside
+/// the blocking read (after admission, before any I/O) until released.
+#[cfg(test)]
+pub(crate) mod range_read_hold {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    pub(crate) struct Hold {
+        prefix: PathBuf,
+        state: Mutex<(usize, bool)>, // (reads parked so far, released)
+        cv: Condvar,
+    }
+
+    /// Arms a hold for its lifetime; dropping it releases every parked read and disarms.
+    pub(crate) struct HoldGuard(pub(crate) Arc<Hold>);
+
+    impl std::ops::Deref for HoldGuard {
+        type Target = Hold;
+        fn deref(&self) -> &Hold {
+            &self.0
+        }
+    }
+
+    impl Drop for HoldGuard {
+        fn drop(&mut self) {
+            self.0.release();
+            ARMED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|h| !Arc::ptr_eq(h, &self.0));
+        }
+    }
+
+    static ARMED: Mutex<Vec<Arc<Hold>>> = Mutex::new(Vec::new());
+
+    impl Hold {
+        pub(crate) fn arm(prefix: &Path) -> HoldGuard {
+            let hold = Arc::new(Hold {
+                prefix: prefix.to_owned(),
+                state: Mutex::new((0, false)),
+                cv: Condvar::new(),
+            });
+            ARMED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(hold.clone());
+            HoldGuard(hold)
+        }
+
+        /// Wait until `n` reads are parked; false on timeout.
+        pub(crate) fn wait_parked(&self, n: usize, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            while st.0 < n {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                st = self
+                    .cv
+                    .wait_timeout(st, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            true
+        }
+
+        pub(crate) fn parked(&self) -> usize {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner).0
+        }
+
+        pub(crate) fn release(&self) {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+            self.cv.notify_all();
+        }
+    }
+
+    pub(crate) fn hold_if_armed(path: &Path) {
+        let hold = ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|h| path.starts_with(&h.prefix))
+            .cloned();
+        let Some(hold) = hold else { return };
+        let mut st = hold.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.0 += 1;
+        hold.cv.notify_all();
+        while !st.1 {
+            st = hold.cv.wait(st).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
 #[cfg(test)]
 mod try_read_range_direct_tests {
     use super::*;
@@ -2226,6 +2331,154 @@ mod try_read_range_direct_tests {
             .await
             .expect("a valid in-range offset must still succeed");
         assert_eq!(bytes.len(), 4096 - 100);
+    }
+}
+
+/// R5: an oversized range read must decide its path by the required size BEFORE taking a pool
+/// buffer. It used to take a pooled buffer (and permit) first, find it too small, allocate its own
+/// and keep the unused lease for the whole read - enough oversized reads then held every permit
+/// and starved the reads that fit.
+#[cfg(test)]
+mod oversized_range_admission_tests {
+    use super::range_read_hold::Hold;
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const BUF: usize = 64 * 1024;
+    const CAP: usize = 2;
+
+    fn scratch() -> tempfile::TempDir {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::TempDir::new_in(base).unwrap()
+    }
+
+    fn pattern(len: usize, salt: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 31 + salt) % 251) as u8).collect()
+    }
+
+    fn store() -> (
+        Arc<ConfigurableFileSystemObjectStore>,
+        Arc<crate::memory::BufferPool>,
+    ) {
+        let pool = BufferPoolConfig {
+            capacity: CAP,
+            buffer_size: BUF,
+            alignment: 4096,
+        }
+        .build()
+        .unwrap();
+        let config = FileSystemConfig {
+            buffer_pool: Some(pool.clone()),
+            ..FileSystemConfig::default() // buffered pread: no O_DIRECT needed for admission
+        };
+        (
+            Arc::new(ConfigurableFileSystemObjectStore::new(config)),
+            pool,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn held_oversized_reads_take_no_pool_buffer_and_do_not_starve_small_reads() {
+        let dir = scratch();
+        let big = dir.path().join("big.dat");
+        let small = dir.path().join("small.dat");
+        let big_data = pattern(4 * BUF, 1);
+        let small_data = pattern(8192, 2);
+        std::fs::write(&big, &big_data).unwrap();
+        std::fs::write(&small, &small_data).unwrap();
+        let (store, pool) = store();
+        let hold = Hold::arm(&big);
+
+        // More oversized reads than there are permits: all are held inside the blocking read.
+        let want = 3 * BUF + 100; // needs 4 pool buffers' worth: cannot use a pooled buffer
+        let mut oversized = Vec::new();
+        for _ in 0..(2 * CAP) {
+            let (store, big) = (store.clone(), big.clone());
+            oversized.push(tokio::spawn(async move {
+                store
+                    .try_read_range_direct(&big, 0, Some(want as u64))
+                    .await
+            }));
+        }
+        let h = hold.0.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || h.wait_parked(CAP, Duration::from_secs(20)))
+                .await
+                .unwrap(),
+            "the oversized reads never got admitted"
+        );
+        assert_eq!(
+            pool.capacity(),
+            CAP,
+            "oversized reads hold pooled permits/buffers they do not use"
+        );
+        assert_eq!(pool.private_available(), 0, "private admission is bounded");
+        assert_eq!(
+            hold.parked(),
+            CAP,
+            "more oversized reads than the admission bound"
+        );
+
+        // A read that fits is not starved by the held oversized reads.
+        let small_read = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.try_read_range_direct(&small, 0, Some(4096)),
+        )
+        .await
+        .expect("a small read was starved by held oversized reads")
+        .unwrap();
+        assert_eq!(small_read.as_ref(), &small_data[..4096]);
+
+        hold.release();
+        for task in oversized {
+            let got = task.await.unwrap().unwrap();
+            assert_eq!(got.as_ref(), &big_data[..want]);
+        }
+        assert_eq!(pool.capacity(), CAP, "pooled permits not all returned");
+        assert_eq!(
+            pool.private_available(),
+            CAP,
+            "private permits not all returned"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_fits_still_borrows_a_pooled_buffer() {
+        let dir = scratch();
+        let file = dir.path().join("fits.dat");
+        let data = pattern(BUF, 3);
+        std::fs::write(&file, &data).unwrap();
+        let (store, pool) = store();
+        let hold = Hold::arm(&file);
+        let read = {
+            let (store, file) = (store.clone(), file.clone());
+            tokio::spawn(async move {
+                store
+                    .try_read_range_direct(&file, 0, Some(BUF as u64))
+                    .await
+            })
+        };
+        let h = hold.0.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || h.wait_parked(1, Duration::from_secs(20)))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            pool.capacity(),
+            CAP - 1,
+            "a fitting read must lease a pooled buffer"
+        );
+        assert_eq!(
+            pool.private_available(),
+            CAP,
+            "and need no private admission"
+        );
+        hold.release();
+        assert_eq!(read.await.unwrap().unwrap().as_ref(), &data[..]);
+        assert_eq!(pool.capacity(), CAP);
     }
 }
 

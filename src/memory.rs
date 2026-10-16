@@ -218,6 +218,10 @@ pub struct BufferPool {
     tx: mpsc::Sender<AlignedBuf>,
     rx: tokio::sync::Mutex<mpsc::Receiver<AlignedBuf>>,
     permits: Arc<Semaphore>,
+    /// Admission for PRIVATE allocations (a request larger than `buf_len`, which cannot use a
+    /// pooled buffer): `capacity` permits of their own, so such requests are bounded in number
+    /// but neither hold a pooled buffer or a pooled permit nor starve the requests that fit.
+    private_permits: Arc<Semaphore>,
     buf_len: usize,
     align: usize,
 }
@@ -242,11 +246,13 @@ impl BufferPool {
         }
         let (tx, rx) = mpsc::channel(capacity);
         let permits = Arc::new(Semaphore::new(capacity));
+        let private_permits = Arc::new(Semaphore::new(capacity));
 
         let pool = Arc::new(Self {
             tx,
             rx: tokio::sync::Mutex::new(rx),
             permits,
+            private_permits,
             buf_len,
             align,
         });
@@ -308,6 +314,33 @@ impl BufferPool {
             align: self.align,
             _permit: permit,
         })
+    }
+
+    /// Size in bytes of every pooled buffer. A request needing more than this cannot use the pool
+    /// and must be served by a private allocation admitted with
+    /// [`acquire_private`](Self::acquire_private); decide by this size BEFORE calling
+    /// [`take`](Self::take), so no pooled buffer is held for nothing.
+    pub fn buffer_len(&self) -> usize {
+        self.buf_len
+    }
+
+    /// Admission for ONE private allocation (a request larger than [`buffer_len`](Self::buffer_len)).
+    /// At most `capacity` private allocations are admitted at a time; the permit is released when
+    /// dropped, so hold it for as long as the allocation lives. It is independent of the pooled
+    /// permits taken by [`take`](Self::take): oversized requests cannot starve pooled ones.
+    pub async fn acquire_private(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, BufferPoolError> {
+        self.private_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| BufferPoolError::Closed)
+    }
+
+    /// Private-allocation permits available right now (diagnostics and tests).
+    pub fn private_available(&self) -> usize {
+        self.private_permits.available_permits()
     }
 
     /// Return a buffer to the pool now (equivalent to dropping it).

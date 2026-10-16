@@ -117,6 +117,14 @@
   `copy=True` snapshots a mutable buffer once under the GIL (exact `bytes` and `BytesView` are immutable and never
   copied), for callers whose other threads may write to the buffer during the call. The misleading "kept for
   compatibility" wording of `write_owned_bytes` is gone.
+- **Round-7 (4/6): an oversized `direct://` range read no longer holds a pool buffer it does not use (R5).**
+  A range larger than the range-read pool's buffer (64 MiB by default) first took a pooled buffer and permit, found
+  it too small, allocated its own larger buffer and kept the unused lease for the whole read: 32 such reads held every
+  permit (and 32 x 64 MiB of unused buffers) and delayed unrelated small reads. The path is now chosen by the
+  required size before anything is taken: a range that fits borrows a pooled buffer as before; a larger one takes
+  only a *private-allocation permit* (`BufferPool::acquire_private`, `capacity` of them, separate from the pooled
+  permits, released when the read ends) and allocates its own buffer, so oversized reads are bounded in number but
+  cannot starve reads that fit. New `BufferPool::buffer_len()`, `acquire_private()`, `private_available()`.
 - **Round-6 edges of the borrowed-buffer barrier.** `GuardedFuture.cancel()` returns `False` once the put is
   already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
   the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really
