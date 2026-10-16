@@ -19,7 +19,7 @@ pub const DEFAULT_MIN_IO_SIZE: usize = 64 * 1024;
 /// Bytes in one MiB, for the `*_MB` environment variables.
 pub const BYTES_PER_MIB: usize = 1024 * 1024;
 
-/// Default size, in bytes, of one `direct://` (O_DIRECT) bounce buffer (64 MiB).
+/// Default size, in bytes, of one `direct://` (O_DIRECT) bounce buffer (16 MiB).
 ///
 /// O_DIRECT needs the buffer ADDRESS, the file offset and the length of every I/O to be
 /// multiples of the device alignment (4096). A PUT source whose address is already aligned is
@@ -29,13 +29,17 @@ pub const BYTES_PER_MIB: usize = 1024 * 1024;
 /// `direct_bounce.rs`: buffers are allocated and first-touched once per node and reused, used in
 /// ping-pong pairs so the copy of chunk `k+1` overlaps the I/O of chunk `k`.
 ///
-/// Why 64 MiB at most: the I/O is large enough that per-syscall cost is noise, while a pair
-/// (2 buffers) per node keeps the POOLED bounce memory small and bounded:
-/// `nodes x pairs x 2 x size` (default: 128 MiB per NUMA node), shared by every in-flight
-/// request in both directions. (Pooled path only: private buffers made when the pool cannot serve
+/// Why 16 MiB: the I/O is large enough that per-syscall cost is noise, while the pooled bounce
+/// memory stays small and bounded: `nodes x pairs x 2 x size` (default: 4 pairs x 2 x 16 MiB =
+/// 128 MiB per NUMA node), shared by every in-flight request in both directions. Several small
+/// pairs rather than one big pair let several requests use warm buffers at once, so a long
+/// transfer does not block the short ones behind it. (The default shape is provisional: chosen
+/// from a discrete-event model of the pool, to be confirmed with native counters on hardware.
+/// Set the two environment variables to restore the earlier 1 pair x 64 MiB.)
+/// (Pooled path only: private buffers made when the pool cannot serve
 /// a request, or by the opt-in `fallback` policy, are outside it; see `direct_bounce.rs`.) Override with [`ENV_DIRECT_IO_BOUNCE_SIZE_MB`], clamped to
 /// [`MIN_DIRECT_IO_BOUNCE_SIZE_MB`]..=[`MAX_DIRECT_IO_BOUNCE_SIZE_MB`].
-pub const DEFAULT_DIRECT_IO_BOUNCE_SIZE: usize = 64 * BYTES_PER_MIB;
+pub const DEFAULT_DIRECT_IO_BOUNCE_SIZE: usize = 16 * BYTES_PER_MIB;
 
 /// Smallest accepted `direct://` bounce-buffer size in MiB.
 pub const MIN_DIRECT_IO_BOUNCE_SIZE_MB: usize = 4;
@@ -45,12 +49,12 @@ pub const MAX_DIRECT_IO_BOUNCE_SIZE_MB: usize = 64;
 
 /// Environment variable overriding [`DEFAULT_DIRECT_IO_BOUNCE_SIZE`], in MiB.
 ///
-/// Clamped to 4..=64; `0` or an unparseable value selects the default (64).
-/// Example: `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=16`.
+/// Clamped to 4..=64; `0` or an unparseable value selects the default (16).
+/// Example: `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=64` (the pre-0.9.128-round-7 size).
 pub const ENV_DIRECT_IO_BOUNCE_SIZE_MB: &str = "S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB";
 
 /// Default number of ping-pong buffer PAIRS per NUMA node (1 pair = 2 buffers).
-pub const DEFAULT_DIRECT_IO_BOUNCE_PAIRS: usize = 1;
+pub const DEFAULT_DIRECT_IO_BOUNCE_PAIRS: usize = 4;
 
 /// Largest accepted pairs-per-node value.
 pub const MAX_DIRECT_IO_BOUNCE_PAIRS: usize = 64;
@@ -101,7 +105,7 @@ pub fn parse_direct_io_bounce_size(raw: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_DIRECT_IO_BOUNCE_SIZE)
 }
 
-/// Pure parser for [`ENV_DIRECT_IO_BOUNCE_PAIRS`]: clamped to 1..=64, default 1.
+/// Pure parser for [`ENV_DIRECT_IO_BOUNCE_PAIRS`]: clamped to 1..=64, default 4.
 pub fn parse_direct_io_bounce_pairs(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -147,16 +151,18 @@ mod direct_io_bounce_size_tests {
     }
 
     #[test]
-    fn default_is_the_documented_64_mib() {
-        assert_eq!(DEFAULT_DIRECT_IO_BOUNCE_SIZE, 64 * BYTES_PER_MIB);
-        assert_eq!(parse_direct_io_bounce_size(None), 64 * BYTES_PER_MIB);
+    fn default_is_the_documented_16_mib() {
+        assert_eq!(DEFAULT_DIRECT_IO_BOUNCE_SIZE, 16 * BYTES_PER_MIB);
+        assert_eq!(parse_direct_io_bounce_size(None), 16 * BYTES_PER_MIB);
     }
 
     #[test]
-    fn pairs_are_clamped_to_1_to_64() {
-        assert_eq!(parse_direct_io_bounce_pairs(None), 1);
-        assert_eq!(parse_direct_io_bounce_pairs(Some("0")), 1);
-        assert_eq!(parse_direct_io_bounce_pairs(Some("x")), 1);
+    fn pairs_are_clamped_to_1_to_64_and_default_to_4() {
+        assert_eq!(DEFAULT_DIRECT_IO_BOUNCE_PAIRS, 4);
+        assert_eq!(parse_direct_io_bounce_pairs(None), 4);
+        assert_eq!(parse_direct_io_bounce_pairs(Some("0")), 4);
+        assert_eq!(parse_direct_io_bounce_pairs(Some("x")), 4);
+        assert_eq!(parse_direct_io_bounce_pairs(Some("1")), 1);
         assert_eq!(parse_direct_io_bounce_pairs(Some("3")), 3);
         assert_eq!(parse_direct_io_bounce_pairs(Some("9999")), 64);
     }

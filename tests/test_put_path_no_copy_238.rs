@@ -99,7 +99,7 @@ const MIB: usize = 1024 * 1024;
 /// file:// writes straight from the caller's `Bytes`: no allocation proportional to it.
 const FILE_PAYLOAD: usize = 64 * MIB;
 /// direct:// copies an UNALIGNED source ONCE, through the shared warm bounce pool, never twice
-/// and never into an object-sized buffer: the extra memory is the pool (one pair of
+/// and never into an object-sized buffer: the extra memory is the pool (the configured pairs of
 /// `direct_io_bounce_size()` buffers per NUMA node). The payload is far larger than the pool so a
 /// full copy cannot hide under the allowance.
 const DIRECT_PAYLOAD: usize = 512 * MIB;

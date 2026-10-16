@@ -227,8 +227,8 @@ buffers, the result of a `direct://` GET) is written straight from the caller's 
 * **Ping-pong pairs.** A request that moves more than one buffer's worth leases one pair (2 buffers) for its whole duration; a smaller one leases a single buffer (see below). PUT: chunk `k+1` is copied
   into one buffer while chunk `k` is written from the other, then they swap (the write runs on a helper thread).
   GET: chunk `k+1` is read into one buffer while chunk `k` is copied out of the other into the destination.
-* **Bounded POOLED memory.** The pool buffers total exactly **`nodes x pairs x 2 x size`** (default: 2 x 64 MiB =
-  128 MiB per NUMA node) for ALL requests in both directions, and every buffer a request leases comes from there.
+* **Bounded POOLED memory.** The pool buffers total exactly **`nodes x pairs x 2 x size`** (default: 4 pairs x 2 x 16 MiB =
+  128 MiB per NUMA node; 8 pairs / 256 MiB on a two-node host) for ALL requests in both directions, and every buffer a request leases comes from there.
   That bound covers the pooled path only; see "Outside the pooled bound" below.
 * **When every pair of the node is in use** the request either **waits** (default) in strict FIFO order shared by
   PUTs and GETs, so neither direction can starve the other, or, with `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY=fallback`,
@@ -262,10 +262,12 @@ buffers, the result of a `direct://` GET) is written straight from the caller's 
 
 | Variable | Default | Description |
 |---|---|---|
-| `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` | `64` | Size of one bounce buffer in MiB, clamped to 4..=64 (`0` or unparseable selects 64). Bigger means fewer syscalls per object; the memory cap grows with it. |
-| `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE` | `1` | Ping-pong pairs (2 buffers each) per NUMA node, 1..=64. More pairs let more requests use warm buffers at once, at `2 x size` more memory per pair per node. |
+| `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` | `16` | Size of one bounce buffer in MiB, clamped to 4..=64 (`0` or unparseable selects 16). Bigger means fewer syscalls per bounced object; the memory cap grows with it. It does not change the size of a page-aligned (zero-copy) transfer. |
+| `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE` | `4` | Ping-pong pairs (2 buffers each) per NUMA node, 1..=64 (`0` or unparseable selects 4). More pairs let more requests use warm buffers at once, at `2 x size` more memory per pair per node. |
 | `S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY` | `wait` | `wait` (FIFO across PUTs and GETs) or `fallback` (private one-buffer fallback), see above. |
 | `S3DLIO_DIRECT_IO_GET_MODE` | `direct` | `direct` (fresh aligned buffer, zero copies) or `pooled` (through the shared pool). |
+
+The default pool shape is **4 pairs x 16 MiB per NUMA node** (128 MiB per node, the same budget as the earlier 1 pair x 64 MiB). It is provisional: chosen from a discrete-event model of the pool (1 x 64 MiB ranked worst in every modelled workload; 4 x 16 MiB best on mixed-size tail latency at the same budget) and to be confirmed with native counters on hardware. To restore the earlier shape set `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=64` and `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE=1`.
 
 The streaming `direct://` writer (`DirectIOWriter`) stages up to 64 MiB in its own aligned buffer; a page-aligned
 chunk bypasses it. Before v0.9.128 `direct://` wrote and read 4 KiB per system call (issue #244).

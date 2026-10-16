@@ -1060,10 +1060,10 @@ fn direct_bounce_config_first_call_sees_the_file() {
     let p = first_call(
         "integration-bounce-config",
         "bounce_config",
-        "S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=16\nS3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE=3\nS3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY=fallback\nS3DLIO_DIRECT_IO_GET_MODE=pooled\n",
+        "S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=8\nS3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE=3\nS3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY=fallback\nS3DLIO_DIRECT_IO_GET_MODE=pooled\n",
     );
     assert_eq!(
-        p.client, "size=16777216 pairs=3 busy=Fallback get=Pooled",
+        p.client, "size=8388608 pairs=3 busy=Fallback get=Pooled",
         "{p:?}"
     );
 }

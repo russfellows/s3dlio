@@ -19,14 +19,16 @@
 //!   `mbind` to the node, best effort, plus first touch from a thread pinned to the node's CPUs),
 //!   then kept for the life of the process.
 //! * **Ping-pong pairs.** A pool holds `pairs` pairs of buffers (`S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE`,
-//!   default 1) of `buffer_size` bytes (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, 4..=64, default 64).
+//!   default 4) of `buffer_size` bytes (`S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB`, 4..=64, default 16; the
+//!   default 4 x 16 MiB shape is provisional, chosen from a discrete-event model and to be confirmed
+//!   on hardware; 1 pair x 64 MiB was the earlier default).
 //!   A transfer of more than one buffer leases a PAIR for its whole duration (a smaller one leases a single buffer, see below):
 //!   * PUT: chunk `k` is copied into buffer A and written while chunk `k+1` is copied into buffer
 //!     B; then the buffers swap. The write runs on a helper thread, the copy on the caller's.
 //!   * GET: chunk `k+1` is read into buffer A by the helper thread while chunk `k` is copied out
 //!     of buffer B into the destination; then they swap.
 //! * **Bounded POOLED memory.** The pool buffers themselves total exactly `nodes x pairs x 2 x
-//!   size` (default 128 MiB per node): every buffer a request leases comes from there, so the bytes
+//!   size` (default 4 x 2 x 16 MiB = 128 MiB per node): every buffer a request leases comes from there, so the bytes
 //!   LEASED at any instant never exceed [`bounce_memory_cap`] under the default `wait` policy.
 //!   That bound covers the pooled path only. Other direct-I/O memory is outside it (see below).
 //! * **Busy policy** (`S3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY`): when every pair of the node is
@@ -48,7 +50,7 @@
 //!   concurrent aligned PUT), the object-sized destination a default-mode GET returns, the
 //!   private buffers of `direct://` range reads (one per read, sized to the range; a range larger
 //!   than the range pool's buffer is admitted by count, `capacity` at a time, and a store with no
-//!   range pool allocates without admission), and the up-to-64 MiB staging of every unaligned
+//!   range pool allocates without admission), and the up-to-64 MiB staging (independent of the bounce size) of every unaligned
 //!   streaming writer. None of these is counted except the implicit and `fallback` buffers.
 //! * **Leases are RAII and owned by the blocking closure that does the I/O**: a cancelled
 //!   future can never return a buffer to the pool while a blocking write or read still uses it.

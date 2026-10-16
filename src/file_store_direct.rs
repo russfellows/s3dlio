@@ -2759,16 +2759,16 @@ mod direct_io_chunking_tests {
     }
 
     /// The per-call arm with a 1 GiB cap (kept for comparison): an unaligned object up to 1 GiB
-    /// is ONE write; the default pooled chunk is 64 MiB, so 1 GiB is 16 pipelined writes.
+    /// is ONE write; the default pooled chunk is 16 MiB, so 1 GiB is 64 pipelined writes.
     #[test]
-    fn per_call_gib_cap_is_one_write_and_the_default_pool_chunk_is_64_mib() {
+    fn per_call_gib_cap_is_one_write_and_the_default_pool_chunk_is_16_mib() {
         for len in [MIB + 3, 512 * MIB, GIB] {
             let steps = plan_direct_write(len, 16, A, GIB, MAX_IO);
             assert_eq!(steps.len(), 1, "{len}: {steps:?}");
         }
-        assert_eq!(DEFAULT_DIRECT_IO_BOUNCE_SIZE, 64 * MIB);
+        assert_eq!(DEFAULT_DIRECT_IO_BOUNCE_SIZE, 16 * MIB);
         let steps = plan_direct_write(GIB, 16, A, DEFAULT_DIRECT_IO_BOUNCE_SIZE, MAX_IO);
-        assert_eq!(steps.len(), 16);
+        assert_eq!(steps.len(), 64);
     }
 
     #[test]
@@ -2962,7 +2962,7 @@ mod direct_io_chunking_tests {
             }
         }
 
-        /// Three pooled chunks through a real O_DIRECT file (default 64 MiB buffers).
+        /// Many pooled chunks through a real O_DIRECT file (130 MiB is nine chunks at the 16 MiB default).
         #[test]
         fn pooled_put_of_many_chunks_roundtrips() {
             check(130 * MIB + 7, false, PutStrategy::Pooled);

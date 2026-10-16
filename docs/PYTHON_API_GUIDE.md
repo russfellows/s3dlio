@@ -273,8 +273,8 @@ Per backend, after that: `s3://`, `az://`, `gs://` (official client) and `file:/
 storage client / `write` with no further s3dlio copy (what the SDKs do internally is outside s3dlio; the legacy
 community GCS client, feature `gcs-community`, copies once). `direct://` (O_DIRECT) writes a **page-aligned**
 source (address a multiple of 4096) straight from your memory in one `write` per at most 2 GiB; any other source
-is copied **once** through a warm, reused, page-aligned bounce buffer (64 MiB by default, shared per NUMA node,
-ping-pong so the copy of the next chunk overlaps the write of the current one; see
+is copied **once** through a warm, reused, page-aligned bounce buffer (16 MiB by default, 4 pairs per NUMA node,
+shared by PUTs and GETs, ping-pong so the copy of the next chunk overlaps the write of the current one; see
 `docs/Environment_Variables.md`). The last partial block of a PUT is always bounced (a zero-padded 4 KiB block).
 `direct://` GET returns page-aligned memory (by default read straight into one fresh aligned buffer), so for
 objects of at least `min_io_size` (4 KiB) on a store with the range engine off (the default),

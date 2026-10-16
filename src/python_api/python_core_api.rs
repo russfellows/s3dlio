@@ -1472,7 +1472,7 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 /// The native stores then write that memory without another copy on `s3://`, `gs://` (official client),
 /// `az://` and `file://`. `direct://` (O_DIRECT) writes a page-aligned source (address
 /// multiple of 4096) straight from it; any other source is copied once into an aligned
-/// bounce buffer from the shared per-NUMA-node pool (64 MiB buffers by default, ping-pong).
+/// bounce buffer from the shared per-NUMA-node pool (16 MiB buffers by default, 4 ping-pong pairs per node).
 ///
 /// The call blocks until the object is written. While it runs the source is exported:
 /// * resizing it from another thread (`bytearray.extend()`/`clear()`) raises `BufferError`;

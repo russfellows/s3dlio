@@ -4,6 +4,18 @@
 
 ### Changed (BEHAVIOUR CHANGE)
 
+- **The `direct://` bounce pool default is now 4 pairs x 16 MiB per NUMA node (was 1 pair x 64 MiB).**
+  The memory budget is unchanged (128 MiB per NUMA node; 8 pairs / 256 MiB in total on a two-node
+  host). The new shape lets four requests per node use warm buffers at once instead of queueing
+  behind one long transfer. The choice is provisional: it comes from a discrete-event model of the
+  pool (1 x 64 MiB ranked worst in every modelled workload, 4 x 16 MiB best on mixed-size tail
+  latency at the same budget), not from a hardware measurement, and is to be confirmed with native
+  counters on hardware. Page-aligned (zero-copy) transfers are not affected: their system-call size
+  does not depend on the bounce size, and the streaming writer's 64 MiB staging buffer is independent
+  of it. A bounced object now takes four times as many (16 MiB) writes or reads. To restore the
+  earlier shape set `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=64` and
+  `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE=1`; both variables are unchanged.
+
 - **The writers' `crc32c:` checksum is now a real CRC-32C (#256).** Every streaming writer (file,
   `direct://`, the data-generating streaming writer, S3, Azure, GCS and the Arrow backend) reported
   its checksum as `crc32c:<hex>` but computed CRC-32 (IEEE) with `crc32fast`, so the value did not
