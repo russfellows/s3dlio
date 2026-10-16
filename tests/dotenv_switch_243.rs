@@ -195,8 +195,14 @@ fn probe_child() {
             format!("range={}", r.is_ok())
         }
         #[cfg(feature = "backend-azure")]
-        "azure_account_url" => s3dlio::azure_client::resolve_azure_account_url("acct")
-            .unwrap_or_else(|e| format!("error: {e}")),
+        // Reports which endpoint was chosen, not the URL itself (the URL carries the account
+        // name; CodeQL rust/cleartext-logging).
+        "azure_account_url" => match s3dlio::azure_client::resolve_azure_account_url("acct") {
+            Ok(url) if url == "http://127.0.0.1:10000/acct" => "file-endpoint".to_string(),
+            Ok(url) if url == "https://acct.blob.core.windows.net" => "public-endpoint".to_string(),
+            Ok(_) => "other-endpoint".to_string(),
+            Err(_) => "error".to_string(),
+        },
         #[cfg(feature = "arrow-backend")]
         "arrow_get" => {
             use s3dlio::object_store::ObjectStore;
@@ -249,11 +255,19 @@ fn probe_child() {
         other => panic!("unknown S3DLIO_243_ENTRY {other}"),
     };
     let var = |n: &str| std::env::var(n).unwrap_or_else(|_| "<unset>".to_string());
+    // The access key is reported as which known test value it holds, never the value itself
+    // (CodeQL rust/cleartext-logging).
+    let key = match std::env::var("AWS_ACCESS_KEY_ID").as_deref() {
+        Err(_) => "<unset>",
+        Ok("dotenv-key") => "dotenv-key",
+        Ok("named-key") => "named-key",
+        Ok(_) => "<other>",
+    };
     println!(
         "PROBE marker={} preset={} key={} client={client}",
         var("S3DLIO_243_MARKER"),
         var("S3DLIO_243_PRESET"),
-        var("AWS_ACCESS_KEY_ID"),
+        key,
     );
 }
 
@@ -717,7 +731,7 @@ fn azure_account_url_resolver_first_call_sees_the_file() {
         "azure_account_url",
         "AZURE_STORAGE_ENDPOINT=http://127.0.0.1:10000\n",
     );
-    assert_eq!(p.client, "http://127.0.0.1:10000/acct", "{p:?}");
+    assert_eq!(p.client, "file-endpoint", "{p:?}");
 }
 
 #[cfg(feature = "arrow-backend")]
