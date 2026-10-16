@@ -52,7 +52,8 @@
 //!   `build_reqwest_http_client*`), the public setting readers in `constants`
 //!   (`H2WindowConfig::from_env`, `connect_timeout_secs`, `max_retry_attempts`,
 //!   `mpi_world_size`, `mpi_aware_thread_budget`, `effective_thread_budget`),
-//!   `MultiEndpointStore::new` / `from_config`, `AzureConfig::default`, and the latched
+//!   `MultiEndpointStore::new` / `from_config`, `AzureConfig::default`,
+//!   `azure_credential::redact_sas` / `warn_unused_sas`, and the latched
 //!   tuning knobs (`S3DLIO_UNSIGNED_PAYLOAD`, `S3DLIO_SKIP_HEAD`,
 //!   `S3DLIO_ENABLE_RANGE_OPTIMIZATION`, `S3DLIO_RANGE_THRESHOLD_MB`,
 //!   `S3DLIO_SIZE_CACHE_TTL_SECS`, `S3DLIO_GCS_RAPID`).

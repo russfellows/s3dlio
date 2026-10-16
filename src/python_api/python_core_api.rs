@@ -1600,9 +1600,11 @@ fn put_outcome_text(result: &PyResult<()>) -> String {
 ///   then `bytearray.extend()/clear()` raise `BufferError` and any write to the bytes is a
 ///   data race (the bytes uploaded are undefined). The awaitable is a `Future` that NEVER reaches
 ///   a terminal state - result, exception or cancelled - while any native reader of the buffer
-///   remains or before the export has actually been released, whatever the caller does:
-///   `Task.cancel()` (also repeated), `asyncio.timeout()` and `wait_for()` leave the awaiting task
-///   pending until the future ends; a cancellation or timeout is delivered only after that point.
+///   remains or before the export has actually been released, under the supported consumer
+///   operations: `await`, `cancel()`, `Task.cancel()` (also repeated), `asyncio.timeout()` and
+///   `wait_for()` leave the awaiting task pending until the future ends; a cancellation or timeout
+///   is delivered only after that point. The future belongs to s3dlio: forcing it to complete with
+///   `set_result` / `set_exception` (or the base-class methods) is unsupported and ends it at once.
 ///   So reusing the buffer after the `await` finished - with a result, an error, `CancelledError`
 ///   or `TimeoutError` - is safe. Cancelling therefore waits for a running native write to finish.
 ///   Every `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (default 30 s) that a reader remains, a
@@ -1723,9 +1725,11 @@ fn wrap_in_guard<'py>(
 /// and defers the future's own terminal state.
 ///
 /// THE CONTRACT: this future never reaches a terminal state (result, exception, cancelled) while
-/// a native reader remains or before the export has really been released - whatever the caller
-/// does (`Task.cancel()` once or repeatedly, `asyncio.timeout`, `wait_for`) and whatever happens
-/// to the barrier machinery. At every quiesce deadline it warns and counts, then waits again. If
+/// a native reader remains or before the export has really been released - under the supported
+/// consumer operations (`await`, `cancel()`, `Task.cancel()` once or repeatedly, `asyncio.timeout`,
+/// `wait_for`) and whatever happens to the barrier machinery. Producer-side calls
+/// (`set_result`, `set_exception`, base-class `asyncio.Future` methods) are unsupported: they end
+/// the future at once. At every quiesce deadline it warns and counts, then waits again. If
 /// the machinery itself fails (the quiesce future cannot be created, `add_done_callback` raises,
 /// the waiter fails, `latch_ready` raises) it falls back to polling with `loop.call_later`, and
 /// if even that cannot be scheduled to a blocking wait on the event-loop thread. A failure is

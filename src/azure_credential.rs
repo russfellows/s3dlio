@@ -762,6 +762,8 @@ pub fn credential_for(mode: CredentialMode) -> Result<Arc<dyn TokenCredential>> 
 
 /// Warn (once) that a SAS token is configured but the mode will not use it.
 pub fn warn_unused_sas(mode: CredentialMode) {
+    // A public entry that reads a setting: the opted-in `.env` file must be loaded first.
+    crate::dotenv::apply();
     if mode != CredentialMode::Sas && present(&process_env, ENV_AZURE_SAS_TOKEN) {
         static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         WARNED.get_or_init(|| {
@@ -776,6 +778,9 @@ pub fn warn_unused_sas(mode: CredentialMode) {
 /// Replace every occurrence of the configured SAS token in `text`, so an error message that
 /// echoes a request URL cannot leak it.
 pub fn redact_sas(text: &str) -> String {
+    // May be the process's first s3dlio call: a token set only in an opted-in `.env` file has
+    // to be known before it can be redacted.
+    crate::dotenv::apply();
     redact_with(text, sas_token(&process_env).ok().as_deref())
 }
 

@@ -8,11 +8,14 @@
   The memory budget is unchanged (128 MiB per NUMA node; 8 pairs / 256 MiB in total on a two-node
   host). The new shape lets four requests per node use warm buffers at once instead of queueing
   behind one long transfer. The choice is provisional: it comes from a discrete-event model of the
-  pool (1 x 64 MiB ranked worst in every modelled workload, 4 x 16 MiB best on mixed-size tail
-  latency at the same budget), not from a hardware measurement, and is to be confirmed with native
-  counters on hardware. Page-aligned (zero-copy) transfers are not affected: their system-call size
-  does not depend on the bounce size, and the streaming writer's 64 MiB staging buffer is independent
-  of it. A bounced object now takes four times as many (16 MiB) writes or reads. To restore the
+  pool, not from a hardware measurement, and is to be confirmed with native counters on hardware.
+  The model's advantage is for unaligned (bounced) scenarios: in a high-concurrency mix of unaligned
+  PUTs it estimates roughly 42 GB/s for 4 x 16 MiB against roughly 18 GB/s for 1 x 64 MiB at the same
+  budget (conditional model estimates, not device measurements). Page-aligned (zero-copy) controls use
+  no bounce memory and tie, and their system-call size does not depend on the bounce size; the
+  streaming writer's 64 MiB staging buffer is independent of it. A bounced object larger than 16 MiB
+  is now moved in more, smaller (16 MiB) writes or reads than with a 64 MiB buffer (up to four times
+  as many for objects of 64 MiB or more; no change for an object that fits in one 16 MiB buffer). To restore the
   earlier shape set `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=64` and
   `S3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE=1`; both variables are unchanged.
 
@@ -62,9 +65,14 @@
   returned the short body. The fresh-size retry only runs after an error, so it never ran. The
   single-request path now requires exactly the planned length (like the multi-range path), and a
   cached size of 0 is no longer read as an empty object: the read fails and is retried once with a
-  size from a fresh `HEAD` (a size just learned from the service stays a legitimate empty read, so
-  reading an object that really is empty costs one extra `HEAD` while its size is cached). Default
-  Azure SDK mode is unchanged. Every caller of `RangeEngine::download` shares the exact-length rule.
+  size from a fresh `HEAD` (a size just learned from the service stays a legitimate empty read), so
+  every read of an empty blob in explicit mode now costs one `HEAD` (the retry caches the size 0 again, so
+  the cost does not go away; before this change such a read made no request at all). Default
+  Azure SDK mode is unchanged. Every caller of `RangeEngine::download` shares the exact-length rule;
+  `file://` and `direct://` behaviour did not change. Pre-existing limit, recorded and not changed: an
+  unguarded read trusts a single `HEAD` (no ETag / `If-Match`), so a blob that grows after the `HEAD`
+  returns its first N bytes as a success, and a `HEAD` response without `Content-Length` is read as
+  size 0 (`AzureBlob::stat`).
 
 - **Python checkpoints kept no checksum (final review F2).** A streamed shard's writer computes a
   `crc32c:` of the logical bytes, but the Python layer dropped it at every step: the dict returned by
@@ -78,6 +86,11 @@
   and `read_shard_by_rank` validates against it (after decompression for `.zst` shards) and raises on
   a mismatch. Manifests and metadata without a checksum behave as before: readable, not validated.
   `PyCheckpointWriter.save_distributed_shard` still computes no checksum for its one-shot upload.
+
+- **`azure_credential::redact_sas` and `warn_unused_sas` now read the dotenv file first.** A Rust
+  caller whose first s3dlio call was `redact_sas` missed a SAS token that was set only in an opted-in
+  `.env` file, so a bare token fragment in the text was not redacted. Both helpers now apply the
+  dotenv settings before reading the environment, like the other first-read entry points.
 
 - **A compressed shard is stored, recorded and statted under one name (R10).** A compressing
   writer for a custom key that already ends in `.zst` (`custom.zst`) stored the object as
@@ -512,7 +525,9 @@
   is done and the export has really been released with a real GIL token (never by a Tokio worker waiting
   for the GIL, and never inferred from `PyGILState_Check`). `put_bytes` waits after the store returned;
   the awaitable of `put_bytes_async(borrow=True)` is a `Future` that never reaches a terminal state
-  (result, error or cancellation) until then (see the round-7 entries), so reusing the buffer after `CancelledError`
+  (result, error or cancellation) until then under the supported consumer operations (`await`, `cancel`,
+  `Task.cancel`, `asyncio.timeout`, `wait_for`; see the round-7 entries). Forcing completion with
+  `set_result` / `set_exception` (or the base-class methods) is unsupported and is not covered. So reusing the buffer after `CancelledError`
   is safe (cancelling waits for a running native write to finish). `put_bytes` waits at most 30 s and then raises
   `ExportStillReferencedError`; the awaitable warns at each missed deadline and keeps waiting
   (`s3dlio._put_export_stats()["quiesce_timeouts"]` counts them). Buffers of Python objects or pointers (`O`/`P` formats) are

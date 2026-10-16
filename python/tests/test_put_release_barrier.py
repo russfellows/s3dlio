@@ -1108,9 +1108,13 @@ def test_exit_waits_for_a_releaser_parked_before_try_attach(work_dir):
     assert elapsed >= 1.4, f"exit did not wait for the parked releaser ({elapsed:.2f}s)"
 
 
-def test_a_future_finished_by_someone_else_stops_polling(work_dir):
-    """P3-4: if the future is made terminal externally, the guard must not keep polling (or
-    keep reporting failures) forever."""
+def test_unsupported_forced_completion_cleanup_stops_polling(work_dir):
+    """UNSUPPORTED-USE CLEANUP, not a supported scenario. The guarantee covers the consumer
+    operations (await, cancel, Task.cancel, timeout, wait_for); calling a producer method on
+    the future (here the base-class ``asyncio.Future.set_result``) is outside it and ends the
+    future at once, whether or not a native reader remains. This only checks that, after such
+    a forced completion, the guard stops polling (and reporting failures) instead of looping
+    forever."""
     cls = guarded_future_class(work_dir)
 
     async def go():
@@ -1133,7 +1137,7 @@ def test_a_future_finished_by_someone_else_stops_polling(work_dir):
         inner.set_result("uploaded")
         await asyncio.sleep(0.2)
         assert calls, "the guard never polled"
-        asyncio.Future.set_result(fut, "external")  # someone else ends it
+        asyncio.Future.set_result(fut, "external")  # UNSUPPORTED: forces the base class
         await asyncio.sleep(0.1)  # let a poll that was already scheduled run
         settled = len(calls)
         await asyncio.sleep(0.3)

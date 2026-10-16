@@ -296,9 +296,12 @@ awaitable completes):
   of `put_bytes_async(..., borrow=True)` is a `Future` that **never reaches a terminal state - result, exception
   or cancelled - while any native reader of the buffer remains or before the export has actually been released**
   (`PyBuffer_Release` has run, so a resize no longer raises `BufferError`). A native reader is any clone of the
-  payload, wherever it lives: a store task, an SDK/HTTP task, a detached file write. Nothing the caller does can
-  change that: `Task.cancel()` (once or repeatedly), `asyncio.timeout()` and `asyncio.wait_for()` all leave
-  the awaiting task pending until the future ends. `cancel()` cancels the put, but a running native write cannot
+  payload, wherever it lives: a store task, an SDK/HTTP task, a detached file write. The supported consumer
+  operations cannot change that: `await`, `fut.cancel()`, `Task.cancel()` (once or repeatedly), `asyncio.timeout()`
+  and `asyncio.wait_for()` all leave the awaiting task pending until the future ends. The guarantee covers
+  those consumer operations only: the future belongs to s3dlio, so calling its producer methods
+  (`set_result`, `set_exception`, or the base-class `asyncio.Future.set_result` / `cancel`) is unsupported and ends
+  it at once, whether or not a native reader remains. `cancel()` cancels the put, but a running native write cannot
   be stopped, so the cancellation (or the timeout) reaches you only AFTER that write finished and the export was
   released. Once the `await` finishes - with a result, an error, `CancelledError` or `TimeoutError` - the buffer
   can be resized or reused. The same holds when the barrier machinery itself fails (an internal error, for

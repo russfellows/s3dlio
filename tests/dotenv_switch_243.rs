@@ -225,6 +225,14 @@ fn probe_child() {
             s3dlio::object_store::AzureConfig::default().sdk_download_concurrency
         ),
         #[cfg(feature = "backend-azure")]
+        "azure_redact_sas" => {
+            // The first s3dlio call of the process is `redact_sas`: the SAS token exists only in
+            // the opted-in .env file. A bare, percent-decoded signature fragment can only be
+            // redacted from the configured token (the layers that look at `sig=` / URL queries
+            // do not see it).
+            s3dlio::azure_credential::redact_sas("the signature abc+def/ghij= was refused")
+        }
+        #[cfg(feature = "backend-azure")]
         "azure" => {
             let _ = s3dlio::azure_client::AzureBlob::with_default_credential("acct", "cont");
             "n/a".to_string()
@@ -762,6 +770,17 @@ fn community_gcs_endpoint_resolver_first_call_sees_the_file() {
         p.client, "gcs_endpoint=Some(\"http://gcs.test:4443\")",
         "{p:?}"
     );
+}
+
+#[cfg(feature = "backend-azure")]
+#[test]
+fn azure_redact_sas_first_call_sees_the_sas_token_from_the_file() {
+    let p = first_call(
+        "r9-azure-redact-sas",
+        "azure_redact_sas",
+        "S3DLIO_AZURE_SAS_TOKEN='sv=2024-01-01&sig=abc%2Bdef%2Fghij%3D'\n",
+    );
+    assert_eq!(p.client, "the signature <redacted> was refused", "{p:?}");
 }
 
 #[cfg(feature = "backend-azure")]

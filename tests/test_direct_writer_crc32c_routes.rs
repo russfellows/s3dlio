@@ -269,33 +269,60 @@ async fn crc32c_page_aligned_chunk_bypasses_staging() {
 #[tokio::test]
 async fn crc32c_mixed_aligned_and_unaligned() {
     let dir = scratch();
+    // Chunk 1: page-aligned, nothing staged -> bypass, straight from the caller's memory.
     let mut a = AlignedBuf::new(MIB, ALIGN).unwrap();
     a.as_mut_slice().copy_from_slice(&pseudo_random(MIB, 4));
+
+    // Chunk 2: starts one byte past a page boundary, so it can never bypass and is staged
+    // (100_001 bytes, nowhere near a full staging buffer).
+    const ODD1_LEN: usize = 100_001;
+    let mut odd1_backing = AlignedBuf::new(ODD1_LEN + 1, ALIGN).unwrap();
+    odd1_backing
+        .as_mut_slice()
+        .copy_from_slice(&pseudo_random(ODD1_LEN + 1, 6));
+    let odd1 = &odd1_backing.as_slice()[1..];
+    assert_eq!(odd1.len(), ODD1_LEN);
+    assert_ne!(odd1.as_ptr() as usize % ALIGN, 0);
+
+    // Chunk 3: the top-up route. With `ODD1_LEN % ALIGN` bytes sitting in the staging buffer
+    // the writer needs `gap` more to reach a block boundary, and it only continues from the
+    // caller's memory when `ptr + gap` is page-aligned. Starting the slice at
+    // `ODD1_LEN % ALIGN` inside a page-aligned buffer makes exactly that true: the writer
+    // copies `gap` bytes, flushes the whole staged blocks, then bypasses the rest.
+    let gap = ALIGN - ODD1_LEN % ALIGN;
+    let topup_len = gap + 5 * ALIGN + 100;
+    let topup_start = ODD1_LEN % ALIGN;
+    let mut topup_backing = AlignedBuf::new(topup_start + topup_len, ALIGN).unwrap();
+    topup_backing
+        .as_mut_slice()
+        .copy_from_slice(&pseudo_random(topup_start + topup_len, 5));
+    let topup = &topup_backing.as_slice()[topup_start..];
+    assert_eq!((topup.as_ptr() as usize + gap) % ALIGN, 0);
+
+    // Chunks 4 and 5 arrive while 100 bytes are staged: the first is too short to top up and
+    // the page-aligned `b` can never top up either (ptr + gap is not a boundary), so both are
+    // copied into staging and only the tail reaches the disk at finalize().
+    let odd2 = pseudo_random(5, 7);
     let mut b = AlignedBuf::new(8 * ALIGN, ALIGN).unwrap();
     b.as_mut_slice()
-        .copy_from_slice(&pseudo_random(8 * ALIGN, 5));
-    let odd1 = pseudo_random(100_001, 6);
-    let odd2 = pseudo_random(5, 7);
-    // An aligned chunk after a staged remainder takes the top-up path; the aligned chunk
-    // first takes the bypass; the trailing odd bytes are the tail.
-    let odd3 = pseudo_random(3 * ALIGN + 17, 8);
-    let chunks: [&[u8]; 6] = [
-        a.as_slice(),
-        &odd1,
-        b.as_slice(),
-        &odd2,
-        &odd3,
-        b.as_slice(),
-    ];
+        .copy_from_slice(&pseudo_random(8 * ALIGN, 8));
+    let chunks: [&[u8]; 5] = [a.as_slice(), odd1, topup, &odd2, b.as_slice()];
+
+    // Before finalize: `a`, the staged `odd1` prefix flushed by the top-up, and the bypassed
+    // part of `topup`. Without the top-up/bypass route `odd1` and `topup` would stay wholly
+    // staged and only `a` (1 MiB) would be on disk.
+    let expected_on_disk = MIB + (ODD1_LEN + gap) + (topup_len - gap) / ALIGN * ALIGN;
+    assert_eq!(expected_on_disk % ALIGN, 0);
+    assert!(expected_on_disk > MIB);
     run_route(
         dir.path(),
         "mixed.bin",
         CompressionConfig::None,
         &chunks,
         |n| {
-            assert!(
-                n as usize >= MIB,
-                "the leading aligned chunk must already be on disk"
+            assert_eq!(
+                n as usize, expected_on_disk,
+                "top-up then caller-memory bypass must have put exactly this many bytes on disk"
             )
         },
     )
