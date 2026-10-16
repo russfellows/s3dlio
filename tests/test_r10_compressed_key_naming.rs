@@ -54,10 +54,35 @@ fn scratch_dir(tag: &str) -> tempfile::TempDir {
     }
 }
 
+/// Incompressible bytes (xorshift), so the compressed stream is about as long as the input.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
 async fn check_stored_name_matches_manifest(
     store: &dyn ObjectStore,
     scheme: &str,
     tag: &str,
+) -> Result<()> {
+    check_with_payload(store, scheme, tag, DATA, 0).await
+}
+
+/// `min_stored`: the stored (compressed) object must be at least this long, so a test can
+/// require the data to span aligned O_DIRECT blocks and not only a short final tail.
+async fn check_with_payload(
+    store: &dyn ObjectStore,
+    scheme: &str,
+    tag: &str,
+    data: &[u8],
+    min_stored: usize,
 ) -> Result<()> {
     for via_put_shard_with_key in [false, true] {
         for (key, stored) in CASES {
@@ -69,10 +94,10 @@ async fn check_stored_name_matches_manifest(
             let what = format!("{scheme} key={key} put_shard_with_key={via_put_shard_with_key}");
 
             let shard = if via_put_shard_with_key {
-                writer.put_shard_with_key(key, DATA).await?
+                writer.put_shard_with_key(key, data).await?
             } else {
                 let mut w = writer.get_shard_writer_with_key(key).await?;
-                w.write_chunk(DATA).await?;
+                w.write_chunk(data).await?;
                 writer
                     .finalize_writer_to_shard_meta(&layout, key.to_string(), w)
                     .await?
@@ -85,7 +110,12 @@ async fn check_stored_name_matches_manifest(
                 "{what}: the stored object is exactly the manifest name"
             );
             let on_disk = std::fs::read(dir.path().join(stored))?;
-            assert_eq!(zstd::decode_all(&on_disk[..])?, DATA, "{what}: decodes");
+            assert!(
+                on_disk.len() >= min_stored,
+                "{what}: stored {}",
+                on_disk.len()
+            );
+            assert_eq!(zstd::decode_all(&on_disk[..])?, data, "{what}: decodes");
             assert_eq!(shard.size, on_disk.len() as u64, "{what}: recorded size");
 
             // The recorded name reads back through the checkpoint reader.
@@ -95,11 +125,11 @@ async fn check_stored_name_matches_manifest(
                 .await?;
             if via_put_shard_with_key {
                 // put_shard_with_key records no checksum; the plain read must still decode.
-                assert_eq!(&reader.read_shard(&shard.key).await?[..], DATA, "{what}");
+                assert_eq!(&reader.read_shard(&shard.key).await?[..], data, "{what}");
             } else {
                 assert!(shard.checksum.is_some(), "{what}");
             }
-            assert_eq!(&back[..], DATA, "{what}: round trip");
+            assert_eq!(&back[..], data, "{what}: round trip");
         }
     }
     Ok(())
@@ -138,4 +168,79 @@ async fn file_scheme_stored_name_equals_manifest_name() -> Result<()> {
 async fn direct_scheme_stored_name_equals_manifest_name() -> Result<()> {
     let store = store_for_uri("direct:///")?;
     check_stored_name_matches_manifest(store.as_ref(), "direct", "direct").await
+}
+
+/// The 76-byte payload above never reaches an aligned O_DIRECT block (its compressed stream is a
+/// short tail). 256 KiB of incompressible data spans many aligned blocks plus an unaligned
+/// tail, so the O_DIRECT data path is the one exercised.
+#[tokio::test]
+async fn direct_scheme_multi_block_payload_stored_name_equals_manifest_name() -> Result<()> {
+    let store = store_for_uri("direct:///")?;
+    let data = incompressible(256 * 1024 + 123);
+    check_with_payload(store.as_ref(), "direct", "direct-big", &data, 256 * 1024).await
+}
+
+// ---- R10b: the Python CheckpointStream path (and the public finalize helpers) -------------
+
+use s3dlio::checkpoint::{CheckpointConfig, CheckpointStore};
+
+/// What `CheckpointStream.write_chunk` / `.finalize` do in `python_aiml_api.rs`: a writer taken
+/// from a `CheckpointStore` configured with compression, `get_shard_writer`, `write_chunk`,
+/// and the stream's finalize (`finalize_writer_to_shard_meta`).
+async fn stream_path(compression: Option<CompressionConfig>, data: &[u8]) -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let uri = format!("file://{}", dir.path().display());
+    let config = CheckpointConfig {
+        compression,
+        ..CheckpointConfig::default()
+    };
+    let ckpt = CheckpointStore::open_with_config(&uri, config)?;
+    let writer = ckpt.writer(1, 0);
+    let layout = KeyLayout::new("checkpoints".to_string(), 5);
+
+    let (mut w, key) = writer.get_shard_writer(&layout).await?;
+    w.write_chunk(data).await?;
+    let shard = writer
+        .finalize_writer_to_shard_meta(&layout, key, w)
+        .await?;
+    let expect_zst = compression.is_some();
+    assert_eq!(shard.key.ends_with(".zst"), expect_zst, "{}", shard.key);
+    assert!(dir.path().join(&shard.key).is_file(), "{}", shard.key);
+    assert_eq!(
+        shard.size,
+        std::fs::metadata(dir.path().join(&shard.key))?.len()
+    );
+
+    // The public helpers a caller uses after finalizing the writer itself: with a compressing
+    // Writer they record the stored name (the key `get_shard_writer` returned is un-suffixed).
+    for with_checksum in [false, true] {
+        let (mut w, key) = writer.get_shard_writer(&layout).await?;
+        w.write_chunk(data).await?;
+        let checksum = w.checksum();
+        w.finalize().await?;
+        let shard = if with_checksum {
+            writer
+                .finalize_shard_meta_with_checksum(&layout, key, checksum)
+                .await?
+        } else {
+            writer.finalize_shard_meta(&layout, key).await?
+        };
+        assert_eq!(shard.key.ends_with(".zst"), expect_zst, "{}", shard.key);
+        assert!(dir.path().join(&shard.key).is_file(), "{}", shard.key);
+        assert_eq!(
+            shard.size,
+            std::fs::metadata(dir.path().join(&shard.key))?.len()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_stream_path_records_the_stored_name_with_compression() -> Result<()> {
+    stream_path(Some(CompressionConfig::zstd_level(3)), DATA).await
+}
+
+#[tokio::test]
+async fn checkpoint_stream_path_unchanged_without_compression() -> Result<()> {
+    stream_path(None, DATA).await
 }

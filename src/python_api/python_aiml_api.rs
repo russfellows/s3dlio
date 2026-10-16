@@ -1640,17 +1640,17 @@ impl PyCheckpointStream {
             let shard_meta = py
                 .detach(|| {
                     self.runtime.block_on(async {
-                        // Finalize the writer
-                        writer.finalize().await?;
-
-                        // Create shard metadata
+                        // Finalize the writer and record the shard under the name it was
+                        // stored as (a compressing store adds `.zst`: R10b).
                         let store_guard = store.lock().await;
                         let ckpt_writer = store_guard.writer(world_size, rank);
                         let layout = crate::checkpoint::paths::KeyLayout::new(
                             "checkpoints".to_string(),
                             step,
                         );
-                        ckpt_writer.finalize_shard_meta(&layout, key).await
+                        ckpt_writer
+                            .finalize_writer_to_shard_meta(&layout, key, writer)
+                            .await
                     })
                 })
                 .map_err(|e| py_err(e.context("Finalize failed")))?;

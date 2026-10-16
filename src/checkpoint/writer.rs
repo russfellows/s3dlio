@@ -179,8 +179,26 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Helper to create ShardMeta after streaming write is complete
+    /// The name a shard written through this Writer is stored (and must be recorded) under:
+    /// the compression extension is added by the one rule, [`CompressionConfig::stored_name`],
+    /// when this Writer is configured with compression. Idempotent, so a caller that already
+    /// passes the stored name is unaffected.
+    ///
+    /// [`CompressionConfig::stored_name`]: crate::object_store::CompressionConfig::stored_name
+    fn recorded_key(&self, key: String) -> String {
+        match &self.compression {
+            Some(compression) => compression.stored_name(&key),
+            None => key,
+        }
+    }
+
+    /// Helper to create ShardMeta after streaming write is complete.
+    ///
+    /// `key` is the key the shard writer was created for (`get_shard_writer`'s second value);
+    /// when this Writer has compression the recorded and statted name is the stored one
+    /// (`shard.bin.zst`), by the same rule the writers use.
     pub async fn finalize_shard_meta(&self, layout: &KeyLayout, key: String) -> Result<ShardMeta> {
+        let key = self.recorded_key(key);
         let uri = layout.to_uri(&self.base_uri, &key);
         let meta = self.store.stat(&uri).await?;
         Ok(ShardMeta {
@@ -199,6 +217,7 @@ impl<'a> Writer<'a> {
         key: String,
         checksum: Option<String>,
     ) -> Result<ShardMeta> {
+        let key = self.recorded_key(key);
         let uri = layout.to_uri(&self.base_uri, &key);
         let meta = self.store.stat(&uri).await?;
         Ok(ShardMeta {
