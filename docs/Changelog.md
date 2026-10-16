@@ -66,6 +66,19 @@
   reading an object that really is empty costs one extra `HEAD` while its size is cached). Default
   Azure SDK mode is unchanged. Every caller of `RangeEngine::download` shares the exact-length rule.
 
+- **Python checkpoints kept no checksum (final review F2).** A streamed shard's writer computes a
+  `crc32c:` of the logical bytes, but the Python layer dropped it at every step: the dict returned by
+  `CheckpointStream.finalize()` had no `checksum`, `finalize_distributed_checkpoint` wrote
+  `"checksum": null` into the manifest (even when the caller supplied one), `load_latest_manifest()`
+  did not return it, and `read_shard_by_rank` read without validation, so a replaced shard (or, for a
+  compressed checkpoint, a different valid zstd stream) came back as if it were the original. The
+  checksum now travels both ways: `finalize()` (and `save_distributed_shard`, when a shard has one)
+  returns `checksum` when there is one, `finalize_distributed_checkpoint` writes it to the manifest
+  (a `None` value means no checksum; a non-string is a `TypeError`), `load_latest_manifest()` returns it,
+  and `read_shard_by_rank` validates against it (after decompression for `.zst` shards) and raises on
+  a mismatch. Manifests and metadata without a checksum behave as before: readable, not validated.
+  `PyCheckpointWriter.save_distributed_shard` still computes no checksum for its one-shot upload.
+
 - **A compressed shard is stored, recorded and statted under one name (R10).** A compressing
   writer for a custom key that already ends in `.zst` (`custom.zst`) stored the object as
   `custom.zst.zst` in the `file://`, `direct://` and Arrow writers, while `finalize_writer_to_shard_meta`
