@@ -83,7 +83,7 @@ pub fn s3_endpoint_url_from_env() -> Option<String> {
 ///   `getenv` directly (libc, native libraries, other Python extension modules
 ///   and their threads) is *not* covered by that lock.
 /// * **Other threads may exist.** Neither caller is single-threaded: the CLI
-///   runs under `#[tokio::main]` (worker threads already started), and Python
+///   has already built its Tokio runtime (worker threads started), and Python
 ///   `configure_s3` can run after s3dlio's Tokio/Rayon runtimes and arbitrary
 ///   Python or native threads have started -- the GIL does not stop non-Python
 ///   threads. The call must therefore be made at start-up, before S3 work or
@@ -93,6 +93,11 @@ pub fn s3_endpoint_url_from_env() -> Option<String> {
 ///   client (while the routing checks, which read the environment, would follow
 ///   the new value).
 pub fn set_s3_endpoint_override(url: &str) {
+    // The `.env` policy first (#243): the check below must see `AWS_ENDPOINT_URL_S3` as the
+    // file defines it, otherwise a file-only service endpoint is loaded AFTER this call and,
+    // having precedence, silently defeats the override. Idempotent; applying never calls back
+    // into this function.
+    crate::dotenv::apply();
     // SAFETY: `set_var` is unsafe only because of concurrent C `getenv` readers
     // (see "Limitations" above). All Rust-side readers are synchronised by std's
     // environment lock. This function cannot guarantee that no native thread

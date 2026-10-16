@@ -96,6 +96,15 @@ fn probe_child() {
             let _ = s3dlio::object_store::store_for_uri("file:///");
             "n/a".to_string()
         }
+        // Round 7 (Blue R8): a public setter that inspects the endpoint variables, made the
+        // FIRST s3dlio call with the service endpoint only in the file.
+        "endpoint_override" => {
+            s3dlio::s3_client::set_s3_endpoint_override("http://new:9000");
+            format!(
+                "endpoint={}",
+                s3dlio::s3_client::s3_endpoint_url_from_env().unwrap_or_else(|| "<none>".into())
+            )
+        }
         #[cfg(feature = "backend-azure")]
         "azure" => {
             let _ = s3dlio::azure_client::AzureBlob::with_default_credential("acct", "cont");
@@ -387,6 +396,23 @@ fn a_latched_get_setting_sees_the_file_on_the_first_get() {
         heads.is_empty(),
         "S3DLIO_SKIP_HEAD from the file must be seen by the first get: {reqs:?}"
     );
+}
+
+// -- Round 7 (Blue R8): a public setter, FIRST call, the service endpoint only in the file --
+
+#[test]
+fn endpoint_override_first_call_beats_the_files_service_endpoint() {
+    // R8: the file's AWS_ENDPOINT_URL_S3 (service-specific, higher precedence) must be applied
+    // BEFORE the setter inspects the endpoint variables, so the setter replaces it.
+    let dir = dir_with_dotenv_plus("r8-override", "AWS_ENDPOINT_URL_S3=http://old:9000\n");
+    let p = probe(
+        &dir,
+        &[
+            ("S3DLIO_LOAD_DOTENV", "1"),
+            ("S3DLIO_243_ENTRY", "endpoint_override"),
+        ],
+    );
+    assert_eq!(p.client, "endpoint=http://new:9000", "{p:?}");
 }
 
 #[test]
