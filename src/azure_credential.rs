@@ -252,9 +252,9 @@ type CredentialSource =
 /// request, and remembers the first that yields a token.
 ///
 /// The winner is kept for the life of the process, but not trusted blindly: if the cached winner
-/// later fails to produce a token (a revoked secret, `az` logged out), the chain is run once more
-/// for that request, so a working member further down is found without a restart; only if the
-/// whole chain fails is the request an error. (The members' own credentials are still built once
+/// later fails to produce a token (a revoked secret, `az` logged out, or a managed identity that
+/// stalls past its deadline), the chain is run once more for that request, so a working member
+/// further down is found without a restart; only if the whole chain fails is the request an error. (The members' own credentials are still built once
 /// per process: a rotated secret, certificate or token file needs a restart; see
 /// [`credential_for`].)
 struct AutoCredential {
@@ -463,7 +463,23 @@ impl TokenCredential for AutoCredential {
     ) -> azure_core::Result<AccessToken> {
         let mut earlier: Option<String> = None;
         if let Some((mode, credential)) = self.winner() {
-            match credential.get_token(scopes, options.clone()).await {
+            // The same deadline as the first attempt: a managed identity that won once and then
+            // stalls on a refresh must not wait out the SDK's retry schedule before the chain.
+            let attempt = credential.get_token(scopes, options.clone());
+            let outcome = match self.member_deadline(mode) {
+                Some(limit) => match tokio::time::timeout(limit, attempt).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(azure_core::Error::with_message(
+                        azure_core::error::ErrorKind::Credential,
+                        format!(
+                            "no token within {} ms ({ENV_AZURE_AUTO_MI_TIMEOUT_MS})",
+                            limit.as_millis()
+                        ),
+                    )),
+                },
+                None => attempt.await,
+            };
+            match outcome {
                 Ok(token) => return Ok(token),
                 Err(e) => {
                     warn!("Azure credential mode auto: the credential in use ({mode}) failed ({e}); trying the chain again");
@@ -924,6 +940,8 @@ mod tests {
         delay: std::time::Duration,
         /// Fail every call from this one on, even though `token` is set.
         fail_after: usize,
+        /// Never complete (not even fail) from this call on: a refresh that stalls for good.
+        hang_after: usize,
     }
 
     #[async_trait::async_trait]
@@ -934,6 +952,9 @@ mod tests {
             _options: Option<TokenRequestOptions<'_>>,
         ) -> azure_core::Result<AccessToken> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= self.hang_after {
+                std::future::pending::<()>().await;
+            }
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
@@ -970,6 +991,22 @@ mod tests {
         )
     }
 
+    /// As [`scripted_auto_with`], with a third per-member knob: the call from which it hangs.
+    fn scripted_auto_hanging(
+        env: Vec<(&'static str, &'static str)>,
+        script: Vec<(CredentialMode, Result<&'static str, &'static str>)>,
+        hang_after: impl Fn(CredentialMode) -> usize,
+    ) -> (AutoCredential, Calls) {
+        scripted_auto_shaped(
+            env,
+            Arc::default(),
+            vec![],
+            std::time::Duration::from_secs(30),
+            script,
+            |mode| (std::time::Duration::ZERO, usize::MAX, hang_after(mode)),
+        )
+    }
+
     /// As [`scripted_auto`], with the negative-probe lifetime and a (delay, fail_after) per member.
     fn scripted_auto_with(
         env: Vec<(&'static str, &'static str)>,
@@ -979,18 +1016,33 @@ mod tests {
         script: Vec<(CredentialMode, Result<&'static str, &'static str>)>,
         shape: impl Fn(CredentialMode) -> (std::time::Duration, usize),
     ) -> (AutoCredential, Calls) {
+        scripted_auto_shaped(env, imds, imds_answers, negative_ttl, script, move |mode| {
+            let (delay, fail_after) = shape(mode);
+            (delay, fail_after, usize::MAX)
+        })
+    }
+
+    fn scripted_auto_shaped(
+        env: Vec<(&'static str, &'static str)>,
+        imds: Arc<std::sync::atomic::AtomicUsize>,
+        imds_answers: Vec<bool>,
+        negative_ttl: std::time::Duration,
+        script: Vec<(CredentialMode, Result<&'static str, &'static str>)>,
+        shape: impl Fn(CredentialMode) -> (std::time::Duration, usize, usize),
+    ) -> (AutoCredential, Calls) {
         let mut calls = Calls::new();
         let mut members = std::collections::HashMap::new();
         for (mode, outcome) in script {
             let counter: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
             calls.insert(mode, Arc::clone(&counter));
-            let (delay, fail_after) = shape(mode);
+            let (delay, fail_after, hang_after) = shape(mode);
             let credential: Arc<dyn TokenCredential> = Arc::new(Scripted {
                 token: outcome.ok(),
                 error: outcome.err().unwrap_or(""),
                 calls: counter,
                 delay,
                 fail_after,
+                hang_after,
             });
             members.insert(mode, credential);
         }
@@ -1173,6 +1225,55 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(called(&calls, Cli), 1);
+    }
+
+    // The deadline also covers the cached winner: a managed identity that won once and then
+    // stalls during a later refresh does not hold the request for the SDK's retry schedule;
+    // the chain is run again and lands on the developer tools.
+    #[tokio::test]
+    async fn a_stalled_managed_identity_winner_is_bounded_by_the_deadline() {
+        use CredentialMode::{Cli, ManagedIdentity};
+        let (auto, calls) = scripted_auto_hanging(
+            vec![
+                (ENV_AZURE_IDENTITY_ENDPOINT, "http://x"),
+                (ENV_AZURE_AUTO_MI_TIMEOUT_MS, "200"),
+            ],
+            vec![(ManagedIdentity, Ok("mi-token")), (Cli, Ok("cli-token"))],
+            // The managed identity answers its first call and never completes another.
+            |mode| {
+                if mode == ManagedIdentity {
+                    1
+                } else {
+                    usize::MAX
+                }
+            },
+        );
+        let first = auto.get_token(&["s"], Option::None).await.unwrap();
+        assert_eq!(first.token.secret(), "mi-token");
+        assert_eq!(called(&calls, Cli), 0);
+
+        // A hang is a failure of the test, not a hung test run: bound the whole request.
+        let started = std::time::Instant::now();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            auto.get_token(&["s"], Option::None),
+        )
+        .await
+        .expect("RED: the cached winner's stalled refresh was not bounded by the deadline")
+        .unwrap();
+        assert_eq!(second.token.secret(), "cli-token");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // The stalled winner was dropped: later requests go straight to the CLI.
+        auto.get_token(&["s"], Option::None).await.unwrap();
+        assert_eq!(
+            called(&calls, ManagedIdentity),
+            3,
+            "first win + the stalled refresh + the chain's own (bounded) attempt, then no more"
+        );
     }
 
     // If the cached winner later fails, the chain is run again for that request.
