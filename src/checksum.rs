@@ -6,9 +6,9 @@
 //! The checksum every s3dlio writer reports: CRC-32C (Castagnoli), issue #256.
 //!
 //! Writers have always labelled their checksum `crc32c:<hex>`; until #256 the value was
-//! CRC-32 (IEEE, `crc32fast`), which differs from CRC-32C for every input and so never
-//! matched a GCS `crc32c` or an S3 `x-amz-checksum-crc32c`. The value is now real
-//! CRC-32C (CRC-32/ISCSI).
+//! CRC-32 (IEEE, `crc32fast`), which differs from CRC-32C for almost every input (both are
+//! zero for empty input) and so did not match a GCS `crc32c` or an S3
+//! `x-amz-checksum-crc32c`. The value is now real CRC-32C (CRC-32/ISCSI).
 //!
 //! # Which implementation, and why
 //!
