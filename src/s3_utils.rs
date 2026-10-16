@@ -1858,6 +1858,8 @@ async fn attempt_range_chunk_fill(
 
 /// Get optimal chunk size based on total transfer size
 fn get_optimal_chunk_size(total_bytes: u64) -> usize {
+    // The `.env` policy first (#243, review R9): `S3DLIO_CHUNK_SIZE` may come from the file.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_CHUNK_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1878,6 +1880,8 @@ fn get_optimal_chunk_size(total_bytes: u64) -> usize {
 
 /// Get optimal concurrency based on total transfer size
 fn get_optimal_concurrency(total_bytes: u64) -> usize {
+    // The `.env` policy first (#243, review R9): `S3DLIO_RANGE_CONCURRENCY` may come from the file.
+    crate::dotenv::apply();
     std::env::var("S3DLIO_RANGE_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse().ok())
