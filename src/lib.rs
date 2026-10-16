@@ -82,6 +82,7 @@ pub mod checkpoint;
 pub mod data_gen;
 pub mod data_gen_alt; // Alternative data generation with ChaCha20
 pub mod data_loader;
+pub mod direct_bounce;
 pub mod file_store;
 pub mod file_store_direct;
 pub mod object_store_logger; // Op-log support for all backends

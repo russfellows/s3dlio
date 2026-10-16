@@ -8,12 +8,13 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods};
+use pyo3::types::{PyAny, PyDict, PyDictMethods};
 use pyo3::Bound;
 use std::os::raw::c_char;
 
 // Project crates
 use crate::multipart::{MultipartUploadConfig, MultipartUploadSink};
+use crate::python_api::put_payload::{hold_for_call, snapshot_for_call};
 use crate::python_api::python_core_api::{py_err, require_max_in_flight, PyBytesView};
 
 // ---------------------------------------------------------------------------
@@ -170,13 +171,37 @@ impl PyMultipartUploadWriter {
 
     /// Write a bytes-like object (bytes, bytearray, memoryview, NumPy buffer).
     ///
-    /// For large buffers (>= 8 MiB), uses an owned fast path internally to avoid
-    /// extra copies. For maximum performance, prefer `reserve()`/`commit()`.
+    /// BORROWS the buffer by default: no copy is made by the Python layer (the sink then copies
+    /// it once into its part buffers, because parts are uploaded asynchronously and outlive the
+    /// call), and the GIL is released for the write. While the call runs the buffer is
+    /// exported (resizing it from another thread raises `BufferError`) and NO thread may modify
+    /// its bytes until the call returns: a concurrent write is a data race and the bytes
+    /// uploaded are undefined. The export is released before the call returns. BEHAVIOUR
+    /// CHANGE in 0.9.128: 0.9.126 and earlier copied a mutable buffer under the GIL first.
+    ///
+    /// Args:
+    ///     data: bytes-like object (or an object with ``__bytes__()``).
+    ///     copy: keyword-only, default False. With ``copy=True`` a mutable buffer is first
+    ///         copied once with the GIL held and the export released, so you may modify or reuse
+    ///         it as soon as the call has started. The snapshot is atomic only against writers
+    ///         that HOLD the GIL (pure-Python threads); a writer that releases the GIL (large
+    ///         NumPy operations, ``readinto``/``recv_into``, CUDA or torch copies) can still tear
+    ///         it and must be serialised by the caller. Exact ``bytes`` and ``BytesView`` are
+    ///         immutable and never copied.
+    ///
+    /// Only a ``BytesView`` takes an owned zero-copy fast path (>= 8 MiB: its shared bytes are
+    /// sliced into parts). Every other buffer is borrowed and the sink copies it once into its
+    /// part buffers. For maximum performance, prefer `reserve()`/`commit()`.
     ///
     /// Returns:
     ///     int: number of bytes accepted.
-    #[pyo3(text_signature = "(self, data, /)")]
-    fn write<'py>(&mut self, py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<usize> {
+    #[pyo3(signature = (data, /, *, copy = false), text_signature = "(self, data, /, *, copy=False)")]
+    fn write<'py>(
+        &mut self,
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        copy: bool,
+    ) -> PyResult<usize> {
         let inner = self
             .inner
             .as_mut()
@@ -200,44 +225,37 @@ impl PyMultipartUploadWriter {
                 .map_err(|e| py_err(e.context("write failed")));
         }
 
-        // 1) Fast path for any buffer-protocol object (NumPy, memoryview, bytearray, etc.)
-        if let Ok(buf) = data.extract::<pyo3::buffer::PyBuffer<u8>>() {
-            let len = buf.len_bytes();
-            let mut vec = vec![0u8; len];
-            buf.copy_to_slice(py, &mut vec[..])
-                .map_err(|e| PyRuntimeError::new_err(format!("buffer copy failed: {e}")))?;
-
-            let res = if len >= OWNED_THRESHOLD {
-                py.detach(|| inner.write_owned_blocking(vec))
+        // 1) Any other bytes-like object (bytes, bytearray, memoryview, NumPy of any dtype, ...):
+        //    the same conversion as put_bytes(). The buffer is read in place, with the GIL
+        //    released, and NOT copied by the Python layer. The sink then copies it once into
+        //    its part buffers: the parts are uploaded asynchronously and outlive this call, so a
+        //    borrowed Python buffer cannot be handed to them without pinning it until they
+        //    finish. Contract: do not modify the buffer from another thread during the call.
+        let not_bytes_like = |e: PyErr| {
+            if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "write() expects bytes-like (bytes, bytearray, memoryview, NumPy buffer) or an object with __bytes__(): {e}"
+                ))
             } else {
-                py.detach(|| inner.write_blocking(&vec))
-            };
-            return res
+                e
+            }
+        };
+        if copy {
+            // `copy=True`: one snapshot with the GIL held (export released), then the owned
+            // bytes are handed to the sink without another copy of the caller's memory.
+            let snapshot = snapshot_for_call(py, data).map_err(not_bytes_like)?;
+            let len = snapshot.len();
+            return py
+                .detach(|| inner.write_bytes_blocking(snapshot))
                 .map(|_| len)
                 .map_err(|e| py_err(e.context("write failed")));
         }
-
-        // 2) Fallback for plain bytes objects
-        if let Ok(bytes) = data.cast::<PyBytes>() {
-            let slice = bytes.as_bytes(); // needs PyBytesMethods import
-            let len = slice.len();
-            if len >= OWNED_THRESHOLD {
-                let vec = slice.to_vec();
-                let res = py.detach(|| inner.write_owned_blocking(vec));
-                return res
-                    .map(|_| len)
-                    .map_err(|e| py_err(e.context("write failed")));
-            } else {
-                let res = py.detach(|| inner.write_blocking(slice));
-                return res
-                    .map(|_| len)
-                    .map_err(|e| py_err(e.context("write failed")));
-            }
-        }
-
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "write() expects bytes-like (bytes, bytearray, memoryview, NumPy buffer)",
-        ))
+        let held = hold_for_call(py, data).map_err(not_bytes_like)?;
+        let len = held.len();
+        let res = py.detach(|| inner.write_blocking(held.as_slice()));
+        held.release(py);
+        res.map(|_| len)
+            .map_err(|e| py_err(e.context("write failed")))
     }
 
     /// Reserve a Rust-owned buffer and return a writable Python `memoryview`.

@@ -259,7 +259,24 @@ where
     let runtime = pyo3_async_runtimes::tokio::get_runtime();
     match tracker.enter() {
         Some(ticket) => runtime.spawn_blocking(move || {
-            f();
+            // Release buffer exports queued by a finished `put_bytes_async(borrow=True)` BEFORE
+            // the result reaches Python, so the caller can resize its buffer right after the
+            // `await`. This thread is a blocking-pool thread that attaches to Python anyway.
+            // Drain and deliver in ONE attach scope (the delivery closure re-enters it cheaply).
+            if super::put_payload::exports_pending() {
+                let mut f = Some(f);
+                let _ = Python::try_attach(|py| {
+                    super::put_payload::drain_pending_exports(py);
+                    if let Some(f) = f.take() {
+                        f();
+                    }
+                });
+                if let Some(f) = f {
+                    f(); // attaching was refused; deliver as before
+                }
+            } else {
+                f();
+            }
             drop(ticket);
         }),
         None => {
@@ -307,7 +324,12 @@ where
 fn drain_async_deliveries_at_exit(py: Python<'_>) {
     let timeout = crate::constants::ASYNC_EXIT_DRAIN_TIMEOUT;
     DELIVERIES.close();
-    if !py.detach(|| DELIVERIES.wait_idle(timeout)) {
+    let drained = py.detach(|| DELIVERIES.wait_idle(timeout));
+    // Close the buffer-export releaser's attach gate, wait (GIL detached) for any attach scope it
+    // is already in, release what is queued and stop releasing for good (issue #238): nothing
+    // may attach to the interpreter once it starts finalizing.
+    super::put_payload::begin_shutdown(py);
+    if !drained {
         tracing::warn!(
             in_flight = DELIVERIES.in_flight(),
             timeout = ?timeout,

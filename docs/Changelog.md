@@ -415,6 +415,207 @@
   `s3://[::1]:port/bucket/dir/`) fetches from the right bucket, at the bucket root and below a prefix,
   and `s3://bkt/` works as before.
 
+### Changed (API)
+
+- `memory::AlignedBuf::new(len, align)` now returns `Result<AlignedBuf, AlignedAllocError>` instead of
+  panicking or aborting on a bad alignment, a size overflow or an out-of-memory condition. New
+  `AlignedBuf::new_zeroed` and unsafe `AlignedBuf::assume_init`; the slice accessors never expose
+  uninitialised memory (the first `as_slice`/`as_mut_slice` zero-fills a buffer that was only filled through
+  the raw pointer).
+- `AlignedBuf` is no longer `Clone` (the derived clone copied the pointer and freed it twice).
+- `memory::BufferPool::new` and `BufferPoolConfig::build` return `Result<_, BufferPoolError>` (a capacity of 0
+  is an error instead of a panic). `BufferPool::take` returns `Result<PooledBuf, BufferPoolError>`:
+  `PooledBuf` is an RAII lease that dereferences to `AlignedBuf` and carries the semaphore permit, returning
+  the buffer to the pool and freeing the permit when it is dropped (`give()` just drops it). Earlier the
+  permit was released when `take()` returned, so any number of buffers could be checked out at once; now
+  at most `capacity` buffers are checked out at once, also when a holder is cancelled. (The pool bounds
+  checked-out leases, not all allocations: the asynchronous prefill and on-demand allocation can briefly
+  coexist, up to `2 x capacity` buffers alive.)
+- The streaming writer's `write_chunk()` / `write_owned_bytes()` and `MultipartUploadWriter.write()` raise
+  `TypeError` (was `RuntimeError` for the streaming writer) for an object that is not bytes-like.
+- `put_bytes_async` gained the keyword-only argument `borrow=False` (see below); positional calls are unchanged.
+- New public `file_store_direct::direct_io_counters()` / `DirectIoCounters`: how many `direct://` transfers
+  really used O_DIRECT versus the buffered fallback that silently takes over when a filesystem refuses O_DIRECT.
+  This has an operational use (a user who chose `direct://` for speed can detect that they are not getting it),
+  so it is public and documented, not test-only.
+
+### Fixed
+
+- **`put_bytes()` / `put_bytes_async()` no longer copy the payload while holding the GIL, and make no
+  copy at all for any contiguous buffer (#238).** The `BytesView` "zero-copy" branch could never run
+  (`BytesView` exports the Python buffer protocol, so the generic buffer branch took it first), and that
+  branch copied the whole buffer into a new `Vec` with the GIL held: every other Python thread stalled
+  (about 0.3 s per 512 MiB PUT) and peak memory rose by twice the payload on the local backends. Buffers
+  whose item type is not a byte (numpy `float32`/`int8`/`bool`, `array.array`, ctypes `'<B'`) were worse:
+  two copies with the GIL held. Now:
+
+  | Input | `put_bytes` | `put_bytes_async` | `put_bytes_async(borrow=True)` |
+  |---|---|---|---|
+  | `BytesView`, exact `bytes` | 0 copies | 0 | 0 |
+  | any other C-contiguous buffer, any item type | 0 copies, read in place with the GIL released | 1 snapshot copy, GIL released | 0 copies |
+  | non-contiguous view | 1 gather copy (GIL held) | 1 | 1 |
+  | `__bytes__()`-only object | 1 copy | 1 | 1 |
+
+  After that, `s3://`, `az://`, official-client `gs://` and `file://` pass the same bytes on with no
+  further s3dlio copy; the legacy community GCS client (feature `gcs-community`) copies once. `direct://`
+  copies once unless the source is page-aligned (see #244).
+  **New:** `put_bytes_async(uri, data, *, borrow=False)`. `borrow=True` promises not to modify, resize or
+  free the buffer until the awaitable completes; s3dlio then reads it in place instead of taking a snapshot
+  (for example pinned host memory). **Contract for every buffer read in place:** it is exported meanwhile,
+  so `bytearray.extend()/clear()` from another thread raises `BufferError`, and the bytes must not be
+  modified from another thread: that is a data race (the bytes uploaded are undefined; the memory is not
+  freed or resized meanwhile, which does not make a concurrent write safe). **Completion barrier:** a put
+  does not complete - normally, with an error, or by cancellation - until every native reader of the buffer
+  is done and the export has really been released with a real GIL token (never by a Tokio worker waiting
+  for the GIL, and never inferred from `PyGILState_Check`). `put_bytes` waits after the store returned;
+  the awaitable of `put_bytes_async(borrow=True)` is a `Future` that never reaches a terminal state
+  (result, error or cancellation) until then (see the round-7 entries), so reusing the buffer after `CancelledError`
+  is safe (cancelling waits for a running native write to finish). `put_bytes` waits at most 30 s and then raises
+  `ExportStillReferencedError`; the awaitable warns at each missed deadline and keeps waiting
+  (`s3dlio._put_export_stats()["quiesce_timeouts"]` counts them). Buffers of Python objects or pointers (`O`/`P` formats) are
+  refused with a `TypeError`.
+
+- **`direct://` PUT and GET no longer move 4 KiB per system call, and a GET returns page-aligned memory
+  (#244).** An O_DIRECT PUT wrote the object one 4 KiB block per `write()` (512 MiB took 45 s, about 11 MiB/s,
+  against 0.79 s on `file://`), and a GET read it 4 KiB per `read()`. A page-aligned source buffer is now
+  written straight from the caller's memory in one `write` (split only at Linux's 2 GiB per-call limit); any
+  other source is copied once through a warm, reused, page-aligned bounce buffer from a process-wide pool, one
+  ping-pong pair per NUMA node shared by PUTs and GETs (the copy of chunk k+1 overlaps the write of chunk k;
+  64 MiB buffers by default, `S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB` 4..=64, `..._PAIRS_PER_NODE`, `..._WHEN_BUSY`;
+  the POOLED bounce memory is `nodes x pairs x 2 x size`; that bound covers the pooled path only, see round 7 and
+  `docs/Environment_Variables.md`). A GET returns
+  page-aligned memory: by default it reads straight into one fresh aligned buffer, so a `direct://` GET followed
+  by a `direct://` PUT needs no bounce copy of the body for objects of at least `min_io_size` (only the final
+  zero-padded 4 KiB block is bounced); `S3DLIO_DIRECT_IO_GET_MODE=pooled` reads through the pool instead.
+  The zero-padded last block, the truncation back to the exact size (skipped when the length is already
+  aligned) and the buffered fallback are unchanged; a failed aligned allocation now retries with a smaller
+  buffer and then falls back to buffered I/O instead of aborting. `put_multipart` on `direct://` is now the same
+  single write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
+  also left zero padding inside the object whenever `part_size` was not a multiple of 4096.
+
+- **Round-7 (1/6): the autonomous buffer-export releaser thread can no longer be inside CPython at interpreter
+  finalization (Python 3.12 shutdown race), within the 30 s exit bound.** (Other `Python::attach` sites are
+  unchanged: result deliveries stay under the #192 gate with its 2 s drain; attaches inside spawned futures elsewhere
+  are not covered.) The autonomous releaser thread checked the shutdown flag and only then called
+  `Python::try_attach`; an attach already past the check could still be waiting for the GIL when the exit
+  callback returned and Python 3.12 began finalizing (pyo3's `Py_IsFinalizing` check exists only for 3.13+).
+  Every autonomous attach now runs inside an attach gate: the releaser increments an in-flight counter, then
+  checks the shutdown flag (if set it leaves without attaching), and decrements after `try_attach` returned; the
+  exit callback sets the flag, then waits for the counter to reach zero with the GIL released, bounded by 30 s
+  (logged and counted in `_put_export_stats()["shutdown_attach_wait_timeouts"]` if exceeded; exit then continues).
+  New diagnostics in `_put_export_stats()`: `shutdown_attach_waits`, `shutdown_attach_wait_timeouts`,
+  `releaser_attaches`. Tested deterministically on 3.12 and 3.13 with a hidden hook that parks the releaser
+  between the counter increment and `try_attach` while the interpreter exits.
+- **Round-7 (2/6): a borrowed put's awaitable can no longer end while a native reader remains or before the
+  export is released (R1, R3, P3).** (R1) When the put had finished but a backend still held a clone, the
+  quiesce timeout produced `ExportStillReferencedError`; an awaiting `Task` that had been cancelled (also a second
+  cancellation, `asyncio.timeout()` or a positive `wait_for()`) replaced that exception with `CancelledError` /
+  `TimeoutError`, so the documented "safe to reuse after cancellation" was false: the buffer could still be read
+  and the caller could overwrite it. Now the awaitable of `put_bytes_async(borrow=True)` never reaches a terminal
+  state - result, exception or cancelled - until the readers are gone and the export is released. At each missed
+  `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` deadline it emits one `RuntimeWarning` (naming the timeout), increments
+  `_put_export_stats()["quiesce_timeouts"]` and keeps waiting. **Behaviour change:** that awaitable no longer
+  raises `ExportStillReferencedError`; a backend that never lets go keeps it pending (and the buffer pinned).
+  The blocking `put_bytes` keeps the error: it is raised in the caller's own stack, where no Task can rewrite it.
+  (R3) Completion used to wait only for the owner's drop; if another thread was mid-release of a batch of exports
+  (an exporter's release callback yielded the GIL) a put could finish while its export was still held and a
+  resize still raised `BufferError`. Release is now independently waitable (blocking and async waiters, GIL
+  released), re-checked after every drain. (P3) If the barrier machinery itself fails (for example
+  `add_done_callback` raising) the awaitable polls every 50 ms, and if that cannot be scheduled blocks, instead of
+  completing or stranding; `_put_export_stats()["internal_errors"]` counts it. Hidden test hooks:
+  `_put_test_retain_next_clone`, `_put_test_retained`, `_put_test_release_retained`.
+- **Round-7 (3/6): streaming-writer buffer ownership is explicit; `copy=True` is the snapshot (R7).**
+  **Behaviour change:** `write_owned_bytes()` no longer copies a mutable buffer under the GIL (0.9.126 and earlier
+  did); since 0.9.128 it borrows the buffer exactly like `write_chunk()`, with the GIL released, and
+  `MultipartUploadWriter.write()` does the same. Zero copy stays the default for every contiguous buffer. The
+  contract is now in the Python-visible docstrings of `write_chunk`, `write_owned_bytes` and
+  `MultipartUploadWriter.write` and in the streaming-writer section of `docs/PYTHON_API_GUIDE.md`: the call
+  borrows the buffer without copying, no thread may modify it until the call returns, and it is released before
+  the call returns. New keyword-only `copy=False` on `write_owned_bytes` and `MultipartUploadWriter.write`:
+  `copy=True` snapshots a mutable buffer once under the GIL (exact `bytes` and `BytesView` are immutable and never
+  copied), for callers whose other Python threads may write to the buffer during the call (atomic only against
+  writers that hold the GIL; a writer that releases it - large NumPy operations, `readinto`/`recv_into`, CUDA/torch
+  copies - can still tear the snapshot and must be serialised by the caller). The misleading "kept for
+  compatibility" wording of `write_owned_bytes` is gone.
+- **Round-7 (4/6): an oversized `direct://` range read no longer holds a pool buffer it does not use (R5).**
+  A range larger than the range-read pool's buffer (64 MiB by default) first took a pooled buffer and permit, found
+  it too small, allocated its own larger buffer and kept the unused lease for the whole read: 32 such reads held every
+  permit (and 32 x 64 MiB of unused buffers) and delayed unrelated small reads. The path is now chosen by the
+  required size before anything is taken: a range that fits borrows a pooled buffer as before; a larger one takes
+  only a *private-allocation permit* (`BufferPool::acquire_private`, `capacity` of them, separate from the pooled
+  permits, released when the read ends) and allocates its own buffer, so oversized reads are bounded in number but
+  cannot starve reads that fit. New `BufferPool::buffer_len()`, `acquire_private()`, `private_available()`.
+- **Round-7 (5/6): the bounce-memory bound is stated for the pooled path only, and the implicit fallback is counted
+  (R6).** Earlier text called `nodes x pairs x 2 x size` the cap on all bounce memory and said nothing but the opt-in
+  `fallback` policy allocates beyond the pool. That was too strong: when a node's pool cannot be created or cannot
+  give the requested alignment, a `direct://` PUT still succeeds - **availability first** -
+  with a private per-call bounce buffer of up to one bounce size, uncounted and outside the cap. Those implicit
+  allocations are now counted in `direct_bounce::bounce_stats()` (new `implicit_fallbacks` per direction,
+  `implicit_fallback_bytes`, and the causes `pool_unavailable` / `alignment_mismatches`), the first is logged, and
+  every "hard cap" statement (module docs, `docs/Environment_Variables.md`, constants, test comments) is narrowed to
+  the pooled path, with the allocations outside it listed (opt-in `fallback` buffers, implicit buffers, aligned-PUT
+  tail block, default-mode GET destination, range-read private buffers, unaligned streaming-writer staging).
+  `bounce_stats()` is no longer hidden from the docs and `BounceStats` is `#[non_exhaustive]`. The benchmark
+  (`examples/direct_bounce_bench.rs`) reports the implicit counters per row and the summary script warns when any is
+  non-zero (that row is not a pooled measurement). Known limits: oversized range reads are admitted by count
+  (`capacity` at a time), not by bytes, and a store without a range pool allocates without admission; the implicit
+  counters are cumulative (no live/peak gauge) and `pool_unavailable` also ticks for pooled-mode GETs that read
+  directly into their destination.
+- **Round-7 (6/6): small corrections.** `scripts/direct_bounce_bench_summary.py` now derives the arms from the data
+  (a valid `C32` result used to be silently dropped) and groups by pairs, busy policy and source as well, so runs of
+  different configurations are no longer pooled (`python/tests/test_direct_bounce_bench_summary.py`). The
+  finalize-durability unit test asserts the exact number of fsyncs (2 for an aligned-plus-tail stream, 1 for an
+  aligned-only stream); the old `syncs <= 2` also passed with zero. The legacy range pool's wording says it bounds
+  buffers *checked out*, not all allocations.
+- **Round-6 edges of the borrowed-buffer barrier.** `GuardedFuture.cancel()` returns `False` once the put is
+  already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
+  the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really
+  released, not only its owner dropped; if the wrapper cannot be built after the put was spawned, the put is
+  asked to cancel (the cancellation takes effect only after the event-loop-blocking, quiesce-timeout-bounded
+  fallback wait, which can end in `ExportStillReferencedError` while the put still runs); `ExportStillReferencedError`
+  names the timeout and what the put did, and an internal barrier failure says so and is counted
+  (`_put_export_stats()["internal_errors"]`); a set but unusable `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` warns once
+  and falls back to the default. Documented: `asyncio.shield()` of a borrowed put bypasses the guard, and
+  `wait_for(fut, t)` can take up to `t` plus the quiesce timeout.
+- **Round-5 hardening of the borrowed-buffer barrier and the direct pool.** (1) The awaitable of
+  `put_bytes_async(borrow=True)` is now a `Future` subclass, not a Task running a coroutine: a coroutine body
+  never runs when its Task is cancelled before the first step, which let `CancelledError` reach the caller while a
+  native write still read the buffer; `cancel()` (including `asyncio.timeout(0)` and `wait_for(.., 0)`) now defers
+  the terminal state until the barrier is satisfied. (2) The guard is built before the put is spawned, and every
+  error path of `put_bytes_async` releases the export before raising. (3) A barrier timeout of the blocking `put_bytes` raises
+  `s3dlio.ExportStillReferencedError` (new; `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`, default 30 s, not signal
+  interruptible) instead of succeeding (the async awaitable no longer raises it: see round 7). (4) The async barrier never attaches to Python by itself (the result
+  delivery, inside the interpreter-exit gate of #192, releases the export); after interpreter shutdown began a
+  `put_bytes` that holds the GIL still releases its export. (5) A `direct://` PUT cancelled while it waits for
+  bounce buffers leaves the previous object intact: the target is created/truncated only after the buffers are
+  leased. (6) The streaming writers accept only buffer-protocol objects and objects with `__bytes__()`:
+  `write_chunk(5)` is a `TypeError` instead of five zero bytes (as are lists and iterables); `put_bytes` is
+  unchanged. (7) Per-call overhead of small puts reduced (no thread hand-offs when the store already dropped the
+  payload). (8) Helper-thread creation failure is an error, not a panic; a failed pool creation is retried after
+  30 s; `mbind` prefers (instead of requires) the node; `direct://` range reads no longer zero-fill the buffer
+  before `pread` and run the read in a blocking task that owns the buffer; CPU indexes read from sysfs are
+  capped.
+
+- **The remaining Python write paths no longer copy the payload with the GIL held (#254).** The streaming
+  writer's `write_chunk()` (which kept the GIL for the whole write of any mutable buffer) and
+  `write_owned_bytes()` (which copied the buffer into a `Vec` with the GIL held) now use the same payload
+  conversion as `put_bytes()`: any C-contiguous buffer of any item type is read in place, with NO copy made by
+  the Python layer and the GIL RELEASED; the export is released before the call returns. `write_owned_bytes()` is
+  now the same as `write_chunk()` (a behaviour change: it used to snapshot; `copy=True` restores that, see the
+  round-7 entry). `MultipartUploadWriter.write()` borrows the buffer the same way and copies it
+  once, with the GIL released, into its part buffers (parts are uploaded asynchronously and outlive the call, so
+  a borrowed Python buffer cannot be handed to them). The same contract as `put_bytes()` applies: do not modify
+  the buffer from another thread during the call (a data race). **Not changed:** the legacy community GCS client
+  (`gcs-community`, `gcs_client.rs`) still does `data.to_vec()` per PUT; its dependency is not available to
+  build offline here, so the one-line change is left for a build that can compile that feature.
+
+- **The `direct://` streaming writer no longer fsyncs on every flush or copies every chunk (#249), and
+  no longer frees an aligned buffer with the wrong layout (#248).** Page-aligned chunks are written from the
+  caller's memory; other data is staged once in a 64 MiB aligned buffer; data is made durable once, at
+  `finalize` (after every write only when `sync_writes` is set). `AlignedBuf::new` now returns a `Result`
+  (and `BufferPool::take` too), and `AlignedBuf` is no longer `Clone` (a clone freed the same memory twice).
+  New `file_store_direct::direct_io_counters()` reports O_DIRECT transfers versus buffered fallbacks.
+
 ## Version 0.9.126 — Exact `s3://` selection, exact object keys, per-endpoint stores on their own server, limits of 0 refused, compressed-writer data-loss fix, mkdir/rmdir on every backend
 
 **Versions 0.9.114 through 0.9.124 were merged but never published to PyPI; the last published

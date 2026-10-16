@@ -450,7 +450,7 @@ s3dlio v0.9.30+ includes all functions needed for DLIO with zero-copy performanc
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `exists()` | ✅ v0.9.26+ | Direct existence check |
-| `put_bytes()` | ✅ v0.9.26+ | Zero-copy write from Python |
+| `put_bytes()` | ✅ v0.9.26+ | Writes bytes-like objects without copying them and with the GIL released (since 0.9.128; earlier releases copied with the GIL held) |
 | `mkdir()` | ✅ v0.9.26+ | Create directories (no-op on object stores, #229) |
 | `stat()` | ✅ Available | Returns metadata dict |
 | `get()` / `get_range()` | ✅ Available | Zero-copy read (v0.9.30+) |

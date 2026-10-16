@@ -123,6 +123,13 @@ fn probe_child() {
             s3dlio::constants::effective_thread_budget()
         ),
         "budget_first" => format!("budget={}", s3dlio::constants::effective_thread_budget()),
+        "bounce_config" => {
+            let c = s3dlio::direct_bounce::config();
+            format!(
+                "size={} pairs={} busy={:?} get={:?}",
+                c.buffer_size, c.pairs_per_node, c.busy, c.get
+            )
+        }
         "aware_budget" => format!("aware={}", s3dlio::constants::mpi_aware_thread_budget()),
         "transport" => transport_wire_protocol(),
         "multi_endpoint" => {
@@ -1002,4 +1009,19 @@ fn s3_cli_never_overrides_the_real_environment() {
         s3_cli_ls(&dir, "cli243-real", &[("AWS_ENDPOINT_URL", url.as_str())]);
     assert!(ok, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("obj-a"), "stdout={stdout}");
+}
+
+#[test]
+fn direct_bounce_config_first_call_sees_the_file() {
+    // Blue integration item 5: `direct_bounce::config()` latches the bounce settings once, so
+    // a first call must already see the values that only the opted-in file defines.
+    let p = first_call(
+        "integration-bounce-config",
+        "bounce_config",
+        "S3DLIO_DIRECT_IO_BOUNCE_SIZE_MB=16\nS3DLIO_DIRECT_IO_BOUNCE_PAIRS_PER_NODE=3\nS3DLIO_DIRECT_IO_BOUNCE_WHEN_BUSY=fallback\nS3DLIO_DIRECT_IO_GET_MODE=pooled\n",
+    );
+    assert_eq!(
+        p.client, "size=16777216 pairs=3 busy=Fallback get=Pooled",
+        "{p:?}"
+    );
 }

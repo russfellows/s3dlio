@@ -598,8 +598,10 @@ impl ObjectStore for FileSystemObjectStore {
             fs::create_dir_all(parent).await?;
         }
 
-        // Bytes→&[u8] via .as_ref() is zero-copy (just returns pointer to Arc'd buffer)
-        fs::write(&path, data.as_ref()).await?;
+        // `tokio::fs::write` copies its input into an owned buffer (issue #238), so a
+        // large PUT briefly held two full copies. Move the `Bytes` into a blocking task
+        // and write from its slice: the payload is never duplicated.
+        tokio::task::spawn_blocking(move || std::fs::write(&path, data.as_ref())).await??;
         Ok(())
     }
 

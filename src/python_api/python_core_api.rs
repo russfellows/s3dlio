@@ -4,13 +4,18 @@
 // SPDX-FileCopyrightText: 2025 Russ Fellows <russ.fellows@gmail.com>
 
 use super::async_bridge::future_into_py;
+use super::put_payload::{
+    deadline_warning_text, export_stats, hold_for_call, latch_ready, note_internal_error,
+    put_payload, quiesce_async, quiesce_blocking, snapshot_for_call, Latch, PayloadUse,
+};
 use bytes::Bytes;
-use pyo3::buffer::PyBuffer;
 use pyo3::conversion::IntoPyObjectExt;
+use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::ffi;
+use pyo3::ffi::c_str;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyDictMethods, PyList, PyListMethods};
 use pyo3::Bound;
 
 use tokio::task;
@@ -1450,14 +1455,37 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 }
 
 // ---------------------------------------------------------------------------
-// put_bytes() - Zero-copy put from Python bytes to any backend
+// put_bytes() - Put from a Python bytes-like object to any backend
 // ---------------------------------------------------------------------------
 
-/// Put bytes data to any storage backend with zero-copy from Python.
+/// Put bytes data to any storage backend, without copying it where possible.
 ///
-/// This function accepts Python bytes/bytearray and writes them to the specified
-/// URI without copying the data on the Rust side. The data is borrowed directly
-/// from Python's memory buffer.
+/// What is copied (details and the safety argument: `put_payload.rs`):
+/// * `s3dlio.BytesView`, exact `bytes`: 0 copies.
+/// * Any other C-contiguous buffer, whatever its item type (bytearray, memoryview, numpy
+///   uint8/float32/bool/..., `array.array`, ctypes arrays, mmap): 0 copies. The buffer is
+///   held and read in place with the GIL released, so other Python threads keep running
+///   during a large PUT.
+/// * A non-contiguous (strided, reversed, transposed) view: one gather copy with the GIL
+///   held. An object that only provides `__bytes__()`: one copy, made by Python.
+///
+/// The native stores then write that memory without another copy on `s3://`, `gs://` (official client),
+/// `az://` and `file://`. `direct://` (O_DIRECT) writes a page-aligned source (address
+/// multiple of 4096) straight from it; any other source is copied once into an aligned
+/// bounce buffer from the shared per-NUMA-node pool (64 MiB buffers by default, ping-pong).
+///
+/// The call blocks until the object is written. While it runs the source is exported:
+/// * resizing it from another thread (`bytearray.extend()`/`clear()`) raises `BufferError`;
+/// * you must not modify its bytes from another thread: that is a DATA RACE (the bytes
+///   uploaded are undefined; the buffer is never freed or resized meanwhile, but that does not
+///   make a concurrent write safe).
+///
+/// The call does not return - normally or with an error - until every native reader of the
+/// buffer is done and the export has been released. The wait is bounded
+/// (`S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`, 30 s) and not interruptible by signals; if a backend
+/// still holds the payload then, the call raises `s3dlio.ExportStillReferencedError` directly in
+/// the calling thread (no Future or Task can rewrite it), the buffer stays pinned and must not
+/// be reused, and `s3dlio._put_export_stats()["quiesce_timeouts"]` counts it.
 ///
 /// # Arguments
 /// * `uri` - Full URI including scheme (s3://, az://, gs://, file://, direct://)
@@ -1489,127 +1517,496 @@ fn exists_async<'py>(py: Python<'py>, uri: &str) -> PyResult<pyo3::Bound<'py, Py
 pub fn put_bytes(py: Python<'_>, uri: &str, data: &Bound<'_, PyAny>) -> PyResult<()> {
     let uri = uri.to_owned();
 
-    // Use same conversion logic as put_bytes_async for consistency
-    let data_owned = if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-        // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
-        let len = buffer.len_bytes();
-        let mut vec = vec![0u8; len];
-        buffer.copy_to_slice(py, &mut vec[..]).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!("Buffer copy failed: {}", e))
-        })?;
+    let payload = put_payload(py, data, PayloadUse::Blocking)?;
+    let data_owned = payload.bytes;
 
-        Bytes::from(vec)
-    } else if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
-        // s3dlio's own BytesView - zero-copy Arc clone (optimal)
-        bytes_view.bytes.clone()
-    } else if let Ok(py_bytes) = data.cast::<PyBytes>() {
-        // PyBytes - direct copy
-        Bytes::copy_from_slice(py_bytes.as_bytes())
-    } else {
-        // Last resort: Try __bytes__() method or bytes() conversion
-        let bytes_result = data.call_method0("__bytes__").or_else(|_| {
-            let bytes_type = py.get_type::<PyBytes>();
-            bytes_type.call1((data,))
-        });
-
-        match bytes_result {
-            Ok(bytes_obj) => {
-                if let Ok(py_bytes) = bytes_obj.cast::<PyBytes>() {
-                    Bytes::copy_from_slice(py_bytes.as_bytes())
-                } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                        "__bytes__() returned non-bytes object: {}",
-                        bytes_obj.get_type().name()?
-                    )));
-                }
-            }
-            Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                    "Cannot convert data to bytes: {}. Expected bytes-like object",
-                    e
-                )));
-            }
-        }
-    };
-
-    py.detach(move || {
+    let result = py.detach(move || {
         // Build the store on the caller thread BEFORE submit_io (issue #173).
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
 
         // Submit to global runtime (io_uring pattern — never calls block_on)
         submit_io(async move { put_verified_with_retry(store.as_ref(), &uri, data_owned).await })
-    })
+    });
+    // The put is over (it succeeded, failed, or the store gave up), but a backend may still hold
+    // a clone of the payload (an SDK/hyper task, a detached writer). Wait until the LAST clone is
+    // gone (the owner's drop), then release the export with this thread's real GIL token: the
+    // call does not return while any native reader can still touch the caller's buffer. When the
+    // store already dropped everything (the usual case) this is just a drain under the GIL.
+    // Bounded (see `export_quiesce_timeout`); on timeout the buffer stays pinned and the call
+    // raises ExportStillReferencedError. The wait is not interruptible by signals.
+    if let Some(latch) = &payload.latch {
+        if quiesce_blocking(py, latch).is_err() {
+            return Err(still_referenced_error(&put_outcome_text(&result)));
+        }
+    }
+    result
+}
+
+create_exception!(
+    _pymod,
+    ExportStillReferencedError,
+    PyRuntimeError,
+    "A storage backend still references a borrowed Python buffer long after the put finished \
+     (S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS). The data may or may not have been written, and the \
+     buffer stays pinned: do not modify, resize or free it."
+);
+
+fn still_referenced_error(outcome: &str) -> PyErr {
+    ExportStillReferencedError::new_err(still_referenced_message(outcome))
+}
+
+/// The message of a barrier timeout: names the timeout value and what the put itself did.
+fn still_referenced_message(outcome: &str) -> String {
+    let timeout = crate::constants::export_quiesce_timeout();
+    format!(
+        "a storage backend still references the buffer {timeout:?} after the put finished \
+         ({outcome}); the buffer stays pinned - do not modify, resize or free it \
+         (S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS)"
+    )
+}
+
+/// The message of an INTERNAL failure of the barrier machinery (not a backend that holds on):
+/// the awaitable falls back to polling and stays pending until the export is released.
+fn barrier_internal_message(detail: &str) -> String {
+    format!(
+        "internal error in the buffer completion barrier ({detail}); the buffer may still be \
+         referenced and stays pinned; the awaitable keeps waiting by polling - do not modify, \
+         resize or free the buffer until it completes"
+    )
+}
+
+/// What the blocking `put_bytes` did, for error messages.
+fn put_outcome_text(result: &PyResult<()>) -> String {
+    match result {
+        Ok(()) => "the put itself succeeded".to_string(),
+        Err(e) => format!("the put itself failed: {e}"),
+    }
 }
 
 /// Async version of put_bytes() - accepts any bytes-like object
 ///
-/// Accepts (in order of optimization):
-/// 1. Buffer protocol objects (dgen_py.BytesView, numpy arrays, bytearray, memoryview) - optimized copy
-/// 2. s3dlio's own BytesView - zero-copy Arc clone
-/// 3. Python bytes - direct copy
-/// 4. Any object with __bytes__() method - converted via bytes()
+/// Must be called with a running event loop, and awaited.
+///
+/// What is copied:
+/// * `s3dlio.BytesView`, exact `bytes`: 0 copies.
+/// * Any other C-contiguous buffer (bytearray, memoryview, numpy of any dtype,
+///   `array.array`, ctypes, mmap), DEFAULT (`borrow=False`): ONE snapshot copy, taken
+///   before this function returns, with the GIL released. The caller may then reuse,
+///   modify or resize the buffer immediately. The only requirement is not to modify it
+///   from another thread DURING that copy.
+/// * Same, with `borrow=True`: 0 copies. The buffer is held and read in place until the
+///   awaitable completes. By passing `borrow=True` the caller PROMISES not to modify, resize
+///   or free the buffer until the awaitable has completed (successfully or not); until
+///   then `bytearray.extend()/clear()` raise `BufferError` and any write to the bytes is a
+///   data race (the bytes uploaded are undefined). The awaitable is a `Future` that NEVER reaches
+///   a terminal state - result, exception or cancelled - while any native reader of the buffer
+///   remains or before the export has actually been released, whatever the caller does:
+///   `Task.cancel()` (also repeated), `asyncio.timeout()` and `wait_for()` leave the awaiting task
+///   pending until the future ends; a cancellation or timeout is delivered only after that point.
+///   So reusing the buffer after the `await` finished - with a result, an error, `CancelledError`
+///   or `TimeoutError` - is safe. Cancelling therefore waits for a running native write to finish.
+///   Every `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` (default 30 s) that a reader remains, a
+///   `RuntimeWarning` naming the timeout is emitted, `s3dlio._put_export_stats()["quiesce_timeouts"]`
+///   is incremented and the wait continues (it does not complete). If the barrier machinery itself
+///   fails, it polls instead; it still completes only after the release. (Await the future itself:
+///   `asyncio.shield(fut)` bypasses the guard - the shield is cancelled at once while the put
+///   still reads the buffer.)
+///   Use it for large buffers you own for the duration of the call (for example pinned host
+///   memory).
+/// * A non-contiguous view: one gather copy with the GIL held; `__bytes__()`-only object:
+///   one copy. (`borrow` has no effect on these.)
 ///
 /// Design philosophy: Be liberal in what you accept, optimize based on what you get.
 /// Never reject valid data - match the permissiveness of minio/boto3/s3torch.
 #[pyfunction]
+#[pyo3(signature = (uri, data, *, borrow = false))]
 fn put_bytes_async<'py>(
     py: Python<'py>,
     uri: &str,
     data: &Bound<'_, PyAny>,
+    borrow: bool,
 ) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let uri = uri.to_owned();
 
-    // Try optimal paths first, fall back gracefully
-    let data_owned = if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-        // Buffer protocol (dgen_py.BytesView, numpy, bytearray, memoryview, etc.)
-        // This is the most common path for external buffer objects
-        let len = buffer.len_bytes();
-        let mut vec = vec![0u8; len];
-        buffer.copy_to_slice(py, &mut vec[..]).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!("Buffer copy failed: {}", e))
-        })?;
-
-        Bytes::from(vec)
-    } else if let Ok(bytes_view) = data.extract::<PyRef<PyBytesView>>() {
-        // s3dlio's own BytesView - zero-copy Arc clone (optimal)
-        bytes_view.bytes.clone()
-    } else if let Ok(py_bytes) = data.cast::<PyBytes>() {
-        // PyBytes - direct copy
-        Bytes::copy_from_slice(py_bytes.as_bytes())
+    let usage = if borrow {
+        PayloadUse::Borrowed
     } else {
-        // Last resort: Try __bytes__() method or bytes() conversion
-        // This handles any custom objects that can be converted to bytes
-        let bytes_result = data.call_method0("__bytes__").or_else(|_| {
-            // If __bytes__() doesn't exist, try bytes(data)
-            let bytes_type = py.get_type::<PyBytes>();
-            bytes_type.call1((data,))
-        });
+        PayloadUse::Snapshot
+    };
+    let payload = put_payload(py, data, usage)?;
+    let latch = payload.latch;
+    let data_owned = payload.bytes;
 
-        match bytes_result {
-            Ok(bytes_obj) => {
-                if let Ok(py_bytes) = bytes_obj.cast::<PyBytes>() {
-                    Bytes::copy_from_slice(py_bytes.as_bytes())
-                } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                        "__bytes__() returned non-bytes object: {}",
-                        bytes_obj.get_type().name()?
+    // A payload that borrows the caller's memory may still be read by native code (a blocking
+    // file write that a cancelled future cannot stop, a backend task) after the Python future
+    // has become terminal. So the awaitable is a `GuardedFuture` whose cancel() cancels the put
+    // but whose own completion - result, error OR cancellation - is delayed until every native
+    // reader is done and the export has been released with a real GIL token.
+    // Everything that can fail is prepared BEFORE the native put is spawned.
+    let guard = match &latch {
+        None => None,
+        Some(latch) => match prepare_guard(py, latch.clone()) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                drop(data_owned); // nothing was spawned: this releases the (queued) export...
+                if quiesce_blocking(py, latch).is_err() {
+                    return Err(still_referenced_error(&format!(
+                        "the put could not be started: {e}"
                     )));
                 }
+                return Err(e);
             }
-            Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("Cannot convert data to bytes: {}. Expected bytes-like object (bytes, bytearray, memoryview, BytesView, numpy array, or object with __bytes__() method)", e)
-                ));
-            }
-        }
+        },
     };
 
-    future_into_py(py, async move {
+    let inner = future_into_py(py, async move {
         let store = get_or_create_store(&uri, global_logger()).map_err(py_err)?;
         put_verified_with_retry(store.as_ref(), &uri, data_owned)
             .await
             .map_err(py_err)
+    });
+    // On EVERY error path from here the barrier is kept: the blocking wait + drain below.
+    let fail = |py: Python<'py>, latch: &Option<std::sync::Arc<Latch>>, e: PyErr| -> PyErr {
+        if let Some(latch) = latch {
+            if quiesce_blocking(py, latch).is_err() {
+                return still_referenced_error(&format!("the put could not be started: {e}"));
+            }
+        }
+        e
+    };
+    let inner = match inner {
+        Ok(i) => i,
+        Err(e) => return Err(fail(py, &latch, e)),
+    };
+    match (guard, &latch) {
+        (Some(g), Some(latch)) => wrap_in_guard(py, g, inner, latch),
+        _ => Ok(inner),
+    }
+}
+
+/// Wrap the already-spawned put future `inner` in the `GuardedFuture`.
+///
+/// If the wrapper cannot be built (the Python class call fails: out of memory) the put is already
+/// running. `inner.cancel()` is requested, but it only schedules the cancellation on the event
+/// loop, and the loop thread is then blocked in the wait below - so the cancellation takes effect
+/// only AFTER that wait and the put keeps running meanwhile. The call falls back to the blocking
+/// wait for the native readers before it raises. **That fallback blocks the event-loop thread**
+/// for as long as the running put needs, bounded by the quiesce timeout
+/// (`S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`); on expiry it raises `ExportStillReferencedError` even
+/// though the put may still be running (the buffer stays pinned). It can only happen on that
+/// OOM-type failure.
+fn wrap_in_guard<'py>(
+    py: Python<'py>,
+    guard: PreparedGuard<'py>,
+    inner: Bound<'py, PyAny>,
+    latch: &std::sync::Arc<Latch>,
+) -> PyResult<Bound<'py, PyAny>> {
+    match guard.instantiate(py, inner.clone()) {
+        Ok(f) => Ok(f),
+        Err(e) => {
+            let _ = inner.call_method0("cancel");
+            if quiesce_blocking(py, latch).is_err() {
+                return Err(still_referenced_error(&format!(
+                    "the put could not be started: {e}"
+                )));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The Python helper that makes an awaitable's completion wait for the export barrier.
+///
+/// Not a coroutine: a coroutine body never runs if its Task is cancelled before the first step,
+/// which would let the caller see `CancelledError` while a native write still reads the buffer.
+/// A `Future` subclass has no such window: `cancel()` is called on it directly, cancels the put,
+/// and defers the future's own terminal state.
+///
+/// THE CONTRACT: this future never reaches a terminal state (result, exception, cancelled) while
+/// a native reader remains or before the export has really been released - whatever the caller
+/// does (`Task.cancel()` once or repeatedly, `asyncio.timeout`, `wait_for`) and whatever happens
+/// to the barrier machinery. At every quiesce deadline it warns and counts, then waits again. If
+/// the machinery itself fails (the quiesce future cannot be created, `add_done_callback` raises,
+/// the waiter fails, `latch_ready` raises) it falls back to polling with `loop.call_later`, and
+/// if even that cannot be scheduled to a blocking wait on the event-loop thread. A failure is
+/// reported through `event('internal', ...)` and counted, never turned into a completion.
+const PUT_GUARD_PY: &std::ffi::CStr = c_str!(
+    "import asyncio
+import warnings
+
+# Failures of the machinery we recover from; KeyboardInterrupt/SystemExit are left alone.
+_RECOVERABLE = (Exception, asyncio.CancelledError)
+
+class GuardedFuture(asyncio.Future):
+    def __init__(self, inner, latch_ready, quiesce, event, block, poll_interval):
+        super().__init__(loop=inner.get_loop())
+        self._inner = inner
+        self._latch_ready = latch_ready
+        self._quiesce = quiesce
+        self._event = event
+        self._block = block
+        self._poll_interval = poll_interval
+        self._outcome = None
+        self._cancel_msg = None
+        self._finishing = False
+        inner.add_done_callback(self._inner_done)
+
+    def cancel(self, msg=None):
+        # Request cancellation of the put; this future stays pending until no native reader of
+        # the borrowed buffer remains and the export is released, then ends cancelled (see
+        # _complete). When the put is already over (inner done: its outcome is fixed and only
+        # the barrier is pending) return False: a Task awaiting this future then records the
+        # cancellation itself and raises CancelledError right after the barrier completes,
+        # instead of the outcome being lost.
+        if self.done() or self._finishing:
+            return False
+        if not self._inner.cancel():
+            return False
+        if self._cancel_msg is None:
+            self._cancel_msg = msg
+        return True
+
+    def _inner_done(self, inner):
+        if self._finishing:
+            return
+        self._finishing = True
+        try:
+            if inner.cancelled():
+                outcome = (2, None)
+            else:
+                exc = inner.exception()
+                outcome = (1, exc) if exc is not None else (0, inner.result())
+        except _RECOVERABLE as e:
+            outcome = (1, e)
+        self._outcome = outcome
+        self._await_release()
+
+    def _await_release(self):
+        # Completes ONLY when latch_ready() returned True (owner dropped AND export released).
+        if self.done():
+            return  # finished by someone else: stop waiting and polling
+        try:
+            if self._latch_ready():
+                self._complete()
+                return
+        except _RECOVERABLE as e:
+            self._fallback('latch_ready', e)
+            return
+        try:
+            waiter = self._quiesce()
+            waiter.add_done_callback(self._quiesced)
+        except _RECOVERABLE as e:
+            self._fallback('quiesce', e)
+
+    def _quiesced(self, waiter):
+        try:
+            timed_out = bool(waiter.result())
+        except _RECOVERABLE as e:
+            self._fallback('waiter', e)
+            return
+        if timed_out:
+            # Deadline: warn, count (the wait counted it), and wait again. NEVER complete here.
+            try:
+                warnings.warn(self._event('timeout', ''), RuntimeWarning, stacklevel=1)
+            except _RECOVERABLE:
+                pass
+        self._await_release()
+
+    def _fallback(self, where, e):
+        try:
+            self._event('internal', '%s: %r' % (where, e))
+        except _RECOVERABLE:
+            pass
+        self._poll()
+
+    def _poll(self):
+        if self.done():
+            return  # finished by someone else: stop polling
+        try:
+            if self._latch_ready():
+                self._complete()
+                return
+        except _RECOVERABLE:
+            pass  # keep polling; the first failure was reported by _fallback
+        try:
+            self.get_loop().call_later(self._poll_interval, self._poll)
+        except _RECOVERABLE as e:
+            try:
+                self._event('internal', 'call_later: %r' % (e,))
+                self._block()  # last resort: blocks this thread until the export is released
+            except _RECOVERABLE:
+                return  # nothing safe is left to do: stay pending (ownership first)
+            self._complete()
+
+    def _complete(self):
+        if self.done():
+            return
+        kind, value = self._outcome
+        if kind == 0:
+            asyncio.Future.set_result(self, value)
+        elif kind == 1:
+            asyncio.Future.set_exception(self, value)
+        else:
+            asyncio.Future.cancel(self, self._cancel_msg)
+"
+);
+
+/// Everything the guard needs that can fail to build; made before the put is spawned.
+struct PreparedGuard<'py> {
+    class: Bound<'py, PyAny>,
+    latch_ready: Bound<'py, PyAny>,
+    quiesce: Bound<'py, PyAny>,
+    event: Bound<'py, PyAny>,
+    block: Bound<'py, PyAny>,
+}
+
+impl<'py> PreparedGuard<'py> {
+    /// Wrap the `inner` put future (cannot fail for lack of resources prepared above).
+    fn instantiate(self, py: Python<'py>, inner: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let _ = py;
+        self.class.call1((
+            inner,
+            self.latch_ready,
+            self.quiesce,
+            self.event,
+            self.block,
+            crate::constants::EXPORT_BARRIER_POLL_INTERVAL.as_secs_f64(),
+        ))
+    }
+}
+
+fn prepare_guard<'py>(
+    py: Python<'py>,
+    latch: std::sync::Arc<Latch>,
+) -> PyResult<PreparedGuard<'py>> {
+    static GUARD: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+    let class = match GUARD.get() {
+        Some(g) => g.bind(py).clone(),
+        None => {
+            let module = PyModule::from_code(
+                py,
+                PUT_GUARD_PY,
+                c_str!("s3dlio_put_guard.py"),
+                c_str!("_s3dlio_put_guard"),
+            )?;
+            let f = module.getattr("GuardedFuture")?.unbind();
+            GUARD.get_or_init(|| f).bind(py).clone()
+        }
+    };
+    let l1 = latch.clone();
+    let l2 = latch.clone();
+    let latch_ready_fn = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
+              -> PyResult<bool> { Ok(latch_ready(args.py(), &l1)) },
+    )?;
+    let quiesce_fn = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
+              -> PyResult<Py<PyAny>> {
+            let latch = latch.clone();
+            // resolves to True when the wait hit its deadline
+            let fut = future_into_py(args.py(), async move { Ok(quiesce_async(latch).await) })?;
+            Ok(fut.unbind())
+        },
+    )?;
+    // Reports a barrier event: ('timeout', _) -> the warning text of the missed deadline (the
+    // wait already counted it); ('internal', detail) -> counts and logs the machinery failure.
+    let event_fn = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
+              -> PyResult<String> {
+            let kind: String = args.get_item(0)?.extract()?;
+            let detail: String = args.get_item(1)?.extract()?;
+            if kind == "internal" {
+                note_internal_error();
+                let msg = barrier_internal_message(&detail);
+                tracing::warn!("s3dlio: {msg}");
+                Ok(msg)
+            } else {
+                Ok(deadline_warning_text(export_stats().quiesce_timeouts))
+            }
+        },
+    )?;
+    // Last resort when even a poll cannot be scheduled: wait on THIS thread (GIL released) until
+    // the export is really released, however long a native reader needs.
+    let block_fn = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
+              -> PyResult<()> {
+            while quiesce_blocking(args.py(), &l2).is_err() {
+                // each missed deadline is logged and counted by the wait; keep waiting
+            }
+            Ok(())
+        },
+    )?;
+    Ok(PreparedGuard {
+        class,
+        latch_ready: latch_ready_fn.into_any(),
+        quiesce: quiesce_fn.into_any(),
+        event: event_fn.into_any(),
+        block: block_fn.into_any(),
     })
+}
+
+/// Counters of the buffer-export barrier (diagnostics and tests):
+/// `{"quiesce_timeouts", "queued", "internal_errors", "shutdown_attach_waits",
+/// "shutdown_attach_wait_timeouts", "releaser_attaches", "test_releaser_parked"}`.
+#[pyfunction]
+fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let s = export_stats();
+    let d = PyDict::new(py);
+    d.set_item("quiesce_timeouts", s.quiesce_timeouts)?;
+    d.set_item("queued", s.queued)?;
+    d.set_item("internal_errors", s.internal_errors)?;
+    d.set_item("shutdown_attach_waits", s.shutdown_attach_waits)?;
+    d.set_item(
+        "shutdown_attach_wait_timeouts",
+        s.shutdown_attach_wait_timeouts,
+    )?;
+    d.set_item("releaser_attaches", s.releaser_attaches)?;
+    d.set_item("test_releaser_parked", s.test_releaser_parked)?;
+    Ok(d)
+}
+
+/// TEST-ONLY hidden hook (not part of the API; never call it in production): queue an undrained export of `data` and, with `park_ms > 0`, park the
+/// autonomous releaser once between its attach-gate entry and `Python::try_attach`.
+#[pyfunction]
+#[pyo3(signature = (data, park_ms = 0))]
+fn _put_test_queue_export(py: Python<'_>, data: &Bound<'_, PyAny>, park_ms: u64) -> PyResult<()> {
+    super::put_payload::test_queue_undrained_export(py, data, park_ms)
+}
+
+/// TEST-ONLY hidden hook (not part of the API; never call it in production): the next borrowed/blocking payload that holds a buffer export keeps one clone
+/// of its bytes, like a backend that keeps reading after the put ended, until
+/// `_put_test_release_retained()`.
+#[pyfunction]
+fn _put_test_retain_next_clone() {
+    super::put_payload::arm_retain_for_test();
+}
+
+/// TEST-ONLY hidden hook (not part of the API; never call it in production): number of clones retained by `_put_test_retain_next_clone()` right now.
+#[pyfunction]
+fn _put_test_retained() -> usize {
+    super::put_payload::retained_for_test()
+}
+
+/// TEST-ONLY hidden hook (not part of the API; never call it in production): drop every retained clone (in order, with the GIL held); returns how many.
+#[pyfunction]
+fn _put_test_release_retained() -> usize {
+    super::put_payload::release_retained_for_test()
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,25 +2754,6 @@ impl PyObjectWriter {
         *lock_ignoring_poison(&self.stats) = snapshot_final_writer_stats(writer);
     }
 
-    /// Lock `inner` from a thread that holds the GIL, without ever waiting for the lock
-    /// while holding it: a thread writing with the GIL released needs the GIL back to
-    /// return, so waiting here with the GIL would deadlock.
-    fn lock_with_gil(
-        &self,
-        py: Python<'_>,
-    ) -> std::sync::MutexGuard<'_, Option<Box<dyn ObjectWriter>>> {
-        loop {
-            match self.inner.try_lock() {
-                Ok(guard) => return guard,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    // Wait for the holder with the GIL released, then try again.
-                    py.detach(|| drop(lock_ignoring_poison(&self.inner)));
-                }
-            }
-        }
-    }
-
     /// Write `data` through the locked writer and publish the new stats. Blocks the
     /// calling thread; the caller decides whether it holds the GIL.
     fn write_locked(
@@ -2395,142 +2773,79 @@ impl PyObjectWriter {
     }
 
     /// Write `data` with the GIL released. `data` must stay valid and unchanged for the
-    /// call without the GIL: immutable `bytes` or an owned copy.
+    /// call without the GIL: an exported buffer the caller promised not to modify, or an
+    /// immutable `bytes`.
     fn write_detached(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
         py.detach(|| {
             let mut guard = lock_ignoring_poison(&self.inner);
             self.write_locked(&mut guard, data)
         })
     }
-
-    /// `write_owned_bytes` for data already copied out of Python, GIL released.
-    fn write_owned_detached(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
-        py.detach(|| {
-            let mut guard = lock_ignoring_poison(&self.inner);
-            let writer = guard.take().ok_or_else(Self::finalized_error)?;
-            // The writer is moved into the 'static future for `submit_io` and handed
-            // back, so a failed write leaves it usable for a retry or `finalize()`.
-            let (writer, result) = submit_io(async move {
-                let mut writer = writer;
-                let r = writer.write_owned_bytes(data).await;
-                Ok::<_, anyhow::Error>((writer, r))
-            })?;
-            self.publish_stats(writer.as_ref());
-            *guard = Some(writer);
-            result.map_err(|e| py_err(e.context("Failed to write owned bytes")))
-        })
-    }
 }
 
 #[pymethods]
 impl PyObjectWriter {
-    /// Write a chunk of bytes to the stream (zero-copy via buffer protocol)
+    /// Write a chunk of bytes to the stream, WITHOUT copying it.
     ///
     /// Accepts any Python object supporting the buffer protocol:
     /// - bytes, bytearray, memoryview
-    /// - NumPy arrays, PyTorch tensors
+    /// - NumPy arrays (any dtype), PyTorch tensors, ctypes arrays, mmap
     /// - Any object with __buffer__ method
     ///
-    /// No copy is made, except for a non-contiguous view (a strided or reversed
-    /// memoryview, a transposed array), which is copied once into contiguous memory.
+    /// CONTRACT - the call BORROWS your buffer: no copy is made by this Python layer for a
+    /// C-contiguous buffer (a non-contiguous view is gathered once by Python, an object that
+    /// only has `__bytes__()` is converted once), and the GIL is RELEASED for the whole blocking
+    /// write. While the call runs the buffer is exported (resizing it from another thread raises
+    /// `BufferError`) and NO thread may modify its bytes until the call returns: a concurrent
+    /// write is a data race and the data written is undefined. The export is released before
+    /// the call returns, so the buffer is yours again right after. Exact `bytes` and
+    /// `s3dlio.BytesView` are immutable, so they can never race. (Before 0.9.128 the GIL was
+    /// held for mutable buffers, which made other Python threads wait for the whole write.)
     ///
-    /// GIL: it is released for the blocking write (issue #201) only when `data` is an
-    /// exact `bytes` object, which no thread can change, or after the copy of a
-    /// non-contiguous view. For every other exporter (bytearray, a writable memoryview,
-    /// numpy, mmap, ctypes, ...) the GIL is kept for the write, as before #201, because
-    /// another thread could otherwise change the memory while it is being read. To keep
-    /// other threads running during a large write of mutable data, pass `bytes(data)`.
+    /// Whether the writer then copies the data itself depends on the backend (a multipart
+    /// writer copies into its part buffers; a file writer does not).
     ///
     /// Calls on one writer from several threads run one after another.
     fn write_chunk(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        // An exact `bytes` object is immutable and `data` keeps it alive: zero-copy and
-        // safe to read without the GIL.
-        if data.is_exact_instance_of::<PyBytes>() {
-            if let Ok(bytes) = data.cast::<PyBytes>() {
-                return self.write_detached(py, bytes.as_bytes());
-            }
-        }
-
-        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-            if !buffer.is_c_contiguous() {
-                // The buffer pointer and byte length do not describe the view's bytes
-                // (strides). Copy them in logical order under the GIL, then write the
-                // owned copy without it.
-                let owned = buffer.to_vec(py).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyBufferError, _>(format!(
-                        "Buffer copy failed: {}",
-                        e
-                    ))
-                })?;
-                drop(buffer);
-                return self.write_detached(py, &owned);
-            }
-
-            // Take the writer lock FIRST. Waiting for it may release the GIL, and a
-            // reference over the caller's memory must not exist while another Python
-            // thread can run and change that memory.
-            let mut guard = self.lock_with_gil(py);
-            let result = if buffer.len_bytes() == 0 {
-                self.write_locked(&mut guard, &[])
-            } else {
-                // SAFETY: the buffer is C-contiguous and `buffer` is a live Py_buffer
-                // export, released only after the write has returned, so the exporter
-                // cannot free or resize the memory meanwhile. The slice is created
-                // only now, after the lock was acquired, and the GIL is HELD from
-                // here through the end of the write (`write_locked` does not release
-                // it), so no Python thread can change the contents while the slice
-                // exists. Non-Python code that shares the memory (a mmap or ctypes
-                // buffer written by native code) is the caller's responsibility, as
-                // in any buffer-protocol consumer. The write only reads from the slice.
-                let slice = unsafe {
-                    std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
-                };
-                self.write_locked(&mut guard, slice)
-            };
-            drop(guard);
-            // Release the export only now.
-            drop(buffer);
-            return result;
-        }
-
-        Err(PyRuntimeError::new_err(
-            "write_chunk requires bytes-like object (bytes, bytearray, memoryview, numpy array, etc.)"
-        ))
+        // Strict: bytes-like or `__bytes__()` only (never an int or an arbitrary iterable).
+        let held = hold_for_call(py, data)?;
+        let result = self.write_detached(py, held.as_slice());
+        // The write took a borrowed slice (nothing keeps a clone), so the export is free now:
+        // release it directly with this thread's GIL token (no queue, no releaser wake-up).
+        held.release(py);
+        result
     }
 
-    /// Write owned bytes (copies the input out of Python, then writes with the GIL released)
+    /// Write bytes the caller owns. BEHAVIOUR CHANGE in 0.9.128: this now BORROWS the buffer
+    /// exactly like `write_chunk()`; in 0.9.126 and earlier it copied a mutable buffer (under
+    /// the GIL) before writing. Pass `copy=True` to get the snapshot back.
     ///
-    /// This method copies data but takes ownership, useful when the caller
-    /// doesn't need the buffer anymore, and it releases the GIL for the whole write
-    /// whatever the type of `data` (the copy is made under the GIL, so a concurrent
-    /// change to a mutable buffer cannot tear it). For a zero-copy write of `bytes`
-    /// use write_chunk().
+    /// * `copy=False` (default): no copy; the buffer is exported and read in place with the GIL
+    ///   released. No thread may modify the buffer until the call returns (a data race
+    ///   otherwise; the data written is undefined); it is released before the call returns.
+    /// * `copy=True`: a mutable buffer (bytearray, memoryview, NumPy, ...) is first copied ONCE
+    ///   with the GIL held, the export is released, and the write then runs on the copy, so you
+    ///   may modify or reuse your buffer as soon as the call has started. The snapshot is atomic
+    ///   only against writers that HOLD the GIL (pure-Python code in other threads). A writer
+    ///   that releases the GIL (a large NumPy operation, `readinto`/`recv_into`, a CUDA or torch
+    ///   copy into pinned memory) can still tear it: serialise such writers yourself. Exact
+    ///   `bytes` and `s3dlio.BytesView` are immutable: they are never copied, in either mode.
     ///
-    /// Implementation note: the writer is temporarily moved out of the lock into the
-    /// `'static` future `submit_io` needs, and always put back afterwards whether or not
-    /// the write succeeded, so a failed `write_owned_bytes()` leaves the writer usable
-    /// for a retry or a clean `finalize()`.
-    fn write_owned_bytes(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Try buffer protocol
-        if let Ok(buffer) = PyBuffer::<u8>::get(data) {
-            let len = buffer.len_bytes();
-            let mut vec = vec![0u8; len];
-            buffer
-                .copy_to_slice(py, &mut vec[..])
-                .map_err(|e| PyRuntimeError::new_err(format!("Buffer copy failed: {}", e)))?;
-            // The copy is made: release the export before the GIL is released.
-            drop(buffer);
-            return self.write_owned_detached(py, vec);
+    /// The writer is put back after a failed write, so a failed `write_owned_bytes()`
+    /// leaves it usable for a retry or a clean `finalize()`.
+    #[pyo3(signature = (data, *, copy = false))]
+    fn write_owned_bytes(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        copy: bool,
+    ) -> PyResult<()> {
+        if copy {
+            // Snapshot first (GIL held, export released), then write the private copy.
+            let snapshot = snapshot_for_call(py, data)?;
+            return self.write_detached(py, &snapshot);
         }
-
-        // Fallback for PyBytes
-        if let Ok(bytes) = data.cast::<PyBytes>() {
-            return self.write_owned_detached(py, bytes.as_bytes().to_vec());
-        }
-
-        Err(PyRuntimeError::new_err(
-            "write_owned_bytes requires bytes-like object",
-        ))
+        self.write_chunk(py, data)
     }
 
     /// Finalize the writer and complete the upload
@@ -3266,6 +3581,15 @@ pub fn register_core_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(exists_async, m)?)?;
     m.add_function(wrap_pyfunction!(put_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(put_bytes_async, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_export_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_test_queue_export, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_test_retain_next_clone, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_test_retained, m)?)?;
+    m.add_function(wrap_pyfunction!(_put_test_release_retained, m)?)?;
+    m.add(
+        "ExportStillReferencedError",
+        m.py().get_type::<ExportStillReferencedError>(),
+    )?;
     m.add_function(wrap_pyfunction!(mkdir, m)?)?;
     m.add_function(wrap_pyfunction!(mkdir_async, m)?)?;
     m.add_function(wrap_pyfunction!(get_many_stats, m)?)?;
@@ -4149,19 +4473,20 @@ mod issue204_store_cache_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Tests -- PyObjectWriter::write_chunk must not create a reference over a mutable
-// exporter's memory before it holds the writer lock: waiting for the lock releases
-// the GIL, and another Python thread may then change that memory under the reference.
+// Tests -- PyObjectWriter::write_chunk / write_owned_bytes (issue #254).
 //
-// A behavioural RED is not possible: the read itself happens with the GIL held, so
-// the only difference is a live `&[u8]` over memory that changes during the wait
-// (undefined behaviour in the abstract machine, no observable torn data). The order
-// of the two steps is therefore pinned structurally.
+// Superseded design: write_chunk used to keep the GIL for every mutable buffer and took the
+// writer lock BEFORE building a slice over the caller's memory (waiting for the lock could
+// release the GIL). It now converts the argument like put_bytes() (a held buffer export, no
+// copy by the Python layer) and writes with the GIL RELEASED under the documented "do not
+// modify during the call" contract. The behaviour (RSS, GIL stall, round trips) is tested in
+// python/tests/test_python_write_paths_254.py; this pins the structure: no private raw-slice
+// path and no GIL-held write is left in write_chunk.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-mod write_chunk_slice_after_lock_tests {
+mod write_chunk_uses_the_shared_payload_conversion_tests {
     #[test]
-    fn the_slice_over_a_mutable_buffer_is_created_after_the_writer_lock_is_taken() {
+    fn write_chunk_converts_with_put_payload_and_writes_detached() {
         let src = include_str!("python_core_api.rs");
         let start = src
             .find("fn write_chunk(&self, py: Python<'_>")
@@ -4169,23 +4494,95 @@ mod write_chunk_slice_after_lock_tests {
         let rest = &src[start..];
         let end = rest.find("\n    }\n").expect("end of write_chunk");
         let body = &rest[..end];
-
-        assert_eq!(
-            body.matches("self.lock_with_gil(py)").count(),
-            1,
-            "RED: write_chunk takes the writer lock in more than one place, so a slice can be \
-             built on a path that has not taken it yet"
-        );
-        let lock = body
-            .find("self.lock_with_gil(py)")
-            .expect("RED: write_chunk's GIL-held path does not take the writer lock");
-        let slice = body
-            .find("from_raw_parts(")
-            .expect("RED: write_chunk's GIL-held path builds no slice");
         assert!(
-            lock < slice,
-            "RED: the slice over the caller's buffer is created before the writer lock is \
-             acquired (acquiring it can release the GIL)"
+            body.contains("hold_for_call("),
+            "write_chunk must use the strict shared conversion"
         );
+        assert!(
+            body.contains("write_detached("),
+            "the write must run with the GIL released"
+        );
+        assert!(
+            !body.contains("from_raw_parts(") && !body.contains("write_locked("),
+            "write_chunk must not build its own slice or write with the GIL held"
+        );
+        assert!(
+            body.contains("held.release(py)"),
+            "the export must be released directly with the GIL token before returning"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests -- the borrowed-put guard (round 6).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod borrowed_put_guard_tests {
+    use super::*;
+    use pyo3::types::PyDict;
+
+    /// A guard whose class constructor raises, over a plain asyncio future standing in for the
+    /// spawned put.
+    fn failing_guard<'py>(py: Python<'py>) -> (PreparedGuard<'py>, Bound<'py, PyAny>) {
+        let locals = PyDict::new(py);
+        py.run(
+            c_str!(
+                "import asyncio\nloop = asyncio.new_event_loop()\ninner = loop.create_future()\nclass Boom:\n    def __init__(self, *a):\n        raise RuntimeError('boom')\nnoop = lambda *a: None"
+            ),
+            None,
+            Some(&locals),
+        )
+        .unwrap();
+        let get = |k: &str| locals.get_item(k).unwrap().unwrap();
+        (
+            PreparedGuard {
+                class: get("Boom"),
+                latch_ready: get("noop"),
+                quiesce: get("noop"),
+                event: get("noop"),
+                block: get("noop"),
+            },
+            get("inner"),
+        )
+    }
+
+    /// Round 6, item 4: when the wrapper cannot be built after the put was spawned, the put is
+    /// CANCELLED before the (blocking) fallback wait, and the original error is raised.
+    #[test]
+    fn constructor_failure_cancels_the_put_then_waits_and_raises_the_original_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (guard, inner) = failing_guard(py);
+            let latch = Latch::new();
+            latch.mark_dropped();
+            latch.mark_released(); // no native reader: the fallback wait returns at once
+            let err = wrap_in_guard(py, guard, inner.clone(), &latch).expect_err("must fail");
+            assert!(err.to_string().contains("boom"), "{err}");
+            let cancelled: bool = inner.call_method0("cancelled").unwrap().extract().unwrap();
+            assert!(cancelled, "the already-spawned put was not cancelled");
+        });
+    }
+
+    #[test]
+    fn barrier_error_messages_name_the_timeout_and_the_put_outcome() {
+        let m = still_referenced_message("the put itself failed: disk full");
+        assert!(m.contains("30s"), "{m}");
+        assert!(m.contains("the put itself failed: disk full"), "{m}");
+        assert!(m.contains("do not modify"), "{m}");
+        let i = barrier_internal_message("RuntimeError('x')");
+        assert!(i.starts_with("internal error"), "{i}");
+        assert!(
+            i.contains("RuntimeError('x')") && i.contains("keeps waiting"),
+            "{i}"
+        );
+        assert!(!i.contains("still references"), "{i}");
+        let w = deadline_warning_text(3);
+        assert!(
+            w.contains("30s") && w.contains("#3") && w.contains("never completed"),
+            "{w}"
+        );
+        let before = export_stats().internal_errors;
+        note_internal_error();
+        assert_eq!(export_stats().internal_errors, before + 1);
     }
 }

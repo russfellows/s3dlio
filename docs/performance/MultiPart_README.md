@@ -148,8 +148,8 @@ print(info)
 
 ### Writing from bytes / memoryview / NumPy
 
-* `write(data)` accepts any **bytes‑like** object (e.g., `bytes`, `bytearray`, `memoryview`, NumPy buffer). It copies **once** into Rust for ownership, then streams.
-* Large buffers (≥ 8 MiB) use an owned fast path internally to avoid additional copies; small buffers use a borrowed slice path.
+* `write(data)` accepts any **bytes‑like** object (e.g., `bytes`, `bytearray`, `memoryview`, NumPy buffer). It copies **once** into Rust (the part buffers), then streams.
+* Only an `s3dlio.BytesView` takes the owned zero-copy fast path (≥ 8 MiB). Every other buffer is borrowed for the call (GIL released; do not modify it until `write` returns) and copied once into the part buffers; `write(data, copy=True)` snapshots a mutable buffer first.
 
 ```python
 # bytes / bytearray

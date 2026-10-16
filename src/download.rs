@@ -282,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn target_memory() {
-        let pool = BufferPoolConfig::default().build();
+        let pool = BufferPoolConfig::default().build().unwrap();
         let target = Target::Memory { pool: pool.clone() };
 
         match target {
