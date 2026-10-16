@@ -172,3 +172,43 @@ async fn test_checkpoint_integrity_validation() -> Result<()> {
 
     Ok(())
 }
+
+// Final review F2b: a compressing one-shot `put_shard` keeps the writer's checksum of the logical
+// bytes, and `CheckpointStore::load_latest` validates against it.
+#[tokio::test]
+async fn compressed_put_shard_keeps_the_checksum_and_load_latest_validates_it() -> Result<()> {
+    use s3dlio::checkpoint::{CheckpointConfig, CheckpointStore, KeyLayout};
+    use s3dlio::object_store::CompressionConfig;
+
+    let temp_dir = TempDir::new()?;
+    let base_uri = format!("file://{}", temp_dir.path().display());
+    let config = CheckpointConfig::default().with_compression(CompressionConfig::zstd_level(3));
+    let store = CheckpointStore::open_with_config(&base_uri, config)?;
+    let data = b"123456789";
+
+    // put_shard (compression branch) returns the CRC-32C of the logical bytes.
+    let layout = KeyLayout::new(base_uri.clone(), 7);
+    let writer = store.writer(1, 0);
+    let shard = writer.put_shard(&layout, data).await?;
+    assert_eq!(shard.checksum.as_deref(), Some("crc32c:e3069283"));
+    let keyed = writer.put_shard_with_key("custom/one.bin", data).await?;
+    assert_eq!(keyed.checksum.as_deref(), Some("crc32c:e3069283"));
+
+    // A full single-rank save then load_latest round trips...
+    store.save(8, 1, "test", data, None).await?;
+    assert_eq!(&store.load_latest().await?.unwrap()[..], data);
+
+    // ...and a different but valid zstd stream under the stored name is refused.
+    let reader = store.reader();
+    let manifest = reader.load_latest_manifest().await?.unwrap();
+    let key = manifest.shards[0].key.clone();
+    assert!(
+        manifest.shards[0].checksum.is_some(),
+        "manifest: {manifest:?}"
+    );
+    let other = zstd::encode_all(&b"987654321"[..], 3)?;
+    std::fs::write(temp_dir.path().join(&key), other)?;
+    let err = store.load_latest().await.unwrap_err().to_string();
+    assert!(err.contains("Integrity validation failed"), "{err}");
+    Ok(())
+}

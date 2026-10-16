@@ -1591,12 +1591,20 @@ fn set_shard_meta_items(
     Ok(())
 }
 
-/// The optional checksum of a shard dict: absent or `None` is `None`; anything but a string is
-/// a `TypeError`.
+/// The optional checksum of a shard dict: absent, `None` and `""` are `None`; anything but a
+/// string is a `TypeError`; a string that is not a supported `crc32c:<hex>` form is an error here,
+/// so a bad value fails when the checkpoint is finalized, not later when it is restored.
 #[cfg(feature = "extension-module")]
 fn shard_checksum_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<Option<String>> {
     match dict.get_item(SHARD_CHECKSUM_KEY)? {
-        Some(value) if !value.is_none() => value.extract::<String>().map(Some),
+        Some(value) if !value.is_none() => {
+            let checksum = value.extract::<String>()?;
+            if checksum.is_empty() {
+                return Ok(None);
+            }
+            crate::checksum::parse_expected_crc32c(&checksum).map_err(py_err)?;
+            Ok(Some(checksum))
+        }
         _ => Ok(None),
     }
 }
@@ -3637,6 +3645,38 @@ mod shard_meta_conversion_tests {
             dict.set_item("checksum", 12345u32).unwrap();
             let err = shard_meta_from_dict(&dict).unwrap_err();
             assert!(err.is_instance_of::<PyTypeError>(py), "{err}");
+        });
+    }
+
+    #[test]
+    fn malformed_checksum_is_refused_and_empty_means_absent() {
+        init();
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            set_shard_meta_items(&dict, &shard(None)).unwrap();
+            for bad in [
+                "md5:abc",
+                "zzz",
+                "crc32c:123456789",
+                "0xe3069283",
+                "crc32c:",
+            ] {
+                dict.set_item("checksum", bad).unwrap();
+                assert!(
+                    shard_meta_from_dict(&dict).is_err(),
+                    "{bad} must be refused"
+                );
+            }
+            dict.set_item("checksum", "").unwrap();
+            assert!(shard_meta_from_dict(&dict).unwrap().checksum.is_none());
+            // Both accepted spellings pass through unchanged.
+            for ok in ["crc32c:e3069283", "e3069283"] {
+                dict.set_item("checksum", ok).unwrap();
+                assert_eq!(
+                    shard_meta_from_dict(&dict).unwrap().checksum.as_deref(),
+                    Some(ok)
+                );
+            }
         });
     }
 

@@ -170,3 +170,106 @@ def test_non_string_checksum_is_a_type_error():
         meta["checksum"] = 12345
         with pytest.raises(TypeError):
             _finalize(store, [meta])
+
+
+# ---------------------------------------------------------------------------
+# F2b: the plain "load latest" loaders validate too, a compressed one-shot save keeps its
+# checksum, and a malformed checksum is refused when the checkpoint is finalized.
+# ---------------------------------------------------------------------------
+
+
+def _finalized_store(tmp, compression_level):
+    root = os.path.join(tmp, "ckpt")
+    store = s3dlio.PyCheckpointStore(
+        f"file://{root}", compression_level=compression_level
+    )
+    meta = _stream_one(store, KNOWN_PAYLOAD)
+    _finalize(store, [meta])
+    return root, store, meta
+
+
+@pytest.mark.parametrize("compression_level", [None, 3], ids=["plain", "zstd"])
+def test_load_latest_and_load_checkpoint_load_unchanged_content(compression_level):
+    with tempfile.TemporaryDirectory() as tmp:
+        root, store, _ = _finalized_store(tmp, compression_level)
+        assert bytes(store.load_latest()) == KNOWN_PAYLOAD
+        assert bytes(s3dlio.load_checkpoint(f"file://{root}")) == KNOWN_PAYLOAD
+
+
+def test_load_latest_and_load_checkpoint_reject_a_replaced_plain_shard():
+    with tempfile.TemporaryDirectory() as tmp:
+        root, store, meta = _finalized_store(tmp, None)
+        with open(os.path.join(root, meta["key"]), "wb") as fh:
+            fh.write(b"987654321")
+        with pytest.raises(Exception, match="(?i)integrity|checksum"):
+            store.load_latest()
+        with pytest.raises(Exception, match="(?i)integrity|checksum"):
+            s3dlio.load_checkpoint(f"file://{root}")
+
+
+def test_load_latest_and_load_checkpoint_reject_a_replaced_zstd_shard():
+    with tempfile.TemporaryDirectory() as tmp:
+        root, store, meta = _finalized_store(tmp, 3)
+        other_root = os.path.join(tmp, "other")
+        other = s3dlio.PyCheckpointStore(f"file://{other_root}", compression_level=3)
+        other_meta = _stream_one(other, b"987654321")
+        shutil.copyfile(
+            os.path.join(other_root, other_meta["key"]), os.path.join(root, meta["key"])
+        )
+        with pytest.raises(Exception, match="(?i)integrity|checksum"):
+            store.load_latest()
+        with pytest.raises(Exception, match="(?i)integrity|checksum"):
+            s3dlio.load_checkpoint(f"file://{root}")
+
+
+def test_checksum_free_manifest_still_loads_through_load_latest():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "ckpt")
+        store = s3dlio.PyCheckpointStore(f"file://{root}")
+        meta = _stream_one(store, KNOWN_PAYLOAD)
+        _finalize(store, [{k: v for k, v in meta.items() if k != "checksum"}])
+        with open(os.path.join(root, meta["key"]), "wb") as fh:
+            fh.write(b"987654321")  # unvalidated, as before
+        assert bytes(store.load_latest()) == b"987654321"
+        assert bytes(s3dlio.load_checkpoint(f"file://{root}")) == b"987654321"
+
+
+def test_compressed_one_shot_save_returns_the_logical_checksum():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "ckpt")
+        store = s3dlio.PyCheckpointStore(f"file://{root}", compression_level=3)
+        writer = store.writer(world_size=1, rank=0)
+        meta = writer.save_distributed_shard(STEP, EPOCH, "test", KNOWN_PAYLOAD)
+        assert meta["key"].endswith(".zst"), meta
+        assert meta["checksum"] == KNOWN_CRC32C, meta
+        # And it validates: finalize with it, then the read decodes before checking.
+        _finalize(store, [meta])
+        assert bytes(store.load_latest()) == KNOWN_PAYLOAD
+
+
+@pytest.mark.parametrize(
+    "bad", ["md5:abc", "zzz", "crc32c:123456789", "0xe3069283", "crc32c:"]
+)
+def test_malformed_checksum_is_refused_at_finalize(bad):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "ckpt")
+        store = s3dlio.PyCheckpointStore(f"file://{root}")
+        meta = _stream_one(store, KNOWN_PAYLOAD)
+        meta["checksum"] = bad
+        with pytest.raises(Exception, match="(?i)checksum"):
+            _finalize(store, [meta])
+        # Nothing was published.
+        assert store.reader().load_latest_manifest() is None
+
+
+def test_empty_checksum_string_means_absent():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "ckpt")
+        store = s3dlio.PyCheckpointStore(f"file://{root}")
+        meta = _stream_one(store, KNOWN_PAYLOAD)
+        meta["checksum"] = ""
+        manifest_key = _finalize(store, [meta])
+        assert [
+            s["checksum"] for s in _manifest_json(root, manifest_key)["shards"]
+        ] == [None]
+        assert bytes(store.load_latest()) == KNOWN_PAYLOAD

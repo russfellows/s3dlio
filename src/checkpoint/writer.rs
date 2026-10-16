@@ -62,6 +62,9 @@ impl<'a> Writer<'a> {
         if let Some(compression) = &self.compression {
             let (mut writer, _) = self.get_shard_writer(layout).await?;
             writer.write_chunk(data).await?;
+            // The checksum of the logical (uncompressed) bytes, taken before finalize consumes
+            // the writer.
+            let checksum = writer.checksum();
             writer.finalize().await?;
 
             // A compressing writer stores the shard under `stored_name`; the manifest and the
@@ -75,7 +78,7 @@ impl<'a> Writer<'a> {
                 key: compressed_key,
                 size: meta.size,
                 etag: meta.e_tag,
-                checksum: None, // TODO: Add checksum support if needed
+                checksum,
             })
         } else {
             // Choose upload method based on size for uncompressed data
@@ -107,6 +110,9 @@ impl<'a> Writer<'a> {
         if let Some(compression) = &self.compression {
             let mut writer = self.get_shard_writer_with_key(key).await?;
             writer.write_chunk(data).await?;
+            // The checksum of the logical (uncompressed) bytes, taken before finalize consumes
+            // the writer.
+            let checksum = writer.checksum();
             writer.finalize().await?;
 
             // A compressing writer stores the shard under `stored_name`; the manifest and the
@@ -120,7 +126,7 @@ impl<'a> Writer<'a> {
                 key: compressed_key,
                 size: meta.size,
                 etag: meta.e_tag,
-                checksum: None,
+                checksum,
             })
         } else {
             // Choose upload method based on size for uncompressed data

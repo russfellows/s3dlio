@@ -85,7 +85,11 @@
   (a `None` value means no checksum; a non-string is a `TypeError`), `load_latest_manifest()` returns it,
   and `read_shard_by_rank` validates against it (after decompression for `.zst` shards) and raises on
   a mismatch. Manifests and metadata without a checksum behave as before: readable, not validated.
-  `PyCheckpointWriter.save_distributed_shard` still computes no checksum for its one-shot upload.
+  `PyCheckpointStore.load_latest()` and `s3dlio.load_checkpoint(uri)` validate too (same rule), and
+  `put_shard` / `put_shard_with_key` on a compressing store now keep the writer's checksum (an
+  uncompressed one-shot save still computes none). A checksum string that is not a supported
+  `crc32c:<hex>` form is refused by `finalize_distributed_checkpoint` instead of publishing a
+  checkpoint that cannot be restored; an empty string means no checksum.
 
 - **`azure_credential::redact_sas` and `warn_unused_sas` now read the dotenv file first.** A Rust
   caller whose first s3dlio call was `redact_sas` missed a SAS token that was set only in an opted-in
