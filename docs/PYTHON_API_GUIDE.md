@@ -315,8 +315,7 @@ awaitable completes):
 * **blocking `put_bytes` keeps `s3dlio.ExportStillReferencedError`.** Its wait is bounded by the same timeout and is
   not interruptible by signals / `KeyboardInterrupt` (the buffer must not be released while it can still be read).
   If a backend still holds the payload after that, the call raises `ExportStillReferencedError` (data may or may
-  not have been written; the message names the timeout and what the put itself did, and the put's own error is
-  chained as `__cause__`). The exception is raised directly in the calling thread's own stack: no Future or Task
+  not have been written; the message names the timeout and what the put itself did, including the text of the put's own error if it failed). The exception is raised directly in the calling thread's own stack: no Future or Task
   stands between, so asyncio cancellation cannot rewrite it. The buffer stays pinned (a resize raises
   `BufferError`): **do not reuse it** after this error. The same class is raised by `put_bytes_async` itself, synchronously, if the put could
   not be started and the readers did not let go in time;
@@ -742,7 +741,10 @@ default for every C-contiguous buffer: `bytearray`, `memoryview`, NumPy of any d
 * exact `bytes` and `s3dlio.BytesView` are immutable: they never race and are never copied, in any mode;
 * **`copy=True`** (`write_owned_bytes` and `MultipartUploadWriter.write` only) first takes ONE snapshot of a mutable
   buffer with the GIL held and releases the export, so you may modify or reuse your buffer as soon as the call has
-  started. Use it when another thread may write to the buffer during the call. It costs one copy of the data;
+  started. Use it when another Python thread may write to the buffer during the call. The snapshot is atomic only
+  against writers that **hold the GIL** (pure-Python code): a writer that releases the GIL (a large NumPy
+  operation, `file.readinto(buf)`, `sock.recv_into(buf)`, a CUDA or torch copy into pinned memory) can still tear
+  it, and you must serialise such writers yourself. It costs one copy of the data;
   `write_chunk` has no `copy` parameter (it always borrows).
 
 **Behaviour change in 0.9.128.** In 0.9.126 and earlier `write_owned_bytes()` copied a mutable buffer under the GIL

@@ -1667,10 +1667,14 @@ fn put_bytes_async<'py>(
 /// Wrap the already-spawned put future `inner` in the `GuardedFuture`.
 ///
 /// If the wrapper cannot be built (the Python class call fails: out of memory) the put is already
-/// running, so the put is cancelled first (queued work is dropped) and the call falls back to the
-/// blocking wait for the native readers before it raises. **That fallback blocks the event-loop
-/// thread** for as long as a running native write takes to finish, bounded by the quiesce timeout
-/// (`S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`); it can only happen on that failure.
+/// running. `inner.cancel()` is requested, but it only schedules the cancellation on the event
+/// loop, and the loop thread is then blocked in the wait below - so the cancellation takes effect
+/// only AFTER that wait and the put keeps running meanwhile. The call falls back to the blocking
+/// wait for the native readers before it raises. **That fallback blocks the event-loop thread**
+/// for as long as the running put needs, bounded by the quiesce timeout
+/// (`S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS`); on expiry it raises `ExportStillReferencedError` even
+/// though the put may still be running (the buffer stays pinned). It can only happen on that
+/// OOM-type failure.
 fn wrap_in_guard<'py>(
     py: Python<'py>,
     guard: PreparedGuard<'py>,
@@ -1759,6 +1763,8 @@ class GuardedFuture(asyncio.Future):
 
     def _await_release(self):
         # Completes ONLY when latch_ready() returned True (owner dropped AND export released).
+        if self.done():
+            return  # finished by someone else: stop waiting and polling
         try:
             if self._latch_ready():
                 self._complete()
@@ -1794,6 +1800,8 @@ class GuardedFuture(asyncio.Future):
         self._poll()
 
     def _poll(self):
+        if self.done():
+            return  # finished by someone else: stop polling
         try:
             if self._latch_ready():
                 self._complete()
@@ -1811,6 +1819,8 @@ class GuardedFuture(asyncio.Future):
             self._complete()
 
     def _complete(self):
+        if self.done():
+            return
         kind, value = self._outcome
         if kind == 0:
             asyncio.Future.set_result(self, value)
@@ -1951,7 +1961,7 @@ fn _put_export_stats(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     Ok(d)
 }
 
-/// Hidden test hook: queue an undrained export of `data` and, with `park_ms > 0`, park the
+/// TEST-ONLY hidden hook (not part of the API; never call it in production): queue an undrained export of `data` and, with `park_ms > 0`, park the
 /// autonomous releaser once between its attach-gate entry and `Python::try_attach`.
 #[pyfunction]
 #[pyo3(signature = (data, park_ms = 0))]
@@ -1959,7 +1969,7 @@ fn _put_test_queue_export(py: Python<'_>, data: &Bound<'_, PyAny>, park_ms: u64)
     super::put_payload::test_queue_undrained_export(py, data, park_ms)
 }
 
-/// Hidden test hook: the next borrowed/blocking payload that holds a buffer export keeps one clone
+/// TEST-ONLY hidden hook (not part of the API; never call it in production): the next borrowed/blocking payload that holds a buffer export keeps one clone
 /// of its bytes, like a backend that keeps reading after the put ended, until
 /// `_put_test_release_retained()`.
 #[pyfunction]
@@ -1967,13 +1977,13 @@ fn _put_test_retain_next_clone() {
     super::put_payload::arm_retain_for_test();
 }
 
-/// Hidden test hook: number of clones retained by `_put_test_retain_next_clone()` right now.
+/// TEST-ONLY hidden hook (not part of the API; never call it in production): number of clones retained by `_put_test_retain_next_clone()` right now.
 #[pyfunction]
 fn _put_test_retained() -> usize {
     super::put_payload::retained_for_test()
 }
 
-/// Hidden test hook: drop every retained clone (in order, with the GIL held); returns how many.
+/// TEST-ONLY hidden hook (not part of the API; never call it in production): drop every retained clone (in order, with the GIL held); returns how many.
 #[pyfunction]
 fn _put_test_release_retained() -> usize {
     super::put_payload::release_retained_for_test()
@@ -2838,8 +2848,11 @@ impl PyObjectWriter {
     ///   otherwise; the data written is undefined); it is released before the call returns.
     /// * `copy=True`: a mutable buffer (bytearray, memoryview, NumPy, ...) is first copied ONCE
     ///   with the GIL held, the export is released, and the write then runs on the copy, so you
-    ///   may modify or reuse your buffer as soon as the call has started. Exact `bytes` and
-    ///   `s3dlio.BytesView` are immutable: they are never copied, in either mode.
+    ///   may modify or reuse your buffer as soon as the call has started. The snapshot is atomic
+    ///   only against writers that HOLD the GIL (pure-Python code in other threads). A writer
+    ///   that releases the GIL (a large NumPy operation, `readinto`/`recv_into`, a CUDA or torch
+    ///   copy into pinned memory) can still tear it: serialise such writers yourself. Exact
+    ///   `bytes` and `s3dlio.BytesView` are immutable: they are never copied, in either mode.
     ///
     /// The writer is put back after a failed write, so a failed `write_owned_bytes()`
     /// leaves it usable for a retry or a clean `finalize()`.

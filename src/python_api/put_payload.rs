@@ -170,8 +170,10 @@ pub(crate) enum PayloadUse {
     /// until the awaitable completes, so it is read in place like `Blocking`.
     Borrowed,
     /// The streaming writers' `copy=True`: a mutable exporter is copied once, with the GIL held
-    /// for the whole copy (no other Python thread can interleave), and the export is released
-    /// before the write starts. Exact `bytes` and `BytesView` are immutable and still not copied.
+    /// for the whole copy (no pure-Python thread can interleave; a writer that RELEASES the GIL -
+    /// large NumPy operations, `readinto`/`recv_into`, CUDA/torch copies - still can and can tear
+    /// the snapshot), and the export is released before the write starts. Exact `bytes` and
+    /// `BytesView` are immutable and still not copied.
     SnapshotUnderGil,
 }
 
@@ -198,6 +200,8 @@ pub(crate) struct Latch {
     notify: tokio::sync::Notify,
     /// Wakes the async waiter when `released` is set.
     notify_released: tokio::sync::Notify,
+    /// Set once the short "re-drain" slice of [`quiesce_async`] has been used.
+    redrain_slice_used: AtomicBool,
 }
 
 #[derive(Default)]
@@ -243,6 +247,7 @@ impl Latch {
             cv: Condvar::new(),
             notify: tokio::sync::Notify::new(),
             notify_released: tokio::sync::Notify::new(),
+            redrain_slice_used: AtomicBool::new(false),
         })
     }
 
@@ -382,6 +387,10 @@ pub(crate) fn quiesce_blocking(py: Python<'_>, latch: &Latch) -> Result<(), Quie
     }
 }
 
+/// How long the first "already dropped" step of [`quiesce_async`] waits before returning so the
+/// caller re-drains: two release grace periods (50 ms).
+const REDRAIN_SLICE: Duration = Duration::from_millis(50);
+
 /// Async counterpart for the awaitable of `put_bytes_async(borrow=True)`. One step of the guard's
 /// loop, bounded by `export_quiesce_timeout()`: while the owner has not been dropped it waits for
 /// the drop; once dropped (the caller has drained the queue and the export is still not released:
@@ -394,6 +403,16 @@ pub(crate) fn quiesce_blocking(py: Python<'_>, latch: &Latch) -> Result<(), Quie
 pub(crate) async fn quiesce_async(latch: Arc<Latch>) -> bool {
     let timeout = export_quiesce_timeout();
     let ok = if latch.is_dropped() {
+        // The owner was already dropped when this step started. Either another drainer is
+        // mid-release, or the last clone died after the caller's `latch_ready()` and the export
+        // sits undrained in the public queue (nobody on the event-loop thread would drain it).
+        // The FIRST such step therefore waits only one short slice and returns, so that the
+        // delivery of this very future drains the queue and the caller re-checks - no dependence
+        // on the releaser thread. Later steps wait the full deadline for a drainer mid-release.
+        if !latch.redrain_slice_used.swap(true, Ordering::AcqRel) {
+            latch.wait_released(REDRAIN_SLICE.min(timeout)).await;
+            return false;
+        }
         latch.wait_released(timeout).await
     } else {
         latch.wait_dropped(timeout).await
@@ -686,6 +705,9 @@ static TEST_PARK_RELEASER_MS: AtomicU64 = AtomicU64::new(0);
 static TEST_RELEASER_PARKED: AtomicU64 = AtomicU64::new(0);
 
 fn park_releaser_for_test() {
+    if TEST_PARK_RELEASER_MS.load(Ordering::Relaxed) == 0 {
+        return; // production: a plain load, no read-modify-write per wake-up
+    }
     let ms = TEST_PARK_RELEASER_MS.swap(0, Ordering::SeqCst);
     if ms > 0 {
         TEST_RELEASER_PARKED.fetch_add(1, Ordering::SeqCst);
@@ -1059,7 +1081,10 @@ pub(crate) fn put_payload(
         Parts::Plain(bytes) => Payload { bytes, latch: None },
         Parts::Export(owner, latch) => {
             let bytes = Bytes::from_owner(owner);
-            if TEST_RETAIN_NEXT.swap(false, Ordering::SeqCst) {
+            // Relaxed load first: the production borrowed-export path does no read-modify-write.
+            if TEST_RETAIN_NEXT.load(Ordering::Relaxed)
+                && TEST_RETAIN_NEXT.swap(false, Ordering::SeqCst)
+            {
                 TEST_RETAINED
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -2012,6 +2037,41 @@ mod tests {
         other_drainer.join().unwrap();
     }
 
+    /// P3-2: the last clone died after the caller's `latch_ready()` and the export sits
+    /// undrained in the public queue. The first step must come back after a short slice (not the
+    /// 30 s deadline, no timeout reported, nothing released by it) so that the delivery drains
+    /// and the guard re-checks; it must not depend on the releaser thread.
+    #[tokio::test]
+    async fn first_already_dropped_step_returns_after_a_short_slice_without_a_timeout() {
+        init();
+        let queue = ReleaseQueue::start(Duration::from_secs(3600), leak_gate(false), true);
+        let (latch, ba) = dropped_but_unreleased(queue);
+        let before = export_stats().quiesce_timeouts;
+        let started = Instant::now();
+        assert!(
+            !quiesce_async(latch.clone()).await,
+            "a slice is not a timeout"
+        );
+        let took = started.elapsed();
+        assert!(took >= REDRAIN_SLICE, "returned before the slice: {took:?}");
+        assert!(
+            took < Duration::from_secs(5),
+            "waited the deadline: {took:?}"
+        );
+        assert!(!latch.is_released(), "nothing drained yet");
+        assert_eq!(
+            export_stats().quiesce_timeouts,
+            before,
+            "no timeout counted"
+        );
+        // What the delivery of the quiesce future does next, then the guard's re-check:
+        Python::attach(|py| {
+            queue.drain(py);
+            assert!(latch.is_released());
+            assert!(resizable(ba.bind(py).as_any()));
+        });
+    }
+
     #[tokio::test]
     async fn async_quiesce_waits_for_the_actual_release_after_the_owner_dropped() {
         init();
@@ -2022,10 +2082,14 @@ mod tests {
             Python::attach(|py| queue.drain(py));
         });
         let started = Instant::now();
-        assert!(
-            !quiesce_async(latch.clone()).await,
-            "must not report a timeout"
-        );
+        // Steps as the guard runs them: re-check after each step (the first "already dropped"
+        // step is only a short re-drain slice, the next one waits for the other drainer).
+        while !latch.is_released() {
+            assert!(
+                !quiesce_async(latch.clone()).await,
+                "must not report a timeout"
+            );
+        }
         assert!(
             started.elapsed() >= Duration::from_millis(290),
             "completed before the export was actually released"

@@ -1106,3 +1106,38 @@ def test_exit_waits_for_a_releaser_parked_before_try_attach(work_dir):
     )
     assert stats["shutdown_attach_wait_timeouts"] == 0, stats
     assert elapsed >= 1.4, f"exit did not wait for the parked releaser ({elapsed:.2f}s)"
+
+
+def test_a_future_finished_by_someone_else_stops_polling(work_dir):
+    """P3-4: if the future is made terminal externally, the guard must not keep polling (or
+    keep reporting failures) forever."""
+    cls = guarded_future_class(work_dir)
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        calls = []
+
+        def latch_ready():
+            calls.append(1)
+            raise RuntimeError("never ready")
+
+        inner = loop.create_future()
+        fut = cls(
+            inner,
+            latch_ready,
+            lambda: loop.create_future(),
+            lambda k, d: "x",
+            lambda: None,
+            0.02,
+        )
+        inner.set_result("uploaded")
+        await asyncio.sleep(0.2)
+        assert calls, "the guard never polled"
+        asyncio.Future.set_result(fut, "external")  # someone else ends it
+        await asyncio.sleep(0.1)  # let a poll that was already scheduled run
+        settled = len(calls)
+        await asyncio.sleep(0.3)
+        assert len(calls) == settled, "kept polling after the future was finished"
+        assert fut.result() == "external"
+
+    run_bounded(go)

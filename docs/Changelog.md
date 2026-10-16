@@ -80,8 +80,10 @@
   single write as `put`; it previously wrote `part_size` chunks (4 KiB by default) each padded to 4 KiB, which
   also left zero padding inside the object whenever `part_size` was not a multiple of 4096.
 
-- **Round-7 (1/6): the buffer-export releaser can no longer be inside CPython at interpreter finalization
-  (Python 3.12 shutdown race).** The autonomous releaser thread checked the shutdown flag and only then called
+- **Round-7 (1/6): the autonomous buffer-export releaser thread can no longer be inside CPython at interpreter
+  finalization (Python 3.12 shutdown race), within the 30 s exit bound.** (Other `Python::attach` sites are
+  unchanged: result deliveries stay under the #192 gate with its 2 s drain; attaches inside spawned futures elsewhere
+  are not covered.) The autonomous releaser thread checked the shutdown flag and only then called
   `Python::try_attach`; an attach already past the check could still be waiting for the GIL when the exit
   callback returned and Python 3.12 began finalizing (pyo3's `Py_IsFinalizing` check exists only for 3.13+).
   Every autonomous attach now runs inside an attach gate: the releaser increments an in-flight counter, then
@@ -118,7 +120,9 @@
   borrows the buffer without copying, no thread may modify it until the call returns, and it is released before
   the call returns. New keyword-only `copy=False` on `write_owned_bytes` and `MultipartUploadWriter.write`:
   `copy=True` snapshots a mutable buffer once under the GIL (exact `bytes` and `BytesView` are immutable and never
-  copied), for callers whose other threads may write to the buffer during the call. The misleading "kept for
+  copied), for callers whose other Python threads may write to the buffer during the call (atomic only against
+  writers that hold the GIL; a writer that releases it - large NumPy operations, `readinto`/`recv_into`, CUDA/torch
+  copies - can still tear the snapshot and must be serialised by the caller). The misleading "kept for
   compatibility" wording of `write_owned_bytes` is gone.
 - **Round-7 (4/6): an oversized `direct://` range read no longer holds a pool buffer it does not use (R5).**
   A range larger than the range-read pool's buffer (64 MiB by default) first took a pooled buffer and permit, found
@@ -154,7 +158,8 @@
   already over (only the barrier is pending), so a Task awaiting it still honours its own cancellation right after
   the barrier completes instead of losing it to the put's result; `latch_ready` needs the export to be really
   released, not only its owner dropped; if the wrapper cannot be built after the put was spawned, the put is
-  cancelled before the (event-loop-blocking, quiesce-timeout-bounded) fallback wait; `ExportStillReferencedError`
+  asked to cancel (the cancellation takes effect only after the event-loop-blocking, quiesce-timeout-bounded
+  fallback wait, which can end in `ExportStillReferencedError` while the put still runs); `ExportStillReferencedError`
   names the timeout and what the put did, and an internal barrier failure says so and is counted
   (`_put_export_stats()["internal_errors"]`); a set but unusable `S3DLIO_EXPORT_QUIESCE_TIMEOUT_SECS` warns once
   and falls back to the default. Documented: `asyncio.shield()` of a borrowed put bypasses the guard, and

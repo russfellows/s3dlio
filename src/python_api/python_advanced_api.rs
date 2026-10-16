@@ -183,11 +183,15 @@ impl PyMultipartUploadWriter {
     ///     data: bytes-like object (or an object with ``__bytes__()``).
     ///     copy: keyword-only, default False. With ``copy=True`` a mutable buffer is first
     ///         copied once with the GIL held and the export released, so you may modify or reuse
-    ///         it as soon as the call has started; exact ``bytes`` and ``BytesView`` are
+    ///         it as soon as the call has started. The snapshot is atomic only against writers
+    ///         that HOLD the GIL (pure-Python threads); a writer that releases the GIL (large
+    ///         NumPy operations, ``readinto``/``recv_into``, CUDA or torch copies) can still tear
+    ///         it and must be serialised by the caller. Exact ``bytes`` and ``BytesView`` are
     ///         immutable and never copied.
     ///
-    /// For large buffers (>= 8 MiB), uses an owned fast path internally to avoid
-    /// extra copies. For maximum performance, prefer `reserve()`/`commit()`.
+    /// Only a ``BytesView`` takes an owned zero-copy fast path (>= 8 MiB: its shared bytes are
+    /// sliced into parts). Every other buffer is borrowed and the sink copies it once into its
+    /// part buffers. For maximum performance, prefer `reserve()`/`commit()`.
     ///
     /// Returns:
     ///     int: number of bytes accepted.
