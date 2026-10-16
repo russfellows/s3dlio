@@ -253,31 +253,8 @@ impl DirectIOWriter {
         }
 
         // Append compression extension to path if needed
-        let final_path = if compression.is_enabled() {
-            let mut path_with_ext = path.clone();
-            let ext = match &compression {
-                CompressionConfig::None => "",
-                CompressionConfig::Zstd { .. } => ".zst",
-            };
-            if let Some(existing_ext) = path_with_ext.extension() {
-                let new_ext = format!("{}{}", existing_ext.to_str().unwrap_or(""), ext);
-                path_with_ext.set_extension(new_ext);
-            } else {
-                let new_name = format!(
-                    "{}{}",
-                    path_with_ext
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_str()
-                        .unwrap_or(""),
-                    ext
-                );
-                path_with_ext.set_file_name(new_name);
-            }
-            path_with_ext
-        } else {
-            path.clone()
-        };
+        // (the one suffix rule, shared with the checkpoint manifest names)
+        let final_path = compression.stored_path(&path);
 
         // Create compressor if needed
         let compressor = match &compression {

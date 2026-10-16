@@ -64,19 +64,10 @@ impl<'a> Writer<'a> {
             writer.write_chunk(data).await?;
             writer.finalize().await?;
 
-            // When compression is enabled, the file gets the compression extension
-            let compressed_uri = if compression.is_enabled() {
-                format!("{}{}", uri, compression.extension())
-            } else {
-                uri
-            };
-
-            // Update the key to include compression extension for the manifest
-            let compressed_key = if compression.is_enabled() {
-                format!("{}{}", key, compression.extension())
-            } else {
-                key
-            };
+            // A compressing writer stores the shard under `stored_name`; the manifest and the
+            // stat use the same rule, so they name the object the writer created.
+            let compressed_uri = compression.stored_name(&uri);
+            let compressed_key = compression.stored_name(&key);
 
             let meta = self.store.stat(&compressed_uri).await?;
             Ok(ShardMeta {
@@ -118,19 +109,10 @@ impl<'a> Writer<'a> {
             writer.write_chunk(data).await?;
             writer.finalize().await?;
 
-            // When compression is enabled, the file gets the compression extension
-            let compressed_uri = if compression.is_enabled() {
-                format!("{}{}", uri, compression.extension())
-            } else {
-                uri
-            };
-
-            // Update the key to include compression extension for the manifest
-            let compressed_key = if compression.is_enabled() {
-                format!("{}{}", key, compression.extension())
-            } else {
-                key.to_string()
-            };
+            // A compressing writer stores the shard under `stored_name`; the manifest and the
+            // stat use the same rule, so they name the object the writer created.
+            let compressed_uri = compression.stored_name(&uri);
+            let compressed_key = compression.stored_name(key);
 
             let meta = self.store.stat(&compressed_uri).await?;
             Ok(ShardMeta {
@@ -239,11 +221,7 @@ impl<'a> Writer<'a> {
         // A compressing writer stores the shard under the compression extension
         // (`shard.bin.zst`), and the manifest must name the stored object.
         let compression = writer.compression();
-        let key = if compression.is_enabled() && !key.ends_with(compression.extension()) {
-            format!("{key}{}", compression.extension())
-        } else {
-            key
-        };
+        let key = compression.stored_name(&key);
         writer.finalize().await?;
         self.finalize_shard_meta_with_checksum(layout, key, checksum)
             .await

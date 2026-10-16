@@ -692,6 +692,16 @@ struct ArrowWriter {
     finalized: bool,
 }
 
+/// The path a compressing Arrow writer stores `path` under: the one suffix rule
+/// ([`CompressionConfig::stored_name`]) that the checkpoint manifest names also use.
+fn compressed_object_path(path: Path, compression: &CompressionConfig) -> Path {
+    if compression.is_enabled() {
+        Path::from(compression.stored_name(path.as_ref()))
+    } else {
+        path
+    }
+}
+
 impl ArrowWriter {
     async fn open(
         dest_uri: &str,
@@ -700,11 +710,7 @@ impl ArrowWriter {
         let (store, path, _url) = ArrowObjectStore::parse(dest_uri)?;
 
         // Adjust path for compression extension
-        let final_path = if compression.is_enabled() {
-            Path::from(format!("{}{}", path, compression.extension()))
-        } else {
-            path
-        };
+        let final_path = compressed_object_path(path, &compression);
 
         // Set up compressor if needed
         let compressor = match compression {
@@ -870,6 +876,27 @@ pub fn store_for_uri(_uri: &str) -> Result<Box<dyn S3DlioObjectStore>> {
 mod tests {
     use super::*;
     use futures::StreamExt;
+
+    // R10: a key that already ends in the compression extension is stored as it is, so the
+    // checkpoint manifest (same rule) names the stored object; any other key gains it once.
+    #[test]
+    fn compressed_object_path_appends_the_extension_once() {
+        let zstd = CompressionConfig::zstd_default();
+        for (key, stored) in [
+            ("dir/plain.bin", "dir/plain.bin.zst"),
+            ("noext", "noext.zst"),
+            ("dir/custom.zst", "dir/custom.zst"),
+        ] {
+            let got = compressed_object_path(Path::from(key), &zstd);
+            assert_eq!(got, Path::from(stored), "{key}");
+            assert_eq!(got.as_ref(), zstd.stored_name(key), "{key}");
+        }
+        let none = CompressionConfig::None;
+        assert_eq!(
+            compressed_object_path(Path::from("dir/custom.zst"), &none),
+            Path::from("dir/custom.zst")
+        );
+    }
 
     // The factory must hand back a store usable through the current trait object.
     #[test]

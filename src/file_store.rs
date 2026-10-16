@@ -110,17 +110,8 @@ impl FileSystemWriter {
         }
 
         // Determine final path with compression extension if needed
-        let final_path = if compression.is_enabled() {
-            let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            let new_extension = if extension.is_empty() {
-                compression.extension().trim_start_matches('.')
-            } else {
-                &format!("{}{}", extension, compression.extension())
-            };
-            path.with_extension(new_extension)
-        } else {
-            path.clone()
-        };
+        // (the one suffix rule, shared with the checkpoint manifest names)
+        let final_path = compression.stored_path(&path);
 
         // Create and open the file for writing
         let file = fs::File::create(&final_path).await?;

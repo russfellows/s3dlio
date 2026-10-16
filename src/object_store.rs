@@ -139,6 +139,38 @@ impl CompressionConfig {
     pub fn is_enabled(&self) -> bool {
         !matches!(self, CompressionConfig::None)
     }
+
+    /// The name a compressing writer stores `name` under: the compression extension is
+    /// appended only when the name does not already end with it (`a.bin` -> `a.bin.zst`,
+    /// `a.zst` -> `a.zst`). With no compression the name is unchanged.
+    ///
+    /// This is the ONE suffix rule: every compressing writer uses it for the physical
+    /// object name and every checkpoint helper uses it for the manifest name, so the
+    /// two cannot disagree.
+    pub fn stored_name(&self, name: &str) -> String {
+        if self.is_enabled() && !name.ends_with(self.extension()) {
+            format!("{name}{}", self.extension())
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// [`stored_name`](Self::stored_name) for a filesystem path (the extension is
+    /// appended to the final component).
+    pub fn stored_path(&self, path: &std::path::Path) -> std::path::PathBuf {
+        if self.is_enabled()
+            && !path
+                .as_os_str()
+                .to_string_lossy()
+                .ends_with(self.extension())
+        {
+            let mut os = path.as_os_str().to_owned();
+            os.push(self.extension());
+            std::path::PathBuf::from(os)
+        } else {
+            path.to_path_buf()
+        }
+    }
 }
 
 /// Configuration options for creating object writers
@@ -2223,18 +2255,12 @@ impl ObjectWriter for S3BufferedWriter {
         self.seal_compression()?;
 
         // Append compression extension if needed
-        let mut final_uri = self.uri.clone();
-        if self.compression.is_enabled() && !final_uri.ends_with(self.compression.extension()) {
-            final_uri.push_str(self.compression.extension());
-        }
+        let final_uri = self.compression.stored_name(&self.uri);
 
         // A writer made by a per-endpoint store uploads with that store's client
         // (issue #208): create, parts, complete and abort all reach its server.
         if let Some(target) = self.target.take() {
-            let mut key = target.key;
-            if self.compression.is_enabled() && !key.ends_with(self.compression.extension()) {
-                key.push_str(self.compression.extension());
-            }
+            let key = self.compression.stored_name(&target.key);
             return crate::s3_utils::put_object_multipart_with_client(
                 &target.client,
                 &target.bucket,
@@ -3115,12 +3141,7 @@ impl ObjectWriter for AzureBufferedWriter {
 
         // Append compression extension if needed
         let (cli, _acct, _cont, key) = AzureObjectStore::client_for_uri(&self.uri)?;
-        let final_key =
-            if self.compression.is_enabled() && !key.ends_with(self.compression.extension()) {
-                format!("{}{}", key, self.compression.extension())
-            } else {
-                key
-            };
+        let final_key = self.compression.stored_name(&key);
 
         // Use Azure multipart upload for the buffered data
         cli.put(&final_key, Bytes::from(self.buffer.clone()), true)
@@ -3747,10 +3768,7 @@ impl ObjectWriter for GcsBufferedWriter {
         self.seal_compression()?;
 
         // Append compression extension if needed
-        let mut final_uri = self.uri.clone();
-        if self.compression.is_enabled() && !final_uri.ends_with(self.compression.extension()) {
-            final_uri.push_str(self.compression.extension());
-        }
+        let final_uri = self.compression.stored_name(&self.uri);
 
         // Parse URI and upload via GCS client
         let (bucket, object) = parse_gcs_uri(&final_uri)?;
